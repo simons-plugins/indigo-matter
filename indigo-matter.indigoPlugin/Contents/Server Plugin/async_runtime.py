@@ -1,9 +1,12 @@
 """Single asyncio event loop hosted on a dedicated background thread.
 
 Indigo plugins run on a synchronous main thread with lifecycle callbacks. This
-plugin, unlike the rest of the workspace, needs two long-lived async I/O
-subsystems (a persistent WebSocket client to matter-server and an embedded
-aiohttp HTTP server). Both live on the single loop owned here.
+plugin, unlike the rest of the workspace, needs a long-lived async I/O subsystem
+— a persistent WebSocket client to matter-server — plus short-lived coroutines
+bridged in from Indigo threads (commissioning, decommission, diagnostics). All
+of these live on the single loop owned here. (The Domio HTTP API is NOT on this
+loop: it is served by the Indigo Web Server as hidden-action handlers — see
+http_handlers.py and docs/IMPLEMENTATION.md §4.)
 
 The rule from the implementation notes — "never call ``asyncio.run`` from
 Indigo's main thread" — is honoured by running ``run_forever()`` on our own

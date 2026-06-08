@@ -118,8 +118,16 @@ class ServerProcess:
             handle.write(self.build_plist())
         self.logger.info("Wrote LaunchAgent %s", self.plist_path)
         # bootstrap (modern) with a load fallback for older macOS
-        if not self._bootstrap():
-            self._launchctl("load", self.plist_path)
+        if self._bootstrap():
+            return
+        result = self._launchctl("load", self.plist_path)
+        if result is None or result.returncode != 0:
+            detail = result.stderr.strip() if result is not None else "launchctl unavailable"
+            self.logger.error(
+                "Failed to load matter-server LaunchAgent (%s); the server may not be "
+                "running. Start it manually or check %s",
+                detail, self.plist_path,
+            )
 
     def uninstall(self) -> None:
         """Unload and remove the LaunchAgent. NEVER touches the storage dir."""

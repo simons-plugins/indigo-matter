@@ -26,6 +26,14 @@ from typing import Any, Optional
 # Wire field names — change HERE and nowhere else if the pinned release differs.
 # Defaults follow the canonical python-matter-server WebSocket API, since
 # matter-server advertises drop-in compatibility with it.
+#
+# TODO(M4-ondevice): these device_command arg names (endpoint_id/cluster_id/
+# command_name/payload) are the canonical python-matter-server spelling and
+# DISAGREE with IMPLEMENTATION.md §2 (endpoint/cluster/command/args). The unit
+# tests assert against these constants, so they pass for either spelling and do
+# NOT pin the wire format. Before/at first on-device run: capture a real frame
+# from matter-server, add it as a literal-JSON golden fixture in test_protocol,
+# and correct these constants if needed. This is the highest wire-compat risk.
 # --------------------------------------------------------------------------
 
 # Envelope

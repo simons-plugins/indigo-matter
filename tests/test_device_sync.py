@@ -172,6 +172,47 @@ def test_reconcile_marks_orphans_unreachable(ds, indigo_env):
     assert 5005 in [d.id for d in devices]
 
 
+def test_delete_node_excludes_failed_deletes_from_returned_ids(ds, indigo_env):
+    _indigo, devices = indigo_env
+    ds.create_from_raw(RELAY_NODE, "Office Plug")
+    dev_id = ds.lookup(42, 1)
+
+    # make Indigo's delete blow up
+    def boom(dev):
+        raise RuntimeError("device in use")
+    _indigo.device.delete = boom
+
+    removed = ds.delete_node(42)
+    assert removed == []  # nothing actually deleted → don't claim it was
+    # index entry retained since the device still exists
+    assert ds.lookup(42, 1) == dev_id
+
+
+def test_partial_creation_is_surfaced_in_result(indigo_env, mock_logger):
+    import device_sync
+    importlib.reload(device_sync)
+    from matter_handlers.registry import HandlerRegistry
+    _indigo, devices = indigo_env
+
+    ds = device_sync.DeviceSync(HandlerRegistry(), mock_logger)
+    # force device creation to fail
+    _indigo.device.create = lambda **kw: (_ for _ in ()).throw(RuntimeError("create failed"))
+
+    result = ds.create_from_raw(RELAY_NODE, "Office Plug")
+    assert result["indigoDeviceIds"] == []
+    assert result["primaryDeviceId"] is None
+    assert result.get("partial") is True
+    assert result["failedEndpoints"] == 1
+    mock_logger.warning.assert_called()
+
+
+def test_reconcile_skips_unparseable_node(ds):
+    bad = {"no_node_id": True}  # parse_node will raise on int(None)
+    # should not raise; bad node skipped, good node created
+    ds.reconcile_all([bad, RELAY_NODE])
+    assert ds.lookup(42, 1) is not None
+
+
 def test_build_command_dispatches_to_handler(ds, mock_indigo_base):
     import indigo
 

@@ -108,6 +108,11 @@ class MatterClient:
             self.server_info = first.get(protocol.KEY_DATA, {})
         self.connected = True
         self._connected_event.set()
+        # TODO(M4-ondevice): start_listening is assumed to stream ALL attribute
+        # changes (python-matter-server behaviour). If the pinned matter-server
+        # release requires explicit per-attribute subscriptions, wire up the
+        # handlers' attributes_to_subscribe() here — currently that method is
+        # defined but unused, and OnOff state would silently never update.
         await self._send_frame(self.proto.build_request(protocol.CMD_START_LISTENING))
         self.logger.info("connected to matter-server, listening")
 

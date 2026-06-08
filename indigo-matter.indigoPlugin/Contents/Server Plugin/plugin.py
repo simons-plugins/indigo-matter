@@ -21,7 +21,7 @@ import indigo  # provided by the Indigo runtime
 from async_runtime import AsyncRuntime
 from commission_jobs import CommissionJobs, node_id_to_str
 from device_sync import DeviceSync
-from http_handlers import HttpApi
+from http_handlers import HttpApi, MatterUnavailable
 from matter_client import MatterClient
 from matter_handlers.registry import HandlerRegistry
 from protocol import Protocol
@@ -238,13 +238,18 @@ class Plugin(indigo.PluginBase):
         }
 
     def _decommission_sync(self, node_id):
+        # None → genuine unknown node (404). MatterUnavailable → 503. Other → 500.
         if self.runtime is None:
-            return None
+            raise MatterUnavailable("plugin not ready")
         try:
             return self.runtime.submit(self._decommission(node_id)).result(timeout=DECOMMISSION_TIMEOUT)
-        except Exception as exc:  # noqa: BLE001
-            self.logger.error("decommission %s failed: %s", node_id, exc)
-            return None
+        except FuturesTimeoutError as exc:
+            self.logger.error("decommission %s timed out", node_id)
+            raise MatterUnavailable("matter-server timed out") from exc
+        except MatterUnavailable:
+            raise
+        except RuntimeError as exc:  # asyncio runtime not running
+            raise MatterUnavailable(str(exc)) from exc
 
     async def _decommission(self, node_id):
         fabric_removed = True
@@ -264,21 +269,28 @@ class Plugin(indigo.PluginBase):
 
     def _diagnostics_sync(self, node_id):
         if self.runtime is None:
-            return None
+            raise MatterUnavailable("plugin not ready")
         try:
             return self.runtime.submit(self._diagnostics(node_id)).result(timeout=DECOMMISSION_TIMEOUT)
-        except Exception as exc:  # noqa: BLE001
-            self.logger.error("diagnostics %s failed: %s", node_id, exc)
-            return None
+        except FuturesTimeoutError as exc:
+            self.logger.error("diagnostics %s timed out", node_id)
+            raise MatterUnavailable("matter-server timed out") from exc
+        except MatterUnavailable:
+            raise
+        except RuntimeError as exc:
+            raise MatterUnavailable(str(exc)) from exc
 
     async def _diagnostics(self, node_id):
         from matter_model import parse_node
         try:
             raw = await self.matter.get_node(node_id)
-        except Exception:  # noqa: BLE001
-            return None
+        except ConnectionError as exc:
+            raise MatterUnavailable(str(exc)) from exc
+        except Exception as exc:  # noqa: BLE001 - protocol/timeout error reading the node
+            self.logger.warning("diagnostics get_node(%s) failed: %s", node_id, exc)
+            raise MatterUnavailable(str(exc)) from exc
         if not raw:
-            return None
+            return None  # genuine unknown node → 404
         node = parse_node(raw)
         return {
             "nodeId": node_id_to_str(node_id),

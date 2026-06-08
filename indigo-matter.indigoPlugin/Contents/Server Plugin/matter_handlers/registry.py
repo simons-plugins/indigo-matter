@@ -26,6 +26,11 @@ def default_handlers() -> list[ClusterHandler]:
 class HandlerRegistry:
     def __init__(self, handlers: Optional[list[ClusterHandler]] = None) -> None:
         self.handlers: list[ClusterHandler] = handlers if handlers is not None else default_handlers()
+        for handler in self.handlers:
+            if not handler.cluster_id:
+                raise ValueError(
+                    f"{type(handler).__name__} must set a non-zero cluster_id"
+                )
         self._by_cluster = {h.cluster_id: h for h in self.handlers}
         self._by_device_type = {h.device_type_id: h for h in self.handlers if h.device_type_id}
 

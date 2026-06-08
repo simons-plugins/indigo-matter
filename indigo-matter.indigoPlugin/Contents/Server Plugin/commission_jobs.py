@@ -19,16 +19,33 @@ import threading
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from enum import Enum
 from typing import Any, Awaitable, Callable, Optional
 
-# Job statuses (API.md §3.3)
-PENDING = "pending"
-COMMISSIONING = "commissioning"
-READING_DESCRIPTORS = "reading_descriptors"
-CREATING_DEVICES = "creating_devices"
-SUCCESS = "success"
-FAILED = "failed"
-TERMINAL = {SUCCESS, FAILED}
+
+class JobStatus(str, Enum):
+    """Commissioning job status (API.md §3.3).
+
+    A ``str`` subclass so it serialises to its wire value via ``json.dumps`` and
+    compares equal to the raw string, while making the legal set explicit and
+    typos a lint/IDE error.
+    """
+    PENDING = "pending"
+    COMMISSIONING = "commissioning"
+    READING_DESCRIPTORS = "reading_descriptors"
+    CREATING_DEVICES = "creating_devices"
+    SUCCESS = "success"
+    FAILED = "failed"
+
+
+# Module-level aliases keep call sites terse and unchanged.
+PENDING = JobStatus.PENDING
+COMMISSIONING = JobStatus.COMMISSIONING
+READING_DESCRIPTORS = JobStatus.READING_DESCRIPTORS
+CREATING_DEVICES = JobStatus.CREATING_DEVICES
+SUCCESS = JobStatus.SUCCESS
+FAILED = JobStatus.FAILED
+TERMINAL = frozenset({JobStatus.SUCCESS, JobStatus.FAILED})
 
 RETENTION = timedelta(minutes=15)
 
@@ -129,7 +146,7 @@ class CommissionJobs:
         if not is_valid_setup_code(setup_code):
             return 400, {
                 "error": "invalid_setup_code",
-                "message": "Setup code must be either MT:... QR payload or 11-digit numeric",
+                "message": "Setup code must be an MT:... QR payload or an 11- or 21-digit numeric pairing code",
             }
         name = (params.get("suggestedName") or "").strip()
         if not name:

@@ -108,6 +108,37 @@ def test_decommission_unknown_node_404():
     assert code == 404
 
 
+def test_decommission_matter_unavailable_is_503():
+    from http_handlers import MatterUnavailable
+
+    def decom(node_id):
+        raise MatterUnavailable("matter-server timed out")
+
+    api, _ = _api(decommission=decom)
+    code, body = api.decommission("POST", ["0x2A"])
+    assert code == 503 and body["error"] == "matter_server_unreachable"
+
+
+def test_decommission_unexpected_error_is_500():
+    def decom(node_id):
+        raise RuntimeError("kaboom")
+
+    api, _ = _api(decommission=decom)
+    code, body = api.decommission("POST", ["0x2A"])
+    assert code == 500 and body["error"] == "internal_error"
+
+
+def test_diagnostics_matter_unavailable_is_503():
+    from http_handlers import MatterUnavailable
+
+    def diag(node_id):
+        raise MatterUnavailable("down")
+
+    api, _ = _api(diagnostics=diag)
+    code, body = api.diagnostics(["0x2A"])
+    assert code == 503
+
+
 def test_diagnostics_routes_to_provider():
     api, _ = _api(diagnostics=lambda nid: {"nodeId": "0x2A", "reachable": True})
     code, body = api.diagnostics(["0x2A"])

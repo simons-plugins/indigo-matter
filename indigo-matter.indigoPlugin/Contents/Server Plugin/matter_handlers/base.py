@@ -32,8 +32,10 @@ class IndigoDeviceSpec:
 class ClusterHandler(ABC):
     """Maps a Matter cluster to Indigo device(s), state, and actions."""
 
-    cluster_id: int
-    cluster_name: str
+    #: Matter cluster id. 0 is a sentinel meaning "subclass forgot to set it";
+    #: HandlerRegistry asserts this is non-zero at registration.
+    cluster_id: int = 0
+    cluster_name: str = ""
     #: Indigo deviceTypeId this handler owns (for action dispatch).
     device_type_id: str = ""
 

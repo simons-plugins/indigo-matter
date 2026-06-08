@@ -17,6 +17,14 @@ from __future__ import annotations
 from typing import Any, Callable, Optional
 
 
+class MatterUnavailable(Exception):
+    """Raised by a provider when matter-server is unreachable / timed out.
+
+    Mapped to 503 so a wedged or down matter-server is never reported to Domio
+    as a 404 'node_not_found' (which the contract reserves for an unknown node).
+    """
+
+
 def parse_node_id(text: str) -> Optional[int]:
     """Parse a nodeId path component ('0xABC' or decimal) to int, or None."""
     try:
@@ -72,7 +80,13 @@ class HttpApi:
         node_id = parse_node_id(path_args[0])
         if node_id is None:
             return 400, {"error": "invalid_node_id", "message": f"bad nodeId: {path_args[0]}"}
-        result = self._decommission(node_id)
+        try:
+            result = self._decommission(node_id)
+        except MatterUnavailable as exc:
+            return 503, {"error": "matter_server_unreachable", "message": str(exc)}
+        except Exception as exc:  # noqa: BLE001
+            self.logger.exception(exc)
+            return 500, {"error": "internal_error", "message": str(exc)}
         if result is None:
             return 404, {"error": "node_not_found"}
         return 200, result
@@ -86,7 +100,13 @@ class HttpApi:
         node_id = parse_node_id(path_args[0])
         if node_id is None:
             return 400, {"error": "invalid_node_id", "message": f"bad nodeId: {path_args[0]}"}
-        result = self._diagnostics(node_id)
+        try:
+            result = self._diagnostics(node_id)
+        except MatterUnavailable as exc:
+            return 503, {"error": "matter_server_unreachable", "message": str(exc)}
+        except Exception as exc:  # noqa: BLE001
+            self.logger.exception(exc)
+            return 500, {"error": "internal_error", "message": str(exc)}
         if result is None:
             return 404, {"error": "node_not_found"}
         return 200, result

@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
+
 import protocol
 from protocol import MatterCommand, Protocol
 from matter_client import MatterClient
@@ -143,6 +145,26 @@ def test_reconnects_with_backoff_after_drop(mock_logger):
         assert client.connected
         assert attempts["n"] >= 2
         assert delays and delays[0] <= 30  # backoff applied, capped
+
+        await client.close()
+        task.cancel()
+    run(scenario())
+
+
+def test_in_flight_request_fails_on_disconnect_instead_of_hanging(mock_logger):
+    async def scenario():
+        # responder never answers get_nodes → the request stays pending
+        fake = FakeWebSocket(responder=lambda f: [])
+        client = _client(mock_logger, fake)
+        task = asyncio.create_task(client.run())
+        await client.wait_connected(timeout=2)
+
+        pending = asyncio.create_task(client.get_nodes())
+        await asyncio.sleep(0.02)  # let it register as in-flight
+        await fake.close()         # drop the socket mid-request
+
+        with pytest.raises(ConnectionError):
+            await asyncio.wait_for(pending, timeout=2)  # must fail, not hang
 
         await client.close()
         task.cancel()
