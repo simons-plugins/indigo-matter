@@ -1,0 +1,11 @@
+# indigo-matter Python dependencies (installed into Indigo's bundled Python).
+#
+# Only one external dependency: the asyncio WebSocket client used to talk to
+# matter-server. aiohttp is deliberately NOT used — the Domio HTTP API is served
+# by the Indigo Web Server (IWS), see docs/IMPLEMENTATION.md §4.
+#
+# NOTE: Indigo's auto-install from requirements.txt has a known silent-skip
+# failure mode; if `import websockets` fails at startup, install manually with a
+# Python whose architecture matches the Indigo server:
+#   /Library/Frameworks/Python.framework/Versions/Current/bin/python3 -m pip install 'websockets>=12,<16'
+websockets>=12,<16

@@ -1,0 +1,35 @@
+<?xml version="1.0"?>
+<PluginConfig>
+    <Field id="matterServerHost" type="textfield" defaultValue="localhost">
+        <Label>matter-server host:</Label>
+    </Field>
+    <Field id="matterServerPort" type="textfield" defaultValue="5580">
+        <Label>matter-server port:</Label>
+    </Field>
+    <Field id="matterServerPath" type="textfield" defaultValue="/ws">
+        <Label>matter-server WebSocket path:</Label>
+    </Field>
+    <Field id="storagePath" type="textfield"
+           defaultValue="~/Library/Application Support/com.simon.indigo-matter/matter-server">
+        <Label>matter-server storage path:</Label>
+    </Field>
+    <!-- No plugin HTTP port: the Domio API is served by the Indigo Web Server
+         (IWS) as hidden-action handlers, not a standalone server. -->
+    <Field id="manageLaunchAgent" type="checkbox" defaultValue="false">
+        <Label>Manage matter-server LaunchAgent automatically:</Label>
+        <Description>When off, the plugin connects to a matter-server you start yourself
+            (recommended during development). When on, the plugin installs and supervises
+            a launchd LaunchAgent (process-management approach PM-B).</Description>
+    </Field>
+    <Field id="primaryInterface" type="textfield" defaultValue="en0">
+        <Label>Primary network interface (for managed LaunchAgent):</Label>
+        <Description>macOS interface matter-server binds to (e.g. en0). Only used when the
+            LaunchAgent is managed automatically.</Description>
+    </Field>
+    <Field id="verboseLogging" type="checkbox" defaultValue="false">
+        <Label>Verbose Matter logging:</Label>
+    </Field>
+    <Field id="traceWebSocket" type="checkbox" defaultValue="false">
+        <Label>Trace matter-server WebSocket messages (debug):</Label>
+    </Field>
+</PluginConfig>
