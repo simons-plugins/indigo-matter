@@ -23,11 +23,13 @@ from .sensors import (
     OccupancyHandler,
     TemperatureHandler,
 )
+from .thermostat import FanControlHandler, ThermostatHandler
 
 
 def default_handlers() -> list[ClusterHandler]:
     """Handlers in priority order. Lighting handlers (Color > Dimmer > Relay)
-    are mutually exclusive via ``is_primary_for``; sensors are additive."""
+    are mutually exclusive via ``is_primary_for``; sensors are additive;
+    Thermostat owns its endpoint and FanControl merges into it."""
     return [
         ColorControlHandler(),
         LevelControlHandler(),
@@ -37,6 +39,8 @@ def default_handlers() -> list[ClusterHandler]:
         OccupancyHandler(),
         ContactHandler(),
         IlluminanceHandler(),
+        ThermostatHandler(),
+        FanControlHandler(),
     ]
 
 

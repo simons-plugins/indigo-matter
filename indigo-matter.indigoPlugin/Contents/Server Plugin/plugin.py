@@ -24,7 +24,7 @@ from device_sync import DeviceSync
 from http_handlers import HttpApi, MatterUnavailable
 from matter_client import MatterClient
 from matter_handlers.registry import HandlerRegistry
-from protocol import Protocol
+from protocol import MatterWrite, Protocol
 from server_process import ServerProcess
 
 PLUGIN_NAME = "indigo-matter"
@@ -163,11 +163,13 @@ class Plugin(indigo.PluginBase):
     def actionControlSensor(self, action, dev):  # noqa: N802
         self.logger.info('ignored "%s" — Matter sensor is read-only', dev.name)
 
-    def _send_matter_command(self, command, dev) -> None:
+    def _send_matter_command(self, action, dev) -> None:
         if self.runtime is None or self.matter is None:
             return
+        # An action is either a cluster-command invoke or an attribute write.
+        coro = self.matter.write(action) if isinstance(action, MatterWrite) else self.matter.send_command(action)
         try:
-            self.runtime.submit(self.matter.send_command(command)).result(timeout=COMMAND_TIMEOUT)
+            self.runtime.submit(coro).result(timeout=COMMAND_TIMEOUT)
         except FuturesTimeoutError:
             self.logger.error("Matter command to %s timed out", dev.name)
             dev.setErrorStateOnServer("timeout")

@@ -91,6 +91,21 @@ class MatterCommand:
 
 
 @dataclass
+class MatterWrite:
+    """A Matter attribute write (e.g. a thermostat setpoint or mode).
+
+    Some Matter operations are attribute writes, not cluster commands —
+    thermostats set setpoints/modes by writing OccupiedHeatingSetpoint /
+    SystemMode etc. rather than invoking a command.
+    """
+    node_id: int
+    endpoint: int
+    cluster: int
+    attribute: int
+    value: Any
+
+
+@dataclass
 class MatterEvent:
     """A normalised inbound event from matter-server."""
     kind: str
@@ -147,6 +162,18 @@ class Protocol:
                 ARG_CLUSTER: cmd.cluster,
                 ARG_COMMAND: cmd.command,
                 ARG_PAYLOAD: dict(cmd.args),
+            },
+            message_id,
+        )
+
+    def build_write(self, write: MatterWrite, message_id: Optional[str] = None) -> dict:
+        # write_attribute args: node_id + attribute_path ("ep/cluster/attribute") + value
+        return self.build_request(
+            CMD_WRITE_ATTR,
+            {
+                ARG_NODE_ID: write.node_id,
+                "attribute_path": self.attr_key(write.endpoint, write.cluster, write.attribute),
+                "value": write.value,
             },
             message_id,
         )

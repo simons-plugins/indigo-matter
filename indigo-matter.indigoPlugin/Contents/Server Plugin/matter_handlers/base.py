@@ -13,11 +13,14 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
-from protocol import MatterCommand  # re-exported for handlers/tests
+from protocol import MatterCommand, MatterWrite  # re-exported for handlers/tests
 
-__all__ = ["IndigoDeviceSpec", "MatterCommand", "ClusterHandler"]
+__all__ = ["IndigoDeviceSpec", "MatterCommand", "MatterWrite", "ClusterHandler", "MatterAction"]
+
+#: A handler action is either a cluster-command invoke or an attribute write.
+MatterAction = Union[MatterCommand, MatterWrite]
 
 
 @dataclass
@@ -60,5 +63,6 @@ class ClusterHandler(ABC):
         """Translate a Matter attribute change to Indigo state updates."""
 
     @abstractmethod
-    def handle_indigo_action(self, indigo_dev: Any, action: Any) -> Optional[MatterCommand]:
-        """Translate an Indigo device action to a Matter command (or None)."""
+    def handle_indigo_action(self, indigo_dev: Any, action: Any) -> Optional[MatterAction]:
+        """Translate an Indigo device action to a Matter command or attribute
+        write (or None)."""

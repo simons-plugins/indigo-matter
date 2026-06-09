@@ -243,6 +243,16 @@
             <Field id="productName" type="textfield" readonly="yes">
                 <Label>Product:</Label>
             </Field>
+            <!-- Thermostat capability flags — set from the Matter device's
+                 clusters at creation; declared here so Indigo builds the
+                 matching states. -->
+            <Field id="NumTemperatureInputs" type="textfield" defaultValue="1" hidden="yes" />
+            <Field id="NumHumidityInputs" type="textfield" defaultValue="0" hidden="yes" />
+            <Field id="SupportsHeatSetpoint" type="checkbox" defaultValue="true" hidden="yes" />
+            <Field id="SupportsCoolSetpoint" type="checkbox" defaultValue="true" hidden="yes" />
+            <Field id="SupportsHvacOperationMode" type="checkbox" defaultValue="true" hidden="yes" />
+            <Field id="SupportsHvacFanMode" type="checkbox" defaultValue="true" hidden="yes" />
+            <Field id="ShowCoolHeatEquipmentStateUI" type="checkbox" defaultValue="true" hidden="yes" />
         </ConfigUI>
         <!-- States inherited from thermostat base: hvacOperationMode,
              hvacFanMode, temperatureInput1, setpointHeat, setpointCool, etc. -->

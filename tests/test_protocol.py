@@ -11,6 +11,7 @@ import protocol
 from protocol import (
     MatterCommand,
     MatterEvent,
+    MatterWrite,
     Protocol,
     ProtocolError,
 )
@@ -47,6 +48,17 @@ def test_build_command_maps_matter_command_to_wire_fields(proto):
     assert args[protocol.ARG_CLUSTER] == 0x0006
     assert args[protocol.ARG_COMMAND] == "On"
     assert args[protocol.ARG_PAYLOAD] == {}
+
+
+def test_build_write_uses_attribute_path(proto):
+    w = MatterWrite(node_id=30, endpoint=1, cluster=0x0201, attribute=0x0012, value=2150)
+    frame = proto.build_write(w, message_id="5")
+    assert frame["message_id"] == "5"
+    assert frame["command"] == protocol.CMD_WRITE_ATTR
+    args = frame["args"]
+    assert args[protocol.ARG_NODE_ID] == 30
+    assert args["attribute_path"] == "1/513/18"  # decimal ep/cluster/attribute
+    assert args["value"] == 2150
 
 
 # ----------------------------------------------------------------------

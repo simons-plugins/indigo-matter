@@ -17,7 +17,7 @@ import time
 from typing import Any, Awaitable, Callable, Optional
 
 import protocol
-from protocol import MatterCommand, Protocol, ProtocolError
+from protocol import MatterCommand, MatterWrite, Protocol, ProtocolError
 
 # Exceptions that mean "the socket dropped, reconnect". websockets raises its own
 # WebSocketException family; we also accept the stdlib connection errors so the
@@ -169,6 +169,9 @@ class MatterClient:
 
     async def send_command(self, cmd: MatterCommand, timeout: float = 5.0) -> Any:
         return await self._request_frame(self.proto.build_command(cmd), timeout)
+
+    async def write(self, write: MatterWrite, timeout: float = 5.0) -> Any:
+        return await self._request_frame(self.proto.build_write(write), timeout)
 
     # convenience wrappers
     async def get_nodes(self) -> Any:
