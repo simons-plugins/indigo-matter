@@ -181,7 +181,12 @@ class MatterClient:
         return await self.request(protocol.CMD_GET_NODE, {"node_id": node_id})
 
     async def commission_with_code(self, code: str, timeout: float = 60.0) -> Any:
-        return await self.request(protocol.CMD_COMMISSION, {"code": code}, timeout)
+        # network_only=True → IP discovery (mDNS) + PASE/CASE over IP, no BLE.
+        # The plugin only ever joins devices that are ALREADY commissioned and on
+        # the network (the "share model": Apple Home is admin 1; we join as a
+        # second administrator via an open commissioning window). We never do
+        # fresh Wi-Fi/Thread onboarding — that is the controlling app's job.
+        return await self.request(protocol.CMD_COMMISSION, {"code": code, "network_only": True}, timeout)
 
     async def remove_node(self, node_id: int) -> Any:
         return await self.request(protocol.CMD_REMOVE_NODE, {"node_id": node_id})
