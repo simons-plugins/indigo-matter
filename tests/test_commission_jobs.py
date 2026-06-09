@@ -131,6 +131,76 @@ def test_commission_failure_removes_node_and_reports_code(mock_logger):
     asyncio.run(scenario())
 
 
+def test_create_job_schedule_failure_returns_503_and_frees_code(mock_logger):
+    # loop down → schedule raises; must 503 and NOT strand a pending job that
+    # would lock the setup code out of all future commissions.
+    def boom(coro):
+        raise RuntimeError("asyncio runtime is not running")
+
+    jobs = _jobs(FakeMatter(), mock_logger, schedule=boom)
+    code, body = jobs.create_job({"setupCode": "12345678901", "suggestedName": "Plug"})
+    assert code == 503 and body["error"] == "matter_server_unreachable"
+    # a retry is treated as new (503 again), not 409 duplicate
+    code2, _ = jobs.create_job({"setupCode": "12345678901", "suggestedName": "Plug"})
+    assert code2 == 503
+
+
+def test_protocol_error_maps_to_commissioning_failed(mock_logger):
+    from protocol import ProtocolError
+
+    async def scenario():
+        class PEMatter(FakeMatter):
+            async def commission_with_code(self, code):
+                raise ProtocolError(50, "PASE failed")
+
+        jobs = _jobs(PEMatter(), mock_logger, schedule=asyncio.ensure_future)
+        _, body = jobs.create_job({"setupCode": "12345678901", "suggestedName": "X"})
+        final = await _await_terminal(jobs, body["jobId"])()
+        assert final["status"] == "failed"
+        assert final["error"]["code"] == "commissioning_failed"
+        assert final["error"]["matterErrorCode"] == 50
+    asyncio.run(scenario())
+
+
+def test_missing_node_id_maps_to_commissioning_failed(mock_logger):
+    async def scenario():
+        class NoIdMatter(FakeMatter):
+            async def commission_with_code(self, code):
+                return {}  # server returned no node_id (PASE/CASE failure)
+
+        jobs = _jobs(NoIdMatter(), mock_logger, schedule=asyncio.ensure_future)
+        _, body = jobs.create_job({"setupCode": "12345678901", "suggestedName": "X"})
+        final = await _await_terminal(jobs, body["jobId"])()
+        assert final["status"] == "failed"
+        assert final["error"]["code"] == "commissioning_failed"
+    asyncio.run(scenario())
+
+
+def test_generic_exception_maps_to_internal_error(mock_logger):
+    async def scenario():
+        class BoomMatter(FakeMatter):
+            async def commission_with_code(self, code):
+                raise RuntimeError("kaboom")
+
+        jobs = _jobs(BoomMatter(), mock_logger, schedule=asyncio.ensure_future)
+        _, body = jobs.create_job({"setupCode": "12345678901", "suggestedName": "X"})
+        final = await _await_terminal(jobs, body["jobId"])()
+        assert final["status"] == "failed"
+        assert final["error"]["code"] == "internal_error"
+    asyncio.run(scenario())
+
+
+def test_recommission_allowed_after_terminal(mock_logger):
+    async def scenario():
+        jobs = _jobs(FakeMatter(node_id=0x1), mock_logger, schedule=asyncio.ensure_future)
+        _, body1 = jobs.create_job({"setupCode": "12345678901", "suggestedName": "X"})
+        await _await_terminal(jobs, body1["jobId"])()
+        # same code after a terminal job is a NEW job, not a 409 duplicate
+        code2, body2 = jobs.create_job({"setupCode": "12345678901", "suggestedName": "X"})
+        assert code2 == 202 and body2["jobId"] != body1["jobId"]
+    asyncio.run(scenario())
+
+
 def test_unknown_job_is_404(mock_logger):
     jobs = _jobs(FakeMatter(), mock_logger)
     code, body = jobs.get_job("nope")

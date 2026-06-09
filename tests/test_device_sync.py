@@ -447,6 +447,33 @@ def test_existing_room_folder_is_reused(ds, indigo_env):
     assert [f.name for f in _indigo.devices.folders] == ["Office"]
 
 
+def test_bad_attribute_value_does_not_update_or_raise(ds, indigo_env, mock_logger):
+    # a malformed value from the device must not raise out of the handler nor
+    # leave the device frozen-without-error — it's caught and logged.
+    _indigo, devices = indigo_env
+    node = {"node_id": 52, "attributes": {"1/1026/0": -2800, "1/29/0": [{"0": 770}]}}
+    ds.create_from_raw(node, "Temp")
+    dev_id = ds.lookup(52, 1)
+    before = dict(devices[dev_id].states)
+
+    ds.handle_event(MatterEvent(
+        kind=protocol.EVT_ATTRIBUTE_UPDATED, node_id=52, endpoint=1, cluster=1026, attribute=0,
+        value="not-a-number",
+        raw={"event": "attribute_updated", "data": [52, "1/1026/0", "not-a-number"]},
+    ))
+    assert devices[dev_id].states == before   # unchanged, no exception
+    assert mock_logger.warning.called
+
+
+def test_malformed_attribute_event_is_logged(ds, mock_logger):
+    # truncated path → node_id None → warned + dropped, never applied
+    ds.handle_event(MatterEvent(
+        kind=protocol.EVT_ATTRIBUTE_UPDATED, node_id=None,
+        raw={"event": "attribute_updated", "data": [1, "1/6"]},
+    ))
+    assert mock_logger.warning.called
+
+
 def test_apply_states_clears_stale_error(ds, indigo_env):
     _indigo, devices = indigo_env
     ds.create_from_raw(RELAY_NODE, "Office Plug")

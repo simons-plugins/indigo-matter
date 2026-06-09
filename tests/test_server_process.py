@@ -115,3 +115,12 @@ def test_npx_resolution_prefers_homebrew(tmp_path, prefs, mock_logger, monkeypat
     monkeypatch.setattr("server_process.os.path.exists", lambda p: p == "/opt/homebrew/bin/npx")
     sp = ServerProcess(prefs, mock_logger, home=str(tmp_path), runner=FakeRunner())
     assert sp.npx_path == "/opt/homebrew/bin/npx"
+
+
+def test_restart_returns_false_and_reinstalls_on_kickstart_failure(sp):
+    sp._run = FakeRunner(returncode=1)  # kickstart fails → fallback reinstall cycle
+    ok = sp.restart()
+    subs = sp._run.subcommands()
+    assert "kickstart" in subs
+    assert "bootstrap" in subs or "load" in subs  # reinstalled
+    assert ok is False  # is_running() with rc=1 → False

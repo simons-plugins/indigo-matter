@@ -84,7 +84,10 @@ class AsyncRuntime:
         if thread is not None:
             thread.join(timeout=timeout)
             if thread.is_alive():
+                # Keep the refs: clearing them would let a later start() spin up a
+                # second loop thread alongside this orphaned one.
                 self.logger.warning("asyncio thread did not exit within %.1fs", timeout)
+                return
         self._thread = None
         self._loop = None
         self._ready.clear()

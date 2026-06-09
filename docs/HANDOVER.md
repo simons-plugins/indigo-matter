@@ -2,7 +2,7 @@
 
 **Last updated:** 2026-06-09 21:09 UTC
 **Branch:** `feature/m0-m4-validation-loop` — pushed to origin
-**Tests:** 171 passing (`cd indigo-matter && /Library/Frameworks/Python.framework/Versions/Current/bin/python3 -m pytest -q`)
+**Tests:** 188 passing (`cd indigo-matter && /Library/Frameworks/Python.framework/Versions/Current/bin/python3 -m pytest -q`)
 **Status:** M0–M8 complete; live-validated on jarvis. Commission half-test, live decommission, and M8 failure-hardening all DONE. Domio share-model contract confirmed. Remaining: Domio E2E (Tapo), version bump + PR.
 
 ### 2026-06-09 session — bugs found by live testing + fixed
@@ -17,6 +17,9 @@
 **Post-review fixes (from /review-pr, same branch):**
 5. **Reachability is now availability-accurate.** Review caught that the M8 reconnect-reconcile cleared `unreachable` for any node merely *present* in the matter-server dump — but `get_nodes` returns all commissioned nodes regardless of liveness. matter-server actually carries an `available` boolean in node-details and fires `node_updated` on availability change. Fix: `NodeInfo.available` parsed from node-details; `_apply_reachability(node)` clears/marks per `available` in both `reconcile_all` and the `node_updated` handler. So a node matter-server reports offline is marked unreachable, and one that recovers is cleared — live, per-device. Plus: `on_connect` task now keeps a strong ref + done-callback (no GC / swallowed exception); `_resync` logs with traceback; fixed a dangling doc-comment ref in color_control. 4 new tests (164 total). NOTE: matter-server v0.6.2's own availability detection is slow (subscription/timeout based) — killing a virtual device did not flip `available` within ~2 min, so the *plugin* handling is unit-tested but live end-to-end availability is gated on matter-server's (alpha) detection.
 6. **Review test-gaps closed.** Added the green tests from the review: multi-endpoint authoritative rename after a node_added race, folder-resolution-failure → folder 0, existing-room-folder reuse, on_connect re-fires on reconnect, `_on_disconnected`→mark_all_unreachable, `_resync`-failure-doesn't-reconcile, and startup wires on_connect/on_disconnect/on_event. **171 tests total.**
+
+**PR #1 full-plugin review (second /review-pr, on the open PR — covered the M0–M7 core):**
+7. **Core fixes (red/yellow/green all done).** (a) `commission_jobs.create_job` no longer strands a PENDING job + locks the setup code if the loop is down → returns 503 and rolls back; (b) `device_sync._on_attribute` now guards the handler transform so a malformed value can't silently freeze a device (logs instead), + malformed-event logging + priming-log parity; (c) commissioning rejections (`ProtocolError`) map to `commissioning_failed` (+`matterErrorCode`), not `internal_error`; (d) type tightening (`Job.status: JobStatus`, `NodeInfo.attributes` typed); (e) `async_runtime.stop()` keeps refs on join-timeout; (f) run-loop future + restart() failures now surfaced (done-callback, throttled health warning, `restart()→bool`). 17 new tests. **188 tests total**, deployed + reconcile re-verified on jarvis.
 
 **Open follow-ups:** (a) diagnostics live response (§3.5) doesn't match the documented shape (numeric cluster ids, no fabrics/network/deviceType) — low priority, future Domio view; (b) Domio's `MatterAPIClient` still needs to implement decommission with `?nodeId=` (guidance shipped in the changes doc); (c) Domio E2E (Tapo); (d) version bump + PR.
 

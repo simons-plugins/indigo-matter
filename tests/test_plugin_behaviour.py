@@ -231,7 +231,7 @@ def test_startup_wires_connect_and_disconnect_callbacks(plugin_mod, monkeypatch)
         def submit(self, coro):
             if hasattr(coro, "close"):
                 coro.close()
-            return None
+            return Mock()  # future-like (startup attaches a done-callback)
 
     monkeypatch.setattr(plugin_mod, "MatterClient", FakeMatter)
     monkeypatch.setattr(plugin_mod, "AsyncRuntime", lambda logger: FakeRuntimeObj())

@@ -84,10 +84,20 @@ class Plugin(indigo.PluginBase):
             diagnostics_provider=self._diagnostics_sync,
         )
 
-        self.runtime.submit(self.matter.run())
+        run_future = self.runtime.submit(self.matter.run())
+        # if the run-loop coroutine ever dies, surface it rather than parking the
+        # exception on an unretrieved future.
+        run_future.add_done_callback(self._log_run_future)
         # reconcile is driven by on_connect (_resync), so it runs on first connect
         # and again on every reconnect — no separate initial-sync task needed.
         self.logger.info("%s started", PLUGIN_NAME)
+
+    def _log_run_future(self, fut) -> None:
+        if fut.cancelled():
+            return
+        exc = fut.exception()
+        if exc is not None:
+            self.logger.exception(exc)
 
     def shutdown(self) -> None:
         self.logger.debug("%s shutting down", PLUGIN_NAME)
@@ -138,8 +148,18 @@ class Plugin(indigo.PluginBase):
     def _health_tick(self) -> None:
         if self.runtime is not None and not self.runtime.is_running:
             self.logger.warning("async runtime is not running")
-        elif self.matter is not None and not self.matter.connected:
-            self.logger.debug("matter-server not currently connected")
+            return
+        if self.matter is not None and not self.matter.connected:
+            ticks = getattr(self, "_disconnect_ticks", 0) + 1
+            self._disconnect_ticks = ticks
+            # debug each ~15s tick, but warn once it's been down ~1 min so a
+            # never-connecting matter-server is visible in the log, not buried.
+            if ticks == 4:
+                self.logger.warning("matter-server still not connected after ~1 min")
+            else:
+                self.logger.debug("matter-server not currently connected")
+        else:
+            self._disconnect_ticks = 0
 
     # ------------------------------------------------------------------
     # Config
@@ -334,11 +354,15 @@ class Plugin(indigo.PluginBase):
     # Menu items
     # ------------------------------------------------------------------
     def menuRestartMatterServer(self):  # noqa: N802
-        if self.server_process is not None:
-            self.server_process.restart()
+        if self.server_process is None:
+            self.logger.warning("LaunchAgent management is off; start matter-server manually")
+            return
+        if self.server_process.restart():
             self.logger.info("matter-server restart requested")
         else:
-            self.logger.warning("LaunchAgent management is off; start matter-server manually")
+            self.logger.error(
+                "matter-server restart failed; check ~/Library/Logs/indigo-matter/matter-server.err.log"
+            )
 
     def menuShowMatterServerLogs(self):  # noqa: N802
         self.logger.info("matter-server log: ~/Library/Logs/indigo-matter/matter-server.log")

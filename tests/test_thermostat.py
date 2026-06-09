@@ -102,3 +102,32 @@ def test_set_fan_mode_writes_fancontrol(mock_indigo_base):
     w = h.handle_indigo_action(_dev(), SimpleNamespace(
         thermostatAction=indigo.kThermostatAction.SetFanMode, actionMode=indigo.kFanMode.Auto))
     assert (w.cluster, w.attribute, w.value) == (0x0202, 0x0000, 5)  # FanControl FanMode Auto=5
+
+
+def test_decrease_setpoints(mock_indigo_base):
+    import indigo
+    h = ThermostatHandler()
+    dec_h = h.handle_indigo_action(_dev(), SimpleNamespace(
+        thermostatAction=indigo.kThermostatAction.DecreaseHeatSetpoint, actionValue=1.5))
+    assert (dec_h.cluster, dec_h.attribute, dec_h.value) == (0x0201, 0x0012, 1850)  # 20.0-1.5
+    dec_c = h.handle_indigo_action(_dev(), SimpleNamespace(
+        thermostatAction=indigo.kThermostatAction.DecreaseCoolSetpoint, actionValue=2.0))
+    assert (dec_c.cluster, dec_c.attribute, dec_c.value) == (0x0201, 0x0011, 2200)  # 24.0-2.0
+
+
+def test_system_mode_mapping_and_unknown_fallback(mock_indigo_base):
+    import indigo
+    h = ThermostatHandler()
+    assert h.on_attribute_update(None, 0x001C, 0) == {"hvacOperationMode": indigo.kHvacMode.Off}
+    assert h.on_attribute_update(None, 0x001C, 1) == {"hvacOperationMode": indigo.kHvacMode.HeatCool}
+    assert h.on_attribute_update(None, 0x001C, 3) == {"hvacOperationMode": indigo.kHvacMode.Cool}
+    # an unknown SystemMode must fall back to Off, not raise
+    assert h.on_attribute_update(None, 0x001C, 99) == {"hvacOperationMode": indigo.kHvacMode.Off}
+
+
+def test_set_hvac_mode_auto_writes_system_mode(mock_indigo_base):
+    import indigo
+    h = ThermostatHandler()
+    w = h.handle_indigo_action(_dev(), SimpleNamespace(
+        thermostatAction=indigo.kThermostatAction.SetHvacMode, actionMode=indigo.kHvacMode.HeatCool))
+    assert (w.cluster, w.attribute, w.value) == (0x0201, 0x001C, 1)  # SYS_AUTO

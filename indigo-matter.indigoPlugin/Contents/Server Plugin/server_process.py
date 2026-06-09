@@ -139,13 +139,16 @@ class ServerProcess:
         except FileNotFoundError:
             pass
 
-    def restart(self) -> None:
-        """Kick the agent so matter-server respawns."""
+    def restart(self) -> bool:
+        """Kick the agent so matter-server respawns. Returns True on success."""
         result = self._launchctl("kickstart", "-k", f"gui/{os.getuid()}/{LABEL}")
-        if result is None or result.returncode != 0:
-            # fall back to unload/load cycle
-            self.uninstall()
-            self.ensure_installed()
+        if result is not None and result.returncode == 0:
+            return True
+        # fall back to a full unload/load cycle
+        self.logger.warning("matter-server kickstart failed; falling back to reinstall")
+        self.uninstall()
+        self.ensure_installed()
+        return self.is_running()
 
     def is_running(self) -> bool:
         result = self._launchctl("print", f"gui/{os.getuid()}/{LABEL}")

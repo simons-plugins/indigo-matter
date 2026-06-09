@@ -171,3 +171,34 @@ def test_color_dimmer_inherits_onoff_and_brightness(mock_indigo_base):
     assert on.cluster == 0x0006 and on.command == "On"
     setb = h.handle_indigo_action(dev, SimpleNamespace(deviceAction=indigo.kDeviceAction.SetBrightness, actionValue=100))
     assert setb.cluster == 0x0008 and setb.args["level"] == 254
+
+
+# ---------------------------------------------------------------------------
+# Edge cases surfaced by review
+# ---------------------------------------------------------------------------
+def test_kelvin_to_mireds_zero_guard():
+    assert kelvin_to_mireds(0) == 0
+
+
+def test_set_color_falls_back_to_device_states_when_no_rgb(mock_indigo_base):
+    import indigo
+    h = ColorControlHandler()
+    dev = SimpleNamespace(pluginProps={"nodeId": "9", "endpointId": "1"},
+                          states={"redLevel": 100, "greenLevel": 0, "blueLevel": 0})
+    cmd = h.handle_indigo_action(dev, SimpleNamespace(
+        deviceAction=indigo.kDeviceAction.SetColorLevels, actionValue={}))
+    assert cmd.command == "MoveToHueAndSaturation"
+    assert cmd.args["saturation"] == 254  # pure red from cached state
+
+
+def test_brighten_and_dim_clamp_to_range(mock_indigo_base):
+    import indigo
+    h = LevelControlHandler()
+    up = h.handle_indigo_action(
+        SimpleNamespace(pluginProps={"nodeId": "8", "endpointId": "1"}, brightness=80),
+        SimpleNamespace(deviceAction=indigo.kDeviceAction.BrightenBy, actionValue=50))
+    assert up.args["level"] == pct_to_level(100)  # clamped at 100
+    down = h.handle_indigo_action(
+        SimpleNamespace(pluginProps={"nodeId": "8", "endpointId": "1"}, brightness=20),
+        SimpleNamespace(deviceAction=indigo.kDeviceAction.DimBy, actionValue=50))
+    assert down.args["level"] == pct_to_level(0)  # clamped at 0

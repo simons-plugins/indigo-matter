@@ -48,7 +48,7 @@ class NodeInfo:
     #: Current attribute values keyed by (endpoint, cluster, attribute) — used to
     #: prime Indigo device states on creation (get_node's snapshot), since
     #: matter-server only emits attribute_updated on subsequent *changes*.
-    attributes: dict = field(default_factory=dict)
+    attributes: dict[tuple[int, int, int], Any] = field(default_factory=dict)
 
 
 def _normalise_attributes(raw_attrs: dict) -> dict[tuple[int, int, int], Any]:

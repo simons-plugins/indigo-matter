@@ -22,6 +22,8 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any, Awaitable, Callable, Optional
 
+from protocol import ProtocolError
+
 
 class JobStatus(str, Enum):
     """Commissioning job status (API.md §3.3).
@@ -87,7 +89,7 @@ class Job:
     suggested_room: Optional[str]
     discriminator: Optional[int] = None
     domio_node_id: Optional[str] = None
-    status: str = PENDING
+    status: JobStatus = PENDING
     progress: float = 0.0
     message: str = ""
     started_at: datetime = field(default_factory=_now_utc)
@@ -175,7 +177,19 @@ class CommissionJobs:
             self._jobs[job.job_id] = job
             self._by_code[setup_code] = job.job_id
 
-        self._schedule(self._run_job(job))
+        coro = self._run_job(job)
+        try:
+            self._schedule(coro)
+        except RuntimeError as exc:
+            # The loop isn't running. Don't leave a stranded PENDING job: it would
+            # never reach a terminal state, never be reaped, and so lock this setup
+            # code out of every future commission (409) until a plugin restart.
+            coro.close()
+            with self._lock:
+                self._jobs.pop(job.job_id, None)
+                if self._by_code.get(setup_code) == job.job_id:
+                    self._by_code.pop(setup_code, None)
+            return 503, {"error": "matter_server_unreachable", "message": str(exc)}
         return 202, {"jobId": job.job_id, "estimatedDurationSeconds": 30}
 
     def get_job(self, job_id: str) -> tuple[int, dict]:
@@ -210,6 +224,12 @@ class CommissionJobs:
             self._advance(job, SUCCESS, 1.0, "Done")
         except CommissionError as exc:
             await self._fail(job, exc.code, exc.message, node_id, exc.matter_error_code)
+        except ProtocolError as exc:
+            # matter-server rejected the commission (bad setup code, window closed,
+            # PASE/CASE failure, …) — a device/commissioning failure, not a plugin
+            # bug, so report it as such rather than internal_error.
+            await self._fail(job, "commissioning_failed", str(exc), node_id,
+                             _opt_int(getattr(exc, "code", None)))
         except Exception as exc:  # noqa: BLE001 - last-resort, mapped to internal_error
             self.logger.exception(exc)
             await self._fail(job, "internal_error", str(exc), node_id)
@@ -230,7 +250,7 @@ class CommissionJobs:
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
-    def _advance(self, job: Job, status: str, progress: float, message: str) -> None:
+    def _advance(self, job: Job, status: JobStatus, progress: float, message: str) -> None:
         with self._lock:
             job.status = status
             job.progress = progress

@@ -148,3 +148,25 @@ def test_parse_node_removed_bare_id(proto):
     evt = proto.parse_event(frame)
     assert evt.kind == protocol.EVT_NODE_REMOVED
     assert evt.node_id == 42
+
+
+def test_parse_node_updated_extracts_node_id(proto):
+    # node_updated carries the full node-details object (used for availability)
+    frame = {"event": "node_updated", "data": {"node_id": 42, "available": False, "attributes": {}}}
+    evt = proto.parse_event(frame)
+    assert evt.kind == protocol.EVT_NODE_UPDATED
+    assert evt.node_id == 42
+
+
+def test_parse_server_shutdown_event(proto):
+    evt = proto.parse_event({"event": "server_shutdown", "data": {}})
+    assert evt.kind == protocol.EVT_SERVER_SHUTDOWN
+    assert evt.node_id is None
+
+
+def test_parse_malformed_attribute_updated_degrades_to_node_none(proto):
+    # a truncated/!list data must not crash; it yields a node_id=None event that
+    # device_sync drops (and now logs) rather than misapplying.
+    evt = proto.parse_event({"event": "attribute_updated", "data": [42, "1/6"]})
+    assert evt.kind == protocol.EVT_ATTRIBUTE_UPDATED
+    assert evt.node_id is None and evt.endpoint is None

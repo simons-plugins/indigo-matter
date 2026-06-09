@@ -265,7 +265,7 @@ class DeviceSync:
             try:
                 states.update(handler.on_attribute_update(dev, attribute, value))
             except Exception as exc:  # noqa: BLE001 - one bad attr must not abort priming
-                self.logger.debug("prime %s attr %s/%s failed: %s", dev_id, cluster, attribute, exc)
+                self.logger.warning("prime %s attr %s/%s failed: %s", dev_id, cluster, attribute, exc)
         if states:
             self.apply_states(dev_id, _kvlist(states))
 
@@ -390,6 +390,10 @@ class DeviceSync:
 
     def _on_attribute(self, evt: protocol.MatterEvent) -> None:
         if evt.node_id is None or evt.endpoint is None or evt.cluster is None:
+            # a malformed attribute_updated frame (e.g. a truncated "ep/cl/at"
+            # path) — surface it rather than dropping silently; protocol.py is the
+            # rename firewall and a wire-shape change should be visible here.
+            self.logger.warning("ignoring malformed attribute event: %r", evt.raw)
             return
         dev_id = self.lookup(evt.node_id, evt.endpoint)
         if dev_id is None:
@@ -400,7 +404,14 @@ class DeviceSync:
         if handler is None:
             return
         dev = indigo.devices[dev_id]
-        states = handler.on_attribute_update(dev, evt.attribute, evt.value)
+        try:
+            states = handler.on_attribute_update(dev, evt.attribute, evt.value)
+        except Exception as exc:  # noqa: BLE001 - one bad value must not silently freeze the device
+            self.logger.warning(
+                "bad update for device %s (ep%s cl%s attr%s value=%r): %s",
+                dev_id, evt.endpoint, evt.cluster, evt.attribute, evt.value, exc,
+            )
+            return
         if states:
             self.apply_states(dev_id, _kvlist(states))
 
