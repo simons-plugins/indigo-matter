@@ -1,15 +1,20 @@
 # indigo-matter — Build Handover
 
-**Last updated:** 2026-06-09 20:31 UTC
-**Branch:** `feature/m0-m4-validation-loop` (HEAD `b2575b6`) — pushed to origin (working tree has uncommitted device_sync/http_handlers/plugin/test changes from the 2026-06-09 fixes below)
-**Tests:** 152 passing (`cd indigo-matter && /Library/Frameworks/Python.framework/Versions/Current/bin/python3 -m pytest -q`)
-**Status:** M0–M7 complete; live-validated on jarvis. Commission half-test + live decommission DONE. M8 partial. Domio share-model contract confirmed.
+**Last updated:** 2026-06-09 21:09 UTC
+**Branch:** `feature/m0-m4-validation-loop` — pushed to origin
+**Tests:** 160 passing (`cd indigo-matter && /Library/Frameworks/Python.framework/Versions/Current/bin/python3 -m pytest -q`)
+**Status:** M0–M8 complete; live-validated on jarvis. Commission half-test, live decommission, and M8 failure-hardening all DONE. Domio share-model contract confirmed. Remaining: Domio E2E (Tapo), version bump + PR.
 
-### 2026-06-09 session — two contract bugs found by live testing + fixed (deployed to jarvis, not yet committed/PR'd)
-1. **suggestedName/suggestedRoom were silently dropped on commission.** `node_added` raced ahead of the commission job and created the device with the bare product name and no folder; the job then found it already indexed and returned it. Fix in `device_sync.create_devices`: the commission pass is now *authoritative* — it renames + re-folders the existing device. suggestedRoom → an Indigo **device folder** (no native "room"), auto-created if missing. Live-proven: device got the chosen name (deduped to "… 2") + the auto-created "Matter Test Room" folder.
-2. **decommission POST never received its nodeId.** IWS only delivers trailing URL path components on **GET**, never POST (proven: `GET diagnostics/0xC`→200, `POST diagnostics/0xC`→400). API.md v1.1 had specced decommission as `POST …/decommission/{nodeId}`. Fix in `http_handlers` + `plugin.http_decommission/http_diagnostics`: read `nodeId` from the **query** (`POST …/decommission?nodeId=0xC`), path kept as fallback. Live-proven: real `OperationalCredentials.removeFabric` (statusCode 0) on the device, device returns to commissionable, Indigo devices deleted, idempotent 404, nodeCount drops.
+### 2026-06-09 session — bugs found by live testing + fixed
+**Committed `858e35b` (indigo-matter) + `5777ba2` (domio-code):**
+1. **suggestedName/suggestedRoom were silently dropped on commission.** `node_added` raced ahead of the commission job. Fix in `device_sync.create_devices`: the commission pass is now *authoritative* — renames + re-folders the existing device. suggestedRoom → an Indigo **device folder** (no native "room"), auto-created. Live-proven.
+2. **decommission POST never received its nodeId.** IWS only delivers trailing URL path components on **GET**, never POST. Fix: read `nodeId` from the **query** (`POST …/decommission?nodeId=0xC`), path kept as fallback. Live-proven (real RemoveFabric, idempotent 404). API.md → **v1.2** in both repos; Domio note at `domio-code/docs/matter-api-v1.2-changes.md`.
 
-**Follow-ups these created:** (a) API.md §3.4 must change decommission to the `?nodeId=` query form + a note re IWS POST; (b) API.md §1 "Local" example is stale — IWS is **HTTPS** on 8176 (Digest locally, Bearer over reflector), not `http://`; (c) Domio's `MatterAPIClient` decommission must send nodeId as a query param; (d) diagnostics live response (§3.5) doesn't yet match the documented shape (numeric cluster ids, no fabrics/network/deviceType) — low priority, it's a future Domio view.
+**This commit (M8 + colour fix):**
+3. **M8 failure hardening.** MatterClient gained `on_connect`/`on_disconnect` seams. On drop / `server_shutdown` event → `device_sync.mark_all_unreachable()`. On (re)connect → `_resync` (replaces `_initial_sync`; runs on first connect AND every reconnect) → `reconcile_all`, which now re-primes existing devices + clears stale `unreachable` (`_refresh_live_node`). Sleep/wake is covered by the same machinery (ping_interval=20 drops the stale socket → callbacks fire). Reconnect path live-verified; disconnect/server_shutdown unit-tested only (can't bounce matter-server remotely).
+4. **Colour `whiteTemperature` rejected (`invalid color level key`).** Surfaced by M8 re-prime; NOT a stale device (a fresh commission errored identically). Root cause: Indigo does not apply the static `<Supports*>` Devices.xml elements to API-created devices — colour support must be set in device **props at creation**. Fix in `color_control.py`: set `SupportsColor/RGB/White/WhiteTemperature` + `WhiteTemperatureMin/Max` in create props, and guard the `whiteTemperature` write with `if "whiteTemperature" in dev.states`. Live-proven: set 3000K → device received `moveToColorTemperature mireds 333`, Indigo `whiteTemperature` state populated, no error.
+
+**Open follow-ups:** (a) diagnostics live response (§3.5) doesn't match the documented shape (numeric cluster ids, no fabrics/network/deviceType) — low priority, future Domio view; (b) Domio's `MatterAPIClient` still needs to implement decommission with `?nodeId=` (guidance shipped in the changes doc); (c) Domio E2E (Tapo); (d) version bump + PR.
 
 This is the resume point. Read this first, then `CLAUDE.md` for architecture and `docs/IMPLEMENTATION.md §2.8` for the verified matter-server protocol.
 
@@ -44,7 +49,7 @@ Plus two improvements found by live testing: **state priming** (apply get_node s
 - **matter-server**: `~/indigo-matter` (npm pkg `matter-server@0.6.2`), launched by `~/indigo-matter/run.sh` → `node …/MatterServer.js --storage-path … --primary-interface en0 --listen-address 127.0.0.1`. WS at `ws://localhost:5580/ws` (localhost-only; BLE off). The **ws-controller source is the protocol ground truth**: `~/indigo-matter/node_modules/@matter-server/ws-controller/dist/esm/`.
 - **Plugin**: installed + running in **Indigo 2025.2**, bundle id `com.simon.indigo-matter`. `requirements.txt` auto-install of `websockets` worked. `manageLaunchAgent` pref is **off** (connects to the manually-run matter-server).
 - **5 commissioned nodes** (Indigo device ids):
-  - matterRelay `714038249` (OnOff Light) · matterDimmer `507300015` · matterColorDimmer `747107241` · matterTemperatureSensor `1824758566` · matterThermostat `1118330069`
+  - matterRelay `714038249` (OnOff Light) · matterDimmer `507300015` · matterColorDimmer `200619536` (node `0xF`; recreated 2026-06-09 with the colour-support-props fix, replaces old `747107241`) · matterTemperatureSensor `1824758566` · matterThermostat `1118330069`
 - **MCP control**: `mcp__indigo__*` (restart_plugin, query_event_log, get_devices_by_type, get_device_by_id, get_devices_by_state, device_turn_on/off, device_set_brightness, device_set_rgb_color, device_set_white_levels, thermostat_set_heat_setpoint, thermostat_set_hvac_mode). `get_device_by_id` only shows relay/dimmer fields — use `get_devices_by_state {"sensorValue": "<0"}` etc. to read custom states.
 - **Cannot exec on jarvis** (no SSH key); CAN read/write its disk via the mount.
 

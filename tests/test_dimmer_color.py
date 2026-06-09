@@ -109,8 +109,28 @@ def test_color_conversions_round_trip():
 
 def test_color_temp_attribute_to_white_temperature():
     h = ColorControlHandler()
-    out = h.on_attribute_update(SimpleNamespace(states={}), 0x0007, 370)
+    # device that advertises white temperature (states include the key)
+    dev = SimpleNamespace(states={"whiteTemperature": 0})
+    out = h.on_attribute_update(dev, 0x0007, 370)
     assert out == {"whiteTemperature": round(1_000_000 / 370)}
+
+
+def test_color_temp_skipped_when_device_lacks_white_temp_state():
+    # a device with no whiteTemperature state must not be sent the key (Indigo
+    # rejects it as an invalid color level) — degrade quietly instead.
+    h = ColorControlHandler()
+    assert h.on_attribute_update(SimpleNamespace(states={}), 0x0007, 370) == {}
+
+
+def test_color_spec_sets_color_support_props():
+    node = parse_node(COLOR_NODE, "RGB Lamp")
+    spec = HandlerRegistry().handlers_for_endpoint(node, _ep(node, 1))[0]
+    assert spec.props["SupportsColor"] is True
+    assert spec.props["SupportsRGB"] is True
+    assert spec.props["SupportsWhite"] is True
+    assert spec.props["SupportsWhiteTemperature"] is True
+    assert spec.props["WhiteTemperatureMin"] == 2000
+    assert spec.props["WhiteTemperatureMax"] == 6500
 
 
 def test_color_hue_update_recomputes_rgb():

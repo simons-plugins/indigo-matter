@@ -183,3 +183,50 @@ def test_request_when_disconnected_raises(mock_logger):
         except ConnectionError:
             pass
     run(scenario())
+
+
+def test_on_connect_runs_after_each_connect(mock_logger):
+    async def scenario():
+        calls = []
+
+        async def on_connect():
+            calls.append(1)
+
+        fake = FakeWebSocket()
+        client = _client(mock_logger, fake, on_connect=on_connect)
+        task = asyncio.create_task(client.run())
+        await client.wait_connected(timeout=2)
+        await asyncio.sleep(0.02)  # let the scheduled on_connect task run
+        assert calls == [1]
+        await client.close()
+        task.cancel()
+    run(scenario())
+
+
+def test_on_disconnect_fires_on_real_drop(mock_logger):
+    async def scenario():
+        events = []
+        fake = FakeWebSocket()
+        client = _client(mock_logger, fake, on_disconnect=lambda: events.append("down"))
+        task = asyncio.create_task(client.run())
+        await client.wait_connected(timeout=2)
+        await fake.close()              # genuine socket drop
+        await asyncio.sleep(0.02)
+        assert events == ["down"]
+        await client.close()
+        task.cancel()
+    run(scenario())
+
+
+def test_on_disconnect_not_called_on_intentional_close(mock_logger):
+    async def scenario():
+        events = []
+        fake = FakeWebSocket()
+        client = _client(mock_logger, fake, on_disconnect=lambda: events.append("down"))
+        task = asyncio.create_task(client.run())
+        await client.wait_connected(timeout=2)
+        await client.close()            # intentional shutdown — not a drop
+        await asyncio.sleep(0.02)
+        assert events == []
+        task.cancel()
+    run(scenario())

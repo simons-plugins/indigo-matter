@@ -67,7 +67,12 @@ class Plugin(indigo.PluginBase):
             except Exception as exc:  # noqa: BLE001
                 self.logger.exception(exc)
 
-        self.matter = MatterClient(self.proto, self.logger, prefs, on_event=self._on_matter_event)
+        self.matter = MatterClient(
+            self.proto, self.logger, prefs,
+            on_event=self._on_matter_event,
+            on_connect=self._resync,
+            on_disconnect=self._on_disconnected,
+        )
         self.jobs = CommissionJobs(
             self.matter, self.device_sync.create_from_raw, self.logger,
             schedule=self.runtime.submit,
@@ -80,7 +85,8 @@ class Plugin(indigo.PluginBase):
         )
 
         self.runtime.submit(self.matter.run())
-        self.runtime.submit(self._initial_sync())
+        # reconcile is driven by on_connect (_resync), so it runs on first connect
+        # and again on every reconnect — no separate initial-sync task needed.
         self.logger.info("%s started", PLUGIN_NAME)
 
     def shutdown(self) -> None:
@@ -94,10 +100,11 @@ class Plugin(indigo.PluginBase):
             self.runtime.stop()
             self.runtime = None
 
-    async def _initial_sync(self) -> None:
-        """After the WS connects, reconcile matter nodes ↔ Indigo devices."""
+    async def _resync(self) -> None:
+        """Reconcile matter nodes ↔ Indigo devices. Driven by the WS client's
+        on_connect, so it runs on the first connect and again on every reconnect
+        (recovers state + clears 'unreachable' after a drop / sleep-wake)."""
         try:
-            await self.matter.wait_connected(timeout=30)
             nodes = await self.matter.get_nodes() or []
             detailed = []
             for node in nodes:
@@ -109,7 +116,11 @@ class Plugin(indigo.PluginBase):
             self.device_sync.reconcile_all(detailed)
             self.logger.info("reconciled %d Matter node(s)", len(detailed))
         except Exception as exc:  # noqa: BLE001
-            self.logger.warning("initial sync incomplete: %s", exc)
+            self.logger.warning("resync incomplete: %s", exc)
+
+    def _on_disconnected(self) -> None:
+        """matter-server connection dropped — devices are unreachable until reconnect."""
+        self.device_sync.mark_all_unreachable()
 
     def runConcurrentThread(self) -> None:
         """Watchdog only — no I/O. Surfaces connectivity; reconnect is owned by

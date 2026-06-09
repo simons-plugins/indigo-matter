@@ -295,6 +295,11 @@ class DeviceSync:
                 live.add((node.node_id, endpoint.endpoint_id))
             try:
                 self.create_devices(node)
+                # On a reconnect/sleep-wake reconcile the device already exists:
+                # refresh its state (it may have changed while we were away) and
+                # clear any stale 'unreachable' — create_devices only touches new
+                # devices, and apply_states won't clear the error if nothing changed.
+                self._refresh_live_node(node)
             except Exception as exc:  # noqa: BLE001
                 self.logger.warning("reconcile of node %s failed: %s", node.node_id, exc)
         with self._lock:
@@ -303,10 +308,26 @@ class DeviceSync:
         for dev_id in orphans:
             self._safe_unreachable(dev_id)
 
+    def _refresh_live_node(self, node: NodeInfo) -> None:
+        for endpoint in node.endpoints:
+            dev_id = self.lookup(node.node_id, endpoint.endpoint_id)
+            if dev_id is None:
+                continue
+            self._prime_states(node, dev_id, endpoint.endpoint_id)
+            self._clear_error(dev_id)
+
     def mark_unreachable(self, node_id: Any) -> None:
         with self._lock:
             targets = [dev_id for (nid, _eid), dev_id in self._index.items()
                        if nid == int(node_id)]
+        for dev_id in targets:
+            self._safe_unreachable(dev_id)
+
+    def mark_all_unreachable(self) -> None:
+        """matter-server connection lost (drop / shutdown / sleep) — every Matter
+        device is unreachable until we reconnect and reconcile."""
+        with self._lock:
+            targets = list(dict.fromkeys(self._index.values()))
         for dev_id in targets:
             self._safe_unreachable(dev_id)
 
@@ -315,6 +336,14 @@ class DeviceSync:
             indigo.devices[dev_id].setErrorStateOnServer("unreachable")
         except Exception as exc:  # noqa: BLE001
             self.logger.debug("could not mark %s unreachable: %s", dev_id, exc)
+
+    def _clear_error(self, dev_id: int) -> None:
+        try:
+            dev = indigo.devices[dev_id]
+            if getattr(dev, "errorState", ""):
+                dev.setErrorStateOnServer("")
+        except Exception as exc:  # noqa: BLE001
+            self.logger.debug("could not clear error on %s: %s", dev_id, exc)
 
     # ------------------------------------------------------------------
     # Inbound events (asyncio thread) → Indigo state
@@ -326,6 +355,11 @@ class DeviceSync:
             self._on_node_added(evt)
         elif evt.kind == protocol.EVT_NODE_REMOVED and evt.node_id is not None:
             self.mark_unreachable(evt.node_id)
+        elif evt.kind == protocol.EVT_SERVER_SHUTDOWN:
+            # matter-server announces shutdown just before closing the socket;
+            # mark everything unreachable now rather than wait for the drop.
+            self.logger.warning("matter-server announced shutdown; marking all Matter devices unreachable")
+            self.mark_all_unreachable()
 
     def _on_node_added(self, evt: protocol.MatterEvent) -> None:
         """A node commissioned/updated out-of-band (e.g. via the dashboard).

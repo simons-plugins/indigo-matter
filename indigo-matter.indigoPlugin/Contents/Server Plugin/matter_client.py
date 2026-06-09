@@ -50,6 +50,8 @@ class MatterClient:
         *,
         connect: Optional[Callable[[str], Awaitable]] = None,
         on_event: Optional[Callable[[protocol.MatterEvent], None]] = None,
+        on_connect: Optional[Callable[[], Awaitable]] = None,
+        on_disconnect: Optional[Callable[[], None]] = None,
         now: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], Awaitable] = asyncio.sleep,
     ) -> None:
@@ -61,6 +63,11 @@ class MatterClient:
         self.uri = f"ws://{host}:{port}{path}"
         self._connect = connect or _default_connect
         self._on_event = on_event
+        # on_connect: async, scheduled after each (re)connect — used to re-reconcile.
+        # on_disconnect: sync, fired on a real drop (not intentional close) — used to
+        # mark devices unreachable. Together they give sleep/wake + crash recovery.
+        self._on_connect = on_connect
+        self._on_disconnect = on_disconnect
         self._sleep = sleep
         self._now = now
 
@@ -116,6 +123,11 @@ class MatterClient:
         # handlers' attributes_to_subscribe() is only a future filtering aid.
         await self._send_frame(self.proto.build_request(protocol.CMD_START_LISTENING))
         self.logger.info("connected to matter-server, listening")
+        # Re-reconcile on every (re)connect so devices that changed (or that we
+        # missed) while disconnected are corrected and 'unreachable' is cleared.
+        # Scheduled as its own task so it doesn't block the listen loop.
+        if self._on_connect is not None:
+            asyncio.create_task(self._on_connect())
 
     async def _listen(self) -> None:
         async for raw in self._ws:
@@ -141,6 +153,7 @@ class MatterClient:
                     fut.set_exception(exc)
 
     def _mark_disconnected(self) -> None:
+        was_connected = self.connected
         self.connected = False
         self._connected_event.clear()
         # fail any in-flight requests so callers don't hang
@@ -148,6 +161,13 @@ class MatterClient:
             if not fut.done():
                 fut.set_exception(ConnectionError("matter-server disconnected"))
         self._pending.clear()
+        # Notify only on a genuine drop of a live connection — not on a failed
+        # initial connect (was never connected) nor an intentional close().
+        if was_connected and not self._closing and self._on_disconnect is not None:
+            try:
+                self._on_disconnect()
+            except Exception as exc:  # pragma: no cover - callback must not kill the loop
+                self.logger.exception(exc)
 
     # ------------------------------------------------------------------
     # Requests

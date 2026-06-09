@@ -66,6 +66,19 @@ class ColorControlHandler(LevelControlHandler):
                     "endpointId": str(endpoint.endpoint_id),
                     "vendorName": node.vendor_name,
                     "productName": node.product_name,
+                    # Color support must be set as device props at creation: Indigo
+                    # does not apply the static <Supports*> Devices.xml elements to
+                    # API-created devices, so without these the device has no real
+                    # white-temperature support and rejects 'whiteTemperature' as an
+                    # invalid color level key. (Matches docs constants.md + the
+                    # Relay-and-Dimmer SDK example.)
+                    "SupportsColor": True,
+                    "SupportsRGB": True,
+                    "SupportsWhite": True,
+                    "SupportsWhiteTemperature": True,
+                    "SupportsRGBandWhiteSimultaneously": False,
+                    "WhiteTemperatureMin": 2000,
+                    "WhiteTemperatureMax": 6500,
                 },
                 initial_states={"onOffState": False, "brightnessLevel": 0},
             )
@@ -78,6 +91,12 @@ class ColorControlHandler(LevelControlHandler):
         if value is None:
             return {}
         if attribute_id == self.ATTR_COLOR_TEMP_MIREDS:
+            # whiteTemperature is only a valid color level when the device actually
+            # advertises it (via the color-support props above). Guard so a
+            # mis-provisioned device degrades quietly instead of erroring on every
+            # update (mirrors the 'if channel in dev.states' SDK pattern).
+            if "whiteTemperature" not in getattr(indigo_dev, "states", {}):
+                return {}
             return {"whiteTemperature": mireds_to_kelvin(int(value))}
         if attribute_id not in (self.ATTR_CURRENT_HUE, self.ATTR_CURRENT_SATURATION):
             return {}

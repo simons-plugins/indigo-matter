@@ -327,6 +327,43 @@ def test_commission_overrides_name_and_room_after_node_added_race(ds, indigo_env
     assert folder.name == "Hallway"
 
 
+def test_mark_all_unreachable(ds, indigo_env):
+    _indigo, devices = indigo_env
+    ds.create_from_raw(RELAY_NODE, "Office Plug")
+    node2 = {"node_id": 99, "attributes": {"1/6/0": False, "1/29/0": [{"0": 266}]}}
+    ds.create_from_raw(node2, "Other Plug")
+    ids = [ds.lookup(42, 1), ds.lookup(99, 1)]
+
+    ds.mark_all_unreachable()
+    for dev_id in ids:
+        assert devices[dev_id].errorState == "unreachable"
+
+
+def test_server_shutdown_event_marks_all_unreachable(ds, indigo_env):
+    _indigo, devices = indigo_env
+    ds.create_from_raw(RELAY_NODE, "Office Plug")
+    dev_id = ds.lookup(42, 1)
+
+    ds.handle_event(MatterEvent(
+        kind=protocol.EVT_SERVER_SHUTDOWN,
+        raw={"event": "server_shutdown", "data": {}},
+    ))
+    assert devices[dev_id].errorState == "unreachable"
+
+
+def test_reconcile_clears_unreachable_on_recovered_node(ds, indigo_env):
+    # disconnect marks devices unreachable; the reconnect reconcile must clear it
+    # for nodes that are present again, even if no attribute value changed.
+    _indigo, devices = indigo_env
+    ds.create_from_raw(RELAY_NODE, "Office Plug")
+    dev_id = ds.lookup(42, 1)
+    ds.mark_all_unreachable()
+    assert devices[dev_id].errorState == "unreachable"
+
+    ds.reconcile_all([RELAY_NODE])
+    assert devices[dev_id].errorState == ""
+
+
 def test_apply_states_clears_stale_error(ds, indigo_env):
     _indigo, devices = indigo_env
     ds.create_from_raw(RELAY_NODE, "Office Plug")
