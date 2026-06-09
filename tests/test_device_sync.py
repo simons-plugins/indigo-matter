@@ -395,6 +395,58 @@ def test_node_updated_availability_toggles_reachability(ds, indigo_env):
     assert devices[dev_id].errorState == ""
 
 
+MULTI_NODE = {
+    "node_id": 92,
+    "attributes": {
+        "1/6/0": False, "1/29/0": [{"0": 266}],   # OnOff on endpoint 1
+        "2/6/0": False, "2/29/0": [{"0": 266}],   # OnOff on endpoint 2
+    },
+}
+
+
+def test_multi_endpoint_authoritative_rename_after_race(ds, indigo_env):
+    # node_added creates both endpoints' devices with bare suffixed names; the
+    # commission pass must rename + re-folder BOTH, with no duplicates.
+    _indigo, devices = indigo_env
+    ds.handle_event(MatterEvent(
+        kind=protocol.EVT_NODE_ADDED, node_id=92,
+        raw={"event": "node_added", "data": MULTI_NODE},
+    ))
+    id1, id2 = ds.lookup(92, 1), ds.lookup(92, 2)
+    assert id1 and id2 and id1 != id2
+    assert "(endpoint 1)" in devices[id1].name and "Patio" not in devices[id1].name
+
+    result = ds.create_from_raw(MULTI_NODE, "Patio", "Outside")
+    assert sorted(result["indigoDeviceIds"]) == sorted([id1, id2])   # no dupes
+    assert devices[id1].name == "Patio (endpoint 1)"
+    assert devices[id2].name == "Patio (endpoint 2)"
+    outside = next(f.id for f in _indigo.devices.folders if f.name == "Outside")
+    assert devices[id1].folderId == outside and devices[id2].folderId == outside
+
+
+def test_folder_resolution_failure_falls_back_to_folder_0(ds, indigo_env):
+    # a folder API failure must not sink device creation
+    _indigo, devices = indigo_env
+
+    def boom(_name):
+        raise RuntimeError("folder API down")
+    _indigo.devices.folder.create = boom
+
+    result = ds.create_from_raw(RELAY_NODE, "Office Plug", "Office")
+    dev = devices[result["primaryDeviceId"]]
+    assert dev.name == "Office Plug"   # still created
+    assert dev.folderId == 0           # degraded gracefully
+
+
+def test_existing_room_folder_is_reused(ds, indigo_env):
+    _indigo, devices = indigo_env
+    ds.create_from_raw(RELAY_NODE, "Office Plug", "Office")
+    node2 = {"node_id": 93, "attributes": {"1/6/0": False, "1/29/0": [{"0": 266}]}}
+    ds.create_from_raw(node2, "Other Plug", "Office")
+    # second device into the same room reuses the folder, doesn't duplicate it
+    assert [f.name for f in _indigo.devices.folders] == ["Office"]
+
+
 def test_apply_states_clears_stale_error(ds, indigo_env):
     _indigo, devices = indigo_env
     ds.create_from_raw(RELAY_NODE, "Office Plug")

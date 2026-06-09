@@ -203,6 +203,41 @@ def test_on_connect_runs_after_each_connect(mock_logger):
     run(scenario())
 
 
+def test_on_connect_fires_again_after_reconnect(mock_logger):
+    # the whole point of on_connect (vs the old one-shot _initial_sync): it must
+    # re-run after a drop+reconnect, not just on the first connect.
+    async def scenario():
+        calls = []
+
+        async def on_connect():
+            calls.append(1)
+
+        fakes = [FakeWebSocket(), FakeWebSocket()]
+        n = {"i": 0}
+
+        def connect(uri):
+            i = n["i"]
+            n["i"] += 1
+            return returns(fakes[i] if i < len(fakes) else fakes[-1])
+
+        async def fake_sleep(_d):
+            await asyncio.sleep(0)  # no real backoff delay
+
+        client = MatterClient(Protocol(), mock_logger, {}, connect=connect,
+                              on_connect=on_connect, sleep=fake_sleep)
+        task = asyncio.create_task(client.run())
+        await client.wait_connected(timeout=2)
+        await fakes[0].close()  # drop → backoff → reconnect to fakes[1]
+        for _ in range(100):
+            await asyncio.sleep(0.01)
+            if len(calls) >= 2 and client.connected:
+                break
+        assert len(calls) >= 2  # fired on the first connect AND the reconnect
+        await client.close()
+        task.cancel()
+    run(scenario())
+
+
 def test_on_connect_failure_is_logged_not_swallowed(mock_logger):
     async def scenario():
         async def boom():

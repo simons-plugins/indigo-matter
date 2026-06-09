@@ -189,3 +189,65 @@ def test_decommission_inner_unknown_unreachable_returns_none(plug):
         result = await plug._decommission(999)
         assert result is None  # → 404 unknown node
     asyncio.run(scenario())
+
+
+def test_on_disconnected_marks_all_unreachable(plug):
+    plug.device_sync = Mock()
+    plug._on_disconnected()
+    plug.device_sync.mark_all_unreachable.assert_called_once()
+
+
+def test_resync_failure_does_not_reconcile(plug):
+    # if get_nodes raises, reconcile_all must NOT run — so unreachable flags set
+    # on disconnect are left intact rather than wrongly cleared.
+    class BoomMatter:
+        async def get_nodes(self):
+            raise RuntimeError("ws down")
+
+    plug.matter = BoomMatter()
+    plug.device_sync = Mock()
+    asyncio.run(plug._resync())
+    plug.device_sync.reconcile_all.assert_not_called()
+
+
+def test_startup_wires_connect_and_disconnect_callbacks(plugin_mod, monkeypatch):
+    # a callback-swap (or dropping one) would silently break the whole M8 story;
+    # pin that startup passes the right methods to MatterClient.
+    captured = {}
+
+    class FakeMatter:
+        def __init__(self, proto, logger, prefs, **kw):
+            captured.update(kw)
+
+        def run(self):
+            return None
+
+    class FakeRuntimeObj:
+        is_running = True
+
+        def start(self):
+            pass
+
+        def submit(self, coro):
+            if hasattr(coro, "close"):
+                coro.close()
+            return None
+
+    monkeypatch.setattr(plugin_mod, "MatterClient", FakeMatter)
+    monkeypatch.setattr(plugin_mod, "AsyncRuntime", lambda logger: FakeRuntimeObj())
+    monkeypatch.setattr(plugin_mod, "CommissionJobs", lambda *a, **k: Mock())
+    monkeypatch.setattr(plugin_mod, "HttpApi", lambda *a, **k: Mock())
+
+    p = plugin_mod.Plugin.__new__(plugin_mod.Plugin)
+    p.logger = Mock()
+    p.pluginPrefs = {}
+    p.proto = object()
+    p.registry = object()
+    p.device_sync = Mock()
+    p.runtime = None
+    p.server_process = None
+
+    p.startup()
+    assert captured["on_connect"] == p._resync
+    assert captured["on_disconnect"] == p._on_disconnected
+    assert captured["on_event"] == p._on_matter_event
