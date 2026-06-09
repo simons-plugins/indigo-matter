@@ -1,0 +1,5 @@
+<?xml version="1.0"?>
+<!-- No custom plugin events in v1. Matter attribute changes surface as Indigo
+     device-state changes, which drive standard Indigo state-change triggers. -->
+<Events>
+</Events>

@@ -1,0 +1,31 @@
+<?xml version="1.0"?>
+<!-- Device control (on/off, brightness, color, thermostat setpoints/modes) is
+     provided by Indigo for the built-in device types and routed via
+     actionControlDevice / actionControlSensor / actionControlThermostat, then
+     dispatched through the cluster mapping layer — so no custom control actions
+     are needed here.
+
+     The uiPath="hidden" actions below are the Domio HTTP API (API.md v1.1),
+     served by the Indigo Web Server (IWS) at
+       …/message/com.simon.indigo-matter/{handler}[/{pathArg}]
+     reachable locally on :8176 and remotely via the Reflector with the same
+     Bearer API key Domio already uses. Auth is enforced by Indigo before the
+     handler runs. -->
+<Actions>
+    <Action id="status" uiPath="hidden">
+        <Name>matter status</Name>
+        <CallbackMethod>http_status</CallbackMethod>
+    </Action>
+    <Action id="commission" uiPath="hidden">
+        <Name>matter commission</Name>
+        <CallbackMethod>http_commission</CallbackMethod>
+    </Action>
+    <Action id="decommission" uiPath="hidden">
+        <Name>matter decommission</Name>
+        <CallbackMethod>http_decommission</CallbackMethod>
+    </Action>
+    <Action id="diagnostics" uiPath="hidden">
+        <Name>matter device diagnostics</Name>
+        <CallbackMethod>http_diagnostics</CallbackMethod>
+    </Action>
+</Actions>

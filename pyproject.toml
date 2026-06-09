@@ -1,0 +1,43 @@
+[project]
+name = "indigo-matter"
+version = "2026.0.1"
+description = "Indigo plugin for Matter device support (via matter-server)"
+requires-python = ">=3.11"
+
+[tool.pylint.main]
+# Target Python version (Indigo 2025.2+ ships Python 3.11+; plugin uses 3.11 features)
+py-version = "3.11"
+
+# Exit with error if score below this
+fail-under = 9.0
+
+# Use all available cores
+jobs = 0
+
+# Paths to ignore
+ignore-paths = ["tests", "__pycache__"]
+
+[tool.pylint.format]
+max-line-length = 120
+
+[tool.pylint.design]
+max-attributes = 20
+max-args = 8
+
+[tool.pylint."messages control"]
+disable = [
+    "too-many-lines",
+    "too-many-public-methods",  # Plugin class requires many Indigo API callbacks
+    "invalid-name",             # Indigo uses camelCase callbacks (actionControlDevice, etc)
+    "too-few-public-methods",   # cluster handlers / dataclasses are intentionally small
+]
+
+[tool.pylint.basic]
+# Allow Indigo's camelCase callback names
+method-rgx = "[a-z_][a-zA-Z0-9_]{2,}$"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+python_classes = "Test*"
+python_functions = "test_*"

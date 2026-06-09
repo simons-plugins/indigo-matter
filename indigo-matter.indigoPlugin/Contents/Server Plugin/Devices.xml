@@ -1,0 +1,294 @@
+<?xml version="1.0"?>
+<!-- Matter device type catalog (v1 cluster scope).
+     Each Matter endpoint maps to one Indigo device via the cluster mapping
+     layer (see matter_handlers/). The readonly identity fields are populated
+     from the Matter node at commissioning time and refreshed on interview. -->
+<Devices>
+
+    <!-- ============================================================ -->
+    <!-- Lighting                                                     -->
+    <!-- ============================================================ -->
+
+    <!-- Relay: OnOff only -->
+    <Device id="matterRelay" type="relay">
+        <Name>Matter Relay</Name>
+        <ConfigUI>
+            <Field id="nodeId" type="textfield" readonly="yes">
+                <Label>Matter Node ID:</Label>
+            </Field>
+            <Field id="endpointId" type="textfield" readonly="yes">
+                <Label>Endpoint:</Label>
+            </Field>
+            <Field id="vendorName" type="textfield" readonly="yes">
+                <Label>Vendor:</Label>
+            </Field>
+            <Field id="productName" type="textfield" readonly="yes">
+                <Label>Product:</Label>
+            </Field>
+        </ConfigUI>
+        <States>
+            <State id="onOffState">
+                <ValueType boolType="OnOff">Boolean</ValueType>
+                <TriggerLabel>On/Off State</TriggerLabel>
+                <ControlPageLabel>On/Off State</ControlPageLabel>
+            </State>
+        </States>
+        <UiDisplayStateId>onOffState</UiDisplayStateId>
+    </Device>
+
+    <!-- Dimmer: OnOff + LevelControl -->
+    <Device id="matterDimmer" type="dimmer">
+        <Name>Matter Dimmer</Name>
+        <ConfigUI>
+            <Field id="nodeId" type="textfield" readonly="yes">
+                <Label>Matter Node ID:</Label>
+            </Field>
+            <Field id="endpointId" type="textfield" readonly="yes">
+                <Label>Endpoint:</Label>
+            </Field>
+            <Field id="vendorName" type="textfield" readonly="yes">
+                <Label>Vendor:</Label>
+            </Field>
+            <Field id="productName" type="textfield" readonly="yes">
+                <Label>Product:</Label>
+            </Field>
+        </ConfigUI>
+        <!-- States inherited from dimmer base type: onOffState, brightnessLevel -->
+    </Device>
+
+    <!-- Color dimmer: OnOff + LevelControl + ColorControl -->
+    <Device id="matterColorDimmer" type="dimmer">
+        <Name>Matter Color Dimmer</Name>
+        <SupportsColor>true</SupportsColor>
+        <SupportsRGB>true</SupportsRGB>
+        <SupportsWhite>true</SupportsWhite>
+        <SupportsWhiteTemperature>true</SupportsWhiteTemperature>
+        <SupportsRGBandWhiteSimultaneously>false</SupportsRGBandWhiteSimultaneously>
+        <WhiteTemperatureMin>2000</WhiteTemperatureMin>
+        <WhiteTemperatureMax>6500</WhiteTemperatureMax>
+        <ConfigUI>
+            <Field id="nodeId" type="textfield" readonly="yes">
+                <Label>Matter Node ID:</Label>
+            </Field>
+            <Field id="endpointId" type="textfield" readonly="yes">
+                <Label>Endpoint:</Label>
+            </Field>
+            <Field id="vendorName" type="textfield" readonly="yes">
+                <Label>Vendor:</Label>
+            </Field>
+            <Field id="productName" type="textfield" readonly="yes">
+                <Label>Product:</Label>
+            </Field>
+        </ConfigUI>
+    </Device>
+
+    <!-- ============================================================ -->
+    <!-- Sensors                                                      -->
+    <!-- ============================================================ -->
+
+    <Device id="matterTemperatureSensor" type="sensor">
+        <Name>Matter Temperature Sensor</Name>
+        <ConfigUI>
+            <Field id="nodeId" type="textfield" readonly="yes">
+                <Label>Matter Node ID:</Label>
+            </Field>
+            <Field id="endpointId" type="textfield" readonly="yes">
+                <Label>Endpoint:</Label>
+            </Field>
+            <Field id="vendorName" type="textfield" readonly="yes">
+                <Label>Vendor:</Label>
+            </Field>
+            <Field id="productName" type="textfield" readonly="yes">
+                <Label>Product:</Label>
+            </Field>
+        </ConfigUI>
+        <States>
+            <State id="sensorValue">
+                <ValueType>Number</ValueType>
+                <TriggerLabel>Temperature</TriggerLabel>
+                <TriggerLabelPrefix>Temperature is</TriggerLabelPrefix>
+                <ControlPageLabel>Temperature</ControlPageLabel>
+            </State>
+            <State id="batteryLevel">
+                <ValueType>Integer</ValueType>
+                <TriggerLabel>Battery Level</TriggerLabel>
+                <ControlPageLabel>Battery Level</ControlPageLabel>
+            </State>
+        </States>
+        <UiDisplayStateId>sensorValue</UiDisplayStateId>
+    </Device>
+
+    <Device id="matterHumiditySensor" type="sensor">
+        <Name>Matter Humidity Sensor</Name>
+        <ConfigUI>
+            <Field id="nodeId" type="textfield" readonly="yes">
+                <Label>Matter Node ID:</Label>
+            </Field>
+            <Field id="endpointId" type="textfield" readonly="yes">
+                <Label>Endpoint:</Label>
+            </Field>
+            <Field id="vendorName" type="textfield" readonly="yes">
+                <Label>Vendor:</Label>
+            </Field>
+            <Field id="productName" type="textfield" readonly="yes">
+                <Label>Product:</Label>
+            </Field>
+        </ConfigUI>
+        <States>
+            <State id="sensorValue">
+                <ValueType>Number</ValueType>
+                <TriggerLabel>Humidity</TriggerLabel>
+                <TriggerLabelPrefix>Humidity is</TriggerLabelPrefix>
+                <ControlPageLabel>Humidity</ControlPageLabel>
+            </State>
+        </States>
+        <UiDisplayStateId>sensorValue</UiDisplayStateId>
+    </Device>
+
+    <Device id="matterMotionSensor" type="sensor">
+        <Name>Matter Motion Sensor</Name>
+        <ConfigUI>
+            <Field id="nodeId" type="textfield" readonly="yes">
+                <Label>Matter Node ID:</Label>
+            </Field>
+            <Field id="endpointId" type="textfield" readonly="yes">
+                <Label>Endpoint:</Label>
+            </Field>
+            <Field id="vendorName" type="textfield" readonly="yes">
+                <Label>Vendor:</Label>
+            </Field>
+            <Field id="productName" type="textfield" readonly="yes">
+                <Label>Product:</Label>
+            </Field>
+        </ConfigUI>
+        <States>
+            <State id="onOffState">
+                <ValueType boolType="OnOff">Boolean</ValueType>
+                <TriggerLabel>Motion</TriggerLabel>
+                <ControlPageLabel>Motion</ControlPageLabel>
+            </State>
+        </States>
+        <UiDisplayStateId>onOffState</UiDisplayStateId>
+    </Device>
+
+    <Device id="matterContactSensor" type="sensor">
+        <Name>Matter Contact Sensor</Name>
+        <ConfigUI>
+            <Field id="nodeId" type="textfield" readonly="yes">
+                <Label>Matter Node ID:</Label>
+            </Field>
+            <Field id="endpointId" type="textfield" readonly="yes">
+                <Label>Endpoint:</Label>
+            </Field>
+            <Field id="vendorName" type="textfield" readonly="yes">
+                <Label>Vendor:</Label>
+            </Field>
+            <Field id="productName" type="textfield" readonly="yes">
+                <Label>Product:</Label>
+            </Field>
+        </ConfigUI>
+        <States>
+            <State id="onOffState">
+                <ValueType boolType="OpenClosed">Boolean</ValueType>
+                <TriggerLabel>Contact</TriggerLabel>
+                <ControlPageLabel>Contact</ControlPageLabel>
+            </State>
+        </States>
+        <UiDisplayStateId>onOffState</UiDisplayStateId>
+    </Device>
+
+    <Device id="matterIlluminanceSensor" type="sensor">
+        <Name>Matter Illuminance Sensor</Name>
+        <ConfigUI>
+            <Field id="nodeId" type="textfield" readonly="yes">
+                <Label>Matter Node ID:</Label>
+            </Field>
+            <Field id="endpointId" type="textfield" readonly="yes">
+                <Label>Endpoint:</Label>
+            </Field>
+            <Field id="vendorName" type="textfield" readonly="yes">
+                <Label>Vendor:</Label>
+            </Field>
+            <Field id="productName" type="textfield" readonly="yes">
+                <Label>Product:</Label>
+            </Field>
+        </ConfigUI>
+        <States>
+            <State id="sensorValue">
+                <ValueType>Number</ValueType>
+                <TriggerLabel>Illuminance</TriggerLabel>
+                <TriggerLabelPrefix>Illuminance is</TriggerLabelPrefix>
+                <ControlPageLabel>Illuminance (lux)</ControlPageLabel>
+            </State>
+        </States>
+        <UiDisplayStateId>sensorValue</UiDisplayStateId>
+    </Device>
+
+    <!-- ============================================================ -->
+    <!-- Thermostat                                                   -->
+    <!-- ============================================================ -->
+
+    <Device id="matterThermostat" type="thermostat">
+        <Name>Matter Thermostat</Name>
+        <ConfigUI>
+            <Field id="nodeId" type="textfield" readonly="yes">
+                <Label>Matter Node ID:</Label>
+            </Field>
+            <Field id="endpointId" type="textfield" readonly="yes">
+                <Label>Endpoint:</Label>
+            </Field>
+            <Field id="vendorName" type="textfield" readonly="yes">
+                <Label>Vendor:</Label>
+            </Field>
+            <Field id="productName" type="textfield" readonly="yes">
+                <Label>Product:</Label>
+            </Field>
+            <!-- Thermostat capability flags — set from the Matter device's
+                 clusters at creation; declared here so Indigo builds the
+                 matching states. -->
+            <Field id="NumTemperatureInputs" type="textfield" defaultValue="1" hidden="yes" />
+            <Field id="NumHumidityInputs" type="textfield" defaultValue="0" hidden="yes" />
+            <Field id="SupportsHeatSetpoint" type="checkbox" defaultValue="true" hidden="yes" />
+            <Field id="SupportsCoolSetpoint" type="checkbox" defaultValue="true" hidden="yes" />
+            <Field id="SupportsHvacOperationMode" type="checkbox" defaultValue="true" hidden="yes" />
+            <Field id="SupportsHvacFanMode" type="checkbox" defaultValue="true" hidden="yes" />
+            <Field id="ShowCoolHeatEquipmentStateUI" type="checkbox" defaultValue="true" hidden="yes" />
+        </ConfigUI>
+        <!-- States inherited from thermostat base: hvacOperationMode,
+             hvacFanMode, temperatureInput1, setpointHeat, setpointCool, etc. -->
+    </Device>
+
+    <!-- ============================================================ -->
+    <!-- Fallback: unknown / unsupported Matter device                -->
+    <!-- ============================================================ -->
+
+    <Device id="matterUnknown" type="custom">
+        <Name>Matter Device (unsupported clusters)</Name>
+        <ConfigUI>
+            <Field id="nodeId" type="textfield" readonly="yes">
+                <Label>Matter Node ID:</Label>
+            </Field>
+            <Field id="endpointId" type="textfield" readonly="yes">
+                <Label>Endpoint:</Label>
+            </Field>
+            <Field id="vendorName" type="textfield" readonly="yes">
+                <Label>Vendor:</Label>
+            </Field>
+            <Field id="productName" type="textfield" readonly="yes">
+                <Label>Product:</Label>
+            </Field>
+            <Field id="supportedClusters" type="textfield" readonly="yes">
+                <Label>Supported Clusters:</Label>
+            </Field>
+        </ConfigUI>
+        <States>
+            <State id="reachable">
+                <ValueType boolType="YesNo">Boolean</ValueType>
+                <TriggerLabel>Reachable</TriggerLabel>
+                <ControlPageLabel>Reachable</ControlPageLabel>
+            </State>
+        </States>
+        <UiDisplayStateId>reachable</UiDisplayStateId>
+    </Device>
+
+</Devices>

@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<MenuItems>
+    <MenuItem id="restartMatterServer">
+        <Name>Restart matter-server</Name>
+        <CallbackMethod>menuRestartMatterServer</CallbackMethod>
+    </MenuItem>
+    <MenuItem id="showMatterServerLogs">
+        <Name>Open matter-server log…</Name>
+        <CallbackMethod>menuShowMatterServerLogs</CallbackMethod>
+    </MenuItem>
+    <MenuItem id="commissionDeviceManually">
+        <Name>Commission device by setup code (advanced)…</Name>
+        <CallbackMethod>menuCommissionDeviceManually</CallbackMethod>
+        <ConfigUI>
+            <Field id="setupCode" type="textfield">
+                <Label>Setup code (MT:... or 11 digits):</Label>
+            </Field>
+            <Field id="suggestedName" type="textfield">
+                <Label>Name:</Label>
+            </Field>
+        </ConfigUI>
+    </MenuItem>
+    <MenuItem id="exportFabricBackup">
+        <Name>Export fabric backup…</Name>
+        <CallbackMethod>menuExportFabricBackup</CallbackMethod>
+    </MenuItem>
+</MenuItems>
