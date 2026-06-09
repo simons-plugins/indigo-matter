@@ -117,29 +117,40 @@ class DeviceSync:
         created: list[int] = []
         primary: Optional[int] = None
         failed = 0
+        # The commission path threads a user-chosen name (via node.suggested_name)
+        # and/or room; reconcile and out-of-band node_added do not. When either is
+        # present this create is *authoritative* and may rename/re-folder a device
+        # that node_added raced ahead and created with the bare product name.
+        authoritative = bool((node.suggested_name or "").strip()) or bool((suggested_room or "").strip())
         with self._lock:
-            # Plan first so the "(endpoint N)" suffix is applied only when more
-            # than one device is actually created — a plug's root endpoint 0
-            # produces no device, so len(node.endpoints) is not the device count.
+            # Plan over every mappable endpoint (existing or not) so the
+            # "(endpoint N)" suffix is decided by the node's true device count,
+            # not by how many happen to be missing on this pass. A plug's root
+            # endpoint 0 produces no handler, so this is not len(node.endpoints).
             plan: list[tuple] = []  # (endpoint, spec)
             for endpoint in node.endpoints:
-                existing = self._index.get((int(node.node_id), int(endpoint.endpoint_id)))
-                if existing is not None:
-                    created.append(existing)
-                    primary = primary if primary is not None else existing
-                    continue
                 for spec in self.registry.handlers_for_endpoint(node, endpoint):
                     plan.append((endpoint, spec))
 
-            expected = len(plan)
-            multi = expected > 1
+            multi = len(plan) > 1
+            folder_id = self._resolve_folder_id(suggested_room) if authoritative else 0
             for endpoint, spec in plan:
                 name = f"{spec.name} (endpoint {endpoint.endpoint_id})" if multi else spec.name
-                dev_id = self._create_one(spec, name, suggested_room)
+                key = (int(node.node_id), int(endpoint.endpoint_id))
+                existing = self._index.get(key)
+                if existing is not None:
+                    # Already created (e.g. node_added won the race). On the
+                    # authoritative commission pass, stamp the chosen name/room.
+                    if authoritative:
+                        self._apply_identity(existing, name, folder_id)
+                    created.append(existing)
+                    primary = primary if primary is not None else existing
+                    continue
+                dev_id = self._create_one(spec, name, folder_id)
                 if dev_id is None:
                     failed += 1
                     continue
-                self._index[(node.node_id, endpoint.endpoint_id)] = dev_id
+                self._index[key] = dev_id
                 created.append(dev_id)
                 primary = primary if primary is not None else dev_id
                 self._prime_states(node, dev_id, endpoint.endpoint_id)
@@ -147,7 +158,7 @@ class DeviceSync:
             # partial creation must be visible to the commission result, not hidden
             self.logger.warning(
                 "node %s: %d of %d expected device(s) failed to create",
-                node.node_id, failed, expected,
+                node.node_id, failed, len(plan),
             )
         result = {
             "indigoDeviceIds": created,
@@ -163,14 +174,14 @@ class DeviceSync:
             result["failedEndpoints"] = failed
         return result
 
-    def _create_one(self, spec: Any, name: str, room: Optional[str]) -> Optional[int]:
+    def _create_one(self, spec: Any, name: str, folder_id: int = 0) -> Optional[int]:
         try:
             dev = indigo.device.create(
                 protocol=indigo.kProtocol.Plugin,
                 deviceTypeId=spec.device_type_id,
                 name=self._unique_name(name),
                 props=spec.props,
-                folder=room or "",
+                folder=folder_id,
             )
         except Exception as exc:  # noqa: BLE001 - surface but don't abort the batch
             self.logger.exception(exc)
@@ -181,6 +192,60 @@ class DeviceSync:
             except Exception as exc:  # noqa: BLE001
                 self.logger.debug("initial state set failed: %s", exc)
         return dev.id
+
+    # ------------------------------------------------------------------
+    # Folder ("room") + identity helpers
+    # ------------------------------------------------------------------
+    def _resolve_folder_id(self, room: Optional[str]) -> int:
+        """Map a Domio 'room' to an Indigo device-folder id, creating it if absent.
+
+        Indigo has no native room concept — devices are organised into folders —
+        so a suggestedRoom becomes a device folder. Returns 0 (no folder) when no
+        room is given, or when the folder can't be resolved/created (a folder
+        problem must never sink device creation).
+        """
+        name = (room or "").strip()
+        if not name:
+            return 0
+        try:
+            for folder in indigo.devices.folders:
+                if folder.name == name:
+                    return folder.id
+            return indigo.devices.folder.create(name).id
+        except Exception as exc:  # noqa: BLE001
+            self.logger.warning("could not resolve/create device folder %r: %s", name, exc)
+            return 0
+
+    def _move_to_folder(self, dev_id: int, folder_id: int) -> None:
+        try:
+            try:
+                indigo.device.moveToFolder(dev_id, value=folder_id)
+            except TypeError:  # older positional signature
+                indigo.device.moveToFolder(dev_id, folder_id)
+        except Exception as exc:  # noqa: BLE001
+            self.logger.warning("could not move device %s to folder %s: %s", dev_id, folder_id, exc)
+
+    def _apply_identity(self, dev_id: int, name: str, folder_id: int) -> None:
+        """Stamp a commission-chosen name/folder onto an already-created device.
+
+        Used when node_added raced ahead and created the device with the bare
+        product name before the commission job (which carries the user's choices)
+        ran. Idempotent: a device that already matches is left untouched.
+        """
+        try:
+            dev = indigo.devices[dev_id]
+        except Exception as exc:  # noqa: BLE001
+            self.logger.debug("apply_identity: device %s unavailable: %s", dev_id, exc)
+            return
+        try:
+            target = name if dev.name == name else self._unique_name(name)
+            if dev.name != target:
+                dev.name = target
+                dev.replaceOnServer()
+        except Exception as exc:  # noqa: BLE001
+            self.logger.warning("could not rename device %s to %r: %s", dev_id, name, exc)
+        if folder_id and getattr(dev, "folderId", 0) != folder_id:
+            self._move_to_folder(dev_id, folder_id)
 
     def _prime_states(self, node: NodeInfo, dev_id: int, endpoint_id: int) -> None:
         """Apply the node's current attribute values to a freshly-created device.

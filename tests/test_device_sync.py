@@ -25,6 +25,7 @@ class FakeDev:
         self.states = {}
         self.error = None
         self.errorState = ""
+        self.folderId = 0
 
     def updateStatesOnServer(self, kvlist):
         for kv in kvlist:
@@ -34,11 +35,34 @@ class FakeDev:
         self.error = value
         self.errorState = value
 
+    def replaceOnServer(self):
+        # Real Indigo persists the in-memory edits (name etc.); the fake already
+        # mutated the object in place, so this is a no-op marker.
+        self.replaced = True
+
+
+class FakeFolder:
+    def __init__(self, folder_id, name):
+        self.id = folder_id
+        self.name = name
+
+
+class FakeFolderFactory:
+    """Stands in for ``indigo.devices.folder`` (the folder command namespace)."""
+
+    def __init__(self, devices):
+        self.devices = devices
+
+    def create(self, name):
+        return self.devices.add_folder(name)
+
 
 class FakeDevices:
     def __init__(self):
         self._by_id = {}
         self._counter = 1000
+        self._folders = {}
+        self._folder_counter = 0
 
     def next_id(self):
         self._counter += 1
@@ -46,6 +70,16 @@ class FakeDevices:
 
     def add(self, dev):
         self._by_id[dev.id] = dev
+
+    def add_folder(self, name):
+        self._folder_counter += 1
+        folder = FakeFolder(self._folder_counter, name)
+        self._folders[folder.id] = folder
+        return folder
+
+    @property
+    def folders(self):
+        return list(self._folders.values())
 
     def __iter__(self):
         return iter(list(self._by_id.values()))
@@ -62,11 +96,17 @@ class FakeDeviceFactory:
         self.devices = devices
         self.created = []
 
-    def create(self, protocol=None, deviceTypeId="", name="", props=None, folder="", **kwargs):
+    def create(self, protocol=None, deviceTypeId="", name="", props=None, folder=0, **kwargs):
         dev = FakeDev(self.devices.next_id(), name, deviceTypeId, dict(props or {}))
+        if isinstance(folder, int) and folder:
+            dev.folderId = folder
         self.devices.add(dev)
         self.created.append(dev)
         return dev
+
+    def moveToFolder(self, dev_or_id, value=None):
+        dev = dev_or_id if hasattr(dev_or_id, "folderId") else self.devices[dev_or_id]
+        dev.folderId = value
 
 
 @pytest.fixture
@@ -74,6 +114,7 @@ def indigo_env(mock_indigo_base):
     indigo = mock_indigo_base
     devices = FakeDevices()
     indigo.devices = devices
+    indigo.devices.folder = FakeFolderFactory(devices)
     indigo.device = FakeDeviceFactory(devices)
     indigo.kProtocol = SimpleNamespace(Plugin="plugin")
     return indigo, devices
@@ -241,6 +282,49 @@ def test_node_added_event_creates_device(ds, indigo_env):
         raw={"event": "node_added", "data": node_details},
     ))
     assert ds.lookup(60, 1) is not None
+
+
+def test_commission_creates_device_in_room_folder(ds, indigo_env):
+    # A suggestedRoom maps to an Indigo device folder, created on demand.
+    _indigo, devices = indigo_env
+    result = ds.create_from_raw(RELAY_NODE, "Office Plug", "Office")
+    dev = devices[result["primaryDeviceId"]]
+    assert dev.name == "Office Plug"
+    folder = next(f for f in _indigo.devices.folders if f.id == dev.folderId)
+    assert folder.name == "Office"
+
+
+def test_commission_overrides_name_and_room_after_node_added_race(ds, indigo_env):
+    """The node_added auto-create must not rob the commission of name/room.
+
+    Reproduces the live race: node_added fires first and creates the device with
+    the bare product name and no folder; the commission job then runs with the
+    user's chosen name + room and must rename/re-folder the *same* device rather
+    than leave the bare one or create a duplicate.
+    """
+    _indigo, devices = indigo_env
+    node_details = {"node_id": 70, "attributes": {"1/6/0": False, "1/29/0": [{"0": 266}]}}
+
+    # 1. node_added wins the race
+    ds.handle_event(MatterEvent(
+        kind=protocol.EVT_NODE_ADDED, node_id=70,
+        raw={"event": "node_added", "data": node_details},
+    ))
+    dev_id = ds.lookup(70, 1)
+    assert dev_id is not None
+    assert devices[dev_id].name != "Hallway Lamp"  # bare product/fallback name
+    assert devices[dev_id].folderId == 0
+
+    # 2. commission job runs with the user's choices
+    result = ds.create_from_raw(node_details, "Hallway Lamp", "Hallway")
+
+    # same device, no duplicate, now bearing the chosen name + folder
+    assert result["primaryDeviceId"] == dev_id
+    assert result["indigoDeviceIds"] == [dev_id]
+    dev = devices[dev_id]
+    assert dev.name == "Hallway Lamp"
+    folder = next(f for f in _indigo.devices.folders if f.id == dev.folderId)
+    assert folder.name == "Hallway"
 
 
 def test_apply_states_clears_stale_error(ds, indigo_env):

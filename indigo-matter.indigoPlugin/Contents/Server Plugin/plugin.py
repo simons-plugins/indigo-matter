@@ -198,13 +198,13 @@ class Plugin(indigo.PluginBase):
         return self._reply(status, body)
 
     def http_decommission(self, action, dev=None, caller_waiting_for_result=None):  # noqa: N802
-        method, path_args, _query = self._parse_request(action)
-        status, body = self.http.decommission(method, path_args)
+        method, path_args, query = self._parse_request(action)
+        status, body = self.http.decommission(method, path_args, query)
         return self._reply(status, body)
 
     def http_diagnostics(self, action, dev=None, caller_waiting_for_result=None):  # noqa: N802
-        _method, path_args, _query = self._parse_request(action)
-        status, body = self.http.diagnostics(path_args)
+        _method, path_args, query = self._parse_request(action)
+        status, body = self.http.diagnostics(path_args, query)
         return self._reply(status, body)
 
     @staticmethod

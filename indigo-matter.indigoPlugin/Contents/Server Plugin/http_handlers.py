@@ -70,16 +70,20 @@ class HttpApi:
         return self._jobs.create_job(query)
 
     # ------------------------------------------------------------------
-    # POST …/decommission/{nodeId}
+    # POST …/decommission?nodeId=…   (or …/decommission/{nodeId})
     # ------------------------------------------------------------------
-    def decommission(self, method: str, path_args: list) -> tuple[int, dict]:
+    def decommission(self, method: str, path_args: list, query: Optional[dict] = None) -> tuple[int, dict]:
         if method.upper() != "POST":
             return 405, {"error": "method_not_allowed", "message": "POST required to decommission"}
-        if not path_args:
-            return 400, {"error": "invalid_request", "message": "nodeId path component required"}
-        node_id = parse_node_id(path_args[0])
+        # IWS only delivers trailing path components on GET, never on POST, so a
+        # POST handler must take its id from the query string. The path component
+        # is kept as a fallback for any transport that does deliver it.
+        raw = path_args[0] if path_args else (query or {}).get("nodeId")
+        if not raw:
+            return 400, {"error": "invalid_request", "message": "nodeId required (nodeId query param)"}
+        node_id = parse_node_id(raw)
         if node_id is None:
-            return 400, {"error": "invalid_node_id", "message": f"bad nodeId: {path_args[0]}"}
+            return 400, {"error": "invalid_node_id", "message": f"bad nodeId: {raw}"}
         try:
             result = self._decommission(node_id)
         except MatterUnavailable as exc:
@@ -94,12 +98,15 @@ class HttpApi:
     # ------------------------------------------------------------------
     # GET …/diagnostics/{nodeId}
     # ------------------------------------------------------------------
-    def diagnostics(self, path_args: list) -> tuple[int, dict]:
-        if not path_args:
-            return 400, {"error": "invalid_request", "message": "nodeId path component required"}
-        node_id = parse_node_id(path_args[0])
+    def diagnostics(self, path_args: list, query: Optional[dict] = None) -> tuple[int, dict]:
+        # GET delivers the path component; accept a nodeId query param too for
+        # symmetry with decommission and transport independence.
+        raw = path_args[0] if path_args else (query or {}).get("nodeId")
+        if not raw:
+            return 400, {"error": "invalid_request", "message": "nodeId required (path component or nodeId query param)"}
+        node_id = parse_node_id(raw)
         if node_id is None:
-            return 400, {"error": "invalid_node_id", "message": f"bad nodeId: {path_args[0]}"}
+            return 400, {"error": "invalid_node_id", "message": f"bad nodeId: {raw}"}
         try:
             result = self._diagnostics(node_id)
         except MatterUnavailable as exc:

@@ -1,9 +1,15 @@
 # indigo-matter — Build Handover
 
-**Last updated:** 2026-06-09
-**Branch:** `feature/m0-m4-validation-loop` (HEAD `b2575b6`) — pushed to origin
-**Tests:** 147 passing (`cd indigo-matter && /Library/Frameworks/Python.framework/Versions/Current/bin/python3 -m pytest -q`)
-**Status:** M0–M7 complete; live-validated on jarvis. M8 partial. Domio share-model contract confirmed.
+**Last updated:** 2026-06-09 20:31 UTC
+**Branch:** `feature/m0-m4-validation-loop` (HEAD `b2575b6`) — pushed to origin (working tree has uncommitted device_sync/http_handlers/plugin/test changes from the 2026-06-09 fixes below)
+**Tests:** 152 passing (`cd indigo-matter && /Library/Frameworks/Python.framework/Versions/Current/bin/python3 -m pytest -q`)
+**Status:** M0–M7 complete; live-validated on jarvis. Commission half-test + live decommission DONE. M8 partial. Domio share-model contract confirmed.
+
+### 2026-06-09 session — two contract bugs found by live testing + fixed (deployed to jarvis, not yet committed/PR'd)
+1. **suggestedName/suggestedRoom were silently dropped on commission.** `node_added` raced ahead of the commission job and created the device with the bare product name and no folder; the job then found it already indexed and returned it. Fix in `device_sync.create_devices`: the commission pass is now *authoritative* — it renames + re-folders the existing device. suggestedRoom → an Indigo **device folder** (no native "room"), auto-created if missing. Live-proven: device got the chosen name (deduped to "… 2") + the auto-created "Matter Test Room" folder.
+2. **decommission POST never received its nodeId.** IWS only delivers trailing URL path components on **GET**, never POST (proven: `GET diagnostics/0xC`→200, `POST diagnostics/0xC`→400). API.md v1.1 had specced decommission as `POST …/decommission/{nodeId}`. Fix in `http_handlers` + `plugin.http_decommission/http_diagnostics`: read `nodeId` from the **query** (`POST …/decommission?nodeId=0xC`), path kept as fallback. Live-proven: real `OperationalCredentials.removeFabric` (statusCode 0) on the device, device returns to commissionable, Indigo devices deleted, idempotent 404, nodeCount drops.
+
+**Follow-ups these created:** (a) API.md §3.4 must change decommission to the `?nodeId=` query form + a note re IWS POST; (b) API.md §1 "Local" example is stale — IWS is **HTTPS** on 8176 (Digest locally, Bearer over reflector), not `http://`; (c) Domio's `MatterAPIClient` decommission must send nodeId as a query param; (d) diagnostics live response (§3.5) doesn't yet match the documented shape (numeric cluster ids, no fabrics/network/deviceType) — low priority, it's a future Domio view.
 
 This is the resume point. Read this first, then `CLAUDE.md` for architecture and `docs/IMPLEMENTATION.md §2.8` for the verified matter-server protocol.
 
@@ -27,8 +33,8 @@ Plus two improvements found by live testing: **state priming** (apply get_node s
 
 ## 2. What's LEFT to build
 
-1. **Commission-handler half-test (do first next session).** Prove the `POST …/commission` → job state machine → device-creation path against a *factory-fresh* virtual device (no Domio app). Recipe in §4.
-2. **M8 — failure hardening.** Much already exists (reconnect/backoff, error mapping, self-heal, unreachable marking, `_mark_disconnected` fails in-flight requests). Remaining: handle `server_shutdown` event (mark all unreachable + reconnect), Mac sleep/wake resubscribe, and a **live decommission** test (`POST …/decommission/{nodeId}` is built + unit-tested, never run live).
+1. ~~**Commission-handler half-test.**~~ ✅ DONE 2026-06-09 (found + fixed the suggestedName/room race — see session note above).
+2. **M8 — failure hardening.** Much already exists (reconnect/backoff, error mapping, self-heal, unreachable marking, `_mark_disconnected` fails in-flight requests). ~~Live decommission test~~ ✅ DONE 2026-06-09 (found + fixed the IWS POST path-arg bug). Remaining: handle `server_shutdown` event (mark all unreachable + reconnect), Mac sleep/wake resubscribe.
 3. **Domio E2E** (the other agent drives): Apple Home commissions a Tapo P125M → "Turn On Pairing Mode" → share code → Domio `MatterAPIClient` → my `/commission`. I just watch the job succeed + device appear.
 4. **Ship:** bump `PluginVersion` in Info.plist (currently `2026.0.1`; bump only when shipping — workspace rule), then open the PR. Don't merge without Simon's go-ahead.
 5. Optional v2 clusters: Window Covering, Lock, Smoke/CO, Air Quality, Energy (out of v1 scope per PRD).

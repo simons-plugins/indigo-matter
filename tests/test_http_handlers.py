@@ -90,6 +90,27 @@ def test_decommission_routes_to_provider():
     assert body["fabricRemoved"] is True
 
 
+def test_decommission_reads_nodeid_from_query():
+    # IWS doesn't deliver path components on POST → nodeId must work via query.
+    seen = {}
+
+    def decom(node_id):
+        seen["nid"] = node_id
+        return {"nodeId": "0x2A", "removedIndigoDeviceIds": [111], "fabricRemoved": True}
+
+    api, _ = _api(decommission=decom)
+    code, body = api.decommission("POST", [], {"nodeId": "0x2A"})
+    assert code == 200
+    assert seen["nid"] == 0x2A
+    assert body["fabricRemoved"] is True
+
+
+def test_decommission_missing_nodeid_400():
+    api, _ = _api()
+    code, body = api.decommission("POST", [], {})
+    assert code == 400 and body["error"] == "invalid_request"
+
+
 def test_decommission_requires_post():
     api, _ = _api()
     code, _ = api.decommission("GET", ["0x2A"])
@@ -149,3 +170,9 @@ def test_diagnostics_missing_node_arg_400():
     api, _ = _api()
     code, _ = api.diagnostics([])
     assert code == 400
+
+
+def test_diagnostics_reads_nodeid_from_query():
+    api, _ = _api(diagnostics=lambda nid: {"nodeId": "0x2A", "reachable": True})
+    code, body = api.diagnostics([], {"nodeId": "0x2A"})
+    assert code == 200 and body["reachable"] is True
