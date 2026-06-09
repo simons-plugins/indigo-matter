@@ -364,6 +364,37 @@ def test_reconcile_clears_unreachable_on_recovered_node(ds, indigo_env):
     assert devices[dev_id].errorState == ""
 
 
+def test_reconcile_marks_unavailable_node_unreachable(ds, indigo_env):
+    # get_nodes returns ALL commissioned nodes; an offline one (available=False)
+    # must be marked unreachable, not cleared just because it's present.
+    _indigo, devices = indigo_env
+    attrs = {"1/6/0": False, "1/29/0": [{"0": 266}]}
+    ds.create_from_raw({"node_id": 80, "attributes": attrs}, "Plug")
+    dev_id = ds.lookup(80, 1)
+    ds.reconcile_all([{"node_id": 80, "available": False, "attributes": attrs}])
+    assert devices[dev_id].errorState == "unreachable"
+
+
+def test_node_updated_availability_toggles_reachability(ds, indigo_env):
+    # matter-server fires node_updated on availability changes.
+    _indigo, devices = indigo_env
+    attrs = {"1/6/0": False, "1/29/0": [{"0": 266}]}
+    ds.create_from_raw({"node_id": 81, "attributes": attrs}, "Plug")
+    dev_id = ds.lookup(81, 1)
+
+    ds.handle_event(MatterEvent(
+        kind=protocol.EVT_NODE_UPDATED, node_id=81,
+        raw={"event": "node_updated", "data": {"node_id": 81, "available": False, "attributes": attrs}},
+    ))
+    assert devices[dev_id].errorState == "unreachable"
+
+    ds.handle_event(MatterEvent(
+        kind=protocol.EVT_NODE_UPDATED, node_id=81,
+        raw={"event": "node_updated", "data": {"node_id": 81, "available": True, "attributes": attrs}},
+    ))
+    assert devices[dev_id].errorState == ""
+
+
 def test_apply_states_clears_stale_error(ds, indigo_env):
     _indigo, devices = indigo_env
     ds.create_from_raw(RELAY_NODE, "Office Plug")

@@ -58,6 +58,11 @@ def test_parse_node_extracts_endpoints_and_identity():
     assert ep1.device_types == (266,)
 
 
+def test_parse_node_available_defaults_true_and_reads_flag():
+    assert parse_node(RELAY_NODE).available is True            # omitted → reachable
+    assert parse_node({**RELAY_NODE, "available": False}).available is False
+
+
 def test_registry_creates_relay_for_onoff_only_endpoint():
     node = parse_node(RELAY_NODE, "Office Plug")
     reg = HandlerRegistry()

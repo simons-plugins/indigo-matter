@@ -203,6 +203,24 @@ def test_on_connect_runs_after_each_connect(mock_logger):
     run(scenario())
 
 
+def test_on_connect_failure_is_logged_not_swallowed(mock_logger):
+    async def scenario():
+        async def boom():
+            raise RuntimeError("resync failed")
+
+        fake = FakeWebSocket()
+        client = _client(mock_logger, fake, on_connect=boom)
+        task = asyncio.create_task(client.run())
+        await client.wait_connected(timeout=2)
+        await asyncio.sleep(0.05)  # let the on_connect task run + done-callback fire
+        # the listen loop survives a failed reconcile, and the failure is surfaced
+        assert client.connected
+        mock_logger.exception.assert_called()
+        await client.close()
+        task.cancel()
+    run(scenario())
+
+
 def test_on_disconnect_fires_on_real_drop(mock_logger):
     async def scenario():
         events = []

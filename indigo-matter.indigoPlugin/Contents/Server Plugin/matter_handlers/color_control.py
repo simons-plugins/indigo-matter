@@ -70,8 +70,8 @@ class ColorControlHandler(LevelControlHandler):
                     # does not apply the static <Supports*> Devices.xml elements to
                     # API-created devices, so without these the device has no real
                     # white-temperature support and rejects 'whiteTemperature' as an
-                    # invalid color level key. (Matches docs constants.md + the
-                    # Relay-and-Dimmer SDK example.)
+                    # invalid color level key. (Matches the Indigo SDK's
+                    # Relay-and-Dimmer example, which sets these via device props.)
                     "SupportsColor": True,
                     "SupportsRGB": True,
                     "SupportsWhite": True,

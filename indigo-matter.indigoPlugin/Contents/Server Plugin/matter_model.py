@@ -40,6 +40,10 @@ class NodeInfo:
     vendor_name: str = ""
     product_name: str = ""
     sw_version: str = ""
+    #: matter-server's reachability flag for the node (node-details ``available``;
+    #: also pushed via a node_updated event when it changes). Defaults True so a
+    #: server that omits the field is treated as reachable (prior behaviour).
+    available: bool = True
     endpoints: list[EndpointInfo] = field(default_factory=list)
     #: Current attribute values keyed by (endpoint, cluster, attribute) — used to
     #: prime Indigo device states on creation (get_node's snapshot), since
@@ -98,6 +102,7 @@ def parse_node(raw: dict, suggested_name: str = "") -> NodeInfo:
         vendor_name=str(basic(_ATTR_VENDOR_NAME, "") or ""),
         product_name=str(basic(_ATTR_PRODUCT_NAME, "") or ""),
         sw_version=str(basic(_ATTR_SW_VERSION_STRING, "") or ""),
+        available=bool(raw.get("available", True)),
         endpoints=endpoints,
         attributes=attrs,
     )

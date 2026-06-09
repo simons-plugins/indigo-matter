@@ -75,6 +75,7 @@ class MatterClient:
         self._pending: dict[str, asyncio.Future] = {}
         self._closing = False
         self._connected_event = asyncio.Event()
+        self._reconcile_task: Optional[asyncio.Task] = None
 
         # liveness flags read by the watchdog (runConcurrentThread)
         self.connected = False
@@ -125,9 +126,12 @@ class MatterClient:
         self.logger.info("connected to matter-server, listening")
         # Re-reconcile on every (re)connect so devices that changed (or that we
         # missed) while disconnected are corrected and 'unreachable' is cleared.
-        # Scheduled as its own task so it doesn't block the listen loop.
+        # Scheduled as its own task so it doesn't block the listen loop; keep a
+        # strong ref (else it can be GC'd) and log any failure rather than letting
+        # it vanish into a never-retrieved task exception.
         if self._on_connect is not None:
-            asyncio.create_task(self._on_connect())
+            self._reconcile_task = asyncio.create_task(self._on_connect())
+            self._reconcile_task.add_done_callback(self._on_reconcile_done)
 
     async def _listen(self) -> None:
         async for raw in self._ws:
@@ -151,6 +155,13 @@ class MatterClient:
                     fut.set_result(self.proto.parse_result(frame))
                 except ProtocolError as exc:
                     fut.set_exception(exc)
+
+    def _on_reconcile_done(self, task: "asyncio.Task") -> None:
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            self.logger.exception(exc)  # on_connect failed — surface, don't swallow
 
     def _mark_disconnected(self) -> None:
         was_connected = self.connected

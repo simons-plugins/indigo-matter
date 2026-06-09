@@ -116,7 +116,10 @@ class Plugin(indigo.PluginBase):
             self.device_sync.reconcile_all(detailed)
             self.logger.info("reconciled %d Matter node(s)", len(detailed))
         except Exception as exc:  # noqa: BLE001
-            self.logger.warning("resync incomplete: %s", exc)
+            # _resync is the sole reconcile path (first connect + every reconnect);
+            # keep the traceback so a first-connect failure (user sees no devices)
+            # is debuggable. On failure nothing is cleared (reconcile_all never ran).
+            self.logger.warning("resync incomplete: %s", exc, exc_info=True)
 
     def _on_disconnected(self) -> None:
         """matter-server connection dropped — devices are unreachable until reconnect."""

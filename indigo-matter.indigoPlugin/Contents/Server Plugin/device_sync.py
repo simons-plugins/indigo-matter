@@ -295,11 +295,12 @@ class DeviceSync:
                 live.add((node.node_id, endpoint.endpoint_id))
             try:
                 self.create_devices(node)
-                # On a reconnect/sleep-wake reconcile the device already exists:
-                # refresh its state (it may have changed while we were away) and
-                # clear any stale 'unreachable' — create_devices only touches new
-                # devices, and apply_states won't clear the error if nothing changed.
-                self._refresh_live_node(node)
+                # Reconcile reachability from matter-server's availability flag:
+                # get_nodes returns ALL commissioned nodes (available or not), so
+                # mere presence is not liveness. For a live node, refresh its state
+                # (it may have changed while we were away) and clear any stale
+                # 'unreachable'; for one matter-server reports offline, mark it.
+                self._apply_reachability(node)
             except Exception as exc:  # noqa: BLE001
                 self.logger.warning("reconcile of node %s failed: %s", node.node_id, exc)
         with self._lock:
@@ -307,6 +308,13 @@ class DeviceSync:
                        if (node_id, _ep) not in live]
         for dev_id in orphans:
             self._safe_unreachable(dev_id)
+
+    def _apply_reachability(self, node: NodeInfo) -> None:
+        """Sync a node's Indigo devices to matter-server's reachability for it."""
+        if node.available:
+            self._refresh_live_node(node)
+        else:
+            self.mark_unreachable(node.node_id)
 
     def _refresh_live_node(self, node: NodeInfo) -> None:
         for endpoint in node.endpoints:
@@ -366,6 +374,8 @@ class DeviceSync:
 
         node_added/node_updated carry the full node-details object; create any
         missing Indigo devices (idempotent — existing endpoints are skipped).
+        matter-server also fires node_updated whenever a node's availability
+        changes, so reflect reachability here too.
         """
         data = evt.raw.get("data") if evt.raw else None
         if not isinstance(data, dict):
@@ -376,6 +386,7 @@ class DeviceSync:
             self.logger.warning("node_added parse failed: %s", exc)
             return
         self.create_devices(node)
+        self._apply_reachability(node)
 
     def _on_attribute(self, evt: protocol.MatterEvent) -> None:
         if evt.node_id is None or evt.endpoint is None or evt.cluster is None:
