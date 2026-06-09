@@ -170,6 +170,8 @@ class Plugin(indigo.PluginBase):
         coro = self.matter.write(action) if isinstance(action, MatterWrite) else self.matter.send_command(action)
         try:
             self.runtime.submit(coro).result(timeout=COMMAND_TIMEOUT)
+            if getattr(dev, "errorState", ""):
+                dev.setErrorStateOnServer("")  # command succeeded — clear a stale error
         except FuturesTimeoutError:
             self.logger.error("Matter command to %s timed out", dev.name)
             dev.setErrorStateOnServer("timeout")

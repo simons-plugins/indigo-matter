@@ -296,7 +296,11 @@ class DeviceSync:
 
     def apply_states(self, dev_id: int, kvlist: list) -> None:
         """The single asyncio→Indigo write seam (see module docstring)."""
-        indigo.devices[dev_id].updateStatesOnServer(kvlist)
+        dev = indigo.devices[dev_id]
+        dev.updateStatesOnServer(kvlist)
+        # a fresh value means the device is reachable — clear any stale error
+        if getattr(dev, "errorState", ""):
+            dev.setErrorStateOnServer("")
 
     # ------------------------------------------------------------------
     # Indigo action → Matter command (B1 path)

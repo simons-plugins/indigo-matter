@@ -24,6 +24,7 @@ class FakeDev:
         self.pluginProps = props
         self.states = {}
         self.error = None
+        self.errorState = ""
 
     def updateStatesOnServer(self, kvlist):
         for kv in kvlist:
@@ -31,6 +32,7 @@ class FakeDev:
 
     def setErrorStateOnServer(self, value):
         self.error = value
+        self.errorState = value
 
 
 class FakeDevices:
@@ -239,6 +241,16 @@ def test_node_added_event_creates_device(ds, indigo_env):
         raw={"event": "node_added", "data": node_details},
     ))
     assert ds.lookup(60, 1) is not None
+
+
+def test_apply_states_clears_stale_error(ds, indigo_env):
+    _indigo, devices = indigo_env
+    ds.create_from_raw(RELAY_NODE, "Office Plug")
+    dev_id = ds.lookup(42, 1)
+    devices[dev_id].setErrorStateOnServer("cmd failed")  # stale error
+    # a fresh state update means the device is reachable → error self-heals
+    ds.apply_states(dev_id, [{"key": "onOffState", "value": True}])
+    assert devices[dev_id].errorState == ""
 
 
 def test_build_command_dispatches_to_handler(ds, mock_indigo_base):
