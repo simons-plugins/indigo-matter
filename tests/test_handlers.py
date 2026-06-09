@@ -73,12 +73,13 @@ def test_registry_creates_relay_for_onoff_only_endpoint():
     assert spec.initial_states == {"onOffState": False}
 
 
-def test_onoff_defers_when_levelcontrol_present():
+def test_onoff_plus_levelcontrol_makes_a_dimmer():
     node = parse_node(DIMMER_NODE, "Lamp")
     reg = HandlerRegistry()
-    # OnOff defers to a dimmer handler; none wired in M4 → no device produced
+    # OnOff defers to LevelControl → a single matterDimmer (not a relay)
     specs = reg.handlers_for_endpoint(node, _endpoint(node, 1))
-    assert specs == []
+    assert len(specs) == 1
+    assert specs[0].device_type_id == "matterDimmer"
 
 
 def test_registry_lookup_by_cluster_and_device_type():

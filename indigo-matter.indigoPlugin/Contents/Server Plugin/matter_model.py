@@ -41,6 +41,10 @@ class NodeInfo:
     product_name: str = ""
     sw_version: str = ""
     endpoints: list[EndpointInfo] = field(default_factory=list)
+    #: Current attribute values keyed by (endpoint, cluster, attribute) — used to
+    #: prime Indigo device states on creation (get_node's snapshot), since
+    #: matter-server only emits attribute_updated on subsequent *changes*.
+    attributes: dict = field(default_factory=dict)
 
 
 def _normalise_attributes(raw_attrs: dict) -> dict[tuple[int, int, int], Any]:
@@ -95,6 +99,7 @@ def parse_node(raw: dict, suggested_name: str = "") -> NodeInfo:
         product_name=str(basic(_ATTR_PRODUCT_NAME, "") or ""),
         sw_version=str(basic(_ATTR_SW_VERSION_STRING, "") or ""),
         endpoints=endpoints,
+        attributes=attrs,
     )
 
 

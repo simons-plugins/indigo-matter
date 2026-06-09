@@ -142,6 +142,7 @@ class DeviceSync:
                 self._index[(node.node_id, endpoint.endpoint_id)] = dev_id
                 created.append(dev_id)
                 primary = primary if primary is not None else dev_id
+                self._prime_states(node, dev_id, endpoint.endpoint_id)
         if failed:
             # partial creation must be visible to the commission result, not hidden
             self.logger.warning(
@@ -180,6 +181,28 @@ class DeviceSync:
             except Exception as exc:  # noqa: BLE001
                 self.logger.debug("initial state set failed: %s", exc)
         return dev.id
+
+    def _prime_states(self, node: NodeInfo, dev_id: int, endpoint_id: int) -> None:
+        """Apply the node's current attribute values to a freshly-created device.
+
+        get_node carries a snapshot of every attribute; matter-server only emits
+        attribute_updated on subsequent *changes*, so without this a device whose
+        value is static at connect time would sit at its hardcoded initial state.
+        """
+        dev = indigo.devices[dev_id]
+        states: dict = {}
+        for (ep, cluster, attribute), value in node.attributes.items():
+            if ep != endpoint_id:
+                continue
+            handler = self.registry.handler_for_cluster(cluster)
+            if handler is None:
+                continue
+            try:
+                states.update(handler.on_attribute_update(dev, attribute, value))
+            except Exception as exc:  # noqa: BLE001 - one bad attr must not abort priming
+                self.logger.debug("prime %s attr %s/%s failed: %s", dev_id, cluster, attribute, exc)
+        if states:
+            self.apply_states(dev_id, _kvlist(states))
 
     def _unique_name(self, name: str) -> str:
         existing = {dev.name for dev in indigo.devices}
@@ -234,8 +257,26 @@ class DeviceSync:
     def handle_event(self, evt: protocol.MatterEvent) -> None:
         if evt.kind == protocol.EVT_ATTRIBUTE_UPDATED:
             self._on_attribute(evt)
+        elif evt.kind in (protocol.EVT_NODE_ADDED, protocol.EVT_NODE_UPDATED):
+            self._on_node_added(evt)
         elif evt.kind == protocol.EVT_NODE_REMOVED and evt.node_id is not None:
             self.mark_unreachable(evt.node_id)
+
+    def _on_node_added(self, evt: protocol.MatterEvent) -> None:
+        """A node commissioned/updated out-of-band (e.g. via the dashboard).
+
+        node_added/node_updated carry the full node-details object; create any
+        missing Indigo devices (idempotent — existing endpoints are skipped).
+        """
+        data = evt.raw.get("data") if evt.raw else None
+        if not isinstance(data, dict):
+            return
+        try:
+            node = parse_node(data)
+        except Exception as exc:  # noqa: BLE001
+            self.logger.warning("node_added parse failed: %s", exc)
+            return
+        self.create_devices(node)
 
     def _on_attribute(self, evt: protocol.MatterEvent) -> None:
         if evt.node_id is None or evt.endpoint is None or evt.cluster is None:

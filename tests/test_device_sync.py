@@ -213,6 +213,34 @@ def test_reconcile_skips_unparseable_node(ds):
     assert ds.lookup(42, 1) is not None
 
 
+def test_create_primes_states_from_node_snapshot(ds, indigo_env):
+    _indigo, devices = indigo_env
+    # OnOff currently TRUE in get_node → device must prime to True, not the default
+    node = {"node_id": 50, "attributes": {"1/6/0": True, "1/29/0": [{"0": 266}]}}
+    ds.create_from_raw(node, "On Plug")
+    dev_id = ds.lookup(50, 1)
+    assert devices[dev_id].states["onOffState"] is True
+
+
+def test_create_primes_sensor_value(ds, indigo_env):
+    _indigo, devices = indigo_env
+    # static temperature -28.00 °C must appear immediately (no attribute_updated will come)
+    node = {"node_id": 51, "attributes": {"1/1026/0": -2800, "1/29/0": [{"0": 770}]}}
+    ds.create_from_raw(node, "Temp")
+    dev_id = ds.lookup(51, 1)
+    assert devices[dev_id].states["sensorValue"] == -28.0
+
+
+def test_node_added_event_creates_device(ds, indigo_env):
+    _indigo, devices = indigo_env
+    node_details = {"node_id": 60, "attributes": {"1/6/0": False, "1/29/0": [{"0": 266}]}}
+    ds.handle_event(MatterEvent(
+        kind=protocol.EVT_NODE_ADDED, node_id=60,
+        raw={"event": "node_added", "data": node_details},
+    ))
+    assert ds.lookup(60, 1) is not None
+
+
 def test_build_command_dispatches_to_handler(ds, mock_indigo_base):
     import indigo
 

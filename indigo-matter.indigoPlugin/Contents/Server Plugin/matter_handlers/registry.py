@@ -13,13 +13,30 @@ from __future__ import annotations
 from typing import Any, Optional
 
 from .base import ClusterHandler, IndigoDeviceSpec
+from .color_control import ColorControlHandler
+from .level_control import LevelControlHandler
 from .on_off import OnOffHandler
+from .sensors import (
+    ContactHandler,
+    HumidityHandler,
+    IlluminanceHandler,
+    OccupancyHandler,
+    TemperatureHandler,
+)
 
 
 def default_handlers() -> list[ClusterHandler]:
-    """Handlers in priority order. Extend here as clusters are added."""
+    """Handlers in priority order. Lighting handlers (Color > Dimmer > Relay)
+    are mutually exclusive via ``is_primary_for``; sensors are additive."""
     return [
+        ColorControlHandler(),
+        LevelControlHandler(),
         OnOffHandler(),
+        TemperatureHandler(),
+        HumidityHandler(),
+        OccupancyHandler(),
+        ContactHandler(),
+        IlluminanceHandler(),
     ]
 
 
@@ -37,9 +54,10 @@ class HandlerRegistry:
     def handlers_for_endpoint(self, node: Any, endpoint: Any) -> list[IndigoDeviceSpec]:
         """All Indigo device specs an endpoint should produce, priority-ordered.
 
-        Once a handler claims the endpoint (produces a device), lower-priority
-        handlers for clusters on the same endpoint are skipped — composition of
-        multiple clusters into one device is each handler's own concern.
+        Lighting handlers (Color/Dimmer/Relay) are mutually exclusive via
+        ``is_primary_for`` (only one matches a given endpoint), so no break is
+        needed; sensor handlers are additive, letting a combined temp+humidity
+        endpoint produce two Indigo sensor devices.
         """
         specs: list[IndigoDeviceSpec] = []
         for handler in self.handlers:
@@ -47,10 +65,7 @@ class HandlerRegistry:
                 continue
             if not handler.is_primary_for(node, endpoint):
                 continue
-            produced = handler.create_indigo_devices(node, endpoint)
-            if produced:
-                specs.extend(produced)
-                break
+            specs.extend(handler.create_indigo_devices(node, endpoint))
         return specs
 
     def handler_for_cluster(self, cluster_id: int) -> Optional[ClusterHandler]:
