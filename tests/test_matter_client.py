@@ -26,12 +26,13 @@ def _client(mock_logger, fake, **kw):
 
 def test_connects_and_captures_server_info(mock_logger):
     async def scenario():
-        fake = FakeWebSocket(server_info={"version": "0.6.2", "fabric_id": "0xABC"})
+        fake = FakeWebSocket(server_info={"sdk_version": "matter-server/0.6.2", "fabric_id": "0xABC"})
         client = _client(mock_logger, fake)
         task = asyncio.create_task(client.run())
         await client.wait_connected(timeout=2)
         assert client.connected
-        assert client.server_info["version"] == "0.6.2"
+        assert client.server_info["sdk_version"] == "matter-server/0.6.2"
+        assert client.server_info["fabric_id"] == "0xABC"
         # start_listening sent on connect
         assert protocol.CMD_START_LISTENING in fake.sent_commands()
         await client.close()
@@ -96,8 +97,8 @@ def test_events_are_dispatched_to_callback(mock_logger):
         task = asyncio.create_task(client.run())
         await client.wait_connected(timeout=2)
 
-        await fake.push_event("attribute_updated",
-                              {"node_id": 42, "attribute": "1/6/0", "value": True})
+        # real shape: data is [node_id, "ep/cl/at", value]
+        await fake.push_event("attribute_updated", [42, "1/6/0", True])
         # let the listen loop process
         for _ in range(20):
             if received:

@@ -29,10 +29,11 @@ class FakeWebSocket:
         self.sent: list[dict] = []
         self._closed = False
         self._responder = responder
-        self._outbox.put_nowait(json.dumps({
-            protocol.KEY_EVENT: "server_info",
-            protocol.KEY_DATA: server_info or {"version": "0.6.2"},
-        }))
+        # matter-server pushes server_info as a BARE object on connect (no
+        # event/message_id wrapper) — match that real handshake shape.
+        self._outbox.put_nowait(json.dumps(
+            server_info or {"sdk_version": "matter-server/0.6.2", "fabric_id": "0x0"}
+        ))
 
     async def send(self, raw: str) -> None:
         if self._closed:

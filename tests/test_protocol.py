@@ -106,26 +106,33 @@ def test_parse_result_raises_on_error_frame(proto):
 # Inbound events
 # ----------------------------------------------------------------------
 def test_parse_node_added_event(proto):
-    frame = {"event": "node_added", "data": {"node_id": 42}}
+    # real shape: data is the node-details object (has node_id)
+    frame = {"event": "node_added", "data": {"node_id": 42, "attributes": {}}}
     evt = proto.parse_event(frame)
     assert isinstance(evt, MatterEvent)
     assert evt.kind == protocol.EVT_NODE_ADDED
     assert evt.node_id == 42
 
 
-def test_parse_attribute_updated_with_path_string(proto):
-    frame = {"event": "attribute_updated",
-             "data": {"node_id": 42, "attribute": "1/6/0", "value": True}}
+def test_parse_attribute_updated_real_array_shape(proto):
+    # GOLDEN: verified against ws-controller v0.6.2 — data is [node_id, path, value]
+    frame = {"event": "attribute_updated", "data": [42, "1/6/0", True]}
     evt = proto.parse_event(frame)
     assert evt.kind == protocol.EVT_ATTRIBUTE_UPDATED
     assert (evt.node_id, evt.endpoint, evt.cluster, evt.attribute) == (42, 1, 6, 0)
     assert evt.value is True
 
 
-def test_parse_attribute_updated_with_discrete_fields(proto):
-    frame = {"event": "attribute_updated",
-             "data": {"node_id": 7, "endpoint": 1, "cluster": 1026,
-                      "attribute_id": 0, "value": 2150}}
+def test_parse_attribute_updated_numeric_value(proto):
+    frame = {"event": "attribute_updated", "data": [7, "1/1026/0", 2150]}
     evt = proto.parse_event(frame)
     assert (evt.node_id, evt.endpoint, evt.cluster, evt.attribute) == (7, 1, 1026, 0)
     assert evt.value == 2150
+
+
+def test_parse_node_removed_bare_id(proto):
+    # real shape: data is the bare node_id
+    frame = {"event": "node_removed", "data": 42}
+    evt = proto.parse_event(frame)
+    assert evt.kind == protocol.EVT_NODE_REMOVED
+    assert evt.node_id == 42

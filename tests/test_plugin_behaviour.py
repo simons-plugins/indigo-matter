@@ -99,11 +99,14 @@ def test_send_command_noop_when_runtime_missing(plug):
 # Status body
 # ---------------------------------------------------------------------------
 def test_status_body_ready(plug):
-    plug.matter = SimpleNamespace(connected=True, server_info={"version": "0.6.2", "fabric_id": "0xAB"})
+    plug.matter = SimpleNamespace(
+        connected=True,
+        server_info={"sdk_version": "matter-server/0.6.2", "fabric_id": "0xAB"},
+    )
     plug.device_sync.node_count = lambda: 3
     body = plug._status_body()
     assert body["ready"] is True
-    assert body["matterServerVersion"] == "0.6.2"
+    assert body["matterServerVersion"] == "matter-server/0.6.2"
     assert body["fabricId"] == "0xAB"
     assert body["nodeCount"] == 3
     assert body["controllerVersion"] == "2026.0.1"

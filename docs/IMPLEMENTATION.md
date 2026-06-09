@@ -294,6 +294,42 @@ sensors), or deferred until Thread is fixed in matter-server, or as a contingenc
 plugin's WebSocket client falls back to python-matter-server for Thread devices
 specifically (WebSocket API is drop-in compatible).
 
+### 2.8 Verified protocol (matter-server v0.6.2 source) — AUTHORITATIVE
+
+Read directly from the running install on jarvis
+(`@matter-server/ws-controller@0.6.2`). Where this disagrees with §2.3–§2.5
+above, **this section wins** (the earlier tables were pre-verification):
+
+- **Envelope.** Request `{message_id, command, args}`. Success `{message_id, result}`.
+  Error `{message_id, error_code, details}` where `error_code` is a `ServerErrorCode`
+  int (0 UnknownError, 1 NodeCommissionFailed, 2 NodeInterviewFailed, 5 NodeNotExists, …).
+- **server_info** is pushed as a **bare object on connect** (no `event`/`message_id`
+  wrapper): `{fabric_id, compressed_fabric_id, fabric_index, schema_version,
+  sdk_version, bluetooth_enabled, …}`. (`sdk_version`, not `version`.) It is also
+  available via the `server_info` command.
+- **`device_command` args:** `node_id, endpoint_id, cluster_id, command_name, payload`
+  (+ optional `timed_request_timeout_ms`). `command_name` is camelized server-side, so
+  `"On"`/`"Off"`/`"Toggle"` are accepted. ← confirms the `protocol.py` constants.
+- **`read_attribute`/`write_attribute` args:** `node_id` + `attribute_path` (a
+  `"endpoint/cluster/attribute"` string, decimal), `value` for writes.
+- **`start_listening`** returns the **full node dump** as its `result` AND switches on
+  the **event firehose** — every attribute change then streams as `attribute_updated`
+  with no per-attribute subscription.
+- **Node-details object (from `get_node` / `get_nodes` / `node_added`):** there is **NO
+  `endpoints` key**. It carries a flat `attributes` map keyed by
+  `"endpoint/cluster/attribute"` (decimal), e.g.
+  `{"node_id": 42, "available": true, "is_bridge": false, "attributes": {"0/40/1":
+  "TP-Link", "1/29/0": [{"0": 266, "1": 2}], "1/6/0": false}}`. Endpoints and their
+  cluster sets are **derived from the attribute paths**; device types come from the
+  Descriptor cluster's DeviceTypeList (`<ep>/29/0`). BasicInformation (cluster 40) on
+  endpoint 0 gives vendor/product (attrs 1/2/3/4) and SoftwareVersionString (attr 10).
+- **Event `data` shapes:** `attribute_updated` → `[node_id, "ep/cl/at", value]` (an
+  ARRAY); `node_removed` → a bare `node_id`; `node_added`/`node_updated` → the
+  node-details object; `endpoint_added`/`endpoint_removed` → `{node_id, endpoint_id}`;
+  `server_shutdown` → `{}`.
+- Large ids (node/fabric) are serialised as bare large JSON numbers (Python parses them
+  as ints natively).
+
 ## 3. Indigo Plugin Scaffold
 
 The plugin follows the standard Indigo plugin structure:

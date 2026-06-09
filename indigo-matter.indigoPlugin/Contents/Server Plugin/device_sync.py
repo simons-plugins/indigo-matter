@@ -116,10 +116,12 @@ class DeviceSync:
     def create_devices(self, node: NodeInfo, suggested_room: Optional[str] = None) -> dict:
         created: list[int] = []
         primary: Optional[int] = None
-        expected = 0
         failed = 0
-        multi = len(node.endpoints) > 1
         with self._lock:
+            # Plan first so the "(endpoint N)" suffix is applied only when more
+            # than one device is actually created — a plug's root endpoint 0
+            # produces no device, so len(node.endpoints) is not the device count.
+            plan: list[tuple] = []  # (endpoint, spec)
             for endpoint in node.endpoints:
                 existing = self._index.get((int(node.node_id), int(endpoint.endpoint_id)))
                 if existing is not None:
@@ -127,17 +129,19 @@ class DeviceSync:
                     primary = primary if primary is not None else existing
                     continue
                 for spec in self.registry.handlers_for_endpoint(node, endpoint):
-                    expected += 1
-                    name = spec.name
-                    if multi:
-                        name = f"{spec.name} (endpoint {endpoint.endpoint_id})"
-                    dev_id = self._create_one(spec, name, suggested_room)
-                    if dev_id is None:
-                        failed += 1
-                        continue
-                    self._index[(node.node_id, endpoint.endpoint_id)] = dev_id
-                    created.append(dev_id)
-                    primary = primary if primary is not None else dev_id
+                    plan.append((endpoint, spec))
+
+            expected = len(plan)
+            multi = expected > 1
+            for endpoint, spec in plan:
+                name = f"{spec.name} (endpoint {endpoint.endpoint_id})" if multi else spec.name
+                dev_id = self._create_one(spec, name, suggested_room)
+                if dev_id is None:
+                    failed += 1
+                    continue
+                self._index[(node.node_id, endpoint.endpoint_id)] = dev_id
+                created.append(dev_id)
+                primary = primary if primary is not None else dev_id
         if failed:
             # partial creation must be visible to the commission result, not hidden
             self.logger.warning(

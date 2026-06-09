@@ -103,16 +103,17 @@ class MatterClient:
     async def _connect_once(self) -> None:
         self.logger.debug("connecting to %s", self.uri)
         self._ws = await self._connect(self.uri)
+        # matter-server pushes server_info as a BARE object on connect (no
+        # event/message_id wrapper) — verified against ws-controller v0.6.2.
         first = await self._recv()
-        if self.proto.is_event(first):
-            self.server_info = first.get(protocol.KEY_DATA, {})
+        if isinstance(first, dict):
+            self.server_info = first
         self.connected = True
         self._connected_event.set()
-        # TODO(M4-ondevice): start_listening is assumed to stream ALL attribute
-        # changes (python-matter-server behaviour). If the pinned matter-server
-        # release requires explicit per-attribute subscriptions, wire up the
-        # handlers' attributes_to_subscribe() here — currently that method is
-        # defined but unused, and OnOff state would silently never update.
+        # start_listening returns the full node dump as its result AND enables
+        # the event firehose; matter-server streams every attribute_updated with
+        # no per-attribute subscription needed (verified against v0.6.2), so the
+        # handlers' attributes_to_subscribe() is only a future filtering aid.
         await self._send_frame(self.proto.build_request(protocol.CMD_START_LISTENING))
         self.logger.info("connected to matter-server, listening")
 

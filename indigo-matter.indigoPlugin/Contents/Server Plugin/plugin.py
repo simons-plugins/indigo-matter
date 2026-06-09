@@ -224,16 +224,18 @@ class Plugin(indigo.PluginBase):
 
     # ----- providers used by HttpApi (bridge into the loop where needed) -----
     def _status_body(self) -> dict:
+        # server_info fields per ws-controller v0.6.2: sdk_version, fabric_id,
+        # bluetooth_enabled (there is no plain "version" key).
         connected = bool(self.matter is not None and self.matter.connected)
         info = (self.matter.server_info if self.matter else None) or {}
         return {
             "ready": connected,
             "controllerVersion": self._version,
             "matterServerReachable": connected,
-            "matterServerVersion": str(info.get("version", "unknown")),
+            "matterServerVersion": str(info.get("sdk_version", "unknown")),
             "fabricId": str(info.get("fabric_id", "")),
             "nodeCount": self.device_sync.node_count(),
-            "bleAvailable": bool(info.get("ble_available", False)),
+            "bleAvailable": bool(info.get("bluetooth_enabled", False)),
             "uptime": int(time.monotonic() - self._start_ts),
         }
 

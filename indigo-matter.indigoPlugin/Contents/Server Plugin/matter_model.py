@@ -53,20 +53,35 @@ def _normalise_attributes(raw_attrs: dict) -> dict[tuple[int, int, int], Any]:
     return out
 
 
-def parse_node(raw: dict, suggested_name: str = "") -> NodeInfo:
-    """Build a :class:`NodeInfo` from matter-server's ``get_node`` result."""
-    endpoints: list[EndpointInfo] = []
-    for ep_key, ep in (raw.get("endpoints") or {}).items():
-        cluster_ids = frozenset(int(c) for c in (ep.get("clusters") or []))
-        device_types = tuple(
-            int(dt.get("device_type"))
-            for dt in (ep.get("device_types") or [])
-            if dt.get("device_type") is not None
-        )
-        endpoints.append(EndpointInfo(int(ep_key), cluster_ids, device_types))
-    endpoints.sort(key=lambda e: e.endpoint_id)
+# Descriptor cluster (0x001D) DeviceTypeList attribute (0): tag-based list of
+# structs {"0": deviceType, "1": revision}.
+_DESCRIPTOR = 0x001D
+_ATTR_DEVICE_TYPE_LIST = 0x0000
 
+
+def parse_node(raw: dict, suggested_name: str = "") -> NodeInfo:
+    """Build a :class:`NodeInfo` from matter-server's node-details object.
+
+    The real node-details object (verified against ws-controller v0.6.2) has NO
+    ``endpoints`` key — only a flat ``attributes`` map keyed by
+    ``"endpoint/cluster/attribute"``. Endpoints and their cluster sets are
+    derived from those attribute paths; device types come from the Descriptor
+    cluster's DeviceTypeList.
+    """
     attrs = _normalise_attributes(raw.get("attributes") or {})
+
+    clusters_by_endpoint: dict[int, set[int]] = {}
+    for (endpoint_id, cluster_id, _attr_id) in attrs:
+        clusters_by_endpoint.setdefault(endpoint_id, set()).add(cluster_id)
+
+    endpoints = [
+        EndpointInfo(
+            endpoint_id=endpoint_id,
+            cluster_ids=frozenset(cluster_ids),
+            device_types=_device_types(attrs, endpoint_id),
+        )
+        for endpoint_id, cluster_ids in sorted(clusters_by_endpoint.items())
+    ]
 
     def basic(attr_id: int, default=None):
         return attrs.get((0, _BASIC_INFO, attr_id), default)
@@ -81,6 +96,18 @@ def parse_node(raw: dict, suggested_name: str = "") -> NodeInfo:
         sw_version=str(basic(_ATTR_SW_VERSION_STRING, "") or ""),
         endpoints=endpoints,
     )
+
+
+def _device_types(attrs: dict, endpoint_id: int) -> tuple[int, ...]:
+    raw_list = attrs.get((endpoint_id, _DESCRIPTOR, _ATTR_DEVICE_TYPE_LIST))
+    if not isinstance(raw_list, list):
+        return ()
+    out: list[int] = []
+    for entry in raw_list:
+        # tag-based struct: {"0": deviceType, "1": revision}
+        if isinstance(entry, dict) and entry.get("0") is not None:
+            out.append(int(entry["0"]))
+    return tuple(out)
 
 
 def _opt_int(value: Any) -> Optional[int]:

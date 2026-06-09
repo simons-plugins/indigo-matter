@@ -23,17 +23,18 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 # --------------------------------------------------------------------------
-# Wire field names — change HERE and nowhere else if the pinned release differs.
-# Defaults follow the canonical python-matter-server WebSocket API, since
-# matter-server advertises drop-in compatibility with it.
-#
-# TODO(M4-ondevice): these device_command arg names (endpoint_id/cluster_id/
-# command_name/payload) are the canonical python-matter-server spelling and
-# DISAGREE with IMPLEMENTATION.md §2 (endpoint/cluster/command/args). The unit
-# tests assert against these constants, so they pass for either spelling and do
-# NOT pin the wire format. Before/at first on-device run: capture a real frame
-# from matter-server, add it as a literal-JSON golden fixture in test_protocol,
-# and correct these constants if needed. This is the highest wire-compat risk.
+# Wire field names. VERIFIED against the matter-server v0.6.2 source on jarvis
+# (@matter-server/ws-controller/dist/esm/server/WebSocketControllerHandler.js):
+#   - device_command args: node_id / endpoint_id / cluster_id / command_name /
+#     payload  (server camelizes command_name, so "On"/"Off"/"Toggle" work).
+#   - success response: {message_id, result}; error: {message_id, error_code,
+#     details}; event: {event, data}.
+#   - start_listening returns the node dump as its result AND turns on the event
+#     firehose (no per-attribute subscription needed).
+#   - server_info is pushed as a BARE object on connect (no event/message_id).
+#   - attribute_updated data is [node_id, "ep/cl/at", value]; node_removed data
+#     is a bare node_id; node_added/updated data is the node-details object.
+# If a future release changes these, this module is still the only place to edit.
 # --------------------------------------------------------------------------
 
 # Envelope
@@ -185,13 +186,27 @@ class Protocol:
         return frame.get(KEY_RESULT)
 
     def parse_event(self, frame: dict) -> MatterEvent:
+        """Normalise an inbound event to a :class:`MatterEvent`.
+
+        Real matter-server v0.6.2 event ``data`` shapes:
+          - attribute_updated: ``[node_id, "endpoint/cluster/attribute", value]``
+          - node_removed:      bare ``node_id``
+          - node_added / node_updated: the node-details object (has ``node_id``)
+          - others (node_event, endpoint_*): a dict with ``node_id``
+        """
         name = frame.get(KEY_EVENT, "")
-        data = frame.get(KEY_DATA, {}) or {}
-        node_id = data.get("node_id")
-        endpoint = cluster = attribute = value = None
-        if name == EVT_ATTRIBUTE_UPDATED:
-            endpoint, cluster, attribute = self._extract_attr_path(data)
-            value = data.get("value")
+        data = frame.get(KEY_DATA)
+        node_id = endpoint = cluster = attribute = value = None
+
+        if name == EVT_ATTRIBUTE_UPDATED and isinstance(data, (list, tuple)) and len(data) >= 3:
+            node_id = data[0]
+            endpoint, cluster, attribute = self.parse_attr_key(str(data[1]))
+            value = data[2]
+        elif name == EVT_NODE_REMOVED:
+            node_id = data if not isinstance(data, dict) else data.get("node_id")
+        elif isinstance(data, dict):
+            node_id = data.get("node_id")
+
         return MatterEvent(
             kind=name,
             node_id=node_id,
@@ -200,22 +215,4 @@ class Protocol:
             attribute=attribute,
             value=value,
             raw=frame,
-        )
-
-    def _extract_attr_path(self, data: dict) -> tuple[Optional[int], Optional[int], Optional[int]]:
-        """Pull endpoint/cluster/attribute from an attribute_updated payload.
-
-        Tolerates both a single ``"ep/cl/at"`` path string (under any of a few
-        documented key names) and discrete fields.
-        """
-        path = data.get("attribute") or data.get("attribute_path") or data.get("key")
-        if isinstance(path, str) and "/" in path:
-            return self.parse_attr_key(path)
-        endpoint = data.get("endpoint", data.get("endpoint_id"))
-        cluster = data.get("cluster", data.get("cluster_id"))
-        attribute = data.get("attribute_id")
-        return (
-            _to_int(endpoint) if endpoint is not None else None,
-            _to_int(cluster) if cluster is not None else None,
-            _to_int(attribute) if attribute is not None else None,
         )
