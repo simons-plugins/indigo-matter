@@ -9,6 +9,13 @@
     <Field id="matterServerPath" type="textfield" defaultValue="/ws">
         <Label>matter-server WebSocket path:</Label>
     </Field>
+    <Field id="nodeBinDir" type="textfield" defaultValue="">
+        <Label>Node bin directory (optional):</Label>
+        <Description>Directory containing node/npx. Leave blank to auto-detect
+            (Homebrew, then nvm, then PATH). nvm users can pin a version here, e.g.
+            ~/.nvm/versions/node/v22.18.0/bin; Homebrew users normally leave it blank.
+            Only used when the LaunchAgent is managed automatically.</Description>
+    </Field>
     <Field id="storagePath" type="textfield"
            defaultValue="~/Library/Application Support/com.simon.indigo-matter/matter-server">
         <Label>matter-server storage path:</Label>

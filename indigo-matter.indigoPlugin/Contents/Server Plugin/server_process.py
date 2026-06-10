@@ -35,6 +35,23 @@ def _expand(path: str, home: str) -> str:
     return path
 
 
+def _parse_node_version(name: str) -> Optional[tuple[int, ...]]:
+    """Parse an nvm node dir / alias label into a comparable version tuple.
+
+    Accepts ``v22.18.0``, ``22.18.0``, ``v22``, ``22`` → ``(22, 18, 0)`` /
+    ``(22,)``. Returns ``None`` for non-numeric labels (e.g. ``lts/*``,
+    ``default``) which cannot be matched to a version directory directly.
+    """
+    cleaned = name.strip()
+    if cleaned.startswith("v"):
+        cleaned = cleaned[1:]
+    parts = cleaned.split(".")
+    try:
+        return tuple(int(p) for p in parts)
+    except ValueError:
+        return None
+
+
 class ServerProcess:
     """Install / control the matter-server LaunchAgent."""
 
@@ -50,6 +67,11 @@ class ServerProcess:
         self.logger = logger
         self._run = runner
         self.home = home or os.path.expanduser("~")
+        # Optional explicit override: directory containing node/npx. nvm users can
+        # pin a specific version here (e.g. ~/.nvm/versions/node/v22.18.0/bin);
+        # blank means auto-detect (Homebrew → nvm → PATH).
+        raw_bin_dir = str(prefs.get("nodeBinDir", "") or "").strip()
+        self.node_bin_dir = _expand(raw_bin_dir, self.home) if raw_bin_dir else ""
         self.npx_path = npx_path or self._resolve_npx()
         self.port = str(prefs.get("matterServerPort", "5580"))
         self.primary_interface = str(prefs.get("primaryInterface", "en0"))
@@ -69,14 +91,113 @@ class ServerProcess:
         return os.path.join(self.home, "Library", "Logs", "indigo-matter")
 
     def _resolve_npx(self) -> str:
+        """Locate the ``npx`` binary, honouring an explicit pref then auto-detect.
+
+        Resolution order:
+          a. ``nodeBinDir`` pref (``{nodeBinDir}/npx``) — explicit override / pin.
+          b. ``/opt/homebrew/bin/npx`` (Apple-Silicon Homebrew).
+          c. ``/usr/local/bin/npx`` (Intel Homebrew).
+          d. nvm auto-detect (``~/.nvm/versions/node/<version>/bin/npx``) —
+             prefers ``~/.nvm/alias/default``, else highest installed version.
+          e. ``shutil.which("npx")`` (whatever's on PATH).
+          f. Apple-Silicon Homebrew default as a last resort; ``ensure_installed``
+             will log if it's absent. We WARN here so a misconfigured user gets a
+             hint rather than a silent dead LaunchAgent.
+
+        Note: nvm's version dir is version-specific and changes when the user
+        upgrades node. ``ensure_installed()`` re-resolves on every plugin startup,
+        so a node upgrade is picked up on the next plugin restart. Set ``nodeBinDir``
+        to pin a specific version explicitly.
+        """
+        # a. explicit override
+        if self.node_bin_dir:
+            candidate = os.path.join(self.node_bin_dir, "npx")
+            if os.path.exists(candidate):
+                return candidate
+            self.logger.warning(
+                "nodeBinDir is set to %s but no npx found there; falling back to "
+                "auto-detect", self.node_bin_dir,
+            )
+        # b + c. Homebrew
         for candidate in NPX_CANDIDATES:
             if os.path.exists(candidate):
                 return candidate
+        # d. nvm
+        nvm_npx = self._resolve_nvm_npx()
+        if nvm_npx:
+            return nvm_npx
+        # e. PATH
         found = shutil.which("npx")
         if found:
             return found
-        # Fall back to the Apple-Silicon default; ensure_installed will log if absent.
+        # f. last resort
+        self.logger.warning(
+            "Could not locate npx (checked nodeBinDir, Homebrew, nvm, and PATH). "
+            "Set the 'Node bin directory' plugin pref to the folder containing "
+            "node/npx (e.g. a ~/.nvm/versions/node/<version>/bin path). Falling "
+            "back to %s.", NPX_CANDIDATES[0],
+        )
         return NPX_CANDIDATES[0]
+
+    def _resolve_nvm_npx(self) -> Optional[str]:
+        """Find an nvm-installed ``npx``.
+
+        Prefers the version named in ``~/.nvm/alias/default`` (a label like
+        ``v22``, ``22``, ``v22.18.0`` or ``lts/*``); a partial label like ``22``
+        matches the highest installed ``v22.*``. Falls back to the highest
+        installed version directory overall. Returns the ``bin/npx`` path if it
+        exists, else ``None``. The chosen ``bin`` dir holds BOTH node and npx, so
+        the plist PATH (``dirname(npx)``) lets launchd run npx→node.
+        """
+        versions_dir = os.path.join(self.home, ".nvm", "versions", "node")
+        if not os.path.isdir(versions_dir):
+            return None
+        try:
+            installed = [d for d in os.listdir(versions_dir)
+                         if os.path.isdir(os.path.join(versions_dir, d))]
+        except OSError:
+            return None
+        if not installed:
+            return None
+
+        chosen: Optional[str] = None
+
+        # Prefer the default alias if it resolves to an installed version.
+        alias_file = os.path.join(self.home, ".nvm", "alias", "default")
+        try:
+            with open(alias_file, "r", encoding="utf-8") as handle:
+                alias = handle.read().strip()
+        except OSError:
+            alias = ""
+        if alias:
+            chosen = self._match_nvm_version(alias, installed)
+
+        # Otherwise (or if the alias didn't resolve) take the highest installed.
+        if chosen is None:
+            chosen = max(installed, key=lambda d: (_parse_node_version(d) or (-1,)))
+
+        npx = os.path.join(versions_dir, chosen, "bin", "npx")
+        return npx if os.path.exists(npx) else None
+
+    @staticmethod
+    def _match_nvm_version(alias: str, installed: list[str]) -> Optional[str]:
+        """Resolve an nvm alias label to one of the installed version dirs.
+
+        Exact match wins; a partial numeric label (``22`` → ``v22.*``) picks the
+        highest matching version. Non-numeric labels (``lts/*``) return ``None``.
+        """
+        if alias in installed:
+            return alias
+        if ("v" + alias) in installed:
+            return "v" + alias
+        wanted = _parse_node_version(alias)
+        if wanted is None:
+            return None
+        matches = [d for d in installed
+                   if (_parse_node_version(d) or ())[:len(wanted)] == wanted]
+        if not matches:
+            return None
+        return max(matches, key=lambda d: _parse_node_version(d) or (-1,))
 
     # ------------------------------------------------------------------
     # Plist
@@ -94,6 +215,9 @@ class ServerProcess:
     def build_plist(self) -> bytes:
         out_log = os.path.join(self.log_dir, "matter-server.log")
         err_log = os.path.join(self.log_dir, "matter-server.err.log")
+        # dirname(npx) is the resolved bin dir. For Homebrew and for nvm this dir
+        # holds BOTH node and npx, so prepending it to launchd's restricted PATH
+        # lets npx find its node interpreter. /usr/bin:/bin stays appended.
         npx_dir = os.path.dirname(self.npx_path)
         spec = {
             "Label": LABEL,
