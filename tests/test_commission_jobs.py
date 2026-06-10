@@ -257,6 +257,133 @@ def test_recommission_allowed_after_terminal(mock_logger):
     asyncio.run(scenario())
 
 
+class TimeoutMatter(FakeMatter):
+    async def commission_with_code(self, code):
+        raise TimeoutError  # asyncio.wait_for expiring (str() == "")
+
+
+def test_commission_timeout_maps_to_commissioning_timeout(mock_logger):
+    # The single most likely real-world failure (observed live: 60s timeout vs
+    # ~124s actual commission) must NOT report internal_error/"" (#17), and must
+    # NOT remove the node — matter-server may still be joining it (#16).
+    async def scenario():
+        matter = TimeoutMatter()
+        jobs = _jobs(matter, mock_logger, schedule=asyncio.ensure_future)
+        _, body = jobs.create_job({"setupCode": "12345678901", "suggestedName": "X"})
+        final = await _await_terminal(jobs, body["jobId"])()
+        assert final["status"] == "failed"
+        assert final["error"]["code"] == "commissioning_timeout"
+        assert "may still join" in final["error"]["message"]
+        assert "300" in final["error"]["message"]  # names the actual deadline
+        assert matter.removed == []  # never tear down an in-flight join
+    asyncio.run(scenario())
+
+
+# ----------------------------------------------------------------------
+# Late-join reconcile (#16): node_added after a commissioning_timeout
+# ----------------------------------------------------------------------
+def test_late_node_added_reconciles_timed_out_job(mock_logger):
+    async def scenario():
+        calls: list = []
+
+        async def recording_create(node, name, room):
+            calls.append((node, name, room))
+            return {"indigoDeviceIds": [222], "primaryDeviceId": 222, "endpointCount": 1}
+
+        jobs = _jobs(TimeoutMatter(), mock_logger, create=recording_create,
+                     schedule=asyncio.ensure_future)
+        _, body = jobs.create_job({"setupCode": "12345678901",
+                                   "suggestedName": "Hall Lamp", "suggestedRoom": "Hallway"})
+        final = await _await_terminal(jobs, body["jobId"])()
+        assert final["error"]["code"] == "commissioning_timeout"
+
+        raw_node = {"node_id": 0xAB, "attributes": {}}
+        claimed = jobs.reconcile_node_added(raw_node)
+        assert claimed == body["jobId"]
+
+        final = await _await_terminal(jobs, body["jobId"])()
+        assert final["status"] == "success"
+        assert final["progress"] == 1.0
+        assert "error" not in final
+        assert final["result"]["nodeId"] == "0xAB"
+        assert final["result"]["primaryDeviceId"] == 222
+        # the user's choices were applied to the late-created devices
+        assert calls == [(raw_node, "Hall Lamp", "Hallway")]
+        # reconciled job is terminal again → reapable, and won't double-claim
+        assert jobs.reconcile_node_added(raw_node) is None
+    asyncio.run(scenario())
+
+
+def test_reconcile_ignores_timeouts_outside_window(mock_logger):
+    async def scenario():
+        clock = {"t": datetime(2026, 6, 10, 12, 0, tzinfo=timezone.utc)}
+        jobs = _jobs(TimeoutMatter(), mock_logger,
+                     schedule=asyncio.ensure_future, clock=lambda: clock["t"])
+        _, body = jobs.create_job({"setupCode": "12345678901", "suggestedName": "X"})
+        await _await_terminal(jobs, body["jobId"])()
+        # node arrives 6 minutes later — outside the bounded reconcile window
+        clock["t"] += timedelta(minutes=6)
+        assert jobs.reconcile_node_added({"node_id": 1}) is None
+        _, final = jobs.get_job(body["jobId"])
+        assert final["status"] == "failed"  # untouched
+    asyncio.run(scenario())
+
+
+def test_reconcile_ignores_non_timeout_failures(mock_logger):
+    async def scenario():
+        class PEMatter(FakeMatter):
+            async def commission_with_code(self, code):
+                from protocol import ProtocolError
+                raise ProtocolError(50, "PASE failed")
+
+        jobs = _jobs(PEMatter(), mock_logger, schedule=asyncio.ensure_future)
+        _, body = jobs.create_job({"setupCode": "12345678901", "suggestedName": "X"})
+        await _await_terminal(jobs, body["jobId"])()
+        # a genuine commissioning failure is final — node_added must not flip it
+        assert jobs.reconcile_node_added({"node_id": 1}) is None
+    asyncio.run(scenario())
+
+
+def test_reconcile_claims_most_recent_timeout(mock_logger):
+    async def scenario():
+        clock = {"t": datetime(2026, 6, 10, 12, 0, tzinfo=timezone.utc)}
+        jobs = _jobs(TimeoutMatter(), mock_logger,
+                     schedule=asyncio.ensure_future, clock=lambda: clock["t"])
+        _, body1 = jobs.create_job({"setupCode": "12345678901", "suggestedName": "A"})
+        await _await_terminal(jobs, body1["jobId"])()
+        clock["t"] += timedelta(minutes=2)
+        _, body2 = jobs.create_job({"setupCode": "98765432109", "suggestedName": "B"})
+        await _await_terminal(jobs, body2["jobId"])()
+
+        assert jobs.reconcile_node_added({"node_id": 7}) == body2["jobId"]
+        await _await_terminal(jobs, body2["jobId"])()
+        _, old = jobs.get_job(body1["jobId"])
+        assert old["status"] == "failed"  # older timeout left alone
+    asyncio.run(scenario())
+
+
+def test_reconcile_create_failure_lands_job_failed(mock_logger):
+    async def scenario():
+        async def failing_create(node, name, room):
+            raise RuntimeError("indigo down")
+
+        jobs = _jobs(TimeoutMatter(), mock_logger, create=failing_create,
+                     schedule=asyncio.ensure_future)
+        _, body = jobs.create_job({"setupCode": "12345678901", "suggestedName": "X"})
+        await _await_terminal(jobs, body["jobId"])()
+        assert jobs.reconcile_node_added({"node_id": 1}) == body["jobId"]
+        final = await _await_terminal(jobs, body["jobId"])()
+        assert final["status"] == "failed"  # terminal again, never stranded
+        assert final["error"]["code"] == "internal_error"
+    asyncio.run(scenario())
+
+
+def test_reconcile_ignores_malformed_node(mock_logger):
+    jobs = _jobs(FakeMatter(), mock_logger)
+    assert jobs.reconcile_node_added({}) is None        # no node_id
+    assert jobs.reconcile_node_added(None) is None      # not a dict
+
+
 def test_unknown_job_is_404(mock_logger):
     jobs = _jobs(FakeMatter(), mock_logger)
     code, body = jobs.get_job("nope")

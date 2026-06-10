@@ -24,6 +24,7 @@ from device_sync import DeviceSync
 from http_handlers import HttpApi, MatterUnavailable
 from matter_client import MatterClient
 from matter_handlers.registry import HandlerRegistry
+import protocol
 from protocol import MatterWrite, Protocol
 from server_process import ServerProcess
 
@@ -218,6 +219,15 @@ class Plugin(indigo.PluginBase):
     # ------------------------------------------------------------------
     def _on_matter_event(self, evt) -> None:
         self.device_sync.handle_event(evt)
+        # A node that arrives AFTER its commission job timed out is matter-server
+        # finishing the join in the background (issue #16): device_sync has just
+        # created the devices (bare product name); now let the job table claim it,
+        # apply suggestedName/suggestedRoom, and flip the job back to success so a
+        # still-polling client gets the real outcome.
+        if self.jobs is not None and evt.kind == protocol.EVT_NODE_ADDED:
+            data = evt.raw.get("data") if evt.raw else None
+            if isinstance(data, dict):
+                self.jobs.reconcile_node_added(data)
 
     # ------------------------------------------------------------------
     # HTTP API (IWS hidden-action handlers — API.md v1.1)

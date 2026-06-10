@@ -283,3 +283,18 @@ def test_on_disconnect_not_called_on_intentional_close(mock_logger):
         assert events == []
         task.cancel()
     run(scenario())
+
+
+def test_commission_timeout_covers_observed_worst_case():
+    # Live rehearsal 2026-06-09: commissioning took ~124s; the old 60s default
+    # timed the job out while matter-server completed the join (#16). Only the
+    # commission RPC gets the long deadline — the global default stays short.
+    import inspect
+
+    from matter_client import COMMISSION_TIMEOUT, MatterClient
+
+    default = inspect.signature(MatterClient.commission_with_code).parameters["timeout"].default
+    assert default == COMMISSION_TIMEOUT
+    assert COMMISSION_TIMEOUT >= 300.0
+    generic = inspect.signature(MatterClient.request).parameters["timeout"].default
+    assert generic <= 30.0

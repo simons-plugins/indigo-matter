@@ -145,6 +145,33 @@ def test_create_from_raw_creates_relay(ds, indigo_env):
     assert ds.node_count() == 1
 
 
+def test_created_device_address_is_node_id_hex(ds, indigo_env):
+    # The node id must be recoverable from the Indigo UI (decommission needs it,
+    # and the commission job that knew it may have died — issue #18).
+    _indigo, devices = indigo_env
+    result = ds.create_from_raw(RELAY_NODE, "Office Plug")
+    dev = devices[result["primaryDeviceId"]]
+    assert dev.pluginProps["address"] == "0x2A"  # node 42
+
+
+def test_device_creation_logs_at_info(ds, indigo_env, mock_logger):
+    # An out-of-band join's ONLY event-log evidence is this line (issue #19):
+    # it must be INFO and carry node id, vendor/product, and the device ids.
+    _indigo, devices = indigo_env
+    result = ds.create_from_raw(RELAY_NODE, "Office Plug")
+    assert mock_logger.info.called
+    fmt, *args = mock_logger.info.call_args[0]
+    message = fmt % tuple(args)
+    assert "0x2A" in message
+    assert "TP-Link" in message
+    assert str(result["primaryDeviceId"]) in message
+
+    # idempotent re-pass creates nothing → stays quiet
+    mock_logger.info.reset_mock()
+    ds.create_from_raw(RELAY_NODE, "Office Plug")
+    assert not mock_logger.info.called
+
+
 def test_create_is_idempotent(ds):
     ds.create_from_raw(RELAY_NODE, "Office Plug")
     first = ds.lookup(42, 1)
