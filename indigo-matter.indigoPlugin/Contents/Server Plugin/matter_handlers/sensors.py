@@ -5,11 +5,13 @@ Sensors are additive per endpoint — a combined temperature+humidity device
 produces two Indigo sensors (the registry collects all matching handlers).
 
 Cluster / attribute / encoding (Matter spec):
-  TemperatureMeasurement   0x0402  MeasuredValue(0)  int16, 0.01 °C
-  RelativeHumidityMeasure  0x0405  MeasuredValue(0)  uint16, 0.01 %RH
+  TemperatureMeasurement   0x0402  MeasuredValue(0)  int16,   0.01 °C
+  RelativeHumidityMeasure  0x0405  MeasuredValue(0)  uint16,  0.01 %RH
   OccupancySensing         0x0406  Occupancy(0)      bitmap8, bit0 = occupied
-  BooleanState             0x0045  StateValue(0)     bool (contact)
-  IlluminanceMeasurement   0x0400  MeasuredValue(0)  uint16, 10000*log10(lux)+1
+  BooleanState             0x0045  StateValue(0)     bool     (contact)
+  IlluminanceMeasurement   0x0400  MeasuredValue(0)  uint16,  10000*log10(lux)+1
+  PressureMeasurement      0x0403  MeasuredValue(0)  int16,   0.1 kPa (= 1 hPa)
+  FlowMeasurement          0x0404  MeasuredValue(0)  uint16,  0.1 m³/h
 """
 from __future__ import annotations
 
@@ -105,3 +107,27 @@ class IlluminanceHandler(_SensorHandler):
         if raw <= 0:
             return 0.0  # 0 = unknown/invalid per spec
         return round(10 ** ((raw - 1) / 10000.0), 1)  # → lux
+
+
+class PressureHandler(_SensorHandler):
+    cluster_id = 0x0403
+    cluster_name = "PressureMeasurement"
+    device_type_id = "matterPressureSensor"
+
+    def transform(self, value: Any) -> float:
+        # MeasuredValue is int16 in units of 0.1 kPa.
+        # 0.1 kPa = 1 hPa (= 1 mbar), so the unit conversion is an identity:
+        # sensorValue (hPa) = raw as a float.
+        # e.g. sea-level standard: raw 1013 → 1013.0 hPa
+        return float(int(value))
+
+
+class FlowHandler(_SensorHandler):
+    cluster_id = 0x0404
+    cluster_name = "FlowMeasurement"
+    device_type_id = "matterFlowSensor"
+
+    def transform(self, value: Any) -> float:
+        # MeasuredValue is uint16 in units of 0.1 m³/h.
+        # e.g. raw 25 → 2.5 m³/h
+        return round(int(value) / 10.0, 1)

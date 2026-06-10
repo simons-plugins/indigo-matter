@@ -621,6 +621,76 @@
     </Device>
 
     <!-- ============================================================ -->
+    <!-- Environmental sensors (pressure, flow)                       -->
+    <!-- batteryLevel declared now; populated once issue #3's         -->
+    <!-- PowerSource handler lands — harmless until then.             -->
+    <!-- ============================================================ -->
+
+    <Device id="matterPressureSensor" type="sensor">
+        <Name>Matter Pressure Sensor</Name>
+        <ConfigUI>
+            <Field id="nodeId" type="textfield" readonly="yes">
+                <Label>Matter Node ID:</Label>
+            </Field>
+            <Field id="endpointId" type="textfield" readonly="yes">
+                <Label>Endpoint:</Label>
+            </Field>
+            <Field id="vendorName" type="textfield" readonly="yes">
+                <Label>Vendor:</Label>
+            </Field>
+            <Field id="productName" type="textfield" readonly="yes">
+                <Label>Product:</Label>
+            </Field>
+        </ConfigUI>
+        <States>
+            <State id="sensorValue">
+                <ValueType>Number</ValueType>
+                <TriggerLabel>Pressure</TriggerLabel>
+                <TriggerLabelPrefix>Pressure is</TriggerLabelPrefix>
+                <ControlPageLabel>Pressure (hPa)</ControlPageLabel>
+            </State>
+            <State id="batteryLevel">
+                <ValueType>Integer</ValueType>
+                <TriggerLabel>Battery Level</TriggerLabel>
+                <ControlPageLabel>Battery Level</ControlPageLabel>
+            </State>
+        </States>
+        <UiDisplayStateId>sensorValue</UiDisplayStateId>
+    </Device>
+
+    <Device id="matterFlowSensor" type="sensor">
+        <Name>Matter Flow Sensor</Name>
+        <ConfigUI>
+            <Field id="nodeId" type="textfield" readonly="yes">
+                <Label>Matter Node ID:</Label>
+            </Field>
+            <Field id="endpointId" type="textfield" readonly="yes">
+                <Label>Endpoint:</Label>
+            </Field>
+            <Field id="vendorName" type="textfield" readonly="yes">
+                <Label>Vendor:</Label>
+            </Field>
+            <Field id="productName" type="textfield" readonly="yes">
+                <Label>Product:</Label>
+            </Field>
+        </ConfigUI>
+        <States>
+            <State id="sensorValue">
+                <ValueType>Number</ValueType>
+                <TriggerLabel>Flow</TriggerLabel>
+                <TriggerLabelPrefix>Flow is</TriggerLabelPrefix>
+                <ControlPageLabel>Flow (m³/h)</ControlPageLabel>
+            </State>
+            <State id="batteryLevel">
+                <ValueType>Integer</ValueType>
+                <TriggerLabel>Battery Level</TriggerLabel>
+                <ControlPageLabel>Battery Level</ControlPageLabel>
+            </State>
+        </States>
+        <UiDisplayStateId>sensorValue</UiDisplayStateId>
+    </Device>
+
+    <!-- ============================================================ -->
     <!-- Fallback: unknown / unsupported Matter device                -->
     <!-- ============================================================ -->
 

@@ -20,9 +20,11 @@ from .level_control import LevelControlHandler
 from .on_off import OnOffHandler
 from .sensors import (
     ContactHandler,
+    FlowHandler,
     HumidityHandler,
     IlluminanceHandler,
     OccupancyHandler,
+    PressureHandler,
     TemperatureHandler,
 )
 from .smoke_co import SmokeCOAlarmHandler
@@ -51,6 +53,8 @@ def default_handlers() -> list[ClusterHandler]:
         OccupancyHandler(),
         ContactHandler(),
         IlluminanceHandler(),
+        PressureHandler(),
+        FlowHandler(),
         ThermostatHandler(),
         FanControlHandler(),
         WindowCoveringHandler(),
