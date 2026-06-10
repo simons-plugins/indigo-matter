@@ -104,6 +104,10 @@ class FakeDeviceFactory:
         self.created.append(dev)
         return dev
 
+    def delete(self, dev):
+        dev_id = dev.id if hasattr(dev, "id") else dev
+        self.devices._by_id.pop(dev_id, None)
+
     def moveToFolder(self, dev_or_id, value=None):
         dev = dev_or_id if hasattr(dev_or_id, "folderId") else self.devices[dev_or_id]
         dev.folderId = value
@@ -524,3 +528,283 @@ def test_build_command_dispatches_to_handler(ds, mock_indigo_base):
     cmd = ds.build_command(Dev(), Action())
     assert cmd is not None
     assert cmd.command == "On" and cmd.node_id == 42
+
+
+# ===========================================================================
+# fix/#44 — additive endpoint collapse
+# ===========================================================================
+
+# Air Quality node: AirQuality + CO2 + PM2.5 + TVOC all on endpoint 1.
+# Cluster ids: AirQuality=0x005B(91), CO2=0x040D(1037),
+#              PM25=0x042A(1066), TVOC=0x042E(1070)
+AQ_NODE = {
+    "node_id": 30,
+    "attributes": {
+        "1/91/0": 2,       # AirQuality MeasuredValue (enum: fair)
+        "1/1037/0": 480.0, # CO2 MeasuredValue ppm (float)
+        "1/1066/0": 12.5,  # PM2.5 MeasuredValue µg/m³ (float)
+        "1/1070/0": 95.0,  # TVOC MeasuredValue (float)
+        "1/29/0": [
+            {"0": 0x0073},  # AirQuality device type
+        ],
+    },
+}
+
+# Pressure + Flow combo sensor on endpoint 1.
+# PressureMeasurement=0x0403(1027), FlowMeasurement=0x0404(1028)
+PRESSURE_FLOW_NODE = {
+    "node_id": 31,
+    "attributes": {
+        "1/1027/0": 10130, # Pressure MeasuredValue (int16 × 0.1 hPa = 1013.0 hPa)
+        "1/1028/0": 25,    # Flow MeasuredValue (uint16 × 0.1 m³/h = 2.5 m³/h)
+        "1/29/0": [{"0": 1027}],
+    },
+}
+
+# Thermostat + FanControl on endpoint 1 (fan merged in, not a separate device).
+THERMOSTAT_FAN_NODE = {
+    "node_id": 32,
+    "attributes": {
+        "1/513/0": 2100,   # Thermostat LocalTemperature (21.00 °C)
+        "1/514/0": 1,      # FanControl FanMode
+        "1/29/0": [{"0": 769}],  # Thermostat device type
+    },
+}
+
+
+def test_aq_node_creates_four_devices(ds, indigo_env):
+    """An AQ endpoint with 4 additive clusters produces 4 separate Indigo devices (fix/#44)."""
+    _indigo, devices = indigo_env
+    result = ds.create_from_raw(AQ_NODE, "Air Sensor")
+    assert len(result["indigoDeviceIds"]) == 4, (
+        f"expected 4 devices, got {len(result['indigoDeviceIds'])}: "
+        f"{[devices[d].deviceTypeId for d in result['indigoDeviceIds']]}"
+    )
+    type_ids = {devices[d].deviceTypeId for d in result["indigoDeviceIds"]}
+    assert type_ids == {"matterAirQualitySensor", "matterCO2Sensor", "matterPM25Sensor", "matterTVOCSensor"}
+
+
+def test_aq_node_lookup_by_type(ds, indigo_env):
+    """lookup(node, ep, type_id) returns the correct device for each AQ type."""
+    _indigo, devices = indigo_env
+    ds.create_from_raw(AQ_NODE, "Air Sensor")
+    aq_id  = ds.lookup(30, 1, "matterAirQualitySensor")
+    co2_id = ds.lookup(30, 1, "matterCO2Sensor")
+    pm_id  = ds.lookup(30, 1, "matterPM25Sensor")
+    tvoc_id = ds.lookup(30, 1, "matterTVOCSensor")
+    assert None not in (aq_id, co2_id, pm_id, tvoc_id)
+    assert len({aq_id, co2_id, pm_id, tvoc_id}) == 4  # all distinct
+
+
+def test_aq_cluster_update_routes_to_correct_device(ds, indigo_env):
+    """A CO2 attribute update goes to the CO2 device, NOT the AirQuality device (fix/#44)."""
+    _indigo, devices = indigo_env
+    ds.create_from_raw(AQ_NODE, "Air Sensor")
+    aq_id  = ds.lookup(30, 1, "matterAirQualitySensor")
+    co2_id = ds.lookup(30, 1, "matterCO2Sensor")
+
+    # CO2 cluster (0x040D) attribute update
+    ds.handle_event(MatterEvent(
+        kind=protocol.EVT_ATTRIBUTE_UPDATED,
+        node_id=30, endpoint=1, cluster=0x040D, attribute=0x0000, value=600.0,
+    ))
+    # CO2 device updated
+    assert devices[co2_id].states.get("sensorValue") == 600.0
+    # AQ device's sensorValue was primed as 2 (fair); must NOT have been overwritten by CO2 value
+    # (If routing is wrong the AQ device's sensorValue would be 600.0)
+    assert devices[aq_id].states.get("sensorValue") != 600.0
+
+
+def test_aq_pm25_update_routes_to_pm25_device(ds, indigo_env):
+    """A PM2.5 cluster update goes to the PM25 device."""
+    _indigo, devices = indigo_env
+    ds.create_from_raw(AQ_NODE, "Air Sensor")
+    pm_id   = ds.lookup(30, 1, "matterPM25Sensor")
+    tvoc_id = ds.lookup(30, 1, "matterTVOCSensor")
+
+    ds.handle_event(MatterEvent(
+        kind=protocol.EVT_ATTRIBUTE_UPDATED,
+        node_id=30, endpoint=1, cluster=0x042A, attribute=0x0000, value=22.3,
+    ))
+    assert devices[pm_id].states.get("sensorValue") == 22.3
+    # TVOC device not affected
+    assert devices[tvoc_id].states.get("sensorValue") != 22.3
+
+
+def test_aq_priming_does_not_cross_contaminate(ds, indigo_env):
+    """Priming the AQ device does not write CO2/PM25/TVOC values into it (fix/#44)."""
+    _indigo, devices = indigo_env
+    ds.create_from_raw(AQ_NODE, "Air Sensor")
+    aq_id = ds.lookup(30, 1, "matterAirQualitySensor")
+    # The AQ node snapshot has CO2=480.0 — this must NOT have been primed into the AQ device
+    # (480.0 is not a valid airQuality enum integer in the 0-6 range, so its presence would
+    # expose the contamination clearly)
+    aq_dev = devices[aq_id]
+    assert aq_dev.states.get("sensorValue") != 480.0, (
+        "AirQuality device was primed with CO2 value — cross-endpoint contamination"
+    )
+
+
+def test_pressure_flow_creates_two_devices(ds, indigo_env):
+    """A Pressure+Flow endpoint creates two separate Indigo devices (fix/#44)."""
+    _indigo, devices = indigo_env
+    result = ds.create_from_raw(PRESSURE_FLOW_NODE, "Combo Sensor")
+    assert len(result["indigoDeviceIds"]) == 2
+    type_ids = {devices[d].deviceTypeId for d in result["indigoDeviceIds"]}
+    assert type_ids == {"matterPressureSensor", "matterFlowSensor"}
+
+
+def test_flow_update_goes_to_flow_device_not_pressure(ds, indigo_env):
+    """Flow cluster update goes to the Flow device, not the Pressure device (fix/#44)."""
+    _indigo, devices = indigo_env
+    ds.create_from_raw(PRESSURE_FLOW_NODE, "Combo Sensor")
+    pressure_id = ds.lookup(31, 1, "matterPressureSensor")
+    flow_id     = ds.lookup(31, 1, "matterFlowSensor")
+
+    # Flow update: raw 25 → 2.5 m³/h
+    ds.handle_event(MatterEvent(
+        kind=protocol.EVT_ATTRIBUTE_UPDATED,
+        node_id=31, endpoint=1, cluster=0x0404, attribute=0x0000, value=25,
+    ))
+    assert devices[flow_id].states.get("sensorValue") == 2.5
+    # Pressure device must not have been updated with the flow value
+    assert devices[pressure_id].states.get("sensorValue") != 2.5
+
+
+def test_pressure_update_goes_to_pressure_device_not_flow(ds, indigo_env):
+    """Pressure cluster update goes to Pressure device."""
+    _indigo, devices = indigo_env
+    ds.create_from_raw(PRESSURE_FLOW_NODE, "Combo Sensor")
+    pressure_id = ds.lookup(31, 1, "matterPressureSensor")
+    flow_id     = ds.lookup(31, 1, "matterFlowSensor")
+
+    # Pressure update: raw 10200 → 10200.0 hPa
+    ds.handle_event(MatterEvent(
+        kind=protocol.EVT_ATTRIBUTE_UPDATED,
+        node_id=31, endpoint=1, cluster=0x0403, attribute=0x0000, value=10200,
+    ))
+    assert devices[pressure_id].states.get("sensorValue") == 10200.0
+    assert devices[flow_id].states.get("sensorValue") != 10200.0
+
+
+def test_thermostat_fan_endpoint_creates_exactly_one_device(ds, indigo_env):
+    """Thermostat+FanControl endpoint creates exactly 1 device (fan merged into thermostat)."""
+    _indigo, devices = indigo_env
+    result = ds.create_from_raw(THERMOSTAT_FAN_NODE, "Thermostat")
+    assert len(result["indigoDeviceIds"]) == 1
+    dev_id = result["primaryDeviceId"]
+    assert devices[dev_id].deviceTypeId == "matterThermostat"
+
+
+def test_thermostat_fan_mode_update_goes_to_thermostat(ds, indigo_env):
+    """FanControl cluster update on a thermostat endpoint routes to the thermostat device."""
+    _indigo, devices = indigo_env
+    import indigo as _indigo_mod
+    ds.create_from_raw(THERMOSTAT_FAN_NODE, "Thermostat")
+    dev_id = ds.lookup(32, 1)  # only one device, no type needed
+    assert dev_id is not None
+
+    # FanMode 5 = Auto
+    ds.handle_event(MatterEvent(
+        kind=protocol.EVT_ATTRIBUTE_UPDATED,
+        node_id=32, endpoint=1, cluster=0x0202, attribute=0x0000, value=5,
+    ))
+    # The thermostat device should have received hvacFanMode
+    assert "hvacFanMode" in devices[dev_id].states
+
+
+def test_aq_node_idempotent_second_create(ds, indigo_env):
+    """A second create_from_raw on the same AQ node is idempotent — no new devices."""
+    _indigo, devices = indigo_env
+    result1 = ds.create_from_raw(AQ_NODE, "Air Sensor")
+    ids1 = sorted(result1["indigoDeviceIds"])
+    result2 = ds.create_from_raw(AQ_NODE, "Air Sensor")
+    ids2 = sorted(result2["indigoDeviceIds"])
+    assert ids1 == ids2
+
+
+def test_aq_node_delete_node_removes_all_four(ds, indigo_env):
+    """delete_node removes all 4 AQ devices (fix/#44 — nested map iteration)."""
+    _indigo, devices = indigo_env
+    result = ds.create_from_raw(AQ_NODE, "Air Sensor")
+    deleted = ds.delete_node(30)
+    assert len(deleted) == 4
+    assert sorted(deleted) == sorted(result["indigoDeviceIds"])
+    # None should be in the index any more
+    assert ds.lookup(30, 1) is None
+
+
+def test_aq_node_mark_unreachable_marks_all(ds, indigo_env):
+    """mark_unreachable(node_id) marks all 4 AQ devices unreachable."""
+    _indigo, devices = indigo_env
+    ds.create_from_raw(AQ_NODE, "Air Sensor")
+    ds.mark_unreachable(30)
+    for type_id in ("matterAirQualitySensor", "matterCO2Sensor", "matterPM25Sensor", "matterTVOCSensor"):
+        dev_id = ds.lookup(30, 1, type_id)
+        assert devices[dev_id].errorState == "unreachable", f"{type_id} not marked unreachable"
+
+
+def test_aq_node_mark_endpoint_unreachable_marks_all(ds, indigo_env):
+    """mark_endpoint_unreachable marks ALL devices on the additive endpoint."""
+    _indigo, devices = indigo_env
+    ds.create_from_raw(AQ_NODE, "Air Sensor")
+    ds.mark_endpoint_unreachable(30, 1)
+    for type_id in ("matterAirQualitySensor", "matterCO2Sensor", "matterPM25Sensor", "matterTVOCSensor"):
+        dev_id = ds.lookup(30, 1, type_id)
+        assert devices[dev_id].errorState == "unreachable", f"{type_id} not marked unreachable"
+
+
+def test_aq_node_endpoint_removed_event_marks_all(ds, indigo_env):
+    """endpoint_removed event marks all additive devices on that endpoint unreachable."""
+    _indigo, devices = indigo_env
+    ds.create_from_raw(AQ_NODE, "Air Sensor")
+    ds.handle_event(MatterEvent(
+        kind=protocol.EVT_ENDPOINT_REMOVED,
+        node_id=30, endpoint=1,
+        raw={"event": "endpoint_removed", "data": {"node_id": 30, "endpoint_id": 1}},
+    ))
+    for type_id in ("matterAirQualitySensor", "matterCO2Sensor", "matterPM25Sensor", "matterTVOCSensor"):
+        dev_id = ds.lookup(30, 1, type_id)
+        assert devices[dev_id].errorState == "unreachable"
+
+
+def test_battery_fanout_reaches_all_devices_on_aq_endpoint(ds, indigo_env):
+    """Node-scoped PowerSource fan-out reaches all additive devices on an endpoint (fix/#44)."""
+    _indigo, devices = indigo_env
+
+    # AQ node + PowerSource on endpoint 0
+    aq_battery_node = {
+        "node_id": 33,
+        "attributes": {
+            "0/47/12": 120,        # BatPercentRemaining = 60 %
+            "1/91/0": 1,           # AirQuality: good
+            "1/1037/0": 400.0,     # CO2
+            "1/1066/0": 5.0,       # PM2.5
+            "1/1070/0": 50.0,      # TVOC
+            "1/29/0": [{"0": 0x0073}],
+        },
+    }
+
+    original_create = _indigo.device.create
+
+    def create_with_battery(**kw):
+        dev = original_create(**kw)
+        dev.states["batteryLevel"] = 0
+        return dev
+
+    _indigo.device.create = create_with_battery
+    ds.create_from_raw(aq_battery_node, "AQ Sensor")
+
+    # Send a battery update
+    ds.handle_event(MatterEvent(
+        kind=protocol.EVT_ATTRIBUTE_UPDATED,
+        node_id=33, endpoint=0, cluster=0x002F, attribute=0x000C, value=160,
+    ))
+
+    # All 4 devices on endpoint 1 should receive batteryLevel = 80
+    for type_id in ("matterAirQualitySensor", "matterCO2Sensor", "matterPM25Sensor", "matterTVOCSensor"):
+        dev_id = ds.lookup(33, 1, type_id)
+        assert dev_id is not None
+        assert devices[dev_id].states.get("batteryLevel") == 80, (
+            f"{type_id}: expected batteryLevel=80, got {devices[dev_id].states.get('batteryLevel')}"
+        )
