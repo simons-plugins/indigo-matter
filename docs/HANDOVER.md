@@ -1,10 +1,28 @@
 # indigo-matter — Build Handover
 
-**Last updated:** 2026-06-10 18:35 UTC
+**Last updated:** 2026-06-10 19:54 UTC
 **Branch:** `main` (all session PRs merged)
 **Version:** `2026.2.12` — **deployed + live-validated on jarvis**
 **Tests:** 582 passing (`cd indigo-matter && /Library/Frameworks/Python.framework/Versions/Current/bin/python3 -m pytest -q`)
-**Status:** Device-class milestone **shipped and live-validated**: PRs #32–#42 (issues #3–#13: battery, window covering, door lock, generic switch + node_event plumbing, bridges, standalone fans, energy, smoke/CO, air quality, valve, pressure/flow), #47 (endpoint-collapse fix — one Indigo device per (endpoint, type)), #48 (capability-props re-assertion at reconcile). jarvis runs 15 nodes: the 5 originals + a 10-device mock fleet (`/tmp/matter-test`, ports 5545–5554, this Mac) covering every new cluster. Live-proven end-to-end: window covering, lock, valve (cmd→transition→settle), button events (node_event), smoke/CO alarm latch, battery fan-out, AQ×4 + pressure/flow as separate devices, energy meter states. Known-open: fan brightness echo blocked by a stale matter-server session to the twice-relaunched fan mock (rig flake); issues #43 (bridge-child authoritative naming), #46 (fan TurnOn FanMode mapping + silent write-error surfacing), #21–#24 (commission hardening). **Next: Simon commissions a real Matter Wi-Fi energy-monitoring plug** — first physical-device validation of the energy path.
+**Status:** **FIRST REAL DEVICE LIVE** — Tapo P110M commissioned via the full Domio share-model flow (Apple Home → pairing code → Domio → `/commission` → matter-server) and reporting **live energy** to Indigo. Domio E2E milestone DONE; energy path physically validated; PR #48 props-re-assertion proven in the wild. Device-class milestone shipped earlier the same day: PRs #32–#42 (issues #3–#13), #47 (endpoint-collapse), #48 (capability-props re-assertion at reconcile). jarvis runs 16 nodes: 5 originals + 10-device mock fleet (`/tmp/matter-test`, ports 5545–5554) + the real Tapo (node 0x22). Known-open: fan brightness echo (rig flake); issues #43 (bridge-child naming), #46 (fan TurnOn FanMode mapping), #21–#24 (commission hardening).
+
+---
+
+## 2026-06-10 session (evening) — FIRST REAL DEVICE: Tapo P110M end-to-end via Domio
+
+**Result: complete success.** Real Matter Wi-Fi energy plug (Tapo P110M, vendorId 5010, productId 264) commissioned through the production path and live in Indigo as `Study matter plug` (device `678761951`, node `0x22`, matterRelay + energy states).
+
+**The flow that worked (= the Domio E2E milestone, now DONE):**
+1. Apple Home commissioned the plug (admin 1) — **failed on the main SSID** (advanced Wi-Fi features), succeeded on the backward-compatible **IoT SSID** (same 192.168.0.x subnet as jarvis — that's the requirement; mDNS + link-local IPv6 don't cross subnets).
+2. Apple Home → Turn On Pairing Mode → share code → **Domio "Add Matter device"** → plugin `/commission` → joined as admin 2 over IP (`network_only`). Job → `node_added` → device created, on/off both directions working.
+
+**Energy-path findings (record for all Tapo M-series):**
+- **Stock P110M firmware 1.0.0 exposes OnOff only** over Matter (ep1 clusters 3,4,5,6,29 — verified via the live `/diagnostics?nodeId=0x22` endpoint, which earned its keep today). No 0x0090/0x0091 → plugin correctly created a plain relay. Energy clusters are Matter 1.3, added by TP-Link **firmware update via the Tapo app**.
+- Adding to the Tapo app required the 5s button hold (Wi-Fi reset, *keeps* fabrics; 10s = factory reset, wipes fabrics — warn users) + QR scan; the Tapo app has no "enter Matter code" path.
+- After firmware update + node rejoin, **the existing Indigo device gained `curEnergyLevel`/`accumEnergyTotal` automatically — no restart, no recreate**. That is PR #48 (capability-props re-assertion at reconcile) validated on real hardware, exactly its design scenario.
+- Fabric survived Wi-Fi reset + Tapo onboarding + firmware update; plug is now 4-admin (Apple Home, Indigo, Tapo cloud, Home Assistant) with no cross-interference. Apple Home took ~a minute to recover post-update — normal settling, not a fault.
+
+**Diagnostics endpoint note:** `GET …/message/com.simon.indigo-matter/diagnostics?nodeId=0x22` (Bearer = reflector key) returns reachable/vendor/product/softwareVersion + per-endpoint numeric cluster ids — first line of investigation for "why didn't my device get state X".
 
 ---
 
@@ -68,7 +86,7 @@ All merged to `main`, all deployed to jarvis. Plugin **2026.0.1 → 2026.1.1** o
 
 **Open follow-ups:** (a) diagnostics live response (§3.5) doesn't match the documented shape (numeric cluster ids, no fabrics/network/deviceType) — low priority, future Domio view; (b) Domio's `MatterAPIClient` still needs to implement decommission with `?nodeId=` (guidance shipped in the changes doc); (c) Domio E2E (Tapo); (d) version bump + PR.
 
-This is the resume point. Read this first, then `CLAUDE.md` for architecture and `docs/IMPLEMENTATION.md §2.8` for the verified matter-server protocol.
+This is the resume point. Read this first, then `CLAUDE.md` for architecture and `docs/IMPLEMENTATION.md §1` for the verified matter-server protocol.
 
 ---
 
@@ -92,7 +110,7 @@ Plus two improvements found by live testing: **state priming** (apply get_node s
 
 1. ~~**Commission-handler half-test.**~~ ✅ DONE 2026-06-09 (found + fixed the suggestedName/room race — see session note above).
 2. **M8 — failure hardening.** Much already exists (reconnect/backoff, error mapping, self-heal, unreachable marking, `_mark_disconnected` fails in-flight requests). ~~Live decommission test~~ ✅ DONE 2026-06-09 (found + fixed the IWS POST path-arg bug). Remaining: handle `server_shutdown` event (mark all unreachable + reconnect), Mac sleep/wake resubscribe.
-3. **Domio E2E** (the other agent drives): Apple Home commissions a Tapo P125M → "Turn On Pairing Mode" → share code → Domio `MatterAPIClient` → my `/commission`. I just watch the job succeed + device appear.
+3. ~~**Domio E2E**~~ ✅ DONE 2026-06-10 with a real Tapo P110M (see session note at top): Apple Home → pairing mode → share code → Domio → `/commission` → device live with energy states.
 4. **Ship:** bump `PluginVersion` in Info.plist (currently `2026.0.1`; bump only when shipping — workspace rule), then open the PR. Don't merge without Simon's go-ahead.
 5. Optional v2 clusters: Window Covering, Lock, Smoke/CO, Air Quality, Energy (out of v1 scope per PRD).
 
