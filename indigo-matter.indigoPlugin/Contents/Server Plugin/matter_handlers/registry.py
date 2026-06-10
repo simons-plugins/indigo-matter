@@ -14,6 +14,7 @@ from typing import Any, Optional
 
 from .base import ClusterHandler, IndigoDeviceSpec
 from .color_control import ColorControlHandler
+from .door_lock import DoorLockHandler
 from .level_control import LevelControlHandler
 from .on_off import OnOffHandler
 from .sensors import (
@@ -47,6 +48,7 @@ def default_handlers() -> list[ClusterHandler]:
         ThermostatHandler(),
         FanControlHandler(),
         WindowCoveringHandler(),
+        DoorLockHandler(),
         PowerSourceHandler(),
     ]
 
