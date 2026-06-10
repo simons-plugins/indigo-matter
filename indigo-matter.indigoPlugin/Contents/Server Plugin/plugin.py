@@ -425,21 +425,28 @@ class Plugin(indigo.PluginBase):
         return f"{size:.1f} TB"
 
     def menuExportFabricBackup(self):  # noqa: N802
+        # menuItem has no ConfigUI/valuesDict, so outcome can only surface via the
+        # log — make both success and failure unmistakable there. create_backup
+        # already prunes (no duplicate prune here) and validates its own output.
+        storage_path = None
         try:
             storage_path = self._resolve_storage_path()
-            archive = fabric_backup.create_backup(storage_path, now=datetime.now(timezone.utc))
+            archive = fabric_backup.create_backup(
+                storage_path, now=datetime.now(timezone.utc), logger=self.logger,
+            )
             size = self._human_size(os.path.getsize(archive))
-            self.logger.info("Fabric backup written: %s (%s)", archive, size)
-            removed = fabric_backup.prune_backups(storage_path, keep=10)
-            if removed:
-                self.logger.info("Pruned %d old fabric backup(s): %s", len(removed), ", ".join(removed))
             self.logger.info(
-                "This is a best-effort live snapshot — matter-server was NOT stopped. A fully "
-                "consistent backup is only guaranteed with the server stopped, but v1 keeps backups "
-                "non-disruptive. Backups live in %s.",
-                fabric_backup.backups_dir_for(storage_path),
+                "Fabric backup complete: %s (%s). This is a best-effort live snapshot — "
+                "matter-server was NOT stopped. Backups live in %s.",
+                archive, size, fabric_backup.backups_dir_for(storage_path),
+            )
+        except FileNotFoundError as exc:
+            # storage dir missing or empty — there is no fabric to back up.
+            self.logger.error(
+                "Fabric backup FAILED — no fabric to back up, nothing was written: %s", exc,
             )
         except Exception as exc:  # noqa: BLE001
+            self.logger.error("Fabric backup FAILED — nothing was written: %s", exc)
             self.logger.exception(exc)
 
     def getFabricBackups(self, filter="", valuesDict=None, typeId="", targetId=0):  # noqa: N802, A002
@@ -480,21 +487,26 @@ class Plugin(indigo.PluginBase):
         try:
             storage_path = self._resolve_storage_path()
             result = fabric_backup.restore_backup(
-                selected, storage_path, self.server_process, now=datetime.now(timezone.utc),
+                selected, storage_path, self.server_process,
+                now=datetime.now(timezone.utc), logger=self.logger,
             )
+            # restore_backup only returns on success: the server was stopped, the
+            # fabric was swapped, the restored dir is non-empty, and start()
+            # returned True. Be honest — matter-server is RESTARTING, the node
+            # count is not yet known; point the user at the real signal instead of
+            # logging a likely-stale count and pretending it is confirmation.
             self.logger.info(
                 "Fabric restored from %s; previous fabric preserved at %s. matter-server is "
-                "restarting — watch the log for 'reconciled N node(s)'.",
+                "restarting — watch the log for 'reconciled N node(s)' to confirm the devices "
+                "came back.",
                 result["restored_from"], result["moved_aside_to"],
             )
-            # Best-effort confirmation after a short bounded wait for reconnection.
-            time.sleep(2.0)
-            try:
-                self.logger.info("Current reconciled node count: %d", self.device_sync.node_count())
-            except Exception:  # noqa: BLE001
-                pass
             return (True, valuesDict)
         except Exception as exc:  # noqa: BLE001
+            # restore_backup rolled back and preserved the original fabric (or
+            # aborted before touching it). Surface the failure in the UI dialog —
+            # never report success when the underlying op failed.
+            self.logger.error("Fabric restore FAILED: %s", exc)
             self.logger.exception(exc)
             errors["backup"] = "Restore failed — see the log. Your existing fabric was preserved."
             return (False, valuesDict, errors)

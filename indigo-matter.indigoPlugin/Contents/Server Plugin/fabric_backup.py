@@ -19,17 +19,27 @@ inside it), so a backup never self-includes and a restore never touches them.
 """
 from __future__ import annotations
 
+import logging
 import os
-import shutil
 import zipfile
 from datetime import datetime
-from typing import Any
+from typing import Any, Optional
 
 BACKUP_PREFIX = "fabric-"
 BACKUP_SUFFIX = ".zip"
 # UTC stamp embedded in archive + move-aside names, e.g. 20260610T124145Z.
 STAMP_FORMAT = "%Y%m%dT%H%M%SZ"
 DEFAULT_KEEP = 10
+
+# Module-level fallback used when a caller does not inject one. The plugin always
+# passes ``self.logger``; tests pass a fake or ``logging.getLogger``. A real logger
+# matters here because the failure paths (rollback escalation, start/stop failures,
+# skipped prune deletions) are precisely the moments the user must be told about.
+_FALLBACK_LOGGER = logging.getLogger("fabric_backup")
+
+
+def _resolve_logger(logger: Optional[Any]) -> Any:
+    return logger if logger is not None else _FALLBACK_LOGGER
 
 
 def _stamp(now: datetime) -> str:
@@ -51,7 +61,7 @@ def _is_nonempty_dir(path: str) -> bool:
     return os.path.isdir(path) and any(os.scandir(path))
 
 
-def create_backup(storage_path: str, *, now: datetime) -> str:
+def create_backup(storage_path: str, *, now: datetime, logger: Optional[Any] = None) -> str:
     """Zip the storage dir into ``backups/fabric-<stamp>.zip``; return its path.
 
     Paths inside the archive are stored relative to the storage-dir root so a
@@ -59,7 +69,16 @@ def create_backup(storage_path: str, *, now: datetime) -> str:
     successful write the backup set is pruned to :data:`DEFAULT_KEEP`. Raises
     ``FileNotFoundError`` if the storage dir is missing or empty — there is no
     fabric to protect, and a silent empty backup would be worse than none.
+
+    The archive is written to ``<final>.tmp`` first, then validated (non-empty,
+    at least one member, ``testzip`` clean) and atomically ``os.replace``-d into
+    its final ``fabric-*.zip`` name. This is a LIVE snapshot (the server is not
+    stopped) so a disk-full / file-vanished-mid-snapshot is a real risk: writing
+    to a ``.tmp`` name means a partial/failed archive is never offered by
+    ``list_backups``/the picker (which only match ``fabric-*.zip``), and the
+    ``.tmp`` is deleted on any failure before the error is re-raised.
     """
+    log = _resolve_logger(logger)
     if not os.path.isdir(storage_path):
         raise FileNotFoundError(f"Storage dir does not exist: {storage_path}")
     if not _is_nonempty_dir(storage_path):
@@ -68,16 +87,42 @@ def create_backup(storage_path: str, *, now: datetime) -> str:
     backups_dir = backups_dir_for(storage_path)
     os.makedirs(backups_dir, exist_ok=True)
     archive_path = os.path.join(backups_dir, f"{BACKUP_PREFIX}{_stamp(now)}{BACKUP_SUFFIX}")
+    tmp_path = archive_path + ".tmp"
 
     root = os.path.normpath(storage_path)
-    with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for dirpath, _dirnames, filenames in os.walk(root):
-            for name in filenames:
-                abs_path = os.path.join(dirpath, name)
-                arcname = os.path.relpath(abs_path, root)
-                zf.write(abs_path, arcname)
+    members_written = 0
+    try:
+        with zipfile.ZipFile(tmp_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for dirpath, _dirnames, filenames in os.walk(root):
+                for name in filenames:
+                    abs_path = os.path.join(dirpath, name)
+                    arcname = os.path.relpath(abs_path, root)
+                    zf.write(abs_path, arcname)
+                    members_written += 1
 
-    prune_backups(storage_path, keep=DEFAULT_KEEP)
+        # Validate the snapshot before it can ever be offered for restore. A
+        # truncated/corrupt archive that looks like a valid filename is worse
+        # than no backup, because the user would trust it.
+        if members_written == 0:
+            raise RuntimeError(f"Backup wrote zero members from {storage_path}")
+        if os.path.getsize(tmp_path) <= 0:
+            raise RuntimeError(f"Backup archive is empty: {tmp_path}")
+        with zipfile.ZipFile(tmp_path, "r") as zf:
+            bad = zf.testzip()
+            if bad is not None:
+                raise RuntimeError(f"Backup archive failed integrity check (corrupt member {bad!r})")
+
+        os.replace(tmp_path, archive_path)
+    except BaseException:
+        # Never leave a partial/failed archive behind — not even the .tmp.
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
+
+    log.info("Fabric backup written: %s (%d member(s))", archive_path, members_written)
+    prune_backups(storage_path, keep=DEFAULT_KEEP, logger=log)
     return archive_path
 
 
@@ -110,18 +155,20 @@ def list_backups(storage_path: str) -> list[dict]:
     return entries
 
 
-def prune_backups(storage_path: str, keep: int = DEFAULT_KEEP) -> list[str]:
+def prune_backups(storage_path: str, keep: int = DEFAULT_KEEP, *, logger: Optional[Any] = None) -> list[str]:
     """Delete backups older than the newest ``keep``; return removed filenames."""
+    log = _resolve_logger(logger)
     backups = list_backups(storage_path)
     removed: list[str] = []
     for entry in backups[keep:]:
         try:
             os.remove(entry["path"])
             removed.append(entry["filename"])
-        except OSError:
+        except OSError as exc:
             # Best-effort: a backup we can't delete is not a failure of the
-            # newly-written backup, so we don't propagate.
-            pass
+            # newly-written backup, so we don't propagate — but we MUST surface it
+            # so a stuck-undeletable backup is visible rather than silently piling up.
+            log.warning("Could not prune old fabric backup %s: %s", entry["path"], exc)
     return removed
 
 
@@ -146,39 +193,63 @@ def restore_backup(
     server_control: Any,
     *,
     now: datetime,
+    logger: Optional[Any] = None,
 ) -> dict:
     """Restore a fabric backup over the live storage dir — safely.
 
     Steps:
-      1. Validate the archive exists and is a valid zip; zip-slip guard.
-      2. ``server_control.stop()`` — the server must be down during the swap.
+      1. Validate the archive exists, is a valid zip with at least one member,
+         and passes ``testzip``; zip-slip guard. (All before touching anything.)
+      2. ``server_control.stop()`` — the server MUST go down before we touch the
+         live fabric. A False return (launchctl failed) ABORTS here, before any
+         move-aside or extract, so we never write over a still-running server.
       3. Move the existing storage dir aside to
          ``<storage_path>.pre-restore-<stamp>`` (NEVER delete in place; skipped
          if the storage dir does not exist).
-      4. Extract the archive into a fresh ``storage_path``.
-      5. ``server_control.start()``.
-      6. On ANY exception during 3–5: roll back (remove the partial new storage
-         dir, move the ``.pre-restore-*`` copy back), then ``start()`` and
-         re-raise with context. The user is never left with no fabric.
+      4. Extract the archive into a fresh ``storage_path`` and assert the result
+         is non-empty (a validly-zipped but empty backup would silently wipe the
+         fabric — so that is treated as a failure and rolled back).
+      5. ``server_control.start()`` — a False return is a failure (server down on
+         the new fabric) and triggers rollback, same as an exception.
+      6. On ANY failure during 3–5: roll back without ever stranding the original.
+         If a partial new ``storage_path`` exists it is moved aside to
+         ``<storage_path>.failed-<stamp>`` (not rmtree'd, so a half-removable dir
+         cannot block the rename-back), THEN the original is renamed back into
+         place, THEN ``start()`` is attempted on the restored fabric. A failing
+         rollback ``start()`` is escalated at ERROR with explicit manual-recovery
+         guidance — that is the loudest case: server down AND fabric possibly not
+         back. The function always ends by raising a wrapped ``RuntimeError`` so
+         the original cause is never masked.
 
     Returns ``{restored_from, moved_aside_to}``. ``moved_aside_to`` is ``None``
     if there was no existing storage dir to preserve.
 
     ``server_control`` is an abstract seam (an object with ``stop()`` and
-    ``start()``); this function never imports indigo or calls launchctl.
+    ``start()`` returning bools); this function never imports indigo or calls
+    launchctl.
     """
+    log = _resolve_logger(logger)
     if not os.path.isfile(archive_path):
         raise FileNotFoundError(f"Backup archive does not exist: {archive_path}")
     if not zipfile.is_zipfile(archive_path):
         raise ValueError(f"Not a valid zip archive: {archive_path}")
-    # Surface a corrupt zip up front (before stopping the server / moving anything).
+    # Surface a corrupt or content-empty zip up front (before stopping the server
+    # or moving anything). A zero-member archive is a wipe waiting to happen.
     with zipfile.ZipFile(archive_path, "r") as zf:
         bad = zf.testzip()
         if bad is not None:
             raise ValueError(f"Corrupt member in archive {archive_path}: {bad}")
+        if not zf.namelist():
+            raise ValueError(f"Backup archive has no members, refusing to restore (would wipe fabric): {archive_path}")
 
     storage_path = os.path.normpath(storage_path)
-    server_control.stop()
+
+    # C1: the server MUST be down before we touch the live fabric. If stop()
+    # reports failure we abort here — storage is untouched, nothing moved aside.
+    if not server_control.stop():
+        raise RuntimeError(
+            "matter-server failed to stop; aborting restore before touching the live fabric"
+        )
 
     moved_aside_to: str | None = None
     if os.path.isdir(storage_path):
@@ -188,23 +259,82 @@ def restore_backup(
     try:
         os.makedirs(storage_path, exist_ok=True)
         _safe_extract(archive_path, storage_path)
-        server_control.start()
+        # H4: a validly-zipped but empty restore is a silent wipe. Refuse it.
+        if not _is_nonempty_dir(storage_path):
+            raise RuntimeError(
+                f"Restored storage dir is empty after extracting {archive_path}; "
+                "refusing to leave the fabric wiped"
+            )
+        # C1: start() returns a bool; False (launchctl failed) is a failure that
+        # must trigger rollback exactly like an exception would.
+        if not server_control.start():
+            raise RuntimeError("matter-server failed to start after restore")
     except BaseException as exc:  # noqa: BLE001 — re-raised after rollback
-        # Roll back: nuke the partial new storage dir, restore the original.
-        try:
-            if os.path.isdir(storage_path):
-                shutil.rmtree(storage_path, ignore_errors=True)
-            if moved_aside_to is not None and os.path.isdir(moved_aside_to):
-                os.rename(moved_aside_to, storage_path)
-        finally:
-            # Always try to bring the server back up on the rolled-back fabric.
-            try:
-                server_control.start()
-            except Exception:  # noqa: BLE001
-                pass
+        _rollback(storage_path, moved_aside_to, server_control, now=now, log=log)
         raise RuntimeError(
             f"Fabric restore from {archive_path} failed and was rolled back "
-            f"(original fabric preserved): {exc}"
+            f"(original fabric preserved at {moved_aside_to or storage_path})"
         ) from exc
 
     return {"restored_from": archive_path, "moved_aside_to": moved_aside_to}
+
+
+def _rollback(
+    storage_path: str,
+    moved_aside_to: Optional[str],
+    server_control: Any,
+    *,
+    now: datetime,
+    log: Any,
+) -> None:
+    """Undo a failed restore without ever stranding or wiping the original fabric.
+
+    Move any partial new ``storage_path`` aside (never rely on a possibly-failing
+    ``rmtree`` to clear the way for the rename-back), then rename the original
+    ``moved_aside_to`` back into place, then bring the server up on it. A failure
+    of the rollback mechanics is escalated and re-raised; a failure of the
+    rollback ``start()`` is the loudest case (user is now fabric-less / server
+    down) and is logged at ERROR with manual-recovery guidance naming the
+    original fabric location.
+    """
+    try:
+        # Clear the partial new dir out of the way WITHOUT rmtree(ignore_errors):
+        # a half-removable dir would otherwise leave storage_path occupied and the
+        # rename-back would raise "Directory not empty", stranding the original.
+        if os.path.exists(storage_path):
+            failed_aside = f"{storage_path}.failed-{_stamp(now)}"
+            os.rename(storage_path, failed_aside)
+            log.warning("Moved partial failed restore aside to %s", failed_aside)
+        if moved_aside_to is not None and os.path.isdir(moved_aside_to):
+            os.rename(moved_aside_to, storage_path)
+    except OSError as rollback_exc:
+        # The rollback mechanics themselves failed: the original fabric is still
+        # safe at moved_aside_to, but it is NOT back in place. Escalate loudly.
+        log.error(
+            "CRITICAL: fabric restore rollback FAILED (%s). Your original fabric is "
+            "PRESERVED but NOT in place. To recover manually: stop matter-server, then "
+            "move %s back to %s, then start matter-server.",
+            rollback_exc, moved_aside_to, storage_path,
+        )
+        raise
+
+    # Bring the server back up on the rolled-back (original) fabric.
+    try:
+        started = server_control.start()
+    except Exception as start_exc:  # noqa: BLE001
+        started = False
+        log.error(
+            "CRITICAL: matter-server failed to restart after restore rollback (%s).", start_exc
+        )
+
+    if not started:
+        # This is the worst case the user can be in: original fabric is back on
+        # disk but the server is down. Make it the loudest possible message and
+        # name the original fabric location explicitly.
+        log.error(
+            "CRITICAL: matter-server is DOWN after restore rollback. Your original fabric "
+            "has been restored to %s. To recover manually: check "
+            "~/Library/Logs/indigo-matter/matter-server.err.log and start matter-server "
+            "(it should pick up the original fabric at %s).",
+            storage_path, storage_path,
+        )

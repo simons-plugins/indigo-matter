@@ -234,12 +234,34 @@ def test_start_installs_when_plist_absent(sp):
     import os
     # no ensure_installed: plist absent
     assert not os.path.exists(sp.plist_path)
-    sp._run = FakeRunner()
+    sp._run = FakeRunner()  # all launchctl calls succeed → is_running() True
     ok = sp.start()
     assert ok is True
     # ensure_installed path: plist written + bootstrap/load attempted
     assert os.path.exists(sp.plist_path)
     assert "bootstrap" in sp._run.subcommands() or "load" in sp._run.subcommands()
+
+
+def test_start_bootstrap_failure_returns_false(sp):
+    # M7: start() on the existing-plist path must report the REAL bootstrap outcome,
+    # not a hardcoded True — fabric restore (C1) relies on this.
+    sp.ensure_installed()  # plist present
+    sp._run = FakeRunner(returncode=1)  # bootstrap fails
+    ok = sp.start()
+    assert ok is False
+    assert "bootstrap" in sp._run.subcommands()
+
+
+def test_start_install_path_returns_is_running(sp):
+    # M7: install path returns is_running() truthiness, not hardcoded True. With
+    # launchctl failing, the install proceeds but is_running()/start() report False.
+    import os
+    assert not os.path.exists(sp.plist_path)
+    sp._run = FakeRunner(returncode=1)  # bootstrap, load, AND print all fail
+    ok = sp.start()
+    assert ok is False  # is_running() with rc=1 → False
+    assert os.path.exists(sp.plist_path)  # plist was still written
+    assert "print" in sp._run.subcommands()  # is_running() was actually consulted
 
 
 def test_npx_resolution_prefers_homebrew(tmp_path, prefs, mock_logger, monkeypatch):
