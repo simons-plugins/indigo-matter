@@ -375,6 +375,71 @@
     </Device>
 
     <!-- ============================================================ -->
+    <!-- Smoke / CO Alarm                                             -->
+    <!-- ============================================================ -->
+
+    <!-- SmokeCOAlarm cluster (0x005C).
+         onOffState is True only for active smoke/CO alarm conditions
+         (ExpressedState ∈ SmokeAlarm/COAlarm/InterconnectSmoke/InterconnectCO).
+         batteryLevel is declared now and will be populated once issue #3's
+         PowerSource handler lands (harmless until then). -->
+    <Device id="matterSmokeCOAlarm" type="sensor">
+        <Name>Matter Smoke/CO Alarm</Name>
+        <ConfigUI>
+            <Field id="nodeId" type="textfield" readonly="yes">
+                <Label>Matter Node ID:</Label>
+            </Field>
+            <Field id="endpointId" type="textfield" readonly="yes">
+                <Label>Endpoint:</Label>
+            </Field>
+            <Field id="vendorName" type="textfield" readonly="yes">
+                <Label>Vendor:</Label>
+            </Field>
+            <Field id="productName" type="textfield" readonly="yes">
+                <Label>Product:</Label>
+            </Field>
+        </ConfigUI>
+        <States>
+            <State id="onOffState">
+                <ValueType boolType="OnOff">Boolean</ValueType>
+                <TriggerLabel>Alarm</TriggerLabel>
+                <ControlPageLabel>Alarm</ControlPageLabel>
+            </State>
+            <State id="expressedState">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Expressed State</TriggerLabel>
+                <ControlPageLabel>Expressed State</ControlPageLabel>
+            </State>
+            <State id="smokeAlarm">
+                <ValueType boolType="YesNo">Boolean</ValueType>
+                <TriggerLabel>Smoke Alarm</TriggerLabel>
+                <ControlPageLabel>Smoke Alarm</ControlPageLabel>
+            </State>
+            <State id="coAlarm">
+                <ValueType boolType="YesNo">Boolean</ValueType>
+                <TriggerLabel>CO Alarm</TriggerLabel>
+                <ControlPageLabel>CO Alarm</ControlPageLabel>
+            </State>
+            <State id="batteryAlert">
+                <ValueType boolType="YesNo">Boolean</ValueType>
+                <TriggerLabel>Battery Alert</TriggerLabel>
+                <ControlPageLabel>Battery Alert</ControlPageLabel>
+            </State>
+            <State id="endOfService">
+                <ValueType boolType="YesNo">Boolean</ValueType>
+                <TriggerLabel>End of Service</TriggerLabel>
+                <ControlPageLabel>End of Service</ControlPageLabel>
+            </State>
+            <State id="batteryLevel">
+                <ValueType>Integer</ValueType>
+                <TriggerLabel>Battery Level</TriggerLabel>
+                <ControlPageLabel>Battery Level</ControlPageLabel>
+            </State>
+        </States>
+        <UiDisplayStateId>onOffState</UiDisplayStateId>
+    </Device>
+
+    <!-- ============================================================ -->
     <!-- Fallback: unknown / unsupported Matter device                -->
     <!-- ============================================================ -->
 
