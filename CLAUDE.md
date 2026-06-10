@@ -55,9 +55,12 @@ reached over the Reflector with the same Bearer API key Domio already uses — *
 standalone server (aiohttp is absent from Indigo's framework Python). See `docs/API.md` v1.1.
 
 **matter-server:** npm package `matter-server` (GitHub `matter-js/matterjs-server`),
-**Alpha** v0.6.2. Thread commissioning is non-functional in v0.6.2 — **Wi-Fi devices only**
-for now; the WS client is portable to python-matter-server as the Thread fallback. See
-`docs/IMPLEMENTATION.md` §2.7.
+**Alpha** v0.6.2. Its one Thread gap is *first-admin* commissioning (provisioning Thread
+credentials over BLE) — which the share model never does. **Wi-Fi validated with real
+hardware; Thread expected to work via the same flow** (Apple Home provisions, plugin
+joins over IP through the Apple TBR), pending validation with a real Thread device. WS
+client is portable to python-matter-server as a fallback. See `docs/MATTER.md` +
+`docs/IMPLEMENTATION.md` §3.
 
 ## Standards
 

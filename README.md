@@ -18,12 +18,17 @@ device's lifetime.
 
 ## Status
 
-**v1 — built and live-validated.** Milestones M0–M8 are complete and verified on the
-reference Indigo server: plugin skeleton, async runtime, matter-server WebSocket client,
-the Domio HTTP API (contract **v1.3**), OnOff/dimmer/color, sensors, thermostat, and
-failure hardening. The plugin can supervise matter-server itself via a managed launchd
-LaunchAgent. **Wi-Fi Matter devices only** for now — matter-server (Alpha v0.6.2) doesn't
-yet support Thread commissioning, and BLE is not enabled on macOS.
+**Built and live-validated, including with real hardware.** The full device-class
+catalogue is shipped — lighting (on/off/dimmer/colour), sensors, thermostats, fans,
+window coverings, locks, valves, buttons, smoke/CO, air quality, energy metering,
+battery levels, and bridges — plus failure hardening, fabric backup/restore, and a
+managed launchd LaunchAgent for matter-server. A real Tapo energy plug has been
+commissioned end-to-end through Domio and reports live power/energy to Indigo.
+
+**Validated with Wi-Fi devices. Thread devices are expected to work** through the same
+share model — Apple Home does the Thread provisioning; the plugin joins over IP via
+your Apple border router (HomePod/Apple TV) — but await validation with real Thread
+hardware. See [docs/MATTER.md](./docs/MATTER.md) for how the pieces fit.
 
 ## Setup
 
@@ -40,6 +45,7 @@ matter-server is a separate Node.js runtime that you install once. See
 
 ## Documentation
 
+- **[docs/MATTER.md](./docs/MATTER.md)** — Matter & Thread explained: how Indigo, Domio, matter-server and Apple Home fit together. **Start here.**
 - **[docs/INSTALL.md](./docs/INSTALL.md)** — matter-server install & plugin setup.
 - `docs/PRD-indigo-matter-plugin.md` — product requirements and milestones.
 - `docs/IMPLEMENTATION.md` — protocols, scaffold, setup, cluster handlers.

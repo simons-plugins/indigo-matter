@@ -1,10 +1,28 @@
 # PRD — Indigo Matter Plugin (`indigo-matter`)
 
-**Status:** Draft for build
+> **HISTORICAL (2026-06-10).** This PRD is the original build spec, preserved
+> as-written; it is no longer maintained. **Everything in it shipped**, and so
+> did most of its own §14 "v2+ candidates" (door lock, window covering,
+> smoke/CO, air quality, energy metering, fabric backup/restore — all live).
+> A real Wi-Fi energy plug has been validated end-to-end via Domio.
+>
+> Where this document disagrees with reality, the living docs win:
+> [`API.md`](./API.md) for the wire contract (the §5.1 endpoint shapes here
+> are stale — e.g. decommission is now `POST …?nodeId=`, not `DELETE`),
+> [`MATTER.md`](./MATTER.md) for architecture/landscape (incl. the corrected
+> Thread position), [`INSTALL.md`](./INSTALL.md) for setup, and
+> [`HANDOVER.md`](./HANDOVER.md) for current state. The ADR is **ADR-0006**
+> in the Domio repo (mirrored as workspace ADR-0004), not the 0001 path below.
+>
+> Still genuinely pending from this PRD: **M11 — Plugin Store submission**,
+> and OQ4's "Indigo admin removed externally" detection beyond basic
+> availability tracking.
+
+**Status:** Historical — shipped (see banner)
 **Owner:** Simon
-**Related ADR:** [`docs/adr/0001-matter-support-architecture.md`](../adr/0001-matter-support-architecture.md) (lives in Domio repo)
-**Companion PRD:** Domio Matter Commissioning (in Domio repo)
-**Last updated:** 2026-05-15
+**Related ADR:** ADR-0006 in the Domio repo (= workspace ADR-0004)
+**Companion PRD:** Domio Matter Commissioning (in Domio repo) — also shipped
+**Last updated:** 2026-05-15 (content); 2026-06-10 (status banner)
 
 ## 1. Summary
 
