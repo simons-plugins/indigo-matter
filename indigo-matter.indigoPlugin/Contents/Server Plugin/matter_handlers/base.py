@@ -41,6 +41,11 @@ class ClusterHandler(ABC):
     cluster_name: str = ""
     #: Indigo deviceTypeId this handler owns (for action dispatch).
     device_type_id: str = ""
+    #: A node-scoped cluster (e.g. PowerSource) lives on a different endpoint
+    #: than the device(s) it augments, so dispatch fans its updates out to ALL
+    #: of the node's Indigo devices rather than just the one at the event's
+    #: endpoint.
+    node_scoped: bool = False
 
     def is_primary_for(self, node: Any, endpoint: Any) -> bool:  # noqa: D401
         """Whether this handler creates the device for *endpoint*.
