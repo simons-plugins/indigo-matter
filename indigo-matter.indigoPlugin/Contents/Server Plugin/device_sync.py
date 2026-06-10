@@ -21,7 +21,7 @@ from typing import Any, Optional
 import indigo
 
 import protocol
-from matter_model import NodeInfo, parse_node
+from matter_model import NodeInfo, node_id_to_str, parse_node
 from protocol import MatterCommand
 
 
@@ -115,6 +115,7 @@ class DeviceSync:
 
     def create_devices(self, node: NodeInfo, suggested_room: Optional[str] = None) -> dict:
         created: list[int] = []
+        new_ids: list[int] = []
         primary: Optional[int] = None
         failed = 0
         # The commission path threads a user-chosen name (via node.suggested_name)
@@ -146,14 +147,30 @@ class DeviceSync:
                     created.append(existing)
                     primary = primary if primary is not None else existing
                     continue
+                # Stamp the node id into the device's address (the Indigo UI's
+                # protocol-identifier column) so the nodeId is recoverable for
+                # decommission without spelunking pluginProps (issue #18).
+                spec.props.setdefault("address", node_id_to_str(node.node_id))
                 dev_id = self._create_one(spec, name, folder_id)
                 if dev_id is None:
                     failed += 1
                     continue
                 self._index[key] = dev_id
                 created.append(dev_id)
+                new_ids.append(dev_id)
                 primary = primary if primary is not None else dev_id
                 self._prime_states(node, dev_id, endpoint.endpoint_id)
+        if new_ids:
+            # The only event-log evidence of an out-of-band join (node_added)
+            # is this line — keep it INFO, not debug (issue #19). Idempotent
+            # re-passes (reconcile) create nothing and stay quiet.
+            self.logger.info(
+                "Matter node %s (%s %s): created Indigo device(s) %s",
+                node_id_to_str(node.node_id),
+                node.vendor_name or "unknown vendor",
+                node.product_name or "unknown product",
+                ", ".join(str(dev_id) for dev_id in new_ids),
+            )
         if failed:
             # partial creation must be visible to the commission result, not hidden
             self.logger.warning(

@@ -23,6 +23,8 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any, Awaitable, Callable, Optional
 
+from matter_client import COMMISSION_TIMEOUT
+from matter_model import node_id_to_str  # noqa: F401 - canonical home; re-exported for callers
 from protocol import ProtocolError
 
 
@@ -52,16 +54,29 @@ TERMINAL = frozenset({JobStatus.SUCCESS, JobStatus.FAILED})
 
 RETENTION = timedelta(minutes=15)
 
+# How long after a commissioning_timeout failure a node_added may still claim
+# the job (issue #16): matter-server keeps commissioning in the background after
+# our RPC gives up (the node was observed joining ~64s after the job died), so a
+# recently-timed-out job is flipped back to success when its node arrives.
+# Bounded so a node added much later (dashboard, manual) can't resurrect stale
+# jobs. Must be < RETENTION or the job may be reaped before it can reconcile.
+RECONCILE_WINDOW = timedelta(minutes=5)
+
+TIMEOUT_MESSAGE = (
+    f"matter-server did not finish commissioning within {COMMISSION_TIMEOUT:.0f}s; "
+    "the device may still join — check Indigo before retrying"
+)
+
 
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def node_id_to_str(node_id: Any) -> str:
-    """Represent a Matter node id as the hex string the API uses."""
-    if isinstance(node_id, str):
-        return node_id
-    return f"0x{int(node_id):X}"
+def _exc_message(exc: BaseException) -> str:
+    """``str(exc)`` is empty for bare exceptions (e.g. ``TimeoutError()``) — fall
+    back to the type name so error payloads are never blank (#17)."""
+    text = str(exc).strip()
+    return text or type(exc).__name__
 
 
 def is_valid_setup_code(code: str) -> bool:
@@ -210,6 +225,115 @@ class CommissionJobs:
             return 200, job.serialize()
 
     # ------------------------------------------------------------------
+    # Late-join reconcile (issue #16; called from the WS event path)
+    # ------------------------------------------------------------------
+    def reconcile_node_added(self, raw_node: dict) -> Optional[str]:
+        """A node joined out-of-band — if a commission job recently failed by
+        timeout, the join is (almost certainly) that job completing in the
+        background: re-open it, apply the user's suggestedName/suggestedRoom,
+        and flip it to success so a still-polling client gets the real outcome.
+
+        Candidates are matched by recency: only jobs that went terminal with
+        ``commissioning_timeout`` within RECONCILE_WINDOW qualify, and the most
+        recent one wins (a single rehearsal/retry flow never has two). Returns
+        the claimed jobId, or None if no job qualified.
+        """
+        if not isinstance(raw_node, dict) or raw_node.get("node_id") is None:
+            with self._lock:
+                waiting = self._timeout_candidates_locked(self._clock() - RECONCILE_WINDOW)
+            if waiting:
+                # A claimable job is waiting and this event was its one shot —
+                # leave evidence. (No candidates = routine restart sync; stay quiet.)
+                self.logger.warning(
+                    "node_added event without a usable node_id ignored while "
+                    "commission job %s awaits reconcile", waiting[-1].job_id)
+            return None
+        node_id = raw_node.get("node_id")
+        stale: Optional[Job] = None
+        with self._lock:
+            cutoff = self._clock() - RECONCILE_WINDOW
+            candidates = self._timeout_candidates_locked(cutoff)
+            if not candidates:
+                expired = self._timeout_candidates_locked(None)
+                stale = expired[-1] if expired else None
+            else:
+                job = candidates[-1]
+                # Claim it inside the lock (a second node_added must not double-claim):
+                # re-opening to CREATING_DEVICES is honest — that's the work left.
+                # Keep the priors so a failed schedule can restore the terminal
+                # timeout state exactly (including the original terminal_at).
+                prior_error, job.error = job.error, None
+                prior_terminal_at, job.terminal_at = job.terminal_at, None
+                prior_progress, job.progress = job.progress, 0.85
+                prior_message, job.message = job.message, "Device joined after timeout; creating Indigo devices…"
+                job.status = CREATING_DEVICES
+        if not candidates:
+            if stale is not None:
+                self.logger.warning(
+                    "node %s joined after commission job %s timed out, but outside "
+                    "the %.0f-minute reconcile window — suggestedName/suggestedRoom "
+                    "were not applied", node_id_to_str(node_id), stale.job_id,
+                    RECONCILE_WINDOW.total_seconds() / 60,
+                )
+            return None
+        coro = self._reconcile_job(job, raw_node)
+        try:
+            self._schedule(coro)
+        except RuntimeError as exc:  # loop down — restore the terminal timeout state
+            coro.close()
+            with self._lock:
+                # One critical section: a poller must never observe a half-restored
+                # job. Restore the ORIGINAL terminal_at (not a fresh stamp) so the
+                # documented reconcile-window bound is preserved.
+                job.status = FAILED
+                job.error = prior_error
+                job.progress = prior_progress
+                job.message = prior_message
+                job.terminal_at = prior_terminal_at
+            self.logger.error(
+                "commission job %s: node %s joined but the reconcile could not be "
+                "scheduled (%s); job restored to its timed-out state",
+                job.job_id, node_id_to_str(node_id), exc,
+            )
+            return None
+        return job.job_id
+
+    def _timeout_candidates_locked(self, cutoff: Optional[datetime]) -> list[Job]:
+        """Jobs that failed with commissioning_timeout, oldest→newest.
+
+        ``cutoff=None`` means any age (used to detect a stale, outside-window
+        candidate worth a log line); otherwise only jobs whose terminal_at is
+        within the reconcile window qualify. Caller must hold ``self._lock``.
+        """
+        return sorted(
+            (
+                job for job in self._jobs.values()
+                if job.status is FAILED
+                and (job.error or {}).get("code") == "commissioning_timeout"
+                and job.terminal_at is not None
+                and (cutoff is None or job.terminal_at >= cutoff)
+            ),
+            key=lambda j: j.terminal_at,
+        )
+
+    async def _reconcile_job(self, job: Job, raw_node: dict) -> None:
+        node_id = raw_node.get("node_id")
+        try:
+            created = self._create_devices(raw_node, job.suggested_name, job.suggested_room)
+            if inspect.isawaitable(created):
+                created = await created
+            job.result = {"nodeId": node_id_to_str(node_id), **created}
+            self._advance(job, SUCCESS, 1.0, "Done (completed after timeout)")
+            self.logger.info(
+                "commission job %s reconciled: node %s joined after the commission "
+                "request timed out", job.job_id, node_id_to_str(node_id),
+            )
+        except Exception as exc:  # noqa: BLE001 - the job must reach a terminal state
+            self.logger.exception(exc)
+            job.error = {"code": "internal_error", "message": _exc_message(exc)}
+            self._advance(job, FAILED, job.progress, "")
+
+    # ------------------------------------------------------------------
     # Async worker (runs on the loop)
     # ------------------------------------------------------------------
     async def _run_job(self, job: Job) -> None:
@@ -243,6 +367,35 @@ class CommissionJobs:
             raise
         except CommissionError as exc:
             await self._fail(job, exc.code, exc.message, node_id, exc.matter_error_code)
+        except (asyncio.TimeoutError, TimeoutError):
+            if node_id is not None:
+                # Commissioning itself SUCCEEDED — this timeout came from a later
+                # step (get_node's short descriptor read). Calling it a
+                # commissioning_timeout would be wrong on every clause ("did not
+                # finish commissioning" / "may still join" about a node that
+                # already joined), and reconcile couldn't repair it: the job was
+                # not yet terminal when node_added fired. Do NOT remove_node —
+                # the node is on the fabric and node_added may already have
+                # created its Indigo devices.
+                message = (
+                    f"timed out reading node descriptors for "
+                    f"{node_id_to_str(node_id)} after commissioning succeeded"
+                )
+                self.logger.error("commission job %s: %s", job.job_id, message)
+                job.error = {"code": "internal_error", "message": message}
+                self._advance(job, FAILED, job.progress, "")
+            else:
+                # The commission RPC gave up, but matter-server keeps commissioning
+                # in the background (issue #16) — the node may still join. Do NOT
+                # remove_node (it could tear down an about-to-succeed join), and use
+                # a specific code/message: str(TimeoutError()) is "" so the generic
+                # branch would report internal_error with an empty message (#17).
+                # If the node arrives within RECONCILE_WINDOW, reconcile_node_added
+                # flips this job back to success. Logged so the event log holds
+                # evidence even after Domio has stopped polling the job.
+                self.logger.warning("commission job %s: %s", job.job_id, TIMEOUT_MESSAGE)
+                job.error = {"code": "commissioning_timeout", "message": TIMEOUT_MESSAGE}
+                self._advance(job, FAILED, job.progress, "")
         except ProtocolError as exc:
             # matter-server rejected the commission (bad setup code, window closed,
             # PASE/CASE failure, …) — a device/commissioning failure, not a plugin
@@ -251,7 +404,7 @@ class CommissionJobs:
                              _opt_int(getattr(exc, "code", None)))
         except Exception as exc:  # noqa: BLE001 - last-resort, mapped to internal_error
             self.logger.exception(exc)
-            await self._fail(job, "internal_error", str(exc), node_id)
+            await self._fail(job, "internal_error", _exc_message(exc), node_id)
 
     async def _fail(self, job: Job, code: str, message: str,
                     node_id: Any, matter_error_code: Optional[int] = None) -> None:

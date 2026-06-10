@@ -12,6 +12,18 @@ from typing import Any, Optional
 
 from protocol import Protocol
 
+def node_id_to_str(node_id: Any) -> str:
+    """Represent a Matter node id as the hex string the API uses.
+
+    The canonical home for this helper (model-level, dependency-free):
+    ``commission_jobs`` re-exports it, ``device_sync`` stamps it into each
+    Indigo device's ``address`` so the node id is recoverable from the UI.
+    """
+    if isinstance(node_id, str):
+        return node_id
+    return f"0x{int(node_id):X}"
+
+
 # BasicInformation cluster (0x0028) attribute ids used for device identity.
 _BASIC_INFO = 0x0028
 _ATTR_VENDOR_NAME = 0x0001

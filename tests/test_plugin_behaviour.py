@@ -34,6 +34,7 @@ def plug(plugin_mod):
     p.matter = None
     p.device_sync = Mock()
     p.http = Mock()
+    p.jobs = None
     return p
 
 
@@ -256,3 +257,45 @@ def test_startup_wires_connect_and_disconnect_callbacks(plugin_mod, monkeypatch)
     assert captured["on_connect"] == p._resync
     assert captured["on_disconnect"] == p._on_disconnected
     assert captured["on_event"] == p._on_matter_event
+
+# ---------------------------------------------------------------------------
+# node_added → commission-job reconcile wiring (#16)
+# ---------------------------------------------------------------------------
+def test_node_added_event_triggers_job_reconcile(plug):
+    import protocol
+    plug.jobs = Mock()
+    data = {"node_id": 7, "attributes": {}}
+    evt = SimpleNamespace(kind=protocol.EVT_NODE_ADDED,
+                          raw={"event": "node_added", "data": data})
+    plug._on_matter_event(evt)
+    plug.device_sync.handle_event.assert_called_once_with(evt)  # devices first
+    plug.jobs.reconcile_node_added.assert_called_once_with(data)
+
+
+def test_device_sync_failure_does_not_starve_reconcile(plug):
+    # Stage isolation: handle_event blowing up must not stop the job table's
+    # reconcile (which can still recover the job via its own create pass).
+    import protocol
+    plug.jobs = Mock()
+    plug.device_sync.handle_event.side_effect = RuntimeError("device sync blew up")
+    data = {"node_id": 7, "attributes": {}}
+    evt = SimpleNamespace(kind=protocol.EVT_NODE_ADDED,
+                          raw={"event": "node_added", "data": data})
+    plug._on_matter_event(evt)  # must not raise
+    plug.jobs.reconcile_node_added.assert_called_once_with(data)
+    plug.logger.exception.assert_called_once()  # failure surfaced, not swallowed
+
+
+def test_non_node_added_event_does_not_reconcile(plug):
+    import protocol
+    plug.jobs = Mock()
+    evt = SimpleNamespace(kind=protocol.EVT_ATTRIBUTE_UPDATED, raw={})
+    plug._on_matter_event(evt)
+    plug.jobs.reconcile_node_added.assert_not_called()
+
+
+def test_node_added_event_safe_without_jobs(plug):
+    # startup not finished (jobs None) — the event path must not blow up
+    import protocol
+    evt = SimpleNamespace(kind=protocol.EVT_NODE_ADDED, raw={"data": {"node_id": 7}})
+    plug._on_matter_event(evt)  # no AttributeError

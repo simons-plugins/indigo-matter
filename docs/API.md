@@ -236,12 +236,25 @@ match Matter spec error codes — verify against matter-server's source. The `co
 | Code | Meaning |
 |---|---|
 | `commissioning_failed` | matter-server returned a failure during commissioning |
+| `commissioning_timeout` | matter-server did not finish commissioning within the plugin's commission timeout (300s). The device **may still join** — matter-server keeps commissioning in the background. Check Indigo before retrying; see the reconcile note below. (v1.3, additive) |
 | `device_unreachable` | Device couldn't be reached on the network |
 | `pase_failed` | PASE handshake failed (usually wrong setup code or device already commissioned) |
 | `case_failed` | CASE session establishment failed |
 | `interview_failed` | Couldn't read device descriptors after commissioning |
 | `unsupported_device` | Device has no clusters mappable by v1 plugin |
 | `internal_error` | Plugin or matter-server internal error; check logs |
+
+**Timeout reconcile (v1.3):** a job that failed with `commissioning_timeout` is not
+necessarily over — matter-server keeps commissioning in the background (observed
+~124s real-world vs the old 60s client timeout). If the node joins within ~5 minutes
+of the timeout, the plugin reconciles: it applies the job's `suggestedName`/
+`suggestedRoom` to the created Indigo devices and flips the job back to `success`
+with the full `result` payload. A client still polling past its own soft timeout
+will therefore see `failed` → (possibly `creating_devices`) → `success`. Clients
+that stopped polling should treat `commissioning_timeout` as "may still finish —
+check Indigo", which matches Domio's existing 120s soft-timeout message. The
+plugin's job-level commission deadline is 300s and may legitimately outlive
+Domio's 120s poll window.
 
 ### 3.4 `POST …/message/com.simon.indigo-matter/decommission?nodeId={nodeId}`
 
@@ -337,6 +350,7 @@ None in v1. Single-user system. Plugin SHOULD log abnormal traffic patterns but 
 
 This contract is v1.3. Changes from v1.2 (all clarifications/additive, no transport change):
 
+- §3.3: new additive error code **`commissioning_timeout`** — the commission RPC to matter-server timed out (300s) but the device may still join; a job that failed this way can later flip back to `success` when the node arrives (timeout reconcile, see §3.3).
 - §3.3: `result.primaryDeviceId` is documented as **nullable** and `result.indigoDeviceIds` as **possibly empty** — `null`/empty when the commissioned device exposes no cluster the plugin maps yet (the job still reports `success`).
 - §3.2: `POST …/commission` returns **503 `matter_server_unreachable`** (instead of accepting the job) when the plugin's WebSocket to matter-server is down.
 - §3.1: the status 503 body's `error`/`message` envelope fields are confirmed as required (they were documented in v1.2 but not emitted by the plugin).

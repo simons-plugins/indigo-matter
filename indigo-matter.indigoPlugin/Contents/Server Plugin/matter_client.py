@@ -38,6 +38,13 @@ except ImportError:  # pragma: no cover
 
 MAX_BACKOFF = 30.0
 
+# Commissioning is the one RPC that legitimately takes minutes: discovery +
+# PASE over the LAN was observed at ~124s in the 2026-06-09 live rehearsal,
+# against the old 60s timeout (issue #16). 300s covers the observed worst case
+# with headroom; this deliberately applies to commission_with_code only — every
+# other RPC keeps the short default so a wedged matter-server still fails fast.
+COMMISSION_TIMEOUT = 300.0
+
 
 class MatterClient:
     """A reconnecting matter-server WebSocket client."""
@@ -211,7 +218,7 @@ class MatterClient:
     async def get_node(self, node_id: int) -> Any:
         return await self.request(protocol.CMD_GET_NODE, {"node_id": node_id})
 
-    async def commission_with_code(self, code: str, timeout: float = 60.0) -> Any:
+    async def commission_with_code(self, code: str, timeout: float = COMMISSION_TIMEOUT) -> Any:
         # network_only=True → IP discovery (mDNS) + PASE/CASE over IP, no BLE.
         # The plugin only ever joins devices that are ALREADY commissioned and on
         # the network (the "share model": Apple Home is admin 1; we join as a
