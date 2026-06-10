@@ -354,7 +354,7 @@ def test_get_fabric_backups_lists_for_picker(plug, plugin_mod, tmp_path):
 
 def test_menu_restore_refuses_in_manual_mode(plug):
     plug.server_process = None
-    ok, _vd, errors = plug.menuRestoreFabricBackup({"backup": "/x.zip", "confirm": True})
+    ok, _vd, errors = plug.menuRestoreFabricBackup({"backup": "/x.zip", "confirm": True}, "restoreFabricBackup")
     assert ok is False
     assert "backup" in errors
     plug.logger.warning.assert_called()
@@ -363,7 +363,7 @@ def test_menu_restore_refuses_in_manual_mode(plug):
 def test_menu_restore_requires_confirmation(plug, tmp_path):
     plug.server_process = SimpleNamespace(storage_path=_storage_with_fabric(tmp_path))
     plug.pluginPrefs = {}
-    ok, _vd, errors = plug.menuRestoreFabricBackup({"backup": "/x.zip", "confirm": False})
+    ok, _vd, errors = plug.menuRestoreFabricBackup({"backup": "/x.zip", "confirm": False}, "restoreFabricBackup")
     assert ok is False
     assert "confirm" in errors
 
@@ -371,7 +371,7 @@ def test_menu_restore_requires_confirmation(plug, tmp_path):
 def test_menu_restore_requires_selection(plug, tmp_path):
     plug.server_process = SimpleNamespace(storage_path=_storage_with_fabric(tmp_path))
     plug.pluginPrefs = {}
-    ok, _vd, errors = plug.menuRestoreFabricBackup({"backup": "", "confirm": True})
+    ok, _vd, errors = plug.menuRestoreFabricBackup({"backup": "", "confirm": True}, "restoreFabricBackup")
     assert ok is False
     assert "backup" in errors
 
@@ -390,7 +390,7 @@ def test_menu_restore_success_path(plug, plugin_mod, tmp_path):
     )
     plug.pluginPrefs = {}
 
-    result = plug.menuRestoreFabricBackup({"backup": archive, "confirm": True})
+    result = plug.menuRestoreFabricBackup({"backup": archive, "confirm": True}, "restoreFabricBackup")
     ok, _vd = result
     assert ok is True
     assert calls == ["stop", "start"]
@@ -423,7 +423,7 @@ def test_menu_restore_surfaces_error_dict_when_restore_fails(plug, tmp_path):
     )
     plug.pluginPrefs = {}
 
-    ok, _vd, errors = plug.menuRestoreFabricBackup({"backup": archive, "confirm": True})
+    ok, _vd, errors = plug.menuRestoreFabricBackup({"backup": archive, "confirm": True}, "restoreFabricBackup")
     assert ok is False
     assert "backup" in errors  # UI shows a dialog
     plug.logger.error.assert_called()
