@@ -146,7 +146,7 @@ def _bridge_identity(attrs: dict, endpoint_id: int) -> dict:
     """
     def _battr(attr_id: int) -> str:
         val = attrs.get((endpoint_id, CLUSTER_BRIDGED_BASIC, attr_id))
-        return str(val or "")
+        return str(val) if val is not None else ""
 
     return {
         "node_label": _battr(_BBRIDGE_ATTR_NODE_LABEL),

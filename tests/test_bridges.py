@@ -16,6 +16,7 @@ VERIFIED wire shapes (ws-controller v0.6.2):
 from __future__ import annotations
 
 import importlib
+from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -29,6 +30,13 @@ from matter_model import (
     EndpointInfo,
     parse_node,
 )
+
+
+@dataclass
+class FakeFolder:
+    """Minimal folder stub (same two fields as test_device_sync.FakeFolder)."""
+    id: int
+    name: str
 
 
 # ---------------------------------------------------------------------------
@@ -181,7 +189,6 @@ class _FakeDevices:
 
     def add_folder(self, name):
         self._folder_counter += 1
-        from test_device_sync import FakeFolder  # same shape used in test_device_sync
         folder = FakeFolder(self._folder_counter, name)
         self._folders[folder.id] = folder
         return folder
@@ -390,6 +397,7 @@ def test_parse_endpoint_removed_malformed_non_dict(proto):
     evt = proto.parse_event(frame)
     assert evt.kind == protocol.EVT_ENDPOINT_REMOVED
     # bare int data → not a dict → falls into fallback (no node_id key matched)
+    assert evt.node_id is None
     assert evt.endpoint is None
 
 
@@ -558,3 +566,22 @@ def test_reachable_attr_unknown_device_is_no_op(bds, bridge_indigo_env):
         cluster=CLUSTER_BRIDGED_BASIC, attribute=BBRIDGE_ATTR_REACHABLE,
         value=False,
     ))  # must not raise
+
+
+def test_reachable_none_value_leaves_device_untouched(bds, bridge_indigo_env):
+    """Reachable attr value=None (absent/null) must not mark device unreachable."""
+    _indigo, devices = bridge_indigo_env
+    bds.create_from_raw(_BRIDGE_NODE_RAW, "")
+    id1 = bds.lookup(200, 1)
+    # Pre-set a clean error state so we can detect any unwanted change.
+    devices[id1].setErrorStateOnServer("")
+
+    bds.handle_event(MatterEvent(
+        kind=protocol.EVT_ATTRIBUTE_UPDATED,
+        node_id=200, endpoint=1,
+        cluster=CLUSTER_BRIDGED_BASIC, attribute=BBRIDGE_ATTR_REACHABLE,
+        value=None,
+        raw={"event": "attribute_updated", "data": [200, "1/57/17", None]},
+    ))
+    # Neither cleared (still "") nor set to "unreachable" — state is unchanged.
+    assert devices[id1].errorState == ""

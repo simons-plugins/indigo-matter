@@ -163,6 +163,11 @@ class DeviceSync:
                 # nodes exactly as before.
                 bridge_label = endpoint.node_label or endpoint.product_name
                 if bridge_label:
+                    # TODO(#43): on an authoritative pass, spec.name (the user's
+                    # chosen bridge name) overwrites each child's own NodeLabel,
+                    # producing "My Hue Bridge", "My Hue Bridge 2", … and wiping
+                    # per-bulb names the user set in the bridge app.  Issue #43
+                    # tracks the fix (prefix or bridge-only authoritative stamp).
                     name = spec.name if authoritative else bridge_label
                 elif multi:
                     name = f"{spec.name} (endpoint {endpoint.endpoint_id})"
@@ -530,7 +535,9 @@ class DeviceSync:
         if evt.cluster == CLUSTER_BRIDGED_BASIC and evt.attribute == BBRIDGE_ATTR_REACHABLE:
             dev_id = self.lookup(evt.node_id, evt.endpoint)
             if dev_id is not None:
-                if evt.value:
+                if evt.value is None:
+                    pass  # unknown is not offline — do nothing
+                elif evt.value:
                     self._clear_error(dev_id)
                 else:
                     self._safe_unreachable(dev_id)
