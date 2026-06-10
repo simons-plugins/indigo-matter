@@ -1086,3 +1086,23 @@ def test_reassert_does_not_add_meter_props_to_non_relay_types(ds, indigo_env):
     assert not getattr(devices[aq_id], "replaced_props", False), (
         "replacePluginPropsOnServer was unexpectedly called on a non-relay type"
     )
+
+
+def test_list_nodes_groups_devices_per_node(ds, indigo_env):
+    _indigo, devices = indigo_env
+    ds.create_from_raw(RELAY_NODE, "Office Plug")
+    nodes = ds.list_nodes()
+    assert len(nodes) == 1
+    node_id, names = nodes[0]
+    assert node_id == 42
+    assert names == ["Office Plug"]
+
+
+def test_list_nodes_survives_out_of_band_delete(ds, indigo_env):
+    _indigo, devices = indigo_env
+    ds.create_from_raw(RELAY_NODE, "Office Plug")
+    dev_id = ds.lookup(42, 1)
+    devices._by_id.pop(dev_id)  # deleted out-of-band; index still has it
+    nodes = ds.list_nodes()
+    assert nodes[0][0] == 42
+    assert nodes[0][1] == [f"device {dev_id}"]

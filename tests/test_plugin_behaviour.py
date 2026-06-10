@@ -429,3 +429,74 @@ def test_menu_restore_surfaces_error_dict_when_restore_fails(plug, tmp_path):
     plug.logger.error.assert_called()
     # original fabric was preserved (rolled back) — not wiped
     assert (Path(storage) / "config").read_text() == "ORIGINAL-LIVE"
+
+
+# ---------------------------------------------------------------------------
+# Decommission menu (getMatterNodes picker + menuDecommissionDevice)
+# ---------------------------------------------------------------------------
+def test_get_matter_nodes_empty_when_not_ready(plug):
+    plug.device_sync = None
+    assert plug.getMatterNodes() == []
+
+
+def test_get_matter_nodes_labels_values_and_hex_node(plug):
+    plug.device_sync.list_nodes = lambda: [(34, ["Study matter plug"]), (35, [])]
+    options = plug.getMatterNodes()
+    assert options[0] == ("34", "Study matter plug — node 0x22")
+    assert options[1][0] == "35"
+    assert "(no Indigo devices)" in options[1][1]
+
+
+def test_menu_decommission_requires_selection(plug):
+    ok, _vd, errors = plug.menuDecommissionDevice({"node": "", "confirm": True}, "decommissionDevice")
+    assert ok is False
+    assert "node" in errors
+
+
+def test_menu_decommission_requires_confirm(plug):
+    ok, _vd, errors = plug.menuDecommissionDevice({"node": "34", "confirm": False}, "decommissionDevice")
+    assert ok is False
+    assert "confirm" in errors
+
+
+def test_menu_decommission_rejects_non_numeric_selection(plug):
+    ok, _vd, errors = plug.menuDecommissionDevice({"node": "bogus", "confirm": True}, "decommissionDevice")
+    assert ok is False
+    assert "node" in errors
+
+
+def test_menu_decommission_unavailable_maps_to_dialog_error(plug):
+    plug.runtime = None  # _decommission_sync raises MatterUnavailable
+    ok, _vd, errors = plug.menuDecommissionDevice({"node": "34", "confirm": True}, "decommissionDevice")
+    assert ok is False
+    assert "node" in errors
+    plug.logger.error.assert_called()
+
+
+def test_menu_decommission_unknown_node_is_dialog_error(plug):
+    plug.matter = Mock()
+    plug.runtime = FakeRuntime(FakeFuture(value=None))
+    ok, _vd, errors = plug.menuDecommissionDevice({"node": "999", "confirm": True}, "decommissionDevice")
+    assert ok is False
+    assert "node" in errors
+
+
+def test_menu_decommission_success_logs_and_closes(plug):
+    plug.matter = Mock()
+    plug.runtime = FakeRuntime(FakeFuture(value={
+        "nodeId": "0x22", "removedIndigoDeviceIds": [678761951], "fabricRemoved": True}))
+    ok, _vd = plug.menuDecommissionDevice({"node": "34", "confirm": True}, "decommissionDevice")
+    assert ok is True
+    plug.logger.info.assert_called()
+
+
+def test_menu_decommission_offline_warns_about_resurrection(plug):
+    # remove_node failed → fabric NOT removed → node still in matter-server →
+    # reconcile will recreate the deleted Indigo devices. The menu must say so.
+    plug.matter = Mock()
+    plug.runtime = FakeRuntime(FakeFuture(value={
+        "nodeId": "0x22", "removedIndigoDeviceIds": [678761951], "fabricRemoved": False}))
+    ok, _vd = plug.menuDecommissionDevice({"node": "34", "confirm": True}, "decommissionDevice")
+    assert ok is True
+    plug.logger.warning.assert_called()
+    assert "reappear" in plug.logger.warning.call_args[0][0]

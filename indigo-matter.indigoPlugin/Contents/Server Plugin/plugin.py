@@ -403,6 +403,58 @@ class Plugin(indigo.PluginBase):
         self.logger.info("manual commission → %s %s", status, body)
         return (status in (202, 409), valuesDict)
 
+    def getMatterNodes(self, filter="", valuesDict=None, typeId="", targetId=0):  # noqa: N802, A002, ARG002
+        """List-callback populating the decommission picker (one entry per node)."""
+        if self.device_sync is None:
+            return []
+        options = []
+        for node_id, names in self.device_sync.list_nodes():
+            label = ", ".join(names) if names else "(no Indigo devices)"
+            options.append((str(node_id), f"{label} — node {node_id_to_str(node_id)}"))
+        return options
+
+    def menuDecommissionDevice(self, valuesDict, menuId=""):  # noqa: N802, ARG002
+        errors = indigo.Dict()
+        selected = valuesDict.get("node", "")
+        if not selected:
+            errors["node"] = "Select a device to decommission."
+            return (False, valuesDict, errors)
+        if not valuesDict.get("confirm", False):
+            errors["confirm"] = "Tick the box to confirm removal from Indigo."
+            return (False, valuesDict, errors)
+        try:
+            node_id = int(selected)
+        except (TypeError, ValueError):
+            errors["node"] = "Invalid selection."
+            return (False, valuesDict, errors)
+        try:
+            result = self._decommission_sync(node_id)
+        except MatterUnavailable as exc:
+            self.logger.error("decommission %s failed — matter-server unavailable: %s",
+                              node_id_to_str(node_id), exc)
+            errors["node"] = "matter-server is unreachable — see the log. Nothing was removed."
+            return (False, valuesDict, errors)
+        if result is None:
+            errors["node"] = "Unknown node — nothing was removed."
+            return (False, valuesDict, errors)
+        if result["fabricRemoved"]:
+            self.logger.info(
+                "Decommissioned Matter node %s: fabric removed, Indigo device(s) deleted: %s",
+                result["nodeId"], result["removedIndigoDeviceIds"] or "none",
+            )
+        else:
+            # remove_node failed (device offline?) — matter-server still knows the
+            # node, so reconcile will recreate the Indigo devices we just deleted.
+            # Be honest about that rather than reporting a clean removal.
+            self.logger.warning(
+                "Decommission of node %s incomplete: Indigo device(s) %s deleted but the "
+                "fabric removal failed (device offline?). The node is still commissioned in "
+                "matter-server and its devices will reappear at the next reconcile — retry "
+                "once the device is reachable.",
+                result["nodeId"], result["removedIndigoDeviceIds"] or "none",
+            )
+        return (True, valuesDict)
+
     def _resolve_storage_path(self) -> str:
         """Storage dir path in BOTH managed and manual modes.
 

@@ -188,6 +188,27 @@ class DeviceSync:
         with self._lock:
             return len({nid for (nid, _eid) in self._index})
 
+    def list_nodes(self) -> list:
+        """Per-node summary for UI pickers: ``[(node_id, [device names])]``.
+
+        Sorted by node id; device names resolved outside the lock so a slow
+        Indigo lookup can't stall state/command dispatch.
+        """
+        with self._lock:
+            by_node: dict[int, set] = {}
+            for (nid, _eid), type_map in self._index.items():
+                by_node.setdefault(nid, set()).update(type_map.values())
+        out = []
+        for nid in sorted(by_node):
+            names = []
+            for dev_id in sorted(by_node[nid]):
+                try:
+                    names.append(indigo.devices[dev_id].name)
+                except Exception:  # noqa: BLE001 - deleted out-of-band mid-iteration
+                    names.append(f"device {dev_id}")
+            out.append((nid, names))
+        return out
+
     # ------------------------------------------------------------------
     # Creation (called from the commissioning worker / reconcile)
     # ------------------------------------------------------------------
