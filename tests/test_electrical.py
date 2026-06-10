@@ -5,6 +5,7 @@ Covers:
 - Energy struct parsing: string-keyed dict, tag-keyed dict, bare number, garbage
 - Relay (OnOff) props decoration with/without the energy clusters present
 - Dimmer (LevelControl) props decoration with/without the energy clusters present
+- ColorDimmer (ColorControl) props decoration with/without the energy clusters present
 """
 from __future__ import annotations
 
@@ -20,6 +21,7 @@ from matter_handlers.electrical import (
 )
 from matter_handlers.on_off import OnOffHandler
 from matter_handlers.level_control import LevelControlHandler
+from matter_handlers.color_control import ColorControlHandler
 from matter_handlers.registry import HandlerRegistry
 
 
@@ -348,14 +350,56 @@ def test_registry_includes_electrical_handlers():
 
 
 def test_registry_electrical_handlers_are_non_primary():
-    """Non-primary handlers should produce no specs via handlers_for_endpoint."""
-    ep = _Endpoint(1, {CLUSTER_ELECTRICAL_POWER, CLUSTER_ELECTRICAL_ENERGY})
-    node = _Node()
+    """Non-primary handlers produce no specs when no primary handler is present.
+
+    (a) Electrical-only endpoint → empty spec list.
+    (b) OnOff + electrical endpoint → exactly one spec (matterRelay), proving
+        the electrical handlers are non-primary while a real primary exists.
+    """
     reg = HandlerRegistry()
-    specs = reg.handlers_for_endpoint(node, ep)
-    # Neither handler is primary, so no specs created by electrical cluster alone
-    assert all(s.device_type_id not in ("", None) for s in specs)
-    device_types = [s.device_type_id for s in specs]
-    # No electrical-specific device type ids should appear
-    assert "matterPowerMeter" not in device_types
-    assert "matterEnergyMeter" not in device_types
+
+    # (a) No primary handler on this endpoint — handlers_for_endpoint returns [].
+    ep_electrical_only = _Endpoint(1, {CLUSTER_ELECTRICAL_POWER, CLUSTER_ELECTRICAL_ENERGY})
+    specs = reg.handlers_for_endpoint(_Node(), ep_electrical_only)
+    assert specs == []
+
+    # (b) OnOff is primary; electrical handlers are non-primary and contribute no
+    #     extra specs of their own — the relay spec is the only one produced.
+    ep_relay_with_energy = _Endpoint(1, {0x0006, CLUSTER_ELECTRICAL_POWER, CLUSTER_ELECTRICAL_ENERGY})
+    specs = reg.handlers_for_endpoint(_Node(), ep_relay_with_energy)
+    assert len(specs) == 1
+    assert specs[0].device_type_id == "matterRelay"
+
+
+# ---------------------------------------------------------------------------
+# Props decoration on colour dimmer (ColorControlHandler) specs
+# ---------------------------------------------------------------------------
+
+class TestColorControlEnergyProps:
+    def _make_ep(self, clusters: set) -> _Endpoint:
+        return _Endpoint(1, clusters)
+
+    def _make_node(self) -> _Node:
+        return _Node()
+
+    def test_colour_dimmer_spec_has_power_and_energy_props_when_both_clusters_present(self):
+        """RGBW bulb with energy metering: matterColorDimmer gets both energy props."""
+        ep = self._make_ep(
+            {0x0006, 0x0008, 0x0300, CLUSTER_ELECTRICAL_POWER, CLUSTER_ELECTRICAL_ENERGY}
+        )
+        specs = ColorControlHandler().create_indigo_devices(self._make_node(), ep)
+        assert len(specs) == 1
+        assert specs[0].device_type_id == "matterColorDimmer"
+        props = specs[0].props
+        assert props.get("SupportsPowerMeter") is True
+        assert props.get("SupportsEnergyMeter") is True
+
+    def test_colour_dimmer_spec_has_no_energy_props_without_energy_clusters(self):
+        """Plain RGBW bulb without energy metering: no energy props injected."""
+        ep = self._make_ep({0x0006, 0x0008, 0x0300})
+        specs = ColorControlHandler().create_indigo_devices(self._make_node(), ep)
+        assert len(specs) == 1
+        assert specs[0].device_type_id == "matterColorDimmer"
+        props = specs[0].props
+        assert "SupportsPowerMeter" not in props
+        assert "SupportsEnergyMeter" not in props
