@@ -32,12 +32,27 @@ _ATTR_PRODUCT_NAME = 0x0003
 _ATTR_PRODUCT_ID = 0x0004
 _ATTR_SW_VERSION_STRING = 0x000A
 
+# BridgedDeviceBasicInformation cluster (0x0039) — per-endpoint identity for
+# bridged child devices (Hue bulbs, Aqara sensors, etc. behind a bridge hub).
+# device_sync imports these to route the per-endpoint Reachable attribute update.
+CLUSTER_BRIDGED_BASIC = 0x0039
+_BBRIDGE_ATTR_VENDOR_NAME = 0x0001    # VendorName  (optional)
+_BBRIDGE_ATTR_PRODUCT_NAME = 0x0003  # ProductName (optional)
+_BBRIDGE_ATTR_NODE_LABEL = 0x0005    # NodeLabel   (user-settable name)
+BBRIDGE_ATTR_REACHABLE = 0x0011      # Reachable   (bool, per-endpoint liveness)
+
 
 @dataclass(frozen=True)
 class EndpointInfo:
     endpoint_id: int
     cluster_ids: frozenset[int]
     device_types: tuple[int, ...] = ()
+    # Per-endpoint identity from BridgedDeviceBasicInformation (0x0039).
+    # Populated only when the endpoint carries cluster 0x0039 (bridged child);
+    # empty strings otherwise.  device_sync uses these for naming.
+    node_label: str = ""
+    vendor_name: str = ""
+    product_name: str = ""
 
     def has(self, cluster_id: int) -> bool:
         return cluster_id in self.cluster_ids
@@ -99,6 +114,7 @@ def parse_node(raw: dict, suggested_name: str = "") -> NodeInfo:
             endpoint_id=endpoint_id,
             cluster_ids=frozenset(cluster_ids),
             device_types=_device_types(attrs, endpoint_id),
+            **_bridge_identity(attrs, endpoint_id),
         )
         for endpoint_id, cluster_ids in sorted(clusters_by_endpoint.items())
     ]
@@ -118,6 +134,25 @@ def parse_node(raw: dict, suggested_name: str = "") -> NodeInfo:
         endpoints=endpoints,
         attributes=attrs,
     )
+
+
+def _bridge_identity(attrs: dict, endpoint_id: int) -> dict:
+    """Extract per-endpoint BridgedDeviceBasicInformation (0x0039) identity.
+
+    Returns a dict with keys ``node_label``, ``vendor_name``, ``product_name``
+    (all str, defaulting to "").  Callers spread it into :class:`EndpointInfo`
+    kwargs; for non-bridged endpoints the cluster is absent so all values stay
+    empty, which is the correct no-op default.
+    """
+    def _battr(attr_id: int) -> str:
+        val = attrs.get((endpoint_id, CLUSTER_BRIDGED_BASIC, attr_id))
+        return str(val or "")
+
+    return {
+        "node_label": _battr(_BBRIDGE_ATTR_NODE_LABEL),
+        "vendor_name": _battr(_BBRIDGE_ATTR_VENDOR_NAME),
+        "product_name": _battr(_BBRIDGE_ATTR_PRODUCT_NAME),
+    }
 
 
 def _device_types(attrs: dict, endpoint_id: int) -> tuple[int, ...]:
