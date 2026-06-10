@@ -113,7 +113,9 @@ class ValveHandler(ClusterHandler):
             command = CMD_CLOSE
         elif device_action == indigo.kDeviceAction.Toggle:
             # Resolve toggle from current on/off state (relay pattern from on_off.py)
-            currently_on = getattr(indigo_dev, "onState", False)
+            currently_on = getattr(indigo_dev, "onState", None)
+            if currently_on is None:
+                return None  # never guess a water valve's direction from unknown state
             command = CMD_CLOSE if currently_on else CMD_OPEN
         else:
             return None

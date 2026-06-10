@@ -40,7 +40,7 @@ VALVE_NODE = {
         "0/40/4": 1234,
         "0/40/10": "1.0.0",
         # Endpoint 1 carries only the valve cluster (0x0081 = 129 decimal)
-        "1/29/0": [{"0": 129, "1": 1}],   # DeviceTypeList — valve cluster
+        "1/29/0": [{"0": 0x0042, "1": 1}],  # DeviceTypeList — WaterValve device type 0x0042
         "1/129/4": 0,                       # CurrentState → Closed
     },
 }
@@ -196,6 +196,34 @@ def test_toggle_from_closed_sends_open(mock_indigo_base):
 
     cmd = handler.handle_indigo_action(dev, action)
     assert cmd.command == CMD_OPEN
+
+
+def test_toggle_with_unknown_state_returns_none(mock_indigo_base):
+    """Toggle must return None when onState is absent — never guess a valve's direction."""
+    import indigo
+    handler = ValveHandler()
+
+    class _DevNoState:
+        """Device double with no onState attribute at all."""
+        pluginProps = {"nodeId": "99", "endpointId": "1"}
+
+    dev = _DevNoState()
+    action = _Action(indigo.kDeviceAction.Toggle)
+    assert handler.handle_indigo_action(dev, action) is None
+
+
+def test_toggle_with_none_state_returns_none(mock_indigo_base):
+    """Toggle must return None when onState is explicitly None."""
+    import indigo
+    handler = ValveHandler()
+
+    class _DevNoneState:
+        pluginProps = {"nodeId": "99", "endpointId": "1"}
+        onState = None
+
+    dev = _DevNoneState()
+    action = _Action(indigo.kDeviceAction.Toggle)
+    assert handler.handle_indigo_action(dev, action) is None
 
 
 def test_unmapped_action_returns_none(mock_indigo_base):
