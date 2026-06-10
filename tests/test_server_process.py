@@ -41,29 +41,82 @@ def prefs():
             "storagePath": "~/Library/Application Support/com.simon.indigo-matter/matter-server"}
 
 
+def _make_pkg(home, *, main: str | None = None, garbage: bool = False):
+    """Create a fake node_modules/matter-server/package.json under ~/indigo-matter.
+
+    With ``main`` set, writes a manifest with that entry. ``garbage=True`` writes a
+    non-JSON file. With neither, no package.json is created (absent case).
+    """
+    pkg_dir = home / "indigo-matter" / "node_modules" / "matter-server"
+    pkg_dir.mkdir(parents=True, exist_ok=True)
+    manifest = pkg_dir / "package.json"
+    if garbage:
+        manifest.write_text("{ not valid json ")
+    elif main is not None:
+        manifest.write_text(f'{{"main": "{main}"}}')
+    return pkg_dir
+
+
 @pytest.fixture
 def sp(tmp_path, prefs, mock_logger):
     home = tmp_path / "home"
     (home / "bin").mkdir(parents=True)
     npx = home / "bin" / "npx"
     npx.write_text("#!/bin/sh\n")
+    (home / "bin" / "node").write_text("#!/bin/sh\n")
     return ServerProcess(
         prefs, mock_logger,
         home=str(home), npx_path=str(npx), runner=FakeRunner(),
     )
 
 
-def test_program_arguments_use_matter_server_via_npx(sp):
+def test_program_arguments_run_node_on_package_main(sp):
     args = sp.program_arguments()
-    assert args[0].endswith("/npx")
-    assert "--prefix" in args and "matter-server" in args
-    # storage + interface flags present
+    # [0] is the node binary in the resolved bin dir, NOT npx
+    assert args[0].endswith("/node")
+    assert not args[0].endswith("/npx")
+    # [1] is the resolved MatterServer.js entry point
+    assert args[1] == sp._server_entry()
+    assert args[1].endswith("/node_modules/matter-server/dist/esm/MatterServer.js")
+    # full flag set still present with correct values
+    assert args[args.index("--port") + 1] == "5580"
+    assert args[args.index("--listen-address") + 1] == "127.0.0.1"
     assert "--storage-path" in args
     assert args[args.index("--primary-interface") + 1] == "en0"
-    assert args[args.index("--port") + 1] == "5580"
-    # crucially: not the wrong package name
+    # the npx / --prefix / bare matter-server bin form is gone entirely
+    assert "npx" not in args[0].rsplit("/", 1)[-1]
+    assert "--prefix" not in args
+    assert "matter-server" not in args  # no bare package-name arg
+    # and never the wrong package name
     assert "matterjs-server" not in args
     assert "@matter-js/matterjs-server" not in args
+
+
+def test_server_entry_reads_main_from_package_json(tmp_path, prefs, mock_logger):
+    home = tmp_path / "home"
+    (home / "bin").mkdir(parents=True)
+    npx = home / "bin" / "npx"
+    npx.write_text("#!/bin/sh\n")
+    _make_pkg(home, main="dist/custom/Entry.js")
+    sp = ServerProcess(prefs, mock_logger, home=str(home), npx_path=str(npx),
+                       runner=FakeRunner())
+    entry = sp._server_entry()
+    assert entry.endswith("/node_modules/matter-server/dist/custom/Entry.js")
+
+
+@pytest.mark.parametrize("kwargs", [{}, {"garbage": True}])
+def test_server_entry_falls_back_when_manifest_absent_or_garbage(tmp_path, prefs, mock_logger, kwargs):
+    home = tmp_path / "home"
+    (home / "bin").mkdir(parents=True)
+    npx = home / "bin" / "npx"
+    npx.write_text("#!/bin/sh\n")
+    if kwargs:
+        _make_pkg(home, **kwargs)  # garbage package.json
+    # else: no package.json at all
+    sp = ServerProcess(prefs, mock_logger, home=str(home), npx_path=str(npx),
+                       runner=FakeRunner())
+    entry = sp._server_entry()
+    assert entry.endswith("/node_modules/matter-server/dist/esm/MatterServer.js")
 
 
 def test_program_arguments_bind_loopback_by_default(sp):
