@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import json
+from pathlib import Path
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -299,3 +300,132 @@ def test_node_added_event_safe_without_jobs(plug):
     import protocol
     evt = SimpleNamespace(kind=protocol.EVT_NODE_ADDED, raw={"data": {"node_id": 7}})
     plug._on_matter_event(evt)  # no AttributeError
+
+
+# ---------------------------------------------------------------------------
+# Fabric backup / restore menu handlers (#26)
+# ---------------------------------------------------------------------------
+def _storage_with_fabric(tmp_path):
+    storage = tmp_path / "appsupport" / "matter-server"
+    storage.mkdir(parents=True)
+    (storage / "config").write_text("fabric")
+    return str(storage)
+
+
+def test_menu_export_fabric_backup_writes_real_zip(plug, plugin_mod, tmp_path, monkeypatch):
+    import fabric_backup
+    storage = _storage_with_fabric(tmp_path)
+    plug.server_process = SimpleNamespace(storage_path=storage)
+    plug.pluginPrefs = {}
+    plug.menuExportFabricBackup()
+    # a real archive landed in the sibling backups dir
+    backups = fabric_backup.list_backups(storage)
+    assert len(backups) == 1
+    plug.logger.exception.assert_not_called()
+    plug.logger.info.assert_called()
+
+
+def test_menu_export_fabric_backup_logs_error_on_no_fabric(plug, tmp_path):
+    # storage dir missing → create_backup raises FileNotFoundError → handler logs
+    # an explicit "no fabric to back up" ERROR and never raises (H5).
+    plug.server_process = SimpleNamespace(storage_path=str(tmp_path / "missing"))
+    plug.pluginPrefs = {}
+    plug.menuExportFabricBackup()  # must not raise
+    plug.logger.error.assert_called()
+    # the message must make clear nothing was written
+    msg = " ".join(str(a) for c in plug.logger.error.call_args_list for a in c.args)
+    assert "nothing was written" in msg.lower()
+
+
+def test_get_fabric_backups_lists_for_picker(plug, plugin_mod, tmp_path):
+    import fabric_backup
+    storage = _storage_with_fabric(tmp_path)
+    plug.server_process = SimpleNamespace(storage_path=storage)
+    plug.pluginPrefs = {}
+    from datetime import datetime, timezone
+    archive = fabric_backup.create_backup(storage, now=datetime(2026, 6, 10, 12, 41, 45, tzinfo=timezone.utc))
+    options = plug.getFabricBackups()
+    assert len(options) == 1
+    path, label = options[0]
+    assert path == archive
+    assert "fabric-20260610T124145Z.zip" in label
+    assert "UTC" in label
+
+
+def test_menu_restore_refuses_in_manual_mode(plug):
+    plug.server_process = None
+    ok, _vd, errors = plug.menuRestoreFabricBackup({"backup": "/x.zip", "confirm": True})
+    assert ok is False
+    assert "backup" in errors
+    plug.logger.warning.assert_called()
+
+
+def test_menu_restore_requires_confirmation(plug, tmp_path):
+    plug.server_process = SimpleNamespace(storage_path=_storage_with_fabric(tmp_path))
+    plug.pluginPrefs = {}
+    ok, _vd, errors = plug.menuRestoreFabricBackup({"backup": "/x.zip", "confirm": False})
+    assert ok is False
+    assert "confirm" in errors
+
+
+def test_menu_restore_requires_selection(plug, tmp_path):
+    plug.server_process = SimpleNamespace(storage_path=_storage_with_fabric(tmp_path))
+    plug.pluginPrefs = {}
+    ok, _vd, errors = plug.menuRestoreFabricBackup({"backup": "", "confirm": True})
+    assert ok is False
+    assert "backup" in errors
+
+
+def test_menu_restore_success_path(plug, plugin_mod, tmp_path):
+    import fabric_backup
+    from datetime import datetime, timezone
+    storage = _storage_with_fabric(tmp_path)
+    archive = fabric_backup.create_backup(storage, now=datetime(2026, 6, 10, 12, 41, 45, tzinfo=timezone.utc))
+
+    calls = []
+    plug.server_process = SimpleNamespace(
+        storage_path=storage,
+        stop=lambda: calls.append("stop") or True,
+        start=lambda: calls.append("start") or True,
+    )
+    plug.pluginPrefs = {}
+
+    result = plug.menuRestoreFabricBackup({"backup": archive, "confirm": True})
+    ok, _vd = result
+    assert ok is True
+    assert calls == ["stop", "start"]
+    plug.logger.exception.assert_not_called()
+    # honest messaging: tells the user the server is restarting + the real signal.
+    msg = " ".join(str(a) for c in plug.logger.info.call_args_list for a in c.args)
+    assert "restarting" in msg.lower()
+    assert "reconciled" in msg.lower()
+
+
+def test_menu_restore_surfaces_error_dict_when_restore_fails(plug, tmp_path):
+    import fabric_backup
+    from datetime import datetime, timezone
+    storage = _storage_with_fabric(tmp_path)
+    (Path(storage) / "config").write_text("ORIGINAL-LIVE")
+    archive = fabric_backup.create_backup(storage, now=datetime(2026, 6, 10, 12, 41, 45, tzinfo=timezone.utc))
+
+    # start() returns False on the first (real) call → restore fails → rollback →
+    # restore_backup raises → handler must surface an errorsDict, NOT report success.
+    start_calls = {"n": 0}
+
+    def fake_start():
+        start_calls["n"] += 1
+        return start_calls["n"] > 1  # first start False, rollback start True
+
+    plug.server_process = SimpleNamespace(
+        storage_path=storage,
+        stop=lambda: True,
+        start=fake_start,
+    )
+    plug.pluginPrefs = {}
+
+    ok, _vd, errors = plug.menuRestoreFabricBackup({"backup": archive, "confirm": True})
+    assert ok is False
+    assert "backup" in errors  # UI shows a dialog
+    plug.logger.error.assert_called()
+    # original fabric was preserved (rolled back) — not wiped
+    assert (Path(storage) / "config").read_text() == "ORIGINAL-LIVE"

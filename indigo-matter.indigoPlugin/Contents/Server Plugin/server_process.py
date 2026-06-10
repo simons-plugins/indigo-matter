@@ -309,6 +309,28 @@ class ServerProcess:
         except FileNotFoundError:
             pass
 
+    def stop(self) -> bool:
+        """Stop matter-server (bootout) but keep the plist so ``start`` can reload it.
+
+        Part of the ``server_control`` seam used by fabric restore. Returns True
+        if the bootout succeeded.
+        """
+        return self._bootout()
+
+    def start(self) -> bool:
+        """Start matter-server: reload the existing plist, or install it if absent.
+
+        Part of the ``server_control`` seam used by fabric restore. Returns the
+        REAL outcome so callers (notably fabric restore) are never told the server
+        started when it did not: a successful ``bootstrap`` on the existing-plist
+        path, or ``is_running()`` after the install path (``ensure_installed`` logs
+        its own launchctl failure but returns None, so we verify independently).
+        """
+        if os.path.exists(self.plist_path):
+            return self._bootstrap()
+        self.ensure_installed()
+        return self.is_running()
+
     def restart(self) -> bool:
         """Kick the agent so matter-server respawns. Returns True on success."""
         result = self._launchctl("kickstart", "-k", f"gui/{os.getuid()}/{LABEL}")

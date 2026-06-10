@@ -13,11 +13,14 @@ names are isolated in ``protocol.py``.
 from __future__ import annotations
 
 import json
+import os
 import time
 from concurrent.futures import TimeoutError as FuturesTimeoutError
+from datetime import datetime, timezone
 
 import indigo  # provided by the Indigo runtime
 
+import fabric_backup
 from async_runtime import AsyncRuntime
 from commission_jobs import CommissionJobs, node_id_to_str
 from device_sync import DeviceSync
@@ -400,5 +403,110 @@ class Plugin(indigo.PluginBase):
         self.logger.info("manual commission → %s %s", status, body)
         return (status in (202, 409), valuesDict)
 
+    def _resolve_storage_path(self) -> str:
+        """Storage dir path in BOTH managed and manual modes.
+
+        In managed mode ``self.server_process`` already knows it. In manual mode
+        we construct a throwaway ``ServerProcess`` purely to read ``storage_path``
+        — its ``__init__`` writes no plist and runs no launchctl, so this is a
+        side-effect-free path lookup.
+        """
+        if self.server_process is not None:
+            return self.server_process.storage_path
+        return ServerProcess(dict(self.pluginPrefs), self.logger).storage_path
+
+    @staticmethod
+    def _human_size(num_bytes: int) -> str:
+        size = float(num_bytes)
+        for unit in ("B", "KB", "MB", "GB", "TB"):
+            if size < 1024.0 or unit == "TB":
+                return f"{size:.1f} {unit}"
+            size /= 1024.0
+        return f"{size:.1f} TB"
+
     def menuExportFabricBackup(self):  # noqa: N802
-        self.logger.info("Fabric backup: copy ~/Library/Application Support/com.simon.indigo-matter/")
+        # menuItem has no ConfigUI/valuesDict, so outcome can only surface via the
+        # log — make both success and failure unmistakable there. create_backup
+        # already prunes (no duplicate prune here) and validates its own output.
+        storage_path = None
+        try:
+            storage_path = self._resolve_storage_path()
+            archive = fabric_backup.create_backup(
+                storage_path, now=datetime.now(timezone.utc), logger=self.logger,
+            )
+            size = self._human_size(os.path.getsize(archive))
+            self.logger.info(
+                "Fabric backup complete: %s (%s). This is a best-effort live snapshot — "
+                "matter-server was NOT stopped. Backups live in %s.",
+                archive, size, fabric_backup.backups_dir_for(storage_path),
+            )
+        except FileNotFoundError as exc:
+            # storage dir missing or empty — there is no fabric to back up.
+            self.logger.error(
+                "Fabric backup FAILED — no fabric to back up, nothing was written: %s", exc,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.logger.error("Fabric backup FAILED — nothing was written: %s", exc)
+            self.logger.exception(exc)
+
+    def getFabricBackups(self, filter="", valuesDict=None, typeId="", targetId=0):  # noqa: N802, A002
+        """List-callback populating the restore picker (newest first)."""
+        try:
+            storage_path = self._resolve_storage_path()
+        except Exception as exc:  # noqa: BLE001
+            self.logger.exception(exc)
+            return []
+        options = []
+        for entry in fabric_backup.list_backups(storage_path):
+            when = datetime.fromtimestamp(entry["mtime"], timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+            label = f"{entry['filename']} — {self._human_size(entry['size_bytes'])} — {when}"
+            options.append((entry["path"], label))
+        return options
+
+    def menuRestoreFabricBackup(self, valuesDict):  # noqa: N802
+        errors = indigo.Dict()
+        # Restore must stop/start matter-server, which the plugin can only do in
+        # managed mode. Externally-managed (run.sh / manual) servers must be
+        # stopped by the user by hand.
+        if self.server_process is None:
+            msg = ("LaunchAgent management is off — the plugin cannot stop matter-server. "
+                   "Stop matter-server yourself, unzip the chosen backup over the storage dir, "
+                   "then restart it. Refusing to restore automatically.")
+            self.logger.warning(msg)
+            errors["backup"] = "Turn on 'Manage LaunchAgent', or restore by hand (see log)."
+            return (False, valuesDict, errors)
+
+        selected = valuesDict.get("backup", "")
+        if not selected:
+            errors["backup"] = "Select a backup to restore."
+            return (False, valuesDict, errors)
+        if not valuesDict.get("confirm", False):
+            errors["confirm"] = "Tick the box to confirm — restore replaces the current fabric."
+            return (False, valuesDict, errors)
+
+        try:
+            storage_path = self._resolve_storage_path()
+            result = fabric_backup.restore_backup(
+                selected, storage_path, self.server_process,
+                now=datetime.now(timezone.utc), logger=self.logger,
+            )
+            # restore_backup only returns on success: the server was stopped, the
+            # fabric was swapped, the restored dir is non-empty, and start()
+            # returned True. Be honest — matter-server is RESTARTING, the node
+            # count is not yet known; point the user at the real signal instead of
+            # logging a likely-stale count and pretending it is confirmation.
+            self.logger.info(
+                "Fabric restored from %s; previous fabric preserved at %s. matter-server is "
+                "restarting — watch the log for 'reconciled N node(s)' to confirm the devices "
+                "came back.",
+                result["restored_from"], result["moved_aside_to"],
+            )
+            return (True, valuesDict)
+        except Exception as exc:  # noqa: BLE001
+            # restore_backup rolled back and preserved the original fabric (or
+            # aborted before touching it). Surface the failure in the UI dialog —
+            # never report success when the underlying op failed.
+            self.logger.error("Fabric restore FAILED: %s", exc)
+            self.logger.exception(exc)
+            errors["backup"] = "Restore failed — see the log. Your existing fabric was preserved."
+            return (False, valuesDict, errors)
