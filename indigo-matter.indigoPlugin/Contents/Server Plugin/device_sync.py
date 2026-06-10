@@ -392,6 +392,8 @@ class DeviceSync:
     def handle_event(self, evt: protocol.MatterEvent) -> None:
         if evt.kind == protocol.EVT_ATTRIBUTE_UPDATED:
             self._on_attribute(evt)
+        elif evt.kind == protocol.EVT_NODE_EVENT:
+            self._on_node_event(evt)
         elif evt.kind in (protocol.EVT_NODE_ADDED, protocol.EVT_NODE_UPDATED):
             self._on_node_added(evt)
         elif evt.kind == protocol.EVT_NODE_REMOVED and evt.node_id is not None:
@@ -420,6 +422,37 @@ class DeviceSync:
             return
         self.create_devices(node)
         self._apply_reachability(node)
+
+    def _on_node_event(self, evt: protocol.MatterEvent) -> None:
+        """A cluster event arrived (button press, lock operation, etc.).
+
+        Routes to the handler's ``on_node_event`` hook using the same device
+        lookup and _active gate semantics as the non-node-scoped attribute path.
+        A malformed frame (missing node_id / endpoint / cluster) is logged and
+        dropped rather than silently ignored, matching the attribute path idiom.
+        """
+        if evt.node_id is None or evt.endpoint is None or evt.cluster is None:
+            self.logger.warning("ignoring malformed node_event frame: %r", evt.raw)
+            return
+        dev_id = self.lookup(evt.node_id, evt.endpoint)
+        if dev_id is None:
+            return
+        if self._active and dev_id not in self._active:
+            return  # gate updates to active devices once any are started
+        handler = self.registry.handler_for_cluster(evt.cluster)
+        if handler is None:
+            return
+        dev = indigo.devices[dev_id]
+        try:
+            states = handler.on_node_event(dev, evt.event_id, evt.event_data)
+        except Exception as exc:  # noqa: BLE001 - one bad event must not silently freeze the device
+            self.logger.warning(
+                "bad node_event for device %s (ep%s cl%s evt%s): %s",
+                dev_id, evt.endpoint, evt.cluster, evt.event_id, exc,
+            )
+            return
+        if states:
+            self.apply_states(dev_id, _kvlist(states))
 
     def _on_attribute(self, evt: protocol.MatterEvent) -> None:
         if evt.node_id is None or evt.endpoint is None or evt.cluster is None:
