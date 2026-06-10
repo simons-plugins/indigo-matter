@@ -25,6 +25,7 @@ from .sensors import (
     OccupancyHandler,
     TemperatureHandler,
 )
+from .smoke_co import SmokeCOAlarmHandler
 from .thermostat import FanControlHandler, ThermostatHandler
 from .power_source import PowerSourceHandler
 from .window_covering import WindowCoveringHandler
@@ -51,6 +52,7 @@ def default_handlers() -> list[ClusterHandler]:
         FanControlHandler(),
         WindowCoveringHandler(),
         DoorLockHandler(),
+        SmokeCOAlarmHandler(),
         ElectricalPowerHandler(),
         ElectricalEnergyHandler(),
         PowerSourceHandler(),
