@@ -34,8 +34,14 @@ from matter_model import (
     node_id_to_str,
     parse_node,
 )
+from matter_handlers.electrical import CLUSTER_ELECTRICAL_ENERGY, CLUSTER_ELECTRICAL_POWER
 from matter_handlers.power_source import CLUSTER_POWER_SOURCE
 from protocol import MatterCommand
+
+# Device type ids for which SupportsPowerMeter/SupportsEnergyMeter are meaningful.
+# This mirrors exactly the handler types that inject these props at creation
+# (on_off → matterRelay, level_control → matterDimmer, color_control → matterColorDimmer).
+_METER_CAPABLE_TYPES = frozenset({"matterRelay", "matterDimmer", "matterColorDimmer"})
 
 
 def _kvlist(states: dict) -> list:
@@ -456,6 +462,94 @@ class DeviceSync:
         if states:
             self.apply_states(dev_id, _kvlist(states))
 
+    # ------------------------------------------------------------------
+    # Capability-prop helpers (issue #45 — self-heal mid-interview creations)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _capability_props(node: NodeInfo, endpoint: Any) -> dict:
+        """Return capability props implied by the node's CURRENT cluster set.
+
+        These props unlock Indigo states that handlers write into:
+        - SupportsPowerMeter   → curEnergyLevel   (cluster 0x0090 on the endpoint)
+        - SupportsEnergyMeter  → accumEnergyTotal  (cluster 0x0091 on the endpoint)
+        - SupportsBatteryLevel → batteryLevel      (cluster 0x002F anywhere on the node)
+
+        The cluster constants are imported from their handler modules — no magic
+        numbers here.  The battery check fans across ALL node endpoints, mirroring
+        the create_devices central setdefault that was the original source of truth.
+        """
+        props: dict = {}
+        if endpoint.has(CLUSTER_ELECTRICAL_POWER):
+            props["SupportsPowerMeter"] = True
+        if endpoint.has(CLUSTER_ELECTRICAL_ENERGY):
+            props["SupportsEnergyMeter"] = True
+        node_has_power_source = any(
+            ep.has(CLUSTER_POWER_SOURCE) for ep in node.endpoints
+        )
+        if node_has_power_source:
+            props["SupportsBatteryLevel"] = True
+        return props
+
+    def _reassert_capability_props(self, node: NodeInfo) -> None:
+        """Re-assert any capability props that are absent/falsy on existing devices.
+
+        Called from _refresh_live_node (reconcile + node_updated) after the node's
+        cluster snapshot is fully populated.  A device created via node_added during
+        commissioning may have been created while the attribute map was incomplete,
+        so some Supports* props were not set — Indigo never created the states, so
+        handler updates are silently dropped forever.
+
+        Strategy:
+        - For each device on each endpoint, compute the capability props the node
+          NOW implies (via _capability_props).
+        - Filter to props that are absent or falsy in the device's current pluginProps.
+        - If any are missing: call replacePluginPropsOnServer — Indigo rebuilds device
+          states from the new props automatically.
+        - Guard per-device so a single failure never sinks the rest of reconcile.
+        - Only ADD props, never remove: a flaky interview must not strip capabilities
+          that were legitimately set in a prior pass.
+        - Meter props (SupportsPowerMeter/SupportsEnergyMeter) only apply to device
+          types in _METER_CAPABLE_TYPES; SupportsBatteryLevel applies to any type
+          (mirrors create_devices' node-level central setdefault behaviour exactly).
+        """
+        for endpoint in node.endpoints:
+            full_cap = self._capability_props(node, endpoint)
+            if not full_cap:
+                continue
+            with self._lock:
+                ep_key = (int(node.node_id), int(endpoint.endpoint_id))
+                type_map = dict(self._index.get(ep_key, {}))
+            for dev_id in type_map.values():
+                try:
+                    dev = indigo.devices[dev_id]
+                    type_id = getattr(dev, "deviceTypeId", "") or ""
+                    current_props = dev.pluginProps
+                    # Build the set of missing props for this specific device type.
+                    # Meter props are only meaningful for relay/dimmer family devices.
+                    missing: dict = {}
+                    for key, value in full_cap.items():
+                        if key in ("SupportsPowerMeter", "SupportsEnergyMeter"):
+                            if type_id not in _METER_CAPABLE_TYPES:
+                                continue
+                        if not current_props.get(key):
+                            missing[key] = value
+                    if not missing:
+                        continue
+                    props = dict(current_props)
+                    props.update(missing)
+                    dev.replacePluginPropsOnServer(props)
+                    self.logger.info(
+                        "re-asserted capability props %s on device %s (%s) for node %s",
+                        list(missing.keys()), dev_id, type_id,
+                        node_id_to_str(node.node_id),
+                    )
+                except Exception as exc:  # noqa: BLE001 - props failure must not sink reconcile
+                    self.logger.warning(
+                        "could not re-assert capability props on device %s: %s",
+                        dev_id, exc,
+                    )
+
     def _unique_name(self, name: str) -> str:
         existing = {dev.name for dev in indigo.devices}
         if name not in existing:
@@ -508,6 +602,9 @@ class DeviceSync:
             self.mark_unreachable(node.node_id)
 
     def _refresh_live_node(self, node: NodeInfo) -> None:
+        # Re-assert any capability props that were missed at creation time (issue #45).
+        # Must run BEFORE _prime_states so the states exist when priming fires.
+        self._reassert_capability_props(node)
         for endpoint in node.endpoints:
             # Snapshot the type-map once; derive both dev_ids, own_type_id, and
             # ep_sibling_types from it so we only acquire the lock once per endpoint.
