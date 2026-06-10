@@ -21,7 +21,13 @@ from typing import Any, Optional
 import indigo
 
 import protocol
-from matter_model import NodeInfo, node_id_to_str, parse_node
+from matter_model import (
+    BBRIDGE_ATTR_REACHABLE,
+    CLUSTER_BRIDGED_BASIC,
+    NodeInfo,
+    node_id_to_str,
+    parse_node,
+)
 from matter_handlers.power_source import CLUSTER_POWER_SOURCE
 from protocol import MatterCommand
 
@@ -146,7 +152,22 @@ class DeviceSync:
             multi = len(plan) > 1
             folder_id = self._resolve_folder_id(suggested_room) if authoritative else 0
             for endpoint, spec in plan:
-                name = f"{spec.name} (endpoint {endpoint.endpoint_id})" if multi else spec.name
+                # Bridged endpoints carry their own identity in cluster 0x0039.
+                # When a bridge label (node_label or product_name) is present:
+                #   - Non-authoritative pass (node_added / reconcile): use the
+                #     bridge label as the device name; skip "(endpoint N)" suffix.
+                #   - Authoritative pass (user-chosen name in suggested_name):
+                #     use spec.name (already encodes suggested_name); still skip
+                #     the suffix — bridged children have unique identities.
+                # For non-bridged endpoints the suffix is applied for multi-endpoint
+                # nodes exactly as before.
+                bridge_label = endpoint.node_label or endpoint.product_name
+                if bridge_label:
+                    name = spec.name if authoritative else bridge_label
+                elif multi:
+                    name = f"{spec.name} (endpoint {endpoint.endpoint_id})"
+                else:
+                    name = spec.name
                 key = (int(node.node_id), int(endpoint.endpoint_id))
                 existing = self._index.get(key)
                 if existing is not None:
@@ -364,6 +385,16 @@ class DeviceSync:
         for dev_id in targets:
             self._safe_unreachable(dev_id)
 
+    def mark_endpoint_unreachable(self, node_id: Any, endpoint_id: Any) -> None:
+        """Mark only the Indigo device for a specific (node, endpoint) unreachable.
+
+        Called on endpoint_removed so that only the removed bridged child is
+        flagged, leaving all other devices on the same node untouched.
+        """
+        dev_id = self.lookup(node_id, endpoint_id)
+        if dev_id is not None:
+            self._safe_unreachable(dev_id)
+
     def mark_all_unreachable(self) -> None:
         """matter-server connection lost (drop / shutdown / sleep) — every Matter
         device is unreachable until we reconnect and reconcile."""
@@ -371,6 +402,18 @@ class DeviceSync:
             targets = list(dict.fromkeys(self._index.values()))
         for dev_id in targets:
             self._safe_unreachable(dev_id)
+
+    def _on_endpoint_removed(self, evt: protocol.MatterEvent) -> None:
+        """A bridged child endpoint was removed from the bridge.
+
+        Marks that endpoint's Indigo device unreachable (never deletes — the user
+        may re-pair the device and the history/name should be preserved).  A
+        malformed frame (missing node_id or endpoint) is logged and dropped.
+        """
+        if evt.node_id is None or evt.endpoint is None:
+            self.logger.warning("ignoring malformed endpoint_removed frame: %r", evt.raw)
+            return
+        self.mark_endpoint_unreachable(evt.node_id, evt.endpoint)
 
     def _safe_unreachable(self, dev_id: int) -> None:
         try:
@@ -398,6 +441,22 @@ class DeviceSync:
             self._on_node_added(evt)
         elif evt.kind == protocol.EVT_NODE_REMOVED and evt.node_id is not None:
             self.mark_unreachable(evt.node_id)
+        elif evt.kind == protocol.EVT_ENDPOINT_ADDED:
+            # matter-server ALWAYS fires node_updated (via structureChanged) after
+            # endpoint_added — verified against PairedNode.ts #triggerNodeStructureChanges
+            # (line 954) in matter.js.  The full node-details object in node_updated
+            # lets _on_node_added run create_devices (idempotent) to pick up the new
+            # endpoint.  Here we just log at debug so the sequence is visible in the
+            # event log, and avoid a redundant create pass with incomplete data.
+            if evt.node_id is not None and evt.endpoint is not None:
+                self.logger.debug(
+                    "endpoint_added: node %s endpoint %s — awaiting node_updated",
+                    evt.node_id, evt.endpoint,
+                )
+            else:
+                self.logger.warning("ignoring malformed endpoint_added frame: %r", evt.raw)
+        elif evt.kind == protocol.EVT_ENDPOINT_REMOVED:
+            self._on_endpoint_removed(evt)
         elif evt.kind == protocol.EVT_SERVER_SHUTDOWN:
             # matter-server announces shutdown just before closing the socket;
             # mark everything unreachable now rather than wait for the drop.
@@ -463,6 +522,18 @@ class DeviceSync:
             # path) — surface it rather than dropping silently; protocol.py is the
             # rename firewall and a wire-shape change should be visible here.
             self.logger.warning("ignoring malformed attribute event: %r", evt.raw)
+            return
+        # BridgedDeviceBasicInformation (0x0039) Reachable (0x0011): per-endpoint
+        # liveness.  Handle BEFORE handler dispatch because device_sync owns
+        # reachability state; handlers return state dicts and must not set error
+        # states directly.  Constants live in matter_model (same home as 0x0028).
+        if evt.cluster == CLUSTER_BRIDGED_BASIC and evt.attribute == BBRIDGE_ATTR_REACHABLE:
+            dev_id = self.lookup(evt.node_id, evt.endpoint)
+            if dev_id is not None:
+                if evt.value:
+                    self._clear_error(dev_id)
+                else:
+                    self._safe_unreachable(dev_id)
             return
         # Handler lookup must precede endpoint lookup: node-scoped handlers (e.g.
         # PowerSource) have no Indigo device at the event's endpoint and require
