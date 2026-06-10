@@ -440,6 +440,148 @@
     </Device>
 
     <!-- ============================================================ -->
+    <!-- Air quality                                                  -->
+    <!-- ============================================================ -->
+
+    <!-- AirQuality enum sensor (cluster 0x005B).
+         sensorValue = raw enum int; airQuality = human-readable string.
+         UiDisplayStateId = airQuality (the string is the useful display). -->
+    <Device id="matterAirQualitySensor" type="sensor">
+        <Name>Matter Air Quality Sensor</Name>
+        <ConfigUI>
+            <Field id="nodeId" type="textfield" readonly="yes">
+                <Label>Matter Node ID:</Label>
+            </Field>
+            <Field id="endpointId" type="textfield" readonly="yes">
+                <Label>Endpoint:</Label>
+            </Field>
+            <Field id="vendorName" type="textfield" readonly="yes">
+                <Label>Vendor:</Label>
+            </Field>
+            <Field id="productName" type="textfield" readonly="yes">
+                <Label>Product:</Label>
+            </Field>
+        </ConfigUI>
+        <States>
+            <State id="sensorValue">
+                <ValueType>Number</ValueType>
+                <TriggerLabel>Air Quality (raw)</TriggerLabel>
+                <ControlPageLabel>Air Quality (raw)</ControlPageLabel>
+            </State>
+            <State id="airQuality">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Air Quality</TriggerLabel>
+                <ControlPageLabel>Air Quality</ControlPageLabel>
+            </State>
+            <State id="batteryLevel">
+                <ValueType>Integer</ValueType>
+                <TriggerLabel>Battery Level</TriggerLabel>
+                <ControlPageLabel>Battery Level</ControlPageLabel>
+            </State>
+        </States>
+        <UiDisplayStateId>airQuality</UiDisplayStateId>
+    </Device>
+
+    <!-- CO2 concentration sensor (cluster 0x040D, ppm). -->
+    <Device id="matterCO2Sensor" type="sensor">
+        <Name>Matter CO&#x2082; Sensor</Name>
+        <ConfigUI>
+            <Field id="nodeId" type="textfield" readonly="yes">
+                <Label>Matter Node ID:</Label>
+            </Field>
+            <Field id="endpointId" type="textfield" readonly="yes">
+                <Label>Endpoint:</Label>
+            </Field>
+            <Field id="vendorName" type="textfield" readonly="yes">
+                <Label>Vendor:</Label>
+            </Field>
+            <Field id="productName" type="textfield" readonly="yes">
+                <Label>Product:</Label>
+            </Field>
+        </ConfigUI>
+        <States>
+            <State id="sensorValue">
+                <ValueType>Number</ValueType>
+                <TriggerLabel>CO&#x2082; (ppm)</TriggerLabel>
+                <TriggerLabelPrefix>CO&#x2082; is</TriggerLabelPrefix>
+                <ControlPageLabel>CO&#x2082; (ppm)</ControlPageLabel>
+            </State>
+            <State id="batteryLevel">
+                <ValueType>Integer</ValueType>
+                <TriggerLabel>Battery Level</TriggerLabel>
+                <ControlPageLabel>Battery Level</ControlPageLabel>
+            </State>
+        </States>
+        <UiDisplayStateId>sensorValue</UiDisplayStateId>
+    </Device>
+
+    <!-- PM2.5 concentration sensor (cluster 0x042A, µg/m³). -->
+    <Device id="matterPM25Sensor" type="sensor">
+        <Name>Matter PM2.5 Sensor</Name>
+        <ConfigUI>
+            <Field id="nodeId" type="textfield" readonly="yes">
+                <Label>Matter Node ID:</Label>
+            </Field>
+            <Field id="endpointId" type="textfield" readonly="yes">
+                <Label>Endpoint:</Label>
+            </Field>
+            <Field id="vendorName" type="textfield" readonly="yes">
+                <Label>Vendor:</Label>
+            </Field>
+            <Field id="productName" type="textfield" readonly="yes">
+                <Label>Product:</Label>
+            </Field>
+        </ConfigUI>
+        <States>
+            <State id="sensorValue">
+                <ValueType>Number</ValueType>
+                <TriggerLabel>PM2.5 (&#xB5;g/m&#xB3;)</TriggerLabel>
+                <TriggerLabelPrefix>PM2.5 is</TriggerLabelPrefix>
+                <ControlPageLabel>PM2.5 (&#xB5;g/m&#xB3;)</ControlPageLabel>
+            </State>
+            <State id="batteryLevel">
+                <ValueType>Integer</ValueType>
+                <TriggerLabel>Battery Level</TriggerLabel>
+                <ControlPageLabel>Battery Level</ControlPageLabel>
+            </State>
+        </States>
+        <UiDisplayStateId>sensorValue</UiDisplayStateId>
+    </Device>
+
+    <!-- TVOC concentration sensor (cluster 0x042E, units device-dependent). -->
+    <Device id="matterTVOCSensor" type="sensor">
+        <Name>Matter TVOC Sensor</Name>
+        <ConfigUI>
+            <Field id="nodeId" type="textfield" readonly="yes">
+                <Label>Matter Node ID:</Label>
+            </Field>
+            <Field id="endpointId" type="textfield" readonly="yes">
+                <Label>Endpoint:</Label>
+            </Field>
+            <Field id="vendorName" type="textfield" readonly="yes">
+                <Label>Vendor:</Label>
+            </Field>
+            <Field id="productName" type="textfield" readonly="yes">
+                <Label>Product:</Label>
+            </Field>
+        </ConfigUI>
+        <States>
+            <State id="sensorValue">
+                <ValueType>Number</ValueType>
+                <TriggerLabel>TVOC</TriggerLabel>
+                <TriggerLabelPrefix>TVOC is</TriggerLabelPrefix>
+                <ControlPageLabel>TVOC</ControlPageLabel>
+            </State>
+            <State id="batteryLevel">
+                <ValueType>Integer</ValueType>
+                <TriggerLabel>Battery Level</TriggerLabel>
+                <ControlPageLabel>Battery Level</ControlPageLabel>
+            </State>
+        </States>
+        <UiDisplayStateId>sensorValue</UiDisplayStateId>
+    </Device>
+
+    <!-- ============================================================ -->
     <!-- Fallback: unknown / unsupported Matter device                -->
     <!-- ============================================================ -->
 
