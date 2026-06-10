@@ -75,6 +75,13 @@ class ServerProcess:
         self.npx_path = npx_path or self._resolve_npx()
         self.port = str(prefs.get("matterServerPort", "5580"))
         self.primary_interface = str(prefs.get("primaryInterface", "en0"))
+        # Address the matter-server WebSocket control API binds to. matter-server
+        # v0.6.2 binds to ALL interfaces when no --listen-address is given, and the
+        # control WS is UNAUTHENTICATED — so the safe default is loopback only. An
+        # empty/whitespace pref must never leak through (that would re-expose all
+        # interfaces), hence the explicit fall back to 127.0.0.1. This is distinct
+        # from matterServerHost ("localhost"), which is the CLIENT connect target.
+        self.listen_address = str(prefs.get("matterServerListenAddress", "127.0.0.1")).strip() or "127.0.0.1"
         self.project_dir = os.path.join(self.home, DEFAULT_PROJECT_DIRNAME)
         default_storage = f"~/Library/Application Support/{LABEL}/matter-server"
         self.storage_path = _expand(str(prefs.get("storagePath", default_storage)), self.home)
@@ -208,6 +215,7 @@ class ServerProcess:
             "--prefix", self.project_dir,
             "matter-server",
             "--port", self.port,
+            "--listen-address", self.listen_address,
             "--storage-path", self.storage_path,
             "--primary-interface", self.primary_interface,
         ]

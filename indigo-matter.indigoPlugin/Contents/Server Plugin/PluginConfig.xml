@@ -33,6 +33,16 @@
         <Description>macOS interface matter-server binds to (e.g. en0). Only used when the
             LaunchAgent is managed automatically.</Description>
     </Field>
+    <Field id="matterServerListenAddress" type="textfield" defaultValue="127.0.0.1">
+        <Label>matter-server listen address (for managed LaunchAgent):</Label>
+        <Description>IP address the managed matter-server binds its WebSocket control API
+            to. Defaults to 127.0.0.1 (loopback) — STRONGLY recommended. The control API is
+            UNAUTHENTICATED, so binding it to 0.0.0.0 or a LAN address exposes full Matter
+            fabric control to anyone on your network; only change this if matter-server runs
+            on a different host and you have a trusted firewall in front of it. (Distinct from
+            "matter-server host" above, which is the client connect target.) Blank falls back
+            to 127.0.0.1. Only used when the LaunchAgent is managed automatically.</Description>
+    </Field>
     <Field id="verboseLogging" type="checkbox" defaultValue="false">
         <Label>Verbose Matter logging:</Label>
     </Field>
