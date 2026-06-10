@@ -1,11 +1,17 @@
 """Reconcile matter-server nodes ↔ Indigo devices, and apply state updates.
 
-The authoritative ``(nodeId, endpointId) → indigoDeviceId`` map is derived from
-each Indigo device's ``pluginProps`` (the single source of truth that survives
-plugin reloads); an in-memory index caches it. The index is read/written from
-both the asyncio loop (reconcile, attribute events) and Indigo threads
-(``deviceStartComm`` → ``note_device``), so every access is guarded by
-``self._lock`` (a re-entrant lock, since the index methods call one another).
+The authoritative ``(nodeId, endpointId) → {device_type_id → indigoDeviceId}``
+map is derived from each Indigo device's ``pluginProps`` (the single source of
+truth that survives plugin reloads); an in-memory index caches it.  The index
+is read/written from both the asyncio loop (reconcile, attribute events) and
+Indigo threads (``deviceStartComm`` → ``note_device``), so every access is
+guarded by ``self._lock`` (a re-entrant lock, since the index methods call one
+another).
+
+The nested-map structure (added in fix/#44) lets multiple additive devices live
+on the same (node, endpoint) — e.g. an Air Quality node exposing AirQuality +
+CO2 + PM2.5 + TVOC on endpoint 1 produces four separate Indigo devices, each
+keyed by its ``deviceTypeId``.
 
 This module is also the asyncio→Indigo write seam: ``apply_states`` is the one
 place ``updateStatesOnServer`` is called *from the loop thread*, so it can be
@@ -40,7 +46,11 @@ class DeviceSync:
     def __init__(self, registry: Any, logger: Any) -> None:
         self.registry = registry
         self.logger = logger
-        self._index: dict[tuple[int, int], int] = {}
+        # Nested index: (node_id, endpoint_id) → {device_type_id: dev_id}
+        # device_type_id="" is the sentinel for handlers that have no deviceTypeId
+        # (e.g. ElectricalPower/Energy) — these are stored under "" and the
+        # fallback in lookup() handles them correctly (single-device endpoint).
+        self._index: dict[tuple[int, int], dict[str, int]] = {}
         self._active: set[int] = set()
         self._lock = threading.RLock()
 
@@ -69,11 +79,59 @@ class DeviceSync:
                 node_id = props.get("nodeId")
                 endpoint_id = props.get("endpointId")
                 if self._prop_present(node_id) and self._prop_present(endpoint_id):
-                    self._index[(int(node_id), int(endpoint_id))] = dev.id
+                    key = (int(node_id), int(endpoint_id))
+                    type_id = getattr(dev, "deviceTypeId", "") or ""
+                    self._index.setdefault(key, {})[type_id] = dev.id
 
-    def lookup(self, node_id: Any, endpoint_id: Any) -> Optional[int]:
+    def lookup(self, node_id: Any, endpoint_id: Any,
+               device_type_id: Optional[str] = None) -> Optional[int]:
+        """Look up an Indigo device id for a (node, endpoint[, type]) triple.
+
+        - With ``device_type_id``: returns the device of exactly that type on
+          the endpoint, or None if it hasn't been created yet.
+        - Without ``device_type_id``: if the endpoint has exactly one device,
+          returns it; if several, returns the first inserted (deterministic) —
+          preserves pre-#44 semantics for callers that mean "the endpoint's
+          device" (e.g. Reachable handler, reachability marking, reconcile
+          refresh, node_event dispatch for handlers without a device_type_id).
+        """
         with self._lock:
-            return self._index.get((int(node_id), int(endpoint_id)))
+            type_map = self._index.get((int(node_id), int(endpoint_id)))
+            if type_map is None:
+                return None
+            if device_type_id is not None:
+                return type_map.get(device_type_id)
+            # no type requested — return the sole device or the first inserted
+            values = list(type_map.values())
+            return values[0] if values else None
+
+    def _all_dev_ids_for_endpoint(self, node_id: Any, endpoint_id: Any) -> list[int]:
+        """Return all dev_ids registered under (node, endpoint), preserving insertion order."""
+        with self._lock:
+            type_map = self._index.get((int(node_id), int(endpoint_id)))
+            if type_map is None:
+                return []
+            return list(type_map.values())
+
+    def _lookup_for_cluster(self, node_id: Any, endpoint_id: Any, cluster: int) -> Optional[int]:
+        """Resolve the correct Indigo device for a non-node-scoped cluster update.
+
+        1. Resolve the handler's ``device_type_id`` (if any).
+        2. If that type is present in the endpoint's type-map → return it.
+        3. Else fall back to ``lookup(node, ep)`` (single/first device) —
+           covers merge-into cases: FanControl→thermostat, Electrical→relay.
+        """
+        handler = self.registry.handler_for_cluster(cluster)
+        if handler is None:
+            return None
+        type_id = getattr(handler, "device_type_id", "") or ""
+        if type_id:
+            with self._lock:
+                type_map = self._index.get((int(node_id), int(endpoint_id)))
+                if type_map and type_id in type_map:
+                    return type_map[type_id]
+        # Fallback: use the single/first device on the endpoint
+        return self.lookup(node_id, endpoint_id)
 
     def note_device(self, dev: Any) -> None:
         """Index a single device from its pluginProps (deviceStartComm)."""
@@ -81,8 +139,10 @@ class DeviceSync:
         node_id = props.get("nodeId")
         endpoint_id = props.get("endpointId")
         if self._prop_present(node_id) and self._prop_present(endpoint_id):
+            key = (int(node_id), int(endpoint_id))
+            type_id = getattr(dev, "deviceTypeId", "") or ""
             with self._lock:
-                self._index[(int(node_id), int(endpoint_id))] = dev.id
+                self._index.setdefault(key, {})[type_id] = dev.id
 
     def delete_node(self, node_id: Any) -> list:
         """Delete all Indigo devices for a node; return the ids actually deleted.
@@ -93,7 +153,11 @@ class DeviceSync:
         """
         target = int(node_id)
         with self._lock:
-            candidates = [dev_id for (nid, _eid), dev_id in self._index.items() if nid == target]
+            # Collect all dev_ids across all endpoints for this node
+            candidates: list[int] = []
+            for (nid, _eid), type_map in self._index.items():
+                if nid == target:
+                    candidates.extend(type_map.values())
             deleted = []
             for dev_id in candidates:
                 try:
@@ -101,11 +165,17 @@ class DeviceSync:
                     deleted.append(dev_id)
                 except Exception as exc:  # noqa: BLE001
                     self.logger.warning("could not delete Indigo device %s: %s", dev_id, exc)
-            # only drop successfully-deleted devices from the index
-            self._index = {
-                key: val for key, val in self._index.items()
-                if not (key[0] == target and val in deleted)
-            }
+            deleted_set = set(deleted)
+            # Drop successfully-deleted devices from the nested index
+            new_index: dict[tuple[int, int], dict[str, int]] = {}
+            for key, type_map in self._index.items():
+                if key[0] == target:
+                    remaining = {tid: did for tid, did in type_map.items() if did not in deleted_set}
+                    if remaining:
+                        new_index[key] = remaining
+                else:
+                    new_index[key] = type_map
+            self._index = new_index
             return deleted
 
     def node_count(self) -> int:
@@ -173,8 +243,12 @@ class DeviceSync:
                     name = f"{spec.name} (endpoint {endpoint.endpoint_id})"
                 else:
                     name = spec.name
-                key = (int(node.node_id), int(endpoint.endpoint_id))
-                existing = self._index.get(key)
+                ep_key = (int(node.node_id), int(endpoint.endpoint_id))
+                type_id = spec.device_type_id
+                # Existing-device check is now per (node, ep, device_type_id)
+                # so additive specs on the same endpoint each get their own device.
+                existing_type_map = self._index.get(ep_key, {})
+                existing = existing_type_map.get(type_id)
                 if existing is not None:
                     # Already created (e.g. node_added won the race). On the
                     # authoritative commission pass, stamp the chosen name/room.
@@ -191,11 +265,11 @@ class DeviceSync:
                 if dev_id is None:
                     failed += 1
                     continue
-                self._index[key] = dev_id
+                self._index.setdefault(ep_key, {})[type_id] = dev_id
                 created.append(dev_id)
                 new_ids.append(dev_id)
                 primary = primary if primary is not None else dev_id
-                self._prime_states(node, dev_id, endpoint.endpoint_id)
+                self._prime_states(node, dev_id, endpoint.endpoint_id, type_id)
         if new_ids:
             # The only event-log evidence of an out-of-band join (node_added)
             # is this line — keep it INFO, not debug (issue #19). Idempotent
@@ -300,7 +374,8 @@ class DeviceSync:
         if folder_id and getattr(dev, "folderId", 0) != folder_id:
             self._move_to_folder(dev_id, folder_id)
 
-    def _prime_states(self, node: NodeInfo, dev_id: int, endpoint_id: int) -> None:
+    def _prime_states(self, node: NodeInfo, dev_id: int, endpoint_id: int,
+                      own_type_id: str) -> None:
         """Apply the node's current attribute values to a freshly-created device.
 
         get_node carries a snapshot of every attribute; matter-server only emits
@@ -310,6 +385,11 @@ class DeviceSync:
         Two passes: first the device's own endpoint (standard clusters); then any
         OTHER endpoints whose cluster handler is node-scoped (e.g. PowerSource on
         endpoint 0 primes battery level into a sensor on endpoint 1).
+
+        Within the own endpoint, skip attributes whose cluster's handler targets
+        a *different* existing device on the same endpoint (fix/#44: prevents the
+        Pressure device being primed with Flow values or an AQ device being primed
+        with CO2 values it doesn't own).
         """
         dev = indigo.devices[dev_id]
         states: dict = {}
@@ -321,6 +401,16 @@ class DeviceSync:
             # node-scoped cluster living on a different endpoint.
             if ep != endpoint_id and not handler.node_scoped:
                 continue
+            # For this device's own endpoint, skip attributes that belong to a
+            # sibling device (handler has a non-empty device_type_id that differs
+            # from this device's type).  This prevents e.g. the Pressure device
+            # being primed with Flow values, or an AQ device receiving CO2 values.
+            # We skip unconditionally — whether or not the sibling has been created
+            # yet — so creation order does not affect priming correctness.
+            if ep == endpoint_id and not handler.node_scoped:
+                handler_type_id = getattr(handler, "device_type_id", "") or ""
+                if handler_type_id and handler_type_id != own_type_id:
+                    continue
             try:
                 states.update(handler.on_attribute_update(dev, attribute, value))
             except Exception as exc:  # noqa: BLE001 - one bad attr must not abort priming
@@ -363,8 +453,12 @@ class DeviceSync:
             except Exception as exc:  # noqa: BLE001
                 self.logger.warning("reconcile of node %s failed: %s", node.node_id, exc)
         with self._lock:
-            orphans = [dev_id for (node_id, _ep), dev_id in self._index.items()
-                       if (node_id, _ep) not in live]
+            orphans = [
+                dev_id
+                for (node_id, _ep), type_map in self._index.items()
+                if (node_id, _ep) not in live
+                for dev_id in type_map.values()
+            ]
         for dev_id in orphans:
             self._safe_unreachable(dev_id)
 
@@ -377,43 +471,61 @@ class DeviceSync:
 
     def _refresh_live_node(self, node: NodeInfo) -> None:
         for endpoint in node.endpoints:
-            dev_id = self.lookup(node.node_id, endpoint.endpoint_id)
-            if dev_id is None:
-                continue
-            self._prime_states(node, dev_id, endpoint.endpoint_id)
-            self._clear_error(dev_id)
+            # Refresh ALL devices on this endpoint (handles additive multi-device eps)
+            for dev_id in self._all_dev_ids_for_endpoint(node.node_id, endpoint.endpoint_id):
+                type_map = {}
+                with self._lock:
+                    ep_key = (int(node.node_id), int(endpoint.endpoint_id))
+                    type_map = dict(self._index.get(ep_key, {}))
+                own_type_id = next(
+                    (tid for tid, did in type_map.items() if did == dev_id), ""
+                )
+                self._prime_states(node, dev_id, endpoint.endpoint_id, own_type_id)
+                self._clear_error(dev_id)
 
     def mark_unreachable(self, node_id: Any) -> None:
         with self._lock:
-            targets = [dev_id for (nid, _eid), dev_id in self._index.items()
-                       if nid == int(node_id)]
+            targets = [
+                dev_id
+                for (nid, _eid), type_map in self._index.items()
+                if nid == int(node_id)
+                for dev_id in type_map.values()
+            ]
         for dev_id in targets:
             self._safe_unreachable(dev_id)
 
     def mark_endpoint_unreachable(self, node_id: Any, endpoint_id: Any) -> None:
-        """Mark only the Indigo device for a specific (node, endpoint) unreachable.
+        """Mark ALL Indigo devices for a specific (node, endpoint) unreachable.
 
-        Called on endpoint_removed so that only the removed bridged child is
-        flagged, leaving all other devices on the same node untouched.
+        Called on endpoint_removed so that every device on the removed bridged
+        child (all additive types) is flagged, leaving devices on other endpoints
+        untouched.
         """
-        dev_id = self.lookup(node_id, endpoint_id)
-        if dev_id is not None:
+        for dev_id in self._all_dev_ids_for_endpoint(node_id, endpoint_id):
             self._safe_unreachable(dev_id)
 
     def mark_all_unreachable(self) -> None:
         """matter-server connection lost (drop / shutdown / sleep) — every Matter
         device is unreachable until we reconnect and reconcile."""
         with self._lock:
-            targets = list(dict.fromkeys(self._index.values()))
+            # Deduplicate dev_ids (same dev can't appear twice in the nested map,
+            # but be defensive)
+            seen: set[int] = set()
+            targets: list[int] = []
+            for type_map in self._index.values():
+                for dev_id in type_map.values():
+                    if dev_id not in seen:
+                        seen.add(dev_id)
+                        targets.append(dev_id)
         for dev_id in targets:
             self._safe_unreachable(dev_id)
 
     def _on_endpoint_removed(self, evt: protocol.MatterEvent) -> None:
         """A bridged child endpoint was removed from the bridge.
 
-        Marks that endpoint's Indigo device unreachable (never deletes — the user
-        may re-pair the device and the history/name should be preserved).  A
-        malformed frame (missing node_id or endpoint) is logged and dropped.
+        Marks ALL of that endpoint's Indigo devices unreachable (never deletes —
+        the user may re-pair the device and the history/name should be preserved).
+        A malformed frame (missing node_id or endpoint) is logged and dropped.
         """
         if evt.node_id is None or evt.endpoint is None:
             self.logger.warning("ignoring malformed endpoint_removed frame: %r", evt.raw)
@@ -504,7 +616,10 @@ class DeviceSync:
         handler = self.registry.handler_for_cluster(evt.cluster)
         if handler is None:
             return
-        dev_id = self.lookup(evt.node_id, evt.endpoint)
+        # Use _lookup_for_cluster so events on a multi-device endpoint reach
+        # the correct device (e.g. a cluster event on the AQ cluster goes to
+        # the AirQuality device, not the CO2 device).
+        dev_id = self._lookup_for_cluster(evt.node_id, evt.endpoint, evt.cluster)
         if dev_id is None:
             return
         if self._active and dev_id not in self._active:
@@ -533,13 +648,17 @@ class DeviceSync:
         # reachability state; handlers return state dicts and must not set error
         # states directly.  Constants live in matter_model (same home as 0x0028).
         if evt.cluster == CLUSTER_BRIDGED_BASIC and evt.attribute == BBRIDGE_ATTR_REACHABLE:
-            dev_id = self.lookup(evt.node_id, evt.endpoint)
-            if dev_id is not None:
-                if evt.value is None:
-                    pass  # unknown is not offline — do nothing
-                elif evt.value:
+            # Mark/clear ALL devices on this endpoint (handles additive endpoints)
+            dev_ids = self._all_dev_ids_for_endpoint(evt.node_id, evt.endpoint)
+            if not dev_ids:
+                return
+            if evt.value is None:
+                pass  # unknown is not offline — do nothing
+            elif evt.value:
+                for dev_id in dev_ids:
                     self._clear_error(dev_id)
-                else:
+            else:
+                for dev_id in dev_ids:
                     self._safe_unreachable(dev_id)
             return
         # Handler lookup must precede endpoint lookup: node-scoped handlers (e.g.
@@ -553,8 +672,12 @@ class DeviceSync:
             # than the devices they augment. Fan the update out to ALL Indigo devices
             # for this node so every sensor on the node receives the battery update.
             with self._lock:
-                dev_ids = [dev_id for (nid, _eid), dev_id in self._index.items()
-                           if nid == int(evt.node_id)]
+                dev_ids = [
+                    dev_id
+                    for (nid, _eid), type_map in self._index.items()
+                    if nid == int(evt.node_id)
+                    for dev_id in type_map.values()
+                ]
             for dev_id in dev_ids:
                 if self._active and dev_id not in self._active:
                     continue  # gate updates to active devices once any are started
@@ -570,8 +693,9 @@ class DeviceSync:
                     )
                     continue
             return
-        # Non-node-scoped path: look up the single device at (node, endpoint).
-        dev_id = self.lookup(evt.node_id, evt.endpoint)
+        # Non-node-scoped path: use _lookup_for_cluster to route to the correct
+        # device when multiple additive devices share an endpoint.
+        dev_id = self._lookup_for_cluster(evt.node_id, evt.endpoint, evt.cluster)
         if dev_id is None:
             return
         if self._active and dev_id not in self._active:

@@ -284,7 +284,7 @@ def test_node_event_routes_to_handler(ds, indigo_env, mock_logger):
     """A well-formed node_event for a known device updates Indigo states."""
     _indigo, devices = indigo_env
     dev = _make_button_dev(devices)
-    ds._index[(10, 1)] = dev.id
+    ds._index[(10, 1)] = {"matterButton": dev.id}
 
     ds.handle_event(MatterEvent(
         kind=protocol.EVT_NODE_EVENT,
@@ -300,7 +300,7 @@ def test_node_event_active_gate_blocks_inactive_device(ds, indigo_env):
     """node_event respects the _active gate: inactive device is skipped."""
     _indigo, devices = indigo_env
     dev = _make_button_dev(devices)
-    ds._index[(10, 1)] = dev.id
+    ds._index[(10, 1)] = {"matterButton": dev.id}
     # mark a DIFFERENT device active → ours is gated out
     ds.set_active(99999, True)
 
@@ -317,7 +317,7 @@ def test_node_event_unknown_cluster_ignored(ds, indigo_env):
     """node_event for a cluster with no registered handler is silently dropped."""
     _indigo, devices = indigo_env
     dev = _make_button_dev(devices)
-    ds._index[(10, 1)] = dev.id
+    ds._index[(10, 1)] = {"matterButton": dev.id}
 
     # cluster 0xFFFF has no handler
     ds.handle_event(MatterEvent(
@@ -355,7 +355,7 @@ def test_node_event_handler_exception_is_isolated(ds, indigo_env, mock_logger):
     """A handler that raises must not propagate; warning is logged."""
     _indigo, devices = indigo_env
     dev = _make_button_dev(devices)
-    ds._index[(10, 1)] = dev.id
+    ds._index[(10, 1)] = {"matterButton": dev.id}
 
     # Patch the handler to raise
     handler = ds.registry.handler_for_cluster(CLUSTER_SWITCH)
