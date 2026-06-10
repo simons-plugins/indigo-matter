@@ -67,6 +67,27 @@ class ClusterHandler(ABC):
     def on_attribute_update(self, indigo_dev: Any, attribute_id: int, value: Any) -> dict:
         """Translate a Matter attribute change to Indigo state updates."""
 
+    def on_node_event(self, indigo_dev: Any, event_id: int, data: Any) -> dict:
+        """Translate a Matter cluster event to Indigo state updates.
+
+        Called when the server sends a ``node_event`` frame for a cluster this
+        handler owns.  The difference from :meth:`on_attribute_update`:
+
+        - ``on_attribute_update`` fires on *attribute* changes — persistent,
+          readable state (OnOff, CurrentLevel, Temperature…).
+        - ``on_node_event`` fires on *cluster events* — transient, edge-triggered
+          signals such as button presses (GenericSwitch), lock operations
+          (DoorLock AccessControlEntryChanged), or occupancy-zone crossings.
+          These are not stored in the device's attribute table; they arrive as
+          momentary events and must be mapped to Indigo state updates if the
+          handler wants them visible to Indigo triggers.
+
+        Default: returns ``{}`` (no-op) so existing handlers need no changes.
+        Override in handlers that subscribe to cluster events (e.g.
+        :class:`~matter_handlers.generic_switch.GenericSwitchHandler`).
+        """
+        return {}  # noqa: D401
+
     @abstractmethod
     def handle_indigo_action(self, indigo_dev: Any, action: Any) -> Optional[MatterAction]:
         """Translate an Indigo device action to a Matter command or attribute
