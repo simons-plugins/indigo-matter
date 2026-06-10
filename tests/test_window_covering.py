@@ -76,6 +76,24 @@ def test_brightness_0_to_lift_10000():
     assert brightness_to_lift_pct100ths(0) == 10000
 
 
+def test_lift_pct100ths_to_brightness_non_boundary():
+    """Non-boundary case: 2500 percent100ths (25% closed) → brightness 75."""
+    assert lift_pct100ths_to_brightness(2500) == 75
+
+
+def test_lift_pct100ths_to_brightness_banker_rounding_at_9950():
+    """9950 percent100ths = 99.5% closed.
+    Python's round() uses banker's rounding: round(99.5) = 100 (rounds to even),
+    so 100 - 100 = 0 before clamping.  Clamping keeps it at 0.
+    """
+    assert lift_pct100ths_to_brightness(9950) == 0
+
+
+def test_lift_pct100ths_to_brightness_out_of_spec_clamped():
+    """Out-of-spec firmware value 10100 must be clamped to 0, not yield -1."""
+    assert lift_pct100ths_to_brightness(10100) == 0
+
+
 # ---------------------------------------------------------------------------
 # Attribute update
 # ---------------------------------------------------------------------------
@@ -181,7 +199,8 @@ def test_brighten_by_relative(mock_indigo_base):
         SimpleNamespace(deviceAction=indigo.kDeviceAction.BrightenBy, actionValue=20),
     )
     assert cmd.command == "GoToLiftPercentage"
-    assert cmd.args == {"liftPercent100thsValue": brightness_to_lift_pct100ths(80)}
+    # 60 + 20 = 80 open → (100 - 80) * 100 = 2000 percent100ths
+    assert cmd.args == {"liftPercent100thsValue": 2000}
 
 
 def test_brighten_by_clamps_at_100(mock_indigo_base):
@@ -206,7 +225,8 @@ def test_dim_by_relative(mock_indigo_base):
         SimpleNamespace(deviceAction=indigo.kDeviceAction.DimBy, actionValue=20),
     )
     assert cmd.command == "GoToLiftPercentage"
-    assert cmd.args == {"liftPercent100thsValue": brightness_to_lift_pct100ths(40)}
+    # 60 - 20 = 40 open → (100 - 40) * 100 = 6000 percent100ths
+    assert cmd.args == {"liftPercent100thsValue": 6000}
 
 
 def test_dim_by_clamps_at_0(mock_indigo_base):

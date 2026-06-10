@@ -28,8 +28,12 @@ ATTR_CURRENT_LIFT_PERCENT100THS = 0x000E
 
 
 def lift_pct100ths_to_brightness(value: int) -> int:
-    """Convert Matter lift percent100ths (0=open, 10000=closed) to Indigo brightness (0–100, 100=open)."""
-    return 100 - round(int(value) / 100)
+    """Convert Matter lift percent100ths (0=open, 10000=closed) to Indigo brightness (0–100, 100=open).
+
+    Clamped to [0, 100] so that out-of-spec firmware values (e.g. 10100) do not
+    produce negative or >100 brightness levels.
+    """
+    return max(0, min(100, 100 - round(int(value) / 100)))
 
 
 def brightness_to_lift_pct100ths(brightness: float) -> int:
