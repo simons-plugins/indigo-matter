@@ -25,13 +25,16 @@ from .sensors import (
 )
 from .thermostat import FanControlHandler, ThermostatHandler
 from .power_source import PowerSourceHandler
+from .window_covering import WindowCoveringHandler
 
 
 def default_handlers() -> list[ClusterHandler]:
     """Handlers in priority order. Lighting handlers (Color > Dimmer > Relay)
     are mutually exclusive via ``is_primary_for``; sensors are additive;
-    Thermostat owns its endpoint and FanControl merges into it. PowerSource is
-    non-primary and node-scoped (order-independent; placed last)."""
+    Thermostat owns its endpoint and FanControl merges into it.
+    WindowCovering does not overlap any lighting cluster so its order relative
+    to them is independent. PowerSource is non-primary and node-scoped
+    (order-independent; placed last)."""
     return [
         ColorControlHandler(),
         LevelControlHandler(),
@@ -43,6 +46,7 @@ def default_handlers() -> list[ClusterHandler]:
         IlluminanceHandler(),
         ThermostatHandler(),
         FanControlHandler(),
+        WindowCoveringHandler(),
         PowerSourceHandler(),
     ]
 

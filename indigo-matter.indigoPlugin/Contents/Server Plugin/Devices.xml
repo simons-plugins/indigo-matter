@@ -279,6 +279,31 @@
     </Device>
 
     <!-- ============================================================ -->
+    <!-- Window Covering                                              -->
+    <!-- ============================================================ -->
+
+    <!-- Window covering: blinds / shades / curtains (WindowCovering cluster 0x0102).
+         Mapped as a dimmer: brightness 100 = fully open, 0 = fully closed. -->
+    <Device id="matterWindowCovering" type="dimmer">
+        <Name>Matter Window Covering</Name>
+        <ConfigUI>
+            <Field id="nodeId" type="textfield" readonly="yes">
+                <Label>Matter Node ID:</Label>
+            </Field>
+            <Field id="endpointId" type="textfield" readonly="yes">
+                <Label>Endpoint:</Label>
+            </Field>
+            <Field id="vendorName" type="textfield" readonly="yes">
+                <Label>Vendor:</Label>
+            </Field>
+            <Field id="productName" type="textfield" readonly="yes">
+                <Label>Product:</Label>
+            </Field>
+        </ConfigUI>
+        <!-- States inherited from dimmer base type: onOffState, brightnessLevel -->
+    </Device>
+
+    <!-- ============================================================ -->
     <!-- Fallback: unknown / unsupported Matter device                -->
     <!-- ============================================================ -->
 
