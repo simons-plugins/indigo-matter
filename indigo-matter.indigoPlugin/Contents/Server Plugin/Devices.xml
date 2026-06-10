@@ -582,6 +582,45 @@
     </Device>
 
     <!-- ============================================================ -->
+    <!-- Valve (ValveConfigurationAndControl 0x0081)                 -->
+    <!-- ============================================================ -->
+
+    <!-- Valve: open/closed relay with a valveState custom state.
+         onOffState = True → open, False → closed.
+         valveState carries the full CurrentState enum: open/closed/transitioning.
+         "Open for duration" (irrigation) and variable-flow (level) are deferred. -->
+    <Device id="matterValve" type="relay">
+        <Name>Matter Valve</Name>
+        <ConfigUI>
+            <Field id="nodeId" type="textfield" readonly="yes">
+                <Label>Matter Node ID:</Label>
+            </Field>
+            <Field id="endpointId" type="textfield" readonly="yes">
+                <Label>Endpoint:</Label>
+            </Field>
+            <Field id="vendorName" type="textfield" readonly="yes">
+                <Label>Vendor:</Label>
+            </Field>
+            <Field id="productName" type="textfield" readonly="yes">
+                <Label>Product:</Label>
+            </Field>
+        </ConfigUI>
+        <States>
+            <State id="onOffState">
+                <ValueType boolType="OnOff">Boolean</ValueType>
+                <TriggerLabel>On/Off State</TriggerLabel>
+                <ControlPageLabel>On/Off State</ControlPageLabel>
+            </State>
+            <State id="valveState">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Valve State</TriggerLabel>
+                <ControlPageLabel>Valve State</ControlPageLabel>
+            </State>
+        </States>
+        <UiDisplayStateId>onOffState</UiDisplayStateId>
+    </Device>
+
+    <!-- ============================================================ -->
     <!-- Fallback: unknown / unsupported Matter device                -->
     <!-- ============================================================ -->
 
