@@ -24,7 +24,7 @@ from typing import Any, Optional
 
 # --------------------------------------------------------------------------
 # Wire field names. VERIFIED against the matter-server v0.6.2 source on jarvis
-# (@matter-server/ws-controller/dist/esm/server/WebSocketControllerHandler.js):
+# (@matter-server/ws-controller/src/server/WebSocketControllerHandler.ts):
 #   - device_command args: node_id / endpoint_id / cluster_id / command_name /
 #     payload  (server camelizes command_name, so "On"/"Off"/"Toggle" work).
 #   - success response: {message_id, result}; error: {message_id, error_code,
@@ -34,6 +34,17 @@ from typing import Any, Optional
 #   - server_info is pushed as a BARE object on connect (no event/message_id).
 #   - attribute_updated data is [node_id, "ep/cl/at", value]; node_removed data
 #     is a bare node_id; node_added/updated data is the node-details object.
+#   - node_event data is a MatterNodeEvent object (verified from
+#     @matter-server/ws-client/dist/esm/models/model.d.ts):
+#       {node_id, endpoint_id, cluster_id, event_id, event_number,
+#        priority, timestamp, timestamp_type, data}
+#     The inner `data` payload is converted via convertMatterToWebSocketNameBased
+#     (camelCase field names). For GenericSwitch cluster (0x003B):
+#       InitialPress (0x01): data = {newPosition: int}
+#       LongPress    (0x02): data = {newPosition: int}
+#       ShortRelease (0x03): data = {previousPosition: int}
+#       MultiPressComplete (0x06): data = {previousPosition: int,
+#                                          totalNumberOfPressesCounted: int}
 # If a future release changes these, this module is still the only place to edit.
 # --------------------------------------------------------------------------
 
@@ -73,6 +84,7 @@ EVT_NODE_UPDATED = "node_updated"
 EVT_NODE_REMOVED = "node_removed"
 EVT_ATTRIBUTE_UPDATED = "attribute_updated"
 EVT_SERVER_SHUTDOWN = "server_shutdown"
+EVT_NODE_EVENT = "node_event"
 
 
 @dataclass
@@ -105,6 +117,14 @@ class MatterWrite:
     value: Any
 
 
+# node_event MatterNodeEvent object field names (wire-level; rename-firewall)
+EVT_NODE_EVENT_NODE_ID     = "node_id"
+EVT_NODE_EVENT_ENDPOINT_ID = "endpoint_id"
+EVT_NODE_EVENT_CLUSTER_ID  = "cluster_id"
+EVT_NODE_EVENT_EVENT_ID    = "event_id"
+EVT_NODE_EVENT_DATA        = "data"
+
+
 @dataclass
 class MatterEvent:
     """A normalised inbound event from matter-server."""
@@ -114,6 +134,10 @@ class MatterEvent:
     cluster: Optional[int] = None
     attribute: Optional[int] = None
     value: Any = None
+    # Populated for EVT_NODE_EVENT frames (cluster events — button presses,
+    # lock operations, etc.) — None for all other event kinds.
+    event_id: Optional[int] = None
+    event_data: Any = None
     raw: dict = field(default_factory=dict)
 
 
@@ -219,11 +243,14 @@ class Protocol:
           - attribute_updated: ``[node_id, "endpoint/cluster/attribute", value]``
           - node_removed:      bare ``node_id``
           - node_added / node_updated: the node-details object (has ``node_id``)
-          - others (node_event, endpoint_*): a dict with ``node_id``
+          - node_event:        MatterNodeEvent dict — see wire-shape comment block
+                               at the top of this module for the verified shape.
+          - others (endpoint_*): a dict with ``node_id``
         """
         name = frame.get(KEY_EVENT, "")
         data = frame.get(KEY_DATA)
         node_id = endpoint = cluster = attribute = value = None
+        event_id = event_data = None
 
         if name == EVT_ATTRIBUTE_UPDATED and isinstance(data, (list, tuple)) and len(data) >= 3:
             node_id = data[0]
@@ -231,6 +258,14 @@ class Protocol:
             value = data[2]
         elif name == EVT_NODE_REMOVED:
             node_id = data if not isinstance(data, dict) else data.get("node_id")
+        elif name == EVT_NODE_EVENT and isinstance(data, dict):
+            # MatterNodeEvent: {node_id, endpoint_id, cluster_id, event_id, data, ...}
+            # Wire field names are isolated to the EVT_NODE_EVENT_* constants above.
+            node_id  = data.get(EVT_NODE_EVENT_NODE_ID)
+            endpoint = data.get(EVT_NODE_EVENT_ENDPOINT_ID)
+            cluster  = data.get(EVT_NODE_EVENT_CLUSTER_ID)
+            event_id = data.get(EVT_NODE_EVENT_EVENT_ID)
+            event_data = data.get(EVT_NODE_EVENT_DATA)
         elif isinstance(data, dict):
             node_id = data.get("node_id")
 
@@ -241,5 +276,7 @@ class Protocol:
             cluster=cluster,
             attribute=attribute,
             value=value,
+            event_id=event_id,
+            event_data=event_data,
             raw=frame,
         )
