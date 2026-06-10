@@ -14,6 +14,7 @@ the device-sync / cluster-handler layers (M4).
 """
 from __future__ import annotations
 
+import asyncio
 import inspect
 import threading
 import uuid
@@ -154,6 +155,14 @@ class CommissionJobs:
         if not name:
             return 400, {"error": "invalid_request", "message": "suggestedName is required"}
 
+        if not getattr(self.matter, "connected", False):
+            # Fail fast per API.md: accepting the job now (202) would only have the
+            # worker fail with a generic internal_error at its first WebSocket call.
+            return 503, {
+                "error": "matter_server_unreachable",
+                "message": "Not connected to matter-server; check it is running and reachable, then retry",
+            }
+
         with self._lock:
             self._reap_locked()
             existing_id = self._by_code.get(setup_code)
@@ -222,6 +231,16 @@ class CommissionJobs:
 
             job.result = {"nodeId": node_id_to_str(node_id), **created}
             self._advance(job, SUCCESS, 1.0, "Done")
+        except asyncio.CancelledError:
+            # Plugin shutdown cancelled the worker task. Land the terminal state
+            # synchronously — _fail awaits remove_node, and any await inside a
+            # cancelled task can re-raise CancelledError before the state is set —
+            # then re-raise so the task actually cancels. Without this the job
+            # strands in COMMISSIONING forever (never reaped) and its setup code
+            # 409s every retry for the life of the process.
+            job.error = {"code": "internal_error", "message": "commissioning cancelled by plugin shutdown"}
+            self._advance(job, FAILED, job.progress, "")
+            raise
         except CommissionError as exc:
             await self._fail(job, exc.code, exc.message, node_id, exc.matter_error_code)
         except ProtocolError as exc:

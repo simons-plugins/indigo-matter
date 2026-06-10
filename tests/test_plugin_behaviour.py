@@ -110,14 +110,19 @@ def test_status_body_ready(plug):
     assert body["fabricId"] == "0xAB"
     assert body["nodeCount"] == 3
     assert body["controllerVersion"] == "2026.0.1"
+    assert "error" not in body and "message" not in body
 
 
 def test_status_body_not_ready_when_disconnected(plug):
-    plug.matter = SimpleNamespace(connected=False, server_info=None)
+    plug.matter = SimpleNamespace(connected=False, server_info=None,
+                                  uri="ws://localhost:5580/ws")
     plug.device_sync.node_count = lambda: 0
     body = plug._status_body()
     assert body["ready"] is False
     assert body["matterServerVersion"] == "unknown"
+    # API.md §3.1: the 503 body carries the error envelope Domio reads
+    assert body["error"] == "matter_server_unreachable"
+    assert body["message"] == "Cannot reach matter-server at ws://localhost:5580/ws"
 
 
 # ---------------------------------------------------------------------------
