@@ -691,6 +691,51 @@
     </Device>
 
     <!-- ============================================================ -->
+    <!-- Generic Switch (buttons / scene controllers, 0x003B)        -->
+    <!-- GenericSwitchHandler (matter_handlers/generic_switch.py)    -->
+    <!-- Button presses arrive as cluster events, not attributes.    -->
+    <!-- lastButtonEvent + pressCount replace onOffState so every    -->
+    <!-- press fires an Indigo trigger even when the label repeats.  -->
+    <!-- ============================================================ -->
+
+    <!-- GenericSwitch cluster (0x003B).
+         lastButtonEvent carries the press label: "shortPress" / "longPress" /
+         "doublePress" / "triplePress" / "multiPressN".
+         pressCount is an ever-incrementing integer so Indigo triggers fire on
+         every button press even when the same label repeats consecutively.
+         No onOffState — buttons have no stable on/off concept. -->
+    <Device id="matterButton" type="sensor">
+        <Name>Matter Button</Name>
+        <ConfigUI>
+            <Field id="nodeId" type="textfield" readonly="yes">
+                <Label>Matter Node ID:</Label>
+            </Field>
+            <Field id="endpointId" type="textfield" readonly="yes">
+                <Label>Endpoint:</Label>
+            </Field>
+            <Field id="vendorName" type="textfield" readonly="yes">
+                <Label>Vendor:</Label>
+            </Field>
+            <Field id="productName" type="textfield" readonly="yes">
+                <Label>Product:</Label>
+            </Field>
+        </ConfigUI>
+        <States>
+            <State id="lastButtonEvent">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Button Event</TriggerLabel>
+                <ControlPageLabel>Button Event</ControlPageLabel>
+            </State>
+            <State id="pressCount">
+                <ValueType>Integer</ValueType>
+                <TriggerLabel>Press Count</TriggerLabel>
+                <ControlPageLabel>Press Count</ControlPageLabel>
+            </State>
+        </States>
+        <UiDisplayStateId>lastButtonEvent</UiDisplayStateId>
+    </Device>
+
+    <!-- ============================================================ -->
     <!-- Fallback: unknown / unsupported Matter device                -->
     <!-- ============================================================ -->
 
