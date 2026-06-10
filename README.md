@@ -26,8 +26,9 @@ managed launchd LaunchAgent for matter-server. A real Tapo energy plug has been
 commissioned end-to-end through Domio and reports live power/energy to Indigo.
 
 **Validated with Wi-Fi devices. Thread devices are expected to work** through the same
-share model — Apple Home does the Thread provisioning; the plugin joins over IP via
-your Apple border router (HomePod/Apple TV) — but await validation with real Thread
+share model — the admin-1 ecosystem (Apple Home, or equally Alexa / Google Home) does
+the Thread provisioning; the plugin joins over IP via that ecosystem's border router
+(HomePod/Apple TV, TBR-capable Echo, Nest Hub) — but await validation with real Thread
 hardware. See [docs/MATTER.md](./docs/MATTER.md) for how the pieces fit.
 
 ## Setup

@@ -36,8 +36,12 @@ power budget.
 
 Thread devices can't talk IP to your LAN directly; they need a **Thread
 Border Router (TBR)** to bridge the mesh onto your network. You probably
-already own one: HomePod minis, HomePod (2nd gen), and recent Apple TV 4K
-models are all Thread border routers, as are recent Nest and Echo devices.
+already own one — by 2026 almost every ecosystem's hub is a TBR:
+
+- **Apple:** HomePod mini, HomePod (2nd gen), recent Apple TV 4K models.
+- **Amazon:** Echo (4th gen), Echo Hub, Echo Studio, Echo Show 8/10/15/21
+  (recent gens), and the eero router family.
+- **Google:** Nest Hub (2nd gen), Nest Hub Max, Nest Wifi Pro.
 
 Two distinctions that save a lot of confusion:
 
@@ -56,12 +60,12 @@ Here's why. The one Thread operation the plugin's controller stack
 ([`matter-server`](https://github.com/matter-js/matterjs-server), matter.js,
 Alpha) can't do is *first-admin* commissioning — handing a factory-fresh
 device the Thread network credentials over BLE. In the share model that step
-is always Apple Home's job: it provisions the device onto **Apple's** Thread
-mesh using its own credentials and radios. From then on the device is just an
-IP endpoint — your Apple border router routes IPv6 between the Thread mesh
-and the LAN and proxies the device's mDNS records, so when the plugin joins
-as a second admin over IP it neither knows nor cares that the last hop is
-Thread.
+is always the admin-1 ecosystem's job: Apple Home (or Alexa, or Google Home —
+see below) provisions the device onto **its own** Thread mesh using its own
+credentials and radios. From then on the device is just an IP endpoint — that
+ecosystem's border router routes IPv6 between the Thread mesh and the LAN and
+proxies the device's mDNS records, so when the plugin joins as a second admin
+over IP it neither knows nor cares that the last hop is Thread.
 
 Practical caveats while this remains unvalidated: matter-server is Alpha, and
 battery Thread devices are "sleepy" (they wake on long intervals), which is
@@ -87,9 +91,10 @@ macOS, and macOS has no Thread credential store.
 This plugin sidesteps the problem entirely with the **share model** (the
 architecture decision recorded as ADR-0006, option "C4"):
 
-> Apple Home commissions the device first — it owns the BLE step and gets the
-> device onto your network. Then the device is *shared* to Indigo over plain
-> IP. Indigo never needs BLE, Thread credentials, or proximity to the device.
+> An ecosystem you already own — Apple Home, or equally Alexa / Google Home —
+> commissions the device first: it owns the BLE step and gets the device onto
+> your network. Then the device is *shared* to Indigo over plain IP. Indigo
+> never needs BLE, Thread credentials, or proximity to the device.
 
 That's only possible because of Matter's best feature: multi-admin.
 
@@ -132,7 +137,7 @@ re-commissioned — which is why the plugin ships fabric **backup and restore**
 
 | Piece | Role |
 | --- | --- |
-| **Apple Home** | First commissioner (admin 1). Does the BLE onboarding and, for Thread devices, provides the border router (HomePod/Apple TV). |
+| **Apple Home** | First commissioner (admin 1). Does the BLE onboarding and, for Thread devices, provides the border router (HomePod/Apple TV). Alexa or Google Home + their TBRs can play this role instead — see "Don't have Apple Home?" below. |
 | **Domio** (iOS app) | Owns the *add device* UX. Relays the pairing code from Apple Home to the plugin. One-shot per device — not in the control path afterwards. |
 | **indigo-matter** (this plugin) | Holds the Indigo fabric, translates Matter clusters ↔ Indigo device types, serves the Domio HTTP API, supervises matter-server. |
 | **matter-server** (Node.js) | The actual Matter controller stack (matter.js). Speaks Matter on the network; the plugin drives it over a local WebSocket. |
@@ -166,6 +171,26 @@ devices onto Wi-Fi without Matter), its *printed* code works directly.
 **Removing:** decommissioning removes only the Indigo fabric — the device
 stays in Apple Home and any other ecosystem. Only a factory reset on the
 device itself removes everything.
+
+### Don't have Apple Home? Alexa or Google Home work too
+
+The plugin and Domio never care *which* ecosystem is admin 1 — they just
+consume a pairing code. Apple Home is the smoothest path for Domio users
+(you're on an iPhone already), but any Matter ecosystem can play the role:
+
+- **Alexa:** commission the device in the Alexa app, then device settings →
+  **Other assistants and apps** → it generates a pairing code. For Thread
+  devices a TBR-capable Echo (see the list above) plays the Apple TV's part.
+- **Google Home:** commission in the Google Home app, then device settings →
+  **Linked Matter apps & services** → share. Nest Hub/Wifi devices are the
+  TBRs.
+
+One rule to remember for **Thread** devices: the device joins the mesh of
+whichever ecosystem commissions it, so that ecosystem's border router must
+stay online for the device to be reachable — an Apple-commissioned device
+rides the Apple TBR, an Alexa-commissioned one rides the Echo. (Pre-Thread-1.4,
+different vendors' meshes in one house are separate networks.) For Wi-Fi
+devices none of this applies — no TBR is involved at all.
 
 ## Sharing with other platforms (and vendor apps)
 
