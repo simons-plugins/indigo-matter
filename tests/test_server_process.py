@@ -66,6 +66,47 @@ def test_program_arguments_use_matter_server_via_npx(sp):
     assert "@matter-js/matterjs-server" not in args
 
 
+def test_program_arguments_bind_loopback_by_default(sp):
+    # Security: with no listen-address pref, the managed server MUST bind loopback
+    # only. matter-server v0.6.2 binds ALL interfaces (and is unauthenticated) when
+    # --listen-address is absent, so the flag must always be present and default to
+    # 127.0.0.1.
+    args = sp.program_arguments()
+    assert "--listen-address" in args
+    assert args[args.index("--listen-address") + 1] == "127.0.0.1"
+
+
+def test_program_arguments_honour_custom_listen_address(tmp_path, mock_logger):
+    home = tmp_path / "home"
+    (home / "bin").mkdir(parents=True)
+    npx = home / "bin" / "npx"
+    npx.write_text("#!/bin/sh\n")
+    prefs = {"matterServerPort": "5580", "primaryInterface": "en0",
+             "matterServerListenAddress": "192.168.1.50"}
+    sp = ServerProcess(prefs, mock_logger, home=str(home), npx_path=str(npx),
+                       runner=FakeRunner())
+    args = sp.program_arguments()
+    assert args[args.index("--listen-address") + 1] == "192.168.1.50"
+
+
+@pytest.mark.parametrize("blank", ["", "   ", "\t\n"])
+def test_program_arguments_blank_listen_address_falls_back_to_loopback(tmp_path, mock_logger, blank):
+    home = tmp_path / "home"
+    (home / "bin").mkdir(parents=True)
+    npx = home / "bin" / "npx"
+    npx.write_text("#!/bin/sh\n")
+    prefs = {"matterServerPort": "5580", "primaryInterface": "en0",
+             "matterServerListenAddress": blank}
+    sp = ServerProcess(prefs, mock_logger, home=str(home), npx_path=str(npx),
+                       runner=FakeRunner())
+    args = sp.program_arguments()
+    # never emit an empty listen address — that would re-expose all interfaces
+    assert "--listen-address" in args
+    idx = args.index("--listen-address")
+    assert args[idx + 1] == "127.0.0.1"
+    assert args[idx + 1].strip() != ""
+
+
 def test_build_plist_is_valid_and_keepalive_on_crash(sp):
     spec = plistlib.loads(sp.build_plist())
     assert spec["Label"] == LABEL
