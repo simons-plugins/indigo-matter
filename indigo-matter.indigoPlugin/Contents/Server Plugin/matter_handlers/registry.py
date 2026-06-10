@@ -27,6 +27,7 @@ from .sensors import (
 )
 from .smoke_co import SmokeCOAlarmHandler
 from .thermostat import FanControlHandler, ThermostatHandler
+from .air_quality import AirQualityHandler, CO2Handler, PM25Handler, TVOCHandler
 from .power_source import PowerSourceHandler
 from .window_covering import WindowCoveringHandler
 
@@ -36,9 +37,10 @@ def default_handlers() -> list[ClusterHandler]:
     are mutually exclusive via ``is_primary_for``; sensors are additive;
     Thermostat owns its endpoint and FanControl merges into it.
     WindowCovering does not overlap any lighting cluster so its order relative
-    to them is independent. ElectricalPower/Energy are non-primary and merge
-    into existing relay/dimmer devices. PowerSource is non-primary and
-    node-scoped (order-independent; placed last)."""
+    to them is independent. Air quality handlers are additive sensors.
+    ElectricalPower/Energy are non-primary and merge into existing
+    relay/dimmer devices. PowerSource is non-primary and node-scoped
+    (order-independent; placed last)."""
     return [
         ColorControlHandler(),
         LevelControlHandler(),
@@ -53,6 +55,10 @@ def default_handlers() -> list[ClusterHandler]:
         WindowCoveringHandler(),
         DoorLockHandler(),
         SmokeCOAlarmHandler(),
+        AirQualityHandler(),
+        CO2Handler(),
+        PM25Handler(),
+        TVOCHandler(),
         ElectricalPowerHandler(),
         ElectricalEnergyHandler(),
         PowerSourceHandler(),
