@@ -266,7 +266,7 @@ class Plugin(indigo.PluginBase):
         # bluetooth_enabled (there is no plain "version" key).
         connected = bool(self.matter is not None and self.matter.connected)
         info = (self.matter.server_info if self.matter else None) or {}
-        return {
+        body = {
             "ready": connected,
             "controllerVersion": self._version,
             "matterServerReachable": connected,
@@ -276,6 +276,13 @@ class Plugin(indigo.PluginBase):
             "bleAvailable": bool(info.get("bluetooth_enabled", False)),
             "uptime": int(time.monotonic() - self._start_ts),
         }
+        if not connected:
+            # API.md §3.1: the 503 body carries the standard error envelope so
+            # Domio can surface an actionable message, not a generic failure.
+            uri = getattr(self.matter, "uri", None) if self.matter else None
+            body["error"] = "matter_server_unreachable"
+            body["message"] = f"Cannot reach matter-server at {uri}" if uri else "Cannot reach matter-server"
+        return body
 
     def _decommission_sync(self, node_id):
         # None → genuine unknown node (404). MatterUnavailable → 503. Other → 500.

@@ -1,8 +1,8 @@
 # Matter API Contract — Domio ↔ Indigo Plugin
 
 **Status:** Authoritative for v1
-**Version:** 1.2
-**Last updated:** 2026-06-09
+**Version:** 1.3
+**Last updated:** 2026-06-10
 
 This document is the single source of truth for the HTTP API between Domio (iOS) and the `indigo-matter` plugin running on the Indigo Server. Both Domio and the plugin implementations MUST conform to this spec. Any change requires a co-ordinated update on both sides — treat as a versioned interface, not an implementation detail.
 
@@ -143,6 +143,15 @@ Submit a setup code for commissioning into the Indigo fabric. Called by Domio im
 }
 ```
 
+**Response 503:** matter-server is unreachable (v1.3). The job is **not** created — the request would otherwise be accepted (202) only for the worker to fail with a generic `internal_error` at its first WebSocket call. Domio should treat this like the status-precheck 503 and prompt the user to retry.
+
+```json
+{
+  "error": "matter_server_unreachable",
+  "message": "Not connected to matter-server; check it is running and reachable, then retry"
+}
+```
+
 ### 3.3 `GET …/message/com.simon.indigo-matter/commission/{jobId}`
 
 Poll commissioning job status. `jobId` is the trailing path component. Domio polls every 1s, with a 120s soft timeout.
@@ -190,6 +199,12 @@ Poll commissioning job status. `jobId` is the trailing path component. Domio pol
   }
 }
 ```
+
+`result.primaryDeviceId` is **nullable** and `result.indigoDeviceIds` **may be empty**
+(v1.3): `primaryDeviceId` is `null` when the device joined the fabric but exposes no
+cluster the plugin maps yet — the device is on the fabric and will gain Indigo devices
+when support is added. The job still reports `success`. Domio MUST handle a `null`
+`primaryDeviceId` (e.g. skip navigating to a device detail view).
 
 **Response 200 (failed):**
 
@@ -320,9 +335,15 @@ None in v1. Single-user system. Plugin SHOULD log abnormal traffic patterns but 
 
 ## 7. Versioning
 
-This contract is v1.2. Changes from v1.1: decommission's `nodeId` moved from a path component to a `?nodeId=` query param (the path form never worked — IWS drops trailing path components on POST); diagnostics additionally accepts `?nodeId=`; the local base URL is HTTPS, not HTTP. v1.1 itself was a transport change from v1.0 (semantics unchanged). Breaking changes require a version bump and a transition period where both versions are supported. Additive changes (new optional params, new handlers) do not require a version bump.
+This contract is v1.3. Changes from v1.2 (all clarifications/additive, no transport change):
 
-Domio includes `X-Matter-API-Version: 1.2` in every request. The plugin SHOULD warn (HTTP 200, with `warning` field) if Domio's version is unrecognised.
+- §3.3: `result.primaryDeviceId` is documented as **nullable** and `result.indigoDeviceIds` as **possibly empty** — `null`/empty when the commissioned device exposes no cluster the plugin maps yet (the job still reports `success`).
+- §3.2: `POST …/commission` returns **503 `matter_server_unreachable`** (instead of accepting the job) when the plugin's WebSocket to matter-server is down.
+- §3.1: the status 503 body's `error`/`message` envelope fields are confirmed as required (they were documented in v1.2 but not emitted by the plugin).
+
+Changes from v1.1 (v1.2): decommission's `nodeId` moved from a path component to a `?nodeId=` query param (the path form never worked — IWS drops trailing path components on POST); diagnostics additionally accepts `?nodeId=`; the local base URL is HTTPS, not HTTP. v1.1 itself was a transport change from v1.0 (semantics unchanged). Breaking changes require a version bump and a transition period where both versions are supported. Additive changes (new optional params, new handlers) do not require a version bump.
+
+Domio includes `X-Matter-API-Version: 1.3` in every request. The plugin SHOULD warn (HTTP 200, with `warning` field) if Domio's version is unrecognised.
 
 ## 8. Future Endpoints (Not in v1)
 

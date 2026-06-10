@@ -16,10 +16,11 @@ from commission_jobs import (
 
 
 class FakeMatter:
-    def __init__(self, node_id=0xAB, node=None):
+    def __init__(self, node_id=0xAB, node=None, connected=True):
         self.node_id = node_id
         self.node = node or {"endpoints": {}}
         self.removed: list = []
+        self.connected = connected
 
     async def commission_with_code(self, code):
         return {"node_id": self.node_id}
@@ -143,6 +144,61 @@ def test_create_job_schedule_failure_returns_503_and_frees_code(mock_logger):
     # a retry is treated as new (503 again), not 409 duplicate
     code2, _ = jobs.create_job({"setupCode": "12345678901", "suggestedName": "Plug"})
     assert code2 == 503
+
+
+def test_create_job_rejected_503_when_matter_server_disconnected(mock_logger):
+    # WS to matter-server down → fail fast with the contract envelope, do NOT
+    # accept a job that can only die with a generic internal_error.
+    jobs = _jobs(FakeMatter(connected=False), mock_logger)
+    code, body = jobs.create_job({"setupCode": "12345678901", "suggestedName": "Plug"})
+    assert code == 503
+    assert body["error"] == "matter_server_unreachable"
+    assert body["message"]  # actionable, non-empty
+
+
+def test_cancelled_worker_fails_job_and_frees_setup_code(mock_logger):
+    # Plugin shutdown cancels the worker mid-commission: the job must land in
+    # FAILED (terminal → reapable) and free the setupCode for a retry, while the
+    # task itself still cancels.
+    async def scenario():
+        started = asyncio.Event()
+
+        class HangingMatter(FakeMatter):
+            async def commission_with_code(self, code):
+                started.set()
+                await asyncio.Event().wait()  # blocks forever until cancelled
+
+        tasks: list[asyncio.Task] = []
+
+        def schedule(coro):
+            task = asyncio.ensure_future(coro)
+            tasks.append(task)
+            return task
+
+        jobs = _jobs(HangingMatter(), mock_logger, schedule=schedule)
+        code, body = jobs.create_job({"setupCode": "12345678901", "suggestedName": "Plug"})
+        assert code == 202
+        await asyncio.wait_for(started.wait(), timeout=1)
+
+        _, mid = jobs.get_job(body["jobId"])
+        assert mid["status"] == "commissioning"
+
+        tasks[0].cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await tasks[0]  # the task really cancelled (CancelledError re-raised)
+
+        _, final = jobs.get_job(body["jobId"])
+        assert final["status"] == "failed"
+        assert final["error"]["code"] == "internal_error"
+        assert "cancelled" in final["error"]["message"]
+        job = jobs._jobs[body["jobId"]]
+        assert job.terminal_at is not None  # reapable
+
+        # the setup code is freed: a retry is a NEW job, not a 409 duplicate
+        code2, body2 = jobs.create_job({"setupCode": "12345678901", "suggestedName": "Plug"})
+        assert code2 == 202 and body2["jobId"] != body["jobId"]
+        tasks[1].cancel()
+    asyncio.run(scenario())
 
 
 def test_protocol_error_maps_to_commissioning_failed(mock_logger):

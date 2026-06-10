@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
     <key>PluginVersion</key>
-    <string>2026.0.1</string>
+    <string>2026.0.2</string>
     <key>ServerApiVersion</key>
     <string>3.6</string>
     <key>IwsApiVersion</key>
@@ -13,9 +13,9 @@
     <key>CFBundleIdentifier</key>
     <string>com.simon.indigo-matter</string>
     <key>CFBundleVersion</key>
-    <string>2026.0.1</string>
+    <string>2026.0.2</string>
     <key>CFBundleShortVersionString</key>
-    <string>2026.0.1</string>
+    <string>2026.0.2</string>
     <key>CFBundleURLTypes</key>
     <array>
         <dict>
