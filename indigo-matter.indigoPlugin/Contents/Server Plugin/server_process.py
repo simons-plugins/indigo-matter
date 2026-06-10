@@ -1,10 +1,14 @@
 """matter-server process management — LaunchAgent (PM-B).
 
-Manages a launchd LaunchAgent that runs matter-server, per IMPLEMENTATION.md §1.4
-(corrected: npm package ``matter-server``, invoked via ``npx --prefix``). This is
-the recommended process-management approach because the server survives Indigo
-plugin reloads (frequent during development) without restarting — it holds device
-sessions that are slow to re-establish.
+Manages a launchd LaunchAgent that runs matter-server, per IMPLEMENTATION.md §1.4.
+The ``matter-server`` npm package (v0.6.2) ships ``"bin": null`` — there is NO
+``matter-server`` executable — so ``npx matter-server`` fails every time with
+"could not determine executable to run", and launchd KeepAlive-respawns it forever.
+We therefore launch node directly on the package main (``dist/esm/MatterServer.js``,
+read from the package's ``package.json``), exactly like the working hand-rolled
+run.sh. This is the recommended process-management approach because the server
+survives Indigo plugin reloads (frequent during development) without restarting —
+it holds device sessions that are slow to re-establish.
 
 Gated by the ``manageLaunchAgent`` plugin pref (default off): when off, the plugin
 simply connects to a matter-server the user starts themselves. The final PM choice
@@ -18,6 +22,7 @@ without touching the real launchd or filesystem.
 """
 from __future__ import annotations
 
+import json
 import os
 import plistlib
 import shutil
@@ -27,6 +32,10 @@ from typing import Any, Callable, Optional
 LABEL = "com.simon.indigo-matter"
 DEFAULT_PROJECT_DIRNAME = "indigo-matter"   # ~/indigo-matter (npm install location)
 NPX_CANDIDATES = ("/opt/homebrew/bin/npx", "/usr/local/bin/npx")
+MATTER_SERVER_PACKAGE = "matter-server"
+# Fallback entry point if the package's package.json is missing/unreadable. Matches
+# matter-server v0.6.2's "main": "dist/esm/MatterServer.js".
+DEFAULT_SERVER_ENTRY = "dist/esm/MatterServer.js"
 
 
 def _expand(path: str, home: str) -> str:
@@ -73,6 +82,10 @@ class ServerProcess:
         raw_bin_dir = str(prefs.get("nodeBinDir", "") or "").strip()
         self.node_bin_dir = _expand(raw_bin_dir, self.home) if raw_bin_dir else ""
         self.npx_path = npx_path or self._resolve_npx()
+        # The node interpreter lives in the same bin dir as npx (Homebrew + nvm both
+        # ship node and npx side-by-side). We launch node directly because the
+        # matter-server npm package exposes no bin executable (see module docstring).
+        self.node_path = os.path.join(os.path.dirname(self.npx_path), "node")
         self.port = str(prefs.get("matterServerPort", "5580"))
         self.primary_interface = str(prefs.get("primaryInterface", "en0"))
         # Address the matter-server WebSocket control API binds to. matter-server
@@ -206,14 +219,37 @@ class ServerProcess:
             return None
         return max(matches, key=lambda d: _parse_node_version(d) or (-1,))
 
+    def _server_entry(self) -> str:
+        """Absolute path to the matter-server package main (the JS to run with node).
+
+        Reads ``main`` from ``{project_dir}/node_modules/matter-server/package.json``
+        so the launch adapts automatically if the package bumps its entry path.
+        Falls back to ``dist/esm/MatterServer.js`` (v0.6.2's value) if the manifest
+        is missing, unreadable, or malformed.
+        """
+        pkg_dir = os.path.join(self.project_dir, "node_modules", MATTER_SERVER_PACKAGE)
+        main = DEFAULT_SERVER_ENTRY
+        manifest = os.path.join(pkg_dir, "package.json")
+        try:
+            with open(manifest, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            entry = data.get("main")
+            if isinstance(entry, str) and entry.strip():
+                main = entry
+        except (OSError, ValueError):
+            pass
+        return os.path.join(pkg_dir, main)
+
     # ------------------------------------------------------------------
     # Plist
     # ------------------------------------------------------------------
     def program_arguments(self) -> list[str]:
+        # node <package main> … — NOT `npx matter-server`: the matter-server npm
+        # package ships "bin": null, so npx cannot resolve an executable and the
+        # LaunchAgent respawn-loops with "could not determine executable to run".
         return [
-            self.npx_path,
-            "--prefix", self.project_dir,
-            "matter-server",
+            self.node_path,
+            self._server_entry(),
             "--port", self.port,
             "--listen-address", self.listen_address,
             "--storage-path", self.storage_path,
@@ -223,9 +259,11 @@ class ServerProcess:
     def build_plist(self) -> bytes:
         out_log = os.path.join(self.log_dir, "matter-server.log")
         err_log = os.path.join(self.log_dir, "matter-server.err.log")
-        # dirname(npx) is the resolved bin dir. For Homebrew and for nvm this dir
-        # holds BOTH node and npx, so prepending it to launchd's restricted PATH
-        # lets npx find its node interpreter. /usr/bin:/bin stays appended.
+        # dirname(npx) is the resolved node bin dir (Homebrew/nvm ship node + npx
+        # together). We invoke node directly because the matter-server package
+        # exposes no bin; prepending this dir to launchd's restricted PATH lets the
+        # spawned node find its own co-located libexec/helpers. /usr/bin:/bin stays
+        # appended.
         npx_dir = os.path.dirname(self.npx_path)
         spec = {
             "Label": LABEL,
