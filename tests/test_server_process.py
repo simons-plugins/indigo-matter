@@ -210,6 +210,38 @@ def test_restart_kickstarts(sp):
     assert "kickstart" in sp._run.subcommands()
 
 
+def test_stop_boots_out_and_keeps_plist(sp):
+    import os
+    sp.ensure_installed()  # plist now on disk
+    assert os.path.exists(sp.plist_path)
+    sp._run = FakeRunner()
+    ok = sp.stop()
+    assert ok is True
+    assert "bootout" in sp._run.subcommands()
+    # stop() is the seam-half that must NOT remove the plist — start() reloads it
+    assert os.path.exists(sp.plist_path)
+
+
+def test_start_bootstraps_existing_plist(sp):
+    sp.ensure_installed()  # plist present
+    sp._run = FakeRunner()
+    ok = sp.start()
+    assert ok is True
+    assert "bootstrap" in sp._run.subcommands()
+
+
+def test_start_installs_when_plist_absent(sp):
+    import os
+    # no ensure_installed: plist absent
+    assert not os.path.exists(sp.plist_path)
+    sp._run = FakeRunner()
+    ok = sp.start()
+    assert ok is True
+    # ensure_installed path: plist written + bootstrap/load attempted
+    assert os.path.exists(sp.plist_path)
+    assert "bootstrap" in sp._run.subcommands() or "load" in sp._run.subcommands()
+
+
 def test_npx_resolution_prefers_homebrew(tmp_path, prefs, mock_logger, monkeypatch):
     # neither candidate exists -> falls back to shutil.which, else homebrew default
     monkeypatch.setattr("server_process.os.path.exists", lambda p: p == "/opt/homebrew/bin/npx")

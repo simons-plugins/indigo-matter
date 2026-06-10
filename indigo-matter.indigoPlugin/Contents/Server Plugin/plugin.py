@@ -13,11 +13,14 @@ names are isolated in ``protocol.py``.
 from __future__ import annotations
 
 import json
+import os
 import time
 from concurrent.futures import TimeoutError as FuturesTimeoutError
+from datetime import datetime, timezone
 
 import indigo  # provided by the Indigo runtime
 
+import fabric_backup
 from async_runtime import AsyncRuntime
 from commission_jobs import CommissionJobs, node_id_to_str
 from device_sync import DeviceSync
@@ -400,5 +403,98 @@ class Plugin(indigo.PluginBase):
         self.logger.info("manual commission → %s %s", status, body)
         return (status in (202, 409), valuesDict)
 
+    def _resolve_storage_path(self) -> str:
+        """Storage dir path in BOTH managed and manual modes.
+
+        In managed mode ``self.server_process`` already knows it. In manual mode
+        we construct a throwaway ``ServerProcess`` purely to read ``storage_path``
+        — its ``__init__`` writes no plist and runs no launchctl, so this is a
+        side-effect-free path lookup.
+        """
+        if self.server_process is not None:
+            return self.server_process.storage_path
+        return ServerProcess(dict(self.pluginPrefs), self.logger).storage_path
+
+    @staticmethod
+    def _human_size(num_bytes: int) -> str:
+        size = float(num_bytes)
+        for unit in ("B", "KB", "MB", "GB", "TB"):
+            if size < 1024.0 or unit == "TB":
+                return f"{size:.1f} {unit}"
+            size /= 1024.0
+        return f"{size:.1f} TB"
+
     def menuExportFabricBackup(self):  # noqa: N802
-        self.logger.info("Fabric backup: copy ~/Library/Application Support/com.simon.indigo-matter/")
+        try:
+            storage_path = self._resolve_storage_path()
+            archive = fabric_backup.create_backup(storage_path, now=datetime.now(timezone.utc))
+            size = self._human_size(os.path.getsize(archive))
+            self.logger.info("Fabric backup written: %s (%s)", archive, size)
+            removed = fabric_backup.prune_backups(storage_path, keep=10)
+            if removed:
+                self.logger.info("Pruned %d old fabric backup(s): %s", len(removed), ", ".join(removed))
+            self.logger.info(
+                "This is a best-effort live snapshot — matter-server was NOT stopped. A fully "
+                "consistent backup is only guaranteed with the server stopped, but v1 keeps backups "
+                "non-disruptive. Backups live in %s.",
+                fabric_backup.backups_dir_for(storage_path),
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.logger.exception(exc)
+
+    def getFabricBackups(self, filter="", valuesDict=None, typeId="", targetId=0):  # noqa: N802, A002
+        """List-callback populating the restore picker (newest first)."""
+        try:
+            storage_path = self._resolve_storage_path()
+        except Exception as exc:  # noqa: BLE001
+            self.logger.exception(exc)
+            return []
+        options = []
+        for entry in fabric_backup.list_backups(storage_path):
+            when = datetime.fromtimestamp(entry["mtime"], timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+            label = f"{entry['filename']} — {self._human_size(entry['size_bytes'])} — {when}"
+            options.append((entry["path"], label))
+        return options
+
+    def menuRestoreFabricBackup(self, valuesDict):  # noqa: N802
+        errors = indigo.Dict()
+        # Restore must stop/start matter-server, which the plugin can only do in
+        # managed mode. Externally-managed (run.sh / manual) servers must be
+        # stopped by the user by hand.
+        if self.server_process is None:
+            msg = ("LaunchAgent management is off — the plugin cannot stop matter-server. "
+                   "Stop matter-server yourself, unzip the chosen backup over the storage dir, "
+                   "then restart it. Refusing to restore automatically.")
+            self.logger.warning(msg)
+            errors["backup"] = "Turn on 'Manage LaunchAgent', or restore by hand (see log)."
+            return (False, valuesDict, errors)
+
+        selected = valuesDict.get("backup", "")
+        if not selected:
+            errors["backup"] = "Select a backup to restore."
+            return (False, valuesDict, errors)
+        if not valuesDict.get("confirm", False):
+            errors["confirm"] = "Tick the box to confirm — restore replaces the current fabric."
+            return (False, valuesDict, errors)
+
+        try:
+            storage_path = self._resolve_storage_path()
+            result = fabric_backup.restore_backup(
+                selected, storage_path, self.server_process, now=datetime.now(timezone.utc),
+            )
+            self.logger.info(
+                "Fabric restored from %s; previous fabric preserved at %s. matter-server is "
+                "restarting — watch the log for 'reconciled N node(s)'.",
+                result["restored_from"], result["moved_aside_to"],
+            )
+            # Best-effort confirmation after a short bounded wait for reconnection.
+            time.sleep(2.0)
+            try:
+                self.logger.info("Current reconciled node count: %d", self.device_sync.node_count())
+            except Exception:  # noqa: BLE001
+                pass
+            return (True, valuesDict)
+        except Exception as exc:  # noqa: BLE001
+            self.logger.exception(exc)
+            errors["backup"] = "Restore failed — see the log. Your existing fabric was preserved."
+            return (False, valuesDict, errors)

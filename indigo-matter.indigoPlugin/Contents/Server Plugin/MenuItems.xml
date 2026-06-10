@@ -24,4 +24,20 @@
         <Name>Export fabric backup…</Name>
         <CallbackMethod>menuExportFabricBackup</CallbackMethod>
     </MenuItem>
+    <MenuItem id="restoreFabricBackup">
+        <Name>Restore fabric backup…</Name>
+        <CallbackMethod>menuRestoreFabricBackup</CallbackMethod>
+        <ConfigUI>
+            <Field id="warning" type="label">
+                <Label>Restoring REPLACES the current fabric and restarts matter-server. The current fabric is moved aside (not deleted) so a bad restore is reversible. Requires 'Manage LaunchAgent' to be on.</Label>
+            </Field>
+            <Field id="backup" type="menu">
+                <Label>Backup to restore:</Label>
+                <List class="self" method="getFabricBackups"/>
+            </Field>
+            <Field id="confirm" type="checkbox" defaultValue="false">
+                <Label>I understand this replaces the current fabric and will restart matter-server.</Label>
+            </Field>
+        </ConfigUI>
+    </MenuItem>
 </MenuItems>
