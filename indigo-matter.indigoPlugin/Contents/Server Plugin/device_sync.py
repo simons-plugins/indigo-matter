@@ -428,6 +428,9 @@ class DeviceSync:
             # rename firewall and a wire-shape change should be visible here.
             self.logger.warning("ignoring malformed attribute event: %r", evt.raw)
             return
+        # Handler lookup must precede endpoint lookup: node-scoped handlers (e.g.
+        # PowerSource) have no Indigo device at the event's endpoint and require
+        # special fan-out treatment before any per-endpoint device resolution.
         handler = self.registry.handler_for_cluster(evt.cluster)
         if handler is None:
             return
@@ -441,17 +444,17 @@ class DeviceSync:
             for dev_id in dev_ids:
                 if self._active and dev_id not in self._active:
                     continue  # gate updates to active devices once any are started
-                dev = indigo.devices[dev_id]
                 try:
+                    dev = indigo.devices[dev_id]
                     states = handler.on_attribute_update(dev, evt.attribute, evt.value)
+                    if states:
+                        self.apply_states(dev_id, _kvlist(states))
                 except Exception as exc:  # noqa: BLE001 - one bad value must not silently freeze the device
                     self.logger.warning(
                         "bad update for device %s (ep%s cl%s attr%s value=%r): %s",
                         dev_id, evt.endpoint, evt.cluster, evt.attribute, evt.value, exc,
                     )
                     continue
-                if states:
-                    self.apply_states(dev_id, _kvlist(states))
             return
         # Non-node-scoped path: look up the single device at (node, endpoint).
         dev_id = self.lookup(evt.node_id, evt.endpoint)

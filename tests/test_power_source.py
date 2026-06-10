@@ -269,3 +269,37 @@ def test_node_scoped_event_on_missing_endpoint_does_not_crash(ds, indigo_env):
         kind=protocol.EVT_ATTRIBUTE_UPDATED,
         node_id=999, endpoint=0, cluster=0x002F, attribute=0x000C, value=100,
     ))
+
+
+def test_node_scoped_fanout_survives_deleted_device(ds, indigo_env):
+    """If one device is deleted from indigo.devices between the index snapshot and the
+    fan-out loop iteration, the KeyError must NOT abort the remaining devices on the node.
+    The surviving device must still receive the batteryLevel update."""
+    import protocol
+    from protocol import MatterEvent
+
+    _indigo, devices = indigo_env
+
+    original_create = _indigo.device.create
+
+    def create_with_battery(**kw):
+        dev = original_create(**kw)
+        dev.states["batteryLevel"] = 0
+        return dev
+
+    _indigo.device.create = create_with_battery
+    ds.create_from_raw(MULTI_SENSOR_NODE, "Multi Sensor")
+    id1 = ds.lookup(201, 1)   # contact sensor
+    id2 = ds.lookup(201, 2)   # humidity sensor
+    assert id1 is not None and id2 is not None and id1 != id2
+
+    # Simulate id1 being deleted from indigo.devices (index still holds the stale id).
+    del devices._by_id[id1]
+
+    # Fire a battery update — id1 lookup raises KeyError; id2 must still be updated.
+    ds.handle_event(MatterEvent(
+        kind=protocol.EVT_ATTRIBUTE_UPDATED,
+        node_id=201, endpoint=0, cluster=0x002F, attribute=0x000C, value=80,
+    ))
+    # id2 should have been updated despite id1 causing an error
+    assert devices[id2].states.get("batteryLevel") == 40   # 80 // 2
