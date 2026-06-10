@@ -170,3 +170,33 @@ def test_parse_malformed_attribute_updated_degrades_to_node_none(proto):
     evt = proto.parse_event({"event": "attribute_updated", "data": [42, "1/6"]})
     assert evt.kind == protocol.EVT_ATTRIBUTE_UPDATED
     assert evt.node_id is None and evt.endpoint is None
+
+
+def test_parse_node_event_hex_string_ids(proto):
+    """node_event ids sent as decimal strings or hex strings are coerced to int.
+
+    The wire sends ints in practice, but the codebase's _to_int contract tolerates
+    hex strings everywhere (matching how parse_attr_key handles attribute_updated).
+    This test asserts that string ids in a node_event frame round-trip correctly.
+    """
+    frame = {
+        "event": "node_event",
+        "data": {
+            "node_id": "7",          # decimal string
+            "endpoint_id": "1",      # decimal string
+            "cluster_id": "0x003B",  # hex string
+            "event_id": "0x03",      # hex string (ShortRelease)
+            "event_number": 42,
+            "priority": 1,
+            "timestamp": 1700000000,
+            "timestamp_type": 1,
+            "data": {"previousPosition": 0},
+        },
+    }
+    evt = proto.parse_event(frame)
+    assert evt.kind == protocol.EVT_NODE_EVENT
+    assert evt.node_id == 7
+    assert evt.endpoint == 1
+    assert evt.cluster == 0x003B
+    assert evt.event_id == 0x03
+    assert evt.event_data == {"previousPosition": 0}

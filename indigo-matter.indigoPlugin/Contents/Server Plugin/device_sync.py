@@ -430,18 +430,21 @@ class DeviceSync:
         lookup and _active gate semantics as the non-node-scoped attribute path.
         A malformed frame (missing node_id / endpoint / cluster) is logged and
         dropped rather than silently ignored, matching the attribute path idiom.
+
+        Ordering mirrors _on_attribute's non-node-scoped path: handler lookup
+        (cheap early-exit) first, then device lookup, then _active gate.
         """
         if evt.node_id is None or evt.endpoint is None or evt.cluster is None:
             self.logger.warning("ignoring malformed node_event frame: %r", evt.raw)
+            return
+        handler = self.registry.handler_for_cluster(evt.cluster)
+        if handler is None:
             return
         dev_id = self.lookup(evt.node_id, evt.endpoint)
         if dev_id is None:
             return
         if self._active and dev_id not in self._active:
             return  # gate updates to active devices once any are started
-        handler = self.registry.handler_for_cluster(evt.cluster)
-        if handler is None:
-            return
         dev = indigo.devices[dev_id]
         try:
             states = handler.on_node_event(dev, evt.event_id, evt.event_data)

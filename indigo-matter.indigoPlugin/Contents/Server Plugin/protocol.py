@@ -261,10 +261,17 @@ class Protocol:
         elif name == EVT_NODE_EVENT and isinstance(data, dict):
             # MatterNodeEvent: {node_id, endpoint_id, cluster_id, event_id, data, ...}
             # Wire field names are isolated to the EVT_NODE_EVENT_* constants above.
-            node_id  = data.get(EVT_NODE_EVENT_NODE_ID)
-            endpoint = data.get(EVT_NODE_EVENT_ENDPOINT_ID)
-            cluster  = data.get(EVT_NODE_EVENT_CLUSTER_ID)
-            event_id = data.get(EVT_NODE_EVENT_EVENT_ID)
+            # Coerce integer fields defensively through _to_int (None-safe) so that
+            # hex-string ids ("0x003B") are tolerated everywhere, matching how the
+            # attribute_updated branch coerces via parse_attr_key.
+            _raw_node_id  = data.get(EVT_NODE_EVENT_NODE_ID)
+            _raw_endpoint = data.get(EVT_NODE_EVENT_ENDPOINT_ID)
+            _raw_cluster  = data.get(EVT_NODE_EVENT_CLUSTER_ID)
+            _raw_event_id = data.get(EVT_NODE_EVENT_EVENT_ID)
+            node_id   = _to_int(_raw_node_id)  if _raw_node_id  is not None else None
+            endpoint  = _to_int(_raw_endpoint) if _raw_endpoint is not None else None
+            cluster   = _to_int(_raw_cluster)  if _raw_cluster  is not None else None
+            event_id  = _to_int(_raw_event_id) if _raw_event_id is not None else None
             event_data = data.get(EVT_NODE_EVENT_DATA)
         elif isinstance(data, dict):
             node_id = data.get("node_id")
