@@ -51,6 +51,12 @@ class DoorLockHandler(ClusterHandler):
                     "endpointId": str(endpoint.endpoint_id),
                     "vendorName": node.vendor_name,
                     "productName": node.product_name,
+                    # Indigo does not apply static Devices.xml <IsLockSubType> to
+                    # API-created devices; set it here so the device gets the lock
+                    # UI (Lock/Unlock buttons, triggers, control-page) instead of
+                    # the generic switch UI — same pattern as ColorControlHandler
+                    # sets SupportsColor/SupportsRGB in props (HANDOVER item 4).
+                    "IsLockSubType": True,
                 },
                 initial_states={},  # defer to first attribute_updated from matter-server
             )
@@ -68,13 +74,18 @@ class DoorLockHandler(ClusterHandler):
             # leaving the current Indigo state unchanged is safer than guessing.
             return {}
 
-        if value == _LOCK_STATE_LOCKED:
+        # Coerce to int: matter-server may deliver the attribute as a float or
+        # string (e.g. "1", 1.0) — same codebase-wide idiom as sensors.py and
+        # thermostat.py use for every numeric attribute comparison.
+        ivalue = int(value)
+
+        if ivalue == _LOCK_STATE_LOCKED:
             return {"onOffState": True, "lockState": "locked"}
 
-        if value == _LOCK_STATE_UNLOCKED:
+        if ivalue == _LOCK_STATE_UNLOCKED:
             return {"onOffState": False, "lockState": "unlocked"}
 
-        # value == _LOCK_STATE_NOT_FULLY_LOCKED (0) or any unexpected numeric value.
+        # ivalue == _LOCK_STATE_NOT_FULLY_LOCKED (0) or any unexpected numeric value.
         # Treated as "not locked" (off) with a jammed indicator.
         # NOTE: surfacing jammed as an Indigo *error* state needs a handler-contract
         # change (setErrorStateOnServer) and is deliberately deferred.
@@ -86,9 +97,17 @@ class DoorLockHandler(ClusterHandler):
         endpoint_id = int(indigo_dev.pluginProps["endpointId"])
         device_action = action.deviceAction
 
-        if device_action == indigo.kDeviceAction.TurnOn:
+        if device_action == indigo.kDeviceAction.Lock:
+            # Lock sub-type devices receive Lock/Unlock from Indigo's lock UI.
+            command = self.CMD_LOCK
+        elif device_action == indigo.kDeviceAction.Unlock:
+            command = self.CMD_UNLOCK
+        elif device_action == indigo.kDeviceAction.TurnOn:
+            # Alias for devices created before the lock sub-type fix, or generic
+            # on/off actions fired from scripts/triggers (on = locked).
             command = self.CMD_LOCK
         elif device_action == indigo.kDeviceAction.TurnOff:
+            # Alias: off = unlocked.
             command = self.CMD_UNLOCK
         elif device_action == indigo.kDeviceAction.Toggle:
             # Matter DoorLock has no Toggle command — resolve from current device state.

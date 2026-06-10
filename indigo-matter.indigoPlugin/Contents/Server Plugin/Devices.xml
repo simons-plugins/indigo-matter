@@ -313,6 +313,11 @@
 
     <Device id="matterLock" type="relay">
         <Name>Matter Lock</Name>
+        <!-- Enable the lock UI (Lock/Unlock buttons, triggers, control-page).
+             Belt-and-suspenders: IsLockSubType is also set in DoorLockHandler
+             creation props because Indigo does not apply static Devices.xml
+             elements to API-created devices (same pattern as matterColorDimmer). -->
+        <IsLockSubType>true</IsLockSubType>
         <ConfigUI>
             <Field id="nodeId" type="textfield" readonly="yes">
                 <Label>Matter Node ID:</Label>

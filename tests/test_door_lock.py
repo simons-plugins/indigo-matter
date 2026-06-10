@@ -2,8 +2,9 @@
 
 Covers:
 - All LockState attribute mappings (Locked, Unlocked, NotFullyLocked, None/null)
-- TurnOn / TurnOff / Toggle action dispatch (Toggle from both locked and unlocked state)
-- create_indigo_devices spec shape
+- int coercion of LockState value (float 1.0, string "1", bool True)
+- Lock / Unlock / TurnOn / TurnOff / Toggle action dispatch
+- create_indigo_devices spec shape (including IsLockSubType prop)
 - Registry lookup by cluster id and device type
 """
 from __future__ import annotations
@@ -70,6 +71,15 @@ class TestCreateIndigoDevices:
         assert spec.props["vendorName"] == "Aqara"
         assert spec.props["productName"] == "U200 Lock"
 
+    def test_is_lock_sub_type_prop_set(self):
+        # IsLockSubType must be True so Indigo renders lock UI, not switch UI.
+        # Indigo ignores static Devices.xml elements for API-created devices —
+        # the prop must be set explicitly in the creation spec (HANDOVER item 4).
+        node = parse_node(LOCK_NODE, "Front Door")
+        handler = DoorLockHandler()
+        spec = handler.create_indigo_devices(node, _ep(node, 1))[0]
+        assert spec.props.get("IsLockSubType") is True
+
     def test_initial_states_deferred(self):
         # initial_states is empty — we wait for the first attribute_updated
         # rather than guessing the lock state at commissioning time.
@@ -126,13 +136,52 @@ class TestAttributeUpdate:
         result = self.handler.on_attribute_update(None, 0x9999, 1)
         assert result == {}
 
+    def test_int_coercion_float_locked(self):
+        # matter-server may deliver numeric attributes as float — must coerce.
+        result = self.handler.on_attribute_update(None, ATTR_LOCK_STATE, 1.0)
+        assert result == {"onOffState": True, "lockState": "locked"}
+
+    def test_int_coercion_string_locked(self):
+        # Defensive: string "1" should also resolve to locked.
+        result = self.handler.on_attribute_update(None, ATTR_LOCK_STATE, "1")
+        assert result == {"onOffState": True, "lockState": "locked"}
+
+    def test_int_coercion_float_unlocked(self):
+        result = self.handler.on_attribute_update(None, ATTR_LOCK_STATE, 2.0)
+        assert result == {"onOffState": False, "lockState": "unlocked"}
+
+    def test_int_coercion_float_jammed(self):
+        result = self.handler.on_attribute_update(None, ATTR_LOCK_STATE, 0.0)
+        assert result == {"onOffState": False, "lockState": "jammed"}
+
 
 # ---------------------------------------------------------------------------
 # handle_indigo_action
 # ---------------------------------------------------------------------------
 
 class TestHandleIndigoAction:
+    def test_lock_action_sends_lock_door(self, mock_indigo_base):
+        # kDeviceAction.Lock is the primary action for lock sub-type relay devices.
+        import indigo
+        handler = DoorLockHandler()
+        cmd = handler.handle_indigo_action(_dev(on_state=False), _action(indigo.kDeviceAction.Lock))
+        assert isinstance(cmd, MatterCommand)
+        assert cmd.node_id == 50
+        assert cmd.endpoint == 1
+        assert cmd.cluster == CLUSTER_DOOR_LOCK
+        assert cmd.command == "LockDoor"
+        assert cmd.args == {}
+
+    def test_unlock_action_sends_unlock_door(self, mock_indigo_base):
+        import indigo
+        handler = DoorLockHandler()
+        cmd = handler.handle_indigo_action(_dev(on_state=True), _action(indigo.kDeviceAction.Unlock))
+        assert isinstance(cmd, MatterCommand)
+        assert cmd.command == "UnlockDoor"
+        assert cmd.args == {}
+
     def test_turn_on_sends_lock_door(self, mock_indigo_base):
+        # TurnOn kept as alias for backward compat (scripts / pre-fix devices).
         import indigo
         handler = DoorLockHandler()
         cmd = handler.handle_indigo_action(_dev(on_state=False), _action(indigo.kDeviceAction.TurnOn))
@@ -144,6 +193,7 @@ class TestHandleIndigoAction:
         assert cmd.args == {}
 
     def test_turn_off_sends_unlock_door(self, mock_indigo_base):
+        # TurnOff kept as alias for backward compat.
         import indigo
         handler = DoorLockHandler()
         cmd = handler.handle_indigo_action(_dev(on_state=True), _action(indigo.kDeviceAction.TurnOff))
