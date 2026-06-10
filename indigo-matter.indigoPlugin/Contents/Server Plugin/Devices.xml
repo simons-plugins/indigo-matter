@@ -348,6 +348,33 @@
     </Device>
 
     <!-- ============================================================ -->
+    <!-- Fan                                                         -->
+    <!-- ============================================================ -->
+
+    <!-- Standalone fan: FanControl (0x0202) without a co-located Thermostat.
+         Uses the dimmer type so brightness = fan speed % and on/off are native.
+         (When FanControl is co-located with Thermostat it merges into
+         matterThermostat — no separate device is created in that case.) -->
+    <Device id="matterFan" type="dimmer">
+        <Name>Matter Fan</Name>
+        <ConfigUI>
+            <Field id="nodeId" type="textfield" readonly="yes">
+                <Label>Matter Node ID:</Label>
+            </Field>
+            <Field id="endpointId" type="textfield" readonly="yes">
+                <Label>Endpoint:</Label>
+            </Field>
+            <Field id="vendorName" type="textfield" readonly="yes">
+                <Label>Vendor:</Label>
+            </Field>
+            <Field id="productName" type="textfield" readonly="yes">
+                <Label>Product:</Label>
+            </Field>
+        </ConfigUI>
+        <!-- States inherited from dimmer base type: onOffState, brightnessLevel -->
+    </Device>
+
+    <!-- ============================================================ -->
     <!-- Fallback: unknown / unsupported Matter device                -->
     <!-- ============================================================ -->
 
