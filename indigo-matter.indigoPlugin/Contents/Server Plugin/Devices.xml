@@ -304,6 +304,50 @@
     </Device>
 
     <!-- ============================================================ -->
+    <!-- Door Lock                                                    -->
+    <!-- DoorLockHandler (matter_handlers/door_lock.py)              -->
+    <!-- on = locked, off = unlocked — relay type gives lock/unlock  -->
+    <!-- buttons, triggers, and control-page support natively.       -->
+    <!-- Custom lockState string state for finer trigger conditions.  -->
+    <!-- ============================================================ -->
+
+    <Device id="matterLock" type="relay">
+        <Name>Matter Lock</Name>
+        <ConfigUI>
+            <Field id="nodeId" type="textfield" readonly="yes">
+                <Label>Matter Node ID:</Label>
+            </Field>
+            <Field id="endpointId" type="textfield" readonly="yes">
+                <Label>Endpoint:</Label>
+            </Field>
+            <Field id="vendorName" type="textfield" readonly="yes">
+                <Label>Vendor:</Label>
+            </Field>
+            <Field id="productName" type="textfield" readonly="yes">
+                <Label>Product:</Label>
+            </Field>
+        </ConfigUI>
+        <States>
+            <State id="onOffState">
+                <ValueType boolType="OnOff">Boolean</ValueType>
+                <TriggerLabel>On/Off State</TriggerLabel>
+                <ControlPageLabel>On/Off State</ControlPageLabel>
+            </State>
+            <!-- lockState: finer trigger granularity beyond the binary on/off.
+                 Values: locked / unlocked / jammed (NotFullyLocked).
+                 NOTE: jammed currently maps to off + lockState="jammed"; surfacing
+                 it as an Indigo error state (setErrorStateOnServer) needs a
+                 handler-contract change and is deliberately deferred. -->
+            <State id="lockState">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Lock State</TriggerLabel>
+                <ControlPageLabel>Lock State</ControlPageLabel>
+            </State>
+        </States>
+        <UiDisplayStateId>onOffState</UiDisplayStateId>
+    </Device>
+
+    <!-- ============================================================ -->
     <!-- Fallback: unknown / unsupported Matter device                -->
     <!-- ============================================================ -->
 
