@@ -11,7 +11,13 @@ from types import SimpleNamespace
 
 import pytest
 
+import os as _os
+
 from server_process import LABEL, ServerProcess
+
+# Captured before any monkeypatching so nvm tests can fake Homebrew "absent"
+# while still letting real tmp_path files report as existing.
+_real_exists = _os.path.exists
 
 
 class FakeRunner:
@@ -124,3 +130,108 @@ def test_restart_returns_false_and_reinstalls_on_kickstart_failure(sp):
     assert "kickstart" in subs
     assert "bootstrap" in subs or "load" in subs  # reinstalled
     assert ok is False  # is_running() with rc=1 → False
+
+
+# ----------------------------------------------------------------------
+# nvm node resolution
+# ----------------------------------------------------------------------
+def _make_nvm(home, version: str, *, default_alias: str | None = None):
+    """Create a fake ~/.nvm tree with a node version (and optional default alias)."""
+    bindir = home / ".nvm" / "versions" / "node" / version / "bin"
+    bindir.mkdir(parents=True)
+    npx = bindir / "npx"
+    npx.write_text("#!/bin/sh\n")
+    (bindir / "node").write_text("#!/bin/sh\n")
+    if default_alias is not None:
+        alias_dir = home / ".nvm" / "alias"
+        alias_dir.mkdir(parents=True, exist_ok=True)
+        (alias_dir / "default").write_text(default_alias + "\n")
+    return npx
+
+
+def test_nvm_default_alias_resolution(tmp_path, prefs, mock_logger, monkeypatch):
+    # No Homebrew npx, so nvm must win.
+    monkeypatch.setattr("server_process.os.path.exists",
+                        lambda p: _real_exists(p) and "homebrew" not in p and "/usr/local/" not in p)
+    home = tmp_path / "home"
+    home.mkdir()
+    npx = _make_nvm(home, "v22.18.0", default_alias="v22")
+    sp = ServerProcess(prefs, mock_logger, home=str(home), runner=FakeRunner())
+    assert sp.npx_path == str(npx)
+
+
+def test_nvm_newest_version_fallback_when_no_default_alias(tmp_path, prefs, mock_logger, monkeypatch):
+    monkeypatch.setattr("server_process.os.path.exists",
+                        lambda p: _real_exists(p) and "homebrew" not in p and "/usr/local/" not in p)
+    home = tmp_path / "home"
+    home.mkdir()
+    _make_nvm(home, "v22.9.0")          # lexically "higher" than v22.10.0
+    newest = _make_nvm(home, "v22.10.0")  # but numerically the newest
+    sp = ServerProcess(prefs, mock_logger, home=str(home), runner=FakeRunner())
+    assert sp.npx_path == str(newest)
+
+
+def test_nvm_partial_alias_matches_highest_in_series(tmp_path, prefs, mock_logger, monkeypatch):
+    monkeypatch.setattr("server_process.os.path.exists",
+                        lambda p: _real_exists(p) and "homebrew" not in p and "/usr/local/" not in p)
+    home = tmp_path / "home"
+    home.mkdir()
+    _make_nvm(home, "v20.5.0")
+    _make_nvm(home, "v22.1.0")
+    want = _make_nvm(home, "v22.18.0")
+    # default alias "22" (no leading v, partial) -> highest v22.*
+    (home / ".nvm" / "alias").mkdir(parents=True, exist_ok=True)
+    (home / ".nvm" / "alias" / "default").write_text("22\n")
+    sp = ServerProcess(prefs, mock_logger, home=str(home), runner=FakeRunner())
+    assert sp.npx_path == str(want)
+
+
+def test_node_bin_dir_pref_wins_over_everything(tmp_path, prefs, mock_logger, monkeypatch):
+    # Pretend Homebrew npx exists AND nvm exists; the explicit pref must still win.
+    monkeypatch.setattr("server_process.os.path.exists", _real_exists)
+    home = tmp_path / "home"
+    home.mkdir()
+    _make_nvm(home, "v22.18.0", default_alias="v22")
+    # also fake-create homebrew-ish path under home so _real_exists sees something
+    custom_bin = home / "custom" / "node" / "bin"
+    custom_bin.mkdir(parents=True)
+    custom_npx = custom_bin / "npx"
+    custom_npx.write_text("#!/bin/sh\n")
+    prefs = dict(prefs, nodeBinDir=str(custom_bin))
+    sp = ServerProcess(prefs, mock_logger, home=str(home), runner=FakeRunner())
+    assert sp.npx_path == str(custom_npx)
+
+
+def test_node_bin_dir_expands_tilde(tmp_path, prefs, mock_logger, monkeypatch):
+    monkeypatch.setattr("server_process.os.path.exists", _real_exists)
+    home = tmp_path / "home"
+    home.mkdir()
+    bindir = home / "mynode" / "bin"
+    bindir.mkdir(parents=True)
+    npx = bindir / "npx"
+    npx.write_text("#!/bin/sh\n")
+    prefs = dict(prefs, nodeBinDir="~/mynode/bin")
+    sp = ServerProcess(prefs, mock_logger, home=str(home), runner=FakeRunner())
+    assert sp.npx_path == str(npx)
+
+
+def test_homebrew_still_resolves_when_no_pref_or_nvm(tmp_path, prefs, mock_logger, monkeypatch):
+    # Only the Apple-Silicon Homebrew npx "exists"; no nodeBinDir, no nvm tree.
+    monkeypatch.setattr("server_process.os.path.exists", lambda p: p == "/opt/homebrew/bin/npx")
+    home = tmp_path / "home"
+    home.mkdir()
+    sp = ServerProcess(prefs, mock_logger, home=str(home), runner=FakeRunner())
+    assert sp.npx_path == "/opt/homebrew/bin/npx"
+
+
+def test_plist_path_env_contains_resolved_npx_dir(tmp_path, prefs, mock_logger, monkeypatch):
+    monkeypatch.setattr("server_process.os.path.exists",
+                        lambda p: _real_exists(p) and "homebrew" not in p and "/usr/local/" not in p)
+    home = tmp_path / "home"
+    home.mkdir()
+    npx = _make_nvm(home, "v22.18.0", default_alias="v22")
+    sp = ServerProcess(prefs, mock_logger, home=str(home), runner=FakeRunner())
+    spec = plistlib.loads(sp.build_plist())
+    path_env = spec["EnvironmentVariables"]["PATH"]
+    assert path_env.startswith(str(npx.parent))
+    assert path_env.endswith(":/usr/bin:/bin")
