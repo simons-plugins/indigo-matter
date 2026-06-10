@@ -1,13 +1,15 @@
-"""M6: sensor cluster handlers (temperature, humidity, occupancy, contact, lux)."""
+"""M6: sensor cluster handlers (temperature, humidity, occupancy, contact, lux, pressure, flow)."""
 from __future__ import annotations
 
 from matter_model import parse_node
 from matter_handlers.registry import HandlerRegistry
 from matter_handlers.sensors import (
     ContactHandler,
+    FlowHandler,
     HumidityHandler,
     IlluminanceHandler,
     OccupancyHandler,
+    PressureHandler,
     TemperatureHandler,
 )
 
@@ -66,7 +68,8 @@ def test_illuminance_lux_decode():
 
 def test_sensors_are_read_only():
     for handler in (TemperatureHandler(), HumidityHandler(), OccupancyHandler(),
-                    ContactHandler(), IlluminanceHandler()):
+                    ContactHandler(), IlluminanceHandler(),
+                    PressureHandler(), FlowHandler()):
         assert handler.handle_indigo_action(None, object()) is None
 
 
@@ -77,3 +80,45 @@ def test_sensor_device_type_lookup():
     assert reg.handler_for_cluster(0x0406).device_type_id == "matterMotionSensor"
     assert reg.handler_for_cluster(0x0045).device_type_id == "matterContactSensor"
     assert reg.handler_for_cluster(0x0400).device_type_id == "matterIlluminanceSensor"
+    assert reg.handler_for_cluster(0x0403).device_type_id == "matterPressureSensor"
+    assert reg.handler_for_cluster(0x0404).device_type_id == "matterFlowSensor"
+
+
+# ── Pressure (0x0403) ────────────────────────────────────────────────────────
+
+def test_pressure_transform():
+    h = PressureHandler()
+    # 0.1 kPa = 1 hPa: unit conversion is an identity (raw value → hPa as float)
+    assert h.on_attribute_update(None, 0x0000, 1013) == {"sensorValue": 1013.0}  # sea level ≈ 1013 hPa
+    assert h.on_attribute_update(None, 0x0000, 870) == {"sensorValue": 870.0}    # high altitude
+
+
+def test_pressure_none_skipped():
+    assert PressureHandler().on_attribute_update(None, 0x0000, None) == {}
+
+
+def test_pressure_create_spec():
+    h = PressureHandler()
+    assert h.device_type_id == "matterPressureSensor"
+    assert h.cluster_id == 0x0403
+    assert h.cluster_name == "PressureMeasurement"
+
+
+# ── Flow (0x0404) ────────────────────────────────────────────────────────────
+
+def test_flow_transform():
+    h = FlowHandler()
+    assert h.on_attribute_update(None, 0x0000, 25) == {"sensorValue": 2.5}   # 25 × 0.1 = 2.5 m³/h
+    assert h.on_attribute_update(None, 0x0000, 100) == {"sensorValue": 10.0}
+    assert h.on_attribute_update(None, 0x0000, 0) == {"sensorValue": 0.0}
+
+
+def test_flow_none_skipped():
+    assert FlowHandler().on_attribute_update(None, 0x0000, None) == {}
+
+
+def test_flow_create_spec():
+    h = FlowHandler()
+    assert h.device_type_id == "matterFlowSensor"
+    assert h.cluster_id == 0x0404
+    assert h.cluster_name == "FlowMeasurement"
