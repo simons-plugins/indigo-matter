@@ -40,6 +40,22 @@ class FakeDev:
         # mutated the object in place, so this is a no-op marker.
         self.replaced = True
 
+    def replacePluginPropsOnServer(self, new_props):
+        # Real Indigo updates pluginProps and rebuilds device states from Supports*
+        # entries.  The fake merges the new props and, for each Supports* key that
+        # transitions to True, seeds the corresponding state so handler guards pass.
+        self.pluginProps = dict(new_props)
+        self.replaced_props = True
+        # Simulate Indigo auto-creating states for Supports* props.
+        _supports_to_states = {
+            "SupportsPowerMeter": "curEnergyLevel",
+            "SupportsEnergyMeter": "accumEnergyTotal",
+            "SupportsBatteryLevel": "batteryLevel",
+        }
+        for prop_key, state_key in _supports_to_states.items():
+            if new_props.get(prop_key) and state_key not in self.states:
+                self.states[state_key] = 0  # Indigo-style initial value
+
 
 class FakeFolder:
     def __init__(self, folder_id, name):
@@ -849,3 +865,224 @@ def test_battery_fanout_reaches_all_devices_on_aq_endpoint(ds, indigo_env):
         assert devices[dev_id].states.get("batteryLevel") == 80, (
             f"{type_id}: expected batteryLevel=80, got {devices[dev_id].states.get('batteryLevel')}"
         )
+
+
+# ===========================================================================
+# fix/#45 — re-assert capability props at reconcile (mid-interview creation)
+# ===========================================================================
+
+# Energy Plug node: OnOff + ElectricalPowerMeasurement (0x0090) + ElectricalEnergyMeasurement (0x0091)
+# This represents node 0x20 (32) from the live-evidence in issue #45.
+ENERGY_PLUG_NODE = {
+    "node_id": 0x20,
+    "available": True,
+    "attributes": {
+        "0/40/1": "ACME",
+        "0/40/3": "Energy Plug",
+        "1/29/0": [{"0": 266}],          # OnOffPlugInUnit
+        "1/6/0": False,                  # OnOff
+        "1/144/8": 1200,                 # ElectricalPowerMeasurement.ActivePower = 1200 mW
+        "1/145/1": {"energy": 3_600_000},  # ElectricalEnergyMeasurement.CumulativeEnergyImported
+    },
+}
+
+
+def test_reconcile_reasserts_missing_meter_props_and_logs_info(ds, indigo_env, mock_logger):
+    """Device created mid-interview (without meter props) gains them at reconcile.
+
+    Reproduces the live evidence from issue #45: a relay device created via
+    node_added before the electrical clusters were visible lacks SupportsPowerMeter /
+    SupportsEnergyMeter, so curEnergyLevel / accumEnergyTotal never exist.
+    After reconcile the props must be present and the INFO log line must be emitted.
+    """
+    _indigo, devices = indigo_env
+    # Simulate a mid-interview creation: relay created WITHOUT meter props.
+    bare_node = {
+        "node_id": 0x20,
+        "available": True,
+        "attributes": {
+            "1/29/0": [{"0": 266}],
+            "1/6/0": False,
+        },
+    }
+    ds.create_from_raw(bare_node, "Energy Plug")
+    dev_id = ds.lookup(0x20, 1)
+    assert dev_id is not None
+    dev = devices[dev_id]
+    # Verify props are absent (the mid-interview state)
+    assert not dev.pluginProps.get("SupportsPowerMeter")
+    assert not dev.pluginProps.get("SupportsEnergyMeter")
+
+    # Reconcile with the full cluster snapshot — props must be added.
+    mock_logger.info.reset_mock()
+    ds.reconcile_all([ENERGY_PLUG_NODE])
+
+    assert dev.pluginProps.get("SupportsPowerMeter") is True
+    assert dev.pluginProps.get("SupportsEnergyMeter") is True
+    # States must now exist so handler updates flow through.
+    assert "curEnergyLevel" in dev.states
+    assert "accumEnergyTotal" in dev.states
+    # INFO line must be emitted — the only visible evidence of the self-heal.
+    assert mock_logger.info.called
+    info_calls = [mock_logger.info.call_args_list[i][0] for i in range(len(mock_logger.info.call_args_list))]
+    reassert_msgs = [fmt % tuple(args) for fmt, *args in info_calls if "re-asserted" in fmt]
+    assert reassert_msgs, "expected at least one INFO 're-asserted capability props' log line"
+
+
+def test_reconcile_reassert_is_idempotent(ds, indigo_env, mock_logger):
+    """A second reconcile pass finds nothing missing and does not call replacePluginPropsOnServer."""
+    _indigo, devices = indigo_env
+    bare_node = {
+        "node_id": 0x20, "available": True,
+        "attributes": {"1/29/0": [{"0": 266}], "1/6/0": False},
+    }
+    ds.create_from_raw(bare_node, "Energy Plug")
+    dev_id = ds.lookup(0x20, 1)
+
+    # First reconcile — props gain added, replaced_props set.
+    ds.reconcile_all([ENERGY_PLUG_NODE])
+    assert devices[dev_id].pluginProps.get("SupportsPowerMeter") is True
+    devices[dev_id].replaced_props = False  # reset sentinel
+
+    # Second reconcile — props already present, no further replacePluginPropsOnServer.
+    mock_logger.info.reset_mock()
+    ds.reconcile_all([ENERGY_PLUG_NODE])
+    assert not getattr(devices[dev_id], "replaced_props", False), (
+        "replacePluginPropsOnServer called again on second pass — not idempotent"
+    )
+    # No 're-asserted' INFO line on the second pass.
+    info_calls = [mock_logger.info.call_args_list[i][0] for i in range(len(mock_logger.info.call_args_list))]
+    reassert_msgs = [fmt % tuple(args) for fmt, *args in info_calls if "re-asserted" in fmt]
+    assert not reassert_msgs, "unexpected 're-asserted' log on idempotent second pass"
+
+
+def test_reconcile_reassert_device_with_props_already_set_is_untouched(ds, indigo_env):
+    """A device created with correct props already is not modified by reassert."""
+    _indigo, devices = indigo_env
+    # Create with full cluster snapshot (fast path — props already set at creation).
+    ds.create_from_raw(ENERGY_PLUG_NODE, "Energy Plug")
+    dev_id = ds.lookup(0x20, 1)
+    dev = devices[dev_id]
+    assert dev.pluginProps.get("SupportsPowerMeter") is True
+    dev.replaced_props = False
+
+    ds.reconcile_all([ENERGY_PLUG_NODE])
+    assert not getattr(dev, "replaced_props", False), (
+        "replacePluginPropsOnServer was called on a device that already had props set"
+    )
+
+
+def test_reconcile_reassert_prop_failure_continues_to_next_device(ds, indigo_env, mock_logger):
+    """A replacePluginPropsOnServer failure must not abort reconcile for other devices."""
+    _indigo, devices = indigo_env
+    # Two relay nodes, both created mid-interview without meter props.
+    bare_node_20 = {
+        "node_id": 0x20, "available": True,
+        "attributes": {"1/29/0": [{"0": 266}], "1/6/0": False},
+    }
+    bare_node_21 = {
+        "node_id": 0x21, "available": True,
+        "attributes": {"1/29/0": [{"0": 266}], "1/6/0": False},
+    }
+    full_node_21 = {
+        "node_id": 0x21, "available": True,
+        "attributes": {
+            "1/29/0": [{"0": 266}], "1/6/0": False,
+            "1/144/8": 800, "1/145/1": {"energy": 1_000_000},
+        },
+    }
+    ds.create_from_raw(bare_node_20, "Plug A")
+    ds.create_from_raw(bare_node_21, "Plug B")
+    dev_id_20 = ds.lookup(0x20, 1)
+    dev_id_21 = ds.lookup(0x21, 1)
+
+    # Make the first device's replacePluginPropsOnServer raise.
+    def boom(props):
+        raise RuntimeError("props API down")
+    devices[dev_id_20].replacePluginPropsOnServer = boom
+
+    # Reconcile both nodes — first device's props fail, second must still be healed.
+    ds.reconcile_all([ENERGY_PLUG_NODE, full_node_21])
+
+    # The failure must have been logged.
+    assert mock_logger.warning.called
+
+    # The second device must still have been healed.
+    assert devices[dev_id_21].pluginProps.get("SupportsPowerMeter") is True
+
+
+def test_reconcile_reasserts_battery_prop_from_power_source_on_other_endpoint(ds, indigo_env, mock_logger):
+    """SupportsBatteryLevel is added when PowerSource is on a DIFFERENT endpoint.
+
+    Mirrors create_devices' node-level central setdefault: any endpoint carrying
+    cluster 0x002F causes SupportsBatteryLevel=True on all devices of that node,
+    regardless of which endpoint the device lives on.
+    """
+    _indigo, devices = indigo_env
+    # Create a relay without SupportsBatteryLevel (PowerSource absent at creation time).
+    bare_node = {
+        "node_id": 0x30, "available": True,
+        "attributes": {"1/29/0": [{"0": 266}], "1/6/0": False},
+    }
+    ds.create_from_raw(bare_node, "Battery Relay")
+    dev_id = ds.lookup(0x30, 1)
+    dev = devices[dev_id]
+    assert not dev.pluginProps.get("SupportsBatteryLevel")
+
+    # Reconcile with a node that now has PowerSource on endpoint 0.
+    full_node = {
+        "node_id": 0x30, "available": True,
+        "attributes": {
+            "0/47/12": 200,               # PowerSource.BatPercentRemaining = 100 %
+            "1/29/0": [{"0": 266}], "1/6/0": False,
+        },
+    }
+    ds.reconcile_all([full_node])
+    assert dev.pluginProps.get("SupportsBatteryLevel") is True
+    assert "batteryLevel" in dev.states
+
+
+def test_reassert_does_not_add_meter_props_to_non_relay_types(ds, indigo_env):
+    """SupportsPowerMeter/SupportsEnergyMeter must NOT be injected onto non-relay types.
+
+    A sensor device (e.g. matterAirQualitySensor) on an endpoint that happens to
+    also advertise the electrical clusters must NOT receive meter props — those props
+    only make sense for matterRelay/matterDimmer/matterColorDimmer.
+    """
+    _indigo, devices = indigo_env
+    # Simulate an AQ sensor created mid-interview, endpoint also happens to carry
+    # electrical clusters (contrived but defensive).
+    aq_node_bare = {
+        "node_id": 0x40, "available": True,
+        "attributes": {
+            "1/29/0": [{"0": 0x0073}],
+            "1/91/0": 1,    # AirQuality: good
+        },
+    }
+    ds.create_from_raw(aq_node_bare, "AQ Sensor")
+    aq_id = ds.lookup(0x40, 1, "matterAirQualitySensor")
+    assert aq_id is not None
+
+    aq_node_full = {
+        "node_id": 0x40, "available": True,
+        "attributes": {
+            "1/29/0": [{"0": 0x0073}],
+            "1/91/0": 1,
+            "1/144/8": 500,              # ElectricalPowerMeasurement (0x0090)
+            "1/145/1": {"energy": 100},  # ElectricalEnergyMeasurement (0x0091)
+        },
+    }
+    devices[aq_id].replaced_props = False
+    ds.reconcile_all([aq_node_full])
+
+    # Meter props must NOT have been injected.
+    assert not devices[aq_id].pluginProps.get("SupportsPowerMeter"), (
+        "SupportsPowerMeter must not be added to matterAirQualitySensor"
+    )
+    assert not devices[aq_id].pluginProps.get("SupportsEnergyMeter"), (
+        "SupportsEnergyMeter must not be added to matterAirQualitySensor"
+    )
+    # replacePluginPropsOnServer must not have been called at all for this device.
+    assert not getattr(devices[aq_id], "replaced_props", False), (
+        "replacePluginPropsOnServer was unexpectedly called on a non-relay type"
+    )
