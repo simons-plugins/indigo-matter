@@ -85,6 +85,22 @@ EVT_NODE_REMOVED = "node_removed"
 EVT_ATTRIBUTE_UPDATED = "attribute_updated"
 EVT_SERVER_SHUTDOWN = "server_shutdown"
 EVT_NODE_EVENT = "node_event"
+# Bridge dynamic-endpoint events (verified against ws-controller v0.6.2):
+#   @matter-server/ws-controller/src/server/WebSocketControllerHandler.ts
+#   lines 288-309 (observers.on nodeEndpointAdded / nodeEndpointRemoved):
+#     endpoint_added:   {event: "endpoint_added",   data: {node_id, endpoint_id}}
+#     endpoint_removed: {event: "endpoint_removed",  data: {node_id, endpoint_id}}
+#   Both ids are the raw TypeScript NodeId/EndpointNumber values (integers).
+#   PairedNode.ts (matter.js) always emits structureChanged → node_updated AFTER
+#   nodeEndpointAdded/nodeEndpointRemoved, so a node_updated reliably follows
+#   each endpoint_added (verified: PairedNode.ts #triggerNodeStructureChanges,
+#   line 954 calls events.structureChanged.emit() after all endpoint events).
+EVT_ENDPOINT_ADDED = "endpoint_added"
+EVT_ENDPOINT_REMOVED = "endpoint_removed"
+
+# endpoint_added / endpoint_removed data field names (wire-level rename firewall)
+EVT_ENDPOINT_NODE_ID = "node_id"
+EVT_ENDPOINT_ENDPOINT_ID = "endpoint_id"
 
 
 @dataclass
@@ -245,7 +261,8 @@ class Protocol:
           - node_added / node_updated: the node-details object (has ``node_id``)
           - node_event:        MatterNodeEvent dict — see wire-shape comment block
                                at the top of this module for the verified shape.
-          - others (endpoint_*): a dict with ``node_id``
+          - endpoint_added / endpoint_removed: ``{node_id, endpoint_id}``
+                               (verified vs. ws-controller v0.6.2 lines 288-309)
         """
         name = frame.get(KEY_EVENT, "")
         data = frame.get(KEY_DATA)
@@ -258,6 +275,12 @@ class Protocol:
             value = data[2]
         elif name == EVT_NODE_REMOVED:
             node_id = data if not isinstance(data, dict) else data.get("node_id")
+        elif name in (EVT_ENDPOINT_ADDED, EVT_ENDPOINT_REMOVED) and isinstance(data, dict):
+            # data = {node_id: int, endpoint_id: int} (verified vs. ws-controller v0.6.2)
+            _raw_node_id  = data.get(EVT_ENDPOINT_NODE_ID)
+            _raw_endpoint = data.get(EVT_ENDPOINT_ENDPOINT_ID)
+            node_id  = _to_int(_raw_node_id)  if _raw_node_id  is not None else None
+            endpoint = _to_int(_raw_endpoint) if _raw_endpoint is not None else None
         elif name == EVT_NODE_EVENT and isinstance(data, dict):
             # MatterNodeEvent: {node_id, endpoint_id, cluster_id, event_id, data, ...}
             # Wire field names are isolated to the EVT_NODE_EVENT_* constants above.
