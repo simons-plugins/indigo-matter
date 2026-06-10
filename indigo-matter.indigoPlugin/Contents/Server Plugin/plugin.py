@@ -218,7 +218,13 @@ class Plugin(indigo.PluginBase):
     # asyncio → Indigo event bridge (called on the loop thread)
     # ------------------------------------------------------------------
     def _on_matter_event(self, evt) -> None:
-        self.device_sync.handle_event(evt)
+        # Stage isolation: a device_sync failure must not starve the job
+        # reconcile below — reconcile_node_added can still recover the job
+        # (it runs its own device-create pass), so it always gets its shot.
+        try:
+            self.device_sync.handle_event(evt)
+        except Exception as exc:  # noqa: BLE001
+            self.logger.exception(exc)
         # A node that arrives AFTER its commission job timed out is matter-server
         # finishing the join in the background (issue #16): device_sync has just
         # created the devices (bare product name); now let the job table claim it,

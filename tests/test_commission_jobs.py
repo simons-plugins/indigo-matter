@@ -8,8 +8,10 @@ import pytest
 
 import commission_jobs
 from commission_jobs import (
+    TIMEOUT_MESSAGE,
     CommissionError,
     CommissionJobs,
+    _exc_message,
     is_valid_setup_code,
     node_id_to_str,
 )
@@ -246,6 +248,28 @@ def test_generic_exception_maps_to_internal_error(mock_logger):
     asyncio.run(scenario())
 
 
+def test_exc_message_falls_back_to_type_name():
+    # str(exc) is "" for bare exceptions — the payload must never be blank (#17)
+    assert _exc_message(RuntimeError("kaboom")) == "kaboom"
+    assert _exc_message(TimeoutError()) == "TimeoutError"
+    assert _exc_message(ValueError("   ")) == "ValueError"
+
+
+def test_bare_exception_failure_has_nonempty_message(mock_logger):
+    async def scenario():
+        class BareBoomMatter(FakeMatter):
+            async def commission_with_code(self, code):
+                raise ValueError  # str() == "" — same class of bug as #17
+
+        jobs = _jobs(BareBoomMatter(), mock_logger, schedule=asyncio.ensure_future)
+        _, body = jobs.create_job({"setupCode": "12345678901", "suggestedName": "X"})
+        final = await _await_terminal(jobs, body["jobId"])()
+        assert final["status"] == "failed"
+        assert final["error"]["code"] == "internal_error"
+        assert final["error"]["message"] == "ValueError"
+    asyncio.run(scenario())
+
+
 def test_recommission_allowed_after_terminal(mock_logger):
     async def scenario():
         jobs = _jobs(FakeMatter(node_id=0x1), mock_logger, schedule=asyncio.ensure_future)
@@ -276,6 +300,34 @@ def test_commission_timeout_maps_to_commissioning_timeout(mock_logger):
         assert "may still join" in final["error"]["message"]
         assert "300" in final["error"]["message"]  # names the actual deadline
         assert matter.removed == []  # never tear down an in-flight join
+        # the timeout is logged so the event log holds evidence even after
+        # Domio stops polling the job
+        mock_logger.warning.assert_called()
+        logged = str(mock_logger.warning.call_args)
+        assert body["jobId"] in logged and "may still join" in logged
+    asyncio.run(scenario())
+
+
+def test_get_node_timeout_after_commission_is_internal_error(mock_logger):
+    # Commissioning SUCCEEDED but the follow-up get_node (10s) timed out: this
+    # must NOT be labeled commissioning_timeout ("may still join" is wrong — it
+    # already joined, and reconcile can't repair a job that wasn't terminal when
+    # node_added fired). The node stays on the fabric: no remove_node.
+    async def scenario():
+        class SlowDescriptorMatter(FakeMatter):
+            async def get_node(self, node_id):
+                raise TimeoutError  # the short descriptor-read deadline expired
+
+        matter = SlowDescriptorMatter(node_id=0xAB)
+        jobs = _jobs(matter, mock_logger, schedule=asyncio.ensure_future)
+        _, body = jobs.create_job({"setupCode": "12345678901", "suggestedName": "X"})
+        final = await _await_terminal(jobs, body["jobId"])()
+        assert final["status"] == "failed"
+        assert final["error"]["code"] == "internal_error"
+        assert "descriptors" in final["error"]["message"]
+        assert "0xAB" in final["error"]["message"]
+        assert "commissioning succeeded" in final["error"]["message"]
+        assert matter.removed == []  # the node joined; don't tear it down
     asyncio.run(scenario())
 
 
@@ -323,9 +375,15 @@ def test_reconcile_ignores_timeouts_outside_window(mock_logger):
         await _await_terminal(jobs, body["jobId"])()
         # node arrives 6 minutes later — outside the bounded reconcile window
         clock["t"] += timedelta(minutes=6)
+        mock_logger.warning.reset_mock()
         assert jobs.reconcile_node_added({"node_id": 1}) is None
         _, final = jobs.get_job(body["jobId"])
         assert final["status"] == "failed"  # untouched
+        # …but no longer silent: the log names the job, the node, and that the
+        # user's suggestedName/suggestedRoom were not applied
+        mock_logger.warning.assert_called_once()
+        logged = str(mock_logger.warning.call_args)
+        assert body["jobId"] in logged and "0x1" in logged and "not applied" in logged
     asyncio.run(scenario())
 
 
@@ -382,6 +440,62 @@ def test_reconcile_ignores_malformed_node(mock_logger):
     jobs = _jobs(FakeMatter(), mock_logger)
     assert jobs.reconcile_node_added({}) is None        # no node_id
     assert jobs.reconcile_node_added(None) is None      # not a dict
+    # no candidate was waiting — routine restart syncs must not spam the log
+    mock_logger.warning.assert_not_called()
+
+
+def test_malformed_node_warns_when_timeout_candidate_waiting(mock_logger):
+    # A claimable timed-out job exists and the malformed node_added was its one
+    # shot at reconciling — leave evidence in the log.
+    async def scenario():
+        jobs = _jobs(TimeoutMatter(), mock_logger, schedule=asyncio.ensure_future)
+        _, body = jobs.create_job({"setupCode": "12345678901", "suggestedName": "X"})
+        await _await_terminal(jobs, body["jobId"])()
+        mock_logger.warning.reset_mock()
+        assert jobs.reconcile_node_added({"weird": True}) is None
+        mock_logger.warning.assert_called_once()
+        assert body["jobId"] in str(mock_logger.warning.call_args)
+    asyncio.run(scenario())
+
+
+def test_reconcile_schedule_failure_restores_timeout_state(mock_logger):
+    # Loop down when the reconcile is scheduled: the restore must be atomic and
+    # exact — original error payload back, terminal_at NOT re-stamped (a fresh
+    # stamp would silently extend the documented reconcile window) — and logged.
+    async def scenario():
+        clock = {"t": datetime(2026, 6, 10, 12, 0, tzinfo=timezone.utc)}
+        sched = {"fail": False}
+
+        def schedule(coro):
+            if sched["fail"]:
+                raise RuntimeError("asyncio runtime is not running")
+            return asyncio.ensure_future(coro)
+
+        jobs = _jobs(TimeoutMatter(), mock_logger, schedule=schedule,
+                     clock=lambda: clock["t"])
+        _, body = jobs.create_job({"setupCode": "12345678901", "suggestedName": "X"})
+        final = await _await_terminal(jobs, body["jobId"])()
+        assert final["error"]["code"] == "commissioning_timeout"
+        original_terminal_at = jobs._jobs[body["jobId"]].terminal_at
+
+        clock["t"] += timedelta(minutes=2)  # later, but still inside the window
+        sched["fail"] = True
+        assert jobs.reconcile_node_added({"node_id": 1}) is None
+
+        job = jobs._jobs[body["jobId"]]
+        assert job.status == "failed"
+        assert job.error == {"code": "commissioning_timeout", "message": TIMEOUT_MESSAGE}
+        assert job.message == ""  # claim-time message rolled back
+        assert job.terminal_at == original_terminal_at  # NOT refreshed to clock now
+        mock_logger.error.assert_called()
+        assert body["jobId"] in str(mock_logger.error.call_args)
+
+        # once the loop is back the job is still claimable — and succeeds
+        sched["fail"] = False
+        assert jobs.reconcile_node_added({"node_id": 1}) == body["jobId"]
+        final = await _await_terminal(jobs, body["jobId"])()
+        assert final["status"] == "success"
+    asyncio.run(scenario())
 
 
 def test_unknown_job_is_404(mock_logger):

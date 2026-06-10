@@ -298,3 +298,41 @@ def test_commission_timeout_covers_observed_worst_case():
     assert COMMISSION_TIMEOUT >= 300.0
     generic = inspect.signature(MatterClient.request).parameters["timeout"].default
     assert generic <= 30.0
+
+
+def test_commission_timeout_value_reaches_the_wait(mock_logger, monkeypatch):
+    # Behavioural counterpart of the signature check above: prove the long
+    # deadline actually reaches the asyncio.wait_for guarding the commission
+    # RPC's pending future, and that a plain request keeps its short default.
+    from matter_client import COMMISSION_TIMEOUT
+
+    captured: list[float] = []
+    real_wait_for = asyncio.wait_for
+
+    async def spying_wait_for(awaitable, timeout):
+        captured.append(timeout)
+        return await real_wait_for(awaitable, timeout)
+
+    monkeypatch.setattr("matter_client.asyncio.wait_for", spying_wait_for)
+
+    async def scenario():
+        fake = FakeWebSocket(responder=scripted_responder({
+            protocol.CMD_COMMISSION: {"node_id": 1},
+            protocol.CMD_GET_NODES: [],
+        }))
+        client = _client(mock_logger, fake)
+        task = asyncio.create_task(client.run())
+        await client.wait_connected(timeout=2)
+
+        captured.clear()  # drop wait_connected's own wait_for
+        result = await client.commission_with_code("MT:Y.TEST")
+        assert result == {"node_id": 1}
+        assert captured == [COMMISSION_TIMEOUT]  # the 300s deadline was used
+
+        captured.clear()
+        await client.get_nodes()
+        assert captured == [10.0]  # plain requests keep the short default
+
+        await client.close()
+        task.cancel()
+    run(scenario())

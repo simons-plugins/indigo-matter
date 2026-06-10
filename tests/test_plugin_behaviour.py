@@ -272,6 +272,20 @@ def test_node_added_event_triggers_job_reconcile(plug):
     plug.jobs.reconcile_node_added.assert_called_once_with(data)
 
 
+def test_device_sync_failure_does_not_starve_reconcile(plug):
+    # Stage isolation: handle_event blowing up must not stop the job table's
+    # reconcile (which can still recover the job via its own create pass).
+    import protocol
+    plug.jobs = Mock()
+    plug.device_sync.handle_event.side_effect = RuntimeError("device sync blew up")
+    data = {"node_id": 7, "attributes": {}}
+    evt = SimpleNamespace(kind=protocol.EVT_NODE_ADDED,
+                          raw={"event": "node_added", "data": data})
+    plug._on_matter_event(evt)  # must not raise
+    plug.jobs.reconcile_node_added.assert_called_once_with(data)
+    plug.logger.exception.assert_called_once()  # failure surfaced, not swallowed
+
+
 def test_non_node_added_event_does_not_reconcile(plug):
     import protocol
     plug.jobs = Mock()
