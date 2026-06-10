@@ -194,11 +194,16 @@ class FanControlHandler(ClusterHandler):
                     "vendorName": node.vendor_name,
                     "productName": node.product_name,
                 },
-                initial_states={},
+                initial_states={"onOffState": False, "brightnessLevel": 0},
             )
         ]
 
     def attributes_to_subscribe(self) -> list[int]:
+        # matter-server's start_listening is a full-node firehose — this list is
+        # documentation of interest, not a wire subscription filter.  When this
+        # handler is co-located with Thermostat, on_attribute_update() only acts
+        # on ATTR_FAN_MODE; ATTR_PERCENT_SETTING / ATTR_PERCENT_CURRENT updates
+        # fall through to {} harmlessly, so the extra entries cause no harm.
         return [ATTR_FAN_MODE, ATTR_PERCENT_SETTING, ATTR_PERCENT_CURRENT]
 
     def on_attribute_update(self, indigo_dev: Any, attribute_id: int, value: Any) -> dict:
@@ -211,7 +216,11 @@ class FanControlHandler(ClusterHandler):
                 return {"hvacFanMode": mode}
             return {}
 
-        # Standalone matterFan device.
+        # Standalone matterFan device — only act when deviceTypeId is explicitly
+        # "matterFan"; any other type (including None) is a safe no-op.
+        if getattr(indigo_dev, "deviceTypeId", None) != "matterFan":
+            return {}
+
         if attribute_id == ATTR_FAN_MODE:
             if value is None:
                 return {}

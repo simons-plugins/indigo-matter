@@ -101,7 +101,7 @@ def test_create_devices_returns_matterfan_spec_when_primary():
     assert spec.props["endpointId"] == "1"
     assert spec.props["vendorName"] == "Dreo"
     assert spec.props["productName"] == "Tower Fan"
-    assert spec.initial_states == {}
+    assert spec.initial_states == {"onOffState": False, "brightnessLevel": 0}
 
 
 def test_create_devices_returns_empty_when_not_primary():
@@ -185,6 +185,12 @@ def test_percent_setting_attribute_returns_empty_on_update():
 def test_unknown_attribute_returns_empty():
     h = FanControlHandler()
     assert h.on_attribute_update(_fan_dev(), 0x9999, 42) == {}
+
+
+def test_none_device_fanmode_update_is_safe_noop():
+    # Device is None (or any type that is neither matterThermostat nor matterFan):
+    # both deviceTypeId branches are skipped and the handler returns {} — a safe no-op.
+    assert FanControlHandler().on_attribute_update(None, ATTR_FAN_MODE, 5) == {}
 
 
 # ---------------------------------------------------------------------------
