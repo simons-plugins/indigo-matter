@@ -141,6 +141,11 @@
                 <TriggerLabelPrefix>Humidity is</TriggerLabelPrefix>
                 <ControlPageLabel>Humidity</ControlPageLabel>
             </State>
+            <State id="batteryLevel">
+                <ValueType>Integer</ValueType>
+                <TriggerLabel>Battery Level</TriggerLabel>
+                <ControlPageLabel>Battery Level</ControlPageLabel>
+            </State>
         </States>
         <UiDisplayStateId>sensorValue</UiDisplayStateId>
     </Device>
@@ -166,6 +171,11 @@
                 <ValueType boolType="OnOff">Boolean</ValueType>
                 <TriggerLabel>Motion</TriggerLabel>
                 <ControlPageLabel>Motion</ControlPageLabel>
+            </State>
+            <State id="batteryLevel">
+                <ValueType>Integer</ValueType>
+                <TriggerLabel>Battery Level</TriggerLabel>
+                <ControlPageLabel>Battery Level</ControlPageLabel>
             </State>
         </States>
         <UiDisplayStateId>onOffState</UiDisplayStateId>
@@ -193,6 +203,11 @@
                 <TriggerLabel>Contact</TriggerLabel>
                 <ControlPageLabel>Contact</ControlPageLabel>
             </State>
+            <State id="batteryLevel">
+                <ValueType>Integer</ValueType>
+                <TriggerLabel>Battery Level</TriggerLabel>
+                <ControlPageLabel>Battery Level</ControlPageLabel>
+            </State>
         </States>
         <UiDisplayStateId>onOffState</UiDisplayStateId>
     </Device>
@@ -219,6 +234,11 @@
                 <TriggerLabel>Illuminance</TriggerLabel>
                 <TriggerLabelPrefix>Illuminance is</TriggerLabelPrefix>
                 <ControlPageLabel>Illuminance (lux)</ControlPageLabel>
+            </State>
+            <State id="batteryLevel">
+                <ValueType>Integer</ValueType>
+                <TriggerLabel>Battery Level</TriggerLabel>
+                <ControlPageLabel>Battery Level</ControlPageLabel>
             </State>
         </States>
         <UiDisplayStateId>sensorValue</UiDisplayStateId>

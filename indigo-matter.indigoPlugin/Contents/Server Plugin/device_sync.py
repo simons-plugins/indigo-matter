@@ -22,6 +22,7 @@ import indigo
 
 import protocol
 from matter_model import NodeInfo, node_id_to_str, parse_node
+from matter_handlers.power_source import CLUSTER_POWER_SOURCE
 from protocol import MatterCommand
 
 
@@ -129,8 +130,17 @@ class DeviceSync:
             # not by how many happen to be missing on this pass. A plug's root
             # endpoint 0 produces no handler, so this is not len(node.endpoints).
             plan: list[tuple] = []  # (endpoint, spec)
+            # Detect PowerSource anywhere on the node so we can set
+            # SupportsBatteryLevel on every device we create. Indigo applies
+            # Supports* via device props at creation, not Devices.xml statics
+            # (the colour-support lesson — see HANDOVER 2026-06-09 item 4).
+            node_has_power_source = any(
+                endpoint.has(CLUSTER_POWER_SOURCE) for endpoint in node.endpoints
+            )
             for endpoint in node.endpoints:
                 for spec in self.registry.handlers_for_endpoint(node, endpoint):
+                    if node_has_power_source:
+                        spec.props.setdefault("SupportsBatteryLevel", True)
                     plan.append((endpoint, spec))
 
             multi = len(plan) > 1
@@ -270,14 +280,20 @@ class DeviceSync:
         get_node carries a snapshot of every attribute; matter-server only emits
         attribute_updated on subsequent *changes*, so without this a device whose
         value is static at connect time would sit at its hardcoded initial state.
+
+        Two passes: first the device's own endpoint (standard clusters); then any
+        OTHER endpoints whose cluster handler is node-scoped (e.g. PowerSource on
+        endpoint 0 primes battery level into a sensor on endpoint 1).
         """
         dev = indigo.devices[dev_id]
         states: dict = {}
         for (ep, cluster, attribute), value in node.attributes.items():
-            if ep != endpoint_id:
-                continue
             handler = self.registry.handler_for_cluster(cluster)
             if handler is None:
+                continue
+            # Include attributes from: this device's own endpoint, OR any
+            # node-scoped cluster living on a different endpoint.
+            if ep != endpoint_id and not handler.node_scoped:
                 continue
             try:
                 states.update(handler.on_attribute_update(dev, attribute, value))
@@ -412,14 +428,40 @@ class DeviceSync:
             # rename firewall and a wire-shape change should be visible here.
             self.logger.warning("ignoring malformed attribute event: %r", evt.raw)
             return
+        # Handler lookup must precede endpoint lookup: node-scoped handlers (e.g.
+        # PowerSource) have no Indigo device at the event's endpoint and require
+        # special fan-out treatment before any per-endpoint device resolution.
+        handler = self.registry.handler_for_cluster(evt.cluster)
+        if handler is None:
+            return
+        if handler.node_scoped:
+            # Node-scoped clusters (e.g. PowerSource) live on a different endpoint
+            # than the devices they augment. Fan the update out to ALL Indigo devices
+            # for this node so every sensor on the node receives the battery update.
+            with self._lock:
+                dev_ids = [dev_id for (nid, _eid), dev_id in self._index.items()
+                           if nid == int(evt.node_id)]
+            for dev_id in dev_ids:
+                if self._active and dev_id not in self._active:
+                    continue  # gate updates to active devices once any are started
+                try:
+                    dev = indigo.devices[dev_id]
+                    states = handler.on_attribute_update(dev, evt.attribute, evt.value)
+                    if states:
+                        self.apply_states(dev_id, _kvlist(states))
+                except Exception as exc:  # noqa: BLE001 - one bad value must not silently freeze the device
+                    self.logger.warning(
+                        "bad update for device %s (ep%s cl%s attr%s value=%r): %s",
+                        dev_id, evt.endpoint, evt.cluster, evt.attribute, evt.value, exc,
+                    )
+                    continue
+            return
+        # Non-node-scoped path: look up the single device at (node, endpoint).
         dev_id = self.lookup(evt.node_id, evt.endpoint)
         if dev_id is None:
             return
         if self._active and dev_id not in self._active:
             return  # gate updates to active devices once any are started
-        handler = self.registry.handler_for_cluster(evt.cluster)
-        if handler is None:
-            return
         dev = indigo.devices[dev_id]
         try:
             states = handler.on_attribute_update(dev, evt.attribute, evt.value)
