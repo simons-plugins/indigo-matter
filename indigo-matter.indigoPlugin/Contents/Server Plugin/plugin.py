@@ -393,7 +393,7 @@ class Plugin(indigo.PluginBase):
     def menuShowMatterServerLogs(self):  # noqa: N802
         self.logger.info("matter-server log: ~/Library/Logs/indigo-matter/matter-server.log")
 
-    def menuCommissionDeviceManually(self, valuesDict):  # noqa: N802
+    def menuCommissionDeviceManually(self, valuesDict, menuId=""):  # noqa: N802, ARG002
         if self.jobs is None:
             return (False, valuesDict)
         status, body = self.jobs.create_job({
@@ -463,7 +463,7 @@ class Plugin(indigo.PluginBase):
             options.append((entry["path"], label))
         return options
 
-    def menuRestoreFabricBackup(self, valuesDict):  # noqa: N802
+    def menuRestoreFabricBackup(self, valuesDict, menuId=""):  # noqa: N802, ARG002
         errors = indigo.Dict()
         # Restore must stop/start matter-server, which the plugin can only do in
         # managed mode. Externally-managed (run.sh / manual) servers must be
