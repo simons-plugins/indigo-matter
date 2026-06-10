@@ -54,8 +54,11 @@ def test_thermostat_attribute_updates(mock_indigo_base):
 def test_fan_attribute_update(mock_indigo_base):
     import indigo
     h = FanControlHandler()
-    assert h.on_attribute_update(None, 0x0000, 5) == {"hvacFanMode": indigo.kFanMode.Auto}
-    assert h.on_attribute_update(None, 0x0000, 4) == {"hvacFanMode": indigo.kFanMode.AlwaysOn}
+    # When the target device is a matterThermostat (co-located fan), FanMode maps
+    # to hvacFanMode — the merged-thermostat path.
+    thermo_dev = SimpleNamespace(deviceTypeId="matterThermostat")
+    assert h.on_attribute_update(thermo_dev, 0x0000, 5) == {"hvacFanMode": indigo.kFanMode.Auto}
+    assert h.on_attribute_update(thermo_dev, 0x0000, 4) == {"hvacFanMode": indigo.kFanMode.AlwaysOn}
 
 
 def _dev():
