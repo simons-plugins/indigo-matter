@@ -15,6 +15,7 @@ from typing import Any, Optional
 from .base import ClusterHandler, IndigoDeviceSpec
 from .color_control import ColorControlHandler
 from .door_lock import DoorLockHandler
+from .electrical import ElectricalEnergyHandler, ElectricalPowerHandler
 from .level_control import LevelControlHandler
 from .on_off import OnOffHandler
 from .sensors import (
@@ -34,8 +35,9 @@ def default_handlers() -> list[ClusterHandler]:
     are mutually exclusive via ``is_primary_for``; sensors are additive;
     Thermostat owns its endpoint and FanControl merges into it.
     WindowCovering does not overlap any lighting cluster so its order relative
-    to them is independent. PowerSource is non-primary and node-scoped
-    (order-independent; placed last)."""
+    to them is independent. ElectricalPower/Energy are non-primary and merge
+    into existing relay/dimmer devices. PowerSource is non-primary and
+    node-scoped (order-independent; placed last)."""
     return [
         ColorControlHandler(),
         LevelControlHandler(),
@@ -49,6 +51,8 @@ def default_handlers() -> list[ClusterHandler]:
         FanControlHandler(),
         WindowCoveringHandler(),
         DoorLockHandler(),
+        ElectricalPowerHandler(),
+        ElectricalEnergyHandler(),
         PowerSourceHandler(),
     ]
 
