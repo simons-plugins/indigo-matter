@@ -696,6 +696,47 @@ def test_thermostat_fan_endpoint_creates_exactly_one_device(ds, indigo_env):
     assert devices[dev_id].deviceTypeId == "matterThermostat"
 
 
+def test_thermostat_fan_mode_is_primed_from_snapshot(ds, indigo_env):
+    """FanControl attr in the node snapshot must prime hvacFanMode into the thermostat.
+
+    Regression test for the merge-into sibling-skip bug: FanControlHandler carries
+    device_type_id='matterFan' (its standalone role), but when co-located with a
+    Thermostat it shares the matterThermostat device.  The skip must NOT fire because
+    'matterFan' is absent from the endpoint's type-map — only 'matterThermostat' is
+    there.  Without the fix, _prime_states skips FanControl unconditionally on type
+    mismatch, leaving hvacFanMode unset after device creation.
+    """
+    _indigo, devices = indigo_env
+    # THERMOSTAT_FAN_NODE has "1/514/0": 1 = FanMode=1 in its snapshot
+    result = ds.create_from_raw(THERMOSTAT_FAN_NODE, "Thermostat")
+    dev_id = result["primaryDeviceId"]
+    assert devices[dev_id].deviceTypeId == "matterThermostat"
+    assert "hvacFanMode" in devices[dev_id].states, (
+        "hvacFanMode was not primed from the node snapshot — "
+        "merge-into FanControl was incorrectly skipped during _prime_states"
+    )
+
+
+def test_aq_priming_isolation_skips_sibling_types(ds, indigo_env):
+    """Priming one AQ sub-device does NOT apply sibling-type values to it.
+
+    Confirms the pressure-vs-flow / AQ cross-contamination guard still fires when
+    the sibling type DOES exist as a separate device on the endpoint (the case where
+    the skip IS correct, unlike the merge-into thermostat+fan case).
+    """
+    _indigo, devices = indigo_env
+    ds.create_from_raw(AQ_NODE, "Air Sensor")
+    aq_id  = ds.lookup(30, 1, "matterAirQualitySensor")
+    co2_id = ds.lookup(30, 1, "matterCO2Sensor")
+    assert aq_id is not None and co2_id is not None and aq_id != co2_id
+    # AQ_NODE snapshot has CO2=480.0; the AQ device must NOT have been primed with it
+    assert devices[aq_id].states.get("sensorValue") != 480.0, (
+        "AirQuality device was primed with CO2 value — sibling-type skip not firing"
+    )
+    # CO2 device must have been primed with its own value
+    assert devices[co2_id].states.get("sensorValue") == 480.0
+
+
 def test_thermostat_fan_mode_update_goes_to_thermostat(ds, indigo_env):
     """FanControl cluster update on a thermostat endpoint routes to the thermostat device."""
     _indigo, devices = indigo_env

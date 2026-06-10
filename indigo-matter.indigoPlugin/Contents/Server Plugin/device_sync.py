@@ -221,6 +221,14 @@ class DeviceSync:
 
             multi = len(plan) > 1
             folder_id = self._resolve_folder_id(suggested_room) if authoritative else 0
+            # Pre-compute the FULL set of planned device_type_ids per endpoint so
+            # _prime_states can identify merge-into handlers correctly regardless
+            # of creation order.  (The index is built incrementally, so checking
+            # it inside the loop would miss not-yet-created siblings.)
+            ep_planned_types: dict[tuple, set] = {}
+            for ep_, spec_ in plan:
+                key_ = (int(node.node_id), int(ep_.endpoint_id))
+                ep_planned_types.setdefault(key_, set()).add(spec_.device_type_id)
             for endpoint, spec in plan:
                 # Bridged endpoints carry their own identity in cluster 0x0039.
                 # When a bridge label (node_label or product_name) is present:
@@ -269,7 +277,10 @@ class DeviceSync:
                 created.append(dev_id)
                 new_ids.append(dev_id)
                 primary = primary if primary is not None else dev_id
-                self._prime_states(node, dev_id, endpoint.endpoint_id, type_id)
+                self._prime_states(
+                    node, dev_id, endpoint.endpoint_id, type_id,
+                    ep_sibling_types=ep_planned_types.get(ep_key, set()),
+                )
         if new_ids:
             # The only event-log evidence of an out-of-band join (node_added)
             # is this line — keep it INFO, not debug (issue #19). Idempotent
@@ -375,7 +386,8 @@ class DeviceSync:
             self._move_to_folder(dev_id, folder_id)
 
     def _prime_states(self, node: NodeInfo, dev_id: int, endpoint_id: int,
-                      own_type_id: str) -> None:
+                      own_type_id: str,
+                      ep_sibling_types: Optional[set] = None) -> None:
         """Apply the node's current attribute values to a freshly-created device.
 
         get_node carries a snapshot of every attribute; matter-server only emits
@@ -390,7 +402,24 @@ class DeviceSync:
         a *different* existing device on the same endpoint (fix/#44: prevents the
         Pressure device being primed with Flow values or an AQ device being primed
         with CO2 values it doesn't own).
+
+        The sibling-type skip is narrowed to fire only when the handler's type
+        actually exists as a SEPARATE device on the endpoint.  Merge-into handlers
+        (FanControl co-located with a Thermostat) carry their standalone
+        device_type_id ("matterFan") but share this device — they must still prime.
+
+        ``ep_sibling_types`` is the *full* set of device_type_ids for this
+        endpoint (all types that will ever exist, not just those created so far).
+        Callers must pass the complete set — ``create_devices`` derives it from
+        the plan list before creation starts; ``_refresh_live_node`` derives it
+        from the live index (which is complete by the time refresh runs).
+        When ``None`` (legacy / fallback), the current index snapshot is used.
         """
+        if ep_sibling_types is None:
+            with self._lock:
+                ep_sibling_types = set(
+                    self._index.get((int(node.node_id), int(endpoint_id)), {}).keys()
+                )
         dev = indigo.devices[dev_id]
         states: dict = {}
         for (ep, cluster, attribute), value in node.attributes.items():
@@ -405,12 +434,21 @@ class DeviceSync:
             # sibling device (handler has a non-empty device_type_id that differs
             # from this device's type).  This prevents e.g. the Pressure device
             # being primed with Flow values, or an AQ device receiving CO2 values.
-            # We skip unconditionally — whether or not the sibling has been created
-            # yet — so creation order does not affect priming correctness.
+            #
+            # However, *merge-into* handlers (e.g. FanControl co-located with a
+            # Thermostat) carry their standalone device_type_id ("matterFan") but
+            # share the thermostat device — they must still prime.  Only skip when
+            # the handler's type actually exists as a SEPARATE device on this
+            # endpoint (present in ep_sibling_types); if the type is absent the
+            # handler is in merge-into mode and its attributes belong here.
             if ep == endpoint_id and not handler.node_scoped:
                 handler_type_id = getattr(handler, "device_type_id", "") or ""
                 if handler_type_id and handler_type_id != own_type_id:
-                    continue
+                    # Only skip when this type exists as a SEPARATE device on the endpoint.
+                    # Merge-into handlers (FanControl co-located with a Thermostat) carry their
+                    # standalone device_type_id but share this device — they must still prime.
+                    if handler_type_id in ep_sibling_types:
+                        continue
             try:
                 states.update(handler.on_attribute_update(dev, attribute, value))
             except Exception as exc:  # noqa: BLE001 - one bad attr must not abort priming
@@ -471,16 +509,20 @@ class DeviceSync:
 
     def _refresh_live_node(self, node: NodeInfo) -> None:
         for endpoint in node.endpoints:
-            # Refresh ALL devices on this endpoint (handles additive multi-device eps)
-            for dev_id in self._all_dev_ids_for_endpoint(node.node_id, endpoint.endpoint_id):
-                type_map = {}
-                with self._lock:
-                    ep_key = (int(node.node_id), int(endpoint.endpoint_id))
-                    type_map = dict(self._index.get(ep_key, {}))
+            # Snapshot the type-map once; derive both dev_ids, own_type_id, and
+            # ep_sibling_types from it so we only acquire the lock once per endpoint.
+            with self._lock:
+                ep_key = (int(node.node_id), int(endpoint.endpoint_id))
+                type_map = dict(self._index.get(ep_key, {}))
+            sibling_types = set(type_map.keys())
+            for dev_id in type_map.values():
                 own_type_id = next(
                     (tid for tid, did in type_map.items() if did == dev_id), ""
                 )
-                self._prime_states(node, dev_id, endpoint.endpoint_id, own_type_id)
+                self._prime_states(
+                    node, dev_id, endpoint.endpoint_id, own_type_id,
+                    ep_sibling_types=sibling_types,
+                )
                 self._clear_error(dev_id)
 
     def mark_unreachable(self, node_id: Any) -> None:
