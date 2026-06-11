@@ -170,9 +170,10 @@ devices onto Wi-Fi without Matter), its *printed* code works directly.
 
 **Removing:** plugin menu → *Decommission Matter device…* — this removes only
 the Indigo fabric; the device stays in Apple Home and any other ecosystem.
-(Deleting the Indigo device alone does *not* work — the plugin recreates it at
-the next reconcile, by design. Only a factory reset on the device itself
-removes everything.)
+(Deleting the Indigo device alone does *not* work — by design, the plugin
+recreates it the next time it reconciles with matter-server, e.g. after a
+plugin restart or reconnect. Only a factory reset on the device itself removes
+everything.)
 
 ### Don't have Apple Home? Alexa or Google Home work too
 

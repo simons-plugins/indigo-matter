@@ -1106,3 +1106,28 @@ def test_list_nodes_survives_out_of_band_delete(ds, indigo_env):
     nodes = ds.list_nodes()
     assert nodes[0][0] == 42
     assert nodes[0][1] == [f"device {dev_id}"]
+
+
+def test_list_nodes_orders_multiple_nodes_and_groups_by_node(ds, indigo_env):
+    # Grouping must be by node id alone — not by (node, endpoint) key — and
+    # ordering must hold with more than one node.
+    import copy
+    node7 = copy.deepcopy(RELAY_NODE)
+    node7["node_id"] = 7
+    ds.create_from_raw(RELAY_NODE, "Office Plug")
+    ds.create_from_raw(node7, "Lamp Plug")
+    nodes = ds.list_nodes()
+    assert [nid for nid, _names in nodes] == [7, 42]
+    assert nodes[0][1] == ["Lamp Plug"]
+    assert nodes[1][1] == ["Office Plug"]
+
+
+def test_list_nodes_merges_multiple_devices_into_one_node_entry(ds, indigo_env):
+    # A node whose endpoint creates several Indigo devices (pressure + flow)
+    # must yield ONE picker entry listing all of them, never one per device.
+    ds.create_from_raw(PRESSURE_FLOW_NODE, "Combo Sensor")
+    nodes = ds.list_nodes()
+    assert len(nodes) == 1
+    node_id, names = nodes[0]
+    assert node_id == 31
+    assert len(names) == 2

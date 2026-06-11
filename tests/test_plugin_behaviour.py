@@ -162,7 +162,18 @@ def test_http_status_handler_returns_reply(plug):
 # ---------------------------------------------------------------------------
 def test_decommission_sync_timeout_raises_unavailable(plug):
     from http_handlers import MatterUnavailable
+    plug.matter = Mock()  # past the not-connected guard, so the timeout path is what's tested
     plug.runtime = FakeRuntime(FakeFuture(exc=FuturesTimeoutError()))
+    with pytest.raises(MatterUnavailable):
+        plug._decommission_sync(42)
+
+
+def test_decommission_sync_matter_none_raises_unavailable(plug):
+    # runtime up but WS client not yet assigned (startup race): must 503, not
+    # misread the AttributeError as "device offline" and delete devices anyway.
+    from http_handlers import MatterUnavailable
+    plug.matter = None
+    plug.runtime = FakeRuntime(FakeFuture(value=None))
     with pytest.raises(MatterUnavailable):
         plug._decommission_sync(42)
 
@@ -490,13 +501,56 @@ def test_menu_decommission_success_logs_and_closes(plug):
     plug.logger.info.assert_called()
 
 
-def test_menu_decommission_offline_warns_about_resurrection(plug):
+def test_menu_decommission_passes_selected_node_id(plug):
+    # Destructive action: a refactor that hands the wrong variable to
+    # _decommission_sync would decommission the wrong physical device.
+    plug._decommission_sync = Mock(return_value={
+        "nodeId": "0x22", "removedIndigoDeviceIds": [1], "fabricRemoved": True})
+    ok, _vd = plug.menuDecommissionDevice({"node": "34", "confirm": True}, "decommissionDevice")
+    assert ok is True
+    plug._decommission_sync.assert_called_once_with(34)  # int, not "34"
+
+
+def test_menu_decommission_unexpected_error_is_dialog_error(plug):
+    # _decommission_sync's contract: None → unknown, MatterUnavailable → 503,
+    # OTHER → caller's problem. The menu must catch it, log it, and keep the
+    # dialog open — not dump a raw traceback into Indigo's UI thread.
+    plug.matter = Mock()
+    plug.runtime = FakeRuntime(FakeFuture(exc=KeyError("index corrupted")))
+    ok, _vd, errors = plug.menuDecommissionDevice({"node": "34", "confirm": True}, "decommissionDevice")
+    assert ok is False
+    assert "node" in errors
+    plug.logger.exception.assert_called()
+
+
+def test_menu_decommission_offline_is_dialog_error_and_warns_resurrection(plug):
     # remove_node failed → fabric NOT removed → node still in matter-server →
-    # reconcile will recreate the deleted Indigo devices. The menu must say so.
+    # reconcile will recreate the deleted Indigo devices. A half-done removal
+    # must NOT close the dialog as success — the user would believe the device
+    # is gone, then watch it reappear.
     plug.matter = Mock()
     plug.runtime = FakeRuntime(FakeFuture(value={
         "nodeId": "0x22", "removedIndigoDeviceIds": [678761951], "fabricRemoved": False}))
-    ok, _vd = plug.menuDecommissionDevice({"node": "34", "confirm": True}, "decommissionDevice")
-    assert ok is True
+    ok, _vd, errors = plug.menuDecommissionDevice({"node": "34", "confirm": True}, "decommissionDevice")
+    assert ok is False
+    assert "reappear" in errors["node"]
     plug.logger.warning.assert_called()
     assert "reappear" in plug.logger.warning.call_args[0][0]
+
+
+def test_get_matter_nodes_never_raises_into_dialog(plug):
+    # A list-callback exception breaks the whole dialog with only a raw
+    # traceback to explain it. Degrade to an empty picker + log instead
+    # (same contract as getFabricBackups).
+    plug.device_sync.list_nodes = Mock(side_effect=RuntimeError("boom"))
+    assert plug.getMatterNodes() == []
+    plug.logger.exception.assert_called()
+
+
+def test_menu_commission_manually_not_ready_surfaces_dialog_error(plug):
+    # jobs is None during startup: the dialog must say why OK did nothing.
+    plug.jobs = None
+    ok, _vd, errors = plug.menuCommissionDeviceManually({"setupCode": "MT:X"}, "commissionDeviceManually")
+    assert ok is False
+    assert "setupCode" in errors
+    plug.logger.warning.assert_called()

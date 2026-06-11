@@ -204,7 +204,11 @@ class DeviceSync:
             for dev_id in sorted(by_node[nid]):
                 try:
                     names.append(indigo.devices[dev_id].name)
-                except Exception:  # noqa: BLE001 - deleted out-of-band mid-iteration
+                except KeyError:
+                    # deleted out-of-band mid-iteration; reconcile will heal the index
+                    names.append(f"device {dev_id}")
+                except Exception as exc:  # noqa: BLE001 - UI label only; never break the picker
+                    self.logger.debug("list_nodes: name lookup for device %s failed: %s", dev_id, exc)
                     names.append(f"device {dev_id}")
             out.append((nid, names))
         return out
