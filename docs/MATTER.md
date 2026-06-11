@@ -163,10 +163,24 @@ The normal flow (Wi-Fi device):
 4. Done. The device appears in Indigo (the room becomes a device folder) and
    is controllable from everything Indigo offers, plus Domio.
 
-**Without Domio** (advanced): the plugin menu has *Commission device by setup
-code…* — same mechanics, paste the code by hand. And if a device is already
+**A point worth being explicit about:** once the pairing-mode code exists, the
+join itself is **pure IP** — no Bluetooth, no phone, no proximity to the
+device. Opening pairing mode makes the device re-announce itself over mDNS on
+the network it's already on; the plugin then does PASE/CASE over IP. This is
+equally true for **Thread** devices (the join rides the border router exactly
+like control traffic does). The phone is only needed for the two things that
+genuinely require it: the out-of-box BLE commissioning, and tapping "Turn On
+Pairing Mode". Everything downstream of the code is ecosystem-free.
+
+**Without Domio** (advanced): because of the above, the plugin menu's
+*Commission device by setup code…* is fully equivalent to the Domio flow —
+paste the pairing-mode code by hand, Wi-Fi or Thread alike. Domio's value is
+purely workflow: you're standing at the new device with the Home app open
+when the code appears, and Domio is the next tap on the same phone — name,
+room, progress, done, without going near the Mac. And if a device is already
 on your network and was never commissioned by anyone (some vendor apps get
-devices onto Wi-Fi without Matter), its *printed* code works directly.
+devices onto Wi-Fi without Matter), its *printed* code works directly in
+either entry point.
 
 **Removing:** plugin menu → *Decommission Matter device…* — this removes only
 the Indigo fabric; the device stays in Apple Home and any other ecosystem.
