@@ -26,13 +26,8 @@
                 <Label>Product:</Label>
             </Field>
         </ConfigUI>
-        <States>
-            <State id="onOffState">
-                <ValueType boolType="OnOff">Boolean</ValueType>
-                <TriggerLabel>On/Off State</TriggerLabel>
-                <ControlPageLabel>On/Off State</ControlPageLabel>
-            </State>
-        </States>
+        <!-- onOffState is native to the relay base type — do not redefine it
+             (Indigo rejects "native state keys cannot be overriden"). -->
         <UiDisplayStateId>onOffState</UiDisplayStateId>
     </Device>
 
@@ -328,11 +323,7 @@
             </Field>
         </ConfigUI>
         <States>
-            <State id="onOffState">
-                <ValueType boolType="OnOff">Boolean</ValueType>
-                <TriggerLabel>On/Off State</TriggerLabel>
-                <ControlPageLabel>On/Off State</ControlPageLabel>
-            </State>
+            <!-- onOffState is native to the relay base type — do not redefine it. -->
             <!-- lockState: finer trigger granularity beyond the binary on/off.
                  Values: locked / unlocked / jammed (NotFullyLocked).
                  NOTE: jammed currently maps to off + lockState="jammed"; surfacing
@@ -606,11 +597,7 @@
             </Field>
         </ConfigUI>
         <States>
-            <State id="onOffState">
-                <ValueType boolType="OnOff">Boolean</ValueType>
-                <TriggerLabel>On/Off State</TriggerLabel>
-                <ControlPageLabel>On/Off State</ControlPageLabel>
-            </State>
+            <!-- onOffState is native to the relay base type — do not redefine it. -->
             <State id="valveState">
                 <ValueType>String</ValueType>
                 <TriggerLabel>Valve State</TriggerLabel>

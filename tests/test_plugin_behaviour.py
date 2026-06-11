@@ -99,6 +99,85 @@ def test_send_command_noop_when_runtime_missing(plug):
 
 
 # ---------------------------------------------------------------------------
+# Universal actions (Request Status / Energy Update / Energy Reset / Beep)
+# ---------------------------------------------------------------------------
+def _universal_plug(plug):
+    plug.runtime = FakeRuntime(FakeFuture(value=None))
+    plug.matter = Mock()
+    return plug
+
+
+@pytest.mark.parametrize("act", ["RequestStatus", "EnergyUpdate"])
+def test_action_universal_status_and_update_refresh_node(plug, mock_indigo_base, act):
+    _universal_plug(plug)
+    dev = _dev()
+    dev.pluginProps = {"nodeId": "5"}
+    action = SimpleNamespace(deviceAction=getattr(mock_indigo_base.kUniversalAction, act))
+    plug.actionControlUniversal(action, dev)
+    plug.matter.interview_node.assert_called_once_with(5)
+
+
+def test_action_universal_energy_reset_is_noop_with_notice(plug, mock_indigo_base):
+    _universal_plug(plug)
+    dev = _dev()
+    dev.pluginProps = {"nodeId": "5"}
+    action = SimpleNamespace(deviceAction=mock_indigo_base.kUniversalAction.EnergyReset)
+    plug.actionControlUniversal(action, dev)
+    plug.matter.interview_node.assert_not_called()
+    plug.logger.info.assert_called()
+
+
+def test_action_universal_refresh_noop_without_node_id(plug, mock_indigo_base):
+    _universal_plug(plug)
+    dev = _dev()
+    dev.pluginProps = {}
+    action = SimpleNamespace(deviceAction=mock_indigo_base.kUniversalAction.RequestStatus)
+    plug.actionControlUniversal(action, dev)  # must not raise
+    plug.matter.interview_node.assert_not_called()
+
+
+def test_action_universal_refresh_timeout_logs_and_sets_error(plug, mock_indigo_base):
+    plug.runtime = FakeRuntime(FakeFuture(exc=FuturesTimeoutError()))
+    plug.matter = Mock()
+    dev = _dev()
+    dev.pluginProps = {"nodeId": "5"}
+    action = SimpleNamespace(deviceAction=mock_indigo_base.kUniversalAction.RequestStatus)
+    plug.actionControlUniversal(action, dev)
+    plug.logger.error.assert_called()
+    assert dev.error == "timeout"
+
+
+def test_action_universal_refresh_failure_logs_and_sets_error(plug, mock_indigo_base):
+    plug.runtime = FakeRuntime(FakeFuture(exc=ValueError("boom")))
+    plug.matter = Mock()
+    dev = _dev()
+    dev.pluginProps = {"nodeId": "5"}
+    action = SimpleNamespace(deviceAction=mock_indigo_base.kUniversalAction.EnergyUpdate)
+    plug.actionControlUniversal(action, dev)
+    plug.logger.error.assert_called()
+    assert dev.error == "cmd failed"
+
+
+def test_action_universal_noop_when_runtime_missing(plug, mock_indigo_base):
+    plug.runtime = None
+    plug.matter = Mock()
+    dev = _dev()
+    dev.pluginProps = {"nodeId": "5"}
+    action = SimpleNamespace(deviceAction=mock_indigo_base.kUniversalAction.RequestStatus)
+    plug.actionControlUniversal(action, dev)  # must not raise
+    plug.matter.interview_node.assert_not_called()
+
+
+def test_action_universal_unknown_action_ignored(plug, mock_indigo_base):
+    _universal_plug(plug)
+    dev = _dev()
+    dev.pluginProps = {"nodeId": "5"}
+    action = SimpleNamespace(deviceAction=mock_indigo_base.kUniversalAction.Beep)
+    plug.actionControlUniversal(action, dev)
+    plug.matter.interview_node.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # Status body
 # ---------------------------------------------------------------------------
 def test_status_body_ready(plug):
@@ -468,34 +547,54 @@ def test_get_device_folders_lists_existing_plus_none(plug, mock_indigo_base):
         SimpleNamespace(id=2, name="Sensors"),
     ]
     options = plug.getDeviceFolders()
-    assert options[0] == ("", "(no folder)")  # leading no-folder option
-    assert ("Lights", "Lights") in options
-    assert ("Sensors", "Sensors") in options
+    # Leading no-folder sentinel is the non-empty id "0" — Indigo rejects "".
+    assert options[0] == ("0", "(no folder)")
+    assert ("1", "Lights") in options
+    assert ("2", "Sensors") in options
+
+
+def test_get_device_folders_ids_are_never_empty_strings(plug, mock_indigo_base):
+    # Regression: an empty list id triggers "illegal ID string (ignoring)".
+    mock_indigo_base.devices.folders = [SimpleNamespace(id=7, name="Garage")]
+    assert all(key != "" for key, _label in plug.getDeviceFolders())
 
 
 def test_get_device_folders_degrades_to_none_on_error(plug, mock_indigo_base):
     boom = Mock()
     boom.__iter__ = Mock(side_effect=RuntimeError("boom"))
     mock_indigo_base.devices.folders = boom
-    assert plug.getDeviceFolders() == [("", "(no folder)")]
+    assert plug.getDeviceFolders() == [("0", "(no folder)")]
     plug.logger.exception.assert_called()
 
 
-def test_manual_commission_passes_folder_as_suggested_room(plug):
+def test_manual_commission_maps_folder_id_to_room_name(plug, mock_indigo_base):
+    mock_indigo_base.devices.folders = [SimpleNamespace(id=5, name="Lights")]
     captured = {}
     plug.jobs = SimpleNamespace(create_job=lambda params: (captured.update(params) or (202, {})))
     ok, _vd = plug.menuCommissionDeviceManually(
-        {"setupCode": "MT:ABC", "suggestedName": "Plug", "folder": "Lights"}, "commissionDeviceManually")
+        {"setupCode": "MT:ABC", "suggestedName": "Plug", "folder": "5"}, "commissionDeviceManually")
     assert ok is True
     assert captured["suggestedRoom"] == "Lights"
     assert captured["setupCode"] == "MT:ABC"
 
 
-def test_manual_commission_no_folder_maps_to_none(plug):
+def test_manual_commission_no_folder_maps_to_none(plug, mock_indigo_base):
+    mock_indigo_base.devices.folders = [SimpleNamespace(id=5, name="Lights")]
+    captured = {}
+    plug.jobs = SimpleNamespace(create_job=lambda params: (captured.update(params) or (202, {})))
+    for sel in ("0", "", None):
+        captured.clear()
+        plug.menuCommissionDeviceManually(
+            {"setupCode": "MT:ABC", "suggestedName": "Plug", "folder": sel}, "commissionDeviceManually")
+        assert captured["suggestedRoom"] is None
+
+
+def test_manual_commission_unknown_folder_id_falls_back_to_none(plug, mock_indigo_base):
+    mock_indigo_base.devices.folders = [SimpleNamespace(id=5, name="Lights")]
     captured = {}
     plug.jobs = SimpleNamespace(create_job=lambda params: (captured.update(params) or (202, {})))
     plug.menuCommissionDeviceManually(
-        {"setupCode": "MT:ABC", "suggestedName": "Plug", "folder": ""}, "commissionDeviceManually")
+        {"setupCode": "MT:ABC", "suggestedName": "Plug", "folder": "999"}, "commissionDeviceManually")
     assert captured["suggestedRoom"] is None
 
 

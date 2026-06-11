@@ -223,6 +223,58 @@ class Plugin(indigo.PluginBase):
     def actionControlSensor(self, action, dev):  # noqa: N802
         self.logger.info('ignored "%s" — Matter sensor is read-only', dev.name)
 
+    def actionControlUniversal(self, action, dev):  # noqa: N802
+        """Indigo's universal buttons: Request Status / Update / Reset / Beep.
+
+        Without this method Indigo logs "plugin does not define method
+        actionControlUniversal" whenever a user presses the energy Update/Reset
+        (or status) buttons. Request Status and Energy Update re-interview the
+        node (see _refresh_node) to re-read its attributes incl. power/energy.
+        Energy Reset is surfaced as unsupported: Matter's accumulated energy is
+        cumulative on the device and there is no Matter command to zero it (and
+        silently bouncing the Indigo state to 0 would be undone by the device's
+        next report). Beep / any other action are ignored."""
+        universal = indigo.kUniversalAction
+        cmd = action.deviceAction
+        if cmd in (universal.RequestStatus, universal.EnergyUpdate):
+            self._refresh_node(dev)
+        elif cmd == universal.EnergyReset:
+            self.logger.info(
+                '"%s": Matter accumulated energy is cumulative on the device and '
+                "cannot be reset from Indigo (no Matter command exists for it).", dev.name)
+        else:
+            self.logger.debug('ignored universal action %r for "%s"', cmd, dev.name)
+
+    def _refresh_node(self, dev) -> None:
+        """Re-interview the device's Matter node so matter-server re-reads its
+        attributes; matter-server then emits a node_updated event which
+        _refresh_live_node turns into refreshed Indigo states (incl. power/
+        energy via the electrical handlers).
+
+        NOTE: the interview ⇒ node_updated emission is matter-server behaviour,
+        not guaranteed here — if it stops firing, a refresh becomes a no-op.
+        Mirrors _send_matter_command: visible error state on timeout/failure,
+        cleared on success, and a debug line on every silent skip so a button
+        that does nothing still leaves a trail."""
+        if self.runtime is None or self.matter is None:
+            self.logger.debug('refresh skipped for "%s" — plugin not fully started', dev.name)
+            return
+        node_id = dev.pluginProps.get("nodeId")
+        if not node_id:
+            self.logger.debug('refresh skipped for "%s" — no nodeId (device not yet reconciled)', dev.name)
+            return
+        try:
+            self.runtime.submit(self.matter.interview_node(int(node_id))).result(timeout=COMMAND_TIMEOUT)
+            self.logger.info('refreshed "%s" (node %s)', dev.name, node_id)
+            if getattr(dev, "errorState", ""):
+                dev.setErrorStateOnServer("")  # refresh succeeded — clear a stale error
+        except FuturesTimeoutError:
+            self.logger.error('refresh of "%s" timed out', dev.name)
+            dev.setErrorStateOnServer("timeout")
+        except Exception as exc:  # noqa: BLE001
+            self.logger.error('refresh of "%s" failed: %s', dev.name, exc)
+            dev.setErrorStateOnServer("cmd failed")
+
     def _send_matter_command(self, action, dev) -> None:
         if self.runtime is None or self.matter is None:
             return
@@ -430,10 +482,10 @@ class Plugin(indigo.PluginBase):
         status, body = self.jobs.create_job({
             "setupCode": valuesDict.get("setupCode", ""),
             "suggestedName": valuesDict.get("suggestedName", "Matter Device"),
-            # The folder picker's value is an existing folder NAME; it flows through
-            # as suggestedRoom, which device_sync maps back to that folder (the same
-            # path Domio's room uses). Empty → no folder (device-list root).
-            "suggestedRoom": valuesDict.get("folder") or None,
+            # The picker's value is a folder id; map it back to the folder NAME and
+            # pass it as suggestedRoom, which device_sync resolves to that folder
+            # (the same path Domio's room uses). "0"/unknown → no folder (root).
+            "suggestedRoom": self._folder_name_for(valuesDict.get("folder")),
         })
         self.logger.info("manual commission → %s %s", status, body)
         return (status in (202, 409), valuesDict)
@@ -441,18 +493,39 @@ class Plugin(indigo.PluginBase):
     def getDeviceFolders(self, filter="", valuesDict=None, typeId="", targetId=0):  # noqa: N802, A002, ARG002
         """List-callback populating the folder picker on the manual-commission menu.
 
-        Lists existing Indigo device folders; the leading empty option leaves the
-        device(s) at the device-list root. The selected folder NAME is passed as
-        suggestedRoom, so device_sync resolves it to the existing folder (it only
-        ever *creates* a folder for a name that doesn't exist, which can't happen
-        here since every option is an existing folder)."""
-        options = [("", "(no folder)")]
+        Options are (folderId, folderName) with a leading "0" → no folder (the
+        device-list root). The id MUST be a non-empty string — Indigo rejects an
+        empty list id with "UI dynamic list function returned illegal ID string",
+        which silently drops the option — so the no-folder sentinel is "0" (folder
+        id 0 == no folder), never "". menuCommissionDeviceManually maps the chosen
+        id back to the folder NAME for suggestedRoom."""
+        options = [("0", "(no folder)")]
         try:
             for folder in indigo.devices.folders:
-                options.append((folder.name, folder.name))
+                options.append((str(folder.id), folder.name))
         except Exception as exc:  # noqa: BLE001 - never break the dialog; degrade to no-folder only
             self.logger.exception(exc)
         return options
+
+    def _folder_name_for(self, folder_id):
+        """Resolve the folder picker's selected id (string) to the folder NAME.
+
+        "0", empty, or an unknown/stale id → None (commission to the device-list
+        root). Never raises — an unresolvable folder must not fail the commission."""
+        if not folder_id or folder_id == "0":
+            return None
+        try:
+            fid = int(folder_id)
+            for folder in indigo.devices.folders:
+                if folder.id == fid:
+                    return folder.name
+            # Parses fine but matches nothing — e.g. folder deleted between the
+            # picker rendering and submit. Benign (device lands at root), but leave
+            # a trail rather than silently dropping the selection.
+            self.logger.debug("folder id %r not found, commissioning at root", folder_id)
+        except Exception as exc:  # noqa: BLE001 - degrade to no folder, never fail the commission
+            self.logger.warning("folder id %r not resolvable, commissioning without a folder: %s", folder_id, exc)
+        return None
 
     def getMatterNodes(self, filter="", valuesDict=None, typeId="", targetId=0):  # noqa: N802, A002, ARG002
         """List-callback populating the decommission picker (one entry per node)."""
