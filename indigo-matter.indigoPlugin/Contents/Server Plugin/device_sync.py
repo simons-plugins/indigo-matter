@@ -188,6 +188,31 @@ class DeviceSync:
         with self._lock:
             return len({nid for (nid, _eid) in self._index})
 
+    def list_nodes(self) -> list:
+        """Per-node summary for UI pickers: ``[(node_id, [device names])]``.
+
+        Sorted by node id; device names resolved outside the lock so a slow
+        Indigo lookup can't stall state/command dispatch.
+        """
+        with self._lock:
+            by_node: dict[int, set] = {}
+            for (nid, _eid), type_map in self._index.items():
+                by_node.setdefault(nid, set()).update(type_map.values())
+        out = []
+        for nid in sorted(by_node):
+            names = []
+            for dev_id in sorted(by_node[nid]):
+                try:
+                    names.append(indigo.devices[dev_id].name)
+                except KeyError:
+                    # deleted out-of-band mid-iteration; reconcile will heal the index
+                    names.append(f"device {dev_id}")
+                except Exception as exc:  # noqa: BLE001 - UI label only; never break the picker
+                    self.logger.debug("list_nodes: name lookup for device %s failed: %s", dev_id, exc)
+                    names.append(f"device {dev_id}")
+            out.append((nid, names))
+        return out
+
     # ------------------------------------------------------------------
     # Creation (called from the commissioning worker / reconcile)
     # ------------------------------------------------------------------

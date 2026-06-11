@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from concurrent.futures import CancelledError as FuturesCancelledError
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from datetime import datetime, timezone
 
@@ -307,6 +308,10 @@ class Plugin(indigo.PluginBase):
         # None → genuine unknown node (404). MatterUnavailable → 503. Other → 500.
         if self.runtime is None:
             raise MatterUnavailable("plugin not ready")
+        if self.matter is None:
+            # Without this guard the AttributeError inside _decommission would be
+            # misread as "device offline" and the Indigo devices deleted anyway.
+            raise MatterUnavailable("matter-server not connected")
         try:
             return self.runtime.submit(self._decommission(node_id)).result(timeout=DECOMMISSION_TIMEOUT)
         except FuturesTimeoutError as exc:
@@ -395,13 +400,94 @@ class Plugin(indigo.PluginBase):
 
     def menuCommissionDeviceManually(self, valuesDict, menuId=""):  # noqa: N802, ARG002
         if self.jobs is None:
-            return (False, valuesDict)
+            # Surface WHY OK did nothing — a bare (False, valuesDict) leaves the
+            # dialog open with no explanation at all.
+            self.logger.warning("manual commission requested before the plugin finished starting")
+            errors = indigo.Dict()
+            errors["setupCode"] = "Plugin still starting — try again in a moment."
+            return (False, valuesDict, errors)
         status, body = self.jobs.create_job({
             "setupCode": valuesDict.get("setupCode", ""),
             "suggestedName": valuesDict.get("suggestedName", "Matter Device"),
         })
         self.logger.info("manual commission → %s %s", status, body)
         return (status in (202, 409), valuesDict)
+
+    def getMatterNodes(self, filter="", valuesDict=None, typeId="", targetId=0):  # noqa: N802, A002, ARG002
+        """List-callback populating the decommission picker (one entry per node)."""
+        if self.device_sync is None:
+            return []
+        try:
+            options = []
+            for node_id, names in self.device_sync.list_nodes():
+                label = ", ".join(names) if names else "(no Indigo devices)"
+                options.append((str(node_id), f"{label} — node {node_id_to_str(node_id)}"))
+            return options
+        except Exception as exc:  # noqa: BLE001 - never break the dialog; degrade to an empty picker
+            self.logger.exception(exc)
+            return []
+
+    def menuDecommissionDevice(self, valuesDict, menuId=""):  # noqa: N802, ARG002
+        """Menu callback: decommission the selected node.
+
+        Returns ``(False, valuesDict, errors)`` to keep the dialog open with a
+        field error, ``(True, valuesDict)`` only when the node was fully
+        removed (fabric AND Indigo devices) — partial outcomes are dialog
+        errors so they can't masquerade as success.
+        """
+        errors = indigo.Dict()
+        selected = valuesDict.get("node", "")
+        if not selected:
+            errors["node"] = "Select a device to decommission."
+            return (False, valuesDict, errors)
+        if not valuesDict.get("confirm", False):
+            errors["confirm"] = "Tick the box to confirm removal from Indigo."
+            return (False, valuesDict, errors)
+        try:
+            node_id = int(selected)
+        except (TypeError, ValueError):
+            errors["node"] = "Invalid selection."
+            return (False, valuesDict, errors)
+        try:
+            result = self._decommission_sync(node_id)
+        except MatterUnavailable as exc:
+            self.logger.error("decommission %s failed — matter-server unavailable: %s",
+                              node_id_to_str(node_id), exc)
+            # A timeout does NOT cancel the in-flight coroutine — the removal may
+            # still complete in the background, so don't claim nothing happened.
+            errors["node"] = ("matter-server did not respond — see the log. The removal may "
+                              "still complete in the background; check the device before retrying.")
+            return (False, valuesDict, errors)
+        except (Exception, FuturesCancelledError) as exc:  # CancelledError is BaseException on 3.10+
+            self.logger.error("decommission %s failed: %s", node_id_to_str(node_id), exc)
+            self.logger.exception(exc)
+            errors["node"] = "Decommission failed — see the Indigo event log."
+            return (False, valuesDict, errors)
+        if result is None:
+            errors["node"] = "Unknown node — nothing was removed."
+            return (False, valuesDict, errors)
+        if result["fabricRemoved"]:
+            self.logger.info(
+                "Decommissioned Matter node %s: fabric removed, Indigo device(s) deleted: %s",
+                result["nodeId"], result["removedIndigoDeviceIds"] or "none",
+            )
+            return (True, valuesDict)
+        # remove_node failed (usually: device offline) — matter-server most likely
+        # still has the node (any remove_node failure is treated as not-removed),
+        # so the next reconcile (plugin restart or matter-server reconnect) will
+        # recreate the Indigo devices we just deleted. Surface that in the dialog —
+        # never report success when the underlying op only half-happened.
+        self.logger.warning(
+            "Decommission of node %s incomplete: Indigo device(s) %s deleted but the "
+            "fabric removal failed (device offline?). The node is still commissioned in "
+            "matter-server and its devices will reappear at the next reconcile — retry "
+            "once the device is reachable.",
+            result["nodeId"], result["removedIndigoDeviceIds"] or "none",
+        )
+        errors["node"] = ("Device unreachable — removed from Indigo, but it is still commissioned "
+                          "in matter-server and will reappear at the next reconcile (plugin restart "
+                          "or reconnect). Retry once the device is powered and reachable.")
+        return (False, valuesDict, errors)
 
     def _resolve_storage_path(self) -> str:
         """Storage dir path in BOTH managed and manual modes.

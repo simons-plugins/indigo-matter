@@ -20,6 +20,22 @@
             </Field>
         </ConfigUI>
     </MenuItem>
+    <MenuItem id="decommissionDevice">
+        <Name>Decommission Matter device…</Name>
+        <CallbackMethod>menuDecommissionDevice</CallbackMethod>
+        <ConfigUI>
+            <Field id="warning" type="label">
+                <Label>Removes the device from Indigo's Matter fabric and deletes its Indigo device(s). The device stays in Apple Home and any other ecosystem. Note: deleting the Indigo device alone does NOT do this — the plugin recreates it when it next reconciles with matter-server.</Label>
+            </Field>
+            <Field id="node" type="menu">
+                <Label>Device (Matter node):</Label>
+                <List class="self" method="getMatterNodes" dynamicReload="true"/>
+            </Field>
+            <Field id="confirm" type="checkbox" defaultValue="false">
+                <Label>I understand this removes the device from Indigo (other ecosystems are unaffected).</Label>
+            </Field>
+        </ConfigUI>
+    </MenuItem>
     <MenuItem id="exportFabricBackup">
         <Name>Export fabric backup…</Name>
         <CallbackMethod>menuExportFabricBackup</CallbackMethod>

@@ -87,3 +87,20 @@ def test_info_plist_bundle_id_and_version(plugin_cls):
             key = None
     assert pairs["CFBundleIdentifier"] == "com.simon.indigo-matter"
     assert pairs["PluginVersion"]  # present and non-empty
+
+
+def test_dynamic_list_methods_exist_on_plugin(plugin_cls):
+    """<List class="self" method="..."> references are invisible to the
+    CallbackMethod checks above; a renamed list method ships a silently
+    empty picker. Validate them across all bundle XML."""
+    checked = 0
+    for xml_path in XML_FILES:
+        if xml_path.suffix != ".xml":
+            continue
+        root = ET.parse(xml_path).getroot()
+        for el in root.iter("List"):
+            if el.get("class") == "self" and el.get("method"):
+                checked += 1
+                assert hasattr(plugin_cls, el.get("method")), \
+                    f"{xml_path.name} references missing list method {el.get('method')}()"
+    assert checked >= 2  # getFabricBackups + getMatterNodes at minimum
