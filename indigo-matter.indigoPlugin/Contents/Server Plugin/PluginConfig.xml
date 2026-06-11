@@ -9,6 +9,13 @@
     <Field id="matterServerPath" type="textfield" defaultValue="/ws">
         <Label>matter-server WebSocket path:</Label>
     </Field>
+    <Field id="fabricLabel" type="textfield" defaultValue="Indigo">
+        <Label>Fabric label:</Label>
+        <Description>How this Indigo controller is named on your Matter devices —
+            it's what other ecosystems' apps show in their "connected services" /
+            admin lists. Applied on every connect; renames existing devices too.
+            Max 32 characters; blank resets to Indigo.</Description>
+    </Field>
     <Field id="nodeBinDir" type="textfield" defaultValue="">
         <Label>Node bin directory (optional):</Label>
         <Description>Directory containing node/npx. Leave blank to auto-detect

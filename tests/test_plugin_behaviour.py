@@ -36,6 +36,7 @@ def plug(plugin_mod):
     p.device_sync = Mock()
     p.http = Mock()
     p.jobs = None
+    p.pluginPrefs = {}
     return p
 
 
@@ -554,3 +555,61 @@ def test_menu_commission_manually_not_ready_surfaces_dialog_error(plug):
     assert ok is False
     assert "setupCode" in errors
     plug.logger.warning.assert_called()
+
+
+# ---------------------------------------------------------------------------
+# Fabric label (set_default_fabric_label on connect)
+# ---------------------------------------------------------------------------
+class LabelMatter:
+    """Async matter fake for the _resync/_assert_fabric_label path."""
+
+    def __init__(self, server_label):
+        self.server_info = {"fabric_label": server_label}
+        self.label_calls = []
+
+    async def set_default_fabric_label(self, label):
+        self.label_calls.append(label)
+
+    async def get_nodes(self):
+        return []
+
+
+def test_fabric_label_set_when_server_differs(plug):
+    # matter-server's default label is 'HomeAssistant' — vendor apps would list
+    # the Indigo fabric as Home Assistant. Default pref must rename it to Indigo.
+    plug.matter = LabelMatter("HomeAssistant")
+    asyncio.run(plug._resync())
+    assert plug.matter.label_calls == ["Indigo"]
+    plug.device_sync.reconcile_all.assert_called_once()  # and reconcile still ran
+
+
+def test_fabric_label_not_resent_when_already_correct(plug):
+    # set_default_fabric_label pushes UpdateFabricLabel to every node — don't
+    # spam per-device writes on every reconnect when nothing changed.
+    plug.matter = LabelMatter("Indigo")
+    asyncio.run(plug._resync())
+    assert plug.matter.label_calls == []
+
+
+def test_fabric_label_pref_respected_truncated_and_blank_falls_back(plug):
+    plug.matter = LabelMatter("HomeAssistant")
+    plug.pluginPrefs = {"fabricLabel": "  My Smart Castle Automation Server XL  "}
+    asyncio.run(plug._resync())
+    assert plug.matter.label_calls == ["My Smart Castle Automation Serve"]  # 32 chars
+    plug.matter = LabelMatter("HomeAssistant")
+    plug.pluginPrefs = {"fabricLabel": "   "}
+    asyncio.run(plug._resync())
+    assert plug.matter.label_calls == ["Indigo"]
+
+
+def test_fabric_label_failure_does_not_block_reconcile(plug):
+    # Cosmetic op on an older matter-server without the command: log at debug,
+    # never block the reconcile that makes devices work.
+    class OldMatter(LabelMatter):
+        async def set_default_fabric_label(self, label):
+            raise RuntimeError("unknown command")
+
+    plug.matter = OldMatter("HomeAssistant")
+    asyncio.run(plug._resync())
+    plug.device_sync.reconcile_all.assert_called_once()
+    plug.logger.debug.assert_called()

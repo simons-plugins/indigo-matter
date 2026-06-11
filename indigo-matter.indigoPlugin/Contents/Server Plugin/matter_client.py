@@ -235,6 +235,11 @@ class MatterClient:
     async def interview_node(self, node_id: int) -> Any:
         return await self.request(protocol.CMD_INTERVIEW, {"node_id": node_id})
 
+    async def set_default_fabric_label(self, label: str) -> Any:
+        # Persists the label for future commissions AND pushes UpdateFabricLabel
+        # to already-commissioned nodes (matter-server calls updateFabricLabel).
+        return await self.request(protocol.CMD_SET_FABRIC_LABEL, {"label": label})
+
     # ------------------------------------------------------------------
     # Lifecycle helpers
     # ------------------------------------------------------------------
