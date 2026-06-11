@@ -18,6 +18,11 @@
             <Field id="suggestedName" type="textfield">
                 <Label>Name:</Label>
             </Field>
+            <Field id="folder" type="menu">
+                <Label>Folder:</Label>
+                <List class="self" method="getDeviceFolders" dynamicReload="true"/>
+                <Description>Where the new Indigo device(s) land. Leave as "(no folder)" for the device-list root.</Description>
+            </Field>
         </ConfigUI>
     </MenuItem>
     <MenuItem id="decommissionDevice">
