@@ -459,6 +459,46 @@ def test_get_matter_nodes_labels_values_and_hex_node(plug):
     assert "(no Indigo devices)" in options[1][1]
 
 
+# ---------------------------------------------------------------------------
+# Manual-commission folder picker (getDeviceFolders + menuCommissionDeviceManually)
+# ---------------------------------------------------------------------------
+def test_get_device_folders_lists_existing_plus_none(plug, mock_indigo_base):
+    mock_indigo_base.devices.folders = [
+        SimpleNamespace(id=1, name="Lights"),
+        SimpleNamespace(id=2, name="Sensors"),
+    ]
+    options = plug.getDeviceFolders()
+    assert options[0] == ("", "(no folder)")  # leading no-folder option
+    assert ("Lights", "Lights") in options
+    assert ("Sensors", "Sensors") in options
+
+
+def test_get_device_folders_degrades_to_none_on_error(plug, mock_indigo_base):
+    boom = Mock()
+    boom.__iter__ = Mock(side_effect=RuntimeError("boom"))
+    mock_indigo_base.devices.folders = boom
+    assert plug.getDeviceFolders() == [("", "(no folder)")]
+    plug.logger.exception.assert_called()
+
+
+def test_manual_commission_passes_folder_as_suggested_room(plug):
+    captured = {}
+    plug.jobs = SimpleNamespace(create_job=lambda params: (captured.update(params) or (202, {})))
+    ok, _vd = plug.menuCommissionDeviceManually(
+        {"setupCode": "MT:ABC", "suggestedName": "Plug", "folder": "Lights"}, "commissionDeviceManually")
+    assert ok is True
+    assert captured["suggestedRoom"] == "Lights"
+    assert captured["setupCode"] == "MT:ABC"
+
+
+def test_manual_commission_no_folder_maps_to_none(plug):
+    captured = {}
+    plug.jobs = SimpleNamespace(create_job=lambda params: (captured.update(params) or (202, {})))
+    plug.menuCommissionDeviceManually(
+        {"setupCode": "MT:ABC", "suggestedName": "Plug", "folder": ""}, "commissionDeviceManually")
+    assert captured["suggestedRoom"] is None
+
+
 def test_menu_decommission_requires_selection(plug):
     ok, _vd, errors = plug.menuDecommissionDevice({"node": "", "confirm": True}, "decommissionDevice")
     assert ok is False

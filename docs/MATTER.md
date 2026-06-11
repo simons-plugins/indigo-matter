@@ -116,6 +116,19 @@ single point of total loss — if it's destroyed, every device must be
 re-commissioned — which is why the plugin ships fabric **backup and restore**
 (menu items: *Export fabric backup…* / *Restore fabric backup…*).
 
+> **Why Apple Home calls our fabric "Matter Test" — this is expected.** When the
+> plugin joins a device, Apple Home shows a "joined a new network" notification
+> and lists the Indigo fabric under a name like **"Matter Test"** rather than
+> "Indigo". Nothing is wrong. The fabric *label* is correctly set to "Indigo"
+> (the plugin sets it, and it's what the device stores), but in that notification
+> Apple displays the fabric's **Vendor ID**, not its label. matter-server (matter.js)
+> commissions under the Matter **test vendor ID `0xFFF1`**, whose registered name
+> is "Matter Test". Showing a custom name there would require a CSA-allocated
+> Vendor ID — paid CSA membership plus product certification — the same limitation
+> every non-certified Matter controller has (Home Assistant shows up the same way).
+> It is purely cosmetic: control, security, and which fabrics the device belongs to
+> are all unaffected.
+
 ## The pieces, end to end
 
 ```text
