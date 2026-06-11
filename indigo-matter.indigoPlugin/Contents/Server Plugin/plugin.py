@@ -223,6 +223,44 @@ class Plugin(indigo.PluginBase):
     def actionControlSensor(self, action, dev):  # noqa: N802
         self.logger.info('ignored "%s" — Matter sensor is read-only', dev.name)
 
+    def actionControlUniversal(self, action, dev):  # noqa: N802
+        """Indigo's universal buttons: Request Status / Update / Reset / Beep.
+
+        Without this method Indigo logs "plugin does not define method
+        actionControlUniversal" whenever a user presses the energy Update/Reset
+        (or status) buttons. Request Status and Energy Update re-interview the
+        node so its attributes — including power/energy — are re-read and pushed
+        back as state updates. Energy Reset is surfaced as unsupported: Matter's
+        accumulated energy is cumulative on the device and there is no Matter
+        command to zero it (and silently bouncing the Indigo state to 0 would be
+        undone by the device's next report)."""
+        universal = indigo.kUniversalAction
+        cmd = action.deviceAction
+        if cmd in (universal.RequestStatus, universal.EnergyUpdate):
+            self._refresh_node(dev)
+        elif cmd == universal.EnergyReset:
+            self.logger.info(
+                '"%s": Matter accumulated energy is cumulative on the device and '
+                "cannot be reset from Indigo (no Matter command exists for it).", dev.name)
+        else:
+            self.logger.debug('ignored universal action %r for "%s"', cmd, dev.name)
+
+    def _refresh_node(self, dev) -> None:
+        """Re-interview the device's Matter node so matter-server re-reads its
+        attributes; the resulting node_updated event refreshes Indigo states."""
+        if self.runtime is None or self.matter is None:
+            return
+        node_id = dev.pluginProps.get("nodeId")
+        if not node_id:
+            return
+        try:
+            self.runtime.submit(self.matter.interview_node(int(node_id))).result(timeout=COMMAND_TIMEOUT)
+            self.logger.info('refreshed "%s" (node %s)', dev.name, node_id)
+        except FuturesTimeoutError:
+            self.logger.error('refresh of "%s" timed out', dev.name)
+        except Exception as exc:  # noqa: BLE001
+            self.logger.error('refresh of "%s" failed: %s', dev.name, exc)
+
     def _send_matter_command(self, action, dev) -> None:
         if self.runtime is None or self.matter is None:
             return

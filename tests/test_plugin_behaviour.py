@@ -99,6 +99,44 @@ def test_send_command_noop_when_runtime_missing(plug):
 
 
 # ---------------------------------------------------------------------------
+# Universal actions (Request Status / Energy Update / Energy Reset / Beep)
+# ---------------------------------------------------------------------------
+def _universal_plug(plug):
+    plug.runtime = FakeRuntime(FakeFuture(value=None))
+    plug.matter = Mock()
+    return plug
+
+
+@pytest.mark.parametrize("act", ["RequestStatus", "EnergyUpdate"])
+def test_action_universal_status_and_update_refresh_node(plug, mock_indigo_base, act):
+    _universal_plug(plug)
+    dev = _dev()
+    dev.pluginProps = {"nodeId": "5"}
+    action = SimpleNamespace(deviceAction=getattr(mock_indigo_base.kUniversalAction, act))
+    plug.actionControlUniversal(action, dev)
+    plug.matter.interview_node.assert_called_once_with(5)
+
+
+def test_action_universal_energy_reset_is_noop_with_notice(plug, mock_indigo_base):
+    _universal_plug(plug)
+    dev = _dev()
+    dev.pluginProps = {"nodeId": "5"}
+    action = SimpleNamespace(deviceAction=mock_indigo_base.kUniversalAction.EnergyReset)
+    plug.actionControlUniversal(action, dev)
+    plug.matter.interview_node.assert_not_called()
+    plug.logger.info.assert_called()
+
+
+def test_action_universal_refresh_noop_without_node_id(plug, mock_indigo_base):
+    _universal_plug(plug)
+    dev = _dev()
+    dev.pluginProps = {}
+    action = SimpleNamespace(deviceAction=mock_indigo_base.kUniversalAction.RequestStatus)
+    plug.actionControlUniversal(action, dev)  # must not raise
+    plug.matter.interview_node.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # Status body
 # ---------------------------------------------------------------------------
 def test_status_body_ready(plug):
