@@ -104,3 +104,18 @@ def test_dynamic_list_methods_exist_on_plugin(plugin_cls):
                 assert hasattr(plugin_cls, el.get("method")), \
                     f"{xml_path.name} references missing list method {el.get('method')}()"
     assert checked >= 2  # getFabricBackups + getMatterNodes at minimum
+
+
+def test_relay_devices_do_not_redefine_native_onoffstate():
+    """onOffState is native to the relay base type — redefining it in <States>
+    makes Indigo reject the device ("native state keys cannot be overriden").
+    Scoped to type="relay" only: sensor types (motion/contact/smoke) legitimately
+    declare a custom onOffState because they set no SupportsOnState."""
+    root = ET.parse(SERVER_PLUGIN / "Devices.xml").getroot()
+    offenders = [
+        dev.get("id")
+        for dev in root.iter("Device")
+        if dev.get("type") == "relay"
+        and any(s.get("id") == "onOffState" for s in dev.iter("State"))
+    ]
+    assert not offenders, f"relay-type devices must not redefine native onOffState: {offenders}"

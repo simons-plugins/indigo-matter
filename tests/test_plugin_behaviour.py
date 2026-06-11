@@ -136,6 +136,47 @@ def test_action_universal_refresh_noop_without_node_id(plug, mock_indigo_base):
     plug.matter.interview_node.assert_not_called()
 
 
+def test_action_universal_refresh_timeout_logs_and_sets_error(plug, mock_indigo_base):
+    plug.runtime = FakeRuntime(FakeFuture(exc=FuturesTimeoutError()))
+    plug.matter = Mock()
+    dev = _dev()
+    dev.pluginProps = {"nodeId": "5"}
+    action = SimpleNamespace(deviceAction=mock_indigo_base.kUniversalAction.RequestStatus)
+    plug.actionControlUniversal(action, dev)
+    plug.logger.error.assert_called()
+    assert dev.error == "timeout"
+
+
+def test_action_universal_refresh_failure_logs_and_sets_error(plug, mock_indigo_base):
+    plug.runtime = FakeRuntime(FakeFuture(exc=ValueError("boom")))
+    plug.matter = Mock()
+    dev = _dev()
+    dev.pluginProps = {"nodeId": "5"}
+    action = SimpleNamespace(deviceAction=mock_indigo_base.kUniversalAction.EnergyUpdate)
+    plug.actionControlUniversal(action, dev)
+    plug.logger.error.assert_called()
+    assert dev.error == "cmd failed"
+
+
+def test_action_universal_noop_when_runtime_missing(plug, mock_indigo_base):
+    plug.runtime = None
+    plug.matter = Mock()
+    dev = _dev()
+    dev.pluginProps = {"nodeId": "5"}
+    action = SimpleNamespace(deviceAction=mock_indigo_base.kUniversalAction.RequestStatus)
+    plug.actionControlUniversal(action, dev)  # must not raise
+    plug.matter.interview_node.assert_not_called()
+
+
+def test_action_universal_unknown_action_ignored(plug, mock_indigo_base):
+    _universal_plug(plug)
+    dev = _dev()
+    dev.pluginProps = {"nodeId": "5"}
+    action = SimpleNamespace(deviceAction=mock_indigo_base.kUniversalAction.Beep)
+    plug.actionControlUniversal(action, dev)
+    plug.matter.interview_node.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # Status body
 # ---------------------------------------------------------------------------
