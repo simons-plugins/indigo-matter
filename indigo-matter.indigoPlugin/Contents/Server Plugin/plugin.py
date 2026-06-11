@@ -430,10 +430,10 @@ class Plugin(indigo.PluginBase):
         status, body = self.jobs.create_job({
             "setupCode": valuesDict.get("setupCode", ""),
             "suggestedName": valuesDict.get("suggestedName", "Matter Device"),
-            # The folder picker's value is an existing folder NAME; it flows through
-            # as suggestedRoom, which device_sync maps back to that folder (the same
-            # path Domio's room uses). Empty → no folder (device-list root).
-            "suggestedRoom": valuesDict.get("folder") or None,
+            # The picker's value is a folder id; map it back to the folder NAME and
+            # pass it as suggestedRoom, which device_sync resolves to that folder
+            # (the same path Domio's room uses). "0"/unknown → no folder (root).
+            "suggestedRoom": self._folder_name_for(valuesDict.get("folder")),
         })
         self.logger.info("manual commission → %s %s", status, body)
         return (status in (202, 409), valuesDict)
@@ -441,18 +441,35 @@ class Plugin(indigo.PluginBase):
     def getDeviceFolders(self, filter="", valuesDict=None, typeId="", targetId=0):  # noqa: N802, A002, ARG002
         """List-callback populating the folder picker on the manual-commission menu.
 
-        Lists existing Indigo device folders; the leading empty option leaves the
-        device(s) at the device-list root. The selected folder NAME is passed as
-        suggestedRoom, so device_sync resolves it to the existing folder (it only
-        ever *creates* a folder for a name that doesn't exist, which can't happen
-        here since every option is an existing folder)."""
-        options = [("", "(no folder)")]
+        Options are (folderId, folderName) with a leading "0" → no folder (the
+        device-list root). The id MUST be a non-empty string — Indigo rejects an
+        empty list id with "UI dynamic list function returned illegal ID string",
+        which silently drops the option — so the no-folder sentinel is "0" (folder
+        id 0 == no folder), never "". menuCommissionDeviceManually maps the chosen
+        id back to the folder NAME for suggestedRoom."""
+        options = [("0", "(no folder)")]
         try:
             for folder in indigo.devices.folders:
-                options.append((folder.name, folder.name))
+                options.append((str(folder.id), folder.name))
         except Exception as exc:  # noqa: BLE001 - never break the dialog; degrade to no-folder only
             self.logger.exception(exc)
         return options
+
+    def _folder_name_for(self, folder_id):
+        """Resolve the folder picker's selected id (string) to the folder NAME.
+
+        "0", empty, or an unknown/stale id → None (commission to the device-list
+        root). Never raises — an unresolvable folder must not fail the commission."""
+        if not folder_id or folder_id == "0":
+            return None
+        try:
+            fid = int(folder_id)
+            for folder in indigo.devices.folders:
+                if folder.id == fid:
+                    return folder.name
+        except Exception as exc:  # noqa: BLE001 - degrade to no folder, never fail the commission
+            self.logger.warning("folder id %r not resolvable, commissioning without a folder: %s", folder_id, exc)
+        return None
 
     def getMatterNodes(self, filter="", valuesDict=None, typeId="", targetId=0):  # noqa: N802, A002, ARG002
         """List-callback populating the decommission picker (one entry per node)."""
