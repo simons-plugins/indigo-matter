@@ -115,10 +115,31 @@ class Plugin(indigo.PluginBase):
             self.runtime.stop()
             self.runtime = None
 
+    async def _assert_fabric_label(self) -> None:
+        """Name the Indigo fabric on devices (matter-server's default label is
+        'HomeAssistant' — vendor apps would list us as Home Assistant).
+
+        Sent only when the server's current label differs: set_default_fabric_label
+        pushes UpdateFabricLabel to every connected node, so re-asserting an
+        unchanged label on each reconnect would be pointless per-device writes.
+        Cosmetic — failure (e.g. an older matter-server without the command) must
+        never block reconcile.
+        """
+        desired = str(self.pluginPrefs.get("fabricLabel", "Indigo")).strip()[:32] or "Indigo"
+        try:
+            current = (self.matter.server_info or {}).get("fabric_label")
+            if current == desired:
+                return
+            await self.matter.set_default_fabric_label(desired)
+            self.logger.info('fabric label set to "%s" (was %s)', desired, current or "server default")
+        except Exception as exc:  # noqa: BLE001
+            self.logger.debug("could not set fabric label (older matter-server?): %s", exc)
+
     async def _resync(self) -> None:
         """Reconcile matter nodes ↔ Indigo devices. Driven by the WS client's
         on_connect, so it runs on the first connect and again on every reconnect
         (recovers state + clears 'unreachable' after a drop / sleep-wake)."""
+        await self._assert_fabric_label()
         try:
             nodes = await self.matter.get_nodes() or []
             detailed = []

@@ -70,6 +70,7 @@ CMD_READ_ATTR = "read_attribute"
 CMD_WRITE_ATTR = "write_attribute"
 CMD_DEVICE = "device_command"            # invoke a cluster command
 CMD_START_LISTENING = "start_listening"
+CMD_SET_FABRIC_LABEL = "set_default_fabric_label"  # persists + pushes UpdateFabricLabel to nodes
 
 # device_command argument keys (the most contested names — see module docstring)
 ARG_NODE_ID = "node_id"
