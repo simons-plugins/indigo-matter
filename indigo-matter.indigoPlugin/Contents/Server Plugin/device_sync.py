@@ -665,6 +665,11 @@ class DeviceSync:
                     # canonical — for a pristine fleet that is the created type.
                     if type_id and "createdTypeId" not in current_props:
                         missing["createdTypeId"] = type_id
+                    # Heal the address (UI protocol-id column, issue #18) onto
+                    # devices created before that stamping existed — it is the
+                    # node id a user needs for decommission.
+                    if not current_props.get("address"):
+                        missing["address"] = node_id_to_str(node.node_id)
                     if not missing:
                         # Props are already correct — but Indigo caches the list
                         # display state at creation and may not re-derive it from

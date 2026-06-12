@@ -1521,3 +1521,17 @@ def test_healthy_button_reconcile_is_quiet(ds, indigo_env, mock_logger):
     ds.reconcile_all([BUTTON_NODE])
     msgs = [c[0][0] for c in mock_logger.warning.call_args_list]
     assert not any("display" in m for m in msgs)
+
+
+def test_reassert_backfills_address_on_legacy_devices(ds, indigo_env):
+    """Devices created before the issue #18 address stamping gain the node-id
+    address at reconcile — it's what a user needs for decommission."""
+    _indigo, devices = indigo_env
+    ds.create_from_raw(TEMP_SENSOR_NODE, "Landing Sensor")
+    dev = devices[ds.lookup(0x40, 1)]
+    props = dict(dev.pluginProps)
+    props.pop("address", None)
+    dev.pluginProps = props
+
+    ds.reconcile_all([TEMP_SENSOR_NODE])
+    assert dev.pluginProps.get("address") == "0x40"
