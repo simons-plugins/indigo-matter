@@ -103,8 +103,9 @@ That's only possible because of Matter's best feature: multi-admin.
 
 A Matter **fabric** is a controller's trust domain — a set of cryptographic
 credentials a controller installs on a device. The crucial design choice in
-Matter is that **a device can belong to several fabrics at once** — the spec
-requires every certified device to accept at least five; many accept more. Each controller talks to the device directly and locally; none of them
+Matter is that **a device can belong to several fabrics at once**. The spec
+floor is five — and since each fabric slot costs the device persistent storage,
+the floor is also what most devices ship. Treat five as your planning number. Each controller talks to the device directly and locally; none of them
 knows or cares about the others.
 
 A single plug in this house happily serves four admins simultaneously: Apple
