@@ -27,6 +27,12 @@ class _SensorHandler(ClusterHandler):
 
     measured_attr = ATTR_MEASURED_VALUE
     state_key = "sensorValue"
+    # Indigo derives a sensor's list display from SupportsSensorValue /
+    # SupportsOnState props, not from Devices.xml <UiDisplayStateId>, for
+    # API-created devices — without these the built-in default
+    # (SupportsOnState=True) makes value sensors display "off" forever
+    # (issue #56). Binary subclasses override with the on/off pair.
+    display_props = {"SupportsSensorValue": True, "SupportsOnState": False}
 
     def create_indigo_devices(self, node: Any, endpoint: Any) -> list[IndigoDeviceSpec]:
         name = node.suggested_name or node.product_name or f"Matter {node.node_id}"
@@ -39,6 +45,7 @@ class _SensorHandler(ClusterHandler):
                     "endpointId": str(endpoint.endpoint_id),
                     "vendorName": node.vendor_name,
                     "productName": node.product_name,
+                    **self.display_props,
                 },
                 initial_states={self.state_key: 0},
             )
@@ -82,6 +89,7 @@ class OccupancyHandler(_SensorHandler):
     cluster_name = "OccupancySensing"
     device_type_id = "matterMotionSensor"
     state_key = "onOffState"
+    display_props = {"SupportsOnState": True, "SupportsSensorValue": False}
 
     def transform(self, value: Any) -> bool:
         return bool(int(value) & 0x01)  # bit0 = occupied
@@ -92,6 +100,7 @@ class ContactHandler(_SensorHandler):
     cluster_name = "BooleanState"
     device_type_id = "matterContactSensor"
     state_key = "onOffState"
+    display_props = {"SupportsOnState": True, "SupportsSensorValue": False}
 
     def transform(self, value: Any) -> bool:
         return bool(value)

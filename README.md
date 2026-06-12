@@ -25,11 +25,15 @@ battery levels, and bridges — plus failure hardening, fabric backup/restore, a
 managed launchd LaunchAgent for matter-server. A real Tapo energy plug has been
 commissioned end-to-end through Domio and reports live power/energy to Indigo.
 
-**Validated with Wi-Fi devices. Thread devices are expected to work** through the same
-share model — the admin-1 ecosystem (Apple Home, or equally Alexa / Google Home) does
-the Thread provisioning; the plugin joins over IP via that ecosystem's border router
-(HomePod/Apple TV, TBR-capable Echo, Nest Hub) — but await validation with real Thread
-hardware. See [docs/MATTER.md](./docs/MATTER.md) for how the pieces fit.
+**Validated with both Wi-Fi and Thread devices** through the same share model — the
+admin-1 ecosystem (Apple Home, or equally Alexa / Google Home) does the Thread
+provisioning; the plugin joins over IP via that ecosystem's border router
+(HomePod/Apple TV, TBR-capable Echo, Nest Hub). Thread validation: an Aqara FP300
+presence multi-sensor (ships in Thread mode) commissioned first time via the manual
+setup-code menu — ~10 s join, all four endpoints (presence, illuminance, temperature,
+humidity) created, battery fan-out and unprompted live attribute reports working
+(matter-server 0.6.8, HomePod TBR). See [docs/MATTER.md](./docs/MATTER.md) for how
+the pieces fit.
 
 ## Setup
 

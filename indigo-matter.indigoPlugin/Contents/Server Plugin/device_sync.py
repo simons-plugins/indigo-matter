@@ -537,11 +537,15 @@ class DeviceSync:
         - Meter props (SupportsPowerMeter/SupportsEnergyMeter) only apply to device
           types in _METER_CAPABLE_TYPES; SupportsBatteryLevel applies to any type
           (mirrors create_devices' node-level central setdefault behaviour exactly).
+
+        Also re-asserts each handler's static ``display_props`` (issue #56 —
+        value sensors created without SupportsSensorValue display "off" forever).
+        Unlike the cluster-implied caps these are exact assertions, not add-only:
+        they are fixed truths of the device type (SupportsOnState must go False
+        on a value sensor), not interview-dependent capabilities.
         """
         for endpoint in node.endpoints:
             full_cap = self._capability_props(node, endpoint)
-            if not full_cap:
-                continue
             with self._lock:
                 ep_key = (int(node.node_id), int(endpoint.endpoint_id))
                 type_map = dict(self._index.get(ep_key, {}))
@@ -550,6 +554,8 @@ class DeviceSync:
                     dev = indigo.devices[dev_id]
                     type_id = getattr(dev, "deviceTypeId", "") or ""
                     current_props = dev.pluginProps
+                    handler = self.registry.handler_for_device(dev)
+                    display_props = getattr(handler, "display_props", {}) or {}
                     # Build the set of missing props for this specific device type.
                     # Meter props are only meaningful for relay/dimmer family devices.
                     missing: dict = {}
@@ -559,7 +565,19 @@ class DeviceSync:
                                 continue
                         if not current_props.get(key):
                             missing[key] = value
+                    for key, value in display_props.items():
+                        # Absence is divergence too: a missing SupportsOnState
+                        # means Indigo's sensor default (True), so a False must
+                        # be written explicitly, not skipped as already-falsy.
+                        if key not in current_props or bool(current_props.get(key)) != bool(value):
+                            missing[key] = value
                     if not missing:
+                        # Props are already correct — but Indigo caches the list
+                        # display state at creation and may not re-derive it from
+                        # a props replace, so a device created before the issue
+                        # #56 fix can be prop-correct yet still display on/off.
+                        # Nag (every reconcile) with the remedy.
+                        self._warn_stale_display_state(dev, type_id, display_props)
                         continue
                     props = dict(current_props)
                     props.update(missing)
@@ -574,6 +592,30 @@ class DeviceSync:
                         "could not re-assert capability props on device %s: %s",
                         dev_id, exc,
                     )
+
+    def _warn_stale_display_state(self, dev: Any, type_id: str, display_props: dict) -> None:
+        """Warn when a value sensor's cached display state is still on/off.
+
+        Indigo derives ``displayStateId`` from the Supports* props at device
+        creation; replacing props afterwards rebuilds states but the display
+        may stay cached on ``onOffState`` (issue #56). The fix is user-side
+        and cheap — deleting the Indigo device and reloading the plugin lets
+        reconcile recreate it with the correct creation props — so name the
+        device and say exactly that. Deliberately checked only when the props
+        themselves are already correct: on the pass that just replaced props,
+        Indigo may not have re-derived yet, and warning there would be noise.
+        """
+        if not display_props.get("SupportsSensorValue"):
+            return  # on/off IS the right display for binary sensors
+        if getattr(dev, "displayStateId", "") != "onOffState":
+            return
+        self.logger.warning(
+            "device %s (%s, %s) was created before the sensor display fix and "
+            "still shows on/off in the device list instead of its reading — "
+            "delete the Indigo device and reload this plugin; it will be "
+            "recreated automatically with the correct display",
+            dev.id, dev.name, type_id,
+        )
 
     def _unique_name(self, name: str) -> str:
         existing = {dev.name for dev in indigo.devices}

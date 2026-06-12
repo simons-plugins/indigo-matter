@@ -59,6 +59,9 @@ class SmokeCOAlarmHandler(ClusterHandler):
     cluster_id    = CLUSTER_SMOKE_CO_ALARM
     cluster_name  = "SmokeCOAlarm"
     device_type_id = "matterSmokeCOAlarm"
+    # Explicit, although it matches Indigo's sensor default: the alarm state
+    # is the display, never a measured value (issue #56).
+    display_props = {"SupportsOnState": True, "SupportsSensorValue": False}
 
     def create_indigo_devices(self, node: Any, endpoint: Any) -> list[IndigoDeviceSpec]:
         name = node.suggested_name or node.product_name or f"Matter {node.node_id}"
@@ -71,6 +74,7 @@ class SmokeCOAlarmHandler(ClusterHandler):
                     "endpointId":  str(endpoint.endpoint_id),
                     "vendorName":  node.vendor_name,
                     "productName": node.product_name,
+                    **self.display_props,
                 },
                 initial_states={"onOffState": False},
             )

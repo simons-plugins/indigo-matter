@@ -122,3 +122,19 @@ def test_flow_create_spec():
     assert h.device_type_id == "matterFlowSensor"
     assert h.cluster_id == 0x0404
     assert h.cluster_name == "FlowMeasurement"
+
+
+def test_value_sensor_specs_carry_sensor_value_display_props():
+    # Issue #56: Indigo derives a sensor's list display from Supports* creation
+    # props, never from Devices.xml <UiDisplayStateId>, for API-created devices.
+    # Without these, value sensors display "off" forever.
+    node = parse_node(TEMP_HUMIDITY_NODE, "Climate")
+    for spec in HandlerRegistry().handlers_for_endpoint(node, _ep(node, 1)):
+        assert spec.props["SupportsSensorValue"] is True, spec.device_type_id
+        assert spec.props["SupportsOnState"] is False, spec.device_type_id
+
+
+def test_binary_sensor_handlers_carry_on_state_display_props():
+    for handler_cls in (OccupancyHandler, ContactHandler):
+        props = handler_cls.display_props
+        assert props == {"SupportsOnState": True, "SupportsSensorValue": False}, handler_cls

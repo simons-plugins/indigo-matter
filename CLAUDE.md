@@ -56,10 +56,10 @@ standalone server (aiohttp is absent from Indigo's framework Python). See `docs/
 
 **matter-server:** npm package `matter-server` (GitHub `matter-js/matterjs-server`),
 **Alpha** v0.6.2. Its one Thread gap is *first-admin* commissioning (provisioning Thread
-credentials over BLE) — which the share model never does. **Wi-Fi validated with real
-hardware; Thread expected to work via the same flow** (the admin-1 ecosystem — Apple
-Home/Alexa/Google Home — provisions; plugin joins over IP through that ecosystem's
-TBR), pending validation with a real Thread device. WS
+credentials over BLE) — which the share model never does. **Wi-Fi and Thread both
+validated with real hardware** (Tapo P110M over Wi-Fi; Aqara FP300 over Thread via a
+HomePod TBR, matter-server 0.6.8 — the admin-1 ecosystem provisions; plugin joins over
+IP through that ecosystem's TBR). WS
 client is portable to python-matter-server as a fallback. See `docs/MATTER.md` +
 `docs/IMPLEMENTATION.md` §3.
 

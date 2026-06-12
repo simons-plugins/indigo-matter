@@ -1,10 +1,41 @@
 # indigo-matter — Build Handover
 
-**Last updated:** 2026-06-10 19:54 UTC
-**Branch:** `main` (all session PRs merged)
-**Version:** `2026.2.12` — **deployed + live-validated on jarvis**
-**Tests:** 582 passing (`cd indigo-matter && /Library/Frameworks/Python.framework/Versions/Current/bin/python3 -m pytest -q`)
-**Status:** **FIRST REAL DEVICE LIVE** — Tapo P110M commissioned via the full Domio share-model flow (Apple Home → pairing code → Domio → `/commission` → matter-server) and reporting **live energy** to Indigo. Domio E2E milestone DONE; energy path physically validated; PR #48 props-re-assertion proven in the wild. Device-class milestone shipped earlier the same day: PRs #32–#42 (issues #3–#13), #47 (endpoint-collapse), #48 (capability-props re-assertion at reconcile). jarvis runs 16 nodes: 5 originals + 10-device mock fleet (`/tmp/matter-test`, ports 5545–5554) + the real Tapo (node 0x22). Known-open: fan brightness echo (rig flake); issues #43 (bridge-child naming), #46 (fan TurnOn FanMode mapping), #21–#24 (commission hardening).
+**Last updated:** 2026-06-12 18:52 UTC
+**Branch:** `fix/sensor-display-props` (PR pending)
+**Version:** `2026.2.21`
+**Tests:** 630 passing (`cd indigo-matter && /Library/Frameworks/Python.framework/Versions/Current/bin/python3 -m pytest -q`)
+**Status:** **Wi-Fi AND Thread validated with real hardware.** Tapo P110M (Wi-Fi, energy) + Aqara FP300 (Thread, presence/lux/temp/humidity — tester CliveS). Known-open: issue #56 follow-ups (button + air-quality display states), fan brightness echo (rig flake); issues #43 (bridge-child naming), #46 (fan TurnOn FanMode mapping), #21–#24 (commission hardening).
+
+---
+
+## 2026-06-12 session — THREAD VALIDATED + sensor display fix (issue #56)
+
+**Thread is real-device validated.** Tester CliveS commissioned an **Aqara FP300**
+presence multi-sensor (Matter over Thread) via the share model: Apple Home admin 1,
+HomePod did the Thread provisioning, manual setup-code menu, **~10 s join** (vs the
+Tapo's 124 s). All four endpoints became Indigo devices; node-scoped battery fan-out
+and unprompted live attribute reports both worked. Environment: Indigo 2025.2, plugin
+2026.2.20, **matter-server 0.6.8** (the README `^0.6.2` install floats — 0.6.8
+behaved), Node 22.22.2, managed LaunchAgent.
+
+**The bug the test found (issue #56, fixed this session):** value sensors displayed
+"off" instead of the reading — the sensor family had slipped through the colour
+lesson (2026-06-09 item 4): `Supports*` must be **creation props**; Devices.xml
+statics (including `<UiDisplayStateId>`) don't apply to API-created devices. Indigo
+defaulted `SupportsOnState=True`/`SupportsSensorValue=False` and derived
+`displayStateId=onOffState`; the populated `sensorValue` was the XML-declared custom
+state shadowing the disabled built-in. Fix: `display_props` class attr on handlers
+(value sensors `SupportsSensorValue=True, SupportsOnState=False`; binary sensors the
+inverse, explicit), merged into creation props AND re-asserted exactly (not add-only —
+absence of `SupportsOnState` means Indigo's default True) by the #45 reconcile
+self-heal. Devices created pre-fix may keep their cached `displayStateId` even after
+the props heal — a reconcile-time warning names each such device with the remedy:
+**delete the Indigo device and reload the plugin; reconcile recreates it correctly**
+(no decommission needed).
+
+**Open follow-ups from #56:** `matterButton` (`lastButtonEvent`) and the air-quality
+string display (`airQuality`) both rely on `UiDisplayStateId`, which API-created
+devices ignore — needs hardware testing to find a working mechanism.
 
 ---
 

@@ -26,6 +26,10 @@ class FakeDev:
         self.error = None
         self.errorState = ""
         self.folderId = 0
+        # Real Indigo derives the list display from Supports* props at CREATION
+        # and caches it (issue #56) — mirror that here, and deliberately do NOT
+        # re-derive it in replacePluginPropsOnServer below.
+        self.displayStateId = "sensorValue" if props.get("SupportsSensorValue") else "onOffState"
 
     def updateStatesOnServer(self, kvlist):
         for kv in kvlist:
@@ -51,6 +55,7 @@ class FakeDev:
             "SupportsPowerMeter": "curEnergyLevel",
             "SupportsEnergyMeter": "accumEnergyTotal",
             "SupportsBatteryLevel": "batteryLevel",
+            "SupportsSensorValue": "sensorValue",
         }
         for prop_key, state_key in _supports_to_states.items():
             if new_props.get(prop_key) and state_key not in self.states:
@@ -1131,3 +1136,124 @@ def test_list_nodes_merges_multiple_devices_into_one_node_entry(ds, indigo_env):
     node_id, names = nodes[0]
     assert node_id == 31
     assert len(names) == 2
+
+
+# ===========================================================================
+# fix/#56 — value sensors must display sensorValue, not on/off
+# ===========================================================================
+
+# Aqara FP300-style endpoint: a temperature sensor (the live evidence in
+# issue #56 — created with no Supports* props, Indigo defaulted the display
+# to onOffState and the device list showed "off" instead of the reading).
+TEMP_SENSOR_NODE = {
+    "node_id": 0x40,
+    "available": True,
+    "attributes": {
+        "0/40/1": "Aqara",
+        "0/40/3": "FP300",
+        "1/29/0": [{"0": 770}],   # TemperatureSensor
+        "1/1026/0": 2400,         # 24.0 °C
+    },
+}
+
+OCCUPANCY_NODE = {
+    "node_id": 0x41,
+    "available": True,
+    "attributes": {
+        "0/40/1": "Aqara",
+        "0/40/3": "FP300",
+        "1/29/0": [{"0": 263}],   # OccupancySensor
+        "1/1030/0": 1,            # occupied
+    },
+}
+
+
+def _strip_display_props(dev):
+    """Rewind a device to its pre-#56 creation shape."""
+    props = dict(dev.pluginProps)
+    props.pop("SupportsSensorValue", None)
+    props.pop("SupportsOnState", None)
+    dev.pluginProps = props
+    dev.displayStateId = "onOffState"
+    dev.replaced_props = False
+
+
+def test_value_sensor_created_with_sensor_value_display_props(ds, indigo_env):
+    _indigo, devices = indigo_env
+    ds.create_from_raw(TEMP_SENSOR_NODE, "Landing Sensor")
+    dev = devices[ds.lookup(0x40, 1)]
+    assert dev.pluginProps.get("SupportsSensorValue") is True
+    assert dev.pluginProps.get("SupportsOnState") is False
+    assert dev.displayStateId == "sensorValue"
+
+
+def test_binary_sensor_created_with_on_state_display_props(ds, indigo_env):
+    _indigo, devices = indigo_env
+    ds.create_from_raw(OCCUPANCY_NODE, "Landing Presence")
+    dev = devices[ds.lookup(0x41, 1)]
+    assert dev.pluginProps.get("SupportsOnState") is True
+    assert dev.pluginProps.get("SupportsSensorValue") is False
+    assert dev.displayStateId == "onOffState"
+
+
+def test_reconcile_reasserts_display_props_on_pre_fix_sensor(ds, indigo_env, mock_logger):
+    """A sensor created before the fix gains explicit display props at reconcile.
+
+    Absence of SupportsOnState means Indigo's sensor default (True), so the
+    re-assert must write BOTH keys explicitly, not only the truthy one.
+    No stale-display warning may fire on this pass — Indigo may legitimately
+    still be applying the props replace.
+    """
+    _indigo, devices = indigo_env
+    ds.create_from_raw(TEMP_SENSOR_NODE, "Landing Sensor")
+    dev = devices[ds.lookup(0x40, 1)]
+    _strip_display_props(dev)
+
+    mock_logger.warning.reset_mock()
+    ds.reconcile_all([TEMP_SENSOR_NODE])
+
+    assert dev.replaced_props is True
+    assert dev.pluginProps.get("SupportsSensorValue") is True
+    assert dev.pluginProps.get("SupportsOnState") is False
+    display_warnings = [
+        c for c in mock_logger.warning.call_args_list if "display" in c[0][0]
+    ]
+    assert not display_warnings, "stale-display warning fired on the same pass as the props fix"
+
+
+def test_second_reconcile_warns_when_display_state_stays_cached(ds, indigo_env, mock_logger):
+    """Indigo caches displayStateId at creation; if a props replace does not
+    re-derive it, the NEXT reconcile must warn, naming the device and the
+    delete-and-reload remedy."""
+    _indigo, devices = indigo_env
+    ds.create_from_raw(TEMP_SENSOR_NODE, "Landing Sensor")
+    dev = devices[ds.lookup(0x40, 1)]
+    _strip_display_props(dev)
+
+    ds.reconcile_all([TEMP_SENSOR_NODE])   # heals props; fake keeps display cached
+    assert dev.displayStateId == "onOffState"
+
+    mock_logger.warning.reset_mock()
+    ds.reconcile_all([TEMP_SENSOR_NODE])
+    msgs = [c[0][0] % tuple(c[0][1:]) for c in mock_logger.warning.call_args_list]
+    stale = [m for m in msgs if "delete the Indigo device" in m]
+    assert stale, f"expected stale-display warning, got: {msgs}"
+    assert "Landing Sensor" in stale[0]
+
+
+def test_healthy_value_sensor_reconcile_is_quiet(ds, indigo_env, mock_logger):
+    """A post-fix device (correct props, sensorValue display) must not warn."""
+    ds.create_from_raw(TEMP_SENSOR_NODE, "Landing Sensor")
+    mock_logger.warning.reset_mock()
+    ds.reconcile_all([TEMP_SENSOR_NODE])
+    msgs = [c[0][0] for c in mock_logger.warning.call_args_list]
+    assert not any("display" in m for m in msgs)
+
+
+def test_binary_sensor_on_off_display_never_warns(ds, indigo_env, mock_logger):
+    """on/off IS the correct display for binary sensors — no nag."""
+    ds.create_from_raw(OCCUPANCY_NODE, "Landing Presence")
+    mock_logger.warning.reset_mock()
+    ds.reconcile_all([OCCUPANCY_NODE])
+    msgs = [c[0][0] for c in mock_logger.warning.call_args_list]
+    assert not any("display" in m for m in msgs)
