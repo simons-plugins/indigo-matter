@@ -43,9 +43,23 @@ most one actuator per endpoint, spec types exist in Devices.xml, initial
 states declared, sensor specs carry explicit display props (the #56 class).
 **Add new wild devices' cluster sets to ZOO** — invariants run automatically.
 
-Still untested on hardware (needs the live rig): whether
-`replacePluginPropsOnServer` re-derives `displayStateId` in real Indigo, and
-the #56 button/air-quality display follow-ups.
+**Live-rig verification (same evening, jarvis on the 2026.2.22 branch build):**
+deployed via rsync + restart with all 15 virtual devices running. First
+reconcile healed every pre-fix device in one pass — 9 value sensors + smoke
+got display props, all 20 devices got `createdTypeId`, every replace passed
+the persistence verification (zero "did not persist" warnings). Second
+restart: "reconciled 16 Matter node(s)" with NO re-asserts and **NO
+stale-display warnings** → **real Indigo DOES re-derive `displayStateId` from
+`replacePluginPropsOnServer`**. Confirmed on-device: the temp sensor's
+`on_state` went `false` → `null` (built-in onOffState removed). So the #56 fix
+is fully self-healing — users (incl. CliveS) just upgrade; delete-and-recreate
+is never needed and the stale-display warning is pure dead-man insurance.
+
+This finding also unlocks the #56 follow-ups: since display re-derives from a
+props replace, the button (`lastButtonEvent`) and air-quality (`airQuality`
+string) displays can be experimented with live by toggling Supports* props —
+no recommission needed. Still untested: what displayStateId becomes when BOTH
+Supports* are False (does Devices.xml UiDisplayStateId finally apply?).
 
 ---
 
