@@ -89,9 +89,11 @@ mkdir -p ~/indigo-matter
 npm install --prefix ~/indigo-matter matter-server@^0.6.2
 ```
 
-This creates `~/indigo-matter/package.json` (pinned to `"matter-server": "^0.6.2"`) and
-`~/indigo-matter/node_modules`. Don't install globally — a project-local install pins the
-version cleanly. The project is Alpha and moving fast; pin, don't track `main`.
+This creates `~/indigo-matter/package.json` with `"matter-server": "^0.6.2"` — note the
+caret: installs float within the 0.6.x series (a fresh install today may give e.g. 0.6.8,
+which has been validated in the field). Don't install globally — a project-local install
+keeps the version controlled. The project is Alpha and moving fast; stay within 0.6.x,
+don't track `main`.
 
 > **Note — there is no `matter-server` command.** The npm package has no `bin`
 > (`"bin": null`); its entry point is `dist/esm/MatterServer.js`. matter-server must be

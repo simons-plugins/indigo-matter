@@ -173,9 +173,9 @@ via `runtime.submit(coro).result(timeout)` and delegate all logic to
   does first-admin commissioning — Apple Home provisions the device onto
   Apple's Thread mesh, and the plugin joins as a second admin over IP through
   the Apple border router, the same flow validated with Wi-Fi hardware.
-  Thread is therefore *expected to work, pending validation with a real
-  device* (see §4 and [`MATTER.md`](./MATTER.md)). Watch upstream for
-  first-admin Thread support regardless.
+  Thread is therefore supported — *validated with a real device* (Aqara
+  FP300 via HomePod TBR; see §4 and [`MATTER.md`](./MATTER.md)). Watch
+  upstream for first-admin Thread support regardless.
 - **BLE commissioning is off by default** (`--ble` to enable). Keep it off:
   the share model never needs it, and on macOS it isn't supported anyway.
 - **The server is Alpha**, not CSA-certified. Pin versions; test before

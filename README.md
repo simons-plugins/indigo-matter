@@ -28,12 +28,9 @@ commissioned end-to-end through Domio and reports live power/energy to Indigo.
 **Validated with both Wi-Fi and Thread devices** through the same share model — the
 admin-1 ecosystem (Apple Home, or equally Alexa / Google Home) does the Thread
 provisioning; the plugin joins over IP via that ecosystem's border router
-(HomePod/Apple TV, TBR-capable Echo, Nest Hub). Thread validation: an Aqara FP300
-presence multi-sensor (ships in Thread mode) commissioned first time via the manual
-setup-code menu — ~10 s join, all four endpoints (presence, illuminance, temperature,
-humidity) created, battery fan-out and unprompted live attribute reports working
-(matter-server 0.6.8, HomePod TBR). See [docs/MATTER.md](./docs/MATTER.md) for how
-the pieces fit.
+(HomePod/Apple TV, TBR-capable Echo, Nest Hub). See
+[docs/MATTER.md](./docs/MATTER.md) for how the pieces fit; validation specifics live
+in [docs/HANDOVER.md](./docs/HANDOVER.md).
 
 ## Setup
 
@@ -44,7 +41,8 @@ matter-server is a separate Node.js runtime that you install once. See
 ## Requirements
 
 - Indigo 2025.2+ on macOS.
-- Node.js 22 LTS (via nvm or Homebrew) and the `matter-server` npm package (Alpha; pinned).
+- Node.js 22 LTS (via nvm or Homebrew) and the `matter-server` npm package (Alpha; caret-ranged
+  to 0.6.x — the install command's `^0.6.2` floats within the minor series).
 - Python dep: `websockets` (see `Contents/Server Plugin/requirements.txt`).
 - The **Domio** iOS app for adding devices.
 
@@ -59,7 +57,7 @@ matter-server is a separate Node.js runtime that you install once. See
 ## Development
 
 ```bash
-pytest          # ~225 unit tests; matter-server (WebSocket) and Indigo are mocked
+pytest          # full unit suite; matter-server (WebSocket) and Indigo are mocked
 ```
 
 See [CLAUDE.md](./CLAUDE.md) for architecture and workspace conventions.

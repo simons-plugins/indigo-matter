@@ -3,7 +3,7 @@
 **Last updated:** 2026-06-12 18:52 UTC
 **Branch:** `fix/sensor-display-props` (PR pending)
 **Version:** `2026.2.21`
-**Tests:** 630 passing (`cd indigo-matter && /Library/Frameworks/Python.framework/Versions/Current/bin/python3 -m pytest -q`)
+**Tests:** 634 passing (`cd indigo-matter && /Library/Frameworks/Python.framework/Versions/Current/bin/python3 -m pytest -q`)
 **Status:** **Wi-Fi AND Thread validated with real hardware.** Tapo P110M (Wi-Fi, energy) + Aqara FP300 (Thread, presence/lux/temp/humidity — tester CliveS). Known-open: issue #56 follow-ups (button + air-quality display states), fan brightness echo (rig flake); issues #43 (bridge-child naming), #46 (fan TurnOn FanMode mapping), #21–#24 (commission hardening).
 
 ---
@@ -15,8 +15,8 @@ presence multi-sensor (Matter over Thread) via the share model: Apple Home admin
 HomePod did the Thread provisioning, manual setup-code menu, **~10 s join** (vs the
 Tapo's 124 s). All four endpoints became Indigo devices; node-scoped battery fan-out
 and unprompted live attribute reports both worked. Environment: Indigo 2025.2, plugin
-2026.2.20, **matter-server 0.6.8** (the README `^0.6.2` install floats — 0.6.8
-behaved), Node 22.22.2, managed LaunchAgent.
+2026.2.20, **matter-server 0.6.8** (the INSTALL.md `^0.6.2` caret install floats
+within 0.6.x — 0.6.8 behaved), Node 22.22.2, managed LaunchAgent.
 
 **The bug the test found (issue #56, fixed this session):** value sensors displayed
 "off" instead of the reading — the sensor family had slipped through the colour

@@ -530,10 +530,11 @@ class DeviceSync:
           NOW implies (via _capability_props).
         - Filter to props that are absent or falsy in the device's current pluginProps.
         - If any are missing: call replacePluginPropsOnServer — Indigo rebuilds device
-          states from the new props automatically.
+          states from the new props automatically — then read the props back and
+          claim success ONLY for keys that verifiably stuck.
         - Guard per-device so a single failure never sinks the rest of reconcile.
-        - Only ADD props, never remove: a flaky interview must not strip capabilities
-          that were legitimately set in a prior pass.
+        - Cluster-implied caps are add-only, never removed: a flaky interview must
+          not strip capabilities that were legitimately set in a prior pass.
         - Meter props (SupportsPowerMeter/SupportsEnergyMeter) only apply to device
           types in _METER_CAPABLE_TYPES; SupportsBatteryLevel applies to any type
           (mirrors create_devices' node-level central setdefault behaviour exactly).
@@ -555,7 +556,9 @@ class DeviceSync:
                     type_id = getattr(dev, "deviceTypeId", "") or ""
                     current_props = dev.pluginProps
                     handler = self.registry.handler_for_device(dev)
-                    display_props = getattr(handler, "display_props", {}) or {}
+                    # None for an unknown deviceTypeId (e.g. stale index entry
+                    # from a renamed type) — that device has no display contract.
+                    display_props = getattr(handler, "display_props", {})
                     # Build the set of missing props for this specific device type.
                     # Meter props are only meaningful for relay/dimmer family devices.
                     missing: dict = {}
@@ -576,17 +579,43 @@ class DeviceSync:
                         # display state at creation and may not re-derive it from
                         # a props replace, so a device created before the issue
                         # #56 fix can be prop-correct yet still display on/off.
-                        # Nag (every reconcile) with the remedy.
-                        self._warn_stale_display_state(dev, type_id, display_props)
+                        # Nag (every pass — reconcile and node_updated) with the
+                        # remedy. Own guard so a bug in the warning code is never
+                        # misreported as a props-replace failure (and never blocks
+                        # the meter/battery heal for the next device).
+                        try:
+                            self._warn_stale_display_state(dev, type_id, display_props)
+                        except Exception as exc:  # noqa: BLE001
+                            self.logger.warning(
+                                "stale-display check failed on device %s: %s", dev_id, exc,
+                            )
                         continue
                     props = dict(current_props)
                     props.update(missing)
                     dev.replacePluginPropsOnServer(props)
-                    self.logger.info(
-                        "re-asserted capability props %s on device %s (%s) for node %s",
-                        list(missing.keys()), dev_id, type_id,
-                        node_id_to_str(node.node_id),
-                    )
+                    # Verify before claiming success: Indigo silently dropping a
+                    # key is exactly the half-happened class issue #56 is about,
+                    # and an unverified INFO here would mask it forever (the
+                    # stale-display nag only runs on passes with nothing missing,
+                    # so a never-converging replace would otherwise loop "success"
+                    # without the actionable warning ever firing).
+                    applied = indigo.devices[dev_id].pluginProps
+                    stuck = [
+                        key for key, value in missing.items()
+                        if key not in applied or bool(applied.get(key)) != bool(value)
+                    ]
+                    if stuck:
+                        self.logger.warning(
+                            "props replace on device %s (%s) did not persist %s — "
+                            "device may keep its previous capabilities/display",
+                            dev_id, type_id, stuck,
+                        )
+                    else:
+                        self.logger.info(
+                            "re-asserted capability props %s on device %s (%s) for node %s",
+                            list(missing.keys()), dev_id, type_id,
+                            node_id_to_str(node.node_id),
+                        )
                 except Exception as exc:  # noqa: BLE001 - props failure must not sink reconcile
                     self.logger.warning(
                         "could not re-assert capability props on device %s: %s",
@@ -601,13 +630,20 @@ class DeviceSync:
         may stay cached on ``onOffState`` (issue #56). The fix is user-side
         and cheap — deleting the Indigo device and reloading the plugin lets
         reconcile recreate it with the correct creation props — so name the
-        device and say exactly that. Deliberately checked only when the props
-        themselves are already correct: on the pass that just replaced props,
-        Indigo may not have re-derived yet, and warning there would be noise.
+        device and say exactly that. Deliberately checked only on passes where
+        no props needed replacing: right after a replace, Indigo may not have
+        re-derived yet, and warning there would be noise (a replace that never
+        converges is surfaced separately by the did-not-persist warning).
         """
         if not display_props.get("SupportsSensorValue"):
             return  # on/off IS the right display for binary sensors
-        if getattr(dev, "displayStateId", "") != "onOffState":
+        display_state = getattr(dev, "displayStateId", None)
+        if display_state is None:
+            # Unreadable is "unknown", not "healthy" — keep a trace, but a real
+            # indigo.Device always has the attribute, so debug-level is enough.
+            self.logger.debug("device %s has no readable displayStateId", dev.id)
+            return
+        if display_state != "onOffState":
             return
         self.logger.warning(
             "device %s (%s, %s) was created before the sensor display fix and "
