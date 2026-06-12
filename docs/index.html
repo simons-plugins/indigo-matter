@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>indigo-matter — Field Notes</title>
+<meta name="description" content="Matter support for Indigo. The field notes: the landscape, and the proving ground.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400..700;1,9..144,400..700&display=swap" rel="stylesheet">
+<link href="https://api.fontshare.com/v2/css?f[]=general-sans@400,500,600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="aizome.css">
+<style>
+  .issues { display: grid; gap: 1.2rem; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); margin: 2.6rem 0 1rem; }
+  .issue {
+    display: block;
+    border: 1.5px solid var(--rule-strong);
+    border-radius: var(--r-lg);
+    background: rgba(255,255,255,.4);
+    padding: 1.6rem 1.5rem 1.4rem;
+    text-decoration: none;
+    transition: transform .25s var(--ease-out-soft), border-color .25s var(--ease-out-soft);
+  }
+  .issue:hover { transform: translateY(-3px); }
+  .issue .kicker { font-size: .74rem; font-weight: 600; letter-spacing: .14em; text-transform: uppercase; }
+  .issue h2 { margin: .5rem 0 .5rem; font-size: 1.7rem; }
+  .issue p { color: var(--ink-soft); font-size: .95rem; margin: 0; }
+  .issue.one  { --accent: var(--leaf); }
+  .issue.two  { --accent: var(--ochre); }
+  .issue .kicker { color: var(--accent); }
+  .issue:hover { border-color: var(--accent); }
+</style>
+</head>
+<body>
+
+<header class="mast">
+  <div class="mast-rule">
+    <span>indigo-matter · Field Notes</span>
+    <span class="no">The index</span>
+    <a href="https://github.com/simons-plugins/indigo-matter">github / simons-plugins / indigo-matter</a>
+  </div>
+  <h1>Matter support for <em>Indigo</em></h1>
+  <p class="standfirst">Commission with the ecosystem you already own; control everything from
+  Indigo. Two long reads explain the whole thing — the landscape, and how it’s proven.</p>
+</header>
+
+<main>
+  <div class="issues">
+    <a class="issue one" href="matter.html">
+      <span class="kicker">№ 1 · for everyone</span>
+      <h2>The Landscape</h2>
+      <p>Matter, Thread, fabrics and the share model — a plain-English guide to where Indigo,
+      Domio, matter-server and Apple Home each fit, plus adding devices and troubleshooting.</p>
+    </a>
+    <a class="issue two" href="testing.html">
+      <span class="kicker">№ 2 · for the curious &amp; plugin devs</span>
+      <h2>The Proving Ground</h2>
+      <p>Four layers of testing — the unit suite, the device zoo, a fifteen-device virtual
+      Matter fleet, and live validation on real hardware over Wi-Fi and Thread.</p>
+    </a>
+  </div>
+</main>
+
+<footer class="colophon">
+  <span>indigo-matter Field Notes · set in Fraunces &amp; General Sans on warm paper<span class="dot">.</span></span>
+  <span>
+    <a href="https://github.com/simons-plugins/indigo-matter/blob/main/docs/INSTALL.md">Install</a> ·
+    <a href="https://github.com/simons-plugins/indigo-matter/blob/main/docs/API.md">API</a> ·
+    <a href="https://domio-smart-home.app">Domio</a>
+  </span>
+</footer>
+
+</body>
+</html>
