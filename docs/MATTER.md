@@ -270,9 +270,12 @@ energy metering and battery merge into the primary device's states.
 
 ## Firmware updates (and why they matter more than usual)
 
-Matter devices typically receive firmware through their **vendor's app**, and
-vendors are still actively *adding Matter features* via firmware. Real
-example from this house: a Tapo P110M energy plug shipped exposing only on/off
+Matter firmware arrives by two routes: the device **vendor's app**, and the
+ecosystems themselves — those that act as Matter OTA providers push updates
+too (**Apple Home auto-updates Matter accessory firmware**; observed on this
+house's Tapo plug). The vendor app typically gets releases first, so check
+there when you're waiting on a feature. And vendors are still actively
+*adding Matter features* via firmware. Real example from this house: a Tapo P110M energy plug shipped exposing only on/off
 over Matter — the energy-measurement clusters (a Matter 1.3 feature) appeared
 only after a firmware update via the Tapo app. The plugin re-reads a node's
 capabilities whenever it rejoins, so the existing Indigo device **gained its
