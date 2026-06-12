@@ -34,6 +34,7 @@ from matter_model import (
     node_id_to_str,
     parse_node,
 )
+from matter_handlers.base import IndigoDeviceSpec
 from matter_handlers.electrical import CLUSTER_ELECTRICAL_ENERGY, CLUSTER_ELECTRICAL_POWER
 from matter_handlers.power_source import CLUSTER_POWER_SOURCE
 from protocol import MatterCommand
@@ -42,6 +43,27 @@ from protocol import MatterCommand
 # This mirrors exactly the handler types that inject these props at creation
 # (on_off → matterRelay, level_control → matterDimmer, color_control → matterColorDimmer).
 _METER_CAPABLE_TYPES = frozenset({"matterRelay", "matterDimmer", "matterColorDimmer"})
+
+#: Clusters that don't, by themselves, make an endpoint a *device*: utility /
+#: metadata clusters any endpoint may carry, plus the merge-only measurement
+#: clusters (their handlers augment a sibling device, never create one). An
+#: endpoint ≥1 whose unhandled clusters are all in this set gets no
+#: matterUnknown placeholder (issue #58).
+_NON_DEVICE_CLUSTERS = frozenset({
+    0x0003,  # Identify
+    0x0004,  # Groups
+    0x0005,  # Scenes (pre-Matter-1.3 id)
+    0x001D,  # Descriptor
+    0x001E,  # Binding
+    0x0028,  # BasicInformation
+    0x002F,  # PowerSource (node-scoped battery, merged into siblings)
+    0x0039,  # BridgedDeviceBasicInformation
+    0x0040,  # FixedLabel
+    0x0041,  # UserLabel
+    0x0062,  # ScenesManagement (Matter 1.3 id)
+    0x0090,  # ElectricalPowerMeasurement (merge-only)
+    0x0091,  # ElectricalEnergyMeasurement (merge-only)
+})
 
 
 def _kvlist(states: dict) -> list:
@@ -245,7 +267,31 @@ class DeviceSync:
                 endpoint.has(CLUSTER_POWER_SOURCE) for endpoint in node.endpoints
             )
             for endpoint in node.endpoints:
-                for spec in self.registry.handlers_for_endpoint(node, endpoint):
+                specs = self.registry.handlers_for_endpoint(node, endpoint)
+                if not specs:
+                    # No handler claimed this endpoint. If it carries clusters
+                    # that DO make it a device (just ones we don't support yet),
+                    # surface it as a matterUnknown placeholder instead of
+                    # silently creating nothing — a commission that "succeeds"
+                    # with no visible device is a half-happened op (issue #58).
+                    # Endpoint 0 is the Matter root (utility clusters only) and
+                    # never gets a placeholder.
+                    fallback = self._unknown_spec(node, endpoint)
+                    if fallback is not None:
+                        specs = [fallback]
+                elif self._index.get(
+                    (int(node.node_id), int(endpoint.endpoint_id)), {}
+                ).get("matterUnknown"):
+                    # The endpoint used to be unsupported (placeholder exists)
+                    # but now maps to real device(s) — e.g. a firmware update
+                    # added clusters. Never auto-delete a user's device; tell
+                    # them the placeholder is obsolete instead.
+                    self.logger.info(
+                        "node %s endpoint %s is now supported — the 'Matter Device "
+                        "(unsupported clusters)' placeholder device can be deleted",
+                        node_id_to_str(node.node_id), endpoint.endpoint_id,
+                    )
+                for spec in specs:
                     if node_has_power_source:
                         spec.props.setdefault("SupportsBatteryLevel", True)
                     plan.append((endpoint, spec))
@@ -304,6 +350,15 @@ class DeviceSync:
                 if dev_id is None:
                     failed += 1
                     continue
+                if type_id == "matterUnknown":
+                    self.logger.info(
+                        "node %s endpoint %s exposes only clusters this plugin does not "
+                        "support yet (%s) — created placeholder device %s; please report "
+                        "the device at github.com/simons-plugins/indigo-matter/issues so "
+                        "support can be added",
+                        node_id_to_str(node.node_id), endpoint.endpoint_id,
+                        spec.props.get("supportedClusters", "?"), dev_id,
+                    )
                 self._index.setdefault(ep_key, {})[type_id] = dev_id
                 created.append(dev_id)
                 new_ids.append(dev_id)
@@ -343,7 +398,38 @@ class DeviceSync:
             result["failedEndpoints"] = failed
         return result
 
+    @staticmethod
+    def _unknown_spec(node: NodeInfo, endpoint: Any) -> Optional[IndigoDeviceSpec]:
+        """Placeholder spec for a device-bearing endpoint no handler claims.
+
+        Returns None for endpoint 0 (the Matter root — utility clusters only)
+        and for endpoints whose clusters are all in _NON_DEVICE_CLUSTERS
+        (nothing device-like to surface).
+        """
+        if int(endpoint.endpoint_id) == 0:
+            return None
+        unmapped = sorted(set(endpoint.cluster_ids) - _NON_DEVICE_CLUSTERS)
+        if not unmapped:
+            return None
+        name = node.suggested_name or node.product_name or f"Matter {node.node_id}"
+        return IndigoDeviceSpec(
+            device_type_id="matterUnknown",
+            name=name,
+            props={
+                "nodeId": str(node.node_id),
+                "endpointId": str(endpoint.endpoint_id),
+                "vendorName": node.vendor_name,
+                "productName": node.product_name,
+                "supportedClusters": ", ".join(f"0x{c:04X}" for c in unmapped),
+            },
+            initial_states={"reachable": True},
+        )
+
     def _create_one(self, spec: Any, name: str, folder_id: int = 0) -> Optional[int]:
+        # Stamp the type the cluster pipeline chose, so the type-edit guard
+        # (validateDeviceConfigUi + deviceStartComm) can detect a manual change
+        # via Indigo's Edit Device Type menu (issue #58).
+        spec.props.setdefault("createdTypeId", spec.device_type_id)
         try:
             dev = indigo.device.create(
                 protocol=indigo.kProtocol.Plugin,
@@ -574,6 +660,16 @@ class DeviceSync:
                         # be written explicitly, not skipped as already-falsy.
                         if key not in current_props or bool(current_props.get(key)) != bool(value):
                             missing[key] = value
+                    # Heal the type-edit guard's stamp onto devices created
+                    # before it existed (issue #58). Records the CURRENT type as
+                    # canonical — for a pristine fleet that is the created type.
+                    if type_id and "createdTypeId" not in current_props:
+                        missing["createdTypeId"] = type_id
+                    # Heal the address (UI protocol-id column, issue #18) onto
+                    # devices created before that stamping existed — it is the
+                    # node id a user needs for decommission.
+                    if not current_props.get("address"):
+                        missing["address"] = node_id_to_str(node.node_id)
                     if not missing:
                         # Props are already correct — but Indigo caches the list
                         # display state at creation and may not re-derive it from
@@ -623,20 +719,25 @@ class DeviceSync:
                     )
 
     def _warn_stale_display_state(self, dev: Any, type_id: str, display_props: dict) -> None:
-        """Warn when a value sensor's cached display state is still on/off.
+        """Warn when a device's cached display state is wrongly stuck on on/off.
 
         Indigo derives ``displayStateId`` from the Supports* props at device
-        creation; replacing props afterwards rebuilds states but the display
-        may stay cached on ``onOffState`` (issue #56). The fix is user-side
-        and cheap — deleting the Indigo device and reloading the plugin lets
-        reconcile recreate it with the correct creation props — so name the
-        device and say exactly that. Deliberately checked only on passes where
-        no props needed replacing: right after a replace, Indigo may not have
-        re-derived yet, and warning there would be noise (a replace that never
-        converges is surfaced separately by the did-not-persist warning).
+        creation; replacing props afterwards rebuilds states and (verified
+        live, 2026-06-12) normally re-derives the display too — this warning
+        is dead-man insurance for the case where it doesn't. Applies to any
+        type whose display_props disclaim the on/off display: value sensors
+        (SupportsSensorValue) and UiDisplayStateId-fallback types like the
+        button and air-quality sensor (both Supports* False). The remedy is
+        user-side and cheap — deleting the Indigo device and reloading the
+        plugin lets reconcile recreate it with the correct creation props —
+        so name the device and say exactly that. Deliberately checked only on
+        passes where no props needed replacing: right after a replace, Indigo
+        may not have re-derived yet, and warning there would be noise (a
+        replace that never converges is surfaced separately by the
+        did-not-persist warning).
         """
-        if not display_props.get("SupportsSensorValue"):
-            return  # on/off IS the right display for binary sensors
+        if display_props.get("SupportsOnState", True):
+            return  # on/off IS the right display (binary sensors, non-sensor types)
         display_state = getattr(dev, "displayStateId", None)
         if display_state is None:
             # Unreadable is "unknown", not "healthy" — keep a trace, but a real

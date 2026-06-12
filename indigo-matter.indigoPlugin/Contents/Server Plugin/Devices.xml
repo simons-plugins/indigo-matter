@@ -436,10 +436,11 @@
 
     <!-- AirQuality enum sensor (cluster 0x005B).
          sensorValue = raw enum int; airQuality = human-readable string.
-         UiDisplayStateId = airQuality would be the useful display, but
-         API-created devices ignore Devices.xml statics (issue #56) — they
-         show the raw enum via SupportsSensorValue. Do NOT try to fix the
-         display here; it needs a creation-prop mechanism (#56 follow-up). -->
+         UiDisplayStateId = airQuality IS the live display — it applies to
+         API-created devices only because the handler sets BOTH
+         SupportsOnState and SupportsSensorValue False in creation props
+         (the built-in display wins whenever one of them is True; verified
+         live, issue #56). -->
     <Device id="matterAirQualitySensor" type="sensor">
         <Name>Matter Air Quality Sensor</Name>
         <ConfigUI>

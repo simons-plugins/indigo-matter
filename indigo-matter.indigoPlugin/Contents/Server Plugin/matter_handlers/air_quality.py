@@ -45,15 +45,20 @@ class AirQualityHandler(_SensorHandler):
 
     Attribute 0x0000 is an enum; we expose both the raw integer (sensorValue)
     and the human-readable string (airQuality) so automations can trigger on
-    the string and display it directly.  Devices.xml declares UiDisplayStateId
-    = airQuality, but API-created devices ignore it (issue #56) — the list
-    display is the raw enum via the inherited SupportsSensorValue prop; the
-    string display is a #56 follow-up pending hardware testing.
+    the string and display it directly.  The list display IS the string:
+    with both Supports* props False the Devices.xml <UiDisplayStateId>
+    applies even to API-created devices (verified live — issue #56).
     """
 
     cluster_id = 0x005B
     cluster_name = "AirQuality"
     device_type_id = "matterAirQualitySensor"
+    # Override the value-sensor pair: with BOTH Supports* False, Indigo falls
+    # back to <UiDisplayStateId>airQuality</UiDisplayStateId>, so the device
+    # list shows "good"/"poor" instead of the raw enum int. Verified live on
+    # jarvis (issue #56 follow-up). sensorValue keeps working — it is an
+    # XML-declared custom state, not the disabled built-in.
+    display_props = {"SupportsOnState": False, "SupportsSensorValue": False}
 
     measured_attr = ATTR_AIR_QUALITY
 

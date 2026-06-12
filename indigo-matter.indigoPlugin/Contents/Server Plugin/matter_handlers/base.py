@@ -17,10 +17,27 @@ from typing import Any, Optional, Union
 
 from protocol import MatterCommand, MatterWrite  # re-exported for handlers/tests
 
-__all__ = ["IndigoDeviceSpec", "MatterCommand", "MatterWrite", "ClusterHandler", "MatterAction"]
+__all__ = [
+    "IndigoDeviceSpec", "MatterCommand", "MatterWrite", "ClusterHandler",
+    "MatterAction", "ENDPOINT_OWNER_CLUSTERS",
+]
 
 #: A handler action is either a cluster-command invoke or an attribute write.
 MatterAction = Union[MatterCommand, MatterWrite]
+
+#: Clusters whose handler owns the whole endpoint. When one of these is present,
+#: OnOff/LevelControl on the same endpoint are subordinate controls of that
+#: device (a fan's power switch, a thermostat's enable) and must NOT produce a
+#: standalone relay/dimmer — that would duplicate the device in Indigo. The
+#: Matter spec makes such combinations normal: e.g. the Fan device type
+#: mandates OnOff alongside FanControl since Matter 1.2 (issue #58).
+ENDPOINT_OWNER_CLUSTERS = frozenset({
+    0x0081,  # ValveConfigurationAndControl
+    0x0101,  # DoorLock
+    0x0102,  # WindowCovering
+    0x0201,  # Thermostat
+    0x0202,  # FanControl
+})
 
 
 @dataclass

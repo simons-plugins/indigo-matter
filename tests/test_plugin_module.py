@@ -119,3 +119,61 @@ def test_relay_devices_do_not_redefine_native_onoffstate():
         and any(s.get("id") == "onOffState" for s in dev.iter("State"))
     ]
     assert not offenders, f"relay-type devices must not redefine native onOffState: {offenders}"
+
+
+# ---------------------------------------------------------------------------
+# fix/#58 — type-edit guard
+# ---------------------------------------------------------------------------
+
+def _dev(props, type_id="matterTemperatureSensor"):
+    from types import SimpleNamespace
+    return SimpleNamespace(id=5, name="Landing Sensor", deviceTypeId=type_id,
+                           pluginProps=props)
+
+
+def test_validate_rejects_type_change(plugin_cls, mock_indigo_base):
+    mock_indigo_base.devices = {5: _dev({"createdTypeId": "matterTemperatureSensor"})}
+    ok, _values, errors = plugin_cls.validateDeviceConfigUi(None, {}, "matterRelay", 5)
+    assert ok is False
+    assert "cannot be changed" in errors["showAlertText"]
+
+
+def test_validate_allows_unchanged_type(plugin_cls, mock_indigo_base):
+    mock_indigo_base.devices = {5: _dev({"createdTypeId": "matterTemperatureSensor"})}
+    result = plugin_cls.validateDeviceConfigUi(None, {}, "matterTemperatureSensor", 5)
+    assert result[0] is True
+
+
+def test_validate_allows_unstamped_device(plugin_cls, mock_indigo_base):
+    # Pre-guard or manually created device — no stamp, no opinion.
+    mock_indigo_base.devices = {5: _dev({})}
+    result = plugin_cls.validateDeviceConfigUi(None, {}, "matterRelay", 5)
+    assert result[0] is True
+
+
+def test_validate_allows_unknown_device_id(plugin_cls, mock_indigo_base):
+    mock_indigo_base.devices = {}
+    result = plugin_cls.validateDeviceConfigUi(None, {}, "matterRelay", 999)
+    assert result[0] is True
+
+
+def test_device_start_comm_warns_on_type_mismatch(plugin_cls, mock_logger):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    stub = SimpleNamespace(logger=mock_logger, device_sync=MagicMock())
+    dev = _dev({"createdTypeId": "matterTemperatureSensor"}, type_id="matterRelay")
+    plugin_cls.deviceStartComm(stub, dev)
+    assert mock_logger.warning.called
+    fmt, *args = mock_logger.warning.call_args[0]
+    message = fmt % tuple(args)
+    assert "cannot be changed" in message and "Landing Sensor" in message
+    stub.device_sync.note_device.assert_called_once_with(dev)
+
+
+def test_device_start_comm_quiet_when_types_match(plugin_cls, mock_logger):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    stub = SimpleNamespace(logger=mock_logger, device_sync=MagicMock())
+    dev = _dev({"createdTypeId": "matterRelay"}, type_id="matterRelay")
+    plugin_cls.deviceStartComm(stub, dev)
+    assert not mock_logger.warning.called
