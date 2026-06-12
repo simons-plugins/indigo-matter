@@ -438,6 +438,24 @@ class DeviceSync:
                 props=spec.props,
                 folder=folder_id,
             )
+        except ValueError as exc:  # noqa: BLE001 - surface but don't abort the batch
+            if "NameNotUnique" in str(exc):
+                # A device with this name exists but was invisible to both the
+                # index and _unique_name — live evidence (issue #62): a device
+                # whose type was changed via Indigo's Type menu is left
+                # configured=False, drops out of iter("self"), and never gets
+                # deviceStartComm, so neither #58 guard can see it. Replace the
+                # raw traceback with the remedy.
+                self.logger.warning(
+                    "a device named \"%s\" already exists but is not usable for this "
+                    "node (typically: its type was changed via Indigo's Type menu, "
+                    "leaving it unconfigured) — delete that device and reload this "
+                    "plugin; it will be recreated correctly",
+                    name,
+                )
+            else:
+                self.logger.exception(exc)
+            return None
         except Exception as exc:  # noqa: BLE001 - surface but don't abort the batch
             self.logger.exception(exc)
             return None

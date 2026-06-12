@@ -227,6 +227,14 @@ class Plugin(indigo.PluginBase):
         return (True, valuesDict)
 
     def deviceStartComm(self, dev):  # noqa: N802
+        # Indigo builds a device's state list at creation and does NOT re-read
+        # Devices.xml on plugin upgrade — without this refresh, states added in
+        # a new release (e.g. colorCapabilities, issue #60) never exist on
+        # fielded devices and every update logs an Indigo error.
+        try:
+            dev.stateListOrDisplayStateIdChanged()
+        except Exception as exc:  # noqa: BLE001 - refresh failure must not block startComm
+            self.logger.debug("state list refresh failed for %s: %s", dev.id, exc)
         # Backstop for type edits made while the plugin was not running (the
         # validateDeviceConfigUi guard can't fire then) — issue #58.
         created = dev.pluginProps.get("createdTypeId", "")
@@ -247,16 +255,22 @@ class Plugin(indigo.PluginBase):
     # Device actions → Matter commands (bridged onto the loop, 5s ack)
     # ------------------------------------------------------------------
     def actionControlDevice(self, action, dev):  # noqa: N802
-        command = self.device_sync.build_command(dev, action)
-        if command is None:
-            return
-        self._send_matter_command(command, dev)
+        self._send_built_commands(self.device_sync.build_command(dev, action), dev)
 
     def actionControlThermostat(self, action, dev):  # noqa: N802
-        command = self.device_sync.build_command(dev, action)
-        if command is None:
+        self._send_built_commands(self.device_sync.build_command(dev, action), dev)
+
+    def _send_built_commands(self, commands, dev) -> None:
+        """Send a handler's command(s). Handlers may return one MatterAction or
+        a list for composite operations (the colour W slider is CT mode + level
+        — two Matter commands); each is sent and acked individually so a
+        failure surfaces on the device exactly as a single command's would."""
+        if commands is None:
             return
-        self._send_matter_command(command, dev)
+        if not isinstance(commands, list):
+            commands = [commands]
+        for command in commands:
+            self._send_matter_command(command, dev)
 
     def actionControlSensor(self, action, dev):  # noqa: N802
         self.logger.info('ignored "%s" — Matter sensor is read-only', dev.name)

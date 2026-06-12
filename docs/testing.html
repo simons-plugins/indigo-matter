@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Proving Ground — indigo-matter Field Notes № 2</title>
+<meta name="description" content="How indigo-matter is tested: the unit suite, the device zoo, a fifteen-device virtual Matter fleet, and live validation on a production Indigo server.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400..700;1,9..144,400..700&display=swap" rel="stylesheet">
+<link href="https://api.fontshare.com/v2/css?f[]=general-sans@400,500,600&display=swap" rel="stylesheet">
+<script>document.documentElement.classList.add("js")</script>
+<link rel="stylesheet" href="aizome.css">
+<style>
+  :root { --accent: var(--ochre); --accent-soft: rgba(176, 122, 43, .10); }
+</style>
+</head>
+<body>
+
+<header class="mast">
+  <div class="mast-rule">
+    <span>indigo-matter · Field Notes</span>
+    <span class="no">№ 2 — The Proving Ground</span>
+    <a href="https://github.com/simons-plugins/indigo-matter">github / simons-plugins / indigo-matter</a>
+  </div>
+  <h1>The <em>proving ground</em></h1>
+  <p class="standfirst">This plugin sits between two systems that are both awkward to test —
+  Indigo’s plugin host and a live Matter fabric. So it is tested in four layers, each catching
+  what the one before it can’t. This is how, and what each layer has actually caught.</p>
+  <div class="mast-foot">
+    <span class="stamp ochre">~750 tests · green</span>
+    <span class="stamp ochre">2 transports · real hardware</span>
+    <span>Companion read: <a href="matter.html">№ 1 — The Landscape</a></span>
+  </div>
+</header>
+
+<main>
+
+<section class="note reveal">
+  <div class="sec-no">§ 00</div>
+  <div class="sec-body">
+    <h2>Four layers, stacked like strata</h2>
+    <ol class="strata">
+      <li><span class="layer-no">1</span><div><b>The unit suite</b> — ~750 pytest tests,
+      everything mocked.<p>Catches logic, protocol parsing, reconcile and state machinery.</p></div></li>
+      <li><span class="layer-no">2</span><div><b>The device zoo</b> — contract invariants over
+      cluster combinations.<p>Catches whole <em>classes</em> of device-mapping bugs at once.</p></div></li>
+      <li><span class="layer-no">3</span><div><b>The virtual fleet</b> — 15+ genuine Matter
+      devices, built from matter.js.<p>Catches real commissioning, subscriptions and command
+      round-trips.</p></div></li>
+      <li><span class="layer-no">4</span><div><b>Real hardware, live server</b> — shipping
+      devices on the production path.<p>Catches everything else — including what Indigo itself
+      actually does.</p></div></li>
+    </ol>
+  </div>
+</section>
+
+<section class="note reveal">
+  <div class="sec-no">§ 01</div>
+  <div class="sec-body">
+    <h2>The unit suite</h2>
+    <pre><code>cd indigo-matter &amp;&amp; python3 -m pytest -q</code></pre>
+    <p class="dropcap">No Indigo server and no matter-server needed: the <code>indigo</code>
+    module is mocked (<code>tests/conftest.py</code>) and matter-server is faked at the
+    WebSocket frame layer (<code>tests/fakes.py</code>), so the real client, reconcile and
+    dispatch code paths run against recorded protocol shapes.
+    <code>tests/test_golden_real.py</code> pins parsing against frames captured from a live
+    matter-server — a wire-format drift fails loudly.</p>
+    <div class="pull">The fake Indigo models the pessimistic case — it caches the display
+    state at creation and refuses to re-derive it — so the self-heal paths are exercised under
+    worst-case behaviour even though real Indigo turned out to be kinder.<small>Test-design
+    note</small></div>
+  </div>
+</section>
+
+<section class="note reveal">
+  <div class="sec-no">§ 02</div>
+  <div class="sec-body">
+    <h2>The device zoo</h2>
+    <p>Matter devices arrive with cluster combinations nobody predicted — the spec
+    <em>requires</em> some surprises. A Matter 1.2+ fan must expose OnOff alongside FanControl.
+    An Extended Color Light need only implement XY and colour temperature — HueSaturation is
+    optional. The zoo (<code>tests/test_device_zoo.py</code>) is a contract harness for
+    exactly this: a table of synthetic nodes run through the <strong>real</strong> handler
+    registry, with five invariants asserted over every entry:</p>
+    <ol>
+      <li>each endpoint maps to exactly the expected Indigo device types;</li>
+      <li><strong>at most one actuator device per endpoint</strong> — two would fight over one
+      physical device;</li>
+      <li>every spec’s device type exists in <code>Devices.xml</code>;</li>
+      <li>every seeded initial state is declared or built-in;</li>
+      <li>every sensor carries explicit display props — Indigo derives the device-list display
+      from creation props, never from XML statics (issue #56).</li>
+    </ol>
+    <h3>Track record</h3>
+    <p>
+      <span class="stamp ochre">Caught — first run</span>&nbsp;
+      <span class="stamp ochre">Caught — same week</span>
+    </p>
+    <p>On its very first run the zoo found a colour light <em>without</em> LevelControl
+    producing a duplicate relay — a case nobody had predicted. Days later it caught the button
+    handler declaring display props without merging them into its creation spec. Invariants
+    find the bugs you didn’t think to write a test for.</p>
+    <div class="aside">
+      <span class="tag">When a strange device shows up</span>
+      Add its cluster set as one <code>ZOO</code> entry (cluster ids in decimal inside the
+      <code>"ep/cluster/attr"</code> keys) with the device types you expect — every invariant
+      then runs over it automatically. This is the intended first response to any “weird
+      device” bug report.
+    </div>
+  </div>
+</section>
+
+<section class="note reveal">
+  <div class="sec-no">§ 03</div>
+  <div class="sec-body">
+    <h2>The virtual fleet</h2>
+    <p>Real Matter devices, minus the shopping. The
+    <a href="https://github.com/project-chip/matter.js">matter.js</a> examples plus small
+    custom scripts compose genuine commissionable Matter nodes on the LAN — the plugin and
+    matter-server cannot tell them from shipping hardware. The development fleet runs
+    fifteen-plus devices:</p>
+    <ul class="chips">
+      <li>relay</li><li>dimmer</li><li>extended colour light</li><li>temp / humidity</li>
+      <li>thermostat</li><li>fan</li><li>window covering</li><li>door lock</li><li>valve</li>
+      <li>button</li><li>smoke / CO</li><li>air quality ×4</li><li>pressure / flow</li>
+      <li>energy plug</li><li>battery sensor</li>
+    </ul>
+    <p>Scripts live in <code>/tmp/matter-test/*.mjs</code>; commissioned identities persist in
+    <code>~/.matter/&lt;id&gt;</code>, so a relaunch keeps the node:</p>
+    <pre><code>pgrep -fl "node .*\.mjs"                        # what's running
+cd /tmp/matter-test &amp;&amp; node fan.mjs &gt;&gt; fan.log 2&gt;&amp;1 &amp;</code></pre>
+    <h3>Hard-won rig rules</h3>
+    <p>Each of these cost a debugging session (war stories in
+    <a href="https://github.com/simons-plugins/indigo-matter/blob/main/docs/HANDOVER.md">HANDOVER.md</a>):</p>
+    <ul>
+      <li><strong>One UDP port per device</strong> — two devices on one port send PASE to the
+      wrong socket.</li>
+      <li><strong>Distinct discriminators with different top nibbles</strong> — the 11-digit
+      manual code only carries the 4-bit short discriminator.</li>
+      <li><strong>Commission within ~15 minutes</strong> of first launch, then the device
+      stops advertising.</li>
+      <li>After cycling many device instances, <strong>restart matter-server</strong> to clear
+      its mDNS cache.</li>
+      <li>Custom devices must enable their cluster <strong>features</strong> explicitly, and
+      must not set server-managed attributes.</li>
+    </ul>
+    <div class="pull">Keep test devices spec-minimal rather than maximal. Minimal devices find
+    more bugs.<small>The fleet’s colour light is XY-only — exactly how it exposed issue
+    #60</small></div>
+    <p>That colour light is an <code>ExtendedColorLightDevice</code> with default features —
+    XY, no HueSaturation. The plugin sent RGB as <code>MoveToHueAndSaturation</code>; the
+    device rejected every colour command with <code>UNSUPPORTED_COMMAND</code>. A maximal test
+    device would have hidden that for years.</p>
+  </div>
+</section>
+
+<section class="note reveal">
+  <div class="sec-no">§ 04</div>
+  <div class="sec-body">
+    <h2>Live validation on a production server</h2>
+    <p>Some truths only real Indigo knows — several of its API behaviours were established
+    empirically here: that <code>Supports*</code> creation props rule the device-list display
+    and XML statics never apply to API-created devices; that with <em>both</em> display props
+    explicitly false, the XML <code>UiDisplayStateId</code> applies after all; that
+    <code>replacePluginPropsOnServer</code> <em>does</em> re-derive the display — proven by
+    deploying a fix over a fleet of pre-fix devices and watching two reconciles.</p>
+    <p>The method, reproducible by any plugin developer with a test server:</p>
+    <ol class="steps">
+      <li><b>Deploy.</b> rsync the build into the live plugin bundle (updates only — first
+      installs must be double-click installed), restart the plugin.</li>
+      <li><b>Read the event log.</b> The plugin is written so the log <em>is</em> the
+      evidence: self-heals log what they changed and verify persistence by reading props back.
+      An unverified write logs as a warning — never as success.</li>
+      <li><b>Restart again.</b> The steady state must be quiet. Anything still healing or
+      warning on pass two is a finding.</li>
+      <li><b>Instrument if needed.</b> For display/UI questions, a temporary INFO line on the
+      deployed copy answers in one restart — and never gets committed.</li>
+    </ol>
+    <h3>Real hardware, production path</h3>
+    <table class="specimen">
+      <caption>Validation record</caption>
+      <thead><tr><th scope="col">Device</th><th scope="col">Transport</th><th scope="col">Date</th><th scope="col">Result</th></tr></thead>
+      <tbody>
+        <tr>
+          <th scope="row">TP-Link Tapo P110M</th>
+          <td>Wi-Fi</td><td>2026-06-10</td>
+          <td>Full Domio share-model flow; on/off + live energy after Tapo’s Matter 1.3
+          firmware update. <span class="stamp ochre">validated</span></td>
+        </tr>
+        <tr>
+          <th scope="row">Aqara FP300</th>
+          <td>Thread · HomePod TBR</td><td>2026-06-12</td>
+          <td>Share model first try — ~10 s join, four endpoints, battery fan-out, unprompted
+          live reports. Third-party tester. <span class="stamp ochre">validated</span></td>
+        </tr>
+      </tbody>
+    </table>
+    <p>The FP300 test also delivered the bug report that became issue #56 — external testers
+    running real devices are part of the methodology, not an afterthought.</p>
+    <div class="aside">
+      <span class="tag">Test a device, file what you find</span>
+      Good or bad, report it at
+      <a href="https://github.com/simons-plugins/indigo-matter/issues">github.com/simons-plugins/indigo-matter/issues</a> —
+      ideally with the endpoint’s cluster list from the diagnostics endpoint. Unknown devices
+      also appear in Indigo as a <em>“Matter Device (unsupported clusters)”</em> placeholder
+      whose settings list exactly the cluster ids to report.
+    </div>
+  </div>
+</section>
+
+</main>
+
+<footer class="colophon">
+  <span>indigo-matter Field Notes · set in Fraunces &amp; General Sans on warm paper<span class="dot">.</span></span>
+  <span>
+    <a href="matter.html">№ 1 — The Landscape</a> ·
+    <a href="https://github.com/simons-plugins/indigo-matter/blob/main/docs/TESTING.md">TESTING.md (plain)</a> ·
+    <a href="https://domio-smart-home.app">Domio</a>
+  </span>
+</footer>
+
+<script>
+  const io = new IntersectionObserver((entries) => {
+    for (const e of entries) if (e.isIntersecting) { e.target.classList.add("in"); io.unobserve(e.target); }
+  }, { rootMargin: "0px 0px -8% 0px" });
+  document.querySelectorAll(".reveal").forEach(el => io.observe(el));
+</script>
+
+</body>
+</html>

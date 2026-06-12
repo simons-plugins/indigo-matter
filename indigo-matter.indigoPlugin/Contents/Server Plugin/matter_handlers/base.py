@@ -114,6 +114,8 @@ class ClusterHandler(ABC):
         return {}  # noqa: D401
 
     @abstractmethod
-    def handle_indigo_action(self, indigo_dev: Any, action: Any) -> Optional[MatterAction]:
+    def handle_indigo_action(self, indigo_dev: Any, action: Any) -> Optional[Union[MatterAction, list]]:
         """Translate an Indigo device action to a Matter command or attribute
-        write (or None)."""
+        write (or None). May return a LIST of actions for composite operations
+        (e.g. the colour W slider = colour-temperature mode + level); the
+        plugin sends them sequentially, each individually acked."""

@@ -1535,3 +1535,20 @@ def test_reassert_backfills_address_on_legacy_devices(ds, indigo_env):
 
     ds.reconcile_all([TEMP_SENSOR_NODE])
     assert dev.pluginProps.get("address") == "0x40"
+
+
+def test_name_collision_logs_remedy_not_traceback(ds, indigo_env, mock_logger):
+    """A NameNotUniqueError on create (issue #62: type-edited device invisible
+    to iter('self') still holds the name server-side) must log the actionable
+    remedy, not a raw traceback, and must not abort the batch."""
+    indigo_mock, devices = indigo_env
+
+    def explode(**kwargs):
+        raise ValueError("NameNotUniqueError")
+    indigo_mock.device.create = explode
+
+    result = ds.create_from_raw(TEMP_SENSOR_NODE, "Landing Sensor")
+    assert result.get("partial") is True
+    msgs = [c[0][0] % tuple(c[0][1:]) for c in mock_logger.warning.call_args_list]
+    assert any("delete that device and reload" in m for m in msgs), msgs
+    assert not mock_logger.exception.called
