@@ -27,7 +27,7 @@ Domio (iOS, MatterSupport) ──commission+handoff──▶ indigo-matter ─�
 ## Related projects
 
 - [`../domio-code/`](../domio-code/) — iOS app; owns commissioning. The Domio↔plugin HTTP contract is **`docs/API.md`** (mirrored in both repos; keep in sync).
-- Workspace **ADR-0006** (`domio-code/docs/adr/`, = workspace `docs/adr/0004`) — the Matter architecture decision (Apple TV TBR + matter-server + multi-admin handoff).
+- The Matter architecture decision (the **share model**: the user's existing ecosystem commissions as admin 1, the plugin joins as a second admin over IP, the ecosystem's hub is the Thread border router) is explained for users in [`docs/MATTER.md`](./docs/MATTER.md).
 
 ## Architecture (this plugin)
 

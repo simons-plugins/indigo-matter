@@ -254,7 +254,7 @@ rsync -c "$SRC/Info.plist" "$DST/Info.plist"
 ### Read-only probe (run ON jarvis): `~/matter-probe.js`
 Dumps `server_info` + `get_nodes`/`get_node` + toggles. Run: `source ~/.nvm/nvm.sh; nvm use 22 >/dev/null; node ~/matter-probe.js`.
 
-## 5. Domio integration (share model — ADR-0006 C4) — CONFIRMED this session
+## 5. Domio integration (share model) — CONFIRMED this session
 
 Domio no longer commissions; it relays a **share code** (Apple Home is admin 1; the plugin joins as admin 2 over IP).
 

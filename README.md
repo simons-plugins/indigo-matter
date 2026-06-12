@@ -11,7 +11,7 @@ Indigo-owned Matter fabric, and translates Matter clusters ↔ Indigo device typ
 Domio (iOS) ──share code──▶ indigo-matter ──WebSocket──▶ matter-server ──IP──▶ Wi-Fi Matter devices
 ```
 
-Commissioning uses the **share model** (ADR-0006, "C4"): Apple Home commissions the
+Commissioning uses the **share model**: Apple Home commissions the
 device first, Domio relays a share/pairing code to the plugin, and the plugin joins the
 device's fabric as a second admin over IP. The plugin owns runtime control for the
 device's lifetime.

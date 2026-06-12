@@ -117,12 +117,11 @@
     BLE radios and, for Thread, the network credentials. A headless Mac running Indigo is a
     poor first commissioner — matter-server runs without BLE on macOS, and macOS has no Thread
     credential store.</p>
-    <p>This plugin sidesteps the problem entirely with the <strong>share model</strong> (the
-    architecture decision recorded as ADR-0006):</p>
+    <p>This plugin sidesteps the problem entirely with the <strong>share model</strong> —
+    the plugin’s founding architecture decision:</p>
     <div class="pull">An ecosystem you already own commissions the device first — it owns the
     Bluetooth step. Then the device is <em>shared</em> to Indigo over plain IP. Indigo never
-    needs BLE, Thread credentials, or proximity to the device.<small>ADR-0006 · the share
-    model</small></div>
+    needs BLE, Thread credentials, or proximity to the device.<small>The share model</small></div>
     <p>That’s only possible because of Matter’s best feature: multi-admin.</p>
   </div>
 </section>
@@ -133,7 +132,9 @@
     <h2>Fabrics &amp; multi-admin: one device, many controllers</h2>
     <p>A Matter <strong>fabric</strong> is a controller’s trust domain — a set of cryptographic
     credentials a controller installs on a device. The crucial design choice in Matter is that
-    <strong>a device can belong to several fabrics at once</strong> (typically five or more).
+    <strong>a device can belong to several fabrics at once</strong>. The spec floor is
+    five — and since each fabric slot costs the device persistent storage, the floor is
+    also what most devices ship. Treat five as your planning number.
     Each controller talks to the device directly and locally; none of them knows or cares
     about the others.</p>
     <p>A single plug in this house happily serves four admins simultaneously:</p>
@@ -315,8 +316,12 @@
   <div class="sec-no">§ 10</div>
   <div class="sec-body">
     <h2>Firmware updates — they matter more than usual</h2>
-    <p>Matter devices typically receive firmware through their <strong>vendor’s app</strong>,
-    and vendors are still actively <em>adding Matter features</em> via firmware.</p>
+    <p>Matter firmware arrives by two routes: the device <strong>vendor’s app</strong>, and
+    the ecosystems themselves — those that act as Matter OTA providers push updates too
+    (<strong>Apple Home auto-updates Matter accessory firmware</strong>; observed on this
+    house’s Tapo plug). The vendor app typically gets releases first, so check there when
+    you’re waiting on a feature. And vendors are still actively <em>adding Matter
+    features</em> via firmware.</p>
     <div class="pull">A Tapo P110M shipped exposing only on/off over Matter. The energy
     clusters appeared after a firmware update — and the existing Indigo device gained its
     energy states automatically. No restart, no re-pairing.<small>Field note, this house,

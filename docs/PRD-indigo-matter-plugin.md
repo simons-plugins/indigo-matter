@@ -11,8 +11,8 @@
 > are stale — e.g. decommission is now `POST …?nodeId=`, not `DELETE`),
 > [`MATTER.md`](./MATTER.md) for architecture/landscape (incl. the corrected
 > Thread position), [`INSTALL.md`](./INSTALL.md) for setup, and
-> [`HANDOVER.md`](./HANDOVER.md) for current state. The ADR is **ADR-0006**
-> in the Domio repo (mirrored as workspace ADR-0004), not the 0001 path below.
+> [`HANDOVER.md`](./HANDOVER.md) for current state. The architecture decision
+> (the share model) is summarised in [`MATTER.md`](./MATTER.md), not the 0001 path below.
 >
 > Still genuinely pending from this PRD: **M11 — Plugin Store submission**,
 > and OQ4's "Indigo admin removed externally" detection beyond basic
@@ -20,8 +20,8 @@
 
 **Status:** Historical — shipped (see banner)
 **Owner:** Simon
-**Related ADR:** ADR-0006 in the Domio repo (= workspace ADR-0004)
-**Companion PRD:** Domio Matter Commissioning (in Domio repo) — also shipped
+**Related ADR:** maintained privately; the decision is summarised in [`MATTER.md`](./MATTER.md)
+**Companion PRD:** Domio Matter Commissioning — also shipped
 **Last updated:** 2026-05-15 (content); 2026-06-10 (status banner)
 
 ## 1. Summary
