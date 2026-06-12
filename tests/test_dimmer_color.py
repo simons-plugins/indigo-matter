@@ -250,9 +250,15 @@ def test_unknown_capabilities_keeps_historical_hs(mock_indigo_base):
 
 def test_color_capabilities_attribute_is_cached_as_state():
     h = ColorControlHandler()
-    assert h.on_attribute_update(SimpleNamespace(states={}), 0x400A, 0x18) == {
-        "colorCapabilities": 0x18,
-    }
+    dev = SimpleNamespace(states={"colorCapabilities": 0})
+    assert h.on_attribute_update(dev, 0x400A, 0x18) == {"colorCapabilities": 0x18}
+
+
+def test_color_capabilities_skipped_when_state_missing():
+    """A device whose state list hasn't been refreshed yet (pre-#60 creation)
+    must degrade quietly instead of logging an Indigo error per report."""
+    h = ColorControlHandler()
+    assert h.on_attribute_update(SimpleNamespace(states={}), 0x400A, 0x18) == {}
 
 
 def test_xy_attribute_updates_recompute_rgb():

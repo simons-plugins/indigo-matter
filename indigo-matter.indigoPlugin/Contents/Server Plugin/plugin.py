@@ -227,6 +227,14 @@ class Plugin(indigo.PluginBase):
         return (True, valuesDict)
 
     def deviceStartComm(self, dev):  # noqa: N802
+        # Indigo builds a device's state list at creation and does NOT re-read
+        # Devices.xml on plugin upgrade — without this refresh, states added in
+        # a new release (e.g. colorCapabilities, issue #60) never exist on
+        # fielded devices and every update logs an Indigo error.
+        try:
+            dev.stateListOrDisplayStateIdChanged()
+        except Exception as exc:  # noqa: BLE001 - refresh failure must not block startComm
+            self.logger.debug("state list refresh failed for %s: %s", dev.id, exc)
         # Backstop for type edits made while the plugin was not running (the
         # validateDeviceConfigUi guard can't fire then) — issue #58.
         created = dev.pluginProps.get("createdTypeId", "")

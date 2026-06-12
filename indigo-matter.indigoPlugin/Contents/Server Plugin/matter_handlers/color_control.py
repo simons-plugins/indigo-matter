@@ -185,7 +185,12 @@ class ColorControlHandler(LevelControlHandler):
             return {"whiteTemperature": mireds_to_kelvin(int(value))}
         if attribute_id == self.ATTR_COLOR_CAPABILITIES:
             # Cached for handle_indigo_action's HS-vs-XY command choice; primed
-            # from the node snapshot at reconcile, refreshed on report.
+            # from the node snapshot at reconcile, refreshed on report. Guarded
+            # like the other states: a device whose state list hasn't been
+            # refreshed yet (deviceStartComm does that on upgrade) must degrade
+            # quietly, not log an Indigo error per report.
+            if "colorCapabilities" not in (getattr(indigo_dev, "states", {}) or {}):
+                return {}
             return {"colorCapabilities": int(value)}
         if attribute_id in (self.ATTR_CURRENT_X, self.ATTR_CURRENT_Y):
             # XY-mode devices report CIE x/y instead of hue/sat. One axis

@@ -177,3 +177,15 @@ def test_device_start_comm_quiet_when_types_match(plugin_cls, mock_logger):
     dev = _dev({"createdTypeId": "matterRelay"}, type_id="matterRelay")
     plugin_cls.deviceStartComm(stub, dev)
     assert not mock_logger.warning.called
+
+
+def test_device_start_comm_refreshes_state_list(plugin_cls, mock_logger):
+    # Indigo never re-reads Devices.xml for existing devices — deviceStartComm
+    # must request the refresh so states added by upgrades exist (issue #60).
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    stub = SimpleNamespace(logger=mock_logger, device_sync=MagicMock())
+    dev = _dev({"createdTypeId": "matterRelay"}, type_id="matterRelay")
+    dev.stateListOrDisplayStateIdChanged = MagicMock()
+    plugin_cls.deviceStartComm(stub, dev)
+    dev.stateListOrDisplayStateIdChanged.assert_called_once_with()
