@@ -50,6 +50,7 @@ matter-server is a separate Node.js runtime that you install once. See
 
 - **[docs/MATTER.md](./docs/MATTER.md)** — Matter & Thread explained: how Indigo, Domio, matter-server and Apple Home fit together. **Start here.**
 - **[docs/INSTALL.md](./docs/INSTALL.md)** — matter-server install & plugin setup.
+- **[docs/TESTING.md](./docs/TESTING.md)** — how the plugin is tested: unit suite, the device zoo, the virtual matter.js fleet, and live validation.
 - `docs/PRD-indigo-matter-plugin.md` — product requirements and milestones.
 - `docs/IMPLEMENTATION.md` — protocols, scaffold, setup, cluster handlers.
 - `docs/API.md` — the Domio ↔ plugin HTTP contract (v1.3, served over the Indigo Web Server).

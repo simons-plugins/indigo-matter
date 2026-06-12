@@ -75,6 +75,31 @@
                 <Label>Product:</Label>
             </Field>
         </ConfigUI>
+        <States>
+            <!-- ColorCapabilities bitmap (attr 0x400A): bit0 HS, bit1 EnhancedHue,
+                 bit2 ColorLoop, bit3 XY, bit4 ColorTemperature. Cached so
+                 handle_indigo_action can pick MoveToHueAndSaturation vs
+                 MoveToColor — HS is OPTIONAL per spec even on Extended Color
+                 Lights (issue #60). -->
+            <State id="colorCapabilities">
+                <ValueType>Integer</ValueType>
+                <TriggerLabel>Color Capabilities</TriggerLabel>
+                <ControlPageLabel>Color Capabilities</ControlPageLabel>
+            </State>
+            <!-- Raw CIE xy (attrs 0x0003/0x0004, 0-65535 scale) - XY-mode
+                 devices report these instead of hue/saturation; kept so a
+                 one-axis update can recompute RGB from both. -->
+            <State id="colorX">
+                <ValueType>Integer</ValueType>
+                <TriggerLabel>Color X</TriggerLabel>
+                <ControlPageLabel>Color X</ControlPageLabel>
+            </State>
+            <State id="colorY">
+                <ValueType>Integer</ValueType>
+                <TriggerLabel>Color Y</TriggerLabel>
+                <ControlPageLabel>Color Y</ControlPageLabel>
+            </State>
+        </States>
     </Device>
 
     <!-- ============================================================ -->
