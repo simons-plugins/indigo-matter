@@ -35,6 +35,10 @@ XML_STATES_BY_ID = {
     d.get("id"): {s.get("id") for s in d.findall("./States/State")}
     for d in _DEVICE_ELEMENTS
 }
+XML_UI_DISPLAY_BY_ID = {
+    d.get("id"): (d.findtext("UiDisplayStateId") or "").strip()
+    for d in _DEVICE_ELEMENTS
+}
 
 # Indigo built-in states implied by the device type / Supports* props
 # (SDK: Example Device - Sensor and Example Device - Relay and Dimmer).
@@ -50,10 +54,6 @@ ACTUATOR_TYPES = {
     "matterThermostat", "matterWindowCovering", "matterLock", "matterValve",
 }
 
-# matterButton intentionally has no explicit display props yet: its display
-# should be the lastButtonEvent custom state, which needs the UiDisplayStateId
-# follow-up tracked in issue #56 — not the Supports* pair.
-SENSOR_DISPLAY_EXEMPT = {"matterButton"}
 
 
 def _raw(node_id, eps):
@@ -209,21 +209,33 @@ def test_zoo_initial_states_are_declared_or_builtin(name):
 @pytest.mark.parametrize("name", ZOO)
 def test_zoo_sensor_specs_carry_explicit_display_props(name):
     # The issue #56 class: Indigo derives a sensor's list display from these
-    # props at creation (Devices.xml statics don't apply to API-created
-    # devices) — every sensor-type spec must state both, exactly one True.
+    # creation props. Precedence (verified live on jarvis): a True Supports*
+    # wins; with BOTH explicitly False, Devices.xml <UiDisplayStateId> applies
+    # — so (False, False) is only legal when the XML declares one that points
+    # at an XML-declared custom state.
     raw, _ = ZOO[name]
     for specs in _specs_by_endpoint(raw).values():
         for spec in specs:
             if XML_TYPE_BY_ID.get(spec.device_type_id) != "sensor":
                 continue
-            if spec.device_type_id in SENSOR_DISPLAY_EXEMPT:
-                continue
             on_state = spec.props.get("SupportsOnState")
             sensor_value = spec.props.get("SupportsSensorValue")
-            assert (on_state, sensor_value) in {(True, False), (False, True)}, (
+            assert (on_state, sensor_value) in {
+                (True, False), (False, True), (False, False),
+            }, (
                 f"{name}: {spec.device_type_id} display props "
                 f"({on_state!r}, {sensor_value!r}) — would display 'off' forever"
             )
+            if (on_state, sensor_value) == (False, False):
+                ui_display = XML_UI_DISPLAY_BY_ID.get(spec.device_type_id, "")
+                assert ui_display, (
+                    f"{name}: {spec.device_type_id} disclaims both built-in "
+                    "displays but Devices.xml has no UiDisplayStateId fallback"
+                )
+                assert ui_display in XML_STATES_BY_ID.get(spec.device_type_id, set()), (
+                    f"{name}: {spec.device_type_id} UiDisplayStateId "
+                    f"'{ui_display}' is not an XML-declared custom state"
+                )
 
 
 def test_every_registered_handler_type_exists_in_devices_xml():

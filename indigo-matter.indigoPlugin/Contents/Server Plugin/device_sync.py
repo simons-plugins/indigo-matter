@@ -714,20 +714,25 @@ class DeviceSync:
                     )
 
     def _warn_stale_display_state(self, dev: Any, type_id: str, display_props: dict) -> None:
-        """Warn when a value sensor's cached display state is still on/off.
+        """Warn when a device's cached display state is wrongly stuck on on/off.
 
         Indigo derives ``displayStateId`` from the Supports* props at device
-        creation; replacing props afterwards rebuilds states but the display
-        may stay cached on ``onOffState`` (issue #56). The fix is user-side
-        and cheap — deleting the Indigo device and reloading the plugin lets
-        reconcile recreate it with the correct creation props — so name the
-        device and say exactly that. Deliberately checked only on passes where
-        no props needed replacing: right after a replace, Indigo may not have
-        re-derived yet, and warning there would be noise (a replace that never
-        converges is surfaced separately by the did-not-persist warning).
+        creation; replacing props afterwards rebuilds states and (verified
+        live, 2026-06-12) normally re-derives the display too — this warning
+        is dead-man insurance for the case where it doesn't. Applies to any
+        type whose display_props disclaim the on/off display: value sensors
+        (SupportsSensorValue) and UiDisplayStateId-fallback types like the
+        button and air-quality sensor (both Supports* False). The remedy is
+        user-side and cheap — deleting the Indigo device and reloading the
+        plugin lets reconcile recreate it with the correct creation props —
+        so name the device and say exactly that. Deliberately checked only on
+        passes where no props needed replacing: right after a replace, Indigo
+        may not have re-derived yet, and warning there would be noise (a
+        replace that never converges is surfaced separately by the
+        did-not-persist warning).
         """
-        if not display_props.get("SupportsSensorValue"):
-            return  # on/off IS the right display for binary sensors
+        if display_props.get("SupportsOnState", True):
+            return  # on/off IS the right display (binary sensors, non-sensor types)
         display_state = getattr(dev, "displayStateId", None)
         if display_state is None:
             # Unreadable is "unknown", not "healthy" — keep a trace, but a real

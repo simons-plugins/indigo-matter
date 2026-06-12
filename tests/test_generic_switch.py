@@ -615,3 +615,14 @@ def test_base_handler_on_node_event_default_returns_empty():
     dev = MagicMock()
     result = h.on_node_event(dev, 0x01, {"someField": 1})
     assert result == {}
+
+
+def test_button_display_is_ui_display_state_fallback():
+    # The button disclaims BOTH built-in displays so Indigo falls back to the
+    # Devices.xml UiDisplayStateId (lastButtonEvent) — precedence verified
+    # live on jarvis (issue #56 follow-up). Without this the device list
+    # showed "off" forever.
+    from matter_handlers.generic_switch import GenericSwitchHandler
+    assert GenericSwitchHandler.display_props == {
+        "SupportsOnState": False, "SupportsSensorValue": False,
+    }

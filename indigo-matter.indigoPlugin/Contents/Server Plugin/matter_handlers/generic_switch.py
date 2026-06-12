@@ -66,6 +66,11 @@ class GenericSwitchHandler(ClusterHandler):
     cluster_id     = CLUSTER_SWITCH
     cluster_name   = "GenericSwitch"
     device_type_id = "matterButton"
+    # With BOTH Supports* False, Indigo falls back to the Devices.xml
+    # <UiDisplayStateId> (lastButtonEvent) even for API-created devices —
+    # the props-driven built-in display only takes precedence when one of
+    # these is True. Verified live on jarvis (issue #56 follow-up).
+    display_props = {"SupportsOnState": False, "SupportsSensorValue": False}
 
     def create_indigo_devices(self, node: Any, endpoint: Any) -> list[IndigoDeviceSpec]:
         name = node.suggested_name or node.product_name or f"Matter {node.node_id}"
@@ -78,6 +83,7 @@ class GenericSwitchHandler(ClusterHandler):
                     "endpointId":  str(endpoint.endpoint_id),
                     "vendorName":  node.vendor_name,
                     "productName": node.product_name,
+                    **self.display_props,
                 },
                 initial_states={
                     "lastButtonEvent": "",

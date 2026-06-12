@@ -55,11 +55,21 @@ stale-display warnings** → **real Indigo DOES re-derive `displayStateId` from
 is fully self-healing — users (incl. CliveS) just upgrade; delete-and-recreate
 is never needed and the stale-display warning is pure dead-man insurance.
 
-This finding also unlocks the #56 follow-ups: since display re-derives from a
-props replace, the button (`lastButtonEvent`) and air-quality (`airQuality`
-string) displays can be experimented with live by toggling Supports* props —
-no recommission needed. Still untested: what displayStateId becomes when BOTH
-Supports* are False (does Devices.xml UiDisplayStateId finally apply?).
+**Follow-up experiment (same evening, also live on jarvis): #56 fully closed.**
+Patched the jarvis copy to set BOTH Supports* False on the button and
+air-quality handlers + temporary displayStateId instrumentation. Result:
+button `displayStateId` → **`lastButtonEvent`**, air quality → **`airQuality`**.
+The precedence rule for API-created devices: a True Supports* prop wins; with
+both explicitly False, Indigo falls back to Devices.xml `<UiDisplayStateId>`.
+Implemented for real: `display_props = {both False}` on GenericSwitchHandler
+and AirQualityHandler (the zoo invariant immediately caught that
+generic_switch didn't merge display_props into its spec props — fixed); the
+stale-display nag now covers any type disclaiming SupportsOnState; zoo
+invariant allows (False, False) only when the XML declares a UiDisplayStateId
+pointing at a declared custom state. 747 tests. Full display census of the
+16-node fleet (from the instrumentation pass): relays/locks/valves onOffState,
+dimmers/covering/fan brightnessLevel, thermostat temperatureInputsAll, value
+sensors sensorValue, button lastButtonEvent, AQ airQuality — all correct.
 
 ---
 

@@ -198,10 +198,18 @@ def test_registry_cluster_id_lookup():
     assert reg.handler_for_cluster(0x042E).device_type_id == "matterTVOCSensor"
 
 
-def test_air_quality_handlers_inherit_value_display_props():
+def test_concentration_handlers_inherit_value_display_props():
     # Issue #56: these are value sensors — their list display must be the
-    # reading, not on/off. (The AirQuality string display, UiDisplayStateId=
-    # airQuality, is a hardware-test follow-up; raw enum beats "off".)
-    for handler_cls in (AirQualityHandler, CO2Handler, PM25Handler, TVOCHandler):
+    # reading, not on/off.
+    for handler_cls in (CO2Handler, PM25Handler, TVOCHandler):
         props = handler_cls.display_props
         assert props == {"SupportsSensorValue": True, "SupportsOnState": False}, handler_cls
+
+
+def test_air_quality_display_is_ui_display_state_fallback():
+    # AirQuality disclaims BOTH built-in displays so Indigo falls back to the
+    # Devices.xml UiDisplayStateId (airQuality string) — precedence verified
+    # live on jarvis (issue #56 follow-up).
+    assert AirQualityHandler.display_props == {
+        "SupportsOnState": False, "SupportsSensorValue": False,
+    }

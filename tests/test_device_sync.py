@@ -27,11 +27,17 @@ class FakeDev:
         self.errorState = ""
         self.folderId = 0
         # Real Indigo derives the list display from Supports* props at CREATION
-        # and caches it (issue #56) — approximate the sensor-family behaviour
-        # here (non-sensor types crudely get onOffState, which the warn path
-        # never reads), and deliberately do NOT re-derive it in
-        # replacePluginPropsOnServer below.
-        self.displayStateId = "sensorValue" if props.get("SupportsSensorValue") else "onOffState"
+        # and caches it (issue #56) — approximate the precedence rule verified
+        # live on jarvis: a True Supports* wins; with BOTH explicitly False the
+        # Devices.xml UiDisplayStateId applies ("uiDisplayState" stands in for
+        # it here). Deliberately do NOT re-derive in replacePluginPropsOnServer
+        # below (models the pessimistic cached case the warn path exists for).
+        if props.get("SupportsSensorValue"):
+            self.displayStateId = "sensorValue"
+        elif "SupportsOnState" in props and not props.get("SupportsOnState"):
+            self.displayStateId = "uiDisplayState"
+        else:
+            self.displayStateId = "onOffState"
 
     def updateStatesOnServer(self, kvlist):
         for kv in kvlist:
@@ -1479,3 +1485,39 @@ def test_reassert_stamps_created_type_id_on_legacy_devices(ds, indigo_env):
 
     ds.reconcile_all([TEMP_SENSOR_NODE])
     assert dev.pluginProps.get("createdTypeId") == "matterTemperatureSensor"
+
+
+BUTTON_NODE = {
+    "node_id": 0x43,
+    "available": True,
+    "attributes": {
+        "0/40/1": "Aqara",
+        "0/40/3": "Mini Switch",
+        "1/29/0": [{"0": 15}],
+        "1/59/1": 0,   # GenericSwitch CurrentPosition
+    },
+}
+
+
+def test_stale_display_warning_covers_ui_display_fallback_types(ds, indigo_env, mock_logger):
+    """A pre-fix button stuck on the on/off display gets the same nag as a
+    value sensor — any type whose display_props disclaim SupportsOnState."""
+    _indigo, devices = indigo_env
+    ds.create_from_raw(BUTTON_NODE, "Hall Button")
+    dev = devices[ds.lookup(0x43, 1)]
+    _strip_display_props(dev)
+
+    ds.reconcile_all([BUTTON_NODE])   # heals props; fake keeps display cached
+    mock_logger.warning.reset_mock()
+    ds.reconcile_all([BUTTON_NODE])
+
+    msgs = [c[0][0] % tuple(c[0][1:]) for c in mock_logger.warning.call_args_list]
+    assert any("delete the Indigo device" in m and "Hall Button" in m for m in msgs), msgs
+
+
+def test_healthy_button_reconcile_is_quiet(ds, indigo_env, mock_logger):
+    ds.create_from_raw(BUTTON_NODE, "Hall Button")
+    mock_logger.warning.reset_mock()
+    ds.reconcile_all([BUTTON_NODE])
+    msgs = [c[0][0] for c in mock_logger.warning.call_args_list]
+    assert not any("display" in m for m in msgs)
