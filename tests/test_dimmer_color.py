@@ -295,3 +295,81 @@ def test_black_rgb_maps_to_white_point():
     from matter_handlers.color_control import rgb_to_matter_xy
     x, y = rgb_to_matter_xy(0, 0, 0)
     assert abs(x / 65536 - 0.3127) < 0.01 and abs(y / 65536 - 0.3290) < 0.01
+
+
+# ---------------------------------------------------------------------------
+# W slider (whiteLevel) — Matter has no white channel; white mode IS CT mode
+# ---------------------------------------------------------------------------
+
+def _color_dev(states=None):
+    from unittest.mock import MagicMock
+    dev = SimpleNamespace(pluginProps={"nodeId": "9", "endpointId": "1"},
+                          states=states or {})
+    dev.updateStatesOnServer = MagicMock()
+    return dev
+
+
+def test_white_level_slider_becomes_ct_plus_level(mock_indigo_base):
+    import indigo
+    h = ColorControlHandler()
+    dev = _color_dev({"whiteTemperature": 4000})
+    action = SimpleNamespace(deviceAction=indigo.kDeviceAction.SetColorLevels,
+                             actionValue={"whiteLevel": 30, "redLevel": 0,
+                                          "greenLevel": 0, "blueLevel": 0})
+    commands = h.handle_indigo_action(dev, action)
+    assert isinstance(commands, list) and len(commands) == 2
+    ct, level = commands
+    assert ct.command == "MoveToColorTemperature"
+    assert ct.args["colorTemperatureMireds"] == round(1_000_000 / 4000)  # stored temp
+    assert level.command == "MoveToLevelWithOnOff" and level.cluster == 0x0008
+    assert level.args["level"] == round(30 * 254 / 100)
+    # Optimistic echo: W slider has no Matter attribute to report back.
+    kv = {item["key"]: item["value"] for item in dev.updateStatesOnServer.call_args[0][0]}
+    assert kv["whiteLevel"] == 30 and kv["redLevel"] == 0
+
+
+def test_white_level_zero_turns_white_off(mock_indigo_base):
+    import indigo
+    h = ColorControlHandler()
+    dev = _color_dev()
+    action = SimpleNamespace(deviceAction=indigo.kDeviceAction.SetColorLevels,
+                             actionValue={"whiteLevel": 0})
+    commands = h.handle_indigo_action(dev, action)
+    assert commands[-1].command == "MoveToLevelWithOnOff"
+    assert commands[-1].args["level"] == 0
+
+
+def test_white_temp_without_level_stays_single_command(mock_indigo_base):
+    import indigo
+    h = ColorControlHandler()
+    dev = _color_dev()
+    action = SimpleNamespace(deviceAction=indigo.kDeviceAction.SetColorLevels,
+                             actionValue={"whiteTemperature": 2700})
+    cmd = h.handle_indigo_action(dev, action)
+    assert not isinstance(cmd, list)
+    assert cmd.command == "MoveToColorTemperature"
+
+
+def test_rgb_request_zeroes_white_level_optimistically(mock_indigo_base):
+    import indigo
+    h = ColorControlHandler()
+    dev = _color_dev({"colorCapabilities": 0x18})
+    action = SimpleNamespace(deviceAction=indigo.kDeviceAction.SetColorLevels,
+                             actionValue={"redLevel": 100, "greenLevel": 0,
+                                          "blueLevel": 0, "whiteLevel": 0})
+    cmd = h.handle_indigo_action(dev, action)
+    assert cmd.command == "MoveToColor"
+    kv = {item["key"]: item["value"] for item in dev.updateStatesOnServer.call_args[0][0]}
+    assert kv == {"whiteLevel": 0}
+
+
+def test_optimistic_echo_skipped_on_devices_without_updater(mock_indigo_base):
+    """Test doubles / odd device objects without updateStatesOnServer must not
+    break the command path."""
+    import indigo
+    h = ColorControlHandler()
+    dev = SimpleNamespace(pluginProps={"nodeId": "9", "endpointId": "1"}, states={})
+    action = SimpleNamespace(deviceAction=indigo.kDeviceAction.SetColorLevels,
+                             actionValue={"whiteLevel": 50})
+    commands = h.handle_indigo_action(dev, action)
+    assert commands[-1].args["level"] == round(50 * 254 / 100)

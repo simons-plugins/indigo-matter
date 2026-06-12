@@ -255,16 +255,22 @@ class Plugin(indigo.PluginBase):
     # Device actions → Matter commands (bridged onto the loop, 5s ack)
     # ------------------------------------------------------------------
     def actionControlDevice(self, action, dev):  # noqa: N802
-        command = self.device_sync.build_command(dev, action)
-        if command is None:
-            return
-        self._send_matter_command(command, dev)
+        self._send_built_commands(self.device_sync.build_command(dev, action), dev)
 
     def actionControlThermostat(self, action, dev):  # noqa: N802
-        command = self.device_sync.build_command(dev, action)
-        if command is None:
+        self._send_built_commands(self.device_sync.build_command(dev, action), dev)
+
+    def _send_built_commands(self, commands, dev) -> None:
+        """Send a handler's command(s). Handlers may return one MatterAction or
+        a list for composite operations (the colour W slider is CT mode + level
+        — two Matter commands); each is sent and acked individually so a
+        failure surfaces on the device exactly as a single command's would."""
+        if commands is None:
             return
-        self._send_matter_command(command, dev)
+        if not isinstance(commands, list):
+            commands = [commands]
+        for command in commands:
+            self._send_matter_command(command, dev)
 
     def actionControlSensor(self, action, dev):  # noqa: N802
         self.logger.info('ignored "%s" — Matter sensor is read-only', dev.name)

@@ -235,18 +235,58 @@ class ColorControlHandler(LevelControlHandler):
             return self._set_color(indigo_dev, action.actionValue)
         return super().handle_indigo_action(indigo_dev, action)
 
-    def _set_color(self, indigo_dev: Any, values: dict) -> MatterCommand:
+    @staticmethod
+    def _apply_optimistic(indigo_dev: Any, states: dict) -> None:
+        """Echo channels Matter can't report back (whiteLevel has no Matter
+        attribute — white mode IS colour-temperature mode), so the Indigo UI
+        slider doesn't snap back. Cosmetic only: a failure here must never
+        block the command (the real state echo arrives from the device for
+        everything that has a Matter attribute)."""
+        updater = getattr(indigo_dev, "updateStatesOnServer", None)
+        if updater is None:
+            return
+        try:
+            updater([{"key": key, "value": value} for key, value in states.items()])
+        except Exception:  # noqa: BLE001 - cosmetic echo only
+            pass
+
+    def _set_color(self, indigo_dev: Any, values: dict):
         node_id = int(indigo_dev.pluginProps["nodeId"])
         endpoint_id = int(indigo_dev.pluginProps["endpointId"])
+        states = getattr(indigo_dev, "states", {}) or {}
         white_temp = values.get("whiteTemperature")
-        if white_temp:
+        white_level = values.get("whiteLevel")
+        rgb_requested = any(
+            float(values.get(key, 0) or 0) > 0
+            for key in ("redLevel", "greenLevel", "blueLevel")
+        )
+
+        def ct_command(kelvin: float) -> MatterCommand:
             return MatterCommand(
                 node_id=node_id, endpoint=endpoint_id, cluster=self.cluster_id,
                 command="MoveToColorTemperature",
-                args={"colorTemperatureMireds": kelvin_to_mireds(float(white_temp)),
+                args={"colorTemperatureMireds": kelvin_to_mireds(kelvin),
                       "transitionTime": 0, "optionsMask": 0, "optionsOverride": 0},
             )
-        states = getattr(indigo_dev, "states", {}) or {}
+
+        # The white side of Indigo's colour picker: whiteTemperature is the
+        # temperature control, whiteLevel is the W slider (white intensity).
+        # Matter colour lights have no separate white channel — white mode IS
+        # colour-temperature mode, and intensity is LevelControl — so the W
+        # slider becomes CT(current/requested temperature) + MoveToLevelWithOnOff.
+        if (white_temp or white_level is not None) and not rgb_requested:
+            kelvin = float(white_temp) if white_temp else float(
+                states.get("whiteTemperature", 0) or 2700
+            )
+            commands: list = [ct_command(kelvin)]
+            optimistic: dict = {"redLevel": 0, "greenLevel": 0, "blueLevel": 0}
+            if white_level is not None:
+                commands.append(self._set_level(node_id, endpoint_id, float(white_level)))
+                optimistic["whiteLevel"] = round(float(white_level))
+            self._apply_optimistic(indigo_dev, optimistic)
+            return commands if len(commands) > 1 else commands[0]
+        if white_temp:
+            return ct_command(float(white_temp))
         red = float(values.get("redLevel", states.get("redLevel", 0)) or 0)
         green = float(values.get("greenLevel", states.get("greenLevel", 0)) or 0)
         blue = float(values.get("blueLevel", states.get("blueLevel", 0)) or 0)
@@ -254,6 +294,7 @@ class ColorControlHandler(LevelControlHandler):
         # the cached ColorCapabilities bitmap. Unknown capabilities (state
         # absent/0 — pre-fix device or snapshot not yet primed) keep the
         # historical HS behaviour rather than guessing.
+        self._apply_optimistic(indigo_dev, {"whiteLevel": 0})
         capabilities = int(states.get("colorCapabilities", 0) or 0)
         if capabilities and not capabilities & CAP_HUE_SATURATION and capabilities & CAP_XY:
             x, y = rgb_to_matter_xy(red, green, blue)
