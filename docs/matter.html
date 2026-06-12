@@ -117,12 +117,11 @@
     BLE radios and, for Thread, the network credentials. A headless Mac running Indigo is a
     poor first commissioner — matter-server runs without BLE on macOS, and macOS has no Thread
     credential store.</p>
-    <p>This plugin sidesteps the problem entirely with the <strong>share model</strong> (the
-    architecture decision recorded as ADR-0006):</p>
+    <p>This plugin sidesteps the problem entirely with the <strong>share model</strong> —
+    the plugin’s founding architecture decision:</p>
     <div class="pull">An ecosystem you already own commissions the device first — it owns the
     Bluetooth step. Then the device is <em>shared</em> to Indigo over plain IP. Indigo never
-    needs BLE, Thread credentials, or proximity to the device.<small>ADR-0006 · the share
-    model</small></div>
+    needs BLE, Thread credentials, or proximity to the device.<small>The share model</small></div>
     <p>That’s only possible because of Matter’s best feature: multi-admin.</p>
   </div>
 </section>
@@ -133,7 +132,8 @@
     <h2>Fabrics &amp; multi-admin: one device, many controllers</h2>
     <p>A Matter <strong>fabric</strong> is a controller’s trust domain — a set of cryptographic
     credentials a controller installs on a device. The crucial design choice in Matter is that
-    <strong>a device can belong to several fabrics at once</strong> (typically five or more).
+    <strong>a device can belong to several fabrics at once</strong> — the spec requires
+    every certified device to accept at least five; many accept more.
     Each controller talks to the device directly and locally; none of them knows or cares
     about the others.</p>
     <p>A single plug in this house happily serves four admins simultaneously:</p>

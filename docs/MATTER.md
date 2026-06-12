@@ -89,8 +89,8 @@ have BLE radios and (for Thread) the network credentials. A headless Mac
 running Indigo is a poor first commissioner: matter-server runs without BLE on
 macOS, and macOS has no Thread credential store.
 
-This plugin sidesteps the problem entirely with the **share model** (the
-architecture decision recorded as ADR-0006, option "C4"):
+This plugin sidesteps the problem entirely with the **share model** — the
+plugin's founding architecture decision:
 
 > An ecosystem you already own — Apple Home, or equally Alexa / Google Home —
 > commissions the device first: it owns the BLE step and gets the device onto
@@ -103,8 +103,8 @@ That's only possible because of Matter's best feature: multi-admin.
 
 A Matter **fabric** is a controller's trust domain — a set of cryptographic
 credentials a controller installs on a device. The crucial design choice in
-Matter is that **a device can belong to several fabrics at once** (typically
-5+). Each controller talks to the device directly and locally; none of them
+Matter is that **a device can belong to several fabrics at once** — the spec
+requires every certified device to accept at least five; many accept more. Each controller talks to the device directly and locally; none of them
 knows or cares about the others.
 
 A single plug in this house happily serves four admins simultaneously: Apple
@@ -322,6 +322,5 @@ reversible.
 *Further reading:* [INSTALL.md](./INSTALL.md) (setup) ·
 [API.md](./API.md) (Domio ↔ plugin contract) ·
 [IMPLEMENTATION.md](./IMPLEMENTATION.md) (internals) ·
-ADR-0006 in the Domio repo (the architecture decision behind the share model) ·
 [Home Assistant's Matter docs](https://www.home-assistant.io/integrations/matter/)
 (an excellent ecosystem-neutral primer that inspired this page).

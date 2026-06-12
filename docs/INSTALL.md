@@ -27,7 +27,7 @@ A few things to know before you start:
 - **Domio drives commissioning.** You add devices from the **Domio iOS app**, not from
   Indigo. Apple Home commissions the device first; Domio relays a share/pairing code to
   the plugin, and the plugin joins the device's fabric as a second admin over IP (the
-  "share model", ADR-0006). The plugin owns runtime control for the device's lifetime.
+  "share model"). The plugin owns runtime control for the device's lifetime.
 - **matter-server is Alpha software.** Pin the version, back up the fabric, and expect
   occasional rough edges.
 
