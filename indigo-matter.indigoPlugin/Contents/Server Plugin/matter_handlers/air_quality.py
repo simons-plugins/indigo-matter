@@ -45,7 +45,10 @@ class AirQualityHandler(_SensorHandler):
 
     Attribute 0x0000 is an enum; we expose both the raw integer (sensorValue)
     and the human-readable string (airQuality) so automations can trigger on
-    the string and display it directly.  UiDisplayStateId = airQuality.
+    the string and display it directly.  Devices.xml declares UiDisplayStateId
+    = airQuality, but API-created devices ignore it (issue #56) — the list
+    display is the raw enum via the inherited SupportsSensorValue prop; the
+    string display is a #56 follow-up pending hardware testing.
     """
 
     cluster_id = 0x005B

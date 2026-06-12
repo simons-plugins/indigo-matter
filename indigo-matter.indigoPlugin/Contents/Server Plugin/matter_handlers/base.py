@@ -46,6 +46,14 @@ class ClusterHandler(ABC):
     #: of the node's Indigo devices rather than just the one at the event's
     #: endpoint.
     node_scoped: bool = False
+    #: Display-capability props every device this handler creates must carry.
+    #: Indigo applies Supports*/subtype capabilities via creation props, not
+    #: Devices.xml statics, for API-created devices (the colour lesson —
+    #: HANDOVER 2026-06-09 item 4; issue #56 for the sensor family). These are
+    #: also re-asserted on existing devices by device_sync's reconcile
+    #: self-heal, so they must be static truths of the device type, not
+    #: per-node capabilities (those belong in create_indigo_devices).
+    display_props: dict = {}
 
     def is_primary_for(self, node: Any, endpoint: Any) -> bool:  # noqa: D401
         """Whether this handler creates the device for *endpoint*.

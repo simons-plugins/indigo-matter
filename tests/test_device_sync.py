@@ -26,6 +26,12 @@ class FakeDev:
         self.error = None
         self.errorState = ""
         self.folderId = 0
+        # Real Indigo derives the list display from Supports* props at CREATION
+        # and caches it (issue #56) — approximate the sensor-family behaviour
+        # here (non-sensor types crudely get onOffState, which the warn path
+        # never reads), and deliberately do NOT re-derive it in
+        # replacePluginPropsOnServer below.
+        self.displayStateId = "sensorValue" if props.get("SupportsSensorValue") else "onOffState"
 
     def updateStatesOnServer(self, kvlist):
         for kv in kvlist:
@@ -51,6 +57,7 @@ class FakeDev:
             "SupportsPowerMeter": "curEnergyLevel",
             "SupportsEnergyMeter": "accumEnergyTotal",
             "SupportsBatteryLevel": "batteryLevel",
+            "SupportsSensorValue": "sensorValue",
         }
         for prop_key, state_key in _supports_to_states.items():
             if new_props.get(prop_key) and state_key not in self.states:
@@ -1131,3 +1138,227 @@ def test_list_nodes_merges_multiple_devices_into_one_node_entry(ds, indigo_env):
     node_id, names = nodes[0]
     assert node_id == 31
     assert len(names) == 2
+
+
+# ===========================================================================
+# fix/#56 — value sensors must display sensorValue, not on/off
+# ===========================================================================
+
+# Aqara FP300-style endpoint: a temperature sensor (the live evidence in
+# issue #56 — created with no Supports* props, Indigo defaulted the display
+# to onOffState and the device list showed "off" instead of the reading).
+TEMP_SENSOR_NODE = {
+    "node_id": 0x40,
+    "available": True,
+    "attributes": {
+        "0/40/1": "Aqara",
+        "0/40/3": "FP300",
+        "1/29/0": [{"0": 770}],   # TemperatureSensor
+        "1/1026/0": 2400,         # 24.0 °C
+    },
+}
+
+OCCUPANCY_NODE = {
+    "node_id": 0x41,
+    "available": True,
+    "attributes": {
+        "0/40/1": "Aqara",
+        "0/40/3": "FP300",
+        "1/29/0": [{"0": 263}],   # OccupancySensor
+        "1/1030/0": 1,            # occupied
+    },
+}
+
+
+def _strip_display_props(dev):
+    """Rewind a device to its pre-#56 creation shape."""
+    props = dict(dev.pluginProps)
+    props.pop("SupportsSensorValue", None)
+    props.pop("SupportsOnState", None)
+    dev.pluginProps = props
+    dev.displayStateId = "onOffState"
+    dev.replaced_props = False
+
+
+def test_value_sensor_created_with_sensor_value_display_props(ds, indigo_env):
+    _indigo, devices = indigo_env
+    ds.create_from_raw(TEMP_SENSOR_NODE, "Landing Sensor")
+    dev = devices[ds.lookup(0x40, 1)]
+    assert dev.pluginProps.get("SupportsSensorValue") is True
+    assert dev.pluginProps.get("SupportsOnState") is False
+    assert dev.displayStateId == "sensorValue"
+
+
+def test_binary_sensor_created_with_on_state_display_props(ds, indigo_env):
+    _indigo, devices = indigo_env
+    ds.create_from_raw(OCCUPANCY_NODE, "Landing Presence")
+    dev = devices[ds.lookup(0x41, 1)]
+    assert dev.pluginProps.get("SupportsOnState") is True
+    assert dev.pluginProps.get("SupportsSensorValue") is False
+    assert dev.displayStateId == "onOffState"
+
+
+def test_reconcile_reasserts_display_props_on_pre_fix_sensor(ds, indigo_env, mock_logger):
+    """A sensor created before the fix gains explicit display props at reconcile.
+
+    Absence of SupportsOnState means Indigo's sensor default (True), so the
+    re-assert must write BOTH keys explicitly, not only the truthy one.
+    No stale-display warning may fire on this pass — Indigo may legitimately
+    still be applying the props replace.
+    """
+    _indigo, devices = indigo_env
+    ds.create_from_raw(TEMP_SENSOR_NODE, "Landing Sensor")
+    dev = devices[ds.lookup(0x40, 1)]
+    _strip_display_props(dev)
+
+    mock_logger.warning.reset_mock()
+    ds.reconcile_all([TEMP_SENSOR_NODE])
+
+    assert dev.replaced_props is True
+    assert dev.pluginProps.get("SupportsSensorValue") is True
+    assert dev.pluginProps.get("SupportsOnState") is False
+    display_warnings = [
+        c for c in mock_logger.warning.call_args_list if "display" in c[0][0]
+    ]
+    assert not display_warnings, "stale-display warning fired on the same pass as the props fix"
+
+
+def test_second_reconcile_warns_when_display_state_stays_cached(ds, indigo_env, mock_logger):
+    """Indigo caches displayStateId at creation; if a props replace does not
+    re-derive it, the NEXT reconcile must warn, naming the device and the
+    delete-and-reload remedy."""
+    _indigo, devices = indigo_env
+    ds.create_from_raw(TEMP_SENSOR_NODE, "Landing Sensor")
+    dev = devices[ds.lookup(0x40, 1)]
+    _strip_display_props(dev)
+
+    ds.reconcile_all([TEMP_SENSOR_NODE])   # heals props; fake keeps display cached
+    assert dev.displayStateId == "onOffState"
+
+    mock_logger.warning.reset_mock()
+    ds.reconcile_all([TEMP_SENSOR_NODE])
+    msgs = [c[0][0] % tuple(c[0][1:]) for c in mock_logger.warning.call_args_list]
+    stale = [m for m in msgs if "delete the Indigo device" in m]
+    assert stale, f"expected stale-display warning, got: {msgs}"
+    assert "Landing Sensor" in stale[0]
+
+
+def test_healthy_value_sensor_reconcile_is_quiet(ds, indigo_env, mock_logger):
+    """A post-fix device (correct props, sensorValue display) must not warn."""
+    ds.create_from_raw(TEMP_SENSOR_NODE, "Landing Sensor")
+    mock_logger.warning.reset_mock()
+    ds.reconcile_all([TEMP_SENSOR_NODE])
+    msgs = [c[0][0] for c in mock_logger.warning.call_args_list]
+    assert not any("display" in m for m in msgs)
+
+
+def test_binary_sensor_on_off_display_never_warns(ds, indigo_env, mock_logger):
+    """on/off IS the correct display for binary sensors — no nag."""
+    ds.create_from_raw(OCCUPANCY_NODE, "Landing Presence")
+    mock_logger.warning.reset_mock()
+    ds.reconcile_all([OCCUPANCY_NODE])
+    msgs = [c[0][0] for c in mock_logger.warning.call_args_list]
+    assert not any("display" in m for m in msgs)
+
+
+# FP300-like: temperature sensor + PowerSource (battery) on the same node —
+# the real-world configuration behind issue #56.
+TEMP_BATTERY_NODE = {
+    "node_id": 0x42,
+    "available": True,
+    "attributes": {
+        "0/40/1": "Aqara",
+        "0/40/3": "FP300",
+        "0/47/12": 200,           # PowerSource.BatPercentRemaining (node-scoped)
+        "1/29/0": [{"0": 770}],   # TemperatureSensor
+        "1/1026/0": 2400,
+    },
+}
+
+
+def test_pre_fix_battery_sensor_heals_battery_and_display_in_one_replace(ds, indigo_env, mock_logger):
+    """The flagship issue #56 case: a battery-powered pre-fix value sensor must
+    gain SupportsBatteryLevel (add-only cluster cap) AND both display props
+    (exact assertion) in a single replacePluginPropsOnServer call, with no
+    stale-display warning on the pass that healed it."""
+    _indigo, devices = indigo_env
+    ds.create_from_raw(TEMP_BATTERY_NODE, "Landing Sensor")
+    dev = devices[ds.lookup(0x42, 1)]
+    _strip_display_props(dev)
+    props = dict(dev.pluginProps)
+    props.pop("SupportsBatteryLevel", None)
+    dev.pluginProps = props
+
+    calls = []
+    real_replace = dev.replacePluginPropsOnServer
+    dev.replacePluginPropsOnServer = lambda p: (calls.append(dict(p)), real_replace(p))
+
+    mock_logger.warning.reset_mock()
+    ds.reconcile_all([TEMP_BATTERY_NODE])
+
+    assert len(calls) == 1, f"expected one combined replace, got {len(calls)}"
+    assert dev.pluginProps.get("SupportsBatteryLevel") is True
+    assert dev.pluginProps.get("SupportsSensorValue") is True
+    assert dev.pluginProps.get("SupportsOnState") is False
+    msgs = [c[0][0] for c in mock_logger.warning.call_args_list]
+    assert not any("display" in m for m in msgs)
+
+
+def test_reassert_corrects_present_but_wrong_display_props(ds, indigo_env):
+    """The exact-assertion contract: a value sensor whose props are PRESENT but
+    wrong (not merely absent) must be corrected."""
+    _indigo, devices = indigo_env
+    ds.create_from_raw(TEMP_SENSOR_NODE, "Landing Sensor")
+    dev = devices[ds.lookup(0x40, 1)]
+    props = dict(dev.pluginProps)
+    props["SupportsSensorValue"] = False
+    props["SupportsOnState"] = True
+    dev.pluginProps = props
+    dev.replaced_props = False
+
+    ds.reconcile_all([TEMP_SENSOR_NODE])
+    assert dev.replaced_props is True
+    assert dev.pluginProps.get("SupportsSensorValue") is True
+    assert dev.pluginProps.get("SupportsOnState") is False
+
+
+def test_unknown_device_type_in_index_is_processed_quietly(ds, indigo_env, mock_logger):
+    """A stale index entry whose deviceTypeId no handler owns (e.g. after a type
+    rename) must neither crash the re-assert loop nor log a could-not-re-assert
+    warning — and must not block healing of other devices."""
+    _indigo, devices = indigo_env
+    ds.create_from_raw(TEMP_SENSOR_NODE, "Landing Sensor")
+    ghost = FakeDev(devices.next_id(), "Ghost", "matterRetiredType",
+                    {"nodeId": str(0x40), "endpointId": "1"})
+    devices.add(ghost)
+
+    mock_logger.warning.reset_mock()
+    ds.reconcile_all([TEMP_SENSOR_NODE])
+
+    msgs = [c[0][0] for c in mock_logger.warning.call_args_list]
+    assert not any("could not re-assert" in m for m in msgs), msgs
+    assert not getattr(ghost, "replaced_props", False)
+
+
+def test_props_replace_that_does_not_persist_warns_instead_of_claiming_success(ds, indigo_env, mock_logger):
+    """Never report success when the op only half-happened: if Indigo silently
+    drops the replaced props, the INFO success line must NOT be logged and a
+    did-not-persist warning must name the keys."""
+    _indigo, devices = indigo_env
+    ds.create_from_raw(TEMP_SENSOR_NODE, "Landing Sensor")
+    dev = devices[ds.lookup(0x40, 1)]
+    _strip_display_props(dev)
+    dev.replacePluginPropsOnServer = lambda p: None  # accepted, never applied
+
+    mock_logger.info.reset_mock()
+    mock_logger.warning.reset_mock()
+    ds.reconcile_all([TEMP_SENSOR_NODE])
+
+    info_msgs = [c[0][0] for c in mock_logger.info.call_args_list]
+    assert not any("re-asserted" in m for m in info_msgs), info_msgs
+    persist_warnings = [
+        c[0] for c in mock_logger.warning.call_args_list if "did not persist" in c[0][0]
+    ]
+    assert persist_warnings, "expected a did-not-persist warning"
+    formatted = persist_warnings[0][0] % tuple(persist_warnings[0][1:])
+    assert "SupportsSensorValue" in formatted and "SupportsOnState" in formatted

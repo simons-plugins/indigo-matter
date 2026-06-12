@@ -52,9 +52,10 @@ Two distinctions that save a lot of confusion:
 
 ### Thread status in this plugin
 
-**Thread devices are expected to work via the normal share-model flow** —
-the same Apple Home → pairing code → Domio path as Wi-Fi (validated with
-Wi-Fi hardware; Thread validation pending a real device).
+**Thread devices work via the normal share-model flow** — the same
+Apple Home → pairing code path as Wi-Fi. Validated with real hardware on
+both transports: a Tapo P110M (Wi-Fi) and an Aqara FP300 presence
+multi-sensor (Thread, via a HomePod border router).
 
 Here's why. The one Thread operation the plugin's controller stack
 ([`matter-server`](https://github.com/matter-js/matterjs-server), matter.js,
@@ -67,10 +68,10 @@ ecosystem's border router routes IPv6 between the Thread mesh and the LAN and
 proxies the device's mDNS records, so when the plugin joins as a second admin
 over IP it neither knows nor cares that the last hop is Thread.
 
-Practical caveats while this remains unvalidated: matter-server is Alpha, and
-battery Thread devices are "sleepy" (they wake on long intervals), which is
-where an alpha controller is most likely to be flaky — a mains-powered Thread
-device is the gentler first test. Thread devices *bridged* into Matter by a
+Practical caveats: matter-server is Alpha, and battery Thread devices are
+"sleepy" (they wake on long intervals), which is where an alpha controller is
+most likely to be flaky — though the first validated Thread device was exactly
+such a sleepy battery sensor and behaved (live unprompted attribute reports). Thread devices *bridged* into Matter by a
 hub you own (Aqara, Hue, SwitchBot) are a separate, hub-dependent route — see
 Bridges below. And should a true gap surface, the WebSocket protocol the
 plugin speaks is deliberately compatible with Home Assistant's

@@ -226,3 +226,11 @@ def test_registry_resolves_by_device_type():
 
 def test_registry_cluster_id_is_correct():
     assert CLUSTER_SMOKE_CO_ALARM == 0x005C
+
+
+def test_create_devices_sets_binary_display_props():
+    # Issue #56: Supports* must be creation props (Devices.xml statics don't
+    # apply to API-created devices). on/off IS the alarm display.
+    spec = _handler().create_indigo_devices(_fake_node(), _fake_endpoint())[0]
+    assert spec.props["SupportsOnState"] is True
+    assert spec.props["SupportsSensorValue"] is False

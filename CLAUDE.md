@@ -55,11 +55,12 @@ reached over the Reflector with the same Bearer API key Domio already uses — *
 standalone server (aiohttp is absent from Indigo's framework Python). See `docs/API.md` v1.1.
 
 **matter-server:** npm package `matter-server` (GitHub `matter-js/matterjs-server`),
-**Alpha** v0.6.2. Its one Thread gap is *first-admin* commissioning (provisioning Thread
-credentials over BLE) — which the share model never does. **Wi-Fi validated with real
-hardware; Thread expected to work via the same flow** (the admin-1 ecosystem — Apple
-Home/Alexa/Google Home — provisions; plugin joins over IP through that ecosystem's
-TBR), pending validation with a real Thread device. WS
+**Alpha**, caret-installed within 0.6.x (jarvis runs 0.6.2; 0.6.8 field-validated). Its
+one Thread gap is *first-admin* commissioning (provisioning Thread
+credentials over BLE) — which the share model never does. **Wi-Fi and Thread both
+validated with real hardware** (Tapo P110M over Wi-Fi; Aqara FP300 over Thread via a
+HomePod TBR — the admin-1 ecosystem provisions; plugin joins over
+IP through that ecosystem's TBR). WS
 client is portable to python-matter-server as a fallback. See `docs/MATTER.md` +
 `docs/IMPLEMENTATION.md` §3.
 
