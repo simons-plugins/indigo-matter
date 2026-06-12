@@ -1325,7 +1325,8 @@ def test_reassert_corrects_present_but_wrong_display_props(ds, indigo_env):
 def test_unknown_device_type_in_index_is_processed_quietly(ds, indigo_env, mock_logger):
     """A stale index entry whose deviceTypeId no handler owns (e.g. after a type
     rename) must neither crash the re-assert loop nor log a could-not-re-assert
-    warning — and must not block healing of other devices."""
+    warning — and must not block healing of other devices. The only change it
+    may receive is the createdTypeId stamp (the #58 type-edit guard heal)."""
     _indigo, devices = indigo_env
     ds.create_from_raw(TEMP_SENSOR_NODE, "Landing Sensor")
     ghost = FakeDev(devices.next_id(), "Ghost", "matterRetiredType",
@@ -1337,7 +1338,9 @@ def test_unknown_device_type_in_index_is_processed_quietly(ds, indigo_env, mock_
 
     msgs = [c[0][0] for c in mock_logger.warning.call_args_list]
     assert not any("could not re-assert" in m for m in msgs), msgs
-    assert not getattr(ghost, "replaced_props", False)
+    # The stamp heal is the one legitimate write; no other props may change.
+    assert ghost.pluginProps.get("createdTypeId") == "matterRetiredType"
+    assert "SupportsSensorValue" not in ghost.pluginProps
 
 
 def test_props_replace_that_does_not_persist_warns_instead_of_claiming_success(ds, indigo_env, mock_logger):
@@ -1362,3 +1365,117 @@ def test_props_replace_that_does_not_persist_warns_instead_of_claiming_success(d
     assert persist_warnings, "expected a did-not-persist warning"
     formatted = persist_warnings[0][0] % tuple(persist_warnings[0][1:])
     assert "SupportsSensorValue" in formatted and "SupportsOnState" in formatted
+
+
+# ===========================================================================
+# fix/#58 — matterUnknown fallback + createdTypeId stamp
+# ===========================================================================
+
+# A node whose only device-bearing endpoint exposes clusters we don't handle
+# (RVC RunMode 0x0054 = 84). Must surface as a placeholder, not vanish.
+UNKNOWN_NODE = {
+    "node_id": 0x50,
+    "available": True,
+    "attributes": {
+        "0/40/1": "Roborock",
+        "0/40/3": "RoboVac",
+        "1/29/0": [{"0": 116}],
+        "1/84/0": 0,
+    },
+}
+
+# Root endpoint only — nothing device-bearing anywhere. Must create nothing.
+ROOT_ONLY_NODE = {
+    "node_id": 0x51,
+    "available": True,
+    "attributes": {"0/40/1": "ACME", "0/29/0": [{"0": 22}]},
+}
+
+# Endpoint whose clusters are all merge-only/utility (electrical measurement):
+# no placeholder — there is no device-shaped thing to surface.
+ELECTRICAL_ONLY_NODE = {
+    "node_id": 0x52,
+    "available": True,
+    "attributes": {
+        "0/40/1": "ACME",
+        "1/29/0": [{"0": 1296}],
+        "1/144/8": 1200,
+        "1/145/1": {"energy": 1},
+    },
+}
+
+
+def test_unknown_endpoint_creates_placeholder_not_nothing(ds, indigo_env, mock_logger):
+    _indigo, devices = indigo_env
+    result = ds.create_from_raw(UNKNOWN_NODE, "Vacuum")
+    assert result["indigoDeviceIds"], "unknown device vanished — commission would claim success with no devices"
+    dev = devices[result["primaryDeviceId"]]
+    assert dev.deviceTypeId == "matterUnknown"
+    assert "0x0054" in dev.pluginProps["supportedClusters"]
+    assert dev.states.get("reachable") is True
+    assert dev.pluginProps["createdTypeId"] == "matterUnknown"
+    # The report-invite must be logged.
+    info_msgs = [c[0][0] % tuple(c[0][1:]) for c in mock_logger.info.call_args_list]
+    assert any("please report" in m for m in info_msgs)
+
+
+def test_unknown_placeholder_is_idempotent(ds, indigo_env):
+    _indigo, devices = indigo_env
+    ds.create_from_raw(UNKNOWN_NODE, "Vacuum")
+    first = ds.lookup(0x50, 1)
+    result = ds.create_from_raw(UNKNOWN_NODE, "Vacuum")
+    assert result["indigoDeviceIds"] == [first]
+
+
+def test_root_only_node_creates_nothing(ds, indigo_env):
+    _indigo, devices = indigo_env
+    result = ds.create_from_raw(ROOT_ONLY_NODE, "Mystery")
+    assert result["indigoDeviceIds"] == []
+    assert len(list(devices)) == 0
+
+
+def test_merge_only_endpoint_gets_no_placeholder(ds, indigo_env):
+    _indigo, devices = indigo_env
+    result = ds.create_from_raw(ELECTRICAL_ONLY_NODE, "Meter")
+    assert result["indigoDeviceIds"] == []
+
+
+def test_placeholder_obsolete_when_endpoint_becomes_supported(ds, indigo_env, mock_logger):
+    """Firmware update adds a supported cluster: the real device is created and
+    the user is told the placeholder can be deleted — never auto-deleted."""
+    _indigo, devices = indigo_env
+    ds.create_from_raw(UNKNOWN_NODE, "Vacuum")
+    placeholder_id = ds.lookup(0x50, 1, "matterUnknown")
+
+    upgraded = {
+        "node_id": 0x50,
+        "available": True,
+        "attributes": dict(UNKNOWN_NODE["attributes"], **{"1/6/0": False}),
+    }
+    mock_logger.info.reset_mock()
+    ds.reconcile_all([upgraded])
+
+    assert ds.lookup(0x50, 1, "matterRelay") is not None
+    assert ds.lookup(0x50, 1, "matterUnknown") == placeholder_id  # untouched
+    info_msgs = [c[0][0] % tuple(c[0][1:]) for c in mock_logger.info.call_args_list]
+    assert any("can be deleted" in m for m in info_msgs)
+
+
+def test_created_devices_carry_created_type_id(ds, indigo_env):
+    _indigo, devices = indigo_env
+    ds.create_from_raw(TEMP_SENSOR_NODE, "Landing Sensor")
+    dev = devices[ds.lookup(0x40, 1)]
+    assert dev.pluginProps["createdTypeId"] == "matterTemperatureSensor"
+
+
+def test_reassert_stamps_created_type_id_on_legacy_devices(ds, indigo_env):
+    """Devices created before the #58 guard gain the stamp at reconcile."""
+    _indigo, devices = indigo_env
+    ds.create_from_raw(TEMP_SENSOR_NODE, "Landing Sensor")
+    dev = devices[ds.lookup(0x40, 1)]
+    props = dict(dev.pluginProps)
+    props.pop("createdTypeId", None)
+    dev.pluginProps = props
+
+    ds.reconcile_all([TEMP_SENSOR_NODE])
+    assert dev.pluginProps.get("createdTypeId") == "matterTemperatureSensor"

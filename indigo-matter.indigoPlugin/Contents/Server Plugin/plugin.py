@@ -198,7 +198,45 @@ class Plugin(indigo.PluginBase):
     # ------------------------------------------------------------------
     # Device lifecycle
     # ------------------------------------------------------------------
+    def validateDeviceConfigUi(self, valuesDict, typeId, devId):  # noqa: N802
+        """Reject changing a Matter device's Indigo type (issue #58).
+
+        Indigo's Edit Device dialog always offers the plugin's full Type menu
+        and a plugin cannot remove it — but Matter device types are derived
+        from the node's clusters at creation. A manual change desyncs the
+        device: the next reconcile creates a duplicate of the correct type,
+        and the re-typed device becomes a zombie whose actions target clusters
+        the node does not implement. ``createdTypeId`` is stamped into props at
+        creation (and healed onto older devices at reconcile); absence of the
+        stamp (e.g. a manually created device) allows the save.
+        """
+        created = ""
+        try:
+            created = indigo.devices[devId].pluginProps.get("createdTypeId", "")
+        except KeyError:
+            pass  # brand-new device — nothing to protect yet
+        if created and typeId != created:
+            errors = indigo.Dict()
+            errors["showAlertText"] = (
+                "Matter device types are derived from the device itself and "
+                f"cannot be changed (this device was created as '{created}'). "
+                "If the device is wrong, delete it and reload the plugin — it "
+                "will be recreated from the node's clusters."
+            )
+            return (False, valuesDict, errors)
+        return (True, valuesDict)
+
     def deviceStartComm(self, dev):  # noqa: N802
+        # Backstop for type edits made while the plugin was not running (the
+        # validateDeviceConfigUi guard can't fire then) — issue #58.
+        created = dev.pluginProps.get("createdTypeId", "")
+        if created and dev.deviceTypeId != created:
+            self.logger.warning(
+                "device %s (%s) was created as type %s but is now %s — Matter "
+                "device types cannot be changed; delete the device and reload "
+                "this plugin to recreate it correctly",
+                dev.id, dev.name, created, dev.deviceTypeId,
+            )
         self.device_sync.note_device(dev)
         self.device_sync.set_active(dev.id, True)
 

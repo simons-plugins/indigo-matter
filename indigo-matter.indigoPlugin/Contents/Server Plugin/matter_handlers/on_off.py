@@ -9,10 +9,11 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from .base import ClusterHandler, IndigoDeviceSpec, MatterCommand
+from .base import ENDPOINT_OWNER_CLUSTERS, ClusterHandler, IndigoDeviceSpec, MatterCommand
 from .electrical import CLUSTER_ELECTRICAL_ENERGY, CLUSTER_ELECTRICAL_POWER
 
 CLUSTER_LEVEL_CONTROL = 0x0008
+CLUSTER_COLOR_CONTROL = 0x0300
 
 
 class OnOffHandler(ClusterHandler):
@@ -26,8 +27,14 @@ class OnOffHandler(ClusterHandler):
     CMD_TOGGLE = "Toggle"
 
     def is_primary_for(self, node: Any, endpoint: Any) -> bool:
-        # LevelControl present → a dimmer handler owns this endpoint.
-        return not endpoint.has(CLUSTER_LEVEL_CONTROL)
+        # A richer lighting handler (dimmer OR colour — a colour light is not
+        # required to carry LevelControl) owns this endpoint; a rich actuator
+        # cluster (fan/thermostat/covering/lock/valve) present → that handler
+        # owns it and this OnOff is its subordinate power switch, not a
+        # standalone relay (issue #58 — duplicate-device class).
+        if endpoint.has(CLUSTER_LEVEL_CONTROL) or endpoint.has(CLUSTER_COLOR_CONTROL):
+            return False
+        return not any(endpoint.has(c) for c in ENDPOINT_OWNER_CLUSTERS)
 
     def create_indigo_devices(self, node: Any, endpoint: Any) -> list[IndigoDeviceSpec]:
         if not self.is_primary_for(node, endpoint):

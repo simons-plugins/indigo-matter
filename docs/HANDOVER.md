@@ -1,10 +1,51 @@
 # indigo-matter — Build Handover
 
-**Last updated:** 2026-06-12 18:52 UTC
-**Branch:** `fix/sensor-display-props` (PR pending)
-**Version:** `2026.2.21`
-**Tests:** 634 passing (`cd indigo-matter && /Library/Frameworks/Python.framework/Versions/Current/bin/python3 -m pytest -q`)
+**Last updated:** 2026-06-12 20:38 UTC
+**Branch:** `fix/device-mapping-hardening` (PR pending)
+**Version:** `2026.2.22`
+**Tests:** 743 passing (`cd indigo-matter && /Library/Frameworks/Python.framework/Versions/Current/bin/python3 -m pytest -q`)
 **Status:** **Wi-Fi AND Thread validated with real hardware.** Tapo P110M (Wi-Fi, energy) + Aqara FP300 (Thread, presence/lux/temp/humidity — tester CliveS). Known-open: issue #56 follow-ups (button + air-quality display states), fan brightness echo (rig flake); issues #43 (bridge-child naming), #46 (fan TurnOn FanMode mapping), #21–#24 (commission hardening).
+
+---
+
+## 2026-06-12 session (late) — endpoint-mapping hardening (issue #58)
+
+Audit prompted by #56 ("what else is in this bug class?"). Three gaps found and
+fixed; a **device-zoo contract harness** (`tests/test_device_zoo.py`) now pins
+the whole class:
+
+1. **Duplicate actuators.** Deferral chain was only OnOff→Level→Color (+
+   Fan→Thermostat). A Matter fan (OnOff mandatory alongside FanControl since
+   1.2), a thermostat/lock/valve/covering with OnOff, or a colour light
+   *without* LevelControl (zoo caught that one immediately) all produced a
+   duplicate relay/dimmer. Fix: `ENDPOINT_OWNER_CLUSTERS` in
+   `matter_handlers/base.py` (Valve 0x0081, DoorLock 0x0101, WindowCovering
+   0x0102, Thermostat 0x0201, FanControl 0x0202); OnOff and LevelControl defer
+   to any of them, and OnOff also defers directly to ColorControl.
+2. **Unknown devices vanished.** An endpoint with only unhandled clusters
+   produced nothing; a node of such endpoints commissioned to SUCCESS with
+   `indigoDeviceIds: []` (Domio shows success, Indigo shows nothing). Fix:
+   `matterUnknown` placeholder (its `supportedClusters` ConfigUI field was
+   already in Devices.xml, never wired) for device-bearing endpoints ≥1 whose
+   clusters aren't all in `_NON_DEVICE_CLUSTERS`; INFO log invites a GitHub
+   device-support report. When a later pass finds the endpoint supported
+   (firmware update — the Tapo pattern), the real device is created and an
+   INFO says the placeholder can be deleted (never auto-deleted).
+3. **Type-edit guard.** Indigo's Edit Device dialog always offers the full
+   Type menu (platform behaviour, can't be removed). `createdTypeId` is now
+   stamped into props at creation and healed onto legacy devices by the
+   reconcile self-heal; `validateDeviceConfigUi` rejects a type change with an
+   explanatory alert; `deviceStartComm` warns as backstop for edits made while
+   the plugin was off.
+
+The zoo asserts, over every cluster-combo entry: expected device types, at
+most one actuator per endpoint, spec types exist in Devices.xml, initial
+states declared, sensor specs carry explicit display props (the #56 class).
+**Add new wild devices' cluster sets to ZOO** — invariants run automatically.
+
+Still untested on hardware (needs the live rig): whether
+`replacePluginPropsOnServer` re-derives `displayStateId` in real Indigo, and
+the #56 button/air-quality display follow-ups.
 
 ---
 

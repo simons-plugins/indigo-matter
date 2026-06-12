@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from .base import ClusterHandler, IndigoDeviceSpec, MatterCommand
+from .base import ENDPOINT_OWNER_CLUSTERS, ClusterHandler, IndigoDeviceSpec, MatterCommand
 from .electrical import CLUSTER_ELECTRICAL_ENERGY, CLUSTER_ELECTRICAL_POWER
 
 CLUSTER_ON_OFF = 0x0006
@@ -35,8 +35,13 @@ class LevelControlHandler(ClusterHandler):
     ATTR_CURRENT_LEVEL = 0x0000
 
     def is_primary_for(self, node: Any, endpoint: Any) -> bool:
-        # ColorControl present → the color handler owns this endpoint.
-        return not endpoint.has(CLUSTER_COLOR_CONTROL)
+        # ColorControl present → the color handler owns this endpoint. A rich
+        # actuator cluster present → that handler owns it (a covering's lift
+        # or a fan's speed is driven through its own cluster, not LevelControl)
+        # and a standalone dimmer would be a duplicate (issue #58).
+        if endpoint.has(CLUSTER_COLOR_CONTROL):
+            return False
+        return not any(endpoint.has(c) for c in ENDPOINT_OWNER_CLUSTERS)
 
     def create_indigo_devices(self, node: Any, endpoint: Any) -> list[IndigoDeviceSpec]:
         if not self.is_primary_for(node, endpoint):
