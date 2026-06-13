@@ -7,7 +7,7 @@
 
      The uiPath="hidden" actions below are the Domio HTTP API (API.md v1.1),
      served by the Indigo Web Server (IWS) at
-       …/message/com.simon.indigo-matter/{handler}[/{pathArg}]
+       …/message/com.simons-plugins.indigo-matter/{handler}[/{pathArg}]
      reachable locally on :8176 and remotely via the Reflector with the same
      Bearer API key Domio already uses. Auth is enforced by Indigo before the
      handler runs. -->

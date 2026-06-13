@@ -38,7 +38,7 @@ class FakeRunner:
 @pytest.fixture
 def prefs():
     return {"matterServerPort": "5580", "primaryInterface": "en0",
-            "storagePath": "~/Library/Application Support/com.simon.indigo-matter/matter-server"}
+            "storagePath": "~/Library/Application Support/com.simons-plugins.indigo-matter/matter-server"}
 
 
 def _make_pkg(home, *, main: str | None = None, garbage: bool = False):

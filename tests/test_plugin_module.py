@@ -85,7 +85,7 @@ def test_info_plist_bundle_id_and_version(plugin_cls):
         elif key is not None:
             pairs[key] = child.text
             key = None
-    assert pairs["CFBundleIdentifier"] == "com.simon.indigo-matter"
+    assert pairs["CFBundleIdentifier"] == "com.simons-plugins.indigo-matter"
     assert pairs["PluginVersion"]  # present and non-empty
 
 

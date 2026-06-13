@@ -5,7 +5,7 @@
 	<key>CFBundleDisplayName</key>
 	<string>Matter</string>
 	<key>CFBundleIdentifier</key>
-	<string>com.simon.indigo-matter</string>
+	<string>com.simons-plugins.indigo-matter</string>
 	<key>CFBundleShortVersionString</key>
 	<string>2026.2.12</string>
 	<key>CFBundleURLTypes</key>
@@ -20,7 +20,7 @@
 	<key>IwsApiVersion</key>
 	<string>1.0.0</string>
 	<key>PluginVersion</key>
-	<string>2026.2.26</string>
+	<string>2026.2.27</string>
 	<key>ServerApiVersion</key>
 	<string>3.6</string>
 </dict>

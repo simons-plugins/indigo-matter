@@ -122,13 +122,13 @@ Let the plugin install and supervise matter-server for you.
    `ifconfig | grep "status: active"`).
 5. Save.
 
-The plugin writes `~/Library/LaunchAgents/com.simon.indigo-matter.plist`
+The plugin writes `~/Library/LaunchAgents/com.simons-plugins.indigo-matter.plist`
 (`RunAtLoad` + `KeepAlive`, running as the Indigo user) and bootstraps it via `launchctl`.
 
 > If a LaunchAgent with the same label is already loaded (e.g. from a previous run or a
 > hand-installed plist), the new one won't take over until you boot the old one out:
 > ```bash
-> launchctl bootout gui/$(id -u)/com.simon.indigo-matter
+> launchctl bootout gui/$(id -u)/com.simons-plugins.indigo-matter
 > ```
 > then restart the Matter plugin (or re-save the config) to re-bootstrap.
 
@@ -145,7 +145,7 @@ A minimal `run.sh`:
 ```bash
 #!/bin/sh
 node ~/indigo-matter/node_modules/matter-server/dist/esm/MatterServer.js \
-  --storage-path "$HOME/Library/Application Support/com.simon.indigo-matter/matter-server" \
+  --storage-path "$HOME/Library/Application Support/com.simons-plugins.indigo-matter/matter-server" \
   --primary-interface en0 \
   --listen-address 127.0.0.1
 ```
@@ -160,7 +160,7 @@ node ~/indigo-matter/node_modules/matter-server/dist/esm/MatterServer.js \
 | **matter-server port** | `5580` | WebSocket port. |
 | **matter-server WebSocket path** | `/ws` | WebSocket path. |
 | **Node bin directory (optional)** | *(blank)* | Directory containing `node`. Blank = auto-detect (Homebrew, then nvm, then PATH). nvm users may pin, e.g. `~/.nvm/versions/node/v22.22.3/bin`. Managed mode only. |
-| **matter-server storage path** | `~/Library/Application Support/com.simon.indigo-matter/matter-server` | The fabric. See Backups. |
+| **matter-server storage path** | `~/Library/Application Support/com.simons-plugins.indigo-matter/matter-server` | The fabric. See Backups. |
 | **Manage matter-server LaunchAgent automatically** | off | On = plugin supervises matter-server (Mode A); off = you run it (Mode B). |
 | **Primary network interface** | `en0` | macOS interface matter-server binds to. Managed mode only. |
 | **matter-server listen address** | `127.0.0.1` | IP the managed server binds its (unauthenticated) control API to. Keep loopback. Managed mode only. See Security. |
@@ -204,7 +204,7 @@ as a native Indigo device.
 The Matter fabric lives at:
 
 ```
-~/Library/Application Support/com.simon.indigo-matter/matter-server/
+~/Library/Application Support/com.simons-plugins.indigo-matter/matter-server/
 ```
 
 This directory holds the fabric root CA private key and every device's operational data.
@@ -217,7 +217,7 @@ yourself. With the plugin (or matter-server) stopped, copy the directory:
 
 ```bash
 cp -R \
-  "$HOME/Library/Application Support/com.simon.indigo-matter/matter-server" \
+  "$HOME/Library/Application Support/com.simons-plugins.indigo-matter/matter-server" \
   "$HOME/Backups/indigo-matter-fabric-$(date -u +%Y%m%d)"
 ```
 
@@ -245,7 +245,7 @@ matter-server runs on a different host and you have a trusted firewall in front 
 | `Connect call failed ('127.0.0.1', 5580)` | matter-server isn't running, crashed, or is on a different port. | Check `matter-server.err.log`; confirm the port matches the config; in managed mode re-save the config; in manual mode (re)start matter-server. |
 | nvm node not found by the managed agent | Auto-detect didn't find the nvm node. | Set **Node bin directory** explicitly, e.g. `~/.nvm/versions/node/v22.22.3/bin`. |
 | `BLE is not enabled on this platform` warning | Expected — BLE isn't used (Wi-Fi only). | Benign; ignore. |
-| New managed LaunchAgent doesn't take effect | A prior agent with the same label is still loaded. | `launchctl bootout gui/$(id -u)/com.simon.indigo-matter`, then restart the plugin. |
+| New managed LaunchAgent doesn't take effect | A prior agent with the same label is still loaded. | `launchctl bootout gui/$(id -u)/com.simons-plugins.indigo-matter`, then restart the plugin. |
 | Hand-edited plist keeps reverting | The plugin regenerates the plist from config on restart. | Change settings via **Configure…**, not the plist. |
 
 ---
@@ -267,10 +267,10 @@ per Step 4.
 ## Uninstall
 
 Removing the plugin from Indigo also removes the managed LaunchAgent (it boots out and
-deletes `~/Library/LaunchAgents/com.simon.indigo-matter.plist`).
+deletes `~/Library/LaunchAgents/com.simons-plugins.indigo-matter.plist`).
 
 The plugin **never** deletes the storage directory. Your fabric at
-`~/Library/Application Support/com.simon.indigo-matter/matter-server/` stays put — so a
+`~/Library/Application Support/com.simons-plugins.indigo-matter/matter-server/` stays put — so a
 reinstall keeps all your devices. Delete it manually only if you intend a full factory
 reset (and re-commission everything).
 </content>
