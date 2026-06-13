@@ -146,6 +146,22 @@ ZOO = {
         _raw(18, {1: {"29/0": [{"0": 773}], "1027/0": 1013, "1028/0": 25}}),
         {1: ["matterFlowSensor", "matterPressureSensor"]},
     ),
+    # IKEA ALPSTUGA (real Matter-over-Thread air-quality sensor): AirQuality +
+    # CO2 + PM2.5 + temperature + humidity, plus an OnOff cluster that toggles
+    # the front DISPLAY (a "dead front" control), not power. CHARACTERISES the
+    # issue #64 wrinkle: the display OnOff produces a generic matterRelay
+    # alongside the five sensors. Kept in `expected` deliberately — when #64 is
+    # fixed (OnOff with the DeadFront feature should not become a relay) the
+    # matterRelay entry is removed here in the same change. The at-most-one-
+    # actuator invariant still holds (one relay), so this stays a phantom-device
+    # note, not a duplicate-actuator failure.
+    "ikea_alpstuga": (
+        _raw(0x99, {1: {"29/0": [{"0": 44}], "91/0": 1, "1037/0": 600.0,
+                        "1066/0": 8.0, "1026/0": 2150, "1029/0": 4800,
+                        "6/0": False}}),
+        {1: ["matterAirQualitySensor", "matterCO2Sensor", "matterHumiditySensor",
+             "matterPM25Sensor", "matterRelay", "matterTemperatureSensor"]},
+    ),
     # An endpoint made only of clusters we don't handle (RVC RunMode 0x0054):
     # the registry yields nothing — device_sync's matterUnknown fallback takes
     # over (covered in test_device_sync.py).
