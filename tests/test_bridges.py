@@ -280,8 +280,9 @@ def test_bridged_endpoint_name_skips_endpoint_suffix(bds, bridge_indigo_env):
     assert "(endpoint" not in devices[dev_id2].name
 
 
-def test_non_bridged_multi_endpoint_keeps_suffix(bds, bridge_indigo_env):
-    """Non-bridged multi-endpoint nodes still get '(endpoint N)' suffix."""
+def test_non_bridged_multi_endpoint_identical_siblings_role_numbered(bds, bridge_indigo_env):
+    """Non-bridged multi-endpoint nodes name by role; identical siblings
+    (two switches) get an endpoint-numbered role suffix."""
     _indigo, devices = bridge_indigo_env
     multi_node = {
         "node_id": 99,
@@ -293,8 +294,8 @@ def test_non_bridged_multi_endpoint_keeps_suffix(bds, bridge_indigo_env):
     bds.create_from_raw(multi_node, "Patio")
     id1 = bds.lookup(99, 1)
     id2 = bds.lookup(99, 2)
-    assert devices[id1].name == "Patio (endpoint 1)"
-    assert devices[id2].name == "Patio (endpoint 2)"
+    assert devices[id1].name == "Patio - Switch 1"
+    assert devices[id2].name == "Patio - Switch 2"
 
 
 def test_authoritative_rename_wins_over_bridge_label(bds, bridge_indigo_env):

@@ -66,6 +66,38 @@ _NON_DEVICE_CLUSTERS = frozenset({
 })
 
 
+#: Friendly role suffix per Indigo device type, used to name the individual
+#: devices of a multi-function node.  A HomePod exposing temperature + humidity
+#: becomes "<name> - Temperature" / "<name> - Humidity" rather than the opaque
+#: "<name> (endpoint 1)".  Endpoint-number naming is kept only as the fallback
+#: for a type absent from this map, and to disambiguate genuinely identical
+#: siblings (e.g. four outlets on one strip — see create_devices).
+_ROLE_LABELS = {
+    "matterRelay": "Switch",
+    "matterDimmer": "Dimmer",
+    "matterColorDimmer": "Light",
+    "matterTemperatureSensor": "Temperature",
+    "matterHumiditySensor": "Humidity",
+    "matterMotionSensor": "Motion",
+    "matterContactSensor": "Contact",
+    "matterIlluminanceSensor": "Illuminance",
+    "matterPressureSensor": "Pressure",
+    "matterFlowSensor": "Flow",
+    "matterThermostat": "Thermostat",
+    "matterFan": "Fan",
+    "matterWindowCovering": "Window Covering",
+    "matterLock": "Lock",
+    "matterValve": "Valve",
+    "matterButton": "Button",
+    "matterSmokeCOAlarm": "Smoke/CO",
+    "matterAirQualitySensor": "Air Quality",
+    "matterCO2Sensor": "CO₂",
+    "matterPM25Sensor": "PM2.5",
+    "matterTVOCSensor": "TVOC",
+    "matterUnknown": "Unsupported",
+}
+
+
 def _kvlist(states: dict) -> list:
     return [{"key": key, "value": value} for key, value in states.items()]
 
@@ -297,6 +329,19 @@ class DeviceSync:
                     plan.append((endpoint, spec))
 
             multi = len(plan) > 1
+            # Count role occurrences across the plan so genuinely identical
+            # siblings (e.g. four outlets on one strip, all "Switch") fall back
+            # to an endpoint-numbered suffix, while a node's distinct functions
+            # (temperature vs humidity) read as "<name> - <role>".
+            role_counts: dict[str, int] = {}
+            for _ep, _spec in plan:
+                role = _ROLE_LABELS.get(_spec.device_type_id, "")
+                if role:
+                    role_counts[role] = role_counts.get(role, 0) + 1
+            # Stamp the hardware product as each device's Model so a node's
+            # sibling devices share one value in the Indigo device list's Model
+            # column (the grouping Indigo offers short of a Device Factory).
+            model = node.product_name or node.vendor_name or ""
             folder_id = self._resolve_folder_id(suggested_room) if authoritative else 0
             # Pre-compute the FULL set of planned device_type_ids per endpoint so
             # _prime_states can identify merge-into handlers correctly regardless
@@ -325,7 +370,17 @@ class DeviceSync:
                     # tracks the fix (prefix or bridge-only authoritative stamp).
                     name = spec.name if authoritative else bridge_label
                 elif multi:
-                    name = f"{spec.name} (endpoint {endpoint.endpoint_id})"
+                    # Name by the device's function ("- Temperature"), not its
+                    # Matter endpoint number, which is meaningless to the user.
+                    # Fall back to the endpoint suffix only for identical
+                    # siblings or an unmapped type.
+                    role = _ROLE_LABELS.get(spec.device_type_id, "")
+                    if role and role_counts.get(role, 0) > 1:
+                        name = f"{spec.name} - {role} {endpoint.endpoint_id}"
+                    elif role:
+                        name = f"{spec.name} - {role}"
+                    else:
+                        name = f"{spec.name} (endpoint {endpoint.endpoint_id})"
                 else:
                     name = spec.name
                 ep_key = (int(node.node_id), int(endpoint.endpoint_id))
@@ -346,7 +401,7 @@ class DeviceSync:
                 # protocol-identifier column) so the nodeId is recoverable for
                 # decommission without spelunking pluginProps (issue #18).
                 spec.props.setdefault("address", node_id_to_str(node.node_id))
-                dev_id = self._create_one(spec, name, folder_id)
+                dev_id = self._create_one(spec, name, folder_id, model)
                 if dev_id is None:
                     failed += 1
                     continue
@@ -425,7 +480,8 @@ class DeviceSync:
             initial_states={"reachable": True},
         )
 
-    def _create_one(self, spec: Any, name: str, folder_id: int = 0) -> Optional[int]:
+    def _create_one(self, spec: Any, name: str, folder_id: int = 0,
+                    model: str = "") -> Optional[int]:
         # Stamp the type the cluster pipeline chose, so the type-edit guard
         # (validateDeviceConfigUi + deviceStartComm) can detect a manual change
         # via Indigo's Edit Device Type menu (issue #58).
@@ -459,6 +515,14 @@ class DeviceSync:
         except Exception as exc:  # noqa: BLE001 - surface but don't abort the batch
             self.logger.exception(exc)
             return None
+        if model:
+            # Cosmetic only (the Model column); a failure here must never sink
+            # an otherwise-created device.
+            try:
+                dev.model = model
+                dev.replaceOnServer()
+            except Exception as exc:  # noqa: BLE001
+                self.logger.debug("could not set model on device %s: %s", dev.id, exc)
         if spec.initial_states:
             try:
                 dev.updateStatesOnServer(_kvlist(spec.initial_states))
@@ -556,7 +620,7 @@ class DeviceSync:
                     self._index.get((int(node.node_id), int(endpoint_id)), {}).keys()
                 )
         dev = indigo.devices[dev_id]
-        states: dict = {}
+        kv: list = []
         for (ep, cluster, attribute), value in node.attributes.items():
             handler = self.registry.handler_for_cluster(cluster)
             if handler is None:
@@ -585,11 +649,13 @@ class DeviceSync:
                     if handler_type_id in ep_sibling_types:
                         continue
             try:
-                states.update(handler.on_attribute_update(dev, attribute, value))
+                update = handler.on_attribute_update(dev, attribute, value)
+                if update:
+                    kv.extend(handler.format_kv(update))
             except Exception as exc:  # noqa: BLE001 - one bad attr must not abort priming
                 self.logger.warning("prime %s attr %s/%s failed: %s", dev_id, cluster, attribute, exc)
-        if states:
-            self.apply_states(dev_id, _kvlist(states))
+        if kv:
+            self.apply_states(dev_id, kv)
 
     # ------------------------------------------------------------------
     # Capability-prop helpers (issue #45 — self-heal mid-interview creations)
@@ -995,7 +1061,7 @@ class DeviceSync:
             )
             return
         if states:
-            self.apply_states(dev_id, _kvlist(states))
+            self.apply_states(dev_id, handler.format_kv(states))
 
     def _on_attribute(self, evt: protocol.MatterEvent) -> None:
         if evt.node_id is None or evt.endpoint is None or evt.cluster is None:
@@ -1046,7 +1112,7 @@ class DeviceSync:
                     dev = indigo.devices[dev_id]
                     states = handler.on_attribute_update(dev, evt.attribute, evt.value)
                     if states:
-                        self.apply_states(dev_id, _kvlist(states))
+                        self.apply_states(dev_id, handler.format_kv(states))
                 except Exception as exc:  # noqa: BLE001 - one bad value must not silently freeze the device
                     self.logger.warning(
                         "bad update for device %s (ep%s cl%s attr%s value=%r): %s",
@@ -1071,7 +1137,7 @@ class DeviceSync:
             )
             return
         if states:
-            self.apply_states(dev_id, _kvlist(states))
+            self.apply_states(dev_id, handler.format_kv(states))
 
     def apply_states(self, dev_id: int, kvlist: list) -> None:
         """The single asyncio→Indigo write seam (see module docstring)."""

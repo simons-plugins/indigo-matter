@@ -474,14 +474,42 @@ def test_multi_endpoint_authoritative_rename_after_race(ds, indigo_env):
     ))
     id1, id2 = ds.lookup(92, 1), ds.lookup(92, 2)
     assert id1 and id2 and id1 != id2
-    assert "(endpoint 1)" in devices[id1].name and "Patio" not in devices[id1].name
+    # Two identical switches → role-numbered suffix, not the bare product name.
+    assert "- Switch 1" in devices[id1].name and "Patio" not in devices[id1].name
 
     result = ds.create_from_raw(MULTI_NODE, "Patio", "Outside")
     assert sorted(result["indigoDeviceIds"]) == sorted([id1, id2])   # no dupes
-    assert devices[id1].name == "Patio (endpoint 1)"
-    assert devices[id2].name == "Patio (endpoint 2)"
+    assert devices[id1].name == "Patio - Switch 1"
+    assert devices[id2].name == "Patio - Switch 2"
     outside = next(f.id for f in _indigo.devices.folders if f.name == "Outside")
     assert devices[id1].folderId == outside and devices[id2].folderId == outside
+
+
+MULTI_FUNCTION_NODE = {
+    "node_id": 77,
+    "attributes": {
+        "0/40/3": "HomePod mini",   # BasicInformation ProductName
+        "1/1026/0": 2150,           # TemperatureMeasurement MeasuredValue = 21.5 °C
+        "1/1029/0": 4750,           # RelativeHumidity MeasuredValue = 47.5 %
+    },
+}
+
+
+def test_multi_function_node_names_by_role_not_endpoint(ds, indigo_env):
+    # A HomePod exposing temperature + humidity must read "HomePod - Temperature"
+    # / "HomePod - Humidity", never "HomePod (endpoint 1)".
+    _indigo, devices = indigo_env
+    ds.create_from_raw(MULTI_FUNCTION_NODE, "HomePod")
+    temp_id = ds.lookup(77, 1, "matterTemperatureSensor")
+    hum_id = ds.lookup(77, 1, "matterHumiditySensor")
+    assert temp_id and hum_id and temp_id != hum_id
+    assert devices[temp_id].name == "HomePod - Temperature"
+    assert devices[hum_id].name == "HomePod - Humidity"
+    # The reading is primed in (formatted) and the product stamped as the Model
+    # so the two devices share a Model column entry.
+    assert devices[temp_id].states["sensorValue"] == 21.5
+    assert devices[temp_id].model == "HomePod mini"
+    assert devices[hum_id].model == "HomePod mini"
 
 
 def test_folder_resolution_failure_falls_back_to_folder_0(ds, indigo_env):
