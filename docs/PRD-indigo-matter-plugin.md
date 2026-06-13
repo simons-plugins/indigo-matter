@@ -90,7 +90,7 @@ The plugin and `matterjs-server` are two processes that must stay in sync. Three
 
 ### 4.3 Storage
 
-- **`matterjs-server`** owns its own storage directory (containing fabric private keys, certificates, node operational data). Path: `~/Library/Application Support/com.simon.indigo-matter/matter-server/`.
+- **`matterjs-server`** owns its own storage directory (containing fabric private keys, certificates, node operational data). Path: `~/Library/Application Support/com.simons-plugins.indigo-matter/matter-server/`.
 - **Plugin** owns Indigo device pluginProps mapping `(nodeId, endpointId, clusterId) → indigoDeviceId`. Stored in Indigo's normal plugin storage; backed up with Indigo's database.
 - Storage must survive plugin upgrades. Treat the matter-server data dir as sacred — losing it loses the fabric and all device pairings.
 
@@ -104,7 +104,7 @@ mechanism and rides the Reflector for remote access). Authentication is Indigo's
 Reflector/API-key auth, enforced before the handler runs. See `API.md` v1.1 (authoritative
 for the wire shape) and `IMPLEMENTATION.md` §4.
 
-**Endpoints** (logical; actual paths are `…/message/com.simon.indigo-matter/{handler}` — see `API.md`):
+**Endpoints** (logical; actual paths are `…/message/com.simons-plugins.indigo-matter/{handler}` — see `API.md`):
 
 ```
 GET /matter/status

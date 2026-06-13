@@ -118,7 +118,7 @@ devices ignore — needs hardware testing to find a working mechanism.
 - After firmware update + node rejoin, **the existing Indigo device gained `curEnergyLevel`/`accumEnergyTotal` automatically — no restart, no recreate**. That is PR #48 (capability-props re-assertion at reconcile) validated on real hardware, exactly its design scenario.
 - Fabric survived Wi-Fi reset + Tapo onboarding + firmware update; plug is now 4-admin (Apple Home, Indigo, Tapo cloud, Home Assistant) with no cross-interference. Apple Home took ~a minute to recover post-update — normal settling, not a fault.
 
-**Diagnostics endpoint note:** `GET …/message/com.simon.indigo-matter/diagnostics?nodeId=0x22` (Bearer = reflector key) returns reachable/vendor/product/softwareVersion + per-endpoint numeric cluster ids — first line of investigation for "why didn't my device get state X".
+**Diagnostics endpoint note:** `GET …/message/com.simons-plugins.indigo-matter/diagnostics?nodeId=0x22` (Bearer = reflector key) returns reachable/vendor/product/softwareVersion + per-endpoint numeric cluster ids — first line of investigation for "why didn't my device get state X".
 
 ---
 
@@ -147,7 +147,7 @@ All merged to `main`, all deployed to jarvis. Plugin **2026.0.1 → 2026.1.1** o
 - **#25 nvm support:** `nodeBinDir` pref + auto-detect (nvm default alias / newest, then Homebrew). The old code only probed Homebrew npx.
 - **#27 loopback security:** `matterServerListenAddress` pref, default `127.0.0.1`. matter-server's WS control API is **unauthenticated** and binds **all interfaces** without `--listen-address` — the managed agent now restricts to loopback.
 - **#28 node-direct launch:** the `matter-server` npm package has **no bin** (`"bin": null`), so `npx matter-server` fails ("could not determine executable to run"). The managed agent now runs `node …/node_modules/matter-server/dist/esm/MatterServer.js` directly (reads `main` from the package).
-- **jarvis cutover:** `manageLaunchAgent` ON, `nodeBinDir=/Users/simon/.nvm/versions/node/v22.22.3/bin`, listen `127.0.0.1`, port 5580. Plugin writes + bootstraps `~/Library/LaunchAgents/com.simon.indigo-matter.plist`; run.sh retired. Loopback bind confirmed in matter-server.log; 5 nodes intact; control + restart validated.
+- **jarvis cutover:** `manageLaunchAgent` ON, `nodeBinDir=/Users/simon/.nvm/versions/node/v22.22.3/bin`, listen `127.0.0.1`, port 5580. Plugin writes + bootstraps `~/Library/LaunchAgents/com.simons-plugins.indigo-matter.plist`; run.sh retired. Loopback bind confirmed in matter-server.log; 5 nodes intact; control + restart validated.
 
 **Docs (PR #29 → 2026.0.7):** `docs/INSTALL.md` (full matter-server install/setup guide), tidied README (was v1.1/M0–M4), **MIT `LICENSE`** (© 2026 Simon Clark).
 
@@ -212,9 +212,9 @@ Plus two improvements found by live testing: **state priming** (apply get_node s
 
 ## 3. Live environment (jarvis = 192.168.0.41, mounted at `/Volumes/Macintosh HD-1`)
 
-- **matter-server**: npm pkg `matter-server@0.6.2` at `~/indigo-matter`. **Now launched by the plugin-managed LaunchAgent** (`~/Library/LaunchAgents/com.simon.indigo-matter.plist`, written by `ServerProcess` since 2026-06-10): `node ~/indigo-matter/node_modules/matter-server/dist/esm/MatterServer.js --port 5580 --listen-address 127.0.0.1 --storage-path ~/Library/Application Support/com.simon.indigo-matter/matter-server --primary-interface en0`, PATH=`~/.nvm/versions/node/v22.22.3/bin:…`. WS at `ws://127.0.0.1:5580/ws` (loopback-only; BLE off). The old `~/indigo-matter/run.sh` is retired (a backup of its plist is at `~/com.simon.indigo-matter.runsh.plist.bak-*` for rollback). Logs: `~/Library/Logs/indigo-matter/matter-server.{log,err.log}`.
-- **Fabric** (sacred — single point of total loss): `~/Library/Application Support/com.simon.indigo-matter/matter-server/`. Plugin backups (zip) live in the sibling `…/backups/`. A static safety copy from the migration: `~/indigo-matter-fabric-backup-20260610-124145Z`.
-- **Plugin**: installed + running in **Indigo 2025.2**, bundle id `com.simon.indigo-matter`, **version 2026.1.1**. **`manageLaunchAgent` pref is ON** (`nodeBinDir=~/.nvm/versions/node/v22.22.3/bin`, `matterServerListenAddress=127.0.0.1`, port 5580). Plugin restart regenerates the plist (bootstrap no-ops if matter-server already loaded; running server undisturbed).
+- **matter-server**: npm pkg `matter-server@0.6.2` at `~/indigo-matter`. **Now launched by the plugin-managed LaunchAgent** (`~/Library/LaunchAgents/com.simons-plugins.indigo-matter.plist`, written by `ServerProcess` since 2026-06-10): `node ~/indigo-matter/node_modules/matter-server/dist/esm/MatterServer.js --port 5580 --listen-address 127.0.0.1 --storage-path ~/Library/Application Support/com.simons-plugins.indigo-matter/matter-server --primary-interface en0`, PATH=`~/.nvm/versions/node/v22.22.3/bin:…`. WS at `ws://127.0.0.1:5580/ws` (loopback-only; BLE off). The old `~/indigo-matter/run.sh` is retired (a backup of its plist is at `~/com.simons-plugins.indigo-matter.runsh.plist.bak-*` for rollback). Logs: `~/Library/Logs/indigo-matter/matter-server.{log,err.log}`.
+- **Fabric** (sacred — single point of total loss): `~/Library/Application Support/com.simons-plugins.indigo-matter/matter-server/`. Plugin backups (zip) live in the sibling `…/backups/`. A static safety copy from the migration: `~/indigo-matter-fabric-backup-20260610-124145Z`.
+- **Plugin**: installed + running in **Indigo 2025.2**, bundle id `com.simons-plugins.indigo-matter`, **version 2026.1.1**. **`manageLaunchAgent` pref is ON** (`nodeBinDir=~/.nvm/versions/node/v22.22.3/bin`, `matterServerListenAddress=127.0.0.1`, port 5580). Plugin restart regenerates the plist (bootstrap no-ops if matter-server already loaded; running server undisturbed).
 - **5 commissioned nodes** (Indigo device ids):
   - matterRelay `714038249` (OnOff Light) · matterDimmer `507300015` · matterColorDimmer `200619536` (node `0xF`; recreated 2026-06-09 with the colour-support-props fix, replaces old `747107241`) · matterTemperatureSensor `1824758566` · matterThermostat `1118330069`
 - **MCP control**: `mcp__indigo__*` (restart_plugin, query_event_log, get_devices_by_type, get_device_by_id, get_devices_by_state, device_turn_on/off, device_set_brightness, device_set_rgb_color, device_set_white_levels, thermostat_set_heat_setpoint, thermostat_set_hvac_mode). `get_device_by_id` only shows relay/dimmer fields — use `get_devices_by_state {"sensorValue": "<0"}` etc. to read custom states.
@@ -227,7 +227,7 @@ DST="/Volumes/Macintosh HD-1/Library/Application Support/Perceptive Automation/I
 rsync -rc --exclude='__pycache__' --exclude='*.pyc' "$SRC/Server Plugin/" "$DST/Server Plugin/"
 rsync -c "$SRC/Info.plist" "$DST/Info.plist"
 # verify: md5 -q "$SRC/Server Plugin/plugin.py" vs "$DST/Server Plugin/plugin.py"
-# then: mcp__indigo__restart_plugin(plugin_id="com.simon.indigo-matter")
+# then: mcp__indigo__restart_plugin(plugin_id="com.simons-plugins.indigo-matter")
 ```
 **First-time install only** is double-click; updates are rsync + restart. The plugin reconciles on every (re)start and via `node_added`. **Verify health** after restart via `mcp__indigo__query_event_log` → expect `connected to matter-server, listening` + `reconciled 5 Matter node(s)`. **Cannot exec on jarvis** (SSH to the prod host is blocked) — read/write its disk via the mount; trigger plugin **menu actions** (backup/restore) only via the Indigo UI (no MCP hook).
 
@@ -259,7 +259,7 @@ Dumps `server_info` + `get_nodes`/`get_node` + toggles. Run: `source ~/.nvm/nvm.
 Domio no longer commissions; it relays a **share code** (Apple Home is admin 1; the plugin joins as admin 2 over IP).
 
 - **Plugin change made:** `matter_client.commission_with_code` now passes `network_only=true` → IP-only discovery + PASE/CASE, no BLE (verified vs source: `commissionNode` uses `ble: bleEnabled && !onNetworkOnly`). Matter commissioning *adds* a fabric → Apple Home untouched.
-- **Contract v1.1 verified against live code:** bundle `com.simon.indigo-matter`; handlers `status` / `commission` (POST create + GET `commission/{jobId}` poll) / `decommission` / `diagnostics`; params `setupCode/suggestedName/suggestedRoom/discriminator/domioNodeId` (URL query); status enum `pending,commissioning,reading_descriptors,creating_devices,success,failed`; result `{nodeId(hex string),indigoDeviceIds,primaryDeviceId,vendorName,productName,…}`. Auth enforced by Indigo/Reflector before the handler. I do NOT currently read `X-Matter-API-Version` (harmless).
+- **Contract v1.1 verified against live code:** bundle `com.simons-plugins.indigo-matter`; handlers `status` / `commission` (POST create + GET `commission/{jobId}` poll) / `decommission` / `diagnostics`; params `setupCode/suggestedName/suggestedRoom/discriminator/domioNodeId` (URL query); status enum `pending,commissioning,reading_descriptors,creating_devices,success,failed`; result `{nodeId(hex string),indigoDeviceIds,primaryDeviceId,vendorName,productName,…}`. Auth enforced by Indigo/Reflector before the handler. I do NOT currently read `X-Matter-API-Version` (harmless).
 - **Domio contract file:** `domio-code/docs/API.md` (mirror of `indigo-matter/docs/API.md`, v1.1). Their client: `domio-code/.../Services/MatterAPIClient.swift`.
 
 ## 6. Architecture quick map (`Contents/Server Plugin/`)

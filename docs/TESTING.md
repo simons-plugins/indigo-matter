@@ -143,6 +143,6 @@ testers running real devices are part of the methodology, not an afterthought.
 If you test a new device, file what you find (good or bad) at
 [github.com/simons-plugins/indigo-matter/issues](https://github.com/simons-plugins/indigo-matter/issues),
 ideally with the endpoint's cluster list from
-`GET …/message/com.simon.indigo-matter/diagnostics?nodeId=0x…` — unknown
+`GET …/message/com.simons-plugins.indigo-matter/diagnostics?nodeId=0x…` — unknown
 devices also appear in Indigo as a *"Matter Device (unsupported clusters)"*
 placeholder whose settings list exactly the cluster ids to report.

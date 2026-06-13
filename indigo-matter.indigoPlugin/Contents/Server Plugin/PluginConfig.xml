@@ -24,7 +24,7 @@
             Only used when the LaunchAgent is managed automatically.</Description>
     </Field>
     <Field id="storagePath" type="textfield"
-           defaultValue="~/Library/Application Support/com.simon.indigo-matter/matter-server">
+           defaultValue="~/Library/Application Support/com.simons-plugins.indigo-matter/matter-server">
         <Label>matter-server storage path:</Label>
     </Field>
     <!-- No plugin HTTP port: the Domio API is served by the Indigo Web Server

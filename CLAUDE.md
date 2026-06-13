@@ -8,7 +8,7 @@
 - **Type**: Indigo plugin
 - **Shortcut**: `matter`
 - **GitHub**: https://github.com/simons-plugins/indigo-matter
-- **Language**: Python 3.11+ (`CFBundleIdentifier` `com.simon.indigo-matter`)
+- **Language**: Python 3.11+ (`CFBundleIdentifier` `com.simons-plugins.indigo-matter`)
 
 ## Role in the workspace
 
@@ -50,7 +50,7 @@ loop→Indigo writes go straight through `device_sync.apply_states` (thread-safe
 | `matter_handlers/` | One `ClusterHandler` per cluster + registry (OnOff in v1) |
 
 **HTTP transport:** the Domio API is served by the **Indigo Web Server** as
-`<Action uiPath="hidden">` handlers at `…/message/com.simon.indigo-matter/{handler}`,
+`<Action uiPath="hidden">` handlers at `…/message/com.simons-plugins.indigo-matter/{handler}`,
 reached over the Reflector with the same Bearer API key Domio already uses — **not** a
 standalone server (aiohttp is absent from Indigo's framework Python). See `docs/API.md` v1.1.
 

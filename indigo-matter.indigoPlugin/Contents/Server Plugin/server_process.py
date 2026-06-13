@@ -29,7 +29,7 @@ import shutil
 import subprocess
 from typing import Any, Callable, Optional
 
-LABEL = "com.simon.indigo-matter"
+LABEL = "com.simons-plugins.indigo-matter"
 DEFAULT_PROJECT_DIRNAME = "indigo-matter"   # ~/indigo-matter (npm install location)
 NPX_CANDIDATES = ("/opt/homebrew/bin/npx", "/usr/local/bin/npx")
 MATTER_SERVER_PACKAGE = "matter-server"

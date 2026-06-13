@@ -146,7 +146,7 @@ def http_commission(self, action, dev=None, caller_waiting_for_result=None):
     # ... bridge into the loop: self.runtime.submit(coro).result(timeout) ...
 ```
 
-**URL shape:** `…/message/com.simon.indigo-matter/{handler}[/{pathArg}]`,
+**URL shape:** `…/message/com.simons-plugins.indigo-matter/{handler}[/{pathArg}]`,
 reachable locally on `:8176` and remotely via the Reflector
 (`https://{reflector}.indigodomo.net/message/…`) with the same
 `Authorization: Bearer {key}` Domio already uses.
