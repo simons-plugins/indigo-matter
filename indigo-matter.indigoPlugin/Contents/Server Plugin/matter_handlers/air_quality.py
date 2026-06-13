@@ -89,6 +89,8 @@ class CO2Handler(_SensorHandler):
     cluster_id = 0x040D
     cluster_name = "CarbonDioxideConcentrationMeasurement"
     device_type_id = "matterCO2Sensor"
+    decimal_places = 1
+    unit = " ppm"
 
     def transform(self, value: Any) -> float:
         return round(float(value), 1)  # ppm, MeasuredValue is a float
@@ -100,6 +102,8 @@ class PM25Handler(_SensorHandler):
     cluster_id = 0x042A
     cluster_name = "PM25ConcentrationMeasurement"
     device_type_id = "matterPM25Sensor"
+    decimal_places = 1
+    unit = " µg/m³"
 
     def transform(self, value: Any) -> float:
         return round(float(value), 1)  # µg/m³, MeasuredValue is a float
@@ -117,6 +121,7 @@ class TVOCHandler(_SensorHandler):
     cluster_id = 0x042E
     cluster_name = "TotalVolatileOrganicCompoundsConcentrationMeasurement"
     device_type_id = "matterTVOCSensor"
+    decimal_places = 1  # unit device-dependent (ppb or µg/m³) — no suffix until 0x0008 is read
 
     def transform(self, value: Any) -> float:
         return round(float(value), 1)  # units device-dependent (ppb or µg/m³)

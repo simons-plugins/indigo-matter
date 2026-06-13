@@ -138,3 +138,37 @@ def test_binary_sensor_handlers_carry_on_state_display_props():
     for handler_cls in (OccupancyHandler, ContactHandler):
         props = handler_cls.display_props
         assert props == {"SupportsOnState": True, "SupportsSensorValue": False}, handler_cls
+
+
+# ---------------------------------------------------------------------------
+# Display formatting (uiValue + decimalPlaces) — without these Indigo renders
+# a rounded float at full precision (the "6 decimal places" report).
+# ---------------------------------------------------------------------------
+
+def test_numeric_sensor_format_kv_adds_uivalue_and_decimal_places():
+    assert TemperatureHandler().format_kv({"sensorValue": 21.5}) == [
+        {"key": "sensorValue", "value": 21.5, "decimalPlaces": 1, "uiValue": "21.5 °C"}
+    ]
+    assert HumidityHandler().format_kv({"sensorValue": 47.5}) == [
+        {"key": "sensorValue", "value": 47.5, "decimalPlaces": 1, "uiValue": "47.5%"}
+    ]
+    assert IlluminanceHandler().format_kv({"sensorValue": 123.4}) == [
+        {"key": "sensorValue", "value": 123.4, "decimalPlaces": 0, "uiValue": "123 lux"}
+    ]
+    assert PressureHandler().format_kv({"sensorValue": 1013.0}) == [
+        {"key": "sensorValue", "value": 1013.0, "decimalPlaces": 0, "uiValue": "1013 hPa"}
+    ]
+    assert FlowHandler().format_kv({"sensorValue": 2.5}) == [
+        {"key": "sensorValue", "value": 2.5, "decimalPlaces": 1, "uiValue": "2.5 m³/h"}
+    ]
+
+
+def test_binary_sensor_format_kv_passes_through_unformatted():
+    # Occupancy/contact display on/off — a numeric uiValue/decimalPlaces would
+    # be meaningless and must NOT be attached.
+    assert OccupancyHandler().format_kv({"onOffState": True}) == [
+        {"key": "onOffState", "value": True}
+    ]
+    assert ContactHandler().format_kv({"onOffState": False}) == [
+        {"key": "onOffState", "value": False}
+    ]

@@ -92,6 +92,21 @@ class ClusterHandler(ABC):
     def on_attribute_update(self, indigo_dev: Any, attribute_id: int, value: Any) -> dict:
         """Translate a Matter attribute change to Indigo state updates."""
 
+    def format_kv(self, states: dict) -> list:
+        """Turn a ``{state_key: value}`` dict into an Indigo ``updateStatesOnServer``
+        kvlist.
+
+        The default is a plain ``[{"key": k, "value": v}, …]`` — identical to
+        the bare mapping callers used before this hook existed.  Override to
+        attach ``uiValue`` / ``decimalPlaces`` so a numeric state renders at a
+        sensible precision in the Indigo UI instead of the raw float
+        (a ``round(x, 2)`` still displays as ``21.340000000001`` without it —
+        the 6-dp problem).  ``device_sync`` calls this for every state write a
+        handler produces, so formatting lives next to the cluster that owns the
+        value rather than in the generic write seam.
+        """
+        return [{"key": key, "value": value} for key, value in states.items()]
+
     def on_node_event(self, indigo_dev: Any, event_id: int, data: Any) -> dict:
         """Translate a Matter cluster event to Indigo state updates.
 

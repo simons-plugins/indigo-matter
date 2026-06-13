@@ -33,6 +33,24 @@ class _SensorHandler(ClusterHandler):
     # (SupportsOnState=True) makes value sensors display "off" forever
     # (issue #56). Binary subclasses override with the on/off pair.
     display_props = {"SupportsSensorValue": True, "SupportsOnState": False}
+    #: UI display precision + unit suffix for the numeric reading.  Without a
+    #: uiValue/decimalPlaces Indigo renders the raw float — a rounded 21.34 can
+    #: still show as 21.340000000001 (the 6-dp problem).  ``decimal_places=None``
+    #: (the boolean sensors below) means "don't format" — the value passes
+    #: through unchanged so the on/off display is untouched.
+    decimal_places: Optional[int] = None
+    unit: str = ""
+
+    def format_kv(self, states: dict) -> list:
+        out: list = []
+        for key, value in states.items():
+            entry = {"key": key, "value": value}
+            if (key == self.state_key and self.decimal_places is not None
+                    and isinstance(value, (int, float)) and not isinstance(value, bool)):
+                entry["decimalPlaces"] = self.decimal_places
+                entry["uiValue"] = f"{value:.{self.decimal_places}f}{self.unit}"
+            out.append(entry)
+        return out
 
     def create_indigo_devices(self, node: Any, endpoint: Any) -> list[IndigoDeviceSpec]:
         name = node.suggested_name or node.product_name or f"Matter {node.node_id}"
@@ -70,6 +88,8 @@ class TemperatureHandler(_SensorHandler):
     cluster_id = 0x0402
     cluster_name = "TemperatureMeasurement"
     device_type_id = "matterTemperatureSensor"
+    decimal_places = 1
+    unit = " °C"
 
     def transform(self, value: Any) -> float:
         return round(int(value) / 100.0, 2)  # 0.01 °C → °C
@@ -79,6 +99,8 @@ class HumidityHandler(_SensorHandler):
     cluster_id = 0x0405
     cluster_name = "RelativeHumidityMeasurement"
     device_type_id = "matterHumiditySensor"
+    decimal_places = 1
+    unit = "%"
 
     def transform(self, value: Any) -> float:
         return round(int(value) / 100.0, 1)  # 0.01 %RH → %RH
@@ -110,6 +132,8 @@ class IlluminanceHandler(_SensorHandler):
     cluster_id = 0x0400
     cluster_name = "IlluminanceMeasurement"
     device_type_id = "matterIlluminanceSensor"
+    decimal_places = 0
+    unit = " lux"
 
     def transform(self, value: Any) -> float:
         raw = int(value)
@@ -122,6 +146,8 @@ class PressureHandler(_SensorHandler):
     cluster_id = 0x0403
     cluster_name = "PressureMeasurement"
     device_type_id = "matterPressureSensor"
+    decimal_places = 0
+    unit = " hPa"
 
     def transform(self, value: Any) -> float:
         # MeasuredValue is int16 in units of 0.1 kPa.
@@ -135,6 +161,8 @@ class FlowHandler(_SensorHandler):
     cluster_id = 0x0404
     cluster_name = "FlowMeasurement"
     device_type_id = "matterFlowSensor"
+    decimal_places = 1
+    unit = " m³/h"
 
     def transform(self, value: Any) -> float:
         # MeasuredValue is uint16 in units of 0.1 m³/h.
