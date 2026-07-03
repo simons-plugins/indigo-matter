@@ -102,7 +102,12 @@ Health check. Domio calls this at the start of every commissioning flow as a pre
 
 ### 3.2 `POST …/message/com.simons-plugins.indigo-matter/commission`
 
-Submit a setup code for commissioning into the Indigo fabric. Called by Domio immediately after it has opened a commissioning window on the device from its own fabric (multi-admin handoff, see ADR §C3).
+Submit a setup code for commissioning into the Indigo fabric as a second admin (multi-admin handoff; workspace ADR-0004). The setup code Domio forwards here can come from either supported flow:
+
+- **C4 — Apple Home / Alexa share (default).** The device is commissioned as admin 1 by the user's existing ecosystem (Apple Home, Alexa, …), which opens a pairing/commissioning window from **its own** fabric. Domio captures the resulting setup code (manual entry or scan) and forwards it here; `domioNodeId` and `expectedFabricSlots` are absent.
+- **C3 — Domio direct commissioning.** Domio commissions the factory-fresh device onto **its own** transient fabric via `MatterSupport`/`MatterExtension`, then opens a commissioning window itself and auto-forwards the fresh setup code — no third-party ecosystem involved, and the device never joins Apple Home. Domio additionally sends `domioNodeId` (its own fabric's node id, for log correlation) and may send `expectedFabricSlots` (a hint that the device should still have at least N fabric slots free after Indigo joins).
+
+Either way the plugin's join is identical: a setup code is a setup code, indistinguishable by source, and joins over IP as the Indigo fabric's second (or third, under C3) admin.
 
 **Request parameters** (URL query items):
 
@@ -113,7 +118,7 @@ Submit a setup code for commissioning into the Indigo fabric. Called by Domio im
 | `suggestedName` | string | yes | User-chosen friendly name. Applied to all created Indigo devices (with " (endpoint N)" suffix for multi-endpoint nodes). |
 | `suggestedRoom` | string | no | Indigo room name. Devices are placed here on creation. If the room doesn't exist, the plugin creates it. |
 | `domioNodeId` | string | no | Domio's nodeId for this device on its own fabric. Logged for correlation only. |
-| `expectedFabricSlots` | int | no | Hint from Domio that this device should have at least N fabric slots available. Plugin logs a warning if matter-server reports fewer. |
+| `expectedFabricSlots` | int | no | Hint from Domio (C3 only) that the device should still have at least N fabric slots free after this join. The plugin computes available slots as the interviewed node's Operational Credentials `SupportedFabrics − CommissionedFabrics` and logs a warning (job still succeeds) if that's fewer than N, or stays silent if the node's interview snapshot didn't expose those attributes. |
 
 **Response 202:** commissioning started.
 
