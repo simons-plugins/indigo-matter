@@ -169,6 +169,19 @@ ZOO = {
         _raw(19, {1: {"29/0": [{"0": 116}], "84/0": 0}}),
         {1: []},
     ),
+    # IKEA GRILLPLATS-shaped split-endpoint energy (issue #79): the relay
+    # lives on ep1, ElectricalPower/Energy/PowerTopology on a dedicated ep2
+    # (Matter 1.3 "Electrical Sensor" device type 0x0510). The registry has no
+    # DeviceSync, so it only sees per-endpoint cluster→handler mapping — ep2's
+    # electrical clusters are merge-only and produce no primary spec of their
+    # own; the meter-link resolution that attributes them to ep1 is a
+    # DeviceSync concern, asserted in test_device_sync.py instead.
+    "grillplats_split_energy": (
+        _raw(0x34, {1: {"29/0": [{"0": 266}], "3/0": 0, "4/0": 0, "6/0": False},
+                    2: {"29/0": [{"0": 0x0510}], "144/8": 1200,
+                        "145/1": {"energy": 1}, "156/65532": 1}}),
+        {1: ["matterRelay"], 2: []},
+    ),
 }
 
 

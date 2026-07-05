@@ -35,7 +35,16 @@ from matter_model import (
     parse_node,
 )
 from matter_handlers.base import IndigoDeviceSpec
-from matter_handlers.electrical import CLUSTER_ELECTRICAL_ENERGY, CLUSTER_ELECTRICAL_POWER
+from matter_handlers.electrical import (
+    ATTR_ACTIVE_ENDPOINTS,
+    ATTR_AVAILABLE_ENDPOINTS,
+    ATTR_POWER_TOPOLOGY_FEATURE_MAP,
+    CLUSTER_ELECTRICAL_ENERGY,
+    CLUSTER_ELECTRICAL_POWER,
+    CLUSTER_POWER_TOPOLOGY,
+    FEATURE_DYNAMIC_POWER_FLOW,
+    FEATURE_SET_TOPOLOGY,
+)
 from matter_handlers.power_source import CLUSTER_POWER_SOURCE
 from protocol import MatterCommand
 
@@ -63,6 +72,15 @@ _NON_DEVICE_CLUSTERS = frozenset({
     0x0062,  # ScenesManagement (Matter 1.3 id)
     0x0090,  # ElectricalPowerMeasurement (merge-only)
     0x0091,  # ElectricalEnergyMeasurement (merge-only)
+    0x009C,  # PowerTopology (merge-only; drives meter-link resolution, issue #79)
+})
+
+#: Electrical clusters annotated in the _unknown_spec log/props when they
+#: co-occur with a genuinely-unsupported cluster on the same endpoint (issue
+#: #79 point 3) — distinct from _NON_DEVICE_CLUSTERS, which also includes
+#: plain utility clusters (Identify, Groups, …) that aren't worth calling out.
+_ELECTRICAL_MERGE_CLUSTERS = frozenset({
+    CLUSTER_ELECTRICAL_POWER, CLUSTER_ELECTRICAL_ENERGY, CLUSTER_POWER_TOPOLOGY,
 })
 
 
@@ -94,6 +112,7 @@ _ROLE_LABELS = {
     "matterCO2Sensor": "CO₂",
     "matterPM25Sensor": "PM2.5",
     "matterTVOCSensor": "TVOC",
+    "matterEnergyMeter": "Energy",
     "matterUnknown": "Unsupported",
 }
 
@@ -113,6 +132,15 @@ class DeviceSync:
         self._index: dict[tuple[int, int], dict[str, int]] = {}
         self._active: set[int] = set()
         self._lock = threading.RLock()
+        # Meter-link maps for split-endpoint energy measurement (issue #79 —
+        # e.g. IKEA GRILLPLATS: relay on ep1, ElectricalPower/Energy on ep2).
+        # Deterministic from the node model, rebuilt by _resolve_meter_links on
+        # every create_devices/reconcile pass — never persisted.
+        # Forward: (node_id, source_ep) -> target_ep, for live attribute routing.
+        self._forward_links: dict[tuple[int, int], int] = {}
+        # Reverse: (node_id, target_ep) -> {source_eps}, for state priming and
+        # capability-prop self-heal (both start from the target device).
+        self._reverse_links: dict[tuple[int, int], set[int]] = {}
 
     # ------------------------------------------------------------------
     # Active-device tracking (deviceStartComm/deviceStopComm)
@@ -180,18 +208,41 @@ class DeviceSync:
         2. If that type is present in the endpoint's type-map → return it.
         3. Else fall back to ``lookup(node, ep)`` (single/first device) —
            covers merge-into cases: FanControl→thermostat, Electrical→relay.
+
+        Electrical measurement clusters (0x0090/0x0091) are rewritten to their
+        linked target endpoint FIRST (issue #79 — split-endpoint energy, e.g.
+        IKEA GRILLPLATS): the electrical handlers have no ``device_type_id``,
+        so without this rewrite step 3's bare ``lookup()`` would resolve (or
+        fail to resolve) against the source endpoint itself, which has no
+        device when the link succeeded.
         """
+        nid, eid = int(node_id), int(endpoint_id)
+        if cluster in (CLUSTER_ELECTRICAL_POWER, CLUSTER_ELECTRICAL_ENERGY):
+            with self._lock:
+                target = self._forward_links.get((nid, eid))
+            if target is not None:
+                eid = target
+                # The linked target endpoint may host more than one device
+                # (e.g. a colour light); prefer the meter-capable one over the
+                # sole/first-device fallback in step 3 so a multi-device
+                # endpoint can never mis-route an energy reading.
+                with self._lock:
+                    type_map = self._index.get((nid, eid))
+                if type_map:
+                    for cap_type in _METER_CAPABLE_TYPES:
+                        if cap_type in type_map:
+                            return type_map[cap_type]
         handler = self.registry.handler_for_cluster(cluster)
         if handler is None:
             return None
         type_id = getattr(handler, "device_type_id", "") or ""
         if type_id:
             with self._lock:
-                type_map = self._index.get((int(node_id), int(endpoint_id)))
+                type_map = self._index.get((nid, eid))
                 if type_map and type_id in type_map:
                     return type_map[type_id]
         # Fallback: use the single/first device on the endpoint
-        return self.lookup(node_id, endpoint_id)
+        return self.lookup(nid, eid)
 
     def note_device(self, dev: Any) -> None:
         """Index a single device from its pluginProps (deviceStartComm)."""
@@ -298,22 +349,45 @@ class DeviceSync:
             node_has_power_source = any(
                 endpoint.has(CLUSTER_POWER_SOURCE) for endpoint in node.endpoints
             )
+            # Pass 1: cache every endpoint's handler-produced specs BEFORE any
+            # fallback/placeholder decision. Meter-link resolution (issue #79)
+            # needs to know which endpoints will host a _METER_CAPABLE_TYPES
+            # device regardless of endpoint iteration order — precedent for
+            # pre-loop node-wide computation is the SupportsBatteryLevel scan
+            # just above.
+            specs_by_ep: dict[int, list] = {
+                int(endpoint.endpoint_id): self.registry.handlers_for_endpoint(node, endpoint)
+                for endpoint in node.endpoints
+            }
+            self._resolve_meter_links(node, specs_by_ep)
+
             for endpoint in node.endpoints:
-                specs = self.registry.handlers_for_endpoint(node, endpoint)
+                eid = int(endpoint.endpoint_id)
+                ep_key = (int(node.node_id), eid)
+                specs = list(specs_by_ep[eid])
                 if not specs:
-                    # No handler claimed this endpoint. If it carries clusters
-                    # that DO make it a device (just ones we don't support yet),
-                    # surface it as a matterUnknown placeholder instead of
-                    # silently creating nothing — a commission that "succeeds"
-                    # with no visible device is a half-happened op (issue #58).
-                    # Endpoint 0 is the Matter root (utility clusters only) and
-                    # never gets a placeholder.
-                    fallback = self._unknown_spec(node, endpoint)
-                    if fallback is not None:
-                        specs = [fallback]
-                elif self._index.get(
-                    (int(node.node_id), int(endpoint.endpoint_id)), {}
-                ).get("matterUnknown"):
+                    if self._is_meter_source_candidate(endpoint, specs):
+                        # Standalone energy-measurement endpoint (e.g. IKEA
+                        # GRILLPLATS ep2): if link resolution found the
+                        # endpoint it measures, no device is created here at
+                        # all — readings route to the linked target via
+                        # _lookup_for_cluster. Otherwise fall back to a
+                        # standalone matterEnergyMeter device rather than the
+                        # matterUnknown placeholder (issue #79).
+                        if ep_key not in self._forward_links:
+                            specs = [self._energy_meter_spec(node, endpoint)]
+                    else:
+                        # No handler claimed this endpoint. If it carries clusters
+                        # that DO make it a device (just ones we don't support yet),
+                        # surface it as a matterUnknown placeholder instead of
+                        # silently creating nothing — a commission that "succeeds"
+                        # with no visible device is a half-happened op (issue #58).
+                        # Endpoint 0 is the Matter root (utility clusters only) and
+                        # never gets a placeholder.
+                        fallback = self._unknown_spec(node, endpoint)
+                        if fallback is not None:
+                            specs = [fallback]
+                elif self._index.get(ep_key, {}).get("matterUnknown"):
                     # The endpoint used to be unsupported (placeholder exists)
                     # but now maps to real device(s) — e.g. a firmware update
                     # added clusters. Never auto-delete a user's device; tell
@@ -326,6 +400,21 @@ class DeviceSync:
                 for spec in specs:
                     if node_has_power_source:
                         spec.props.setdefault("SupportsBatteryLevel", True)
+                    if spec.device_type_id in _METER_CAPABLE_TYPES:
+                        # Central injection (issue #79): a linked source
+                        # endpoint's electrical clusters unlock the meter
+                        # states on the TARGET device. The existing
+                        # same-endpoint checks in on_off/level_control/
+                        # color_control stay untouched — they cover the
+                        # Tapo-style co-located case.
+                        for src_eid in self._reverse_links.get(ep_key, ()):
+                            src_endpoint = self._endpoint_by_id(node, src_eid)
+                            if src_endpoint is None:
+                                continue
+                            if src_endpoint.has(CLUSTER_ELECTRICAL_POWER):
+                                spec.props.setdefault("SupportsPowerMeter", True)
+                            if src_endpoint.has(CLUSTER_ELECTRICAL_ENERGY):
+                                spec.props.setdefault("SupportsEnergyMeter", True)
                     plan.append((endpoint, spec))
 
             multi = len(plan) > 1
@@ -467,6 +556,16 @@ class DeviceSync:
         if not unmapped:
             return None
         name = node.suggested_name or node.product_name or f"Matter {node.node_id}"
+        supported = ", ".join(f"0x{c:04X}" for c in unmapped)
+        # List merge-only electrical clusters too when they co-occur with a
+        # genuinely-unsupported one, so the log/UI doesn't silently drop them
+        # (issue #79 point 3) — they're real clusters on this endpoint, just
+        # not the reason a placeholder was needed.
+        merge_only = sorted(set(endpoint.cluster_ids) & _ELECTRICAL_MERGE_CLUSTERS)
+        if merge_only:
+            supported += " (endpoint also exposes merge-only {})".format(
+                ", ".join(f"0x{c:04X}" for c in merge_only)
+            )
         return IndigoDeviceSpec(
             device_type_id="matterUnknown",
             name=name,
@@ -475,10 +574,133 @@ class DeviceSync:
                 "endpointId": str(endpoint.endpoint_id),
                 "vendorName": node.vendor_name,
                 "productName": node.product_name,
-                "supportedClusters": ", ".join(f"0x{c:04X}" for c in unmapped),
+                "supportedClusters": supported,
             },
             initial_states={"reachable": True},
         )
+
+    @staticmethod
+    def _energy_meter_spec(node: NodeInfo, endpoint: Any) -> IndigoDeviceSpec:
+        """Fallback spec for a standalone energy-measurement endpoint whose
+        reading can't be attributed to any actuator endpoint (issue #79) —
+        e.g. a bridge, or a power strip with more than one relay and no
+        SetTopology endpoint list. Sibling of ``_unknown_spec`` — built
+        directly by device_sync, not via a registered ``ClusterHandler``
+        (``is_primary_for`` has no access to cross-endpoint link state;
+        ``_unknown_spec`` is the established device_sync-owned-spec
+        precedent). ElectricalPowerHandler/ElectricalEnergyHandler then write
+        to this device via the normal per-endpoint route — no link needed,
+        since the device lives on the source endpoint itself.
+        """
+        name = node.suggested_name or node.product_name or f"Matter {node.node_id}"
+        return IndigoDeviceSpec(
+            device_type_id="matterEnergyMeter",
+            name=name,
+            props={
+                "nodeId": str(node.node_id),
+                "endpointId": str(endpoint.endpoint_id),
+                "vendorName": node.vendor_name,
+                "productName": node.product_name,
+            },
+            initial_states={"curEnergyLevel": 0.0, "accumEnergyTotal": 0.0, "reachable": True},
+        )
+
+    @staticmethod
+    def _endpoint_by_id(node: NodeInfo, endpoint_id: int) -> Optional[Any]:
+        for endpoint in node.endpoints:
+            if int(endpoint.endpoint_id) == endpoint_id:
+                return endpoint
+        return None
+
+    @staticmethod
+    def _is_meter_source_candidate(endpoint: Any, specs: list) -> bool:
+        """A device-bearing endpoint that has 0x0090/0x0091 but produces no
+        primary handler spec of its own — a standalone energy-measurement
+        endpoint whose reading must be attributed to another endpoint, or
+        fall back to a standalone matterEnergyMeter device (issue #79).
+
+        Requires the endpoint's clusters to be otherwise entirely within
+        _NON_DEVICE_CLUSTERS (the same bar _unknown_spec uses): an endpoint
+        that ALSO carries a genuinely-unsupported cluster is not a "pure"
+        energy-measurement endpoint, so it must fall through to the
+        matterUnknown placeholder path instead — otherwise the unsupported
+        cluster is silently dropped with no placeholder and no log line,
+        reintroducing the exact "commission succeeds with nothing visible"
+        failure mode issue #58 fixed.
+        """
+        if int(endpoint.endpoint_id) == 0 or specs:
+            return False
+        if not (endpoint.has(CLUSTER_ELECTRICAL_POWER) or endpoint.has(CLUSTER_ELECTRICAL_ENERGY)):
+            return False
+        return not (set(endpoint.cluster_ids) - _NON_DEVICE_CLUSTERS)
+
+    def _resolve_meter_target(self, node: NodeInfo, source_endpoint: Any,
+                              meter_capable_eps: set) -> Optional[int]:
+        """Resolve the single endpoint a candidate source endpoint's energy
+        readings should be attributed to, or None if attribution is ambiguous
+        (caller falls back to a standalone matterEnergyMeter device).
+
+        1. SetTopology (0x009C FeatureMap bit 2): read AvailableEndpoints
+           (preferring ActiveEndpoints when DynamicPowerFlow is also set) and
+           link only when exactly one listed endpoint hosts a
+           _METER_CAPABLE_TYPES device.
+        2. NodeTopology, no 0x009C at all, or SetTopology attrs unreadable:
+           the node's SINGLE endpoint hosting a _METER_CAPABLE_TYPES device
+           (the "sole actuator" heuristic) — zero or more than one candidate
+           means attribution is ambiguous, so no link is made. Never guess on
+           a multi-actuator node (bridges, power strips without SetTopology).
+        """
+        eid = int(source_endpoint.endpoint_id)
+        feature_map = node.attributes.get(
+            (eid, CLUSTER_POWER_TOPOLOGY, ATTR_POWER_TOPOLOGY_FEATURE_MAP)
+        )
+        if source_endpoint.has(CLUSTER_POWER_TOPOLOGY) and isinstance(feature_map, int) \
+                and feature_map & FEATURE_SET_TOPOLOGY:
+            attr_id = ATTR_ACTIVE_ENDPOINTS if feature_map & FEATURE_DYNAMIC_POWER_FLOW \
+                else ATTR_AVAILABLE_ENDPOINTS
+            listed = node.attributes.get((eid, CLUSTER_POWER_TOPOLOGY, attr_id))
+            if isinstance(listed, list):
+                candidates = sorted({int(e) for e in listed} & meter_capable_eps)
+                return candidates[0] if len(candidates) == 1 else None
+            # SetTopology bit set but the endpoint-list attribute is
+            # unreadable — fall through to the sole-actuator heuristic below.
+        candidates = sorted(meter_capable_eps)
+        return candidates[0] if len(candidates) == 1 else None
+
+    def _resolve_meter_links(self, node: NodeInfo, specs_by_ep: dict) -> None:
+        """Rebuild this node's meter-link maps (issue #79 — split-endpoint
+        energy measurement).
+
+        No persistent storage: rebuilt from the node model on every
+        create_devices call (commission, node_added, reconcile), so a stale
+        link from a prior interview state self-heals automatically.
+        """
+        node_id = int(node.node_id)
+        with self._lock:
+            self._forward_links = {
+                k: v for k, v in self._forward_links.items() if k[0] != node_id
+            }
+            self._reverse_links = {
+                k: v for k, v in self._reverse_links.items() if k[0] != node_id
+            }
+        meter_capable_eps = {
+            eid for eid, specs in specs_by_ep.items()
+            if any(spec.device_type_id in _METER_CAPABLE_TYPES for spec in specs)
+        }
+        forward: dict[tuple[int, int], int] = {}
+        reverse: dict[tuple[int, int], set] = {}
+        for endpoint in node.endpoints:
+            eid = int(endpoint.endpoint_id)
+            if not self._is_meter_source_candidate(endpoint, specs_by_ep.get(eid, [])):
+                continue
+            target_eid = self._resolve_meter_target(node, endpoint, meter_capable_eps)
+            if target_eid is None:
+                continue
+            forward[(node_id, eid)] = target_eid
+            reverse.setdefault((node_id, target_eid), set()).add(eid)
+        with self._lock:
+            self._forward_links.update(forward)
+            self._reverse_links.update(reverse)
 
     def _create_one(self, spec: Any, name: str, folder_id: int = 0,
                     model: str = "") -> Optional[int]:
@@ -595,7 +817,9 @@ class DeviceSync:
 
         Two passes: first the device's own endpoint (standard clusters); then any
         OTHER endpoints whose cluster handler is node-scoped (e.g. PowerSource on
-        endpoint 0 primes battery level into a sensor on endpoint 1).
+        endpoint 0 primes battery level into a sensor on endpoint 1), OR that are
+        a linked meter-source endpoint for this device (issue #79 — split-endpoint
+        energy, e.g. IKEA GRILLPLATS ep2's ActivePower priming the ep1 relay).
 
         Within the own endpoint, skip attributes whose cluster's handler targets
         a *different* existing device on the same endpoint (fix/#44: prevents the
@@ -620,14 +844,17 @@ class DeviceSync:
                     self._index.get((int(node.node_id), int(endpoint_id)), {}).keys()
                 )
         dev = indigo.devices[dev_id]
+        with self._lock:
+            linked_sources = self._reverse_links.get((int(node.node_id), int(endpoint_id)), set())
         kv: list = []
         for (ep, cluster, attribute), value in node.attributes.items():
             handler = self.registry.handler_for_cluster(cluster)
             if handler is None:
                 continue
-            # Include attributes from: this device's own endpoint, OR any
-            # node-scoped cluster living on a different endpoint.
-            if ep != endpoint_id and not handler.node_scoped:
+            # Include attributes from: this device's own endpoint, any
+            # node-scoped cluster living on a different endpoint, or a linked
+            # meter-source endpoint (issue #79 — split-endpoint energy).
+            if ep != endpoint_id and not handler.node_scoped and ep not in linked_sources:
                 continue
             # For this device's own endpoint, skip attributes that belong to a
             # sibling device (handler has a non-empty device_type_id that differs
@@ -661,24 +888,43 @@ class DeviceSync:
     # Capability-prop helpers (issue #45 — self-heal mid-interview creations)
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _capability_props(node: NodeInfo, endpoint: Any) -> dict:
+    def _capability_props(self, node: NodeInfo, endpoint: Any) -> dict:
         """Return capability props implied by the node's CURRENT cluster set.
 
         These props unlock Indigo states that handlers write into:
-        - SupportsPowerMeter   → curEnergyLevel   (cluster 0x0090 on the endpoint)
-        - SupportsEnergyMeter  → accumEnergyTotal  (cluster 0x0091 on the endpoint)
+        - SupportsPowerMeter   → curEnergyLevel   (cluster 0x0090 on the endpoint,
+                                                     or on a LINKED source endpoint)
+        - SupportsEnergyMeter  → accumEnergyTotal  (cluster 0x0091 on the endpoint,
+                                                     or on a LINKED source endpoint)
         - SupportsBatteryLevel → batteryLevel      (cluster 0x002F anywhere on the node)
 
         The cluster constants are imported from their handler modules — no magic
         numbers here.  The battery check fans across ALL node endpoints, mirroring
         the create_devices central setdefault that was the original source of truth.
+
+        No longer a ``@staticmethod``: split-endpoint energy (issue #79 — e.g.
+        IKEA GRILLPLATS) needs the instance's meter-link map to fold a linked
+        source endpoint's electrical clusters into the TARGET endpoint's props,
+        so the reconcile self-heal (below) can add meter props to a relay
+        whose energy actually lives on a sibling endpoint.
         """
         props: dict = {}
         if endpoint.has(CLUSTER_ELECTRICAL_POWER):
             props["SupportsPowerMeter"] = True
         if endpoint.has(CLUSTER_ELECTRICAL_ENERGY):
             props["SupportsEnergyMeter"] = True
+        with self._lock:
+            linked_sources = self._reverse_links.get(
+                (int(node.node_id), int(endpoint.endpoint_id)), set()
+            )
+        for src_eid in linked_sources:
+            src_endpoint = self._endpoint_by_id(node, src_eid)
+            if src_endpoint is None:
+                continue
+            if src_endpoint.has(CLUSTER_ELECTRICAL_POWER):
+                props["SupportsPowerMeter"] = True
+            if src_endpoint.has(CLUSTER_ELECTRICAL_ENERGY):
+                props["SupportsEnergyMeter"] = True
         node_has_power_source = any(
             ep.has(CLUSTER_POWER_SOURCE) for ep in node.endpoints
         )
