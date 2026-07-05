@@ -504,6 +504,72 @@ def test_unknown_job_is_404(mock_logger):
     assert code == 404 and body["error"] == "job_not_found"
 
 
+# ----------------------------------------------------------------------
+# expectedFabricSlots (API.md §3.2): warn on low post-join fabric capacity
+# ----------------------------------------------------------------------
+def _node_with_fabrics(supported, commissioned, node_id=0x1):
+    return {
+        "node_id": node_id,
+        "attributes": {
+            "0/62/2": supported,      # SupportedFabrics
+            "0/62/3": commissioned,   # CommissionedFabrics
+        },
+    }
+
+
+def test_expected_fabric_slots_warns_when_fewer_available(mock_logger):
+    async def scenario():
+        matter = FakeMatter(node_id=0x1, node=_node_with_fabrics(5, 4))
+        jobs = _jobs(matter, mock_logger, schedule=asyncio.ensure_future)
+        _, body = jobs.create_job({
+            "setupCode": "12345678901", "suggestedName": "X", "expectedFabricSlots": "3",
+        })
+        final = await _await_terminal(jobs, body["jobId"])()
+        assert final["status"] == "success"  # diagnostic only, never blocking
+        mock_logger.warning.assert_called_once()
+        logged = str(mock_logger.warning.call_args)
+        assert body["jobId"] in logged and "fabric slot" in logged
+        assert ", 1, 3)" in logged  # available=1, expected=3
+    asyncio.run(scenario())
+
+
+def test_expected_fabric_slots_silent_when_sufficient(mock_logger):
+    async def scenario():
+        matter = FakeMatter(node_id=0x1, node=_node_with_fabrics(5, 2))
+        jobs = _jobs(matter, mock_logger, schedule=asyncio.ensure_future)
+        _, body = jobs.create_job({
+            "setupCode": "12345678901", "suggestedName": "X", "expectedFabricSlots": "3",
+        })
+        await _await_terminal(jobs, body["jobId"])()
+        mock_logger.warning.assert_not_called()
+    asyncio.run(scenario())
+
+
+def test_expected_fabric_slots_silent_when_absent_from_node(mock_logger):
+    async def scenario():
+        # Interview snapshot has no Operational Credentials attributes at all —
+        # unknown capacity must never be treated as zero / trigger a warning.
+        matter = FakeMatter(node_id=0x1, node={"node_id": 0x1, "attributes": {}})
+        jobs = _jobs(matter, mock_logger, schedule=asyncio.ensure_future)
+        _, body = jobs.create_job({
+            "setupCode": "12345678901", "suggestedName": "X", "expectedFabricSlots": "3",
+        })
+        await _await_terminal(jobs, body["jobId"])()
+        mock_logger.warning.assert_not_called()
+    asyncio.run(scenario())
+
+
+def test_expected_fabric_slots_silent_when_not_requested(mock_logger):
+    async def scenario():
+        # Low capacity, but Domio didn't send the hint — no warning.
+        matter = FakeMatter(node_id=0x1, node=_node_with_fabrics(5, 5))
+        jobs = _jobs(matter, mock_logger, schedule=asyncio.ensure_future)
+        _, body = jobs.create_job({"setupCode": "12345678901", "suggestedName": "X"})
+        await _await_terminal(jobs, body["jobId"])()
+        mock_logger.warning.assert_not_called()
+    asyncio.run(scenario())
+
+
 def test_terminal_jobs_are_reaped_after_retention(mock_logger):
     async def scenario():
         clock = {"t": datetime(2026, 6, 8, 12, 0, tzinfo=timezone.utc)}

@@ -25,7 +25,7 @@ from typing import Any, Awaitable, Callable, Optional
 
 from matter_client import COMMISSION_TIMEOUT
 from matter_model import node_id_to_str  # noqa: F401 - canonical home; re-exported for callers
-from protocol import ProtocolError
+from protocol import Protocol, ProtocolError
 
 
 class JobStatus(str, Enum):
@@ -67,6 +67,39 @@ TIMEOUT_MESSAGE = (
     "the device may still join — check Indigo before retrying"
 )
 
+# Operational Credentials cluster (0x003E), endpoint 0 — SupportedFabrics
+# (0x0002) minus CommissionedFabrics (0x0003) is the remaining fabric capacity
+# after this join, used for the API.md §3.2 `expectedFabricSlots` warning.
+_OP_CREDS_CLUSTER = 0x003E
+_ATTR_SUPPORTED_FABRICS = 0x0002
+_ATTR_COMMISSIONED_FABRICS = 0x0003
+
+
+def _fabric_slots_available(node: dict) -> Optional[int]:
+    """Best-effort read of remaining fabric capacity from the interview payload.
+
+    Returns None (unknown, never treated as zero) if the node's attribute
+    snapshot doesn't include both Operational Credentials attributes.
+    """
+    supported = commissioned = None
+    for key, value in (node.get("attributes") or {}).items():
+        try:
+            endpoint, cluster, attribute = Protocol.parse_attr_key(str(key))
+        except (ValueError, AttributeError):
+            continue
+        if endpoint != 0 or cluster != _OP_CREDS_CLUSTER:
+            continue
+        if attribute == _ATTR_SUPPORTED_FABRICS:
+            supported = value
+        elif attribute == _ATTR_COMMISSIONED_FABRICS:
+            commissioned = value
+    if supported is None or commissioned is None:
+        return None
+    try:
+        return int(supported) - int(commissioned)
+    except (TypeError, ValueError):
+        return None
+
 
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
@@ -105,6 +138,7 @@ class Job:
     suggested_room: Optional[str]
     discriminator: Optional[int] = None
     domio_node_id: Optional[str] = None
+    expected_fabric_slots: Optional[int] = None
     status: JobStatus = PENDING
     progress: float = 0.0
     message: str = ""
@@ -196,6 +230,7 @@ class CommissionJobs:
                 suggested_room=(params.get("suggestedRoom") or None),
                 discriminator=_opt_int(params.get("discriminator")),
                 domio_node_id=(params.get("domioNodeId") or None),
+                expected_fabric_slots=_opt_int(params.get("expectedFabricSlots")),
                 started_at=self._clock(),
             )
             self._jobs[job.job_id] = job
@@ -347,6 +382,7 @@ class CommissionJobs:
 
             self._advance(job, READING_DESCRIPTORS, 0.6, "Discovering device capabilities…")
             node = await self.matter.get_node(node_id)
+            self._warn_if_fabric_slots_short(job, node, node_id)
 
             self._advance(job, CREATING_DEVICES, 0.85, "Creating Indigo devices…")
             created = self._create_devices(node, job.suggested_name, job.suggested_room)
@@ -418,6 +454,22 @@ class CommissionJobs:
             error["matterErrorCode"] = matter_error_code
         job.error = error
         self._advance(job, FAILED, job.progress, "")
+
+    def _warn_if_fabric_slots_short(self, job: Job, node: dict, node_id: Any) -> None:
+        """API.md §3.2 `expectedFabricSlots`: log a warning (never blocking) if
+        the device's post-join fabric capacity is under what Domio expects.
+        Silent when the hint is absent or the interview snapshot didn't include
+        the Operational Credentials attributes (older firmware, partial read)."""
+        if job.expected_fabric_slots is None:
+            return
+        available = _fabric_slots_available(node)
+        if available is None or available >= job.expected_fabric_slots:
+            return
+        self.logger.warning(
+            "commission job %s: node %s reports only %d fabric slot(s) available "
+            "after joining, but Domio expected at least %d (expectedFabricSlots)",
+            job.job_id, node_id_to_str(node_id), available, job.expected_fabric_slots,
+        )
 
     # ------------------------------------------------------------------
     # Internals
