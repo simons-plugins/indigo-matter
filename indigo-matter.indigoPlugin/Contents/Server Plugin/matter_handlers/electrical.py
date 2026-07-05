@@ -32,7 +32,8 @@ CLUSTER_POWER_TOPOLOGY = 0x009C
 # FeatureMap (global attribute 0xFFFC, present on every cluster).
 ATTR_POWER_TOPOLOGY_FEATURE_MAP = 0xFFFC
 
-# Power Topology FeatureMap bits (Matter 1.3 spec §2.11.4).
+# Power Topology FeatureMap bits (connectedhomeip power-topology-cluster.xml /
+# src/app_clusters/PowerTopology.adoc).
 FEATURE_NODE_TOPOLOGY = 1 << 0        # "measures the whole node" — no endpoint list
 FEATURE_TREE_TOPOLOGY = 1 << 1
 FEATURE_SET_TOPOLOGY = 1 << 2         # gates AvailableEndpoints (0x0000)

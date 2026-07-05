@@ -182,6 +182,14 @@ ZOO = {
                         "145/1": {"energy": 1}, "156/65532": 1}}),
         {1: ["matterRelay"], 2: []},
     ),
+    # A pump-shaped endpoint (issue #81): OnOff + an extra cluster (0x0200)
+    # this plugin has no handler for at all. The registry still maps OnOff to
+    # a relay — the "leftover cluster" diagnostic that flags 0x0200 is a
+    # DeviceSync concern (asserted in test_device_sync.py), not visible here.
+    "mixed_unmapped": (
+        _raw(0x9B, {1: {"29/0": [{"0": 266}], "6/0": False, "512/0": 0}}),
+        {1: ["matterRelay"]},
+    ),
 }
 
 

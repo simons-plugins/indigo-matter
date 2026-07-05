@@ -141,6 +141,23 @@ class DeviceSync:
         # Reverse: (node_id, target_ep) -> {source_eps}, for state priming and
         # capability-prop self-heal (both start from the target device).
         self._reverse_links: dict[tuple[int, int], set[int]] = {}
+        # Every cluster this plugin recognizes at all — either a registered
+        # ClusterHandler (whether or not it's primary for a given endpoint;
+        # e.g. PowerSource/Electrical never produce a spec of their own but
+        # ARE recognized) or a plain utility cluster. Used by the issue #81
+        # "leftover cluster" diagnostic to distinguish a genuinely-unsupported
+        # cluster from one this plugin already accounts for some other way.
+        self._recognized_clusters = frozenset(
+            h.cluster_id for h in registry.handlers
+        ) | _NON_DEVICE_CLUSTERS
+        # PowerSource-bearing endpoints per node (issue #82 — bridge battery
+        # cross-contamination). Populated by create_devices/_resolve_meter_links-
+        # adjacent bookkeeping on every create pass; consulted by creation,
+        # priming, and live fan-out to decide whether PowerSource is node-wide
+        # (the common single-endpoint case, e.g. FP300: battery on ep0, sensor
+        # on ep1) or must stay confined to its own endpoint (a bridge with
+        # more than one battery-bearing child).
+        self._power_source_eps: dict[int, set[int]] = {}
 
     # ------------------------------------------------------------------
     # Active-device tracking (deviceStartComm/deviceStopComm)
@@ -204,17 +221,20 @@ class DeviceSync:
     def _lookup_for_cluster(self, node_id: Any, endpoint_id: Any, cluster: int) -> Optional[int]:
         """Resolve the correct Indigo device for a non-node-scoped cluster update.
 
+        0. Electrical measurement clusters (0x0090/0x0091) are rewritten to
+           their linked target endpoint FIRST (issue #79 — split-endpoint
+           energy, e.g. IKEA GRILLPLATS): the electrical handlers have no
+           ``device_type_id``, so without this rewrite step 3's bare
+           ``lookup()`` would resolve (or fail to resolve) against the source
+           endpoint itself, which has no device when the link succeeded.
         1. Resolve the handler's ``device_type_id`` (if any).
         2. If that type is present in the endpoint's type-map → return it.
         3. Else fall back to ``lookup(node, ep)`` (single/first device) —
            covers merge-into cases: FanControl→thermostat, Electrical→relay.
 
-        Electrical measurement clusters (0x0090/0x0091) are rewritten to their
-        linked target endpoint FIRST (issue #79 — split-endpoint energy, e.g.
-        IKEA GRILLPLATS): the electrical handlers have no ``device_type_id``,
-        so without this rewrite step 3's bare ``lookup()`` would resolve (or
-        fail to resolve) against the source endpoint itself, which has no
-        device when the link succeeded.
+        Step 0 is numbered to match execution order in the code below, not
+        just to list a concern — it must run before the bare ``lookup()`` in
+        step 3 has a chance to miss the (now-empty) source endpoint.
         """
         nid, eid = int(node_id), int(endpoint_id)
         if cluster in (CLUSTER_ELECTRICAL_POWER, CLUSTER_ELECTRICAL_ENERGY):
@@ -342,13 +362,26 @@ class DeviceSync:
             # not by how many happen to be missing on this pass. A plug's root
             # endpoint 0 produces no handler, so this is not len(node.endpoints).
             plan: list[tuple] = []  # (endpoint, spec)
-            # Detect PowerSource anywhere on the node so we can set
-            # SupportsBatteryLevel on every device we create. Indigo applies
+            # Detect which endpoint(s) carry PowerSource. Indigo applies
             # Supports* via device props at creation, not Devices.xml statics
             # (the colour-support lesson — see HANDOVER 2026-06-09 item 4).
-            node_has_power_source = any(
-                endpoint.has(CLUSTER_POWER_SOURCE) for endpoint in node.endpoints
-            )
+            # Single PowerSource-bearing endpoint (the common case — e.g. FP300:
+            # battery on ep0, sensor on ep1) keeps the original node-wide
+            # behaviour: SupportsBatteryLevel on every device regardless of its
+            # own endpoint. More than one PowerSource-bearing endpoint (a
+            # bridge with multiple battery-powered children) must NOT fan out
+            # node-wide — issue #82's cross-contamination bug — so each
+            # device only gets the prop when ITS OWN endpoint bears PowerSource.
+            power_source_eps = {
+                int(endpoint.endpoint_id) for endpoint in node.endpoints
+                if endpoint.has(CLUSTER_POWER_SOURCE)
+            }
+            multi_power_source = len(power_source_eps) > 1
+            with self._lock:
+                if power_source_eps:
+                    self._power_source_eps[int(node.node_id)] = power_source_eps
+                else:
+                    self._power_source_eps.pop(int(node.node_id), None)
             # Pass 1: cache every endpoint's handler-produced specs BEFORE any
             # fallback/placeholder decision. Meter-link resolution (issue #79)
             # needs to know which endpoints will host a _METER_CAPABLE_TYPES
@@ -364,7 +397,18 @@ class DeviceSync:
             for endpoint in node.endpoints:
                 eid = int(endpoint.endpoint_id)
                 ep_key = (int(node.node_id), eid)
-                specs = list(specs_by_ep[eid])
+                raw_specs = specs_by_ep[eid]
+                specs = list(raw_specs)
+                # Captured up front (issue #80 review point B) so the
+                # obsolescence log below can fire for EVERY way an endpoint
+                # stops needing its matterUnknown placeholder this pass — not
+                # just the "already had real specs" case the old `elif` only
+                # covered. Without this, an endpoint reclassified as a
+                # meter-linked source (specs stay empty) or as an ambiguous
+                # matterEnergyMeter fallback never got the "can be deleted"
+                # log, orphaning the placeholder (or leaving a duplicate
+                # device with no log connecting them).
+                had_placeholder = bool(self._index.get(ep_key, {}).get("matterUnknown"))
                 if not specs:
                     if self._is_meter_source_candidate(endpoint, specs):
                         # Standalone energy-measurement endpoint (e.g. IKEA
@@ -387,18 +431,41 @@ class DeviceSync:
                         fallback = self._unknown_spec(node, endpoint)
                         if fallback is not None:
                             specs = [fallback]
-                elif self._index.get(ep_key, {}).get("matterUnknown"):
-                    # The endpoint used to be unsupported (placeholder exists)
-                    # but now maps to real device(s) — e.g. a firmware update
-                    # added clusters. Never auto-delete a user's device; tell
-                    # them the placeholder is obsolete instead.
+                elif raw_specs:
+                    # Endpoint produced real handler spec(s): surface any
+                    # cluster this plugin recognizes nothing about at all, so
+                    # it isn't silently dropped once a device already exists
+                    # for the endpoint (issue #81 — e.g. a pump exposing
+                    # OnOff + an unhandled cluster: the relay is created but
+                    # the extra cluster vanishes with no diagnostic). No
+                    # second device — an INFO log only, same voice as the
+                    # matterUnknown placeholder log; may repeat every
+                    # reconcile pass (same precedent as the obsolescence log
+                    # below).
+                    leftover = sorted(set(endpoint.cluster_ids) - self._recognized_clusters)
+                    if leftover:
+                        self.logger.info(
+                            "node %s endpoint %s also exposes clusters this plugin "
+                            "does not support yet (%s) — please report the device "
+                            "at github.com/simons-plugins/indigo-matter/issues",
+                            node_id_to_str(node.node_id), endpoint.endpoint_id,
+                            ", ".join(f"0x{c:04X}" for c in leftover),
+                        )
+                if had_placeholder and not any(s.device_type_id == "matterUnknown" for s in specs):
+                    # The endpoint no longer needs (or has already replaced)
+                    # its matterUnknown placeholder this pass. Never
+                    # auto-delete a user's device; tell them it's obsolete.
                     self.logger.info(
                         "node %s endpoint %s is now supported — the 'Matter Device "
                         "(unsupported clusters)' placeholder device can be deleted",
                         node_id_to_str(node.node_id), endpoint.endpoint_id,
                     )
                 for spec in specs:
-                    if node_has_power_source:
+                    # Single-PowerSource-endpoint node: fan out to every
+                    # device as before. Multi-PowerSource-endpoint node
+                    # (issue #82): only the device(s) on the SAME endpoint as
+                    # a PowerSource cluster get the prop.
+                    if power_source_eps and (not multi_power_source or eid in power_source_eps):
                         spec.props.setdefault("SupportsBatteryLevel", True)
                     if spec.device_type_id in _METER_CAPABLE_TYPES:
                         # Central injection (issue #79): a linked source
@@ -632,7 +699,7 @@ class DeviceSync:
             return False
         if not (endpoint.has(CLUSTER_ELECTRICAL_POWER) or endpoint.has(CLUSTER_ELECTRICAL_ENERGY)):
             return False
-        return not (set(endpoint.cluster_ids) - _NON_DEVICE_CLUSTERS)
+        return not set(endpoint.cluster_ids) - _NON_DEVICE_CLUSTERS
 
     def _resolve_meter_target(self, node: NodeInfo, source_endpoint: Any,
                               meter_capable_eps: set) -> Optional[int]:
@@ -643,12 +710,19 @@ class DeviceSync:
         1. SetTopology (0x009C FeatureMap bit 2): read AvailableEndpoints
            (preferring ActiveEndpoints when DynamicPowerFlow is also set) and
            link only when exactly one listed endpoint hosts a
-           _METER_CAPABLE_TYPES device.
+           _METER_CAPABLE_TYPES device. A malformed endpoint-list element
+           (None/str/dict — issue #80 review point C) degrades to the
+           sole-actuator heuristic below rather than raising and aborting the
+           whole node's device creation.
         2. NodeTopology, no 0x009C at all, or SetTopology attrs unreadable:
            the node's SINGLE endpoint hosting a _METER_CAPABLE_TYPES device
            (the "sole actuator" heuristic) — zero or more than one candidate
            means attribution is ambiguous, so no link is made. Never guess on
            a multi-actuator node (bridges, power strips without SetTopology).
+
+        Every path that returns None is logged at debug (issue #80 review
+        point D) so "why do I have two devices for my plug" is diagnosable
+        from the event log without adding print-debugging.
         """
         eid = int(source_endpoint.endpoint_id)
         feature_map = node.attributes.get(
@@ -660,12 +734,34 @@ class DeviceSync:
                 else ATTR_AVAILABLE_ENDPOINTS
             listed = node.attributes.get((eid, CLUSTER_POWER_TOPOLOGY, attr_id))
             if isinstance(listed, list):
-                candidates = sorted({int(e) for e in listed} & meter_capable_eps)
-                return candidates[0] if len(candidates) == 1 else None
+                try:
+                    listed_eps = {int(e) for e in listed}
+                except (TypeError, ValueError):
+                    listed_eps = None
+                if listed_eps is not None:
+                    candidates = sorted(listed_eps & meter_capable_eps)
+                    if len(candidates) == 1:
+                        return candidates[0]
+                    self.logger.debug(
+                        "meter-link: node %s source endpoint %s SetTopology "
+                        "listed=%s meter-capable=%s — ambiguous/empty match, no link",
+                        node_id_to_str(node.node_id), eid,
+                        sorted(listed_eps), sorted(meter_capable_eps),
+                    )
+                    return None
+                # malformed endpoint-list element — fall through to the
+                # sole-actuator heuristic below rather than raise.
             # SetTopology bit set but the endpoint-list attribute is
             # unreadable — fall through to the sole-actuator heuristic below.
         candidates = sorted(meter_capable_eps)
-        return candidates[0] if len(candidates) == 1 else None
+        if len(candidates) == 1:
+            return candidates[0]
+        self.logger.debug(
+            "meter-link: node %s source endpoint %s sole-actuator heuristic "
+            "candidates=%s — expected exactly one meter-capable endpoint, no link",
+            node_id_to_str(node.node_id), eid, candidates,
+        )
+        return None
 
     def _resolve_meter_links(self, node: NodeInfo, specs_by_ep: dict) -> None:
         """Rebuild this node's meter-link maps (issue #79 — split-endpoint
@@ -683,10 +779,24 @@ class DeviceSync:
             self._reverse_links = {
                 k: v for k, v in self._reverse_links.items() if k[0] != node_id
             }
-        meter_capable_eps = {
-            eid for eid, specs in specs_by_ep.items()
-            if any(spec.device_type_id in _METER_CAPABLE_TYPES for spec in specs)
-        }
+        # A target endpoint that already has its OWN co-located 0x0090/0x0091
+        # (Tapo-style) alongside its actuator clusters must never also become
+        # a link TARGET (issue #80 review point A): otherwise an unrelated
+        # orphaned electrical-only endpoint on the same node links onto it and
+        # overwrites its own readings (both at priming and via live routing).
+        # Such a node's orphan endpoint correctly falls back to a standalone
+        # matterEnergyMeter device instead.
+        endpoints_by_id = {int(ep.endpoint_id): ep for ep in node.endpoints}
+        meter_capable_eps = set()
+        for eid, specs in specs_by_ep.items():
+            if not any(spec.device_type_id in _METER_CAPABLE_TYPES for spec in specs):
+                continue
+            ep = endpoints_by_id.get(eid)
+            if ep is not None and (
+                ep.has(CLUSTER_ELECTRICAL_POWER) or ep.has(CLUSTER_ELECTRICAL_ENERGY)
+            ):
+                continue
+            meter_capable_eps.add(eid)
         forward: dict[tuple[int, int], int] = {}
         reverse: dict[tuple[int, int], set] = {}
         for endpoint in node.endpoints:
@@ -821,6 +931,14 @@ class DeviceSync:
         a linked meter-source endpoint for this device (issue #79 — split-endpoint
         energy, e.g. IKEA GRILLPLATS ep2's ActivePower priming the ep1 relay).
 
+        The node-scoped cross-endpoint fan-in is itself confined to the
+        device's own endpoint when the node has MORE THAN ONE PowerSource-
+        bearing endpoint (issue #82 — a bridge with several battery-powered
+        children): otherwise endpoint 2's battery reading would prime
+        endpoint 1's device too. A node with zero or one PowerSource endpoint
+        keeps the original any-endpoint behaviour (the common single-battery
+        case, e.g. FP300).
+
         Within the own endpoint, skip attributes whose cluster's handler targets
         a *different* existing device on the same endpoint (fix/#44: prevents the
         Pressure device being primed with Flow values or an AQ device being primed
@@ -846,6 +964,7 @@ class DeviceSync:
         dev = indigo.devices[dev_id]
         with self._lock:
             linked_sources = self._reverse_links.get((int(node.node_id), int(endpoint_id)), set())
+            multi_power_source = len(self._power_source_eps.get(int(node.node_id), ())) > 1
         kv: list = []
         for (ep, cluster, attribute), value in node.attributes.items():
             handler = self.registry.handler_for_cluster(cluster)
@@ -855,6 +974,12 @@ class DeviceSync:
             # node-scoped cluster living on a different endpoint, or a linked
             # meter-source endpoint (issue #79 — split-endpoint energy).
             if ep != endpoint_id and not handler.node_scoped and ep not in linked_sources:
+                continue
+            # Issue #82: a node-scoped cluster (PowerSource) on a DIFFERENT
+            # endpoint only fans in when the node has at most one
+            # PowerSource-bearing endpoint — a bridge with several
+            # battery-powered children must not cross-contaminate.
+            if ep != endpoint_id and handler.node_scoped and multi_power_source:
                 continue
             # For this device's own endpoint, skip attributes that belong to a
             # sibling device (handler has a non-empty device_type_id that differs
@@ -896,11 +1021,17 @@ class DeviceSync:
                                                      or on a LINKED source endpoint)
         - SupportsEnergyMeter  → accumEnergyTotal  (cluster 0x0091 on the endpoint,
                                                      or on a LINKED source endpoint)
-        - SupportsBatteryLevel → batteryLevel      (cluster 0x002F anywhere on the node)
+        - SupportsBatteryLevel → batteryLevel      (cluster 0x002F anywhere on the node,
+                                                     confined to its own endpoint when
+                                                     the node has more than one
+                                                     PowerSource-bearing endpoint)
 
         The cluster constants are imported from their handler modules — no magic
-        numbers here.  The battery check fans across ALL node endpoints, mirroring
-        the create_devices central setdefault that was the original source of truth.
+        numbers here.  The battery check mirrors create_devices' central setdefault
+        (issue #82): a single PowerSource-bearing endpoint still fans out to every
+        device on the node, but more than one (a bridge with several
+        battery-powered children) confines the prop to each device's own endpoint
+        so siblings don't cross-contaminate.
 
         No longer a ``@staticmethod``: split-endpoint energy (issue #79 — e.g.
         IKEA GRILLPLATS) needs the instance's meter-link map to fold a linked
@@ -925,10 +1056,11 @@ class DeviceSync:
                 props["SupportsPowerMeter"] = True
             if src_endpoint.has(CLUSTER_ELECTRICAL_ENERGY):
                 props["SupportsEnergyMeter"] = True
-        node_has_power_source = any(
-            ep.has(CLUSTER_POWER_SOURCE) for ep in node.endpoints
-        )
-        if node_has_power_source:
+        with self._lock:
+            power_source_eps = self._power_source_eps.get(int(node.node_id), set())
+        if power_source_eps and (
+            len(power_source_eps) == 1 or int(endpoint.endpoint_id) in power_source_eps
+        ):
             props["SupportsBatteryLevel"] = True
         return props
 
@@ -1343,14 +1475,27 @@ class DeviceSync:
         if handler.node_scoped:
             # Node-scoped clusters (e.g. PowerSource) live on a different endpoint
             # than the devices they augment. Fan the update out to ALL Indigo devices
-            # for this node so every sensor on the node receives the battery update.
+            # for this node so every sensor on the node receives the battery update —
+            # UNLESS the node has more than one PowerSource-bearing endpoint (issue
+            # #82 — a bridge with several battery-powered children), in which case
+            # fanning out node-wide would cross-contaminate siblings; confine the
+            # update to devices on the event's own endpoint instead.
             with self._lock:
-                dev_ids = [
-                    dev_id
-                    for (nid, _eid), type_map in self._index.items()
-                    if nid == int(evt.node_id)
-                    for dev_id in type_map.values()
-                ]
+                multi_power_source = len(self._power_source_eps.get(int(evt.node_id), ())) > 1
+                if multi_power_source:
+                    dev_ids = [
+                        dev_id
+                        for (nid, eid), type_map in self._index.items()
+                        if nid == int(evt.node_id) and eid == int(evt.endpoint)
+                        for dev_id in type_map.values()
+                    ]
+                else:
+                    dev_ids = [
+                        dev_id
+                        for (nid, _eid), type_map in self._index.items()
+                        if nid == int(evt.node_id)
+                        for dev_id in type_map.values()
+                    ]
             for dev_id in dev_ids:
                 if self._active and dev_id not in self._active:
                     continue  # gate updates to active devices once any are started

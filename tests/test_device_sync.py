@@ -1861,3 +1861,321 @@ def test_tapo_colocated_energy_unchanged_no_meter_links(ds, indigo_env):
     assert dev.pluginProps.get("SupportsEnergyMeter") is True
     assert not ds._forward_links
     assert not ds._reverse_links
+
+
+# ===========================================================================
+# issue #80 review batch — PR #80 follow-up fixes/hardening on top of #79.
+# ===========================================================================
+
+# ep1: relay WITH its own co-located 0x0090/0x0091 (Tapo-style) — 500 mW /
+# 250,000 mWh. ep2: an UNRELATED orphaned electrical-only endpoint with
+# DIFFERENT readings — 900 mW / 700,000 mWh. ep2 must NOT link onto ep1 (that
+# would overwrite ep1's own readings, both at priming and live routing); it
+# must fall back to its own standalone matterEnergyMeter device instead.
+COLOCATED_PLUS_ORPHAN_NODE = {
+    "node_id": 0x53,
+    "available": True,
+    "attributes": {
+        "1/29/0": [{"0": 266}],
+        "1/6/0": False,
+        "1/144/8": 500,                    # ep1's OWN ActivePower
+        "1/145/1": {"energy": 250_000},    # ep1's OWN CumulativeEnergyImported
+        "2/144/8": 900,                    # ep2 orphan ActivePower (different!)
+        "2/145/1": {"energy": 700_000},    # ep2 orphan CumulativeEnergyImported
+    },
+}
+
+
+def test_colocated_target_excluded_from_meter_link_no_crosstalk(ds, indigo_env):
+    """issue #80 review point A: an endpoint with its OWN co-located 0x90/0x91
+    must never become a link TARGET for an unrelated orphan endpoint on the
+    same node — that would let the orphan's readings silently overwrite the
+    co-located device's own (both at priming and live routing)."""
+    _indigo, devices = indigo_env
+    ds.create_from_raw(COLOCATED_PLUS_ORPHAN_NODE, "Mixed Node")
+
+    assert not ds._forward_links, "ep1 must never become a meter-link target here"
+    assert not ds._reverse_links
+
+    relay = devices[ds.lookup(0x53, 1)]
+    assert relay.deviceTypeId == "matterRelay"
+    assert relay.pluginProps.get("SupportsPowerMeter") is True
+    assert relay.pluginProps.get("SupportsEnergyMeter") is True
+    # ep1's OWN readings win, untouched by ep2's orphan values.
+    assert relay.states.get("curEnergyLevel") == 0.5        # 500 mW → 0.5 W
+    assert relay.states.get("accumEnergyTotal") == 0.25     # 250,000 mWh → 0.25 kWh
+
+    ep2_dev_id = ds.lookup(0x53, 2)
+    assert ep2_dev_id is not None, "orphan endpoint must fall back to its own device"
+    ep2_dev = devices[ep2_dev_id]
+    assert ep2_dev.deviceTypeId == "matterEnergyMeter"
+    assert ep2_dev.states.get("curEnergyLevel") == 0.9      # 900 mW → 0.9 W (its own)
+    assert ep2_dev.states.get("accumEnergyTotal") == 0.7    # 700,000 mWh → 0.7 kWh
+
+
+# A node whose ep2 starts out with a genuinely-unsupported cluster (RVC
+# RunMode) and later loses it in favour of split-endpoint electrical clusters
+# — simulates the live jarvis scenario (device 1456954491): an existing
+# matterUnknown placeholder that must become obsolete once ep2 reclassifies
+# as a meter-linked SOURCE (which itself gets no device — specs stay empty).
+GRILLPLATS_PRE_EP2_UNKNOWN_NODE = {
+    "node_id": 0x54,
+    "available": True,
+    "attributes": {
+        "1/29/0": [{"0": 266}],
+        "1/6/0": False,
+        "2/29/0": [{"0": 0x0510}],
+        "2/84/0": 0,   # RVC RunMode — genuinely unsupported, triggers a placeholder
+    },
+}
+
+GRILLPLATS_EP2_HEALED_NODE = {
+    "node_id": 0x54,
+    "available": True,
+    "attributes": {
+        "1/29/0": [{"0": 266}],
+        "1/6/0": False,
+        "2/29/0": [{"0": 0x0510}],
+        "2/144/8": 1200,
+        "2/145/1": {"energy": 3_600_000},
+        "2/156/65532": 1,   # NodeTopology
+    },
+}
+
+
+def test_obsolescence_log_fires_when_endpoint_becomes_meter_linked_source(ds, indigo_env, mock_logger):
+    """issue #80 review point B: an endpoint reclassified as a meter-linked
+    SOURCE (which itself gets no device — specs stay empty) must still
+    surface the obsolescence log for its stale matterUnknown placeholder. The
+    old `elif` only fired when the endpoint kept producing a real spec of its
+    own, silently orphaning the placeholder in this case."""
+    _indigo, devices = indigo_env
+    ds.create_from_raw(GRILLPLATS_PRE_EP2_UNKNOWN_NODE, "Grill Plug")
+    placeholder_id = ds.lookup(0x54, 2, "matterUnknown")
+    assert placeholder_id is not None
+    relay_id = ds.lookup(0x54, 1)
+    assert not devices[relay_id].pluginProps.get("SupportsPowerMeter")
+
+    mock_logger.info.reset_mock()
+    ds.reconcile_all([GRILLPLATS_EP2_HEALED_NODE])
+
+    # Relay healed via the existing reconcile self-heal path.
+    assert devices[relay_id].pluginProps.get("SupportsPowerMeter") is True
+    assert devices[relay_id].pluginProps.get("SupportsEnergyMeter") is True
+    # ep2's stale placeholder is untouched (never auto-deleted) and no NEW
+    # device was created on ep2 either (the link succeeded).
+    assert ds.lookup(0x54, 2, "matterUnknown") == placeholder_id
+    assert ds._all_dev_ids_for_endpoint(0x54, 2) == [placeholder_id]
+    info_msgs = [c[0][0] % tuple(c[0][1:]) for c in mock_logger.info.call_args_list]
+    assert any("can be deleted" in m for m in info_msgs)
+
+
+# Same idea, but the node stays ambiguous (two actuators): ep2's electrical
+# clusters can't be attributed, so a NEW matterEnergyMeter is created beside
+# the stale matterUnknown placeholder — the log must connect the two.
+AMBIGUOUS_PRE_EP2_UNKNOWN_NODE = {
+    "node_id": 0x55,
+    "available": True,
+    "attributes": {
+        "1/29/0": [{"0": 266}], "1/6/0": False,
+        "2/29/0": [{"0": 1296}], "2/84/0": 0,   # RVC RunMode — placeholder trigger
+        "3/29/0": [{"0": 266}], "3/6/0": False,
+    },
+}
+
+AMBIGUOUS_EP2_BECOMES_ELECTRICAL_NODE = {
+    "node_id": 0x55,
+    "available": True,
+    "attributes": {
+        "1/29/0": [{"0": 266}], "1/6/0": False,
+        "2/144/8": 800, "2/145/1": {"energy": 200_000},
+        "3/29/0": [{"0": 266}], "3/6/0": False,
+    },
+}
+
+
+def test_obsolescence_log_fires_alongside_new_meter_fallback_device(ds, indigo_env, mock_logger):
+    """issue #80 review point B: the ambiguous-attribution case creates a NEW
+    matterEnergyMeter beside a stale matterUnknown placeholder — the
+    obsolescence log must fire so the two are connected, not silently orphaned."""
+    _indigo, devices = indigo_env
+    ds.create_from_raw(AMBIGUOUS_PRE_EP2_UNKNOWN_NODE, "Power Strip")
+    placeholder_id = ds.lookup(0x55, 2, "matterUnknown")
+    assert placeholder_id is not None
+
+    mock_logger.info.reset_mock()
+    ds.reconcile_all([AMBIGUOUS_EP2_BECOMES_ELECTRICAL_NODE])
+
+    new_meter_id = ds.lookup(0x55, 2, "matterEnergyMeter")
+    assert new_meter_id is not None
+    assert new_meter_id != placeholder_id
+    assert ds.lookup(0x55, 2, "matterUnknown") == placeholder_id  # untouched
+    info_msgs = [c[0][0] % tuple(c[0][1:]) for c in mock_logger.info.call_args_list]
+    assert any("can be deleted" in m for m in info_msgs)
+
+
+# SetTopology bit set but AvailableEndpoints contains malformed elements
+# (None, non-numeric string) — must degrade to the sole-actuator heuristic
+# rather than raise (which would abort the whole node's device creation,
+# since link resolution runs inside create_devices' lock-held body).
+GRILLPLATS_MALFORMED_SET_TOPOLOGY_NODE = {
+    "node_id": 0x38,
+    "available": True,
+    "attributes": {
+        "1/29/0": [{"0": 266}],
+        "1/6/0": False,
+        "2/29/0": [{"0": 0x0510}],
+        "2/144/8": 1200,
+        "2/145/1": {"energy": 3_600_000},
+        "2/156/65532": 4,          # FeatureMap = SetTopology (bit 2)
+        "2/156/0": [None, "x"],    # malformed AvailableEndpoints elements
+    },
+}
+
+
+def test_set_topology_malformed_endpoint_list_falls_back_to_heuristic(ds, indigo_env):
+    """issue #80 review point C: a malformed SetTopology endpoint-list
+    element must not raise and abort node creation — it degrades to the
+    sole-actuator heuristic, which still links since there's exactly one
+    meter-capable endpoint."""
+    _indigo, devices = indigo_env
+    result = ds.create_from_raw(GRILLPLATS_MALFORMED_SET_TOPOLOGY_NODE, "Grill Plug")
+    dev = devices[result["primaryDeviceId"]]
+    assert dev.deviceTypeId == "matterRelay"
+    assert dev.pluginProps.get("SupportsPowerMeter") is True
+    assert ds.lookup(0x38, 2) is None
+
+
+# A pump-shaped node: OnOff (recognized, relay created) + an extra cluster
+# (0x0200) this plugin has no handler for at all — must be surfaced as a
+# diagnostic, not silently dropped (issue #81), without creating a second device.
+PUMP_MIXED_CLUSTER_NODE = {
+    "node_id": 0x56,
+    "available": True,
+    "attributes": {
+        "1/29/0": [{"0": 266}],
+        "1/6/0": False,
+        "1/512/0": 0,   # 0x0200 — recognized by no registered handler
+    },
+}
+
+
+def test_unmapped_cluster_alongside_real_device_logs_diagnostic(ds, indigo_env, mock_logger):
+    """issue #81: a cluster this plugin doesn't recognize at all, co-occurring
+    with a real handled cluster (a pump's OnOff + an extra cluster), must not
+    be silently dropped once the endpoint's relay is created — an INFO log
+    must name it, with no second device."""
+    _indigo, devices = indigo_env
+    ds.create_from_raw(PUMP_MIXED_CLUSTER_NODE, "Pump")
+    dev = devices[ds.lookup(0x56, 1)]
+    assert dev.deviceTypeId == "matterRelay"
+    assert ds._all_dev_ids_for_endpoint(0x56, 1) == [dev.id], "no second device created"
+    info_msgs = [c[0][0] % tuple(c[0][1:]) for c in mock_logger.info.call_args_list]
+    assert any("0x0200" in m and "does not support yet" in m for m in info_msgs)
+
+
+def test_pure_relay_endpoint_has_no_unmapped_cluster_log(ds, indigo_env, mock_logger):
+    """Regression: a plain relay with nothing left over must NOT get the
+    issue #81 diagnostic log."""
+    _indigo, devices = indigo_env
+    ds.create_from_raw(RELAY_NODE, "Office Plug")
+    info_msgs = [c[0][0] for c in mock_logger.info.call_args_list]
+    assert not any("does not support yet" in m for m in info_msgs)
+
+
+# DynamicPowerFlow (bit 3) gates ActiveEndpoints (attr 0x0001) over
+# AvailableEndpoints (attr 0x0000) — proven via a decoy endpoint (99, which
+# doesn't exist on the node) in AvailableEndpoints, while ActiveEndpoints
+# correctly lists the real actuator endpoint 1.
+GRILLPLATS_DYNAMIC_POWER_FLOW_DECOY_NODE = {
+    "node_id": 0x57,
+    "available": True,
+    "attributes": {
+        "1/29/0": [{"0": 266}],
+        "1/6/0": False,
+        "2/29/0": [{"0": 0x0510}],
+        "2/144/8": 1200,
+        "2/145/1": {"energy": 3_600_000},
+        "2/156/65532": 12,   # FeatureMap = SetTopology(bit2) | DynamicPowerFlow(bit3)
+        "2/156/0": [99],     # AvailableEndpoints — decoy, must be ignored
+        "2/156/1": [1],      # ActiveEndpoints — the real list when DYPF is set
+    },
+}
+
+
+def test_dynamic_power_flow_prefers_active_endpoints_over_available_decoy(ds, indigo_env):
+    """issue #80 review point G1: with DynamicPowerFlow set, ActiveEndpoints
+    (not AvailableEndpoints) must be consulted."""
+    _indigo, devices = indigo_env
+    result = ds.create_from_raw(GRILLPLATS_DYNAMIC_POWER_FLOW_DECOY_NODE, "Grill Plug")
+    dev = devices[result["primaryDeviceId"]]
+    assert dev.deviceTypeId == "matterRelay"
+    assert dev.pluginProps.get("SupportsPowerMeter") is True
+    assert ds.lookup(0x57, 2) is None
+
+
+def test_electrical_attribute_event_before_any_create_is_silent_noop(ds, indigo_env):
+    """issue #80 review point G2: an electrical attribute event for a node
+    that has never been created/reconciled must not raise and must create
+    nothing — the reading is silently dropped (there's nowhere for it to go
+    yet)."""
+    _indigo, devices = indigo_env
+    ds.handle_event(MatterEvent(
+        kind=protocol.EVT_ATTRIBUTE_UPDATED,
+        node_id=0x62, endpoint=2, cluster=0x0090, attribute=0x0008, value=1000,
+    ))  # must not raise
+    assert len(list(devices)) == 0
+
+
+# ===========================================================================
+# issue #82 — bridge battery cross-contamination
+# ===========================================================================
+
+BRIDGE_MULTI_BATTERY_NODE = {
+    "node_id": 0x61,
+    "available": True,
+    "attributes": {
+        "0/40/1": "ACME",
+        "0/40/3": "Multi Sensor Bridge",
+        # Child 1: temperature sensor + its OWN PowerSource (battery = 80%)
+        "1/29/0": [{"0": 770}],
+        "1/1026/0": 2100,
+        "1/47/12": 160,             # BatPercentRemaining = 160/2 = 80%
+        # Child 2: humidity sensor + its OWN PowerSource (battery = 40%, distinct)
+        "2/29/0": [{"0": 775}],
+        "2/1029/0": 5500,
+        "2/47/12": 80,              # BatPercentRemaining = 80/2 = 40%
+        # Child 3: mains relay — no PowerSource at all
+        "3/29/0": [{"0": 266}],
+        "3/6/0": False,
+    },
+}
+
+
+def test_bridge_multi_power_source_battery_isolated_per_endpoint(ds, indigo_env):
+    """issue #82: a bridge with MORE THAN ONE PowerSource-bearing endpoint
+    must not fan battery updates node-wide — each child gets ONLY its own
+    battery level, and a mains child (no PowerSource) gets no
+    SupportsBatteryLevel at all."""
+    _indigo, devices = indigo_env
+    ds.create_from_raw(BRIDGE_MULTI_BATTERY_NODE, "Multi Sensor Bridge")
+    temp_id = ds.lookup(0x61, 1, "matterTemperatureSensor")
+    hum_id = ds.lookup(0x61, 2, "matterHumiditySensor")
+    relay_id = ds.lookup(0x61, 3, "matterRelay")
+    assert temp_id and hum_id and relay_id
+
+    assert devices[temp_id].pluginProps.get("SupportsBatteryLevel") is True
+    assert devices[hum_id].pluginProps.get("SupportsBatteryLevel") is True
+    assert not devices[relay_id].pluginProps.get("SupportsBatteryLevel")
+
+    assert devices[temp_id].states.get("batteryLevel") == 80
+    assert devices[hum_id].states.get("batteryLevel") == 40
+    assert "batteryLevel" not in devices[relay_id].states
+
+    # Live routing: an update on ep1's PowerSource must not leak to ep2/ep3.
+    ds.handle_event(MatterEvent(
+        kind=protocol.EVT_ATTRIBUTE_UPDATED,
+        node_id=0x61, endpoint=1, cluster=0x002F, attribute=0x000C, value=200,
+    ))
+    assert devices[temp_id].states.get("batteryLevel") == 100
+    assert devices[hum_id].states.get("batteryLevel") == 40   # untouched, no leak

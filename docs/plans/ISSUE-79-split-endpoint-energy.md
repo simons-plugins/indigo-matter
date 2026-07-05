@@ -60,8 +60,9 @@ For each candidate, resolve the target:
 
 1. **SetTopology** (0x9C FeatureMap 0xFFFC bit 2 set): read
    `AvailableEndpoints` (attr 0x0000; prefer `ActiveEndpoints` 0x0001 when
-   DynamicPowerFlow is set) from `node.attributes`. Link to each listed
-   endpoint that hosts a `_METER_CAPABLE_TYPES` device. v1 keeps the link
+   DynamicPowerFlow is set) from `node.attributes`. Link only when exactly
+   one listed endpoint hosts a `_METER_CAPABLE_TYPES` device; ambiguous
+   multi-match falls back to the standalone device. v1 keeps the link
    static after reconcile (DYPF changes picked up on next reconcile — note
    as follow-up).
 2. **NodeTopology, no 0x9C at all, or SetTopology attrs unreadable**: find
@@ -129,7 +130,7 @@ For each candidate, resolve the target:
 
 **Behaviour change to an existing test:** `ELECTRICAL_ONLY_NODE`
 (fixture at `test_device_sync.py:1430`, assertion in
-`test_merge_only_endpoint_gets_no_placeholder` at `:1471-1473`) currently
+`test_merge_only_endpoint_gets_no_placeholder` at `:1471-1474`) currently
 asserts "no device at all". Under this plan a node whose *only* device
 endpoint is electrical gets the fallback `matterEnergyMeter` instead —
 update the test; it is the issue's requested behaviour.
@@ -157,9 +158,10 @@ update the test; it is the issue's requested behaviour.
 
 ### Rollout
 
-1. PR with version bump (`PluginVersion` in Info.plist). Suggest
-   **2026.3.0** (user-visible feature: split-endpoint energy support) —
-   confirm with Simon; 2026.2.24 if he prefers patch.
+1. PR with version bump (`PluginVersion` in Info.plist). 2026.4.0 shipped
+   (the repo was already at 2026.3.2 by the time this landed, past the
+   2026.3.0/2026.2.24 suggestion above — kept here for the historical record
+   of the original recommendation).
 2. Deploy to jarvis (cp + restart), verify:
    - Reconcile heals relay 1794293937 → props + energy states appear.
    - Live wattage/energy from GRILLPLATS (it's on the house fabric).
@@ -187,3 +189,44 @@ update the test; it is the issue's requested behaviour.
 - Follow-up (not in scope): DynamicPowerFlow live re-linking; Voltage /
   ActiveCurrent extra states (0x90 optional attrs — GRILLPLATS has the AC
   feature, could surface later).
+
+### Post-review addendum (2026-07-05)
+
+Four review agents plus an audit surfaced a consolidated fix batch, applied on
+top of the original #79 implementation in the same PR (#80):
+
+- **A — co-located target crosstalk:** an endpoint with its own co-located
+  0x0090/0x0091 (Tapo-style) could still be selected as a link TARGET for an
+  unrelated orphaned electrical-only endpoint on the same node, letting the
+  orphan's readings overwrite the co-located device's own. Fixed by excluding
+  any endpoint that already carries 0x0090/0x0091 itself from
+  `meter_capable_eps` in `_resolve_meter_links`.
+- **B — obsolescence log unreachable for meter-linked endpoints:** the
+  "placeholder can be deleted" log lived in an `elif` gated on non-empty
+  specs, so an endpoint reclassified as a meter-linked source (specs stay
+  empty) or an ambiguous-fallback `matterEnergyMeter` never triggered it,
+  orphaning the old placeholder. Restructured `create_devices` to capture
+  `had_placeholder` up front and emit the log whenever the endpoint no longer
+  needs a `matterUnknown` placeholder this pass, regardless of which path
+  produced its final spec list.
+- **C — unguarded `int()` over the SetTopology endpoint list:** a malformed
+  `AvailableEndpoints`/`ActiveEndpoints` element (`None`, a string, a dict)
+  raised inside `_resolve_meter_target`, and since link resolution runs
+  inside `create_devices`' lock-held body this aborted the whole node's
+  device creation. Now wrapped in `try/except (TypeError, ValueError)`,
+  degrading to the sole-actuator heuristic.
+- **D — debug logging on link-resolution failure:** both return-None paths in
+  `_resolve_meter_target` now log at debug (node, source endpoint, candidate
+  set, reason) so "why do I have two devices for my plug" is diagnosable.
+- **Issue #81 (rolled in) — silent partial coverage:** when an endpoint
+  produces real handler spec(s), any remaining cluster not claimed by a
+  registered handler and not in `_NON_DEVICE_CLUSTERS` is now surfaced via an
+  INFO log (no second device) instead of silently dropped.
+- **Issue #82 (rolled in) — bridge battery cross-contamination:** a node with
+  more than one PowerSource-bearing endpoint no longer fans battery updates
+  node-wide across creation props, `_prime_states`, and the live
+  `_on_attribute` fan-out (plus the reconcile self-heal path,
+  `_capability_props`) — each device now only gets the battery capability/
+  update from its OWN endpoint. A node with exactly one PowerSource-bearing
+  endpoint keeps the original node-wide behaviour (the common case, e.g.
+  FP300: battery on ep0, sensor on ep1).
