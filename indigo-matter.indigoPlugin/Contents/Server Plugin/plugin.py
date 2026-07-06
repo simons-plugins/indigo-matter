@@ -339,9 +339,9 @@ class Plugin(indigo.PluginBase):
             self.logger.error('"%s": invalid sensitivity level %r', dev.name, action.props.get("level"))
             return
         if "sensitivityLevel" not in dev.states:
-            # deviceFilter="self" lists every plugin device (Indigo's deviceFilter
-            # takes ONE filter — a comma list matches nothing, live-verified
-            # 2026-07-06), so reject non-0x0080 devices here instead.
+            # Defense-in-depth: the two Actions.xml entries are already scoped
+            # to motion/contact types, but a stale saved action (or a future
+            # filter change) could still hand us a device without the state.
             self.logger.error('"%s": device does not support sensitivity (no Boolean State '
                               'Configuration cluster)', dev.name)
             return
