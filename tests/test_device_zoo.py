@@ -13,7 +13,10 @@ Invariants:
   3. every spec's device_type_id exists in Devices.xml;
   4. every initial state is XML-declared or an Indigo built-in;
   5. every sensor-type spec carries explicit SupportsOnState /
-     SupportsSensorValue with exactly one True (the issue #56 class).
+     SupportsSensorValue with exactly one True (the issue #56 class);
+  6. no device type's <States> block redeclares a state key that a True
+     Supports* prop already derives natively (the PR #73 class — Indigo
+     rejects plugin-declared state keys that duplicate a native one).
 """
 from __future__ import annotations
 
@@ -52,6 +55,15 @@ BUILTIN_STATES = {
 ACTUATOR_TYPES = {
     "matterRelay", "matterDimmer", "matterColorDimmer", "matterFan",
     "matterThermostat", "matterWindowCovering", "matterLock", "matterValve",
+}
+
+# Supports* creation prop → the native Indigo state key it derives (PR #73:
+# Indigo rejects a plugin-declared <State> that duplicates one of these).
+NATIVE_STATE_KEY_BY_PROP = {
+    "SupportsSensorValue": "sensorValue",
+    "SupportsOnState": "onOffState",
+    "SupportsPowerMeter": "curEnergyLevel",
+    "SupportsEnergyMeter": "accumEnergyTotal",
 }
 
 
@@ -273,6 +285,20 @@ def test_zoo_sensor_specs_carry_explicit_display_props(name):
                     f"{name}: {spec.device_type_id} UiDisplayStateId "
                     f"'{ui_display}' is not an XML-declared custom state"
                 )
+
+
+@pytest.mark.parametrize("name", ZOO)
+def test_zoo_native_props_not_redeclared_in_devices_xml(name):
+    raw, _ = ZOO[name]
+    for specs in _specs_by_endpoint(raw).values():
+        for spec in specs:
+            declared = XML_STATES_BY_ID.get(spec.device_type_id, set())
+            for prop, key in NATIVE_STATE_KEY_BY_PROP.items():
+                if spec.props.get(prop) is True:
+                    assert key not in declared, (
+                        f"{name}: {spec.device_type_id} declares native state "
+                        f"'{key}' in Devices.xml even though {prop} is True"
+                    )
 
 
 def test_every_registered_handler_type_exists_in_devices_xml():
