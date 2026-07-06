@@ -689,6 +689,51 @@
     </Device>
 
     <!-- ============================================================ -->
+    <!-- Fallback: standalone energy-measurement endpoint (issue #79)  -->
+    <!-- ============================================================ -->
+
+    <Device id="matterEnergyMeter" type="custom">
+        <Name>Matter Energy Meter</Name>
+        <ConfigUI>
+            <Field id="nodeId" type="textfield" readonly="yes">
+                <Label>Matter Node ID:</Label>
+            </Field>
+            <Field id="endpointId" type="textfield" readonly="yes">
+                <Label>Endpoint:</Label>
+            </Field>
+            <Field id="vendorName" type="textfield" readonly="yes">
+                <Label>Vendor:</Label>
+            </Field>
+            <Field id="productName" type="textfield" readonly="yes">
+                <Label>Product:</Label>
+            </Field>
+        </ConfigUI>
+        <!-- custom types get no auto states from Supports* props, so these ids
+             must match exactly what ElectricalPowerHandler/ElectricalEnergyHandler
+             already write (they guard on key presence in indigo_dev.states). -->
+        <States>
+            <State id="curEnergyLevel">
+                <ValueType>Number</ValueType>
+                <TriggerLabel>Power</TriggerLabel>
+                <TriggerLabelPrefix>Power is</TriggerLabelPrefix>
+                <ControlPageLabel>Power (W)</ControlPageLabel>
+            </State>
+            <State id="accumEnergyTotal">
+                <ValueType>Number</ValueType>
+                <TriggerLabel>Total Energy</TriggerLabel>
+                <TriggerLabelPrefix>Total Energy is</TriggerLabelPrefix>
+                <ControlPageLabel>Total Energy (kWh)</ControlPageLabel>
+            </State>
+            <State id="reachable">
+                <ValueType boolType="YesNo">Boolean</ValueType>
+                <TriggerLabel>Reachable</TriggerLabel>
+                <ControlPageLabel>Reachable</ControlPageLabel>
+            </State>
+        </States>
+        <UiDisplayStateId>curEnergyLevel</UiDisplayStateId>
+    </Device>
+
+    <!-- ============================================================ -->
     <!-- Fallback: unknown / unsupported Matter device                -->
     <!-- ============================================================ -->
 

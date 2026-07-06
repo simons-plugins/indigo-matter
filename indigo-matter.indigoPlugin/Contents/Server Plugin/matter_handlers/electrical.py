@@ -20,6 +20,29 @@ from .base import ClusterHandler, IndigoDeviceSpec, MatterAction
 CLUSTER_ELECTRICAL_POWER = 0x0090
 CLUSTER_ELECTRICAL_ENERGY = 0x0091
 
+# Power Topology (0x009C) — Matter 1.3's "Electrical Sensor" device type
+# (0x0510, e.g. IKEA GRILLPLATS) puts the ElectricalPower/Energy clusters on
+# their own endpoint rather than co-locating them with the relay/dimmer. This
+# cluster tells device_sync which OTHER endpoint(s) the measurement applies
+# to (issue #79). It has no ClusterHandler of its own — no live attribute
+# routing is needed, device_sync reads its snapshot values directly out of
+# node.attributes when resolving the meter-link map.
+CLUSTER_POWER_TOPOLOGY = 0x009C
+
+# FeatureMap (global attribute 0xFFFC, present on every cluster).
+ATTR_POWER_TOPOLOGY_FEATURE_MAP = 0xFFFC
+
+# Power Topology FeatureMap bits (connectedhomeip power-topology-cluster.xml /
+# src/app_clusters/PowerTopology.adoc).
+FEATURE_NODE_TOPOLOGY = 1 << 0        # "measures the whole node" — no endpoint list
+FEATURE_TREE_TOPOLOGY = 1 << 1
+FEATURE_SET_TOPOLOGY = 1 << 2         # gates AvailableEndpoints (0x0000)
+FEATURE_DYNAMIC_POWER_FLOW = 1 << 3   # gates ActiveEndpoints (0x0001)
+
+# Power Topology attributes (only meaningful when SetTopology is set).
+ATTR_AVAILABLE_ENDPOINTS = 0x0000
+ATTR_ACTIVE_ENDPOINTS = 0x0001
+
 
 # ---------------------------------------------------------------------------
 # ElectricalPowerMeasurement helpers
