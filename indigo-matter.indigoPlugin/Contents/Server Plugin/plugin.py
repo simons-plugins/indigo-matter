@@ -338,6 +338,13 @@ class Plugin(indigo.PluginBase):
         except (TypeError, ValueError):
             self.logger.error('"%s": invalid sensitivity level %r', dev.name, action.props.get("level"))
             return
+        if "sensitivityLevel" not in dev.states:
+            # deviceFilter="self" lists every plugin device (Indigo's deviceFilter
+            # takes ONE filter — a comma list matches nothing, live-verified
+            # 2026-07-06), so reject non-0x0080 devices here instead.
+            self.logger.error('"%s": device does not support sensitivity (no Boolean State '
+                              'Configuration cluster)', dev.name)
+            return
         node_id = dev.pluginProps.get("nodeId")
         endpoint_id = dev.pluginProps.get("endpointId")
         if not node_id or endpoint_id in (None, ""):

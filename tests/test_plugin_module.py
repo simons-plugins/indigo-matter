@@ -207,15 +207,32 @@ def test_action_control_device_sends_each_command_of_a_list(plugin_cls):
 # issue #85 — Set Sensitivity Level (the plugin's first custom device action)
 # ---------------------------------------------------------------------------
 
-def _sensitivity_dev(node_id="45", endpoint_id="1"):
+def _sensitivity_dev(node_id="45", endpoint_id="1", states=None):
     from types import SimpleNamespace
     from unittest.mock import MagicMock
     dev = SimpleNamespace(
         id=5, name="Landing Presence",
         pluginProps={"nodeId": node_id, "endpointId": endpoint_id},
+        # Real 0x0080-bearing devices carry the XML-declared state; the action
+        # callback rejects devices without it (deviceFilter="self" fallback).
+        states={"sensitivityLevel": 1} if states is None else states,
         updateStateOnServer=MagicMock(),
     )
     return dev
+
+
+def test_action_set_sensitivity_level_rejects_device_without_state(plugin_cls, mock_logger):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    dev = _sensitivity_dev(states={})  # e.g. a relay picked via deviceFilter="self"
+    stub = SimpleNamespace(
+        device_sync=MagicMock(), logger=mock_logger,
+        _send_matter_command=MagicMock(return_value=True),
+    )
+    plugin_cls.actionSetSensitivityLevel(stub, SimpleNamespace(props={"level": "1"}), dev)
+    stub._send_matter_command.assert_not_called()
+    dev.updateStateOnServer.assert_not_called()
+    assert any("does not support sensitivity" in str(c) for c in mock_logger.error.call_args_list)
 
 
 def test_get_sensitivity_levels_confirmed_three_gets_friendly_labels(plugin_cls, mock_indigo_base, mock_logger):

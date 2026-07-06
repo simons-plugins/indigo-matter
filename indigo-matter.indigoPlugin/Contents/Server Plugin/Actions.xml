@@ -15,7 +15,7 @@
      handler runs. -->
 <Actions>
     <Action id="setSensitivityLevel"
-            deviceFilter="self.matterMotionSensor, self.matterContactSensor" uiPath="DeviceActions">
+            deviceFilter="self" uiPath="DeviceActions">
         <Name>Set Sensitivity Level</Name>
         <CallbackMethod>actionSetSensitivityLevel</CallbackMethod>
         <ConfigUI>
