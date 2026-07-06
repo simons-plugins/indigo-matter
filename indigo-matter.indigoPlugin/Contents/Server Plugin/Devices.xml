@@ -123,12 +123,6 @@
             </Field>
         </ConfigUI>
         <States>
-            <State id="sensorValue">
-                <ValueType>Number</ValueType>
-                <TriggerLabel>Temperature</TriggerLabel>
-                <TriggerLabelPrefix>Temperature is</TriggerLabelPrefix>
-                <ControlPageLabel>Temperature</ControlPageLabel>
-            </State>
             <State id="batteryLevel">
                 <ValueType>Integer</ValueType>
                 <TriggerLabel>Battery Level</TriggerLabel>
@@ -155,12 +149,6 @@
             </Field>
         </ConfigUI>
         <States>
-            <State id="sensorValue">
-                <ValueType>Number</ValueType>
-                <TriggerLabel>Humidity</TriggerLabel>
-                <TriggerLabelPrefix>Humidity is</TriggerLabelPrefix>
-                <ControlPageLabel>Humidity</ControlPageLabel>
-            </State>
             <State id="batteryLevel">
                 <ValueType>Integer</ValueType>
                 <TriggerLabel>Battery Level</TriggerLabel>
@@ -187,11 +175,6 @@
             </Field>
         </ConfigUI>
         <States>
-            <State id="onOffState">
-                <ValueType boolType="OnOff">Boolean</ValueType>
-                <TriggerLabel>Motion</TriggerLabel>
-                <ControlPageLabel>Motion</ControlPageLabel>
-            </State>
             <State id="batteryLevel">
                 <ValueType>Integer</ValueType>
                 <TriggerLabel>Battery Level</TriggerLabel>
@@ -218,11 +201,6 @@
             </Field>
         </ConfigUI>
         <States>
-            <State id="onOffState">
-                <ValueType boolType="OpenClosed">Boolean</ValueType>
-                <TriggerLabel>Contact</TriggerLabel>
-                <ControlPageLabel>Contact</ControlPageLabel>
-            </State>
             <State id="batteryLevel">
                 <ValueType>Integer</ValueType>
                 <TriggerLabel>Battery Level</TriggerLabel>
@@ -249,12 +227,6 @@
             </Field>
         </ConfigUI>
         <States>
-            <State id="sensorValue">
-                <ValueType>Number</ValueType>
-                <TriggerLabel>Illuminance</TriggerLabel>
-                <TriggerLabelPrefix>Illuminance is</TriggerLabelPrefix>
-                <ControlPageLabel>Illuminance (lux)</ControlPageLabel>
-            </State>
             <State id="batteryLevel">
                 <ValueType>Integer</ValueType>
                 <TriggerLabel>Battery Level</TriggerLabel>
@@ -416,11 +388,6 @@
             </Field>
         </ConfigUI>
         <States>
-            <State id="onOffState">
-                <ValueType boolType="OnOff">Boolean</ValueType>
-                <TriggerLabel>Alarm</TriggerLabel>
-                <ControlPageLabel>Alarm</ControlPageLabel>
-            </State>
             <State id="expressedState">
                 <ValueType>String</ValueType>
                 <TriggerLabel>Expressed State</TriggerLabel>
@@ -520,12 +487,6 @@
             </Field>
         </ConfigUI>
         <States>
-            <State id="sensorValue">
-                <ValueType>Number</ValueType>
-                <TriggerLabel>CO&#x2082; (ppm)</TriggerLabel>
-                <TriggerLabelPrefix>CO&#x2082; is</TriggerLabelPrefix>
-                <ControlPageLabel>CO&#x2082; (ppm)</ControlPageLabel>
-            </State>
             <State id="batteryLevel">
                 <ValueType>Integer</ValueType>
                 <TriggerLabel>Battery Level</TriggerLabel>
@@ -553,12 +514,6 @@
             </Field>
         </ConfigUI>
         <States>
-            <State id="sensorValue">
-                <ValueType>Number</ValueType>
-                <TriggerLabel>PM2.5 (&#xB5;g/m&#xB3;)</TriggerLabel>
-                <TriggerLabelPrefix>PM2.5 is</TriggerLabelPrefix>
-                <ControlPageLabel>PM2.5 (&#xB5;g/m&#xB3;)</ControlPageLabel>
-            </State>
             <State id="batteryLevel">
                 <ValueType>Integer</ValueType>
                 <TriggerLabel>Battery Level</TriggerLabel>
@@ -586,12 +541,6 @@
             </Field>
         </ConfigUI>
         <States>
-            <State id="sensorValue">
-                <ValueType>Number</ValueType>
-                <TriggerLabel>TVOC</TriggerLabel>
-                <TriggerLabelPrefix>TVOC is</TriggerLabelPrefix>
-                <ControlPageLabel>TVOC</ControlPageLabel>
-            </State>
             <State id="batteryLevel">
                 <ValueType>Integer</ValueType>
                 <TriggerLabel>Battery Level</TriggerLabel>
@@ -659,12 +608,6 @@
             </Field>
         </ConfigUI>
         <States>
-            <State id="sensorValue">
-                <ValueType>Number</ValueType>
-                <TriggerLabel>Pressure</TriggerLabel>
-                <TriggerLabelPrefix>Pressure is</TriggerLabelPrefix>
-                <ControlPageLabel>Pressure (hPa)</ControlPageLabel>
-            </State>
             <State id="batteryLevel">
                 <ValueType>Integer</ValueType>
                 <TriggerLabel>Battery Level</TriggerLabel>
@@ -691,12 +634,6 @@
             </Field>
         </ConfigUI>
         <States>
-            <State id="sensorValue">
-                <ValueType>Number</ValueType>
-                <TriggerLabel>Flow</TriggerLabel>
-                <TriggerLabelPrefix>Flow is</TriggerLabelPrefix>
-                <ControlPageLabel>Flow (m³/h)</ControlPageLabel>
-            </State>
             <State id="batteryLevel">
                 <ValueType>Integer</ValueType>
                 <TriggerLabel>Battery Level</TriggerLabel>
