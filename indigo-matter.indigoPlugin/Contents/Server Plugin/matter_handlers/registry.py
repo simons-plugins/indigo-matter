@@ -13,6 +13,7 @@ from __future__ import annotations
 from typing import Any, Optional
 
 from .base import ClusterHandler, IndigoDeviceSpec
+from .boolean_state_config import BooleanStateConfigHandler
 from .color_control import ColorControlHandler
 from .door_lock import DoorLockHandler
 from .electrical import ElectricalEnergyHandler, ElectricalPowerHandler
@@ -44,8 +45,9 @@ def default_handlers() -> list[ClusterHandler]:
     do not overlap any lighting cluster so their order relative to them is
     independent. Air quality handlers are additive sensors.
     ElectricalPower/Energy are non-primary and merge into existing relay/dimmer
-    devices. PowerSource is non-primary and node-scoped (order-independent;
-    placed last)."""
+    devices. BooleanStateConfiguration (0x0080) is non-primary and merges into
+    existing occupancy/contact sensor devices (issue #85). PowerSource is
+    non-primary and node-scoped (order-independent; placed last)."""
     return [
         ColorControlHandler(),
         LevelControlHandler(),
@@ -70,6 +72,7 @@ def default_handlers() -> list[ClusterHandler]:
         TVOCHandler(),
         ElectricalPowerHandler(),
         ElectricalEnergyHandler(),
+        BooleanStateConfigHandler(),
         PowerSourceHandler(),
     ]
 

@@ -35,6 +35,10 @@ from matter_model import (
     parse_node,
 )
 from matter_handlers.base import IndigoDeviceSpec
+from matter_handlers.boolean_state_config import (
+    ATTR_SUPPORTED_SENSITIVITY_LEVELS,
+    CLUSTER_BOOLEAN_STATE_CONFIG,
+)
 from matter_handlers.electrical import (
     ATTR_ACTIVE_ENDPOINTS,
     ATTR_AVAILABLE_ENDPOINTS,
@@ -158,6 +162,12 @@ class DeviceSync:
         # on ep1) or must stay confined to its own endpoint (a bridge with
         # more than one battery-bearing child).
         self._power_source_eps: dict[int, set[int]] = {}
+        # BooleanStateConfiguration's SupportedSensitivityLevels (0x0080/0x0001)
+        # per (node_id, endpoint_id) — issue #85. NodeInfo snapshots are
+        # transient (this class holds no other node-attribute cache), so the
+        # Set Sensitivity Level menu callback (plugin.py) needs this value
+        # captured somewhere durable; refreshed on every create/reconcile pass.
+        self._sensitivity_supported: dict[tuple[int, int], int] = {}
 
     # ------------------------------------------------------------------
     # Active-device tracking (deviceStartComm/deviceStopComm)
@@ -382,6 +392,7 @@ class DeviceSync:
                     self._power_source_eps[int(node.node_id)] = power_source_eps
                 else:
                     self._power_source_eps.pop(int(node.node_id), None)
+            self._cache_sensitivity_levels(node)
             # Pass 1: cache every endpoint's handler-produced specs BEFORE any
             # fallback/placeholder decision. Meter-link resolution (issue #79)
             # needs to know which endpoints will host a _METER_CAPABLE_TYPES
@@ -1008,6 +1019,34 @@ class DeviceSync:
                 self.logger.warning("prime %s attr %s/%s failed: %s", dev_id, cluster, attribute, exc)
         if kv:
             self.apply_states(dev_id, kv)
+
+    # ------------------------------------------------------------------
+    # BooleanStateConfiguration sensitivity-level cache (issue #85)
+    # ------------------------------------------------------------------
+
+    def _cache_sensitivity_levels(self, node: NodeInfo) -> None:
+        """Cache SupportedSensitivityLevels (0x0080/0x0001) per endpoint.
+
+        Read by :meth:`sensitivity_levels_supported`, which the Set
+        Sensitivity Level menu callback (plugin.py) uses to label the picker.
+        Scans the full node snapshot rather than going through a handler,
+        since the value is deliberately NOT an Indigo state (it's a count, not
+        a reading) — there is nothing else to dispatch it to.
+        """
+        with self._lock:
+            for (ep, cluster, attribute), value in node.attributes.items():
+                if cluster != CLUSTER_BOOLEAN_STATE_CONFIG or attribute != ATTR_SUPPORTED_SENSITIVITY_LEVELS:
+                    continue
+                try:
+                    self._sensitivity_supported[(int(node.node_id), int(ep))] = int(value)
+                except (TypeError, ValueError):
+                    continue
+
+    def sensitivity_levels_supported(self, node_id: Any, endpoint_id: Any) -> Optional[int]:
+        """SupportedSensitivityLevels for (node, endpoint), or None if unknown
+        (not yet reconciled, or the node doesn't expose the cluster)."""
+        with self._lock:
+            return self._sensitivity_supported.get((int(node_id), int(endpoint_id)))
 
     # ------------------------------------------------------------------
     # Capability-prop helpers (issue #45 — self-heal mid-interview creations)

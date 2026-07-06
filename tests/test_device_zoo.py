@@ -140,6 +140,14 @@ ZOO = {
         _raw(14, {1: {"29/0": [{"0": 21}], "69/0": True}}),
         {1: ["matterContactSensor"]},
     ),
+    # Aqara FP300-shaped: OccupancySensing + BooleanStateConfiguration (0x0080,
+    # decimal 128) co-located on ep1 (issue #85). BooleanStateConfig is
+    # merge-only — it contributes no extra spec of its own, same invariant as
+    # the electrical clusters above.
+    "occupancy_with_sensitivity": (
+        _raw(0x2D, {1: {"29/0": [{"0": 263}], "1030/0": 1, "128/0": 1, "128/1": 3}}),
+        {1: ["matterMotionSensor"]},
+    ),
     "smoke_alarm": (
         _raw(15, {1: {"29/0": [{"0": 118}], "92/0": 0}}),
         {1: ["matterSmokeCOAlarm"]},
@@ -306,7 +314,7 @@ def test_every_registered_handler_type_exists_in_devices_xml():
     # removed Devices.xml id would create devices that Indigo rejects.
     for handler in HandlerRegistry().handlers:
         if not handler.device_type_id:
-            continue  # merge-only handlers (PowerSource, Electrical*)
+            continue  # merge-only handlers (PowerSource, Electrical*, BooleanStateConfig)
         assert handler.device_type_id in XML_TYPE_BY_ID, (
             f"{type(handler).__name__} → {handler.device_type_id} not in Devices.xml"
         )

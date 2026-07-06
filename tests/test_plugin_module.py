@@ -201,3 +201,155 @@ def test_action_control_device_sends_each_command_of_a_list(plugin_cls):
     plugin_cls.actionControlDevice(stub, action=SimpleNamespace(), dev="dev")
     sent = [c[0][0] for c in stub._send_matter_command.call_args_list]
     assert sent == pair
+
+
+# ---------------------------------------------------------------------------
+# issue #85 — Set Sensitivity Level (the plugin's first custom device action)
+# ---------------------------------------------------------------------------
+
+def _sensitivity_dev(node_id="45", endpoint_id="1"):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    dev = SimpleNamespace(
+        id=5, name="Landing Presence",
+        pluginProps={"nodeId": node_id, "endpointId": endpoint_id},
+        updateStateOnServer=MagicMock(),
+    )
+    return dev
+
+
+def test_get_sensitivity_levels_confirmed_three_gets_friendly_labels(plugin_cls, mock_indigo_base, mock_logger):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    dev = _sensitivity_dev()
+    mock_indigo_base.devices = {5: dev}
+    stub = SimpleNamespace(device_sync=MagicMock(), logger=mock_logger)
+    stub.device_sync.sensitivity_levels_supported.return_value = 3
+    options = plugin_cls.getSensitivityLevels(stub, targetId=5)
+    assert options == [("0", "Low (0)"), ("1", "Standard (1)"), ("2", "High (2)")]
+    stub.device_sync.sensitivity_levels_supported.assert_called_once_with(45, 1)
+
+
+def test_get_sensitivity_levels_confirmed_other_count_gets_generic_labels(plugin_cls, mock_indigo_base, mock_logger):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    dev = _sensitivity_dev()
+    mock_indigo_base.devices = {5: dev}
+    stub = SimpleNamespace(device_sync=MagicMock(), logger=mock_logger)
+    stub.device_sync.sensitivity_levels_supported.return_value = 5
+    options = plugin_cls.getSensitivityLevels(stub, targetId=5)
+    assert options == [("0", "Level 0"), ("1", "Level 1"), ("2", "Level 2"),
+                        ("3", "Level 3"), ("4", "Level 4")]
+
+
+def test_get_sensitivity_levels_unknown_count_falls_back_generic(plugin_cls, mock_indigo_base, mock_logger):
+    """Unknown support (device not yet reconciled) must NOT presume the FP300's
+    Low/Standard/High semantics even though the fallback also has 3 entries."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    dev = _sensitivity_dev()
+    mock_indigo_base.devices = {5: dev}
+    stub = SimpleNamespace(device_sync=MagicMock(), logger=mock_logger)
+    stub.device_sync.sensitivity_levels_supported.return_value = None
+    options = plugin_cls.getSensitivityLevels(stub, targetId=5)
+    assert options == [("0", "Level 0"), ("1", "Level 1"), ("2", "Level 2")]
+
+
+def test_get_sensitivity_levels_degrades_when_device_lookup_fails(plugin_cls, mock_indigo_base, mock_logger):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    mock_indigo_base.devices = {}  # targetId not found
+    stub = SimpleNamespace(device_sync=MagicMock(), logger=mock_logger)
+    options = plugin_cls.getSensitivityLevels(stub, targetId=999)
+    assert options == [("0", "Level 0"), ("1", "Level 1"), ("2", "Level 2")]
+
+
+def test_action_set_sensitivity_level_sends_matter_write_and_echoes_state(plugin_cls, mock_logger):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    from protocol import MatterWrite
+    dev = _sensitivity_dev()
+    stub = SimpleNamespace(
+        device_sync=MagicMock(), logger=mock_logger,
+        _send_matter_command=MagicMock(return_value=True),
+    )
+    stub.device_sync.sensitivity_levels_supported.return_value = 3
+    action = SimpleNamespace(props={"level": "2"})
+    plugin_cls.actionSetSensitivityLevel(stub, action, dev)
+
+    assert stub._send_matter_command.call_count == 1
+    write, sent_dev = stub._send_matter_command.call_args[0]
+    assert isinstance(write, MatterWrite)
+    assert (write.node_id, write.endpoint, write.cluster, write.attribute, write.value) == (45, 1, 0x0080, 0x0000, 2)
+    assert sent_dev is dev
+    dev.updateStateOnServer.assert_called_once_with("sensitivityLevel", 2)
+
+
+def test_action_set_sensitivity_level_no_echo_when_send_fails(plugin_cls, mock_logger):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    dev = _sensitivity_dev()
+    stub = SimpleNamespace(
+        device_sync=MagicMock(), logger=mock_logger,
+        _send_matter_command=MagicMock(return_value=False),
+    )
+    stub.device_sync.sensitivity_levels_supported.return_value = 3
+    action = SimpleNamespace(props={"level": "1"})
+    plugin_cls.actionSetSensitivityLevel(stub, action, dev)
+    dev.updateStateOnServer.assert_not_called()
+
+
+def test_action_set_sensitivity_level_rejects_out_of_range(plugin_cls, mock_logger):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    dev = _sensitivity_dev()
+    stub = SimpleNamespace(
+        device_sync=MagicMock(), logger=mock_logger,
+        _send_matter_command=MagicMock(return_value=True),
+    )
+    stub.device_sync.sensitivity_levels_supported.return_value = 3
+    action = SimpleNamespace(props={"level": "5"})
+    plugin_cls.actionSetSensitivityLevel(stub, action, dev)
+    stub._send_matter_command.assert_not_called()
+    dev.updateStateOnServer.assert_not_called()
+    assert mock_logger.error.called
+
+
+def test_action_set_sensitivity_level_rejects_invalid_level(plugin_cls, mock_logger):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    dev = _sensitivity_dev()
+    stub = SimpleNamespace(device_sync=MagicMock(), logger=mock_logger,
+                           _send_matter_command=MagicMock())
+    action = SimpleNamespace(props={"level": "not-a-number"})
+    plugin_cls.actionSetSensitivityLevel(stub, action, dev)
+    stub._send_matter_command.assert_not_called()
+    assert mock_logger.error.called
+
+
+def test_action_set_sensitivity_level_rejects_device_with_no_node(plugin_cls, mock_logger):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    dev = _sensitivity_dev(node_id="", endpoint_id="")
+    stub = SimpleNamespace(device_sync=MagicMock(), logger=mock_logger,
+                           _send_matter_command=MagicMock())
+    action = SimpleNamespace(props={"level": "1"})
+    plugin_cls.actionSetSensitivityLevel(stub, action, dev)
+    stub._send_matter_command.assert_not_called()
+    assert mock_logger.error.called
+
+
+def test_action_set_sensitivity_level_allows_any_level_when_support_unknown(plugin_cls, mock_logger):
+    """No confirmed SupportedSensitivityLevels yet — don't block the write;
+    matter-server/the device is the final arbiter."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    dev = _sensitivity_dev()
+    stub = SimpleNamespace(
+        device_sync=MagicMock(), logger=mock_logger,
+        _send_matter_command=MagicMock(return_value=True),
+    )
+    stub.device_sync.sensitivity_levels_supported.return_value = None
+    action = SimpleNamespace(props={"level": "9"})
+    plugin_cls.actionSetSensitivityLevel(stub, action, dev)
+    stub._send_matter_command.assert_called_once()
