@@ -28,6 +28,17 @@ _SUPPORTS_TO_STATE = {
     "SupportsSensorValue": "sensorValue",
 }
 
+# Devices.xml declares these as plain custom states (no Supports* prop gates
+# them) — real Indigo instantiates a device's declared <States> at CREATION
+# regardless of props, unlike the Supports*-driven built-ins above. Only
+# BooleanStateConfigHandler's guard (issue #85 — "sensitivityLevel" not in
+# indigo_dev.states) needs this modelled; matterLock's lockState needs no
+# guard (door_lock.py writes it unconditionally) so it needs no seeding here.
+_STATIC_DEVICE_TYPE_STATES = {
+    "matterMotionSensor": {"sensitivityLevel"},
+    "matterContactSensor": {"sensitivityLevel"},
+}
+
 
 class FakeDev:
     def __init__(self, dev_id, name, device_type_id, props):
@@ -39,6 +50,8 @@ class FakeDev:
         for prop_key, state_key in _SUPPORTS_TO_STATE.items():
             if props.get(prop_key):
                 self.states[state_key] = 0  # Indigo-style initial value
+        for state_key in _STATIC_DEVICE_TYPE_STATES.get(device_type_id, ()):
+            self.states.setdefault(state_key, 0)
         self.error = None
         self.errorState = ""
         self.folderId = 0
@@ -2179,3 +2192,95 @@ def test_bridge_multi_power_source_battery_isolated_per_endpoint(ds, indigo_env)
     ))
     assert devices[temp_id].states.get("batteryLevel") == 100
     assert devices[hum_id].states.get("batteryLevel") == 40   # untouched, no leak
+
+
+# ===========================================================================
+# issue #85 — BooleanStateConfiguration (0x0080) sensitivity level
+# ===========================================================================
+
+# Aqara FP300-shaped node: OccupancySensing (0x0406) co-located with
+# BooleanStateConfiguration (0x0080, decimal 128) on endpoint 1 — the live
+# hardware wrinkle behind issue #85 (the spec pairs 0x0080 with BooleanState/
+# 0x0045 instead, exercised separately below via CONTACT_SENSITIVITY_NODE).
+OCCUPANCY_SENSITIVITY_NODE = {
+    "node_id": 0x2D,
+    "available": True,
+    "attributes": {
+        "0/40/1": "Aqara",
+        "0/40/3": "FP300",
+        "1/29/0": [{"0": 263}],   # OccupancySensor
+        "1/1030/0": 1,            # occupied
+        "1/128/0": 1,             # CurrentSensitivityLevel = Standard
+        "1/128/1": 3,             # SupportedSensitivityLevels
+    },
+}
+
+# BooleanState-paired shape (the spec's own pairing) — a contact sensor
+# exposing 0x0080 alongside BooleanState (0x0045, decimal 69).
+CONTACT_SENSITIVITY_NODE = {
+    "node_id": 0x2E,
+    "available": True,
+    "attributes": {
+        "1/29/0": [{"0": 21}],    # ContactSensor
+        "1/69/0": True,
+        "1/128/0": 2,             # CurrentSensitivityLevel = High
+        "1/128/1": 3,             # SupportedSensitivityLevels
+    },
+}
+
+
+def test_sensitivity_level_primed_on_motion_sensor_creation(ds, indigo_env):
+    _indigo, devices = indigo_env
+    ds.create_from_raw(OCCUPANCY_SENSITIVITY_NODE, "Landing Presence")
+    dev = devices[ds.lookup(0x2D, 1)]
+    assert dev.deviceTypeId == "matterMotionSensor"
+    assert dev.states.get("sensitivityLevel") == 1
+
+
+def test_sensitivity_level_primed_on_contact_sensor_creation(ds, indigo_env):
+    _indigo, devices = indigo_env
+    ds.create_from_raw(CONTACT_SENSITIVITY_NODE, "Back Door")
+    dev = devices[ds.lookup(0x2E, 1)]
+    assert dev.deviceTypeId == "matterContactSensor"
+    assert dev.states.get("sensitivityLevel") == 2
+
+
+def test_sensitivity_level_live_attribute_event_updates_state(ds, indigo_env):
+    _indigo, devices = indigo_env
+    ds.create_from_raw(OCCUPANCY_SENSITIVITY_NODE, "Landing Presence")
+    dev = devices[ds.lookup(0x2D, 1)]
+    ds.handle_event(MatterEvent(
+        kind=protocol.EVT_ATTRIBUTE_UPDATED,
+        node_id=0x2D, endpoint=1, cluster=0x0080, attribute=0x0000, value=0,
+    ))
+    assert dev.states.get("sensitivityLevel") == 0
+
+
+def test_no_leftover_cluster_log_for_boolean_state_config(ds, indigo_env, mock_logger):
+    """Regression: before issue #85 registered a handler for 0x0080, this
+    node's motion sensor would have logged the issue #81 'does not support
+    yet' diagnostic for it — now it must be quiet."""
+    ds.create_from_raw(OCCUPANCY_SENSITIVITY_NODE, "Landing Presence")
+    info_msgs = [c[0][0] % tuple(c[0][1:]) for c in mock_logger.info.call_args_list]
+    assert not any("0x0080" in m and "does not support yet" in m for m in info_msgs)
+
+
+def test_sensitivity_levels_supported_returns_cached_count(ds, indigo_env):
+    ds.create_from_raw(OCCUPANCY_SENSITIVITY_NODE, "Landing Presence")
+    assert ds.sensitivity_levels_supported(0x2D, 1) == 3
+
+
+def test_sensitivity_levels_supported_none_before_reconcile(ds, indigo_env):
+    assert ds.sensitivity_levels_supported(0x2D, 1) is None
+
+
+def test_sensitivity_levels_supported_refreshed_on_reconcile(ds, indigo_env):
+    """The cache must not go stale across a reconnect — reconcile_all re-primes
+    it from the fresh snapshot, same as every other capability cache here."""
+    ds.create_from_raw(OCCUPANCY_SENSITIVITY_NODE, "Landing Presence")
+    assert ds.sensitivity_levels_supported(0x2D, 1) == 3
+    import copy
+    changed = copy.deepcopy(OCCUPANCY_SENSITIVITY_NODE)
+    changed["attributes"]["1/128/1"] = 5
+    ds.reconcile_all([changed])
+    assert ds.sensitivity_levels_supported(0x2D, 1) == 5

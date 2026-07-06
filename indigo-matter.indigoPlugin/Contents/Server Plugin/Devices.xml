@@ -180,6 +180,13 @@
                 <TriggerLabel>Battery Level</TriggerLabel>
                 <ControlPageLabel>Battery Level</ControlPageLabel>
             </State>
+            <!-- BooleanStateConfiguration (0x0080) — issue #85. Co-locates with
+                 OccupancySensing on e.g. the Aqara FP300. -->
+            <State id="sensitivityLevel">
+                <ValueType>Integer</ValueType>
+                <TriggerLabel>Sensitivity Level</TriggerLabel>
+                <ControlPageLabel>Sensitivity Level</ControlPageLabel>
+            </State>
         </States>
         <UiDisplayStateId>onOffState</UiDisplayStateId>
     </Device>
@@ -205,6 +212,13 @@
                 <ValueType>Integer</ValueType>
                 <TriggerLabel>Battery Level</TriggerLabel>
                 <ControlPageLabel>Battery Level</ControlPageLabel>
+            </State>
+            <!-- BooleanStateConfiguration (0x0080) — issue #85. This is the
+                 cluster's spec-native pairing (BooleanState, 0x0045). -->
+            <State id="sensitivityLevel">
+                <ValueType>Integer</ValueType>
+                <TriggerLabel>Sensitivity Level</TriggerLabel>
+                <ControlPageLabel>Sensitivity Level</ControlPageLabel>
             </State>
         </States>
         <UiDisplayStateId>onOffState</UiDisplayStateId>

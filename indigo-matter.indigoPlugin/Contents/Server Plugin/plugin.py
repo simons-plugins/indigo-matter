@@ -27,6 +27,10 @@ from commission_jobs import CommissionJobs, node_id_to_str
 from device_sync import DeviceSync
 from http_handlers import HttpApi, MatterUnavailable
 from matter_client import MatterClient
+from matter_handlers.boolean_state_config import (
+    ATTR_CURRENT_SENSITIVITY,
+    CLUSTER_BOOLEAN_STATE_CONFIG,
+)
 from matter_handlers.registry import HandlerRegistry
 import protocol
 from protocol import MatterWrite, Protocol
@@ -297,6 +301,73 @@ class Plugin(indigo.PluginBase):
         else:
             self.logger.debug('ignored universal action %r for "%s"', cmd, dev.name)
 
+    def getSensitivityLevels(self, filter="", valuesDict=None, typeId="", targetId=0):  # noqa: N802, A002, ARG002
+        """List-callback populating the Set Sensitivity Level action's picker.
+
+        Reads SupportedSensitivityLevels (0x0080/0x0001), cached by device_sync
+        at the device's last create/reconcile pass — get_node's snapshot isn't
+        otherwise retained (issue #85). A CONFIRMED count of 3 gets the Aqara
+        FP300's real labels (Low/Standard/High); any other confirmed count gets
+        generic "Level N" options. Unknown (device not yet reconciled, or
+        offline) never presumes the FP300 labelling — it degrades to a generic
+        0..2 scale so the dialog is never empty but also never lies about what
+        the device actually supports.
+        """
+        known = None
+        try:
+            dev = indigo.devices[targetId]
+            node_id = dev.pluginProps.get("nodeId")
+            endpoint_id = dev.pluginProps.get("endpointId")
+            if node_id and endpoint_id not in (None, ""):
+                known = self.device_sync.sensitivity_levels_supported(int(node_id), int(endpoint_id))
+        except Exception as exc:  # noqa: BLE001 - never break the dialog; degrade to the generic fallback
+            self.logger.debug("getSensitivityLevels: could not resolve device %r: %s", targetId, exc)
+        if known and known > 0:
+            labels = ["Low (0)", "Standard (1)", "High (2)"] if known == 3 else [f"Level {i}" for i in range(known)]
+        else:
+            labels = [f"Level {i}" for i in range(3)]  # unconfirmed — generic 3-level fallback
+        return [(str(i), label) for i, label in enumerate(labels)]
+
+    def actionSetSensitivityLevel(self, action, dev):  # noqa: N802
+        """Custom device action (issue #85): write BooleanStateConfiguration's
+        writable CurrentSensitivityLevel (0x0080/0x0000) — the Aqara FP300's
+        motion sensitivity (co-located with OccupancySensing), or a contact
+        sensor's equivalent per the Matter spec's own BooleanState pairing."""
+        try:
+            level = int(action.props.get("level", ""))
+        except (TypeError, ValueError):
+            self.logger.error('"%s": invalid sensitivity level %r', dev.name, action.props.get("level"))
+            return
+        if "sensitivityLevel" not in dev.states:
+            # Defense-in-depth: the two Actions.xml entries are already scoped
+            # to motion/contact types, but a stale saved action (or a future
+            # filter change) could still hand us a device without the state.
+            self.logger.error('"%s": device does not support sensitivity (no Boolean State '
+                              'Configuration cluster)', dev.name)
+            return
+        node_id = dev.pluginProps.get("nodeId")
+        endpoint_id = dev.pluginProps.get("endpointId")
+        if not node_id or endpoint_id in (None, ""):
+            self.logger.error('"%s": cannot set sensitivity — device has no Matter node/endpoint yet', dev.name)
+            return
+        supported = self.device_sync.sensitivity_levels_supported(int(node_id), int(endpoint_id))
+        if supported and not 0 <= level < supported:
+            self.logger.error(
+                '"%s": sensitivity level %d out of range (device supports 0-%d)',
+                dev.name, level, supported - 1,
+            )
+            return
+        write = MatterWrite(int(node_id), int(endpoint_id), CLUSTER_BOOLEAN_STATE_CONFIG,
+                             ATTR_CURRENT_SENSITIVITY, level)
+        if self._send_matter_command(write, dev):
+            # Optimistic echo (precedent: color_control's whiteLevel echo) — the
+            # firehose attribute_updated report will confirm/correct this once
+            # matter-server processes the write.
+            try:
+                dev.updateStateOnServer("sensitivityLevel", level)
+            except Exception as exc:  # noqa: BLE001 - cosmetic echo only, must not fail the action
+                self.logger.debug('optimistic sensitivityLevel echo failed for "%s": %s', dev.name, exc)
+
     def _refresh_node(self, dev) -> None:
         """Re-interview the device's Matter node so matter-server re-reads its
         attributes; matter-server then emits a node_updated event which
@@ -327,21 +398,24 @@ class Plugin(indigo.PluginBase):
             self.logger.error('refresh of "%s" failed: %s', dev.name, exc)
             dev.setErrorStateOnServer("cmd failed")
 
-    def _send_matter_command(self, action, dev) -> None:
+    def _send_matter_command(self, action, dev) -> bool:
         if self.runtime is None or self.matter is None:
-            return
+            return False
         # An action is either a cluster-command invoke or an attribute write.
         coro = self.matter.write(action) if isinstance(action, MatterWrite) else self.matter.send_command(action)
         try:
             self.runtime.submit(coro).result(timeout=COMMAND_TIMEOUT)
             if getattr(dev, "errorState", ""):
                 dev.setErrorStateOnServer("")  # command succeeded — clear a stale error
+            return True
         except FuturesTimeoutError:
             self.logger.error("Matter command to %s timed out", dev.name)
             dev.setErrorStateOnServer("timeout")
+            return False
         except Exception as exc:  # noqa: BLE001
             self.logger.error("Matter command to %s failed: %s", dev.name, exc)
             dev.setErrorStateOnServer("cmd failed")
+            return False
 
     # ------------------------------------------------------------------
     # asyncio → Indigo event bridge (called on the loop thread)

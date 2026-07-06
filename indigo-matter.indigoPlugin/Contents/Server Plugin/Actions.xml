@@ -2,8 +2,10 @@
 <!-- Device control (on/off, brightness, color, thermostat setpoints/modes) is
      provided by Indigo for the built-in device types and routed via
      actionControlDevice / actionControlSensor / actionControlThermostat, then
-     dispatched through the cluster mapping layer — so no custom control actions
-     are needed here.
+     dispatched through the cluster mapping layer. BooleanStateConfiguration's
+     sensitivity level (issue #85) has no Indigo built-in action shape (an
+     arbitrary numeric picker), so it is the plugin's first custom device
+     action below.
 
      The uiPath="hidden" actions below are the Domio HTTP API (API.md v1.1),
      served by the Indigo Web Server (IWS) at
@@ -12,6 +14,32 @@
      Bearer API key Domio already uses. Auth is enforced by Indigo before the
      handler runs. -->
 <Actions>
+    <!-- Indigo's deviceFilter takes exactly ONE filter (comma lists match
+         nothing — live-verified 2026-07-06), so the sensitivity action is two
+         type-scoped entries sharing one callback: motion (the Aqara FP300
+         pairing) and contact (the Matter spec's BooleanState pairing). -->
+    <Action id="setSensitivityLevel"
+            deviceFilter="self.matterMotionSensor" uiPath="DeviceActions">
+        <Name>Set Sensitivity Level</Name>
+        <CallbackMethod>actionSetSensitivityLevel</CallbackMethod>
+        <ConfigUI>
+            <Field id="level" type="menu">
+                <Label>Sensitivity Level:</Label>
+                <List class="self" method="getSensitivityLevels" dynamicReload="true"/>
+            </Field>
+        </ConfigUI>
+    </Action>
+    <Action id="setSensitivityLevelContact"
+            deviceFilter="self.matterContactSensor" uiPath="DeviceActions">
+        <Name>Set Sensitivity Level (Contact Sensor)</Name>
+        <CallbackMethod>actionSetSensitivityLevel</CallbackMethod>
+        <ConfigUI>
+            <Field id="level" type="menu">
+                <Label>Sensitivity Level:</Label>
+                <List class="self" method="getSensitivityLevels" dynamicReload="true"/>
+            </Field>
+        </ConfigUI>
+    </Action>
     <Action id="status" uiPath="hidden">
         <Name>matter status</Name>
         <CallbackMethod>http_status</CallbackMethod>
