@@ -64,9 +64,17 @@ class MatterClient:
     ) -> None:
         self.proto = proto
         self.logger = logger
-        host = prefs.get("matterServerHost", "localhost")
-        port = prefs.get("matterServerPort", "5580")
-        path = prefs.get("matterServerPath", "/ws")
+        # A blank config field must fall back to the default, not sail through.
+        # prefs.get(key, default) only fires the default when the key is ABSENT;
+        # a present-but-empty "" would yield e.g. "ws://host:/ws", and websockets
+        # then silently connects to port 80 instead of matter-server (issue: user
+        # told to set host with no port → connect attempts on :80).
+        def _pref(key: str, default: str) -> str:
+            return str(prefs.get(key) or "").strip() or default
+
+        host = _pref("matterServerHost", "localhost")
+        port = _pref("matterServerPort", "5580")
+        path = _pref("matterServerPath", "/ws")
         self.uri = f"ws://{host}:{port}{path}"
         self._connect = connect or _default_connect
         self._on_event = on_event
@@ -103,7 +111,7 @@ class MatterClient:
             except asyncio.CancelledError:
                 raise
             except _WS_ERRORS as exc:
-                self.logger.warning("matter-server connection lost: %s", exc)
+                self.logger.warning("matter-server connection lost (%s): %s", self.uri, exc)
             except Exception as exc:  # pragma: no cover - defensive
                 self.logger.exception(exc)
             finally:

@@ -336,3 +336,31 @@ def test_commission_timeout_value_reaches_the_wait(mock_logger, monkeypatch):
         await client.close()
         task.cancel()
     run(scenario())
+
+
+class TestUriBuilding:
+    """The connect URI must fall back to defaults for absent OR blank prefs.
+
+    Regression: a user told to set the host with no port left matterServerPort
+    blank; prefs.get(..., "5580") returned the empty string (key present), so
+    the URI became "ws://host:/ws" and websockets silently used port 80.
+    """
+
+    def _uri(self, prefs):
+        return MatterClient(Protocol(), None, prefs, connect=lambda uri: None).uri
+
+    def test_defaults_when_prefs_absent(self):
+        assert self._uri({}) == "ws://localhost:5580/ws"
+
+    def test_blank_port_falls_back_to_default(self):
+        # host set (as the user was advised), port left blank
+        assert self._uri({"matterServerHost": "jobs2.local", "matterServerPort": ""}) == \
+            "ws://jobs2.local:5580/ws"
+
+    def test_whitespace_prefs_fall_back(self):
+        prefs = {"matterServerHost": "  ", "matterServerPort": "  ", "matterServerPath": "  "}
+        assert self._uri(prefs) == "ws://localhost:5580/ws"
+
+    def test_explicit_values_are_used_and_trimmed(self):
+        prefs = {"matterServerHost": " host ", "matterServerPort": " 9000 ", "matterServerPath": " /x "}
+        assert self._uri(prefs) == "ws://host:9000/x"
