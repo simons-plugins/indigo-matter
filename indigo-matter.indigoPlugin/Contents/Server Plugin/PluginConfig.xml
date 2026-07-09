@@ -1,4 +1,7 @@
 <?xml version="1.0"?>
+<!-- Conditional fields carry alwaysUseInDialogHeightCalc="true" so Indigo reserves
+     their height at open time — otherwise the window is sized for the default
+     (local) view and the taller "On another computer" / advanced sections overflow. -->
 <PluginConfig>
     <Field id="introLabel" type="label">
         <Label>Where is matter-server running? On this Mac, the plugin starts and manages it for you — there is nothing else to set up.</Label>
@@ -15,58 +18,70 @@
     <!-- LOCAL (turnkey): plugin runs matter-server on loopback; nothing to enter -->
     <Field id="localInfo" type="label" fontSize="small" fontColor="darkgray"
            alignWithControl="true"
-           visibleBindingId="serverLocation" visibleBindingValue="local">
+           visibleBindingId="serverLocation" visibleBindingValue="local"
+           alwaysUseInDialogHeightCalc="true">
         <Label>The plugin runs matter-server here on loopback (127.0.0.1:5580) and keeps it alive. No host or port to enter.</Label>
     </Field>
     <Field id="showAdvanced" type="checkbox" defaultValue="false"
-           visibleBindingId="serverLocation" visibleBindingValue="local">
+           visibleBindingId="serverLocation" visibleBindingValue="local"
+           alwaysUseInDialogHeightCalc="true">
         <Label>Show advanced server settings</Label>
     </Field>
     <Field id="nodeBinDir" type="textfield" defaultValue=""
-           visibleBindingId="showAdvanced" visibleBindingValue="true">
+           visibleBindingId="showAdvanced" visibleBindingValue="true"
+           alwaysUseInDialogHeightCalc="true">
         <Label>Node bin directory (optional):</Label>
         <Description>Directory containing node/npx. Leave blank to auto-detect
             (Homebrew, then nvm, then PATH). nvm users can pin a version here, e.g.
             ~/.nvm/versions/node/v22.18.0/bin; Homebrew users normally leave it blank.</Description>
     </Field>
     <Field id="primaryInterface" type="textfield" defaultValue="en0"
-           visibleBindingId="showAdvanced" visibleBindingValue="true">
+           visibleBindingId="showAdvanced" visibleBindingValue="true"
+           alwaysUseInDialogHeightCalc="true">
         <Label>Primary network interface:</Label>
         <Description>macOS interface matter-server uses for Matter/Thread discovery (e.g. en0).</Description>
     </Field>
     <Field id="storagePath" type="textfield"
            defaultValue="~/Library/Application Support/com.simons-plugins.indigo-matter/matter-server"
-           visibleBindingId="showAdvanced" visibleBindingValue="true">
+           visibleBindingId="showAdvanced" visibleBindingValue="true"
+           alwaysUseInDialogHeightCalc="true">
         <Label>matter-server storage path:</Label>
     </Field>
 
     <!-- REMOTE: connect to a matter-server on another computer -->
     <Field id="remoteSep" type="separator"
-           visibleBindingId="serverLocation" visibleBindingValue="remote"/>
+           visibleBindingId="serverLocation" visibleBindingValue="remote"
+           alwaysUseInDialogHeightCalc="true"/>
     <Field id="remoteHeader" type="label" fontColor="blue"
-           visibleBindingId="serverLocation" visibleBindingValue="remote">
+           visibleBindingId="serverLocation" visibleBindingValue="remote"
+           alwaysUseInDialogHeightCalc="true">
         <Label>Connection details</Label>
     </Field>
     <Field id="matterServerHost" type="textfield" defaultValue="localhost"
-           visibleBindingId="serverLocation" visibleBindingValue="remote">
+           visibleBindingId="serverLocation" visibleBindingValue="remote"
+           alwaysUseInDialogHeightCalc="true">
         <Label>matter-server host:</Label>
     </Field>
     <Field id="matterServerHostHelp" type="label" fontSize="small" fontColor="darkgray"
            alignWithControl="true"
-           visibleBindingId="serverLocation" visibleBindingValue="remote">
+           visibleBindingId="serverLocation" visibleBindingValue="remote"
+           alwaysUseInDialogHeightCalc="true">
         <Label>Hostname or IP only — no "http://" and no port here (e.g. 192.168.1.20).
             The remote matter-server must bind to a reachable address, not 127.0.0.1.</Label>
     </Field>
     <Field id="matterServerPort" type="textfield" defaultValue="5580"
-           visibleBindingId="serverLocation" visibleBindingValue="remote">
+           visibleBindingId="serverLocation" visibleBindingValue="remote"
+           alwaysUseInDialogHeightCalc="true">
         <Label>matter-server port:</Label>
     </Field>
     <Field id="matterServerPath" type="textfield" defaultValue="/ws"
-           visibleBindingId="serverLocation" visibleBindingValue="remote">
+           visibleBindingId="serverLocation" visibleBindingValue="remote"
+           alwaysUseInDialogHeightCalc="true">
         <Label>WebSocket path:</Label>
     </Field>
     <Field id="remoteWarn" type="label" fontSize="small" fontColor="red"
-           visibleBindingId="serverLocation" visibleBindingValue="remote">
+           visibleBindingId="serverLocation" visibleBindingValue="remote"
+           alwaysUseInDialogHeightCalc="true">
         <Label>matter-server's control API is UNAUTHENTICATED. Only connect over a network you trust.</Label>
     </Field>
 
