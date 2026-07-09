@@ -339,28 +339,38 @@ def test_commission_timeout_value_reaches_the_wait(mock_logger, monkeypatch):
 
 
 class TestUriBuilding:
-    """The connect URI must fall back to defaults for absent OR blank prefs.
+    """Local mode forces loopback; remote mode uses the fields (blank-safe).
 
     Regression: a user told to set the host with no port left matterServerPort
     blank; prefs.get(..., "5580") returned the empty string (key present), so
-    the URI became "ws://host:/ws" and websockets silently used port 80.
+    the URI became "ws://host:/ws" and websockets silently used port 80. Local
+    mode now sidesteps this entirely by ignoring host/port.
     """
 
     def _uri(self, prefs):
         return MatterClient(Protocol(), None, prefs, connect=lambda uri: None).uri
 
-    def test_defaults_when_prefs_absent(self):
+    def test_local_is_default_and_forces_loopback(self):
         assert self._uri({}) == "ws://localhost:5580/ws"
 
-    def test_blank_port_falls_back_to_default(self):
-        # host set (as the user was advised), port left blank
-        assert self._uri({"matterServerHost": "jobs2.local", "matterServerPort": ""}) == \
-            "ws://jobs2.local:5580/ws"
-
-    def test_whitespace_prefs_fall_back(self):
-        prefs = {"matterServerHost": "  ", "matterServerPort": "  ", "matterServerPath": "  "}
+    def test_local_ignores_stale_host_and_port(self):
+        # the exact misconfiguration from the field: host + wrong port, local mode
+        prefs = {"serverLocation": "local",
+                 "matterServerHost": "jobs2.local", "matterServerPort": "8176"}
         assert self._uri(prefs) == "ws://localhost:5580/ws"
 
-    def test_explicit_values_are_used_and_trimmed(self):
-        prefs = {"matterServerHost": " host ", "matterServerPort": " 9000 ", "matterServerPath": " /x "}
+    def test_remote_uses_the_fields(self):
+        prefs = {"serverLocation": "remote",
+                 "matterServerHost": "192.168.1.20", "matterServerPort": "5580"}
+        assert self._uri(prefs) == "ws://192.168.1.20:5580/ws"
+
+    def test_remote_blank_port_falls_back_to_default(self):
+        # the original bug, still guarded on the remote path
+        prefs = {"serverLocation": "remote",
+                 "matterServerHost": "jobs2.local", "matterServerPort": ""}
+        assert self._uri(prefs) == "ws://jobs2.local:5580/ws"
+
+    def test_remote_values_are_trimmed(self):
+        prefs = {"serverLocation": "remote",
+                 "matterServerHost": " host ", "matterServerPort": " 9000 ", "matterServerPath": " /x "}
         assert self._uri(prefs) == "ws://host:9000/x"

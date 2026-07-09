@@ -67,15 +67,19 @@ class MatterClient:
         # A blank config field must fall back to the default, not sail through.
         # prefs.get(key, default) only fires the default when the key is ABSENT;
         # a present-but-empty "" would yield e.g. "ws://host:/ws", and websockets
-        # then silently connects to port 80 instead of matter-server (issue: user
-        # told to set host with no port → connect attempts on :80).
+        # then silently connects to port 80 instead of matter-server.
         def _pref(key: str, default: str) -> str:
             return str(prefs.get(key) or "").strip() or default
 
-        host = _pref("matterServerHost", "localhost")
-        port = _pref("matterServerPort", "5580")
-        path = _pref("matterServerPath", "/ws")
-        self.uri = f"ws://{host}:{port}{path}"
+        if _pref("serverLocation", "local") == "local":
+            # Turnkey local: the plugin runs matter-server here on loopback, so
+            # always dial it there and ignore any stale host/port in prefs.
+            self.uri = "ws://localhost:5580/ws"
+        else:
+            host = _pref("matterServerHost", "localhost")
+            port = _pref("matterServerPort", "5580")
+            path = _pref("matterServerPath", "/ws")
+            self.uri = f"ws://{host}:{port}{path}"
         self._connect = connect or _default_connect
         self._on_event = on_event
         # on_connect: async, scheduled after each (re)connect — used to re-reconcile.
