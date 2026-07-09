@@ -64,10 +64,22 @@ class MatterClient:
     ) -> None:
         self.proto = proto
         self.logger = logger
-        host = prefs.get("matterServerHost", "localhost")
-        port = prefs.get("matterServerPort", "5580")
-        path = prefs.get("matterServerPath", "/ws")
-        self.uri = f"ws://{host}:{port}{path}"
+        # A blank config field must fall back to the default, not sail through.
+        # prefs.get(key, default) only fires the default when the key is ABSENT;
+        # a present-but-empty "" would yield e.g. "ws://host:/ws", and websockets
+        # then silently connects to port 80 instead of matter-server.
+        def _pref(key: str, default: str) -> str:
+            return str(prefs.get(key) or "").strip() or default
+
+        if _pref("serverLocation", "local") == "local":
+            # Turnkey local: the plugin runs matter-server here on loopback, so
+            # always dial it there and ignore any stale host/port in prefs.
+            self.uri = "ws://localhost:5580/ws"
+        else:
+            host = _pref("matterServerHost", "localhost")
+            port = _pref("matterServerPort", "5580")
+            path = _pref("matterServerPath", "/ws")
+            self.uri = f"ws://{host}:{port}{path}"
         self._connect = connect or _default_connect
         self._on_event = on_event
         # on_connect: async, scheduled after each (re)connect — used to re-reconcile.
@@ -103,7 +115,7 @@ class MatterClient:
             except asyncio.CancelledError:
                 raise
             except _WS_ERRORS as exc:
-                self.logger.warning("matter-server connection lost: %s", exc)
+                self.logger.warning("matter-server connection lost (%s): %s", self.uri, exc)
             except Exception as exc:  # pragma: no cover - defensive
                 self.logger.exception(exc)
             finally:

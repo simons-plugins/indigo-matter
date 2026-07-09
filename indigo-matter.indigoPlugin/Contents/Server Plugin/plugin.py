@@ -41,6 +41,47 @@ COMMAND_TIMEOUT = 5.0
 DECOMMISSION_TIMEOUT = 15.0
 
 
+def server_location(prefs: dict) -> str:
+    """Resolve the one user-facing choice: is matter-server on this Mac?
+
+    Returns ``"local"`` (the plugin runs and manages matter-server here on
+    loopback) or ``"remote"`` (connect to a matter-server elsewhere).
+
+    Migrates pre-2026.6 prefs that predate the ``serverLocation`` menu:
+      * a managed LaunchAgent meant the plugin already ran the server here → local;
+      * a host pointed at another machine → remote (keep its host/port);
+      * anything else — a fresh install or a loopback self-run server → local,
+        the turnkey default.
+    """
+    loc = str(prefs.get("serverLocation") or "").strip().lower()
+    if loc in ("local", "remote"):
+        return loc
+    if prefs.get("manageLaunchAgent", False):
+        return "local"
+    host = str(prefs.get("matterServerHost") or "").strip().lower()
+    if host and host not in ("localhost", "127.0.0.1", "::1"):
+        return "remote"
+    return "local"
+
+
+def sanitize_host(raw: str) -> str:
+    """Reduce a user-entered host to a bare hostname / IP.
+
+    Users paste full URLs into the host field (e.g. ``http://jobs2.local:8176``);
+    a scheme, an embedded port, and any path all corrupt ``ws://{host}:{port}{path}``.
+    Strip them so the separate port field stays authoritative. IPv6 literals
+    (multiple colons) are left untouched.
+    """
+    host = str(raw or "").strip()
+    if "://" in host:
+        host = host.split("://", 1)[1]
+    host = host.split("/", 1)[0]  # drop any /path
+    # strip an embedded :PORT (host:1234) but preserve IPv6 literals (many colons)
+    if host.count(":") == 1 and host.rsplit(":", 1)[1].isdigit():
+        host = host.rsplit(":", 1)[0]
+    return host
+
+
 class Plugin(indigo.PluginBase):
     """Matter plugin entry point."""
 
@@ -66,10 +107,27 @@ class Plugin(indigo.PluginBase):
         self.debug = bool(self.pluginPrefs.get("verboseLogging", False))
         prefs = dict(self.pluginPrefs)
 
+        # One user-facing choice — is matter-server on this Mac? — drives both
+        # the connection target and whether the plugin runs the server. 'local'
+        # is turnkey: the plugin manages matter-server on loopback and dials it
+        # there, so a stale/blank host or port can never be used.
+        location = server_location(prefs)
+        managed = location == "local"
+        if managed:
+            prefs["matterServerHost"] = "localhost"
+            prefs["matterServerPort"] = "5580"
+            prefs["matterServerPath"] = "/ws"
+            prefs["matterServerListenAddress"] = "127.0.0.1"
+        prefs["serverLocation"] = location
+        # Persist the resolved choice so the config UI and later reads agree
+        # (also migrates pre-2026.6 prefs that had no serverLocation key).
+        self.pluginPrefs["serverLocation"] = location
+        self.pluginPrefs["manageLaunchAgent"] = managed
+
         self.runtime = AsyncRuntime(self.logger)
         self.runtime.start()
 
-        if prefs.get("manageLaunchAgent", False):
+        if managed:
             try:
                 self.server_process = ServerProcess(prefs, self.logger)
                 self.server_process.ensure_installed()
@@ -194,10 +252,29 @@ class Plugin(indigo.PluginBase):
     # ------------------------------------------------------------------
     # Config
     # ------------------------------------------------------------------
+    def validatePrefsConfigUi(self, valuesDict):  # noqa: N802
+        """Sanitise the remote host and require it when connecting off-Mac."""
+        location = str(valuesDict.get("serverLocation", "local")).strip().lower()
+        if location == "remote":
+            host = sanitize_host(valuesDict.get("matterServerHost", ""))
+            valuesDict["matterServerHost"] = host  # strip pasted scheme/port/path
+            if not host:
+                errors = indigo.Dict()
+                errors["matterServerHost"] = (
+                    "Enter the hostname or IP of the computer running matter-server."
+                )
+                return (False, valuesDict, errors)
+        return (True, valuesDict)
+
     def closedPrefsConfigUi(self, valuesDict, userCancelled):  # noqa: N802
         if userCancelled:
             return
         self.debug = bool(valuesDict.get("verboseLogging", False))
+        # The connection + managed server are wired once in startup from a prefs
+        # snapshot, so a changed location/host only takes effect on reload.
+        self.logger.info(
+            "matter-server settings saved — reload the plugin to apply them"
+        )
 
     # ------------------------------------------------------------------
     # Device lifecycle

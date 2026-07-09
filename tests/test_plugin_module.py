@@ -370,3 +370,59 @@ def test_action_set_sensitivity_level_allows_any_level_when_support_unknown(plug
     action = SimpleNamespace(props={"level": "9"})
     plugin_cls.actionSetSensitivityLevel(stub, action, dev)
     stub._send_matter_command.assert_called_once()
+
+
+@pytest.fixture
+def plugin_module(mock_indigo_base):
+    import importlib
+    import plugin as pm
+    importlib.reload(pm)
+    return pm
+
+
+class TestServerLocation:
+    def test_explicit_local(self, plugin_module):
+        assert plugin_module.server_location({"serverLocation": "local"}) == "local"
+
+    def test_explicit_remote(self, plugin_module):
+        assert plugin_module.server_location({"serverLocation": "remote"}) == "remote"
+
+    def test_migrates_managed_to_local(self, plugin_module):
+        # pre-2026.6 prefs: no serverLocation, LaunchAgent was managed
+        assert plugin_module.server_location({"manageLaunchAgent": True}) == "local"
+
+    def test_migrates_remote_host_to_remote(self, plugin_module):
+        # pre-2026.6 prefs: not managed, host on another machine → connect-only
+        assert plugin_module.server_location(
+            {"manageLaunchAgent": False, "matterServerHost": "192.168.1.20"}) == "remote"
+
+    def test_empty_prefs_default_local(self, plugin_module):
+        # fresh install → turnkey local (matches PluginConfig.xml default)
+        assert plugin_module.server_location({}) == "local"
+
+    def test_loopback_self_run_is_local(self, plugin_module):
+        # not managed but host is loopback → fold into turnkey local
+        assert plugin_module.server_location(
+            {"manageLaunchAgent": False, "matterServerHost": "localhost"}) == "local"
+
+
+class TestSanitizeHost:
+    def test_strips_scheme_and_embedded_port(self, plugin_module):
+        # the exact paste from the field
+        assert plugin_module.sanitize_host("http://jobs2.local:8176") == "jobs2.local"
+
+    def test_strips_path(self, plugin_module):
+        assert plugin_module.sanitize_host("jobs2.local/ws") == "jobs2.local"
+
+    def test_plain_host_untouched(self, plugin_module):
+        assert plugin_module.sanitize_host("192.168.1.20") == "192.168.1.20"
+
+    def test_trims_whitespace(self, plugin_module):
+        assert plugin_module.sanitize_host("  jobs2.local  ") == "jobs2.local"
+
+    def test_ipv6_literal_preserved(self, plugin_module):
+        # multiple colons → not treated as host:port
+        assert plugin_module.sanitize_host("fd57::1") == "fd57::1"
+
+    def test_blank_stays_blank(self, plugin_module):
+        assert plugin_module.sanitize_host("") == ""
