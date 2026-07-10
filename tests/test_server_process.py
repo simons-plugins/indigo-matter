@@ -589,3 +589,33 @@ def test_program_arguments_blank_storage_falls_back(tmp_path, mock_logger):
                        npx_path=str(home / "bin" / "npx"), runner=FakeRunner())
     storage = sp.program_arguments()[sp.program_arguments().index("--storage-path") + 1]
     assert storage.strip() != "" and storage.endswith("/matter-server")
+
+
+def _sp_port(tmp_path, mock_logger, prefs):
+    home = tmp_path / "home"
+    (home / "bin").mkdir(parents=True)
+    (home / "bin" / "npx").write_text("#!/bin/sh\n")
+    sp = ServerProcess(prefs, mock_logger, home=str(home),
+                       npx_path=str(home / "bin" / "npx"), runner=FakeRunner())
+    args = sp.program_arguments()
+    return args[args.index("--port") + 1]
+
+
+def test_local_mode_forces_port_5580_even_with_stale_pref(tmp_path, mock_logger):
+    # local WS client always dials 5580, so the server must too — a stale/other port
+    # pref must not diverge them.
+    port = _sp_port(tmp_path, mock_logger,
+                    {"serverLocation": "local", "matterServerPort": "9999"})
+    assert port == "5580"
+
+
+def test_local_mode_forces_port_5580_when_blank(tmp_path, mock_logger):
+    port = _sp_port(tmp_path, mock_logger,
+                    {"serverLocation": "local", "matterServerPort": ""})
+    assert port == "5580"
+
+
+def test_remote_mode_honours_configured_port(tmp_path, mock_logger):
+    port = _sp_port(tmp_path, mock_logger,
+                    {"serverLocation": "remote", "matterServerPort": "5590"})
+    assert port == "5590"

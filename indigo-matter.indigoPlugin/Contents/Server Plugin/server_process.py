@@ -101,13 +101,17 @@ class ServerProcess:
         # ship node and npx side-by-side). We launch node directly because the
         # matter-server npm package exposes no bin executable (see module docstring).
         self.node_path = os.path.join(os.path.dirname(self.npx_path), "node")
-        # Blank-but-present prefs must fall back to the default, not sail through:
-        # prefs.get(key, default) only fires the default when the key is ABSENT. A
-        # present-but-empty matterServerPort would become `--port ""`, which
-        # matter-server's CLI rejects with "Invalid integer:" and crash-loops (same
-        # class of bug the WS client's _pref() guards against). Applies to every value
-        # that becomes a launch arg.
-        self.port = str(prefs.get("matterServerPort") or "").strip() or "5580"
+        # Port. In LOCAL mode the WS client hardcodes ws://localhost:5580/ws, so the
+        # server must listen on 5580 too — the matterServerPort field is hidden in
+        # local mode (its defaultValue never applies) and would otherwise reach the
+        # CLI as "" → matter-server "Invalid integer:" crash-loop, or as a stale value
+        # that diverges from what the client dials. Force 5580 in local mode; in remote
+        # mode honour the pref but still fall back on blank (prefs.get only defaults on
+        # an ABSENT key, not a present-but-empty one).
+        if str(prefs.get("serverLocation") or "").strip().lower() == "local":
+            self.port = "5580"
+        else:
+            self.port = str(prefs.get("matterServerPort") or "").strip() or "5580"
         self.primary_interface = str(prefs.get("primaryInterface") or "").strip() or "en0"
         # Address the matter-server WebSocket control API binds to. matter-server
         # v0.6.2 binds to ALL interfaces when no --listen-address is given, and the
