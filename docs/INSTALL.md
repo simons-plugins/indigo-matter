@@ -49,9 +49,23 @@ file.
 
 ## Step 1 — Install Node.js 22
 
-Pick **one** of the following. The reference server uses nvm with Node 22.
+Pick **one** of the following. **Homebrew is the paved road** — it puts node at a
+stable, launchd-visible path (`/opt/homebrew/bin`), so the plugin's auto-detect just
+works and you leave `nodeBinDir` blank. nvm works too but is fussier (per-version
+paths that change on upgrade, and launchd doesn't source your shell's nvm) — treat it
+as the advanced option and pin `nodeBinDir` explicitly.
 
-### Option A — nvm (recommended)
+### Option A — Homebrew (recommended)
+
+```bash
+brew install node@22
+brew link node@22
+node --version    # confirm v22.x
+```
+
+Leave **Node bin directory** (`nodeBinDir`) blank — auto-detect finds Homebrew first.
+
+### Option B — nvm (advanced)
 
 ```bash
 # Install nvm if you don't have it (see https://github.com/nvm-sh/nvm)
@@ -62,27 +76,27 @@ nvm use 22
 node --version    # confirm v22.x
 ```
 
-With nvm, node lives at `~/.nvm/versions/node/vXX/bin`. The plugin auto-detects nvm
-(default alias, else newest installed), but you can pin the exact directory in the
-plugin config (`nodeBinDir`) if auto-detect picks the wrong one.
-
-### Option B — Homebrew
-
-```bash
-brew install node@22
-brew link node@22
-node --version    # confirm v22.x
-```
-
-Homebrew users normally leave `nodeBinDir` blank.
+With nvm, node lives at `~/.nvm/versions/node/<your-version>/bin` (run the command
+above to see *your* exact version — don't copy someone else's). The plugin auto-detects
+nvm (default alias, else newest installed), but **pin the exact directory** in the plugin
+config (`nodeBinDir`) so a node upgrade or a wrong auto-detect can't swap the node out
+from under an installed package.
 
 ---
 
 ## Step 2 — Install matter-server
 
-Install matter-server into a dedicated project directory at `~/indigo-matter`. The
-plugin's managed LaunchAgent expects the package at
-`~/indigo-matter/node_modules/matter-server`.
+The package lives at `~/indigo-matter/node_modules/matter-server`, where the plugin's
+managed LaunchAgent expects it.
+
+**Easiest (recommended): let the plugin do it.** In local/managed mode, use
+**Plugins ▸ Matter ▸ Install/update matter-server**. The plugin installs the package
+with the *same* node it will run the server with, and pins that node in `nodeBinDir` —
+which is the thing that prevents the most common failure (installing with one node and
+running with another, whose native modules won't load). No Terminal needed. Skip to
+Step 3.
+
+**Manual (self-managers):** install it yourself with the node you intend to run:
 
 ```bash
 mkdir -p ~/indigo-matter
@@ -114,8 +128,9 @@ matter-server.
 Let the plugin install and supervise matter-server for you.
 
 1. Tick **Manage matter-server LaunchAgent automatically**.
-2. If you installed Node with **nvm**, set **Node bin directory** to your node bin dir,
-   e.g. `~/.nvm/versions/node/v22.22.3/bin`. Homebrew users leave it blank (auto-detect).
+2. **Homebrew users: leave Node bin directory blank** (auto-detect). Only if you used nvm,
+   set it to *your* node bin dir — run `echo ~/.nvm/versions/node/$(nvm version)/bin` to get
+   the exact path; don't copy a version string from these docs.
 3. Leave **matter-server listen address** at `127.0.0.1` (loopback — see Security).
 4. Leave **port** `5580`, **WebSocket path** `/ws`, **host** `localhost`, **primary
    interface** `en0` (change only if your active interface differs — check with
@@ -159,7 +174,7 @@ node ~/indigo-matter/node_modules/matter-server/dist/esm/MatterServer.js \
 | **matter-server host** | `localhost` | Client connect target the plugin dials. |
 | **matter-server port** | `5580` | WebSocket port. |
 | **matter-server WebSocket path** | `/ws` | WebSocket path. |
-| **Node bin directory (optional)** | *(blank)* | Directory containing `node`. Blank = auto-detect (Homebrew, then nvm, then PATH). nvm users may pin, e.g. `~/.nvm/versions/node/v22.22.3/bin`. Managed mode only. |
+| **Node bin directory (optional)** | *(blank)* | Directory containing `node`. Blank = auto-detect (Homebrew, then nvm, then PATH). nvm users should pin their own path (see Step 1). Managed mode only. |
 | **matter-server storage path** | `~/Library/Application Support/com.simons-plugins.indigo-matter/matter-server` | The fabric. See Backups. |
 | **Manage matter-server LaunchAgent automatically** | off | On = plugin supervises matter-server (Mode A); off = you run it (Mode B). |
 | **Primary network interface** | `en0` | macOS interface matter-server binds to. Managed mode only. |
@@ -243,7 +258,7 @@ matter-server runs on a different host and you have a trusted firewall in front 
 |---|---|---|
 | `npm error could not determine executable to run` | Old plugin (< 2026.0.6) launched matter-server via `npx`, which no longer works (the package has no bin). | Upgrade the plugin to ≥ 2026.0.6. |
 | `Connect call failed ('127.0.0.1', 5580)` | matter-server isn't running, crashed, or is on a different port. | Check `matter-server.err.log`; confirm the port matches the config; in managed mode re-save the config; in manual mode (re)start matter-server. |
-| nvm node not found by the managed agent | Auto-detect didn't find the nvm node. | Set **Node bin directory** explicitly, e.g. `~/.nvm/versions/node/v22.22.3/bin`. |
+| nvm node not found by the managed agent | Auto-detect didn't find the nvm node. | Set **Node bin directory** explicitly to your own nvm bin dir (see Step 1), or use Homebrew node. |
 | `BLE is not enabled on this platform` warning | Expected — BLE isn't used (Wi-Fi only). | Benign; ignore. |
 | New managed LaunchAgent doesn't take effect | A prior agent with the same label is still loaded. | `launchctl bootout gui/$(id -u)/com.simons-plugins.indigo-matter`, then restart the plugin. |
 | Hand-edited plist keeps reverting | The plugin regenerates the plist from config on restart. | Change settings via **Configure…**, not the plist. |

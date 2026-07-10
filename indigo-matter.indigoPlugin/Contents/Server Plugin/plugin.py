@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 from concurrent.futures import CancelledError as FuturesCancelledError
 from concurrent.futures import TimeoutError as FuturesTimeoutError
@@ -99,6 +100,7 @@ class Plugin(indigo.PluginBase):
         self.jobs: CommissionJobs | None = None
         self.http: HttpApi | None = None
         self.server_process: ServerProcess | None = None
+        self._install_thread: threading.Thread | None = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -689,6 +691,44 @@ class Plugin(indigo.PluginBase):
     # ------------------------------------------------------------------
     # Menu items
     # ------------------------------------------------------------------
+    def menuInstallMatterServer(self):  # noqa: N802
+        """Install/update the matter-server npm package, then pin the node used.
+
+        Only meaningful in local (managed) mode — self-managers keep their own
+        server untouched. Runs off the Indigo main thread so the UI never blocks on
+        npm; progress and outcome go to the log.
+        """
+        if server_location(self.pluginPrefs) != "local":
+            self.logger.error(
+                "Install is only for local mode. Set 'is matter-server on this Mac?' "
+                "to local (managed) first, or install/manage the server yourself."
+            )
+            return
+        if self._install_thread is not None and self._install_thread.is_alive():
+            self.logger.warning("matter-server install already in progress.")
+            return
+        self._install_thread = threading.Thread(
+            target=self._install_matter_server, name="matter-install", daemon=True)
+        self._install_thread.start()
+
+    def _install_matter_server(self) -> None:
+        try:
+            sp = self.server_process or ServerProcess(dict(self.pluginPrefs), self.logger)
+            if not sp.install():
+                return
+            # Pin the exact node used so the LaunchAgent runs the same one forever —
+            # this is what keeps install-node == run-node and avoids ABI crash-loops.
+            self.pluginPrefs["nodeBinDir"] = sp.resolved_bin_dir
+            indigo.server.savePluginPrefs()
+            self.server_process = ServerProcess(dict(self.pluginPrefs), self.logger)
+            self.server_process.ensure_installed()
+            self.logger.info(
+                "matter-server installed and pinned to node at %s. It should connect "
+                "shortly — the client reconnects automatically.", sp.resolved_bin_dir,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.logger.exception(exc)
+
     def menuRestartMatterServer(self):  # noqa: N802
         if self.server_process is None:
             self.logger.warning("LaunchAgent management is off; start matter-server manually")

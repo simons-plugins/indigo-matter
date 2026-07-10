@@ -33,15 +33,27 @@ LABEL = "com.simons-plugins.indigo-matter"
 DEFAULT_PROJECT_DIRNAME = "indigo-matter"   # ~/indigo-matter (npm install location)
 NPX_CANDIDATES = ("/opt/homebrew/bin/npx", "/usr/local/bin/npx")
 MATTER_SERVER_PACKAGE = "matter-server"
+# Default caret spec installed by install(). Kept in one place so a version bump is
+# a one-line change (matches docs/INSTALL.md).
+DEFAULT_INSTALL_SPEC = "matter-server@^0.6.2"
 # Fallback entry point if the package's package.json is missing/unreadable. Matches
 # matter-server v0.6.2's "main": "dist/esm/MatterServer.js".
 DEFAULT_SERVER_ENTRY = "dist/esm/MatterServer.js"
+# Records the node version the package was installed with, so preflight can catch an
+# install-node vs run-node mismatch (native-binding ABI crash) before it crash-loops.
+INSTALL_NODE_STAMP = ".indigo-node"
 
 
 def _expand(path: str, home: str) -> str:
     if path.startswith("~"):
         return home + path[1:]
     return path
+
+
+def _node_major(version: Optional[str]) -> Optional[int]:
+    """Major version int from a node version string (``v22.18.0`` → 22), else None."""
+    parsed = _parse_node_version(version) if version else None
+    return parsed[0] if parsed else None
 
 
 def _parse_node_version(name: str) -> Optional[tuple[int, ...]]:
@@ -112,6 +124,16 @@ class ServerProcess:
     @property
     def log_dir(self) -> str:
         return os.path.join(self.home, "Library", "Logs", "indigo-matter")
+
+    @property
+    def resolved_bin_dir(self) -> str:
+        """The node/npx bin directory this instance resolved to.
+
+        The caller pins this into the ``nodeBinDir`` pref after install() so the node
+        that RAN the install is the node that RUNS the server — the match that avoids
+        native-binding ABI crash-loops.
+        """
+        return os.path.dirname(self.npx_path)
 
     def _resolve_npx(self) -> str:
         """Locate the ``npx`` binary, honouring an explicit pref then auto-detect.
@@ -300,11 +322,55 @@ class ServerProcess:
         if not self._exists(entry):
             return (
                 f"the matter-server package is not installed ({entry} is missing). "
-                f"In Terminal, run 'npm install matter-server' inside "
-                f"{self.project_dir} using the same node ({self.node_path}), then "
-                f"restart the plugin."
+                f"Use the plugin menu: Plugins ▸ Matter ▸ Install/update matter-server "
+                f"(or run 'npm install {DEFAULT_INSTALL_SPEC}' in {self.project_dir} "
+                f"with the same node, {self.node_path}), then restart the plugin."
             )
+        # ABI guard: if the package was installed with a different node MAJOR than the
+        # one we're about to run, its native bindings won't load (a silent crash-loop).
+        # Only probe when a stamp exists, and never false-block when either is unknown.
+        stamped = self._read_install_node_major()
+        if stamped is not None:
+            current = _node_major(self._node_version())
+            if current is not None and stamped != current:
+                return (
+                    f"matter-server was installed with Node {stamped}.x but the "
+                    f"resolved node ({self.node_path}) is {current}.x — its native "
+                    f"modules won't load. Reinstall with the current node: Plugins ▸ "
+                    f"Matter ▸ Install/update matter-server."
+                )
         return None
+
+    def _node_version(self) -> Optional[str]:
+        """Return the resolved node's version string (e.g. ``v22.18.0``), or None."""
+        try:
+            result = self._run([self.node_path, "--version"], capture_output=True,
+                               text=True, check=False)
+        except OSError:
+            return None
+        if result is None or result.returncode != 0:
+            return None
+        return (result.stdout or "").strip() or None
+
+    def _install_stamp_path(self) -> str:
+        return os.path.join(self.project_dir, INSTALL_NODE_STAMP)
+
+    def _read_install_node_major(self) -> Optional[int]:
+        try:
+            with open(self._install_stamp_path(), "r", encoding="utf-8") as handle:
+                return _node_major(handle.read().strip())
+        except OSError:
+            return None
+
+    def _record_install_node(self) -> None:
+        version = self._node_version()
+        if not version:
+            return
+        try:
+            with open(self._install_stamp_path(), "w", encoding="utf-8") as handle:
+                handle.write(version + "\n")
+        except OSError as exc:  # pragma: no cover - best-effort stamp
+            self.logger.warning("could not record install node version: %s", exc)
 
     def tail_error_log(self, max_lines: int = 20) -> Optional[str]:
         """Return the last ``max_lines`` of matter-server.err.log, else None.
@@ -321,6 +387,40 @@ class ServerProcess:
             return None
         tail = "".join(lines[-max_lines:]).strip()
         return tail or None
+
+    def install(self, spec: str = DEFAULT_INSTALL_SPEC) -> bool:
+        """npm-install the matter-server package with the resolved node. Idempotent.
+
+        Installs into ``~/indigo-matter`` using the ``npm`` co-located with the node
+        this instance resolved — so the package's native deps are built for the SAME
+        node the LaunchAgent will run (the install/run match that avoids ABI
+        crash-loops). Records that node's version for :meth:`preflight`'s ABI guard.
+        Streams npm's output to the log; returns True on success. Blocking — callers
+        should run it off the Indigo main thread.
+        """
+        npm = os.path.join(self.resolved_bin_dir, "npm")
+        if not self._exists(npm):
+            self.logger.error(
+                "npm was not found next to node at %s. Set the 'Node bin directory' "
+                "pref or install Node (e.g. 'brew install node').", self.resolved_bin_dir,
+            )
+            return False
+        os.makedirs(self.project_dir, exist_ok=True)
+        self.logger.info("Installing %s into %s (node: %s) — this can take a minute…",
+                         spec, self.project_dir, self.node_path)
+        try:
+            result = self._run([npm, "install", "--prefix", self.project_dir, spec],
+                               capture_output=True, text=True, check=False)
+        except OSError as exc:
+            self.logger.error("matter-server install could not start: %s", exc)
+            return False
+        if result is None or result.returncode != 0:
+            detail = ((result.stderr or result.stdout).strip() if result else "npm unavailable")
+            self.logger.error("matter-server install failed:\n%s", detail[-2000:])
+            return False
+        self._record_install_node()
+        self.logger.info("matter-server installed.")
+        return True
 
     def ensure_installed(self) -> None:
         """Create dirs, write the plist, and load it. Idempotent.
