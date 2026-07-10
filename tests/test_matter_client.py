@@ -374,3 +374,31 @@ class TestUriBuilding:
         prefs = {"serverLocation": "remote",
                  "matterServerHost": " host ", "matterServerPort": " 9000 ", "matterServerPath": " /x "}
         assert self._uri(prefs) == "ws://host:9000/x"
+
+
+def test_on_repeated_failure_fires_once_per_streak(mock_logger):
+    """Diagnostic hook fires once after >=2 consecutive failures, not every cycle (#90)."""
+    async def scenario():
+        calls = []
+        attempts = {"n": 0}
+
+        async def fake_sleep(d):
+            if attempts["n"] >= 4:      # let a few failed cycles run, then stop
+                await client.close()
+            await asyncio.sleep(0)
+
+        def connect(uri):
+            attempts["n"] += 1
+            async def boom():
+                raise ConnectionError("refused")
+            return boom()
+
+        client = MatterClient(Protocol(), mock_logger, {},
+                              connect=connect, sleep=fake_sleep,
+                              on_repeated_failure=lambda n: calls.append(n))
+        await client.run()              # returns once closed
+        # exactly one diagnostic despite many consecutive failures (no spam)
+        assert len(calls) == 1
+        # and only from the second failure onward, not the first blip
+        assert calls[0] >= 2
+    run(scenario())

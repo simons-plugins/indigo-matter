@@ -5,6 +5,7 @@ real launchd or the real LaunchAgents directory.
 """
 from __future__ import annotations
 
+import os
 import plistlib
 import subprocess
 from types import SimpleNamespace
@@ -57,6 +58,15 @@ def _make_pkg(home, *, main: str | None = None, garbage: bool = False):
     return pkg_dir
 
 
+def _make_entry(home, main: str = "dist/esm/MatterServer.js"):
+    """Create the matter-server package + its entry JS so preflight() passes."""
+    pkg_dir = _make_pkg(home, main=main)
+    entry = pkg_dir / main
+    entry.parent.mkdir(parents=True, exist_ok=True)
+    entry.write_text("// fake entry\n")
+    return entry
+
+
 @pytest.fixture
 def sp(tmp_path, prefs, mock_logger):
     home = tmp_path / "home"
@@ -64,6 +74,8 @@ def sp(tmp_path, prefs, mock_logger):
     npx = home / "bin" / "npx"
     npx.write_text("#!/bin/sh\n")
     (home / "bin" / "node").write_text("#!/bin/sh\n")
+    # a properly-installed matter-server so preflight() passes on the happy path
+    _make_entry(home)
     return ServerProcess(
         prefs, mock_logger,
         home=str(home), npx_path=str(npx), runner=FakeRunner(),
@@ -383,3 +395,74 @@ def test_plist_path_env_contains_resolved_npx_dir(tmp_path, prefs, mock_logger, 
     path_env = spec["EnvironmentVariables"]["PATH"]
     assert path_env.startswith(str(npx.parent))
     assert path_env.endswith(":/usr/bin:/bin")
+
+
+# ---------------------------------------------------------------------------
+# preflight + ensure_installed guard (#89) and tail_error_log (#90)
+# ---------------------------------------------------------------------------
+
+def _sp_with(tmp_path, prefs, mock_logger, *, node: bool, entry: bool):
+    """Build a ServerProcess whose node/entry presence is controlled for preflight."""
+    home = tmp_path / "home"
+    (home / "bin").mkdir(parents=True)
+    npx = home / "bin" / "npx"
+    npx.write_text("#!/bin/sh\n")
+    if node:
+        (home / "bin" / "node").write_text("#!/bin/sh\n")
+    if entry:
+        _make_entry(home)
+    return ServerProcess(prefs, mock_logger, home=str(home), npx_path=str(npx),
+                         runner=FakeRunner())
+
+
+def test_preflight_passes_when_node_and_entry_present(sp):
+    assert sp.preflight() is None
+
+
+def test_preflight_flags_missing_node(tmp_path, prefs, mock_logger):
+    sp = _sp_with(tmp_path, prefs, mock_logger, node=False, entry=True)
+    problem = sp.preflight()
+    assert problem is not None and "node" in problem.lower()
+
+
+def test_preflight_flags_missing_matter_server(tmp_path, prefs, mock_logger):
+    sp = _sp_with(tmp_path, prefs, mock_logger, node=True, entry=False)
+    problem = sp.preflight()
+    assert problem is not None and "npm install matter-server" in problem
+
+
+def test_ensure_installed_skips_plist_when_preflight_fails(tmp_path, prefs, mock_logger):
+    sp = _sp_with(tmp_path, prefs, mock_logger, node=True, entry=False)
+    sp.ensure_installed()
+    assert not os.path.exists(sp.plist_path)          # no crash-looping job written
+    assert "bootstrap" not in sp._run.subcommands()   # nothing loaded
+    assert sp.logger.error.called                     # user got an actionable error
+
+
+def test_ensure_installed_tears_down_stale_plist_on_preflight_fail(sp, tmp_path):
+    sp.ensure_installed()                              # healthy: plist written
+    assert os.path.exists(sp.plist_path)
+    # matter-server disappears (e.g. user removed ~/indigo-matter); re-run
+    import shutil
+    shutil.rmtree(os.path.join(sp.project_dir, "node_modules"))
+    sp._run = FakeRunner()
+    sp.ensure_installed()
+    assert not os.path.exists(sp.plist_path)           # stale job removed
+    assert "bootout" in sp._run.subcommands()          # crash-loop stopped
+    assert os.path.isdir(sp.storage_path)              # storage still sacred
+
+
+def test_tail_error_log_returns_last_lines(sp):
+    os.makedirs(sp.log_dir, exist_ok=True)
+    with open(os.path.join(sp.log_dir, "matter-server.err.log"), "w") as handle:
+        handle.write("".join(f"line {i}\n" for i in range(50)))
+    tail = sp.tail_error_log(max_lines=5)
+    assert tail is not None
+    assert tail.splitlines() == ["line 45", "line 46", "line 47", "line 48", "line 49"]
+
+
+def test_tail_error_log_none_when_absent_or_empty(sp):
+    assert sp.tail_error_log() is None                 # no file yet
+    os.makedirs(sp.log_dir, exist_ok=True)
+    open(os.path.join(sp.log_dir, "matter-server.err.log"), "w").close()
+    assert sp.tail_error_log() is None                 # empty file → None
