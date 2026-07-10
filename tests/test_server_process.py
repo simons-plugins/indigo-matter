@@ -549,3 +549,43 @@ def test_preflight_ok_when_node_major_matches(tmp_path, prefs, mock_logger):
 def test_preflight_does_not_false_block_without_stamp(sp):
     # node + entry present, no install stamp → ABI check skipped, preflight passes
     assert sp.preflight() is None
+
+
+# ---------------------------------------------------------------------------
+# Blank-but-present prefs must fall back to defaults, not reach the CLI as ""
+# (forum t=21404: `--port ""` → matter-server "Invalid integer:" crash-loop)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("blank", ["", "   ", "\t"])
+def test_program_arguments_blank_port_falls_back(tmp_path, mock_logger, blank):
+    home = tmp_path / "home"
+    (home / "bin").mkdir(parents=True)
+    (home / "bin" / "npx").write_text("#!/bin/sh\n")
+    prefs = {"matterServerPort": blank, "primaryInterface": "en0"}
+    sp = ServerProcess(prefs, mock_logger, home=str(home),
+                       npx_path=str(home / "bin" / "npx"), runner=FakeRunner())
+    args = sp.program_arguments()
+    assert args[args.index("--port") + 1] == "5580"   # never empty
+
+
+@pytest.mark.parametrize("blank", ["", "   "])
+def test_program_arguments_blank_primary_interface_falls_back(tmp_path, mock_logger, blank):
+    home = tmp_path / "home"
+    (home / "bin").mkdir(parents=True)
+    (home / "bin" / "npx").write_text("#!/bin/sh\n")
+    prefs = {"matterServerPort": "5580", "primaryInterface": blank}
+    sp = ServerProcess(prefs, mock_logger, home=str(home),
+                       npx_path=str(home / "bin" / "npx"), runner=FakeRunner())
+    args = sp.program_arguments()
+    assert args[args.index("--primary-interface") + 1] == "en0"
+
+
+def test_program_arguments_blank_storage_falls_back(tmp_path, mock_logger):
+    home = tmp_path / "home"
+    (home / "bin").mkdir(parents=True)
+    (home / "bin" / "npx").write_text("#!/bin/sh\n")
+    prefs = {"matterServerPort": "5580", "primaryInterface": "en0", "storagePath": "   "}
+    sp = ServerProcess(prefs, mock_logger, home=str(home),
+                       npx_path=str(home / "bin" / "npx"), runner=FakeRunner())
+    storage = sp.program_arguments()[sp.program_arguments().index("--storage-path") + 1]
+    assert storage.strip() != "" and storage.endswith("/matter-server")

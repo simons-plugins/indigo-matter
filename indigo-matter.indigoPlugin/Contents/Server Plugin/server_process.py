@@ -101,8 +101,14 @@ class ServerProcess:
         # ship node and npx side-by-side). We launch node directly because the
         # matter-server npm package exposes no bin executable (see module docstring).
         self.node_path = os.path.join(os.path.dirname(self.npx_path), "node")
-        self.port = str(prefs.get("matterServerPort", "5580"))
-        self.primary_interface = str(prefs.get("primaryInterface", "en0"))
+        # Blank-but-present prefs must fall back to the default, not sail through:
+        # prefs.get(key, default) only fires the default when the key is ABSENT. A
+        # present-but-empty matterServerPort would become `--port ""`, which
+        # matter-server's CLI rejects with "Invalid integer:" and crash-loops (same
+        # class of bug the WS client's _pref() guards against). Applies to every value
+        # that becomes a launch arg.
+        self.port = str(prefs.get("matterServerPort") or "").strip() or "5580"
+        self.primary_interface = str(prefs.get("primaryInterface") or "").strip() or "en0"
         # Address the matter-server WebSocket control API binds to. matter-server
         # v0.6.2 binds to ALL interfaces when no --listen-address is given, and the
         # control WS is UNAUTHENTICATED — so the safe default is loopback only. An
@@ -112,7 +118,8 @@ class ServerProcess:
         self.listen_address = str(prefs.get("matterServerListenAddress", "127.0.0.1")).strip() or "127.0.0.1"
         self.project_dir = os.path.join(self.home, DEFAULT_PROJECT_DIRNAME)
         default_storage = f"~/Library/Application Support/{LABEL}/matter-server"
-        self.storage_path = _expand(str(prefs.get("storagePath", default_storage)), self.home)
+        raw_storage = str(prefs.get("storagePath") or "").strip() or default_storage
+        self.storage_path = _expand(raw_storage, self.home)
 
     # ------------------------------------------------------------------
     # Paths
