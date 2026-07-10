@@ -1,5 +1,9 @@
 <?xml version="1.0"?>
 <MenuItems>
+    <MenuItem id="installMatterServer">
+        <Name>Install/update matter-server</Name>
+        <CallbackMethod>menuInstallMatterServer</CallbackMethod>
+    </MenuItem>
     <MenuItem id="restartMatterServer">
         <Name>Restart matter-server</Name>
         <CallbackMethod>menuRestartMatterServer</CallbackMethod>

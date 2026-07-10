@@ -752,3 +752,37 @@ def test_fabric_label_failure_does_not_block_reconcile(plug):
     asyncio.run(plug._resync())
     plug.device_sync.reconcile_all.assert_called_once()
     plug.logger.debug.assert_called()
+
+
+# ---------------------------------------------------------------------------
+# Install/update matter-server menu action (pins node so run == install)
+# ---------------------------------------------------------------------------
+
+def test_install_handler_pins_node_and_reinstalls(plug, plugin_mod, monkeypatch):
+    plug.server_process = SimpleNamespace(install=lambda: True,
+                                          resolved_bin_dir="/opt/homebrew/bin")
+    plug.pluginPrefs = {"serverLocation": "local"}
+    reinstalled = SimpleNamespace(ensure_installed=Mock())
+    monkeypatch.setattr(plugin_mod, "ServerProcess", lambda *a, **k: reinstalled)
+    plug._install_matter_server()
+    # the node used for install is pinned so the LaunchAgent runs the same one
+    assert plug.pluginPrefs["nodeBinDir"] == "/opt/homebrew/bin"
+    assert plug.server_process is reinstalled
+    reinstalled.ensure_installed.assert_called_once()
+    plug.logger.exception.assert_not_called()
+
+
+def test_install_handler_aborts_when_install_fails(plug, plugin_mod, monkeypatch):
+    plug.server_process = SimpleNamespace(install=lambda: False, resolved_bin_dir="/x")
+    plug.pluginPrefs = {"serverLocation": "local"}
+    monkeypatch.setattr(plugin_mod, "ServerProcess",
+                        lambda *a, **k: SimpleNamespace(ensure_installed=Mock()))
+    plug._install_matter_server()
+    assert "nodeBinDir" not in plug.pluginPrefs   # no pin, no reinstall on failure
+
+
+def test_menu_install_refuses_in_remote_mode(plug):
+    plug.pluginPrefs = {"serverLocation": "remote"}
+    plug._install_thread = None
+    plug.menuInstallMatterServer()
+    plug.logger.error.assert_called()

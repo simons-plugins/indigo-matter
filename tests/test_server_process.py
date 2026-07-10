@@ -466,3 +466,86 @@ def test_tail_error_log_none_when_absent_or_empty(sp):
     os.makedirs(sp.log_dir, exist_ok=True)
     open(os.path.join(sp.log_dir, "matter-server.err.log"), "w").close()
     assert sp.tail_error_log() is None                 # empty file → None
+
+
+# ---------------------------------------------------------------------------
+# install() + node pinning + ABI (node-major) guard
+# ---------------------------------------------------------------------------
+
+class NodeVersionRunner(FakeRunner):
+    """FakeRunner that answers `node --version` with a fixed version string."""
+
+    def __init__(self, version: str = "v22.18.0", returncode: int = 0):
+        super().__init__(returncode)
+        self.version = version
+
+    def __call__(self, cmd, **kwargs):
+        self.calls.append(cmd)
+        if len(cmd) >= 2 and cmd[0].endswith("node") and cmd[1] == "--version":
+            return subprocess.CompletedProcess(cmd, 0, stdout=self.version + "\n", stderr="")
+        return subprocess.CompletedProcess(cmd, self.returncode, stdout="", stderr="")
+
+
+def _sp_with_tools(tmp_path, prefs, mock_logger, *, tools=("npx", "node", "npm"),
+                   entry=False, runner=None):
+    home = tmp_path / "home"
+    (home / "bin").mkdir(parents=True)
+    for tool in tools:
+        (home / "bin" / tool).write_text("#!/bin/sh\n")
+    if entry:
+        _make_entry(home)
+    return ServerProcess(prefs, mock_logger, home=str(home),
+                         npx_path=str(home / "bin" / "npx"),
+                         runner=runner or NodeVersionRunner())
+
+
+def test_resolved_bin_dir_is_npx_parent(sp):
+    assert sp.resolved_bin_dir == os.path.dirname(sp.npx_path)
+
+
+def test_install_runs_npm_and_records_node_stamp(tmp_path, prefs, mock_logger):
+    sp = _sp_with_tools(tmp_path, prefs, mock_logger, runner=NodeVersionRunner("v22.18.0"))
+    assert sp.install() is True
+    npm_calls = [c for c in sp._run.calls if c[0].endswith("npm")]
+    assert npm_calls, "expected an npm invocation"
+    assert "install" in npm_calls[0] and "--prefix" in npm_calls[0]
+    assert any("matter-server" in a for a in npm_calls[0])
+    # stamps the node major so preflight can catch a later mismatch
+    assert sp._read_install_node_major() == 22
+
+
+def test_install_fails_when_npm_missing(tmp_path, prefs, mock_logger):
+    sp = _sp_with_tools(tmp_path, prefs, mock_logger, tools=("npx", "node"))  # no npm
+    assert sp.install() is False
+    assert sp.logger.error.called
+
+
+def test_install_fails_on_npm_error(tmp_path, prefs, mock_logger):
+    sp = _sp_with_tools(tmp_path, prefs, mock_logger,
+                        runner=NodeVersionRunner(returncode=1))  # npm returns nonzero
+    assert sp.install() is False
+
+
+def test_preflight_flags_node_major_mismatch(tmp_path, prefs, mock_logger):
+    # installed with node 20, now resolving node 22 → native modules won't load
+    sp = _sp_with_tools(tmp_path, prefs, mock_logger, tools=("npx", "node"),
+                        entry=True, runner=NodeVersionRunner("v22.5.0"))
+    os.makedirs(sp.project_dir, exist_ok=True)
+    with open(sp._install_stamp_path(), "w") as handle:
+        handle.write("v20.11.0\n")
+    problem = sp.preflight()
+    assert problem is not None and "20" in problem and "22" in problem
+
+
+def test_preflight_ok_when_node_major_matches(tmp_path, prefs, mock_logger):
+    sp = _sp_with_tools(tmp_path, prefs, mock_logger, tools=("npx", "node"),
+                        entry=True, runner=NodeVersionRunner("v22.5.0"))
+    os.makedirs(sp.project_dir, exist_ok=True)
+    with open(sp._install_stamp_path(), "w") as handle:
+        handle.write("v22.1.0\n")
+    assert sp.preflight() is None
+
+
+def test_preflight_does_not_false_block_without_stamp(sp):
+    # node + entry present, no install stamp → ABI check skipped, preflight passes
+    assert sp.preflight() is None
