@@ -59,6 +59,7 @@ class MatterClient:
         on_event: Optional[Callable[[protocol.MatterEvent], None]] = None,
         on_connect: Optional[Callable[[], Awaitable]] = None,
         on_disconnect: Optional[Callable[[], None]] = None,
+        on_repeated_failure: Optional[Callable[[int], None]] = None,
         now: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], Awaitable] = asyncio.sleep,
     ) -> None:
@@ -87,6 +88,11 @@ class MatterClient:
         # mark devices unreachable. Together they give sleep/wake + crash recovery.
         self._on_connect = on_connect
         self._on_disconnect = on_disconnect
+        # on_repeated_failure: sync, fired ONCE per failure streak (after a couple of
+        # consecutive reconnect failures, reset on the next successful connect) so a
+        # supervisor can surface WHY the server is unreachable without log spam.
+        self._on_repeated_failure = on_repeated_failure
+        self._diag_fired = False
         self._sleep = sleep
         self._now = now
 
@@ -111,11 +117,13 @@ class MatterClient:
             try:
                 await self._connect_once()
                 attempt = 0
+                self._diag_fired = False
                 await self._listen()
             except asyncio.CancelledError:
                 raise
             except _WS_ERRORS as exc:
                 self.logger.warning("matter-server connection lost (%s): %s", self.uri, exc)
+                self._maybe_report_repeated_failure(attempt)
             except Exception as exc:  # pragma: no cover - defensive
                 self.logger.exception(exc)
             finally:
@@ -126,6 +134,21 @@ class MatterClient:
             attempt += 1
             self.logger.debug("reconnecting to matter-server in %.0fs", delay)
             await self._sleep(delay)
+
+    def _maybe_report_repeated_failure(self, attempt: int) -> None:
+        """Fire ``on_repeated_failure`` once per streak, after ≥2 consecutive fails.
+
+        ``attempt`` is 0 on the first failure, so ``>= 1`` means the second failure
+        onward — enough to tell a real problem from a one-off blip (e.g. the server
+        restarting) without emitting a diagnostic on every backoff cycle.
+        """
+        if self._on_repeated_failure is None or self._diag_fired or attempt < 1:
+            return
+        self._diag_fired = True
+        try:
+            self._on_repeated_failure(attempt + 1)
+        except Exception:  # pragma: no cover - diagnostics must not kill the run loop
+            self.logger.exception("on_repeated_failure hook raised")
 
     async def _connect_once(self) -> None:
         self.logger.debug("connecting to %s", self.uri)

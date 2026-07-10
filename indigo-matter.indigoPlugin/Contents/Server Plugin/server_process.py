@@ -72,9 +72,12 @@ class ServerProcess:
         home: Optional[str] = None,
         npx_path: Optional[str] = None,
         runner: Callable[..., "subprocess.CompletedProcess"] = subprocess.run,
+        exists: Callable[[str], bool] = os.path.exists,
     ) -> None:
         self.logger = logger
         self._run = runner
+        # Injectable existence check keeps preflight() unit-testable without the FS.
+        self._exists = exists
         self.home = home or os.path.expanduser("~")
         # Optional explicit override: directory containing node/npx. nvm users can
         # pin a specific version here (e.g. ~/.nvm/versions/node/v22.18.0/bin);
@@ -279,11 +282,64 @@ class ServerProcess:
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
+    def preflight(self) -> Optional[str]:
+        """Return a human-readable reason matter-server can't launch, else None.
+
+        Guards the two failures that otherwise surface only as a launchd crash-loop
+        (and a bare "connection refused" at the WS client): a missing node
+        interpreter, or the matter-server npm package not being installed. Both are
+        common for nvm users whose ``nodeBinDir`` didn't resolve to a real bin dir.
+        """
+        if not self._exists(self.node_path):
+            return (
+                f"node was not found at {self.node_path}. Set the 'Node bin "
+                f"directory' plugin pref to a folder containing node/npx, or install "
+                f"Node (e.g. 'brew install node'), then restart the plugin."
+            )
+        entry = self._server_entry()
+        if not self._exists(entry):
+            return (
+                f"the matter-server package is not installed ({entry} is missing). "
+                f"In Terminal, run 'npm install matter-server' inside "
+                f"{self.project_dir} using the same node ({self.node_path}), then "
+                f"restart the plugin."
+            )
+        return None
+
+    def tail_error_log(self, max_lines: int = 20) -> Optional[str]:
+        """Return the last ``max_lines`` of matter-server.err.log, else None.
+
+        Surfaces WHY the launchd-managed server keeps dying (module-not-found,
+        native-binding ABI mismatch, a bad ``--flag``, …) where the WS client only
+        sees "connection refused". Returns None if the log is absent or empty.
+        """
+        path = os.path.join(self.log_dir, "matter-server.err.log")
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as handle:
+                lines = handle.readlines()
+        except OSError:
+            return None
+        tail = "".join(lines[-max_lines:]).strip()
+        return tail or None
+
     def ensure_installed(self) -> None:
-        """Create dirs, write the plist, and load it. Idempotent."""
+        """Create dirs, write the plist, and load it. Idempotent.
+
+        Runs :meth:`preflight` first. A launchd job pointing at a missing node or an
+        uninstalled matter-server can only crash-loop (``KeepAlive`` respawns it) and
+        the WS client sees a bare "connection refused". So on a preflight failure:
+        log an actionable error, tear down any stale plist to stop an existing
+        crash-loop, and do NOT (re)write it.
+        """
         os.makedirs(self.storage_path, exist_ok=True)
         os.makedirs(self.log_dir, exist_ok=True)
         os.makedirs(os.path.dirname(self.plist_path), exist_ok=True)
+        problem = self.preflight()
+        if problem:
+            self.logger.error("matter-server cannot start: %s", problem)
+            if self._exists(self.plist_path):
+                self.uninstall()  # stop an existing crash-loop; leaves storage intact
+            return
         with open(self.plist_path, "wb") as handle:
             handle.write(self.build_plist())
         self.logger.info("Wrote LaunchAgent %s", self.plist_path)

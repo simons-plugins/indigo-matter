@@ -134,11 +134,15 @@ class Plugin(indigo.PluginBase):
             except Exception as exc:  # noqa: BLE001
                 self.logger.exception(exc)
 
+        # Only in managed/local mode can we read the server's own error log; in remote
+        # mode there is no local log to surface.
+        on_repeated_failure = self._on_server_unreachable if self.server_process else None
         self.matter = MatterClient(
             self.proto, self.logger, prefs,
             on_event=self._on_matter_event,
             on_connect=self._resync,
             on_disconnect=self._on_disconnected,
+            on_repeated_failure=on_repeated_failure,
         )
         self.jobs = CommissionJobs(
             self.matter, self.device_sync.create_from_raw, self.logger,
@@ -222,6 +226,31 @@ class Plugin(indigo.PluginBase):
     def _on_disconnected(self) -> None:
         """matter-server connection dropped — devices are unreachable until reconnect."""
         self.device_sync.mark_all_unreachable()
+
+    def _on_server_unreachable(self, attempts: int) -> None:
+        """Managed mode: matter-server still unreachable after several attempts.
+
+        The WS client only sees "connection refused"; the real reason is in the
+        server's own stderr. Surface a tail of it (or a not-installed hint) into the
+        Indigo log so users don't have to hunt for ~/Library/Logs/indigo-matter.
+        Fired once per failure streak by the client, so this never spams.
+        """
+        sp = self.server_process
+        if sp is None:
+            return
+        tail = sp.tail_error_log()
+        if tail:
+            self.logger.error(
+                "matter-server is not responding after %d attempts and appears to be "
+                "crashing. Recent matter-server errors:\n%s", attempts, tail,
+            )
+        else:
+            self.logger.error(
+                "matter-server is not responding after %d attempts and its error log is "
+                "empty — it may not be installed. Check %s and run "
+                "'npm install matter-server' there, then restart the plugin.",
+                attempts, sp.project_dir,
+            )
 
     def runConcurrentThread(self) -> None:
         """Watchdog only — no I/O. Surfaces connectivity; reconnect is owned by
