@@ -528,7 +528,7 @@ class RaisingRunner(FakeRunner):
         if "install" in cmd:
             raise OSError("Permission denied")
         if len(cmd) >= 2 and cmd[0].endswith("node") and cmd[1] == "--version":
-            return subprocess.CompletedProcess(cmd, 0, stdout="v22.0.0\n", stderr="")
+            return subprocess.CompletedProcess(cmd, 0, stdout="v22.18.0\n", stderr="")
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
 
@@ -686,3 +686,23 @@ def test_install_puts_node_bin_dir_on_subprocess_path(tmp_path, prefs, mock_logg
     assert sp.install() is True
     assert captured["env"] is not None
     assert captured["env"]["PATH"].split(os.pathsep)[0] == sp.resolved_bin_dir
+
+
+def test_install_blocks_on_too_old_node(tmp_path, prefs, mock_logger):
+    # 1.2.2 needs Node >= 22.13.0; a too-old node must NOT "successfully" install an
+    # unrunnable server (npm engines is advisory).
+    sp = _sp_with_tools(tmp_path, prefs, mock_logger, runner=NodeVersionRunner("v20.11.0"))
+    assert sp.install() is False
+    assert not any("install" in c for c in sp._run.calls)   # npm never ran
+    assert sp.logger.error.called
+
+
+def test_install_proceeds_when_node_meets_minimum(tmp_path, prefs, mock_logger):
+    sp = _sp_with_tools(tmp_path, prefs, mock_logger, runner=NodeVersionRunner("v22.13.0"))
+    assert sp.install() is True                              # 22.13.0 is exactly the floor
+
+
+def test_install_not_blocked_when_node_version_unreadable(tmp_path, prefs, mock_logger):
+    # unknown current node must not false-block (never blocks on an unreadable version)
+    sp = _sp_with_tools(tmp_path, prefs, mock_logger, runner=FakeRunner())  # node --version → ""
+    assert sp.install() is True

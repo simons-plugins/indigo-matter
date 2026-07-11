@@ -150,6 +150,17 @@ class MatterClient:
         except Exception:  # pragma: no cover - diagnostics must not kill the run loop
             self.logger.exception("on_repeated_failure hook raised")
 
+    def rearm_failure_diagnostic(self) -> None:
+        """Allow ``on_repeated_failure`` to fire again this streak.
+
+        The hook is normally latched once per failure streak (reset only on a
+        successful connect). A supervisor that *suppresses* one firing (e.g. during an
+        expected restart) calls this to DEFER — not drop — the diagnostic, so a
+        still-failing server surfaces its real error on the next cycle instead of going
+        silent for the whole streak.
+        """
+        self._diag_fired = False
+
     async def _connect_once(self) -> None:
         self.logger.debug("connecting to %s", self.uri)
         self._ws = await self._connect(self.uri)
