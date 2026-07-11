@@ -762,6 +762,7 @@ def test_install_handler_pins_node_and_reinstalls(plug, plugin_mod, monkeypatch)
     plug.server_process = SimpleNamespace(install=lambda: True,
                                           resolved_bin_dir="/opt/homebrew/bin")
     plug.pluginPrefs = {"serverLocation": "local"}
+    plug._stopping = False
     reinstalled = SimpleNamespace(ensure_installed=Mock())
     monkeypatch.setattr(plugin_mod, "ServerProcess", lambda *a, **k: reinstalled)
     plug._install_matter_server()
@@ -769,16 +770,59 @@ def test_install_handler_pins_node_and_reinstalls(plug, plugin_mod, monkeypatch)
     assert plug.pluginPrefs["nodeBinDir"] == "/opt/homebrew/bin"
     assert plug.server_process is reinstalled
     reinstalled.ensure_installed.assert_called_once()
+    plugin_mod.indigo.server.savePluginPrefs.assert_called()   # pin PERSISTS
     plug.logger.exception.assert_not_called()
 
 
-def test_install_handler_aborts_when_install_fails(plug, plugin_mod, monkeypatch):
+def test_install_handler_aborts_and_logs_when_install_fails(plug, plugin_mod, monkeypatch):
     plug.server_process = SimpleNamespace(install=lambda: False, resolved_bin_dir="/x")
     plug.pluginPrefs = {"serverLocation": "local"}
+    plug._stopping = False
+    reinstalled = SimpleNamespace(ensure_installed=Mock())
+    monkeypatch.setattr(plugin_mod, "ServerProcess", lambda *a, **k: reinstalled)
+    plug._install_matter_server()
+    assert "nodeBinDir" not in plug.pluginPrefs        # no pin on failure
+    reinstalled.ensure_installed.assert_not_called()   # no reinstall on failure
+    plug.logger.error.assert_called()                  # failure is surfaced, not silent
+
+
+def test_install_handler_skips_state_mutation_when_stopping(plug, plugin_mod, monkeypatch):
+    plug.server_process = SimpleNamespace(install=lambda: True, resolved_bin_dir="/x")
+    plug.pluginPrefs = {"serverLocation": "local"}
+    plug._stopping = True                              # plugin tearing down
     monkeypatch.setattr(plugin_mod, "ServerProcess",
                         lambda *a, **k: SimpleNamespace(ensure_installed=Mock()))
     plug._install_matter_server()
-    assert "nodeBinDir" not in plug.pluginPrefs   # no pin, no reinstall on failure
+    assert "nodeBinDir" not in plug.pluginPrefs        # no pin/rewrite against teardown
+
+
+def test_menu_install_spawns_daemon_thread_in_local_mode(plug, plugin_mod, monkeypatch):
+    plug.pluginPrefs = {"serverLocation": "local"}
+    plug._install_thread = None
+    captured = {}
+
+    class FakeThread:
+        def __init__(self, target=None, name=None, daemon=None):
+            captured.update(target=target, daemon=daemon)
+
+        def start(self):
+            captured["started"] = True
+
+        def is_alive(self):
+            return False
+
+    monkeypatch.setattr(plugin_mod.threading, "Thread", FakeThread)
+    plug.menuInstallMatterServer()
+    assert captured.get("started") is True
+    assert captured["daemon"] is True
+    assert captured["target"] == plug._install_matter_server
+
+
+def test_menu_install_refuses_when_already_running(plug):
+    plug.pluginPrefs = {"serverLocation": "local"}
+    plug._install_thread = SimpleNamespace(is_alive=lambda: True)
+    plug.menuInstallMatterServer()
+    plug.logger.warning.assert_called()               # "already in progress", no 2nd install
 
 
 def test_menu_install_refuses_in_remote_mode(plug):

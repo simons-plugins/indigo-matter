@@ -101,6 +101,7 @@ class Plugin(indigo.PluginBase):
         self.http: HttpApi | None = None
         self.server_process: ServerProcess | None = None
         self._install_thread: threading.Thread | None = None
+        self._stopping = False
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -174,6 +175,12 @@ class Plugin(indigo.PluginBase):
 
     def shutdown(self) -> None:
         self.logger.debug("%s shutting down", PLUGIN_NAME)
+        # Signal any in-flight background install to skip its post-npm plugin-state
+        # mutation, then wait briefly for it so we don't rewrite the LaunchAgent or
+        # prefs against a tearing-down plugin.
+        self._stopping = True
+        if self._install_thread is not None and self._install_thread.is_alive():
+            self._install_thread.join(timeout=5)
         if self.runtime is not None and self.runtime.is_running and self.matter is not None:
             try:
                 self.runtime.submit(self.matter.close()).result(timeout=4)
@@ -249,8 +256,8 @@ class Plugin(indigo.PluginBase):
         else:
             self.logger.error(
                 "matter-server is not responding after %d attempts and its error log is "
-                "empty — it may not be installed. Check %s and run "
-                "'npm install matter-server' there, then restart the plugin.",
+                "empty — it may not be installed (checked %s). Use Plugins ▸ Matter ▸ "
+                "Install/update matter-server, then restart the plugin.",
                 attempts, sp.project_dir,
             )
 
@@ -707,6 +714,8 @@ class Plugin(indigo.PluginBase):
         if self._install_thread is not None and self._install_thread.is_alive():
             self.logger.warning("matter-server install already in progress.")
             return
+        self.logger.info("Starting matter-server install in the background — watch the "
+                         "log for progress; this can take a minute.")
         self._install_thread = threading.Thread(
             target=self._install_matter_server, name="matter-install", daemon=True)
         self._install_thread.start()
@@ -715,6 +724,12 @@ class Plugin(indigo.PluginBase):
         try:
             sp = self.server_process or ServerProcess(dict(self.pluginPrefs), self.logger)
             if not sp.install():
+                self.logger.error(
+                    "Install/update matter-server did not complete — see the error "
+                    "above. The server was not (re)installed; retry when resolved."
+                )
+                return
+            if self._stopping:  # plugin is tearing down — don't mutate its state
                 return
             # Pin the exact node used so the LaunchAgent runs the same one forever —
             # this is what keeps install-node == run-node and avoids ABI crash-loops.
@@ -727,7 +742,15 @@ class Plugin(indigo.PluginBase):
                 "shortly — the client reconnects automatically.", sp.resolved_bin_dir,
             )
         except Exception as exc:  # noqa: BLE001
+            # npm may have succeeded and only the pin/activate step failed — say so, so
+            # the user doesn't reinstall in circles chasing a downstream problem.
             self.logger.exception(exc)
+            self.logger.error(
+                "matter-server install did not complete after the npm step — the "
+                "package may be installed but the node was not pinned and the server "
+                "was not (re)started. See the trace above, then retry Plugins ▸ Matter "
+                "▸ Install/update matter-server."
+            )
 
     def menuRestartMatterServer(self):  # noqa: N802
         if self.server_process is None:
