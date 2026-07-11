@@ -763,13 +763,16 @@ def test_install_handler_pins_node_and_reinstalls(plug, plugin_mod, monkeypatch)
                                           resolved_bin_dir="/opt/homebrew/bin")
     plug.pluginPrefs = {"serverLocation": "local"}
     plug._stopping = False
-    reinstalled = SimpleNamespace(ensure_installed=Mock())
+    plug._restart_expected_until = 0.0
+    reinstalled = SimpleNamespace(ensure_installed=Mock(), restart=Mock())
     monkeypatch.setattr(plugin_mod, "ServerProcess", lambda *a, **k: reinstalled)
     plug._install_matter_server()
     # the node used for install is pinned so the LaunchAgent runs the same one
     assert plug.pluginPrefs["nodeBinDir"] == "/opt/homebrew/bin"
     assert plug.server_process is reinstalled
     reinstalled.ensure_installed.assert_called_once()
+    reinstalled.restart.assert_called_once()                   # auto-restart onto new version
+    assert plug._restart_expected_until > 0                    # crash-diagnostic suppressed
     plugin_mod.indigo.server.savePluginPrefs.assert_called()   # pin PERSISTS
     plug.logger.exception.assert_not_called()
 

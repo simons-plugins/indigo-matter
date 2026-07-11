@@ -165,7 +165,10 @@ class MatterClient:
         # no per-attribute subscription needed (verified against v0.6.2), so the
         # handlers' attributes_to_subscribe() is only a future filtering aid.
         await self._send_frame(self.proto.build_request(protocol.CMD_START_LISTENING))
-        self.logger.info("connected to matter-server, listening")
+        # Log the server version so a restart/install can be confirmed to have landed on
+        # the intended version (sdk_version e.g. "matter-server/1.2.2 (matter.js/…)").
+        version = (self.server_info or {}).get("sdk_version", "version unknown")
+        self.logger.info("connected to matter-server (%s), listening", version)
         # Re-reconcile on every (re)connect so devices that changed (or that we
         # missed) while disconnected are corrected and 'unreachable' is cleared.
         # Scheduled as its own task so it doesn't block the listen loop; keep a
