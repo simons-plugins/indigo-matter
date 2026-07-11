@@ -37,6 +37,10 @@ MATTER_SERVER_PACKAGE = "matter-server"
 # package is fast-moving pre-1.0-style Alpha/Beta. Kept in one place so a version bump
 # is a one-line change (matches docs/INSTALL.md). NOTE: 1.2.2 requires Node >= 22.13.0.
 DEFAULT_INSTALL_SPEC = "matter-server@1.2.2"
+# matter-server 1.2.2's package.json declares engines node >= 22.13.0. npm's engines
+# check is advisory by default (exits 0 on an older node), so install() gates on this
+# itself — otherwise a too-old node "successfully" installs an unrunnable server.
+MIN_NODE_VERSION = (22, 13)
 # Fallback entry point if the package's package.json is missing/unreadable. Matches the
 # "main" of both 0.6.x and 1.2.x ("dist/esm/MatterServer.js"); _server_entry() reads the
 # real value from the installed package.json and only falls back to this.
@@ -434,6 +438,19 @@ class ServerProcess:
             self.logger.error(
                 "npm was not found next to node at %s. Set the 'Node bin directory' "
                 "pref or install Node (e.g. 'brew install node').", self.resolved_bin_dir,
+            )
+            return False
+        # Gate on the node version BEFORE npm — npm's engines check is advisory and
+        # would otherwise install an unrunnable server. Only block when we actually know
+        # the version (a too-old node), never on an unreadable one.
+        current = _parse_node_version(self._node_version() or "")
+        if current is not None and current[:2] < MIN_NODE_VERSION:
+            self.logger.error(
+                "%s requires Node >= %s but the resolved node (%s) is %s. Update Node "
+                "(e.g. 'brew install node') or point the 'Node bin directory' pref at a "
+                "newer node, then retry.",
+                spec, ".".join(map(str, MIN_NODE_VERSION)), self.node_path,
+                ".".join(map(str, current)),
             )
             return False
         os.makedirs(self.project_dir, exist_ok=True)

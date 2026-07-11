@@ -402,3 +402,45 @@ def test_on_repeated_failure_fires_once_per_streak(mock_logger):
         # and only from the second failure onward, not the first blip
         assert calls[0] >= 2
     run(scenario())
+
+
+def test_connect_log_names_the_server_version(mock_logger):
+    async def scenario():
+        fake = FakeWebSocket(server_info={"sdk_version": "matter-server/1.2.2", "fabric_id": "0x1"})
+        client = _client(mock_logger, fake)
+        task = asyncio.create_task(client.run())
+        await client.wait_connected(timeout=2)
+        connect = [c for c in mock_logger.info.call_args_list
+                   if c.args and "connected to matter-server" in str(c.args[0])]
+        assert connect and connect[0].args[1] == "matter-server/1.2.2"
+        await client.close()
+        task.cancel()
+    run(scenario())
+
+
+def test_connect_log_version_unknown_when_absent(mock_logger):
+    async def scenario():
+        fake = FakeWebSocket(server_info={"fabric_id": "0x1"})   # no sdk_version key
+        client = _client(mock_logger, fake)
+        task = asyncio.create_task(client.run())
+        await client.wait_connected(timeout=2)
+        connect = [c for c in mock_logger.info.call_args_list
+                   if c.args and "connected to matter-server" in str(c.args[0])]
+        assert connect and connect[0].args[1] == "version unknown"
+        await client.close()
+        task.cancel()
+    run(scenario())
+
+
+def test_rearm_failure_diagnostic_allows_refire(mock_logger):
+    # after the hook fires once (latched), rearm lets it fire again this streak
+    calls = []
+    fake = FakeWebSocket()
+    client = MatterClient(Protocol(), mock_logger, {}, connect=lambda uri: returns(fake),
+                          on_repeated_failure=lambda n: calls.append(n))
+    client._diag_fired = True         # simulate "already fired this streak"
+    client._maybe_report_repeated_failure(3)
+    assert calls == []                # latched → no fire
+    client.rearm_failure_diagnostic()
+    client._maybe_report_repeated_failure(3)
+    assert calls == [4]               # re-armed → fires again

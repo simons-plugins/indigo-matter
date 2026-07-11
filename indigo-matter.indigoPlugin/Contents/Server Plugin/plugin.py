@@ -103,8 +103,11 @@ class Plugin(indigo.PluginBase):
         self._install_thread: threading.Thread | None = None
         self._stopping = False
         # When WE restart matter-server (menu / post-install), the client sees a brief
-        # outage — suppress the "appears to be crashing" diagnostic until this deadline.
+        # outage — suppress the "appears to be crashing" diagnostic until this deadline
+        # (cleared early on a successful reconnect). _restart_notice_shown dedups the
+        # "restarting…" info line to once per window.
         self._restart_expected_until = 0.0
+        self._restart_notice_shown = False
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -217,6 +220,9 @@ class Plugin(indigo.PluginBase):
         """Reconcile matter nodes ↔ Indigo devices. Driven by the WS client's
         on_connect, so it runs on the first connect and again on every reconnect
         (recovers state + clears 'unreachable' after a drop / sleep-wake)."""
+        # A successful (re)connect means any expected-restart window has served its
+        # purpose — close it so a LATER crash isn't wrongly suppressed as "restarting".
+        self._restart_expected_until = 0.0
         await self._assert_fabric_label()
         try:
             nodes = await self.matter.get_nodes() or []
@@ -251,8 +257,16 @@ class Plugin(indigo.PluginBase):
         if sp is None:
             return
         if time.time() < self._restart_expected_until:
-            # We deliberately restarted it — this outage is expected, not a crash.
-            self.logger.info("matter-server is restarting; reconnecting…")
+            # We deliberately restarted it — this outage is expected, not a crash. But
+            # DEFER, don't drop: re-arm the client so if the server never comes back the
+            # real error still surfaces on a later cycle (past the window). _resync
+            # clears the window on a successful reconnect, so this only persists on an
+            # actually-failing restart.
+            if not self._restart_notice_shown:
+                self.logger.info("matter-server is restarting; reconnecting…")
+                self._restart_notice_shown = True
+            if self.matter is not None:
+                self.matter.rearm_failure_diagnostic()
             return
         tail = sp.tail_error_log()
         if tail:
@@ -267,6 +281,12 @@ class Plugin(indigo.PluginBase):
                 "Install/update matter-server, then restart the plugin.",
                 attempts, sp.project_dir,
             )
+
+    def _expect_restart(self) -> None:
+        """Open the ~30s window during which a client outage is treated as an expected
+        restart (see :meth:`_on_server_unreachable`), not a crash."""
+        self._restart_expected_until = time.time() + 30
+        self._restart_notice_shown = False
 
     def runConcurrentThread(self) -> None:
         """Watchdog only — no I/O. Surfaces connectivity; reconnect is owned by
@@ -748,8 +768,17 @@ class Plugin(indigo.PluginBase):
             # newly-installed package sits on disk while the OLD process keeps running
             # (a running LaunchAgent doesn't pick up new files). This is what makes the
             # menu action a one-click, no-CLI update.
-            self._restart_expected_until = time.time() + 30
-            self.server_process.restart()
+            self._expect_restart()
+            if not self.server_process.restart():
+                # Don't claim success: the new version may not be running.
+                self._restart_expected_until = 0.0  # let the crash diagnostic work
+                self.logger.error(
+                    "matter-server was installed and pinned to node at %s, but the "
+                    "restart onto the new version FAILED — the old version may still be "
+                    "running. Use Plugins ▸ Matter ▸ Restart matter-server, or reload "
+                    "the plugin.", sp.resolved_bin_dir,
+                )
+                return
             self.logger.info(
                 "matter-server installed, pinned to node at %s, and restarting onto the "
                 "new version — it reconnects automatically.", sp.resolved_bin_dir,
@@ -769,10 +798,11 @@ class Plugin(indigo.PluginBase):
         if self.server_process is None:
             self.logger.warning("LaunchAgent management is off; start matter-server manually")
             return
-        self._restart_expected_until = time.time() + 30  # expected outage, not a crash
+        self._expect_restart()  # expected outage, not a crash
         if self.server_process.restart():
             self.logger.info("matter-server restart requested")
         else:
+            self._restart_expected_until = 0.0  # restart failed — don't suppress the diagnostic
             self.logger.error(
                 "matter-server restart failed; check ~/Library/Logs/indigo-matter/matter-server.err.log"
             )

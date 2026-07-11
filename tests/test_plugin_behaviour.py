@@ -833,3 +833,63 @@ def test_menu_install_refuses_in_remote_mode(plug):
     plug._install_thread = None
     plug.menuInstallMatterServer()
     plug.logger.error.assert_called()
+
+
+# --- restart-suppression window: defer (not drop) the crash diagnostic ---
+
+def test_on_server_unreachable_suppresses_and_rearms_within_window(plug):
+    plug.server_process = SimpleNamespace(tail_error_log=Mock(return_value="boom"), project_dir="/x")
+    plug.matter = SimpleNamespace(rearm_failure_diagnostic=Mock())
+    plug._restart_expected_until = 9e18          # far future = inside the window
+    plug._restart_notice_shown = False
+    plug._on_server_unreachable(2)
+    plug.logger.error.assert_not_called()                        # not reported as a crash
+    plug.server_process.tail_error_log.assert_not_called()
+    plug.matter.rearm_failure_diagnostic.assert_called_once()    # DEFERRED, not dropped
+
+
+def test_on_server_unreachable_surfaces_crash_outside_window(plug):
+    plug.server_process = SimpleNamespace(tail_error_log=Mock(return_value="stack trace"), project_dir="/x")
+    plug.matter = SimpleNamespace(rearm_failure_diagnostic=Mock())
+    plug._restart_expected_until = 0.0           # window closed
+    plug._restart_notice_shown = False
+    plug._on_server_unreachable(2)
+    plug.logger.error.assert_called()                            # real crash surfaced
+    plug.matter.rearm_failure_diagnostic.assert_not_called()
+
+
+def test_on_server_unreachable_no_server_process_is_noop(plug):
+    plug.server_process = None
+    plug._on_server_unreachable(2)               # must not raise
+    plug.logger.error.assert_not_called()
+
+
+def test_install_handler_logs_when_restart_fails(plug, plugin_mod, monkeypatch):
+    plug.server_process = SimpleNamespace(install=lambda: True, resolved_bin_dir="/x")
+    plug.pluginPrefs = {"serverLocation": "local"}
+    plug._stopping = False
+    plug._restart_expected_until = 0.0
+    plug._restart_notice_shown = False
+    reinstalled = SimpleNamespace(ensure_installed=Mock(), restart=Mock(return_value=False))
+    monkeypatch.setattr(plugin_mod, "ServerProcess", lambda *a, **k: reinstalled)
+    plug._install_matter_server()
+    plug.logger.error.assert_called()            # restart failure surfaced, not silent success
+    assert plug._restart_expected_until == 0.0   # window cleared so the crash diagnostic works
+
+
+def test_menu_restart_sets_window_on_success(plug):
+    plug.server_process = SimpleNamespace(restart=Mock(return_value=True))
+    plug._restart_expected_until = 0.0
+    plug._restart_notice_shown = True
+    plug.menuRestartMatterServer()
+    assert plug._restart_expected_until > 0       # outage treated as expected
+    plug.server_process.restart.assert_called_once()
+
+
+def test_menu_restart_clears_window_on_failure(plug):
+    plug.server_process = SimpleNamespace(restart=Mock(return_value=False))
+    plug._restart_expected_until = 0.0
+    plug._restart_notice_shown = False
+    plug.menuRestartMatterServer()
+    assert plug._restart_expected_until == 0.0    # failed restart must not suppress diagnostics
+    plug.logger.error.assert_called()
