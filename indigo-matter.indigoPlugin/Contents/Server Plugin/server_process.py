@@ -437,9 +437,14 @@ class ServerProcess:
         os.makedirs(self.project_dir, exist_ok=True)
         self.logger.info("Installing %s into %s (node: %s) — this can take a minute…",
                          spec, self.project_dir, self.node_path)
+        # npm is a `#!/usr/bin/env node` script, so `node` must be on PATH — but the
+        # plugin's subprocess env (under launchd) usually isn't, which fails with
+        # "env: node: No such file or directory". Prepend the resolved node bin dir.
+        env = dict(os.environ)
+        env["PATH"] = self.resolved_bin_dir + os.pathsep + env.get("PATH", "")
         try:
             result = self._run([npm, "install", "--prefix", self.project_dir, spec],
-                               capture_output=True, text=True, check=False)
+                               capture_output=True, text=True, check=False, env=env)
         except OSError as exc:
             self.logger.error("matter-server install could not start: %s", exc)
             return False
