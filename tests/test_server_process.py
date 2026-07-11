@@ -520,32 +520,152 @@ def test_install_fails_when_npm_missing(tmp_path, prefs, mock_logger):
     assert sp.logger.error.called
 
 
+class RaisingRunner(FakeRunner):
+    """Raises OSError on the npm `install` call (exec failure); node --version works."""
+
+    def __call__(self, cmd, **kwargs):
+        self.calls.append(cmd)
+        if "install" in cmd:
+            raise OSError("Permission denied")
+        if len(cmd) >= 2 and cmd[0].endswith("node") and cmd[1] == "--version":
+            return subprocess.CompletedProcess(cmd, 0, stdout="v22.0.0\n", stderr="")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+
+def _write_stamp(sp, version):
+    os.makedirs(sp.project_dir, exist_ok=True)
+    with open(sp._install_stamp_path(), "w") as handle:
+        handle.write(version)
+
+
 def test_install_fails_on_npm_error(tmp_path, prefs, mock_logger):
     sp = _sp_with_tools(tmp_path, prefs, mock_logger,
                         runner=NodeVersionRunner(returncode=1))  # npm returns nonzero
     assert sp.install() is False
+    assert sp._read_install_node_major() is None   # a FAILED install leaves no stamp
 
 
-def test_preflight_flags_node_major_mismatch(tmp_path, prefs, mock_logger):
-    # installed with node 20, now resolving node 22 → native modules won't load
+def test_install_returns_false_when_npm_exec_raises(tmp_path, prefs, mock_logger):
+    # npm exists on disk but exec fails (permissions / wrong arch) → OSError branch.
+    sp = _sp_with_tools(tmp_path, prefs, mock_logger, runner=RaisingRunner())
+    assert sp.install() is False
+    assert sp.logger.error.called
+
+
+# --- ABI check is now ADVISORY (abi_warning), never a fatal preflight block ---
+
+def test_abi_warning_flags_node_major_mismatch(tmp_path, prefs, mock_logger):
+    # installed with node 20, now resolving node 22
     sp = _sp_with_tools(tmp_path, prefs, mock_logger, tools=("npx", "node"),
                         entry=True, runner=NodeVersionRunner("v22.5.0"))
-    os.makedirs(sp.project_dir, exist_ok=True)
-    with open(sp._install_stamp_path(), "w") as handle:
-        handle.write("v20.11.0\n")
-    problem = sp.preflight()
-    assert problem is not None and "20" in problem and "22" in problem
+    _write_stamp(sp, "v20.11.0\n")
+    warning = sp.abi_warning()
+    assert warning is not None and "20" in warning and "22" in warning
+    assert sp.preflight() is None                  # NOT fatal — preflight still passes
 
 
-def test_preflight_ok_when_node_major_matches(tmp_path, prefs, mock_logger):
+def test_ensure_installed_warns_but_still_writes_plist_on_abi_mismatch(tmp_path, prefs, mock_logger):
+    # a stale stamp must NOT block a possibly-working server or tear down its plist.
     sp = _sp_with_tools(tmp_path, prefs, mock_logger, tools=("npx", "node"),
                         entry=True, runner=NodeVersionRunner("v22.5.0"))
-    os.makedirs(sp.project_dir, exist_ok=True)
-    with open(sp._install_stamp_path(), "w") as handle:
-        handle.write("v22.1.0\n")
+    _write_stamp(sp, "v20.11.0\n")
+    sp.ensure_installed()
+    assert os.path.exists(sp.plist_path)           # server still gets to run
+    assert sp.logger.warning.called                # but the user is warned
+
+
+def test_abi_warning_none_when_majors_match(tmp_path, prefs, mock_logger):
+    sp = _sp_with_tools(tmp_path, prefs, mock_logger, tools=("npx", "node"),
+                        entry=True, runner=NodeVersionRunner("v22.5.0"))
+    _write_stamp(sp, "v22.1.0\n")
+    assert sp.abi_warning() is None
+
+
+def test_abi_warning_none_when_node_version_unreadable(tmp_path, prefs, mock_logger):
+    # stamp present but `node --version` yields nothing → unknown current → no warning
+    sp = _sp_with_tools(tmp_path, prefs, mock_logger, tools=("npx", "node"),
+                        entry=True, runner=FakeRunner())  # node --version → empty stdout
+    _write_stamp(sp, "v20.11.0\n")
+    assert sp.abi_warning() is None
+
+
+def test_abi_warning_none_on_garbage_stamp(tmp_path, prefs, mock_logger):
+    sp = _sp_with_tools(tmp_path, prefs, mock_logger, tools=("npx", "node"),
+                        entry=True, runner=NodeVersionRunner("v22.5.0"))
+    _write_stamp(sp, "not-a-version\n")
+    assert sp.abi_warning() is None                # corrupt stamp never false-warns
+
+
+def test_abi_warning_and_preflight_none_without_stamp(sp):
+    assert sp.abi_warning() is None
     assert sp.preflight() is None
 
 
-def test_preflight_does_not_false_block_without_stamp(sp):
-    # node + entry present, no install stamp → ABI check skipped, preflight passes
-    assert sp.preflight() is None
+# ---------------------------------------------------------------------------
+# Blank-but-present prefs must fall back to defaults, not reach the CLI as ""
+# (forum t=21404: `--port ""` → matter-server "Invalid integer:" crash-loop)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("blank", ["", "   ", "\t"])
+def test_program_arguments_blank_port_falls_back(tmp_path, mock_logger, blank):
+    home = tmp_path / "home"
+    (home / "bin").mkdir(parents=True)
+    (home / "bin" / "npx").write_text("#!/bin/sh\n")
+    prefs = {"matterServerPort": blank, "primaryInterface": "en0"}
+    sp = ServerProcess(prefs, mock_logger, home=str(home),
+                       npx_path=str(home / "bin" / "npx"), runner=FakeRunner())
+    args = sp.program_arguments()
+    assert args[args.index("--port") + 1] == "5580"   # never empty
+
+
+@pytest.mark.parametrize("blank", ["", "   "])
+def test_program_arguments_blank_primary_interface_falls_back(tmp_path, mock_logger, blank):
+    home = tmp_path / "home"
+    (home / "bin").mkdir(parents=True)
+    (home / "bin" / "npx").write_text("#!/bin/sh\n")
+    prefs = {"matterServerPort": "5580", "primaryInterface": blank}
+    sp = ServerProcess(prefs, mock_logger, home=str(home),
+                       npx_path=str(home / "bin" / "npx"), runner=FakeRunner())
+    args = sp.program_arguments()
+    assert args[args.index("--primary-interface") + 1] == "en0"
+
+
+def test_program_arguments_blank_storage_falls_back(tmp_path, mock_logger):
+    home = tmp_path / "home"
+    (home / "bin").mkdir(parents=True)
+    (home / "bin" / "npx").write_text("#!/bin/sh\n")
+    prefs = {"matterServerPort": "5580", "primaryInterface": "en0", "storagePath": "   "}
+    sp = ServerProcess(prefs, mock_logger, home=str(home),
+                       npx_path=str(home / "bin" / "npx"), runner=FakeRunner())
+    storage = sp.program_arguments()[sp.program_arguments().index("--storage-path") + 1]
+    assert storage.strip() != "" and storage.endswith("/matter-server")
+
+
+def _sp_port(tmp_path, mock_logger, prefs):
+    home = tmp_path / "home"
+    (home / "bin").mkdir(parents=True)
+    (home / "bin" / "npx").write_text("#!/bin/sh\n")
+    sp = ServerProcess(prefs, mock_logger, home=str(home),
+                       npx_path=str(home / "bin" / "npx"), runner=FakeRunner())
+    args = sp.program_arguments()
+    return args[args.index("--port") + 1]
+
+
+def test_local_mode_forces_port_5580_even_with_stale_pref(tmp_path, mock_logger):
+    # local WS client always dials 5580, so the server must too — a stale/other port
+    # pref must not diverge them.
+    port = _sp_port(tmp_path, mock_logger,
+                    {"serverLocation": "local", "matterServerPort": "9999"})
+    assert port == "5580"
+
+
+def test_local_mode_forces_port_5580_when_blank(tmp_path, mock_logger):
+    port = _sp_port(tmp_path, mock_logger,
+                    {"serverLocation": "local", "matterServerPort": ""})
+    assert port == "5580"
+
+
+def test_remote_mode_honours_configured_port(tmp_path, mock_logger):
+    port = _sp_port(tmp_path, mock_logger,
+                    {"serverLocation": "remote", "matterServerPort": "5590"})
+    assert port == "5590"

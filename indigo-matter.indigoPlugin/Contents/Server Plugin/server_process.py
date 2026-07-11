@@ -101,8 +101,18 @@ class ServerProcess:
         # ship node and npx side-by-side). We launch node directly because the
         # matter-server npm package exposes no bin executable (see module docstring).
         self.node_path = os.path.join(os.path.dirname(self.npx_path), "node")
-        self.port = str(prefs.get("matterServerPort", "5580"))
-        self.primary_interface = str(prefs.get("primaryInterface", "en0"))
+        # Port. In LOCAL mode the WS client hardcodes ws://localhost:5580/ws, so the
+        # server must listen on 5580 too — the matterServerPort field is hidden in
+        # local mode (its defaultValue never applies) and would otherwise reach the
+        # CLI as "" → matter-server "Invalid integer:" crash-loop, or as a stale value
+        # that diverges from what the client dials. Force 5580 in local mode; in remote
+        # mode honour the pref but still fall back on blank (prefs.get only defaults on
+        # an ABSENT key, not a present-but-empty one).
+        if str(prefs.get("serverLocation") or "").strip().lower() == "local":
+            self.port = "5580"
+        else:
+            self.port = str(prefs.get("matterServerPort") or "").strip() or "5580"
+        self.primary_interface = str(prefs.get("primaryInterface") or "").strip() or "en0"
         # Address the matter-server WebSocket control API binds to. matter-server
         # v0.6.2 binds to ALL interfaces when no --listen-address is given, and the
         # control WS is UNAUTHENTICATED — so the safe default is loopback only. An
@@ -112,7 +122,8 @@ class ServerProcess:
         self.listen_address = str(prefs.get("matterServerListenAddress", "127.0.0.1")).strip() or "127.0.0.1"
         self.project_dir = os.path.join(self.home, DEFAULT_PROJECT_DIRNAME)
         default_storage = f"~/Library/Application Support/{LABEL}/matter-server"
-        self.storage_path = _expand(str(prefs.get("storagePath", default_storage)), self.home)
+        raw_storage = str(prefs.get("storagePath") or "").strip() or default_storage
+        self.storage_path = _expand(raw_storage, self.home)
 
     # ------------------------------------------------------------------
     # Paths
@@ -305,12 +316,14 @@ class ServerProcess:
     # Lifecycle
     # ------------------------------------------------------------------
     def preflight(self) -> Optional[str]:
-        """Return a human-readable reason matter-server can't launch, else None.
+        """Return a FATAL reason matter-server can't launch, else None.
 
         Guards the two failures that otherwise surface only as a launchd crash-loop
         (and a bare "connection refused" at the WS client): a missing node
         interpreter, or the matter-server npm package not being installed. Both are
         common for nvm users whose ``nodeBinDir`` didn't resolve to a real bin dir.
+        The Node-ABI check is deliberately NOT here — see :meth:`abi_warning` (it is
+        advisory, not fatal, because a stale stamp must never block a working server).
         """
         if not self._exists(self.node_path):
             return (
@@ -326,20 +339,30 @@ class ServerProcess:
                 f"(or run 'npm install {DEFAULT_INSTALL_SPEC}' in {self.project_dir} "
                 f"with the same node, {self.node_path}), then restart the plugin."
             )
-        # ABI guard: if the package was installed with a different node MAJOR than the
-        # one we're about to run, its native bindings won't load (a silent crash-loop).
-        # Only probe when a stamp exists, and never false-block when either is unknown.
-        stamped = self._read_install_node_major()
-        if stamped is not None:
-            current = _node_major(self._node_version())
-            if current is not None and stamped != current:
-                return (
-                    f"matter-server was installed with Node {stamped}.x but the "
-                    f"resolved node ({self.node_path}) is {current}.x — its native "
-                    f"modules won't load. Reinstall with the current node: Plugins ▸ "
-                    f"Matter ▸ Install/update matter-server."
-                )
         return None
+
+    def abi_warning(self) -> Optional[str]:
+        """Return an ADVISORY warning if node's major differs from the install stamp.
+
+        A mismatch *may* mean the package's native bindings won't load — but the stamp
+        is only written by this plugin's install(), so a user who reinstalls
+        out-of-band (Terminal npm) leaves a STALE stamp behind. Blocking on it would
+        refuse a perfectly good server, so this is a warning only: let the server try,
+        and if it really is a mismatch it crash-loops and matter-server.err.log
+        surfaces the cause. Never fires when either version is unknown.
+        """
+        stamped = self._read_install_node_major()
+        if stamped is None:
+            return None
+        current = _node_major(self._node_version())
+        if current is None or stamped == current:
+            return None
+        return (
+            f"matter-server was installed with Node {stamped}.x but the resolved node "
+            f"({self.node_path}) is {current}.x. If it fails to start, reinstall via "
+            f"Plugins ▸ Matter ▸ Install/update matter-server, or clear the stale stamp "
+            f"({self._install_stamp_path()})."
+        )
 
     def _node_version(self) -> Optional[str]:
         """Return the resolved node's version string (e.g. ``v22.18.0``), or None."""
@@ -383,7 +406,13 @@ class ServerProcess:
         try:
             with open(path, "r", encoding="utf-8", errors="replace") as handle:
                 lines = handle.readlines()
-        except OSError:
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            # An existing-but-unreadable log (e.g. permissions) is distinct from "no
+            # log"; log it so the caller's "may not be installed" hint isn't mistaken
+            # for the whole story.
+            self.logger.debug("could not read %s: %s", path, exc)
             return None
         tail = "".join(lines[-max_lines:]).strip()
         return tail or None
@@ -394,9 +423,9 @@ class ServerProcess:
         Installs into ``~/indigo-matter`` using the ``npm`` co-located with the node
         this instance resolved — so the package's native deps are built for the SAME
         node the LaunchAgent will run (the install/run match that avoids ABI
-        crash-loops). Records that node's version for :meth:`preflight`'s ABI guard.
-        Streams npm's output to the log; returns True on success. Blocking — callers
-        should run it off the Indigo main thread.
+        crash-loops). Records that node's version for :meth:`abi_warning`. Captures
+        npm's output and logs it on failure; returns True on success. Blocking —
+        callers should run it off the Indigo main thread.
         """
         npm = os.path.join(self.resolved_bin_dir, "npm")
         if not self._exists(npm):
@@ -415,8 +444,14 @@ class ServerProcess:
             self.logger.error("matter-server install could not start: %s", exc)
             return False
         if result is None or result.returncode != 0:
-            detail = ((result.stderr or result.stdout).strip() if result else "npm unavailable")
-            self.logger.error("matter-server install failed:\n%s", detail[-2000:])
+            # Combine both streams (npm splits the cause across them) and keep the
+            # HEAD — npm front-loads the real error; the tail is boilerplate footer.
+            if result is None:
+                detail = "npm unavailable"
+            else:
+                detail = "\n".join(p for p in ((result.stdout or "").strip(),
+                                                (result.stderr or "").strip()) if p)
+            self.logger.error("matter-server install failed:\n%s", (detail or "no output")[:3000])
             return False
         self._record_install_node()
         self.logger.info("matter-server installed.")
@@ -440,6 +475,9 @@ class ServerProcess:
             if self._exists(self.plist_path):
                 self.uninstall()  # stop an existing crash-loop; leaves storage intact
             return
+        abi = self.abi_warning()
+        if abi:
+            self.logger.warning("matter-server: %s", abi)  # advisory — do NOT block
         with open(self.plist_path, "wb") as handle:
             handle.write(self.build_plist())
         self.logger.info("Wrote LaunchAgent %s", self.plist_path)
