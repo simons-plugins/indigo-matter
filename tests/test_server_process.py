@@ -216,10 +216,15 @@ def test_is_running_reflects_launchctl_returncode(tmp_path, prefs, mock_logger):
     assert stopped.is_running() is False
 
 
-def test_restart_kickstarts(sp):
+def test_restart_reloads_plist_not_kickstart(sp):
+    # restart() must bootout + bootstrap so launchd re-reads the (corrected) plist —
+    # kickstart -k would respawn the stale in-memory args (e.g. a pre-fix `--port ""`).
+    sp.ensure_installed()
     sp._run = FakeRunner()
-    sp.restart()
-    assert "kickstart" in sp._run.subcommands()
+    assert sp.restart() is True
+    subs = sp._run.subcommands()
+    assert "bootout" in subs and "bootstrap" in subs
+    assert "kickstart" not in subs
 
 
 def test_stop_boots_out_and_keeps_plist(sp):
@@ -283,12 +288,14 @@ def test_npx_resolution_prefers_homebrew(tmp_path, prefs, mock_logger, monkeypat
     assert sp.npx_path == "/opt/homebrew/bin/npx"
 
 
-def test_restart_returns_false_and_reinstalls_on_kickstart_failure(sp):
-    sp._run = FakeRunner(returncode=1)  # kickstart fails → fallback reinstall cycle
+def test_restart_returns_false_and_reinstalls_on_reload_failure(sp):
+    sp.ensure_installed()
+    sp._run = FakeRunner(returncode=1)  # bootstrap fails → fallback reinstall cycle
     ok = sp.restart()
     subs = sp._run.subcommands()
-    assert "kickstart" in subs
+    assert "bootout" in subs
     assert "bootstrap" in subs or "load" in subs  # reinstalled
+    assert "kickstart" not in subs
     assert ok is False  # is_running() with rc=1 → False
 
 
@@ -450,6 +457,50 @@ def test_ensure_installed_tears_down_stale_plist_on_preflight_fail(sp, tmp_path)
     assert not os.path.exists(sp.plist_path)           # stale job removed
     assert "bootout" in sp._run.subcommands()          # crash-loop stopped
     assert os.path.isdir(sp.storage_path)              # storage still sacred
+
+
+# ---------------------------------------------------------------------------
+# Stale launchd job: rewriting the plist FILE never updates an already-loaded
+# job's cached args, so ensure_installed must reload when they diverge — this is
+# what unsticks a pre-fix `--port ""` crash-loop (forum t=21404) on upgrade.
+# ---------------------------------------------------------------------------
+
+def test_ensure_installed_leaves_healthy_matching_job_untouched(sp):
+    # First apply records the marker + bootstraps. A second reload with the SAME args
+    # must NOT restart the server (device sessions are slow to re-establish).
+    sp.ensure_installed()
+    sp._run = FakeRunner()  # rc0 → is_running() True
+    sp.ensure_installed()
+    subs = sp._run.subcommands()
+    assert "print" in subs          # is_running() consulted
+    assert "bootout" not in subs    # healthy up-to-date job left running
+    assert "bootstrap" not in subs
+
+
+def test_ensure_installed_reloads_stale_job_when_no_marker(sp):
+    # The stuck user: a job is already loaded (bootstrapped by an old plugin with the
+    # buggy `--port ""`) but no applied-marker exists. The corrected plist must be
+    # forced in via bootout + bootstrap so the crash-loop clears on the first reload.
+    if os.path.exists(sp._applied_marker_path()):
+        os.remove(sp._applied_marker_path())
+    sp._run = FakeRunner()  # rc0 → is_running() True and launchctl calls succeed
+    sp.ensure_installed()
+    subs = sp._run.subcommands()
+    assert "bootout" in subs        # stale in-memory args dropped
+    assert "bootstrap" in subs      # corrected plist bootstrapped
+    # marker now recorded so subsequent unchanged reloads won't needlessly restart
+    assert sp._read_applied_digest() is not None
+
+
+def test_ensure_installed_reloads_when_args_changed(sp):
+    os.makedirs(sp.log_dir, exist_ok=True)
+    with open(sp._applied_marker_path(), "w") as handle:
+        handle.write("stale-digest-from-old-args\n")
+    sp._run = FakeRunner()
+    sp.ensure_installed()
+    subs = sp._run.subcommands()
+    assert "bootout" in subs and "bootstrap" in subs
+    assert sp._read_applied_digest() != "stale-digest-from-old-args"
 
 
 def test_tail_error_log_returns_last_lines(sp):
