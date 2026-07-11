@@ -669,3 +669,20 @@ def test_remote_mode_honours_configured_port(tmp_path, mock_logger):
     port = _sp_port(tmp_path, mock_logger,
                     {"serverLocation": "remote", "matterServerPort": "5590"})
     assert port == "5590"
+
+
+def test_install_puts_node_bin_dir_on_subprocess_path(tmp_path, prefs, mock_logger):
+    # npm is a `#!/usr/bin/env node` script → node must be on PATH, or the install
+    # fails with "env: node: No such file or directory" (caught live on jarvis).
+    captured = {}
+
+    class EnvCapturingRunner(NodeVersionRunner):
+        def __call__(self, cmd, **kwargs):
+            if "install" in cmd:
+                captured["env"] = kwargs.get("env")
+            return super().__call__(cmd, **kwargs)
+
+    sp = _sp_with_tools(tmp_path, prefs, mock_logger, runner=EnvCapturingRunner())
+    assert sp.install() is True
+    assert captured["env"] is not None
+    assert captured["env"]["PATH"].split(os.pathsep)[0] == sp.resolved_bin_dir
