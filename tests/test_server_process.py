@@ -560,11 +560,15 @@ def test_apply_plist_warns_when_stale_job_wont_bootout(sp):
 class ProcRunner(FakeRunner):
     """Models `ps`, `kill` (simulating process exit), and `launchctl print` (pid)."""
 
-    def __init__(self, ps_lines=None, print_pid=None, ignore_term=False, returncode=0):
+    def __init__(self, ps_lines=None, print_pid=None, ignore_term=False,
+                 omit_pid_line=False, returncode=0):
         super().__init__(returncode)
         self.ps_lines = list(ps_lines or [])
         self.print_pid = print_pid
         self.ignore_term = ignore_term
+        # When True, `launchctl print` still succeeds (job loaded → is_running() True) but
+        # emits no "pid = N" line, so _managed_pid() returns None — the safety-valve state.
+        self.omit_pid_line = omit_pid_line
         self.signals: list[tuple[str, str]] = []
 
     def __call__(self, cmd, **kwargs):
@@ -580,7 +584,8 @@ class ProcRunner(FakeRunner):
         if len(cmd) >= 2 and cmd[0] == "launchctl" and cmd[1] == "print":
             if self.print_pid is None:
                 return subprocess.CompletedProcess(cmd, 1, "", "")
-            out = f"\tstate = running\n\tpid = {self.print_pid}\n"
+            out = "\tstate = running\n" if self.omit_pid_line else \
+                f"\tstate = running\n\tpid = {self.print_pid}\n"
             return subprocess.CompletedProcess(cmd, 0, stdout=out, stderr="")
         return subprocess.CompletedProcess(cmd, self.returncode, stdout="", stderr="")
 
@@ -668,6 +673,22 @@ def test_reload_leaves_healthy_job_untouched_when_no_orphan(tmp_path, mock_logge
     subs = [c[1] for c in runner.calls if len(c) > 1]
     assert "bootout" not in subs
     assert not runner.signals
+
+
+def test_reload_never_reaps_when_managed_pid_unknown(tmp_path, mock_logger):
+    # Safety valve: is_running() True but the managed pid can't be parsed. We must NOT
+    # reap (we can't tell the healthy job from an orphan) and must leave it untouched.
+    runner = ProcRunner(print_pid=5423, omit_pid_line=True)  # loaded, but no "pid =" line
+    sp = _sp_proc_installed(tmp_path, mock_logger, runner)
+    sp.ensure_installed()                # records marker
+    runner.ps_lines = [_server_cmd(sp, 545)]   # an orphan is present…
+    runner.calls.clear()
+    runner.signals.clear()
+    sp.ensure_installed()
+    assert runner.signals == []          # …but we refuse to signal anything
+    subs = [c[1] for c in runner.calls if len(c) > 1]
+    assert "bootout" not in subs and "bootstrap" not in subs
+    assert not any(c and c[0] == "ps" for c in runner.calls)   # reap never even scanned
 
 
 def test_reload_reaps_orphan_and_restarts_when_it_blocks_a_matching_job(tmp_path, mock_logger):

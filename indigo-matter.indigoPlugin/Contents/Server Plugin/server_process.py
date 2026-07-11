@@ -744,8 +744,12 @@ class ServerProcess:
         )
         for pid in pids:
             self._signal(pid, "TERM")
-        for _ in range(10):  # ~3s grace for a clean SIGTERM shutdown (lock released on exit)
-            self._sleep(0.3)
+        # Poll for a clean SIGTERM shutdown (matter-server releases the lock in its exit
+        # handler, normally sub-second). Bounded ~1.5s worst case; this blocks the
+        # (already synchronous) start/restart path only in the rare orphan-present case —
+        # a brief, deliberate stall to un-wedge a server that would otherwise never start.
+        for _ in range(6):
+            self._sleep(0.25)
             if not self._running_server_pids(exclude_pid=exclude_pid):
                 return len(pids)
         for pid in self._running_server_pids(exclude_pid=exclude_pid):
@@ -807,9 +811,15 @@ class ServerProcess:
 
     def _signal(self, pid: int, sig: str) -> None:
         try:
-            self._run(["kill", f"-{sig}", str(pid)], capture_output=True, text=True, check=False)
+            result = self._run(["kill", f"-{sig}", str(pid)], capture_output=True, text=True, check=False)
         except OSError as exc:  # pragma: no cover - best-effort
             self.logger.debug("kill -%s %s failed: %s", sig, pid, exc)
+            return
+        # A non-zero kill (permission denied, ESRCH) is silently swallowed by check=False;
+        # log it so a misbehaving reap is visible rather than reported as fully signalled.
+        if result is not None and result.returncode != 0:
+            self.logger.debug("kill -%s %s exited %s: %s", sig, pid, result.returncode,
+                              (result.stderr or "").strip())
 
     # ------------------------------------------------------------------
     # launchctl helpers
