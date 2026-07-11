@@ -34,15 +34,18 @@ in [docs/HANDOVER.md](./docs/HANDOVER.md).
 
 ## Setup
 
-matter-server is a separate Node.js runtime that you install once. See
-**[docs/INSTALL.md](./docs/INSTALL.md)** for the full install and configuration guide
-(Node 22, matter-server, the two run modes, verification, backups, and troubleshooting).
+matter-server is a separate Node.js runtime. In local mode the plugin installs and
+manages it for you — **Plugins ▸ Matter ▸ Install/update matter-server** installs the
+pinned version with your Node and restarts onto it (no Terminal). See
+**[docs/INSTALL.md](./docs/INSTALL.md)** for the full guide (Node, matter-server, the two
+run modes, verification, backups, and troubleshooting).
 
 ## Requirements
 
 - Indigo 2025.2+ on macOS.
-- Node.js 22 LTS (via nvm or Homebrew) and the `matter-server` npm package (Alpha; caret-ranged
-  to 0.6.x — the install command's `^0.6.2` floats within the minor series).
+- **Node.js ≥ 22.13.0** (Homebrew is the paved road; nvm works too) and the `matter-server`
+  npm package — Beta, **exact-pinned to 1.2.2** (`DEFAULT_INSTALL_SPEC`; the Install action
+  uses this).
 - Python dep: `websockets` (see `Contents/Server Plugin/requirements.txt`).
 - The **Domio** iOS app for adding devices.
 
