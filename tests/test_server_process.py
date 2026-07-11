@@ -133,7 +133,7 @@ def test_server_entry_falls_back_when_manifest_absent_or_garbage(tmp_path, prefs
 
 def test_program_arguments_bind_loopback_by_default(sp):
     # Security: with no listen-address pref, the managed server MUST bind loopback
-    # only. matter-server v0.6.2 binds ALL interfaces (and is unauthenticated) when
+    # only. matter-server binds ALL interfaces (and is unauthenticated) when
     # --listen-address is absent, so the flag must always be present and default to
     # 127.0.0.1.
     args = sp.program_arguments()

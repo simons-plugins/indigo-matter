@@ -1,8 +1,8 @@
 """matter-server process management — LaunchAgent (PM-B).
 
 Manages a launchd LaunchAgent that runs matter-server, per IMPLEMENTATION.md §1.4.
-The ``matter-server`` npm package (v0.6.2) ships ``"bin": null`` — there is NO
-``matter-server`` executable — so ``npx matter-server`` fails every time with
+The ``matter-server`` npm package ships ``"bin": null`` (true through at least 1.2.2)
+— there is NO ``matter-server`` executable — so ``npx matter-server`` fails with
 "could not determine executable to run", and launchd KeepAlive-respawns it forever.
 We therefore launch node directly on the package main (``dist/esm/MatterServer.js``,
 read from the package's ``package.json``), exactly like the working hand-rolled
@@ -33,11 +33,13 @@ LABEL = "com.simons-plugins.indigo-matter"
 DEFAULT_PROJECT_DIRNAME = "indigo-matter"   # ~/indigo-matter (npm install location)
 NPX_CANDIDATES = ("/opt/homebrew/bin/npx", "/usr/local/bin/npx")
 MATTER_SERVER_PACKAGE = "matter-server"
-# Default caret spec installed by install(). Kept in one place so a version bump is
-# a one-line change (matches docs/INSTALL.md).
-DEFAULT_INSTALL_SPEC = "matter-server@^0.6.2"
-# Fallback entry point if the package's package.json is missing/unreadable. Matches
-# matter-server v0.6.2's "main": "dist/esm/MatterServer.js".
+# Version installed by install(). Pinned (exact, not caret) for reproducibility — the
+# package is fast-moving pre-1.0-style Alpha/Beta. Kept in one place so a version bump
+# is a one-line change (matches docs/INSTALL.md). NOTE: 1.2.2 requires Node >= 22.13.0.
+DEFAULT_INSTALL_SPEC = "matter-server@1.2.2"
+# Fallback entry point if the package's package.json is missing/unreadable. Matches the
+# "main" of both 0.6.x and 1.2.x ("dist/esm/MatterServer.js"); _server_entry() reads the
+# real value from the installed package.json and only falls back to this.
 DEFAULT_SERVER_ENTRY = "dist/esm/MatterServer.js"
 # Records the node version the package was installed with, so preflight can catch an
 # install-node vs run-node mismatch (native-binding ABI crash) before it crash-loops.
@@ -113,8 +115,8 @@ class ServerProcess:
         else:
             self.port = str(prefs.get("matterServerPort") or "").strip() or "5580"
         self.primary_interface = str(prefs.get("primaryInterface") or "").strip() or "en0"
-        # Address the matter-server WebSocket control API binds to. matter-server
-        # v0.6.2 binds to ALL interfaces when no --listen-address is given, and the
+        # Address the matter-server WebSocket control API binds to. It binds to ALL
+        # interfaces when no --listen-address is given, and the
         # control WS is UNAUTHENTICATED — so the safe default is loopback only. An
         # empty/whitespace pref must never leak through (that would re-expose all
         # interfaces), hence the explicit fall back to 127.0.0.1. This is distinct
@@ -260,7 +262,7 @@ class ServerProcess:
 
         Reads ``main`` from ``{project_dir}/node_modules/matter-server/package.json``
         so the launch adapts automatically if the package bumps its entry path.
-        Falls back to ``dist/esm/MatterServer.js`` (v0.6.2's value) if the manifest
+        Falls back to ``dist/esm/MatterServer.js`` (the 0.6.x/1.2.x value) if the manifest
         is missing, unreadable, or malformed.
         """
         pkg_dir = os.path.join(self.project_dir, "node_modules", MATTER_SERVER_PACKAGE)
