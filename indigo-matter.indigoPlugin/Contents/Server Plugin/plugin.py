@@ -102,6 +102,9 @@ class Plugin(indigo.PluginBase):
         self.server_process: ServerProcess | None = None
         self._install_thread: threading.Thread | None = None
         self._stopping = False
+        # When WE restart matter-server (menu / post-install), the client sees a brief
+        # outage — suppress the "appears to be crashing" diagnostic until this deadline.
+        self._restart_expected_until = 0.0
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -246,6 +249,10 @@ class Plugin(indigo.PluginBase):
         """
         sp = self.server_process
         if sp is None:
+            return
+        if time.time() < self._restart_expected_until:
+            # We deliberately restarted it — this outage is expected, not a crash.
+            self.logger.info("matter-server is restarting; reconnecting…")
             return
         tail = sp.tail_error_log()
         if tail:
@@ -737,9 +744,15 @@ class Plugin(indigo.PluginBase):
             indigo.server.savePluginPrefs()
             self.server_process = ServerProcess(dict(self.pluginPrefs), self.logger)
             self.server_process.ensure_installed()
+            # Restart matter-server onto the just-installed version — otherwise the
+            # newly-installed package sits on disk while the OLD process keeps running
+            # (a running LaunchAgent doesn't pick up new files). This is what makes the
+            # menu action a one-click, no-CLI update.
+            self._restart_expected_until = time.time() + 30
+            self.server_process.restart()
             self.logger.info(
-                "matter-server installed and pinned to node at %s. It should connect "
-                "shortly — the client reconnects automatically.", sp.resolved_bin_dir,
+                "matter-server installed, pinned to node at %s, and restarting onto the "
+                "new version — it reconnects automatically.", sp.resolved_bin_dir,
             )
         except Exception as exc:  # noqa: BLE001
             # npm may have succeeded and only the pin/activate step failed — say so, so
@@ -756,6 +769,7 @@ class Plugin(indigo.PluginBase):
         if self.server_process is None:
             self.logger.warning("LaunchAgent management is off; start matter-server manually")
             return
+        self._restart_expected_until = time.time() + 30  # expected outage, not a crash
         if self.server_process.restart():
             self.logger.info("matter-server restart requested")
         else:
