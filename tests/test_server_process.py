@@ -493,7 +493,7 @@ def test_ensure_installed_reloads_stale_job_when_no_marker(sp):
 
 
 def test_ensure_installed_reloads_when_args_changed(sp):
-    os.makedirs(sp.log_dir, exist_ok=True)
+    os.makedirs(os.path.dirname(sp._applied_marker_path()), exist_ok=True)
     with open(sp._applied_marker_path(), "w") as handle:
         handle.write("stale-digest-from-old-args\n")
     sp._run = FakeRunner()
@@ -501,6 +501,54 @@ def test_ensure_installed_reloads_when_args_changed(sp):
     subs = sp._run.subcommands()
     assert "bootout" in subs and "bootstrap" in subs
     assert sp._read_applied_digest() != "stale-digest-from-old-args"
+
+
+def test_applied_marker_lives_in_project_dir_and_survives_log_wipe(sp):
+    # The marker must NOT live in the logs dir: losing it forces a needless restart of
+    # a healthy server. It belongs beside .indigo-node in the (durable) project dir.
+    import shutil
+    sp.ensure_installed()
+    marker = sp._applied_marker_path()
+    assert os.path.dirname(marker) == sp.project_dir
+    assert os.path.exists(marker)
+    shutil.rmtree(sp.log_dir, ignore_errors=True)   # e.g. user clears plugin logs
+    assert os.path.exists(marker)                    # marker unaffected
+    assert sp._read_applied_digest() is not None
+
+
+def test_apply_and_restart_record_digest_of_on_disk_plist(sp):
+    # The marker must reflect the bytes launchd actually loaded (the file), not a
+    # recomputed build_plist() that could drift from disk.
+    import hashlib
+    sp.ensure_installed()
+    sp._run = FakeRunner()
+    assert sp.restart() is True
+    with open(sp.plist_path, "rb") as handle:
+        disk_digest = hashlib.sha256(handle.read()).hexdigest()
+    assert sp._read_applied_digest() == disk_digest
+
+
+def test_apply_plist_warns_when_stale_job_wont_bootout(sp):
+    # is_running() True but the stale job refuses to bootout — the user must be told the
+    # old definition may persist, not have it fail silently.
+    class PerCommandRunner(FakeRunner):
+        def __init__(self, codes):
+            super().__init__()
+            self.codes = codes
+
+        def __call__(self, cmd, **kwargs):
+            self.calls.append(cmd)
+            sub = cmd[1] if len(cmd) > 1 else ""
+            return subprocess.CompletedProcess(cmd, self.codes.get(sub, 0), stdout="", stderr="")
+
+    sp.ensure_installed()
+    with open(sp._applied_marker_path(), "w") as handle:
+        handle.write("stale-digest\n")                # force a mismatch → reload path
+    sp._run = PerCommandRunner({"print": 0, "bootout": 1, "bootstrap": 0})
+    sp.logger.reset_mock()
+    sp.ensure_installed()
+    assert "bootout" in sp._run.subcommands()          # a stop was attempted
+    assert sp.logger.warning.called                    # and its failure surfaced
 
 
 def test_tail_error_log_returns_last_lines(sp):
