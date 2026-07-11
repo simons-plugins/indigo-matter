@@ -14,21 +14,21 @@ running but matter-server is not.
 
 The `indigo-matter` plugin does not speak Matter directly. It manages a separate
 Node.js process — **matter-server** (npm package
-[`matter-server`](https://github.com/matter-js/matterjs-server), currently **Alpha
-v0.6.2**) — which holds the Indigo-owned Matter fabric and exposes a WebSocket control
+[`matter-server`](https://github.com/matter-js/matterjs-server), currently **Beta
+1.2.2**) — which holds the Indigo-owned Matter fabric and exposes a WebSocket control
 API. The plugin connects to that WebSocket and translates Matter clusters into
 first-class Indigo devices.
 
 A few things to know before you start:
 
-- **Wi-Fi Matter devices only, for now.** Thread first-commission is non-functional in
-  matter-server 0.6.2 (it does not supply the Thread network name), and BLE is not
-  enabled on macOS. Wi-Fi Matter devices work today.
+- **Wi-Fi Matter devices only, for now.** first-admin Thread commissioning (provisioning Thread credentials over BLE)
+  is unsupported, and BLE is not enabled on macOS — but Thread devices still join fine
+  over IP via the share model (below), and Wi-Fi Matter devices work directly.
 - **Domio drives commissioning.** You add devices from the **Domio iOS app**, not from
   Indigo. Apple Home commissions the device first; Domio relays a share/pairing code to
   the plugin, and the plugin joins the device's fabric as a second admin over IP (the
   "share model"). The plugin owns runtime control for the device's lifetime.
-- **matter-server is Alpha software.** Pin the version, back up the fabric, and expect
+- **matter-server is Beta software.** Pin the version, back up the fabric, and expect
   occasional rough edges.
 
 ---
@@ -38,7 +38,7 @@ A few things to know before you start:
 - **macOS** running your Indigo Server.
 - **Indigo 2025.2+** with the `indigo-matter` plugin installed (≥ **2026.0.6** — earlier
   builds launched matter-server via `npx` and no longer work; see Troubleshooting).
-- **Node.js 22 LTS**, installed via **nvm** or **Homebrew** (Step 1).
+- **Node.js ≥ 22.13.0** (required by matter-server 1.2.2), via **Homebrew** or nvm (Step 1).
 - Network: the Indigo Server and your Wi-Fi Matter devices on the same LAN.
 
 The plugin's only Python dependency (`websockets`) is auto-installed from
@@ -100,14 +100,15 @@ Step 3.
 
 ```bash
 mkdir -p ~/indigo-matter
-npm install --prefix ~/indigo-matter matter-server@^0.6.2
+npm install --prefix ~/indigo-matter matter-server@1.2.2
 ```
 
-This creates `~/indigo-matter/package.json` with `"matter-server": "^0.6.2"` — note the
-caret: installs float within the 0.6.x series (a fresh install today may give e.g. 0.6.8,
-which has been validated in the field). Don't install globally — a project-local install
-keeps the version controlled. The project is Alpha and moving fast; stay within 0.6.x,
-don't track `main`.
+This creates `~/indigo-matter/package.json` with `"matter-server": "1.2.2"` — an **exact
+pin** (no caret). The package is fast-moving Beta, so the plugin pins a specific
+validated version rather than floating; the menu install action uses this same version.
+Don't install globally — a project-local install keeps the version controlled.
+**matter-server 1.2.2 requires Node ≥ 22.13.0** (Step 1). To move to a newer server later,
+bump the version deliberately and re-validate.
 
 > **Note — there is no `matter-server` command.** The npm package has no `bin`
 > (`"bin": null`); its entry point is `dist/esm/MatterServer.js`. matter-server must be
