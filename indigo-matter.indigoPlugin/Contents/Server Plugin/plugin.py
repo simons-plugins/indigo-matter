@@ -270,9 +270,17 @@ class Plugin(indigo.PluginBase):
             return
         tail = sp.tail_error_log()
         if tail:
+            hint = ""
+            if "Storage is locked" in tail or "storage-lock" in tail:
+                # A second matter-server (orphaned from an earlier LaunchAgent) holds the
+                # storage lock. The plugin now reaps such strays on start/restart; point
+                # the user at that in case a reap couldn't run (e.g. ps unavailable).
+                hint = ("\nAnother matter-server appears to be holding the storage lock. "
+                        "Use Plugins ▸ Matter ▸ Restart matter-server (it stops stray "
+                        "servers), or reboot the Mac if it persists.")
             self.logger.error(
                 "matter-server is not responding after %d attempts and appears to be "
-                "crashing. Recent matter-server errors:\n%s", attempts, tail,
+                "crashing. Recent matter-server errors:\n%s%s", attempts, tail, hint,
             )
         else:
             self.logger.error(
@@ -747,9 +755,16 @@ class Plugin(indigo.PluginBase):
             target=self._install_matter_server, name="matter-install", daemon=True)
         self._install_thread.start()
 
-    def _install_matter_server(self) -> None:
+    def _install_matter_server(self, clean: bool = False) -> None:
         try:
             sp = self.server_process or ServerProcess(dict(self.pluginPrefs), self.logger)
+            if clean:
+                # "Start fresh": delete node_modules and reinstall. Stops/reaps the server
+                # first and leaves the storage (fabric/pairings) intact. Used to recover a
+                # matter-server that won't start after an upgrade.
+                self.logger.info("Removing the installed matter-server for a clean "
+                                 "reinstall (your devices/pairings are kept)…")
+                sp.remove_package()
             if not sp.install():
                 self.logger.error(
                     "Install/update matter-server did not complete — see the error "
@@ -793,6 +808,33 @@ class Plugin(indigo.PluginBase):
                 "was not (re)started. See the trace above, then retry Plugins ▸ Matter "
                 "▸ Install/update matter-server."
             )
+
+    def menuReinstallMatterServerClean(self, valuesDict, menuId=""):  # noqa: N802, ARG002
+        """Menu callback: delete matter-server and reinstall it fresh (keeps devices).
+
+        The "blow it all away and start over" recovery when matter-server won't start
+        after an upgrade (e.g. a wedged install or a stray process). Removes
+        ~/indigo-matter/node_modules and reinstalls; the fabric/storage is left intact so
+        commissioned devices survive. Runs in the background like the plain install.
+        """
+        errors = indigo.Dict()
+        if not valuesDict.get("confirm", False):
+            errors["confirm"] = "Tick the box to confirm the reinstall."
+            return (False, valuesDict, errors)
+        if server_location(self.pluginPrefs) != "local":
+            errors["confirm"] = ("Reinstall is only for local (managed) mode. Set 'is "
+                                 "matter-server on this Mac?' to local first.")
+            return (False, valuesDict, errors)
+        if self._install_thread is not None and self._install_thread.is_alive():
+            errors["confirm"] = "An install is already in progress — wait for it to finish."
+            return (False, valuesDict, errors)
+        self.logger.info("Starting a clean matter-server reinstall in the background — "
+                         "watch the log for progress; this can take a minute.")
+        self._install_thread = threading.Thread(
+            target=self._install_matter_server, kwargs={"clean": True},
+            name="matter-reinstall", daemon=True)
+        self._install_thread.start()
+        return (True, valuesDict)
 
     def menuRestartMatterServer(self):  # noqa: N802
         if self.server_process is None:

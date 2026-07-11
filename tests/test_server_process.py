@@ -551,6 +551,159 @@ def test_apply_plist_warns_when_stale_job_wont_bootout(sp):
     assert sp.logger.warning.called                    # and its failure surfaced
 
 
+# ---------------------------------------------------------------------------
+# Orphan reaping: a matter-server can outlive its LaunchAgent and hold the storage
+# lock, so every fresh start crashes with "Storage is locked by another process"
+# (forum t=21404). bootout only stops the managed job — we must reap the stray.
+# ---------------------------------------------------------------------------
+
+class ProcRunner(FakeRunner):
+    """Models `ps`, `kill` (simulating process exit), and `launchctl print` (pid)."""
+
+    def __init__(self, ps_lines=None, print_pid=None, ignore_term=False, returncode=0):
+        super().__init__(returncode)
+        self.ps_lines = list(ps_lines or [])
+        self.print_pid = print_pid
+        self.ignore_term = ignore_term
+        self.signals: list[tuple[str, str]] = []
+
+    def __call__(self, cmd, **kwargs):
+        self.calls.append(cmd)
+        if cmd and cmd[0] == "ps":
+            return subprocess.CompletedProcess(cmd, 0, stdout="\n".join(self.ps_lines) + "\n", stderr="")
+        if cmd and cmd[0] == "kill":
+            sig, pid = cmd[1].lstrip("-"), cmd[2]
+            self.signals.append((sig, pid))
+            if sig == "KILL" or not self.ignore_term:  # process exits (KILL always; TERM unless stubborn)
+                self.ps_lines = [ln for ln in self.ps_lines if ln.split()[0] != pid]
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        if len(cmd) >= 2 and cmd[0] == "launchctl" and cmd[1] == "print":
+            if self.print_pid is None:
+                return subprocess.CompletedProcess(cmd, 1, "", "")
+            out = f"\tstate = running\n\tpid = {self.print_pid}\n"
+            return subprocess.CompletedProcess(cmd, 0, stdout=out, stderr="")
+        return subprocess.CompletedProcess(cmd, self.returncode, stdout="", stderr="")
+
+
+def _sp_proc(tmp_path, mock_logger, runner, prefs=None):
+    home = tmp_path / "home"
+    (home / "bin").mkdir(parents=True, exist_ok=True)
+    (home / "bin" / "npx").write_text("#!/bin/sh\n")
+    prefs = prefs or {"serverLocation": "local", "matterServerPort": "5580",
+                      "primaryInterface": "en0",
+                      "storagePath": "~/Library/Application Support/x/matter-server"}
+    return ServerProcess(prefs, mock_logger, home=str(home),
+                         npx_path=str(home / "bin" / "npx"), runner=runner,
+                         sleep=lambda *_a: None)
+
+
+def _server_cmd(sp, pid, storage=None):
+    pkg = os.path.join(sp.project_dir, "node_modules", "matter-server")
+    return f"{pid} node {pkg}/dist/esm/MatterServer.js --storage-path {storage or sp.storage_path} --port 5580"
+
+
+def test_running_server_pids_matches_ours_and_excludes_others(tmp_path, mock_logger):
+    runner = ProcRunner()
+    sp = _sp_proc(tmp_path, mock_logger, runner)
+    runner.ps_lines = [
+        _server_cmd(sp, 545),                                   # ours (matches pkg + storage)
+        "600 node /Users/x/other/app.js --storage-path /tmp",   # unrelated node process
+        _server_cmd(sp, 700, storage="/some/other/storage"),    # our package, DIFFERENT storage
+    ]
+    assert sp._running_server_pids() == [545]
+    assert sp._running_server_pids(exclude_pid=545) == []       # exclude spares the managed job
+
+
+def test_reap_orphan_servers_terminates_matching(tmp_path, mock_logger):
+    runner = ProcRunner(ps_lines=None)
+    sp = _sp_proc(tmp_path, mock_logger, runner)
+    runner.ps_lines = [_server_cmd(sp, 545)]
+    assert sp.reap_orphan_servers() == 1
+    assert ("TERM", "545") in runner.signals
+    assert sp.logger.warning.called
+
+
+def test_reap_escalates_to_sigkill_when_term_ignored(tmp_path, mock_logger):
+    runner = ProcRunner(ignore_term=True)
+    sp = _sp_proc(tmp_path, mock_logger, runner)
+    runner.ps_lines = [_server_cmd(sp, 545)]
+    assert sp.reap_orphan_servers() == 1
+    assert ("TERM", "545") in runner.signals
+    assert ("KILL", "545") in runner.signals
+
+
+def test_reap_returns_zero_and_stays_quiet_when_none_running(tmp_path, mock_logger):
+    runner = ProcRunner(ps_lines=[])
+    sp = _sp_proc(tmp_path, mock_logger, runner)
+    assert sp.reap_orphan_servers() == 0
+    assert not runner.signals
+
+
+def test_managed_pid_parses_launchctl_print(tmp_path, mock_logger):
+    runner = ProcRunner(print_pid=5423)
+    sp = _sp_proc(tmp_path, mock_logger, runner)
+    assert sp._managed_pid() == 5423
+    runner.print_pid = None
+    assert sp._managed_pid() is None
+
+
+def _sp_proc_installed(tmp_path, mock_logger, runner):
+    """A _sp_proc whose matter-server entry exists so ensure_installed's preflight passes."""
+    sp = _sp_proc(tmp_path, mock_logger, runner)
+    entry = os.path.join(sp.project_dir, "node_modules", "matter-server", "dist", "esm", "MatterServer.js")
+    os.makedirs(os.path.dirname(entry), exist_ok=True)
+    with open(entry, "w") as handle:
+        handle.write("// fake\n")
+    with open(os.path.join(sp.home, "bin", "node"), "w") as handle:
+        handle.write("#!/bin/sh\n")
+    return sp
+
+
+def test_reload_leaves_healthy_job_untouched_when_no_orphan(tmp_path, mock_logger):
+    runner = ProcRunner(print_pid=5423)  # managed job loaded; ps has no matter-server
+    sp = _sp_proc_installed(tmp_path, mock_logger, runner)
+    sp.ensure_installed()                # records marker
+    runner.calls.clear()
+    sp.ensure_installed()                # reload: healthy + no orphan → no restart
+    subs = [c[1] for c in runner.calls if len(c) > 1]
+    assert "bootout" not in subs
+    assert not runner.signals
+
+
+def test_reload_reaps_orphan_and_restarts_when_it_blocks_a_matching_job(tmp_path, mock_logger):
+    runner = ProcRunner(print_pid=5423)
+    sp = _sp_proc_installed(tmp_path, mock_logger, runner)
+    sp.ensure_installed()                # records marker (digest matches on next reload)
+    runner.ps_lines = [_server_cmd(sp, 545)]   # an orphan now holds the lock
+    runner.calls.clear()
+    runner.signals.clear()
+    sp.ensure_installed()
+    assert ("TERM", "545") in runner.signals               # orphan reaped (excluding pid 5423)
+    subs = [c[1] for c in runner.calls if len(c) > 1]
+    assert "bootout" in subs and "bootstrap" in subs        # and a clean restart forced
+
+
+def test_restart_reaps_orphan_before_bootstrap(tmp_path, mock_logger):
+    runner = ProcRunner(print_pid=None)
+    sp = _sp_proc_installed(tmp_path, mock_logger, runner)
+    sp.ensure_installed()                # writes the plist
+    runner.ps_lines = [_server_cmd(sp, 545)]
+    runner.signals.clear()
+    assert sp.restart() is True
+    assert ("TERM", "545") in runner.signals
+
+
+def test_remove_package_deletes_node_modules_but_keeps_storage(sp):
+    os.makedirs(sp.storage_path, exist_ok=True)
+    node_modules = os.path.join(sp.project_dir, "node_modules")
+    assert os.path.isdir(node_modules)
+    sp._run = FakeRunner()
+    sp.remove_package()
+    assert not os.path.exists(node_modules)      # package blown away
+    assert os.path.isdir(sp.storage_path)        # storage is sacred — pairings survive
+    assert "bootout" in sp._run.subcommands()    # server stopped first
+
+
 def test_tail_error_log_returns_last_lines(sp):
     os.makedirs(sp.log_dir, exist_ok=True)
     with open(os.path.join(sp.log_dir, "matter-server.err.log"), "w") as handle:
