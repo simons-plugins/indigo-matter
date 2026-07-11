@@ -22,6 +22,7 @@ without touching the real launchd or filesystem.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import plistlib
@@ -48,6 +49,14 @@ DEFAULT_SERVER_ENTRY = "dist/esm/MatterServer.js"
 # Records the node version the package was installed with, so preflight can catch an
 # install-node vs run-node mismatch (native-binding ABI crash) before it crash-loops.
 INSTALL_NODE_STAMP = ".indigo-node"
+# Records the sha256 of the plist launchd was last told to load (bootstrap). launchd
+# caches a job's ProgramArguments at bootstrap time — rewriting the plist FILE does not
+# touch an already-loaded job — so we compare against this to tell "current definition
+# already running" (leave the healthy server alone) from "stale job loaded" (reload). See
+# _apply_plist(). Lives beside INSTALL_NODE_STAMP in project_dir (the npm install dir),
+# NOT log_dir: a marker in a logs folder is easily lost to log cleanup, and losing it
+# would force a needless restart of a healthy server — the very cost this avoids.
+APPLIED_PLIST_MARKER = ".launchagent.sha256"
 
 
 def _expand(path: str, home: str) -> str:
@@ -502,11 +511,47 @@ class ServerProcess:
         abi = self.abi_warning()
         if abi:
             self.logger.warning("matter-server: %s", abi)  # advisory — do NOT block
+        desired = self.build_plist()
         with open(self.plist_path, "wb") as handle:
-            handle.write(self.build_plist())
+            handle.write(desired)
         self.logger.info("Wrote LaunchAgent %s", self.plist_path)
-        # bootstrap (modern) with a load fallback for older macOS
-        if self._bootstrap():
+        self._apply_plist(desired)
+
+    def _apply_plist(self, desired: bytes) -> None:
+        """Make launchd actually run the plist just written, reloading only on change.
+
+        launchd caches a job's ProgramArguments at bootstrap time, so overwriting the
+        plist FILE does nothing to a job that is already loaded — a plugin upgrade that
+        fixes a bad argument (the pre-2026.7.1 ``--port ""`` that crash-loops with
+        "Invalid integer:") leaves the OLD, broken job running until we bootout and
+        re-bootstrap. We record the digest of the plist we last applied so we can tell:
+
+          * digest matches the running job → leave it (the server survives plugin
+            reloads without dropping slow-to-re-establish device sessions);
+          * digest differs, or nothing recorded (upgrading from a version that never
+            wrote a marker — exactly the stuck user) → the loaded job is stale, so
+            bootout and re-bootstrap. This makes the first reload after upgrade
+            self-heal a crash-looping ``--port ""`` job.
+        """
+        digest = self._digest_of(desired)
+        if self.is_running():
+            if self._read_applied_digest() == digest:
+                return  # current definition already loaded — never restart a healthy server
+            # Stale in-memory args (e.g. a pre-fix `--port ""`). Drop the old job so the
+            # corrected plist we just wrote is what launchd bootstraps below.
+            if not self._bootout():
+                # The stale job wouldn't stop — bootstrap/load below will fail on the
+                # still-loaded label, so surface it rather than letting the crash-loop
+                # persist silently. We still fall through to retry in case the job was
+                # actually gone despite a non-zero bootout.
+                self.logger.warning(
+                    "could not stop the existing matter-server job to apply new "
+                    "settings; the previous definition may keep running until the "
+                    "next plugin reload"
+                )
+        # bootstrap (modern) with a load fallback for older macOS. The marker records the
+        # bytes we just wrote (== on disk), so it always reflects what launchd loaded.
+        if self._bootstrap_and_record(desired):
             return
         result = self._launchctl("load", self.plist_path)
         if result is None or result.returncode != 0:
@@ -516,6 +561,55 @@ class ServerProcess:
                 "running. Start it manually or check %s",
                 detail, self.plist_path,
             )
+        else:
+            self._record_applied_digest(digest)
+
+    def _bootstrap_and_record(self, plist_bytes: Optional[bytes] = None) -> bool:
+        """Bootstrap the plist and, on success, record the digest of what launchd loaded.
+
+        Pass ``plist_bytes`` when the caller already holds the exact bytes it wrote to
+        disk (``_apply_plist``); otherwise (``restart``/``start``, which bootstrap the
+        existing file) the bytes are read back from ``plist_path`` so the applied-marker
+        always reflects the file launchd was told to load — never a recomputed
+        :meth:`build_plist` that could have drifted from disk. Returns the bootstrap
+        outcome; a best-effort marker write never changes it.
+        """
+        if not self._bootstrap():
+            return False
+        if plist_bytes is None:
+            plist_bytes = self._plist_on_disk()
+        if plist_bytes is not None:
+            self._record_applied_digest(self._digest_of(plist_bytes))
+        return True
+
+    @staticmethod
+    def _digest_of(data: bytes) -> str:
+        return hashlib.sha256(data).hexdigest()
+
+    def _plist_on_disk(self) -> Optional[bytes]:
+        try:
+            with open(self.plist_path, "rb") as handle:
+                return handle.read()
+        except OSError:
+            return None
+
+    def _applied_marker_path(self) -> str:
+        return os.path.join(self.project_dir, APPLIED_PLIST_MARKER)
+
+    def _read_applied_digest(self) -> Optional[str]:
+        try:
+            with open(self._applied_marker_path(), "r", encoding="utf-8") as handle:
+                return handle.read().strip() or None
+        except OSError:
+            return None
+
+    def _record_applied_digest(self, digest: str) -> None:
+        try:
+            os.makedirs(self.project_dir, exist_ok=True)
+            with open(self._applied_marker_path(), "w", encoding="utf-8") as handle:
+                handle.write(digest + "\n")
+        except OSError as exc:  # pragma: no cover - best-effort marker
+            self.logger.debug("could not record applied LaunchAgent digest: %s", exc)
 
     def uninstall(self) -> None:
         """Unload and remove the LaunchAgent. NEVER touches the storage dir."""
@@ -545,17 +639,27 @@ class ServerProcess:
         its own launchctl failure but returns None, so we verify independently).
         """
         if os.path.exists(self.plist_path):
-            return self._bootstrap()
+            return self._bootstrap_and_record()
         self.ensure_installed()
         return self.is_running()
 
     def restart(self) -> bool:
-        """Kick the agent so matter-server respawns. Returns True on success."""
-        result = self._launchctl("kickstart", "-k", f"gui/{os.getuid()}/{LABEL}")
-        if result is not None and result.returncode == 0:
+        """Reload matter-server from the on-disk plist so the CURRENT args take effect.
+
+        NOT ``kickstart -k``: that respawns the job's *cached* in-memory definition, so
+        a job first bootstrapped by a pre-fix plugin keeps its buggy ``--port ""`` (the
+        "Invalid integer:" crash-loop) even after the plist has been corrected — only a
+        bootout + bootstrap makes launchd re-read the file. This is also the path the
+        plugin takes right after installing a new matter-server version: the args are
+        unchanged but the code on disk is new, so the running process must be replaced
+        (which is why the caller can't rely on :meth:`ensure_installed` alone — that
+        deliberately leaves an up-to-date job untouched). Returns True on success.
+        """
+        self._bootout()  # ok if not loaded — we bootstrap fresh next regardless
+        if self._bootstrap_and_record():  # records the digest of the plist actually loaded
             return True
-        # fall back to a full unload/load cycle
-        self.logger.warning("matter-server kickstart failed; falling back to reinstall")
+        # fall back to a full unload/reinstall cycle
+        self.logger.warning("matter-server reload failed; falling back to reinstall")
         self.uninstall()
         self.ensure_installed()
         return self.is_running()

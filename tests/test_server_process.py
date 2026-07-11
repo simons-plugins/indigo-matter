@@ -216,10 +216,15 @@ def test_is_running_reflects_launchctl_returncode(tmp_path, prefs, mock_logger):
     assert stopped.is_running() is False
 
 
-def test_restart_kickstarts(sp):
+def test_restart_reloads_plist_not_kickstart(sp):
+    # restart() must bootout + bootstrap so launchd re-reads the (corrected) plist —
+    # kickstart -k would respawn the stale in-memory args (e.g. a pre-fix `--port ""`).
+    sp.ensure_installed()
     sp._run = FakeRunner()
-    sp.restart()
-    assert "kickstart" in sp._run.subcommands()
+    assert sp.restart() is True
+    subs = sp._run.subcommands()
+    assert "bootout" in subs and "bootstrap" in subs
+    assert "kickstart" not in subs
 
 
 def test_stop_boots_out_and_keeps_plist(sp):
@@ -283,12 +288,14 @@ def test_npx_resolution_prefers_homebrew(tmp_path, prefs, mock_logger, monkeypat
     assert sp.npx_path == "/opt/homebrew/bin/npx"
 
 
-def test_restart_returns_false_and_reinstalls_on_kickstart_failure(sp):
-    sp._run = FakeRunner(returncode=1)  # kickstart fails → fallback reinstall cycle
+def test_restart_returns_false_and_reinstalls_on_reload_failure(sp):
+    sp.ensure_installed()
+    sp._run = FakeRunner(returncode=1)  # bootstrap fails → fallback reinstall cycle
     ok = sp.restart()
     subs = sp._run.subcommands()
-    assert "kickstart" in subs
+    assert "bootout" in subs
     assert "bootstrap" in subs or "load" in subs  # reinstalled
+    assert "kickstart" not in subs
     assert ok is False  # is_running() with rc=1 → False
 
 
@@ -450,6 +457,98 @@ def test_ensure_installed_tears_down_stale_plist_on_preflight_fail(sp, tmp_path)
     assert not os.path.exists(sp.plist_path)           # stale job removed
     assert "bootout" in sp._run.subcommands()          # crash-loop stopped
     assert os.path.isdir(sp.storage_path)              # storage still sacred
+
+
+# ---------------------------------------------------------------------------
+# Stale launchd job: rewriting the plist FILE never updates an already-loaded
+# job's cached args, so ensure_installed must reload when they diverge — this is
+# what unsticks a pre-fix `--port ""` crash-loop (forum t=21404) on upgrade.
+# ---------------------------------------------------------------------------
+
+def test_ensure_installed_leaves_healthy_matching_job_untouched(sp):
+    # First apply records the marker + bootstraps. A second reload with the SAME args
+    # must NOT restart the server (device sessions are slow to re-establish).
+    sp.ensure_installed()
+    sp._run = FakeRunner()  # rc0 → is_running() True
+    sp.ensure_installed()
+    subs = sp._run.subcommands()
+    assert "print" in subs          # is_running() consulted
+    assert "bootout" not in subs    # healthy up-to-date job left running
+    assert "bootstrap" not in subs
+
+
+def test_ensure_installed_reloads_stale_job_when_no_marker(sp):
+    # The stuck user: a job is already loaded (bootstrapped by an old plugin with the
+    # buggy `--port ""`) but no applied-marker exists. The corrected plist must be
+    # forced in via bootout + bootstrap so the crash-loop clears on the first reload.
+    if os.path.exists(sp._applied_marker_path()):
+        os.remove(sp._applied_marker_path())
+    sp._run = FakeRunner()  # rc0 → is_running() True and launchctl calls succeed
+    sp.ensure_installed()
+    subs = sp._run.subcommands()
+    assert "bootout" in subs        # stale in-memory args dropped
+    assert "bootstrap" in subs      # corrected plist bootstrapped
+    # marker now recorded so subsequent unchanged reloads won't needlessly restart
+    assert sp._read_applied_digest() is not None
+
+
+def test_ensure_installed_reloads_when_args_changed(sp):
+    os.makedirs(os.path.dirname(sp._applied_marker_path()), exist_ok=True)
+    with open(sp._applied_marker_path(), "w") as handle:
+        handle.write("stale-digest-from-old-args\n")
+    sp._run = FakeRunner()
+    sp.ensure_installed()
+    subs = sp._run.subcommands()
+    assert "bootout" in subs and "bootstrap" in subs
+    assert sp._read_applied_digest() != "stale-digest-from-old-args"
+
+
+def test_applied_marker_lives_in_project_dir_and_survives_log_wipe(sp):
+    # The marker must NOT live in the logs dir: losing it forces a needless restart of
+    # a healthy server. It belongs beside .indigo-node in the (durable) project dir.
+    import shutil
+    sp.ensure_installed()
+    marker = sp._applied_marker_path()
+    assert os.path.dirname(marker) == sp.project_dir
+    assert os.path.exists(marker)
+    shutil.rmtree(sp.log_dir, ignore_errors=True)   # e.g. user clears plugin logs
+    assert os.path.exists(marker)                    # marker unaffected
+    assert sp._read_applied_digest() is not None
+
+
+def test_apply_and_restart_record_digest_of_on_disk_plist(sp):
+    # The marker must reflect the bytes launchd actually loaded (the file), not a
+    # recomputed build_plist() that could drift from disk.
+    import hashlib
+    sp.ensure_installed()
+    sp._run = FakeRunner()
+    assert sp.restart() is True
+    with open(sp.plist_path, "rb") as handle:
+        disk_digest = hashlib.sha256(handle.read()).hexdigest()
+    assert sp._read_applied_digest() == disk_digest
+
+
+def test_apply_plist_warns_when_stale_job_wont_bootout(sp):
+    # is_running() True but the stale job refuses to bootout — the user must be told the
+    # old definition may persist, not have it fail silently.
+    class PerCommandRunner(FakeRunner):
+        def __init__(self, codes):
+            super().__init__()
+            self.codes = codes
+
+        def __call__(self, cmd, **kwargs):
+            self.calls.append(cmd)
+            sub = cmd[1] if len(cmd) > 1 else ""
+            return subprocess.CompletedProcess(cmd, self.codes.get(sub, 0), stdout="", stderr="")
+
+    sp.ensure_installed()
+    with open(sp._applied_marker_path(), "w") as handle:
+        handle.write("stale-digest\n")                # force a mismatch → reload path
+    sp._run = PerCommandRunner({"print": 0, "bootout": 1, "bootstrap": 0})
+    sp.logger.reset_mock()
+    sp.ensure_installed()
+    assert "bootout" in sp._run.subcommands()          # a stop was attempted
+    assert sp.logger.warning.called                    # and its failure surfaced
 
 
 def test_tail_error_log_returns_last_lines(sp):
