@@ -828,6 +828,78 @@ def test_menu_install_refuses_when_already_running(plug):
     plug.logger.warning.assert_called()               # "already in progress", no 2nd install
 
 
+# ---------------------------------------------------------------------------
+# Clean reinstall menu action ("blow away matter-server.js and start fresh")
+# ---------------------------------------------------------------------------
+
+def test_install_handler_clean_removes_package_before_reinstall(plug, plugin_mod, monkeypatch):
+    order = []
+    plug.server_process = SimpleNamespace(
+        remove_package=lambda: order.append("remove"),
+        install=lambda: (order.append("install"), True)[1],
+        resolved_bin_dir="/opt/homebrew/bin")
+    plug.pluginPrefs = {"serverLocation": "local"}
+    plug._stopping = False
+    plug._restart_expected_until = 0.0
+    reinstalled = SimpleNamespace(ensure_installed=Mock(), restart=Mock(return_value=True))
+    monkeypatch.setattr(plugin_mod, "ServerProcess", lambda *a, **k: reinstalled)
+    plug._install_matter_server(clean=True)
+    assert order == ["remove", "install"]             # package deleted BEFORE reinstalling
+    reinstalled.restart.assert_called_once()
+
+
+def test_install_handler_default_does_not_remove_package(plug, plugin_mod, monkeypatch):
+    removed = []
+    plug.server_process = SimpleNamespace(
+        remove_package=lambda: removed.append(True),
+        install=lambda: True, resolved_bin_dir="/x")
+    plug.pluginPrefs = {"serverLocation": "local"}
+    plug._stopping = False
+    plug._restart_expected_until = 0.0
+    monkeypatch.setattr(plugin_mod, "ServerProcess",
+                        lambda *a, **k: SimpleNamespace(ensure_installed=Mock(),
+                                                        restart=Mock(return_value=True)))
+    plug._install_matter_server()                     # clean defaults to False
+    assert removed == []                              # a plain update never deletes the package
+
+
+def test_menu_reinstall_clean_requires_confirmation(plug):
+    plug.pluginPrefs = {"serverLocation": "local"}
+    ok, _vd, errors = plug.menuReinstallMatterServerClean({"confirm": False}, "reinstallMatterServerClean")
+    assert ok is False
+    assert "confirm" in errors                        # dialog stays open, no destructive action
+
+
+def test_menu_reinstall_clean_refuses_remote_mode(plug):
+    plug.pluginPrefs = {"serverLocation": "remote"}
+    ok, _vd, errors = plug.menuReinstallMatterServerClean({"confirm": True}, "reinstallMatterServerClean")
+    assert ok is False
+    assert "confirm" in errors
+
+
+def test_menu_reinstall_clean_spawns_thread_with_clean_kwarg(plug, plugin_mod, monkeypatch):
+    plug.pluginPrefs = {"serverLocation": "local"}
+    plug._install_thread = None
+    captured = {}
+
+    class FakeThread:
+        def __init__(self, target=None, name=None, daemon=None, kwargs=None):
+            captured.update(target=target, daemon=daemon, kwargs=kwargs or {})
+
+        def start(self):
+            captured["started"] = True
+
+        def is_alive(self):
+            return False
+
+    monkeypatch.setattr(plugin_mod.threading, "Thread", FakeThread)
+    result = plug.menuReinstallMatterServerClean({"confirm": True}, "reinstallMatterServerClean")
+    assert result[0] is True
+    assert captured.get("started") is True
+    assert captured["kwargs"] == {"clean": True}       # runs the CLEAN reinstall path
+    assert captured["target"] == plug._install_matter_server
+
+
 def test_menu_install_refuses_in_remote_mode(plug):
     plug.pluginPrefs = {"serverLocation": "remote"}
     plug._install_thread = None

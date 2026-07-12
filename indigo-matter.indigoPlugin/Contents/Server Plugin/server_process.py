@@ -28,6 +28,7 @@ import os
 import plistlib
 import shutil
 import subprocess
+import time
 from typing import Any, Callable, Optional
 
 LABEL = "com.simons-plugins.indigo-matter"
@@ -100,11 +101,14 @@ class ServerProcess:
         npx_path: Optional[str] = None,
         runner: Callable[..., "subprocess.CompletedProcess"] = subprocess.run,
         exists: Callable[[str], bool] = os.path.exists,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self.logger = logger
         self._run = runner
         # Injectable existence check keeps preflight() unit-testable without the FS.
         self._exists = exists
+        # Injectable so reap_orphan_servers()'s TERM→KILL grace is instant in tests.
+        self._sleep = sleep
         self.home = home or os.path.expanduser("~")
         # Optional explicit override: directory containing node/npx. nvm users can
         # pin a specific version here (e.g. ~/.nvm/versions/node/v22.18.0/bin);
@@ -534,21 +538,33 @@ class ServerProcess:
             self-heal a crash-looping ``--port ""`` job.
         """
         digest = self._digest_of(desired)
-        if self.is_running():
-            if self._read_applied_digest() == digest:
-                return  # current definition already loaded — never restart a healthy server
-            # Stale in-memory args (e.g. a pre-fix `--port ""`). Drop the old job so the
-            # corrected plist we just wrote is what launchd bootstraps below.
-            if not self._bootout():
-                # The stale job wouldn't stop — bootstrap/load below will fail on the
-                # still-loaded label, so surface it rather than letting the crash-loop
-                # persist silently. We still fall through to retry in case the job was
-                # actually gone despite a non-zero bootout.
-                self.logger.warning(
-                    "could not stop the existing matter-server job to apply new "
-                    "settings; the previous definition may keep running until the "
-                    "next plugin reload"
-                )
+        running = self.is_running()
+        if running and self._read_applied_digest() == digest:
+            # The current definition is already loaded. Normally we leave the healthy
+            # server running (survives plugin reloads without dropping device sessions) —
+            # but a matching plist does NOT prove it is healthy: if an orphaned
+            # matter-server holds the storage lock, the managed job is crash-looping
+            # despite the right args. Reap the orphan (never the managed job — exclude its
+            # pid); only if one was actually blocking it do we force a clean restart.
+            managed_pid = self._managed_pid()
+            if managed_pid is None:
+                return  # can't tell the healthy job from an orphan — don't risk killing it
+            if self.reap_orphan_servers(exclude_pid=managed_pid) == 0:
+                return  # healthy and unobstructed — survive the reload untouched
+            # else: an orphan was starving it; fall through to a clean bootout + bootstrap.
+        if running and not self._bootout():
+            # A loaded job wouldn't stop — bootstrap/load below will fail on the still
+            # -loaded label, so surface it rather than letting the crash-loop persist
+            # silently. We still fall through in case the job was actually gone.
+            self.logger.warning(
+                "could not stop the existing matter-server job to apply new settings; "
+                "the previous definition may keep running until the next plugin reload"
+            )
+        # A matter-server can outlive the LaunchAgent that started it (bootout stops only
+        # the managed job), and bootout may return before the process has fully exited and
+        # released the storage lock. Reap any such straggler so the fresh instance below
+        # isn't killed by "Storage is locked by another process".
+        self.reap_orphan_servers()
         # bootstrap (modern) with a load fallback for older macOS. The marker records the
         # bytes we just wrote (== on disk), so it always reflects what launchd loaded.
         if self._bootstrap_and_record(desired):
@@ -621,6 +637,33 @@ class ServerProcess:
         except FileNotFoundError:
             pass
 
+    def remove_package(self) -> None:
+        """Delete the installed matter-server package for a clean reinstall.
+
+        Stops the managed job and reaps any orphan first (so nothing holds the files or
+        the storage lock), then removes ``node_modules`` and ``package-lock.json`` under
+        project_dir and drops the applied-plist marker so the next ensure_installed
+        re-bootstraps. The storage dir is SACRED and never touched — commissioned devices
+        and pairings survive a clean reinstall. Blocking; run off the Indigo main thread.
+        """
+        self._bootout()
+        self.reap_orphan_servers()
+        for name in ("node_modules", "package-lock.json"):
+            target = os.path.join(self.project_dir, name)
+            try:
+                if os.path.isdir(target):
+                    shutil.rmtree(target)
+                elif os.path.exists(target):
+                    os.remove(target)
+            except OSError as exc:
+                self.logger.warning("could not remove %s: %s", target, exc)
+        try:
+            os.remove(self._applied_marker_path())
+        except OSError:
+            pass
+        self.logger.info("Removed the matter-server package under %s (storage left intact)",
+                         self.project_dir)
+
     def stop(self) -> bool:
         """Stop matter-server (bootout) but keep the plist so ``start`` can reload it.
 
@@ -639,6 +682,7 @@ class ServerProcess:
         its own launchctl failure but returns None, so we verify independently).
         """
         if os.path.exists(self.plist_path):
+            self.reap_orphan_servers()  # nothing legit runs after stop(); clear any orphan
             return self._bootstrap_and_record()
         self.ensure_installed()
         return self.is_running()
@@ -656,6 +700,10 @@ class ServerProcess:
         deliberately leaves an up-to-date job untouched). Returns True on success.
         """
         self._bootout()  # ok if not loaded — we bootstrap fresh next regardless
+        # bootout only stops the LaunchAgent's own job; a matter-server that outlived an
+        # earlier LaunchAgent keeps holding the storage lock and would make the fresh
+        # instance die with "Storage is locked by another process". Reap it first.
+        self.reap_orphan_servers()
         if self._bootstrap_and_record():  # records the digest of the plist actually loaded
             return True
         # fall back to a full unload/reinstall cycle
@@ -667,6 +715,111 @@ class ServerProcess:
     def is_running(self) -> bool:
         result = self._launchctl("print", f"gui/{os.getuid()}/{LABEL}")
         return bool(result is not None and result.returncode == 0)
+
+    # ------------------------------------------------------------------
+    # Orphan reaping — a matter-server can outlive the LaunchAgent that started it
+    # ------------------------------------------------------------------
+    def reap_orphan_servers(self, exclude_pid: Optional[int] = None) -> int:
+        """Stop any matter-server process bound to THIS plugin's storage.
+
+        launchd's ``bootout`` only stops the job it currently manages; a server that
+        outlived an earlier LaunchAgent (common after the reload/reinstall churn this
+        plugin has seen) keeps running and holds the storage lock, so every fresh
+        instance dies with "Storage is locked by another process (pid N)" — matter-server
+        only auto-clears a lock whose owner is *dead*. We find the live owner by matching
+        our package dir AND our ``--storage-path`` in the process command line (so an
+        unrelated node process, or another user's server, is never touched), then
+        SIGTERM it, wait briefly, and SIGKILL any that ignore TERM.
+
+        Pass ``exclude_pid`` (the managed job's pid) to leave a healthy running server
+        alone while still clearing an orphan beside it. Returns how many were signalled.
+        """
+        pids = self._running_server_pids(exclude_pid=exclude_pid)
+        if not pids:
+            return 0
+        self.logger.warning(
+            "Stopping %d stray matter-server process(es) (pid %s) that outlived their "
+            "LaunchAgent and hold the storage lock, so a fresh server can start.",
+            len(pids), ", ".join(map(str, pids)),
+        )
+        for pid in pids:
+            self._signal(pid, "TERM")
+        # Poll for a clean SIGTERM shutdown (matter-server releases the lock in its exit
+        # handler, normally sub-second). Bounded ~1.5s worst case; this blocks the
+        # (already synchronous) start/restart path only in the rare orphan-present case —
+        # a brief, deliberate stall to un-wedge a server that would otherwise never start.
+        for _ in range(6):
+            self._sleep(0.25)
+            if not self._running_server_pids(exclude_pid=exclude_pid):
+                return len(pids)
+        for pid in self._running_server_pids(exclude_pid=exclude_pid):
+            self.logger.warning("matter-server pid %s ignored SIGTERM; sending SIGKILL", pid)
+            self._signal(pid, "KILL")
+        return len(pids)
+
+    def _running_server_pids(self, exclude_pid: Optional[int] = None) -> list[int]:
+        """PIDs of running matter-server processes bound to this plugin's storage.
+
+        Matches both our package dir (``…/node_modules/matter-server``) and our
+        ``storage_path`` in the command line — the pair is unique to this plugin's
+        server, so we never mistake an unrelated node process for one of ours.
+        """
+        try:
+            # -ww: never truncate the command column — our --storage-path sits late in
+            # the arg list, and macOS ps truncates to a default width without it, which
+            # would drop the match and hide the orphan.
+            result = self._run(["ps", "-A", "-ww", "-o", "pid=,command="],
+                               capture_output=True, text=True, check=False)
+        except OSError:
+            return []
+        if result is None or result.returncode != 0:
+            return []
+        pkg_dir = os.path.join(self.project_dir, "node_modules", MATTER_SERVER_PACKAGE)
+        pids: list[int] = []
+        for line in (result.stdout or "").splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            head, _, command = stripped.partition(" ")
+            try:
+                pid = int(head)
+            except ValueError:
+                continue
+            if pid == exclude_pid:
+                continue
+            if pkg_dir in command and self.storage_path in command:
+                pids.append(pid)
+        return pids
+
+    def _managed_pid(self) -> Optional[int]:
+        """The pid of the LaunchAgent's currently-running job, or None if not running.
+
+        Parsed from ``launchctl print``'s ``pid = N`` line so reap can EXCLUDE the
+        healthy managed server while still clearing an orphan beside it.
+        """
+        result = self._launchctl("print", f"gui/{os.getuid()}/{LABEL}")
+        if result is None or result.returncode != 0:
+            return None
+        for line in (result.stdout or "").splitlines():
+            stripped = line.strip()
+            if stripped.startswith("pid ="):
+                try:
+                    return int(stripped.split("=", 1)[1].strip())
+                except (ValueError, IndexError):
+                    return None
+        return None
+
+    def _signal(self, pid: int, sig: str) -> None:
+        try:
+            result = self._run(["kill", f"-{sig}", str(pid)], capture_output=True, text=True, check=False)
+        except OSError as exc:  # pragma: no cover - best-effort
+            self.logger.debug("kill -%s %s failed: %s", sig, pid, exc)
+            return
+        # A non-zero kill (permission denied, ESRCH) is silently swallowed by check=False;
+        # log it so a misbehaving reap is visible rather than reported as fully signalled.
+        if result is not None and result.returncode != 0:
+            self.logger.debug("kill -%s %s exited %s: %s", sig, pid, result.returncode,
+                              (result.stderr or "").strip())
 
     # ------------------------------------------------------------------
     # launchctl helpers

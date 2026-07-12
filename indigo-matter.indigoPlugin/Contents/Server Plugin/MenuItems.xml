@@ -8,6 +8,18 @@
         <Name>Restart matter-server</Name>
         <CallbackMethod>menuRestartMatterServer</CallbackMethod>
     </MenuItem>
+    <MenuItem id="reinstallMatterServerClean">
+        <Name>Reinstall matter-server (clean)…</Name>
+        <CallbackMethod>menuReinstallMatterServerClean</CallbackMethod>
+        <ConfigUI>
+            <Field id="warning" type="label">
+                <Label>Deletes the installed matter-server package (~/indigo-matter/node_modules) and reinstalls it fresh, then restarts. Your commissioned devices are NOT affected — the fabric/storage is left untouched. Use this if matter-server won't start after an upgrade (e.g. a wedged install or a "Storage is locked" error).</Label>
+            </Field>
+            <Field id="confirm" type="checkbox" defaultValue="false">
+                <Label>I understand this reinstalls matter-server (devices/pairings are kept).</Label>
+            </Field>
+        </ConfigUI>
+    </MenuItem>
     <MenuItem id="showMatterServerLogs">
         <Name>Open matter-server log…</Name>
         <CallbackMethod>menuShowMatterServerLogs</CallbackMethod>

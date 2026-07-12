@@ -261,7 +261,9 @@ matter-server runs on a different host and you have a trusted firewall in front 
 | `Connect call failed ('127.0.0.1', 5580)` | matter-server isn't running, crashed, or is on a different port. | Check `matter-server.err.log`; confirm the port matches the config; in managed mode re-save the config; in manual mode (re)start matter-server. |
 | nvm node not found by the managed agent | Auto-detect didn't find the nvm node. | Set **Node bin directory** explicitly to your own nvm bin dir (see Step 1), or use Homebrew node. |
 | `BLE is not enabled on this platform` warning | Expected — BLE isn't used (Wi-Fi only). | Benign; ignore. |
-| New managed LaunchAgent doesn't take effect | A prior agent with the same label is still loaded. | `launchctl bootout gui/$(id -u)/com.simons-plugins.indigo-matter`, then restart the plugin. |
+| New managed LaunchAgent doesn't take effect | A prior agent with the same label is still loaded. | Plugins ▸ Matter ▸ **Restart matter-server** (it reloads the plist and stops strays), or `launchctl bootout gui/$(id -u)/com.simons-plugins.indigo-matter` then restart the plugin. |
+| `Server failed to start [storage-lock] Storage is locked by another process (pid N)` | A second matter-server (orphaned from an earlier LaunchAgent) is still running and holds the storage lock. | The plugin now reaps such strays on start/restart — Plugins ▸ Matter ▸ **Restart matter-server**. If it persists, reboot the Mac (kills the orphan; the lock goes stale and is reclaimed automatically). |
+| matter-server won't start after an upgrade (wedged install) | The installed package is damaged or incompatible. | Plugins ▸ Matter ▸ **Reinstall matter-server (clean)…** — deletes `~/indigo-matter/node_modules` and reinstalls fresh. Your commissioned devices are kept (the fabric/storage is untouched). |
 | Hand-edited plist keeps reverting | The plugin regenerates the plist from config on restart. | Change settings via **Configure…**, not the plist. |
 
 ---
