@@ -66,6 +66,10 @@ def _expand(path: str, home: str) -> str:
     return path
 
 
+_PREF_TRUE = ("true", "yes", "on", "1")
+_PREF_FALSE = ("false", "no", "off", "0", "")
+
+
 def _pref_flag(value: Any) -> bool:
     """Parse a checkbox pref; strings need an explicit affirmative, else it's off.
 
@@ -76,8 +80,18 @@ def _pref_flag(value: Any) -> bool:
     ``bool()``.
     """
     if isinstance(value, str):
-        return value.strip().lower() in ("true", "yes", "on", "1")
+        return value.strip().lower() in _PREF_TRUE
     return bool(value)
+
+
+def _pref_unrecognised(value: Any) -> bool:
+    """True for a string pref that is neither a recognised yes nor a recognised no.
+
+    Such a value reads as OFF, which for this flag is the safe direction — but it is
+    the one remaining way the user's choice can be dropped with nothing in the log, so
+    the caller warns. Non-strings are never unrecognised (``bool()`` is total).
+    """
+    return isinstance(value, str) and value.strip().lower() not in _PREF_TRUE + _PREF_FALSE
 
 
 def _node_major(version: Optional[str]) -> Optional[int]:
@@ -160,7 +174,14 @@ class ServerProcess:
         # dev/test bridges (Homebridge's Matter accessory server currently presents a
         # test PAA). Verified against matter-server 1.2.2 (DEFAULT_INSTALL_SPEC), which
         # declares it as an optional-value option, so the bare flag means "on".
-        self.enable_test_net_dcl = _pref_flag(prefs.get("enableTestNetDcl", False))
+        raw_test_net_dcl = prefs.get("enableTestNetDcl", False)
+        self.enable_test_net_dcl = _pref_flag(raw_test_net_dcl)
+        if _pref_unrecognised(raw_test_net_dcl):
+            self.logger.warning(
+                "the 'Allow test/development device certificates' pref has the "
+                "unrecognised value %r — treating it as OFF. Set it by ticking or "
+                "unticking the checkbox in Configure….", raw_test_net_dcl,
+            )
         self.project_dir = os.path.join(self.home, DEFAULT_PROJECT_DIRNAME)
         default_storage = f"~/Library/Application Support/{LABEL}/matter-server"
         raw_storage = str(prefs.get("storagePath") or "").strip() or default_storage
@@ -334,10 +355,12 @@ class ServerProcess:
         ]
         if self.enable_test_net_dcl:
             # MUST stay last. matter-server declares this as "--enable-test-net-dcl
-            # [value]" (optional value), so commander swallows any following non-"--"
-            # token as its value and its parser then aborts startup — which under
-            # KeepAlive is a respawn loop, the same class of failure the npx note above
-            # exists to prevent. Append new flags BEFORE this one.
+            # [value]" (optional value), so commander consumes any following token that
+            # does not start with "-" as its value. A boolean-ish one ("false", "0", …)
+            # is swallowed SILENTLY and can turn the flag off; anything else fails
+            # parsing and aborts startup, which under KeepAlive is a respawn loop — the
+            # same class of failure the npx note above exists to prevent. Append new
+            # flags BEFORE this one.
             args.append("--enable-test-net-dcl")
         return args
 
@@ -524,7 +547,7 @@ class ServerProcess:
         self.logger.info("matter-server installed.")
         return True
 
-    def ensure_installed(self) -> None:
+    def ensure_installed(self) -> Optional[bool]:
         """Create dirs, write the plist, and load it. Idempotent.
 
         Runs :meth:`preflight` first. A launchd job pointing at a missing node or an
@@ -532,6 +555,19 @@ class ServerProcess:
         the WS client sees a bare "connection refused". So on a preflight failure:
         log an actionable error, tear down any stale plist to stop an existing
         crash-loop, and do NOT (re)write it.
+
+        Three outcomes, because callers need to tell them apart:
+
+          * ``None``  — preflight failed; nothing was written and any stale plist was
+            REMOVED. There is no job to restart, so a caller must stop here rather
+            than "restarting" a LaunchAgent that no longer exists.
+          * ``True``  — launchd was (re)loaded, so the server is already running the
+            plist just written. A caller wanting a restart has nothing left to do.
+          * ``False`` — the current definition was already loaded and healthy, so the
+            server was deliberately left untouched (it survives plugin reloads without
+            dropping slow-to-re-establish device sessions).
+
+        Also warns, on every call, while the attestation-relaxing flag is set.
         """
         os.makedirs(self.storage_path, exist_ok=True)
         os.makedirs(self.log_dir, exist_ok=True)
@@ -541,31 +577,42 @@ class ServerProcess:
             self.logger.error("matter-server cannot start: %s", problem)
             if self._exists(self.plist_path):
                 self.uninstall()  # stop an existing crash-loop; leaves storage intact
-            return
+            return None
         abi = self.abi_warning()
         if abi:
             self.logger.warning("matter-server: %s", abi)  # advisory — do NOT block
         if self.enable_test_net_dcl:
-            # Every startup, not just on change: the hazard of this setting is that it
-            # is ticked once to pair one device and then forgotten, and nothing else in
-            # the log says the fabric accepts unverified certificate chains. Warning
-            # level so it survives verboseLogging being off.
+            # Every call, not just on change: the hazard of this setting is that it is
+            # ticked once to pair one device and then forgotten, and nothing else in the
+            # log says the fabric accepts unverified certificate chains. Warning level so
+            # it survives verboseLogging being off.
+            #
+            # Deliberately phrased as what we are STARTING matter-server with, not as the
+            # state of whatever is currently listening: this is derived from a prefs
+            # snapshot, and a stray server that outlived its LaunchAgent can still be
+            # serving with different arguments (see docs/INSTALL.md troubleshooting).
             self.logger.warning(
-                "device attestation is RELAXED: --enable-test-net-dcl is on, so "
-                "matter-server additionally trusts the Matter test-net DCL — devices "
-                "with test/development certificates are accepted and test-net OTA "
-                "firmware may be offered to them. Untick 'Allow test/development device "
-                "certificates' in Configure… and reload the plugin when you no longer "
-                "need it."
+                "starting matter-server with RELAXED device attestation "
+                "(--enable-test-net-dcl): it additionally trusts the Matter test-net "
+                "DCL, so devices with test/development certificates are accepted and "
+                "test-net OTA firmware may be offered to them. Untick 'Allow "
+                "test/development device certificates' in Configure… when you no "
+                "longer need it."
             )
         desired = self.build_plist()
         with open(self.plist_path, "wb") as handle:
             handle.write(desired)
         self.logger.info("Wrote LaunchAgent %s", self.plist_path)
-        self._apply_plist(desired)
+        return self._apply_plist(desired)
 
-    def _apply_plist(self, desired: bytes) -> None:
-        """Make launchd actually run the plist just written, reloading only on change.
+    def _apply_plist(self, desired: bytes) -> bool:
+        """Make launchd run the plist just written; True if it was actually (re)loaded.
+
+        The return value lets a caller that wants a restart tell "I already restarted
+        it for you" from "the running job was left alone", so it doesn't stop and
+        start the server a second time for nothing — two outages instead of one, each
+        dropping every device's CASE session.
+
 
         launchd caches a job's ProgramArguments at bootstrap time, so overwriting the
         plist FILE does nothing to a job that is already loaded — a plugin upgrade that
@@ -591,9 +638,9 @@ class ServerProcess:
             # pid); only if one was actually blocking it do we force a clean restart.
             managed_pid = self._managed_pid()
             if managed_pid is None:
-                return  # can't tell the healthy job from an orphan — don't risk killing it
+                return False  # can't tell the healthy job from an orphan — don't risk killing it
             if self.reap_orphan_servers(exclude_pid=managed_pid) == 0:
-                return  # healthy and unobstructed — survive the reload untouched
+                return False  # healthy and unobstructed — survive the reload untouched
             # else: an orphan was starving it; fall through to a clean bootout + bootstrap.
         if running and not self._bootout():
             # A loaded job wouldn't stop — bootstrap/load below will fail on the still
@@ -611,7 +658,7 @@ class ServerProcess:
         # bootstrap (modern) with a load fallback for older macOS. The marker records the
         # bytes we just wrote (== on disk), so it always reflects what launchd loaded.
         if self._bootstrap_and_record(desired):
-            return
+            return True
         result = self._launchctl("load", self.plist_path)
         if result is None or result.returncode != 0:
             detail = result.stderr.strip() if result is not None else "launchctl unavailable"
@@ -620,8 +667,9 @@ class ServerProcess:
                 "running. Start it manually or check %s",
                 detail, self.plist_path,
             )
-        else:
-            self._record_applied_digest(digest)
+            return False
+        self._record_applied_digest(digest)
+        return True
 
     def _bootstrap_and_record(self, plist_bytes: Optional[bytes] = None) -> bool:
         """Bootstrap the plist and, on success, record the digest of what launchd loaded.
@@ -742,6 +790,16 @@ class ServerProcess:
         (which is why the caller can't rely on :meth:`ensure_installed` alone — that
         deliberately leaves an up-to-date job untouched). Returns True on success.
         """
+        if not self._exists(self.plist_path):
+            # Nothing to bootstrap. Without this the bootstrap fails with a bare rc 5 and
+            # the fallback below logs "falling back to reinstall" while reinstalling
+            # nothing — burying the real cause (which ensure_installed already logged
+            # when it tore the plist down) under a misleading message.
+            self.logger.error(
+                "no matter-server LaunchAgent at %s — nothing to restart. Fix the "
+                "problem reported above, then reload the plugin.", self.plist_path,
+            )
+            return False
         self._bootout()  # ok if not loaded — we bootstrap fresh next regardless
         # bootout only stops the LaunchAgent's own job; a matter-server that outlived an
         # earlier LaunchAgent keeps holding the storage lock and would make the fresh

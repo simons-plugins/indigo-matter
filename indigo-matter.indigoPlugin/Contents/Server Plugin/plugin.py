@@ -112,22 +112,34 @@ class Plugin(indigo.PluginBase):
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
-    def startup(self) -> None:
-        self.debug = bool(self.pluginPrefs.get("verboseLogging", False))
-        prefs = dict(self.pluginPrefs)
+    def _server_prefs(self) -> dict:
+        """Current prefs with local-mode pinning applied — build every ServerProcess here.
 
-        # One user-facing choice — is matter-server on this Mac? — drives both
-        # the connection target and whether the plugin runs the server. 'local'
-        # is turnkey: the plugin manages matter-server on loopback and dials it
-        # there, so a stale/blank host or port can never be used.
+        Local mode is turnkey: the plugin runs matter-server on loopback and dials it
+        there, so a stale or blank host/port can never be used. That pinning lands in a
+        COPY (only ``serverLocation``/``manageLaunchAgent`` are persisted), so anything
+        constructing a ServerProcess from raw ``pluginPrefs`` skips it and can write a
+        different plist than startup does — which, because ``_apply_plist`` reloads on a
+        digest change, would flip-flop the server on every reload. One helper keeps every
+        call site honest.
+        """
+        prefs = dict(self.pluginPrefs)
         location = server_location(prefs)
-        managed = location == "local"
-        if managed:
+        if location == "local":
             prefs["matterServerHost"] = "localhost"
             prefs["matterServerPort"] = "5580"
             prefs["matterServerPath"] = "/ws"
             prefs["matterServerListenAddress"] = "127.0.0.1"
         prefs["serverLocation"] = location
+        return prefs
+
+    def startup(self) -> None:
+        self.debug = bool(self.pluginPrefs.get("verboseLogging", False))
+        # One user-facing choice — is matter-server on this Mac? — drives both
+        # the connection target and whether the plugin runs the server.
+        prefs = self._server_prefs()
+        location = prefs["serverLocation"]
+        managed = location == "local"
         # Persist the resolved choice so the config UI and later reads agree
         # (also migrates pre-2026.6 prefs that had no serverLocation key).
         self.pluginPrefs["serverLocation"] = location
@@ -346,7 +358,8 @@ class Plugin(indigo.PluginBase):
         # The connection + managed server are wired once in startup from a prefs
         # snapshot, so a changed location/host only takes effect on reload.
         self.logger.info(
-            "matter-server settings saved — reload the plugin to apply them"
+            "matter-server settings saved — reload the plugin (or Plugins ▸ Matter ▸ "
+            "Restart matter-server) to apply them"
         )
 
     # ------------------------------------------------------------------
@@ -757,7 +770,7 @@ class Plugin(indigo.PluginBase):
 
     def _install_matter_server(self, clean: bool = False) -> None:
         try:
-            sp = self.server_process or ServerProcess(dict(self.pluginPrefs), self.logger)
+            sp = self.server_process or ServerProcess(self._server_prefs(), self.logger)
             if clean:
                 # "Start fresh": delete node_modules and reinstall. Stops/reaps the server
                 # first and leaves the storage (fabric/pairings) intact. Used to recover a
@@ -777,7 +790,7 @@ class Plugin(indigo.PluginBase):
             # this is what keeps install-node == run-node and avoids ABI crash-loops.
             self.pluginPrefs["nodeBinDir"] = sp.resolved_bin_dir
             indigo.server.savePluginPrefs()
-            self.server_process = ServerProcess(dict(self.pluginPrefs), self.logger)
+            self.server_process = ServerProcess(self._server_prefs(), self.logger)
             self.server_process.ensure_installed()
             # Restart matter-server onto the just-installed version — otherwise the
             # newly-installed package sits on disk while the OLD process keeps running
@@ -844,12 +857,32 @@ class Plugin(indigo.PluginBase):
         # and restart() bootstraps the plist *as it is on disk*, which only
         # ensure_installed() regenerates — so without this, a setting changed since
         # startup (notably the attestation flag) is silently NOT applied and this menu
-        # still logs success. Mirrors the rebuild in _install_matter_server.
-        self.server_process = ServerProcess(dict(self.pluginPrefs), self.logger)
+        # still logs success.
+        self.server_process = ServerProcess(self._server_prefs(), self.logger)
         self._expect_restart()  # expected outage, not a crash
-        self.server_process.ensure_installed()  # rewrite the plist from current prefs
-        if self.server_process.restart():
+        try:
+            # None = preflight failed (plist torn down, nothing to restart);
+            # True = it already reloaded launchd, so a restart() here would stop and
+            # start the server a SECOND time for nothing — two outages, every device's
+            # session dropped twice; False = job left running, so we do the restart.
+            reloaded = self.server_process.ensure_installed()
+            restarted = True if reloaded else (
+                False if reloaded is None else self.server_process.restart()
+            )
+        except Exception as exc:  # noqa: BLE001
+            # Unguarded, this would escape with the expected-restart window still armed,
+            # suppressing the crash diagnostic for 30s while the server is down.
+            self._restart_expected_until = 0.0
+            self.logger.exception(exc)
+            return
+        if restarted:
             self.logger.info("matter-server restart requested")
+        elif reloaded is None:
+            self._restart_expected_until = 0.0
+            self.logger.error(
+                "matter-server cannot be restarted — see the error above. Its LaunchAgent "
+                "was removed to stop a crash-loop; fix the cause, then reload the plugin."
+            )
         else:
             self._restart_expected_until = 0.0  # restart failed — don't suppress the diagnostic
             self.logger.error(
@@ -1001,7 +1034,7 @@ class Plugin(indigo.PluginBase):
         """
         if self.server_process is not None:
             return self.server_process.storage_path
-        return ServerProcess(dict(self.pluginPrefs), self.logger).storage_path
+        return ServerProcess(self._server_prefs(), self.logger).storage_path
 
     @staticmethod
     def _human_size(num_bytes: int) -> str:

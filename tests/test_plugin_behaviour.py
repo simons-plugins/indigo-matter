@@ -355,7 +355,10 @@ def test_startup_passes_test_net_dcl_through_unpinned(plugin_mod, monkeypatch):
         p.server_process = None
         p.startup()
         assert seen["enableTestNetDcl"] is value      # passed through in BOTH directions
-        assert seen["matterServerPort"] == "5580"     # these four ARE pinned, by design
+        # The four keys that ARE pinned in local mode, by design.
+        assert seen["matterServerHost"] == "localhost"
+        assert seen["matterServerPort"] == "5580"
+        assert seen["matterServerPath"] == "/ws"
         assert seen["matterServerListenAddress"] == "127.0.0.1"
 
 
@@ -1004,7 +1007,8 @@ def test_menu_restart_sets_window_on_success(plug, plugin_mod, monkeypatch):
     # ServerProcess MUST be patched: the menu rebuilds it from current prefs, and an
     # unpatched one would construct a real instance against the real $HOME (whose
     # ensure_installed can delete the developer's live LaunchAgent plist).
-    rebuilt = SimpleNamespace(ensure_installed=Mock(), restart=Mock(return_value=True))
+    rebuilt = SimpleNamespace(ensure_installed=Mock(return_value=False),
+                              restart=Mock(return_value=True))
     monkeypatch.setattr(plugin_mod, "ServerProcess", lambda *a, **k: rebuilt)
     plug.server_process = SimpleNamespace(restart=Mock(return_value=True))
     plug.pluginPrefs = {"serverLocation": "local"}
@@ -1016,7 +1020,8 @@ def test_menu_restart_sets_window_on_success(plug, plugin_mod, monkeypatch):
 
 
 def test_menu_restart_clears_window_on_failure(plug, plugin_mod, monkeypatch):
-    rebuilt = SimpleNamespace(ensure_installed=Mock(), restart=Mock(return_value=False))
+    rebuilt = SimpleNamespace(ensure_installed=Mock(return_value=False),
+                              restart=Mock(return_value=False))
     monkeypatch.setattr(plugin_mod, "ServerProcess", lambda *a, **k: rebuilt)
     plug.server_process = SimpleNamespace(restart=Mock(return_value=False))
     plug.pluginPrefs = {"serverLocation": "local"}
@@ -1033,7 +1038,13 @@ def test_menu_restart_applies_prefs_changed_since_startup(plug, plugin_mod, monk
     # security-relevant setting changed since startup is silently NOT applied while the
     # menu still reports success. Seen in the field with enableTestNetDcl.
     seen = {}
-    rebuilt = SimpleNamespace(ensure_installed=Mock(), restart=Mock(return_value=True))
+    # ONE parent mock so the call SEQUENCE is recorded. Independent Mocks would let
+    # ensure_installed run *after* restart() — which reintroduces the exact bug, since
+    # restart() bootstraps whatever is on disk at the time — with the suite still green.
+    parent = Mock()
+    parent.ensure_installed.return_value = False   # job left running, so restart() must run
+    parent.restart.return_value = True
+    rebuilt = SimpleNamespace(ensure_installed=parent.ensure_installed, restart=parent.restart)
 
     def _factory(prefs, logger):
         seen.update(prefs)
@@ -1047,5 +1058,57 @@ def test_menu_restart_applies_prefs_changed_since_startup(plug, plugin_mod, monk
     plug._restart_notice_shown = False
     plug.menuRestartMatterServer()
     assert seen["enableTestNetDcl"] is True       # current prefs reached the new instance
-    rebuilt.ensure_installed.assert_called_once()  # plist regenerated before bootstrap
+    assert [c[0] for c in parent.mock_calls] == ["ensure_installed", "restart"]
     stale.restart.assert_not_called()             # never restart the stale snapshot
+
+
+def test_menu_restart_does_not_double_restart_when_prefs_changed(plug, plugin_mod, monkeypatch):
+    # ensure_installed() returning True means it ALREADY reloaded launchd for the new
+    # plist. Restarting again would stop and start the server a second time — two
+    # outages, every device's session dropped twice — in exactly the case this menu
+    # exists for.
+    parent = Mock()
+    parent.ensure_installed.return_value = True
+    rebuilt = SimpleNamespace(ensure_installed=parent.ensure_installed, restart=parent.restart)
+    monkeypatch.setattr(plugin_mod, "ServerProcess", lambda *a, **k: rebuilt)
+    plug.server_process = SimpleNamespace(restart=Mock())  # non-None: management is on
+    plug.pluginPrefs = {"serverLocation": "local"}
+    plug._restart_expected_until = 0.0
+    plug._restart_notice_shown = False
+    plug.menuRestartMatterServer()
+    parent.restart.assert_not_called()
+    plug.logger.info.assert_called()              # still reported as a restart to the user
+
+
+def test_menu_restart_stops_when_preflight_tore_the_plist_down(plug, plugin_mod, monkeypatch):
+    # ensure_installed() returning None means preflight failed and the LaunchAgent was
+    # REMOVED. restart() would then bootstrap a missing file and report the wrong cause,
+    # so the menu must stop and say what actually happened.
+    parent = Mock()
+    parent.ensure_installed.return_value = None
+    rebuilt = SimpleNamespace(ensure_installed=parent.ensure_installed, restart=parent.restart)
+    monkeypatch.setattr(plugin_mod, "ServerProcess", lambda *a, **k: rebuilt)
+    plug.server_process = SimpleNamespace(restart=Mock())  # non-None: management is on
+    plug.pluginPrefs = {"serverLocation": "local"}
+    plug._restart_expected_until = 0.0
+    plug._restart_notice_shown = False
+    plug.menuRestartMatterServer()
+    parent.restart.assert_not_called()
+    assert plug._restart_expected_until == 0.0    # no outage to suppress; diagnostics stay live
+    plug.logger.error.assert_called()
+
+
+def test_menu_restart_clears_window_when_ensure_installed_raises(plug, plugin_mod, monkeypatch):
+    # _expect_restart() arms a 30s window BEFORE ensure_installed() runs. If that throws
+    # (permissions, full disk) the window must not be left armed, or the crash diagnostic
+    # is suppressed for 30s while the server is down.
+    rebuilt = SimpleNamespace(ensure_installed=Mock(side_effect=OSError("boom")),
+                              restart=Mock(return_value=True))
+    monkeypatch.setattr(plugin_mod, "ServerProcess", lambda *a, **k: rebuilt)
+    plug.server_process = SimpleNamespace(restart=Mock())  # non-None: management is on
+    plug.pluginPrefs = {"serverLocation": "local"}
+    plug._restart_expected_until = 0.0
+    plug._restart_notice_shown = False
+    plug.menuRestartMatterServer()                 # must not raise into Indigo's dispatcher
+    assert plug._restart_expected_until == 0.0
+    plug.logger.exception.assert_called()
