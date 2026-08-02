@@ -66,6 +66,19 @@ def _expand(path: str, home: str) -> str:
     return path
 
 
+def _pref_flag(value: Any) -> bool:
+    """True only for an explicit affirmative pref value; anything unclear is off.
+
+    Indigo checkbox prefs normally arrive as real bools, but a value read straight
+    from a ``defaultValue="false"`` field (or hand-edited prefs) can be the STRING
+    ``"false"`` — which ``bool()`` reports as True. For a flag that relaxes device
+    attestation, failing open like that is the wrong direction, so parse strictly.
+    """
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "yes", "on", "1")
+    return bool(value)
+
+
 def _node_major(version: Optional[str]) -> Optional[int]:
     """Major version int from a node version string (``v22.18.0`` → 22), else None."""
     parsed = _parse_node_version(version) if version else None
@@ -139,6 +152,13 @@ class ServerProcess:
         # interfaces), hence the explicit fall back to 127.0.0.1. This is distinct
         # from matterServerHost ("localhost"), which is the CLIENT connect target.
         self.listen_address = str(prefs.get("matterServerListenAddress", "127.0.0.1")).strip() or "127.0.0.1"
+        # Also trust the test-net DCL (device attestation roots for uncertified
+        # devices) on top of the production DCL. Off by default: a device that fails
+        # attestation is one whose certificate chain we can't verify. Needed to
+        # commission dev/test bridges such as Homebridge's Matter accessory server,
+        # which present a test PAA. matter-server exposes this as an optional-value
+        # option; the bare flag means "on".
+        self.enable_test_net_dcl = _pref_flag(prefs.get("enableTestNetDcl", False))
         self.project_dir = os.path.join(self.home, DEFAULT_PROJECT_DIRNAME)
         default_storage = f"~/Library/Application Support/{LABEL}/matter-server"
         raw_storage = str(prefs.get("storagePath") or "").strip() or default_storage
@@ -302,7 +322,7 @@ class ServerProcess:
         # node <package main> … — NOT `npx matter-server`: the matter-server npm
         # package ships "bin": null, so npx cannot resolve an executable and the
         # LaunchAgent respawn-loops with "could not determine executable to run".
-        return [
+        args = [
             self.node_path,
             self._server_entry(),
             "--port", self.port,
@@ -310,6 +330,9 @@ class ServerProcess:
             "--storage-path", self.storage_path,
             "--primary-interface", self.primary_interface,
         ]
+        if self.enable_test_net_dcl:
+            args.append("--enable-test-net-dcl")
+        return args
 
     def build_plist(self) -> bytes:
         out_log = os.path.join(self.log_dir, "matter-server.log")

@@ -47,6 +47,16 @@
            alwaysUseInDialogHeightCalc="true">
         <Label>matter-server storage path:</Label>
     </Field>
+    <Field id="enableTestNetDcl" type="checkbox" defaultValue="false"
+           visibleBindingId="showAdvanced" visibleBindingValue="true"
+           alwaysUseInDialogHeightCalc="true">
+        <Label>Allow test/development device certificates:</Label>
+        <Description>Trusts the Matter test-net DCL in addition to the production one,
+            so devices with test attestation certificates can be commissioned — needed
+            for dev bridges such as Homebridge. Leave off unless a commissioning attempt
+            fails on device attestation: it means the device's certificate chain is not
+            verified against production Matter roots.</Description>
+    </Field>
 
     <!-- REMOTE: connect to a matter-server on another computer -->
     <Field id="remoteSep" type="separator"

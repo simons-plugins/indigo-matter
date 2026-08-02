@@ -180,6 +180,7 @@ node ~/indigo-matter/node_modules/matter-server/dist/esm/MatterServer.js \
 | **Manage matter-server LaunchAgent automatically** | off | On = plugin supervises matter-server (Mode A); off = you run it (Mode B). |
 | **Primary network interface** | `en0` | macOS interface matter-server binds to. Managed mode only. |
 | **matter-server listen address** | `127.0.0.1` | IP the managed server binds its (unauthenticated) control API to. Keep loopback. Managed mode only. See Security. |
+| **Allow test/development device certificates** | off | Passes `--enable-test-net-dcl` to the managed matter-server, trusting the Matter test-net DCL alongside the production one. Turn on only if commissioning fails on device attestation because the device uses a test certificate (Homebridge and other dev bridges do). Managed mode only; takes effect on plugin reload. |
 | **Verbose Matter logging** | off | Extra plugin logging. |
 | **Trace matter-server WebSocket messages** | off | Logs raw WS frames (debug). |
 
@@ -264,6 +265,7 @@ matter-server runs on a different host and you have a trusted firewall in front 
 | New managed LaunchAgent doesn't take effect | A prior agent with the same label is still loaded. | Plugins ▸ Matter ▸ **Restart matter-server** (it reloads the plist and stops strays), or `launchctl bootout gui/$(id -u)/com.simons-plugins.indigo-matter` then restart the plugin. |
 | `Server failed to start [storage-lock] Storage is locked by another process (pid N)` | A second matter-server (orphaned from an earlier LaunchAgent) is still running and holds the storage lock. | The plugin now reaps such strays on start/restart — Plugins ▸ Matter ▸ **Restart matter-server**. If it persists, reboot the Mac (kills the orphan; the lock goes stale and is reclaimed automatically). |
 | matter-server won't start after an upgrade (wedged install) | The installed package is damaged or incompatible. | Plugins ▸ Matter ▸ **Reinstall matter-server (clean)…** — deletes `~/indigo-matter/node_modules` and reinstalls fresh. Your commissioned devices are kept (the fabric/storage is untouched). |
+| Commissioning fails on device attestation (test/development certificate) | The device presents a test PAA (Homebridge and other dev bridges do); only the production DCL is trusted by default. | Configure… ▸ **Show advanced server settings** ▸ **Allow test/development device certificates**, then reload the plugin. Managed (local) mode only — for a remote matter-server, add `--enable-test-net-dcl` where you start it. |
 | Hand-edited plist keeps reverting | The plugin regenerates the plist from config on restart. | Change settings via **Configure…**, not the plist. |
 
 ---

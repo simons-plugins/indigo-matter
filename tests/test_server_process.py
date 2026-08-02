@@ -172,6 +172,53 @@ def test_program_arguments_blank_listen_address_falls_back_to_loopback(tmp_path,
     assert args[idx + 1].strip() != ""
 
 
+def test_program_arguments_omit_test_net_dcl_by_default(sp):
+    # Attestation is a security check: the flag must be opt-in, never emitted
+    # because a pref key is simply absent.
+    assert "--enable-test-net-dcl" not in sp.program_arguments()
+
+
+@pytest.mark.parametrize("truthy", [True, "true", "True", "yes", "on", "1"])
+def test_program_arguments_enable_test_net_dcl_when_pref_set(tmp_path, mock_logger, truthy):
+    home = tmp_path / "home"
+    (home / "bin").mkdir(parents=True)
+    npx = home / "bin" / "npx"
+    npx.write_text("#!/bin/sh\n")
+    prefs = {"matterServerPort": "5580", "primaryInterface": "en0",
+             "enableTestNetDcl": truthy}
+    sp = ServerProcess(prefs, mock_logger, home=str(home), npx_path=str(npx),
+                       runner=FakeRunner())
+    args = sp.program_arguments()
+    # bare flag, no value — matter-server declares it as "--enable-test-net-dcl [value]"
+    # (optional value), so the flag alone means on.
+    assert args[-1] == "--enable-test-net-dcl"
+    assert args[args.index("--primary-interface") + 1] == "en0"
+
+
+@pytest.mark.parametrize("falsey", [False, "", "   ", 0, None, "false", "False", "no", "0"])
+def test_program_arguments_falsey_test_net_dcl_stays_off(tmp_path, mock_logger, falsey):
+    home = tmp_path / "home"
+    (home / "bin").mkdir(parents=True)
+    npx = home / "bin" / "npx"
+    npx.write_text("#!/bin/sh\n")
+    prefs = {"matterServerPort": "5580", "primaryInterface": "en0",
+             "enableTestNetDcl": falsey}
+    sp = ServerProcess(prefs, mock_logger, home=str(home), npx_path=str(npx),
+                       runner=FakeRunner())
+    assert "--enable-test-net-dcl" not in sp.program_arguments()
+
+
+def test_toggling_test_net_dcl_changes_the_plist_digest(sp, tmp_path, mock_logger):
+    # The applied-plist marker is what makes _apply_plist reload launchd, so the
+    # two plists must differ — otherwise flipping the pref would leave the old
+    # (flag-less) job running until some unrelated setting changed.
+    prefs = {"matterServerPort": "5580", "primaryInterface": "en0",
+             "enableTestNetDcl": True}
+    on = ServerProcess(prefs, mock_logger, home=sp.home, npx_path=sp.npx_path,
+                       runner=FakeRunner())
+    assert on.build_plist() != sp.build_plist()
+
+
 def test_build_plist_is_valid_and_keepalive_on_crash(sp):
     spec = plistlib.loads(sp.build_plist())
     assert spec["Label"] == LABEL
