@@ -51,11 +51,13 @@
            visibleBindingId="showAdvanced" visibleBindingValue="true"
            alwaysUseInDialogHeightCalc="true">
         <Label>Allow test/development device certificates:</Label>
-        <Description>Trusts the Matter test-net DCL in addition to the production one,
-            so devices with test attestation certificates can be commissioned — needed
-            for dev bridges such as Homebridge. Leave off unless a commissioning attempt
-            fails on device attestation: it means the device's certificate chain is not
-            verified against production Matter roots.</Description>
+        <Description>Additionally trusts the Matter test-net DCL, so devices whose
+            certificates chain to a test root are accepted — needed for dev bridges such
+            as Homebridge. Production verification is unchanged. It also lets
+            matter-server offer test-net OTA firmware to your commissioned devices, so
+            leave it off unless a commissioning attempt fails on device attestation, and
+            untick it once that device is paired. Applies to the managed server on this
+            Mac; takes effect when the plugin reloads.</Description>
     </Field>
 
     <!-- REMOTE: connect to a matter-server on another computer -->

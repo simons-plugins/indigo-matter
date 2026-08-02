@@ -67,12 +67,13 @@ def _expand(path: str, home: str) -> str:
 
 
 def _pref_flag(value: Any) -> bool:
-    """True only for an explicit affirmative pref value; anything unclear is off.
+    """Parse a checkbox pref; strings need an explicit affirmative, else it's off.
 
-    Indigo checkbox prefs normally arrive as real bools, but a value read straight
-    from a ``defaultValue="false"`` field (or hand-edited prefs) can be the STRING
-    ``"false"`` — which ``bool()`` reports as True. For a flag that relaxes device
-    attestation, failing open like that is the wrong direction, so parse strictly.
+    Saved Indigo checkbox prefs arrive as real bools, but a pref can also reach us
+    as a string (``"true"``/``"false"``), and ``bool("false")`` is True. For a flag
+    that relaxes device attestation, failing open is the wrong direction, so strings
+    are parsed strictly and anything unrecognised is off. Non-strings fall back to
+    ``bool()``.
     """
     if isinstance(value, str):
         return value.strip().lower() in ("true", "yes", "on", "1")
@@ -153,11 +154,12 @@ class ServerProcess:
         # from matterServerHost ("localhost"), which is the CLIENT connect target.
         self.listen_address = str(prefs.get("matterServerListenAddress", "127.0.0.1")).strip() or "127.0.0.1"
         # Also trust the test-net DCL (device attestation roots for uncertified
-        # devices) on top of the production DCL. Off by default: a device that fails
-        # attestation is one whose certificate chain we can't verify. Needed to
-        # commission dev/test bridges such as Homebridge's Matter accessory server,
-        # which present a test PAA. matter-server exposes this as an optional-value
-        # option; the bare flag means "on".
+        # devices) on top of the production DCL, and allow test-net OTA images.
+        # Off by default: a device that fails attestation is one whose certificate
+        # chain we can't verify against production Matter roots. Needed to commission
+        # dev/test bridges (Homebridge's Matter accessory server currently presents a
+        # test PAA). Verified against matter-server 1.2.2 (DEFAULT_INSTALL_SPEC), which
+        # declares it as an optional-value option, so the bare flag means "on".
         self.enable_test_net_dcl = _pref_flag(prefs.get("enableTestNetDcl", False))
         self.project_dir = os.path.join(self.home, DEFAULT_PROJECT_DIRNAME)
         default_storage = f"~/Library/Application Support/{LABEL}/matter-server"
@@ -331,6 +333,11 @@ class ServerProcess:
             "--primary-interface", self.primary_interface,
         ]
         if self.enable_test_net_dcl:
+            # MUST stay last. matter-server declares this as "--enable-test-net-dcl
+            # [value]" (optional value), so commander swallows any following non-"--"
+            # token as its value and its parser then aborts startup — which under
+            # KeepAlive is a respawn loop, the same class of failure the npx note above
+            # exists to prevent. Append new flags BEFORE this one.
             args.append("--enable-test-net-dcl")
         return args
 
@@ -538,6 +545,19 @@ class ServerProcess:
         abi = self.abi_warning()
         if abi:
             self.logger.warning("matter-server: %s", abi)  # advisory — do NOT block
+        if self.enable_test_net_dcl:
+            # Every startup, not just on change: the hazard of this setting is that it
+            # is ticked once to pair one device and then forgotten, and nothing else in
+            # the log says the fabric accepts unverified certificate chains. Warning
+            # level so it survives verboseLogging being off.
+            self.logger.warning(
+                "device attestation is RELAXED: --enable-test-net-dcl is on, so "
+                "matter-server additionally trusts the Matter test-net DCL — devices "
+                "with test/development certificates are accepted and test-net OTA "
+                "firmware may be offered to them. Untick 'Allow test/development device "
+                "certificates' in Configure… and reload the plugin when you no longer "
+                "need it."
+            )
         desired = self.build_plist()
         with open(self.plist_path, "wb") as handle:
             handle.write(desired)

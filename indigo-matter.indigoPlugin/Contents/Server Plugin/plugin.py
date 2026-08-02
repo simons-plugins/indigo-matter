@@ -840,7 +840,14 @@ class Plugin(indigo.PluginBase):
         if self.server_process is None:
             self.logger.warning("LaunchAgent management is off; start matter-server manually")
             return
+        # Rebuild from CURRENT prefs first. ServerProcess snapshots prefs at construction
+        # and restart() bootstraps the plist *as it is on disk*, which only
+        # ensure_installed() regenerates — so without this, a setting changed since
+        # startup (notably the attestation flag) is silently NOT applied and this menu
+        # still logs success. Mirrors the rebuild in _install_matter_server.
+        self.server_process = ServerProcess(dict(self.pluginPrefs), self.logger)
         self._expect_restart()  # expected outage, not a crash
+        self.server_process.ensure_installed()  # rewrite the plist from current prefs
         if self.server_process.restart():
             self.logger.info("matter-server restart requested")
         else:
