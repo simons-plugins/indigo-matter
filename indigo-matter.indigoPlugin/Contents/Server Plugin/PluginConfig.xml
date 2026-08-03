@@ -47,6 +47,19 @@
            alwaysUseInDialogHeightCalc="true">
         <Label>matter-server storage path:</Label>
     </Field>
+    <Field id="enableTestNetDcl" type="checkbox" defaultValue="false"
+           visibleBindingId="showAdvanced" visibleBindingValue="true"
+           alwaysUseInDialogHeightCalc="true">
+        <Label>Allow test/development device certificates:</Label>
+        <Description>Additionally trusts the Matter test-net DCL, so devices whose
+            certificates chain to a test root are accepted — needed for dev bridges such
+            as Homebridge. Production verification is unchanged. It also allows
+            test-net OTA firmware to be offered to commissioned devices, so
+            leave it off unless a commissioning attempt fails on device attestation, and
+            untick it once that device is paired. Applies to the managed server on this
+            Mac; takes effect when the plugin reloads, or via Plugins ▸ Matter ▸ Restart
+            matter-server.</Description>
+    </Field>
 
     <!-- REMOTE: connect to a matter-server on another computer -->
     <Field id="remoteSep" type="separator"

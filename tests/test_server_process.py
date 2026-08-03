@@ -172,6 +172,157 @@ def test_program_arguments_blank_listen_address_falls_back_to_loopback(tmp_path,
     assert args[idx + 1].strip() != ""
 
 
+def test_program_arguments_omit_test_net_dcl_by_default(sp):
+    # Attestation is a security check: the flag must be opt-in, never emitted
+    # because a pref key is simply absent.
+    assert "--enable-test-net-dcl" not in sp.program_arguments()
+
+
+@pytest.mark.parametrize("truthy", [True, "true", "True", "yes", "on", "1"])
+def test_program_arguments_enable_test_net_dcl_when_pref_set(tmp_path, mock_logger, truthy):
+    home = tmp_path / "home"
+    (home / "bin").mkdir(parents=True)
+    npx = home / "bin" / "npx"
+    npx.write_text("#!/bin/sh\n")
+    prefs = {"matterServerPort": "5580", "primaryInterface": "en0",
+             "enableTestNetDcl": truthy}
+    sp = ServerProcess(prefs, mock_logger, home=str(home), npx_path=str(npx),
+                       runner=FakeRunner())
+    args = sp.program_arguments()
+    # Bare flag, no value — matter-server declares it as "--enable-test-net-dcl [value]"
+    # (optional value), so the flag alone means on. Assert the PROPERTY that makes the
+    # bare form safe rather than a fixed position: nothing that isn't itself a flag may
+    # follow it, or commander swallows that token as the option's value and the server
+    # aborts at startup.
+    idx = args.index("--enable-test-net-dcl")
+    assert idx == len(args) - 1 or args[idx + 1].startswith("--")
+    assert args[args.index("--primary-interface") + 1] == "en0"
+
+
+@pytest.mark.parametrize("falsey", [False, "", "   ", 0, None, "false", "False", "no", "0"])
+def test_program_arguments_falsey_test_net_dcl_stays_off(tmp_path, mock_logger, falsey):
+    home = tmp_path / "home"
+    (home / "bin").mkdir(parents=True)
+    npx = home / "bin" / "npx"
+    npx.write_text("#!/bin/sh\n")
+    prefs = {"matterServerPort": "5580", "primaryInterface": "en0",
+             "enableTestNetDcl": falsey}
+    sp = ServerProcess(prefs, mock_logger, home=str(home), npx_path=str(npx),
+                       runner=FakeRunner())
+    assert "--enable-test-net-dcl" not in sp.program_arguments()
+
+
+def test_toggling_test_net_dcl_changes_the_plist_digest(sp, prefs, mock_logger):
+    # The applied-plist marker is what makes _apply_plist reload launchd, so the
+    # two plists must differ — otherwise flipping the pref would leave the old
+    # (flag-less) job running until some unrelated setting changed.
+    # Derived from the SAME prefs dict as `sp` so the flag is the only difference;
+    # building a fresh dict would isolate it only by coincidence.
+    on = ServerProcess({**prefs, "enableTestNetDcl": True}, mock_logger,
+                       home=sp.home, npx_path=sp.npx_path, runner=FakeRunner())
+    # Compare the digests _apply_plist actually compares against the applied marker,
+    # not just the bytes they are derived from.
+    assert on._digest_of(on.build_plist()) != sp._digest_of(sp.build_plist())
+
+
+def test_ensure_installed_writes_test_net_dcl_into_the_plist(sp, prefs, mock_logger):
+    # End to end through the file: program_arguments() → build_plist() → disk. The
+    # generic link is covered for the default instance elsewhere, but never with the
+    # flag on, and the plist on disk is what launchd actually bootstraps.
+    on = ServerProcess({**prefs, "enableTestNetDcl": True}, mock_logger,
+                       home=sp.home, npx_path=sp.npx_path, runner=FakeRunner())
+    on.ensure_installed()
+    with open(on.plist_path, "rb") as handle:
+        spec = plistlib.loads(handle.read())
+    assert "--enable-test-net-dcl" in spec["ProgramArguments"]
+
+
+def test_ensure_installed_warns_while_attestation_is_relaxed(sp, prefs, mock_logger):
+    # The whole hazard is that this gets ticked once and forgotten, so the warning
+    # must fire on EVERY startup, not only when the value changes.
+    on = ServerProcess({**prefs, "enableTestNetDcl": True}, mock_logger,
+                       home=sp.home, npx_path=sp.npx_path, runner=FakeRunner())
+    on.ensure_installed()
+    on.ensure_installed()
+    relaxed = [c for c in mock_logger.warning.call_args_list
+               if "--enable-test-net-dcl" in str(c)]
+    assert len(relaxed) == 2
+
+
+def test_ensure_installed_reports_whether_launchd_was_reloaded(sp):
+    """The tri-state that stops the restart menu double-restarting the server.
+
+    True  = launchd was (re)loaded, so a caller wanting a restart is already done;
+    False = the current definition was left running untouched.
+    """
+    assert sp.ensure_installed() is True          # no applied marker yet → bootstrapped
+    subs = sp._run.subcommands()
+    assert "bootstrap" in subs
+    # Second call: marker matches and the job is loaded, so it is deliberately left
+    # alone. _managed_pid() finds no pid in the fake launchctl output, which is the
+    # "can't tell healthy from orphan — don't touch it" path.
+    assert sp.ensure_installed() is False
+
+
+def test_ensure_installed_returns_none_when_preflight_fails(tmp_path, prefs, mock_logger):
+    # No matter-server package installed → preflight fails, any stale plist is removed,
+    # and there is nothing left to restart. Callers must be able to tell this apart from
+    # "left it running".
+    home = tmp_path / "home"
+    (home / "bin").mkdir(parents=True)
+    npx = home / "bin" / "npx"
+    npx.write_text("#!/bin/sh\n")
+    (home / "bin" / "node").write_text("#!/bin/sh\n")
+    sp = ServerProcess(prefs, mock_logger, home=str(home), npx_path=str(npx),
+                       runner=FakeRunner())
+    assert sp.ensure_installed() is None
+    mock_logger.error.assert_called()
+
+
+def test_restart_refuses_when_no_plist_exists(tmp_path, prefs, mock_logger):
+    # Without this guard restart() bootstraps a missing file, gets a bare failure, and
+    # logs "falling back to reinstall" while reinstalling nothing — burying the real
+    # cause that ensure_installed already reported when it tore the plist down.
+    home = tmp_path / "home"
+    (home / "bin").mkdir(parents=True)
+    npx = home / "bin" / "npx"
+    npx.write_text("#!/bin/sh\n")
+    sp = ServerProcess(prefs, mock_logger, home=str(home), npx_path=str(npx),
+                       runner=FakeRunner())
+    assert sp.restart() is False
+    assert "bootstrap" not in sp._run.subcommands()
+    assert not [c for c in mock_logger.warning.call_args_list if "reinstall" in str(c)]
+
+
+@pytest.mark.parametrize("junk", ["enabled", "y", "t", "please"])
+def test_unrecognised_test_net_dcl_pref_reads_off_and_says_so(tmp_path, mock_logger, junk):
+    # Fail-closed is right, but silently discarding the user's value is the one way this
+    # setting can still evaporate with nothing in the log.
+    home = tmp_path / "home"
+    (home / "bin").mkdir(parents=True)
+    (home / "bin" / "npx").write_text("#!/bin/sh\n")
+    sp = ServerProcess({"matterServerPort": "5580", "enableTestNetDcl": junk}, mock_logger,
+                       home=str(home), npx_path=str(home / "bin" / "npx"), runner=FakeRunner())
+    assert sp.enable_test_net_dcl is False
+    assert "--enable-test-net-dcl" not in sp.program_arguments()
+    assert [c for c in mock_logger.warning.call_args_list if "unrecognised" in str(c)]
+
+
+@pytest.mark.parametrize("known", [True, False, "true", "false", "off", ""])
+def test_recognised_test_net_dcl_pref_is_silent(tmp_path, mock_logger, known):
+    home = tmp_path / "home"
+    (home / "bin").mkdir(parents=True)
+    (home / "bin" / "npx").write_text("#!/bin/sh\n")
+    sp = ServerProcess({"matterServerPort": "5580", "enableTestNetDcl": known}, mock_logger,
+                       home=str(home), npx_path=str(home / "bin" / "npx"), runner=FakeRunner())
+    assert not [c for c in mock_logger.warning.call_args_list if "unrecognised" in str(c)]
+
+
+def test_ensure_installed_silent_when_test_net_dcl_is_off(sp, mock_logger):
+    sp.ensure_installed()
+    assert not [c for c in mock_logger.warning.call_args_list if "--enable-test-net-dcl" in str(c)]
+
+
 def test_build_plist_is_valid_and_keepalive_on_crash(sp):
     spec = plistlib.loads(sp.build_plist())
     assert spec["Label"] == LABEL
