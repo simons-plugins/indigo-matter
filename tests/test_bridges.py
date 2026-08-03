@@ -586,3 +586,80 @@ def test_reachable_none_value_leaves_device_untouched(bds, bridge_indigo_env):
     ))
     # Neither cleared (still "") nor set to "unreachable" — state is unchanged.
     assert devices[id1].errorState == ""
+
+
+# ===========================================================================
+# 6. Empty bridge: commissioned fine, exposes nothing, says why (issue #105)
+# ===========================================================================
+
+# What jarvis actually saw on 2026-08-02: a Homebridge child bridge that
+# commissioned cleanly (attestation accepted) and published exactly ONE endpoint
+# — a bare Aggregator (0x000E) with no bridged children. Descriptor is its only
+# cluster, so no handler claims it and _unknown_spec correctly declines to build
+# a placeholder. Result before this fix: success, zero devices, zero explanation.
+_EMPTY_BRIDGE_NODE_RAW = {
+    "node_id": 35,
+    "available": True,
+    "attributes": {
+        "0/40/1": "Homebridge",
+        "0/40/3": "HomeConnect",
+        "1/29/0": [{"0": 14}],          # Descriptor → DeviceType 0x000E (Aggregator)
+    },
+}
+
+# The same bridge doing its job: aggregator on ep1, one bridged child on ep2.
+_POPULATED_BRIDGE_NODE_RAW = {
+    "node_id": 36,
+    "available": True,
+    "attributes": {
+        "0/40/1": "Homebridge",
+        "0/40/3": "HomeConnect",
+        "1/29/0": [{"0": 14}],          # Aggregator
+        "2/57/5": "Kitchen lamp",       # bridged child NodeLabel
+        "2/57/17": True,
+        "2/6/0": True,
+        "2/29/0": [{"0": 266}],         # OnOff Light
+    },
+}
+
+
+def _aggregator_warnings(logger):
+    return [str(call) for call in logger.warning.call_args_list
+            if "Aggregator" in str(call)]
+
+
+def test_empty_bridge_creates_nothing_and_explains_why(bds, bridge_indigo_env):
+    """#105: an Aggregator with no children must not commission into silence."""
+    _indigo, devices = bridge_indigo_env
+    result = bds.create_from_raw(_EMPTY_BRIDGE_NODE_RAW, "")
+    assert result["indigoDeviceIds"] == []      # still creates nothing — that part was right
+    assert bds.lookup(35, 1) is None            # not even a placeholder for the aggregator
+    warnings = _aggregator_warnings(bds.logger)
+    assert len(warnings) == 1
+    text = warnings[0]
+    assert "0x23" in text                        # node id, hex (35)
+    assert "not currently exposing any" in text  # points the user at the bridge
+    assert "HomeConnect" in text                 # names which bridge
+
+
+def test_bridge_with_children_does_not_warn(bds, bridge_indigo_env):
+    """A working bridge must stay quiet — the warning is for the empty case only."""
+    _indigo, devices = bridge_indigo_env
+    bds.create_from_raw(_POPULATED_BRIDGE_NODE_RAW, "")
+    assert bds.lookup(36, 2) is not None         # the child became a device
+    assert _aggregator_warnings(bds.logger) == []
+
+
+def test_node_with_no_devices_and_no_aggregator_does_not_warn(bds, bridge_indigo_env):
+    """Guard against over-firing: 'created nothing' alone is not a bridge fault."""
+    _indigo, _devices = bridge_indigo_env
+    bds.create_from_raw({"node_id": 77, "attributes": {"0/40/3": "Some Thing"}}, "")
+    assert _aggregator_warnings(bds.logger) == []
+
+
+def test_empty_bridge_warning_names_the_aggregator_endpoint(bds, bridge_indigo_env):
+    """The endpoint id is what the user needs to match against the bridge's own log."""
+    _indigo, _devices = bridge_indigo_env
+    bds.create_from_raw(_EMPTY_BRIDGE_NODE_RAW, "")
+    text = _aggregator_warnings(bds.logger)[0]
+    assert "endpoint" in text and "1" in text

@@ -87,6 +87,14 @@ _ELECTRICAL_MERGE_CLUSTERS = frozenset({
     CLUSTER_ELECTRICAL_POWER, CLUSTER_ELECTRICAL_ENERGY, CLUSTER_POWER_TOPOLOGY,
 })
 
+#: Matter device type 0x000E (Aggregator) — the endpoint a bridge publishes to
+#: parent its bridged children. It carries no device clusters of its own (only
+#: Descriptor), so it correctly produces no Indigo device; the children hang off
+#: it as separate endpoints. A bridge that publishes an Aggregator with NO
+#: children therefore commissions successfully and creates nothing at all, with
+#: no explanation — the silent dead end reported in issue #105.
+DEVICE_TYPE_AGGREGATOR = 0x000E
+
 
 #: Friendly role suffix per Indigo device type, used to name the individual
 #: devices of a multi-function node.  A HomePod exposing temperature + humidity
@@ -495,6 +503,9 @@ class DeviceSync:
                                 spec.props.setdefault("SupportsEnergyMeter", True)
                     plan.append((endpoint, spec))
 
+            if not plan:
+                self._warn_if_empty_bridge(node)
+
             multi = len(plan) > 1
             # Count role occurrences across the plan so genuinely identical
             # siblings (e.g. four outlets on one strip, all "Switch") fall back
@@ -619,6 +630,40 @@ class DeviceSync:
             result["partial"] = True
             result["failedEndpoints"] = failed
         return result
+
+    def _warn_if_empty_bridge(self, node: NodeInfo) -> None:
+        """Explain a bridge that commissioned fine but exposes nothing (issue #105).
+
+        An Aggregator endpoint carries no device clusters of its own, so it correctly
+        yields no Indigo device — the bridged children are meant to hang off it as
+        separate endpoints. When a bridge publishes the aggregator and NO children,
+        commissioning reports success and creates nothing, with no hint that the fault
+        lies on the bridge's side. A device-bearing endpoint this plugin doesn't support
+        at least gets a matterUnknown placeholder; this case got silence.
+
+        Only called when the node produced no devices at all, so a bridge whose children
+        are present — even if they only rate placeholders — never triggers it. Like the
+        other diagnostics here it may repeat on a reconcile pass; that is the same
+        precedent as the placeholder-obsolescence log, and the condition is one the user
+        has to fix on the bridge anyway.
+        """
+        aggregator_eps = [
+            endpoint.endpoint_id for endpoint in node.endpoints
+            if DEVICE_TYPE_AGGREGATOR in (endpoint.device_types or ())
+        ]
+        if not aggregator_eps:
+            return
+        self.logger.warning(
+            "Matter node %s (%s %s) is a bridge that is not currently exposing any "
+            "devices over Matter: endpoint %s is an Aggregator with no bridged "
+            "children, so there is nothing for this plugin to create. Check the "
+            "bridge's own configuration — on Homebridge/Matterbridge this usually means "
+            "no accessory has been mapped to a Matter device type yet.",
+            node_id_to_str(node.node_id),
+            node.vendor_name or "unknown vendor",
+            node.product_name or "unknown product",
+            ", ".join(str(eid) for eid in aggregator_eps),
+        )
 
     @staticmethod
     def _unknown_spec(node: NodeInfo, endpoint: Any) -> Optional[IndigoDeviceSpec]:
