@@ -1,11 +1,78 @@
 # indigo-matter — Build Handover
 
-**Last updated:** 2026-08-03 12:31 UTC
-**Branch:** `fix/104-server-supervision` — **PR #107 open, CI green, NOT merged**. `main` is at v2026.7.11 (docs-only PR #106).
-**Version:** `2026.7.12` on the branch; `2026.7.11` on `main`
-**Tests:** 1001 passing (`cd indigo-matter && /Library/Frameworks/Python.framework/Versions/Current/bin/python3 -m pytest -q`)
-**Deployed:** jarvis is **unchanged** — still running the #103 code (v2026.7.10 era). Nothing from #106 (docs) or #107 (unmerged) has been deployed.
-**Status:** **Wi-Fi AND Thread validated with real hardware.** Test/development certificates now commissionable (`--enable-test-net-dcl`), validated end to end against a Homebridge Matter bridge. #104's three server-supervision faults are **fixed in PR #107, awaiting merge**. Known-open: #105 (bridge/aggregator handling — needs real-bridge validation, cannot be closed on code alone), `domio-code` #236, plus the older #43, #46, #21–#24.
+**Last updated:** 2026-08-03 16:34 UTC
+**Branch:** `main` — PRs #106, #107, #108 all merged.
+**Version:** `2026.7.13`
+**Tests:** 1005 passing (`cd indigo-matter && /Library/Frameworks/Python.framework/Versions/Current/bin/python3 -m pytest -q`)
+**Deployed:** jarvis is **unchanged** — still running the #103 code (v2026.7.10 era). **Nothing from #106/#107/#108 has been deployed**, so the #104 supervision fixes are NOT yet live on jarvis.
+**Status:** **Wi-Fi AND Thread validated with real hardware.** #104's three server-supervision faults are fixed and merged (#107). #105's diagnostic is merged (#108) but **#105 stays open** — the bridged-endpoint path still has no real-bridge validation. `domio-code` #236 is fixed and closed (domio-code PR #237). Known-open: #105, plus the older #43, #46, #21–#24.
+
+---
+
+## 2026-08-03 session (afternoon) — #105 diagnostic, domio #236, and a live Thread outage
+
+**Merged:** #107 (server supervision, v2026.7.12), #108 (empty-bridge warning, v2026.7.13),
+`domio-code` #237 (FabricExists resume). **#104 and `domio-code` #236 closed.**
+
+### #108 — say something when a bridge exposes nothing
+
+Warns when a node produces no devices AND has an Aggregator (`0x000E`) endpoint.
+Scoped so a working bridge stays silent and a node that merely creates nothing
+isn't blamed on a bridge fault — both limits are tested. **#105 stays open**: its
+central claim is that `_bridge_identity` / cluster `0x0039` / dynamic
+`endpoint_added` have never met a real bridge, which needs hardware.
+
+> **Trap worth remembering:** the commit said *"Does NOT close #105"* and GitHub
+> closed #105 anyway — its linked-issue parser matches the literal `close #105`
+> and does not understand negation. Never write the phrase at all; say
+> "addresses part of #105" instead. Reopened with the remaining scope restated.
+
+### `domio-code` #236 — the retry that could never match
+
+Two causes, both fixed: `MTRErrorCodeFabricExists` was unhandled, and
+`nextNodeID()` handed out a fresh id every attempt, so a half-commissioned device
+sat on the fabric under the OLD id forever. `MatterFabricStore` now persists a
+per-device node-ID mapping, written **before** the attempt (the case that needs it
+is an attempt that fails partway). Keyed on the **setup passcode** — a manual
+pairing code truncates the discriminator to its top 4 bits, and QR vs manual
+encodings are different strings, so either would miss a user who scans once and
+types the next time. Note `MTRErrorCode` does not exist in Swift: `NS_ERROR_ENUM`
+imports as `MTRError.Code`.
+
+### Live incident: every Thread device dropped, and it wasn't the plugin
+
+Six devices showed `unreachable` in Indigo. Diagnosis order that worked:
+
+1. **`unreachable` is `errorState`, not a device state.** Querying state
+   `reachable: false` returns nothing and looks like all-clear — the plugin sets
+   it via `setErrorStateOnServer`. This cost the first wrong answer.
+2. All six belonged to **one node**, `0x27` (IKEA ALPSTUGA). matter-server logs
+   node ids in **hex**, so its `@1:27` is Indigo address `0x27`.
+3. matter-server's err log records **failures only** — silence never proves
+   recovery. Confirm from the device's `last_successful_comm`, and check the
+   value actually moved (a stale reading looks perfectly plausible).
+4. Restarting the HomePod took **all 5 Thread nodes** offline within 3 minutes
+   while both Wi-Fi Matter nodes were untouched — proving that one HomePod is the
+   **sole Thread border router**, a single point of failure for every Thread
+   device. A HomePod update on 08-02 had left it unstable: `0x27` logged 4 of its
+   9 all-time "marking unavailable" events that day. The restart fixed it.
+
+**Triage rule:** when Matter devices go unreachable, split them Thread vs Wi-Fi
+first. Only-Thread means suspect the border router, not the devices.
+
+The fabric currently holds 8 nodes: `0x27` ALPSTUGA, `0x2d` Aqara FP300, `0x2e`
+BILRESA, `0x2f` TIMMERFLOTTE, `0x31` Tapo plug, `0x32` Shelly 1PM, `0x34`
+GRILLPLATS, `0x35` **Homebridge iCloud** — the last being #105's empty bridge,
+still live and still producing nothing. Decommission when convenient.
+
+### Still not done
+
+- **Deploy to jarvis.** Three merged versions behind; the #104 fixes are not live.
+- **#105 real-bridge validation** — needs a Hue bridge or Matterbridge with children.
+- **Second Thread border router** — a Thread-capable Apple TV would remove the SPOF.
+- CodeRabbit was **rate-limited on every `indigo-matter` PR this session** (#106,
+  #107, #108), so all three merged on a passing check that was not a real review.
+  `domio-code` #237 did get a genuine review, with no findings.
 
 ---
 
