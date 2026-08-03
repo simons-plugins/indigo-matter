@@ -1,10 +1,105 @@
 # indigo-matter — Build Handover
 
-**Last updated:** 2026-06-12 20:38 UTC
-**Branch:** `fix/device-mapping-hardening` (PR pending)
-**Version:** `2026.2.22`
-**Tests:** 743 passing (`cd indigo-matter && /Library/Frameworks/Python.framework/Versions/Current/bin/python3 -m pytest -q`)
-**Status:** **Wi-Fi AND Thread validated with real hardware.** Tapo P110M (Wi-Fi, energy) + Aqara FP300 (Thread, presence/lux/temp/humidity — tester CliveS). Known-open: issue #56 follow-ups (button + air-quality display states), fan brightness echo (rig flake); issues #43 (bridge-child naming), #46 (fan TurnOn FanMode mapping), #21–#24 (commission hardening).
+**Last updated:** 2026-08-03 12:08 UTC
+**Branch:** `main` (PR #103 merged, release **v2026.7.10** published)
+**Version:** `2026.7.10`
+**Tests:** 992 passing (`cd indigo-matter && /Library/Frameworks/Python.framework/Versions/Current/bin/python3 -m pytest -q`)
+**Deployed:** jarvis is running merged `main` (verified 2026-08-03 13:07 local — clean start, 8 nodes reconciled).
+**Status:** **Wi-Fi AND Thread validated with real hardware.** Test/development certificates now commissionable (`--enable-test-net-dcl`), validated end to end against a Homebridge Matter bridge. Known-open: #104 (server-management faults), #105 (bridge/aggregator handling), plus the older #43, #46, #21–#24.
+
+---
+
+## 2026-08-02/03 session — test-net DCL flag, and three operational faults it exposed
+
+**Shipped:** PR #103 (commits `401d996`, `1860abe`, `d0d1c47`), released as v2026.7.10.
+
+### What was added
+
+An off-by-default advanced pref, **Allow test/development device certificates**,
+which appends `--enable-test-net-dcl` to the managed matter-server. Devices that
+present a test PAA — Homebridge and other dev bridges — otherwise fail device
+attestation against the production DCL alone. matter-server 1.2.2 already accepted
+the flag; this exposes it. Note it is genuinely additive to production trust, and it
+**also** allows test-net OTA firmware to be offered (`MatterController.js:285` →
+`allowTestOtaImages: true`), which is why it warns on every start and is documented
+as something to untick once the device is paired.
+
+### The bit worth remembering: the code was right on day one
+
+The flag worked from the first deploy. It *looked* broken for about an hour because
+of three unrelated operational faults, all now either fixed or filed:
+
+1. **Saving the pref does not apply it.** `closedPrefsConfigUi` writes nothing;
+   only `ensure_installed()` regenerates the plist. Fixed for the restart menu
+   (it now rebuilds `ServerProcess` from current prefs); the config dialog and docs
+   now say reload-or-restart explicitly.
+2. **A stray matter-server held port 5580 and kept serving with the old arguments**
+   while the plugin logged a healthy `connected … reconciled N nodes`. Every new
+   instance died with `EADDRINUSE`. The orphan reaper missed it because
+   `_running_server_pids()` matches on *storage path*, and that stray had a different
+   one — a server sharing our storage path would have failed earlier, at the storage
+   lock. **Filed as #104**, with the suggestion to reap on the contended **port**
+   rather than the storage path.
+3. **launchd would not respawn it.** matter-server appears to exit 0 on that FATAL,
+   and `KeepAlive` is `{SuccessfulExit: false, Crashed: true}`, so a clean exit is
+   deliberately not restarted and the job stayed dead. Also in #104.
+
+Diagnosis order that worked, worth reusing: `lsof -nP -iTCP:5580 -sTCP:LISTEN` →
+`ps -ww -o pid=,command= -p <PID>` → compare against `ProgramArguments` in the plist.
+The log alone cannot distinguish "our server with the new flag" from "someone else's
+server on our port", which is why the startup warning is now phrased as what we are
+*starting* matter-server with, never as the state of whatever is listening.
+
+### Review rounds (two, both via /pr-review-toolkit:review-pr)
+
+Round one found the flag was invisible in the log and that the restart menu could
+report success without applying anything. Round two found my fix for that was itself
+unpinned: **mutation testing showed that moving `ensure_installed()` after
+`restart()` reintroduces the original bug with the whole suite green.** Fixed by
+routing both through one parent mock so the call order is asserted. The same round
+found the fix double-restarted (two outages, every CASE session dropped twice) in
+exactly the case the menu exists for, which is why `ensure_installed()` now returns
+a tri-state (`None` preflight-failed / `True` reloaded / `False` left running).
+
+Also corrected: an `EADDRINUSE` claim I had put in `INSTALL.md` that was wrong in
+mechanism (see fault 2 above), and OTA wording that over-claimed relative to the code.
+
+### Field validation
+
+Commissioned a Homebridge Matter child bridge end to end. Same device, same
+certificate, opposite outcomes across the fix:
+
+```
+20:33:55  Attestation rejected: Device uses a test/development certificate …
+20:54:55  Attestation accepted
+```
+
+**But no Indigo devices appeared** — the bridge published a bare `Aggregator (0x0e)`
+endpoint with no bridged children, so there was nothing to build devices from. The
+plugin behaved correctly. The bridged-endpoint path (`_bridge_identity`, cluster
+0x0039, dynamic `endpoint_added`) remains **unit-tested only, never validated against
+a bridge that actually publishes children**. Filed as **#105**, along with the
+suggestion to say something when a commissioned bridge is exposing nothing, and a
+note to decommission the now-useless node `@1:35`.
+
+### Related, outside this repo
+
+`domio-code` **#236** — Domio's commissioning dead-ends on
+`MTRErrorCodeFabricExists` (code 11). A partly-failed attempt leaves the device on
+Domio's fabric, the error is unhandled, and `nextNodeID()` guarantees the retry never
+matches the existing node, so the device is permanently un-addable until the user
+removes it in iOS Settings ▸ General ▸ Matter Accessories. Suggested fix: catch it and
+resume via `openCommissioningWindow` instead of failing.
+
+### Repo hazard worth knowing
+
+`tests/test_plugin_behaviour.py::test_startup_wires_connect_and_disconnect_callbacks`
+still constructs a **real** `ServerProcess` against the real `$HOME` and calls
+`ensure_installed()`, whose preflight-failure path calls `uninstall()` — which deletes
+`~/Library/LaunchAgents/com.simons-plugins.indigo-matter.plist`. On a machine where
+the plugin is installed, running `pytest` deletes the live LaunchAgent. The three
+menu/startup tests touched by #103 now patch `ServerProcess`; that one does not.
+Tracked in #104.
 
 ---
 
