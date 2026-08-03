@@ -628,7 +628,8 @@ class ServerProcess:
             self-heal a crash-looping ``--port ""`` job.
         """
         digest = self._digest_of(desired)
-        running = self.is_running()
+        job = self._managed_job()          # one launchctl print: loaded + pid + live args
+        running = job["loaded"]
         if running and self._read_applied_digest() == digest:
             # The current definition is already loaded. Normally we leave the healthy
             # server running (survives plugin reloads without dropping device sessions) —
@@ -636,11 +637,30 @@ class ServerProcess:
             # matter-server holds the storage lock, the managed job is crash-looping
             # despite the right args. Reap the orphan (never the managed job — exclude its
             # pid); only if one was actually blocking it do we force a clean restart.
-            managed_pid = self._managed_pid()
+            managed_pid = job["pid"]
+            if managed_pid is None and job["pid_line"]:
+                # A pid line we couldn't parse: the job may well be alive, and we cannot
+                # tell it from an orphan — don't risk killing it.
+                return False
             if managed_pid is None:
-                return False  # can't tell the healthy job from an orphan — don't risk killing it
-            if self.reap_orphan_servers(exclude_pid=managed_pid) == 0:
-                return False  # healthy and unobstructed — survive the reload untouched
+                # Loaded with NO pid line: the job is dead and launchd has decided not to
+                # respawn it (#104 fault 2 — matter-server exits 0 on a fatal startup
+                # error, which KeepAlive {SuccessfulExit: false} reads as a clean exit).
+                # There is no healthy server to protect here, so fall through to the
+                # bootout + bootstrap below, which is the only thing that revives it.
+                self.logger.warning(
+                    "the matter-server LaunchAgent is loaded but not running, and launchd "
+                    "will not respawn it on its own (matter-server exits 0 even on a fatal "
+                    "startup error such as 'listen EADDRINUSE', which its KeepAlive policy "
+                    "treats as a clean exit). Restarting it now; see %s for the cause.",
+                    os.path.join(self.log_dir, "matter-server.err.log"),
+                )
+            elif self.reap_orphan_servers(exclude_pid=managed_pid) == 0:
+                # Healthy and unobstructed — survive the reload untouched. A matching
+                # digest proves the right plist was WRITTEN, not that the live job is
+                # using it, so check the running args before declaring victory.
+                self._warn_on_argument_drift(job["arguments"])
+                return False
             # else: an orphan was starving it; fall through to a clean bootout + bootstrap.
         if running and not self._bootout():
             # A loaded job wouldn't stop — bootstrap/load below will fail on the still
@@ -829,13 +849,17 @@ class ServerProcess:
         instance dies with "Storage is locked by another process (pid N)" — matter-server
         only auto-clears a lock whose owner is *dead*. We find the live owner by matching
         our package dir AND our ``--storage-path`` in the process command line (so an
-        unrelated node process, or another user's server, is never touched), then
-        SIGTERM it, wait briefly, and SIGKILL any that ignore TERM.
+        unrelated node process, or another user's server, is never touched), OR by
+        finding a matter-server squatting on our port — see :meth:`_running_server_pids`
+        for why the storage-path match alone has a blind spot. Matches are SIGTERMed, we
+        wait briefly, then SIGKILL any that ignore TERM. A port holder we can't identify
+        as a matter-server is never signalled, only warned about.
 
         Pass ``exclude_pid`` (the managed job's pid) to leave a healthy running server
         alone while still clearing an orphan beside it. Returns how many were signalled.
         """
         pids = self._running_server_pids(exclude_pid=exclude_pid)
+        self._warn_on_foreign_port_holder(reapable=pids, exclude_pid=exclude_pid)
         if not pids:
             return 0
         self.logger.warning(
@@ -858,13 +882,8 @@ class ServerProcess:
             self._signal(pid, "KILL")
         return len(pids)
 
-    def _running_server_pids(self, exclude_pid: Optional[int] = None) -> list[int]:
-        """PIDs of running matter-server processes bound to this plugin's storage.
-
-        Matches both our package dir (``…/node_modules/matter-server``) and our
-        ``storage_path`` in the command line — the pair is unique to this plugin's
-        server, so we never mistake an unrelated node process for one of ours.
-        """
+    def _ps_map(self) -> dict[int, str]:
+        """pid → full command line for every running process ({} if ps is unavailable)."""
         try:
             # -ww: never truncate the command column — our --storage-path sits late in
             # the arg list, and macOS ps truncates to a default width without it, which
@@ -872,25 +891,143 @@ class ServerProcess:
             result = self._run(["ps", "-A", "-ww", "-o", "pid=,command="],
                                capture_output=True, text=True, check=False)
         except OSError:
-            return []
+            return {}
         if result is None or result.returncode != 0:
-            return []
-        pkg_dir = os.path.join(self.project_dir, "node_modules", MATTER_SERVER_PACKAGE)
-        pids: list[int] = []
+            return {}
+        procs: dict[int, str] = {}
         for line in (result.stdout or "").splitlines():
             stripped = line.strip()
             if not stripped:
                 continue
             head, _, command = stripped.partition(" ")
             try:
-                pid = int(head)
+                procs[int(head)] = command
             except ValueError:
                 continue
+        return procs
+
+    def _port_listener_pids(self) -> list[int]:
+        """PIDs listening on our WebSocket port, via ``lsof`` ([] if it can't tell).
+
+        The port — not the storage path — is the resource a second server actually
+        contends for: a stray that holds it makes every fresh instance die with
+        "listen EADDRINUSE" (issue #104). lsof is best-effort; failure just means we
+        fall back to storage-path matching alone, exactly as before.
+        """
+        try:
+            result = self._run(
+                ["lsof", "-nP", f"-iTCP:{self.port}", "-sTCP:LISTEN", "-t"],
+                capture_output=True, text=True, check=False,
+            )
+        except OSError:
+            return []
+        # rc 1 simply means "nothing is listening" — not an error worth logging.
+        if result is None or result.returncode not in (0, 1):
+            return []
+        pids: list[int] = []
+        for line in (result.stdout or "").split():
+            try:
+                pids.append(int(line))
+            except ValueError:
+                continue
+        return pids
+
+    def _running_server_pids(self, exclude_pid: Optional[int] = None) -> list[int]:
+        """PIDs of running matter-server processes this plugin should reap.
+
+        Two independent match signals, because either alone has a blind spot:
+
+        * **storage path** — our package dir (``…/node_modules/matter-server``) AND our
+          ``storage_path`` in the command line. The pair is unique to this plugin's
+          server, so an unrelated node process is never touched. Blind to a server
+          started from a different install layout, an older path, or by hand.
+        * **our port** — anything listening on ``self.port`` whose command line names
+          the matter-server package. This is the case that cost an hour in #104: a
+          stray from another path held 5580, so the storage-path match never saw it
+          while every new instance died with EADDRINUSE. A port holder that is *not*
+          a matter-server is deliberately NOT reaped (see :meth:`reap_orphan_servers`,
+          which warns about it instead) — killing an unrelated listener would be a
+          far worse failure than the one we are fixing.
+        """
+        procs = self._ps_map()
+        if not procs:
+            return []
+        pkg_dir = os.path.join(self.project_dir, "node_modules", MATTER_SERVER_PACKAGE)
+        port_pids = set(self._port_listener_pids())
+        pids: list[int] = []
+        for pid, command in procs.items():
             if pid == exclude_pid:
                 continue
-            if pkg_dir in command and self.storage_path in command:
+            ours = pkg_dir in command and self.storage_path in command
+            strays_on_our_port = pid in port_pids and MATTER_SERVER_PACKAGE in command
+            if ours or strays_on_our_port:
                 pids.append(pid)
-        return pids
+        return sorted(pids)
+
+    def _warn_on_foreign_port_holder(self, reapable: list[int],
+                                     exclude_pid: Optional[int] = None) -> None:
+        """Warn when our port is held by something we will not reap.
+
+        The #104 failure mode was silent: matter-server logged "listen EADDRINUSE
+        127.0.0.1:5580" and exited, the plugin reported "connected … listening"
+        (against the *stray*), and nothing tied the two together. We refuse to kill a
+        process we can't identify as ours, but staying quiet about it is what turned a
+        one-line diagnosis into an hour. Say it once per reap, with the pid and command
+        so ``lsof``/``kill`` are an obvious next step.
+        """
+        holders = [pid for pid in self._port_listener_pids()
+                   if pid != exclude_pid and pid not in reapable]
+        if not holders:
+            return
+        procs = self._ps_map()
+        for pid in holders:
+            self.logger.warning(
+                "port %s is already held by pid %s (%s), which this plugin will not "
+                "stop because it is not a matter-server it recognises. A new "
+                "matter-server cannot bind and will exit with EADDRINUSE — stop that "
+                "process, or set a different port in Configure….",
+                self.port, pid, procs.get(pid, "unknown command"),
+            )
+
+    def _managed_job(self) -> dict:
+        """Parse ``launchctl print`` once into the three facts callers need.
+
+        * ``loaded`` — the label exists (``launchctl print`` succeeded).
+        * ``pid`` — the running job's pid, or None.
+        * ``pid_line`` — whether a ``pid =`` line was present *at all*. This is the
+          difference between "loaded but NOT running" (no such line; launchd reports
+          ``state = not running``) and "running, but we could not parse the pid", and
+          the two must not be conflated. #104's fault 2 lives in that gap: matter-server
+          exits 0 on the ``EADDRINUSE`` FATAL, so launchd's ``KeepAlive
+          {SuccessfulExit: false}`` policy classes it a clean exit and deliberately
+          never respawns it — the job sits loaded-and-dead indefinitely. Treating that
+          as "healthy, hands off" is why a plugin reload could not recover it either.
+        * ``arguments`` — the ProgramArguments launchd actually cached at bootstrap,
+          which is NOT necessarily what the plist on disk now says (fault 3).
+        """
+        job = {"loaded": False, "pid": None, "pid_line": False, "arguments": []}
+        result = self._launchctl("print", f"gui/{os.getuid()}/{LABEL}")
+        if result is None or result.returncode != 0:
+            return job
+        job["loaded"] = True
+        in_arguments = False
+        for line in (result.stdout or "").splitlines():
+            stripped = line.strip()
+            if in_arguments:
+                if stripped == "}":
+                    in_arguments = False
+                elif stripped:
+                    job["arguments"].append(stripped)
+                continue
+            if stripped.replace(" ", "") == "arguments={":
+                in_arguments = True
+            elif stripped.startswith("pid ="):
+                job["pid_line"] = True
+                try:
+                    job["pid"] = int(stripped.split("=", 1)[1].strip())
+                except (ValueError, IndexError):
+                    job["pid"] = None
+        return job
 
     def _managed_pid(self) -> Optional[int]:
         """The pid of the LaunchAgent's currently-running job, or None if not running.
@@ -898,17 +1035,30 @@ class ServerProcess:
         Parsed from ``launchctl print``'s ``pid = N`` line so reap can EXCLUDE the
         healthy managed server while still clearing an orphan beside it.
         """
-        result = self._launchctl("print", f"gui/{os.getuid()}/{LABEL}")
-        if result is None or result.returncode != 0:
-            return None
-        for line in (result.stdout or "").splitlines():
-            stripped = line.strip()
-            if stripped.startswith("pid ="):
-                try:
-                    return int(stripped.split("=", 1)[1].strip())
-                except (ValueError, IndexError):
-                    return None
-        return None
+        return self._managed_job()["pid"]
+
+    def _warn_on_argument_drift(self, running_args: list[str]) -> None:
+        """Warn when the live job's arguments differ from what we would launch now.
+
+        launchd caches ProgramArguments at bootstrap, so a job can serve happily for
+        days with arguments the plist no longer contains — which is precisely how #104
+        presented: the plugin reported a healthy connection while matter-server ran with
+        the *old* args, and a feature the user had just enabled simply appeared not to
+        work. A matching applied-digest proves the right plist was written, never that
+        the running job is using it. One warning turns that into a one-line diagnosis.
+        """
+        if not running_args:
+            return  # launchctl gave us no arguments block — nothing to compare
+        desired = self.program_arguments()
+        if running_args == desired:
+            return
+        self.logger.warning(
+            "the running matter-server was started with different arguments than the "
+            "current settings would use — it is serving STALE configuration. Running: "
+            "%s. Expected: %s. Reload the plugin (or Plugins ▸ Matter ▸ Restart "
+            "matter-server) to apply the current settings.",
+            " ".join(running_args), " ".join(desired),
+        )
 
     def _signal(self, pid: int, sig: str) -> None:
         try:

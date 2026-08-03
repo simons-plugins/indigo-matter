@@ -22,15 +22,26 @@ _real_exists = _os.path.exists
 
 
 class FakeRunner:
-    """Records launchctl invocations; returns a configurable returncode."""
+    """Records launchctl invocations; returns a configurable returncode.
 
-    def __init__(self, returncode: int = 0):
+    A successful ``launchctl print`` also emits a ``pid = N`` line, because that is
+    what launchd actually prints for a *running* job. Without it these fakes describe
+    a job that is loaded but dead — a state the plugin now deliberately recovers from
+    (#104 fault 2) — so tests meaning "healthy job" have to say so.
+    """
+
+    def __init__(self, returncode: int = 0, pid: int = 4242):
         self.calls: list[list[str]] = []
         self.returncode = returncode
+        self.pid = pid
 
     def __call__(self, cmd, **kwargs):
         self.calls.append(cmd)
-        return subprocess.CompletedProcess(cmd, self.returncode, stdout="", stderr="")
+        stdout = ""
+        if (len(cmd) >= 2 and cmd[0] == "launchctl" and cmd[1] == "print"
+                and self.returncode == 0 and self.pid is not None):
+            stdout = f"\tstate = running\n\tpid = {self.pid}\n"
+        return subprocess.CompletedProcess(cmd, self.returncode, stdout=stdout, stderr="")
 
     def subcommands(self) -> list[str]:
         return [c[1] for c in self.calls if len(c) > 1]
@@ -712,20 +723,33 @@ class ProcRunner(FakeRunner):
     """Models `ps`, `kill` (simulating process exit), and `launchctl print` (pid)."""
 
     def __init__(self, ps_lines=None, print_pid=None, ignore_term=False,
-                 omit_pid_line=False, returncode=0):
+                 omit_pid_line=False, garbled_pid=False, listen_pids=None,
+                 job_arguments=None, returncode=0):
         super().__init__(returncode)
         self.ps_lines = list(ps_lines or [])
         self.print_pid = print_pid
         self.ignore_term = ignore_term
-        # When True, `launchctl print` still succeeds (job loaded → is_running() True) but
-        # emits no "pid = N" line, so _managed_pid() returns None — the safety-valve state.
+        # When True, `launchctl print` succeeds (job loaded) but emits no "pid = N" line
+        # at all — launchd's "loaded but NOT running" state. The plugin treats this as a
+        # dead job to revive (#104 fault 2), NOT as the safety-valve state.
         self.omit_pid_line = omit_pid_line
+        # When True, a "pid =" line IS present but unparseable. THIS is the safety valve:
+        # the job may be alive and we can't identify it, so nothing may be signalled.
+        self.garbled_pid = garbled_pid
+        # PIDs `lsof` reports as listening on the port.
+        self.listen_pids = list(listen_pids or [])
+        # ProgramArguments launchd reports for the live job (fault 3 drift detection).
+        self.job_arguments = list(job_arguments or [])
         self.signals: list[tuple[str, str]] = []
 
     def __call__(self, cmd, **kwargs):
         self.calls.append(cmd)
         if cmd and cmd[0] == "ps":
             return subprocess.CompletedProcess(cmd, 0, stdout="\n".join(self.ps_lines) + "\n", stderr="")
+        if cmd and cmd[0] == "lsof":
+            out = "".join(f"{pid}\n" for pid in self.listen_pids)
+            # lsof exits 1 when nothing matches, which is not an error.
+            return subprocess.CompletedProcess(cmd, 0 if self.listen_pids else 1, stdout=out, stderr="")
         if cmd and cmd[0] == "kill":
             sig, pid = cmd[1].lstrip("-"), cmd[2]
             self.signals.append((sig, pid))
@@ -735,8 +759,15 @@ class ProcRunner(FakeRunner):
         if len(cmd) >= 2 and cmd[0] == "launchctl" and cmd[1] == "print":
             if self.print_pid is None:
                 return subprocess.CompletedProcess(cmd, 1, "", "")
-            out = "\tstate = running\n" if self.omit_pid_line else \
-                f"\tstate = running\n\tpid = {self.print_pid}\n"
+            out = "\tstate = running\n"
+            if self.garbled_pid:
+                out += "\tpid = (unknown)\n"
+            elif not self.omit_pid_line:
+                out += f"\tpid = {self.print_pid}\n"
+            if self.job_arguments:
+                out += "\targuments = {\n"
+                out += "".join(f"\t\t{arg}\n" for arg in self.job_arguments)
+                out += "\t}\n"
             return subprocess.CompletedProcess(cmd, 0, stdout=out, stderr="")
         return subprocess.CompletedProcess(cmd, self.returncode, stdout="", stderr="")
 
@@ -768,6 +799,57 @@ def test_running_server_pids_matches_ours_and_excludes_others(tmp_path, mock_log
     ]
     assert sp._running_server_pids() == [545]
     assert sp._running_server_pids(exclude_pid=545) == []       # exclude spares the managed job
+
+
+def _stray_cmd(pid, port=5580):
+    """A matter-server from a DIFFERENT install path — invisible to storage-path matching."""
+    return (f"{pid} node /opt/old-install/node_modules/matter-server/dist/esm/MatterServer.js "
+            f"--storage-path /somewhere/else --port {port}")
+
+
+def test_running_server_pids_matches_stray_holding_our_port(tmp_path, mock_logger):
+    """#104 fault 1: the stray that actually blocked startup held the PORT, not our storage.
+
+    `_running_server_pids` required BOTH our package dir and our --storage-path, so a
+    matter-server started from another path was invisible — it kept serving on 5580 with
+    stale args while every fresh instance died with EADDRINUSE and the plugin reported a
+    healthy connection. Matching on the port as a fallback signal is what catches it.
+    """
+    runner = ProcRunner()
+    sp = _sp_proc(tmp_path, mock_logger, runner)
+    runner.ps_lines = [_stray_cmd(66659)]
+    runner.listen_pids = []
+    assert sp._running_server_pids() == []        # storage-path matching alone is blind…
+    runner.listen_pids = [66659]                  # …until we notice it holds our port
+    assert sp._running_server_pids() == [66659]
+
+
+def test_running_server_pids_never_reaps_a_foreign_port_holder(tmp_path, mock_logger):
+    # Killing an unrelated listener would be a far worse failure than the one we fix.
+    runner = ProcRunner(listen_pids=[900])
+    sp = _sp_proc(tmp_path, mock_logger, runner)
+    runner.ps_lines = ["900 /usr/local/bin/some-other-server --port 5580"]
+    assert sp._running_server_pids() == []
+
+
+def test_reap_warns_when_our_port_is_held_by_something_else(tmp_path, mock_logger):
+    # The one log line that would have ended the hour of misdiagnosis in #104.
+    runner = ProcRunner(listen_pids=[900])
+    sp = _sp_proc(tmp_path, mock_logger, runner)
+    runner.ps_lines = ["900 /usr/local/bin/some-other-server --port 5580"]
+    assert sp.reap_orphan_servers() == 0          # nothing signalled…
+    assert not runner.signals
+    warning = " ".join(str(c) for c in sp.logger.warning.call_args_list)
+    assert "900" in warning and "5580" in warning  # …but the conflict is surfaced
+
+
+def test_reap_stays_quiet_when_the_port_holder_is_the_managed_job(tmp_path, mock_logger):
+    # The healthy managed server obviously holds its own port — never warn about that.
+    runner = ProcRunner(listen_pids=[5423])
+    sp = _sp_proc(tmp_path, mock_logger, runner)
+    runner.ps_lines = [_server_cmd(sp, 5423)]
+    assert sp.reap_orphan_servers(exclude_pid=5423) == 0
+    assert not sp.logger.warning.called
 
 
 def test_reap_orphan_servers_terminates_matching(tmp_path, mock_logger):
@@ -803,6 +885,26 @@ def test_managed_pid_parses_launchctl_print(tmp_path, mock_logger):
     assert sp._managed_pid() is None
 
 
+def test_managed_job_parses_pid_and_arguments(tmp_path, mock_logger):
+    runner = ProcRunner(print_pid=5423, job_arguments=["/bin/node", "--port", "5580"])
+    sp = _sp_proc(tmp_path, mock_logger, runner)
+    job = sp._managed_job()
+    assert job["loaded"] is True
+    assert job["pid"] == 5423 and job["pid_line"] is True
+    assert job["arguments"] == ["/bin/node", "--port", "5580"]
+
+
+def test_managed_job_distinguishes_dead_job_from_unparseable_pid(tmp_path, mock_logger):
+    # These two states look identical through _managed_pid() (both None) but must drive
+    # opposite decisions: revive the dead job, keep hands off the ambiguous one.
+    dead = _sp_proc(tmp_path, mock_logger, ProcRunner(print_pid=5423, omit_pid_line=True))
+    assert dead._managed_job() == {"loaded": True, "pid": None, "pid_line": False,
+                                   "arguments": []}
+    garbled = _sp_proc(tmp_path, mock_logger, ProcRunner(print_pid=5423, garbled_pid=True))
+    job = garbled._managed_job()
+    assert job["pid"] is None and job["pid_line"] is True
+
+
 def _sp_proc_installed(tmp_path, mock_logger, runner):
     """A _sp_proc whose matter-server entry exists so ensure_installed's preflight passes."""
     sp = _sp_proc(tmp_path, mock_logger, runner)
@@ -826,10 +928,39 @@ def test_reload_leaves_healthy_job_untouched_when_no_orphan(tmp_path, mock_logge
     assert not runner.signals
 
 
-def test_reload_never_reaps_when_managed_pid_unknown(tmp_path, mock_logger):
-    # Safety valve: is_running() True but the managed pid can't be parsed. We must NOT
-    # reap (we can't tell the healthy job from an orphan) and must leave it untouched.
-    runner = ProcRunner(print_pid=5423, omit_pid_line=True)  # loaded, but no "pid =" line
+def test_reload_warns_when_the_live_job_runs_stale_arguments(tmp_path, mock_logger):
+    """#104 fault 3: a matching applied-digest proves the right plist was WRITTEN.
+
+    launchd caches ProgramArguments at bootstrap, so the live job can keep serving with
+    the arguments it was started with long after the plist changed. That is exactly how
+    #104 presented — the plugin reported a healthy connection while matter-server ran the
+    OLD args, and a freshly-enabled setting simply appeared not to work.
+    """
+    runner = ProcRunner(print_pid=5423)
+    sp = _sp_proc_installed(tmp_path, mock_logger, runner)
+    sp.ensure_installed()                       # records the marker
+    runner.job_arguments = ["/bin/node", "/old/MatterServer.js", "--port", "5580"]
+    sp.logger.warning.reset_mock()
+    assert sp.ensure_installed() is False       # healthy job still left running…
+    warning = " ".join(str(c) for c in sp.logger.warning.call_args_list)
+    assert "STALE" in warning                   # …but the drift is called out
+
+
+def test_reload_stays_quiet_when_the_live_job_matches_the_plist(tmp_path, mock_logger):
+    runner = ProcRunner(print_pid=5423)
+    sp = _sp_proc_installed(tmp_path, mock_logger, runner)
+    sp.ensure_installed()
+    runner.job_arguments = sp.program_arguments()   # live job matches what we'd launch
+    sp.logger.warning.reset_mock()
+    assert sp.ensure_installed() is False
+    assert not sp.logger.warning.called
+
+
+def test_reload_never_reaps_when_pid_line_is_unparseable(tmp_path, mock_logger):
+    # Safety valve: a "pid =" line IS present but we can't read it, so the job may well
+    # be alive. We must NOT reap (can't tell the healthy job from an orphan) and must
+    # leave it untouched. Distinct from the loaded-but-dead case below.
+    runner = ProcRunner(print_pid=5423, garbled_pid=True)
     sp = _sp_proc_installed(tmp_path, mock_logger, runner)
     sp.ensure_installed()                # records marker
     runner.ps_lines = [_server_cmd(sp, 545)]   # an orphan is present…
@@ -840,6 +971,25 @@ def test_reload_never_reaps_when_managed_pid_unknown(tmp_path, mock_logger):
     subs = [c[1] for c in runner.calls if len(c) > 1]
     assert "bootout" not in subs and "bootstrap" not in subs
     assert not any(c and c[0] == "ps" for c in runner.calls)   # reap never even scanned
+
+
+def test_reload_revives_a_job_that_is_loaded_but_dead(tmp_path, mock_logger):
+    """#104 fault 2: loaded with NO pid line means launchd is not running the job.
+
+    matter-server exits 0 on a fatal startup error ("listen EADDRINUSE"), so
+    KeepAlive {SuccessfulExit: false} reads it as a clean exit and deliberately never
+    respawns it — the job stays dead indefinitely. Treating that as "healthy, hands
+    off" is why a plugin reload could not recover it either. A reload must restart it.
+    """
+    runner = ProcRunner(print_pid=5423, omit_pid_line=True)  # loaded, but no "pid =" line
+    sp = _sp_proc_installed(tmp_path, mock_logger, runner)
+    sp.ensure_installed()                # records marker (digest matches on next reload)
+    runner.calls.clear()
+    runner.signals.clear()
+    assert sp.ensure_installed() is True          # reported as "launchd was reloaded"
+    subs = [c[1] for c in runner.calls if len(c) > 1]
+    assert "bootout" in subs and "bootstrap" in subs
+    assert sp.logger.warning.called               # and the dead job was explained
 
 
 def test_reload_reaps_orphan_and_restarts_when_it_blocks_a_matching_job(tmp_path, mock_logger):
