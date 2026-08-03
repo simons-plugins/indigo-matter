@@ -1,11 +1,77 @@
 # indigo-matter — Build Handover
 
-**Last updated:** 2026-08-03 12:08 UTC
-**Branch:** `main` (PR #103 merged, release **v2026.7.10** published)
-**Version:** `2026.7.10`
-**Tests:** 992 passing (`cd indigo-matter && /Library/Frameworks/Python.framework/Versions/Current/bin/python3 -m pytest -q`)
-**Deployed:** jarvis is running merged `main` (verified 2026-08-03 13:07 local — clean start, 8 nodes reconciled).
-**Status:** **Wi-Fi AND Thread validated with real hardware.** Test/development certificates now commissionable (`--enable-test-net-dcl`), validated end to end against a Homebridge Matter bridge. Known-open: #104 (server-management faults), #105 (bridge/aggregator handling), plus the older #43, #46, #21–#24.
+**Last updated:** 2026-08-03 12:31 UTC
+**Branch:** `fix/104-server-supervision` — **PR #107 open, CI green, NOT merged**. `main` is at v2026.7.11 (docs-only PR #106).
+**Version:** `2026.7.12` on the branch; `2026.7.11` on `main`
+**Tests:** 1001 passing (`cd indigo-matter && /Library/Frameworks/Python.framework/Versions/Current/bin/python3 -m pytest -q`)
+**Deployed:** jarvis is **unchanged** — still running the #103 code (v2026.7.10 era). Nothing from #106 (docs) or #107 (unmerged) has been deployed.
+**Status:** **Wi-Fi AND Thread validated with real hardware.** Test/development certificates now commissionable (`--enable-test-net-dcl`), validated end to end against a Homebridge Matter bridge. #104's three server-supervision faults are **fixed in PR #107, awaiting merge**. Known-open: #105 (bridge/aggregator handling — needs real-bridge validation, cannot be closed on code alone), `domio-code` #236, plus the older #43, #46, #21–#24.
+
+---
+
+## 2026-08-03 session — closing out #104 (server supervision)
+
+**Shipped:** PR #106 (handover, merged, v2026.7.11). **Open:** PR #107 (commits `cd264c2`,
+`2a32910`, `a2d653a`) — all three #104 faults plus the pytest hazard. CI green; CodeRabbit
+reported **"Review rate limited"**, so it is a passing check but *not* an actual review.
+
+### The reaper was matching the wrong resource
+
+This is the finding worth carrying forward. The two halves of #104 turned out to be one
+root cause: **the reaper matched on storage path, but the resource actually contended is
+the port.** A stray from a different install layout held 5580 and kept serving with old
+arguments; `_running_server_pids()` required both our package dir *and* our
+`--storage-path`, so it was invisible. Reaping on the port would have prevented the whole
+misdiagnosis.
+
+The port is now a second, independent match signal. Deliberate limit: a port holder that
+cannot be identified as a matter-server is **never signalled**, only warned about with pid
+and command. Killing an unrelated listener is a worse failure than the one being fixed.
+
+### Loaded-but-dead needed a distinction the code did not have
+
+`_managed_pid()` collapsed two very different `launchctl print` states into `None`. They
+must drive opposite decisions, so `_managed_job()` now separates them:
+
+| `launchctl print` | Meaning | Action |
+|---|---|---|
+| no `pid =` line at all | loaded but **not running** | revive — bootout + bootstrap |
+| `pid =` present, unparseable | may well be alive | hands off (original safety valve) |
+
+**`KeepAlive` was left alone on purpose** (`{SuccessfulExit: false, Crashed: true}`).
+Switching to `KeepAlive: true` would fix the respawn but reintroduce the infinite
+crash-loop on genuine misconfiguration that this module's docstring exists to prevent.
+Detecting and reviving the dead job gets the recovery without that trade.
+
+Third fault: a matching applied-digest proves the right plist was *written*, never that the
+live job is using it — launchd caches `ProgramArguments` at bootstrap. Drift is now warned
+about, which is the single line that would have made this a one-line diagnosis.
+
+### Two tests were passing for the wrong reason
+
+Worth knowing before trusting this suite's "healthy job" assertions. The base `FakeRunner`
+returned empty stdout for `launchctl print`, so "healthy job left untouched" was really the
+unparseable-pid safety valve firing — not health. `FakeRunner` now emits a realistic
+`pid = N`, so those tests assert what their names claim.
+
+One existing test had to change intent: `test_reload_never_reaps_when_managed_pid_unknown`
+pinned the exact behaviour #104 calls a bug (it used "no pid line" to mean "ambiguous").
+Split into `..._when_pid_line_is_unparseable` (valve preserved) and
+`test_reload_revives_a_job_that_is_loaded_but_dead` (the fix).
+
+New tests were verified against a stashed source tree — 6 of 7 fail without the change; the
+7th (`never_reaps_a_foreign_port_holder`) is a regression guard that must keep passing.
+Same mutation-testing instinct as the previous session: a test that cannot fail is worthless.
+
+### Still open, and why
+
+- **#105** — the warning for an empty aggregator is an hour's work, but the issue's central
+  claim is that the bridged-endpoint path has **never met a real bridge**. That needs a Hue
+  bridge or a Matterbridge with real accessories. Closing it on the warning alone would bury
+  the thing it was filed to remember. Node `@1:35` still wants decommissioning on jarvis.
+- **`domio-code` #236** — unchanged, and the one with real user pain: the device is
+  *permanently* un-addable until cleared in iOS Settings. Needs node-ID persistence keyed by
+  setup-code/discriminator, since `nextNodeID()` guarantees a retry never matches.
 
 ---
 
@@ -100,6 +166,9 @@ still constructs a **real** `ServerProcess` against the real `$HOME` and calls
 the plugin is installed, running `pytest` deletes the live LaunchAgent. The three
 menu/startup tests touched by #103 now patch `ServerProcess`; that one does not.
 Tracked in #104.
+
+> **Resolved 2026-08-03 in PR #107** — that test now patches `ServerProcess`. A sweep of
+> the suite confirmed it was the last one; the hazard described above no longer applies.
 
 ---
 

@@ -389,6 +389,12 @@ def test_startup_wires_connect_and_disconnect_callbacks(plugin_mod, monkeypatch)
     monkeypatch.setattr(plugin_mod, "AsyncRuntime", lambda logger: FakeRuntimeObj())
     monkeypatch.setattr(plugin_mod, "CommissionJobs", lambda *a, **k: Mock())
     monkeypatch.setattr(plugin_mod, "HttpApi", lambda *a, **k: Mock())
+    # MUST be patched. pluginPrefs={} resolves to serverLocation "local", so startup()
+    # builds a REAL ServerProcess against the real $HOME and calls ensure_installed() —
+    # whose preflight-failure path calls uninstall(), deleting the developer's live
+    # ~/Library/LaunchAgents/com.simons-plugins.indigo-matter.plist. Running pytest on a
+    # machine with the plugin installed would tear down the running server (#104).
+    monkeypatch.setattr(plugin_mod, "ServerProcess", lambda *a, **k: Mock())
 
     p = plugin_mod.Plugin.__new__(plugin_mod.Plugin)
     p.logger = Mock()
