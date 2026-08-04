@@ -69,7 +69,7 @@ client is portable to python-matter-server as a fallback. See `docs/MATTER.md` +
 
 Inherits workspace standards from [root CLAUDE.md](../CLAUDE.md#common-standards-apply-to-every-project-unless-its-claudemd-overrides). Key points:
 
-- **Version bump per PR**: `Info.plist` `PluginVersion` (format `YYYY.R.P`, currently `2026.0.1`).
+- **Version bump per PR**: `Info.plist` `PluginVersion` (format `YYYY.R.P`; the plist is the source of truth for the current value).
 - **Testing**: `pytest` (`pyproject.toml`, pylint + 120-char like netro). matter-server is mocked at the WS layer (`tests/fakes.py`); the `indigo` module is mocked. Run: `cd indigo-matter && pytest`.
 - **Merge**: GitHub PR only, never `--admin`, never squash, wait for CI green, wait for user go-ahead.
 

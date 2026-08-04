@@ -1,10 +1,12 @@
 # PRD — Indigo Matter Export (Indigo as a Matter bridge)
 
-**Status:** Draft — scoping
+**Status:** Accepted — build in progress
 **Owner:** Simon
-**Governing ADR:** [`../../docs/adr/0006-indigo-as-matter-bridge.md`](../../docs/adr/0006-indigo-as-matter-bridge.md) (accepted 2026-08-03)
+**Governing ADR:** [`../../docs/adr/0006-indigo-as-matter-bridge.md`](../../docs/adr/0006-indigo-as-matter-bridge.md) (accepted 2026-08-03; workspace-level — the path resolves in the multi-repo workspace checkout, not on GitHub), as amended by ADR-0007 (validation-evidence criterion)
 **Companion PRD:** [`PRD-indigo-matter-plugin.md`](./PRD-indigo-matter-plugin.md) (historical — the inbound/controller build)
-**Last updated:** 2026-08-03
+**Local protocol spec:** [`BRIDGE_PROTOCOL.md`](./BRIDGE_PROTOCOL.md)
+**Last updated:** 2026-08-04 (research pass: matter.js 0.17.8 verified by execution; scope and
+packaging decisions taken — see §5.2 exclusions, §10, §11)
 
 ## 1. Summary
 
@@ -89,10 +91,11 @@ generalising `server_process.py` rather than duplicating it. Two differences
 from the controller agent:
 
 - It is **not started at all** while the allow-list is empty (XG5).
-- It has no data directory to treat as sacred in the controller's sense, but it
-  *does* hold commissioned-fabric credentials for paired ecosystems — losing
-  them un-pairs every ecosystem and forces re-pairing. Back it up alongside the
-  controller's storage.
+- Its data directory is **every bit as sacred as the controller's**, for
+  different reasons: it holds the commissioned-fabric credentials for every
+  paired ecosystem (losing them un-pairs everything) *and* the endpoint-ID
+  allocation map (losing that duplicates every accessory in every ecosystem —
+  §4.3). Back it up alongside the controller's storage.
 
 ### 4.3 Storage
 
@@ -105,8 +108,22 @@ from the controller agent:
 - **Endpoint stability (XG4)** is a hard requirement. Endpoint IDs and Bridged
   Device Basic Information `UniqueID` values MUST be allocated once, persisted,
   and derived from the Indigo device ID — never from list position or iteration
-  order. A monotonic persisted allocator, mirroring `MatterFabricStore.nextNodeID()`
-  in the Domio work, is the known-good shape.
+  order. matter.js keys its persisted endpoint numbers solely on the string
+  `Endpoint.id` (verified at 0.17.8): a stable `id` gives stable numbers across
+  restarts, reorderings and removals, while an omitted `id` falls back to
+  positional `part0/part1/…` and silently swaps identities when a device is
+  removed. Therefore: `id` = the immutable Indigo device ID (sanitised),
+  supplied explicitly, never reused, never mutated.
+- **Drift detection.** The bridge node persists a `UniqueID → endpoint number`
+  map and warns loudly if any mapping changes at startup (matterbridge's
+  `checkEndpointNumbers()` pattern) — the only way to make "is it us or the
+  controller?" falsifiable in the field.
+- **Storage loss is the #1 real-world accessory-duplication cause** (not logic
+  bugs): a missing/relocated storage dir reallocates every endpoint number and
+  every ecosystem re-creates every accessory, losing names, rooms and
+  automations. The storage path must survive plugin and Indigo upgrades, is
+  backed up alongside the controller's, and "storage missing but previously
+  commissioned" is a loud refuse-to-start (§7), never a silent re-init.
 
 ### 4.4 Local protocol
 
@@ -116,7 +133,26 @@ state changes outward, and the bridge node pushes ecosystem commands inward.
 **Decision:** mirror the controller's WebSocket + JSON message shape. It costs
 nothing new to learn, `matter_client.py` is a working reference for the client
 half, and the existing test doubles generalise. The bridge node listens on
-loopback only, on a configurable port defaulting adjacent to the controller's.
+loopback only, on a configurable port defaulting to **5581** (the controller's
+WS is 5580).
+Unlike `protocol.py` there is **no rename firewall** — we own both ends and ship
+them together — but the handshake carries a `protocolVersion`, because launchd
+deliberately keeps the old node running across plugin reloads and version skew
+is the failure that will actually happen. Full spec: [`BRIDGE_PROTOCOL.md`](./BRIDGE_PROTOCOL.md).
+
+The **Matter side** of the node binds UDP **5540** (the Matter default, also
+pref-configurable) with the Aggregator at **Endpoint 1**. matter.js's
+ECOSYSTEMS.md documents both as Alexa's hard requirement (it discovers nothing
+on any other port and needs EP1 beside the root); we have not verified this
+(XOQ1), but the constraint costs nothing now and is painful to retrofit. No
+conflict with the controller: `matter-server` listens on TCP 5580 plus
+ephemeral UDP, not 5540. But 5540 *is* contended by any other Matter device
+stack on the same Mac — Homebridge 2.x, matterbridge, an HA container in host
+mode — so a bind failure is a first-class §7 failure mode, surfaced with the
+holder named, and the pref is the escape hatch (moving off 5540 forfeits the
+documented Alexa behaviour). mDNS is pinned to the primary interface (reusing
+the `primaryInterface` pref) — matter.js's own mDNS stack defaults to all
+interfaces and breaks on Macs with VPN/utun interfaces.
 
 ## 5. Components
 
@@ -135,7 +171,9 @@ devices — which rules out a plain multi-select.
 
 **Decision: UI-D**, falling back to **UI-B** if Indigo's XML dialog list
 controls prove unworkable at scale — the same "recommended start, documented
-fallback" treatment PM-B/PM-A got in the original PRD.
+fallback" treatment PM-B/PM-A got in the original PRD. (UI-C, a hybrid
+variant, was folded into UI-D during drafting; the lettering gap is
+deliberate.)
 
 The candidate list MUST be filtered by plugin ID to exclude `indigo-matter`'s
 own devices, making the loop guard (XNG3) structural rather than a runtime check.
@@ -163,22 +201,22 @@ safest interpretation (plug/light) rather than guessing.
 |---|---|---|---|
 | Relay | Plug *(default)* | On/Off Plug-in Unit | Safest default |
 | Relay | Light | On/Off Light | |
-| Relay | Lock | Door Lock | Requires ecosystem PIN/confirm semantics; see §7 |
-| Relay | Valve | Water Valve | Inherit inbound's flood-safe toggle behaviour |
+| Relay | Lock | Door Lock | Requires ecosystem PIN/confirm semantics; see §7. matter.js's DoorLock implementation is its most complete (users/credentials/schedules, encrypted at rest) — the risk is ecosystem UX, not the library |
+| Relay | Valve | *Not exportable in v1* | Descoped 2026-08-04; see below |
 | Relay | Garage door | *Not exportable in v1* | Polarity + safety; see below |
 | Dimmer | Light | Dimmable Light | |
 | Dimmer (colour) | Light | Extended Color Light | Colour-temp-only devices → Color Temperature Light |
-| Dimmer | Window covering | Window Covering | Polarity declared per export (100% = open, inbound convention) |
-| Dimmer | Fan | Fan | Where the Indigo device is a fan modelled as a dimmer |
+| Dimmer | Window covering | Window Covering | Polarity declared per export (100% = open, inbound convention). Must implement `handleMovement()` — matter.js's default snaps to target instantly |
+| Dimmer | Fan | *Not exportable in v1* | Descoped 2026-08-04; see below |
 | Sensor (binary, motion) | — | Occupancy Sensor | |
 | Sensor (binary, contact) | — | Contact Sensor | |
 | Sensor (numeric, °C) | — | Temperature Sensor | |
 | Sensor (numeric, %RH) | — | Humidity Sensor | |
 | Sensor (numeric, lux) | — | Light Sensor | |
-| Sensor (numeric, pressure) | — | Pressure Sensor | |
-| Sensor (numeric, flow) | — | Flow Sensor | |
-| Thermostat | — | Thermostat | Setpoints, modes; fan merged if present |
-| SpeedControl | Fan | Fan | Map speed index → percent |
+| Sensor (numeric, pressure) | — | Pressure Sensor | Apple Home ignores this type (Google supports it); exported anyway, documented |
+| Sensor (numeric, flow) | — | Flow Sensor | Apple Home ignores this type (Google supports it); exported anyway, documented |
+| Thermostat | — | Thermostat | Setpoints, modes. No fan in v1 (the FanControl descope applies here too); v2 candidate. matter.js provides the cluster machinery; the HVAC logic is ours |
+| SpeedControl | Fan | *Not exportable in v1* | Descoped 2026-08-04; see below |
 
 Matter device-type IDs are deliberately omitted here; take them from the
 matter.js device-type catalogue at implementation rather than transcribing
@@ -189,7 +227,9 @@ them into a PRD where they can rot.
 | Excluded | Why |
 |---|---|
 | Any device created by `indigo-matter` | Loop guard (XNG3), enforced at §5.1 |
-| Sprinkler devices | Matter has no irrigation-controller type; per-zone Water Valve is a lossy fit. v2 candidate |
+| Valve role | **Descoped 2026-08-04.** matter.js's `ValveConfigurationAndControlServer` is an empty stub — the whole command surface would be ours to implement — and ecosystem support is poor (Apple unresolved, Alexa ignores the type). v2 candidate |
+| Fan role (Dimmer- or SpeedControl-backed) | **Descoped 2026-08-04.** matter.js's `FanControlServer` only seeds a default `fanMode`; all fan behaviour would be ours to implement. v2 candidate |
+| Sprinkler devices | Matter has no irrigation-controller type; per-zone Water Valve is a lossy fit (and Water Valve itself is descoped). v2 candidate |
 | MultiIO devices | No coherent single-accessory representation |
 | `custom` devices with no resolvable role | Includes the plugin's own energy-meter type |
 | Garage doors | Needs the polarity handling the catalog doesn't yet carry (`onState` true = closed, turnOn = close), and mis-mapping is a physical-safety issue. Blocked on the catalog role/polarity work |
@@ -203,15 +243,34 @@ silently missing.
 One Matter node: root endpoint, an **Aggregator** endpoint, and one **Bridged
 Node** child endpoint per exported device carrying Bridged Device Basic
 Information (`NodeLabel`, `Reachable`, `UniqueID`) — the standard bridge
-topology the plugin already consumes inbound (`MATTER.md:238-244`).
+topology the plugin already consumes inbound (the "Bridges" section of
+`MATTER.md`; in code, `matter_model.py`'s BridgedDeviceBasicInformation
+handling and `device_sync.py`'s `DEVICE_TYPE_AGGREGATOR`).
 
-- **Max fabrics:** set to allow at least 5 concurrent ecosystems.
+- **Distribution:** the bridge node is a **published npm package**
+  (`indigo-matter-bridge`, TypeScript, decided 2026-08-04), exact-pinned by the
+  plugin the same way `matter-server@1.2.2` is — the existing
+  `npm install --prefix` machinery works unchanged. matter.js itself is
+  **exact-pinned** (no caret): patch releases have changed what Apple Home
+  renders with zero code change on the bridge side.
+- **Max fabrics:** matter.js defaults `supportedFabrics` to 254, so ≥5
+  concurrent ecosystems needs no action. Note Apple consumes **two** slots
+  (iCloud Keychain sync).
 - **Reachable** must track the Indigo device's enabled/available state so
-  ecosystems grey out unavailable accessories instead of timing out.
+  ecosystems grey out unavailable accessories instead of timing out. Prefer
+  `Reachable = false` over endpoint removal for anything temporary.
 - **Removal:** dropping a device from the allow-list removes its endpoint and
-  updates the aggregator's `PartsList`; ecosystems remove the accessory.
+  updates the aggregator's `PartsList` (automatic in matter.js); ecosystems
+  remove the accessory. Bulk removals are rate-limited (~100ms apart,
+  matterbridge's pattern) so controllers see one subscription update each.
+- **Echo guard:** matter.js attribute-change events fire for our own
+  Indigo-originated writes as well as controller commands; the bridge node
+  discriminates on the event context (`ctx.offline`) or the Indigo↔ecosystem
+  loop is infinite.
 - **Endpoint count:** no hard cap in v1, but log a warning past ~100 exports —
-  ecosystem per-home accessory limits (Apple's in particular) will bite first.
+  ecosystem per-home accessory limits will bite first (Alexa hard-caps at 50
+  bridged devices; Apple degrades past ~200). Memory is not the constraint:
+  measured ~145MB RSS floor + ~0.3MB per endpoint at 0.17.8 (XOQ6 answered).
 
 ### 5.4 Lifecycle hooks
 
@@ -221,18 +280,34 @@ topology the plugin already consumes inbound (`MATTER.md:238-244`).
   plugin reloads must not un-pair ecosystems).
 - `deviceUpdated` — diff relevant states, push outward.
 - `deviceDeleted` — remove from allow-list, drop the endpoint.
-- `runConcurrentThread` — health check, reconnect, reconcile drift.
+- `runConcurrentThread` — health check, reconnect, reconcile drift, and
+  periodic bridge-node RSS logging (the XOQ6 watchdog).
 
 ### 5.5 Configuration UI
 
 Plugin config gains an **Export** section: enable/disable export wholesale,
-bridge-node port, and a pairing-status readout (which ecosystems are paired,
-fabric slots used/remaining). Per-export settings live in the §5.1 dialog.
+the two bridge-node ports (local-protocol WS, default 5581; Matter UDP,
+default 5540), and a pairing-status readout (which ecosystems are paired,
+fabric slots used/remaining). The readout earns its place even though
+matter.js defaults to 254 fabric slots: what users actually need to see is
+*which* ecosystems hold a fabric and whether a commissioning window is open,
+not slot arithmetic. Per-export settings live in the §5.1 dialog.
 
 ## 6. Pairing and fabric management
 
-- **Pair:** a menu action surfaces the bridge node's setup code and QR payload.
-  The user adds it in each ecosystem's app as they would any Matter accessory.
+- **Pair:** a menu action surfaces a pairing code and QR payload. The user
+  adds the bridge in each ecosystem's app as they would any Matter accessory.
+  A commissioning passcode is **not durable**: once the first ecosystem
+  commissions, the original code stops working, and each further admin needs
+  an *enhanced commissioning window* with a freshly derived code — so the
+  menu action is "open a pairing window" (`open_commissioning_window`,
+  BRIDGE_PROTOCOL §3.8), not "show the code". **Display mechanism** (Indigo
+  dialogs have no dynamic labels and no image fields): the manual code is
+  written to the event log — the plugin's established pattern for runtime
+  strings — and the QR is rendered on an IWS-served page, reachable from the
+  same menu action. Passcode and discriminator are **randomised per install**
+  (identical passcodes produce identical pairing codes across installs —
+  verified) and persisted by the bridge node.
 - **Uncertified prompt:** expect an uncertified-accessory warning in every
   ecosystem (ADR-0006). Document it as *expected* in `INSTALL.md`, with the
   Homebridge parallel, so it doesn't read as a fault.
@@ -248,16 +323,22 @@ fabric slots used/remaining). Per-export settings live in the §5.1 dialog.
 | Bridge node down | Plugin marks export status degraded; Indigo devices unaffected; agent restarted by launchd; reconcile on reconnect |
 | Ecosystem sends a command for a deleted Indigo device | Endpoint already removed; if racing, return failure rather than silently dropping |
 | Indigo device disabled | `Reachable` = false; accessory greys out |
-| Allow-list emptied | Endpoints removed; agent stopped; pairings retained unless explicitly reset |
-| Lock/valve command | Never auto-confirm destructive state changes; honour the inbound flood-safe/lock conventions |
-| Endpoint map lost/corrupt | Refuse to auto-reallocate; surface an error and require an explicit rebuild, since silent reallocation duplicates accessories in every paired ecosystem |
+| Allow-list emptied | Endpoints removed (the deliberate `intent: "replace_all"` path, BRIDGE_PROTOCOL §3.1); agent stopped; pairings retained unless explicitly reset |
+| Lock command | Never auto-confirm destructive state changes; honour the inbound lock conventions |
+| Matter UDP port (5540) already bound | Another Matter device stack (Homebridge 2.x, matterbridge, HA) holds it; surface the error naming the holder; the port pref is the escape hatch (§4.4) |
+| Endpoint map lost/corrupt | Refuse to auto-reallocate; surface an error and require an explicit rebuild (`rebuild_endpoint_map`, BRIDGE_PROTOCOL §3.11), since silent reallocation duplicates accessories in every paired ecosystem |
 
 ## 8. Acceptance criteria
 
 - **XAC1.** Fresh install: no bridge process running, nothing paired, nothing exported.
-- **XAC2.** Exporting one relay starts the bridge node and yields a pairing code.
-- **XAC3.** Bridge pairs into **Apple Home and at least one non-Apple ecosystem**
-  from the same code, both controlling the device.
+- **XAC2.** Exporting one relay starts the bridge node and yields a pairing
+  code, within XG1's 30 seconds. (Lands at E7 — the start-on-export wiring.)
+- **XAC3.** Bridge pairs into **Apple Home** from the displayed code and
+  controls the device. Multi-fabric capability is proven by adding a **second
+  admin we already own** — Domio's own fabric (ADR-0005) or a matter-server
+  controller — not by requiring a third-party ecosystem we cannot test (XOQ1).
+  This is a deliberate narrowing of ADR-0006's confirmation criterion,
+  recorded in **ADR-0007**.
 - **XAC4.** Command round-trip both directions within 500ms (XG2).
 - **XAC5.** Endpoint IDs and `UniqueID`s survive plugin reload, bridge-node
   restart and Mac reboot with no accessory duplication (XG4).
@@ -275,47 +356,91 @@ fabric slots used/remaining). Per-export settings live in the §5.1 dialog.
 
 | # | Milestone | Gating criterion |
 |---|---|---|
-| E0 | Bridge node skeleton | Node process starts, exposes an aggregator with one hard-coded endpoint, pairs into Apple Home |
-| E1 | **Google Home pairing spike** | Determines whether an uncertified bridge pairs at all. **Runs before E2** — it gates what v1 can advertise |
-| E2 | Local protocol + plugin client | Plugin drives endpoint create/remove over WS |
-| E3 | Allow-list + UI-D dialog | Devices selectable with role; loop guard live (XAC6, XAC9) |
-| E4 | Relay + dimmer export | XAC2, XAC3, XAC4 |
-| E5 | Sensors + thermostat export | Mapping table complete for v1 |
-| E6 | Endpoint persistence | XAC5 — the highest-risk correctness requirement |
-| E7 | Pairing/unpairing UX + fabric readout | §6 complete |
-| E8 | launchd agent + failure recovery | §7, XAC7, XAC8 |
-| E9 | Docs | `INSTALL.md` export section, uncertified-prompt explanation, `MATTER.md` outbound architecture |
+| E0 | Bridge node skeleton — **the validation gate** | Node process starts, exposes an aggregator with one hard-coded endpoint, and **pairs into Apple Home**. If an uncertified bridge will not pair here, the design is dead and nothing after this matters |
+| E1 | Local protocol + plugin client | Plugin drives endpoint create/remove over WS |
+| E2 | Allow-list + UI-D dialog | Devices selectable with role; loop guard live (XAC6, XAC9) |
+| E3 | Relay + dimmer export | XAC4 both directions, and XAC3's Apple Home control, against a manually started bridge node (start-on-export is E7's; the code display is E6's) |
+| E4 | Sensors + thermostat export | Mapping table complete for v1 |
+| E5 | Endpoint persistence | XAC5 — the highest-risk correctness requirement |
+| E6 | Pairing/unpairing UX + fabric readout | §6 complete, including XAC3's displayed-code pairing flow |
+| E7 | launchd agent + failure recovery | §7, XAC1, XAC2, XAC7, XAC8 |
+| E8 | Docs | `INSTALL.md` export section, uncertified-prompt explanation, ecosystems-untested note (§10), `MATTER.md` outbound architecture |
 
-E0 and E1 are the validation loop. Until E1 resolves, v1's ecosystem claims are
-unknown; everything after E2 is mechanical.
+**E0 is the whole validation loop.** It answers the only question that can kill
+the feature — *will any ecosystem pair an uncertified bridge?* — on hardware
+already present for the TBR. E0 runs **on jarvis** (decided 2026-08-04): the
+real deployment host, same L2 as the Apple hub. Everything after E1 is
+well-understood, though not all of it is easy — E5 remains the highest-risk
+correctness milestone (§4.3).
+
+**Sequencing note (XOQ3 outcome):** the `AgentSpec` extraction of
+`server_process.py` lands as its own behaviour-preserving PR between E0 and
+E1, so E7 is wiring, not refactoring.
+
+There is deliberately **no per-ecosystem spike**. A test earns its place by
+changing a decision, and a Google Home or Alexa result changes none: we ship
+to whatever pairs, and the remedies for a refusal — a real vendor ID, or
+per-ecosystem developer-console registration — are weighed and declined in
+**ADR-0007**. Those ecosystems are therefore untested-and-unclaimed (§10),
+not blockers.
 
 ## 10. Open questions
 
-- **XOQ1.** Does Google Home pair an uncertified test-VID bridge, and does it
-  require Developer Console registration? **Blocking on scope claims** — E1.
-- **XOQ2.** Alexa and SmartThings tolerance — assumed permissive, unverified.
-- **XOQ3.** Does `server_process.py` generalise cleanly to a second agent, or
-  does it need extracting first? Audit before E8.
-- **XOQ4.** Which DAC/VID the bridge node presents, and whether matter.js's
-  default test credentials are used as-is. Distinct from ADR-0005's *fabric*
-  VID (ADR-0006, "Two different vendor IDs, same number").
+- **XOQ1.** Whether Google Home pairs an uncertified test-VID bridge (it may
+  require Developer Console registration), and likewise Alexa and SmartThings.
+  **Not blocking, and not scheduled.** No hardware to test them on, no decision
+  hangs on the answer, and the only fix for a refusal — a real vendor ID — is
+  out of scope by §12. Treat as **untested and unclaimed**: promise Apple Home
+  in the docs, say nothing about the rest, and let the first user report settle
+  it. Revisit only if one of them becomes a hard requirement. The scope
+  narrowing relative to ADR-0006's confirmation criterion is recorded in
+  ADR-0007. (XOQ2, Alexa/SmartThings tolerance, was folded into this question
+  in the 2026-08-04 revision; the numbering gap is deliberate.)
+- **XOQ3. Answered (2026-08-04 audit).** It needs extracting first: identity
+  (launchd label, package name, stamp files, log names, argv, port) is
+  module-global, and two agents sharing the applied-plist stamp would trigger
+  spurious bootout cycles. But ~700 of its 1092 lines parameterise cleanly
+  behind a frozen `AgentSpec`; the extraction is behaviour-preserving and is
+  **pulled forward to before E1** so the hard-won recovery machinery (plist
+  digest, loaded-but-dead recovery, orphan reaper) is never duplicated.
+- **XOQ4. Answered (2026-08-04 research).** matter.js hardcodes no VID: it
+  generates a fresh self-signed PAA→PAI→DAC chain at runtime for whatever
+  `vendorId`/`productId` is configured, with a Certification Declaration
+  signed by the CHIP *development* CD key (`certificationType: Test`). The
+  0xFFF1/0x8000 values come from its examples, not the library. v1 uses the
+  test-range VID 0xFFF1 deliberately (uncertified is the honest posture,
+  ADR-0006); still distinct from ADR-0005's *fabric* VID.
 - **XOQ5.** Whether role belongs in `indigo-device-catalog` now rather than as
   plugin-local metadata later — cross-repo, and it would unblock garage doors.
-- **XOQ6.** Bridge-node memory footprint at 100+ endpoints on an 8GB jarvis,
-  given the workspace's existing memory-pressure history.
+- **XOQ6. Answered (2026-08-04, measured at 0.17.8):** ~145MB RSS floor,
+  ~0.3MB per additional endpoint, ~177MB at 100 endpoints, startup <0.5s.
+  Budget ~200MB on jarvis — comparable to one more mid-sized plugin, and far
+  below the MQTT-leak class of problem. Watchdog still tracks it (§5.4).
 
 ## 11. Dependencies
 
 - **matter.js** device-role API — new coupling, per ADR-0006's accepted cost.
+  Concretely: `@matter/main` + `@matter/nodejs` (0.17.8 at time of writing),
+  **exact-pinned**. Upstream repo is now the `matter-js` GitHub org (Open Home
+  Foundation). Do **not** depend on `@matter/examples` — stale on npm; the
+  live examples are in the repo's `examples/` tree.
 - **Node.js ≥ 22.13.0** — already required.
 - **Ecosystem tolerance of uncertified accessories** — external, unowned, XOQ1.
+  Apple Home's "Add Anyway" flow is the documented, working path (Homebridge
+  2.0 and Homey ship on it); Apple DTS's position on uncertified bridges is
+  "behaviour is undefined", so it can tighten under us — a risk we accept.
 - **`indigo-device-catalog`** — soft dependency for v2 role defaults (XOQ5).
 
 ## 12. Out of scope for v1 (v2+ candidates)
 
 - Role/polarity defaults sourced from `indigo-device-catalog`.
 - Garage doors (blocked on the above).
+- Valve export (matter.js cluster is an empty stub; ecosystem support poor).
+- Fan export (matter.js cluster is a stub; includes SpeedControl-backed fans).
 - Sprinkler export as per-zone Water Valves.
-- Power/energy export via Matter's Electrical Sensor type.
+- Power/energy export via Matter's Electrical Sensor type (Apple ignores it in UI).
 - CSA certification and a real vendor ID.
-- Multiple bridge nodes / per-ecosystem export sets.
+- Multiple bridge nodes / per-ecosystem export sets. (If a device class ever
+  destabilises a whole bridge in Apple Home — the matterbridge RVC precedent —
+  per-device isolation onto its own server node is the known fix; design the
+  endpoint model so that promotion doesn't require re-architecture.)
