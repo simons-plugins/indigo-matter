@@ -16,6 +16,12 @@ device first, Domio relays a share/pairing code to the plugin, and the plugin jo
 device's fabric as a second admin over IP. The plugin owns runtime control for the
 device's lifetime.
 
+> **This is an independent, uncertified implementation.** It is not certified by the
+> Connectivity Standards Alliance (CSA), and is not affiliated with or endorsed by them.
+> It works, and is validated against real hardware — but it carries none of the
+> interoperability guarantees that come with a certified Matter controller. See
+> [Trademarks and certification](#trademarks-and-certification).
+
 ## Status
 
 **Built and live-validated, including with real hardware.** The full device-class
@@ -65,6 +71,37 @@ pytest          # full unit suite; matter-server (WebSocket) and Indigo are mock
 ```
 
 See [CLAUDE.md](./CLAUDE.md) for architecture and workspace conventions.
+
+## Trademarks and certification
+
+This plugin is an **independent, unofficial integration**. It is **not certified** by the
+Connectivity Standards Alliance, and has no affiliation with, sponsorship from, or
+endorsement by the CSA.
+
+"Matter" and the Matter logo are trademarks of the Connectivity Standards Alliance. They
+are *certification* marks — on a certified product they signal that it passed CSA
+testing. This plugin has not been through that process, so nothing here should be read as
+a claim that it has. For contrast, Home Assistant may display Matter branding because it
+holds two CSA certifications (Home Assistant as a certified user interface component, and
+the Open Home Foundation Matter Server as a certified software component).
+
+What that means in practice:
+
+- The plugin speaks the Matter protocol via [`matter-server`](https://github.com/matter-js/matterjs-server)
+  and works with real, certified devices — but it has not been tested against the CSA's
+  certification suite, so device-by-device interoperability is not guaranteed.
+- Commissioning uses the **share model**, so the device is first commissioned by a
+  certified ecosystem (Apple Home, Alexa, Google Home); this plugin joins as a second
+  admin. Your device's own certification is unaffected by anything here.
+- The optional **Allow test/development device certificates** setting relaxes device
+  attestation so uncertified devices (development boards, Homebridge/Matterbridge
+  bridges) can be commissioned. It is off by default, warns on every start, and should
+  be turned off once the device is paired.
+
+The icon bundles the Matter symbol from
+[Wikimedia Commons](https://commons.wikimedia.org/wiki/File:Logo_of_Matter_connectivity_standard.svg),
+which is public domain for copyright purposes. See
+[docs/branding/README.md](./docs/branding/README.md) for provenance.
 
 ## License
 
