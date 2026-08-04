@@ -21,13 +21,23 @@ first-class Indigo devices.
 
 A few things to know before you start:
 
-- **Wi-Fi Matter devices only, for now.** first-admin Thread commissioning (provisioning Thread credentials over BLE)
-  is unsupported, and BLE is not enabled on macOS — but Thread devices still join fine
-  over IP via the share model (below), and Wi-Fi Matter devices work directly.
-- **Domio drives commissioning.** You add devices from the **Domio iOS app**, not from
-  Indigo. Apple Home commissions the device first; Domio relays a share/pairing code to
-  the plugin, and the plugin joins the device's fabric as a second admin over IP (the
-  "share model"). The plugin owns runtime control for the device's lifetime.
+- **Wi-Fi and Thread devices both work.** What this plugin can't do is *first-admin*
+  commissioning — handing a factory-fresh device its network credentials over BLE, which
+  matter-server can't do because BLE isn't enabled on macOS. That step belongs to a device
+  that has a BLE radio: a phone, or an ecosystem hub. Everything after it is plain IP, so
+  Thread devices join and are controlled exactly like Wi-Fi ones, via the border router.
+- **Two ways to add a device, and they're equivalent.** The **Domio iOS app**, or the
+  plugin menu's **Commission device by setup code…** — both take a pairing code, both
+  handle Wi-Fi and Thread. Domio is not required.
+  - *Share model (the usual path):* an ecosystem you already own — Apple Home, Alexa,
+    Google Home — commissions the device first and owns the BLE step; the device is then
+    shared to Indigo over IP and the plugin joins as a second admin.
+  - *Factory-fresh Thread via Domio:* iOS commissions the device to the iPhone as part of
+    that flow, which is what supplies the Thread credentials.
+  - *Already on your network, never commissioned:* its printed code works directly, from
+    either entry point.
+
+  However it was added, the plugin owns runtime control for the device's lifetime.
 - **matter-server is Beta software.** Pin the version, back up the fabric, and expect
   occasional rough edges.
 
@@ -39,7 +49,8 @@ A few things to know before you start:
 - **Indigo 2025.2+** with the `indigo-matter` plugin installed (≥ **2026.0.6** — earlier
   builds launched matter-server via `npx` and no longer work; see Troubleshooting).
 - **Node.js ≥ 22.13.0** (required by matter-server 1.2.2), via **Homebrew** or nvm (Step 1).
-- Network: the Indigo Server and your Wi-Fi Matter devices on the same LAN.
+- Network: the Indigo Server on the same LAN as your Matter devices — Wi-Fi ones
+  directly, Thread ones via their border router.
 
 The plugin's only Python dependency (`websockets`) is auto-installed from
 `requirements.txt`; if that silently fails, install it manually per the note in that
@@ -209,8 +220,8 @@ Webserver listening on http://127.0.0.1:5580
 If matter-server crashed on launch, the reason is in
 `~/Library/Logs/indigo-matter/matter-server.err.log`.
 
-Once both are healthy, add a Wi-Fi Matter device from the **Domio app** — it will appear
-as a native Indigo device.
+Once both are healthy, add a device — from the **Domio app**, or via **Plugins ▸ Matter ▸
+Commission device by setup code…** — and it will appear as a native Indigo device.
 
 ---
 
@@ -261,7 +272,7 @@ matter-server runs on a different host and you have a trusted firewall in front 
 | `npm error could not determine executable to run` | Old plugin (< 2026.0.6) launched matter-server via `npx`, which no longer works (the package has no bin). | Upgrade the plugin to ≥ 2026.0.6. |
 | `Connect call failed ('127.0.0.1', 5580)` | matter-server isn't running, crashed, or is on a different port. | Check `matter-server.err.log`; confirm the port matches the config; in managed mode re-save the config; in manual mode (re)start matter-server. |
 | nvm node not found by the managed agent | Auto-detect didn't find the nvm node. | Set **Node bin directory** explicitly to your own nvm bin dir (see Step 1), or use Homebrew node. |
-| `BLE is not enabled on this platform` warning | Expected — BLE isn't used (Wi-Fi only). | Benign; ignore. |
+| `BLE is not enabled on this platform` warning | Expected — matter-server never uses BLE. The out-of-box BLE step belongs to a phone or ecosystem hub; everything this plugin does is over IP, for Wi-Fi and Thread alike. | Benign; ignore. |
 | New managed LaunchAgent doesn't take effect | A prior agent with the same label is still loaded. | Plugins ▸ Matter ▸ **Restart matter-server** (it reloads the plist and stops strays), or `launchctl bootout gui/$(id -u)/com.simons-plugins.indigo-matter` then restart the plugin. |
 | `Server failed to start [storage-lock] Storage is locked by another process (pid N)` | A second matter-server (orphaned from an earlier LaunchAgent) is still running and holds the storage lock. | The plugin now reaps such strays on start/restart — Plugins ▸ Matter ▸ **Restart matter-server**. If it persists, reboot the Mac (kills the orphan; the lock goes stale and is reclaimed automatically). |
 | matter-server won't start after an upgrade (wedged install) | The installed package is damaged or incompatible. | Plugins ▸ Matter ▸ **Reinstall matter-server (clean)…** — deletes `~/indigo-matter/node_modules` and reinstalls fresh. Your commissioned devices are kept (the fabric/storage is untouched). |

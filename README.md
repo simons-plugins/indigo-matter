@@ -48,16 +48,43 @@ the plugin's own commission-by-setup-code menu. Thread provisioning is done by a
 with a BLE radio and the network credentials (an admin-1 ecosystem, or the iPhone itself
 during the Domio flow); the plugin then joins over IP via that ecosystem's border router
 (HomePod/Apple TV, TBR-capable Echo, Nest Hub). See
-[Matter](https://simons-plugins.github.io/indigo-matter/MATTER.html) for how the pieces fit; validation specifics live
-in [Handover](https://simons-plugins.github.io/indigo-matter/HANDOVER.html).
+[Field Notes № 1](https://simons-plugins.github.io/indigo-matter/matter.html) for how the pieces
+fit; validation specifics live in
+[Handover](https://simons-plugins.github.io/indigo-matter/HANDOVER.html).
 
 ## Setup
 
-matter-server is a separate Node.js runtime. In local mode the plugin installs and
-manages it for you — **Plugins ▸ Matter ▸ Install/update matter-server** installs the
-pinned version with your Node and restarts onto it (no Terminal). See
-**[Install](https://simons-plugins.github.io/indigo-matter/INSTALL.html)** for the full guide (Node, matter-server, the two
-run modes, verification, backups, and troubleshooting).
+The plugin doesn't speak Matter directly — it drives **matter-server**, a separate
+Node.js process holding the Indigo-owned fabric. In local mode the plugin installs and
+manages it for you, so setup is three steps and no Terminal beyond installing Node:
+
+**1. Install Node.js 22** (≥ 22.13.0):
+
+```bash
+brew install node@22
+brew link node@22
+node --version          # confirm v22.x
+```
+
+Leave **Node bin directory** blank in the plugin config — auto-detect finds Homebrew
+first. (nvm works too; pin `nodeBinDir` explicitly if you use it.)
+
+**2. Install matter-server:** **Plugins ▸ Matter ▸ Install/update matter-server**. This
+installs the pinned version with the *same* Node it will run the server with, and pins
+that Node — which avoids the most common failure, installing with one Node and running
+with another whose native modules won't load.
+
+**3. Verify** — the Indigo event log should show:
+
+```text
+connected to matter-server, listening
+reconciled N Matter node(s)
+```
+
+`N` is 0 on a fresh install; that's fine. If you instead see
+`Connect call failed ('127.0.0.1', 5580)`, matter-server isn't running — that, plus
+manual mode, fabric backups, upgrading and uninstalling, is covered in the
+[full install guide](https://simons-plugins.github.io/indigo-matter/INSTALL.html).
 
 ## Requirements
 
@@ -71,22 +98,19 @@ run modes, verification, backups, and troubleshooting).
 
 ## Documentation
 
-**[Field Notes](https://simons-plugins.github.io/indigo-matter/)** — longer-form write-ups,
-published as a site:
+**[Field Notes](https://simons-plugins.github.io/indigo-matter/)** — the guides, properly
+typeset. **Start here.**
 
 - **[№ 1 — The Landscape](https://simons-plugins.github.io/indigo-matter/matter.html)** —
-  Matter, Thread, and where Indigo fits.
+  Matter & Thread explained: how Indigo, Domio, matter-server and Apple Home fit together,
+  what to do when you don't have Apple Home, sharing with other platforms, firmware, and
+  troubleshooting.
 - **[№ 2 — The Proving Ground](https://simons-plugins.github.io/indigo-matter/testing.html)** —
-  how this plugin is tested.
+  how this plugin is tested: the unit suite, the device zoo, the virtual matter.js fleet,
+  and live validation on a production server.
 
-Reference documentation:
-
-- **[Matter](https://simons-plugins.github.io/indigo-matter/MATTER.html)** — Matter & Thread explained: how Indigo, Domio, matter-server and Apple Home fit together. **Start here.**
-- **[Install](https://simons-plugins.github.io/indigo-matter/INSTALL.html)** — matter-server install & plugin setup.
-- **[Testing](https://simons-plugins.github.io/indigo-matter/TESTING.html)** — how the plugin is tested: unit suite, the device zoo, the virtual matter.js fleet, and live validation.
-- **[PRD](https://simons-plugins.github.io/indigo-matter/PRD-indigo-matter-plugin.html)** — product requirements and milestones.
-- **[Implementation](https://simons-plugins.github.io/indigo-matter/IMPLEMENTATION.html)** — protocols, scaffold, setup, cluster handlers.
-- **[API](https://simons-plugins.github.io/indigo-matter/API.html)** — the Domio ↔ plugin HTTP contract (v1.3, served over the Indigo Web Server).
+Setup is covered above; the [full install guide](https://simons-plugins.github.io/indigo-matter/INSTALL.html)
+has manual mode, backups, upgrading and troubleshooting.
 
 ## Development
 
@@ -94,7 +118,12 @@ Reference documentation:
 pytest          # full unit suite; matter-server (WebSocket) and Indigo are mocked
 ```
 
-See [CLAUDE.md](https://github.com/simons-plugins/indigo-matter/blob/main/CLAUDE.md) for architecture and workspace conventions.
+Developer reference, in the repo — not intended as user documentation:
+
+- [`docs/IMPLEMENTATION.md`](https://github.com/simons-plugins/indigo-matter/blob/main/docs/IMPLEMENTATION.md) — protocols, scaffold, cluster handlers.
+- [`docs/API.md`](https://github.com/simons-plugins/indigo-matter/blob/main/docs/API.md) — the Domio ↔ plugin HTTP contract (v1.3).
+- [`docs/PRD-indigo-matter-plugin.md`](https://github.com/simons-plugins/indigo-matter/blob/main/docs/PRD-indigo-matter-plugin.md) — product requirements and milestones.
+- [`CLAUDE.md`](https://github.com/simons-plugins/indigo-matter/blob/main/CLAUDE.md) — architecture and workspace conventions.
 
 ## Trademarks and certification
 

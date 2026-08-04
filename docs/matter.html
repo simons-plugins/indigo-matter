@@ -210,8 +210,9 @@
       as the Indigo Mac (§ 11).</li>
       <li><b>Open pairing mode.</b> Home app → device settings → <em>Turn On Pairing Mode</em>.
       A fresh one-time setup code appears — the printed QR code will <em>not</em> work for this.</li>
-      <li><b>Add in Domio.</b> Add Matter device → enter the code, a name and a room. Domio
-      posts it to the plugin; the plugin joins as a second admin over IP and creates the
+      <li><b>Enter the code</b>, in whichever is closer to hand — <b>Domio</b> (add Matter
+      device → code, name, room) or <b>Indigo</b> (Plugins ▸ Matter ▸ <em>Commission device by
+      setup code…</em>). Either way the plugin joins as a second admin over IP and creates the
       Indigo device(s). Discovery can take a couple of minutes on a busy LAN — the plugin
       waits up to five.</li>
       <li><b>Done.</b> The device appears in Indigo (the room becomes a device folder),
@@ -220,12 +221,15 @@
     <div class="pull">Once the pairing-mode code exists, the join is pure IP — no Bluetooth, no
     phone, no proximity. Everything downstream of the code is ecosystem-free.<small>True for
     Thread exactly as for Wi-Fi</small></div>
-    <p><strong>Without Domio</strong> (advanced): because of the above, the plugin menu’s
-    <em>Commission device by setup code…</em> is fully equivalent — paste the pairing-mode code
-    by hand, Wi-Fi or Thread alike. Domio’s value is workflow: you’re standing at the new
-    device with the Home app open when the code appears, and Domio is the next tap on the same
-    phone. (And if a device is already on your network but was never commissioned by anyone,
-    its <em>printed</em> code works directly in either entry point.)</p>
+    <p><strong>The two entry points are equals</strong>, and for the same reason: once the code
+    exists, the rest is plain IP. The plugin menu’s <em>Commission device by setup code…</em>
+    does exactly what Domio does — paste the pairing-mode code, Wi-Fi or Thread alike. Neither
+    is a fallback for the other, and Domio is not required.</p>
+    <p>Pick on convenience, not capability. Domio wins when you’re standing at the new device
+    with the Home app open and the code has just appeared — it’s the next tap on the same phone,
+    and you never go near the Mac. The plugin menu wins when you’re already in Indigo, or have
+    the code some other way. (And if a device is already on your network but was never
+    commissioned by anyone, its <em>printed</em> code works directly in either entry point.)</p>
     <p><strong>Removing:</strong> plugin menu → <em>Decommission Matter device…</em> — removes
     only the Indigo fabric; the device stays in Apple Home and everywhere else. Deleting the
     Indigo device alone does <em>not</em> work — by design the plugin recreates it at the next
