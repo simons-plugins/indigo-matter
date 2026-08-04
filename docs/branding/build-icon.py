@@ -25,7 +25,10 @@ CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 RENDER = 1024
 SCALE = RENDER / 256.0
 SYMBOL_WIDTH = 86   # design units — 100 crowds the walls, 74 looks lost
-SYMBOL_CX, SYMBOL_CY = 128, 152
+# y136 centres it in the house: the frame spans y44-204, and lower values
+# (152 was the first cut) leave an obvious gap under the gable, while 130
+# starts crowding the roof apex.
+SYMBOL_CX, SYMBOL_CY = 128, 136
 
 
 def _shot(svg, png, w, h):
