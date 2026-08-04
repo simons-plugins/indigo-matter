@@ -49,7 +49,8 @@ A few things to know before you start:
 - **Indigo 2025.2+** with the `indigo-matter` plugin installed (≥ **2026.0.6** — earlier
   builds launched matter-server via `npx` and no longer work; see Troubleshooting).
 - **Node.js ≥ 22.13.0** (required by matter-server 1.2.2), via **Homebrew** or nvm (Step 1).
-- Network: the Indigo Server and your Wi-Fi Matter devices on the same LAN.
+- Network: the Indigo Server on the same LAN as your Matter devices — Wi-Fi ones
+  directly, Thread ones via their border router.
 
 The plugin's only Python dependency (`websockets`) is auto-installed from
 `requirements.txt`; if that silently fails, install it manually per the note in that
