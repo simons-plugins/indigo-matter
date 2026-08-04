@@ -17,6 +17,7 @@ import {
     type ErrorCodeValue,
     EventName,
     type EventFrame,
+    type EventNameValue,
     type HandshakeFrame,
     PROTOCOL_VERSION,
     ProtocolError,
@@ -74,7 +75,7 @@ export class BridgeWsServer {
      * when nobody is attached: the plugin re-`attach`es on reconnect and gets a
      * full reconcile, so a missed event has nothing to recover.
      */
-    sendEvent(event: string, data: Record<string, unknown>): void {
+    sendEvent(event: EventNameValue, data: Record<string, unknown>): void {
         const socket = this.#attached;
         if (socket === undefined) {
             return;

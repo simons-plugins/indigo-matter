@@ -68,19 +68,56 @@ export interface ErrorFrame {
     details: string;
 }
 
-/** node → plugin, unsolicited (§1). */
-export interface EventFrame {
-    event: string;
-    data: Record<string, unknown>;
-}
-
 /** §5 `window_closed` — why the enhanced commissioning window ended. */
 export type WindowClosedReason = "expired" | "commissioned";
 
-/** §5 event names emitted in E0. The rest arrive with endpoint CRUD in E1. */
+/**
+ * The complete §5 event name domain. Only `window_closed` is *emitted* in E0 —
+ * the rest arrive with endpoint CRUD — but the whole set is declared here so the
+ * fixture mirror can catch a misspelt name at compile time rather than shipping
+ * an event the plugin logs as unknown and drops.
+ */
 export const EventName = {
+    command: "command",
+    fabricsChanged: "fabrics_changed",
+    commissioned: "commissioned",
+    decommissioned: "decommissioned",
     windowClosed: "window_closed",
+    driftDetected: "drift_detected",
 } as const;
+
+export type EventNameValue = (typeof EventName)[keyof typeof EventName];
+
+/** node → plugin, unsolicited (§1). */
+export interface EventFrame {
+    event: EventNameValue;
+    data: Record<string, unknown>;
+}
+
+/**
+ * The v1 role enum (§4.2) — the TypeScript mirror of `bridge_protocol.ROLES`.
+ * Typing `EndpointSummary.role` as this rather than `string` is what makes a
+ * typo in a golden frame or a summary a compile error on this side.
+ */
+export const Role = {
+    onOffPlugInUnit: "onOffPlugInUnit",
+    onOffLight: "onOffLight",
+    dimmableLight: "dimmableLight",
+    colorTemperatureLight: "colorTemperatureLight",
+    extendedColorLight: "extendedColorLight",
+    windowCovering: "windowCovering",
+    doorLock: "doorLock",
+    occupancySensor: "occupancySensor",
+    contactSensor: "contactSensor",
+    temperatureSensor: "temperatureSensor",
+    humiditySensor: "humiditySensor",
+    lightSensor: "lightSensor",
+    pressureSensor: "pressureSensor",
+    flowSensor: "flowSensor",
+    thermostat: "thermostat",
+} as const;
+
+export type RoleValue = (typeof Role)[keyof typeof Role];
 
 /** §4.3 */
 export interface FabricInfo {
@@ -101,7 +138,7 @@ export interface StatusReport {
 export interface EndpointSummary {
     indigoDeviceId: number;
     endpointNumber: number;
-    role: string;
+    role: RoleValue;
 }
 
 export interface DriftEntry {

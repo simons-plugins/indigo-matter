@@ -25,6 +25,7 @@ import {
     type FabricInfo,
     type PairingReport,
     ProtocolError,
+    Role,
     type StatusReport,
     type WindowClosedReason,
 } from "./protocol.js";
@@ -40,7 +41,7 @@ export const PRODUCT_NAME = "Indigo Matter Bridge";
 /** The one hard-coded export of E0. E1 replaces this with protocol-driven CRUD. */
 const E0_DEVICE_ID = 999001;
 const E0_LABEL = "Indigo E0 Test";
-const E0_ROLE = "onOffPlugInUnit";
+const E0_ROLE = Role.onOffPlugInUnit;
 
 /** PBKDF iteration count for enhanced-window verifiers. Spec floor is 1000. */
 const PBKDF_ITERATIONS = 1000;

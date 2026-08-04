@@ -15,7 +15,7 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/main.js",
-    "test": "tsc -p tsconfig.test.json && rm -rf .test-build/test/fixtures && cp -R test/fixtures .test-build/test/fixtures && node --test \".test-build/test/*.test.js\"",
+    "test": "tsc -p tsconfig.test.json && rm -rf .test-build/test/fixtures && mkdir -p .test-build/test/fixtures && cp -R ../tests/fixtures/bridge_protocol .test-build/test/fixtures/bridge_protocol && node --test \".test-build/test/*.test.js\"",
     "clean": "rm -rf dist .test-build"
   },
   "dependencies": {

@@ -13,6 +13,10 @@ import protocol
 
 _CLOSE = object()
 
+#: Pass as ``handshake`` for a peer that opens the socket and then says nothing —
+#: the "something else is listening on this port" case the hello timeout covers.
+NO_HANDSHAKE = object()
+
 
 class FakeWebSocket:
     """A controllable stand-in for a ``websockets`` connection.
@@ -24,16 +28,27 @@ class FakeWebSocket:
     """
 
     def __init__(self, responder: Optional[Callable[[dict], list]] = None,
-                 server_info: Optional[dict] = None):
+                 server_info: Optional[dict] = None,
+                 handshake=None):
         self._outbox: asyncio.Queue = asyncio.Queue()
         self.sent: list[dict] = []
         self._closed = False
         self._responder = responder
-        # matter-server pushes server_info as a BARE object on connect (no
-        # event/message_id wrapper) — match that real handshake shape.
-        self._outbox.put_nowait(json.dumps(
-            server_info or {"sdk_version": "matter-server/0.6.2", "fabric_id": "0x0"}
-        ))
+        # Both peers push a BARE object as their first frame (no event/message_id
+        # wrapper): matter-server's server_info, the bridge node's hello (§2).
+        # ``handshake`` seeds whichever one the test needs; matter-server's is the
+        # default so the controller tests read unchanged. NO_HANDSHAKE seeds
+        # nothing at all — the socket opens and then stays mute.
+        if handshake is not NO_HANDSHAKE:
+            self._outbox.put_nowait(json.dumps(
+                handshake if handshake is not None
+                else (server_info or {"sdk_version": "matter-server/0.6.2", "fabric_id": "0x0"})
+            ))
+
+    @property
+    def closed(self) -> bool:
+        """True once anyone has closed this socket — the client included."""
+        return self._closed
 
     async def send(self, raw: str) -> None:
         if self._closed:
@@ -67,6 +82,14 @@ class FakeWebSocket:
 
     async def push_event(self, event: str, data: dict) -> None:
         await self._outbox.put(json.dumps({protocol.KEY_EVENT: event, protocol.KEY_DATA: data}))
+
+    async def push_raw(self, raw: str) -> None:
+        """Deliver an arbitrary text frame — including one that is not valid JSON."""
+        await self._outbox.put(raw)
+
+    async def push_frame(self, frame) -> None:
+        """Deliver an arbitrary JSON-encodable frame (a list, a bare string, …)."""
+        await self._outbox.put(json.dumps(frame))
 
     def sent_commands(self) -> list[str]:
         return [f.get(protocol.KEY_COMMAND) for f in self.sent]

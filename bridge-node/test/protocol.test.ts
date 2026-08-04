@@ -33,6 +33,20 @@ async function attach(client: TestClient): Promise<Record<string, unknown>> {
     return client.request(golden.attach.request);
 }
 
+/**
+ * What the E0 node answers an `attach` with.
+ *
+ * NOT `golden.attach.response`: that frame is the lawful §3.1 pair for a request
+ * carrying `endpoints: []` (empty desired set → empty live set), which is what
+ * the plugin asserts against. E0 does not reconcile the requested set at all —
+ * it serves one hard-coded endpoint and returns that status — so this is the
+ * live truth until E2 makes attach reconcile. Deliberate, and the fixture's
+ * _comment says so.
+ */
+function e0AttachResponse(messageId: string): Record<string, unknown> {
+    return { message_id: messageId, result: golden.get_status.response.result };
+}
+
 before(async () => {
     await server.listen();
 });
@@ -59,7 +73,7 @@ describe("attach (§3.1)", () => {
     it("accepts a matching protocol version and returns a StatusReport", async () => {
         const client = await connect();
         const response = await attach(client);
-        assert.deepEqual(response, golden.attach.response);
+        assert.deepEqual(response, e0AttachResponse(golden.attach.request.message_id as string));
         client.close();
     });
 
@@ -104,7 +118,7 @@ describe("attach (§3.1)", () => {
         const client = await connect();
         await attach(client);
         const again = await attach(client);
-        assert.deepEqual(again, golden.attach.response);
+        assert.deepEqual(again, e0AttachResponse(golden.attach.request.message_id as string));
         assert.equal(client.closed, false);
 
         const status = await client.request(golden.get_status.request);
@@ -122,7 +136,7 @@ describe("gating (§1.1)", () => {
         client.close();
     });
 
-    it("returns unknown_command for E1 endpoint CRUD", async () => {
+    it("returns unknown_command for a name outside §3", async () => {
         const client = await connect();
         await attach(client);
         const response = await client.request(golden.unknown_command.request);
@@ -229,6 +243,11 @@ describe("open_commissioning_window (§3.8)", () => {
             });
             assert.equal(response.error_code, "malformed_args", `durationSeconds ${durationSeconds} was accepted`);
         }
+        // The golden frame for that refusal, asserted whole (§7).
+        assert.deepEqual(
+            await client.request(golden.open_window_malformed_args.request),
+            golden.open_window_malformed_args.response,
+        );
         for (const durationSeconds of [180, 900]) {
             const response = await client.request({
                 message_id: `ok-${durationSeconds}`,
@@ -244,14 +263,12 @@ describe("open_commissioning_window (§3.8)", () => {
     it("reports an unexpected facade failure as internal, with the message as details", async () => {
         // The StubBridge hook exists precisely so this path is covered without
         // a Matter stack that can be made to fail on demand.
-        bridge.openWindowError = new Error("mDNS advertiser is down");
+        bridge.openWindowError = new Error(golden.open_window_internal.response.details as string);
         try {
             const client = await connect();
             await attach(client);
-            const response = await client.request(golden.open_commissioning_window.request);
-            assert.equal(response.error_code, "internal");
-            assert.equal(response.details, "mDNS advertiser is down");
-            assert.equal(response.message_id, golden.open_commissioning_window.request.message_id);
+            const response = await client.request(golden.open_window_internal.request);
+            assert.deepEqual(response, golden.open_window_internal.response);
             client.close();
         } finally {
             bridge.openWindowError = undefined;
@@ -261,14 +278,13 @@ describe("open_commissioning_window (§3.8)", () => {
     it("passes a ProtocolError through with its own error_code", async () => {
         bridge.openWindowError = new ProtocolError(
             ErrorCode.commissioningWindowFailed,
-            "A commissioning window is already open",
+            golden.open_window_failed.response.details as string,
         );
         try {
             const client = await connect();
             await attach(client);
-            const response = await client.request(golden.open_commissioning_window.request);
-            assert.equal(response.error_code, "commissioning_window_failed");
-            assert.equal(response.details, "A commissioning window is already open");
+            const response = await client.request(golden.open_window_failed.request);
+            assert.deepEqual(response, golden.open_window_failed.response);
             client.close();
         } finally {
             bridge.openWindowError = undefined;

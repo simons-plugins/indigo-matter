@@ -7,6 +7,7 @@ runtime is mocked via ``mock_indigo_base``.
 """
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, Mock
@@ -20,6 +21,16 @@ SERVER_PLUGIN_DIR = (
     / "Server Plugin"
 )
 sys.path.insert(0, str(SERVER_PLUGIN_DIR))
+
+#: The golden bridge-protocol frames (BRIDGE_PROTOCOL §7). THE shared location:
+#: `bridge-node`'s TypeScript suite copies this same directory into its build,
+#: so a frame change that only updates one side fails that side's tests.
+BRIDGE_FRAMES_PATH = Path(__file__).parent / "fixtures" / "bridge_protocol" / "frames.json"
+
+
+def load_bridge_frames() -> dict:
+    """Parse the golden bridge-protocol frames."""
+    return json.loads(BRIDGE_FRAMES_PATH.read_text(encoding="utf-8"))
 
 
 @pytest.fixture
