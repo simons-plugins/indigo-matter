@@ -685,15 +685,24 @@ class Plugin(indigo.PluginBase):
             raise MatterUnavailable(str(exc)) from exc
 
     async def _decommission(self, node_id):
+        # Captured BEFORE the delete: it is the only way to tell "node we have
+        # never heard of" (a genuine 404) from "node we know, whose removal
+        # failed". Conflating them told the user "Unknown node" about a node that
+        # was still commissioned, and — for a node with no Indigo devices, where
+        # removed_ids is always empty — dropped it from the picker so the
+        # decommission could not be retried (issue #111 review).
+        known = self.device_sync.knows_node(node_id)
         fabric_removed = True
         try:
             await self.matter.remove_node(node_id)
         except Exception as exc:  # noqa: BLE001
             self.logger.warning("remove_node failed (device may be offline): %s", exc)
             fabric_removed = False
-        removed_ids = self.device_sync.delete_node(node_id)
-        if not removed_ids and fabric_removed is False:
-            return None  # unknown node and unreachable → 404
+        # Only forget the node if it actually left the fabric; otherwise it must
+        # stay listed so the user can retry.
+        removed_ids = self.device_sync.delete_node(node_id, forget=fabric_removed)
+        if not removed_ids and not fabric_removed and not known:
+            return None  # genuinely unknown and unreachable → 404
         return {
             "nodeId": node_id_to_str(node_id),
             "removedIndigoDeviceIds": removed_ids,

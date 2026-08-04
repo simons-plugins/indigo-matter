@@ -133,6 +133,28 @@ def _kvlist(states: dict) -> list:
     return [{"key": key, "value": value} for key, value in states.items()]
 
 
+def _salvage_node_id(raw: Any) -> Optional[int]:
+    """Best-effort node id from a raw node dict that ``parse_node`` rejected.
+
+    Accepts the plain ints matter-server sends and the ``"0x…"`` strings this
+    codebase elsewhere treats as a legitimate node-id form (see
+    ``node_id_to_str``). Returns None when nothing usable is present.
+    """
+    if not isinstance(raw, dict):
+        return None
+    value = raw.get("node_id")
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        try:
+            return int(value, 0)
+        except ValueError:
+            return None
+    return None
+
+
 class DeviceSync:
     def __init__(self, registry: Any, logger: Any) -> None:
         self.registry = registry
@@ -176,6 +198,21 @@ class DeviceSync:
         # Set Sensitivity Level menu callback (plugin.py) needs this value
         # captured somewhere durable; refreshed on every create/reconcile pass.
         self._sensitivity_supported: dict[tuple[int, int], int] = {}
+        # Every node id matter-server has told us about this session, whether or
+        # not it produced any Indigo device. `_index` cannot serve this purpose:
+        # it is keyed by endpoints that HAVE an Indigo device (however the entry
+        # got there — creation, note_device, or rebuild_index), so a node that
+        # maps to nothing never appears in it, and the decommission picker (which
+        # reads list_nodes()) could never offer the one kind of node most in need
+        # of decommissioning — an empty bridge (issue #111; #105 explains why such
+        # a node exists at all).
+        #
+        # Unlike `_index` this is NOT rebuilt from Indigo at startup — nothing in
+        # Indigo records a node that produced no devices — so an empty bridge is
+        # unlistable until the first successful reconcile. Refreshed on every
+        # reconcile pass (WS connect/reconnect only, see plugin._resync), so a
+        # node removed out of band stops being offered.
+        self._known_nodes: set[int] = set()
 
     # ------------------------------------------------------------------
     # Active-device tracking (deviceStartComm/deviceStopComm)
@@ -293,15 +330,30 @@ class DeviceSync:
             with self._lock:
                 self._index.setdefault(key, {})[type_id] = dev.id
 
-    def delete_node(self, node_id: Any) -> list:
+    def delete_node(self, node_id: Any, forget: bool = True) -> list:
         """Delete all Indigo devices for a node; return the ids actually deleted.
 
         Ids whose Indigo delete fails are NOT included in the returned list, so
         the decommission response never claims a device was removed when it
         wasn't.
+
+        ``forget`` controls whether the node also stops being offered by
+        :meth:`list_nodes`. Pass the *fabric removal's* outcome: only this
+        method's caller knows whether the node actually left the fabric, and
+        forgetting one that didn't is unrecoverable for a node with no Indigo
+        devices — ``_index`` cannot restore it, so it would vanish from the
+        picker while still commissioned, with no way to retry until the next
+        reconcile (issue #111 review).
         """
         target = int(node_id)
         with self._lock:
+            # Stop offering a node that has genuinely left the fabric. Pruning
+            # _index alone used to suffice — a node with no index entries simply
+            # vanished from list_nodes() — but now that list_nodes() also draws
+            # on _known_nodes, a decommissioned node would linger there until the
+            # next reconcile_all and could be picked a second time.
+            if forget:
+                self._known_nodes.discard(target)
             # Collect all dev_ids across all endpoints for this node
             candidates: list[int] = []
             for (nid, _eid), type_map in self._index.items():
@@ -327,18 +379,37 @@ class DeviceSync:
             self._index = new_index
             return deleted
 
-    def node_count(self) -> int:
+    def knows_node(self, node_id: Any) -> bool:
+        """Whether this node is one we currently track — same set list_nodes offers.
+
+        Lets a caller tell "node we have never heard of" from "node we know, whose
+        removal failed", which the decommission path must not conflate: the latter
+        deserves the retry guidance, not a 404 (issue #111 review).
+        """
+        target = int(node_id)
         with self._lock:
-            return len({nid for (nid, _eid) in self._index})
+            return target in self._known_nodes or any(nid == target for (nid, _eid) in self._index)
+
+    def node_count(self) -> int:
+        # Counts the same nodes list_nodes() offers — including one that produced
+        # no Indigo devices. Deriving this from _index alone would under-report a
+        # commissioned empty bridge in the /status payload's nodeCount.
+        with self._lock:
+            return len(self._known_nodes | {nid for (nid, _eid) in self._index})
 
     def list_nodes(self) -> list:
         """Per-node summary for UI pickers: ``[(node_id, [device names])]``.
+
+        Every node matter-server has reported is listed, INCLUDING one that
+        produced no Indigo devices — its entry carries an empty name list, which
+        ``getMatterNodes`` in ``plugin.py`` renders as "(no Indigo devices)".
+        See ``_known_nodes`` for why ``_index`` alone could not do this.
 
         Sorted by node id; device names resolved outside the lock so a slow
         Indigo lookup can't stall state/command dispatch.
         """
         with self._lock:
-            by_node: dict[int, set] = {}
+            by_node: dict[int, set] = {nid: set() for nid in self._known_nodes}
             for (nid, _eid), type_map in self._index.items():
                 by_node.setdefault(nid, set()).update(type_map.values())
         out = []
@@ -375,6 +446,9 @@ class DeviceSync:
         # that node_added raced ahead and created with the bare product name.
         authoritative = bool((node.suggested_name or "").strip()) or bool((suggested_room or "").strip())
         with self._lock:
+            # Covers the commission and node_added paths; reconcile_all maintains
+            # _known_nodes independently (see list_nodes).
+            self._known_nodes.add(int(node.node_id))
             # Plan over every mappable endpoint (existing or not) so the
             # "(endpoint N)" suffix is decided by the node's true device count,
             # not by how many happen to be missing on this pass. A plug's root
@@ -1315,13 +1389,26 @@ class DeviceSync:
     def reconcile_all(self, raw_nodes: list) -> None:
         self.rebuild_index()
         live: set[tuple[int, int]] = set()
+        seen_nodes: set[int] = set()
         for raw in raw_nodes:
             # one malformed node must not sink reconciliation for the rest
             try:
                 node = parse_node(raw)
             except Exception as exc:  # noqa: BLE001
-                self.logger.warning("skipping unparseable Matter node: %s", exc)
+                # Keep the node offered for decommission if its id is salvageable.
+                # Parse failure is a property of the node's SHAPE, so it recurs on
+                # every pass — dropping it would make a malformed node permanently
+                # undecommissionable, and a malformed node is a prime candidate for
+                # removal. The id is all _decommission needs.
+                salvaged = _salvage_node_id(raw)
+                if salvaged is not None:
+                    seen_nodes.add(salvaged)
+                self.logger.warning(
+                    "skipping unparseable Matter node %s: %s",
+                    node_id_to_str(salvaged) if salvaged is not None else "(id unreadable)", exc,
+                )
                 continue
+            seen_nodes.add(int(node.node_id))
             for endpoint in node.endpoints:
                 live.add((node.node_id, endpoint.endpoint_id))
             try:
@@ -1335,12 +1422,28 @@ class DeviceSync:
             except Exception as exc:  # noqa: BLE001
                 self.logger.warning("reconcile of node %s failed: %s", node.node_id, exc)
         with self._lock:
+            # raw_nodes is matter-server's authoritative list, so a node absent
+            # from it is no longer commissioned — stop offering it for
+            # decommission rather than inviting an op that cannot succeed.
+            dropped = self._known_nodes - seen_nodes
+            self._known_nodes = seen_nodes
             orphans = [
                 dev_id
                 for (node_id, _ep), type_map in self._index.items()
                 if (node_id, _ep) not in live
                 for dev_id in type_map.values()
             ]
+        if dropped:
+            # A node with Indigo devices leaves evidence when it disappears (the
+            # orphan sweep above marks them unreachable). One with NO devices
+            # leaves none at all, so without this line a transient short/empty
+            # get_nodes() would silently retract it from the decommission list and
+            # read to the user as "it must already be gone".
+            self.logger.warning(
+                "Matter node(s) %s are no longer reported by matter-server — they will "
+                "not be offered for decommission until they reappear.",
+                ", ".join(node_id_to_str(n) for n in sorted(dropped)),
+            )
         for dev_id in orphans:
             self._safe_unreachable(dev_id)
 

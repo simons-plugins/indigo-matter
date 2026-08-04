@@ -1186,6 +1186,145 @@ def test_list_nodes_orders_multiple_nodes_and_groups_by_node(ds, indigo_env):
     assert nodes[1][1] == ["Office Plug"]
 
 
+# ---------------------------------------------------------------------------
+# A node that produced NO devices must still be listed (issue #105 follow-on):
+# the decommission picker reads list_nodes(), so an empty bridge that isn't
+# listed can never be decommissioned — the one node most in need of it.
+# ---------------------------------------------------------------------------
+
+# The real shape from jarvis: a Homebridge child bridge publishing a bare
+# Aggregator (0x000E) on ep1 with descriptor only and an empty PartsList.
+EMPTY_BRIDGE_NODE = {
+    "node_id": 53,                      # 0x35
+    "available": True,
+    "attributes": {
+        "0/40/1": "Homebridge",
+        "0/40/3": "Homebridge iCloud",
+        "1/29/0": [{"0": 14}],          # Descriptor -> DeviceType 0x000E Aggregator
+    },
+}
+
+
+def test_list_nodes_includes_a_node_that_created_no_devices(ds, indigo_env):
+    ds.create_from_raw(EMPTY_BRIDGE_NODE, "")
+    nodes = ds.list_nodes()
+    assert nodes == [(53, [])]          # listed, with no device names
+
+
+def test_list_nodes_includes_empty_bridge_alongside_real_nodes(ds, indigo_env):
+    ds.create_from_raw(RELAY_NODE, "Office Plug")
+    ds.create_from_raw(EMPTY_BRIDGE_NODE, "")
+    nodes = dict(ds.list_nodes())
+    assert nodes[42] == ["Office Plug"]
+    assert nodes[53] == []              # the empty bridge is selectable too
+
+
+def test_reconcile_lists_an_empty_bridge_it_has_seen(ds, indigo_env):
+    # The path that actually matters: a bridge picked up by reconcile (not by a
+    # user-driven commission) must reach the picker.
+    ds.reconcile_all([EMPTY_BRIDGE_NODE])
+    assert ds.list_nodes() == [(53, [])]
+
+
+def test_decommission_removes_an_empty_bridge_from_the_picker_immediately(ds, indigo_env):
+    """Regression: a decommissioned node must not linger in the picker.
+
+    Pruning _index alone used to be enough — a node with no index entries simply
+    vanished from list_nodes(). Once list_nodes() also drew on _known_nodes, a
+    node with no devices survived its own decommission and could be selected a
+    second time, which is exactly what happened on jarvis with 0x35.
+    """
+    ds.create_from_raw(EMPTY_BRIDGE_NODE, "")
+    assert ds.list_nodes() == [(53, [])]
+    ds.delete_node(53)                    # what decommission calls
+    assert ds.list_nodes() == []          # gone at once, without waiting for a reconcile
+
+
+def test_failed_fabric_removal_keeps_an_empty_bridge_listed_for_retry(ds, indigo_env):
+    """forget=False must leave the node offered — otherwise the retry is impossible.
+
+    An empty bridge has no _index entries, so _known_nodes is the ONLY thing
+    keeping it in the picker. Forgetting it when the fabric removal failed left
+    a still-commissioned node unreachable from the UI (issue #111 review).
+    """
+    ds.create_from_raw(EMPTY_BRIDGE_NODE, "")
+    ds.delete_node(53, forget=False)          # fabric removal failed
+    assert ds.list_nodes() == [(53, [])]      # still offered, still retryable
+
+
+def test_knows_node_covers_device_less_and_device_bearing_nodes(ds, indigo_env):
+    ds.create_from_raw(EMPTY_BRIDGE_NODE, "")
+    ds.create_from_raw(RELAY_NODE, "Office Plug")
+    assert ds.knows_node(53) is True          # tracked only via _known_nodes
+    assert ds.knows_node(42) is True
+    assert ds.knows_node(999) is False        # genuinely unknown -> 404 path
+
+
+def test_node_count_includes_a_node_with_no_devices(ds, indigo_env):
+    # node_count feeds /status's nodeCount; deriving it from _index alone
+    # under-reported a commissioned empty bridge relative to the picker.
+    ds.create_from_raw(RELAY_NODE, "Office Plug")
+    ds.create_from_raw(EMPTY_BRIDGE_NODE, "")
+    assert ds.node_count() == 2
+    assert len(ds.list_nodes()) == ds.node_count()
+
+
+def test_unparseable_node_is_still_offered_for_decommission(ds, indigo_env, mock_logger):
+    """Parse failure is a property of the node's SHAPE, so it recurs every pass.
+
+    Dropping it would make a malformed node permanently undecommissionable —
+    and a malformed node is a prime candidate for removal. The id is all
+    _decommission needs.
+    """
+    bad = {"node_id": 53, "attributes": {"1/29/0": [{"0": "not-an-int"}]}}
+    ds.reconcile_all([bad])
+    assert ds.list_nodes() == [(53, [])]
+    assert ds.knows_node(53) is True
+    warning = " ".join(str(c) for c in ds.logger.warning.call_args_list)
+    assert "0x35" in warning                  # the id survives into the log
+
+
+def test_unparseable_node_with_no_usable_id_is_skipped_quietly(ds, indigo_env):
+    ds.reconcile_all([{"attributes": {"1/29/0": [{"0": "nope"}]}}])
+    assert ds.list_nodes() == []
+    warning = " ".join(str(c) for c in ds.logger.warning.call_args_list)
+    assert "id unreadable" in warning
+
+
+def test_reconcile_warns_when_a_known_node_stops_being_reported(ds, indigo_env):
+    # A device-less node leaves NO other trace when it vanishes (no device to
+    # mark unreachable), so a transient short get_nodes() would silently retract
+    # it from the picker.
+    ds.reconcile_all([EMPTY_BRIDGE_NODE])
+    ds.logger.warning.reset_mock()
+    ds.reconcile_all([])
+    warning = " ".join(str(c) for c in ds.logger.warning.call_args_list)
+    assert "0x35" in warning and "no longer reported" in warning
+
+
+def test_decommission_removes_a_device_bearing_node_from_the_picker(ds, indigo_env):
+    ds.create_from_raw(RELAY_NODE, "Office Plug")
+    assert [n for n, _ in ds.list_nodes()] == [42]
+    ds.delete_node(42)
+    assert ds.list_nodes() == []
+
+
+def test_decommission_leaves_other_nodes_in_the_picker(ds, indigo_env):
+    ds.create_from_raw(RELAY_NODE, "Office Plug")
+    ds.create_from_raw(EMPTY_BRIDGE_NODE, "")
+    ds.delete_node(53)                    # remove only the empty bridge
+    assert [n for n, _ in ds.list_nodes()] == [42]
+
+
+def test_reconcile_drops_a_node_that_is_no_longer_commissioned(ds, indigo_env):
+    # raw_nodes is authoritative: a node gone from it must stop being offered,
+    # otherwise the picker invites a decommission that would 404.
+    ds.reconcile_all([EMPTY_BRIDGE_NODE])
+    assert ds.list_nodes() == [(53, [])]
+    ds.reconcile_all([])
+    assert ds.list_nodes() == []
+
+
 def test_list_nodes_merges_multiple_devices_into_one_node_entry(ds, indigo_env):
     # A node whose endpoint creates several Indigo devices (pressure + flow)
     # must yield ONE picker entry listing all of them, never one per device.
