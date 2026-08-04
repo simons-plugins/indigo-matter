@@ -2,19 +2,31 @@
 
 Matter device support for the [Indigo](https://www.indigodomo.com) home automation server.
 
-Add Matter devices from the **Domio** iOS app; control them as first-class Indigo
-devices (triggers, schedules, action groups, control pages, API). The plugin manages a
-[`matter-server`](https://github.com/matter-js/matterjs-server) instance, holds the
-Indigo-owned Matter fabric, and translates Matter clusters ↔ Indigo device types.
+Add Matter devices from the **Domio** iOS app or the plugin's own menu; control them as
+first-class Indigo devices (triggers, schedules, action groups, control pages, API). The
+plugin manages a [`matter-server`](https://github.com/matter-js/matterjs-server) instance,
+holds the Indigo-owned Matter fabric, and translates Matter clusters ↔ Indigo device types.
 
 ```
-Domio (iOS) ──share code──▶ indigo-matter ──WebSocket──▶ matter-server ──IP──▶ Wi-Fi Matter devices
+Domio (iOS) ─┐
+             ├── setup code ──▶ indigo-matter ──WebSocket──▶ matter-server ──IP──▶ Wi-Fi + Thread devices
+plugin menu ─┘
 ```
 
-Commissioning uses the **share model**: Apple Home commissions the
-device first, Domio relays a share/pairing code to the plugin, and the plugin joins the
-device's fabric as a second admin over IP. The plugin owns runtime control for the
-device's lifetime.
+Devices can be added from **either** entry point — the **Domio** iOS app, or the plugin
+menu's *Commission device by setup code…* — and the two are equivalent, for Wi-Fi and
+Thread alike.
+
+Most devices arrive via the **share model**: an ecosystem you already own (Apple Home, or
+equally Alexa / Google Home) does the out-of-box Bluetooth onboarding — the one step a
+headless Mac can't, since matter-server runs without BLE — and the device is then shared
+to Indigo over plain IP, where the plugin joins as a second admin. A **factory-fresh
+Thread** device can be added through Domio because iOS commissions it to the iPhone as
+part of that flow, which is what supplies the Thread credentials. A device already on
+your network that was never commissioned by anyone can be added **directly** with its
+printed code, from either entry point.
+
+However it was added, the plugin owns runtime control for the device's lifetime.
 
 > **This is an independent, uncertified implementation.** It is not certified by the
 > Connectivity Standards Alliance (CSA), and is not affiliated with or endorsed by them.
@@ -31,9 +43,10 @@ battery levels, and bridges — plus failure hardening, fabric backup/restore, a
 managed launchd LaunchAgent for matter-server. A real Tapo energy plug has been
 commissioned end-to-end through Domio and reports live power/energy to Indigo.
 
-**Validated with both Wi-Fi and Thread devices** through the same share model — the
-admin-1 ecosystem (Apple Home, or equally Alexa / Google Home) does the Thread
-provisioning; the plugin joins over IP via that ecosystem's border router
+**Validated with both Wi-Fi and Thread devices**, and from both entry points — Domio and
+the plugin's own commission-by-setup-code menu. Thread provisioning is done by a device
+with a BLE radio and the network credentials (an admin-1 ecosystem, or the iPhone itself
+during the Domio flow); the plugin then joins over IP via that ecosystem's border router
 (HomePod/Apple TV, TBR-capable Echo, Nest Hub). See
 [Matter](https://simons-plugins.github.io/indigo-matter/MATTER.html) for how the pieces fit; validation specifics live
 in [Handover](https://simons-plugins.github.io/indigo-matter/HANDOVER.html).
@@ -53,7 +66,8 @@ run modes, verification, backups, and troubleshooting).
   npm package — Beta, **exact-pinned to 1.2.2** (`DEFAULT_INSTALL_SPEC`; the Install action
   uses this).
 - Python dep: `websockets` (see `Contents/Server Plugin/requirements.txt`).
-- The **Domio** iOS app for adding devices.
+- The **Domio** iOS app for adding devices — optional: the plugin menu's *Commission
+  device by setup code…* does the same job from Indigo.
 
 ## Documentation
 
