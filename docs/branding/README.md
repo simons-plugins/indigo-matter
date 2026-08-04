@@ -12,7 +12,12 @@ An Indigo-purple house — the platform — framing the **Matter** symbol: Matte
 |---|---|
 | `icon-house.svg` | the house frame, hand-drawn for this plugin |
 | `matter-logo-upstream.svg` | the official Matter lockup, fetched verbatim (see below) |
-| `build-icon.py` | composites the two and writes `Contents/Resources/icon.png` |
+| `build-icon.py` | composites the two and writes both icon copies |
+| `icon.png` | **the icon, outside the bundle** — grab it from here for the Plugin Store upload form rather than digging into the `.indigoPlugin` |
+
+`build-icon.py` writes `icon.png` here *and* the real one at
+`indigo-matter.indigoPlugin/Contents/Resources/icon.png` in the same run, so the two
+cannot drift. The bundle copy is the one Indigo actually reads.
 
 Rebuild after changing either source:
 

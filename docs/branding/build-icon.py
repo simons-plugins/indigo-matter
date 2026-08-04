@@ -19,6 +19,10 @@ from PIL import Image
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
 OUT = os.path.join(REPO, "indigo-matter.indigoPlugin", "Contents", "Resources", "icon.png")
+# A second copy outside the bundle, so the icon can be grabbed without digging into
+# the .indigoPlugin (the Plugin Store upload form takes a PNG directly). Written by
+# the same run as OUT so the two can never drift.
+OUT_COPY = os.path.join(HERE, "icon.png")
 CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 
 # Design units are the icon's 256x256 viewBox; RENDER is the supersample factor.
@@ -93,8 +97,11 @@ def main():
     h = int(sym.height * (w / sym.width))
     house.alpha_composite(sym.resize((w, h), Image.LANCZOS),
                           (int(SYMBOL_CX * SCALE - w / 2), int(SYMBOL_CY * SCALE - h / 2)))
-    house.resize((256, 256), Image.LANCZOS).save(OUT)
+    icon = house.resize((256, 256), Image.LANCZOS)
+    icon.save(OUT)
+    icon.save(OUT_COPY)
     print(f"wrote {OUT} (256x256)")
+    print(f"wrote {OUT_COPY} (256x256)")
 
 
 if __name__ == "__main__":
