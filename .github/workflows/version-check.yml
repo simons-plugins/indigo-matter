@@ -51,3 +51,22 @@ jobs:
             exit 1
           fi
           echo "✓ Version $VERSION is new and can be released."
+
+      - name: Check CFBundleVersion fits the Plugin Store
+        run: |
+          PLIST=$(find . -maxdepth 3 -ipath "*.indigoplugin/Contents/Info.plist" | head -1)
+          if [ -z "$PLIST" ]; then
+            echo "::error::No .indigoPlugin/Contents/Info.plist found." >&2
+            exit 1
+          fi
+          BUNDLE_VERSION=$(grep -A1 '<key>CFBundleVersion</key>' "$PLIST" | grep '<string>' | sed 's/.*<string>\(.*\)<\/string>.*/\1/')
+          if [ -z "$BUNDLE_VERSION" ]; then
+            echo "::error::Could not read CFBundleVersion from $PLIST." >&2
+            exit 1
+          fi
+          echo "CFBundleVersion: $BUNDLE_VERSION (${#BUNDLE_VERSION} characters)"
+          if [ ${#BUNDLE_VERSION} -gt 8 ]; then
+            echo "::error::CFBundleVersion '$BUNDLE_VERSION' is ${#BUNDLE_VERSION} characters. The Indigo Plugin Store stores it in a varchar(8) column, so anything longer fails ingestion with \"1406 (22001): Data too long for column 'bundleVersion'\" and the store silently stops picking up releases. CFBundleVersion is the bundle-layout version, not the release version (that is PluginVersion) — use a short static value such as 1.0.0."
+            exit 1
+          fi
+          echo "CFBundleVersion fits the store's 8-character column."
