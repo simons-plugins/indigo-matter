@@ -5,3 +5,6 @@ __pycache__/
 *.indigoPlugin.zip
 .coverage
 docs/branding/.build/
+bridge-node/node_modules/
+bridge-node/dist/
+bridge-node/.test-build/
