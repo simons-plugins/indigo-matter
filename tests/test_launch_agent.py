@@ -13,6 +13,8 @@ which would delete the developer's live LaunchAgent (docs/HANDOVER.md).
 """
 from __future__ import annotations
 
+import dataclasses
+import hashlib
 import os
 import plistlib
 
@@ -75,7 +77,7 @@ def test_agent_spec_is_frozen():
     # The identity must not drift under a loaded launchd job — a changed label or
     # storage path mid-life orphans the running process.
     spec = _spec("com.example.thing", "thing", "/tmp/thing-store")
-    with pytest.raises(Exception):
+    with pytest.raises(dataclasses.FrozenInstanceError):
         spec.label = "com.example.other"
 
 
@@ -268,6 +270,23 @@ def test_controller_plist_matches_the_pre_extraction_golden(tmp_path, mock_logge
         "StandardErrorPath": os.path.join(logs, "matter-server.err.log"),
         "EnvironmentVariables": {"PATH": "/opt/homebrew/bin:/usr/bin:/bin"},
     }
+
+
+def test_controller_plist_bytes_are_stable(mock_logger):
+    """Pin the RAW serialized bytes, not just the parsed dict.
+
+    The applied-plist marker is sha256 over these bytes: a serialization change
+    (format, key order, XML header) that leaves the parsed dict equal would pass the
+    golden test above yet invalidate every existing install's marker — forcing a
+    bootout+bootstrap of a healthy server and dropping every device's CASE session,
+    exactly what the legacy-marker-filename decision exists to avoid. A deliberate
+    plist content change updates this hash; a serialization drift must never.
+    Inputs are fully literal (fixed home, no tmp_path) so the bytes are reproducible.
+    """
+    sp = ServerProcess(GOLDEN_PREFS, mock_logger, home="/Users/example",
+                       npx_path="/opt/homebrew/bin/npx", runner=FakeRunner())
+    digest = hashlib.sha256(sp.build_plist()).hexdigest()
+    assert digest == "6096e2609fc24ceda25eb2d1d617b35985101cf14922b8f7e240568e7a00c37e"
 
 
 def test_controller_spec_pins_matter_server(tmp_path, mock_logger):

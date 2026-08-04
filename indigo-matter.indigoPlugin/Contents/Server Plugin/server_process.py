@@ -193,7 +193,7 @@ class ServerProcess(LaunchAgent):
             home=resolved_home, npx_path=npx_path,
             runner=runner, exists=exists, sleep=sleep,
         )
-        self.port = port
+        self._port = port
         self.primary_interface = str(prefs.get("primaryInterface") or "").strip() or "en0"
         # Address the matter-server WebSocket control API binds to. It binds to ALL
         # interfaces when no --listen-address is given, and the
@@ -217,6 +217,14 @@ class ServerProcess(LaunchAgent):
                 "unrecognised value %r — treating it as OFF. Set it by ticking or "
                 "unticking the checkbox in Configure….", raw_test_net_dcl,
             )
+
+    @property
+    def port(self) -> str:
+        """The CLI port string, read-only. ``spec.port`` (the lsof/EADDRINUSE signal)
+        is frozen from the same pref at construction; a post-construction ``sp.port =``
+        would change the command line but not the port the orphan reaper polices.
+        Both derive from prefs — rebuild the ServerProcess to change them."""
+        return self._port
 
     def install(self, install_spec: str = DEFAULT_INSTALL_SPEC) -> bool:
         """npm-install matter-server. Signature pins the default for callers/docs."""

@@ -47,6 +47,13 @@ MIN_NODE_VERSION = (22, 13)
 # DELIBERATELY SHARED between agents (not per-label): project_dir holds ONE node_modules
 # installed by ONE node, and every agent's LaunchAgent runs that same node. A per-agent
 # stamp would claim they can diverge, which is exactly the ABI crash this guards against.
+# CAVEAT the sharing does not cover: if nodeBinDir is repointed BETWEEN two agents'
+# installs, the later install rewrites the stamp with the new node and the earlier
+# agent's already-built native bindings go unwarned (npm install of package B does not
+# rebuild package A's bindings). Single-agent today this cannot happen (its own install
+# always rewrites the stamp). TODO(E7): when the bridge agent lands, either record
+# per-package node versions inside the one stamp or re-install both packages on a
+# nodeBinDir change.
 INSTALL_NODE_STAMP = ".indigo-node"
 
 
@@ -117,6 +124,9 @@ class AgentSpec:
     storage_path: str
     out_log: str
     err_log: str
+    # Safe as a plain field ONLY because it is required: a Callable given a dataclass
+    # DEFAULT lands on the class, the descriptor protocol binds it, and it would be
+    # called with the spec instead of the agent. Never give this field a default.
     argv: Callable[[Any], list[str]]
     port: Optional[int] = None
     applied_marker: Optional[str] = None
