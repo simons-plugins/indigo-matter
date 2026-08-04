@@ -52,21 +52,38 @@ jobs:
           fi
           echo "✓ Version $VERSION is new and can be released."
 
-      - name: Check CFBundleVersion fits the Plugin Store
+      - name: Validate Info.plist version keys
         run: |
           PLIST=$(find . -maxdepth 3 -ipath "*.indigoplugin/Contents/Info.plist" | head -1)
           if [ -z "$PLIST" ]; then
             echo "::error::No .indigoPlugin/Contents/Info.plist found." >&2
             exit 1
           fi
-          BUNDLE_VERSION=$(grep -A1 '<key>CFBundleVersion</key>' "$PLIST" | grep '<string>' | sed 's/.*<string>\(.*\)<\/string>.*/\1/')
-          if [ -z "$BUNDLE_VERSION" ]; then
-            echo "::error::Could not read CFBundleVersion from $PLIST." >&2
-            exit 1
+          read_key() { grep -A1 "<key>$1</key>" "$PLIST" | grep '<string>' | sed 's/.*<string>\(.*\)<\/string>.*/\1/'; }
+          PLUGIN_VERSION=$(read_key PluginVersion)
+          BUNDLE_VERSION=$(read_key CFBundleVersion)
+          fail=0
+          # Plugin Developer's Guide, "General Rules": version numbers in Info.plist
+          # must be of the form X.Y.Z — digits and periods only, no beta or
+          # pre-release signifiers.
+          for pair in "PluginVersion:$PLUGIN_VERSION" "CFBundleVersion:$BUNDLE_VERSION"; do
+            key=${pair%%:*}; val=${pair#*:}
+            if [ -z "$val" ]; then
+              echo "::error::$key is missing from $PLIST."; fail=1; continue
+            fi
+            if ! printf '%s' "$val" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+              echo "::error::$key is '$val'. The Plugin Developer's Guide requires the form X.Y.Z — digits and periods only, no beta or pre-release signifiers."
+              fail=1
+            fi
+          done
+          # UNDOCUMENTED store limit: the Plugin Store keeps CFBundleVersion in a
+          # varchar(8) column. Longer values fail ingestion with "1406 (22001): Data
+          # too long for column 'bundleVersion'" and the store silently stops picking
+          # up releases. Note 2026.2.12 satisfies X.Y.Z yet still breaks it, which is
+          # why this needs its own check.
+          if [ -n "$BUNDLE_VERSION" ] && [ ${#BUNDLE_VERSION} -gt 8 ]; then
+            echo "::error::CFBundleVersion '$BUNDLE_VERSION' is ${#BUNDLE_VERSION} characters; the Plugin Store column holds 8. Per the Plugin Developer's Guide CFBundleVersion 'represents the layout of the bundle' and 'is controlled by us' (Indigo Domotics) — it is not your release version (that is PluginVersion). Use a short static value such as 1.0.0 and do not bump it per release."
+            fail=1
           fi
-          echo "CFBundleVersion: $BUNDLE_VERSION (${#BUNDLE_VERSION} characters)"
-          if [ ${#BUNDLE_VERSION} -gt 8 ]; then
-            echo "::error::CFBundleVersion '$BUNDLE_VERSION' is ${#BUNDLE_VERSION} characters. The Indigo Plugin Store stores it in a varchar(8) column, so anything longer fails ingestion with \"1406 (22001): Data too long for column 'bundleVersion'\" and the store silently stops picking up releases. CFBundleVersion is the bundle-layout version, not the release version (that is PluginVersion) — use a short static value such as 1.0.0."
-            exit 1
-          fi
-          echo "CFBundleVersion fits the store's 8-character column."
+          [ $fail -eq 0 ] || exit 1
+          echo "PluginVersion=$PLUGIN_VERSION  CFBundleVersion=$BUNDLE_VERSION (${#BUNDLE_VERSION} chars) - OK"
