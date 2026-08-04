@@ -1,5 +1,6 @@
 /**
- * Compile-time mirror of `fixtures/e0-frames.json` (§7 testing contract).
+ * Compile-time mirror of the E0 half of `../tests/fixtures/bridge_protocol/frames.json`
+ * — the repo-root golden file shared with the Python suite (§7 testing contract).
  *
  * `JSON.parse` erases types, so the golden file alone cannot fail `tsc` when a
  * shape in `protocol.ts` drifts. Each payload is restated here bound with

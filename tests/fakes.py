@@ -24,15 +24,19 @@ class FakeWebSocket:
     """
 
     def __init__(self, responder: Optional[Callable[[dict], list]] = None,
-                 server_info: Optional[dict] = None):
+                 server_info: Optional[dict] = None,
+                 handshake: Optional[dict] = None):
         self._outbox: asyncio.Queue = asyncio.Queue()
         self.sent: list[dict] = []
         self._closed = False
         self._responder = responder
-        # matter-server pushes server_info as a BARE object on connect (no
-        # event/message_id wrapper) — match that real handshake shape.
+        # Both peers push a BARE object as their first frame (no event/message_id
+        # wrapper): matter-server's server_info, the bridge node's hello (§2).
+        # ``handshake`` seeds whichever one the test needs; matter-server's is the
+        # default so the controller tests read unchanged.
         self._outbox.put_nowait(json.dumps(
-            server_info or {"sdk_version": "matter-server/0.6.2", "fabric_id": "0x0"}
+            handshake if handshake is not None
+            else (server_info or {"sdk_version": "matter-server/0.6.2", "fabric_id": "0x0"})
         ))
 
     async def send(self, raw: str) -> None:

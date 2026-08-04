@@ -41,11 +41,15 @@ loop→Indigo writes go straight through `device_sync.apply_states` (thread-safe
 | `plugin.py` | Lifecycle glue, action bridge, IWS HTTP handlers |
 | `async_runtime.py` | The event loop + thread + bridge primitives |
 | `protocol.py` | **Rename firewall** — the only place that knows matter-server wire field names |
-| `matter_client.py` | Persistent reconnecting WS client (uses `websockets`) |
+| `ws_json_client.py` | Shared transport core for both WS clients: run loop, `min(2**attempt, 30)` reconnect backoff, `message_id`→future correlation, disconnect/diagnostic handling. Handshake + frame vocabulary are subclass hooks; unmatched **error** responses are logged (BRIDGE_PROTOCOL §3.4) |
+| `matter_client.py` | matter-server client (inbound): the `serverLocation` URI, the `server_info` + `start_listening` handshake, controller command wrappers |
+| `bridge_protocol.py` | Bridge-node wire contract — envelope/commands/error codes/roles + normalised `BridgeCommand`/`StatusReport`/`PairingReport`/`FabricInfo`. **Not** a rename firewall (we own both ends); `protocolVersion` is what protects us. See `docs/BRIDGE_PROTOCOL.md` |
+| `bridge_client.py` | Bridge-node client (outbound export): hello+attach handshake that fails closed on version skew, endpoint CRUD, fire-and-forget `set_state`, §5 event callbacks |
 | `launch_agent.py` | Generic launchd LaunchAgent machinery (npm/npx/node resolution, plist authoring, applied-plist digest, orphan/EADDRINUSE reaping), driven by a frozen `AgentSpec` that carries one agent's identity. Extracted so the Matter **bridge node** can be a second agent without duplicating it (PRD-indigo-matter-export §4.2 / XOQ3) |
 | `server_process.py` | `ServerProcess` = the matter-server (controller) specialisation of `LaunchAgent`: its prefs, its argv, its pinned version. Gated by the `serverLocation` pref — the config asks "is matter-server on this Mac?"; `local` (turnkey default) manages it here on loopback, `remote` connects to a server elsewhere. `manageLaunchAgent`/host/port are derived from that in `startup` (see `plugin.py:server_location`) |
 | `commission_jobs.py` | Commissioning job state machine (API.md §3.2/§3.3) |
 | `device_sync.py` | Node↔Indigo reconciliation + state/command seams |
+| `fabric_backup.py` | Fabric backup/restore for the matter-server storage dir (issue #26) — zip snapshots into a sibling `backups/`, move-aside restore, retention prune. Pure + injectable (paths, clock, `stop()/start()` control) so it unit-tests against `tmp_path` |
 | `http_handlers.py` | Domio API routing (served over IWS, not aiohttp) |
 | `matter_model.py` | Parse matter-server node dict → node/endpoint objects |
 | `matter_handlers/` | One `ClusterHandler` per cluster + registry (OnOff in v1) |
@@ -71,7 +75,8 @@ client is portable to python-matter-server as a fallback. See `docs/MATTER.md` +
 Inherits workspace standards from [root CLAUDE.md](../CLAUDE.md#common-standards-apply-to-every-project-unless-its-claudemd-overrides). Key points:
 
 - **Version bump per PR**: `Info.plist` `PluginVersion` (format `YYYY.R.P`; the plist is the source of truth for the current value).
-- **Testing**: `pytest` (`pyproject.toml`, pylint + 120-char like netro). matter-server is mocked at the WS layer (`tests/fakes.py`); the `indigo` module is mocked. Run: `cd indigo-matter && pytest`.
+- **Testing**: `pytest` (`pyproject.toml`, pylint + 120-char like netro). matter-server is mocked at the WS layer (`tests/fakes.py`); the `indigo` module is mocked. Run: `cd indigo-matter && pytest`. The bridge node has its own suite: `cd bridge-node && npm run build && npm test`.
+- **Bridge-protocol golden frames**: `tests/fixtures/bridge_protocol/frames.json` is the ONE shared fixture file (BRIDGE_PROTOCOL §7) — the Python suite reads it directly, `npm test` copies it into the TS build. Change a frame and both suites must be updated, by design.
 - **Merge**: GitHub PR only, never `--admin`, never squash, wait for CI green, wait for user go-ahead.
 
 ## Status

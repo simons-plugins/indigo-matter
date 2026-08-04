@@ -1,7 +1,8 @@
 /**
- * §7 testing contract: the golden JSON is shared with the Python suite, so it
- * cannot itself be typed. `fixture-shapes.ts` is its compile-time mirror; this
- * file is the runtime half that keeps the two honest.
+ * §7 testing contract: the golden JSON (`../tests/fixtures/bridge_protocol/frames.json`,
+ * at the repo root) is shared with the Python suite, so it cannot itself be
+ * typed. `fixture-shapes.ts` is its compile-time mirror; this file is the
+ * runtime half that keeps the two honest.
  */
 
 import assert from "node:assert/strict";
@@ -35,6 +36,31 @@ describe("golden fixtures match their typed mirror", () => {
             assert.deepEqual(actual, expected);
         });
     }
+
+    describe("pending E1 exchanges", () => {
+        const names = Object.keys(golden.pending).filter(key => !key.startsWith("_"));
+
+        it("every pending entry is a well-formed exchange", () => {
+            assert.ok(names.length > 0, "pending section should not be empty while E1 is in flight");
+            for (const name of names) {
+                const exchange = golden.pending[name];
+                assert.ok(exchange?.request !== undefined, `${name} has no request`);
+                assert.ok(exchange?.response !== undefined, `${name} has no response`);
+                assert.equal(
+                    exchange.request.message_id,
+                    exchange.response.message_id,
+                    `${name} request/response message_id must match`,
+                );
+            }
+        });
+
+        // Shape assertions wait for the node-side handlers: `protocol.ts` has no
+        // types for these results yet, so there is nothing to mirror. The Python
+        // client suite asserts them today — that half of E1 ships now.
+        for (const name of names) {
+            it.skip(`${name} — node handler not implemented yet`, () => {});
+        }
+    });
 
     it("covers all four §3.7 pairing states", () => {
         // uncommissioned+window, commissioned+no window, commissioned+window;
