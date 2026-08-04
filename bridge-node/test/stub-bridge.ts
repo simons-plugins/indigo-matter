@@ -14,6 +14,7 @@ import type {
     CommissioningWindowResult,
     PairingReport,
     StatusReport,
+    WindowClosedReason,
 } from "../src/protocol.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -32,7 +33,10 @@ export interface GoldenFrames {
     get_status: GoldenExchange;
     get_pairing_uncommissioned: GoldenExchange;
     get_pairing_commissioned: GoldenExchange;
+    get_pairing_commissioned_window_open: GoldenExchange;
     open_commissioning_window: GoldenExchange;
+    window_closed_expired: Record<string, unknown>;
+    window_closed_commissioned: Record<string, unknown>;
 }
 
 export const golden: GoldenFrames = JSON.parse(
@@ -41,23 +45,49 @@ export const golden: GoldenFrames = JSON.parse(
 
 export class StubBridge implements BridgeFacade {
     commissioned = false;
+    /** Only meaningful while {@link commissioned}: selects the 3rd §3.7 state. */
+    windowOpen = false;
     openWindowError?: Error;
+    /**
+     * Makes `openCommissioningWindow` genuinely slow, for the ordering test.
+     * A single tick is not enough: `ws` delivers pipelined frames in separate
+     * read events, so a one-tick handler finishes before the next frame even
+     * arrives and the out-of-order bug never shows.
+     */
+    delayOpenWindowMs = 0;
     readonly openWindowCalls: number[] = [];
+    #windowClosed?: (reason: WindowClosedReason) => void;
 
     getStatus(): StatusReport {
         return structuredClone(golden.get_status.response.result) as StatusReport;
     }
 
     getPairing(): PairingReport {
-        const source = this.commissioned ? golden.get_pairing_commissioned : golden.get_pairing_uncommissioned;
+        const source = !this.commissioned
+            ? golden.get_pairing_uncommissioned
+            : this.windowOpen
+              ? golden.get_pairing_commissioned_window_open
+              : golden.get_pairing_commissioned;
         return structuredClone(source.response.result) as PairingReport;
     }
 
     async openCommissioningWindow(durationSeconds: number): Promise<CommissioningWindowResult> {
         this.openWindowCalls.push(durationSeconds);
+        if (this.delayOpenWindowMs > 0) {
+            await new Promise(resolve => setTimeout(resolve, this.delayOpenWindowMs));
+        }
         if (this.openWindowError !== undefined) {
             throw this.openWindowError;
         }
         return structuredClone(golden.open_commissioning_window.response.result) as CommissioningWindowResult;
+    }
+
+    onWindowClosed(listener: (reason: WindowClosedReason) => void): void {
+        this.#windowClosed = listener;
+    }
+
+    /** Stand in for the Matter stack closing the window. */
+    emitWindowClosed(reason: WindowClosedReason): void {
+        this.#windowClosed?.(reason);
     }
 }

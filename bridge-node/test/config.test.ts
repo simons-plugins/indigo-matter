@@ -6,7 +6,13 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
-import { DEFAULT_MATTER_PORT, DEFAULT_STORAGE_PATH, DEFAULT_WS_PORT, parseArgs } from "../src/config.js";
+import {
+    assertMdnsInterface,
+    DEFAULT_MATTER_PORT,
+    DEFAULT_STORAGE_PATH,
+    DEFAULT_WS_PORT,
+    parseArgs,
+} from "../src/config.js";
 
 describe("parseArgs", () => {
     it("defaults to 5540 / 5581 and the Application Support storage path", () => {
@@ -48,13 +54,34 @@ describe("parseArgs", () => {
     });
 
     it("rejects unknown flags, missing values and bad ports", () => {
-        assert.throws(() => parseArgs(["--nope", "x"]), /Unknown argument --nope/);
+        assert.throws(() => parseArgs(["--nope", "x"]), /Unknown argument: --nope/);
         assert.throws(() => parseArgs(["--ws-port"]), /requires a value/);
         assert.throws(() => parseArgs(["--ws-port", "0"]), /must be an integer/);
         assert.throws(() => parseArgs(["--matter-port", "abc"]), /must be an integer/);
     });
 
+    it("names an unknown flag as unknown, not as missing a value", () => {
+        // The known-flag check comes first, so `--bogus` with nothing after it
+        // is still reported as unknown — the message a bad plist needs.
+        assert.throws(() => parseArgs(["--bogus"]), /Unknown argument: --bogus/);
+        assert.throws(() => parseArgs(["--bogus", "--ws-port", "5581"]), /Unknown argument: --bogus/);
+        assert.throws(() => parseArgs(["--ws-port", "5581", "--bogus"]), /Unknown argument: --bogus/);
+        assert.throws(() => parseArgs(["stray"]), /Unknown argument: stray/);
+    });
+
     it("returns help for --help", () => {
         assert.equal(parseArgs(["--help"]), "help");
+    });
+});
+
+describe("assertMdnsInterface", () => {
+    it("accepts an interface the host actually has", () => {
+        assert.doesNotThrow(() => assertMdnsInterface("en0", ["lo0", "en0", "en1"]));
+    });
+
+    it("names the missing interface and lists what is available", () => {
+        assert.throws(() => assertMdnsInterface("en9", ["lo0", "en0"]), /--mdns-interface en9 is not a network interface/);
+        assert.throws(() => assertMdnsInterface("en9", ["lo0", "en0"]), /available: lo0, en0/);
+        assert.throws(() => assertMdnsInterface("en9", []), /available: none/);
     });
 });

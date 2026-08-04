@@ -54,6 +54,10 @@ function parsePort(name: string, raw: string): number {
     return value;
 }
 
+/** Flags that take a following value. Checked before "requires a value", so an
+ * unrecognised flag is reported as unknown rather than as a missing value. */
+const VALUE_FLAGS = new Set(["--storage-path", "--matter-port", "--ws-port", "--mdns-interface"]);
+
 /**
  * Parse `process.argv.slice(2)`. Throws on unknown or malformed arguments — a
  * bad launchd plist should fail loudly at start rather than silently run with
@@ -70,6 +74,9 @@ export function parseArgs(argv: readonly string[]): BridgeConfig | "help" {
         const flag = argv[i]!;
         if (flag === "--help" || flag === "-h") {
             return "help";
+        }
+        if (!VALUE_FLAGS.has(flag)) {
+            throw new Error(`Unknown argument: ${flag}`);
         }
         const value = argv[i + 1];
         if (value === undefined || value.startsWith("--")) {
@@ -90,11 +97,25 @@ export function parseArgs(argv: readonly string[]): BridgeConfig | "help" {
                 config.mdnsInterface = value;
                 break;
             default:
-                throw new Error(`Unknown argument ${flag}`);
+                throw new Error(`Unknown argument: ${flag}`);
         }
     }
 
     return config;
+}
+
+/**
+ * Fail before start if `--mdns-interface` names something this host does not
+ * have: matter.js takes the name on trust and would advertise on nothing,
+ * which presents as "the bridge never appears" with no error anywhere.
+ */
+export function assertMdnsInterface(name: string, available: readonly string[]): void {
+    if (!available.includes(name)) {
+        throw new Error(
+            `--mdns-interface ${name} is not a network interface on this host ` +
+                `(available: ${available.length > 0 ? available.join(", ") : "none"})`,
+        );
+    }
 }
 
 export { USAGE };

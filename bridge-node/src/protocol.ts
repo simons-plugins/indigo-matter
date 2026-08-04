@@ -12,6 +12,18 @@ export const PROTOCOL_VERSION = 1;
 /** Seconds a connection may sit past the handshake without attaching (§2). */
 export const UNATTACHED_TIMEOUT_MS = 10_000;
 
+/**
+ * Enhanced commissioning window bounds, in seconds (§3.8).
+ *
+ * Matter caps `CommissioningTimeout` at 900s and floors it at 180s. The cap is
+ * ours to enforce: matter.js 0.17.8's `DeviceCommissioner` builds a
+ * `STANDARD_COMMISSIONING_TIMEOUT` timer but never starts it, so nothing on the
+ * Matter side would close a longer window.
+ */
+export const WINDOW_DURATION_MIN_SECONDS = 180;
+export const WINDOW_DURATION_MAX_SECONDS = 900;
+export const WINDOW_DURATION_DEFAULT_SECONDS = 900;
+
 /** The complete `error_code` domain for protocol version 1 (§1.1). */
 export const ErrorCode = {
     unknownCommand: "unknown_command",
@@ -61,6 +73,14 @@ export interface EventFrame {
     event: string;
     data: Record<string, unknown>;
 }
+
+/** §5 `window_closed` — why the enhanced commissioning window ended. */
+export type WindowClosedReason = "expired" | "commissioned";
+
+/** §5 event names emitted in E0. The rest arrive with endpoint CRUD in E1. */
+export const EventName = {
+    windowClosed: "window_closed",
+} as const;
 
 /** §4.3 */
 export interface FabricInfo {
@@ -115,6 +135,12 @@ export interface BridgeFacade {
     getStatus(): StatusReport;
     getPairing(): PairingReport;
     openCommissioningWindow(durationSeconds: number): Promise<CommissioningWindowResult>;
+    /**
+     * Register the sink for `window_closed` (§3.8/§5). One listener, last
+     * registration wins — this seam is what lets the protocol server emit the
+     * event without importing the Matter stack, and lets tests fire it.
+     */
+    onWindowClosed(listener: (reason: WindowClosedReason) => void): void;
 }
 
 /** A protocol-level failure a command handler can throw to shape its response. */
@@ -126,4 +152,14 @@ export class ProtocolError extends Error {
         super(details);
         this.name = "ProtocolError";
     }
+}
+
+/** The human-readable message for an unknown throwable — what `details` carries. */
+export function describeError(error: unknown): string {
+    return error instanceof Error ? error.message : String(error);
+}
+
+/** The same, with a stack when there is one — for the log, never for the wire. */
+export function describeErrorWithStack(error: unknown): string {
+    return error instanceof Error ? (error.stack ?? error.message) : String(error);
 }

@@ -19,13 +19,17 @@ import type { BridgeConfig } from "./config.js";
 import {
     type BridgeFacade,
     type CommissioningWindowResult,
+    describeError,
+    describeErrorWithStack,
     ErrorCode,
     type FabricInfo,
     type PairingReport,
     ProtocolError,
     type StatusReport,
+    type WindowClosedReason,
 } from "./protocol.js";
 import { type BridgeIdentity, nodeUniqueIdFor, serialNumberFor } from "./storage.js";
+import { CommissioningWindow } from "./window.js";
 
 /** Test vendor id. Uncertified by design — see ADR-0006 "Attestation cuts both ways". */
 export const VENDOR_ID = 0xfff1;
@@ -44,34 +48,34 @@ const PBKDF_SALT_BYTES = 32;
 
 export { matterJsVersion };
 
-/** `Endpoint.id` derivation — the identity key of BRIDGE_PROTOCOL §4.1/§6.3. */
-export function endpointIdFor(indigoDeviceId: number): string {
-    return `indigo-${indigoDeviceId}`;
-}
-
 /** Bridged Device Basic Information `UniqueID`, stable across restarts. */
 export function uniqueIdFor(indigoDeviceId: number): string {
     return `indigo-${indigoDeviceId}`;
 }
 
-interface OpenWindow {
-    expiresAt: Date;
-    manualPairingCode: string;
-    qrPairingCode: string;
-    timer: NodeJS.Timeout;
-}
+/**
+ * `Endpoint.id` derivation — the identity key of BRIDGE_PROTOCOL §4.1/§6.3.
+ * Deliberately the *same* value as {@link uniqueIdFor}: one derivation means the
+ * two can never drift apart, and §6.3's one-way identity flow reads directly.
+ */
+export const endpointIdFor = uniqueIdFor;
 
 export class BridgeNode implements BridgeFacade {
     #server?: ServerNode;
     #child?: Endpoint;
-    #window?: OpenWindow;
+    readonly #window: CommissioningWindow;
 
     constructor(
         private readonly config: BridgeConfig,
         private readonly identity: BridgeIdentity,
         private readonly bridgeVersion: string,
         private readonly log: (message: string) => void = console.log,
-    ) {}
+    ) {
+        this.#window = new CommissioningWindow({
+            log: message => this.log(message),
+            onExpire: () => this.endMatterCommissioning(),
+        });
+    }
 
     /** Matter wants an integer software version; derive it from the npm semver. */
     private get softwareVersion(): number {
@@ -85,13 +89,19 @@ export class BridgeNode implements BridgeFacade {
      */
     async start(): Promise<void> {
         const environment = Environment.default;
-        // matter.js resolves both of these lazily through its VariableService,
+        // matter.js resolves all of these lazily through its VariableService,
         // so setting them before `ServerNode.create` is what keeps storage out
         // of ~/.matter and pins mDNS when asked.
         environment.vars.set("storage.path", this.config.storagePath);
         if (this.config.mdnsInterface !== undefined) {
             environment.vars.set("mdns.networkInterface", this.config.mdnsInterface);
         }
+        // We own SIGTERM/SIGINT outright. matter.js's ProcessManager installs its
+        // own interrupt handlers when the runtime starts, and being registered
+        // first they run first — tearing the ServerNode down concurrently with
+        // main.ts's ordered shutdown. `runtime.signals` is the documented opt-out
+        // (`ProcessManager.hasSignalSupport` reads it).
+        environment.vars.set("runtime.signals", false);
 
         const server = await ServerNode.create({
             id: "indigo-matter-bridge",
@@ -138,7 +148,18 @@ export class BridgeNode implements BridgeFacade {
         this.#child = child;
 
         server.events.commissioning.fabricsChanged.on((fabricIndex, action) => {
-            this.log(`Fabric ${action}: index ${fabricIndex} (${this.fabrics().length} total)`);
+            // A throw here propagates straight into matter.js's observable, and
+            // `fabrics()` reads server state that is legitimately gone once
+            // close() is under way. Log-only, never rethrow.
+            try {
+                this.log(`Fabric ${action}: index ${fabricIndex} (${this.fabrics().length} total)`);
+            } catch (error) {
+                try {
+                    this.log(`Fabric ${action}: index ${fabricIndex} (count unavailable: ${describeError(error)})`);
+                } catch {
+                    // The logger itself failed; there is nowhere left to report.
+                }
+            }
         });
 
         await server.start();
@@ -191,9 +212,14 @@ export class BridgeNode implements BridgeFacade {
         };
     }
 
+    /** §5: the sink for `window_closed`, wired up by the protocol server. */
+    onWindowClosed(listener: (reason: WindowClosedReason) => void): void {
+        this.#window.onClosed(listener);
+    }
+
     getPairing(): PairingReport {
         const commissioned = this.server.lifecycle.isCommissioned;
-        const window = this.#window;
+        const window = this.#window.current;
 
         if (window !== undefined) {
             return {
@@ -244,27 +270,33 @@ export class BridgeNode implements BridgeFacade {
      * E7 to close, not something E0's pairing flow depends on.
      */
     async openCommissioningWindow(durationSeconds: number): Promise<CommissioningWindowResult> {
+        // Before anything Matter-side: `allowEnhancedCommissioning` swaps the PASE
+        // commissioner and only then throws on a double-open, which would kill the
+        // code the user is already holding. See CommissioningWindow.assertClosed.
+        this.#window.assertClosed();
+
         const server = this.server;
-        const crypto = server.env.get(Crypto);
 
-        const passcode = PaseClient.generateRandomPasscode(crypto);
-        const discriminator = PaseClient.generateRandomDiscriminator(crypto);
-        const salt = crypto.randomBytes(PBKDF_SALT_BYTES);
-        const verifier = await PaseClient.generatePakePasscodeVerifier(crypto, passcode, {
-            iterations: PBKDF_ITERATIONS,
-            salt,
-        });
-
+        let discriminator: number;
+        let passcode: number;
         try {
+            const crypto = server.env.get(Crypto);
+            passcode = PaseClient.generateRandomPasscode(crypto);
+            discriminator = PaseClient.generateRandomDiscriminator(crypto);
+            const salt = crypto.randomBytes(PBKDF_SALT_BYTES);
+            const verifier = await PaseClient.generatePakePasscodeVerifier(crypto, passcode, {
+                iterations: PBKDF_ITERATIONS,
+                salt,
+            });
             const paseServer = PaseServer.fromVerificationValue(server.env.get(SessionManager), verifier, {
                 iterations: PBKDF_ITERATIONS,
                 salt,
             });
             await server.env.get(DeviceCommissioner).allowEnhancedCommissioning(discriminator, paseServer, () => {
-                this.clearWindow();
-                this.log("Commissioning window closed");
+                this.#window.noteEnded();
             });
         } catch (error) {
+            this.log(`Failed to open commissioning window: ${describeErrorWithStack(error)}`);
             throw new ProtocolError(ErrorCode.commissioningWindowFailed, describeError(error));
         }
 
@@ -281,34 +313,30 @@ export class BridgeNode implements BridgeFacade {
             },
         ]);
 
-        const expiresAt = this.setWindow(durationSeconds, manualPairingCode, qrPairingCode);
+        // DeviceCommissioner *does* build a STANDARD_COMMISSIONING_TIMEOUT timer
+        // in `#enterCommissioningMode`, but never calls `.start()` on it — a
+        // matter.js 0.17.8 bug — so nothing on the Matter side would ever close
+        // this window. Ours is the only timer. If upstream fixes that, the two
+        // race, which is why we cap durationSeconds at Matter's own 900s maximum:
+        // whichever fires first, the outcome is the same.
+        const expiresAt = this.#window.open(durationSeconds, manualPairingCode, qrPairingCode);
         return { manualPairingCode, qrPairingCode, windowExpiresAt: expiresAt.toISOString() };
     }
 
-    private setWindow(durationSeconds: number, manualPairingCode: string, qrPairingCode: string): Date {
-        this.clearWindow();
-        const expiresAt = new Date(Date.now() + durationSeconds * 1000);
-        // DeviceCommissioner does not time the window out for us — that timer
-        // lived in the cluster behaviour we had to bypass — so we close it.
-        const timer = setTimeout(() => {
-            this.#window = undefined;
-            this.log("Commissioning window expired");
-            void this.#server?.env.get(DeviceCommissioner).endCommissioning();
-        }, durationSeconds * 1000);
-        timer.unref();
-        this.#window = { expiresAt, manualPairingCode, qrPairingCode, timer };
-        return expiresAt;
-    }
-
-    private clearWindow(): void {
-        if (this.#window !== undefined) {
-            clearTimeout(this.#window.timer);
-            this.#window = undefined;
+    /** End the Matter-side window after ours expired. Never throws. */
+    private endMatterCommissioning(): void {
+        const server = this.#server;
+        if (server === undefined) {
+            return;
         }
+        void server.env
+            .get(DeviceCommissioner)
+            .endCommissioning()
+            .catch((error: unknown) => this.log(`Failed to end commissioning: ${describeError(error)}`));
     }
 
     async close(): Promise<void> {
-        this.clearWindow();
+        this.#window.clear();
         const server = this.#server;
         this.#server = undefined;
         this.#child = undefined;
@@ -316,8 +344,4 @@ export class BridgeNode implements BridgeFacade {
             await server.close();
         }
     }
-}
-
-function describeError(error: unknown): string {
-    return error instanceof Error ? error.message : String(error);
 }

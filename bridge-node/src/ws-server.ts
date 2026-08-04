@@ -11,12 +11,19 @@ import { WebSocketServer, type WebSocket } from "ws";
 
 import {
     type BridgeFacade,
+    describeError,
+    describeErrorWithStack,
     ErrorCode,
     type ErrorCodeValue,
+    EventName,
+    type EventFrame,
     type HandshakeFrame,
     PROTOCOL_VERSION,
     ProtocolError,
     UNATTACHED_TIMEOUT_MS,
+    WINDOW_DURATION_DEFAULT_SECONDS,
+    WINDOW_DURATION_MAX_SECONDS,
+    WINDOW_DURATION_MIN_SECONDS,
 } from "./protocol.js";
 
 export const LOOPBACK_HOST = "127.0.0.1";
@@ -34,6 +41,13 @@ export interface BridgeWsServerOptions {
 interface ClientState {
     attached: boolean;
     unattachedTimer?: NodeJS.Timeout;
+    /**
+     * Tail of this socket's handler chain. §1 promises frames are processed in
+     * receipt order, and handlers genuinely await (`open_commissioning_window`
+     * does crypto), so each frame is queued behind the previous one rather than
+     * dispatched concurrently.
+     */
+    pending: Promise<void>;
 }
 
 /** Commands whose handlers exist in E0. Endpoint CRUD arrives in E1. */
@@ -52,6 +66,21 @@ export class BridgeWsServer {
         this.#handlers.set("get_status", async () => this.options.bridge.getStatus());
         this.#handlers.set("get_pairing", async () => this.options.bridge.getPairing());
         this.#handlers.set("open_commissioning_window", async args => this.handleOpenWindow(args));
+        options.bridge.onWindowClosed(reason => this.sendEvent(EventName.windowClosed, { reason }));
+    }
+
+    /**
+     * Push an unsolicited event (§1/§5) to the attached client. Dropped silently
+     * when nobody is attached: the plugin re-`attach`es on reconnect and gets a
+     * full reconcile, so a missed event has nothing to recover.
+     */
+    sendEvent(event: string, data: Record<string, unknown>): void {
+        const socket = this.#attached;
+        if (socket === undefined) {
+            return;
+        }
+        const frame: EventFrame = { event, data };
+        this.send(socket, frame);
     }
 
     /** Bind and start accepting connections. Resolves once listening. */
@@ -84,7 +113,10 @@ export class BridgeWsServer {
         this.#wss = undefined;
         for (const [socket, state] of this.#clients) {
             clearTimeout(state.unattachedTimer);
-            socket.close();
+            // `terminate`, not `close`: a graceful close waits for the peer's
+            // close frame, and shutdown must not be held hostage by a plugin
+            // that is itself mid-crash. `wss.close()` below then resolves.
+            socket.terminate();
         }
         this.#clients.clear();
         this.#attached = undefined;
@@ -94,8 +126,13 @@ export class BridgeWsServer {
     }
 
     private onConnection(socket: WebSocket): void {
-        const state: ClientState = { attached: false };
+        const state: ClientState = { attached: false, pending: Promise.resolve() };
         this.#clients.set(socket, state);
+
+        // Before the handshake send: `ws` throws an unhandled 'error' event if a
+        // socket fails with no listener attached, and a socket can fail on the
+        // very first write.
+        socket.on("error", error => this.#log(`Socket error: ${describeError(error)}`));
 
         // §2 step 1: the bare handshake frame, before anything else.
         const handshake: HandshakeFrame = {
@@ -115,8 +152,19 @@ export class BridgeWsServer {
         }, timeoutMs);
         state.unattachedTimer.unref?.();
 
-        socket.on("message", data => {
-            void this.onMessage(socket, state, data.toString());
+        socket.on("message", (data, isBinary) => {
+            if (isBinary) {
+                // The protocol is JSON text frames only (§1); nothing to answer.
+                this.#log("Dropping binary frame");
+                return;
+            }
+            const raw = data.toString();
+            // §1: strictly in receipt order — chain, never fan out. The tail
+            // catch also guarantees the chain is never left rejected, so one bad
+            // frame cannot stall every frame behind it.
+            state.pending = state.pending
+                .then(() => this.onMessage(socket, state, raw))
+                .catch(error => this.#log(`Frame handling failed: ${describeErrorWithStack(error)}`));
         });
         socket.on("close", () => {
             clearTimeout(state.unattachedTimer);
@@ -126,7 +174,6 @@ export class BridgeWsServer {
                 this.#log("Attached client disconnected");
             }
         });
-        socket.on("error", error => this.#log(`Socket error: ${describeError(error)}`));
     }
 
     private async onMessage(socket: WebSocket, state: ClientState, raw: string): Promise<void> {
@@ -157,13 +204,17 @@ export class BridgeWsServer {
         const commandArgs: Record<string, unknown> =
             typeof args === "object" && args !== null ? (args as Record<string, unknown>) : {};
 
+        // Gating first: before `attach` the node has said nothing about which
+        // commands it knows, so `not_attached` is the honest answer even for a
+        // name it would otherwise reject (§1.1).
+        if (command !== "attach" && !state.attached) {
+            this.sendError(socket, messageId, ErrorCode.notAttached, `${command} requires a successful attach first`);
+            return;
+        }
+
         const handler = this.#handlers.get(command);
         if (handler === undefined) {
             this.sendError(socket, messageId, ErrorCode.unknownCommand, `Unknown command ${command}`);
-            return;
-        }
-        if (command !== "attach" && !state.attached) {
-            this.sendError(socket, messageId, ErrorCode.notAttached, `${command} requires a successful attach first`);
             return;
         }
 
@@ -179,7 +230,9 @@ export class BridgeWsServer {
                 }
                 return;
             }
-            this.#log(`Command ${command} failed: ${describeError(error)}`);
+            // Stack node-side, message on the wire: `details` is what the Indigo
+            // log shows a user, the stack is what we need to debug the node.
+            this.#log(`Command ${command} failed: ${describeErrorWithStack(error)}`);
             this.sendError(socket, messageId, ErrorCode.internal, describeError(error));
         }
     }
@@ -221,13 +274,24 @@ export class BridgeWsServer {
         this.#log(`Client attached (plugin ${pluginVersion})`);
 
         // E1 reconciles `args.endpoints` here; E0 serves a fixed endpoint set.
+        // The §3.1 mass-removal guard (`mass_removal_refused` unless
+        // `intent: "replace_all"`) belongs with that reconcile — it is E1 scope,
+        // and until then there is no client-supplied set that could empty.
         return this.options.bridge.getStatus();
     }
 
     private async handleOpenWindow(args: Record<string, unknown>): Promise<unknown> {
-        const duration = args.durationSeconds ?? 900;
-        if (typeof duration !== "number" || !Number.isInteger(duration) || duration <= 0) {
-            throw new ProtocolError(ErrorCode.malformedArgs, "durationSeconds must be a positive integer");
+        const duration = args.durationSeconds ?? WINDOW_DURATION_DEFAULT_SECONDS;
+        if (
+            typeof duration !== "number" ||
+            !Number.isInteger(duration) ||
+            duration < WINDOW_DURATION_MIN_SECONDS ||
+            duration > WINDOW_DURATION_MAX_SECONDS
+        ) {
+            throw new ProtocolError(
+                ErrorCode.malformedArgs,
+                `durationSeconds must be an integer ${WINDOW_DURATION_MIN_SECONDS}-${WINDOW_DURATION_MAX_SECONDS}`,
+            );
         }
         return this.options.bridge.openCommissioningWindow(duration);
     }
@@ -241,8 +305,4 @@ export class BridgeWsServer {
             socket.send(JSON.stringify(frame));
         }
     }
-}
-
-function describeError(error: unknown): string {
-    return error instanceof Error ? error.message : String(error);
 }

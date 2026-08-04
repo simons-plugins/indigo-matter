@@ -63,6 +63,16 @@ export class TestClient {
         this.#socket.send(JSON.stringify(frame));
     }
 
+    /** Bypass JSON.stringify — for the garbage-frame tests. */
+    sendRaw(payload: string | Buffer): void {
+        this.#socket.send(payload);
+    }
+
+    /** True once no more frames are buffered — used to assert "nothing came back". */
+    get buffered(): number {
+        return this.#frames.length;
+    }
+
     /** Send a request and return its response frame. */
     async request(frame: unknown): Promise<Record<string, unknown>> {
         this.send(frame);

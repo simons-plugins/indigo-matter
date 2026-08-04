@@ -10,16 +10,22 @@
  */
 
 import { randomInt, randomUUID } from "node:crypto";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+
+import { describeError } from "./protocol.js";
 
 /** Inclusive passcode bounds. Matter core spec §5.1.1.6. */
 export const PASSCODE_MIN = 1;
 export const PASSCODE_MAX = 99_999_998;
 
-/** Trivial passcodes that must never be used. Matter core spec §5.1.7.1. */
+/**
+ * Trivial passcodes that must never be used. Matter core spec §5.1.7.1.
+ * `0` is listed there too and is outside {@link PASSCODE_MIN}, but a persisted
+ * file can still carry it, so it is named here rather than left to the bounds.
+ */
 export const INVALID_PASSCODES: readonly number[] = [
-    11111111, 22222222, 33333333, 44444444, 55555555, 66666666, 77777777, 88888888, 99999999, 12345678, 87654321,
+    0, 11111111, 22222222, 33333333, 44444444, 55555555, 66666666, 77777777, 88888888, 99999999, 12345678, 87654321,
 ];
 
 /** The discriminator is 12 bits. */
@@ -76,23 +82,65 @@ function isUsableIdentity(value: unknown): value is BridgeIdentity {
     );
 }
 
+function isNotFound(error: unknown): boolean {
+    return (error as NodeJS.ErrnoException | null)?.code === "ENOENT";
+}
+
+/**
+ * Write `identity.json` atomically: a temp file in the *same* directory (so the
+ * rename stays within one filesystem and is therefore atomic), then `rename`.
+ * A crash mid-write must never leave a half-written identity behind, because a
+ * half-written identity reads as corrupt and gets regenerated.
+ */
+function writeIdentity(file: string, identity: BridgeIdentity): void {
+    const temp = `${file}.${process.pid}.tmp`;
+    try {
+        writeFileSync(temp, `${JSON.stringify(identity, null, 2)}\n`, { mode: 0o600 });
+        renameSync(temp, file);
+    } catch (error) {
+        try {
+            unlinkSync(temp);
+        } catch {
+            // Best effort: the temp file may never have been created.
+        }
+        throw error;
+    }
+}
+
 /**
  * Read `identity.json` from {@link storagePath}, creating it (and the directory)
  * with freshly randomised values on first run. An unreadable or invalid file is
  * replaced — a bridge that cannot advertise is worse than one that needs
  * re-pairing, and E0 has nothing paired to protect yet.
+ *
+ * TODO(E1): a corrupt-but-present identity must refuse to start (PRD §4.3) —
+ * regeneration un-pairs every ecosystem. Only the missing-file branch may mint.
  */
-export function loadOrCreateIdentity(storagePath: string): BridgeIdentity {
+export function loadOrCreateIdentity(
+    storagePath: string,
+    log: (message: string) => void = () => {},
+): BridgeIdentity {
     mkdirSync(storagePath, { recursive: true });
     const file = join(storagePath, IDENTITY_FILE);
 
+    // `undefined` means "no file at all"; anything else is why we are replacing
+    // a file that does exist — the distinction E1 turns into refuse-to-start.
+    let problem: string | undefined;
     try {
         const parsed: unknown = JSON.parse(readFileSync(file, "utf8"));
         if (isUsableIdentity(parsed)) {
+            log(`Loaded bridge identity from ${file}`);
             return parsed;
         }
-    } catch {
-        // Missing or corrupt — fall through and mint a new identity.
+        problem = "present but not a usable identity (missing or out-of-range fields)";
+    } catch (error) {
+        problem = isNotFound(error) ? undefined : `unreadable (${describeError(error)})`;
+    }
+
+    if (problem === undefined) {
+        log(`No identity at ${file}; minting new bridge identity`);
+    } else {
+        log(`Replacing bridge identity at ${file}: ${problem}`);
     }
 
     const identity: BridgeIdentity = {
@@ -100,7 +148,7 @@ export function loadOrCreateIdentity(storagePath: string): BridgeIdentity {
         passcode: generatePasscode(),
         discriminator: generateDiscriminator(),
     };
-    writeFileSync(file, `${JSON.stringify(identity, null, 2)}\n`, { mode: 0o600 });
+    writeIdentity(file, identity);
     return identity;
 }
 

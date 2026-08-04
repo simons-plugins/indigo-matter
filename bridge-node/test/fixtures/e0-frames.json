@@ -151,6 +151,30 @@
       }
     }
   },
+  "get_pairing_commissioned_window_open": {
+    "request": {
+      "message_id": "m9",
+      "command": "get_pairing",
+      "args": {}
+    },
+    "response": {
+      "message_id": "m9",
+      "result": {
+        "commissioned": true,
+        "windowOpen": true,
+        "windowExpiresAt": "2026-08-04T12:15:00.000Z",
+        "manualPairingCode": "34970112332",
+        "qrPairingCode": "MT:-24J0AFN00KA0648G00",
+        "fabrics": [
+          {
+            "fabricIndex": 1,
+            "label": "Apple Home",
+            "vendorId": 4937
+          }
+        ]
+      }
+    }
+  },
   "open_commissioning_window": {
     "request": {
       "message_id": "m8",
@@ -166,6 +190,18 @@
         "qrPairingCode": "MT:-24J0AFN00KA0648G00",
         "windowExpiresAt": "2026-08-04T12:15:00.000Z"
       }
+    }
+  },
+  "window_closed_expired": {
+    "event": "window_closed",
+    "data": {
+      "reason": "expired"
+    }
+  },
+  "window_closed_commissioned": {
+    "event": "window_closed",
+    "data": {
+      "reason": "commissioned"
     }
   }
 }
