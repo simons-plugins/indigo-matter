@@ -35,15 +35,15 @@ commissioned end-to-end through Domio and reports live power/energy to Indigo.
 admin-1 ecosystem (Apple Home, or equally Alexa / Google Home) does the Thread
 provisioning; the plugin joins over IP via that ecosystem's border router
 (HomePod/Apple TV, TBR-capable Echo, Nest Hub). See
-[docs/MATTER.md](./docs/MATTER.md) for how the pieces fit; validation specifics live
-in [docs/HANDOVER.md](./docs/HANDOVER.md).
+[Matter](https://simons-plugins.github.io/indigo-matter/MATTER.html) for how the pieces fit; validation specifics live
+in [Handover](https://simons-plugins.github.io/indigo-matter/HANDOVER.html).
 
 ## Setup
 
 matter-server is a separate Node.js runtime. In local mode the plugin installs and
 manages it for you — **Plugins ▸ Matter ▸ Install/update matter-server** installs the
 pinned version with your Node and restarts onto it (no Terminal). See
-**[docs/INSTALL.md](./docs/INSTALL.md)** for the full guide (Node, matter-server, the two
+**[Install](https://simons-plugins.github.io/indigo-matter/INSTALL.html)** for the full guide (Node, matter-server, the two
 run modes, verification, backups, and troubleshooting).
 
 ## Requirements
@@ -65,14 +65,14 @@ published as a site:
 - **[№ 2 — The Proving Ground](https://simons-plugins.github.io/indigo-matter/testing.html)** —
   how this plugin is tested.
 
-Reference docs in this repo:
+Reference documentation:
 
-- **[docs/MATTER.md](./docs/MATTER.md)** — Matter & Thread explained: how Indigo, Domio, matter-server and Apple Home fit together. **Start here.**
-- **[docs/INSTALL.md](./docs/INSTALL.md)** — matter-server install & plugin setup.
-- **[docs/TESTING.md](./docs/TESTING.md)** — how the plugin is tested: unit suite, the device zoo, the virtual matter.js fleet, and live validation.
-- `docs/PRD-indigo-matter-plugin.md` — product requirements and milestones.
-- `docs/IMPLEMENTATION.md` — protocols, scaffold, setup, cluster handlers.
-- `docs/API.md` — the Domio ↔ plugin HTTP contract (v1.3, served over the Indigo Web Server).
+- **[Matter](https://simons-plugins.github.io/indigo-matter/MATTER.html)** — Matter & Thread explained: how Indigo, Domio, matter-server and Apple Home fit together. **Start here.**
+- **[Install](https://simons-plugins.github.io/indigo-matter/INSTALL.html)** — matter-server install & plugin setup.
+- **[Testing](https://simons-plugins.github.io/indigo-matter/TESTING.html)** — how the plugin is tested: unit suite, the device zoo, the virtual matter.js fleet, and live validation.
+- **[PRD](https://simons-plugins.github.io/indigo-matter/PRD-indigo-matter-plugin.html)** — product requirements and milestones.
+- **[Implementation](https://simons-plugins.github.io/indigo-matter/IMPLEMENTATION.html)** — protocols, scaffold, setup, cluster handlers.
+- **[API](https://simons-plugins.github.io/indigo-matter/API.html)** — the Domio ↔ plugin HTTP contract (v1.3, served over the Indigo Web Server).
 
 ## Development
 
@@ -80,7 +80,7 @@ Reference docs in this repo:
 pytest          # full unit suite; matter-server (WebSocket) and Indigo are mocked
 ```
 
-See [CLAUDE.md](./CLAUDE.md) for architecture and workspace conventions.
+See [CLAUDE.md](https://github.com/simons-plugins/indigo-matter/blob/main/CLAUDE.md) for architecture and workspace conventions.
 
 ## Trademarks and certification
 
@@ -111,9 +111,9 @@ What that means in practice:
 The icon bundles the Matter symbol from
 [Wikimedia Commons](https://commons.wikimedia.org/wiki/File:Logo_of_Matter_connectivity_standard.svg),
 which is public domain for copyright purposes. See
-[docs/branding/README.md](./docs/branding/README.md) for provenance.
+[docs/branding/README.md](https://github.com/simons-plugins/indigo-matter/blob/main/docs/branding/README.md) for provenance.
 
 ## License
 
-MIT — see [LICENSE](./LICENSE).
+MIT — see [LICENSE](https://github.com/simons-plugins/indigo-matter/blob/main/LICENSE).
 </content>
