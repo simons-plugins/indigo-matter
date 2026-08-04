@@ -8,13 +8,35 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
+import { EventName } from "../src/protocol.js";
 import * as shapes from "./fixture-shapes.js";
+import type { GoldenEvent } from "./stub-bridge.js";
 import { golden } from "./stub-bridge.js";
+
+/** The §5 domain, as runtime values, for the event sweep below. */
+const EVENT_NAMES: readonly string[] = Object.values(EventName);
+
+/**
+ * Every top-level event frame in the golden file, found by shape rather than by
+ * name — a new `command`/`fabrics_changed`/… fixture is swept the moment it is
+ * added, instead of sitting in the file referenced by nothing.
+ */
+function goldenEvents(): [string, GoldenEvent][] {
+    return Object.entries(golden as Record<string, unknown>).filter(
+        (entry): entry is [string, GoldenEvent] => {
+            const value = entry[1];
+            return typeof value === "object" && value !== null && "event" in value;
+        },
+    );
+}
 
 describe("golden fixtures match their typed mirror", () => {
     const cases: [string, unknown, unknown][] = [
         ["handshake", golden.handshake, shapes.handshake],
-        ["attach result", golden.attach.response.result, shapes.status],
+        // §3.1: the golden attach REQUEST carries `endpoints: []`, so the lawful
+        // answer is an empty live set. The E0 node ignores the requested set and
+        // serves its fixed endpoint — see protocol.test.ts, and E2.
+        ["attach result", golden.attach.response.result, shapes.statusEmpty],
         ["get_status result", golden.get_status.response.result, shapes.status],
         ["get_pairing (uncommissioned)", golden.get_pairing_uncommissioned.response.result, shapes.pairingUncommissioned],
         ["get_pairing (commissioned)", golden.get_pairing_commissioned.response.result, shapes.pairingCommissioned],
@@ -29,6 +51,12 @@ describe("golden fixtures match their typed mirror", () => {
         ["attach version_mismatch", golden.attach_version_mismatch.response, shapes.versionMismatch],
         ["not_attached", golden.not_attached.response, shapes.notAttached],
         ["unknown_command", golden.unknown_command.response, shapes.unknownCommand],
+        ["open_commissioning_window malformed_args", golden.open_window_malformed_args.response,
+            shapes.openWindowMalformedArgs],
+        ["open_commissioning_window commissioning_window_failed", golden.open_window_failed.response,
+            shapes.openWindowFailed],
+        ["open_commissioning_window internal", golden.open_window_internal.response,
+            shapes.openWindowInternal],
     ];
 
     for (const [name, actual, expected] of cases) {
@@ -60,6 +88,32 @@ describe("golden fixtures match their typed mirror", () => {
         for (const name of names) {
             it.skip(`${name} — node handler not implemented yet`, () => {});
         }
+    });
+
+    describe("§5 event frames", () => {
+        // These used to be declared on GoldenFrames and referenced by nothing:
+        // seven frames the TS side carried but never checked, so a malformed one
+        // would only ever have been caught by the Python suite.
+        const events = goldenEvents();
+
+        it("every event frame is a well-formed envelope with a §5 name", () => {
+            assert.ok(events.length > 0, "the golden file must carry §5 event frames");
+            for (const [name, frame] of events) {
+                assert.ok(EVENT_NAMES.includes(frame.event), `${name}: ${frame.event} is not a §5 event`);
+                assert.equal(typeof frame.data, "object", `${name} has no data object`);
+                assert.notEqual(frame.data, null, `${name} has a null data`);
+                // §1: events carry no message_id — that is what distinguishes them.
+                assert.ok(!("message_id" in frame), `${name} must not carry a message_id`);
+                assert.deepEqual(Object.keys(frame).sort(), ["data", "event"], `${name} envelope`);
+            }
+        });
+
+        it("covers every §5 event name", () => {
+            const covered = new Set(events.map(([, frame]) => frame.event));
+            for (const name of EVENT_NAMES) {
+                assert.ok(covered.has(name), `no golden frame for the ${name} event`);
+            }
+        });
     });
 
     it("covers all four §3.7 pairing states", () => {

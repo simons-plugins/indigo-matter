@@ -299,7 +299,21 @@ ecosystem acts. Both are enumerated here in full; there is no other source.
 
 `drift` lists any `UniqueID → endpointNumber` mappings that changed since last
 persist (PRD §4.3 drift detection); non-empty drift is surfaced as a plugin
-error, never auto-repaired.
+error, never auto-repaired. Each entry is a `DriftEntry`:
+
+```json
+{"uniqueId": "indigo-123456789", "expected": 2, "actual": 5}
+```
+
+- `uniqueId` — the node's `UniqueID` for the endpoint, derived from
+  `indigoDeviceId` (§4.1). It is the *persisted* identity, which is why drift is
+  reported against it rather than against the device id.
+- `expected` — the endpoint number the persisted map says this `uniqueId` has.
+- `actual` — the endpoint number it currently has.
+
+`endpoints[].role` is one of the §4.2 enum; `endpointCount` is
+`endpoints.length` (it is sent explicitly so a client can log the size without
+walking the list).
 
 ## 5. Events (node → plugin)
 

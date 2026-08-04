@@ -19,7 +19,13 @@ from typing import Any, Awaitable, Callable, Optional
 
 import protocol
 from protocol import MatterCommand, MatterWrite, Protocol
-from ws_json_client import MAX_BACKOFF, WsJsonClient, pref_str  # noqa: F401  (MAX_BACKOFF re-exported)
+# MAX_BACKOFF is re-exported: it was importable from here before the transport
+# was extracted, and callers (and tests) still reach for it at this address.
+from ws_json_client import (  # pylint: disable=unused-import
+    MAX_BACKOFF,
+    WsJsonClient,
+    pref_str,
+)
 
 # Commissioning is the one RPC that legitimately takes minutes: discovery +
 # PASE over the LAN was observed at ~124s in the 2026-06-09 live rehearsal,
@@ -110,8 +116,13 @@ class MatterClient(WsJsonClient):
             return
         try:
             self._on_event(evt)
-        except Exception as exc:  # pragma: no cover - handler must not kill the loop
-            self.logger.exception(exc)
+        except Exception as exc:  # handler must not kill the loop
+            # Name the event and its data: which event broke the handler is the
+            # whole question, and a bare traceback from inside a callback that
+            # takes every event kind cannot answer it.
+            self.logger.exception("matter-server event %s failed on %r: %s",
+                                  frame.get(protocol.KEY_EVENT, "?"),
+                                  frame.get(protocol.KEY_DATA), exc)
 
     # ------------------------------------------------------------------
     # Requests

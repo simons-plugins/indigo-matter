@@ -118,8 +118,11 @@ class TestHandshake:
             assert bridge_protocol.ARG_INTENT not in frame["args"]
 
             assert attached, "on_attached never fired"
-            assert attached[0].endpoint_count == 1
+            # The golden attach answers the golden attach REQUEST, which carries
+            # `endpoints: []` — so the lawful §3.1 answer is an empty live set.
+            assert attached[0].endpoint_count == 0
             assert client.status is attached[0]
+            assert client.attached, "a successful attach is what `attached` means"
             assert client.hello.bridge_version == HELLO["bridgeVersion"]
 
             await client.close()
@@ -309,7 +312,8 @@ class TestCommands:
         status = self._exchange(mock_logger, lambda c: c.rebuild_endpoint_map(),
                                 "rebuild_endpoint_map", PENDING)
         assert status.endpoint_count == 2
-        assert status.endpoints[1].endpoint_number == 3
+        # §3.11 REallocates — the numbers differ from the ones attach reported.
+        assert status.endpoints[1].endpoint_number == 5
 
     def test_error_response_raises(self, mock_logger):
         async def scenario():
@@ -583,3 +587,435 @@ class TestUri:
         # The controller client's field bug (blank pref → port 80) must not repeat.
         assert self._uri({"bridgeWsPort": ""}) == "ws://127.0.0.1:5581/"
         assert self._uri({"bridgeWsPort": " 5599 "}) == "ws://127.0.0.1:5599/"
+
+
+def error_response(code: str, details: str = "because") -> dict:
+    """An error frame body for ``golden_responder``'s override table (§1)."""
+    return {"error_code": code, "details": details}
+
+
+def logged(mock_logger, level: str) -> str:
+    """Every argument of every call at ``level``, flattened for substring checks."""
+    return " ".join(str(call) for call in getattr(mock_logger, level).call_args_list)
+
+
+class TestAttachRefused:
+    """§1.1 — the node can refuse an attach, and "retry in 1s" answers none of it.
+
+    Before this, every refusal took the same path: the ``BridgeProtocolError``
+    escaped the handshake, the run loop logged a bare traceback, and one second
+    later the client attached again to be refused again — forever, for reasons a
+    reconnect cannot change.
+    """
+
+    def _refuse(self, mock_logger, code, **kw):
+        """Run a client against a node that refuses the handshake attach."""
+        state = {}
+
+        async def scenario():
+            delays = []
+
+            async def fake_sleep(delay):
+                delays.append(delay)
+                await client.close()
+                await asyncio.sleep(0)
+
+            fake = _fake(responder=golden_responder(
+                {bridge_protocol.CMD_ATTACH: error_response(code, f"{code} details")}))
+            client = _client(mock_logger, fake, sleep=fake_sleep, **kw)
+            task = asyncio.create_task(client.run())
+            # A halting refusal returns from run(); a recovery one keeps running.
+            for _ in range(200):
+                if task.done() or client.recovery:
+                    break
+                await asyncio.sleep(0.005)
+            state.update(client=client, fake=fake, delays=delays, task=task)
+            if not task.done():
+                await client.close()
+                task.cancel()
+        run(scenario())
+        return state
+
+    def test_mass_removal_refused_halts_with_its_own_reason(self, mock_logger):
+        # §3.1's guard fired: the node still serves endpoints and we asked it to
+        # serve none. Attaching again with the same set gets the same answer.
+        refusals = []
+        state = self._refuse(mock_logger, bridge_protocol.ERR_MASS_REMOVAL_REFUSED,
+                             on_attach_refused=lambda code, details: refusals.append((code, details)))
+        client = state["client"]
+
+        assert client.halted
+        assert client.halted_reason == bridge_protocol.ERR_MASS_REMOVAL_REFUSED
+        assert not client.attached
+        assert state["delays"] == [], "a refusal that will repeat must not be retried"
+        assert refusals == [(bridge_protocol.ERR_MASS_REMOVAL_REFUSED,
+                             f"{bridge_protocol.ERR_MASS_REMOVAL_REFUSED} details")]
+        errors = logged(mock_logger, "error")
+        assert bridge_protocol.ERR_MASS_REMOVAL_REFUSED in errors
+        assert "allow-list" in errors, "the log must carry the remedy, not just the code"
+
+    def test_version_mismatch_on_the_attach_also_halts(self, mock_logger):
+        # Distinct from the hello-frame skew: the node accepted the connection
+        # and rejected the attach args. Same conclusion, different route in.
+        state = self._refuse(mock_logger, bridge_protocol.ERR_VERSION_MISMATCH)
+        assert state["client"].halted
+        assert state["client"].halted_reason == bridge_protocol.ERR_VERSION_MISMATCH
+        assert state["delays"] == []
+        assert "restart the bridge agent" in logged(mock_logger, "error")
+
+    def test_a_transient_refusal_reconnects_and_names_the_code(self, mock_logger):
+        # `internal` says the node fell over on its own; that genuinely may work
+        # next time. What must not survive is the bare traceback it used to log.
+        state = self._refuse(mock_logger, bridge_protocol.ERR_INTERNAL)
+        assert not state["client"].halted
+        assert state["delays"], "a transient refusal must be retried"
+        warnings = logged(mock_logger, "warning")
+        assert bridge_protocol.ERR_INTERNAL in warnings
+        assert "handshake failed" in warnings
+        assert not mock_logger.exception.called, "a known error_code is not a traceback"
+
+    def test_malformed_args_is_treated_as_transient(self, mock_logger):
+        state = self._refuse(mock_logger, bridge_protocol.ERR_MALFORMED_ARGS)
+        assert not state["client"].halted
+        assert state["delays"]
+
+
+class TestEndpointMapInvalid:
+    """§1.1 — the one refusal where dropping the socket destroys the way out.
+
+    In this state the node serves nothing and accepts exactly ``get_status``,
+    ``get_pairing`` and ``rebuild_endpoint_map``. That rebuild is PRD §7's
+    user-confirmed recovery, so the connection is held open, un-attached.
+    """
+
+    def _recovering(self, mock_logger, overrides=None):
+        table = {bridge_protocol.CMD_ATTACH: error_response(
+            bridge_protocol.ERR_ENDPOINT_MAP_INVALID,
+            PENDING["endpoint_map_invalid"]["response"]["details"])}
+        table.update(overrides or {})
+        fake = _fake(responder=golden_responder(table))
+        return fake, _client(mock_logger, fake)
+
+    def test_the_connection_is_kept_open_un_attached(self, mock_logger):
+        async def scenario():
+            refusals = []
+            fake, client = self._recovering(mock_logger)
+            client._on_attach_refused = lambda code, details: refusals.append(code)
+            task = asyncio.create_task(client.run())
+            await settle(lambda: client.recovery)
+
+            assert client.connected, "the recovery commands need this socket"
+            assert not client.attached
+            assert client.recovery
+            assert not client.halted
+            assert refusals == [bridge_protocol.ERR_ENDPOINT_MAP_INVALID]
+            assert "confirm the rebuild" in logged(mock_logger, "error")
+
+            await client.close()
+            task.cancel()
+        run(scenario())
+
+    def test_the_three_recovery_commands_still_work(self, mock_logger):
+        # §1.1 names exactly these three. If the client cannot reach them, the
+        # refuse-to-start state is a dead end rather than a recoverable one.
+        async def scenario():
+            fake, client = self._recovering(mock_logger)
+            task = asyncio.create_task(client.run())
+            await settle(lambda: client.recovery)
+
+            assert (await client.get_status()).endpoint_count == 1
+            assert (await client.get_pairing()).commissioned is True
+
+            await client.close()
+            task.cancel()
+        run(scenario())
+
+    def test_a_successful_rebuild_re_attaches(self, mock_logger):
+        # The map is valid again, so the connection stops being a three-command
+        # lifeline: without this the export stays dark until the next reconnect.
+        async def scenario():
+            attached = []
+            # Once the map is rebuilt the node accepts the attach it refused.
+            answers = {bridge_protocol.CMD_ATTACH: error_response(
+                bridge_protocol.ERR_ENDPOINT_MAP_INVALID, "map unreadable")}
+
+            def responder(frame):
+                command = frame["command"]
+                if command == bridge_protocol.CMD_REBUILD_ENDPOINT_MAP:
+                    answers[bridge_protocol.CMD_ATTACH] = FRAMES["attach"]["response"]
+                body = {**RESPONSES, **answers}.get(command)
+                return [{**body, "message_id": frame["message_id"]}]
+
+            fake = _fake(responder=responder)
+            client = _client(mock_logger, fake, on_attached=attached.append)
+            task = asyncio.create_task(client.run())
+            await settle(lambda: client.recovery)
+            assert not client.attached
+
+            status = await client.rebuild_endpoint_map()
+
+            assert client.attached, "the client must re-attach once the map is rebuilt"
+            assert not client.recovery
+            assert attached and attached[-1] is status
+            assert bridge_protocol.CMD_ATTACH in fake.sent_commands()
+
+            await client.close()
+            task.cancel()
+        run(scenario())
+
+    def test_state_pushes_are_dropped_while_un_attached(self, mock_logger):
+        # `connected` is true here, so a transport-level check would have posted
+        # state into a node that is serving no endpoints at all.
+        async def scenario():
+            fake, client = self._recovering(mock_logger)
+            task = asyncio.create_task(client.run())
+            await settle(lambda: client.recovery)
+
+            await client.set_state(123456789, {"onOff": True})
+            assert bridge_protocol.CMD_SET_STATE not in fake.sent_commands()
+
+            await client.close()
+            task.cancel()
+        run(scenario())
+
+
+class TestSetStateFailurePaths:
+    """§3.4 — a push must never raise on Indigo's device thread, and must never lie."""
+
+    def test_a_send_that_raises_is_dropped_not_propagated(self, mock_logger):
+        # The listen loop has not noticed the socket died, so `connected` is
+        # still True and the guard passes — then send() raises straight into
+        # whatever Indigo callback triggered the state change.
+        class DyingSocket(FakeWebSocket):
+            async def send(self, raw: str) -> None:
+                import json as _json
+                if _json.loads(raw).get("command") == bridge_protocol.CMD_SET_STATE:
+                    raise ConnectionResetError("broken pipe")
+                await super().send(raw)
+
+        async def scenario():
+            fake = DyingSocket(responder=golden_responder(), handshake=HELLO)
+            client = _client(mock_logger, fake)
+            task = asyncio.create_task(client.run())
+            await client.wait_connected(timeout=2)
+            mock_logger.debug.reset_mock()
+
+            await client.set_state(123456789, {"onOff": True})   # must not raise
+
+            assert "send failed" in logged(mock_logger, "debug")
+            assert "123456789" in logged(mock_logger, "debug")
+
+            await client.close()
+            task.cancel()
+        run(scenario())
+
+    def test_a_push_while_halted_warns_that_nothing_is_being_delivered(self, mock_logger):
+        # "attach will reconcile" is true while reconnecting and false while
+        # halted — there is no reconnect coming. Logging it at debug meant the
+        # one state where the export is silently dead was the quietest of all.
+        async def scenario():
+            client = _client(mock_logger, _fake())
+            client.halted = True
+            client.halted_reason = "version_skew"
+
+            await client.set_state(123456789, {"onOff": True})
+
+            warnings = logged(mock_logger, "warning")
+            assert "halted" in warnings
+            assert "NOT being delivered" in warnings
+            assert "version_skew" in warnings
+        run(scenario())
+
+    def test_an_unmatched_error_names_the_device(self, mock_logger):
+        # §3.4 responses are not awaited, so the warning is all anyone gets. A
+        # bare message_id is not something a user can act on.
+        async def scenario():
+            fake = _fake(responder=golden_responder(
+                {bridge_protocol.CMD_SET_STATE: PENDING["set_state_unknown_device"]["response"]}))
+            client = _client(mock_logger, fake)
+            task = asyncio.create_task(client.run())
+            await client.wait_connected(timeout=2)
+
+            await client.set_state(123456791, {"onOff": True})
+            await settle(lambda: mock_logger.warning.called)
+
+            warnings = logged(mock_logger, "warning")
+            assert "set_state dev 123456791" in warnings, warnings
+            assert bridge_protocol.ERR_UNKNOWN_DEVICE in warnings
+            # Matched or logged, the note is consumed either way.
+            assert client._send_context == {}
+
+            await client.close()
+            task.cancel()
+        run(scenario())
+
+
+class TestHandshakeInterleaving:
+    """The attach is pumped inline — everything else on the wire must survive it."""
+
+    def test_an_event_arriving_during_the_handshake_is_not_lost(self, mock_logger):
+        # The node may emit before it answers: it has an attached client the
+        # instant it processes the attach. The inline pump has to dispatch those
+        # normally, which means on_command CAN fire before on_attached.
+        async def scenario():
+            order = []
+
+            def responder(frame):
+                if frame["command"] != bridge_protocol.CMD_ATTACH:
+                    return golden_responder()(frame)
+                return [
+                    {"event": bridge_protocol.EVT_COMMAND,
+                     "data": FRAMES["command_on_off"]["data"]},
+                    {**FRAMES["attach"]["response"], "message_id": frame["message_id"]},
+                ]
+
+            fake = _fake(responder=responder)
+            client = _client(mock_logger, fake,
+                             on_command=lambda cmd: order.append(("command", cmd.command)),
+                             on_attached=lambda _s: order.append(("attached", None)))
+            task = asyncio.create_task(client.run())
+            await client.wait_connected(timeout=2)
+            await settle(lambda: len(order) == 2)
+
+            assert order == [("command", "onOff"), ("attached", None)], order
+            assert client.attached
+            assert client.last_event_ts is not None
+
+            await client.close()
+            task.cancel()
+        run(scenario())
+
+
+class TestHaltAndResume:
+    """The full skew → halt → fix → resume → attach cycle, behaviourally."""
+
+    def test_a_resumed_client_attaches_to_a_fixed_node(self, mock_logger):
+        async def scenario():
+            sockets = [_fake(handshake=SKEWED_HELLO), _fake()]
+            index = {"i": 0}
+
+            def connect(_uri):
+                i = min(index["i"], len(sockets) - 1)
+                index["i"] += 1
+                return returns(sockets[i])
+
+            async def fake_sleep(_delay):
+                await asyncio.sleep(0)
+
+            attached = []
+            client = _client(mock_logger, sockets[0], connect=connect, sleep=fake_sleep,
+                             on_attached=attached.append)
+
+            await asyncio.wait_for(client.run(), timeout=2)
+            assert client.halted and client.halted_reason == "version_skew"
+            assert not attached
+
+            client.resume()                       # the agent was restarted
+            task = asyncio.create_task(client.run())
+            await client.wait_connected(timeout=2)
+            await settle(lambda: attached)
+
+            assert client.attached
+            assert attached, "the fixed node must actually be attached to"
+            assert bridge_protocol.CMD_ATTACH in sockets[1].sent_commands()
+
+            await client.close()
+            task.cancel()
+        run(scenario())
+
+
+class TestReattach:
+    """§3.1 on a live connection is a refresh, not just a frame on the wire."""
+
+    def test_attach_on_a_live_connection_updates_the_status(self, mock_logger):
+        async def scenario():
+            answers = {bridge_protocol.CMD_ATTACH: FRAMES["attach"]["response"]}
+
+            def responder(frame):
+                body = {**RESPONSES, **answers}.get(frame["command"])
+                return [{**body, "message_id": frame["message_id"]}]
+
+            fake = _fake(responder=responder)
+            client = _client(mock_logger, fake)
+            task = asyncio.create_task(client.run())
+            await client.wait_connected(timeout=2)
+            assert client.status.endpoint_count == 0
+
+            # The node now serves the two-endpoint set.
+            answers[bridge_protocol.CMD_ATTACH] = PENDING["attach_with_endpoints"]["response"]
+            refreshed = await client.attach([KITCHEN_LAMP])
+
+            assert client.status is refreshed
+            assert refreshed.endpoint_count == 2
+            assert [ep.endpoint_number for ep in client.status.endpoints] == [2, 3]
+
+            await client.close()
+            task.cancel()
+        run(scenario())
+
+
+class TestEventDiagnostics:
+    """§5 — a callback that blows up must say WHICH event blew it up."""
+
+    def test_the_failure_log_names_the_event_and_its_data(self, mock_logger):
+        def boom(_command):
+            raise RuntimeError("handler exploded")
+
+        async def scenario():
+            fake = _fake()
+            client = _client(mock_logger, fake, on_command=boom)
+            task = asyncio.create_task(client.run())
+            await client.wait_connected(timeout=2)
+            await fake.push_event(bridge_protocol.EVT_COMMAND, FRAMES["command_on_off"]["data"])
+            await settle(lambda: mock_logger.exception.called)
+
+            reported = logged(mock_logger, "exception")
+            assert bridge_protocol.EVT_COMMAND in reported
+            assert "123456789" in reported, "the payload is the lead; log it"
+            assert client.connected
+
+            await client.close()
+            task.cancel()
+        run(scenario())
+
+
+class TestResultValidation:
+    """A missing field in a result is a protocol error, never a plausible default."""
+
+    def test_upsert_endpoint_without_an_endpoint_number_raises(self, mock_logger):
+        # Endpoint numbers ARE the exported accessory's identity (§6.3). A
+        # defaulted 0 would be fed straight to the drift detector that exists to
+        # catch exactly this kind of divergence.
+        async def scenario():
+            fake = _fake(responder=golden_responder(
+                {bridge_protocol.CMD_UPSERT_ENDPOINT: {"result": {}}}))
+            client = _client(mock_logger, fake)
+            task = asyncio.create_task(client.run())
+            await client.wait_connected(timeout=2)
+
+            with pytest.raises(bridge_protocol.BridgeProtocolError):
+                await client.upsert_endpoint(KITCHEN_LAMP)
+
+            await client.close()
+            task.cancel()
+        run(scenario())
+
+    def test_a_window_without_pairing_codes_raises(self, mock_logger):
+        # An empty code is handed to the user as the thing to type into their
+        # ecosystem. A window that opened with no usable code is worse than one
+        # that failed to open.
+        async def scenario():
+            fake = _fake(responder=golden_responder(
+                {bridge_protocol.CMD_OPEN_WINDOW:
+                    {"result": {"windowExpiresAt": "2026-08-04T12:15:00.000Z"}}}))
+            client = _client(mock_logger, fake)
+            task = asyncio.create_task(client.run())
+            await client.wait_connected(timeout=2)
+
+            with pytest.raises(bridge_protocol.BridgeProtocolError) as excinfo:
+                await client.open_commissioning_window()
+            assert "manualPairingCode" in str(excinfo.value)
+
+            await client.close()
+            task.cancel()
+        run(scenario())

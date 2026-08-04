@@ -24,6 +24,12 @@ export interface GoldenExchange {
     response: Record<string, unknown>;
 }
 
+/** A §1 event frame as it sits in the golden file. */
+export interface GoldenEvent {
+    event: string;
+    data: Record<string, unknown>;
+}
+
 export interface GoldenFrames {
     handshake: Record<string, unknown>;
     attach: GoldenExchange;
@@ -35,18 +41,20 @@ export interface GoldenFrames {
     get_pairing_commissioned: GoldenExchange;
     get_pairing_commissioned_window_open: GoldenExchange;
     open_commissioning_window: GoldenExchange;
-    window_closed_expired: Record<string, unknown>;
-    window_closed_commissioned: Record<string, unknown>;
-    /** §5 events the node does not emit yet; here so the plugin can parse them. */
-    command_on_off: Record<string, unknown>;
-    command_set_level: Record<string, unknown>;
-    command_lock: Record<string, unknown>;
-    fabrics_changed_added: Record<string, unknown>;
-    commissioned: Record<string, unknown>;
-    decommissioned: Record<string, unknown>;
-    drift_detected: Record<string, unknown>;
+    /** §1.1 failures the node really does answer with today. */
+    open_window_malformed_args: GoldenExchange;
+    open_window_failed: GoldenExchange;
+    open_window_internal: GoldenExchange;
+    window_closed_expired: GoldenEvent;
+    window_closed_commissioned: GoldenEvent;
     /** §3.1-§3.11 exchanges awaiting node-side handlers — skipped by this suite. */
     pending: Record<string, GoldenExchange>;
+    /**
+     * §5 event frames the node does not emit yet — they exist so the plugin can
+     * parse them, and `fixtures.test.ts` sweeps every one of them by name rather
+     * than listing them, so a new event frame is covered the moment it is added.
+     */
+    [key: string]: unknown;
 }
 
 /**

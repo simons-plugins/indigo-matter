@@ -35,9 +35,24 @@ def _events() -> dict:
 EXCHANGES = _exchanges()
 EVENTS = _events()
 
-# The plugin cannot build a frame that declares a protocol version other than its
-# own — that fixture exists to pin the NODE's rejection of a future plugin (§2).
-UNBUILDABLE = {"attach_version_mismatch"}
+#: Fixtures with no public builder, and the assertion that replaces the
+#: round-trip. Both are frames the plugin is INCAPABLE of producing — which is
+#: the point of them: they pin what the node does with a client that is not this
+#: one. Anything else missing a builder is a hole, so the default is still to
+#: fail with "no builder for command".
+UNBUILDABLE = {
+    # §2: the plugin only ever declares its own protocol version.
+    "attach_version_mismatch": lambda request:
+        request["args"]["protocolVersion"] != bridge_protocol.PROTOCOL_VERSION,
+    # §1: a name outside the §3 domain — there is no builder because there is no
+    # command. (It used to be `upsert_endpoint`, "unknown" only until the node
+    # grew the handler, which made the fixture expire on its own.)
+    "unknown_command": lambda request: request["command"] not in bridge_protocol.COMMANDS,
+}
+
+#: Endpoint specs that deliberately carry a role outside the §4.2 enum, to pin
+#: the node's ``unknown_role`` refusal. Everything else must be a v1 role.
+UNLAWFUL_ROLE_FIXTURES = {"pending:upsert_endpoint_unknown_role"}
 
 
 def _build(proto: BridgeProtocol, request: dict):
@@ -81,8 +96,9 @@ class TestRequests:
     @pytest.mark.parametrize("name", sorted(EXCHANGES))
     def test_request_round_trips_through_the_builder(self, name):
         request = EXCHANGES[name]["request"]
-        if name in UNBUILDABLE:
-            assert request["args"]["protocolVersion"] != bridge_protocol.PROTOCOL_VERSION
+        unbuildable = UNBUILDABLE.get(name)
+        if unbuildable is not None:
+            assert unbuildable(request), f"{name} is buildable after all — drop the exemption"
             return
         assert _build(BridgeProtocol(), request) == request
 
@@ -217,31 +233,109 @@ class TestEvents:
         assert reasons == {"expired", "commissioned"}
 
 
+def _endpoint_specs(name: str, exchange: dict):
+    """Every ``EndpointSpec`` in a request, whichever arg carries it (§3.1/§3.2)."""
+    args = exchange["request"].get("args") or {}
+    yield from args.get("endpoints", [])
+    if "endpoint" in args:
+        yield args["endpoint"]
+
+
+def _covered_roles() -> set:
+    return {spec["role"]
+            for name, exchange in EXCHANGES.items() if name not in UNLAWFUL_ROLE_FIXTURES
+            for spec in _endpoint_specs(name, exchange)}
+
+
+def _covered_state_keys() -> set:
+    """Keys carried by a real ``set_state`` frame — §3.4 is the only push path."""
+    keys = set()
+    for exchange in EXCHANGES.values():
+        request = exchange["request"]
+        if request["command"] != bridge_protocol.CMD_SET_STATE:
+            continue
+        keys |= set((request.get("args") or {}).get("states") or {})
+    return keys
+
+
+def _covered_command_names() -> set:
+    return {frame["data"]["command"] for frame in EVENTS.values()
+            if frame["event"] == bridge_protocol.EVT_COMMAND}
+
+
+def _covered_error_codes() -> set:
+    return {exchange["response"][bridge_protocol.KEY_ERROR_CODE]
+            for exchange in EXCHANGES.values()
+            if bridge_protocol.KEY_ERROR_CODE in exchange["response"]}
+
+
 class TestCoverage:
-    """The fixture file is the contract; it has to cover all of it."""
+    """The fixture file is the contract; it has to cover all of it.
+
+    Every expectation below is ENUMERATED from ``bridge_protocol`` — the §3
+    command set, the §1.1 error domain, the §4.2 role vocabularies — never from
+    a list restated here. Adding a role, a command name, a state key or an error
+    code therefore fails this suite until a golden frame carries it, and
+    deleting the frame that carries one fails it again.
+    """
 
     def test_every_command_has_a_golden_frame(self):
         covered = {exchange["request"]["command"] for exchange in EXCHANGES.values()}
-        expected = {
-            getattr(bridge_protocol, name) for name in dir(bridge_protocol)
-            if name.startswith("CMD_")
-        }
-        assert expected - covered == set()
+        assert bridge_protocol.COMMANDS - covered == set()
 
     def test_every_event_has_a_golden_frame(self):
         covered = {frame["event"] for frame in EVENTS.values()}
         assert bridge_protocol.EVENT_NAMES - covered == set()
 
+    def test_every_error_code_has_a_golden_frame(self):
+        # §1.1 is "the complete domain for protocol version 1"; a code the client
+        # has never once been handed is a code nobody has thought about handling.
+        assert bridge_protocol.ERROR_CODES - _covered_error_codes() == set()
+
+    def test_every_role_appears_in_an_endpoint_spec(self):
+        assert bridge_protocol.ROLES - _covered_roles() == set()
+
+    def test_every_state_key_appears_in_a_set_state_frame(self):
+        expected = {key for keys in bridge_protocol.ROLE_STATE_KEYS.values() for key in keys}
+        assert expected - _covered_state_keys() == set()
+
+    def test_every_role_command_appears_in_a_command_event(self):
+        expected = {name for names in bridge_protocol.ROLE_COMMANDS.values() for name in names}
+        assert expected - _covered_command_names() == set()
+
+    def test_sensor_roles_have_no_commands(self):
+        # §4.2: sensors are read-only in Matter. An empty tuple there is a
+        # decision, and this is what stops it being read as an oversight and
+        # "fixed" by inventing a command the node would never emit.
+        for role in ("occupancySensor", "contactSensor", "temperatureSensor",
+                     "humiditySensor", "lightSensor", "pressureSensor", "flowSensor"):
+            assert bridge_protocol.ROLE_COMMANDS[role] == ()
+
+    def test_the_two_role_vocabularies_agree_on_the_role_set(self):
+        assert set(bridge_protocol.ROLE_COMMANDS) == bridge_protocol.ROLES
+
     def test_every_endpoint_spec_uses_a_v1_role(self):
-        roles = set()
-        for exchange in EXCHANGES.values():
-            args = exchange["request"].get("args") or {}
-            for spec in args.get("endpoints", []):
-                roles.add(spec["role"])
-            if "endpoint" in args:
-                roles.add(args["endpoint"]["role"])
-        assert roles and roles <= bridge_protocol.ROLES
+        for name, exchange in EXCHANGES.items():
+            for spec in _endpoint_specs(name, exchange):
+                lawful = spec["role"] in bridge_protocol.ROLES
+                assert lawful is (name not in UNLAWFUL_ROLE_FIXTURES), \
+                    f"{name} carries role {spec['role']!r}"
+
+    def test_rebuild_reallocates_rather_than_echoing_the_previous_numbers(self):
+        # §3.11 exists to hand out NEW endpoint numbers (that is why it duplicates
+        # accessories). A fixture that echoed attach's numbers demonstrated the
+        # opposite of the command's whole reason to exist.
+        before = {ep["indigoDeviceId"]: ep["endpointNumber"]
+                  for ep in PENDING["attach_with_endpoints"]["response"]["result"]["endpoints"]}
+        after = {ep["indigoDeviceId"]: ep["endpointNumber"]
+                 for ep in PENDING["rebuild_endpoint_map"]["response"]["result"]["endpoints"]}
+        assert set(before) == set(after)
+        assert all(after[dev] != before[dev] for dev in before), (before, after)
 
     def test_endpoint_spec_round_trips(self):
         wire = PENDING["upsert_endpoint"]["request"]["args"]["endpoint"]
         assert EndpointSpec.from_wire(wire).to_wire() == wire
+
+    def test_every_role_spec_round_trips(self):
+        for spec in PENDING["attach_all_roles"]["request"]["args"]["endpoints"]:
+            assert EndpointSpec.from_wire(spec).to_wire() == spec

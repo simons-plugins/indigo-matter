@@ -29,11 +29,28 @@ export const handshake = {
     matterJsVersion: "0.0.0-test",
 } satisfies HandshakeFrame;
 
+/** What the E0 node actually serves: one hard-coded endpoint, ignoring `attach`. */
 export const status = {
     commissioned: false,
     fabrics: [],
     endpointCount: 1,
     endpoints: [{ indigoDeviceId: 999001, endpointNumber: 2, role: "onOffPlugInUnit" }],
+    drift: [],
+} satisfies StatusReport;
+
+/**
+ * The lawful §3.1 answer to the golden `attach` REQUEST, which carries
+ * `endpoints: []` — an empty desired set reconciles to an empty live set.
+ *
+ * The E0 node does not reconcile yet (it ignores the requested set and serves
+ * {@link status}), so `protocol.test.ts` asserts attach against the live status
+ * instead. The two converge when E2 makes `attach` do the reconcile for real.
+ */
+export const statusEmpty = {
+    commissioned: false,
+    fabrics: [],
+    endpointCount: 0,
+    endpoints: [],
     drift: [],
 } satisfies StatusReport;
 
@@ -98,5 +115,26 @@ export const notAttached = {
 export const unknownCommand = {
     message_id: "m4",
     error_code: "unknown_command",
-    details: "Unknown command upsert_endpoint",
+    details: "Unknown command no_such_command",
+} satisfies ErrorFrame;
+
+/** §3.8 rejects a duration outside the Matter 180-900s bounds. */
+export const openWindowMalformedArgs = {
+    message_id: "m25",
+    error_code: "malformed_args",
+    details: "durationSeconds must be an integer 180-900",
+} satisfies ErrorFrame;
+
+/** §3.8: the Matter stack refused — a ProtocolError the facade threw. */
+export const openWindowFailed = {
+    message_id: "m26",
+    error_code: "commissioning_window_failed",
+    details: "A commissioning window is already open",
+} satisfies ErrorFrame;
+
+/** §1.1 `internal`: any other facade failure, with its message as `details`. */
+export const openWindowInternal = {
+    message_id: "m27",
+    error_code: "internal",
+    details: "mDNS advertiser is down",
 } satisfies ErrorFrame;

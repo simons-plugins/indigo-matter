@@ -59,6 +59,13 @@ CMD_REMOVE_FABRIC = "remove_fabric"
 CMD_FACTORY_RESET = "factory_reset"
 CMD_REBUILD_ENDPOINT_MAP = "rebuild_endpoint_map"
 
+#: The complete §3 command domain. Anything else gets ``unknown_command``.
+COMMANDS = frozenset({
+    CMD_ATTACH, CMD_UPSERT_ENDPOINT, CMD_REMOVE_ENDPOINT, CMD_SET_STATE, CMD_SET_REACHABLE,
+    CMD_GET_STATUS, CMD_GET_PAIRING, CMD_OPEN_WINDOW, CMD_REMOVE_FABRIC, CMD_FACTORY_RESET,
+    CMD_REBUILD_ENDPOINT_MAP,
+})
+
 # attach args (§3.1)
 ARG_PLUGIN_VERSION = "pluginVersion"
 ARG_ENDPOINTS = "endpoints"
@@ -115,15 +122,60 @@ EVENT_NAMES = frozenset({
     EVT_WINDOW_CLOSED, EVT_DRIFT_DETECTED,
 })
 
-#: The v1 role enum (§4.2). Role→state-key/command vocabularies are enumerated
-#: in §4.2 and land with the export mapping (E2/E3); this set is what the
-#: allow-list validates against.
-ROLES = frozenset({
-    "onOffPlugInUnit", "onOffLight", "dimmableLight", "colorTemperatureLight",
-    "extendedColorLight", "windowCovering", "doorLock", "occupancySensor",
-    "contactSensor", "temperatureSensor", "humiditySensor", "lightSensor",
-    "pressureSensor", "flowSensor", "thermostat",
-})
+# --------------------------------------------------------------------------
+# Roles (§4.2) — the two vocabularies each role defines
+# --------------------------------------------------------------------------
+# §4.2 is the only source for these, and it writes the light rows additively
+# ("+ colorTempMireds"); they are spelled out in full here so nothing has to
+# re-derive the inheritance. The export mapping (E2/E3) consumes them, and the
+# golden-frame coverage test enumerates from here rather than a hand-kept list —
+# add a role or a command and the fixtures are required to grow with it.
+
+#: role → the ``set_state`` keys the plugin may push (§3.4/§4.2).
+ROLE_STATE_KEYS = {
+    "onOffPlugInUnit": ("onOff",),
+    "onOffLight": ("onOff",),
+    "dimmableLight": ("onOff", "level"),
+    "colorTemperatureLight": ("onOff", "level", "colorTempMireds"),
+    "extendedColorLight": ("onOff", "level", "colorTempMireds", "hue", "saturation"),
+    "windowCovering": ("position",),
+    "doorLock": ("locked",),
+    "occupancySensor": ("occupied",),
+    "contactSensor": ("contact",),
+    "temperatureSensor": ("temperatureC",),
+    "humiditySensor": ("humidityPct",),
+    "lightSensor": ("lux",),
+    "pressureSensor": ("pressureKPa",),
+    "flowSensor": ("flowM3h",),
+    "thermostat": ("localTemperatureC", "heatingSetpointC", "coolingSetpointC", "systemMode"),
+}
+
+#: role → the ``command`` event names the node emits for it (§5/§4.2). Sensors
+#: are read-only in Matter, so their tuple is empty by design, not by omission.
+ROLE_COMMANDS = {
+    "onOffPlugInUnit": ("onOff",),
+    "onOffLight": ("onOff",),
+    "dimmableLight": ("onOff", "setLevel"),
+    "colorTemperatureLight": ("onOff", "setLevel", "setColorTemp"),
+    "extendedColorLight": ("onOff", "setLevel", "setColorTemp", "setColor"),
+    "windowCovering": ("goToPosition", "stopMotion"),
+    "doorLock": ("lock", "unlock"),
+    "occupancySensor": (),
+    "contactSensor": (),
+    "temperatureSensor": (),
+    "humiditySensor": (),
+    "lightSensor": (),
+    "pressureSensor": (),
+    "flowSensor": (),
+    "thermostat": ("setHeatingSetpoint", "setCoolingSetpoint", "setSystemMode"),
+}
+
+#: The v1 role enum (§4.2) — derived, so a role can only exist with both of its
+#: vocabularies declared. This set is what the allow-list validates against.
+ROLES = frozenset(ROLE_STATE_KEYS)
+
+#: The v1 ``systemMode`` domain, in both directions (§4.2).
+SYSTEM_MODES = ("off", "heat", "cool", "auto")
 
 
 class BridgeProtocolError(Exception):
@@ -332,12 +384,23 @@ def parse_pairing(result: Any) -> PairingReport:
 
 
 def parse_window(result: Any) -> CommissioningWindow:
-    """Normalise an ``open_commissioning_window`` payload (§3.8)."""
-    data = result or {}
+    """Normalise an ``open_commissioning_window`` payload (§3.8).
+
+    Every field is required. A missing pairing code defaulted to ``""`` would be
+    handed to the user as the code to type into their ecosystem — a window that
+    silently opened with no way to use it is worse than a failed one.
+    """
+    data = result if isinstance(result, dict) else {}
+    missing = [key for key in ("manualPairingCode", "qrPairingCode", "windowExpiresAt")
+               if not data.get(key)]
+    if missing:
+        raise BridgeProtocolError(
+            ERR_MALFORMED_ARGS,
+            f"open_commissioning_window result is missing {', '.join(missing)}: {result!r}")
     return CommissioningWindow(
-        manual_pairing_code=str(data.get("manualPairingCode", "")),
-        qr_pairing_code=str(data.get("qrPairingCode", "")),
-        window_expires_at=str(data.get("windowExpiresAt", "")),
+        manual_pairing_code=str(data["manualPairingCode"]),
+        qr_pairing_code=str(data["qrPairingCode"]),
+        window_expires_at=str(data["windowExpiresAt"]),
     )
 
 
