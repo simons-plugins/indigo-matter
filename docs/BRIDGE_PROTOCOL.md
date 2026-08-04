@@ -1,11 +1,15 @@
 # BRIDGE_PROTOCOL.md — plugin ⇄ bridge-node local protocol
 
 **Version:** 1 (`protocolVersion: 1`)
-**Transport:** WebSocket, JSON text frames, loopback only
+**Transport:** WebSocket, JSON text frames, loopback only, default port **5581**
+(pref-configurable; the controller's WS is 5580)
 **Peers:** the Indigo plugin (client) and the `indigo-matter-bridge` node
 (server). We author both ends and ship them together.
 **Governing docs:** [`PRD-indigo-matter-export.md`](./PRD-indigo-matter-export.md) §4.4,
-ADR-0006.
+ADR-0006 (workspace-level).
+
+Section references: a bare `§N` refers to this document; PRD sections are
+always written `PRD §N`.
 
 This is the outbound twin of the controller protocol that `protocol.py` /
 `matter_client.py` speak. It reuses the same envelope grammar so the client
@@ -28,9 +32,33 @@ Identical shapes to the controller protocol:
 | Event | node → plugin | `{"event": "<str>", "data": {…}}` (no `message_id`) |
 
 `message_id` is an opaque string chosen by the plugin, echoed verbatim.
+**Every request gets exactly one response**, including ones the plugin chooses
+not to await (§3.4). Frames on one connection are processed strictly in
+receipt order, so a `set_state` sent after an `upsert_endpoint` on the same
+socket is applied after it.
+
 Unknown *fields* are ignored by both peers (forward compatibility inside a
 protocol version). Unknown *commands* get `error_code: "unknown_command"`.
 Unknown *events* are logged and dropped by the plugin.
+
+### 1.1 Error codes
+
+The complete `error_code` domain for protocol version 1. Anything else is a
+bug in the node.
+
+| `error_code` | Meaning |
+|---|---|
+| `unknown_command` | Command name not in §3 |
+| `malformed_args` | Args missing/mistyped for the command |
+| `version_mismatch` | `attach` carried a different `protocolVersion`; node refuses and closes the socket after responding |
+| `not_attached` | Any command other than `attach` before a successful `attach` on this connection |
+| `unknown_device` | `indigoDeviceId` has no live endpoint |
+| `unknown_role` | `role` not in the §4.2 enum |
+| `role_change` | `upsert_endpoint` tried to change an existing endpoint's role (§4.1) |
+| `mass_removal_refused` | `attach` would remove every live endpoint without `"intent": "replace_all"` (§3.1) |
+| `endpoint_map_invalid` | Node is in the refuse-to-start state (PRD §7); only `get_status`, `get_pairing` and `rebuild_endpoint_map` are accepted |
+| `commissioning_window_failed` | Matter stack refused to open the enhanced commissioning window |
+| `internal` | Unexpected node-side failure; `details` carries the message |
 
 ## 2. Handshake
 
@@ -41,9 +69,16 @@ On every new connection, before anything else:
 2. Plugin sends `attach` (§3.1). If `protocolVersion` differs from the
    plugin's own, the plugin does **not** attach: it surfaces an error telling
    the user to restart/update the bridge agent (typically the plugin was
-   updated while launchd kept the old node alive). The node accepts exactly
-   one attached client at a time; a second `attach` supersedes the first
-   (the old socket is closed) — the plugin's reconnect loop relies on this.
+   updated while launchd kept the old node alive). Node-side, a mismatched
+   `attach` gets `error_code: "version_mismatch"` and the socket is closed —
+   skew fails closed from both directions.
+
+The node accepts exactly one attached client at a time; a new successful
+`attach` supersedes the incumbent (the old socket is closed). This exists to
+recover from half-open sockets: if the plugin's TCP connection dies silently
+(plugin crash, reload), the node would otherwise hold a dead "attached" client
+forever and refuse the reconnecting plugin. A connection that completes the
+handshake but has not attached within **10 seconds** is closed by the node.
 
 ## 3. Commands (plugin → node)
 
@@ -59,9 +94,16 @@ Declares the client and delivers the desired endpoint set in one shot.
 }}
 ```
 
-Result: `{"status": <StatusReport>}` (§5.1). The node reconciles its live
-endpoint set against `endpoints` — creating, updating and removing as needed —
-so a fresh connection is always a full reconcile (PRD §5.4 `startup`).
+Result: `<StatusReport>` (§4.3). The node reconciles its live endpoint set
+against `endpoints` — creating, updating and removing as needed — so a fresh
+connection is always a full reconcile (PRD §5.4 `startup`).
+
+**Mass-removal guard.** If `endpoints` is empty (or would remove every live
+endpoint) while the node currently serves a non-empty set, the node refuses
+with `error_code: "mass_removal_refused"` unless the args carry
+`"intent": "replace_all"`. Removing every exported accessory from every paired
+ecosystem must be deliberate (the §5.1 allow-list being emptied), never the
+side effect of a stale or buggy client attaching with a default state.
 
 ### 3.2 `upsert_endpoint`
 
@@ -80,8 +122,9 @@ Idempotent. Result: `{"endpointNumber": <int>}`.
 
 Removes the child endpoint (`endpoint.close()`); the persisted endpoint-number
 allocation is **retained** so re-adding the same device restores the same
-number. Idempotent — removing an absent endpoint succeeds. Bulk removals are
-paced ~100ms apart by the node.
+number. Idempotent — removing an absent endpoint succeeds with
+`{"removed": false}`; a live removal returns `{"removed": true}`. Bulk
+removals are paced ~100ms apart by the node.
 
 ### 3.4 `set_state`
 
@@ -91,8 +134,15 @@ paced ~100ms apart by the node.
 
 Pushes Indigo-originated state outward. `states` keys are role-specific (§4.2).
 The node applies them as **local** (offline-context) writes so they are not
-echoed back as commands. The plugin sends this fire-and-forget (it must never
-block Indigo's device thread on the result).
+echoed back as `command` events. Result: `{}` on success, or a normal error
+response (`unknown_device`, `malformed_args`).
+
+The plugin sends this **without awaiting the result** — it must never block
+Indigo's device thread. The response still arrives; the client's frame loop
+MUST log any error response it cannot match to a waiting future (rather than
+dropping it silently), because an unnoticed `set_state` failure looks exactly
+like "the ecosystem shows stale state". This is a required behaviour change
+from `matter_client.py`, which drops unmatched responses without a log line.
 
 ### 3.5 `set_reachable`
 
@@ -102,34 +152,82 @@ block Indigo's device thread on the result).
 
 Split from `set_state` because it maps to Bridged Device Basic Information,
 not the functional cluster, and is driven by device enable/disable rather than
-state change.
+state change. `reachable` is also present on `EndpointSpec`; both paths write
+the same attribute and last-write-wins — there is no precedence rule.
+Result: `{}`.
 
 ### 3.6 `get_status`
 
-Result: `<StatusReport>` (§5.1). Used by the watchdog tick and the §5.5
-config readout.
+Result: `<StatusReport>` (§4.3) — the same shape `attach` returns. Used by the
+watchdog tick and the PRD §5.5 config readout.
 
 ### 3.7 `get_pairing`
 
+Reports pairing state. A Matter commissioning passcode is **not durable**:
+once the first fabric commissions, the basic window closes and the original
+code stops working; each additional admin needs an *enhanced* commissioning
+window with a freshly derived code (§3.8).
+
 Result:
 ```json
-{"commissioned": false,
- "manualPairingCode": "34970112332",
- "qrPairingCode": "MT:Y.K90IRV01KA0648G00",
+{"commissioned": true,
+ "windowOpen": false,
+ "windowExpiresAt": null,
+ "manualPairingCode": null,
+ "qrPairingCode": null,
  "fabrics": [ <FabricInfo>, … ]}
 ```
 
-### 3.8 `remove_fabric`
+`manualPairingCode`/`qrPairingCode` are non-null only while a window is open
+(always true for the never-commissioned initial state, whose codes are the
+persisted originals).
+
+### 3.8 `open_commissioning_window`
+
+```json
+{"command": "open_commissioning_window", "args": {"durationSeconds": 900}}
+```
+
+Opens an enhanced commissioning window so another ecosystem can be added.
+Result: `{"manualPairingCode": "...", "qrPairingCode": "MT:...",
+"windowExpiresAt": "<ISO 8601 UTC>"}`. Fails with
+`commissioning_window_failed` if the stack refuses (e.g. a window is already
+open in a conflicting state). Emits `window_closed` (§5) when it expires or a
+commissioner completes.
+
+### 3.9 `remove_fabric`
 
 ```json
 {"command": "remove_fabric", "args": {"fabricIndex": 2}}
 ```
 
-### 3.9 `factory_reset`
+Result: `{}`.
+
+### 3.10 `factory_reset`
 
 Wipes commissioning credentials and starts advertising fresh (PRD §6 "reset
-all pairings"). The endpoint-number map is **preserved** — a reset must not
-scramble identities if the user re-pairs the same ecosystems.
+all pairings"). The endpoint-number map is **preserved by default** — a reset
+must not scramble identities if the user re-pairs the same ecosystems. This
+requires the map to be persisted **outside** the matter.js storage context
+that its factory reset wipes: the node keeps it in its own file
+(`endpoint-map.json`) in the bridge storage dir, written through the same
+persistence layer as the drift detector's baseline.
+
+```json
+{"command": "factory_reset", "args": {"preserveEndpointNumbers": true}}
+```
+
+Passing `false` wipes the map too — the "explicit rebuild" of PRD §7, for the
+case where the map itself is what's corrupt.
+
+### 3.11 `rebuild_endpoint_map`
+
+The recovery path out of the `endpoint_map_invalid` refuse-to-start state
+(PRD §7 "Endpoint map lost/corrupt"). Reallocates endpoint numbers for the
+current endpoint set from scratch and persists a new map. This **will**
+duplicate accessories in paired ecosystems — that is exactly why it is a
+separate, explicit command that the plugin only issues after the user
+confirms via a warning dialog. Result: `<StatusReport>`.
 
 ## 4. Shapes
 
@@ -153,32 +251,43 @@ scramble identities if the user re-pairs the same ecosystems.
 - `label` — Bridged Device Basic Information `NodeLabel`.
 - `options` — role-specific extras (e.g. window-covering polarity).
 
-### 4.2 Roles and their state keys (v1)
+### 4.2 Roles: state keys and commands (v1)
 
-| `role` | Matter device type | `states` keys |
-|---|---|---|
-| `onOffPlugInUnit` | On/Off Plug-in Unit | `onOff: bool` |
-| `onOffLight` | On/Off Light | `onOff: bool` |
-| `dimmableLight` | Dimmable Light | `onOff: bool`, `level: 0-100` |
-| `colorTemperatureLight` | Color Temperature Light | + `colorTempMireds: int` |
-| `extendedColorLight` | Extended Color Light | + `hue: 0-360`, `saturation: 0-100` |
-| `windowCovering` | Window Covering | `position: 0-100` (100 = open, inbound convention; polarity in `options`) |
-| `doorLock` | Door Lock | `locked: bool` |
-| `occupancySensor` | Occupancy Sensor | `occupied: bool` |
-| `contactSensor` | Contact Sensor | `contact: bool` (true = closed) |
-| `temperatureSensor` | Temperature Sensor | `temperatureC: float` |
-| `humiditySensor` | Humidity Sensor | `humidityPct: float` |
-| `lightSensor` | Light Sensor | `lux: float` |
-| `pressureSensor` | Pressure Sensor | `pressureKPa: float` |
-| `flowSensor` | Flow Sensor | `flowM3h: float` |
-| `thermostat` | Thermostat | `localTemperatureC`, `heatingSetpointC`, `coolingSetpointC`, `systemMode` |
+Each role defines two vocabularies: the **state keys** the plugin pushes via
+`set_state`, and the **commands** the node emits as `command` events when an
+ecosystem acts. Both are enumerated here in full; there is no other source.
 
-Units are Indigo-natural at the protocol boundary (°C, %, lux, 0–100 levels);
-the node owns the conversion to Matter wire units (0.01°C, mireds, the
-illuminance log scale, 0–254 levels). Exactly one converter per role, in the
-node, next to the cluster it feeds.
+| `role` | Matter device type | `set_state` keys | `command` names (args) |
+|---|---|---|---|
+| `onOffPlugInUnit` | On/Off Plug-in Unit | `onOff: bool` | `onOff {"value": bool}` |
+| `onOffLight` | On/Off Light | `onOff: bool` | `onOff {"value": bool}` |
+| `dimmableLight` | Dimmable Light | `onOff: bool`, `level: 0-100` | `onOff`, `setLevel {"level": 0-100}` |
+| `colorTemperatureLight` | Color Temperature Light | + `colorTempMireds: 153-500` | + `setColorTemp {"colorTempMireds": int}` |
+| `extendedColorLight` | Extended Color Light | + `hue: 0-360`, `saturation: 0-100` | + `setColor {"hue": 0-360, "saturation": 0-100}` |
+| `windowCovering` | Window Covering | `position: 0-100` (100 = open, inbound convention; polarity in `options`) | `goToPosition {"position": 0-100}`, `stopMotion {}` |
+| `doorLock` | Door Lock | `locked: bool` | `lock {}`, `unlock {}` |
+| `occupancySensor` | Occupancy Sensor | `occupied: bool` | — (sensors emit no commands) |
+| `contactSensor` | Contact Sensor | `contact: bool` (true = closed) | — |
+| `temperatureSensor` | Temperature Sensor | `temperatureC: float` | — |
+| `humiditySensor` | Humidity Sensor | `humidityPct: float` | — |
+| `lightSensor` | Light Sensor | `lux: float` | — |
+| `pressureSensor` | Pressure Sensor | `pressureKPa: float` | — |
+| `flowSensor` | Flow Sensor | `flowM3h: float` | — |
+| `thermostat` | Thermostat | `localTemperatureC: float`, `heatingSetpointC: float`, `coolingSetpointC: float`, `systemMode: str` | `setHeatingSetpoint {"valueC": float}`, `setCoolingSetpoint {"valueC": float}`, `setSystemMode {"mode": str}` |
 
-### 4.3 `StatusReport` (§5.1) and `FabricInfo`
+- `systemMode` domain (both directions): `"off" | "heat" | "cool" | "auto"`.
+  The node owns the mapping to/from Matter's `SystemModeEnum` integers.
+- `level`/`position` are integers 0–100 in both directions; the node owns the
+  0–254 Matter LevelControl conversion and its rounding (round-half-up, with
+  0 ↔ off preserved exactly).
+- Thermostat **fan is not part of v1** (the Fan descope, PRD §5.2); there are
+  no fan state keys or commands. v2 candidate.
+- Units are Indigo-natural at the protocol boundary (°C, %, lux, 0–100);
+  the node owns all Matter wire conversions (0.01°C, mireds bounds-clamping,
+  the illuminance log scale). Exactly one converter per role, in the node,
+  next to the cluster it feeds.
+
+### 4.3 `StatusReport` and `FabricInfo`
 
 ```json
 {"commissioned": true,
@@ -196,12 +305,12 @@ error, never auto-repaired.
 
 | Event | `data` | Meaning |
 |---|---|---|
-| `command` | `{"indigoDeviceId", "command", "args"}` | Ecosystem-originated action, e.g. `{"command": "onOff", "args": {"value": true}}`, `{"command": "moveToLevel", "args": {"level": 40}}`, `{"command": "lock"}` |
+| `command` | `{"indigoDeviceId", "command", "args"}` | Ecosystem-originated action; names and args exactly as enumerated per role in §4.2 |
 | `fabrics_changed` | `{"fabrics": […], "change": "added"\|"deleted"\|"updated"}` | Pairing/unpairing activity |
 | `commissioned` / `decommissioned` | `{}` | First fabric added / last removed |
+| `window_closed` | `{"reason": "expired"\|"commissioned"}` | The enhanced commissioning window ended |
 | `drift_detected` | `{"drift": […]}` | Endpoint-number drift found at startup |
 
-`command` events carry the same role-relative vocabulary as `set_state` keys.
 The plugin resolves `indigoDeviceId` through the allow-list before acting; a
 command for a device no longer exported gets no action and a warning (PRD §7
 race row — the node responds to the ecosystem with failure when the endpoint
@@ -210,7 +319,8 @@ is already gone).
 ## 6. Invariants
 
 1. **Loopback only.** The node binds `127.0.0.1`; there is no auth on the
-   socket because there is no remote surface.
+   socket because there is no remote surface. The mass-removal guard (§3.1)
+   exists because "local process" still includes stale plugin instances.
 2. **The plugin is the source of truth for the export set**; the node is the
    source of truth for commissioning state and endpoint numbers. Neither peer
    caches the other's domain across reconnects — `attach` reconciles.
@@ -219,11 +329,17 @@ is already gone).
 4. **State pushes are echo-guarded** in the node (`ctx.offline`); the plugin
    never receives a `command` event for a change it pushed.
 5. **Version skew fails closed:** mismatched `protocolVersion` means no
-   attach, an error in the Indigo log, and untouched pairings.
+   attach (both peers enforce it), an error in the Indigo log, and untouched
+   pairings.
+6. **Destructive operations are explicit:** emptying the endpoint set needs
+   `intent: "replace_all"`; discarding endpoint identity needs
+   `preserveEndpointNumbers: false` or `rebuild_endpoint_map`. Neither can
+   happen as a default.
 
 ## 7. Testing contract
 
-Golden frames for every command/response/event pair live beside the Python
-tests (the `test_golden_real.py` pattern) and are the cross-language contract:
-the TypeScript node's protocol tests consume the same fixtures, so a frame
-change that only updates one side fails that side's suite.
+Golden frames for every command/response/event pair live as **JSON fixture
+files** under `tests/fixtures/bridge_protocol/`, consumed by both the Python
+suite and the TypeScript node's protocol tests — a deliberate departure from
+`test_golden_real.py`'s inline-dict pattern, which a TS suite cannot import.
+A frame change that only updates one side fails that side's suite.
