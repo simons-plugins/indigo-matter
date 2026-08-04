@@ -176,6 +176,15 @@ class DeviceSync:
         # Set Sensitivity Level menu callback (plugin.py) needs this value
         # captured somewhere durable; refreshed on every create/reconcile pass.
         self._sensitivity_supported: dict[tuple[int, int], int] = {}
+        # Every node id matter-server has told us about this session, whether or
+        # not it produced any Indigo device. `_index` cannot serve this purpose:
+        # it is only written when a device is CREATED, so a node that maps to
+        # nothing never appears in it — and the decommission picker, which reads
+        # list_nodes(), could therefore never offer the one kind of node most in
+        # need of decommissioning (an empty bridge, issue #105). Refreshed from
+        # the authoritative node list on every reconcile pass so a node removed
+        # out of band stops being offered.
+        self._known_nodes: set[int] = set()
 
     # ------------------------------------------------------------------
     # Active-device tracking (deviceStartComm/deviceStopComm)
@@ -334,11 +343,18 @@ class DeviceSync:
     def list_nodes(self) -> list:
         """Per-node summary for UI pickers: ``[(node_id, [device names])]``.
 
+        Every node matter-server has reported is listed, INCLUDING one that
+        produced no Indigo devices — its entry simply carries an empty name
+        list, which the picker renders as "(no Indigo devices)". Deriving this
+        from ``_index`` alone (which is only written on device creation) made
+        an empty bridge impossible to select, so the very node most in need of
+        decommissioning could not be decommissioned (issue #105).
+
         Sorted by node id; device names resolved outside the lock so a slow
         Indigo lookup can't stall state/command dispatch.
         """
         with self._lock:
-            by_node: dict[int, set] = {}
+            by_node: dict[int, set] = {nid: set() for nid in self._known_nodes}
             for (nid, _eid), type_map in self._index.items():
                 by_node.setdefault(nid, set()).update(type_map.values())
         out = []
@@ -374,6 +390,11 @@ class DeviceSync:
         # present this create is *authoritative* and may rename/re-folder a device
         # that node_added raced ahead and created with the bare product name.
         authoritative = bool((node.suggested_name or "").strip()) or bool((suggested_room or "").strip())
+        # Remember the node itself, independently of whether it yields devices —
+        # this is the only record an empty bridge leaves behind, and the
+        # decommission picker depends on it (see list_nodes).
+        with self._lock:
+            self._known_nodes.add(int(node.node_id))
         with self._lock:
             # Plan over every mappable endpoint (existing or not) so the
             # "(endpoint N)" suffix is decided by the node's true device count,
@@ -1315,6 +1336,7 @@ class DeviceSync:
     def reconcile_all(self, raw_nodes: list) -> None:
         self.rebuild_index()
         live: set[tuple[int, int]] = set()
+        seen_nodes: set[int] = set()
         for raw in raw_nodes:
             # one malformed node must not sink reconciliation for the rest
             try:
@@ -1322,6 +1344,7 @@ class DeviceSync:
             except Exception as exc:  # noqa: BLE001
                 self.logger.warning("skipping unparseable Matter node: %s", exc)
                 continue
+            seen_nodes.add(int(node.node_id))
             for endpoint in node.endpoints:
                 live.add((node.node_id, endpoint.endpoint_id))
             try:
@@ -1335,6 +1358,12 @@ class DeviceSync:
             except Exception as exc:  # noqa: BLE001
                 self.logger.warning("reconcile of node %s failed: %s", node.node_id, exc)
         with self._lock:
+            # raw_nodes is matter-server's authoritative list, so a node absent
+            # from it is no longer commissioned — drop it from the picker rather
+            # than offering a decommission that would 404. A node whose parse
+            # failed above is deliberately not in seen_nodes and falls out here;
+            # the next successful reconcile restores it.
+            self._known_nodes = seen_nodes
             orphans = [
                 dev_id
                 for (node_id, _ep), type_map in self._index.items()

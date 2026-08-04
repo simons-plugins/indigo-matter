@@ -1186,6 +1186,55 @@ def test_list_nodes_orders_multiple_nodes_and_groups_by_node(ds, indigo_env):
     assert nodes[1][1] == ["Office Plug"]
 
 
+# ---------------------------------------------------------------------------
+# A node that produced NO devices must still be listed (issue #105 follow-on):
+# the decommission picker reads list_nodes(), so an empty bridge that isn't
+# listed can never be decommissioned — the one node most in need of it.
+# ---------------------------------------------------------------------------
+
+# The real shape from jarvis: a Homebridge child bridge publishing a bare
+# Aggregator (0x000E) on ep1 with descriptor only and an empty PartsList.
+EMPTY_BRIDGE_NODE = {
+    "node_id": 53,                      # 0x35
+    "available": True,
+    "attributes": {
+        "0/40/1": "Homebridge",
+        "0/40/3": "Homebridge iCloud",
+        "1/29/0": [{"0": 14}],          # Descriptor -> DeviceType 0x000E Aggregator
+    },
+}
+
+
+def test_list_nodes_includes_a_node_that_created_no_devices(ds, indigo_env):
+    ds.create_from_raw(EMPTY_BRIDGE_NODE, "")
+    nodes = ds.list_nodes()
+    assert nodes == [(53, [])]          # listed, with no device names
+
+
+def test_list_nodes_includes_empty_bridge_alongside_real_nodes(ds, indigo_env):
+    ds.create_from_raw(RELAY_NODE, "Office Plug")
+    ds.create_from_raw(EMPTY_BRIDGE_NODE, "")
+    nodes = dict(ds.list_nodes())
+    assert nodes[42] == ["Office Plug"]
+    assert nodes[53] == []              # the empty bridge is selectable too
+
+
+def test_reconcile_lists_an_empty_bridge_it_has_seen(ds, indigo_env):
+    # The path that actually matters: a bridge picked up by reconcile (not by a
+    # user-driven commission) must reach the picker.
+    ds.reconcile_all([EMPTY_BRIDGE_NODE])
+    assert ds.list_nodes() == [(53, [])]
+
+
+def test_reconcile_drops_a_node_that_is_no_longer_commissioned(ds, indigo_env):
+    # raw_nodes is authoritative: a node gone from it must stop being offered,
+    # otherwise the picker invites a decommission that would 404.
+    ds.reconcile_all([EMPTY_BRIDGE_NODE])
+    assert ds.list_nodes() == [(53, [])]
+    ds.reconcile_all([])
+    assert ds.list_nodes() == []
+
+
 def test_list_nodes_merges_multiple_devices_into_one_node_entry(ds, indigo_env):
     # A node whose endpoint creates several Indigo devices (pressure + flow)
     # must yield ONE picker entry listing all of them, never one per device.
