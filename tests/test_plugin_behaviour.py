@@ -270,7 +270,8 @@ def test_decommission_inner_offline_reports_fabric_not_removed(plug):
         async def boom(node_id):
             raise ConnectionError("offline")
         plug.matter = SimpleNamespace(remove_node=boom)
-        plug.device_sync.delete_node = lambda nid: [111]
+        plug.device_sync.knows_node = lambda nid: True
+        plug.device_sync.delete_node = lambda nid, forget=True: [111]
         result = await plug._decommission(42)
         assert result["fabricRemoved"] is False
         assert result["removedIndigoDeviceIds"] == [111]
@@ -283,10 +284,85 @@ def test_decommission_inner_unknown_unreachable_returns_none(plug):
         async def boom(node_id):
             raise ConnectionError("offline")
         plug.matter = SimpleNamespace(remove_node=boom)
-        plug.device_sync.delete_node = lambda nid: []  # no devices either
+        plug.device_sync.knows_node = lambda nid: False   # never heard of it
+        plug.device_sync.delete_node = lambda nid, forget=True: []  # no devices either
         result = await plug._decommission(999)
         assert result is None  # → 404 unknown node
     asyncio.run(scenario())
+
+
+def test_get_matter_nodes_renders_a_real_device_less_node_end_to_end(plug, mock_logger, monkeypatch):
+    """Ties the two halves of the picker together with no stub in between.
+
+    Both existing picker tests stub list_nodes, and the DeviceSync tests assert
+    (53, []) is producible — but nothing proved the real producer feeds the real
+    renderer. Before the #111 fix that gap let a green suite assert a branch
+    production code could never reach.
+    """
+    import device_sync
+    from matter_handlers.registry import HandlerRegistry
+    real = device_sync.DeviceSync(HandlerRegistry(), mock_logger)
+    real.create_from_raw(
+        {"node_id": 53, "available": True,
+         "attributes": {"0/40/1": "Homebridge", "0/40/3": "Homebridge iCloud",
+                        "1/29/0": [{"0": 14}]}},   # bare Aggregator, no children
+        "",
+    )
+    plug.device_sync = real
+    options = plug.getMatterNodes()
+    assert options == [("53", "(no Indigo devices) — node 0x35")]
+
+
+def test_decommission_of_known_device_less_node_offline_is_not_reported_unknown(plug):
+    """A commissioned empty bridge whose fabric removal fails must not 404.
+
+    removed_ids is ALWAYS empty for a node with no Indigo devices, so the old
+    `not removed_ids and not fabric_removed` guard told the user "Unknown node —
+    nothing was removed" about a node that was still commissioned, and the
+    unconditional forget dropped it from the picker so the decommission could
+    never be retried (issue #111 review).
+    """
+    async def scenario():
+        async def boom(node_id):
+            raise ConnectionError("offline")
+        plug.matter = SimpleNamespace(remove_node=boom)
+        plug.device_sync.knows_node = lambda nid: True     # we DO know it
+        plug.device_sync.delete_node = lambda nid, forget=True: []   # but it has no devices
+        result = await plug._decommission(53)
+        assert result is not None                          # not the 404 path
+        assert result["fabricRemoved"] is False            # → "retry once reachable"
+        assert result["nodeId"] == "0x35"
+    asyncio.run(scenario())
+
+
+def test_decommission_does_not_forget_a_node_whose_fabric_removal_failed(plug):
+    """The node must stay listed so the user can retry — the crux of the fix."""
+    seen = {}
+
+    async def scenario():
+        async def boom(node_id):
+            raise ConnectionError("offline")
+        plug.matter = SimpleNamespace(remove_node=boom)
+        plug.device_sync.knows_node = lambda nid: True
+        plug.device_sync.delete_node = lambda nid, forget=True: seen.update(forget=forget) or []
+        await plug._decommission(53)
+    asyncio.run(scenario())
+    assert seen["forget"] is False
+
+
+def test_decommission_forgets_a_node_that_actually_left_the_fabric(plug):
+    seen = {}
+
+    async def scenario():
+        async def ok(node_id):
+            return None
+        plug.matter = SimpleNamespace(remove_node=ok)
+        plug.device_sync.knows_node = lambda nid: True
+        plug.device_sync.delete_node = lambda nid, forget=True: seen.update(forget=forget) or []
+        result = await plug._decommission(53)
+        assert result["fabricRemoved"] is True
+    asyncio.run(scenario())
+    assert seen["forget"] is True
 
 
 def test_on_disconnected_marks_all_unreachable(plug):
