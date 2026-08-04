@@ -1226,6 +1226,34 @@ def test_reconcile_lists_an_empty_bridge_it_has_seen(ds, indigo_env):
     assert ds.list_nodes() == [(53, [])]
 
 
+def test_decommission_removes_an_empty_bridge_from_the_picker_immediately(ds, indigo_env):
+    """Regression: a decommissioned node must not linger in the picker.
+
+    Pruning _index alone used to be enough — a node with no index entries simply
+    vanished from list_nodes(). Once list_nodes() also drew on _known_nodes, a
+    node with no devices survived its own decommission and could be selected a
+    second time, which is exactly what happened on jarvis with 0x35.
+    """
+    ds.create_from_raw(EMPTY_BRIDGE_NODE, "")
+    assert ds.list_nodes() == [(53, [])]
+    ds.delete_node(53)                    # what decommission calls
+    assert ds.list_nodes() == []          # gone at once, without waiting for a reconcile
+
+
+def test_decommission_removes_a_device_bearing_node_from_the_picker(ds, indigo_env):
+    ds.create_from_raw(RELAY_NODE, "Office Plug")
+    assert [n for n, _ in ds.list_nodes()] == [42]
+    ds.delete_node(42)
+    assert ds.list_nodes() == []
+
+
+def test_decommission_leaves_other_nodes_in_the_picker(ds, indigo_env):
+    ds.create_from_raw(RELAY_NODE, "Office Plug")
+    ds.create_from_raw(EMPTY_BRIDGE_NODE, "")
+    ds.delete_node(53)                    # remove only the empty bridge
+    assert [n for n, _ in ds.list_nodes()] == [42]
+
+
 def test_reconcile_drops_a_node_that_is_no_longer_commissioned(ds, indigo_env):
     # raw_nodes is authoritative: a node gone from it must stop being offered,
     # otherwise the picker invites a decommission that would 404.

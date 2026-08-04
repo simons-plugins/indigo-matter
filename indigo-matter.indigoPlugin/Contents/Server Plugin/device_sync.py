@@ -311,6 +311,13 @@ class DeviceSync:
         """
         target = int(node_id)
         with self._lock:
+            # The node is leaving the fabric, so stop offering it in the picker
+            # immediately. Pruning _index alone used to be enough — a node with
+            # no index entries simply vanished from list_nodes() — but now that
+            # list_nodes() also draws on _known_nodes, a decommissioned node
+            # would linger there until the next reconcile_all and could be
+            # picked a second time.
+            self._known_nodes.discard(target)
             # Collect all dev_ids across all endpoints for this node
             candidates: list[int] = []
             for (nid, _eid), type_map in self._index.items():
