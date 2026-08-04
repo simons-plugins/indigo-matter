@@ -26,6 +26,8 @@ import fabric_backup
 from async_runtime import AsyncRuntime
 from commission_jobs import CommissionJobs, node_id_to_str
 from device_sync import DeviceSync
+import export_catalog
+from export_store import ExportEntry, ExportStore, OPTION_INVERT
 from http_handlers import HttpApi, MatterUnavailable
 from matter_client import MatterClient
 from matter_handlers.boolean_state_config import (
@@ -40,6 +42,20 @@ from server_process import ServerProcess
 PLUGIN_NAME = "indigo-matter"
 COMMAND_TIMEOUT = 5.0
 DECOMMISSION_TIMEOUT = 15.0
+
+#: Menu id of the export dialog (MenuItems.xml) — matched in
+#: ``get_menu_action_config_ui_values`` so other menus are never seeded.
+MENU_MANAGE_EXPORTS = "manageMatterExports"
+#: Option-id prefix marking a picker row the user may look at but not choose
+#: (PRD §5.2: excluded devices are shown *with a reason*, never hidden — XAC9).
+EXCLUDED_OPTION_PREFIX = "x-"
+#: The "nothing selected" / "list truncated" sentinel. Never "": Indigo rejects
+#: an empty list id with "UI dynamic list function returned illegal ID string"
+#: and silently drops the option.
+NO_SELECTION_ID = "0"
+#: Picker cap. Past this the tail row asks the user to narrow the filter — a
+#: 2000-device database would otherwise build an unusable popup menu.
+EXPORT_PICKER_LIMIT = 300
 
 
 def server_location(prefs: dict) -> str:
@@ -100,6 +116,10 @@ class Plugin(indigo.PluginBase):
         self.jobs: CommissionJobs | None = None
         self.http: HttpApi | None = None
         self.server_process: ServerProcess | None = None
+        # The export allow-list (PRD §5.1). Built in startup, before anything
+        # can consult it; None means "the plugin has not started yet", which
+        # every export callback checks rather than assuming.
+        self.exports: ExportStore | None = None
         self._install_thread: threading.Thread | None = None
         self._stopping = False
         # When WE restart matter-server (menu / post-install), the client sees a brief
@@ -144,6 +164,15 @@ class Plugin(indigo.PluginBase):
         # (also migrates pre-2026.6 prefs that had no serverLocation key).
         self.pluginPrefs["serverLocation"] = location
         self.pluginPrefs["manageLaunchAgent"] = managed
+
+        # Load the export allow-list first: it is pure prefs I/O, and E3's
+        # bridge wiring will need it already populated when it starts. An
+        # unreadable list must not stop the (inbound) plugin starting, so
+        # ExportStore degrades to empty and preserves the blob rather than
+        # raising — see export_store._corrupt.
+        self.exports = ExportStore(self.pluginPrefs, self.logger)
+        if len(self.exports):
+            self.logger.info("Matter export allow-list: %d device(s) exported", len(self.exports))
 
         self.runtime = AsyncRuntime(self.logger)
         self.runtime.start()
@@ -1032,6 +1061,289 @@ class Plugin(indigo.PluginBase):
                           "in matter-server and will reappear at the next reconcile (plugin restart "
                           "or reconnect). Retry once the device is powered and reachable.")
         return (False, valuesDict, errors)
+
+    # ------------------------------------------------------------------
+    # Matter export allow-list — the "Manage Matter Exports…" dialog
+    # (PRD-indigo-matter-export §5.1 UI-D; roles per BRIDGE_PROTOCOL §4.2)
+    # ------------------------------------------------------------------
+    def _export_plugin_id(self) -> str:
+        """This plugin's id, for the loop guard (XNG3/XAC6).
+
+        Read from the running plugin rather than hardcoded, so the guard can
+        never drift from the bundle it is protecting; the catalog constant is
+        only the fallback for a plugin object built without one (tests).
+        """
+        return getattr(self, "pluginId", "") or export_catalog.DEFAULT_PLUGIN_ID
+
+    @staticmethod
+    def _truthy(value) -> bool:
+        """Indigo checkboxes arrive as bools or as "true"/"false" strings."""
+        if isinstance(value, str):
+            return value.strip().lower() in ("true", "yes", "1")
+        return bool(value)
+
+    @staticmethod
+    def _indigo_device(device_id):
+        """``indigo.devices[device_id]`` or None — a stale id is never fatal."""
+        try:
+            return indigo.devices[int(device_id)]
+        except Exception:  # noqa: BLE001 - KeyError, ValueError, or Indigo's own
+            return None
+
+    def _export_selection(self, values_dict) -> tuple[str, int]:
+        """Decode the picker value into ``(kind, device_id)``.
+
+        ``kind`` is ``"none"`` (nothing chosen, or the truncation row),
+        ``"excluded"`` (an ``x-`` row the user may see but not pick), or
+        ``"device"``.
+        """
+        raw = str((values_dict or {}).get("exportDevice", "") or "")
+        if not raw or raw == NO_SELECTION_ID:
+            return ("none", 0)
+        excluded = raw.startswith(EXCLUDED_OPTION_PREFIX)
+        if excluded:
+            raw = raw[len(EXCLUDED_OPTION_PREFIX):]
+        try:
+            device_id = int(raw)
+        except (TypeError, ValueError):
+            return ("none", 0)
+        return ("excluded" if excluded else "device", device_id)
+
+    def _export_summary(self) -> str:
+        if self.exports is None:
+            return "Plugin still starting — reopen this dialog in a moment."
+        count = len(self.exports)
+        if not count:
+            return "Nothing is exported yet."
+        return f"{count} device(s) exported."
+
+    def get_menu_action_config_ui_values(self, menu_id):
+        """Seed the export dialog (menu dialogs never remember their values).
+
+        Only the export menu is seeded — this callback fires for EVERY menu
+        item that has a ConfigUI, and returning values for another one would
+        overwrite its defaults.
+        """
+        values = indigo.Dict()
+        if menu_id != MENU_MANAGE_EXPORTS:
+            return values
+        values["exportFilter"] = ""
+        values["exportDevice"] = NO_SELECTION_ID
+        values["exportRole"] = ""
+        values["exportName"] = ""
+        values["exportInvert"] = False
+        values["exportStatus"] = self._export_summary()
+        return values
+
+    def getExportCandidates(self, filter="", valuesDict=None, typeId="", targetId=0):  # noqa: N802, A002, ARG002
+        """Picker rows: every Indigo device, exportable or not (XAC9).
+
+        Excluded devices are listed **with the reason in the label** and an
+        ``x-``-prefixed id so the callbacks can reject the pick cleanly —
+        hiding them would leave a user hunting for a device that will never
+        appear. ``filter`` here is the XML's static filter attribute, NOT the
+        user's text: textfields have no callbacks, so the typed filter arrives
+        in ``valuesDict`` and the Apply-filter button drives the reload.
+        """
+        try:
+            text = str((valuesDict or {}).get("exportFilter", "") or "").strip().lower()
+            exported = self.exports.ids() if self.exports is not None else frozenset()
+            plugin_id = self._export_plugin_id()
+            options: list[tuple[str, str]] = []
+            truncated = 0
+            for dev in indigo.devices:
+                name = str(getattr(dev, "name", "") or "")
+                if text and text not in name.lower():
+                    continue
+                if len(options) >= EXPORT_PICKER_LIMIT:
+                    truncated += 1
+                    continue
+                verdict = export_catalog.classify(dev, plugin_id)
+                if isinstance(verdict, export_catalog.Excluded):
+                    options.append((f"{EXCLUDED_OPTION_PREFIX}{dev.id}",
+                                    f"{name} — not exportable: {verdict.reason}"))
+                else:
+                    mark = "● " if dev.id in exported else ""
+                    options.append((str(dev.id), f"{mark}{name}"))
+            if truncated:
+                options.append((NO_SELECTION_ID,
+                                f"… {truncated} more — narrow the filter"))
+            if not options:
+                options.append((NO_SELECTION_ID, "(no devices match the filter)"))
+            return options
+        except Exception as exc:  # noqa: BLE001 - never break the dialog
+            self.logger.exception(exc)
+            return []
+
+    def getExportRoles(self, filter="", valuesDict=None, typeId="", targetId=0):  # noqa: N802, A002, ARG002
+        """Roles the picked device may legitimately be exported as (§5.2).
+
+        Empty for no selection or an excluded pick — an empty role menu is the
+        honest rendering of "there is nothing you may choose here".
+        """
+        try:
+            kind, device_id = self._export_selection(valuesDict)
+            if kind != "device":
+                return []
+            dev = self._indigo_device(device_id)
+            if dev is None:
+                return []
+            verdict = export_catalog.classify(dev, self._export_plugin_id())
+            if isinstance(verdict, export_catalog.Excluded):
+                return []
+            return [(role, export_catalog.role_label(role)) for role in verdict.eligible_roles]
+        except Exception as exc:  # noqa: BLE001 - never break the dialog
+            self.logger.exception(exc)
+            return []
+
+    def getCurrentExports(self, filter="", valuesDict=None, typeId="", targetId=0):  # noqa: N802, A002, ARG002
+        """Read-only summary of the allow-list (one row per export)."""
+        try:
+            if self.exports is None:
+                return [(NO_SELECTION_ID, "(plugin still starting)")]
+            options = []
+            for entry in self.exports.all():
+                dev = self._indigo_device(entry.indigo_device_id)
+                name = str(getattr(dev, "name", "") or "") if dev is not None else ""
+                if not name:
+                    name = f"(deleted device {entry.indigo_device_id})"
+                label = f"{name} → {export_catalog.role_label(entry.role)}"
+                if entry.name_override:
+                    label += f' · shown as "{entry.name_override}"'
+                if entry.options.get(OPTION_INVERT):
+                    label += " · inverted"
+                options.append((str(entry.indigo_device_id), label))
+            return options or [(NO_SELECTION_ID, "(nothing exported yet)")]
+        except Exception as exc:  # noqa: BLE001 - never break the dialog
+            self.logger.exception(exc)
+            return []
+
+    def exportReloadPicker(self, valuesDict, typeId="", devId=0):  # noqa: N802, ARG002
+        """Apply-filter button: the return trip is what reloads the lists."""
+        values = valuesDict
+        text = str(values.get("exportFilter", "") or "").strip()
+        values["exportStatus"] = (f'Filtered on "{text}". {self._export_summary()}' if text
+                                  else self._export_summary())
+        return values
+
+    def exportDeviceChanged(self, valuesDict, typeId="", devId=0):  # noqa: N802, ARG002
+        """Picker selection changed: load that device's saved export, or defaults.
+
+        Menu callbacks return a valuesDict, not an error dict (the SDK's menu
+        contract), so an excluded pick is reported in the read-only status
+        field here and *rejected* — with a real field error — by the
+        Add/update button below. Both paths are covered by tests.
+        """
+        values = valuesDict
+        kind, device_id = self._export_selection(values)
+        if kind == "none":
+            values["exportRole"] = ""
+            values["exportName"] = ""
+            values["exportInvert"] = False
+            values["exportStatus"] = self._export_summary()
+            return values
+        dev = self._indigo_device(device_id)
+        if kind == "excluded" or dev is None:
+            reason = "that device no longer exists"
+            if dev is not None:
+                verdict = export_catalog.classify(dev, self._export_plugin_id())
+                reason = verdict.reason if isinstance(verdict, export_catalog.Excluded) \
+                    else "that device is not exportable"
+            values["exportRole"] = ""
+            values["exportName"] = ""
+            values["exportInvert"] = False
+            values["exportStatus"] = f"Not exportable: {reason}"
+            return values
+        verdict = export_catalog.classify(dev, self._export_plugin_id())
+        if isinstance(verdict, export_catalog.Excluded):
+            values["exportRole"] = ""
+            values["exportStatus"] = f"Not exportable: {verdict.reason}"
+            return values
+        entry = self.exports.get(device_id) if self.exports is not None else None
+        if entry is not None:
+            values["exportRole"] = entry.role
+            values["exportName"] = entry.name_override or ""
+            values["exportInvert"] = bool(entry.options.get(OPTION_INVERT, False))
+            values["exportStatus"] = f"{dev.name} is exported as {export_catalog.role_label(entry.role)}."
+        else:
+            values["exportRole"] = verdict.default_role
+            values["exportName"] = ""
+            values["exportInvert"] = False
+            values["exportStatus"] = f"{dev.name} is not exported yet."
+        return values
+
+    def exportAddOrUpdate(self, valuesDict, typeId="", devId=0):  # noqa: N802, ARG002
+        """Add or update one export. Validates the role against the catalog.
+
+        A role the catalog does not offer for this device is refused here
+        rather than by the bridge node, which would only reject it with
+        ``unknown_role``/``role_change`` long after the user could connect the
+        failure to what they did (BRIDGE_PROTOCOL §1.1).
+        """
+        values = valuesDict
+        errors = indigo.Dict()
+        if self.exports is None:
+            errors["exportDevice"] = "Plugin still starting — try again in a moment."
+            return (values, errors)
+        kind, device_id = self._export_selection(values)
+        if kind == "none":
+            errors["exportDevice"] = "Select a device to export."
+            return (values, errors)
+        dev = self._indigo_device(device_id)
+        if dev is None:
+            errors["exportDevice"] = "That device no longer exists — refresh the list."
+            return (values, errors)
+        verdict = export_catalog.classify(dev, self._export_plugin_id())
+        if kind == "excluded" or isinstance(verdict, export_catalog.Excluded):
+            reason = verdict.reason if isinstance(verdict, export_catalog.Excluded) \
+                else "not exportable"
+            errors["exportDevice"] = f"{dev.name} cannot be exported: {reason}"
+            values["exportStatus"] = f"Not exportable: {reason}"
+            return (values, errors)
+        role = str(values.get("exportRole", "") or "")
+        if role not in verdict.eligible_roles:
+            errors["exportRole"] = ("Choose how this device should appear "
+                                    f"({', '.join(verdict.eligible_roles)}).")
+            return (values, errors)
+        name_override = str(values.get("exportName", "") or "").strip() or None
+        options = {}
+        if role == export_catalog.ROLE_WINDOW_COVERING and self._truthy(values.get("exportInvert")):
+            options[OPTION_INVERT] = True
+        existed = device_id in self.exports
+        self.exports.upsert(ExportEntry(
+            indigo_device_id=device_id, role=role,
+            name_override=name_override, options=options,
+        ))
+        verb = "Updated" if existed else "Added"
+        self.logger.info("%s Matter export: %s (id %s) as %s%s",
+                         verb, dev.name, device_id, role,
+                         f' named "{name_override}"' if name_override else "")
+        values["exportStatus"] = f"{verb} {dev.name} as {export_catalog.role_label(role)}. " \
+                                 f"{self._export_summary()}"
+        return values
+
+    def exportRemove(self, valuesDict, typeId="", devId=0):  # noqa: N802, ARG002
+        """Drop the picked device from the allow-list."""
+        values = valuesDict
+        errors = indigo.Dict()
+        if self.exports is None:
+            errors["exportDevice"] = "Plugin still starting — try again in a moment."
+            return (values, errors)
+        kind, device_id = self._export_selection(values)
+        if kind == "none":
+            errors["exportDevice"] = "Select a device to remove from the export list."
+            return (values, errors)
+        if not self.exports.remove(device_id):
+            errors["exportDevice"] = "That device is not exported."
+            return (values, errors)
+        dev = self._indigo_device(device_id)
+        name = str(getattr(dev, "name", "") or "") if dev is not None else f"device {device_id}"
+        self.logger.info("Removed Matter export: %s (id %s)", name, device_id)
+        values["exportRole"] = ""
+        values["exportName"] = ""
+        values["exportInvert"] = False
+        values["exportStatus"] = f"Removed {name}. {self._export_summary()}"
+        return values
 
     def _resolve_storage_path(self) -> str:
         """Storage dir path in BOTH managed and manual modes.

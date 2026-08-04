@@ -116,3 +116,122 @@ def scripted_responder(results: dict) -> Callable[[dict], list]:
 async def returns(value):
     """Await-able that yields ``value`` (for the client's connect factory)."""
     return value
+
+
+# ---------------------------------------------------------------------------
+# Fake Indigo devices for the export catalog / picker (PRD §5.1-§5.2)
+# ---------------------------------------------------------------------------
+# ``export_catalog`` dispatches on the IOM class-name chain, not isinstance
+# (the indigo module is a MagicMock in tests — see conftest). So these classes
+# are named exactly as Indigo's are and mirror its inheritance: DimmerDevice
+# and SpeedControlDevice really are RelayDevice subclasses, which is precisely
+# the ambiguity the catalog's most-specific-first ordering has to survive.
+#
+# Pessimistic discipline (docs/TESTING.md): each class declares only the
+# capability flags its real counterpart carries, and ``minimal_device`` builds
+# a device with none at all, so the catalog's getattr defaults are exercised
+# rather than assumed.
+
+#: pluginId for a device that is NOT ours — the loop guard must let it through.
+OTHER_PLUGIN_ID = "com.example.someone-else"
+
+
+class FakeIndigoDevice:
+    """Base: the device attributes every Indigo device really has."""
+
+    def __init__(self, dev_id=1, name="Device", plugin_id=OTHER_PLUGIN_ID, **attrs):
+        self.id = dev_id
+        self.name = name
+        self.pluginId = plugin_id
+        self.pluginProps = dict(attrs.pop("pluginProps", None) or {})
+        self.deviceTypeId = attrs.pop("deviceTypeId", "")
+        self.displayStateValUi = attrs.pop("displayStateValUi", "")
+        self.model = attrs.pop("model", "")
+        self.subModel = attrs.pop("subModel", "")
+        for key, value in attrs.items():
+            setattr(self, key, value)
+
+
+class RelayDevice(FakeIndigoDevice):
+    """indigo.RelayDevice — on/off only."""
+
+    def __init__(self, *args, **kwargs):
+        self.supportsOnState = kwargs.pop("supportsOnState", True)
+        super().__init__(*args, **kwargs)
+
+
+class DimmerDevice(RelayDevice):
+    """indigo.DimmerDevice — a relay that also dims, and maybe colours."""
+
+    def __init__(self, *args, **kwargs):
+        self.supportsColor = kwargs.pop("supportsColor", False)
+        self.supportsRGB = kwargs.pop("supportsRGB", False)
+        self.supportsWhiteTemperature = kwargs.pop("supportsWhiteTemperature", False)
+        super().__init__(*args, **kwargs)
+
+
+class SpeedControlDevice(RelayDevice):
+    """indigo.SpeedControlDevice — fans; excluded in v1."""
+
+
+class SensorDevice(FakeIndigoDevice):
+    """indigo.SensorDevice — binary (supportsOnState) or numeric (supportsSensorValue)."""
+
+    def __init__(self, *args, **kwargs):
+        self.supportsOnState = kwargs.pop("supportsOnState", False)
+        self.supportsSensorValue = kwargs.pop("supportsSensorValue", False)
+        super().__init__(*args, **kwargs)
+
+
+class ThermostatDevice(FakeIndigoDevice):
+    """indigo.ThermostatDevice."""
+
+
+class SprinklerDevice(FakeIndigoDevice):
+    """indigo.SprinklerDevice — no Matter irrigation type; excluded in v1."""
+
+
+class MultiIODevice(FakeIndigoDevice):
+    """indigo.MultiIODevice — no single-accessory representation; excluded."""
+
+
+class CustomDevice(FakeIndigoDevice):
+    """A plugin-defined `custom` device — no resolvable Matter role."""
+
+
+def minimal_device(class_name, dev_id=1, name="Device", plugin_id=OTHER_PLUGIN_ID):
+    """A device carrying ONLY id/name/pluginId, in a class of ``class_name``.
+
+    Models the pessimistic case: an Indigo object whose capability flags we
+    must not assume exist. Everything the catalog reads beyond those three
+    attributes has to fall back cleanly.
+    """
+    klass = type(class_name, (object,), {})
+    dev = klass()
+    dev.id = dev_id
+    dev.name = name
+    dev.pluginId = plugin_id
+    return dev
+
+
+class FakeIndigoDevices:
+    """Stands in for ``indigo.devices``: iterable, and subscriptable by id."""
+
+    def __init__(self, devices=()):
+        self._devices = list(devices)
+
+    def add(self, device):
+        self._devices.append(device)
+        return device
+
+    def __iter__(self):
+        return iter(self._devices)
+
+    def __len__(self):
+        return len(self._devices)
+
+    def __getitem__(self, device_id):
+        for device in self._devices:
+            if device.id == device_id:
+                return device
+        raise KeyError(device_id)
