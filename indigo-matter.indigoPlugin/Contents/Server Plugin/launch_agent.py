@@ -381,7 +381,7 @@ class LaunchAgent:
         if not self._exists(entry):
             return (
                 f"the {self.spec.package} package is not installed ({entry} is missing). "
-                f"Use the plugin menu: Plugins ▸ Matter ▸ Install/update matter-server "
+                f"Use the plugin menu: Plugins ▸ Matter ▸ Install/update {self.spec.package} "
                 f"(or run 'npm install {self.spec.install_spec}' in {self.project_dir} "
                 f"with the same node, {self.node_path}), then restart the plugin."
             )
@@ -406,7 +406,7 @@ class LaunchAgent:
         return (
             f"{self.spec.package} was installed with Node {stamped}.x but the resolved node "
             f"({self.node_path}) is {current}.x. If it fails to start, reinstall via "
-            f"Plugins ▸ Matter ▸ Install/update matter-server, or clear the stale stamp "
+            f"Plugins ▸ Matter ▸ Install/update {self.spec.package}, or clear the stale stamp "
             f"({self._install_stamp_path()})."
         )
 

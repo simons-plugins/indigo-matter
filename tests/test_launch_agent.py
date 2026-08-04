@@ -171,6 +171,57 @@ def test_install_node_stamp_is_deliberately_shared(tmp_path, mock_logger):
     assert second._read_install_node_major() == 22
 
 
+def test_preflight_fail_returns_none_and_spares_the_sibling(tmp_path, mock_logger):
+    """The tri-state's None leg, pinned at the GENERIC level with a sibling present.
+
+    ensure_installed() on a failed preflight must return None, log an error, and
+    remove ITS OWN stale plist — via uninstall(), which is exactly where a careless
+    implementation would tear down more than its own label. The sibling's plist
+    survives and no launchctl call names the sibling's label.
+    """
+    home = tmp_path / "home"
+    healthy = _agent(home, _spec("com.example.a", "pkg-a", str(tmp_path / "a-store")), mock_logger)
+    assert healthy.ensure_installed() is True
+
+    broken = _agent(home, _spec("com.example.b", "pkg-b", str(tmp_path / "b-store")), mock_logger)
+    assert broken.ensure_installed() is True        # healthy first: leaves a plist behind
+    os.remove(os.path.join(broken.project_dir, "node_modules", "pkg-b", "dist", "Main.js"))
+    broken._run = FakeRunner()
+    assert broken.ensure_installed() is None        # preflight now fails
+    mock_logger.error.assert_called()
+    assert not os.path.exists(broken.plist_path)    # its own stale plist removed
+    assert os.path.exists(healthy.plist_path)       # sibling's job definition intact
+    assert all("com.example.a" not in " ".join(call) for call in broken._run.calls)
+
+
+def test_remove_package_pins_the_shared_destruction_semantics(tmp_path, mock_logger):
+    """TODO(E7): remove_package() destroys the SIBLING's package too. Pinned, not endorsed.
+
+    It rmtree's the shared node_modules wholesale while booting out only its own
+    label — so the sibling keeps a loaded job definition and a stale applied marker
+    pointing at a package that no longer exists (crash-loop on next respawn).
+    Tolerable while exactly one agent exists; NOT tolerable once the bridge agent
+    lands. E7 must make this per-package (npm-uninstall semantics) or sibling-aware,
+    and this test exists so that change is deliberate: when E7 fixes the semantics,
+    rewrite these assertions to pin the new isolation instead.
+    """
+    home = tmp_path / "home"
+    controller = _agent(home, _spec("com.example.a", "pkg-a", str(tmp_path / "a-store")), mock_logger)
+    sibling = _agent(home, _spec("com.example.b", "pkg-b", str(tmp_path / "b-store")), mock_logger)
+    assert controller.ensure_installed() is True
+    assert sibling.ensure_installed() is True
+    sibling_entry = os.path.join(sibling.project_dir, "node_modules", "pkg-b", "dist", "Main.js")
+    assert os.path.exists(sibling_entry)
+
+    controller._run = FakeRunner()
+    controller.remove_package()
+    assert not os.path.exists(sibling_entry)        # sibling's package gone (today's semantics)
+    assert sibling.preflight() is not None          # so its preflight now fails
+    assert os.path.exists(sibling.plist_path)       # while its job definition remains
+    assert sibling._read_applied_digest()           # with a stale-but-present marker
+    assert all("com.example.b" not in " ".join(call) for call in controller._run.calls)
+
+
 # ---------------------------------------------------------------------------
 # Reaping is per-agent: an agent must never signal the other agent's process
 # ---------------------------------------------------------------------------
