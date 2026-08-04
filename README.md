@@ -57,6 +57,16 @@ run modes, verification, backups, and troubleshooting).
 
 ## Documentation
 
+**[Field Notes](https://simons-plugins.github.io/indigo-matter/)** — longer-form write-ups,
+published as a site:
+
+- **[№ 1 — The Landscape](https://simons-plugins.github.io/indigo-matter/matter.html)** —
+  Matter, Thread, and where Indigo fits.
+- **[№ 2 — The Proving Ground](https://simons-plugins.github.io/indigo-matter/testing.html)** —
+  how this plugin is tested.
+
+Reference docs in this repo:
+
 - **[docs/MATTER.md](./docs/MATTER.md)** — Matter & Thread explained: how Indigo, Domio, matter-server and Apple Home fit together. **Start here.**
 - **[docs/INSTALL.md](./docs/INSTALL.md)** — matter-server install & plugin setup.
 - **[docs/TESTING.md](./docs/TESTING.md)** — how the plugin is tested: unit suite, the device zoo, the virtual matter.js fleet, and live validation.
