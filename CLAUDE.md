@@ -42,7 +42,8 @@ loop→Indigo writes go straight through `device_sync.apply_states` (thread-safe
 | `async_runtime.py` | The event loop + thread + bridge primitives |
 | `protocol.py` | **Rename firewall** — the only place that knows matter-server wire field names |
 | `matter_client.py` | Persistent reconnecting WS client (uses `websockets`) |
-| `server_process.py` | matter-server LaunchAgent (PM-B), gated by the `serverLocation` pref — the config asks "is matter-server on this Mac?"; `local` (turnkey default) manages it here on loopback, `remote` connects to a server elsewhere. `manageLaunchAgent`/host/port are derived from that in `startup` (see `plugin.py:server_location`) |
+| `launch_agent.py` | Generic launchd LaunchAgent machinery (npm/npx/node resolution, plist authoring, applied-plist digest, orphan/EADDRINUSE reaping), driven by a frozen `AgentSpec` that carries one agent's identity. Extracted so the Matter **bridge node** can be a second agent without duplicating it (PRD-indigo-matter-export §4.2 / XOQ3) |
+| `server_process.py` | `ServerProcess` = the matter-server (controller) specialisation of `LaunchAgent`: its prefs, its argv, its pinned version. Gated by the `serverLocation` pref — the config asks "is matter-server on this Mac?"; `local` (turnkey default) manages it here on loopback, `remote` connects to a server elsewhere. `manageLaunchAgent`/host/port are derived from that in `startup` (see `plugin.py:server_location`) |
 | `commission_jobs.py` | Commissioning job state machine (API.md §3.2/§3.3) |
 | `device_sync.py` | Node↔Indigo reconciliation + state/command seams |
 | `http_handlers.py` | Domio API routing (served over IWS, not aiohttp) |
