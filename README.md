@@ -7,7 +7,7 @@ first-class Indigo devices (triggers, schedules, action groups, control pages, A
 plugin manages a [`matter-server`](https://github.com/matter-js/matterjs-server) instance,
 holds the Indigo-owned Matter fabric, and translates Matter clusters ↔ Indigo device types.
 
-```
+```text
 Domio (iOS) ─┐
              ├── setup code ──▶ indigo-matter ──WebSocket──▶ matter-server ──IP──▶ Wi-Fi + Thread devices
 plugin menu ─┘
