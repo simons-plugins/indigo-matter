@@ -343,7 +343,9 @@ class TestRequestTimeouts:
         # The handshake's attach is pumped inline, so its deadline is a bare
         # asyncio.TimeoutError with an empty str() — "connection lost: " was all
         # the log said about the single most diagnostic failure in §2.
-        monkeypatch.setattr("bridge_client.ATTACH_TIMEOUT", 0.05)
+        # The deadline is derived from the endpoint count (E3b), so pin the
+        # formula rather than its floor constant.
+        monkeypatch.setattr("bridge_client.attach_timeout_for", lambda _count: 0.05)
 
         async def scenario():
             delays = []

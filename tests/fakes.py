@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from concurrent.futures import Future
 from typing import Callable, Optional
 
 import protocol
@@ -119,6 +120,97 @@ async def returns(value):
 
 
 # ---------------------------------------------------------------------------
+# Export (outbound) doubles — the E3 bridge wiring
+# ---------------------------------------------------------------------------
+class RecordingRuntime:
+    """Stands in for ``AsyncRuntime``, running each coroutine to completion NOW.
+
+    ``ExportBridge`` deliberately never awaits what it submits (§3.4), so a
+    runtime that merely queued coroutines would let every assertion pass against
+    work that never happened. Running them synchronously on the calling thread
+    keeps the tests deterministic *and* exercises ``_fire``'s done-callback, which
+    is the only thing that stops a failed state push being silent.
+    """
+
+    def __init__(self, running: bool = True):
+        self.is_running = running
+        self.submitted: list = []
+
+    def submit(self, coro):
+        self.submitted.append(coro)
+        if not self.is_running:
+            raise RuntimeError("asyncio runtime is not running")
+        future: Future = Future()
+        try:
+            future.set_result(asyncio.run(coro))
+        except Exception as exc:  # the client's own errors reach the callback
+            future.set_exception(exc)
+        return future
+
+
+class FakeBridgeClient:
+    """Records what ``ExportBridge`` sends, without a socket or a node.
+
+    Mirrors the slice of :class:`bridge_client.BridgeClient` the export engine
+    actually touches. ``calls`` is ordered, because frame order is part of the
+    contract (§1: frames are applied in receipt order).
+    """
+
+    def __init__(self, logger=None, prefs=None, **kwargs):
+        self.logger = logger
+        self.prefs = dict(prefs or {})
+        self.kwargs = kwargs
+        self.calls: list[tuple] = []
+        self.attached = True
+        self.connected = True
+        self.halted = False
+        self.halted_reason = None
+        self.recovery = False
+        self.closed = False
+        self.ran = False
+        #: command name → exception to raise instead of succeeding.
+        self.fail: dict = {}
+
+    # -- the recorded surface -------------------------------------------
+    async def run(self):
+        self.ran = True
+
+    async def attach(self, endpoints=None, *, replace_all=False, timeout=None):
+        return self._record("attach", endpoints, replace_all)
+
+    async def upsert_endpoint(self, spec, timeout=None):
+        return self._record("upsert_endpoint", spec)
+
+    async def remove_endpoint(self, device_id, timeout=None):
+        return self._record("remove_endpoint", device_id)
+
+    async def set_state(self, device_id, states):
+        return self._record("set_state", device_id, dict(states))
+
+    async def set_reachable(self, device_id, reachable, timeout=None):
+        return self._record("set_reachable", device_id, reachable)
+
+    async def close(self):
+        self.closed = True
+        self._record("close")
+
+    # -- introspection ---------------------------------------------------
+    def _record(self, name, *args):
+        self.calls.append((name, *args))
+        if name in self.fail:
+            raise self.fail[name]
+        return None
+
+    def names(self) -> list[str]:
+        return [call[0] for call in self.calls]
+
+    def only(self, name: str) -> tuple:
+        matches = [call for call in self.calls if call[0] == name]
+        assert len(matches) == 1, f"expected exactly one {name}, got {self.names()}"
+        return matches[0]
+
+
+# ---------------------------------------------------------------------------
 # Fake Indigo devices for the export catalog / picker (PRD §5.1-§5.2)
 # ---------------------------------------------------------------------------
 # ``export_catalog`` dispatches on the IOM class-name chain, not isinstance
@@ -143,6 +235,10 @@ class FakeIndigoDevice:
         self.id = dev_id
         self.name = name
         self.pluginId = plugin_id
+        # Every real Indigo device carries both, and §4.1 `reachable` is derived
+        # from them (XAC8) — so they are base attributes, not per-class extras.
+        self.enabled = attrs.pop("enabled", True)
+        self.configured = attrs.pop("configured", True)
         self.pluginProps = dict(attrs.pop("pluginProps", None) or {})
         self.deviceTypeId = attrs.pop("deviceTypeId", "")
         self.displayStateValUi = attrs.pop("displayStateValUi", "")
@@ -157,16 +253,28 @@ class RelayDevice(FakeIndigoDevice):
 
     def __init__(self, *args, **kwargs):
         self.supportsOnState = kwargs.pop("supportsOnState", True)
+        self.onState = kwargs.pop("onState", False)
         super().__init__(*args, **kwargs)
 
 
 class DimmerDevice(RelayDevice):
-    """indigo.DimmerDevice — a relay that also dims, and maybe colours."""
+    """indigo.DimmerDevice — a relay that also dims, and maybe colours.
+
+    The colour attributes default to ``None``, which is what real Indigo reports
+    on a device with no colour channel — the export handlers have to omit those
+    §4.2 keys rather than push a fabricated 0.
+    """
 
     def __init__(self, *args, **kwargs):
         self.supportsColor = kwargs.pop("supportsColor", False)
         self.supportsRGB = kwargs.pop("supportsRGB", False)
         self.supportsWhiteTemperature = kwargs.pop("supportsWhiteTemperature", False)
+        self.brightness = kwargs.pop("brightness", 0)
+        self.redLevel = kwargs.pop("redLevel", None)
+        self.greenLevel = kwargs.pop("greenLevel", None)
+        self.blueLevel = kwargs.pop("blueLevel", None)
+        self.whiteLevel = kwargs.pop("whiteLevel", None)
+        self.whiteTemperature = kwargs.pop("whiteTemperature", None)
         super().__init__(*args, **kwargs)
 
 
