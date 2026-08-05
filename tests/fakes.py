@@ -199,6 +199,38 @@ class CustomDevice(FakeIndigoDevice):
     """A plugin-defined `custom` device — no resolvable Matter role."""
 
 
+class HostileDevice:
+    """A device proxy where EVERY attribute access raises.
+
+    Models an Indigo device object being deleted underneath us: the proxy is
+    still in the list, but reading anything off it blows up. The catalog must
+    turn this into an ``Excluded`` verdict, never an exception — the picker
+    walks the whole database, so one of these would otherwise empty the dialog.
+    ``id``/``name`` raise too, deliberately: the picker cannot even label it.
+    """
+
+    def __getattr__(self, name):
+        raise RuntimeError(f"device proxy is gone (reading {name!r})")
+
+
+class HostilePluginIdDevice(RelayDevice):
+    """Readable enough to be *listed*, but classification detonates.
+
+    The other half of the class: ``id``/``name`` work, so the picker can build
+    a row, and then reading ``pluginId`` — the loop guard's only input —
+    raises. The verdict must be excluded, never eligible: an unreadable
+    ``pluginId`` is precisely the case where we cannot prove the guard passed.
+    """
+
+    @property
+    def pluginId(self):
+        raise RuntimeError("pluginId blew up")
+
+    @pluginId.setter
+    def pluginId(self, value):
+        pass  # the base __init__ assigns it; only the READ has to raise
+
+
 def minimal_device(class_name, dev_id=1, name="Device", plugin_id=OTHER_PLUGIN_ID):
     """A device carrying ONLY id/name/pluginId, in a class of ``class_name``.
 

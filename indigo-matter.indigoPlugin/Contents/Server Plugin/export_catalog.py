@@ -24,13 +24,27 @@ Two structural notes:
   against real Indigo objects and the test doubles, and it resolves the
   Dimmer-is-a-Relay ambiguity by most-specific-first ordering.
 
+* **:func:`classify` never raises.** It runs over every device in the database
+  to build a picker, and Indigo device proxies are live objects — one being
+  deleted underneath us can raise from any attribute access. A raising device
+  becomes :data:`REASON_DEVICE_ERROR`, not a broken dialog, and the failure is
+  fail-*closed*: if we could not even read ``pluginId`` we cannot prove the
+  loop guard passed, so the only safe verdict is excluded.
+
 Every role emitted here is in the BRIDGE_PROTOCOL §4.2 enum
 (``bridge_protocol.ROLES``); ``tests/test_export_catalog.py`` pins that.
 """
 from __future__ import annotations
 
+import logging
+import re
 from dataclasses import dataclass
 from typing import Optional, Union
+
+#: Module logger. The catalog is pure and Indigo-free, so it logs through the
+#: stdlib root configuration Indigo already installs rather than taking a
+#: logger argument on every call site.
+_LOG = logging.getLogger(__name__)
 
 #: This plugin's bundle id (``Info.plist`` ``CFBundleIdentifier``). Only a
 #: fallback: callers pass ``self.pluginId`` so the guard follows the running
@@ -85,6 +99,7 @@ REASON_MULTI_IO = "no coherent single-accessory representation"
 REASON_NO_ROLE = "no resolvable Matter role"
 REASON_SENSOR_UNITS = "no faithful Matter sensor type"
 REASON_SENSOR_NO_VALUE = "sensor reports neither an on/off state nor a value"
+REASON_DEVICE_ERROR = "error reading device — see Event Log"
 
 #: Roles a user might reasonably expect and the reason v1 does not offer them
 #: (§5.2 "Explicitly not exportable in v1"). Indigo cannot tell us a relay is a
@@ -105,22 +120,44 @@ NUMERIC_SENSOR_ROLES = (
     ROLE_PRESSURE_SENSOR, ROLE_FLOW_SENSOR,
 )
 
-#: Unit hints → role, **first match wins**. Ordered so unambiguous words beat
-#: broad ones ("humidity" before "temp", which matches half the sensors in a
-#: typical database). Indigo has no canonical sensor-unit property, so the
-#: hints are gathered from pluginProps, the formatted UI value and the device's
-#: own naming — see :func:`_unit_text`.
-_UNIT_PATTERNS = (
-    (ROLE_HUMIDITY_SENSOR, ("%rh", "rh%", "humidity", "moisture")),
-    (ROLE_LIGHT_SENSOR, ("lux", " lx", "illuminance", "light level", "luminance")),
-    (ROLE_PRESSURE_SENSOR, ("kpa", "hpa", "mbar", "millibar", "psi", "inhg", "pressure")),
-    (ROLE_FLOW_SENSOR, ("m3/h", "m³/h", "l/min", "lpm", "gpm", "flow rate", "flow")),
-    (ROLE_TEMPERATURE_SENSOR, ("°c", "°f", "degc", "degf", "celsius", "fahrenheit",
-                               "temperature", "temp")),
+#: Unit hints → role as **regexes**, first match wins within a tier. Ordered so
+#: unambiguous words beat broad ones ("humidity" before "temp", which matches
+#: half the sensors in a typical database).
+#:
+#: Every *prose* needle is anchored with ``\b`` because plain substring
+#: matching turned ordinary device names into sensors: "Fluxcapacitor" contains
+#: "lux", "Attempt Counter" contains "temp", "Epsilon Meter" contains "psi" and
+#: "Overflow Alarm" contains "flow". Symbol needles that begin with punctuation
+#: (``°c``, ``%rh``, ``l/min``) cannot carry a leading ``\b`` — there is no word
+#: boundary before ``°`` at the start of a string — and do not need one: they
+#: are already unambiguous. Indigo has no canonical sensor-unit property, so the
+#: hints are gathered from pluginProps, the formatted UI value and, last, the
+#: device's own naming — see :func:`_unit_texts`.
+_UNIT_PATTERNS = tuple(
+    (role, tuple(re.compile(pattern) for pattern in patterns)) for role, patterns in (
+        (ROLE_HUMIDITY_SENSOR, (r"%\s?rh\b", r"\brh\s?%", r"\bhumidity\b", r"\bmoisture\b")),
+        (ROLE_LIGHT_SENSOR, (r"\blux\b", r"\blx\b", r"\billuminance\b", r"\blight level\b",
+                             r"\bluminance\b")),
+        (ROLE_PRESSURE_SENSOR, (r"\bk?pa\b", r"\bhpa\b", r"\bmbar\b", r"\bmillibar\b",
+                                r"\bpsi\b", r"\binhg\b", r"\bpressure\b")),
+        (ROLE_FLOW_SENSOR, (r"\bm3/h", r"m³/h", r"\bl/min\b", r"\blpm\b", r"\bgpm\b",
+                            r"\bflow rate\b", r"\bflow\b")),
+        (ROLE_TEMPERATURE_SENSOR, (r"°\s?c\b", r"°\s?f\b", r"\bdeg\s?c\b", r"\bdeg\s?f\b",
+                                   r"\bcelsius\b", r"\bfahrenheit\b", r"\btemperature\b",
+                                   r"\btemp\b")),
+    )
 )
 
 #: pluginProps keys plugins commonly use to record a sensor's unit.
 _UNIT_PROP_KEYS = ("unit", "units", "sensorUnits", "unitOfMeasure", "uiUnits", "sensorType")
+
+#: Device attributes searched for unit hints, **strongest evidence first**.
+#: ``name`` sits in its own tier below the rest: a declared unit or a formatted
+#: value is a statement about the unit, a name is a coincidence waiting to
+#: happen. It is kept rather than dropped because plenty of real Indigo sensors
+#: carry their unit nowhere else ("Greenhouse Temperature").
+_UNIT_ATTRS_STRONG = ("displayStateValUi", "model", "subModel")
+_UNIT_ATTRS_WEAK = ("name",)
 
 # --------------------------------------------------------------------------
 # Type dispatch — IOM class names, most specific first
@@ -184,13 +221,24 @@ def classify(dev, plugin_id: str = DEFAULT_PLUGIN_ID) -> Verdict:
     excluded first, before any type reasoning, which is what makes the loop
     guard structural (XNG3/XAC6) rather than a downstream check that a future
     edit could route around.
+
+    Never raises. Indigo device objects are live proxies, and one being deleted
+    while the picker walks the database can raise from any attribute access —
+    which would otherwise take out the whole dialog. Such a device is
+    :data:`REASON_DEVICE_ERROR`, never eligible: if ``pluginId`` could not be
+    read we cannot prove the loop guard passed, so the fail-safe answer is no.
     """
-    if _plugin_id_of(dev) == plugin_id:
-        return Excluded(REASON_LOOP_GUARD)
-    handler = _BY_KIND.get(device_kind(dev))
-    if handler is None:
-        return Excluded(REASON_NO_ROLE)
-    return handler(dev)
+    try:
+        if _plugin_id_of(dev) == plugin_id:
+            return Excluded(REASON_LOOP_GUARD)
+        handler = _BY_KIND.get(device_kind(dev))
+        if handler is None:
+            return Excluded(REASON_NO_ROLE)
+        return handler(dev)
+    except Exception as exc:  # pylint: disable=broad-except
+        _LOG.error("Matter export: could not classify a device for export — %s", exc,
+                   exc_info=True)
+        return Excluded(REASON_DEVICE_ERROR)
 
 
 def is_exportable(dev, plugin_id: str = DEFAULT_PLUGIN_ID) -> bool:
@@ -315,27 +363,43 @@ def _default_first(roles: list[str], default: str) -> tuple[str, ...]:
     return tuple(seen)
 
 
-def _unit_text(dev) -> str:
-    """Everything about a device that might name its unit, lower-cased.
+def _unit_texts(dev) -> tuple[str, str]:
+    """``(strong, weak)`` lower-cased haystacks for the unit heuristic.
 
     Indigo carries no canonical unit property on ``SensorDevice`` — plugins
     record it in their own props, and the only universal surface is the
-    formatted display value (``displayStateValUi``, e.g. ``"72.3 °F"``). So we
-    read the likely props, then the formatted value, then the device's own
-    naming, and match keywords over the lot.
+    formatted display value (``displayStateValUi``, e.g. ``"72.3 °F"``). Those
+    are the **strong** tier: a declared unit is a statement about the unit.
+    The device's own **name** is the weak tier, consulted only when nothing
+    declared a unit, because a name is prose the user wrote for themselves. It
+    is kept rather than dropped because plenty of real Indigo sensors carry
+    their unit nowhere else ("Greenhouse Temperature").
     """
-    parts: list[str] = []
+    strong: list[str] = []
     props = getattr(dev, "pluginProps", None)
     if isinstance(props, dict):
         for key in _UNIT_PROP_KEYS:
             value = props.get(key)
             if isinstance(value, str):
-                parts.append(value)
-    for attr in ("displayStateValUi", "model", "subModel", "name"):
+                strong.append(value)
+    for attr in _UNIT_ATTRS_STRONG:
         value = getattr(dev, attr, None)
         if isinstance(value, str):
-            parts.append(value)
-    return " ".join(parts).lower()
+            strong.append(value)
+    weak = [value for value in (getattr(dev, attr, None) for attr in _UNIT_ATTRS_WEAK)
+            if isinstance(value, str)]
+    return " ".join(strong).lower(), " ".join(weak).lower()
+
+
+def _role_for_text(text: str) -> Optional[str]:
+    """First :data:`_UNIT_PATTERNS` role whose regex matches ``text``."""
+    if not text:
+        return None
+    for role, needles in _UNIT_PATTERNS:
+        for needle in needles:
+            if needle.search(text):
+                return role
+    return None
 
 
 def _numeric_sensor_role(dev) -> Optional[str]:
@@ -346,11 +410,5 @@ def _numeric_sensor_role(dev) -> Optional[str]:
     correct it, which is the same "user-declared role" posture §5.2 takes for
     relays.
     """
-    text = _unit_text(dev)
-    if not text:
-        return None
-    for role, needles in _UNIT_PATTERNS:
-        for needle in needles:
-            if needle in text:
-                return role
-    return None
+    strong, weak = _unit_texts(dev)
+    return _role_for_text(strong) or _role_for_text(weak)

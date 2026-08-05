@@ -11,7 +11,10 @@ Invariants:
   3. `default_role` is always the FIRST eligible role (the picker's first
      option must be its safest one);
   4. every exclusion carries a non-empty reason (XAC9 shows it in the picker);
-  5. the loop guard beats every other rule, for every device shape (XAC6).
+  5. the loop guard beats every other rule, for every device shape (XAC6);
+  6. reverse coverage — the union of every eligible role across the zoo IS
+     `bridge_protocol.ROLES`, so a role added to the protocol cannot ship
+     UI-unreachable (and `classify` never raises, whatever the device does).
 """
 from __future__ import annotations
 
@@ -25,9 +28,10 @@ import export_catalog
 from bridge_protocol import ROLES
 from export_catalog import EligibleDevice, Excluded, classify
 from fakes import (
-    OTHER_PLUGIN_ID,
     CustomDevice,
     DimmerDevice,
+    HostileDevice,
+    HostilePluginIdDevice,
     MultiIODevice,
     RelayDevice,
     SensorDevice,
@@ -54,6 +58,14 @@ ZOO = {
     "dimmer_full_colour": (
         DimmerDevice(3, "Lounge Bulb", supportsColor=True, supportsRGB=True,
                      supportsWhiteTemperature=True),
+        EligibleDevice(("extendedColorLight", "dimmableLight", "colorTemperatureLight",
+                        "windowCovering"), "extendedColorLight"),
+    ),
+    # RGB WITHOUT white-temperature — the shape a plain colour bulb actually
+    # ships in. Its own row because the mixed-capability row above cannot tell
+    # "rgb implies extendedColorLight" apart from "whiteTemp implies it".
+    "dimmer_rgb_only": (
+        DimmerDevice(19, "Party Bulb", supportsColor=True, supportsRGB=True),
         EligibleDevice(("extendedColorLight", "dimmableLight", "colorTemperatureLight",
                         "windowCovering"), "extendedColorLight"),
     ),
@@ -169,6 +181,63 @@ def test_zoo_exclusions_always_carry_a_reason(name):
         assert verdict.reason.strip()
 
 
+def test_zoo_offers_every_protocol_role_somewhere():
+    """Invariant 6 (reverse coverage) — no role can land UI-unreachable.
+
+    The forward invariant says every role we emit is a real §4.2 role. This is
+    its mirror: every §4.2 role must be reachable from SOME device shape in the
+    zoo. Adding a role to `bridge_protocol.ROLES` (and to the node) without a
+    device that can ever be declared as it would ship a role the picker never
+    offers — dead protocol surface nobody notices for a milestone.
+    """
+    offered = set()
+    for device, _expected in ZOO.values():
+        # OURS, not OTHER_PLUGIN_ID: the zoo devices themselves carry
+        # OTHER_PLUGIN_ID, so classifying against it would loop-guard the
+        # entire zoo and make this invariant vacuous.
+        verdict = classify(device, OURS)
+        if isinstance(verdict, EligibleDevice):
+            offered.update(verdict.eligible_roles)
+    assert offered == set(ROLES), (
+        f"unreachable roles: {sorted(set(ROLES) - offered)}; "
+        f"non-protocol roles offered: {sorted(offered - set(ROLES))}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# C1 — classify() never propagates. Indigo proxies die mid-iteration.
+# ---------------------------------------------------------------------------
+def test_a_device_whose_every_attribute_raises_is_excluded_not_fatal():
+    assert classify(HostileDevice(), OURS) == Excluded(export_catalog.REASON_DEVICE_ERROR)
+
+
+def test_an_unreadable_plugin_id_fails_closed():
+    """If the loop guard's input cannot be read, the answer is NOT eligible."""
+    verdict = classify(HostilePluginIdDevice(1, "Flaky Plug"), OURS)
+    assert verdict == Excluded(export_catalog.REASON_DEVICE_ERROR)
+    assert not isinstance(verdict, EligibleDevice)
+
+
+def test_classification_failure_is_logged_once(caplog):
+    with caplog.at_level("ERROR"):
+        classify(HostileDevice(), OURS)
+    assert len([r for r in caplog.records if "could not classify" in r.message]) == 1
+
+
+def test_a_raising_capability_flag_is_excluded_not_fatal():
+    class ExplodingSensor(SensorDevice):
+        @property
+        def supportsOnState(self):  # noqa: N802 - mirrors Indigo's own naming
+            raise RuntimeError("state read failed")
+
+        @supportsOnState.setter
+        def supportsOnState(self, value):
+            pass
+
+    assert classify(ExplodingSensor(1, "Odd"), OURS) == Excluded(
+        export_catalog.REASON_DEVICE_ERROR)
+
+
 # ---------------------------------------------------------------------------
 # XAC6 — the loop guard. Required by name in the PRD's acceptance criteria.
 # ---------------------------------------------------------------------------
@@ -280,6 +349,57 @@ def test_unit_heuristic_falls_back_to_the_device_name():
     assert classify(dev, OURS).default_role == "temperatureSensor"
 
 
+# ---------------------------------------------------------------------------
+# C2 — the needles are WORDS, not substrings
+# ---------------------------------------------------------------------------
+# Substring matching turned ordinary English into sensor units: every name
+# below contains a needle ("flux" ⊃ lux, "attempt" ⊃ temp, "epsilon" ⊃ psi,
+# "overflow" ⊃ flow, "moist"…), and each was silently mis-defaulted.
+@pytest.mark.parametrize("name", [
+    "Fluxcapacitor",        # lux
+    "Attempt Counter",      # temp
+    "Epsilon Meter",        # psi
+    "Overflow Alarm",       # flow
+    "Deluxe Panel",         # lux
+    "Contempt Index",       # temp
+])
+def test_a_word_that_merely_contains_a_unit_is_not_a_unit(name):
+    dev = SensorDevice(1, name, supportsSensorValue=True)
+    assert classify(dev, OURS) == Excluded(export_catalog.REASON_SENSOR_UNITS), name
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("19.5 °C", "temperatureSensor"),
+    ("Humidity 47%RH", "humiditySensor"),
+    ("Flow (l/min)", "flowSensor"),
+    ("340 lux", "lightSensor"),
+    ("1013 hPa", "pressureSensor"),
+    ("Tank Pressure", "pressureSensor"),
+    ("Soil moisture", "humiditySensor"),
+    ("Light level", "lightSensor"),
+], ids=lambda v: str(v))
+def test_genuine_units_still_classify_after_the_word_boundaries(text, expected):
+    dev = SensorDevice(1, "", supportsSensorValue=True, displayStateValUi=text)
+    assert classify(dev, OURS).default_role == expected
+
+
+def test_a_declared_unit_outranks_the_device_name():
+    """Names are the weakest evidence: a declared unit must win outright.
+
+    "Flow" in a name would otherwise beat a props-declared "%RH" purely
+    because flow sorts before temperature in the pattern table.
+    """
+    dev = SensorDevice(1, "Bathroom Flow Sensor", supportsSensorValue=True,
+                       pluginProps={"unit": "%RH"})
+    assert classify(dev, OURS).default_role == "humiditySensor"
+
+
+def test_the_formatted_value_outranks_the_device_name():
+    dev = SensorDevice(1, "Kitchen Temperature", supportsSensorValue=True,
+                       displayStateValUi="1013 hPa")
+    assert classify(dev, OURS).default_role == "pressureSensor"
+
+
 def test_humidity_beats_temperature_in_a_combined_name():
     """First match wins, and 'humidity' is the unambiguous word."""
     dev = SensorDevice(1, "Temperature/Humidity — Humidity", supportsSensorValue=True,
@@ -307,7 +427,8 @@ def test_excluded_roles_are_documented_with_reasons():
 def test_excluded_roles_are_never_offered():
     offered = set()
     for device, _expected in ZOO.values():
-        verdict = classify(device, OTHER_PLUGIN_ID)
+        # OURS for the same reason as the reverse-coverage invariant above.
+        verdict = classify(device, OURS)
         if isinstance(verdict, EligibleDevice):
             offered.update(verdict.eligible_roles)
     assert offered.isdisjoint(export_catalog.EXCLUDED_ROLES)

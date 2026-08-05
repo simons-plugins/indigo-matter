@@ -84,9 +84,18 @@
             <Field id="exportPickerHeading" type="label" fontColor="darkgray">
                 <Label>1 · Pick a device</Label>
             </Field>
+            <!--
+                Textfields carry only <Label> (SDK: ConfigUI → Text Field);
+                <Description> is documented for checkboxes and menus, NOT for
+                textfields, so the guidance that used to live inside these two
+                fields sits in its own label field instead. The <Description>
+                elements on the menus below are documented and stay put.
+            -->
             <Field id="exportFilter" type="textfield">
                 <Label>Filter by name:</Label>
-                <Description>Type part of a device name, then click Apply filter. Leave empty to list everything.</Description>
+            </Field>
+            <Field id="exportFilterHelp" type="label" fontColor="darkgray">
+                <Label>Type part of a device name, then click Apply filter. Leave empty to list everything.</Label>
             </Field>
             <Field id="exportReload" type="button">
                 <Label></Label>
@@ -110,7 +119,9 @@
             </Field>
             <Field id="exportName" type="textfield">
                 <Label>Name in ecosystems:</Label>
-                <Description>Optional. Leave empty to use the Indigo device name.</Description>
+            </Field>
+            <Field id="exportNameHelp" type="label" fontColor="darkgray">
+                <Label>Optional. Leave empty to use the Indigo device name.</Label>
             </Field>
             <Field id="exportInvert" type="checkbox" defaultValue="false"
                    visibleBindingId="exportRole" visibleBindingValue="windowCovering"

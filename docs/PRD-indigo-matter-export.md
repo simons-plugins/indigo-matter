@@ -235,8 +235,8 @@ them into a PRD where they can rot.
 | Garage doors | Needs the polarity handling the catalog doesn't yet carry (`onState` true = closed, turnOn = close), and mis-mapping is a physical-safety issue. Blocked on the catalog role/polarity work |
 | Sensors with units outside the table | No faithful Matter sensor type |
 
-Excluded devices must be **absent from the picker with a reason shown**, not
-silently missing.
+Excluded devices must **appear in the picker as excluded, with reasons** (XAC9),
+not silently missing.
 
 ### 5.3 Bridge node
 

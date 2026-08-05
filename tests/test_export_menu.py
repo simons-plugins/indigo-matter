@@ -11,10 +11,17 @@ including the two acceptance criteria the PRD names explicitly:
   catalog level in `test_export_catalog.py`);
 * **XAC9** — excluded devices appear in the picker *with reasons*, never
   silently missing.
+
+Two contracts hardened in PR #122 are pinned here too: button `CallbackMethod`s
+return **the values dict only** (the SDK documents a dict, not a
+`(values, errors)` tuple — that shape belongs to validation methods), so every
+refusal has to be visible in `exportStatus`; and one unreadable device costs one
+picker row, never the whole list.
 """
 from __future__ import annotations
 
 import importlib
+import json
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from unittest.mock import Mock
@@ -27,6 +34,8 @@ from fakes import (
     OTHER_PLUGIN_ID,
     DimmerDevice,
     FakeIndigoDevices,
+    HostileDevice,
+    HostilePluginIdDevice,
     RelayDevice,
     SensorDevice,
     SprinklerDevice,
@@ -65,7 +74,7 @@ def plug(plugin_mod, devices):  # noqa: ARG001 - devices installs indigo.devices
     p.logger = Mock()
     p.pluginId = OURS
     p.pluginPrefs = {}
-    p.exports = ExportStore(p.pluginPrefs, p.logger)
+    p.exports = ExportStore(lambda: p.pluginPrefs, p.logger)
     return p
 
 
@@ -202,32 +211,108 @@ def test_picker_marks_already_exported_devices(plug):
     assert labels["102"] == "Hall Dimmer"
 
 
-def test_picker_filter_is_case_insensitive_substring(plug):
+def test_picker_filter_is_case_insensitive_substring(plug, plugin_mod):
     labels = _labels(plug.getExportCandidates(valuesDict=_values(exportFilter="hAlL")))
-    assert set(labels) == {"102", "103"}
+    assert set(labels) == {plugin_mod.NO_SELECTION_ID, "102", "103"}
 
 
-def test_picker_filter_with_no_matches_still_returns_a_legal_option(plug):
+def test_picker_always_leads_with_a_real_row_for_the_seeded_value(plug, plugin_mod):
+    """The dialog is SEEDED with exportDevice="0", so "0" must be a real row.
+
+    Without it the menu opens on a value that matches no option, which Indigo
+    renders as a blank first item the user cannot get back to.
+    """
+    options = plug.getExportCandidates(valuesDict=_values())
+    assert options[0] == (plugin_mod.NO_SELECTION_ID, plugin_mod.NO_SELECTION_LABEL)
+
+
+def test_picker_option_ids_are_unique(plug, devices, plugin_mod):
+    """"0" belongs to the seed row alone — the tail may not reuse it."""
+    for device_id in range(1000, 1000 + plugin_mod.EXPORT_PICKER_LIMIT + 5):
+        devices.add(RelayDevice(device_id, f"Bulk {device_id}"))
+    ids = [key for key, _label in plug.getExportCandidates(valuesDict=_values())]
+    assert len(ids) == len(set(ids))
+
+
+def test_picker_filter_with_no_matches_still_returns_a_legal_option(plug, plugin_mod):
     options = plug.getExportCandidates(valuesDict=_values(exportFilter="zzz"))
-    assert options == [("0", "(no devices match the filter)")]
+    assert options == [(plugin_mod.NO_SELECTION_ID, plugin_mod.NO_SELECTION_LABEL),
+                       plugin_mod.NO_MATCH_OPTION]
 
 
 def test_picker_caps_the_list_and_offers_a_narrowing_tail(plug, devices, plugin_mod):
     for device_id in range(1000, 1000 + plugin_mod.EXPORT_PICKER_LIMIT + 5):
         devices.add(RelayDevice(device_id, f"Bulk {device_id}"))
     options = plug.getExportCandidates(valuesDict=_values())
-    assert len(options) == plugin_mod.EXPORT_PICKER_LIMIT + 1
-    tail_id, tail_label = options[-1]
-    assert tail_id == "0"
-    assert "narrow the filter" in tail_label
+    # seed row + the cap + the tail
+    assert len(options) == plugin_mod.EXPORT_PICKER_LIMIT + 2
+    assert options[-1] == plugin_mod.TRUNCATED_OPTION
+    assert options[-1][0] != plugin_mod.NO_SELECTION_ID
 
 
-def test_picker_degrades_to_empty_on_error(plug, mock_indigo_base):
+def test_the_truncation_tail_is_not_a_selectable_device(plug, plugin_mod):
+    assert plug._export_selection(
+        {"exportDevice": plugin_mod.TRUNCATED_OPTION[0]}) == ("none", 0)
+    assert plug._export_selection(
+        {"exportDevice": plugin_mod.NO_MATCH_OPTION[0]}) == ("none", 0)
+
+
+def test_picker_says_so_when_it_fails_outright(plug, mock_indigo_base, plugin_mod):
     boom = Mock()
     boom.__iter__ = Mock(side_effect=RuntimeError("boom"))
     mock_indigo_base.devices = boom
-    assert plug.getExportCandidates(valuesDict=_values()) == []
+    assert plug.getExportCandidates(valuesDict=_values()) == [plugin_mod.LIST_ERROR_OPTION]
     plug.logger.exception.assert_called()
+
+
+# ---------------------------------------------------------------------------
+# D3 — one bad device costs one row, not the whole dialog
+# ---------------------------------------------------------------------------
+def test_one_unreadable_device_costs_one_row(plug, devices, plugin_mod):
+    devices.add(HostileDevice())
+    options = plug.getExportCandidates(valuesDict=_values())
+    labels = _labels(options)
+    assert labels["101"] == "Study Plug"          # the rest of the list survives
+    broken = [label for label in labels.values() if plugin_mod.ROW_ERROR_LABEL in label]
+    assert len(broken) == 1
+    plug.logger.exception.assert_called()
+
+
+def test_many_unreadable_devices_log_one_stack_trace(plug, devices):
+    for _ in range(5):
+        devices.add(HostileDevice())
+    plug.getExportCandidates(valuesDict=_values())
+    assert plug.logger.exception.call_count == 1
+    assert plug.logger.error.call_count == 4
+
+
+def test_an_unclassifiable_device_is_an_excluded_row_not_a_crash(plug, devices):
+    """C1 end-to-end: classify() absorbs it, so the picker shows a reason."""
+    devices.add(HostilePluginIdDevice(555, "Flaky Plug"))
+    labels = _labels(plug.getExportCandidates(valuesDict=_values()))
+    assert "555" not in labels                     # not selectable
+    assert "error reading device" in labels["x-555"]
+
+
+def test_current_exports_contains_a_bad_row(plug, plugin_mod, monkeypatch):
+    plug.exports.upsert(ExportEntry(101, "onOffPlugInUnit"))
+    plug.exports.upsert(ExportEntry(102, "dimmableLight"))
+    real = export_catalog.role_label
+
+    def flaky(role):
+        if role == "onOffPlugInUnit":
+            raise RuntimeError("boom")
+        return real(role)
+
+    monkeypatch.setattr(export_catalog, "role_label", flaky)
+    labels = _labels(plug.getCurrentExports())
+    assert "102" in labels
+    assert any(plugin_mod.ROW_ERROR_LABEL in label for label in labels.values())
+
+
+def test_current_exports_says_so_when_it_fails_outright(plug, plugin_mod, monkeypatch):
+    monkeypatch.setattr(plug.exports, "all", Mock(side_effect=RuntimeError("boom")))
+    assert plug.getCurrentExports() == [plugin_mod.LIST_ERROR_OPTION]
 
 
 def test_picker_works_before_the_store_exists(plug):
@@ -260,10 +345,13 @@ def test_role_picker_is_empty_for_a_stale_device_id(plug):
     assert plug.getExportRoles(valuesDict=_values(exportDevice="999999")) == []
 
 
-def test_role_picker_degrades_to_empty_on_error(plug, monkeypatch):
+def test_role_picker_says_so_when_it_fails_outright(plug, plugin_mod, monkeypatch):
+    """An empty role menu means "nothing you may choose"; a failure must not
+    borrow that meaning."""
     monkeypatch.setattr(export_catalog, "classify",
                         Mock(side_effect=RuntimeError("boom")))
-    assert plug.getExportRoles(valuesDict=_values(exportDevice="101")) == []
+    assert plug.getExportRoles(
+        valuesDict=_values(exportDevice="101")) == [plugin_mod.LIST_ERROR_OPTION]
     plug.logger.exception.assert_called()
 
 
@@ -324,6 +412,45 @@ def test_device_changed_reports_an_excluded_pick_in_the_status_field(plug):
 def test_device_changed_reports_our_own_device_as_loop_guarded(plug):
     values = plug.exportDeviceChanged(_values(exportDevice="x-105"), "manageMatterExports")
     assert export_catalog.REASON_LOOP_GUARD in values["exportStatus"]
+
+
+# ---------------------------------------------------------------------------
+# D4 — excluded AND exported is a real state, and it has to be legible
+# ---------------------------------------------------------------------------
+def test_picker_keeps_the_exported_marker_on_an_excluded_device(plug):
+    """A device that became unexportable AFTER it was exported keeps its dot.
+
+    Dropping the marker makes the picker disagree with the "Currently exported"
+    list, which reads as a picker bug rather than the stale export it is.
+    """
+    plug.exports.upsert(ExportEntry(104, "onOffPlugInUnit"))
+    label = _labels(plug.getExportCandidates(valuesDict=_values()))["x-104"]
+    assert label.startswith("● ")
+    assert export_catalog.REASON_SPRINKLER in label
+
+
+def test_device_changed_warns_when_an_excluded_device_is_still_exported(plug):
+    plug.exports.upsert(ExportEntry(104, "onOffPlugInUnit"))
+    values = plug.exportDeviceChanged(_values(exportDevice="x-104"), "manageMatterExports")
+    assert "IS currently exported" in values["exportStatus"]
+    assert "fail to bridge" in values["exportStatus"]
+
+
+def test_device_changed_does_not_cry_wolf_for_an_unexported_exclusion(plug):
+    values = plug.exportDeviceChanged(_values(exportDevice="x-104"), "manageMatterExports")
+    assert "IS currently exported" not in values["exportStatus"]
+
+
+def test_device_changed_clears_the_whole_pane_for_an_excluded_pick(plug, devices):
+    """The second excluded branch used to leave a stale name/polarity behind."""
+    devices.add(HostilePluginIdDevice(555, "Flaky Plug"))
+    values = plug.exportDeviceChanged(
+        _values(exportDevice="555", exportRole="onOffLight", exportName="Stale",
+                exportInvert=True),
+        "manageMatterExports")
+    assert values["exportRole"] == ""
+    assert values["exportName"] == ""
+    assert values["exportInvert"] is False
 
 
 def test_device_changed_clears_the_detail_pane_on_no_selection(plug):
@@ -390,50 +517,49 @@ def test_add_records_covering_polarity_only_for_coverings(plug):
 
 
 def test_add_requires_a_selection(plug):
-    _values_out, errors = plug.exportAddOrUpdate(_values(), "manageMatterExports")
-    assert "exportDevice" in errors
+    values = plug.exportAddOrUpdate(_values(), "manageMatterExports")
+    assert "Select a device to export" in values["exportStatus"]
     assert len(plug.exports) == 0
 
 
-def test_add_rejects_an_excluded_pick_with_a_field_error(plug):
-    values, errors = plug.exportAddOrUpdate(
+def test_add_rejects_an_excluded_pick_in_the_status_field(plug):
+    values = plug.exportAddOrUpdate(
         _values(exportDevice="x-104", exportRole="onOffLight"), "manageMatterExports")
-    assert export_catalog.REASON_SPRINKLER in errors["exportDevice"]
     assert export_catalog.REASON_SPRINKLER in values["exportStatus"]
     assert len(plug.exports) == 0
 
 
 def test_xac6_add_refuses_our_own_device_even_if_the_id_is_unprefixed(plug):
     """Server-side rejection, not just a picker label — the guard is structural."""
-    _out, errors = plug.exportAddOrUpdate(
+    values = plug.exportAddOrUpdate(
         _values(exportDevice="105", exportRole="onOffLight"), "manageMatterExports")
-    assert export_catalog.REASON_LOOP_GUARD in errors["exportDevice"]
+    assert export_catalog.REASON_LOOP_GUARD in values["exportStatus"]
     assert len(plug.exports) == 0
 
 
 def test_add_rejects_a_role_the_device_is_not_eligible_for(plug):
-    _out, errors = plug.exportAddOrUpdate(
+    values = plug.exportAddOrUpdate(
         _values(exportDevice="101", exportRole="thermostat"), "manageMatterExports")
-    assert "exportRole" in errors
+    assert "Choose how this device should appear" in values["exportStatus"]
     assert len(plug.exports) == 0
 
 
 def test_add_rejects_an_empty_role(plug):
-    _out, errors = plug.exportAddOrUpdate(_values(exportDevice="101"), "manageMatterExports")
-    assert "exportRole" in errors
+    values = plug.exportAddOrUpdate(_values(exportDevice="101"), "manageMatterExports")
+    assert "Choose how this device should appear" in values["exportStatus"]
 
 
 def test_add_rejects_a_stale_device_id(plug):
-    _out, errors = plug.exportAddOrUpdate(
+    values = plug.exportAddOrUpdate(
         _values(exportDevice="999999", exportRole="onOffLight"), "manageMatterExports")
-    assert "no longer exists" in errors["exportDevice"]
+    assert "no longer exists" in values["exportStatus"]
 
 
-def test_add_before_startup_is_a_dialog_error(plug):
+def test_add_before_startup_says_so(plug):
     plug.exports = None
-    _out, errors = plug.exportAddOrUpdate(
+    values = plug.exportAddOrUpdate(
         _values(exportDevice="101", exportRole="onOffLight"), "manageMatterExports")
-    assert "still starting" in errors["exportDevice"]
+    assert "still starting" in values["exportStatus"]
 
 
 # ---------------------------------------------------------------------------
@@ -449,13 +575,13 @@ def test_remove_drops_the_entry_and_clears_the_pane(plug):
 
 
 def test_remove_requires_a_selection(plug):
-    _out, errors = plug.exportRemove(_values(), "manageMatterExports")
-    assert "exportDevice" in errors
+    values = plug.exportRemove(_values(), "manageMatterExports")
+    assert "Select a device to remove" in values["exportStatus"]
 
 
-def test_remove_of_something_not_exported_is_a_field_error(plug):
-    _out, errors = plug.exportRemove(_values(exportDevice="101"), "manageMatterExports")
-    assert errors["exportDevice"] == "That device is not exported."
+def test_remove_of_something_not_exported_is_reported(plug):
+    values = plug.exportRemove(_values(exportDevice="101"), "manageMatterExports")
+    assert values["exportStatus"] == "That device is not exported."
 
 
 def test_remove_works_for_a_deleted_indigo_device(plug):
@@ -465,10 +591,99 @@ def test_remove_works_for_a_deleted_indigo_device(plug):
     assert "device 999999" in values["exportStatus"]
 
 
-def test_remove_before_startup_is_a_dialog_error(plug):
+def test_remove_before_startup_says_so(plug):
     plug.exports = None
-    _out, errors = plug.exportRemove(_values(exportDevice="101"), "manageMatterExports")
-    assert "still starting" in errors["exportDevice"]
+    values = plug.exportRemove(_values(exportDevice="101"), "manageMatterExports")
+    assert "still starting" in values["exportStatus"]
+
+
+# ---------------------------------------------------------------------------
+# D1 — button callbacks return the values dict ONLY
+# ---------------------------------------------------------------------------
+# The SDK's button reference documents a button CallbackMethod as returning "a
+# dictionary back to the dialog containing any field changes"; the
+# (valuesDict, errorsDict) tuple belongs to the VALIDATION methods. It also says
+# a button's own field is read-only and so cannot carry an error message. Every
+# refusal therefore has to reach the user through exportStatus.
+BUTTON_CALLS = [
+    ("exportReloadPicker", _values()),
+    ("exportAddOrUpdate", _values()),                                   # no selection
+    ("exportAddOrUpdate", _values(exportDevice="x-104")),               # excluded
+    ("exportAddOrUpdate", _values(exportDevice="999999")),              # stale id
+    ("exportAddOrUpdate", _values(exportDevice="101")),                 # no role
+    ("exportAddOrUpdate", _values(exportDevice="101", exportRole="thermostat")),
+    ("exportAddOrUpdate", _values(exportDevice="101", exportRole="onOffLight")),
+    ("exportRemove", _values()),
+    ("exportRemove", _values(exportDevice="101")),
+]
+
+
+@pytest.mark.parametrize("callback,values", BUTTON_CALLS,
+                         ids=[f"{name}-{i}" for i, (name, _v) in enumerate(BUTTON_CALLS)])
+def test_button_callbacks_return_a_bare_values_dict(plug, callback, values):
+    result = getattr(plug, callback)(dict(values), "manageMatterExports")
+    assert not isinstance(result, tuple), f"{callback} returned the undocumented tuple"
+    assert "exportStatus" in result
+
+
+@pytest.mark.parametrize("callback,values", BUTTON_CALLS,
+                         ids=[f"{name}-{i}" for i, (name, _v) in enumerate(BUTTON_CALLS)])
+def test_every_button_path_leaves_a_non_empty_status(plug, callback, values):
+    """Including the early returns: a silent dialog is indistinguishable from
+    a dead button."""
+    result = getattr(plug, callback)(dict(values), "manageMatterExports")
+    assert str(result["exportStatus"]).strip()
+
+
+@pytest.mark.parametrize("callback", ["exportAddOrUpdate", "exportRemove"])
+def test_button_callbacks_before_startup_still_return_a_dict(plug, callback):
+    plug.exports = None
+    result = getattr(plug, callback)(
+        _values(exportDevice="101", exportRole="onOffLight"), "manageMatterExports")
+    assert not isinstance(result, tuple)
+
+
+# ---------------------------------------------------------------------------
+# S6 — a failed save is never reported as success
+# ---------------------------------------------------------------------------
+def test_add_reports_a_failed_save_instead_of_claiming_success(plug, monkeypatch):
+    monkeypatch.setattr(plug.exports, "upsert", Mock(side_effect=RuntimeError("prefs died")))
+    values = plug.exportAddOrUpdate(
+        _values(exportDevice="101", exportRole="onOffLight"), "manageMatterExports")
+    assert values["exportStatus"] == "FAILED to save the export list — see Event Log"
+    plug.logger.exception.assert_called()
+
+
+def test_remove_reports_a_failed_save_instead_of_claiming_success(plug, monkeypatch):
+    plug.exports.upsert(ExportEntry(101, "onOffLight"))
+    monkeypatch.setattr(plug.exports, "remove", Mock(side_effect=RuntimeError("prefs died")))
+    values = plug.exportRemove(_values(exportDevice="101"), "manageMatterExports")
+    assert values["exportStatus"] == "FAILED to save the export list — see Event Log"
+    plug.logger.exception.assert_called()
+
+
+# ---------------------------------------------------------------------------
+# S3 — a load failure must never render as "Nothing is exported yet."
+# ---------------------------------------------------------------------------
+def test_the_dialog_reports_an_unreadable_export_list(plug):
+    plug.pluginPrefs = {PREF_KEY: "{broken"}
+    plug.exports = ExportStore(lambda: plug.pluginPrefs, plug.logger)
+    status = plug.get_menu_action_config_ui_values("manageMatterExports")["exportStatus"]
+    assert "could not be read" in status
+    assert "preserved" in status
+    assert "Nothing is exported yet." not in status
+
+
+def test_the_dialog_reports_dropped_rows_alongside_the_count(plug):
+    blob = json.dumps({"v": 1, "exports": [
+        {"indigoDeviceId": 101, "role": "onOffLight"},
+        {"indigoDeviceId": 102, "role": "teleporter"},
+    ]})
+    plug.pluginPrefs = {PREF_KEY: blob}
+    plug.exports = ExportStore(lambda: plug.pluginPrefs, plug.logger)
+    status = plug._export_summary()
+    assert "could not be read" in status
+    assert "1 device(s) exported" in status
 
 
 # ---------------------------------------------------------------------------
@@ -515,7 +730,9 @@ def test_plugin_id_falls_back_to_the_bundle_constant(plug):
 # ---------------------------------------------------------------------------
 # startup wiring — the allow-list must exist before anything consults it
 # ---------------------------------------------------------------------------
-def test_startup_loads_the_allow_list_from_prefs(plugin_mod, monkeypatch):
+@pytest.fixture
+def started(plugin_mod, devices, monkeypatch):  # noqa: ARG001 - devices installs indigo.devices
+    """A Plugin whose startup() can be driven without touching the real host."""
     class FakeRuntimeObj:
         is_running = True
 
@@ -535,17 +752,115 @@ def test_startup_loads_the_allow_list_from_prefs(plugin_mod, monkeypatch):
     # MUST be patched — an unpatched ServerProcess touches the real $HOME (#104).
     monkeypatch.setattr(plugin_mod, "ServerProcess", lambda *a, **k: Mock())
 
-    p = plugin_mod.Plugin.__new__(plugin_mod.Plugin)
-    p.logger = Mock()
-    p.pluginPrefs = {}
-    p.proto = object()
-    p.registry = object()
-    p.device_sync = Mock()
-    p.runtime = None
-    p.server_process = None
-    p.exports = None
-    ExportStore(p.pluginPrefs, p.logger).upsert(ExportEntry(101, "onOffLight"))
+    def build(prefs=None):
+        p = plugin_mod.Plugin.__new__(plugin_mod.Plugin)
+        p.logger = Mock()
+        p.pluginId = OURS
+        p.pluginPrefs = {} if prefs is None else prefs
+        p.proto = object()
+        p.registry = object()
+        p.device_sync = Mock()
+        p.runtime = None
+        p.server_process = None
+        p.exports = None
+        return p
 
+    return build
+
+
+def _seed(prefs, *entries):
+    store = ExportStore(lambda: prefs, Mock())
+    for entry in entries:
+        store.upsert(entry)
+    return prefs
+
+
+def test_startup_loads_the_allow_list_from_prefs(started):
+    p = started()
+    _seed(p.pluginPrefs, ExportEntry(101, "onOffLight"))
     p.startup()
     assert p.exports is not None
+    assert p.exports.ids() == frozenset({101})
+
+
+def test_startup_wires_the_store_to_indigos_prefs_flush(started, mock_indigo_base):
+    """S1 — the store's commit step must be a REAL flush, not the default no-op."""
+    p = started()
+    p.startup()
+    mock_indigo_base.server.savePluginPrefs.reset_mock()
+    p.exports.upsert(ExportEntry(101, "onOffLight"))
+    mock_indigo_base.server.savePluginPrefs.assert_called_once()
+
+
+def test_startup_wires_the_store_to_a_live_prefs_binding(started):
+    """S2 — a PluginConfig save can hand the plugin a NEW pluginPrefs object."""
+    p = started()
+    p.startup()
+    p.pluginPrefs = {}                      # Indigo rebinds it
+    p.exports.upsert(ExportEntry(101, "onOffLight"))
+    assert PREF_KEY in p.pluginPrefs        # the write followed the rebinding
+
+
+def test_startup_drops_a_restored_entry_for_our_own_device(started):
+    """S5 — load is an unguarded write path; the loop guard is re-run there.
+
+    Device 105 carries OUR pluginId. A blob restored from a backup (or edited
+    by hand) that exports it must not survive into the store, or E3 would build
+    an endpoint for a device this plugin created.
+    """
+    prefs = _seed({}, ExportEntry(101, "onOffLight"), ExportEntry(105, "onOffLight"))
+    p = started(prefs)
+    p.startup()
+    assert p.exports.ids() == frozenset({101})
+    assert p.exports.load_error is not None
+
+
+def test_startup_keeps_a_merely_unexportable_entry(started):
+    """Only the loop guard deletes. Ordinary ineligibility is reported, not acted on."""
+    prefs = _seed({}, ExportEntry(104, "onOffPlugInUnit"))   # sprinkler
+    p = started(prefs)
+    p.startup()
+    assert p.exports.ids() == frozenset({104})
+
+
+# ---------------------------------------------------------------------------
+# R1 — startup reconcile is REPORT-ONLY
+# ---------------------------------------------------------------------------
+def test_reconcile_warns_about_a_deleted_device_but_keeps_it(started):
+    prefs = _seed({}, ExportEntry(999999, "onOffLight"))
+    p = started(prefs)
+    p.startup()
+    assert p.exports.ids() == frozenset({999999})
+    assert any("no longer exists" in str(call)
+               for call in p.logger.warning.call_args_list)
+
+
+def test_reconcile_warns_about_a_now_unexportable_device(started):
+    prefs = _seed({}, ExportEntry(104, "onOffPlugInUnit"))   # sprinkler
+    p = started(prefs)
+    p.startup()
+    assert any("no longer exportable" in str(call)
+               for call in p.logger.warning.call_args_list)
+
+
+def test_reconcile_warns_about_a_role_the_device_no_longer_offers(started):
+    prefs = _seed({}, ExportEntry(101, "windowCovering"))    # relay: no covering role
+    p = started(prefs)
+    p.startup()
+    assert any("no longer offers" in str(call)
+               for call in p.logger.warning.call_args_list)
+
+
+def test_reconcile_is_silent_when_everything_is_fine(started):
+    prefs = _seed({}, ExportEntry(101, "onOffPlugInUnit"))
+    p = started(prefs)
+    p.startup()
+    assert p.logger.warning.call_args_list == []
+
+
+def test_reconcile_never_fails_startup(started, monkeypatch):
+    prefs = _seed({}, ExportEntry(101, "onOffPlugInUnit"))
+    p = started(prefs)
+    monkeypatch.setattr(export_catalog, "classify", Mock(side_effect=RuntimeError("boom")))
+    p.startup()                              # must not raise
     assert p.exports.ids() == frozenset({101})
