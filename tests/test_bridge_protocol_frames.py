@@ -33,6 +33,10 @@ def _events() -> dict:
 
 
 EXCHANGES = _exchanges()
+#: The same exchanges keyed by bare name, for tests that name one frame. A frame
+#: moves out of "pending" when the NODE implements it (E3 moved the endpoint-CRUD
+#: family); the plugin-side shapes asserted here do not change when it does.
+BY_NAME = {name.removeprefix("pending:"): exchange for name, exchange in EXCHANGES.items()}
 EVENTS = _events()
 
 #: Fixtures with no public builder, and the assertion that replaces the
@@ -113,7 +117,7 @@ class TestRequests:
         assert bridge_protocol.ARG_INTENT not in plain["args"]
         deliberate = BridgeProtocol().build_attach("2026.8.1", [], replace_all=True, message_id="x")
         assert deliberate["args"][bridge_protocol.ARG_INTENT] == bridge_protocol.INTENT_REPLACE_ALL
-        assert deliberate == PENDING["attach_replace_all"]["request"] | {"message_id": "x"}
+        assert deliberate == BY_NAME["attach_replace_all"]["request"] | {"message_id": "x"}
 
     def test_factory_reset_preserves_endpoint_numbers_by_default(self):
         # §3.10: a reset must not scramble identities unless asked to.
@@ -140,12 +144,12 @@ class TestResponses:
 
     def test_status_report_is_normalised(self):
         report = bridge_protocol.parse_status(
-            PENDING["attach_with_endpoints"]["response"]["result"])
+            BY_NAME["attach_with_endpoints"]["response"]["result"])
         assert report.commissioned is True
         assert report.endpoint_count == 2
         assert [ep.indigo_device_id for ep in report.endpoints] == [123456789, 123456790]
         assert [ep.endpoint_number for ep in report.endpoints] == [2, 3]
-        assert report.endpoints[1].role == "doorLock"
+        assert report.endpoints[1].role == "dimmableLight"
         assert report.fabrics[0].fabric_index == 1
         assert report.fabrics[0].label == "Apple Home"
         assert report.fabrics[0].vendor_id == 4937
@@ -179,9 +183,9 @@ class TestResponses:
         assert window.window_expires_at.endswith("Z")
 
     def test_removal_results(self):
-        assert PENDING["remove_endpoint"]["response"]["result"]["removed"] is True
+        assert BY_NAME["remove_endpoint"]["response"]["result"]["removed"] is True
         # §3.3: removing an absent endpoint SUCCEEDS — idempotent, not an error.
-        absent = PENDING["remove_endpoint_absent"]["response"]
+        absent = BY_NAME["remove_endpoint_absent"]["response"]
         assert bridge_protocol.KEY_ERROR_CODE not in absent
         assert absent["result"]["removed"] is False
 
@@ -326,16 +330,16 @@ class TestCoverage:
         # accessories). A fixture that echoed attach's numbers demonstrated the
         # opposite of the command's whole reason to exist.
         before = {ep["indigoDeviceId"]: ep["endpointNumber"]
-                  for ep in PENDING["attach_with_endpoints"]["response"]["result"]["endpoints"]}
+                  for ep in BY_NAME["attach_with_endpoints"]["response"]["result"]["endpoints"]}
         after = {ep["indigoDeviceId"]: ep["endpointNumber"]
-                 for ep in PENDING["rebuild_endpoint_map"]["response"]["result"]["endpoints"]}
+                 for ep in BY_NAME["rebuild_endpoint_map"]["response"]["result"]["endpoints"]}
         assert set(before) == set(after)
         assert all(after[dev] != before[dev] for dev in before), (before, after)
 
     def test_endpoint_spec_round_trips(self):
-        wire = PENDING["upsert_endpoint"]["request"]["args"]["endpoint"]
+        wire = BY_NAME["upsert_endpoint"]["request"]["args"]["endpoint"]
         assert EndpointSpec.from_wire(wire).to_wire() == wire
 
     def test_every_role_spec_round_trips(self):
-        for spec in PENDING["attach_all_roles"]["request"]["args"]["endpoints"]:
+        for spec in BY_NAME["attach_all_roles"]["request"]["args"]["endpoints"]:
             assert EndpointSpec.from_wire(spec).to_wire() == spec

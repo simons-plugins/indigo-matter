@@ -111,9 +111,9 @@ function writeIdentity(file: string, identity: BridgeIdentity): void {
  * Read `identity.json` from {@link storagePath}, creating it (and the directory)
  * with freshly randomised values on first run. An unreadable or invalid file is
  * replaced — a bridge that cannot advertise is worse than one that needs
- * re-pairing, and E0 has nothing paired to protect yet.
+ * re-pairing, and nothing is paired to protect until the first commissioning.
  *
- * TODO(E1): a corrupt-but-present identity must refuse to start (PRD §4.3) —
+ * TODO(E5): a corrupt-but-present identity must refuse to start (PRD §4.3) —
  * regeneration un-pairs every ecosystem. Only the missing-file branch may mint.
  */
 export function loadOrCreateIdentity(
@@ -124,7 +124,7 @@ export function loadOrCreateIdentity(
     const file = join(storagePath, IDENTITY_FILE);
 
     // `undefined` means "no file at all"; anything else is why we are replacing
-    // a file that does exist — the distinction E1 turns into refuse-to-start.
+    // a file that does exist — the distinction E5 turns into refuse-to-start.
     let problem: string | undefined;
     try {
         const parsed: unknown = JSON.parse(readFileSync(file, "utf8"));
@@ -155,7 +155,7 @@ export function loadOrCreateIdentity(
 /**
  * Matter `SerialNumber` is capped at 32 characters, so the UUID is used with its
  * dashes stripped. Matter requires `UniqueID` and `SerialNumber` to differ, so
- * {@link uniqueIdFor} takes the full value and this takes the first half.
+ * the node's UniqueID takes the full value and this takes the first half.
  */
 export function serialNumberFor(identity: BridgeIdentity): string {
     return identity.installId.replace(/-/g, "").slice(0, 16);

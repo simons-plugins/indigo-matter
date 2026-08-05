@@ -1,15 +1,21 @@
 /**
  * The Matter side of the bridge: a ServerNode with an Aggregator at endpoint 1
- * and (in E0) a single hard-coded bridged child endpoint.
+ * and one bridged child endpoint per exported Indigo device.
  *
- * All matter.js coupling lives here and in main.ts — ADR-0006's binding
- * constraint keeps it out of the Indigo plugin entirely, and this module keeps
- * it out of the protocol layer so the protocol is testable on its own.
+ * The child set is entirely protocol-driven (§3.1-§3.3) and lives in
+ * {@link EndpointRegistry}; a node that has never been attached to serves an
+ * empty aggregator. Endpoint *numbers* are persisted by matter.js against
+ * `Endpoint.id`, so a device that comes back with the same id comes back with
+ * the same number — presence in the running set is not what preserves identity.
+ *
+ * All matter.js coupling lives here, in `endpoints.ts`/`registry.ts` and in
+ * main.ts — ADR-0006's binding constraint keeps it out of the Indigo plugin
+ * entirely, and this module keeps it out of the protocol layer so the protocol
+ * is testable on its own.
  */
 
 import { Endpoint, Environment, ServerNode, VendorId, version as matterJsVersion } from "@matter/main";
-import { BridgedDeviceBasicInformationServer } from "@matter/main/behaviors/bridged-device-basic-information";
-import { OnOffPlugInUnitDevice } from "@matter/main/devices/on-off-plug-in-unit";
+import { BasicInformationServer } from "@matter/main/behaviors/basic-information";
 import { AggregatorEndpoint } from "@matter/main/endpoints/aggregator";
 import { Crypto } from "@matter/main";
 import { DeviceCommissioner, PaseClient, PaseServer, SessionManager } from "@matter/main/protocol";
@@ -18,17 +24,21 @@ import { CommissioningFlowType, ManualPairingCodeCodec, QrPairingCodeCodec } fro
 import type { BridgeConfig } from "./config.js";
 import {
     type BridgeFacade,
+    type CommandEventData,
     type CommissioningWindowResult,
     describeError,
     describeErrorWithStack,
+    type EndpointSpec,
     ErrorCode,
     type FabricInfo,
     type PairingReport,
     ProtocolError,
-    Role,
+    type RemoveResult,
     type StatusReport,
+    type UpsertResult,
     type WindowClosedReason,
 } from "./protocol.js";
+import { EndpointRegistry } from "./registry.js";
 import { type BridgeIdentity, nodeUniqueIdFor, serialNumberFor } from "./storage.js";
 import { CommissioningWindow } from "./window.js";
 
@@ -38,10 +48,8 @@ export const PRODUCT_ID = 0x8000;
 export const VENDOR_NAME = "simons-plugins";
 export const PRODUCT_NAME = "Indigo Matter Bridge";
 
-/** The one hard-coded export of E0. E1 replaces this with protocol-driven CRUD. */
-const E0_DEVICE_ID = 999001;
-const E0_LABEL = "Indigo E0 Test";
-const E0_ROLE = Role.onOffPlugInUnit;
+/** PRD §5.3: no hard cap, but past this many exports the log says so. */
+export const ENDPOINT_COUNT_WARNING = 100;
 
 /** PBKDF iteration count for enhanced-window verifiers. Spec floor is 1000. */
 const PBKDF_ITERATIONS = 1000;
@@ -49,21 +57,10 @@ const PBKDF_SALT_BYTES = 32;
 
 export { matterJsVersion };
 
-/** Bridged Device Basic Information `UniqueID`, stable across restarts. */
-export function uniqueIdFor(indigoDeviceId: number): string {
-    return `indigo-${indigoDeviceId}`;
-}
-
-/**
- * `Endpoint.id` derivation — the identity key of BRIDGE_PROTOCOL §4.1/§6.3.
- * Deliberately the *same* value as {@link uniqueIdFor}: one derivation means the
- * two can never drift apart, and §6.3's one-way identity flow reads directly.
- */
-export const endpointIdFor = uniqueIdFor;
-
 export class BridgeNode implements BridgeFacade {
     #server?: ServerNode;
-    #child?: Endpoint;
+    #registry?: EndpointRegistry;
+    #command?: (data: CommandEventData) => void;
     readonly #window: CommissioningWindow;
 
     constructor(
@@ -85,8 +82,10 @@ export class BridgeNode implements BridgeFacade {
     }
 
     /**
-     * Build the node and bring it online. Aggregator is added first so it takes
-     * endpoint 1; the bridged child then lands at 2.
+     * Build the node and bring it online. The aggregator is added first so it
+     * takes endpoint 1; bridged children land at 2 and up, in the order the
+     * first `attach` creates them (and thereafter at whatever number matter.js
+     * has persisted against their id).
      */
     async start(): Promise<void> {
         const environment = Environment.default;
@@ -134,19 +133,13 @@ export class BridgeNode implements BridgeFacade {
         const aggregator = new Endpoint(AggregatorEndpoint, { id: "aggregator" });
         await server.add(aggregator);
 
-        const child = new Endpoint(OnOffPlugInUnitDevice.with(BridgedDeviceBasicInformationServer), {
-            id: endpointIdFor(E0_DEVICE_ID),
-            bridgedDeviceBasicInformation: {
-                nodeLabel: E0_LABEL,
-                productName: PRODUCT_NAME,
-                productLabel: E0_LABEL,
-                serialNumber: String(E0_DEVICE_ID),
-                uniqueId: uniqueIdFor(E0_DEVICE_ID),
-                reachable: true,
-            },
+        this.#registry = new EndpointRegistry({
+            aggregator,
+            productName: PRODUCT_NAME,
+            log: message => this.log(message),
+            emit: data => this.#command?.(data),
+            onConfigurationChange: () => this.bumpConfigurationVersion(),
         });
-        await aggregator.add(child);
-        this.#child = child;
 
         server.events.commissioning.fabricsChanged.on((fabricIndex, action) => {
             // A throw here propagates straight into matter.js's observable, and
@@ -196,26 +189,82 @@ export class BridgeNode implements BridgeFacade {
         }));
     }
 
+    private get registry(): EndpointRegistry {
+        if (this.#registry === undefined) {
+            throw new ProtocolError(ErrorCode.internal, "Matter node not started");
+        }
+        return this.#registry;
+    }
+
     getStatus(): StatusReport {
-        const child = this.#child;
-        const endpoints =
-            child === undefined
-                ? []
-                : [{ indigoDeviceId: E0_DEVICE_ID, endpointNumber: Number(child.number), role: E0_ROLE }];
+        const endpoints = this.#registry?.summaries() ?? [];
         return {
             commissioned: this.server.lifecycle.isCommissioned,
             fabrics: this.fabrics(),
             endpointCount: endpoints.length,
             endpoints,
-            // E6 introduces the persisted endpoint-number allocator; until then
-            // there is no baseline to drift from.
+            // E5 introduces the persisted endpoint-number map and its drift
+            // detector; until then there is no baseline to drift from.
             drift: [],
         };
+    }
+
+    /** §3.1 — reconcile the live endpoint set, then answer with the new status. */
+    async reconcile(endpoints: readonly EndpointSpec[], replaceAll: boolean): Promise<StatusReport> {
+        await this.registry.reconcile(endpoints, replaceAll);
+        if (this.registry.size > ENDPOINT_COUNT_WARNING) {
+            this.log(
+                `${this.registry.size} exported endpoints exceeds the ${ENDPOINT_COUNT_WARNING} advisory limit; ` +
+                    "ecosystem per-home accessory caps will bite before memory does",
+            );
+        }
+        return this.getStatus();
+    }
+
+    /** §3.2 */
+    async upsertEndpoint(spec: EndpointSpec): Promise<UpsertResult> {
+        return this.registry.upsert(spec);
+    }
+
+    /** §3.3 */
+    async removeEndpoint(indigoDeviceId: number): Promise<RemoveResult> {
+        return this.registry.remove(indigoDeviceId);
+    }
+
+    /** §3.4 */
+    async setState(indigoDeviceId: number, states: Record<string, unknown>): Promise<void> {
+        await this.registry.setState(indigoDeviceId, states);
+    }
+
+    /** §3.5 */
+    async setReachable(indigoDeviceId: number, reachable: boolean): Promise<void> {
+        await this.registry.setReachable(indigoDeviceId, reachable);
+    }
+
+    /**
+     * PRD §5.3 / Matter 1.5: a changed bridged-node set is a configuration
+     * change of the bridge. Bumping the root's `ConfigurationVersion` also
+     * covers the children — matter.js's own
+     * `BridgedDeviceBasicInformationServer.increaseConfigurationVersion`
+     * increments the root as well, so doing it once per batch is both cheaper
+     * and truer to "one logical change, one increment".
+     */
+    private async bumpConfigurationVersion(): Promise<void> {
+        const server = this.#server;
+        if (server === undefined) {
+            return;
+        }
+        await server.act(agent => agent.get(BasicInformationServer).increaseConfigurationVersion());
     }
 
     /** §5: the sink for `window_closed`, wired up by the protocol server. */
     onWindowClosed(listener: (reason: WindowClosedReason) => void): void {
         this.#window.onClosed(listener);
+    }
+
+    /** §5: the sink for `command`. One listener, last registration wins. */
+    onCommand(listener: (data: CommandEventData) => void): void {
+        this.#command = listener;
     }
 
     getPairing(): PairingReport {
@@ -268,7 +317,7 @@ export class BridgeNode implements BridgeFacade {
      * `adminFabricIndex`) and therefore cannot be invoked from an offline agent.
      * The consequence is that the cluster's `windowStatus`/`adminFabricIndex`
      * attributes do not reflect a locally-opened window — a conformance gap for
-     * E7 to close, not something E0's pairing flow depends on.
+     * E7 to close, not something the pairing flow depends on.
      */
     async openCommissioningWindow(durationSeconds: number): Promise<CommissioningWindowResult> {
         // Before anything Matter-side: `allowEnhancedCommissioning` swaps the PASE
@@ -340,7 +389,8 @@ export class BridgeNode implements BridgeFacade {
         this.#window.clear();
         const server = this.#server;
         this.#server = undefined;
-        this.#child = undefined;
+        this.#registry?.close();
+        this.#registry = undefined;
         if (server !== undefined) {
             await server.close();
         }

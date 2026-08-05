@@ -26,6 +26,7 @@ import {
     WINDOW_DURATION_MAX_SECONDS,
     WINDOW_DURATION_MIN_SECONDS,
 } from "./protocol.js";
+import { parseDeviceId, parseEndpointSpec, parseEndpointSpecs, parseReplaceAll } from "./reconcile.js";
 
 export const LOOPBACK_HOST = "127.0.0.1";
 
@@ -51,7 +52,11 @@ interface ClientState {
     pending: Promise<void>;
 }
 
-/** Commands whose handlers exist in E0. Endpoint CRUD arrives in E1. */
+/**
+ * A §3 command handler. Argument shape is validated here (that is what
+ * `malformed_args`/`unknown_role` mean); everything that needs to know the live
+ * endpoint set is decided behind {@link BridgeFacade}.
+ */
 type CommandHandler = (args: Record<string, unknown>, socket: WebSocket, state: ClientState) => Promise<unknown>;
 
 export class BridgeWsServer {
@@ -67,7 +72,16 @@ export class BridgeWsServer {
         this.#handlers.set("get_status", async () => this.options.bridge.getStatus());
         this.#handlers.set("get_pairing", async () => this.options.bridge.getPairing());
         this.#handlers.set("open_commissioning_window", async args => this.handleOpenWindow(args));
+        this.#handlers.set("upsert_endpoint", async args =>
+            this.options.bridge.upsertEndpoint(parseEndpointSpec(args.endpoint)),
+        );
+        this.#handlers.set("remove_endpoint", async args =>
+            this.options.bridge.removeEndpoint(parseDeviceId(args.indigoDeviceId)),
+        );
+        this.#handlers.set("set_state", async args => this.handleSetState(args));
+        this.#handlers.set("set_reachable", async args => this.handleSetReachable(args));
         options.bridge.onWindowClosed(reason => this.sendEvent(EventName.windowClosed, { reason }));
+        options.bridge.onCommand(data => this.sendEvent(EventName.command, data));
     }
 
     /**
@@ -254,6 +268,12 @@ export class BridgeWsServer {
             );
         }
 
+        // §3.1: parse before attaching state changes hands, so a malformed
+        // endpoint set cannot supersede a healthy incumbent on its way to being
+        // rejected.
+        const endpoints = parseEndpointSpecs(args.endpoints);
+        const replaceAll = parseReplaceAll(args.intent);
+
         // §2: exactly one attached client; a new attach supersedes the incumbent,
         // which is how we recover from a half-open socket left by a plugin crash.
         const incumbent = this.#attached;
@@ -272,13 +292,32 @@ export class BridgeWsServer {
         this.#attached = socket;
 
         const pluginVersion = typeof args.pluginVersion === "string" ? args.pluginVersion : "unknown";
-        this.#log(`Client attached (plugin ${pluginVersion})`);
+        this.#log(`Client attached (plugin ${pluginVersion}), reconciling ${endpoints.length} endpoint(s)`);
 
-        // E1 reconciles `args.endpoints` here; E0 serves a fixed endpoint set.
-        // The §3.1 mass-removal guard (`mass_removal_refused` unless
-        // `intent: "replace_all"`) belongs with that reconcile — it is E1 scope,
-        // and until then there is no client-supplied set that could empty.
-        return this.options.bridge.getStatus();
+        // §3.1: a fresh connection is always a full reconcile. The mass-removal
+        // guard lives behind the facade because only it knows the live set; a
+        // refusal leaves this client attached but the endpoint set untouched,
+        // which is what lets the plugin retry with an explicit intent.
+        return this.options.bridge.reconcile(endpoints, replaceAll);
+    }
+
+    private async handleSetState(args: Record<string, unknown>): Promise<unknown> {
+        const indigoDeviceId = parseDeviceId(args.indigoDeviceId);
+        const states = args.states;
+        if (typeof states !== "object" || states === null || Array.isArray(states)) {
+            throw new ProtocolError(ErrorCode.malformedArgs, "states must be an object");
+        }
+        await this.options.bridge.setState(indigoDeviceId, states as Record<string, unknown>);
+        return {};
+    }
+
+    private async handleSetReachable(args: Record<string, unknown>): Promise<unknown> {
+        const indigoDeviceId = parseDeviceId(args.indigoDeviceId);
+        if (typeof args.reachable !== "boolean") {
+            throw new ProtocolError(ErrorCode.malformedArgs, "reachable must be a boolean");
+        }
+        await this.options.bridge.setReachable(indigoDeviceId, args.reachable);
+        return {};
     }
 
     private async handleOpenWindow(args: Record<string, unknown>): Promise<unknown> {

@@ -34,10 +34,19 @@ describe("golden fixtures match their typed mirror", () => {
     const cases: [string, unknown, unknown][] = [
         ["handshake", golden.handshake, shapes.handshake],
         // §3.1: the golden attach REQUEST carries `endpoints: []`, so the lawful
-        // answer is an empty live set. The E0 node ignores the requested set and
-        // serves its fixed endpoint — see protocol.test.ts, and E2.
+        // answer against a node with nothing live is an empty live set.
         ["attach result", golden.attach.response.result, shapes.statusEmpty],
         ["get_status result", golden.get_status.response.result, shapes.status],
+        ["attach_with_endpoints result", golden.attach_with_endpoints.response.result, shapes.status],
+        ["attach_replace_all result", golden.attach_replace_all.response.result, shapes.statusReplaceAll],
+        ["attach mass_removal_refused", golden.attach_mass_removal_refused.response, shapes.massRemovalRefused],
+        ["upsert_endpoint result", golden.upsert_endpoint.response.result, shapes.upsertResult],
+        ["upsert_endpoint role_change", golden.upsert_endpoint_role_change.response, shapes.roleChange],
+        ["remove_endpoint result", golden.remove_endpoint.response.result, shapes.removeResult],
+        ["remove_endpoint (absent) result", golden.remove_endpoint_absent.response.result, shapes.removeAbsentResult],
+        ["set_state result", golden.set_state.response.result, shapes.emptyResult],
+        ["set_state unknown_device", golden.set_state_unknown_device.response, shapes.setStateUnknownDevice],
+        ["set_reachable result", golden.set_reachable.response.result, shapes.emptyResult],
         ["get_pairing (uncommissioned)", golden.get_pairing_uncommissioned.response.result, shapes.pairingUncommissioned],
         ["get_pairing (commissioned)", golden.get_pairing_commissioned.response.result, shapes.pairingCommissioned],
         [
@@ -65,11 +74,11 @@ describe("golden fixtures match their typed mirror", () => {
         });
     }
 
-    describe("pending E1 exchanges", () => {
+    describe("pending exchanges (§3.9-§3.11 and the E4 roles)", () => {
         const names = Object.keys(golden.pending).filter(key => !key.startsWith("_"));
 
         it("every pending entry is a well-formed exchange", () => {
-            assert.ok(names.length > 0, "pending section should not be empty while E1 is in flight");
+            assert.ok(names.length > 0, "pending section should not be empty while E4 is outstanding");
             for (const name of names) {
                 const exchange = golden.pending[name];
                 assert.ok(exchange?.request !== undefined, `${name} has no request`);
@@ -82,9 +91,10 @@ describe("golden fixtures match their typed mirror", () => {
             }
         });
 
-        // Shape assertions wait for the node-side handlers: `protocol.ts` has no
-        // types for these results yet, so there is nothing to mirror. The Python
-        // client suite asserts them today — that half of E1 ships now.
+        // Shape assertions wait for the node-side handlers. The Python client
+        // suite asserts them today — the plugin half shipped at E1 — and a
+        // frame graduates to a real deepEqual above when the node grows its
+        // handler, which is what E3 did to the endpoint-CRUD family.
         for (const name of names) {
             it.skip(`${name} — node handler not implemented yet`, () => {});
         }
