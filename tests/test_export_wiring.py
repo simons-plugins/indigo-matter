@@ -62,6 +62,10 @@ def plug(plugin_mod, devices):  # noqa: ARG001 - devices installs indigo.devices
     p.export_bridge.active = False
     p._exported_ids = frozenset()
     p._subscribed_to_devices = False
+    p._device_updates_seen = False
+    p._no_update_ticks = 0
+    p._resubscribe_attempts = 0
+    p._resubscribe_gave_up = False
     p._export_callback_failed = set()
     p.runtime = None
     return p
@@ -439,7 +443,8 @@ class TestStatusSummary:
 
     def _bridge_in(self, plug, **state):
         """A bridge whose client is in some non-serving state."""
-        client = Mock(halted=False, halted_reason=None, recovery=False, attached=True)
+        client = Mock(halted=False, halted_reason=None, recovery=False, attached=True,
+                      status=None)
         for key, value in state.items():
             setattr(client, key, value)
         plug.export_bridge.active = True
@@ -472,6 +477,44 @@ class TestStatusSummary:
     def test_a_healthy_bridge_adds_nothing(self, plug):
         plug.exports.upsert(ExportEntry(101, "onOffLight"))
         self._bridge_in(plug)
+        assert plug._export_summary() == "1 device(s) exported."
+
+    def _status(self, **kw):
+        import bridge_protocol
+        base = dict(commissioned=True, fabrics=[], endpoint_count=1, endpoints=[],
+                    drift=[], drift_checked=True, warnings=[])
+        base.update(kw)
+        return bridge_protocol.StatusReport(**base)
+
+    def test_node_warnings_reach_the_dialog(self, plug):
+        """§4.3 `warnings` were parsed and read by nobody.
+
+        A map the node could not write showed up in the log at the moment it
+        happened and nowhere afterwards — and this dialog is where a user goes
+        when an accessory is behaving oddly.
+        """
+        plug.exports.upsert(ExportEntry(101, "onOffLight"))
+        self._bridge_in(plug, status=self._status(warnings=["disk is full"]))
+        assert "disk is full" in plug._export_summary()
+
+    def test_drift_reaches_the_dialog(self, plug):
+        import bridge_protocol
+        plug.exports.upsert(ExportEntry(101, "onOffLight"))
+        drift = bridge_protocol.parse_drift([{"uniqueId": "indigo-101", "expected": 2, "actual": 5}])
+        self._bridge_in(plug, status=self._status(drift=drift))
+        summary = plug._export_summary()
+        assert "DRIFTED" in summary
+        assert "never repaired automatically" in summary
+
+    def test_an_unchecked_baseline_is_not_reported_as_an_all_clear(self, plug):
+        """`drift: []` with `driftChecked: false` is an absence, not an answer."""
+        plug.exports.upsert(ExportEntry(101, "onOffLight"))
+        self._bridge_in(plug, status=self._status(drift_checked=False))
+        assert "have not been checked" in plug._export_summary()
+
+    def test_a_healthy_status_still_adds_nothing(self, plug):
+        plug.exports.upsert(ExportEntry(101, "onOffLight"))
+        self._bridge_in(plug, status=self._status())
         assert plug._export_summary() == "1 device(s) exported."
 
     def test_a_load_error_still_leads(self, plug):
@@ -520,3 +563,105 @@ class TestLifecycleWiring:
         plug.runtime = Mock(is_running=True)
         plug.matter = None
         plug._health_tick()   # must not raise
+
+    def test_the_watchdog_actually_drives_the_resubscribe_watchdog(self, plug, monkeypatch):
+        """⊗ The resubscribe watchdog's ONLY production caller.
+
+        Deleting ``self._resubscribe_tick()`` from ``_health_tick`` left the
+        whole suite green, because every resubscribe test called the tick by
+        hand. The feature exists to break a silence, so an unwired one is worth
+        nothing at all — and nothing would ever have said so.
+        """
+        called = []
+        monkeypatch.setattr(type(plug), "_resubscribe_tick",
+                            lambda self: called.append(1), raising=False)
+        plug.export_bridge = None
+        plug.runtime = Mock(is_running=True)
+        plug.matter = None
+        plug._health_tick()
+        assert called, "the watchdog tick must drive the resubscribe watchdog"
+
+
+class TestResubscribeWatchdog:
+    """E5: the belt and braces under an assumption the docs do not confirm.
+
+    The whole outbound push path rests on ``subscribeToChanges`` behaving the
+    same issued from a menu callback as from ``startup``. The canonical
+    reference calls it a request to the server — which is why the conditional
+    subscription is safe — but there is no acknowledgement to check and no
+    unsubscribe to compare against, so if that is ever wrong the symptom is
+    silence: exported accessories simply stop following Indigo.
+    """
+
+    def _exporting(self, plug, mock_indigo_base):
+        subscribe = Mock()
+        mock_indigo_base.devices.subscribeToChanges = subscribe
+        plug.exports.upsert(ExportEntry(101, "onOffLight"))
+        plug._exports_changed()
+        subscribe.reset_mock()
+        return subscribe
+
+    def test_it_re_issues_after_a_minute_with_no_device_updates_at_all(
+            self, plug, mock_indigo_base):
+        subscribe = self._exporting(plug, mock_indigo_base)
+        for _ in range(4):
+            plug._resubscribe_tick()
+        subscribe.assert_called_once_with()
+
+    def test_one_device_update_disarms_it_for_good(self, plug, mock_indigo_base):
+        """Evidence the subscription took. Any device counts — it is server-wide."""
+        subscribe = self._exporting(plug, mock_indigo_base)
+        plug.deviceUpdated(RelayDevice(999, "Someone Else's Lamp"),
+                           RelayDevice(999, "Someone Else's Lamp"))
+        for _ in range(20):
+            plug._resubscribe_tick()
+        subscribe.assert_not_called()
+
+    def test_it_gives_up_rather_than_nagging_forever(self, plug, mock_indigo_base):
+        """"No updates" is also exactly what a quiet house looks like.
+
+        An unbounded retry would be a permanent debug line for every user whose
+        exported devices happen not to change, which is not a diagnostic.
+        """
+        subscribe = self._exporting(plug, mock_indigo_base)
+        for _ in range(4 * 10):
+            plug._resubscribe_tick()
+        assert subscribe.call_count == 3
+
+    def test_the_re_issues_are_a_minute_apart_not_back_to_back(
+            self, plug, mock_indigo_base):
+        """⊗ The streak counter must RESTART after a re-issue.
+
+        Only the total was pinned, so deleting ``self._no_update_ticks = 0``
+        survived: attempts 2 and 3 then fire on the two ticks immediately after
+        the first, spending the whole bounded budget inside ~30s instead of
+        giving the subscription three separate minutes to prove itself.
+        """
+        subscribe = self._exporting(plug, mock_indigo_base)
+        for _ in range(4):
+            plug._resubscribe_tick()
+        assert subscribe.call_count == 1
+        plug._resubscribe_tick()          # one tick later — must NOT re-issue
+        assert subscribe.call_count == 1
+
+    def test_giving_up_says_so_once_and_names_the_consequence(
+            self, plug, mock_indigo_base):
+        """⊗ It used to give up with a bare ``return`` at no log level at all.
+
+        The one feature whose purpose is to break a silence ended by going
+        silent, in exactly the house where it had failed to help.
+        """
+        self._exporting(plug, mock_indigo_base)
+        for _ in range(4 * 10):
+            plug._resubscribe_tick()
+        giving_up = [c for c in plug.logger.warning.call_args_list
+                     if "NOT following Indigo state" in str(c.args[0])]
+        assert len(giving_up) == 1, "said once per streak, not once per tick"
+        assert "reload the plugin" in str(giving_up[0].args[0])
+
+    def test_it_stays_quiet_while_nothing_is_exported(self, plug, mock_indigo_base):
+        subscribe = Mock()
+        mock_indigo_base.devices.subscribeToChanges = subscribe
+        for _ in range(20):
+            plug._resubscribe_tick()
+        subscribe.assert_not_called()

@@ -13,6 +13,7 @@ import {
     type BridgeFacade,
     describeError,
     describeErrorWithStack,
+    endpointMapInvalidDetails,
     ErrorCode,
     type ErrorCodeValue,
     EventName,
@@ -21,12 +22,20 @@ import {
     type HandshakeFrame,
     PROTOCOL_VERSION,
     ProtocolError,
+    RECOVERY_COMMANDS,
     UNATTACHED_TIMEOUT_MS,
     WINDOW_DURATION_DEFAULT_SECONDS,
     WINDOW_DURATION_MAX_SECONDS,
     WINDOW_DURATION_MIN_SECONDS,
 } from "./protocol.js";
-import { parseDeviceId, parseEndpointSpec, parseEndpointSpecs, parseReplaceAll } from "./reconcile.js";
+import {
+    parseDeviceId,
+    parseEndpointSpec,
+    parseEndpointSpecs,
+    parseFabricIndex,
+    parsePreserveEndpointNumbers,
+    parseReplaceAll,
+} from "./reconcile.js";
 
 export const LOOPBACK_HOST = "127.0.0.1";
 
@@ -80,8 +89,23 @@ export class BridgeWsServer {
         );
         this.#handlers.set("set_state", async args => this.handleSetState(args));
         this.#handlers.set("set_reachable", async args => this.handleSetReachable(args));
+        this.#handlers.set("remove_fabric", async args => {
+            await this.options.bridge.removeFabric(parseFabricIndex(args.fabricIndex));
+            return {};
+        });
+        this.#handlers.set("factory_reset", async args => {
+            await this.options.bridge.factoryReset(parsePreserveEndpointNumbers(args.preserveEndpointNumbers));
+            return {};
+        });
+        this.#handlers.set("rebuild_endpoint_map", async () => this.options.bridge.rebuildEndpointMap());
         options.bridge.onWindowClosed(reason => this.sendEvent(EventName.windowClosed, { reason }));
         options.bridge.onCommand(data => this.sendEvent(EventName.command, data));
+        options.bridge.onDriftDetected(drift => this.sendEvent(EventName.driftDetected, { drift }));
+        options.bridge.onFabricsChanged((fabrics, change) =>
+            this.sendEvent(EventName.fabricsChanged, { fabrics, change }),
+        );
+        options.bridge.onCommissioned(() => this.sendEvent(EventName.commissioned, {}));
+        options.bridge.onDecommissioned(() => this.sendEvent(EventName.decommissioned, {}));
     }
 
     /**
@@ -165,13 +189,45 @@ export class BridgeWsServer {
 
         // §2: a connection that handshakes but never attaches is closed.
         const timeoutMs = this.options.unattachedTimeoutMs ?? UNATTACHED_TIMEOUT_MS;
-        state.unattachedTimer = setTimeout(() => {
-            if (!state.attached) {
+        // Said once per socket, not once per period: while the node is refusing
+        // the plugin holds this connection open indefinitely, and a line every
+        // 10s for the life of the process buries everything else in the log.
+        let announcedHold = false;
+        const armUnattachedTimer = (): void => {
+            state.unattachedTimer = setTimeout(() => {
+                if (state.attached) {
+                    return;
+                }
+                // Deferred, not disarmed, while we are refusing. In that state
+                // the node itself is what stops this client attaching (§1.1
+                // refuses `attach`), and the plugin deliberately HOLDS the
+                // socket open un-attached because it is the only route to the
+                // §3.11 rebuild. Closing it anyway put the two in a fight:
+                // refuse, close, reconnect, refuse — every 10s, and a rebuild
+                // the user had just confirmed could be cut off mid-flight by
+                // our own timer. Re-arming rather than returning bare is what
+                // keeps the check alive AFTER the rebuild clears the refusal:
+                // a one-shot timer had already fired by then, so a client that
+                // still never attached was never reaped again for the life of
+                // the process.
+                if (this.options.bridge.endpointMapRefusal() !== undefined) {
+                    if (!announcedHold) {
+                        announcedHold = true;
+                        this.#log(
+                            "Holding an un-attached connection open: the node is refusing to serve " +
+                                "endpoints and this socket is the client's only route to " +
+                                "rebuild_endpoint_map (§1.1)",
+                        );
+                    }
+                    armUnattachedTimer();
+                    return;
+                }
                 this.#log(`Closing connection that did not attach within ${timeoutMs}ms`);
                 socket.close();
-            }
-        }, timeoutMs);
-        state.unattachedTimer.unref?.();
+            }, timeoutMs);
+            state.unattachedTimer.unref?.();
+        };
+        armUnattachedTimer();
 
         socket.on("message", (data, isBinary) => {
             if (isBinary) {
@@ -225,10 +281,29 @@ export class BridgeWsServer {
         const commandArgs: Record<string, unknown> =
             typeof args === "object" && args !== null ? (args as Record<string, unknown>) : {};
 
-        // Gating first: before `attach` the node has said nothing about which
-        // commands it knows, so `not_attached` is the honest answer even for a
-        // name it would otherwise reject (§1.1).
-        if (command !== "attach" && !state.attached) {
+        // The refuse-to-start gate comes before everything, including the
+        // attach gate. In this state there is nothing to attach *to* — the node
+        // will not create an endpoint until its map is rebuilt — so answering
+        // `not_attached` would send the plugin round a reconnect loop that can
+        // never succeed, and hide the one error that names the remedy. The
+        // three §1.1 recovery commands are exempt from the attach requirement
+        // for the same reason: the client holding this socket open never got to
+        // attach, and `rebuild_endpoint_map` is the only way it ever will.
+        const refusal = this.options.bridge.endpointMapRefusal();
+        if (refusal !== undefined) {
+            if (!RECOVERY_COMMANDS.has(command)) {
+                this.sendError(
+                    socket,
+                    messageId,
+                    ErrorCode.endpointMapInvalid,
+                    endpointMapInvalidDetails(refusal),
+                );
+                return;
+            }
+        } else if (command !== "attach" && !state.attached) {
+            // Gating: before `attach` the node has said nothing about which
+            // commands it knows, so `not_attached` is the honest answer even for
+            // a name it would otherwise reject (§1.1).
             this.sendError(socket, messageId, ErrorCode.notAttached, `${command} requires a successful attach first`);
             return;
         }

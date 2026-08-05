@@ -69,6 +69,12 @@ describe("golden fixtures match their typed mirror", () => {
             shapes.openWindowFailed],
         ["open_commissioning_window internal", golden.open_window_internal.response,
             shapes.openWindowInternal],
+        ["remove_fabric result", golden.remove_fabric.response.result, shapes.removeFabricResult],
+        ["factory_reset result", golden.factory_reset.response.result, shapes.factoryResetResult],
+        ["factory_reset (discard map) result", golden.factory_reset_discard_map.response.result,
+            shapes.factoryResetResult],
+        ["rebuild_endpoint_map result", golden.rebuild_endpoint_map.response.result, shapes.rebuiltStatus],
+        ["endpoint_map_invalid", golden.endpoint_map_invalid.response, shapes.endpointMapInvalid],
     ];
 
     for (const [name, actual, expected] of cases) {
@@ -144,11 +150,18 @@ describe("golden fixtures match their typed mirror", () => {
         });
     });
 
-    describe("pending exchanges (§3.9-§3.11)", () => {
+    describe("pending exchanges", () => {
         const names = Object.keys(golden.pending).filter(key => !key.startsWith("_"));
 
-        it("every pending entry is a well-formed exchange", () => {
-            assert.ok(names.length > 0, "the fabric/reset/rebuild family is still outstanding");
+        it("is empty — every golden frame is answered by a real handler", () => {
+            // E5 graduated the last five (§3.9-§3.11 plus the §1.1 refusal), so
+            // there is no longer any frame this suite skips. If a future
+            // protocol addition puts one back, this test is what makes the skip
+            // deliberate rather than a shape assertion someone forgot to write.
+            assert.deepEqual(names, []);
+        });
+
+        it("every pending entry, if any, is a well-formed exchange", () => {
             for (const name of names) {
                 const exchange = golden.pending[name];
                 assert.ok(exchange?.request !== undefined, `${name} has no request`);
@@ -160,14 +173,6 @@ describe("golden fixtures match their typed mirror", () => {
                 );
             }
         });
-
-        // Shape assertions wait for the node-side handlers. The Python client
-        // suite asserts them today — the plugin half shipped at E1 — and a
-        // frame graduates to a real deepEqual above when the node grows its
-        // handler, which is what E3 did to the endpoint-CRUD family.
-        for (const name of names) {
-            it.skip(`${name} — node handler not implemented yet`, () => {});
-        }
     });
 
     describe("§5 event frames", () => {

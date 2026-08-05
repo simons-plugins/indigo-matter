@@ -73,10 +73,16 @@ export class TestClient {
         return this.#frames.length;
     }
 
-    /** Send a request and return its response frame. */
-    async request(frame: unknown): Promise<Record<string, unknown>> {
+    /**
+     * Send a request and return its response frame.
+     *
+     * `timeoutMs` is worth raising for §3.10: `ServerNode.erase()` takes the
+     * Matter stack offline, wipes its storage and brings it back up, which is
+     * comfortably longer than the 2s a local handler normally needs.
+     */
+    async request(frame: unknown, timeoutMs?: number): Promise<Record<string, unknown>> {
         this.send(frame);
-        return this.next();
+        return this.next(timeoutMs);
     }
 
     async waitForClose(timeoutMs = 2000): Promise<void> {

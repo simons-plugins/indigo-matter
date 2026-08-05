@@ -1,11 +1,407 @@
 # indigo-matter — Build Handover
 
-**Last updated:** 2026-08-03 16:34 UTC
+**Last updated:** 2026-08-05 18:58 UTC
+**Active work:** `feat/e5-persistence-hardening` (PR #126) — see the two E5
+sections below; the `main` summary in this header describes the last merge, not
+that branch.
 **Branch:** `main` — PRs #106, #107, #108 all merged.
 **Version:** `2026.7.13`
 **Tests:** 1005 passing (`cd indigo-matter && /Library/Frameworks/Python.framework/Versions/Current/bin/python3 -m pytest -q`)
 **Deployed:** jarvis is **unchanged** — still running the #103 code (v2026.7.10 era). **Nothing from #106/#107/#108 has been deployed**, so the #104 supervision fixes are NOT yet live on jarvis.
 **Status:** **Wi-Fi AND Thread validated with real hardware.** #104's three server-supervision faults are fixed and merged (#107). #105's diagnostic is merged (#108) but **#105 stays open** — the bridged-endpoint path still has no real-bridge validation. `domio-code` #236 is fixed and closed (domio-code PR #237). Known-open: #105, plus the older #43, #46, #21–#24.
+
+---
+
+## 2026-08-05 — E5 hardening, ROUND TWO: the PR #126 whole-PR reviews
+
+Plugin `2026.8.0`, bridge-node `0.4.0`. Suites: **2056 Python**, **344 TS**
+(from 2025/316 at the round-one batch below).
+
+Three independent expert reviews of the **whole** PR — code correctness, silent
+failures, and test coverage measured by 136 mutations, of which **37 survived**.
+The theme of the survivors is one shape, and it is worth naming because it will
+recur: **the helper is covered, the real caller is not.** `fabric_backup` has a
+thorough suite and its only call site was unpinned. `_resubscribe_tick` has four
+tests and nothing called it from `_health_tick`. The queue counters had tests
+that set them by hand and nothing drove them through a dispatch. In every case
+deleting the wiring left the suite green and the feature dead.
+
+The five that would have hurt a real user:
+
+1. **The confirm gates were inert *in the tests*, live in production.** Deleting
+   the confirm check from either recovery menu left the suite green — and with a
+   live client the destructive action really ran on an unticked box. The gates
+   themselves were correct; the tests never set `plug.export_bridge`, so the
+   connection check one line below filled the same `errors` key and the
+   assertion could not tell the two apart. Now asserted against the client
+   (`factory_reset.assert_not_called()`), which is the only question that
+   matters.
+2. **`replace_all_provider` was a `bool` where a count is required.**
+   `BridgeClient` declares `Callable[[], int]` and sizes the discharge attach's
+   deadline from it, because that attach sends *nothing* while removing
+   *everything* — so `len(specs)` is the wrong number by construction.
+   `_owes_replace_all` returned `bool`, and `int(True) == 1` sailed through
+   silently: every discharge got the 8s floor, an 80-accessory un-export timed
+   out mid-reconcile, tore down the socket and retried forever — the exact
+   regression the deadline formula was added to prevent. The wrapper is gone;
+   `_pending_replace_all` (a count) *is* the provider. The two "un-export of %d
+   accessory record(s)" log lines told the truth for the first time as a
+   side effect.
+3. **The §4.3 warnings channel had no reader.** `BridgeClient.get_status` had
+   zero production callers, `health_tick` was explicitly "no I/O", and four
+   docstrings plus BRIDGE_PROTOCOL §4.3 all said it was polled. Three of the
+   four faults it exists for happen *after* the attach — the identity witness
+   write on first commissioning, the witness clear on `factory_reset`, the map
+   write from `upsert`/`remove`'s drift check — so they reached the user as
+   nothing at all. `health_tick` now polls `get_status` once per ~15s tick while
+   attached, fire-and-forget, and surfaces warnings once per streak.
+4. **The identity refusal lasted exactly one restart.** `quarantineIdentity`
+   renames `identity.json` aside; the next start saw ENOENT, read it as a first
+   run, minted and **wrote** a new identity, and served under a `SerialNumber`
+   no ecosystem has ever seen — with only the routine first-run log line.
+   `identityProblem` now also refuses when the file is absent *and* a sibling
+   `identity.json.unreadable-*` exists, so the refusal is sticky until a human
+   restores, repairs or deliberately deletes it. Relatedly, `refuse()` printed
+   "until the endpoint map is rebuilt" for **every** reason including
+   `identityUnreadable`, where the rebuild explicitly throws — one error code,
+   two opposite remedies (now a table in BRIDGE_PROTOCOL §1.1, mirrored as
+   `bridge_protocol.REFUSE_IDENTITY_UNREADABLE` and branched on in
+   `_on_attach_refused`).
+5. **`rebuild_endpoint_map` reported the opposite of what happened.** The node
+   writes the map and clears its refusal *before* answering, so by the time the
+   inline re-attach runs the irreversible half is done. If that attach failed,
+   the menu said "FAILED — the bridge node is unchanged and still refusing to
+   export" (both clauses false), `self.recovery` was never cleared so every push
+   went on being dropped, and the user was invited to repeat an operation that
+   duplicates accessories in every paired ecosystem. Recovery is now cleared the
+   moment the report lands; the re-attach is triaged through
+   `_handle_attach_refused` instead of bypassing it; and the two outcomes are
+   reported separately. The menu deadline is `rebuild_timeout_for(n)` rather
+   than a flat 45s that expired mid-re-attach past ~90 endpoints.
+
+Also fixed:
+
+- **The un-export debt accounting.** `_last_export_count` overwrote rather than
+  accumulated, and `_record_pending_replace_all(0)` **popped** the pref — so an
+  add-then-remove cycle after a debt-driven reconnect erased an outstanding debt
+  of 5 with nothing having discharged it. Recording now takes the max and never
+  writes 0; clearing is a separate `_clear_pending_replace_all`, reachable only
+  from the two places that watched an intent-carrying attach succeed. An
+  unreadable pref value is logged rather than silently read as "nothing owed".
+- **The resubscribe watchdog gave up with a bare `return`, at no log level.**
+  The one feature whose purpose is to break a silence ended by going silent. It
+  now says so once, naming the consequence. `_device_updates_seen` still never
+  re-arms — documented as a deliberate limit, because re-arming would make every
+  quiet house warn that export is broken.
+- **`noteFabrics`' bare `catch { return }`** swallowed the failure, stranded
+  `commissionedAt` (so a later deliberate last-fabric unpair refuses with
+  "fabric storage is gone") and dropped every `fabrics_changed` /
+  `commissioned` / `decommissioned` event. It logs now, in the voice of
+  `node.ts:208`, and still never rethrows.
+- **M11:** the rebuild menu gated only on `client.connected`. Run against a
+  healthy node it silently discarded the retained endpoint-number allocations of
+  every non-live export — the ones that make re-adding a device restore the same
+  accessory. It now requires a refusal to be in force, and the dialog says so.
+- Plus the M-series: ignored `persist()`/`seed()`/`discard()` return values,
+  `factory_reset`'s witness verification passing on an *unreadable* identity,
+  `driftChecked` going true off an empty comparison, the corrupt-map quarantine
+  gaps (`persist()` overwriting without one; a fixed `.corrupt` name that a
+  second quarantine overwrote), the command deadline saying out loud that it
+  does not correct the ecosystem, and the ws-server's unattached timer never
+  re-arming after a refusal clears.
+
+### Deferred, with reasons
+
+- **`COMMAND_TIMEOUT` / `COMMAND_QUEUE_WARN` constant-scaling mutants are not
+  pinned** (30s → 10 hours; 3 → 100000). The only test that distinguishes them
+  is a wall-clock assertion, which trades a real flake for a synthetic mutant.
+  The *logic* around them — the `shield`, and both queue counters — is now
+  driven through the real dispatch path and dies on mutation.
+- **`get_status` is polled, not threaded through the `factory_reset` /
+  `upsert` / `remove` responses.** Those are protocol shape changes (§3.2/§3.10
+  return `{endpointNumber}` and `{}`) needing golden-frame and doc churn on both
+  suites, and the 15s poll already reaches every fault they would carry.
+- **`main.ts`'s `clearTimeout(escapeHatch)` is an equivalent mutant.** Deleting
+  it keeps the suite green, and correctly so: the hatch is `unref()`'d and
+  `process.exit(0)` runs synchronously on the next line, so cleared-vs-uncleared
+  has no observable difference. The only way to expose it is to also delete the
+  exit — which is a *different* mutation, and that one dies. `main.ts` was not
+  refactored to manufacture a seam for a line with no behaviour.
+- **A5's last-fabric path and the `commissionedAt` write remain hardware-gated**
+  end-to-end — unchanged from round one, and still on the jarvis script. The A1
+  bootstrap is no longer among them: `PosedNode` (a read-only Proxy over the two
+  things `node.ts` actually reads about commissioning — `lifecycle.isCommissioned`
+  and `state.commissioning.fabrics`) covers it at node level without a fabric.
+- **One pre-existing test was wrong and is corrected.** `"runs after a reconcile
+  that failed part-way through"` never part-applied anything: `reconcileNow`
+  validates every role up front, so its `role: "notARole"` threw before a single
+  endpoint was created, and it passed only because `check([])` flipped
+  `driftChecked` — the exact bug M3 fixes. It now uses an over-long `NodeLabel`,
+  which genuinely builds endpoint 1 and throws on endpoint 2.
+- **Still open from earlier:** #105 (bridged-endpoint real-bridge validation),
+  #83, #84, #62 follow-up, plus the older #43, #46, #21–#24. `remove_fabric`
+  still has no UI; it needs E6's fabric readout to pick an index from.
+
+---
+
+## 2026-08-05 — E5 hardening: the PR #126 three-review batch
+
+Applied on `feat/e5-persistence-hardening` on top of the E5 commit below.
+Plugin `2026.7.31`, bridge-node `0.4.0`. Suites at this commit: **2025 Python**,
+**316 TS** (from 1978/291 at the E5 commit).
+
+Two independent expert reviews plus a test-coverage review; 5 Criticals, ~10
+Highs, 5 Mediums and 9 coverage gaps. The five that would have hurt a real user:
+
+1. **A1 — the deploy blocker.** `refuseReasonFor` refused a commissioned bridge
+   with **no** `endpoint-map.json`, and that is the state of *every* install
+   commissioned before E5, because the file did not exist yet. jarvis today has
+   2 fabrics, 4 endpoints and no map: deploying E5 as written would have refused
+   the attach and stopped serving all four accessories. And it bought nothing —
+   **matter.js owns the numbers**, this map only witnesses them, so a missing
+   witness renumbers precisely nothing. Absent-on-commissioned is now a
+   **BOOTSTRAP**: seed the baseline from matter.js's own persisted allocation
+   (read through `ServerNodeStore`, guarded, falling back to the first attach's
+   live set) and serve, logged as a migration. Only a *present-but-unreadable*
+   map still refuses.
+2. **A2 — the recovery exits did not exist.** `rebuild_endpoint_map` had no
+   caller anywhere in the plugin, while three user-facing strings told the user
+   to confirm the rebuild "in the plugin". Two menu items now exist:
+   **"Rebuild Matter Endpoint Map…"** (§3.11, one confirm + the duplication
+   warning) and **"Reset Matter Export Pairings…"** (§3.10 `preserve=true`, two
+   confirms). Both gate on `client.connected`, not `attached` — §1.1 holds the
+   socket open un-attached and that is the only state a rebuild is needed in.
+   `remove_fabric` still has no UI; it needs E6's fabric readout to pick an
+   index from, and is deliberately deferred there.
+3. **A3 — the refusal destroyed the thing it protects.** `main.ts` called
+   `identityProblem()` and then `loadOrCreateIdentity()` unconditionally, and
+   the mint writes through `rename` — so an unreadable `identity.json` (the
+   `SerialNumber`/`UniqueID` every ecosystem knows us by, unregenerable) was
+   obliterated one line *before* the refusal that exists to protect it. Now:
+   move it aside to `identity.json.unreadable-<stamp>`, mint **in memory only**,
+   write nothing. `rebuildEndpointMap` also refuses to clear an
+   `identityUnreadable` refusal — different loss, different remedy.
+4. **A4 — pending debt + a disjoint re-add was a permanent halt.**
+   `_owes_replace_all` was ANDed with an empty allow-list. Empty the list while
+   the node is down (debt = 5), export a *different* device: the attach carried
+   no intent, the node's §3.1 guard saw 5 removals / 0 survivors, answered
+   `mass_removal_refused` — which HALTS — and blamed an allow-list that was
+   never the problem. Nothing retries a halt. The debt now answers
+   independently of store emptiness, and a `mass_removal_refused` reached while
+   a debt is recorded retries **once** with the intent instead of halting.
+5. **A5 — `remove_fabric` on the last fabric.** matter.js self-factory-resets
+   when the fabric set empties (`CommissioningServer` → `doFactoryReset()` →
+   `erase()`), and we never cleared our witness — so the next boot refused with
+   `fabricStorageLost`, blaming lost storage for a deliberate unpairing. Handled
+   in `noteFabrics`/`noteLastFabricGone` rather than in the command, so the
+   route where an *ecosystem* unpairs us is covered too.
+
+Also worth carrying forward:
+
+- **`StatusReport.warnings: string[]` is new in §4.3.** The node writes to
+  stdout and in this milestone is started **by hand**, so stdout is a terminal
+  nobody is watching — a map it could not write was invisible. The plugin
+  surfaces warnings once per streak on attach and in the export dialog.
+  `persist()`/`markCommissioned()`/`clearCommissioned()` now report whether the
+  write landed; `rebuild_endpoint_map` **fails** rather than answering
+  "serving normally again" over a map that never reached disk; `factory_reset`
+  re-reads `identity.json` to verify the witness is gone before reporting
+  completion.
+- **`driftChecked` no longer lies over a RAM-only baseline.** A `#dirty` flag
+  keeps it false while the map owes the disk something, and the next `check()`
+  retries the write even when it added nothing.
+- **§5 `fabrics_changed` / `commissioned` / `decommissioned` are actually
+  emitted.** All three were declared, documented, carried by golden frames and
+  consumed by the plugin's client — and sent by nothing.
+- **The §5 command executor has a 30s deadline, submitted/completed counters
+  and a queue-depth warning.** One wedged Z-Wave call used to block every
+  command for every device with zero log output.
+- **`preserveEndpointNumbers: true` preserves the ability to NOTICE, not the
+  numbers** — `erase()` wipes matter.js's own allocation. §3.10 now says so, and
+  the reset re-runs the drift check and reports what preservation bought.
+
+### Where the coverage still is not
+
+- **A5's last-fabric path has no automated test.** Reaching it needs a real
+  commissioned fabric, which the suite cannot create without hardware — the same
+  constraint that made `refuseReasonFor` a pure function. It is on the jarvis
+  script.
+- **`commissionedAt` is only ever written by the live fabric-changed listener**
+  (`node.ts`). Every refuse test injects it into the constructed identity, so
+  only a real pairing exercises the write.
+- **`mapUnreadable` and the A1 bootstrap are unreachable end-to-end** without a
+  real fabric: the unit tests cover `refuseReasonFor` and `EndpointMapStore.seed`
+  directly, and `persistence.test.ts` covers everything a test *can* commission.
+
+---
+
+## 2026-08-05 — E5 (endpoint persistence), branch `feat/e5-persistence-hardening`
+
+Plugin `2026.7.30`, bridge-node `0.4.0`. Suites at this commit: **1978 Python**,
+**291 TS** (from 1947/239). `tests/fixtures/bridge_protocol/frames.json`'s
+`pending` section is now **EMPTY**; the TS suite asserted it here and the Python
+suite gained the matching assertion in the hardening batch above.
+
+### The shape of the thing, because it is not what the protocol implies
+
+**Our endpoint map does not allocate endpoint numbers. matter.js does.** It
+keys its own persisted numbers on the string `Endpoint.id`, which
+`endpointIdFor` makes a pure function of the Indigo device id, and that is what
+actually holds identity together across a restart. `endpoint-map.json` is an
+independent **witness** of what those numbers were last time, so that the one
+failure that silently duplicates every accessory in every paired ecosystem —
+matter.js's storage being lost, moved or reset underneath us — becomes a
+sentence in the log instead of a mystery in someone's Home app. Report-only, per
+§4.3, and the baseline is deliberately **not** updated when drift is found: move
+it to match and the next pass calls the same fault clean.
+
+**Identified and NOT taken: pinning the numbers.** `Endpoint.Configuration` in
+matter.js 0.17.8 accepts a `number`, so the map *could* be authoritative rather
+than a witness — which would make `factory_reset preserveEndpointNumbers: true`
+mean what its name suggests, since `erase()` wipes matter.js's own allocation
+and the preserved map currently only preserves the ability to *notice*. Not done
+here because §4.3 says drift is never auto-repaired and pinning is auto-repair
+by another name; it would hide the storage loss that caused it. Worth revisiting
+as a deliberate protocol decision, not as an implementation detail.
+
+**Refusing is a protocol state, not a process exit.** The Matter stack still
+starts, so `get_pairing` answers and the user can see where they are; what is
+refused is `attach`, which is what actually prevents the duplication — no
+attach, no endpoint created. Three ways in, and the third needed a new durable
+fact:
+
+| Condition | Reason |
+|---|---|
+| fabrics exist, `endpoint-map.json` **present and unreadable** | the numbers being served cannot be checked against a baseline we know exists |
+| `identity.commissionedAt` set, no fabrics | PRD §7 "storage missing but previously commissioned" |
+| `identity.json` present but unusable | minting over it changes the `SerialNumber` every ecosystem knows us by |
+
+> **Corrected by the #126 batch.** The first row originally read "unreadable **or
+> absent**", and that was wrong in the direction that breaks deployments: every
+> bridge commissioned before E5 has fabrics and no map file, so an upgrade
+> refused and stopped serving working accessories. Absent-on-commissioned is now
+> a bootstrap, not a refusal. The claim below that "an upgrade never refuses"
+> was true only of the `commissionedAt` field, never of the map.
+
+`commissionedAt` is a new optional field on `identity.json`, stamped the first
+time a fabric is observed. It has to live there because the failure it witnesses
+*is* matter.js's storage having vanished — anything stored inside that storage
+cannot tell "never paired" from "paired, then the directory was lost". Absent on
+pre-E5 identities, which reads correctly as "no evidence of *commissioning*" —
+though on its own that was never enough to stop an upgrade refusing, because the
+missing **map** did it instead (see the correction above). Cleared by
+`factory_reset`, by `rebuild_endpoint_map`, and — since the #126 batch — whenever
+the fabric set empties, or the reset would refuse to itself on the next start.
+
+The refusal decision is `endpoint-map.ts`'s `refuseReasonFor` — one pure
+function, no matter.js — because the case that matters most (fabrics exist +
+broken map) cannot be reached in a test without commissioning real hardware.
+
+### Two matter.js 0.17.8 findings
+
+- **`ServerNode.erase()` leaves a ref'd timer that `close()` never clears.**
+  Measured with `process.getActiveResourcesInfo()`: without an erase, close
+  leaves only unref'd UDP handles and the process exits; with one, a `Timeout`
+  survives and it does not. Consequence in production: a *clean* shutdown after
+  a factory reset would have sat until `main.ts`'s escape hatch fired and then
+  exited **1**, telling launchd a successful stop was a crash. `main.ts` now
+  `process.exit(0)`s once both ordered closes have returned; the escape hatch
+  still owns every path where a close does not return. Same cause, test side:
+  `npm test` now passes `--test-force-exit`.
+- **`OperationalCredentialsServer.removeFabric` asserts a remote actor**, exactly
+  as `AdministratorCommissioning` does for §3.8, so §3.9 drives `FabricManager`
+  → `fabric.leave()` directly. `leave` rather than `delete`: it flushes
+  subscriptions and emits the leave event, so a controller learns it was removed
+  instead of just losing the node.
+
+### Plugin side — the #124 review carry-overs
+
+- **Diffs are measured against the last state PUSHED, not against `orig_dev`**
+  (`ExportHandler.diff_from`, `ExportBridge._pushed`). A tolerance compared
+  against the previous *Indigo reading* only ever bounds one step: hue's ±1°
+  meant a ramp of 1° per step reported "unchanged" every single time, so the
+  accessory stayed where the ramp began while the lamp walked arbitrarily far
+  away — no error, no log line, no bound. Against the last pushed value the same
+  tolerance bounds the *total* error at 1°. Snapshots are seeded when a spec is
+  built (an attach/upsert IS a push), merged rather than replaced on each
+  `set_state` (§3.4 maps are partial), and dropped with the export.
+- **`pendingReplaceAll` is persisted** (`matterExportPendingReplaceAll` in
+  prefs, XAC7). Emptying the allow-list is the only moment the plugin ever says
+  "remove everything"; if that attach did not land, nothing said it again —
+  empty list → XG5 → no client → no attach → the accessories stayed in every
+  ecosystem for good. The flag is written *before* the attempt (the ways it does
+  not land include a reload and a power cut, neither of which reaches an
+  `except`), reconnects on its own with an empty allow-list, and is discharged by
+  the one successful attach, which then drops the client again.
+- **§5 commands leave the loop** — `run_in_executor` on a **single** worker.
+  One, not a pool: two commands for the same accessory running concurrently lets
+  a `setLevel 20` overtake a `setLevel 80` and both "succeed".
+- **`start()` is gated** while an un-export is in flight, and the deferred start
+  is picked up by that coroutine's `finally` — refused, not dropped.
+- **`_set_color_temp`'s `whiteLevel or 100` caught a real 0** (`0.0` is falsy).
+  `None` means no white channel and skips the write; **0** means the channel
+  exists and is off, and defaulting it turned "set the colour temperature" into
+  "…and switch the white channel to full" — a bridge turning a lamp on nobody
+  asked it to, in response to a command Matter defines as orthogonal to on/off.
+- **`subscribeToChanges` gets a bounded watchdog.** The whole push path rests on
+  one undocumented assumption (that it works the same from a menu callback as
+  from `startup`), and if that is ever wrong the symptom is silence. Re-issued
+  after ~1 min with an active export and no `deviceUpdated` *at all*, at most 3
+  times — bounded because "no updates" is also exactly what a quiet house looks
+  like.
+- **Fabric backup now includes the bridge-node storage dir** under a reserved
+  `bridge-node/` archive prefix (so an old controller-only archive still
+  restores). Live-snapshot safety: `identity.json` and `endpoint-map.json` are
+  written temp-plus-`rename`, so a reader sees one whole version or the other;
+  matter.js's own store under that dir carries the same caveat the controller's
+  already does. **Restore deliberately does not extract them** — that needs the
+  bridge node stopped and there is no stop seam until E7 — so it warns with the
+  member count, the prefix and the manual recipe rather than half-restoring in
+  silence.
+
+### Deferred items — the current state of the list
+
+Still deferred, unchanged, both needing a `BRIDGE_PROTOCOL.md` change:
+
+1. **No spelling for "I no longer know" (§3.4/§4.2).** A published state key can
+   vanish and `set_state` cannot carry an absence, so the ecosystem keeps the
+   last value indefinitely. The decision stands: keep last-known-good and make
+   the gap visible (`diff_with_gaps`/`diff_from` return it, `_report_stopped_keys`
+   says it once per device per streak). A real fix is a §4.2 "unknown" value or a
+   §3.x `clear_state`. **Unchanged by E5** — `diff_from` reports the gap against
+   what was pushed, which is if anything the more accurate question, but it still
+   has nowhere to put the answer on the wire.
+
+   **And since E5 the detection is process-scoped** (#126 C4). `diff_from`
+   compares against `_pushed`, and `_pushed` is seeded from `states_for`, which
+   *omits* a key that is already absent — so a sensor that was already flat when
+   the plugin loaded has no baseline entry for the key it stopped reporting, and
+   `_report_stopped_keys` therefore says nothing. The practical shape: a
+   dead-battery sensor warns **once**, at the moment it goes quiet, and never
+   again after a plugin reload. That is not a regression from anything (there
+   was no report at all before E5) and it is arguably the right noise level, but
+   it means "no stopped-key warnings since the reload" is not evidence that
+   every sensor is reporting. A real fix rides with the §4.2 "unknown" value.
+2. **Dropped invocations are not reported to the plugin.** A `lock`/`unlock`
+   arriving while the plugin is away reaches no sink and there is no frame for
+   telling the plugin what it missed on the next `attach`. `doorLock` still fails
+   the Matter invocation so Home says the accessory did not respond; every other
+   role still warns and returns. **Unchanged by E5.**
+
+New, and deferred on purpose:
+
+3. **Restoring the bridge-node storage from a backup** needs a bridge `stop()`/
+   `start()` control — E7's launchd agent. Backup is done; restore reports and
+   skips (above).
+4. **Pinning endpoint numbers from the map** (the `Endpoint.Configuration.number`
+   finding above) — a protocol-level decision about what `preserveEndpointNumbers`
+   promises, not a patch.
+
+### Still open from before
+
+`bridgeWsPort` is still not in `PluginConfig.xml` (E6/E7 own the Export panel),
+the bridge node is still started by hand, and **none of E5 has been deployed to
+jarvis** — the XAC5 validation script is in the PR description.
 
 ---
 

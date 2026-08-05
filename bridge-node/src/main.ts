@@ -12,8 +12,14 @@ import { networkInterfaces } from "node:os";
 
 import { assertMdnsInterface, parseArgs, USAGE } from "./config.js";
 import { BridgeNode, matterJsVersion } from "./node.js";
-import { describeError, describeErrorWithStack } from "./protocol.js";
-import { loadOrCreateIdentity } from "./storage.js";
+import { describeError, describeErrorWithStack, RefuseReason } from "./protocol.js";
+import {
+    type BridgeIdentity,
+    identityProblem,
+    loadOrCreateIdentity,
+    mintIdentity,
+    quarantineIdentity,
+} from "./storage.js";
 import { BridgeWsServer } from "./ws-server.js";
 
 const bridgeVersion: string = createRequire(import.meta.url)("../package.json").version;
@@ -63,9 +69,42 @@ async function main(): Promise<void> {
         );
     }
 
-    const identity = await phase("identity load failed", () => loadOrCreateIdentity(config.storagePath, log));
+    // Asked BEFORE the identity is loaded, because loading it is what would
+    // replace an unusable one — and replacing it mints a new `SerialNumber` and
+    // `UniqueID`, which every paired ecosystem reads as a different accessory
+    // (E5 / PRD §4.3). A missing file is a first run and answers `undefined`.
+    const identityFault = await phase("identity check failed", () => identityProblem(config.storagePath));
 
-    const bridge = new BridgeNode(config, identity, bridgeVersion, log);
+    // The two answers take opposite paths, and running the mint unconditionally
+    // — as the first cut of E5 did — destroyed the file the refusal below exists
+    // to protect, one line before refusing to protect it. `loadOrCreateIdentity`
+    // writes through `rename`, so the unusable original was gone by the time
+    // anybody was told there had been a problem.
+    let identity: BridgeIdentity;
+    if (identityFault === undefined) {
+        identity = await phase("identity load failed", () => loadOrCreateIdentity(config.storagePath, log));
+    } else {
+        log(`Bridge identity unusable: ${identityFault}`);
+        const movedTo = quarantineIdentity(config.storagePath, log);
+        if (movedTo !== undefined) {
+            log(`Moved the unusable identity to ${movedTo} — repair or restore it, then restart`);
+        }
+        // In memory only. The node needs *an* identity to build a ServerNode at
+        // all (that is what keeps `get_pairing` answering, §1.1), but nothing
+        // durable may be written over an identity we could not read: no
+        // endpoints are served while refusing, so this one is never anybody's
+        // accessory and must not outlive the process.
+        identity = mintIdentity();
+        log("Using a temporary in-memory bridge identity; NOTHING has been written to identity.json");
+    }
+
+    const bridge = new BridgeNode(
+        config,
+        identity,
+        bridgeVersion,
+        log,
+        identityFault === undefined ? undefined : RefuseReason.identityUnreadable,
+    );
     await phase(`Matter node start failed (matter port ${config.matterPort}, storage ${config.storagePath})`, () =>
         bridge.start(),
     );
@@ -113,8 +152,17 @@ async function main(): Promise<void> {
             } catch (error) {
                 log(`Error closing Matter node: ${describeErrorWithStack(error)}`);
             }
-            pending = "event loop drain";
+            clearTimeout(escapeHatch);
             log("Shutdown complete");
+            // Both closes returned, in order, so everything that is ours is
+            // down — and what is left on the loop is not ours to wait for.
+            // matter.js 0.17.8's `ServerNode.erase()` (§3.10) leaves a ref'd
+            // timer behind that `close()` does not clear, measured at 0.17.8:
+            // without this, a perfectly clean shutdown *after a factory reset*
+            // would sit until the escape hatch fired and then exit 1, telling
+            // launchd a successful stop was a crash. Exit 0 here; the escape
+            // hatch still owns every path where a close does NOT return.
+            process.exit(0);
         })();
     };
     process.on("SIGTERM", () => shutdown("SIGTERM"));

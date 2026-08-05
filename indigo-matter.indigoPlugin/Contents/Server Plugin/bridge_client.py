@@ -84,6 +84,24 @@ def attach_timeout_for(endpoint_count: int) -> float:
     return max(ATTACH_TIMEOUT,
                ATTACH_TIMEOUT_BASE + ATTACH_TIMEOUT_PER_ENDPOINT * max(0, int(endpoint_count)))
 
+
+#: Slack on top of the work a §3.11 rebuild can actually do, so the *caller's*
+#: deadline is never the tighter of the two.
+REBUILD_TIMEOUT_HEADROOM = 5.0
+
+
+def rebuild_timeout_for(endpoint_count: int) -> float:
+    """Wall-clock ceiling for one §3.11 rebuild **including its re-attach**.
+
+    A caller that waits on ``rebuild_endpoint_map`` is waiting on two deadlines
+    in series — :data:`LONG_TIMEOUT` for the rebuild itself, then a full
+    :func:`attach_timeout_for` for the re-attach — and a flat number chosen
+    without reference to either is a trap the moment the export list is large:
+    the menu's own 45s expired mid-re-attach on ~90 endpoints and reported a
+    failure over a rebuild that had already succeeded and could not be undone.
+    """
+    return LONG_TIMEOUT + attach_timeout_for(endpoint_count) + REBUILD_TIMEOUT_HEADROOM
+
 #: Attach refusals that reconnecting cannot fix, with the remedy the user needs.
 #: Everything NOT listed here (``internal``, ``malformed_args``, …) is treated as
 #: transient and retried on the normal backoff — retrying these three instead
@@ -103,6 +121,26 @@ TERMINAL_ATTACH_ERRORS = {
         "in already-paired ecosystems"
     ),
 }
+
+#: The remedy when an ``endpoint_map_invalid`` refusal is really about the
+#: IDENTITY file. §1.1 has one code for every refuse-to-start reason, and the
+#: reason text is the only thing that distinguishes them — so the map remedy
+#: above is not merely unhelpful here, it points at the §3.11 rebuild, which the
+#: node refuses outright for this reason (it cannot fix an identity, and
+#: clearing the refusal would serve endpoints under a serial nobody has seen).
+IDENTITY_REFUSAL_REMEDY = (
+    "the node's identity file is unreadable, so it is serving nothing — a rebuild CANNOT fix "
+    "this and the node will refuse one. The unusable file was moved aside as "
+    "identity.json.unreadable-<timestamp>; restore or repair it and restart the bridge node"
+)
+
+
+def remedy_for(code: str, details: str) -> Optional[str]:
+    """The user-facing remedy for a terminal refusal, or ``None`` if untriaged."""
+    if (code == bridge_protocol.ERR_ENDPOINT_MAP_INVALID
+            and bridge_protocol.REFUSE_IDENTITY_UNREADABLE in (details or "")):
+        return IDENTITY_REFUSAL_REMEDY
+    return TERMINAL_ATTACH_ERRORS.get(code)
 
 #: The subset of :data:`TERMINAL_ATTACH_ERRORS` that halts the client outright.
 #: ``endpoint_map_invalid`` is the exception: §1.1 keeps the connection usable
@@ -130,8 +168,9 @@ class BridgeClient(WsJsonClient):
         *,
         plugin_version: str = "unknown",
         endpoint_provider: Optional[Callable[[], list]] = None,
+        replace_all_provider: Optional[Callable[[], int]] = None,
         connect: Optional[Callable[[str], Awaitable]] = None,
-        on_attached: Optional[Callable[[StatusReport], None]] = None,
+        on_attached: Optional[Callable[[StatusReport, bool], None]] = None,
         on_attach_refused: Optional[Callable[[str, str], None]] = None,
         on_version_skew: Optional[Callable[[bridge_protocol.Hello], None]] = None,
         on_command: Optional[Callable[[bridge_protocol.BridgeCommand], None]] = None,
@@ -157,6 +196,13 @@ class BridgeClient(WsJsonClient):
         )
         self.plugin_version = plugin_version
         self._endpoint_provider = endpoint_provider or (lambda: [])
+        #: How many endpoints an un-export still owes the node — 0 for none.
+        #: Non-zero makes the *handshake's* attach carry §3.1's `replace_all`
+        #: and sizes its deadline (``export_bridge._pending_replace_all``, XAC7).
+        #: The user emptied the allow-list, the node was unreachable, and
+        #: without this the accessories stay in every paired ecosystem for good,
+        #: because nothing else ever attaches with an empty set again.
+        self._replace_all_provider = replace_all_provider or (lambda: 0)
         self._on_attached = on_attached
         self._on_attach_refused = on_attach_refused
         self._on_version_skew = on_version_skew
@@ -217,16 +263,62 @@ class BridgeClient(WsJsonClient):
         # "the attach is on its way" rather than "we are still deciding what to
         # send" — which is what every waiter on ``wait_connected`` assumes.
         specs = await self._gather_endpoints()
+        owed = self._owed_removals()
+        replace_all = self._replace_all(owed)
         # Requests are legal from here on: attach is one.
         self._mark_connected()
         try:
-            status = await self._attach(specs, replace_all=False, timeout=None, inline=True)
+            status = await self._attach(specs, replace_all=replace_all, timeout=None, inline=True)
         except BridgeProtocolError as exc:
+            if str(exc.code) == bridge_protocol.ERR_MASS_REMOVAL_REFUSED and not replace_all:
+                try:
+                    if await self._retry_with_intent():
+                        return
+                except BridgeProtocolError as retried:
+                    exc = retried
             self._handle_attach_refused(exc)
             return
         self._attached = True
         self.recovery = False
-        self._notify(self._on_attached, status)
+        self._notify(self._on_attached, status, replace_all)
+
+    def _owed_removals(self) -> int:
+        """How many endpoints an un-export still owes the node, per the provider.
+
+        The provider answers with a count rather than a flag because the two
+        questions it feeds need different halves of it: *whether* to carry
+        §3.1's opt-in, and *how long* the resulting attach may take (the node
+        paces bulk removals ~100ms apart, §3.3).
+        """
+        try:
+            return max(0, int(self._replace_all_provider() or 0))
+        except Exception as exc:  # pylint: disable=broad-except
+            self.logger.warning("could not read the pending un-export flag (%s); "
+                                "attaching without it", exc)
+            return 0
+
+    def _replace_all(self, owed: int) -> bool:
+        """Whether this attach carries §3.1's ``intent: replace_all``.
+
+        **The desired set's size is deliberately not consulted.** It used to
+        gate this — "a `replace_all` alongside real endpoints is meaningless, so
+        only ask when we are sending nothing" — and that turned a debt plus a
+        *disjoint* re-add into a permanent halt: the removals still emptied the
+        node's live set, the guard still fired, and the attach that carried no
+        intent was refused with ``mass_removal_refused``, which halts.
+
+        Carrying the intent whenever a debt exists is safe in the direction that
+        matters. §3.1's guard fires only when the reconcile would leave the live
+        set EMPTY, so on any attach carrying real endpoints the flag is inert —
+        it cannot license a removal the desired set was not already asking for.
+        What it does is stop the one refusal that has no retry behind it.
+        """
+        if owed <= 0:
+            return False
+        self.logger.info(
+            "attaching with intent: replace_all — finishing an un-export of %d accessory "
+            "record(s) that did not complete earlier", owed)
+        return True
 
     def _handle_attach_refused(self, exc: BridgeProtocolError) -> None:
         """Decide what an ``attach`` the node refused means (§1.1).
@@ -245,7 +337,7 @@ class BridgeClient(WsJsonClient):
           but log *which* error it was rather than dumping a traceback.
         """
         code = str(exc.code)
-        remedy = TERMINAL_ATTACH_ERRORS.get(code)
+        remedy = remedy_for(code, exc.details)
         if remedy is None:
             self._notify(self._on_attach_refused, code, exc.details)
             raise HandshakeFailed(f"bridge node refused attach: {code} ({exc.details})")
@@ -255,6 +347,37 @@ class BridgeClient(WsJsonClient):
             raise ClientHalted(f"attach refused: {code} ({exc.details})", reason=code)
         # endpoint_map_invalid: stay connected, un-attached, in recovery.
         self.recovery = True
+
+    async def _retry_with_intent(self) -> bool:
+        """Answer a ``mass_removal_refused`` by re-attaching WITH the opt-in.
+
+        Belt and braces behind :meth:`_replace_all`, and the belt is the part
+        that matters: ``mass_removal_refused`` HALTS, and a halted client never
+        retries anything. If we reach it while a debt is recorded then the
+        removal the node refused is one the user genuinely asked for — that is
+        what the debt IS — and halting there strands every exported accessory in
+        every ecosystem permanently, behind a message blaming the allow-list.
+
+        Exactly once, and only when a debt says so. A blind retry-with-intent
+        would turn the §3.1 guard into a speed bump; this cannot fire for a
+        client that was never told to un-export anything.
+        """
+        # RE-read, deliberately: the only way to be here at all is that the
+        # first read did not see a debt (a debt always carries the intent), so
+        # the interesting case is precisely the one where that read was wrong —
+        # a prefs read that glitched, or a debt written between the two.
+        owed = self._owed_removals()
+        if owed <= 0:
+            return False
+        self.logger.warning(
+            "the bridge node refused the attach as a mass removal, but an un-export of %d "
+            "accessory record(s) IS outstanding — retrying once with intent: replace_all "
+            "rather than halting", owed)
+        status = await self._attach(None, replace_all=True, timeout=None, inline=True)
+        self._attached = True
+        self.recovery = False
+        self._notify(self._on_attached, status, True)
+        return True
 
     def _is_event(self, frame: dict) -> bool:
         return self.proto.is_event(frame)
@@ -390,7 +513,14 @@ class BridgeClient(WsJsonClient):
         """
         specs = await self._gather_endpoints() if endpoints is None else endpoints
         if timeout is None:
-            timeout = attach_timeout_for(len(specs))
+            # Sized over whichever count the node will actually spend time on.
+            # An attach's cost is its ~100ms-paced REMOVALS (§3.3), and for the
+            # discharge attach those are the opposite of what is sent: nothing
+            # goes, everything owed comes back off. `len(specs)` alone handed an
+            # 80-accessory un-export the 8s floor, timed it out mid-reconcile,
+            # then tore the socket down and retried — forever, with the
+            # accessories still in every ecosystem.
+            timeout = attach_timeout_for(max(len(specs), self._owed_removals()))
         frame = self.proto.build_attach(self.plugin_version, specs, replace_all=replace_all)
         if inline:
             result = await self._handshake_request(frame, timeout, bridge_protocol.CMD_ATTACH)
@@ -525,12 +655,68 @@ class BridgeClient(WsJsonClient):
         When it is called from the recovery state (the node refused our attach)
         it also re-attaches: the map is valid again, so the connection can stop
         being a three-command lifeline and go back to being an export.
+
+        **The rebuild and the re-attach are two outcomes, not one.** By the time
+        the node answers this command it has already written the new map and
+        stopped refusing — that is what its StatusReport *means*, and it is the
+        irreversible half. Letting a failure of the re-attach after it propagate
+        as though the whole thing failed produced a menu that told the user "the
+        bridge node is unchanged and still refusing to export" when neither
+        clause was true, left ``recovery`` set so every state push went on being
+        dropped, and invited them to repeat an operation that duplicates
+        accessories in every paired ecosystem.
+
+        So the recovery flag is cleared the moment the report lands, and the
+        re-attach goes through the same triage as any other refused attach
+        (:meth:`_handle_attach_refused`) rather than bypassing it. Its failure
+        is reported and swallowed here: the caller gets the rebuild's status,
+        and whether the connection came back is readable from :attr:`attached`.
         """
         result = await self._request_frame(self.proto.build_rebuild_endpoint_map(), timeout)
         self.status = bridge_protocol.parse_status(result)
-        if self.recovery:
-            self.logger.info("endpoint map rebuilt; re-attaching to the bridge node")
-            status = await self.attach()
-            self._notify(self._on_attached, status)
-            return status
-        return self.status
+        if not self.recovery:
+            return self.status
+        # The node has rebuilt and stopped refusing. Whatever happens next, THAT
+        # is now the truth about it, and nothing below may make it look otherwise.
+        self.recovery = False
+        rebuilt = self.status
+        self.logger.info("endpoint map rebuilt; re-attaching to the bridge node")
+        # The debt outlives the refusal: a node that was refusing never took
+        # our un-export either, so the re-attach has to carry the same opt-in
+        # the handshake would have.
+        replace_all = self._replace_all(self._owed_removals())
+        try:
+            status = await self.attach(replace_all=replace_all)
+        except BridgeProtocolError as exc:
+            self._triage_rebuilt_reattach(exc)
+            return rebuilt
+        self._notify(self._on_attached, status, replace_all)
+        return status
+
+    def _triage_rebuilt_reattach(self, exc: BridgeProtocolError) -> None:
+        """Handle a refusal of the post-rebuild re-attach, without unwinding.
+
+        :meth:`_handle_attach_refused` is written for the handshake, where the
+        run loop is the thing that catches what it raises — it is what turns a
+        :class:`ClientHalted` into the :attr:`halted` latch and a
+        :class:`HandshakeFailed` into a backoff. Here there is no run loop above
+        us: we are on a live connection, called from a menu. Re-using the triage
+        is still right (a refusal means the same thing whoever asked), so the
+        two states it can only signal by raising are applied here instead, and
+        the exception stops — the rebuild it followed genuinely happened and
+        must not be reported as a failure.
+        """
+        try:
+            self._handle_attach_refused(exc)
+        except ClientHalted as halt:
+            # Exactly what WsJsonClient.run does with one, because nothing else
+            # is going to see this one.
+            self.halted = True
+            self.halted_reason = halt.reason or None
+            self.logger.error(
+                "the endpoint map was rebuilt, but re-attaching HALTED the bridge client (%s); "
+                "nothing is being exported and it will not retry on its own", halt)
+        except HandshakeFailed as failed:
+            self.logger.warning(
+                "the endpoint map was rebuilt, but re-attaching was refused (%s); the ordinary "
+                "reconnect will try again", failed)

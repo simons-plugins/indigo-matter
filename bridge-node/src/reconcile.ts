@@ -104,6 +104,35 @@ export function parseEndpointSpecs(value: unknown): EndpointSpec[] {
     return specs;
 }
 
+/** §3.9: the fabric to drop. `fabricIndex` is a 1-based Matter fabric index. */
+export function parseFabricIndex(value: unknown): number {
+    if (typeof value !== "number" || !Number.isInteger(value) || value < 1) {
+        throw new ProtocolError(
+            ErrorCode.malformedArgs,
+            `fabricIndex must be a positive integer, got ${JSON.stringify(value)}`,
+        );
+    }
+    return value;
+}
+
+/**
+ * §3.10: whether a factory reset keeps `endpoint-map.json`.
+ *
+ * Absent means `true` — the §6.6 rule that destructive operations cannot happen
+ * as a default. Discarding endpoint identity is the destructive half of this
+ * command, so it takes an explicit `false`; a client that omits the flag gets
+ * the reset it asked for and keeps the identities it did not mention.
+ */
+export function parsePreserveEndpointNumbers(value: unknown): boolean {
+    if (value === undefined) {
+        return true;
+    }
+    if (typeof value !== "boolean") {
+        throw new ProtocolError(ErrorCode.malformedArgs, "preserveEndpointNumbers must be a boolean");
+    }
+    return value;
+}
+
 /** §3.1: the opt-in that makes emptying the endpoint set deliberate. */
 export function parseReplaceAll(intent: unknown): boolean {
     if (intent === undefined) {

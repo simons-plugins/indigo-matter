@@ -389,7 +389,28 @@ class ExportHandler:
         addition; it is noted in ``docs/HANDOVER.md`` and deliberately not made
         here.
         """
-        before = self.states_for(orig_dev, options)
+        return self.diff_from(self.states_for(orig_dev, options), new_dev, options)
+
+    def diff_from(self, pushed: Optional[dict], new_dev: Any,
+                  options: Optional[dict] = None) -> StateDiff:
+        """:meth:`diff_with_gaps` against a snapshot instead of a device (E5).
+
+        The snapshot callers pass is the one they last actually **pushed**, and
+        the difference from ``diff_with_gaps`` is the whole reason this exists:
+        a tolerance compares against whatever ``before`` is, so comparing
+        against the *previous Indigo reading* lets a change smaller than the
+        tolerance happen over and over and never be sent. A hue ramping one
+        degree per step against ``HUE_TOLERANCE_DEGREES`` of 1 pushes nothing,
+        ever, while the accessory drifts arbitrarily far from the lamp. Diffing
+        against the last pushed value bounds that error at exactly the
+        tolerance, which is what a tolerance is supposed to mean.
+
+        ``pushed`` of ``None`` means "nothing has been pushed for this device"
+        and every readable key is treated as changed — the safe direction: an
+        unnecessary ``set_state`` is idempotent, a missed one is stale state in
+        somebody's Home app.
+        """
+        before = dict(pushed or {})
         after = self.states_for(new_dev, options)
         changed = {
             key: value for key, value in after.items()
@@ -509,7 +530,7 @@ class ColorTemperatureLightExport(DimmableLightExport):
         return {**super().commands(), COMMAND_SET_COLOR_TEMP: self._set_color_temp}
 
     @staticmethod
-    def _set_color_temp(args: dict, dev: Any, _options: dict) -> None:
+    def _set_color_temp(args: dict, dev: Any, _options: dict) -> Optional[str]:
         """Set white temperature, preserving the white channel's own level.
 
         ``setColorLevels`` documents whiteTemperature as used *in combination
@@ -527,9 +548,17 @@ class ColorTemperatureLightExport(DimmableLightExport):
           truncating 369.9 to 369 is a different colour, not a rounding detail;
         * **no white channel means no command.** ``whiteLevel is None`` is real
           Indigo for "this device has no white channel at all" — inventing 100
-          for it asks its driver to drive something it does not have. A
-          whiteLevel of *0* is different: the channel exists and is off, and
-          that IS the blacked-out-room case the default is for;
+          for it asks its driver to drive something it does not have, so the
+          command is skipped entirely. A whiteLevel of **0** is a different
+          answer to a different question: the channel exists and is currently
+          off, and 0 is the *real* value, so it is sent as 0. The `or 100`
+          default that used to sit here caught it — `0.0` is falsy — and turned
+          "set the colour temperature of a lamp that is off" into "set the
+          colour temperature AND switch the white channel to full", which is a
+          bridge turning a light on that nobody asked it to. Matter keeps
+          colour and on/off orthogonal for exactly this reason: a
+          `MoveToColorTemperature` on an off lamp changes its colour, not its
+          state;
         * **RGB is zeroed alongside.** Matter's ``colorMode`` is one-of, and the
           node's push side picks hue/saturation over colour temperature when a
           device reports both (``bridge-node/src/endpoints.ts`` ``colorPatch``).
@@ -544,17 +573,23 @@ class ColorTemperatureLightExport(DimmableLightExport):
             raise ValueError(f"setColorTemp without usable mireds: {args!r}")
         white_level = _number(dev, "whiteLevel")
         if white_level is None:
-            _LOG.debug("setColorTemp skipped: device %s has no white channel",
-                       getattr(dev, "id", "?"))
-            return
+            # The tri-state reason, not a bare `return`. `dispatch` ends in
+            # `handler(...) or True`, so returning None reported SUCCESS for a
+            # command that did nothing at all — the ecosystem had already
+            # flipped its tile to the new colour temperature, the lamp never
+            # moved, and the only trace was a debug line from a static method
+            # that cannot name the device. The caller latches this per device.
+            return ("the Indigo device has no white channel, so there is no colour "
+                    "temperature to set")
         levels: dict[str, int] = {
-            "whiteLevel": int(_clamp(round(white_level or 100), 0, 100)),
+            "whiteLevel": int(_clamp(round(white_level), 0, 100)),
             "whiteTemperature": mireds_to_kelvin(
                 int(_clamp(round(mireds), MIREDS_MIN, MIREDS_MAX))),
         }
         if _number(dev, "redLevel") is not None:
             levels.update(redLevel=0, greenLevel=0, blueLevel=0)
         indigo.dimmer.setColorLevels(dev, **levels)
+        return None
 
 
 class ExtendedColorLightExport(ColorTemperatureLightExport):

@@ -23,6 +23,7 @@ from typing import Optional
 
 import indigo  # provided by the Indigo runtime
 
+import bridge_client
 import fabric_backup
 from async_runtime import AsyncRuntime
 from commission_jobs import CommissionJobs, node_id_to_str
@@ -45,6 +46,15 @@ from server_process import ServerProcess
 PLUGIN_NAME = "indigo-matter"
 COMMAND_TIMEOUT = 5.0
 DECOMMISSION_TIMEOUT = 15.0
+
+#: Watchdog ticks (~15s each) of an active export with no ``deviceUpdated`` at
+#: all before ``subscribeToChanges`` is re-issued — see
+#: ``Plugin._resubscribe_tick``. ~1 minute, the same shape as every other streak
+#: counter here.
+RESUBSCRIBE_TICKS = 4
+#: How many times, at most. Bounded because a house where nothing changes looks
+#: identical to a subscription that never registered.
+MAX_RESUBSCRIBE_ATTEMPTS = 3
 
 #: Menu id of the export dialog (MenuItems.xml) — matched in
 #: ``get_menu_action_config_ui_values`` so other menus are never seeded.
@@ -149,6 +159,16 @@ class Plugin(indigo.PluginBase):
         self._exported_ids: frozenset[int] = frozenset()
         #: Whether ``indigo.devices.subscribeToChanges()`` has been issued.
         self._subscribed_to_devices = False
+        #: Whether a ``deviceUpdated`` has arrived since the subscription was
+        #: issued — the only observable evidence that it actually took.
+        self._device_updates_seen = False
+        #: How many watchdog ticks have passed with a subscription and no
+        #: ``deviceUpdated``, and how many times we have re-issued it.
+        self._no_update_ticks = 0
+        self._resubscribe_attempts = 0
+        #: Set once the watchdog has said out loud that it is giving up, so the
+        #: one line naming the consequence is said once and not every 15s.
+        self._resubscribe_gave_up = False
         #: Device ids whose export callback is currently failing. This callback
         #: fires on every change of an exported device, so a stuck failure would
         #: otherwise write one traceback per dimmer-ramp step; cleared on the
@@ -253,6 +273,10 @@ class Plugin(indigo.PluginBase):
         self.export_bridge = ExportBridge(
             self.exports, self.runtime, self.logger, lambda: self.pluginPrefs,
             plugin_version=self._version, plugin_id=self._export_plugin_id(),
+            # The un-export debt (XAC7) is written to prefs and has to reach
+            # disk to be worth writing: the failure it covers is the plugin
+            # never getting another chance to say it.
+            save_prefs=self._save_plugin_prefs,
         )
         self._exports_changed()
 
@@ -320,15 +344,79 @@ class Plugin(indigo.PluginBase):
         """
         if self._subscribed_to_devices:
             return
+        self._issue_device_subscription()
+
+    def _issue_device_subscription(self) -> bool:
+        """The bare call, without the once-only guard. True if it did not raise."""
         try:
             indigo.devices.subscribeToChanges()
         except Exception as exc:  # noqa: BLE001
             self.logger.error("Matter export: could not subscribe to Indigo device changes — "
                               "exported accessories will not follow Indigo state. %s", exc)
             self.logger.exception(exc)
-            return
+            return False
         self._subscribed_to_devices = True
         self.logger.debug("subscribed to Indigo device changes (export is active)")
+        return True
+
+    def _resubscribe_tick(self) -> None:
+        """Re-issue ``subscribeToChanges`` if it looks like it never took.
+
+        **Why this exists.** The whole outbound push path rests on one
+        undocumented assumption: that ``subscribeToChanges`` works the same
+        issued from a menu callback as from ``startup``. The canonical reference
+        describes it as a request to the server, which is why it is safe to make
+        conditional (see :meth:`_subscribe_to_device_changes`) — but it does not
+        *say* so, there is no acknowledgement to check, and no unsubscribe to
+        compare against. If the assumption is ever wrong on some Indigo build,
+        the symptom is silence: exported accessories simply stop following
+        Indigo, with no error anywhere.
+
+        **Giving up is itself news.** Exhausting the attempts used to be a bare
+        ``return``, at no log level at all — so the one feature whose entire
+        purpose is to break a silence ended by going silent, in exactly the
+        house where it had failed to help. It now says so once, naming the
+        consequence and the remedy rather than the counter.
+
+        **``_device_updates_seen`` deliberately never re-arms**, and that is a
+        known limit rather than an oversight: a subscription that dies *later*
+        in a session is not noticed here, because the flag only records that an
+        update was seen at some point. Re-arming it on a window would make every
+        genuinely quiet house — nobody home, nothing switching for a few minutes
+        — re-issue the subscription and eventually warn that export is broken
+        when it is working perfectly. The failure this watchdog exists for is a
+        subscription that never registered *at all*, which is the one it can
+        tell apart from a quiet house, and it stays scoped to that.
+        """
+        if not self._exported_ids or not self._subscribed_to_devices:
+            return
+        if self._device_updates_seen:
+            return
+        if self._resubscribe_attempts >= MAX_RESUBSCRIBE_ATTEMPTS:
+            if not self._resubscribe_gave_up:
+                self._resubscribe_gave_up = True
+                self.logger.warning(
+                    "Matter export: no Indigo device update has arrived since exporting, after "
+                    "re-issuing subscribeToChanges %d times. Unless the house is simply idle, "
+                    "exported accessories are NOT following Indigo state and nothing further will "
+                    "retry on its own — reload the plugin.", MAX_RESUBSCRIBE_ATTEMPTS)
+            return
+        self._no_update_ticks += 1
+        if self._no_update_ticks < RESUBSCRIBE_TICKS:
+            return
+        self._no_update_ticks = 0
+        self._resubscribe_attempts += 1
+        # **Bounded, because "no updates" is also what a quiet house looks
+        # like.** A device that nobody touches genuinely produces no callback,
+        # so this cannot be a permanent retry loop without being permanent
+        # noise. A handful of re-issues covers the case it is for — a
+        # subscription that never registered — and after that the evidence is
+        # indistinguishable from nothing having happened.
+        self.logger.debug(
+            "Matter export: no device updates since subscribing; re-issuing "
+            "subscribeToChanges (attempt %d of %d)",
+            self._resubscribe_attempts, MAX_RESUBSCRIBE_ATTEMPTS)
+        self._issue_device_subscription()
 
     def deviceUpdated(self, origDev, newDev):  # noqa: N802
         """Push an exported device's change outward.
@@ -340,6 +428,12 @@ class Plugin(indigo.PluginBase):
         locked and nothing is allocated for a device nobody exported.
         """
         super().deviceUpdated(origDev, newDev)
+        # Set for ANY device, before the allow-list gate: the flag is evidence
+        # that the *subscription* is alive, and the subscription covers every
+        # device on the server. Gating it on an exported device would leave the
+        # watchdog re-issuing a perfectly good subscription in any house where
+        # the exported devices happen to be idle.
+        self._device_updates_seen = True
         if newDev.id not in self._exported_ids:
             return
         if self.export_bridge is None:
@@ -548,6 +642,7 @@ class Plugin(indigo.PluginBase):
         # the reverse.
         if self.export_bridge is not None:
             self.export_bridge.health_tick()
+        self._resubscribe_tick()
 
     # ------------------------------------------------------------------
     # Config
@@ -1409,9 +1504,33 @@ class Plugin(indigo.PluginBase):
                     "— restart the bridge node.")
         if client.recovery:
             return (" The bridge node is waiting for an endpoint-map rebuild — exports are not "
-                    "live until it is done.")
+                    "live until it is done. Use 'Rebuild Matter Endpoint Map…' in the plugin "
+                    "menu.")
         if not client.attached:
             return " Not connected to the bridge node — exports are not live."
+        return self._export_health_note(client.status)
+
+    @staticmethod
+    def _export_health_note(status) -> str:
+        """The §4.3 facts the dialog is the only place a user would look for.
+
+        `drift` and `warnings` were parsed and then read by nobody: an endpoint
+        number that had moved, or a map the node could not write, showed up in
+        the log at the moment it happened and nowhere at all afterwards. This
+        dialog is where somebody goes when an accessory is behaving oddly.
+        """
+        if status is None:
+            return ""
+        if status.warnings:
+            return (f" The bridge node reports {len(status.warnings)} persistence problem(s): "
+                    f"{'; '.join(status.warnings)}")
+        if status.drift:
+            return (f" WARNING: {len(status.drift)} exported accessory number(s) have DRIFTED — "
+                    "they may have swapped identities in paired ecosystems. See the log; this is "
+                    "never repaired automatically.")
+        if not status.drift_checked:
+            return (" Endpoint numbers have not been checked against a saved map yet — that "
+                    "happens on the first reconcile.")
         return ""
 
     def get_menu_action_config_ui_values(self, menu_id):
@@ -1792,6 +1911,125 @@ class Plugin(indigo.PluginBase):
         values["exportStatus"] = f"Removed {name}. {self._export_summary()}"
         return values
 
+    # ------------------------------------------------------------------
+    # Export-bridge recovery menus (BRIDGE_PROTOCOL §3.10/§3.11)
+    # ------------------------------------------------------------------
+    def _recovery_client(self, errors, field: str):
+        """The bridge client, or ``None`` with ``errors`` filled in.
+
+        Both recovery commands need a live socket, and the state they exist to
+        fix is exactly the one where the plugin holds the connection open
+        UN-attached (§1.1 recovery). So `connected`, not `attached`, is the
+        right gate — requiring an attach would make the rebuild unreachable in
+        the only situation that needs it.
+        """
+        bridge = self.export_bridge
+        client = bridge.client if bridge is not None else None
+        if client is None or not client.connected:
+            msg = ("Not connected to the Matter export bridge node. Start it (it is launched by "
+                   "hand in this build), export at least one device so the plugin connects, then "
+                   "try again.")
+            self.logger.warning(msg)
+            errors[field] = "Not connected to the bridge node — see the log."
+            return None
+        return client
+
+    def menuRebuildEndpointMap(self, valuesDict, menuId=""):  # noqa: N802, ARG002
+        """§3.11 — the way out of the endpoint_map_invalid refuse-to-start state.
+
+        Two outcomes are reported separately, because they can differ and the
+        expensive one is the first: the rebuild is irreversible (it duplicates
+        accessories in every paired ecosystem) while the re-attach that follows
+        it is an ordinary connection step that retries on its own. Reporting the
+        pair as one used to tell users their node was "unchanged and still
+        refusing" over a map that had already been rewritten — and invite them
+        to do it again.
+        """
+        errors = indigo.Dict()
+        if not self._truthy(valuesDict.get("confirm")):
+            errors["confirm"] = "Tick the box — a rebuild can duplicate paired accessories."
+            return (False, valuesDict, errors)
+        client = self._recovery_client(errors, "confirm")
+        if client is None:
+            return (False, valuesDict, errors)
+        if not client.recovery:
+            # M11: `connected` is the right gate for REACHING the node, but it
+            # is not a reason to rebuild. Run against a healthy node this
+            # silently discards the retained endpoint-number allocations of
+            # every export that is not currently live — §3.3 keeps them exactly
+            # so that re-adding a device restores its accessory — and there is
+            # nothing to recover from in the first place.
+            msg = ("Matter export: the bridge node is NOT refusing to serve endpoints, so there "
+                   "is nothing to rebuild. Rebuilding anyway would discard the retained endpoint "
+                   "numbers of every device that is not currently exported, and those are what "
+                   "make re-adding one restore the same accessory.")
+            self.logger.warning(msg)
+            errors["confirm"] = ("The bridge node is not refusing to export — there is nothing "
+                                 "to rebuild. See the log.")
+            return (False, valuesDict, errors)
+        # Derived from the same two deadlines the call itself is built from: a
+        # flat number here is the one that expires first on a large export list,
+        # turning a rebuild that worked into a reported failure.
+        deadline = bridge_client.rebuild_timeout_for(
+            len(self.exports) if self.exports is not None else 0)
+        try:
+            status = self.runtime.submit(client.rebuild_endpoint_map()).result(timeout=deadline)
+        except Exception as exc:  # noqa: BLE001
+            # Never report success over a rebuild that did not persist: the node
+            # answers with an error rather than a StatusReport when the new map
+            # could not be written, and the refusal is still in force.
+            self.logger.error("Matter export: rebuilding the endpoint map FAILED — %s. The bridge "
+                              "node is unchanged and still refusing to export.", exc)
+            self.logger.exception(exc)
+            errors["confirm"] = "Rebuild failed — see the log. Nothing was changed."
+            return (False, valuesDict, errors)
+        self.logger.warning(
+            "Matter export: endpoint map REBUILT — the bridge node has stopped refusing and is "
+            "serving %d endpoint(s). Check every paired ecosystem for duplicated accessories and "
+            "delete the dead ones by hand. Do NOT run this again for the same fault.",
+            status.endpoint_count)
+        for warning in status.warnings:
+            self.logger.warning("Matter export: the bridge node reports — %s", warning)
+        if not client.attached:
+            # The rebuild stands; only the connection step after it did not. The
+            # client's own triage has already named the reason at error level.
+            self.logger.warning(
+                "Matter export: the rebuild succeeded but re-attaching to the bridge node did "
+                "not. The rebuild does NOT need repeating — exports resume when the connection "
+                "does, and the reason is logged above.")
+        return (True, valuesDict)
+
+    def menuResetBridgePairings(self, valuesDict, menuId=""):  # noqa: N802, ARG002
+        """§3.10 — wipe the export bridge's commissioning and re-advertise."""
+        errors = indigo.Dict()
+        # Two boxes, deliberately. This is the only plugin action that destroys
+        # every ecosystem pairing at once, and it is irreversible without
+        # re-pairing each ecosystem by hand.
+        if not self._truthy(valuesDict.get("confirm")) \
+                or not self._truthy(valuesDict.get("confirmAgain")):
+            field = "confirm" if not self._truthy(valuesDict.get("confirm")) else "confirmAgain"
+            errors[field] = "Tick BOTH boxes — this removes every ecosystem pairing."
+            return (False, valuesDict, errors)
+        client = self._recovery_client(errors, "confirmAgain")
+        if client is None:
+            return (False, valuesDict, errors)
+        try:
+            # preserve_endpoint_numbers=True: a user resetting to re-pair the
+            # same ecosystems should not also lose accessory identity. The
+            # "the map itself is corrupt" path is the rebuild above.
+            self.runtime.submit(client.factory_reset(True)).result(timeout=45)
+        except Exception as exc:  # noqa: BLE001
+            self.logger.error("Matter export: resetting the bridge pairings FAILED — %s. "
+                              "Pairings are unchanged.", exc)
+            self.logger.exception(exc)
+            errors["confirmAgain"] = "Reset failed — see the log. Pairings were not changed."
+            return (False, valuesDict, errors)
+        self.logger.warning(
+            "Matter export: the bridge node's pairings have been RESET. It is advertising for "
+            "commissioning again — pair it from each ecosystem, and remove the now-dead Indigo "
+            "bridge from any ecosystem that still lists it.")
+        return (True, valuesDict)
+
     def _resolve_storage_path(self) -> str:
         """Storage dir path in BOTH managed and manual modes.
 
@@ -1803,6 +2041,20 @@ class Plugin(indigo.PluginBase):
         if self.server_process is not None:
             return self.server_process.storage_path
         return ServerProcess(self._server_prefs(), self.logger).storage_path
+
+    def _bridge_storage_path(self) -> str:
+        """The **export** bridge node's storage dir — sibling of the controller's.
+
+        Hard-coded relative to the controller's rather than read from a pref
+        because there is no pref: E3's node is started by hand and E7 owns the
+        agent that will have one. The path is the PRD §4.3 default
+        (``…/com.simons-plugins.indigo-matter/bridge-node``), which is also
+        `bridge-node/src/config.ts`'s `DEFAULT_STORAGE_PATH`. A user who moved
+        it gets a backup without those members and a log line saying so, which
+        is the same outcome as not having exported anything.
+        """
+        controller = os.path.normpath(self._resolve_storage_path())
+        return os.path.join(os.path.dirname(controller), "bridge-node")
 
     @staticmethod
     def _human_size(num_bytes: int) -> str:
@@ -1822,6 +2074,10 @@ class Plugin(indigo.PluginBase):
             storage_path = self._resolve_storage_path()
             archive = fabric_backup.create_backup(
                 storage_path, now=datetime.now(timezone.utc), logger=self.logger,
+                # PRD-indigo-matter-export §4.3: the bridge node's storage is
+                # backed up alongside the controller's. Losing it costs every
+                # ecosystem pairing AND every exported accessory's identity.
+                bridge_storage_path=self._bridge_storage_path(),
             )
             size = self._human_size(os.path.getsize(archive))
             self.logger.info(

@@ -152,6 +152,53 @@
             </Field>
         </ConfigUI>
     </MenuItem>
+    <!--
+        The two export-side recovery exits (BRIDGE_PROTOCOL §3.10/§3.11).
+
+        Both existed only as node commands until now: `rebuild_endpoint_map`
+        had NO caller anywhere in the plugin, while three user-facing strings
+        (the attach-refusal error, the client's remedy text and the export
+        dialog's status line) told the user to "confirm the rebuild in the
+        plugin". There was nothing to confirm — the only way out of the
+        refuse-to-start state was to hand-edit a JSON file in the storage dir.
+    -->
+    <MenuItem id="rebuildEndpointMap">
+        <Name>Rebuild Matter Endpoint Map…</Name>
+        <CallbackMethod>menuRebuildEndpointMap</CallbackMethod>
+        <ConfigUI>
+            <Field id="warning" type="label">
+                <Label>Use this ONLY when the plugin says the bridge node is refusing to export because its endpoint-number map is unreadable. The map records which Matter accessory number belongs to which Indigo device; rebuilding it accepts whatever numbers exist now as correct.
+
+WARNING: this WILL duplicate accessories in ecosystems that are already paired (Apple Home, Alexa, Google). The old accessories do not disappear — they stop working and you have to delete them by hand, and any names, rooms, scenes and automations built on them are lost.
+
+Your pairings themselves are NOT touched, and no Indigo device is changed.
+
+If the bridge node is NOT refusing, this does nothing useful and is refused: there is no fault to recover from, and a rebuild would discard the retained endpoint numbers of every device you are not currently exporting — the ones that make re-adding a device restore the same accessory rather than create a second one.</Label>
+            </Field>
+            <Field id="confirm" type="checkbox" defaultValue="false">
+                <Label>I understand this may duplicate accessories in paired ecosystems.</Label>
+            </Field>
+        </ConfigUI>
+    </MenuItem>
+    <MenuItem id="resetBridgePairings">
+        <Name>Reset Matter Export Pairings…</Name>
+        <CallbackMethod>menuResetBridgePairings</CallbackMethod>
+        <ConfigUI>
+            <Field id="warning" type="label">
+                <Label>Removes EVERY ecosystem pairing from the Matter export bridge and starts advertising for commissioning again. Apple Home, Alexa, Google and anything else you have paired will lose all of the accessories Indigo exports, and you will have to pair the bridge again from scratch.
+
+This is the export side only. Matter devices that Indigo CONTROLS are not affected, and no Indigo device is changed or deleted.
+
+Endpoint numbers are kept, so re-pairing the same ecosystems restores the same accessory identities where it can.</Label>
+            </Field>
+            <Field id="confirm" type="checkbox" defaultValue="false">
+                <Label>I understand every ecosystem pairing for exported accessories will be removed.</Label>
+            </Field>
+            <Field id="confirmAgain" type="checkbox" defaultValue="false">
+                <Label>I have read the warning above and want to reset the export bridge now.</Label>
+            </Field>
+        </ConfigUI>
+    </MenuItem>
     <MenuItem id="exportFabricBackup">
         <Name>Export fabric backup…</Name>
         <CallbackMethod>menuExportFabricBackup</CallbackMethod>

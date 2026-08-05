@@ -41,6 +41,7 @@ from fakes import (
     DimmerDevice,
     FakeBridgeClient,
     FakeIndigoDevices,
+    InlineExecutor,
     RecordingRuntime,
     RelayDevice,
     SprinklerDevice,
@@ -72,12 +73,19 @@ class Harness:
             self.store.upsert(entry)
         self.runtime = RecordingRuntime()
         self.clients: list[FakeBridgeClient] = []
+        self.executor = InlineExecutor()
+        self.saves = 0
         self.bridge = module.ExportBridge(
             self.store, self.runtime, mock_logger, lambda: self.prefs,
             plugin_version="2026.7.28", plugin_id=OURS,
             device_getter=self._device,
             client_factory=self._client,
+            save_prefs=self._save_prefs,
+            executor_factory=lambda: self.executor,
         )
+
+    def _save_prefs(self) -> None:
+        self.saves += 1
 
     def _device(self, device_id):
         try:
@@ -95,8 +103,20 @@ class Harness:
         assert self.clients, "no bridge client was created"
         return self.clients[-1]
 
-    def start(self) -> FakeBridgeClient:
+    def start(self, seed: bool = True) -> FakeBridgeClient:
+        """Start the client and, by default, simulate its attach.
+
+        The real client's handshake calls the endpoint provider before anything
+        else, and building a spec is what seeds the per-device "last pushed"
+        snapshot every later diff is measured against (E5). A harness that
+        started the client without that would leave every ``device_updated``
+        test diffing against nothing — a state the running plugin cannot be in,
+        because a push is gated on being attached and an attach always ran the
+        provider first.
+        """
         self.bridge.start()
+        if seed:
+            self.bridge.endpoint_specs()
         return self.client
 
 
@@ -342,7 +362,7 @@ class TestLifecycle:
         h.store.remove(101)
         h.bridge.exports_changed()
         assert h.bridge.active is False
-        assert "may linger" in warnings_of(mock_logger)
+        assert "will linger" in warnings_of(mock_logger)
         # F4: the socket must still be released — the client is unreachable from
         # here on, so a skipped close() leaks it until the plugin reloads.
         assert client.closed is True
@@ -384,9 +404,14 @@ class TestDeviceUpdated:
         assert h.client.only("set_state") == ("set_state", 102, {"level": 90})
 
     def test_an_unchanged_device_sends_nothing(self, bridge_mod, mock_logger, devices):
+        """"Unchanged" means "equal to what we last PUSHED", since E5.
+
+        ``devices[101]`` is ``onState=False``, so that is what the attach put on
+        the wire and what this diff is measured against.
+        """
         h = self._harness(bridge_mod, mock_logger, devices, ExportEntry(101, "onOffLight"))
-        same = RelayDevice(101, "Study Plug", onState=True)
-        h.bridge.device_updated(same, RelayDevice(101, "Study Plug", onState=True))
+        same = RelayDevice(101, "Study Plug", onState=False)
+        h.bridge.device_updated(same, RelayDevice(101, "Study Plug", onState=False))
         assert h.client.names() == []
 
     def test_a_rename_re_sends_the_spec_so_the_label_follows(self, bridge_mod, mock_logger,
@@ -761,6 +786,62 @@ class TestSilentFailures:
         assert expected in warnings_of(mock_logger)
         assert "101" in warnings_of(mock_logger)
 
+    def test_a_key_a_device_STOPS_reporting_is_said_once(
+            self, bridge_mod, mock_logger, devices):
+        """The protocol has no way to push an absence, so the ecosystem keeps
+        the last value: a flat sensor reads as its final temperature forever."""
+        bridge = bridge_mod.ExportBridge.__new__(bridge_mod.ExportBridge)
+        bridge._logger = mock_logger
+        bridge._stopped_keys = {}
+        dev = RelayDevice(1, "Sensor")
+        for _ in range(3):
+            bridge._report_stopped_keys(dev, "temperatureSensor", frozenset({"temperature"}))
+        assert mock_logger.warning.call_count == 1
+        assert "stopped reporting" in warnings_of(mock_logger)
+
+    def test_a_SECOND_lost_key_is_news_even_after_the_first(
+            self, bridge_mod, mock_logger, devices):
+        """⊗ The latch is on the key SET, not on "there is a gap".
+
+        Keyed on the device alone, a sensor that loses its temperature and then
+        ALSO loses its humidity says nothing the second time — and the second
+        loss is a different fault with a different cause. Nothing exercised the
+        second loss, so the weaker latch survived.
+        """
+        bridge = bridge_mod.ExportBridge.__new__(bridge_mod.ExportBridge)
+        bridge._logger = mock_logger
+        bridge._stopped_keys = {}
+        dev = RelayDevice(1, "Sensor")
+        bridge._report_stopped_keys(dev, "temperatureSensor", frozenset({"temperature"}))
+        bridge._report_stopped_keys(dev, "temperatureSensor", frozenset({"temperature"}))
+        assert mock_logger.warning.call_count == 1
+        bridge._report_stopped_keys(dev, "temperatureSensor",
+                                   frozenset({"temperature", "humidity"}))
+        assert mock_logger.warning.call_count == 2, "a NEW lost key is news again"
+
+    def test_the_skip_latch_RE_ARMS_once_the_device_is_bridgeable_again(
+            self, bridge_mod, mock_logger, devices):
+        """⊗ Clearing the latch on a successful spec is what makes it a latch.
+
+        Without it the reason is remembered for the life of the plugin, so a
+        device that breaks, is fixed, and breaks again the same way is skipped
+        in total silence the second time — and the user has no idea their
+        export stopped working again.
+        """
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(101, "onOffLight")])
+        h.start()
+        devices.drop(101)
+        h.bridge.endpoint_specs()
+        assert "no longer exists" in warnings_of(mock_logger)
+        first = mock_logger.warning.call_count
+
+        devices.add(RelayDevice(101, "Study Plug"))
+        h.bridge.endpoint_specs()               # healthy again — latch must clear
+        devices.drop(101)
+        h.bridge.endpoint_specs()               # the SAME fault must be news again
+
+        assert mock_logger.warning.call_count > first
+
     def test_the_halted_drop_warning_is_once_per_streak(self, bridge_mod, mock_logger, devices):
         h = self._bridge(bridge_mod, mock_logger, devices)
         h.client.attached = False
@@ -861,15 +942,15 @@ class TestSilentFailures:
         """F6/F7: a bare traceback per state change tells you nothing and never stops."""
         h = self._bridge(bridge_mod, mock_logger, devices)
         handler = bridge_mod.export_handlers.handler_for("onOffLight")
-        original = handler.diff_with_gaps
-        handler.diff_with_gaps = lambda _o, _n, _opt=None: (
+        original = handler.diff_from
+        handler.diff_from = lambda _p, _n, _opt=None: (
             _ for _ in ()).throw(RuntimeError("bad device"))
         try:
             for _ in range(10):
                 h.bridge.device_updated(RelayDevice(101, "Study Plug", onState=False),
                                         RelayDevice(101, "Study Plug", onState=True))
         finally:
-            handler.diff_with_gaps = original
+            handler.diff_from = original
         assert mock_logger.exception.call_count == 1
         assert "Study Plug" in errors_of(mock_logger)
         assert "101" in errors_of(mock_logger)
@@ -982,3 +1063,861 @@ class TestSilentFailures:
             indigo_device_id=705, command="goToPosition", args={"position": 40}))
         h.bridge.on_command(stop)
         assert mock_logger.warning.call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# E5 — the un-export that did not land (XAC7)
+# ---------------------------------------------------------------------------
+class TestPendingUnExport:
+    """The orphaned-accessories-forever gap, closed.
+
+    Emptying the allow-list is the ONE moment the plugin ever tells the node to
+    remove everything (§3.1 ``intent: replace_all``). If that attach does not
+    land — the node is down, launchd has not restarted it, the plugin is
+    reloading — nothing ever says it again: the allow-list is empty, so XG5 says
+    no client, so there is no connection, so there is no attach. Every exported
+    accessory stays in every paired ecosystem for good, controlling nothing.
+    """
+
+    def _emptied_with_a_dead_node(self, bridge_mod, mock_logger, devices, count=1):
+        entries = [ExportEntry(200 + n, "onOffLight") for n in range(count)]
+        h = Harness(bridge_mod, mock_logger, devices, entries)
+        client = h.start()
+        client.fail["attach"] = ConnectionError("node is gone")
+        for entry in entries:
+            h.store.remove(entry.indigo_device_id)
+        h.bridge.exports_changed()
+        return h
+
+    def test_a_failed_un_export_is_recorded_in_prefs(self, bridge_mod, mock_logger, devices):
+        h = self._emptied_with_a_dead_node(bridge_mod, mock_logger, devices, count=3)
+        assert h.prefs[bridge_mod.PREF_PENDING_REPLACE_ALL] == 3
+        assert h.saves >= 1, "the debt has to reach disk to survive the reload it covers"
+
+    def test_a_successful_un_export_leaves_no_debt(self, bridge_mod, mock_logger, devices):
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(101, "onOffLight")])
+        h.start()
+        h.store.remove(101)
+        h.bridge.exports_changed()
+        assert bridge_mod.PREF_PENDING_REPLACE_ALL not in h.prefs
+
+    def test_the_debt_reconnects_even_though_nothing_is_exported(
+            self, bridge_mod, mock_logger, devices):
+        """XG5 says no client while nothing is exported. This is the exception."""
+        h = self._emptied_with_a_dead_node(bridge_mod, mock_logger, devices)
+        assert h.bridge.active is False
+
+        h.bridge.exports_changed()          # e.g. the next startup, or a dialog close
+
+        assert h.bridge.active is True, "an outstanding un-export must reconnect on its own"
+        assert h.bridge._pending_replace_all() == 1
+
+    def test_the_reconnected_attach_carries_the_replace_all_intent(
+            self, bridge_mod, mock_logger, devices):
+        """Without the intent the node answers `mass_removal_refused`, forever."""
+        h = self._emptied_with_a_dead_node(bridge_mod, mock_logger, devices)
+        h.bridge.exports_changed()
+        provider = h.client.kwargs["replace_all_provider"]
+        assert provider() == 1
+
+    def test_the_provider_answers_a_COUNT_because_the_deadline_is_built_from_it(
+            self, bridge_mod, mock_logger, devices):
+        """⊗ A bool here is an outage, not a style point.
+
+        `BridgeClient` declares `Callable[[], int]` and feeds the answer to
+        `attach_timeout_for`, because the discharge attach sends nothing while
+        removing everything — so `len(specs)` is exactly the wrong number. A
+        wrapper returning `bool` sailed through the client's `int()` as 1, so
+        every discharge got the 8s floor: an 80-accessory un-export timed out
+        mid-reconcile, was torn down and retried, forever.
+        """
+        h = self._emptied_with_a_dead_node(bridge_mod, mock_logger, devices, count=80)
+
+        provider = h.client.kwargs["replace_all_provider"]
+        assert provider() == 80, "the DEBT is 80 endpoints, not 'yes'"
+        assert not isinstance(provider(), bool)
+        # And the deadline the un-export actually asked for is sized over it.
+        assert h.client.attach_timeouts[-1] == bridge_client.attach_timeout_for(80)
+        assert h.client.attach_timeouts[-1] > bridge_client.ATTACH_TIMEOUT
+
+    def test_a_later_un_export_never_SHRINKS_an_outstanding_debt(
+            self, bridge_mod, mock_logger, devices):
+        """⊗ The node is still holding the first un-export's accessories.
+
+        Overwriting under-sized the deadline for the removals it actually owes:
+        80 unpaid, then one device exported and removed again wrote 1, and the
+        discharge attach that has to remove 81 records was given the 8s floor.
+        """
+        h = Harness(bridge_mod, mock_logger, devices, [])
+        h.prefs[bridge_mod.PREF_PENDING_REPLACE_ALL] = 80
+        h.store.upsert(ExportEntry(101, "onOffLight"))
+        h.bridge.exports_changed()
+        # The node is still down, so this un-export does not land either — which
+        # is the only state in which the recorded count is still observable.
+        h.client.fail["attach"] = ConnectionError("node is still gone")
+        h.store.remove(101)
+        h.bridge.exports_changed()
+        assert h.bridge._pending_replace_all() == 80
+        # ...and the deadline the discharge will ask for covers all 80, not 1.
+        assert h.client.attach_timeouts[-1] == bridge_client.attach_timeout_for(80)
+
+    def test_an_empty_to_empty_transition_never_ERASES_an_outstanding_debt(
+            self, bridge_mod, mock_logger, devices):
+        """⊗ Recording 0 used to POP the pref, destroying an unpaid debt.
+
+        `exports_changed` reconnects with no exports purely to discharge a
+        debt, which sets `_last_export_count` to 0 — so the very next empty
+        transition arrived at the recorder with `removing == 0` and wiped a
+        debt of 5 that nothing had discharged. If the attach then failed, the
+        only surviving record that five accessories should be gone was gone
+        with it, and no later attach would ever carry the intent again.
+        """
+        h = Harness(bridge_mod, mock_logger, devices, [])
+        h.prefs[bridge_mod.PREF_PENDING_REPLACE_ALL] = 5
+        h.bridge.exports_changed()          # the debt-driven reconnect (count 0)
+        assert h.bridge.active is True
+        h.client.fail["attach"] = RuntimeError("node went away mid-un-export")
+
+        h.bridge.exports_changed()          # empty → empty, with a live client
+
+        assert h.bridge._pending_replace_all() == 5, "an unpaid debt must survive"
+
+    def test_an_unreadable_flag_SAYS_SO_rather_than_reading_as_nothing_owed(
+            self, bridge_mod, mock_logger, devices):
+        """The debt is the only thing that makes an un-export recoverable."""
+        h = Harness(bridge_mod, mock_logger, devices, [])
+        h.prefs[bridge_mod.PREF_PENDING_REPLACE_ALL] = "not a number"
+        assert h.bridge._pending_replace_all() == 0
+        said = " ".join(str(call.args[0]) for call in mock_logger.warning.call_args_list)
+        assert "unreadable" in said
+
+    def test_a_re_populated_allow_list_does_NOT_cancel_the_debt(
+            self, bridge_mod, mock_logger, devices):
+        """⊗ The debt survives a disjoint re-add, or the client halts forever.
+
+        The old rule ANDed the debt with an empty allow-list — "a re-populated
+        list supersedes it" — and the two are not alternatives. Empty the list
+        while the node is down (debt), then export a *different* device: the
+        node still has to remove everything it holds, its §3.1 guard still sees
+        zero survivors, and an attach without the intent is refused with
+        `mass_removal_refused`, which HALTS the client permanently behind a
+        message blaming the allow-list.
+        """
+        h = self._emptied_with_a_dead_node(bridge_mod, mock_logger, devices)
+        h.store.upsert(ExportEntry(101, "onOffLight"))
+        h.bridge.exports_changed()
+        assert h.bridge._pending_replace_all() == 1
+
+    def test_a_successful_attach_discharges_the_debt_and_drops_the_client(
+            self, bridge_mod, mock_logger, devices):
+        h = self._emptied_with_a_dead_node(bridge_mod, mock_logger, devices)
+        h.bridge.exports_changed()
+        client = h.client
+
+        h.bridge._on_attached(bridge_protocol.parse_status(
+            FRAMES["attach_replace_all"]["response"]["result"]), True)
+
+        assert bridge_mod.PREF_PENDING_REPLACE_ALL not in h.prefs
+        assert client.closed is True, "XG5: nothing exported, so nothing needs a socket"
+        assert h.bridge.active is False
+        assert "outstanding un-export completed" in " ".join(
+            str(call.args[0]) for call in mock_logger.info.call_args_list)
+
+    def test_an_attach_that_did_NOT_carry_the_intent_discharges_nothing(
+            self, bridge_mod, mock_logger, devices):
+        """⊗ Discharge on what the attach SENT, never on live state.
+
+        Reading "is a debt recorded now?" here wipes a debt written *while this
+        attach was in flight*: the user empties the allow-list at the moment an
+        ordinary reconnect lands, that attach carried no intent and removed
+        nothing, and one step later the flag is cleared with a log line
+        asserting an un-export that never happened. The accessories stay in
+        every ecosystem and nothing anywhere knows they should not.
+        """
+        h = self._emptied_with_a_dead_node(bridge_mod, mock_logger, devices)
+        h.bridge.exports_changed()
+
+        h.bridge._on_attached(bridge_protocol.parse_status(
+            FRAMES["attach_replace_all"]["response"]["result"]), False)
+
+        assert h.prefs[bridge_mod.PREF_PENDING_REPLACE_ALL] == 1
+        assert "outstanding un-export completed" not in " ".join(
+            str(call.args[0]) for call in mock_logger.info.call_args_list)
+
+    def test_a_debt_discharged_beside_real_exports_keeps_the_client(
+            self, bridge_mod, mock_logger, devices):
+        """XG5 hangs up only when nothing is exported — not merely on discharge."""
+        h = self._emptied_with_a_dead_node(bridge_mod, mock_logger, devices)
+        h.store.upsert(ExportEntry(101, "onOffLight"))
+        h.bridge.exports_changed()
+        client = h.client
+
+        h.bridge._on_attached(bridge_protocol.parse_status(
+            FRAMES["attach_replace_all"]["response"]["result"]), True)
+
+        assert bridge_mod.PREF_PENDING_REPLACE_ALL not in h.prefs
+        assert client.closed is False, "there is something exported; it needs the socket"
+        assert h.bridge.active is True
+
+    def test_an_unreadable_flag_is_treated_as_no_debt(self, bridge_mod, mock_logger, devices):
+        h = Harness(bridge_mod, mock_logger, devices, [])
+        h.prefs[bridge_mod.PREF_PENDING_REPLACE_ALL] = "not a number"
+        assert h.bridge._pending_replace_all() == 0
+        h.bridge.exports_changed()
+        assert h.bridge.active is False
+
+
+class TestStartGating:
+    """The destroy-then-recreate race around the un-export."""
+
+    def test_start_during_an_un_export_is_deferred_not_dropped(
+            self, bridge_mod, mock_logger, devices, monkeypatch):
+        """A user who empties the list and immediately re-adds must end up connected.
+
+        ``_replace_all_then_stop`` clears ``self.client`` the instant it fires,
+        so an unguarded ``start()`` would build a second client on top of the
+        socket the first is still using to say "remove everything" — and then
+        race it to the same node, which supersedes one of them.
+        """
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(101, "onOffLight")])
+        first = h.start()
+        started_during: list = []
+
+        async def _slow_attach(endpoints=None, *, replace_all=False, timeout=None):
+            # Stand in for a node that takes its time over the paced removals.
+            h.store.upsert(ExportEntry(101, "onOffLight"))
+            h.bridge.exports_changed()
+            started_during.append(len(h.clients))
+            return None
+
+        monkeypatch.setattr(first, "attach", _slow_attach)
+        h.store.remove(101)
+        h.bridge.exports_changed()
+
+        assert started_during == [1], "no second client while the un-export is in flight"
+        assert len(h.clients) == 2, "and the deferred start still happened afterwards"
+        assert h.bridge.active is True
+
+    def test_a_deferred_start_is_honoured_even_when_the_un_export_never_RAN(
+            self, bridge_mod, mock_logger, devices):
+        """⊗ The fire-failure path releases the gate AND the deferred start.
+
+        `_un_exporting` gates `start()`, and only the coroutine's `finally`
+        clears it — so if the coroutine was never scheduled at all, a user who
+        empties the allow-list and immediately re-adds a device gets a
+        permanently inert bridge on top of an un-export that also did not
+        happen. Only the flag was pinned, not the start it was holding back.
+        """
+        devices.add(RelayDevice(101, "Lamp", onState=True))
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(101, "onOffLight")])
+        h.start()
+
+        # `save_prefs` is called from INSIDE the un-export window — it is the
+        # plugin's own `savePluginPrefs`, and the debt is written before the
+        # coroutine is fired. Re-adding a device from there is the shortest
+        # honest route to the state the recovery block exists for: a start
+        # request parked behind an un-export that then never ran at all.
+        def _save_and_re_add():
+            if h.bridge._un_exporting and not h.bridge._start_after_un_export:
+                h.runtime.is_running = False    # ...and the loop dies with it
+                h.bridge.start()                # deferred, not performed
+
+        h.bridge._save_prefs = _save_and_re_add
+
+        h.store.remove(101)
+        h.bridge.exports_changed()          # the un-export cannot be fired
+
+        assert h.bridge._un_exporting is False, "the gate must not stick shut"
+        assert h.bridge.active is True, (
+            "the start parked behind the un-export must still happen — the "
+            "coroutine whose `finally` would have done it never ran")
+
+
+# ---------------------------------------------------------------------------
+# E5 — diffing against what was pushed, not against the last Indigo reading
+# ---------------------------------------------------------------------------
+class TestPushedSnapshot:
+    def _colour(self, devices, green):
+        return DimmerDevice(300, "Strip", supportsColor=True, supportsRGB=True,
+                            onState=True, brightness=100,
+                            redLevel=100, greenLevel=green, blueLevel=0)
+
+    def test_a_sub_tolerance_ramp_still_reaches_the_ecosystem(
+            self, bridge_mod, mock_logger, devices):
+        """The bug this whole change exists for: unbounded, silent drift.
+
+        Hue carries a ±1° tolerance (Matter's 0-254 hue round-trips ±1°). One
+        unit of green against full red moves the recovered hue about 0.6°, so
+        every single step of a ramp compares "unchanged" against the *previous
+        Indigo reading* — and the accessory sits at the colour it had when the
+        ramp started while the lamp walks arbitrarily far away from it. No
+        error, no warning, nothing in the log at all.
+
+        Against the last value actually pushed, the same tolerance bounds the
+        TOTAL error at 1°, which is what a tolerance is supposed to mean.
+        """
+        devices.add(self._colour(devices, 0))
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(300, "extendedColorLight")])
+        h.start()
+
+        for green in range(1, 11):
+            h.bridge.device_updated(self._colour(devices, green - 1), self._colour(devices, green))
+
+        hues = [call[2]["hue"] for call in h.client.calls
+                if call[0] == "set_state" and "hue" in call[2]]
+        assert hues, "a 6-degree ramp must reach the ecosystem"
+        assert hues[-1] > 4, f"the last pushed hue must track the lamp, got {hues}"
+
+    def test_a_state_equal_to_the_last_push_sends_nothing(
+            self, bridge_mod, mock_logger, devices):
+        """The other half: this must not become "push on every callback"."""
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(102, "dimmableLight")])
+        h.start()
+        for _ in range(5):
+            h.bridge.device_updated(DimmerDevice(102, "Hall Dimmer", onState=True, brightness=40),
+                                    DimmerDevice(102, "Hall Dimmer", onState=True, brightness=40))
+        assert h.client.names() == []
+
+    def test_a_partial_push_is_merged_not_replaced(self, bridge_mod, mock_logger, devices):
+        """§3.4 state maps are partial and the node leaves absent keys alone.
+
+        A snapshot that replaced rather than merged would forget every key the
+        last push happened not to carry, and re-send it on the next change.
+        """
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(102, "dimmableLight")])
+        h.start()
+        h.bridge.device_updated(DimmerDevice(102, "Hall Dimmer", onState=True, brightness=40),
+                                DimmerDevice(102, "Hall Dimmer", onState=True, brightness=90))
+        h.bridge.device_updated(DimmerDevice(102, "Hall Dimmer", onState=True, brightness=90),
+                                DimmerDevice(102, "Hall Dimmer", onState=True, brightness=90))
+        assert [call for call in h.client.calls if call[0] == "set_state"] == [
+            ("set_state", 102, {"level": 90}),
+        ], "onOff was already pushed by the attach and must not be re-sent"
+
+    def test_the_snapshot_dies_with_the_export(self, bridge_mod, mock_logger, devices):
+        """Bounded memory: entries are removed with the export, never accumulated."""
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(101, "onOffLight")])
+        h.start()
+        assert 101 in h.bridge._pushed
+        h.store.remove(101)
+        h.bridge.remove(101)
+        assert h.bridge._pushed == {}
+
+    def test_a_skipped_device_drops_its_snapshot(self, bridge_mod, mock_logger, devices):
+        """A device we are not sending to has a snapshot that is stale by definition."""
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(101, "onOffLight")])
+        h.start()
+        assert 101 in h.bridge._pushed
+        devices.drop(101)
+        h.bridge.endpoint_specs()
+        assert 101 not in h.bridge._pushed
+
+    def test_a_CORRECTION_folds_into_the_snapshot_it_just_pushed(
+            self, bridge_mod, mock_logger, devices, mock_indigo_base):
+        """⊗ The unbounded-drift bug, coming back in through the correction path.
+
+        `_correct` pushes the device's real state after a dispatch we could not
+        apply, so the snapshot must record it. Otherwise the next diff is
+        measured from a value the ecosystem no longer holds — which is exactly
+        the fault the last-pushed snapshot exists to close.
+        """
+        dev = RelayDevice(123456789, "Golden Plug", onState=False)
+        devices.add(dev)
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(123456789, "onOffLight")])
+        h.start()
+        assert h.bridge._pushed[123456789] == {"onOff": False}
+
+        # The command half-applies: dispatch raises, but the relay really moved.
+        import export_handlers
+        handler = export_handlers.handler_for("onOffLight")
+        real_dispatch = handler.dispatch
+
+        def boom(command, args, device, options):
+            device.onState = True                # the device DID move
+            raise RuntimeError("driver blew up after switching")
+
+        handler.dispatch = boom
+        try:
+            h.bridge.on_command(
+                bridge_protocol.parse_command(FRAMES["command_on_off"]["data"]))
+        finally:
+            handler.dispatch = real_dispatch
+
+        assert h.bridge._pushed[123456789] == {"onOff": True}, (
+            "the snapshot must mirror the corrective push the ecosystem received")
+
+    def test_a_correction_is_gated_on_a_LIVE_client_like_every_other_push(
+            self, bridge_mod, mock_logger, devices, mock_indigo_base):
+        """⊗ `self.client` is not the same question as "can it take a frame".
+
+        A halted or un-attached client accepts nothing (§1.1), so reaching past
+        `_live_client` here posts a corrective push into a node that is serving
+        nothing — and loses the one warning that says the ecosystem is now
+        showing a command that failed.
+        """
+        dev = RelayDevice(123456789, "Golden Plug", onState=False)
+        devices.add(dev)
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(123456789, "onOffLight")])
+        h.start()
+        h.client.attached = False
+        h.client.halted = True
+        h.client.halted_reason = "version_skew"
+        before = len([call for call in h.client.calls if call[0] == "set_state"])
+
+        import export_handlers
+        handler = export_handlers.handler_for("onOffLight")
+        real_dispatch = handler.dispatch
+        handler.dispatch = lambda *a: (_ for _ in ()).throw(RuntimeError("driver died"))
+        try:
+            h.bridge.on_command(
+                bridge_protocol.parse_command(FRAMES["command_on_off"]["data"]))
+        finally:
+            handler.dispatch = real_dispatch
+
+        after = len([call for call in h.client.calls if call[0] == "set_state"])
+        assert after == before, "nothing may be pushed into a halted node"
+        assert "HALTED" in warnings_of(mock_logger)
+
+
+# ---------------------------------------------------------------------------
+# E5 — §5 commands leave the loop
+# ---------------------------------------------------------------------------
+class TestCommandDispatchOffLoop:
+    def test_the_indigo_call_runs_on_the_command_worker(
+            self, bridge_mod, mock_logger, devices, mock_indigo_base):
+        """The loop is SHARED with the inbound matter-server client.
+
+        A blocking ``indigo.device.turnOn`` on it makes every live Matter device
+        update wait behind somebody pressing a button in the Home app.
+        """
+        devices.add(RelayDevice(123456789, "Golden Plug", onState=False))
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(123456789, "onOffLight")])
+        h.start()
+
+        h.bridge.on_command(bridge_protocol.parse_command(FRAMES["command_on_off"]["data"]))
+
+        assert h.executor.submitted == 1
+        mock_indigo_base.device.turnOn.assert_called_once()
+
+    def test_a_command_for_an_unexported_device_costs_no_thread_hop(
+            self, bridge_mod, mock_logger, devices):
+        """The store and role lookups stay on the loop: they are dict reads."""
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(101, "onOffLight")])
+        h.start()
+        h.bridge.on_command(bridge_protocol.parse_command(FRAMES["command_on_off"]["data"]))
+        assert h.executor.submitted == 0
+        assert "not exported" in warnings_of(mock_logger)
+
+    def test_the_worker_is_shut_down_with_the_client(
+            self, bridge_mod, mock_logger, devices, mock_indigo_base):
+        devices.add(RelayDevice(123456789, "Golden Plug", onState=False))
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(123456789, "onOffLight")])
+        h.start()
+        h.bridge.on_command(bridge_protocol.parse_command(FRAMES["command_on_off"]["data"]))
+        h.bridge.stop()
+        # `wait=False`: a dispatch blocked on a wedged IndigoServer must not hold
+        # plugin shutdown open. `cancel_futures=True`: work that has not STARTED
+        # must not run against a plugin that is already tearing down.
+        assert h.executor.shutdown_calls == [(False, True)]
+
+    def test_a_queued_coroutine_cannot_rebuild_the_worker_after_stop(
+            self, bridge_mod, mock_logger, devices, mock_indigo_base):
+        """A stopped bridge must not leave a live worker thread behind it.
+
+        ``_command_worker`` builds on first use, and a §5 command already queued
+        on the loop when ``stop()`` ran would otherwise construct a brand-new
+        ThreadPoolExecutor underneath a bridge that has shut down — one nothing
+        ever joins.
+        """
+        devices.add(RelayDevice(123456789, "Golden Plug", onState=False))
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(123456789, "onOffLight")])
+        h.start()
+        h.bridge.stop()
+
+        h.bridge.on_command(bridge_protocol.parse_command(FRAMES["command_on_off"]["data"]))
+
+        assert h.executor.submitted == 0
+        assert h.bridge._executor is None
+
+
+# ---------------------------------------------------------------------------
+# E5 hardening (PR #126 dual-review batch)
+# ---------------------------------------------------------------------------
+class TestCommandWorkerHealth:
+    """One wedged `indigo.*` call must not be a silent house-wide outage.
+
+    The worker is deliberately single-threaded (per-device FIFO), and the price
+    is that whatever is at the front blocks every command for every device. Left
+    unbounded and unwatched that is an outage with NO log output at all: the
+    frames keep arriving, the queue keeps growing, and from Indigo's side
+    nothing happened.
+    """
+
+    def _harness(self, bridge_mod, mock_logger, devices, hang=False):
+        devices.add(RelayDevice(123456789, "Golden Plug", onState=False))
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(123456789, "onOffLight")])
+        h.start()
+        # Set AFTER start(): the attach's own provider run must not hang.
+        h.executor.hang = hang
+        return h
+
+    def test_the_worker_is_single_threaded_on_purpose(self, bridge_mod):
+        """FIFO is a CORRECTNESS property, not a resource budget.
+
+        Two commands for the same accessory running concurrently lets a
+        `setLevel 20` overtake a `setLevel 80` — both "succeed" and the lamp is
+        left at the wrong brightness with nothing to correct it. A pool would
+        pass every other test in this file.
+        """
+        executor = bridge_mod._command_executor()
+        try:
+            assert executor._max_workers == 1
+        finally:
+            executor.shutdown(wait=False)
+
+    def test_dispatch_order_is_preserved_by_a_real_executor(self, bridge_mod):
+        """The property the single worker exists for, against a real pool."""
+        executor = bridge_mod._command_executor()
+        order: list = []
+        try:
+            futures = [executor.submit(order.append, n) for n in range(25)]
+            for future in futures:
+                future.result(timeout=5)
+        finally:
+            executor.shutdown(wait=True)
+        assert order == list(range(25))
+
+    def test_a_wedged_dispatch_is_named_with_its_command_and_device(
+            self, bridge_mod, mock_logger, devices, mock_indigo_base, monkeypatch):
+        monkeypatch.setattr(bridge_mod, "COMMAND_TIMEOUT", 0.01)
+        h = self._harness(bridge_mod, mock_logger, devices, hang=True)
+        h.bridge.on_command(bridge_protocol.parse_command(FRAMES["command_on_off"]["data"]))
+
+        errors = " ".join(str(call.args[0]) % call.args[1:] if len(call.args) > 1
+                          else str(call.args[0]) for call in mock_logger.error.call_args_list)
+        assert "onOff" in errors and "123456789" in errors
+        assert "has not returned" in errors
+
+    def _push(self, h, times=1):
+        for _ in range(times):
+            h.bridge.on_command(
+                bridge_protocol.parse_command(FRAMES["command_on_off"]["data"]))
+
+    def test_a_REAL_wedged_dispatch_raises_the_queue_depth(
+            self, bridge_mod, mock_logger, devices, mock_indigo_base, monkeypatch):
+        """⊗ The counters, driven through the actual dispatch path.
+
+        Every other test here sets `_submitted`/`_completed` by hand, so nothing
+        drove them through `_dispatch_off_loop` — and deleting `self._submitted
+        += 1` left the "commands are stuck" warning permanently unreachable in
+        production while the suite stayed green. That warning is the ONLY
+        symptom of a wedged `indigo.*` call: every command still arrives,
+        nothing raises, and the house simply stops answering the Home app.
+        """
+        monkeypatch.setattr(bridge_mod, "COMMAND_TIMEOUT", 0.01)
+        monkeypatch.setattr(bridge_mod, "COMMAND_QUEUE_WARN", 2)
+        h = self._harness(bridge_mod, mock_logger, devices, hang=True)
+
+        self._push(h, 3)
+        h.bridge.health_tick()
+
+        assert "queued on the command worker" in warnings_of(mock_logger)
+
+    def test_commands_that_COMPLETED_do_not_read_as_a_stuck_queue(
+            self, bridge_mod, mock_logger, devices, mock_indigo_base, monkeypatch):
+        """⊗ The other half of the same accounting.
+
+        `_completed` was also only ever set by hand, so deleting its increment
+        left a permanent false "commands are stuck" alarm on a bridge that was
+        working perfectly — and nothing noticed.
+        """
+        monkeypatch.setattr(bridge_mod, "COMMAND_QUEUE_WARN", 2)
+        h = self._harness(bridge_mod, mock_logger, devices)
+
+        self._push(h, 4)
+        h.bridge.health_tick()
+
+        assert "queued on the command worker" not in warnings_of(mock_logger)
+
+    def test_the_queue_depth_warning_fires_once_per_streak(
+            self, bridge_mod, mock_logger, devices, mock_indigo_base):
+        h = self._harness(bridge_mod, mock_logger, devices)
+        # Stand in for work handed to a worker that is not coming back.
+        h.bridge._submitted = bridge_mod.COMMAND_QUEUE_WARN
+
+        h.bridge.health_tick()
+        h.bridge.health_tick()
+
+        queued = [call for call in mock_logger.warning.call_args_list
+                  if "queued on the command worker" in str(call.args[0])]
+        assert len(queued) == 1, "a standing queue must not repeat every 15s"
+
+        # ...and it re-arms once the queue drains, so a NEW pile-up is news.
+        h.bridge._completed = h.bridge._submitted
+        h.bridge.health_tick()
+        h.bridge._submitted += bridge_mod.COMMAND_QUEUE_WARN
+        h.bridge.health_tick()
+        queued = [call for call in mock_logger.warning.call_args_list
+                  if "queued on the command worker" in str(call.args[0])]
+        assert len(queued) == 2
+
+    def test_stop_reports_how_many_commands_were_dropped(
+            self, bridge_mod, mock_logger, devices, mock_indigo_base):
+        h = self._harness(bridge_mod, mock_logger, devices)
+        h.bridge._submitted = 4
+        h.bridge._completed = 1
+        h.bridge._executor = h.executor
+
+        h.bridge.stop()
+
+        assert "3 ecosystem command(s) still queued" in warnings_of(mock_logger)
+
+
+class TestNodeWarnings:
+    """§4.3 `warnings` — the node's only route to a log a human reads.
+
+    The node writes to stdout and, in this milestone, is started BY HAND, so its
+    stdout is a terminal that closed hours ago. A map it could not write is the
+    exact fault E5 exists to make visible.
+    """
+
+    def _status(self, warnings):
+        return bridge_protocol.parse_status({
+            "commissioned": True, "fabrics": [], "endpointCount": 0,
+            "endpoints": [], "drift": [], "driftChecked": True, "warnings": warnings,
+        })
+
+    def test_a_reported_warning_reaches_the_indigo_log(
+            self, bridge_mod, mock_logger, devices):
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(101, "onOffLight")])
+        h.bridge._on_attached(self._status(["Could not write the endpoint map"]), False)
+        assert "Could not write the endpoint map" in warnings_of(mock_logger)
+
+    def test_a_standing_warning_is_said_once_per_streak(
+            self, bridge_mod, mock_logger, devices):
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(101, "onOffLight")])
+        status = self._status(["disk full"])
+        h.bridge._on_attached(status, False)
+        h.bridge._on_attached(status, False)
+        said = [call for call in mock_logger.warning.call_args_list
+                if "disk full" in str(call.args)]
+        assert len(said) == 1
+
+    def test_a_new_warning_beside_a_standing_one_is_still_news(
+            self, bridge_mod, mock_logger, devices):
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(101, "onOffLight")])
+        h.bridge._on_attached(self._status(["disk full"]), False)
+        h.bridge._on_attached(self._status(["disk full", "identity unwritable"]), False)
+        assert "identity unwritable" in warnings_of(mock_logger)
+
+    def test_an_empty_warnings_list_says_nothing_and_re_arms(
+            self, bridge_mod, mock_logger, devices):
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(101, "onOffLight")])
+        h.bridge._on_attached(self._status(["disk full"]), False)
+        h.bridge._on_attached(self._status([]), False)
+        h.bridge._on_attached(self._status(["disk full"]), False)
+        said = [call for call in mock_logger.warning.call_args_list
+                if "disk full" in str(call.args)]
+        assert len(said) == 2, "a fault that recurs after clearing is news again"
+
+
+class TestNodeWarningsAreActuallyPolled:
+    """⊗ The §4.3 warnings channel had NO reader at all.
+
+    Four docstrings and BRIDGE_PROTOCOL §4.3 all said `get_status` is polled,
+    and nothing polled it: `_report_node_warnings` ran on the attach response
+    and nowhere else, while `BridgeClient.get_status` had zero production
+    callers. Three of the four faults the channel was built for cannot happen at
+    attach time, so they reached the user as nothing at all —
+
+    * the identity witness write on FIRST commissioning, which happens when a
+      fabric appears, long after the attach;
+    * the witness clear on `factory_reset`, whose failure makes the very next
+      start refuse to serve and blame lost storage for the reset the user asked
+      for;
+    * the endpoint-map write from `upsert`/`remove`'s drift check, which is a
+      full disk quietly costing the ability to notice a mass renumbering.
+    """
+
+    def _status(self, warnings):
+        return bridge_protocol.parse_status({
+            "commissioned": True, "fabrics": [], "endpointCount": 1,
+            "endpoints": [], "drift": [], "driftChecked": True, "warnings": warnings,
+        })
+
+    def _attached(self, bridge_mod, mock_logger, devices):
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(101, "onOffLight")])
+        h.start()
+        h.client.attached = True
+        return h
+
+    def test_the_watchdog_asks_the_node_how_it_is(self, bridge_mod, mock_logger, devices):
+        h = self._attached(bridge_mod, mock_logger, devices)
+        h.bridge.health_tick()
+        assert "get_status" in h.client.names()
+
+    def test_a_fault_that_appears_AFTER_the_attach_still_reaches_the_log(
+            self, bridge_mod, mock_logger, devices):
+        """The whole point: these faults happen while the socket is up."""
+        h = self._attached(bridge_mod, mock_logger, devices)
+        h.bridge._on_attached(self._status([]), False)      # clean at attach time
+        h.client.status = self._status(
+            ["Could not record the commissioning marker in identity.json"])
+
+        h.bridge.health_tick()
+
+        assert "commissioning marker" in warnings_of(mock_logger)
+
+    def test_a_standing_fault_is_not_repeated_every_15_seconds(
+            self, bridge_mod, mock_logger, devices):
+        h = self._attached(bridge_mod, mock_logger, devices)
+        h.client.status = self._status(["disk full"])
+        for _ in range(5):
+            h.bridge.health_tick()
+        said = [call for call in mock_logger.warning.call_args_list
+                if "disk full" in str(call.args)]
+        assert len(said) == 1, "a full disk does not un-fill; say it once per streak"
+
+    def test_a_poll_that_fails_is_not_itself_news(self, bridge_mod, mock_logger, devices):
+        """The socket being gone is what `_disconnect_ticks` is for."""
+        h = self._attached(bridge_mod, mock_logger, devices)
+        h.client.fail["get_status"] = ConnectionError("node went away")
+        h.bridge.health_tick()      # must not raise
+        assert "status poll failed" not in warnings_of(mock_logger)
+
+    def test_a_halted_or_recovering_node_is_not_polled(
+            self, bridge_mod, mock_logger, devices):
+        """Both have already said the one thing that matters, at error level."""
+        h = self._attached(bridge_mod, mock_logger, devices)
+        h.client.recovery = True
+        h.client.attached = False
+        h.bridge.health_tick()
+        assert "get_status" not in h.client.names()
+
+
+class TestRefusalRemedies:
+    """⊗ One §1.1 error code, two OPPOSITE remedies.
+
+    `endpoint_map_invalid` covers every refuse-to-start reason — §1.1 defines
+    the state, not the cause — so the reason text is the only thing on the wire
+    that says which fix applies. An unreadable MAP is fixed by §3.11's rebuild.
+    An unreadable IDENTITY is not, and cannot be: the node refuses that rebuild
+    outright, because clearing the refusal would leave the bridge serving under
+    a `SerialNumber` no paired ecosystem has ever seen. Both used to get the map
+    wording, which sent that user at the one door deliberately locked against
+    them — and promised duplicated accessories on the way through it.
+    """
+
+    def test_an_unreadable_MAP_is_told_about_the_rebuild(
+            self, bridge_mod, mock_logger, devices):
+        h = Harness(bridge_mod, mock_logger, devices, [])
+        h.bridge._on_attach_refused(bridge_protocol.ERR_ENDPOINT_MAP_INVALID,
+                                    "endpoint map is unreadable; only get_status...")
+        said = " ".join(str(call.args[0]) % call.args[1:] if len(call.args) > 1
+                        else str(call.args[0]) for call in mock_logger.error.call_args_list)
+        assert "endpoint-number map is unreadable" in said
+        assert "rebuilt" in said
+
+    def test_an_unreadable_IDENTITY_is_told_the_rebuild_will_NOT_help(
+            self, bridge_mod, mock_logger, devices):
+        h = Harness(bridge_mod, mock_logger, devices, [])
+        h.bridge._on_attach_refused(
+            bridge_protocol.ERR_ENDPOINT_MAP_INVALID,
+            f"{bridge_protocol.REFUSE_IDENTITY_UNREADABLE}; only get_status...")
+        said = " ".join(str(call.args[0]) % call.args[1:] if len(call.args) > 1
+                        else str(call.args[0]) for call in mock_logger.error.call_args_list)
+        assert "identity file is unreadable" in said
+        assert "will NOT fix this" in said
+        assert "identity.json.unreadable-" in said
+        assert "duplicate accessories" not in said
+
+
+class TestDriftLatch:
+    """`_on_drift_detected` had no latch, and drift is never repaired.
+
+    After a `factory_reset preserveEndpointNumbers: true` that is EVERY exported
+    device on every reconcile, with no way for the user to clear it short of
+    §3.11 — so the one error that names the problem is buried under its own
+    repetitions.
+    """
+
+    def _drift(self, *pairs):
+        return bridge_protocol.parse_drift(
+            [{"uniqueId": u, "expected": e, "actual": a} for u, e, a in pairs])
+
+    def test_the_same_drift_set_is_reported_once(self, bridge_mod, mock_logger, devices):
+        h = Harness(bridge_mod, mock_logger, devices, [])
+        drift = self._drift(("indigo-1", 2, 5))
+        h.bridge._on_drift_detected(drift)
+        h.bridge._on_drift_detected(self._drift(("indigo-1", 2, 5)))
+        assert mock_logger.error.call_count == 1
+
+    def test_a_device_joining_the_drift_is_reported(self, bridge_mod, mock_logger, devices):
+        h = Harness(bridge_mod, mock_logger, devices, [])
+        h.bridge._on_drift_detected(self._drift(("indigo-1", 2, 5)))
+        h.bridge._on_drift_detected(self._drift(("indigo-1", 2, 5), ("indigo-2", 3, 6)))
+        assert mock_logger.error.call_count == 2
+
+
+class TestUnExportSnapshotAndGating:
+    def test_the_pushed_snapshots_are_dropped_by_an_un_export(
+            self, bridge_mod, mock_logger, devices):
+        """Nothing is exported, so nothing has a last-pushed state.
+
+        Left behind, the snapshots are a baseline for devices the node no longer
+        holds — and the next diff against one would suppress a key the ecosystem
+        has never actually been told.
+        """
+        devices.add(RelayDevice(101, "Lamp", onState=True))
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(101, "onOffLight")])
+        h.start()
+        assert h.bridge._pushed
+
+        h.store.remove(101)
+        h.bridge.exports_changed()
+
+        assert h.bridge._pushed == {}
+
+    def test_a_failed_submit_does_not_gate_start_forever(
+            self, bridge_mod, mock_logger, devices):
+        """`_un_exporting` gates `start()`, and its coroutine's `finally` is the
+        only thing that clears it. If the coroutine was never scheduled, that
+        gate stays shut for the life of the plugin and a user who re-adds a
+        device gets a permanently inert bridge."""
+        devices.add(RelayDevice(101, "Lamp", onState=True))
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(101, "onOffLight")])
+        h.start()
+        h.runtime.is_running = False
+
+        h.store.remove(101)
+        h.bridge.exports_changed()
+
+        assert h.bridge._un_exporting is False
+        h.runtime.is_running = True
+        h.store.upsert(ExportEntry(101, "onOffLight"))
+        h.bridge.exports_changed()
+        assert h.bridge.active is True
+
+
+class TestIndigoDeviceLookup:
+    def test_a_missing_device_is_quiet(self, bridge_mod, mock_logger, mock_indigo_base):
+        mock_indigo_base.devices = {}
+        assert bridge_mod._indigo_device(999, mock_logger) is None
+        assert "could not read Indigo device" not in warnings_of(mock_logger)
+
+    def test_indigo_failing_to_answer_is_NOT_reported_as_a_deleted_device(
+            self, bridge_mod, mock_logger, mock_indigo_base):
+        """The bare `except Exception` gave both the same silent None.
+
+        "Device %s no longer exists" sends the user to delete an export that was
+        never the problem; a broken IPC connection needs the opposite response.
+        """
+        class _Broken:
+            def __getitem__(self, _key):
+                raise ConnectionError("IndigoServer went away")
+
+        mock_indigo_base.devices = _Broken()
+        assert bridge_mod._indigo_device(101, mock_logger) is None
+        said = warnings_of(mock_logger)
+        assert "could not read Indigo device" in said
+        assert "NOT the device having been deleted" in said

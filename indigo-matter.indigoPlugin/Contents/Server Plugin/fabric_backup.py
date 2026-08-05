@@ -27,6 +27,15 @@ from typing import Any, Optional
 
 BACKUP_PREFIX = "fabric-"
 BACKUP_SUFFIX = ".zip"
+#: Archive sub-path for the **bridge node's** storage dir (PRD-indigo-matter-export
+#: §4.3). Losing that directory loses two different irreplaceable things: the
+#: operational credentials for every ecosystem the bridge is paired into, and the
+#: ``endpoint-map.json`` whose loss duplicates every exported accessory in every
+#: one of them. It is a sibling of the controller's storage dir, not a child, so
+#: the archive needs a reserved prefix to keep the two apart — and the prefix is
+#: what makes an old (controller-only) archive still restorable: it has no
+#: members under here, so the restore simply finds none.
+BRIDGE_MEMBER_PREFIX = "bridge-node/"
 # UTC stamp embedded in archive + move-aside names, e.g. 20260610T124145Z.
 STAMP_FORMAT = "%Y%m%dT%H%M%SZ"
 DEFAULT_KEEP = 10
@@ -61,7 +70,21 @@ def _is_nonempty_dir(path: str) -> bool:
     return os.path.isdir(path) and any(os.scandir(path))
 
 
-def create_backup(storage_path: str, *, now: datetime, logger: Optional[Any] = None) -> str:
+def _add_tree(zf: zipfile.ZipFile, root: str, prefix: str = "") -> int:
+    """Add every file under ``root`` to ``zf`` under ``prefix``; return the count."""
+    root = os.path.normpath(root)
+    written = 0
+    for dirpath, _dirnames, filenames in os.walk(root):
+        for name in filenames:
+            abs_path = os.path.join(dirpath, name)
+            arcname = prefix + os.path.relpath(abs_path, root)
+            zf.write(abs_path, arcname)
+            written += 1
+    return written
+
+
+def create_backup(storage_path: str, *, now: datetime, logger: Optional[Any] = None,
+                  bridge_storage_path: Optional[str] = None) -> str:
     """Zip the storage dir into ``backups/fabric-<stamp>.zip``; return its path.
 
     Paths inside the archive are stored relative to the storage-dir root so a
@@ -77,6 +100,21 @@ def create_backup(storage_path: str, *, now: datetime, logger: Optional[Any] = N
     to a ``.tmp`` name means a partial/failed archive is never offered by
     ``list_backups``/the picker (which only match ``fabric-*.zip``), and the
     ``.tmp`` is deleted on any failure before the error is re-raised.
+
+    ``bridge_storage_path`` adds the **export** side's storage dir under
+    :data:`BRIDGE_MEMBER_PREFIX` (PRD-indigo-matter-export §4.3: "Back it up
+    alongside the controller's storage"). It is optional and a missing directory
+    is skipped rather than raising — a user who exports nothing has no bridge
+    storage, and that must not stop the controller's fabric being protected.
+
+    **On snapshotting the bridge dir while its node is running.** The two files
+    that carry identity — ``identity.json`` and ``endpoint-map.json`` — are
+    written by the node through a temp-file-plus-``rename``, so a reader either
+    sees the whole previous version or the whole new one and never a torn file.
+    matter.js's own storage under that dir carries the same live-snapshot caveat
+    the controller's already does and gets it for the same reason: stopping the
+    node to take a backup would drop every ecosystem's subscriptions, which is a
+    worse and much more frequent harm than the narrow window it would close.
     """
     log = _resolve_logger(logger)
     if not os.path.isdir(storage_path):
@@ -91,14 +129,28 @@ def create_backup(storage_path: str, *, now: datetime, logger: Optional[Any] = N
 
     root = os.path.normpath(storage_path)
     members_written = 0
+    bridge_members = 0
     try:
         with zipfile.ZipFile(tmp_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-            for dirpath, _dirnames, filenames in os.walk(root):
-                for name in filenames:
-                    abs_path = os.path.join(dirpath, name)
-                    arcname = os.path.relpath(abs_path, root)
-                    zf.write(abs_path, arcname)
-                    members_written += 1
+            members_written = _add_tree(zf, root)
+            if bridge_storage_path:
+                if _is_nonempty_dir(bridge_storage_path):
+                    bridge_members = _add_tree(zf, bridge_storage_path, BRIDGE_MEMBER_PREFIX)
+                    members_written += bridge_members
+                else:
+                    # The promise the docstring makes ("a missing directory is
+                    # skipped") only holds up if the skip is AUDIBLE. The path
+                    # is derived, not configured, so the way this goes wrong in
+                    # the field is that it points somewhere the node is not —
+                    # and the user gets a plausible success line for an archive
+                    # with no identity.json and no endpoint-map.json in it,
+                    # which is exactly the archive they will reach for after
+                    # losing those two files.
+                    log.warning(
+                        "Fabric backup: no Matter export bridge storage at %s, so this backup "
+                        "does NOT contain identity.json or endpoint-map.json. That is expected "
+                        "if you export nothing; if you do export devices, check where the "
+                        "bridge node's --storage-path actually points.", bridge_storage_path)
 
         # Validate the snapshot before it can ever be offered for restore. A
         # truncated/corrupt archive that looks like a valid filename is worse
@@ -121,7 +173,15 @@ def create_backup(storage_path: str, *, now: datetime, logger: Optional[Any] = N
             pass
         raise
 
-    log.info("Fabric backup written: %s (%d member(s))", archive_path, members_written)
+    if bridge_members:
+        # The path is named on success too: it is derived from the controller's
+        # rather than configured, so "which directory did this actually cover?"
+        # is a question the log should answer without anybody having to guess.
+        log.info("Fabric backup written: %s (%d member(s), including %d from the Matter "
+                 "export bridge node at %s)", archive_path, members_written, bridge_members,
+                 bridge_storage_path)
+    else:
+        log.info("Fabric backup written: %s (%d member(s))", archive_path, members_written)
     prune_backups(storage_path, keep=DEFAULT_KEEP, logger=log)
     return archive_path
 
@@ -172,19 +232,33 @@ def prune_backups(storage_path: str, keep: int = DEFAULT_KEEP, *, logger: Option
     return removed
 
 
+def bridge_members_in(archive_path: str) -> list[str]:
+    """Members of ``archive_path`` that belong to the bridge node's storage dir."""
+    with zipfile.ZipFile(archive_path, "r") as zf:
+        return [name for name in zf.namelist() if name.startswith(BRIDGE_MEMBER_PREFIX)]
+
+
 def _safe_extract(archive_path: str, dest: str) -> None:
-    """Extract ``archive_path`` into ``dest`` with a zip-slip guard.
+    """Extract the **controller** members of ``archive_path`` into ``dest``.
 
     Any member whose resolved path escapes ``dest`` (via ``..`` or an absolute
     path) is rejected before a single byte is written.
+
+    :data:`BRIDGE_MEMBER_PREFIX` members are skipped: they belong to a different
+    directory owned by a different process, and writing them under the
+    controller's storage would put a second Matter node's credentials somewhere
+    nothing will ever read them. :func:`restore_backup` reports them instead —
+    loudly, because a half-restore nobody mentioned is how a user discovers next
+    week that their exported accessories all came back as new ones.
     """
     dest_root = os.path.realpath(dest)
     with zipfile.ZipFile(archive_path, "r") as zf:
-        for member in zf.namelist():
+        members = [name for name in zf.namelist() if not name.startswith(BRIDGE_MEMBER_PREFIX)]
+        for member in members:
             target = os.path.realpath(os.path.join(dest, member))
             if target != dest_root and not target.startswith(dest_root + os.sep):
                 raise ValueError(f"Unsafe path in archive (zip-slip): {member!r}")
-        zf.extractall(dest)
+        zf.extractall(dest, members=members)
 
 
 def restore_backup(
@@ -227,6 +301,14 @@ def restore_backup(
     ``server_control`` is an abstract seam (an object with ``stop()`` and
     ``start()`` returning bools); this function never imports indigo or calls
     launchctl.
+
+    **The bridge node's members are backed up but not restored here** (E5).
+    Restoring them safely needs the bridge node stopped for the same reason step
+    2 stops the controller — it holds the directory open and would write over a
+    restore the moment it next persisted — and there is no bridge ``stop()``
+    seam until E7 wires its launchd agent. Silently extracting them anyway would
+    be the worst of the three options, so they are reported with the manual
+    recipe instead, and the controller's fabric is restored as it always was.
     """
     log = _resolve_logger(logger)
     if not os.path.isfile(archive_path):
@@ -243,6 +325,15 @@ def restore_backup(
             raise ValueError(f"Backup archive has no members, refusing to restore (would wipe fabric): {archive_path}")
 
     storage_path = os.path.normpath(storage_path)
+    skipped = bridge_members_in(archive_path)
+    if skipped:
+        log.warning(
+            "This backup also contains %d file(s) from the Matter export bridge node. They are "
+            "NOT being restored: the bridge node has to be stopped first and this plugin cannot "
+            "stop it yet. If you need them, stop the bridge node and extract the '%s' entries of "
+            "%s over %s by hand. Restoring the controller fabric only.",
+            len(skipped), BRIDGE_MEMBER_PREFIX, archive_path,
+            os.path.join(os.path.dirname(storage_path), "bridge-node"))
 
     # C1: the server MUST be down before we touch the live fabric. If stop()
     # reports failure we abort here — storage is untouched, nothing moved aside.

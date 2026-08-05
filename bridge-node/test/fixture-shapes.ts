@@ -54,6 +54,10 @@ export const status = {
     // §4.3: false until E5 persists the endpoint-number map — an empty `drift`
     // on its own would read as an all-clear nobody has actually checked.
     driftChecked: false,
+    // §4.3: empty is the healthy state. Non-empty means a persistence failure
+    // the node could not fix, surfaced here because the node's only other
+    // channel is a stdout nobody is watching.
+    warnings: [],
 } satisfies StatusReport;
 
 /**
@@ -68,6 +72,7 @@ export const statusEmpty = {
     endpoints: [],
     drift: [],
     driftChecked: false,
+    warnings: [],
 } satisfies StatusReport;
 
 /** §3.1 with `intent: "replace_all"`: the live set is emptied deliberately. */
@@ -78,6 +83,7 @@ export const statusReplaceAll = {
     endpoints: [],
     drift: [],
     driftChecked: false,
+    warnings: [],
 } satisfies StatusReport;
 
 /** §3.2 — the live endpoint's Matter number, for the plugin's own records. */
@@ -217,4 +223,49 @@ export const openWindowInternal = {
     message_id: "m27",
     error_code: "internal",
     details: "mDNS advertiser is down",
+} satisfies ErrorFrame;
+
+/** §3.9/§3.10 both answer with an empty result; named for what they mean. */
+export const removeFabricResult = {};
+export const factoryResetResult = {};
+
+/**
+ * §3.11's answer — a `StatusReport` like any other, with two things that only
+ * this frame says.
+ *
+ * The endpoint numbers are 4 and 5 where every other status frame says 2 and 3:
+ * a rebuild is the command for the case where the numbers have *already* moved,
+ * and a fixture that showed them unmoved would be modelling the one situation in
+ * which nobody would run it.
+ *
+ * `driftChecked` is `true` because §4.3's rule is "false until the node persists
+ * the endpoint-number map", and a rebuild persists one. The empty `drift` beside
+ * it is trivially true — the map was written *from* the live set one line
+ * earlier — and says nothing about the mapping that was discarded.
+ */
+export const rebuiltStatus = {
+    commissioned: true,
+    fabrics: [APPLE_HOME],
+    endpointCount: 2,
+    endpoints: [
+        { indigoDeviceId: 123456789, endpointNumber: 4, role: "onOffLight" },
+        { indigoDeviceId: 123456790, endpointNumber: 5, role: "dimmableLight" },
+    ],
+    drift: [],
+    driftChecked: true,
+    warnings: [],
+} satisfies StatusReport;
+
+/**
+ * §1.1's refuse-to-start refusal (PRD §7).
+ *
+ * The request it answers is an ordinary `upsert_endpoint`, chosen because it is
+ * the most innocuous thing the plugin does: the point of the frame is that in
+ * this state *everything* outside the three recovery commands is refused,
+ * including work that has nothing to do with the endpoint map.
+ */
+export const endpointMapInvalid = {
+    message_id: "m24",
+    error_code: "endpoint_map_invalid",
+    details: "endpoint map is unreadable; only get_status, get_pairing and rebuild_endpoint_map are accepted",
 } satisfies ErrorFrame;

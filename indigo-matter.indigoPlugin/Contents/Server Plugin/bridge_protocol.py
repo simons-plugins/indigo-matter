@@ -107,6 +107,20 @@ ERROR_CODES = frozenset({
     ERR_ENDPOINT_MAP_INVALID, ERR_COMMISSIONING_WINDOW_FAILED, ERR_INTERNAL,
 })
 
+#: The ``details`` prefix a §1.1 refusal carries when the fault is an unusable
+#: ``identity.json`` rather than an unusable endpoint map (``RefuseReason``
+#: in ``bridge-node/src/protocol.ts``, mirrored here per BRIDGE_PROTOCOL §1.1).
+#:
+#: One error CODE covers every refuse-to-start reason — §1.1 defines the state,
+#: not the cause — so the reason text is the only thing on the wire that says
+#: which remedy applies, and the two are opposites. An unreadable MAP is fixed
+#: by §3.11's rebuild. An unreadable IDENTITY is not, and cannot be: the node
+#: refuses that rebuild outright, because clearing the refusal would leave the
+#: bridge serving under a ``SerialNumber`` no paired ecosystem has ever seen —
+#: the exact harm the refusal exists to prevent. Telling the user to rebuild
+#: there sends them at the one door that is deliberately locked.
+REFUSE_IDENTITY_UNREADABLE = "the bridge identity file is present but unreadable"
+
 # --------------------------------------------------------------------------
 # Events (§5)
 # --------------------------------------------------------------------------
@@ -268,6 +282,16 @@ class StatusReport:
     endpoint_count: int
     endpoints: list
     drift: list
+    #: Whether ``drift`` is an answer or an absence. ``drift: []`` alone is
+    #: ambiguous — "checked, nothing moved" and "there is no baseline to check
+    #: against" are opposites — so an empty ``drift`` is only an all-clear when
+    #: this is true. Defaulted so a report from a pre-warnings node still parses.
+    drift_checked: bool = False
+    #: §4.3 — persistence failures the node hit and cannot fix on its own. The
+    #: node's only other channel is stdout, and in this milestone it is started
+    #: by hand, so stdout is a terminal nobody is watching. Current, not
+    #: historical: an entry disappears when the operation it describes succeeds.
+    warnings: list = field(default_factory=list)
 
 
 @dataclass
@@ -355,6 +379,8 @@ def parse_status(result: Any) -> StatusReport:
             for item in (data.get("endpoints") or [])
         ],
         drift=parse_drift(data.get("drift")),
+        drift_checked=bool(data.get("driftChecked", False)),
+        warnings=[str(item) for item in (data.get("warnings") or [])],
     )
 
 

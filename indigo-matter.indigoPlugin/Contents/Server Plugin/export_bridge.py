@@ -40,12 +40,19 @@ Four disciplines worth knowing before editing:
 * **...and nothing here may block the loop either.** The reverse direction has
   the same rule and one fewer guarantee: whether ``indigo.*`` device *commands*
   are safe from a non-Indigo thread is unverified from the docs. Bulk Indigo IPC
-  is kept off the loop (:meth:`ExportBridge.endpoint_specs` runs in an executor),
-  and :meth:`ExportBridge.on_command` is deliberately the single remaining seam
-  — one method, so it can follow the day the loop is seen stalling.
+  is kept off the loop (:meth:`ExportBridge.endpoint_specs` runs in an executor)
+  and since E5 so is the inbound direction: :meth:`ExportBridge.on_command`
+  hands the whole ``indigo.*`` call to a **single-threaded** executor. One
+  worker, not a pool, because §4.2 commands are per-device state changes and a
+  pool would let two of them for the same accessory land out of order — a
+  `setLevel 20` overtaking a `setLevel 80` leaves the lamp permanently wrong.
+  One worker gives global FIFO, which trivially contains per-device FIFO, and
+  costs nothing: these are human-paced button presses, not a data feed.
 """
 from __future__ import annotations
 
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Optional
 
 import bridge_protocol
@@ -59,6 +66,24 @@ from bridge_protocol import EndpointSpec
 #: this is ~1 minute — the same shape (and the same reasoning) as the
 #: matter-server counter in ``plugin._health_tick``.
 DISCONNECT_WARN_TICKS = 4
+
+#: Deadline for ONE §5 command dispatch, in seconds. Generous: an Indigo device
+#: command is a synchronous IPC round trip that may itself be waiting on a radio,
+#: and a bridge that gave up early would report a failure the house then went and
+#: performed anyway. Short enough that a genuinely wedged worker is named while
+#: the user is still looking at the log.
+COMMAND_TIMEOUT = 30.0
+
+#: How many dispatches may be outstanding before the watchdog says so. The
+#: worker is single-threaded, so anything above a couple means work is stacking
+#: up behind something that is not returning.
+COMMAND_QUEUE_WARN = 3
+
+#: Pref key holding the size of an un-export whose ``attach`` never landed
+#: (XAC7). Absent or 0 means there is nothing owed to the node. An int rather
+#: than a bool because the §3.1 attach that discharges it has to size its own
+#: deadline over the removals — see :func:`bridge_client.attach_timeout_for`.
+PREF_PENDING_REPLACE_ALL = "matterExportPendingReplaceAll"
 
 
 class ExportBridge:
@@ -75,6 +100,11 @@ class ExportBridge:
     :param device_getter: ``id → indigo device or None``. Injected so this
         module unit-tests without the Indigo runtime.
     :param client_factory: builds the :class:`BridgeClient`; injected for tests.
+    :param save_prefs: flush callable for the prefs mapping, so the pending
+        un-export flag survives a crash. Injected for the same reason
+        ``ExportStore`` takes one.
+    :param executor_factory: builds the command executor; injected so tests can
+        run dispatches inline instead of on a thread.
     """
 
     # The seams ARE the API, exactly as BridgeClient's callbacks are.
@@ -83,15 +113,19 @@ class ExportBridge:
                  plugin_version: str = "unknown",
                  plugin_id: str = export_catalog.DEFAULT_PLUGIN_ID,
                  device_getter: Optional[Callable[[int], Any]] = None,
-                 client_factory: Optional[Callable[..., BridgeClient]] = None) -> None:
+                 client_factory: Optional[Callable[..., BridgeClient]] = None,
+                 save_prefs: Optional[Callable[[], None]] = None,
+                 executor_factory: Optional[Callable[[], Any]] = None) -> None:
         self._store = store
         self._runtime = runtime
         self._logger = logger
         self._prefs_getter = prefs_getter
         self._plugin_version = plugin_version
         self._plugin_id = plugin_id
-        self._device_getter = device_getter or _indigo_device
+        self._device_getter = device_getter or (lambda dev_id: _indigo_device(dev_id, logger))
         self._client_factory = client_factory or BridgeClient
+        self._save_prefs = save_prefs
+        self._executor_factory = executor_factory or _command_executor
 
         #: The live client, or ``None`` while nothing is exported (XG5).
         self.client: Optional[BridgeClient] = None
@@ -130,6 +164,36 @@ class ExportBridge:
         #: empty, and its attach deadline has to cover REMOVING that many
         #: endpoints (see :func:`bridge_client.attach_timeout_for`).
         self._last_export_count = len(store)
+        #: ``device id → the §4.2 states last actually PUSHED to the node``.
+        #: What ``device_updated`` diffs against, instead of the previous Indigo
+        #: reading — see :meth:`device_updated`. Bounded by the allow-list:
+        #: entries are seeded when a spec is built and dropped when the export
+        #: is removed or skipped.
+        self._pushed: dict[int, dict] = {}
+        #: True while :meth:`_replace_all_then_stop`'s coroutine is in flight.
+        #: :meth:`start` must not build a second client underneath it.
+        self._un_exporting = False
+        #: Set when :meth:`start` was called during an un-export, so the client
+        #: is created once that finishes rather than never.
+        self._start_after_un_export = False
+        #: The single worker §5 commands are dispatched on; built on first use.
+        self._executor: Optional[Any] = None
+        #: Set once :meth:`stop` has run, so a coroutine still queued on the
+        #: loop cannot rebuild the executor we just shut down and leave a live
+        #: worker thread behind a "stopped" bridge.
+        self._stopped = False
+        #: §5 dispatches submitted / completed. The gap is the queue depth, and
+        #: it is the only observable of a wedged worker (see :meth:`health_tick`).
+        self._submitted = 0
+        self._completed = 0
+        #: Set while the queue-depth warning has been said for this streak.
+        self._queue_warned = False
+        #: The last §4.3 ``warnings`` set the node reported, so a standing
+        #: persistence failure is said once rather than once per attach.
+        self._node_warnings: frozenset = frozenset()
+        #: The last drift set reported, for the same reason — see
+        #: :meth:`_on_drift_detected`.
+        self._drift_reported: frozenset = frozenset()
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -140,13 +204,27 @@ class ExportBridge:
         return self.client is not None
 
     def start(self) -> None:
-        """Create and run the client. Idempotent."""
+        """Create and run the client. Idempotent.
+
+        **Refuses while an un-export is in flight.** ``_replace_all_then_stop``
+        sets ``self.client = None`` the instant it fires, so a user who empties
+        the allow-list and immediately re-adds a device would otherwise build a
+        second client on top of a socket the first one is still using to say
+        "remove everything" — and then race it. The un-export's ``finally``
+        picks the request back up, so the start is deferred, never dropped.
+        """
+        if self._un_exporting:
+            self._start_after_un_export = True
+            self._logger.debug(
+                "Matter export: start deferred until the in-flight un-export finishes")
+            return
         if self.client is not None:
             return
         self.client = self._client_factory(
             self._logger, self._prefs_getter(),
             plugin_version=self._plugin_version,
             endpoint_provider=self.endpoint_specs,
+            replace_all_provider=self._pending_replace_all,
             on_command=self.on_command,
             on_attached=self._on_attached,
             on_attach_refused=self._on_attach_refused,
@@ -164,13 +242,48 @@ class ExportBridge:
 
     def stop(self, timeout: float = 4.0) -> None:
         """Close the client. Idempotent; never raises at shutdown."""
+        self._stopped = True
         client, self.client = self.client, None
+        executor, self._executor = self._executor, None
+        if executor is not None:
+            dropped = max(0, self._submitted - self._completed)
+            if dropped:
+                # These reached the plugin and never reached Indigo. The
+                # ecosystem applied every one of them optimistically, so this
+                # is the count of tiles now showing something the house is not
+                # doing — and nothing retries a §5 command.
+                self._logger.warning(
+                    "Matter export: shutting down with %d ecosystem command(s) still queued or "
+                    "in flight — they will NOT be applied, and paired ecosystems already show "
+                    "them as done.", dropped)
+            # Not `wait=True`: a dispatch blocked on a wedged IndigoServer would
+            # hold plugin shutdown open, and the command it is running has
+            # already been reported to the ecosystem either way.
+            # `cancel_futures` so the ones that have not STARTED are dropped
+            # rather than run against a plugin that is already tearing down.
+            try:
+                executor.shutdown(wait=False, cancel_futures=True)
+            except TypeError:
+                # Injected doubles need not take the 3.9+ keyword.
+                executor.shutdown(wait=False)
         if client is None:
             return
         try:
             self._runtime.submit(client.close()).result(timeout=timeout)
         except Exception as exc:  # pylint: disable=broad-except
             self._logger.debug("bridge client close error: %s", exc)
+
+    def _stop_soon(self, why: str) -> None:
+        """Drop the client without waiting — safe to call ON the loop thread.
+
+        :meth:`stop` blocks on the close future, which from the loop thread is a
+        self-deadlock: the coroutine it is waiting for can only run on the
+        thread that is waiting. The one caller that needs this is
+        :meth:`_on_attached`, which runs inside the client's own handshake.
+        """
+        client, self.client = self.client, None
+        if client is not None:
+            self._fire(client.close(), why)
 
     def exports_changed(self) -> None:
         """The allow-list changed — start or stop the client to match (XG5).
@@ -192,6 +305,132 @@ class ExportBridge:
             # needs the §3.1 opt-in for that, so it is a deliberate attach
             # rather than a disconnect — and only THEN do we close.
             self._replace_all_then_stop(removing)
+        elif self._pending_replace_all():
+            # Nothing is exported and there is no client — but the node is still
+            # holding accessories from a previous session whose un-export never
+            # landed. XG5 says no client while nothing is exported; this is the
+            # one exception, and it lasts exactly one successful attach.
+            self._logger.info(
+                "Matter export: reconnecting to finish an un-export that did not complete "
+                "earlier (%d accessory record(s) still owed removal)",
+                self._pending_replace_all())
+            self.start()
+
+    def _pending_replace_all(self) -> int:
+        """**How many** endpoints an un-export still owes the node (XAC7).
+
+        This is :class:`bridge_client.BridgeClient`'s ``replace_all_provider``,
+        read on every (re)connect, and it answers the DEBT question and nothing
+        else: how much un-export is there that the node has not been told about?
+
+        **A count, not a flag, and the difference is a real outage.** The client
+        feeds this answer to :func:`bridge_client.attach_timeout_for` to size the
+        discharge attach's deadline, because the node paces bulk removals ~100ms
+        apart (§3.3) and the discharge attach sends *nothing* while removing
+        *everything* — so its own ``len(specs)`` is exactly the wrong number. A
+        wrapper here used to return ``bool``, and ``int(True) == 1`` sailed
+        silently through the client's ``int()``: every discharge got the 8s
+        floor, an 80-accessory un-export timed out mid-reconcile, the socket was
+        torn down and retried, forever, with the accessories still in every
+        ecosystem — the precise regression the deadline formula exists to stop.
+        It also made the client's two "un-export of %d accessory record(s)" log
+        lines say 1, whatever the truth was.
+
+        It is still truth-tested in two places (here and in the client), which a
+        count supports perfectly well: 0 debts is falsy.
+
+        **The debt is never ANDed with an empty allow-list, and that used to
+        produce a permanent halt.** The reasoning was that a re-populated
+        allow-list supersedes the debt — but the two are not alternatives, they
+        compose. Empty the list while the node is down (debt = 5), then export
+        one different device: the next attach carries ``[B]``, so the AND said
+        "no intent needed", and the node's §3.1 guard saw five removals against
+        zero survivors, refused with ``mass_removal_refused``, and the client
+        HALTED — forever, with a message telling the user to check an allow-list
+        that was not the problem. Carrying the intent whenever a debt exists
+        costs nothing in the ordinary case: the node's guard only fires when the
+        result would be empty, so a legitimate non-empty attach is unaffected.
+
+        A prefs value that is not a number is 0 **and says so**: the debt is the
+        only thing that makes an un-export recoverable at all, so silently
+        reading it as "nothing owed" is how every exported accessory is stranded
+        in every paired ecosystem with nothing left anywhere that knows it.
+        """
+        raw = self._prefs_getter().get(PREF_PENDING_REPLACE_ALL)
+        try:
+            return int(raw or 0)
+        except (TypeError, ValueError) as exc:
+            self._logger.warning(
+                "Matter export: the outstanding un-export count in prefs is unreadable (%r: %s) — "
+                "treating it as nothing owed. If accessories from a previous session are still "
+                "showing in a paired ecosystem, re-export one device and remove it again to "
+                "re-record the removal.", raw, exc)
+            return 0
+
+    def _record_pending_replace_all(self, removing: int) -> None:
+        """Record an un-export attempt — **accumulating**, never clearing.
+
+        Written to prefs rather than held in memory because the failure it
+        covers is precisely the one that outlives the process: the node is down
+        or the plugin is reloading, the attach never lands, and every accessory
+        stays in every paired ecosystem forever with nothing left anywhere that
+        knows it should not (XAC7).
+
+        **It takes the larger of the old debt and the new one, and it never
+        writes 0.** Overwriting was wrong in both directions, and the second one
+        destroyed the record outright:
+
+        * *Under-sizing.* A debt of 80 sits unpaid because the node is down. The
+          user exports one device and removes it again; this was called with 1
+          and the pref became 1. The node still holds 81 records, so the
+          discharge attach still has to remove 81 — but its deadline was sized
+          for 1, which is the 8s floor, so it times out mid-reconcile and
+          retries forever. The count is what buys the deadline (§3.3 pacing),
+          so it has to describe everything the node might still be holding.
+        * *Erasure.* ``exports_changed`` reconnects with no exports purely to
+          discharge a debt, which sets ``_last_export_count`` to 0 — so the very
+          next empty↔empty transition arrived here with ``removing == 0`` and
+          POPPED a debt of 5 that nothing had discharged. If the attach then
+          failed, the only surviving record that five accessories should be gone
+          was gone with it, and no later attach would ever carry the intent.
+
+        Clearing is therefore a separate, deliberate act with a separate name —
+        :meth:`_clear_pending_replace_all` — reached only from the two places
+        that have watched an attach *carrying the intent* succeed.
+        """
+        owed = max(self._pending_replace_all(), int(removing))
+        if owed <= 0:
+            return
+        try:
+            self._prefs_getter()[PREF_PENDING_REPLACE_ALL] = owed
+            if self._save_prefs is not None:
+                self._save_prefs()
+        except Exception as exc:  # pylint: disable=broad-except
+            self._logger.warning(
+                "Matter export: could not record that the un-export is outstanding (%s). "
+                "If it does not complete now, exported accessories may linger.", exc)
+
+    def _clear_pending_replace_all(self) -> None:
+        """The debt has been paid — an attach that CARRIED the intent landed.
+
+        Split from :meth:`_record_pending_replace_all` so that clearing can only
+        ever be the answer to a discharge somebody watched happen, rather than a
+        side effect of passing 0 to a recorder (see there for what that cost).
+        """
+        try:
+            self._prefs_getter().pop(PREF_PENDING_REPLACE_ALL, None)
+            if self._save_prefs is not None:
+                self._save_prefs()
+        except Exception as exc:  # pylint: disable=broad-except
+            # The opposite direction from a failed record, and the message used
+            # to be the same one — which described a risk that no longer exists.
+            # What a failed CLEAR means is that the debt is still on disk after
+            # it has been paid, so the next attach will carry `replace_all`
+            # again for an un-export that already happened.
+            self._logger.warning(
+                "Matter export: the un-export completed but the outstanding-work flag could "
+                "not be cleared (%s). A later reconnect may repeat the removal request; "
+                "nothing extra is removed by it.", exc)
 
     def _replace_all_then_stop(self, removing: int) -> None:
         """Un-export everything with the §3.1 intent, then drop the client.
@@ -218,25 +457,48 @@ class ExportBridge:
         if client is None:
             return
         self.client = None                 # inert immediately; the close is in flight
+        self._un_exporting = True
+        self._pushed.clear()
+        # Recorded BEFORE the attempt, not after a failure: the ways this does
+        # not land include the plugin being reloaded and the Mac losing power
+        # mid-attach, and neither of those reaches an `except`.
+        self._record_pending_replace_all(removing)
         self._logger.info("Matter export: allow-list is now empty — removing every "
                           "exported accessory (pairings are kept)")
 
         async def _un_export() -> None:
             try:
+                # Sized over everything the node may be holding, which after an
+                # earlier failed un-export is more than this one emptied.
                 await client.attach([], replace_all=True,
-                                    timeout=attach_timeout_for(removing))
+                                    timeout=attach_timeout_for(self._pending_replace_all()))
+                self._clear_pending_replace_all()
             except Exception as exc:  # pylint: disable=broad-except
                 self._logger.warning(
                     "Matter export: could not tell the bridge node the export list is empty "
-                    "(%s). Accessories may linger in paired ecosystems until it restarts.", exc)
+                    "(%s). Accessories will linger in paired ecosystems until the plugin can "
+                    "reach the node again — it will retry on its own.", exc)
             finally:
                 # The socket must be released whatever happened above —
                 # including a CancelledError at shutdown, which is a
                 # BaseException and so walks straight past the handler.
                 await client.close()
+                self._un_exporting = False
+                if self._start_after_un_export:
+                    self._start_after_un_export = False
+                    self.start()
 
-        self._fire(_un_export(), "un-exporting everything",
-                   lost="exported accessories will linger in paired ecosystems")
+        if not self._fire(_un_export(), "un-exporting everything",
+                          lost="exported accessories will linger in paired ecosystems"):
+            # The coroutine that would have cleared this never ran. Left set,
+            # `_un_exporting` gates `start()` for the life of the plugin — so a
+            # user who re-adds a device gets a permanently inert bridge on top
+            # of an un-export that also did not happen. The debt in prefs is
+            # what makes the un-export recoverable; this must not block it.
+            self._un_exporting = False
+            if self._start_after_un_export:
+                self._start_after_un_export = False
+                self.start()
 
     # ------------------------------------------------------------------
     # The endpoint provider (§3.1 attach reconcile source)
@@ -287,6 +549,12 @@ class ExportBridge:
             # turning a permanently-broken device into a warning per reconnect.
             return self._skip(device_id, "its state could not be read", detail=str(exc))
         self._skipped.pop(device_id, None)
+        # A spec IS a push: `attach` and `upsert_endpoint` both carry `states`
+        # and the node applies them, so this is the snapshot every subsequent
+        # diff is measured from (see :meth:`device_updated`). Seeding it here
+        # rather than at the call site keeps the two paths that build a spec —
+        # the attach provider and `upsert` — from having to remember.
+        self._pushed[device_id] = dict(states)
         return EndpointSpec(
             indigo_device_id=device_id,
             role=entry.role,
@@ -303,6 +571,11 @@ class ExportBridge:
         ``detail`` is free-form context that goes in the line but never in the
         key (see the ``states_for`` call site for why that distinction exists).
         """
+        # A device we are not sending is a device we are not pushing to, so its
+        # snapshot is stale by definition; drop it and let the next successful
+        # spec re-seed. This is also what bounds the dict for a device that has
+        # been deleted from Indigo but not yet from the allow-list.
+        self._pushed.pop(device_id, None)
         if self._skipped.get(device_id) != why:
             self._skipped[device_id] = why
             self._logger.warning(
@@ -317,6 +590,19 @@ class ExportBridge:
 
         The caller has already established that this device is in the allow-list
         — that check is a set lookup on Indigo's thread and must stay there.
+
+        **The diff is against the last state we PUSHED, not against
+        ``orig_dev``** (E5). Every diff carries per-key tolerances
+        (``export_handlers.ExportHandler.tolerances``), and a tolerance measured
+        against the previous *Indigo reading* only ever bounds one step: a hue
+        ramping 1° at a time past a ±1° tolerance reports "unchanged" on every
+        single step, so the accessory sits at the colour it had when the ramp
+        started while the lamp walks away from it — no error, no log line,
+        unbounded drift. Measured against what the ecosystem was actually last
+        told, the same tolerance bounds the *total* error at 1°, which is what
+        a tolerance is supposed to mean. ``orig_dev`` is still needed, for the
+        two things that are genuinely about the transition rather than about
+        state: the rename and the reachability flip.
         """
         entry = self._store.get(new_dev.id)
         if entry is None:                      # removed between the check and here
@@ -337,7 +623,8 @@ class ExportBridge:
             self._fire(client.set_reachable(new_dev.id, reachable_of(new_dev)),
                        f"set_reachable dev {new_dev.id}")
         try:
-            states, stopped = handler.diff_with_gaps(orig_dev, new_dev, entry.options)
+            states, stopped = handler.diff_from(
+                self._pushed.get(new_dev.id), new_dev, entry.options)
         except Exception as exc:  # pylint: disable=broad-except
             # Once per device per streak: this fires on every change of an
             # exported device, so a lamp on a dimmer ramp would otherwise write
@@ -354,7 +641,28 @@ class ExportBridge:
         self._update_failed.discard(new_dev.id)
         self._report_stopped_keys(new_dev, entry.role, stopped)
         if states:
+            self._note_pushed(new_dev.id, states)
             self._fire(client.set_state(new_dev.id, states), f"set_state dev {new_dev.id}")
+
+    def _note_pushed(self, device_id: int, states: dict) -> None:
+        """Fold a push into the device's snapshot.
+
+        Merged rather than replaced because ``set_state`` args are partial by
+        design (§3.4) and the node leaves keys it was not given untouched — so
+        the snapshot has to mirror that or the next diff would re-send every
+        key the last one happened not to include.
+
+        Recorded when the push is *scheduled*, not when it is acknowledged.
+        ``set_state`` is fire-and-forget and its failure mode is the socket
+        being gone, which the next ``attach`` fully reconciles from
+        ``states_for`` anyway — whereas waiting for an ack would mean holding
+        Indigo's device thread on the node.
+        """
+        snapshot = self._pushed.get(device_id)
+        if snapshot is None:
+            self._pushed[device_id] = dict(states)
+        else:
+            snapshot.update(states)
 
     def _report_stopped_keys(self, dev: Any, role: str, stopped: frozenset) -> None:
         """Say once when a device stops answering a key it used to publish.
@@ -453,6 +761,8 @@ class ExportBridge:
         self._update_failed.discard(device_id)
         self._stopped_keys.pop(device_id, None)
         self._no_op_reported.pop(device_id, None)
+        # The snapshot dies with the export — that is what bounds it (E5).
+        self._pushed.pop(device_id, None)
         client = self._live_client("remove_endpoint", device_id)
         if client is None:
             return
@@ -489,13 +799,22 @@ class ExportBridge:
     def on_command(self, command: bridge_protocol.BridgeCommand) -> None:
         """Apply one ecosystem-originated action to its Indigo device.
 
-        Called from the client's frame loop, i.e. on the asyncio thread.
-        ``indigo.*`` device commands being safe to issue from a non-Indigo
-        thread is **unverified from the docs** — ``device_sync.apply_states``'s
-        precedent covers state *writes* on our own devices, which is not the
-        same claim. It is kept here rather than hedged because this is the
-        single seam: one method, one call, so moving it to ``run_in_executor``
-        is a local change the day the loop is seen stalling on Indigo IPC.
+        Called from the client's frame loop, i.e. on the asyncio thread — and
+        since E5 it does no Indigo IPC there. Everything from
+        ``indigo.devices[id]`` onwards runs in
+        :meth:`_command_worker`'s executor, because both halves of the tail are
+        blocking calls into IndigoServer and this loop is **shared with the
+        inbound matter-server client**: a slow Indigo server would otherwise
+        stall live Matter device updates behind somebody pressing a button in
+        the Home app. (That `indigo.*` device commands are safe from a
+        non-Indigo thread at all remains unverified from the docs — the
+        precedent, ``device_sync.apply_states``, covers state *writes* on our
+        own devices. Moving them onto a worker thread does not change that
+        claim; it only stops them blocking the loop.)
+
+        The store lookup and the role lookup stay on the loop deliberately: both
+        are in-process dictionary reads, and doing them here means a command for
+        a device nobody exports costs no thread hop at all.
         """
         device_id = command.indigo_device_id
         entry = self._store.get(device_id)
@@ -512,6 +831,93 @@ class ExportBridge:
                 "Matter export: %r arrived for device %s exported as %s, a role this version "
                 "cannot bridge — ignoring.", command.command, device_id, entry.role)
             return
+        self._fire(self._dispatch_off_loop(command, entry, handler),
+                   f"{command.command} for dev {device_id}")
+
+    async def _dispatch_off_loop(self, command, entry, handler) -> None:
+        """Run :meth:`_apply_command` on the command worker, under a deadline.
+
+        **The deadline is the whole point.** One worker gives per-device FIFO
+        (see :meth:`_command_worker`), and the price of that is that one wedged
+        ``indigo.*`` call — a Z-Wave device that has stopped answering, a driver
+        holding a lock — blocks every subsequent command for every exported
+        device. Unbounded and unwatched, that is an outage with **no log output
+        at all**: the frames keep arriving, the queue keeps growing, and from
+        Indigo's side nothing happened.
+
+        A timeout does not un-wedge the worker — the thread is still stuck in
+        the call, and there is no way to interrupt it — so this is not a
+        recovery. It is the thing that makes the failure *nameable*: which
+        command, on which device, is the one that stopped.
+
+        **And it deliberately does not correct the ecosystem.** :meth:`_correct`
+        is the answer to a dispatch that *returned* a failure; there is no
+        version of it that helps here. Reading the device back is itself Indigo
+        IPC, so it would either queue behind the very call that is wedged (the
+        worker is single-threaded, which is the whole point) or run on the loop
+        — the one thing E5 moved off it — and the device it would be reading is
+        the one that has stopped answering. So the ecosystem goes on showing the
+        command it optimistically applied, and the log says so out loud rather
+        than leaving the user to infer it.
+        """
+        worker = self._command_worker()
+        if worker is None:
+            return
+        loop = asyncio.get_running_loop()
+        self._submitted += 1
+        future = loop.run_in_executor(worker, self._apply_command, command, entry, handler)
+        # Counted where it actually finishes, not where we stop waiting: a
+        # `run_in_executor` future cannot be cancelled once the thread has
+        # picked it up, so a timed-out command is still running and must still
+        # read as outstanding. `shield` is what keeps `wait_for` from pretending
+        # otherwise. The callback also retrieves the result, so a late failure
+        # is not an un-retrieved exception.
+        future.add_done_callback(self._note_command_done)
+        try:
+            await asyncio.wait_for(asyncio.shield(future), timeout=COMMAND_TIMEOUT)
+        except asyncio.TimeoutError:
+            self._logger.error(
+                "Matter export: %r for device %s (%s) has not returned after %.0fs. The command "
+                "worker is single-threaded, so every §5 command after it is queued behind this "
+                "one — check whether that Indigo device or its plugin is responding. The "
+                "ecosystem that sent it already shows it as done and NOTHING will correct that "
+                "until the device next reports or the bridge re-attaches.",
+                command.command, command.indigo_device_id, entry.role, COMMAND_TIMEOUT)
+
+    def _note_command_done(self, future) -> None:
+        """One dispatch finished, whenever that turned out to be."""
+        self._completed += 1
+        if future.cancelled():
+            return
+        exc = future.exception()
+        if exc is not None:
+            self._logger.warning("Matter export: a §5 command dispatch failed — %s", exc)
+
+    def _command_worker(self):
+        """The single thread §5 commands are applied on. Built on first use.
+
+        **One worker, and that is a correctness choice, not a resource one.**
+        §4.2 commands are state changes on a specific accessory, and a pool
+        would let two for the same device run concurrently — a `setLevel 20`
+        overtaking a `setLevel 80` leaves the lamp at the wrong brightness with
+        nothing to correct it, because both "succeeded". A single worker makes
+        the executor FIFO, which contains per-device FIFO, and matches the
+        receipt order §1 already promises for the frames themselves. The cost is
+        nil: these are human-paced button presses.
+        """
+        if self._stopped:
+            # A coroutine that was already queued on the loop when `stop()` ran
+            # would otherwise build a brand-new worker thread underneath a
+            # bridge that has shut down, and nothing would ever join it.
+            self._logger.debug("Matter export: command worker requested after stop; ignoring")
+            return None
+        if self._executor is None:
+            self._executor = self._executor_factory()
+        return self._executor
+
+    def _apply_command(self, command: bridge_protocol.BridgeCommand, entry, handler) -> None:
+        """The blocking half of :meth:`on_command`. Runs on the command worker."""
+        device_id = command.indigo_device_id
         dev = self._device_getter(device_id)
         if dev is None:
             self._logger.warning(
@@ -598,14 +1004,25 @@ class ExportBridge:
                 "Matter export: cannot push truth for device %s — it reports no readable state "
                 "at all, so the ecosystem keeps showing the command that failed.", device_id)
             return
+        self._note_pushed(device_id, states)
         self._fire(client.set_state(device_id, states),
                    f"corrective set_state dev {device_id}")
 
     # ------------------------------------------------------------------
     # Client callbacks
     # ------------------------------------------------------------------
-    def _on_attached(self, status) -> None:
-        """A successful attach ends every outage, so it clears every latch."""
+    def _on_attached(self, status, carried_replace_all: bool = False) -> None:
+        """A successful attach ends every outage, so it clears every latch.
+
+        ``carried_replace_all`` is what the completed attach actually SENT, and
+        it is the only safe thing to discharge the debt on. Reading live state
+        here instead — "is a debt recorded now?" — discharged a debt that was
+        written *while this attach was in flight*: the user empties the
+        allow-list at the moment a reconnect lands, the reconnect's attach never
+        carried the intent, and one step later the flag is cleared with a log
+        line asserting an un-export that never happened. The accessories stay in
+        every ecosystem, and nothing is left that knows they should not.
+        """
         self._disconnect_ticks = 0
         self._unreachable_reported = False
         self._halted_reported = False
@@ -614,6 +1031,42 @@ class ExportBridge:
         self._logger.info("Matter export: bridge node attached — %d endpoint(s) live, %s",
                           status.endpoint_count,
                           "commissioned" if status.commissioned else "not yet paired")
+        self._report_node_warnings(status)
+        if carried_replace_all and self._pending_replace_all():
+            owed = self._pending_replace_all()
+            self._clear_pending_replace_all()
+            self._logger.info(
+                "Matter export: the outstanding un-export completed — %d accessory record(s) "
+                "removed from the bridge node; paired ecosystems will drop them.", owed)
+            if len(self._store) == 0:
+                # XG5 again: nothing is exported, so nothing needs a socket.
+                # Only when the list is still empty — a debt discharged by an
+                # attach that also carried real endpoints is an export we must
+                # keep serving, not one to hang up on.
+                self._stop_soon("closing the bridge client after the outstanding un-export")
+
+    def _report_node_warnings(self, status) -> None:
+        """Say what the node could not persist (§4.3 ``warnings``).
+
+        The node writes to stdout and, in this milestone, is **started by hand**
+        — so its stdout is a terminal that closed hours ago. A map it could not
+        write, a commissioning witness it could not clear: those are precisely
+        the faults E5 exists to make visible, and this is the only channel that
+        reaches a user's Indigo log.
+
+        Latched on the warning SET, so a standing fault (a full disk does not
+        un-fill) is said once per streak rather than once per 15s watchdog tick,
+        while a *new* fault appearing beside it is said immediately.
+        """
+        warnings = frozenset(getattr(status, "warnings", ()) or ())
+        if not warnings:
+            self._node_warnings = frozenset()
+            return
+        if warnings == self._node_warnings:
+            return
+        self._node_warnings = warnings
+        for warning in sorted(warnings):
+            self._logger.warning("Matter export: the bridge node reports — %s", warning)
 
     def _on_attach_refused(self, code: str, details: str) -> None:
         """Surface a refusal with its remedy. The client has already triaged it.
@@ -627,6 +1080,21 @@ class ExportBridge:
         succeeds.
         """
         if code == bridge_protocol.ERR_ENDPOINT_MAP_INVALID:
+            # One code, two opposite remedies — see REFUSE_IDENTITY_UNREADABLE.
+            # This branch used to hard-code the map wording for both, so a user
+            # whose identity.json was unreadable was sent to a rebuild the node
+            # refuses by design, and told it would duplicate their accessories
+            # on the way.
+            if bridge_protocol.REFUSE_IDENTITY_UNREADABLE in details:
+                self._logger.error(
+                    "Matter export: the bridge node is serving NOTHING because its identity file "
+                    "is unreadable (%s). Rebuilding the endpoint map will NOT fix this and the "
+                    "node refuses to try — the unusable file was moved aside as "
+                    "identity.json.unreadable-<timestamp> in the bridge storage folder. Restore "
+                    "or repair it and restart the bridge node. Deleting it instead starts a "
+                    "brand-new bridge, which every paired ecosystem sees as a different device.",
+                    details)
+                return
             self._logger.error(
                 "Matter export: the bridge node is serving NOTHING because its endpoint-number "
                 "map is unreadable (%s). Nothing will be exported until it is rebuilt — and a "
@@ -648,6 +1116,20 @@ class ExportBridge:
             hello.protocol_version, bridge_protocol.PROTOCOL_VERSION, hello.bridge_version)
 
     def _on_drift_detected(self, drift: list) -> None:
+        """Report a drift SET once, however many times the node re-reports it.
+
+        Drift is by design never repaired, so it is re-detected by every attach
+        and every upsert for as long as it lasts — and after a
+        ``factory_reset preserveEndpointNumbers: true`` that is *every exported
+        device*, on every reconcile, with no way for the user to clear it short
+        of §3.11. Unlatched, the one error that names the problem is buried
+        under its own repetitions. Latched on the set, so a device joining the
+        drift is still news.
+        """
+        seen = frozenset((d.unique_id, d.expected, d.actual) for d in drift)
+        if seen == self._drift_reported:
+            return
+        self._drift_reported = seen
         self._logger.error(
             "Matter export: endpoint-number DRIFT detected — %s. Exported accessories may have "
             "swapped identities in paired ecosystems. This is never repaired automatically.",
@@ -670,7 +1152,35 @@ class ExportBridge:
     # Watchdog
     # ------------------------------------------------------------------
     def health_tick(self) -> None:
-        """One watchdog pass. No I/O — it only reads client state and logs."""
+        """One watchdog pass: read client state, log, and poll the node (§4.3).
+
+        **The poll is the only reader the §4.3 ``warnings`` channel has.** Every
+        docstring around it — and BRIDGE_PROTOCOL §4.3 itself — says the node's
+        persistence failures reach a user because ``get_status`` is polled, and
+        for one review cycle nothing polled it: :meth:`_report_node_warnings`
+        ran on the attach response and nowhere else. Three of the four faults it
+        was built for cannot happen at attach time and so reached the user as
+        precisely nothing —
+
+        * the identity witness write on FIRST commissioning (§4.3
+          ``identity-write``), which happens when a fabric appears, long after
+          the attach;
+        * the witness clear on ``factory_reset``, whose failure means the very
+          next start refuses to serve and blames lost storage for the reset the
+          user asked for;
+        * the endpoint-map write from ``upsert``/``remove``'s ``checkDrift``,
+          which is a full disk quietly costing the ability to detect that every
+          accessory has been renumbered.
+
+        The node's own log is stdout, and in this milestone the node is started
+        **by hand** — so stdout is a terminal that closed hours ago. There is no
+        other channel.
+
+        One WS round-trip per ~15s tick against a loopback socket, fire-and-
+        forget like every other push here, so it costs Indigo's watchdog thread
+        nothing: this method still does no blocking I/O of its own.
+        """
+        self._check_command_queue()
         client = self.client
         if client is None:
             return
@@ -693,6 +1203,7 @@ class ExportBridge:
             return
         if client.attached:
             self._disconnect_ticks = 0
+            self._poll_node_status(client)
             return
         self._disconnect_ticks += 1
         if self._disconnect_ticks == DISCONNECT_WARN_TICKS:
@@ -701,11 +1212,58 @@ class ExportBridge:
         else:
             self._logger.debug("Matter export: bridge node not currently attached")
 
+    def _poll_node_status(self, client) -> None:
+        """Ask the node how it is, and say what it answers (§3.6 → §4.3).
+
+        Only while attached: the recovery and halted states return above, and in
+        both of them the node has already said the one thing that matters, at
+        error level, through :meth:`_on_attach_refused`.
+
+        The answer is handled in the coroutine rather than by awaiting it here,
+        because this runs on Indigo's watchdog thread and nothing on that thread
+        may block on the node (the whole reason ``health_tick`` was "no I/O").
+        A failed poll is not itself news — the socket being gone is what
+        ``_disconnect_ticks`` is for — so it goes to debug and the next tick
+        tries again.
+        """
+        async def _poll() -> None:
+            try:
+                status = await client.get_status()
+            except Exception as exc:  # pylint: disable=broad-except
+                self._logger.debug("Matter export: status poll failed (%s)", exc)
+                return
+            self._report_node_warnings(status)
+
+        self._fire(_poll(), "the bridge node status poll")
+
+    def _check_command_queue(self) -> None:
+        """Say once when §5 dispatches are stacking up on the single worker.
+
+        The gap between submitted and completed IS the queue depth, and a
+        growing one is the only symptom of a wedged ``indigo.*`` call: every
+        command still arrives, nothing raises, and the house simply stops
+        responding to the Home app. Once per streak, cleared when it drains.
+        """
+        outstanding = self._submitted - self._completed
+        if outstanding < COMMAND_QUEUE_WARN:
+            self._queue_warned = False
+            return
+        if self._queue_warned:
+            return
+        self._queue_warned = True
+        self._logger.warning(
+            "Matter export: %d ecosystem command(s) are queued on the command worker and not "
+            "completing. They run one at a time, so something at the front is not returning — "
+            "the timeout line above names it.", outstanding)
+
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
-    def _fire(self, coro, what: str, lost: str = "") -> None:
+    def _fire(self, coro, what: str, lost: str = "") -> bool:
         """Schedule ``coro`` on the loop and never wait for it.
+
+        Returns whether it was scheduled — the un-export path needs to know,
+        because its own ``finally`` is what releases the gate on :meth:`start`.
 
         The result is still collected by a done-callback: a ``set_state`` that
         failed looks exactly like "the ecosystem is showing stale state", so it
@@ -728,8 +1286,9 @@ class ExportBridge:
                                      what, exc, lost)
             else:
                 self._logger.debug("Matter export: could not schedule %s (%s)", what, exc)
-            return
+            return False
         future.add_done_callback(lambda fut: self._log_future(fut, what))
+        return True
 
     def _log_future(self, future, what: str) -> None:
         if future.cancelled():
@@ -751,8 +1310,22 @@ def reachable_of(dev: Any) -> bool:
     return bool(getattr(dev, "enabled", False)) and bool(getattr(dev, "configured", False))
 
 
-def _indigo_device(device_id: int) -> Any:
-    """``indigo.devices[device_id]`` or ``None``. Imported lazily, see below."""
+def _command_executor():
+    """The default command worker — see :meth:`ExportBridge._command_worker`."""
+    return ThreadPoolExecutor(max_workers=1, thread_name_prefix="matter-export-cmd")
+
+
+def _indigo_device(device_id: int, logger: Any = None) -> Any:
+    """``indigo.devices[device_id]`` or ``None``. Imported lazily, see below.
+
+    The narrow catch is the point. "This id is not in the device table" is the
+    expected answer for an allow-list entry whose device was deleted, and the
+    caller handles it — but the bare ``except Exception`` that used to be here
+    gave the same silent ``None`` to a broken IPC connection, a permissions
+    failure, or any other reason IndigoServer could not answer. Those look
+    identical from the outside ("device %s no longer exists") and lead the user
+    to delete an export that was never the problem.
+    """
     # The import is deferred so this module stays importable (and unit-testable)
     # without the Indigo runtime, the same posture export_catalog/export_store
     # take. Every real call site is inside the running plugin.
@@ -760,5 +1333,14 @@ def _indigo_device(device_id: int) -> Any:
 
     try:
         return indigo.devices[int(device_id)]
-    except Exception:  # pylint: disable=broad-except
+    except (KeyError, IndexError, TypeError, ValueError):
+        # Genuinely absent (or an id that is not one). The caller's message —
+        # "the Indigo device no longer exists" — is true.
+        return None
+    except Exception as exc:  # pylint: disable=broad-except
+        if logger is not None:
+            logger.warning(
+                "Matter export: could not read Indigo device %s (%s: %s). This is NOT the device "
+                "having been deleted — it is Indigo failing to answer.",
+                device_id, type(exc).__name__, exc)
         return None

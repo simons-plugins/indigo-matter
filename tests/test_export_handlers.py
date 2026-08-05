@@ -310,14 +310,55 @@ class TestColorTemperature:
             "setColorTemp", {"colorTempMireds": 250}, dev)
         mock_indigo_base.dimmer.setColorLevels.assert_not_called()
 
-    def test_a_white_channel_reporting_off_still_gets_full_level(
+    def test_the_skip_is_REPORTED_as_a_no_op_rather_than_as_a_success(
             self, handlers, mock_indigo_base):
-        """A colour tweak must never be the thing that blacks out the room."""
+        """The tri-state, or the caller latches nothing and says nothing.
+
+        ``dispatch`` ends in ``handler(...) or True``, so a bare ``None`` from
+        the skip above reported SUCCESS for a command that did nothing at all —
+        the ecosystem had already flipped its tile to the new colour
+        temperature, the lamp never moved, and the only trace was a debug line
+        from a static method that cannot name the device.
+        """
+        dev = DimmerDevice(1, "Lamp", whiteLevel=None)
+        outcome = handlers.handler_for("colorTemperatureLight").dispatch(
+            "setColorTemp", {"colorTempMireds": 250}, dev)
+        assert isinstance(outcome, str), f"expected a no-op reason, got {outcome!r}"
+        assert "no white channel" in outcome
+
+    def test_a_real_write_still_reports_plain_success(self, handlers, mock_indigo_base):
+        dev = DimmerDevice(1, "Lamp", whiteLevel=50)
+        assert handlers.handler_for("colorTemperatureLight").dispatch(
+            "setColorTemp", {"colorTempMireds": 250}, dev) is True
+
+    def test_a_white_channel_reporting_off_keeps_its_real_level(
+            self, handlers, mock_indigo_base):
+        """E5: `whiteLevel or 100` caught the real 0 — `0.0` is falsy.
+
+        The two zero-ish answers are different facts and need opposite
+        treatment, which is what the truthiness test destroyed. ``None`` means
+        "no white channel exists" and is handled above by skipping the write
+        entirely; **0** means "the channel exists and is currently off", and it
+        is the device's real state. Defaulting it to 100 turned a colour-
+        temperature change into a colour-temperature change *plus* switching the
+        white channel to full — a bridge turning a lamp on that nobody asked it
+        to, in response to a command Matter defines as orthogonal to on/off.
+        """
         dev = DimmerDevice(1, "Lamp", whiteLevel=0)
         handlers.handler_for("colorTemperatureLight").dispatch(
             "setColorTemp", {"colorTempMireds": 250}, dev)
         _args, kwargs = mock_indigo_base.dimmer.setColorLevels.call_args
-        assert kwargs["whiteLevel"] == 100
+        assert kwargs["whiteLevel"] == 0
+        # The thing the command WAS for still happens.
+        assert kwargs["whiteTemperature"] == 4000
+
+    def test_a_lit_white_channel_keeps_its_level_too(self, handlers, mock_indigo_base):
+        """The general rule the 0 case is an instance of: preserve, never invent."""
+        dev = DimmerDevice(1, "Lamp", whiteLevel=35)
+        handlers.handler_for("colorTemperatureLight").dispatch(
+            "setColorTemp", {"colorTempMireds": 250}, dev)
+        _args, kwargs = mock_indigo_base.dimmer.setColorLevels.call_args
+        assert kwargs["whiteLevel"] == 35
 
     @pytest.mark.parametrize("mireds,expected_kelvin", [
         (1, 6536),        # → clamped up to MIREDS_MIN 153
