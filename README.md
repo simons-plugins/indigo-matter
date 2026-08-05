@@ -91,12 +91,16 @@ during the Domio flow); the plugin then joins over IP via that ecosystem's borde
 fit; validation specifics live in
 [Handover](https://simons-plugins.github.io/indigo-matter/HANDOVER.html).
 
-**Matter out — built, unit-tested on both sides, live validation pending.** The allow-list,
+**Matter out — built, unit-tested on both sides, partly validated live.** The allow-list,
 the role mapping, endpoint persistence, pairing and fabric management, and the managed
 LaunchAgent are all in place, and the bridge node's own suite stands up a real Matter stack.
-What has **not** happened yet is the first end-to-end pairing against a live Apple Home, and
-the reboot-survival check on accessory identity — both of which are blocked on publishing
-`indigo-matter-bridge` to npm. Treat the export half as new.
+On live hardware the bridge **has** been commissioned into Apple Home (uncertified prompt
+and all), an on/off light and a dimmer **have** been controlled in both directions, and
+accessory identity **has** survived an upgrade without duplicating. Still outstanding:
+pairing through the plugin's own menu rather than the node's console, a second controller
+alongside Apple Home, the reboot leg of the identity check, and the managed LaunchAgent
+end to end — that last one blocked on publishing `indigo-matter-bridge` to npm. Treat the
+export half as new. See [MATTER.md](docs/MATTER.md) for the full status.
 
 ## Setup
 

@@ -419,11 +419,35 @@ Honestly stated, because the difference matters:
 - **Any Matter controller you already own** counts too, including Home Assistant
   and Indigo's own controller — the bridge does not care who commissions it.
 
-**Status at the time of writing:** every code path is unit-tested on both sides
-(and the bridge node's suite stands up a real Matter stack), but the first
-end-to-end pairing against a live Apple Home — and the reboot-survival check on
-accessory identity — are still pending on the reference server. Treat the export
-half as new.
+**Status at the time of writing.** Every code path is unit-tested on both sides,
+and the bridge node's own suite stands up a real Matter stack. Beyond that, what
+has actually been done on live hardware, and what has not:
+
+*Validated on the reference server, against a real Apple Home:*
+
+- The bridge pairs. An uncertified bridge was commissioned into Apple Home and
+  the uncertified-accessory prompt accepted — the question that could have
+  killed the feature outright.
+- Exported devices work in both directions: an on/off light and a dimmer,
+  controlled from Apple Home and from Indigo, with the change showing up on the
+  other side.
+- Accessory identity survived a plugin and bridge-node upgrade: three exported
+  accessories kept their endpoint numbers across the upgrade with no duplicates
+  in Apple Home.
+
+*Not yet done, and honestly outstanding:*
+
+- Pairing **through the plugin's own menu** (the flow this page describes).
+  The pairing above was driven from the bridge node's console before that menu
+  existed.
+- The **second admin**: multi-fabric operation has not been demonstrated by
+  adding a second controller alongside Apple Home.
+- The **reboot** leg of the identity check — a plugin reload and a bridge-node
+  restart have both been survived, a full Mac reboot has not.
+- The **managed LaunchAgent** end to end, which is blocked on publishing
+  `indigo-matter-bridge` to npm.
+
+Treat the export half as new.
 
 ### Why every ecosystem calls it "uncertified"
 
