@@ -23,12 +23,14 @@ Four disciplines worth knowing before editing:
   from a stale declaration is how an accessory ends up controlling the wrong
   thing.
 
-* **A role the plugin cannot bridge is skipped, loudly, not sent.** The §5.1
-  dialog already offers ``doorLock``/``windowCovering``/the sensors as roles, so
-  the allow-list can hold E4 entries today. An unknown role fails the *whole*
-  ``attach`` on the node side (E3a), so one E4 export would silently un-export
-  every working one. Skip-with-warning keeps the blast radius at one device, and
-  the count is surfaced in the dialog's status line.
+* **A role the plugin cannot bridge is skipped, loudly, not sent.** E4 made
+  ``export_handlers`` total over the v1 §4.2 enum, so this no longer fires for
+  anything a user can select — but it is the guard for a role a *future*
+  protocol version adds, and for an allow-list blob restored from a newer
+  install. An unknown role fails the *whole* ``attach`` on the node side (E3a),
+  so one such export would silently un-export every working one.
+  Skip-with-warning keeps the blast radius at one device, and the count is
+  surfaced in the dialog's status line.
 
 * **Nothing here may block Indigo's thread.** ``deviceUpdated`` runs on Indigo's
   callback thread for *every* device on the server. State pushes are submitted
@@ -94,7 +96,7 @@ class ExportBridge:
         #: The live client, or ``None`` while nothing is exported (XG5).
         self.client: Optional[BridgeClient] = None
         #: Last reason each device was skipped by the provider, so a permanent
-        #: skip (an E4 role) logs once rather than on every reconnect.
+        #: skip (an unbridgeable role) logs once, not on every reconnect.
         self._skipped: dict[int, str] = {}
         #: Consecutive watchdog ticks seen disconnected.
         self._disconnect_ticks = 0
@@ -266,10 +268,10 @@ class ExportBridge:
                                          f"(now: {', '.join(verdict.eligible_roles)})")
         handler = export_handlers.handler_for(entry.role)
         if handler is None:
-            return self._skip(device_id, f"the role {entry.role!r} cannot be bridged yet — "
-                                         "sensors, locks, coverings and thermostats land in E4")
+            return self._skip(device_id, f"the role {entry.role!r} is not one this plugin "
+                                         "version can bridge")
         try:
-            states = handler.states_for(dev)
+            states = handler.states_for(dev, entry.options)
         except Exception as exc:  # pylint: disable=broad-except
             self._logger.exception(exc)
             # The exception TEXT is deliberately not part of the dedupe key: a
@@ -328,7 +330,7 @@ class ExportBridge:
             self._fire(client.set_reachable(new_dev.id, reachable_of(new_dev)),
                        f"set_reachable dev {new_dev.id}")
         try:
-            states = handler.diff(orig_dev, new_dev)
+            states = handler.diff(orig_dev, new_dev, entry.options)
         except Exception as exc:  # pylint: disable=broad-except
             # Once per device per streak: this fires on every change of an
             # exported device, so a lamp on a dimmer ramp would otherwise write
@@ -480,7 +482,7 @@ class ExportBridge:
                 "ignoring.", command.command, device_id)
             return
         try:
-            if not handler.dispatch(command.command, command.args, dev):
+            if not handler.dispatch(command.command, command.args, dev, entry.options):
                 self._logger.warning(
                     "Matter export: the bridge node sent %r for device %s (%s), which that role "
                     "does not define — ignoring.", command.command, device_id, entry.role)

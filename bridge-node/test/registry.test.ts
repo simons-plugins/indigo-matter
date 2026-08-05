@@ -21,9 +21,11 @@ import { after, describe, it } from "node:test";
 
 import { Endpoint, Environment, Logger, ServerNode, VendorId } from "@matter/main";
 import { BasicInformationServer } from "@matter/main/behaviors/basic-information";
+import { DoorLockServer } from "@matter/main/behaviors/door-lock";
+import { WindowCoveringServer } from "@matter/main/behaviors/window-covering";
 import { AggregatorEndpoint } from "@matter/main/endpoints/aggregator";
 
-import { endpointIdFor, uniqueIdFor, watchCommands } from "../src/endpoints.js";
+import { endpointIdFor, SUPPORTED_ROLES, uniqueIdFor, watchCommands } from "../src/endpoints.js";
 import {
     type CommandEventData,
     type EndpointSpec,
@@ -144,6 +146,18 @@ function spec(indigoDeviceId: number, role: RoleValue, overrides: Partial<Endpoi
     };
 }
 
+/**
+ * A role that is in no version of the §4.2 enum.
+ *
+ * E4 completed the v1 table, so there is no longer a *lawful* role the node
+ * cannot build — but the refusal path is not dead code: PM-B deliberately keeps
+ * an old bridge node alive across plugin reloads, so "a role this build has
+ * never heard of" is exactly what a newer plugin sends an older node. The cast
+ * is the only way to express that from inside the current typings, and it is
+ * what the refusal tests below use in place of the E4 roles they used to name.
+ */
+const FUTURE_ROLE = "waterValve" as RoleValue;
+
 async function rejects(run: () => Promise<unknown>, code: string): Promise<ProtocolError> {
     try {
         await run();
@@ -253,11 +267,11 @@ describe("role factory", () => {
         }
     });
 
-    it("refuses a lawful §4.2 role this bridge version cannot build", async () => {
+    it("refuses a role this bridge version cannot build", async () => {
         const h = await harness();
         try {
             const error = await rejects(
-                () => h.registry.reconcile([spec(1, Role.doorLock)], false),
+                () => h.registry.reconcile([spec(1, FUTURE_ROLE)], false),
                 ErrorCode.internal,
             );
             assert.match(error.message, /not implemented by this bridge version/);
@@ -340,8 +354,8 @@ describe("reconcile (§3.1)", () => {
     });
 
     it("refuses a mixed set whole, leaving even the planned removals in place", async () => {
-        // The dangerous shape: one supported role and one E4 role, against a
-        // POPULATED live set. If the role check ever moved after planning — or
+        // The dangerous shape: one supported role and one unbuildable role,
+        // against a POPULATED live set. If the role check ever moved after planning — or
         // worse, into the per-spec loop — the removals would run first and the
         // user would lose accessories to a request that was refused anyway.
         const h = await harness();
@@ -351,8 +365,8 @@ describe("reconcile (§3.1)", () => {
 
             await rejects(
                 // 2 is dropped from the desired set, so it is a planned removal;
-                // 3 is a lawful v1 role this bridge cannot build.
-                () => h.registry.reconcile([spec(1, Role.onOffLight), spec(3, Role.doorLock)], false),
+                // 3 is a role this build cannot construct.
+                () => h.registry.reconcile([spec(1, Role.onOffLight), spec(3, FUTURE_ROLE)], false),
                 ErrorCode.internal,
             );
 
@@ -363,12 +377,12 @@ describe("reconcile (§3.1)", () => {
         }
     });
 
-    it("refuses an upsert of an E4 role without touching the live set", async () => {
+    it("refuses an upsert of an unbuildable role without touching the live set", async () => {
         const h = await harness();
         try {
             await h.registry.reconcile([spec(1, Role.onOffLight)], false);
             const before = h.registry.summaries();
-            await rejects(() => h.registry.upsert(spec(2, Role.thermostat)), ErrorCode.internal);
+            await rejects(() => h.registry.upsert(spec(2, FUTURE_ROLE)), ErrorCode.internal);
             assert.deepEqual(h.registry.summaries(), before);
             assert.equal([...h.aggregator.parts].length, 1);
         } finally {
@@ -993,6 +1007,423 @@ describe("endpoint-number stability (PRD §4.3 / XAC5)", () => {
             assert.deepEqual(second.commands, [], "a restart sprayed command events");
         } finally {
             await second.close();
+        }
+    });
+});
+
+// ---------------------------------------------------------------------------
+// E4: the roles that complete the v1 §4.2 table
+// ---------------------------------------------------------------------------
+
+/** The §4.2 roles E4 added, with the behaviour each one must carry. */
+const E4_BEHAVIORS: [RoleValue, string][] = [
+    [Role.occupancySensor, "occupancySensing"],
+    [Role.contactSensor, "booleanState"],
+    [Role.temperatureSensor, "temperatureMeasurement"],
+    [Role.humiditySensor, "relativeHumidityMeasurement"],
+    [Role.lightSensor, "illuminanceMeasurement"],
+    [Role.pressureSensor, "pressureMeasurement"],
+    [Role.flowSensor, "flowMeasurement"],
+    [Role.thermostat, "thermostat"],
+    [Role.doorLock, "doorLock"],
+    [Role.windowCovering, "windowCovering"],
+];
+
+/**
+ * The covering behaviour as the bridge builds it. `goToLiftPercentage` only
+ * exists on the position-aware variant, so `agent.get()` needs the same
+ * `.with()` the role factory used — the bare `WindowCoveringServer` type does
+ * not carry the command.
+ */
+const PositionAwareCovering = WindowCoveringServer.with("Lift", "PositionAwareLift");
+
+/** The one endpoint a single-spec reconcile produced. */
+function only(h: Harness): Endpoint {
+    const endpoint = [...h.aggregator.parts][0];
+    assert.ok(endpoint !== undefined, "the reconcile built no endpoint");
+    return endpoint;
+}
+
+describe("role factory (E4)", () => {
+    it("supports every role in the §4.2 enum", () => {
+        // The E4 completion criterion, asserted rather than described: the
+        // table and the enum are now the same set, so an enum addition without
+        // a factory fails here first.
+        assert.deepEqual([...SUPPORTED_ROLES].sort(), [...(Object.values(Role) as RoleValue[])].sort());
+    });
+
+    it("builds each E4 role with bridged info and exactly its own cluster", async () => {
+        const h = await harness();
+        try {
+            await h.registry.reconcile(
+                E4_BEHAVIORS.map(([role], index) => spec(910_001 + index, role, { label: `E4-${index}` })),
+                false,
+            );
+            assert.equal(h.registry.size, E4_BEHAVIORS.length);
+
+            for (const [index, [role, behavior]] of E4_BEHAVIORS.entries()) {
+                const id = 910_001 + index;
+                const endpoint = [...h.aggregator.parts].find(part => part.id === endpointIdFor(id));
+                assert.ok(endpoint !== undefined, `${role} endpoint missing`);
+
+                const info = endpoint.stateOf("bridgedDeviceBasicInformation") as Record<string, unknown>;
+                assert.equal(info.nodeLabel, `E4-${index}`);
+                assert.equal(info.uniqueId, uniqueIdFor(id));
+                assert.notEqual(info.uniqueId, info.serialNumber);
+                assert.equal(info.configurationVersion, 1);
+
+                const behaviors = Object.keys(endpoint.state);
+                assert.ok(behaviors.includes(behavior), `${role} has no ${behavior}`);
+                // None of the E4 roles is a light: an accidental OnOff would
+                // mean the device type was picked wrong.
+                assert.ok(!behaviors.includes("onOff"), `${role} unexpectedly has OnOff`);
+            }
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("builds every E4 role from a spec that already carries its full state", async () => {
+        // The colour-state construction bug in reverse: thermostat and doorLock
+        // both supply mandatory attributes through `initialState`, and a spec's
+        // own `states` has to merge with those rather than replace them.
+        const h = await harness();
+        try {
+            await h.registry.reconcile(
+                [
+                    spec(1, Role.thermostat, {
+                        states: {
+                            localTemperatureC: 20.5,
+                            heatingSetpointC: 21,
+                            coolingSetpointC: 24,
+                            systemMode: "heat",
+                        },
+                    }),
+                    spec(2, Role.doorLock, { states: { locked: true } }),
+                    spec(3, Role.windowCovering, { states: { position: 70 } }),
+                ],
+                false,
+            );
+            assert.equal(h.registry.size, 3);
+
+            const thermostat = [...h.aggregator.parts].find(part => part.id === endpointIdFor(1));
+            const state = thermostat?.stateOf("thermostat") as Record<string, unknown>;
+            assert.equal(state.localTemperature, 2050);
+            assert.equal(state.occupiedHeatingSetpoint, 2100);
+            assert.equal(state.occupiedCoolingSetpoint, 2400);
+            assert.equal(state.systemMode, 4, "SystemMode.Heat");
+            // Supplied by initialState and NOT clobbered by the spec's states.
+            assert.equal(state.controlSequenceOfOperation, 4, "ControlSequenceOfOperation.CoolingAndHeating");
+
+            const lock = [...h.aggregator.parts].find(part => part.id === endpointIdFor(2));
+            const lockState = lock?.stateOf("doorLock") as Record<string, unknown>;
+            assert.equal(lockState.lockState, 1, "LockState.Locked");
+            assert.equal(lockState.operatingMode, 0, "OperatingMode.Normal — from initialState");
+
+            const covering = [...h.aggregator.parts].find(part => part.id === endpointIdFor(3));
+            const position = covering?.stateOf("windowCovering") as Record<string, unknown>;
+            // 70 % open is 30 % closed. This is the inversion, on a real endpoint.
+            assert.equal(position.currentPositionLiftPercent100ths, 3000);
+            assert.equal(position.targetPositionLiftPercent100ths, 3000);
+        } finally {
+            await h.close();
+        }
+    });
+});
+
+describe("sensor set_state (§3.4, E4)", () => {
+    /** role → the §4.2 states to push, and the `measuredValue` they must produce. */
+    const CASES: [RoleValue, string, Record<string, unknown>, unknown][] = [
+        [Role.temperatureSensor, "temperatureMeasurement", { temperatureC: 21.5 }, 2150],
+        [Role.humiditySensor, "relativeHumidityMeasurement", { humidityPct: 48 }, 4800],
+        [Role.lightSensor, "illuminanceMeasurement", { lux: 100 }, 20_001],
+        // 0.1 kPa, not kPa — the conversion most likely to be wrong by 10x.
+        [Role.pressureSensor, "pressureMeasurement", { pressureKPa: 101.3 }, 1013],
+        [Role.flowSensor, "flowMeasurement", { flowM3h: 1.25 }, 13],
+    ];
+
+    for (const [role, behavior, states, expected] of CASES) {
+        it(`writes ${role} on the cluster's own scale`, async () => {
+            const h = await harness();
+            try {
+                await h.registry.reconcile([spec(1, role)], false);
+                await h.registry.setState(1, states);
+                assert.equal((only(h).stateOf(behavior) as Record<string, unknown>).measuredValue, expected);
+                assert.deepEqual(h.commands, [], "a sensor emitted a command");
+            } finally {
+                await h.close();
+            }
+        });
+    }
+
+    it("writes the occupancy bitmap, not a bare boolean", async () => {
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(1, Role.occupancySensor)], false);
+            await h.registry.setState(1, { occupied: true });
+            // matter.js models the attribute as an `Occupancy` bitmap instance
+            // whose bit 0 is the whole meaning, so the field is read rather
+            // than the object compared — a deepEqual against a plain object
+            // fails on the class, not on the value.
+            const occupancy = (): unknown =>
+                ((only(h).stateOf("occupancySensing") as Record<string, unknown>).occupancy as { occupied: boolean })
+                    .occupied;
+            assert.equal(occupancy(), true);
+            await h.registry.setState(1, { occupied: false });
+            assert.equal(occupancy(), false);
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("writes contact with no inversion — both sides call true 'closed'", async () => {
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(1, Role.contactSensor)], false);
+            await h.registry.setState(1, { contact: true });
+            assert.equal((only(h).stateOf("booleanState") as Record<string, unknown>).stateValue, true);
+            await h.registry.setState(1, { contact: false });
+            assert.equal((only(h).stateOf("booleanState") as Record<string, unknown>).stateValue, false);
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("refuses a sensor state key belonging to another sensor", async () => {
+        // Every sensor writes `measuredValue`, so a mixed-up role would look
+        // like it worked; the §4.2 key is the only thing that distinguishes them.
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(1, Role.temperatureSensor)], false);
+            const error = await rejects(() => h.registry.setState(1, { humidityPct: 48 }), ErrorCode.malformedArgs);
+            assert.match(error.message, /humidityPct/);
+        } finally {
+            await h.close();
+        }
+    });
+});
+
+describe("thermostat commands (§4.2, E4)", () => {
+    it("reports each ecosystem setpoint and mode write as its §4.2 command", async () => {
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(5, Role.thermostat)], false);
+            const endpoint = only(h);
+
+            // Ecosystems drive a thermostat by writing the attributes, so one
+            // watcher per attribute covers the whole command family.
+            ecosystemWrite(endpoint, "thermostat", "occupiedHeatingSetpoint", 2150, 2000);
+            ecosystemWrite(endpoint, "thermostat", "occupiedCoolingSetpoint", 2400, 2600);
+            ecosystemWrite(endpoint, "thermostat", "systemMode", 3, 4);
+
+            assert.deepEqual(h.commands, [
+                { indigoDeviceId: 5, command: "setHeatingSetpoint", args: { valueC: 21.5 } },
+                { indigoDeviceId: 5, command: "setCoolingSetpoint", args: { valueC: 24 } },
+                { indigoDeviceId: 5, command: "setSystemMode", args: { mode: "cool" } },
+            ]);
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("says nothing about a mode outside §4.2's four values", async () => {
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(5, Role.thermostat)], false);
+            // EmergencyHeat. Legal Matter, no §4.2 spelling — reporting the
+            // nearest guess would have Indigo act on something nobody asked for.
+            ecosystemWrite(only(h), "thermostat", "systemMode", 5, 4);
+            assert.deepEqual(h.commands, []);
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("does not echo its own set_state back as a command", async () => {
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(5, Role.thermostat)], false);
+            await h.registry.setState(5, { localTemperatureC: 19, heatingSetpointC: 21, systemMode: "auto" });
+            assert.deepEqual(h.commands, [], "a local thermostat write echoed back");
+        } finally {
+            await h.close();
+        }
+    });
+});
+
+describe("door lock commands (§4.2, §7, E4)", () => {
+    it("reports lock and unlock invocations", async () => {
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(9, Role.doorLock)], false);
+            const endpoint = only(h);
+            await endpoint.act(agent => agent.get(DoorLockServer).unlockDoor({}));
+            await endpoint.act(agent => agent.get(DoorLockServer).lockDoor({}));
+            assert.deepEqual(h.commands, [
+                { indigoDeviceId: 9, command: "unlock", args: {} },
+                { indigoDeviceId: 9, command: "lock", args: {} },
+            ]);
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("NEVER auto-confirms: lockState does not move on the ecosystem's say-so", async () => {
+        // PRD §7. matter.js's stock lockDoor/unlockDoor set lockState themselves,
+        // which for a bridge means the ecosystem shows the door locked the
+        // instant it asks — before Indigo, the mesh or the bolt agree. The
+        // overrides exist for this assertion.
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(9, Role.doorLock, { states: { locked: false } })], false);
+            const endpoint = only(h);
+            assert.equal((endpoint.stateOf("doorLock") as Record<string, unknown>).lockState, 2, "Unlocked");
+
+            await endpoint.act(agent => agent.get(DoorLockServer).lockDoor({}));
+            assert.equal(
+                (endpoint.stateOf("doorLock") as Record<string, unknown>).lockState,
+                2,
+                "the ecosystem's lockDoor moved lockState by itself",
+            );
+
+            // It moves when — and only when — Indigo says the bolt actually did.
+            await h.registry.setState(9, { locked: true });
+            assert.equal((endpoint.stateOf("doorLock") as Record<string, unknown>).lockState, 1, "Locked");
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("does not echo the confirming set_state back as a lock command", async () => {
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(9, Role.doorLock)], false);
+            await h.registry.setState(9, { locked: true });
+            await h.registry.setState(9, { locked: false });
+            assert.deepEqual(h.commands, []);
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("stops reporting once the registry lets the endpoint go", async () => {
+        // The invocation roles have no observables, so the COMMAND_SINKS entry
+        // is the only thing between a forgotten lock and a command for a device
+        // the plugin no longer exports. `close()` rather than `remove()`
+        // because a removed endpoint is *closed* and cannot be invoked at all —
+        // which is its own guarantee, but tests matter.js, not the teardown.
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(9, Role.doorLock)], false);
+            const endpoint = only(h);
+            await endpoint.act(agent => agent.get(DoorLockServer).lockDoor({}));
+            assert.equal(h.commands.length, 1, "the sink should be live beforehand");
+
+            h.registry.close();
+            await endpoint.act(agent => agent.get(DoorLockServer).unlockDoor({}));
+            assert.equal(h.commands.length, 1, "a released lock still reported");
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("refuses an invocation on a removed endpoint outright (PRD §7 race row)", async () => {
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(9, Role.doorLock)], false);
+            const endpoint = only(h);
+            await h.registry.remove(9);
+            await assert.rejects(async () => endpoint.act(agent => agent.get(DoorLockServer).lockDoor({})));
+            assert.deepEqual(h.commands, []);
+        } finally {
+            await h.close();
+        }
+    });
+});
+
+describe("window covering commands (§4.2, E4)", () => {
+    it("maps every movement command to a §4.2 position, inverted", async () => {
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(6, Role.windowCovering, { states: { position: 100 } })], false);
+            const endpoint = only(h);
+
+            // 3000 percent100ths is 30 % CLOSED, i.e. §4.2 position 70.
+            await endpoint.act(agent =>
+                agent.get(PositionAwareCovering).goToLiftPercentage({ liftPercent100thsValue: 3000 }),
+            );
+            await endpoint.act(agent => agent.get(PositionAwareCovering).downOrClose());
+            await endpoint.act(agent => agent.get(PositionAwareCovering).upOrOpen());
+
+            assert.deepEqual(h.commands, [
+                { indigoDeviceId: 6, command: "goToPosition", args: { position: 70 } },
+                { indigoDeviceId: 6, command: "goToPosition", args: { position: 0 } },
+                { indigoDeviceId: 6, command: "goToPosition", args: { position: 100 } },
+            ]);
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("reports a stop, and settles the ecosystem's in-motion rendering", async () => {
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(6, Role.windowCovering, { states: { position: 100 } })], false);
+            const endpoint = only(h);
+            await endpoint.act(agent =>
+                agent.get(PositionAwareCovering).goToLiftPercentage({ liftPercent100thsValue: 5000 }),
+            );
+            h.commands.length = 0;
+
+            await endpoint.act(agent => agent.get(PositionAwareCovering).stopMotion());
+            assert.deepEqual(h.commands, [{ indigoDeviceId: 6, command: "stopMotion", args: {} }]);
+            // super.handleStopMovement() settles target onto current, so the
+            // accessory stops animating. It is a statement about the request,
+            // not a claim about where the blind ended up.
+            const state = endpoint.stateOf("windowCovering") as Record<string, number>;
+            assert.equal(state.targetPositionLiftPercent100ths, state.currentPositionLiftPercent100ths);
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("does not move the position itself — matter.js's instant snap is overridden", async () => {
+        // PRD §5.2: "Must implement handleMovement() — matter.js's default snaps
+        // to target instantly". A bridge that snapped would tell every ecosystem
+        // the blind had arrived before Indigo had even been asked.
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(6, Role.windowCovering, { states: { position: 100 } })], false);
+            const endpoint = only(h);
+            await endpoint.act(agent =>
+                agent.get(PositionAwareCovering).goToLiftPercentage({ liftPercent100thsValue: 8000 }),
+            );
+            assert.equal(
+                (endpoint.stateOf("windowCovering") as Record<string, unknown>).currentPositionLiftPercent100ths,
+                0,
+                "the covering snapped to target without Indigo",
+            );
+
+            // Indigo reports the blind arrived; only now does the position move.
+            await h.registry.setState(6, { position: 20 });
+            assert.equal(
+                (endpoint.stateOf("windowCovering") as Record<string, unknown>).currentPositionLiftPercent100ths,
+                8000,
+            );
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("does not echo its own position push back as a goToPosition", async () => {
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(6, Role.windowCovering)], false);
+            await h.registry.setState(6, { position: 40 });
+            await h.registry.setState(6, { position: 0 });
+            assert.deepEqual(h.commands, []);
+        } finally {
+            await h.close();
         }
     });
 });

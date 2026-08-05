@@ -8,9 +8,10 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
-import { EventName } from "../src/protocol.js";
+import { rejectedStateKeys } from "../src/endpoints.js";
+import { type EndpointSpec, EventName, Role, type RoleValue } from "../src/protocol.js";
 import * as shapes from "./fixture-shapes.js";
-import type { GoldenEvent } from "./stub-bridge.js";
+import type { GoldenEvent, GoldenExchange } from "./stub-bridge.js";
 import { golden } from "./stub-bridge.js";
 
 /** The §5 domain, as runtime values, for the event sweep below. */
@@ -76,11 +77,78 @@ describe("golden fixtures match their typed mirror", () => {
         });
     }
 
-    describe("pending exchanges (§3.9-§3.11 and the E4 roles)", () => {
+    describe("the §4.2 role table, from the golden frames", () => {
+        /** `attach_all_roles`' endpoint specs — one per v1 role, by contract. */
+        const specs = (golden.attach_all_roles.request.args as { endpoints: EndpointSpec[] }).endpoints;
+        const byDeviceId = new Map(specs.map(spec => [spec.indigoDeviceId, spec]));
+
+        /**
+         * Every `set_state_*` frame at the top level, paired with the role its
+         * device was attached as. Found by device id rather than by decoding
+         * the frame's own name, so a fixture renamed from
+         * `set_state_light_sensor` to something else is still swept.
+         */
+        function setStateFrames(): [string, EndpointSpec, Record<string, unknown>][] {
+            return Object.entries(golden as Record<string, unknown>)
+                .filter((entry): entry is [string, GoldenExchange] => entry[0].startsWith("set_state_"))
+                .flatMap(([name, exchange]) => {
+                    const args = exchange.request.args as { indigoDeviceId?: number; states?: unknown };
+                    const spec = byDeviceId.get(args.indigoDeviceId ?? -1);
+                    // set_state_unknown_device / _bad_keys are deliberately about
+                    // devices that were never attached; they have their own
+                    // shape assertions above.
+                    return spec === undefined ? [] : [[name, spec, args.states as Record<string, unknown>]];
+                });
+        }
+
+        it("attaches every v1 role exactly once", () => {
+            assert.deepEqual(
+                specs.map(spec => spec.role).sort(),
+                [...(Object.values(Role) as RoleValue[])].sort(),
+                "attach_all_roles is the file's only statement of the whole §4.2 enum",
+            );
+        });
+
+        it("builds every attached spec's initial state without refusing a key", () => {
+            // `createEndpoint` runs the same statePatchOrRefuse as `set_state`,
+            // so an initial `states` the role does not speak is a malformed_args
+            // at attach — which would take the whole reconcile down.
+            for (const spec of specs) {
+                assert.deepEqual(rejectedStateKeys(spec.role, spec.states), [], `${spec.role} initial states`);
+            }
+        });
+
+        it("consumes every key of every role's set_state frame", () => {
+            // The cross-check that matters most: the golden file is the shared
+            // §4.2 vocabulary, and this asserts the node's converters answer to
+            // all of it. A mistyped key in `endpoints.ts` (`humidityPercent`
+            // for `humidityPct`) would otherwise be a silent no-op that only
+            // shows as a sensor stuck at "unknown" in someone's Home app.
+            const frames = setStateFrames();
+            assert.ok(frames.length > 0, "no set_state frames matched an attached device");
+            for (const [name, spec, states] of frames) {
+                assert.ok(Object.keys(states).length > 0, `${name} sends no states`);
+                assert.deepEqual(rejectedStateKeys(spec.role, states), [], `${name} (${spec.role})`);
+            }
+        });
+
+        it("gives every role its own set_state frame", () => {
+            const covered = new Set(setStateFrames().map(([, spec]) => spec.role));
+            // `onOffLight`'s frame is the plain top-level `set_state`, which
+            // targets the same device id the other attach fixtures use rather
+            // than one of attach_all_roles' — hence the explicit add.
+            covered.add(Role.onOffLight);
+            for (const role of Object.values(Role) as RoleValue[]) {
+                assert.ok(covered.has(role), `no set_state golden frame for ${role}`);
+            }
+        });
+    });
+
+    describe("pending exchanges (§3.9-§3.11)", () => {
         const names = Object.keys(golden.pending).filter(key => !key.startsWith("_"));
 
         it("every pending entry is a well-formed exchange", () => {
-            assert.ok(names.length > 0, "pending section should not be empty while E4 is outstanding");
+            assert.ok(names.length > 0, "the fabric/reset/rebuild family is still outstanding");
             for (const name of names) {
                 const exchange = golden.pending[name];
                 assert.ok(exchange?.request !== undefined, `${name} has no request`);

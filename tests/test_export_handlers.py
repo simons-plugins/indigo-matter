@@ -20,7 +20,13 @@ import importlib
 import pytest
 
 import bridge_protocol
-from fakes import DimmerDevice, RelayDevice
+from fakes import (
+    DimmerDevice,
+    FakeIndigoDevice,
+    RelayDevice,
+    SensorDevice,
+    ThermostatDevice,
+)
 
 
 @pytest.fixture
@@ -40,65 +46,131 @@ def handlers(mock_indigo_base):
 # ---------------------------------------------------------------------------
 # The zoo (invariants over the whole table)
 # ---------------------------------------------------------------------------
-E3_ROLES = (
-    "onOffPlugInUnit", "onOffLight", "dimmableLight",
-    "colorTemperatureLight", "extendedColorLight",
-)
+ALL_ROLES = tuple(sorted(bridge_protocol.ROLES))
 
 
-def test_every_e3_role_has_a_handler(handlers):
-    assert set(handlers.HANDLERS) == set(E3_ROLES)
+def test_every_v1_role_has_a_handler(handlers):
+    """The E4 completion criterion: the table and the §4.2 enum are one set.
+
+    Not a subset either way. A missing handler is an export the user selected
+    that never appears in any ecosystem; an extra one is a role the node would
+    refuse with ``unknown_role``, failing the whole attach.
+    """
+    assert set(handlers.HANDLERS) == bridge_protocol.ROLES
+    assert handlers.BRIDGEABLE_ROLES == bridge_protocol.ROLES
 
 
-def test_no_handler_claims_a_role_outside_the_protocol_enum(handlers):
-    assert set(handlers.HANDLERS) <= bridge_protocol.ROLES
-
-
-@pytest.mark.parametrize("role", E3_ROLES)
+@pytest.mark.parametrize("role", ALL_ROLES)
 def test_the_handler_is_registered_under_its_own_role(handlers, role):
     assert handlers.HANDLERS[role].role == role
+    assert handlers.is_bridgeable(role)
 
 
-@pytest.mark.parametrize("role", E3_ROLES)
+@pytest.mark.parametrize("role", ALL_ROLES)
 def test_state_keys_are_a_subset_of_the_roles_4_2_vocabulary(handlers, role):
     """A key the node does not know for this role is dropped on the floor."""
-    dev = _fully_populated_device()
-    produced = set(handlers.HANDLERS[role].states_for(dev))
+    produced = set(handlers.HANDLERS[role].states_for(_capable_device(role)))
     allowed = set(bridge_protocol.ROLE_STATE_KEYS[role])
     assert produced <= allowed, f"{role} emits {produced - allowed}"
 
 
-@pytest.mark.parametrize("role", E3_ROLES)
+@pytest.mark.parametrize("role", ALL_ROLES)
 def test_a_capable_device_produces_the_whole_vocabulary(handlers, role):
     """The other direction: a device that CAN answer every key must answer it.
 
     Subset-only would pass for a handler that silently stopped reporting
     brightness, which an ecosystem renders as a light stuck at its last level.
     """
-    dev = _fully_populated_device()
-    assert set(handlers.HANDLERS[role].states_for(dev)) == \
+    assert set(handlers.HANDLERS[role].states_for(_capable_device(role))) == \
         set(bridge_protocol.ROLE_STATE_KEYS[role])
 
 
-@pytest.mark.parametrize("role", E3_ROLES)
+#: The roles E4 added. Kept as a list because several invariants below are true
+#: of them and NOT of the on/off family — see the fabrication test.
+E4_ROLES = ("windowCovering", "doorLock", "occupancySensor", "contactSensor",
+            "temperatureSensor", "humiditySensor", "lightSensor",
+            "pressureSensor", "flowSensor", "thermostat")
+
+
+@pytest.mark.parametrize("role", E4_ROLES)
+def test_a_device_that_answers_nothing_produces_no_fabricated_keys(handlers, role):
+    """§3.4 state maps are partial; a fabricated value goes out as fact.
+
+    The dangerous ones are the booleans — a lock or a contact sensor defaulting
+    to False tells every ecosystem the door is shut, which is the reading a user
+    would act on. Every E4 attribute is documented nullable in the IOM
+    (``onState``/``sensorValue`` are "None if the sensor doesn't support…"), so
+    "say nothing" is always available and always the honest answer.
+
+    The on/off light family is deliberately excluded: a relay always has an
+    ``onState``, so ``onOff`` is unconditional there and has been since E3.
+    """
+    silent = FakeIndigoDevice(1, "Mute", onState=None, sensorValue=None,
+                              brightness=None, temperatures=None,
+                              heatSetpoint=None, coolSetpoint=None, hvacMode=None)
+    assert handlers.HANDLERS[role].states_for(silent) == {}
+
+
+@pytest.mark.parametrize("role", ALL_ROLES)
 def test_dispatch_covers_every_command_the_role_declares(handlers, role):
     assert set(handlers.HANDLERS[role].commands()) == set(bridge_protocol.ROLE_COMMANDS[role])
 
 
-@pytest.mark.parametrize("role", sorted(bridge_protocol.ROLES - set(E3_ROLES)))
-def test_an_e4_role_is_explicitly_unbridgeable(handlers, role):
-    """E4 roles must answer ``None``, not raise and not half-work.
+@pytest.mark.parametrize("role", ALL_ROLES)
+def test_a_diff_of_a_device_against_itself_is_empty(handlers, role):
+    """Every role, not just the ones with an interesting tolerance.
 
-    The allow-list can already hold them — the §5.1 dialog offers doorLock,
-    windowCovering and the sensors as roles — and an unknown role fails the
-    WHOLE attach on the node (E3a), so the caller has to be able to ask.
+    A handler that recomputed a value non-deterministically — or compared an
+    inverted reading against a raw one — would push a `set_state` on every
+    unrelated device change in the house.
     """
-    assert handlers.handler_for(role) is None
-    assert not handlers.is_bridgeable(role)
+    dev = _capable_device(role)
+    assert handlers.HANDLERS[role].diff(dev, _capable_device(role)) == {}
+
+
+def test_the_sensor_roles_declare_no_commands(handlers):
+    """Matter sensors are read-only; an empty tuple in §4.2 is by design."""
+    for role in ("occupancySensor", "contactSensor", "temperatureSensor",
+                 "humiditySensor", "lightSensor", "pressureSensor", "flowSensor"):
+        assert handlers.HANDLERS[role].commands() == {}
+
+
+def test_the_invert_option_key_matches_the_stores(handlers):
+    """The two spell it separately so neither imports the other; pin them here."""
+    import export_store
+    assert handlers.OPTION_INVERT == export_store.OPTION_INVERT
+    assert export_store.INVERTIBLE_ROLES == ("windowCovering",)
+
+
+def _capable_device(role: str):
+    """A device shaped so that ``role``'s handler can answer every §4.2 key.
+
+    One Frankenstein device per role rather than one for all fifteen: a single
+    object carrying ``sensorValue``, ``temperatures`` and RGB channels at once
+    exists nowhere in Indigo, and the invariant it would prove ("the handler
+    reads *something*") is weaker than the one here ("the handler reads what a
+    real device of this kind actually offers").
+    """
+    if role in ("occupancySensor", "contactSensor"):
+        return SensorDevice(1, "Zoo Sensor", onState=True, supportsOnState=True)
+    if role in ("temperatureSensor", "humiditySensor", "lightSensor",
+                "pressureSensor", "flowSensor"):
+        return SensorDevice(1, "Zoo Sensor", sensorValue=21.5, supportsSensorValue=True)
+    if role == "thermostat":
+        # `indigo` is the conftest mock here, so kHvacMode.Heat is a stable
+        # sentinel object — which is exactly how the real enum members compare.
+        import indigo
+        return ThermostatDevice(1, "Zoo Stat", temperatures=[20.5], heatSetpoint=21.0,
+                                coolSetpoint=24.0, hvacMode=indigo.kHvacMode.Heat)
+    if role == "doorLock":
+        return RelayDevice(1, "Zoo Lock", onState=True)
+    if role == "windowCovering":
+        return DimmerDevice(1, "Zoo Blind", onState=True, brightness=70)
+    return _fully_populated_device()
 
 
 def _fully_populated_device():
-    """A dimmer that can answer every E3 state key."""
+    """A dimmer that can answer every light role's state key."""
     return DimmerDevice(1, "Zoo Lamp", onState=True, brightness=60,
                         redLevel=100, greenLevel=0, blueLevel=0,
                         whiteLevel=80, whiteTemperature=2700,
@@ -446,3 +518,272 @@ def test_hue_survives_a_round_trip_through_rgb(handlers, hue):
     red, green, blue = handlers.hue_saturation_to_rgb(hue, 100)
     back, _saturation = handlers.rgb_to_hue_saturation(red, green, blue)
     assert abs(back - hue) <= handlers.HUE_TOLERANCE_DEGREES
+
+
+# ---------------------------------------------------------------------------
+# windowCovering (E4)
+# ---------------------------------------------------------------------------
+class TestWindowCovering:
+    """§4.2 ``position`` is 0-100 with 100 = open — the inbound convention."""
+
+    @staticmethod
+    def _handler(handlers):
+        return handlers.HANDLERS["windowCovering"]
+
+    def test_position_is_the_brightness_when_polarity_is_normal(self, handlers):
+        dev = DimmerDevice(1, "Blind", brightness=70)
+        assert self._handler(handlers).states_for(dev) == {"position": 70}
+        assert self._handler(handlers).states_for(dev, {}) == {"position": 70}
+
+    def test_the_invert_option_flips_the_reading(self, handlers):
+        """A motor wired so Indigo brightness 100 drives the blind shut."""
+        dev = DimmerDevice(1, "Blind", brightness=70)
+        assert self._handler(handlers).states_for(dev, {"invert": True}) == {"position": 30}
+
+    def test_only_a_literal_true_inverts(self, handlers):
+        """A truthy-but-not-True option is a corrupt blob, not a polarity."""
+        dev = DimmerDevice(1, "Blind", brightness=70)
+        assert self._handler(handlers).states_for(dev, {"invert": "yes"}) == {"position": 70}
+
+    def test_a_device_with_no_brightness_says_nothing(self, handlers):
+        assert self._handler(handlers).states_for(DimmerDevice(1, "Blind", brightness=None)) == {}
+
+    def test_dispatch_sets_brightness_directly(self, handlers, mock_indigo_base):
+        dev = DimmerDevice(1, "Blind", brightness=0)
+        self._handler(handlers).dispatch("goToPosition", {"position": 65}, dev)
+        mock_indigo_base.dimmer.setBrightness.assert_called_once_with(dev, value=65)
+
+    def test_dispatch_inverts_when_the_export_says_so(self, handlers, mock_indigo_base):
+        dev = DimmerDevice(1, "Blind", brightness=0)
+        self._handler(handlers).dispatch("goToPosition", {"position": 65}, dev, {"invert": True})
+        mock_indigo_base.dimmer.setBrightness.assert_called_once_with(dev, value=35)
+
+    def test_the_inversion_round_trips(self, handlers, mock_indigo_base):
+        """Push then command must land back where it started, or the blind walks."""
+        handler = self._handler(handlers)
+        for brightness in range(0, 101):
+            dev = DimmerDevice(1, "Blind", brightness=brightness)
+            position = handler.states_for(dev, {"invert": True})["position"]
+            handler.dispatch("goToPosition", {"position": position}, dev, {"invert": True})
+            assert mock_indigo_base.dimmer.setBrightness.call_args.kwargs["value"] == brightness
+
+    def test_dispatch_clamps_an_out_of_range_position(self, handlers, mock_indigo_base):
+        dev = DimmerDevice(1, "Blind", brightness=0)
+        self._handler(handlers).dispatch("goToPosition", {"position": 250}, dev)
+        mock_indigo_base.dimmer.setBrightness.assert_called_once_with(dev, value=100)
+
+    def test_dispatch_without_a_position_raises_rather_than_guessing(self, handlers):
+        with pytest.raises(ValueError, match="goToPosition"):
+            self._handler(handlers).dispatch("goToPosition", {}, DimmerDevice(1, "Blind"))
+
+    def test_stop_motion_is_accepted_and_drives_nothing(self, handlers, mock_indigo_base):
+        """Indigo has no stop for a dimmer-modelled covering (see the handler).
+
+        Accepted, so ``export_bridge`` does not log "a command that role does not
+        define" — which would read as a protocol bug rather than the documented
+        limitation it is.
+        """
+        dev = DimmerDevice(1, "Blind", brightness=50)
+        assert self._handler(handlers).dispatch("stopMotion", {}, dev) is True
+        mock_indigo_base.dimmer.setBrightness.assert_not_called()
+        mock_indigo_base.device.turnOff.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# doorLock (E4)
+# ---------------------------------------------------------------------------
+class TestDoorLock:
+    @staticmethod
+    def _handler(handlers):
+        return handlers.HANDLERS["doorLock"]
+
+    def test_locked_follows_on_state(self, handlers):
+        """on = locked, mirroring ``matter_handlers/door_lock.py`` exactly."""
+        assert self._handler(handlers).states_for(RelayDevice(1, "Door", onState=True)) == \
+            {"locked": True}
+        assert self._handler(handlers).states_for(RelayDevice(1, "Door", onState=False)) == \
+            {"locked": False}
+
+    def test_an_unknown_state_is_omitted_not_reported_as_unlocked(self, handlers):
+        assert self._handler(handlers).states_for(RelayDevice(1, "Door", onState=None)) == {}
+
+    def test_lock_dispatches_the_indigo_lock_command(self, handlers, mock_indigo_base):
+        dev = RelayDevice(1, "Door", onState=False)
+        self._handler(handlers).dispatch("lock", {}, dev)
+        mock_indigo_base.device.lock.assert_called_once_with(dev)
+
+    def test_unlock_dispatches_the_indigo_unlock_command(self, handlers, mock_indigo_base):
+        dev = RelayDevice(1, "Door", onState=True)
+        self._handler(handlers).dispatch("unlock", {}, dev)
+        mock_indigo_base.device.unlock.assert_called_once_with(dev)
+
+    def test_a_lock_never_falls_back_to_turn_on(self, handlers, mock_indigo_base):
+        """PRD §7: no fallback path with no lock semantics.
+
+        ``indigo.device.lock`` needs ``IsLockSubType``; if the device is not one,
+        IndigoServer refuses — which is the right place for that refusal.
+        Quietly driving a relay the user declared a lock through ``turnOn``
+        instead would work often enough to hide the misconfiguration.
+        """
+        self._handler(handlers).dispatch("lock", {}, RelayDevice(1, "Door"))
+        mock_indigo_base.device.turnOn.assert_not_called()
+        mock_indigo_base.device.turnOff.assert_not_called()
+
+    def test_dispatch_confirms_nothing(self, handlers, mock_indigo_base):
+        """No state write, no read-back, no synthesised confirmation."""
+        dev = RelayDevice(1, "Door", onState=False)
+        self._handler(handlers).dispatch("lock", {}, dev)
+        assert dev.onState is False, "the handler wrote the state it was hoping for"
+        mock_indigo_base.device.statusRequest.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# thermostat (E4)
+# ---------------------------------------------------------------------------
+class TestThermostat:
+    @staticmethod
+    def _handler(handlers):
+        return handlers.HANDLERS["thermostat"]
+
+    @staticmethod
+    def _dev(**attrs):
+        import indigo
+        attrs.setdefault("temperatures", [20.5])
+        attrs.setdefault("heatSetpoint", 21.0)
+        attrs.setdefault("coolSetpoint", 24.0)
+        attrs.setdefault("hvacMode", indigo.kHvacMode.Heat)
+        return ThermostatDevice(1, "Hall Stat", **attrs)
+
+    def test_states_read_the_documented_thermostat_attributes(self, handlers):
+        assert self._handler(handlers).states_for(self._dev()) == {
+            "localTemperatureC": 20.5,
+            "heatingSetpointC": 21.0,
+            "coolingSetpointC": 24.0,
+            "systemMode": "heat",
+        }
+
+    def test_the_first_temperature_sensor_is_the_matter_local_temperature(self, handlers):
+        """Matter's Thermostat has exactly one; Indigo allows three."""
+        states = self._handler(handlers).states_for(self._dev(temperatures=[19.0, 30.0, 5.0]))
+        assert states["localTemperatureC"] == 19.0
+
+    def test_an_empty_temperature_list_omits_the_key(self, handlers):
+        assert "localTemperatureC" not in self._handler(handlers).states_for(
+            self._dev(temperatures=[]))
+
+    @pytest.mark.parametrize("attribute,expected", [
+        ("Off", "off"), ("Heat", "heat"), ("Cool", "cool"), ("HeatCool", "auto"),
+    ])
+    def test_every_mode_in_the_4_2_domain_maps(self, handlers, attribute, expected):
+        import indigo
+        dev = self._dev(hvacMode=getattr(indigo.kHvacMode, attribute))
+        assert self._handler(handlers).states_for(dev)["systemMode"] == expected
+
+    @pytest.mark.parametrize("attribute,expected", [
+        ("ProgramHeat", "heat"), ("ProgramCool", "cool"), ("ProgramHeatCool", "auto"),
+    ])
+    def test_the_program_modes_collapse_onto_their_base_mode(self, handlers, attribute,
+                                                             expected):
+        """Matter has no "running its own schedule" value.
+
+        Reporting `off` for ProgramHeat would be a worse lie than reporting
+        `heat` — which is, after all, what the thermostat is doing.
+        """
+        import indigo
+        dev = self._dev(hvacMode=getattr(indigo.kHvacMode, attribute))
+        assert self._handler(handlers).states_for(dev)["systemMode"] == expected
+
+    def test_an_unreadable_mode_is_omitted_rather_than_guessed(self, handlers):
+        assert "systemMode" not in self._handler(handlers).states_for(self._dev(hvacMode=None))
+
+    def test_diff_reports_only_the_setpoint_that_moved(self, handlers):
+        assert self._handler(handlers).diff(self._dev(), self._dev(heatSetpoint=22.5)) == \
+            {"heatingSetpointC": 22.5}
+
+    def test_setpoint_dispatch_uses_the_documented_indigo_commands(self, handlers,
+                                                                   mock_indigo_base):
+        dev = self._dev()
+        handler = self._handler(handlers)
+        handler.dispatch("setHeatingSetpoint", {"valueC": 21.5}, dev)
+        handler.dispatch("setCoolingSetpoint", {"valueC": 23.0}, dev)
+        mock_indigo_base.thermostat.setHeatSetpoint.assert_called_once_with(dev, value=21.5)
+        mock_indigo_base.thermostat.setCoolSetpoint.assert_called_once_with(dev, value=23.0)
+
+    def test_a_setpoint_is_passed_through_unconverted(self, handlers, mock_indigo_base):
+        """§4.2 says °C; Indigo records no unit. See the module docstring."""
+        dev = self._dev()
+        self._handler(handlers).dispatch("setHeatingSetpoint", {"valueC": 18.3}, dev)
+        mock_indigo_base.thermostat.setHeatSetpoint.assert_called_once_with(dev, value=18.3)
+
+    @pytest.mark.parametrize("mode,attribute", [
+        ("off", "Off"), ("heat", "Heat"), ("cool", "Cool"), ("auto", "HeatCool"),
+    ])
+    def test_mode_dispatch_uses_the_kHvacMode_members(self, handlers, mock_indigo_base,
+                                                      mode, attribute):
+        """`auto` is HeatCool, never ProgramHeatCool — the user asked for both
+        setpoints to be honoured, not for the built-in programme to take over."""
+        dev = self._dev()
+        self._handler(handlers).dispatch("setSystemMode", {"systemMode": mode}, dev)
+        mock_indigo_base.thermostat.setHvacMode.assert_called_once_with(
+            dev, value=getattr(mock_indigo_base.kHvacMode, attribute))
+
+    def test_a_mode_outside_the_domain_raises_rather_than_guessing(self, handlers):
+        with pytest.raises(ValueError, match="§4.2 domain"):
+            self._handler(handlers).dispatch("setSystemMode", {"systemMode": "dry"},
+                                             self._dev())
+
+    def test_a_setpoint_without_a_number_raises(self, handlers):
+        with pytest.raises(ValueError, match="valueC"):
+            self._handler(handlers).dispatch("setHeatingSetpoint", {"valueC": "warm"},
+                                             self._dev())
+
+
+# ---------------------------------------------------------------------------
+# Sensors (E4)
+# ---------------------------------------------------------------------------
+class TestSensors:
+    @pytest.mark.parametrize("role,key", [
+        ("occupancySensor", "occupied"), ("contactSensor", "contact"),
+    ])
+    def test_a_binary_sensor_reads_on_state_without_inverting(self, handlers, role, key):
+        """Both mirror the inbound handlers: `contact` true means CLOSED."""
+        handler = handlers.HANDLERS[role]
+        assert handler.states_for(SensorDevice(1, "S", onState=True)) == {key: True}
+        assert handler.states_for(SensorDevice(1, "S", onState=False)) == {key: False}
+
+    @pytest.mark.parametrize("role,key", [
+        ("temperatureSensor", "temperatureC"), ("humiditySensor", "humidityPct"),
+        ("lightSensor", "lux"), ("pressureSensor", "pressureKPa"),
+        ("flowSensor", "flowM3h"),
+    ])
+    def test_a_numeric_sensor_reads_sensor_value_under_its_own_key(self, handlers, role, key):
+        handler = handlers.HANDLERS[role]
+        assert handler.states_for(SensorDevice(1, "S", sensorValue=101.3)) == {key: 101.3}
+
+    def test_an_integer_reading_is_reported_as_a_float(self, handlers):
+        """§4.2 types these as float; the node's converters take numbers either way."""
+        states = handlers.HANDLERS["lightSensor"].states_for(SensorDevice(1, "S",
+                                                                         sensorValue=320))
+        assert states == {"lux": 320.0}
+
+    def test_a_boolean_is_not_a_sensor_value(self, handlers):
+        """`True` is an int in Python; reporting it as 1 lux would be nonsense."""
+        assert handlers.HANDLERS["lightSensor"].states_for(
+            SensorDevice(1, "S", sensorValue=True)) == {}
+
+    def test_a_reading_that_did_not_move_pushes_nothing(self, handlers):
+        handler = handlers.HANDLERS["temperatureSensor"]
+        assert handler.diff(SensorDevice(1, "S", sensorValue=21.5),
+                            SensorDevice(1, "S", sensorValue=21.5)) == {}
+
+    def test_a_reading_has_no_tolerance_because_nothing_round_trips(self, handlers):
+        """Unlike hue: Matter sensors are read-only, so there is no echo to damp."""
+        handler = handlers.HANDLERS["temperatureSensor"]
+        assert handler.diff(SensorDevice(1, "S", sensorValue=21.5),
+                            SensorDevice(1, "S", sensorValue=21.6)) == {"temperatureC": 21.6}
+
+    def test_a_sensor_dispatches_nothing_at_all(self, handlers):
+        for role in ("occupancySensor", "contactSensor", "temperatureSensor",
+                     "humiditySensor", "lightSensor", "pressureSensor", "flowSensor"):
+            assert handlers.HANDLERS[role].dispatch("onOff", {"value": True},
+                                                    SensorDevice(1, "S")) is False

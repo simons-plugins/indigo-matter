@@ -204,6 +204,28 @@ def test_zoo_offers_every_protocol_role_somewhere():
     )
 
 
+def test_every_role_the_picker_offers_can_actually_be_bridged(mock_indigo_base):
+    """The third side of the triangle, closed by E4.
+
+    The two invariants above tie the catalog to the *protocol*. This ties it to
+    the *implementation*: a role the picker offers but no handler serves is an
+    export the user selects, sees confirmed in the dialog, and then never finds
+    in any ecosystem — the failure mode E4 exists to remove. Before E4 this
+    could not be asserted; now it can, so it is.
+    """
+    import importlib
+    import export_handlers
+    importlib.reload(export_handlers)
+    offered = set()
+    for device, _expected in ZOO.values():
+        verdict = classify(device, OURS)
+        if isinstance(verdict, EligibleDevice):
+            offered.update(verdict.eligible_roles)
+    assert offered <= export_handlers.BRIDGEABLE_ROLES, (
+        f"offered but not bridgeable: {sorted(offered - export_handlers.BRIDGEABLE_ROLES)}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # C1 — classify() never propagates. Indigo proxies die mid-iteration.
 # ---------------------------------------------------------------------------

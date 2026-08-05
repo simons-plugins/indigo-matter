@@ -1,6 +1,6 @@
 {
   "name": "indigo-matter-bridge",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "description": "Matter bridge node for the indigo-matter Indigo plugin — exports selected Indigo devices as Matter accessories.",
   "license": "MIT",

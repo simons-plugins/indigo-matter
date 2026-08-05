@@ -11,17 +11,37 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
 import {
+    celsiusToMatter,
     clampMireds,
+    cubicMetresPerHourToMatter,
     degreesToMatterHue,
     HUE_DEGREES_MAX,
+    HUMIDITY_CENTI_MAX,
+    humidityToMatter,
+    ILLUMINANCE_MAX,
+    ILLUMINANCE_MIN,
     isEcosystemChange,
+    kilopascalsToMatter,
+    luxToMatter,
     MATTER_LEVEL_MAX,
     matterHueToDegrees,
+    matterToCelsius,
+    matterToCubicMetresPerHour,
+    matterToHumidity,
+    matterToKilopascals,
+    matterToLux,
     matterToPercent,
+    matterToSystemMode,
     MIREDS_MAX,
     MIREDS_MIN,
+    percent100thsToPosition,
+    PERCENT100THS_CLOSED,
+    PERCENT100THS_OPEN,
     percentToCurrentLevel,
     percentToMatter,
+    positionToPercent100ths,
+    systemModeToMatter,
+    TEMPERATURE_CENTI_MIN,
 } from "../src/endpoints.js";
 
 /** 0..100 inclusive — the whole §4.2 percent domain, not a sample of it. */
@@ -122,6 +142,189 @@ describe("hue conversion (§4.2)", () => {
         for (const hue of ALL_MATTER_LEVELS) {
             const degrees = matterHueToDegrees(hue);
             assert.ok(Number.isInteger(degrees) && degrees >= 0 && degrees <= HUE_DEGREES_MAX, `hue ${hue}`);
+        }
+    });
+});
+
+describe("temperature conversion (§4.2, E4)", () => {
+    it("uses the 0.01 °C scale in both directions", () => {
+        assert.equal(celsiusToMatter(21.5), 2150);
+        assert.equal(celsiusToMatter(0), 0);
+        assert.equal(matterToCelsius(2150), 21.5);
+    });
+
+    it("round-trips every tenth of a degree over a household range", () => {
+        for (let tenths = -400; tenths <= 500; tenths++) {
+            const celsius = tenths / 10;
+            assert.equal(matterToCelsius(celsiusToMatter(celsius)), celsius, `${celsius} °C`);
+        }
+    });
+
+    it("handles negatives without the half-up rule drifting", () => {
+        // roundHalfUp is floor(v + 0.5), so a negative exact half rounds toward
+        // zero: -0.005 °C is -0.5 centi and lands on 0, not -1. Pinned because
+        // temperature is the first signed unit in the file.
+        assert.equal(celsiusToMatter(-18.4), -1840);
+        assert.equal(celsiusToMatter(-0.005), 0);
+    });
+
+    it("clamps to the cluster's absolute-zero floor rather than emitting an illegal int16", () => {
+        assert.equal(celsiusToMatter(-500), TEMPERATURE_CENTI_MIN);
+        assert.equal(celsiusToMatter(100_000), 32767);
+    });
+});
+
+describe("humidity conversion (§4.2, E4)", () => {
+    it("uses the 0.01 % scale", () => {
+        assert.equal(humidityToMatter(48), 4800);
+        assert.equal(matterToHumidity(4800), 48);
+    });
+
+    it("round-trips every whole percent exactly", () => {
+        for (let percent = 0; percent <= 100; percent++) {
+            assert.equal(matterToHumidity(humidityToMatter(percent)), percent, `${percent} %`);
+        }
+    });
+
+    it("clamps outside 0-100 %, which the cluster's 0-10000 domain requires", () => {
+        assert.equal(humidityToMatter(-5), 0);
+        assert.equal(humidityToMatter(140), HUMIDITY_CENTI_MAX);
+    });
+});
+
+describe("illuminance conversion (§4.2, E4)", () => {
+    it("implements the cluster's documented log scale", () => {
+        // "MeasuredValue = 10,000 x log10(illuminance) + 1"
+        assert.equal(luxToMatter(1), 1);
+        assert.equal(luxToMatter(10), 10_001);
+        assert.equal(luxToMatter(100), 20_001);
+        assert.equal(luxToMatter(1000), 30_001);
+    });
+
+    it("round-trips a decade of readings to within the scale's own resolution", () => {
+        // One Matter step is a factor of 10^(1/10000), i.e. ~0.023% — so the
+        // property is relative, not absolute. A linear scale would fail this at
+        // the bottom of the range and an inverted one everywhere.
+        for (const lux of [1, 2, 5, 12.5, 50, 320, 1000, 12_000, 100_000]) {
+            const back = matterToLux(luxToMatter(lux));
+            assert.ok(Math.abs(back - lux) / lux < 0.001, `${lux} lx came back as ${back}`);
+        }
+    });
+
+    it("is monotonic across the whole measurable band", () => {
+        let previous = -1;
+        for (let lux = 1; lux <= 100_000; lux *= 1.05) {
+            const measured = luxToMatter(lux);
+            assert.ok(measured >= previous, `${lux} lx went backwards`);
+            assert.ok(measured >= ILLUMINANCE_MIN && measured <= ILLUMINANCE_MAX, `${lux} lx out of band`);
+            previous = measured;
+        }
+    });
+
+    it("reports sub-lux darkness as the cluster's 0 sentinel, not as 1 lx", () => {
+        // log10(0) is -Infinity and the band starts at 1 lx, so 0 is the only
+        // honest answer the cluster offers — "too low to be measured".
+        assert.equal(luxToMatter(0), 0);
+        assert.equal(luxToMatter(0.4), 0);
+        assert.equal(luxToMatter(-3), 0);
+        assert.equal(matterToLux(0), 0);
+    });
+
+    it("clamps a reading past the top of the band", () => {
+        assert.equal(luxToMatter(1e9), ILLUMINANCE_MAX);
+    });
+});
+
+describe("pressure and flow conversion (§4.2, E4)", () => {
+    it("uses the 0.1 kPa scale for pressure, NOT kPa", () => {
+        // "MeasuredValue = 10 x Pressure [kPa]" — the key is `pressureKPa` but
+        // the wire unit is a tenth of that, which is the trap this pins.
+        assert.equal(kilopascalsToMatter(101.3), 1013);
+        assert.equal(matterToKilopascals(1013), 101.3);
+    });
+
+    it("uses the 0.1 m³/h scale for flow", () => {
+        assert.equal(cubicMetresPerHourToMatter(1.25), 13);
+        assert.equal(cubicMetresPerHourToMatter(1.2), 12);
+        assert.equal(matterToCubicMetresPerHour(12), 1.2);
+    });
+
+    it("round-trips both at their own resolution", () => {
+        for (let tenths = 0; tenths <= 1200; tenths++) {
+            const value = tenths / 10;
+            assert.equal(matterToKilopascals(kilopascalsToMatter(value)), value, `${value} kPa`);
+            assert.equal(matterToCubicMetresPerHour(cubicMetresPerHourToMatter(value)), value, `${value} m³/h`);
+        }
+    });
+
+    it("keeps flow inside uint16 — a negative flow is not representable", () => {
+        assert.equal(cubicMetresPerHourToMatter(-5), 0);
+        assert.equal(cubicMetresPerHourToMatter(1e9), 65535);
+    });
+
+    it("allows a negative pressure, which is a legal int16 reading", () => {
+        assert.equal(kilopascalsToMatter(-2.5), -25);
+    });
+});
+
+describe("window-covering position (§4.2, E4)", () => {
+    it("INVERTS: §4.2 100 is open, Matter 0 is open", () => {
+        // The single most dangerous conversion in E4 — both sides are "percent"
+        // and they mean opposite things.
+        assert.equal(positionToPercent100ths(100), PERCENT100THS_OPEN);
+        assert.equal(positionToPercent100ths(0), PERCENT100THS_CLOSED);
+        assert.equal(percent100thsToPosition(PERCENT100THS_OPEN), 100);
+        assert.equal(percent100thsToPosition(PERCENT100THS_CLOSED), 0);
+    });
+
+    it("round-trips every one of the 101 positions exactly", () => {
+        for (const position of ALL_PERCENTS) {
+            assert.equal(percent100thsToPosition(positionToPercent100ths(position)), position, `position ${position}`);
+        }
+    });
+
+    it("puts a partial position on the right side of half-open", () => {
+        // 70% open is 30% closed. Getting the inversion backwards passes the
+        // round-trip test above and fails this one.
+        assert.equal(positionToPercent100ths(70), 3000);
+        assert.equal(percent100thsToPosition(3000), 70);
+        assert.equal(percent100thsToPosition(7500), 25);
+    });
+
+    it("clamps rather than emitting a percent100ths outside the cluster's range", () => {
+        assert.equal(positionToPercent100ths(-10), PERCENT100THS_CLOSED);
+        assert.equal(positionToPercent100ths(180), PERCENT100THS_OPEN);
+        assert.equal(percent100thsToPosition(-1), 100);
+        assert.equal(percent100thsToPosition(99_999), 0);
+    });
+});
+
+describe("thermostat systemMode mapping (§4.2, E4)", () => {
+    it("round-trips the whole four-value domain", () => {
+        for (const mode of ["off", "heat", "cool", "auto"]) {
+            const matter = systemModeToMatter(mode);
+            assert.equal(typeof matter, "number", `${mode} has no Matter value`);
+            assert.equal(matterToSystemMode(matter), mode);
+        }
+    });
+
+    it("pins the enum integers, which are not contiguous", () => {
+        // SystemModeEnum has no 2: Off=0, Auto=1, Cool=3, Heat=4.
+        assert.equal(systemModeToMatter("off"), 0);
+        assert.equal(systemModeToMatter("auto"), 1);
+        assert.equal(systemModeToMatter("cool"), 3);
+        assert.equal(systemModeToMatter("heat"), 4);
+    });
+
+    it("refuses a mode outside §4.2's domain in both directions", () => {
+        assert.equal(systemModeToMatter("emergencyHeat"), undefined);
+        assert.equal(systemModeToMatter(4), undefined);
+        assert.equal(systemModeToMatter(undefined), undefined);
+        // EmergencyHeat(5), Precooling(6), FanOnly(7), Dry(8), Sleep(9) are all
+        // legal Matter but have no §4.2 spelling — reporting nothing is the
+        // honest answer, not the nearest guess.
+        for (const value of [2, 5, 6, 7, 8, 9]) {
+            assert.equal(matterToSystemMode(value), undefined, `SystemMode ${value}`);
         }
     });
 });

@@ -11,8 +11,12 @@
     "",
     "Top level: the handshake, the exchanges the node implements, and every §5",
     "event. 'pending' holds exchanges for commands the node does not implement",
-    "yet (the E4 roles' set_state family, §3.9-§3.11); the TS suite skips those,",
-    "the Python client suite does not — the plugin half shipped at E1.",
+    "yet (§3.9-§3.11); the TS suite skips those, the Python client suite does",
+    "not — the plugin half shipped at E1.",
+    "",
+    "E4 completed the §4.2 role table, so 'attach_all_roles' and the whole",
+    "'set_state_*' family graduated out of 'pending' and are asserted by both",
+    "suites. What is left there is the fabric/reset/rebuild family only.",
     "",
     "Two frames are deliberately not what a live node produces from a cold start,",
     "and the suites know it:",
@@ -695,21 +699,518 @@
       "change": "deleted"
     }
   },
+  "attach_all_roles": {
+    "request": {
+      "message_id": "m28",
+      "command": "attach",
+      "args": {
+        "protocolVersion": 1,
+        "pluginVersion": "2026.8.1",
+        "endpoints": [
+          {
+            "indigoDeviceId": 900001,
+            "role": "onOffPlugInUnit",
+            "label": "Hall Plug",
+            "reachable": true,
+            "states": {
+              "onOff": true
+            },
+            "options": {}
+          },
+          {
+            "indigoDeviceId": 900002,
+            "role": "onOffLight",
+            "label": "Porch Light",
+            "reachable": true,
+            "states": {
+              "onOff": true
+            },
+            "options": {}
+          },
+          {
+            "indigoDeviceId": 900003,
+            "role": "dimmableLight",
+            "label": "Lounge Lamp",
+            "reachable": true,
+            "states": {
+              "onOff": true,
+              "level": 60
+            },
+            "options": {}
+          },
+          {
+            "indigoDeviceId": 900004,
+            "role": "colorTemperatureLight",
+            "label": "Study Lamp",
+            "reachable": true,
+            "states": {
+              "onOff": true,
+              "level": 60,
+              "colorTempMireds": 320
+            },
+            "options": {}
+          },
+          {
+            "indigoDeviceId": 900005,
+            "role": "extendedColorLight",
+            "label": "Snug Lamp",
+            "reachable": true,
+            "states": {
+              "onOff": true,
+              "level": 60,
+              "colorTempMireds": 320,
+              "hue": 210,
+              "saturation": 80
+            },
+            "options": {}
+          },
+          {
+            "indigoDeviceId": 900006,
+            "role": "windowCovering",
+            "label": "Kitchen Blind",
+            "reachable": true,
+            "states": {
+              "position": 100
+            },
+            "options": {}
+          },
+          {
+            "indigoDeviceId": 900007,
+            "role": "doorLock",
+            "label": "Back Door",
+            "reachable": true,
+            "states": {
+              "locked": true
+            },
+            "options": {}
+          },
+          {
+            "indigoDeviceId": 900008,
+            "role": "occupancySensor",
+            "label": "Landing Occupancy",
+            "reachable": true,
+            "states": {
+              "occupied": true
+            },
+            "options": {}
+          },
+          {
+            "indigoDeviceId": 900009,
+            "role": "contactSensor",
+            "label": "Garage Contact",
+            "reachable": true,
+            "states": {
+              "contact": true
+            },
+            "options": {}
+          },
+          {
+            "indigoDeviceId": 900010,
+            "role": "temperatureSensor",
+            "label": "Loft Temperature",
+            "reachable": true,
+            "states": {
+              "temperatureC": 21.5
+            },
+            "options": {}
+          },
+          {
+            "indigoDeviceId": 900011,
+            "role": "humiditySensor",
+            "label": "Bathroom Humidity",
+            "reachable": true,
+            "states": {
+              "humidityPct": 48.0
+            },
+            "options": {}
+          },
+          {
+            "indigoDeviceId": 900012,
+            "role": "lightSensor",
+            "label": "Porch Lux",
+            "reachable": true,
+            "states": {
+              "lux": 320.0
+            },
+            "options": {}
+          },
+          {
+            "indigoDeviceId": 900013,
+            "role": "pressureSensor",
+            "label": "Weather Pressure",
+            "reachable": true,
+            "states": {
+              "pressureKPa": 101.3
+            },
+            "options": {}
+          },
+          {
+            "indigoDeviceId": 900014,
+            "role": "flowSensor",
+            "label": "Mains Flow",
+            "reachable": true,
+            "states": {
+              "flowM3h": 1.25
+            },
+            "options": {}
+          },
+          {
+            "indigoDeviceId": 900015,
+            "role": "thermostat",
+            "label": "Hall Thermostat",
+            "reachable": true,
+            "states": {
+              "localTemperatureC": 20.5,
+              "heatingSetpointC": 21.0,
+              "coolingSetpointC": 24.0,
+              "systemMode": "heat"
+            },
+            "options": {}
+          }
+        ]
+      }
+    },
+    "response": {
+      "message_id": "m28",
+      "result": {
+        "commissioned": true,
+        "fabrics": [
+          {
+            "fabricIndex": 1,
+            "label": "Apple Home",
+            "vendorId": 4937
+          }
+        ],
+        "endpointCount": 15,
+        "endpoints": [
+          {
+            "indigoDeviceId": 900001,
+            "endpointNumber": 2,
+            "role": "onOffPlugInUnit"
+          },
+          {
+            "indigoDeviceId": 900002,
+            "endpointNumber": 3,
+            "role": "onOffLight"
+          },
+          {
+            "indigoDeviceId": 900003,
+            "endpointNumber": 4,
+            "role": "dimmableLight"
+          },
+          {
+            "indigoDeviceId": 900004,
+            "endpointNumber": 5,
+            "role": "colorTemperatureLight"
+          },
+          {
+            "indigoDeviceId": 900005,
+            "endpointNumber": 6,
+            "role": "extendedColorLight"
+          },
+          {
+            "indigoDeviceId": 900006,
+            "endpointNumber": 7,
+            "role": "windowCovering"
+          },
+          {
+            "indigoDeviceId": 900007,
+            "endpointNumber": 8,
+            "role": "doorLock"
+          },
+          {
+            "indigoDeviceId": 900008,
+            "endpointNumber": 9,
+            "role": "occupancySensor"
+          },
+          {
+            "indigoDeviceId": 900009,
+            "endpointNumber": 10,
+            "role": "contactSensor"
+          },
+          {
+            "indigoDeviceId": 900010,
+            "endpointNumber": 11,
+            "role": "temperatureSensor"
+          },
+          {
+            "indigoDeviceId": 900011,
+            "endpointNumber": 12,
+            "role": "humiditySensor"
+          },
+          {
+            "indigoDeviceId": 900012,
+            "endpointNumber": 13,
+            "role": "lightSensor"
+          },
+          {
+            "indigoDeviceId": 900013,
+            "endpointNumber": 14,
+            "role": "pressureSensor"
+          },
+          {
+            "indigoDeviceId": 900014,
+            "endpointNumber": 15,
+            "role": "flowSensor"
+          },
+          {
+            "indigoDeviceId": 900015,
+            "endpointNumber": 16,
+            "role": "thermostat"
+          }
+        ],
+        "drift": [],
+        "driftChecked": false
+      }
+    }
+  },
+  "set_state_on_off_plug_in_unit": {
+    "request": {
+      "message_id": "m30",
+      "command": "set_state",
+      "args": {
+        "indigoDeviceId": 900001,
+        "states": {
+          "onOff": true
+        }
+      }
+    },
+    "response": {
+      "message_id": "m30",
+      "result": {}
+    }
+  },
+  "set_state_dimmable_light": {
+    "request": {
+      "message_id": "m31",
+      "command": "set_state",
+      "args": {
+        "indigoDeviceId": 900003,
+        "states": {
+          "onOff": true,
+          "level": 60
+        }
+      }
+    },
+    "response": {
+      "message_id": "m31",
+      "result": {}
+    }
+  },
+  "set_state_color_temperature_light": {
+    "request": {
+      "message_id": "m32",
+      "command": "set_state",
+      "args": {
+        "indigoDeviceId": 900004,
+        "states": {
+          "onOff": true,
+          "level": 60,
+          "colorTempMireds": 320
+        }
+      }
+    },
+    "response": {
+      "message_id": "m32",
+      "result": {}
+    }
+  },
+  "set_state_extended_color_light": {
+    "request": {
+      "message_id": "m33",
+      "command": "set_state",
+      "args": {
+        "indigoDeviceId": 900005,
+        "states": {
+          "onOff": true,
+          "level": 60,
+          "colorTempMireds": 320,
+          "hue": 210,
+          "saturation": 80
+        }
+      }
+    },
+    "response": {
+      "message_id": "m33",
+      "result": {}
+    }
+  },
+  "set_state_window_covering": {
+    "request": {
+      "message_id": "m34",
+      "command": "set_state",
+      "args": {
+        "indigoDeviceId": 900006,
+        "states": {
+          "position": 100
+        }
+      }
+    },
+    "response": {
+      "message_id": "m34",
+      "result": {}
+    }
+  },
+  "set_state_door_lock": {
+    "request": {
+      "message_id": "m35",
+      "command": "set_state",
+      "args": {
+        "indigoDeviceId": 900007,
+        "states": {
+          "locked": true
+        }
+      }
+    },
+    "response": {
+      "message_id": "m35",
+      "result": {}
+    }
+  },
+  "set_state_occupancy_sensor": {
+    "request": {
+      "message_id": "m36",
+      "command": "set_state",
+      "args": {
+        "indigoDeviceId": 900008,
+        "states": {
+          "occupied": true
+        }
+      }
+    },
+    "response": {
+      "message_id": "m36",
+      "result": {}
+    }
+  },
+  "set_state_contact_sensor": {
+    "request": {
+      "message_id": "m37",
+      "command": "set_state",
+      "args": {
+        "indigoDeviceId": 900009,
+        "states": {
+          "contact": true
+        }
+      }
+    },
+    "response": {
+      "message_id": "m37",
+      "result": {}
+    }
+  },
+  "set_state_temperature_sensor": {
+    "request": {
+      "message_id": "m38",
+      "command": "set_state",
+      "args": {
+        "indigoDeviceId": 900010,
+        "states": {
+          "temperatureC": 21.5
+        }
+      }
+    },
+    "response": {
+      "message_id": "m38",
+      "result": {}
+    }
+  },
+  "set_state_humidity_sensor": {
+    "request": {
+      "message_id": "m39",
+      "command": "set_state",
+      "args": {
+        "indigoDeviceId": 900011,
+        "states": {
+          "humidityPct": 48.0
+        }
+      }
+    },
+    "response": {
+      "message_id": "m39",
+      "result": {}
+    }
+  },
+  "set_state_light_sensor": {
+    "request": {
+      "message_id": "m40",
+      "command": "set_state",
+      "args": {
+        "indigoDeviceId": 900012,
+        "states": {
+          "lux": 320.0
+        }
+      }
+    },
+    "response": {
+      "message_id": "m40",
+      "result": {}
+    }
+  },
+  "set_state_pressure_sensor": {
+    "request": {
+      "message_id": "m41",
+      "command": "set_state",
+      "args": {
+        "indigoDeviceId": 900013,
+        "states": {
+          "pressureKPa": 101.3
+        }
+      }
+    },
+    "response": {
+      "message_id": "m41",
+      "result": {}
+    }
+  },
+  "set_state_flow_sensor": {
+    "request": {
+      "message_id": "m42",
+      "command": "set_state",
+      "args": {
+        "indigoDeviceId": 900014,
+        "states": {
+          "flowM3h": 1.25
+        }
+      }
+    },
+    "response": {
+      "message_id": "m42",
+      "result": {}
+    }
+  },
+  "set_state_thermostat": {
+    "request": {
+      "message_id": "m43",
+      "command": "set_state",
+      "args": {
+        "indigoDeviceId": 900015,
+        "states": {
+          "localTemperatureC": 20.5,
+          "heatingSetpointC": 21.0,
+          "coolingSetpointC": 24.0,
+          "systemMode": "heat"
+        }
+      }
+    },
+    "response": {
+      "message_id": "m43",
+      "result": {}
+    }
+  },
   "pending": {
     "_comment": [
-      "Commands and roles the bridge node does not implement yet. The TS suite skips",
-      "these (and asserts they are skipped for a reason); the Python client suite",
-      "asserts them in full, because the plugin side ships first.",
+      "Commands the bridge node does not implement yet (§3.9-§3.11: remove_fabric,",
+      "factory_reset, rebuild_endpoint_map and the endpoint_map_invalid refusal).",
+      "The TS suite skips these (and asserts they are skipped for a reason); the",
+      "Python client suite asserts them in full, because the plugin side ships first.",
       "",
-      "'attach_all_roles' and the 'set_state_*' family exist so every §4.2 role,",
-      "state key and command name is carried by a real frame rather than a list in",
-      "a test file — tests/test_bridge_protocol_frames.py enumerates the",
-      "vocabularies from bridge_protocol.ROLE_STATE_KEYS / ROLE_COMMANDS and fails",
-      "if any of them has no frame. onOffLight's set_state is the plain 'set_state'",
-      "entry at the top level; the rest are named per role.",
-      "",
-      "E3 implements the relay/dimmer/colour roles only, so attach_all_roles stays",
-      "here until E4 adds sensors, thermostat, doorLock and windowCovering."
+      "'attach_all_roles' and the 'set_state_*' family used to live here. They",
+      "graduated at E4, when the node grew the sensor, thermostat, doorLock and",
+      "windowCovering role factories — every §4.2 role, state key and command name",
+      "is now carried by a live frame, and tests/test_bridge_protocol_frames.py",
+      "enumerates the vocabularies from bridge_protocol.ROLE_STATE_KEYS /",
+      "ROLE_COMMANDS and fails if any of them has no frame."
     ],
     "remove_fabric": {
       "request": {
@@ -806,505 +1307,6 @@
         "message_id": "m24",
         "error_code": "endpoint_map_invalid",
         "details": "endpoint map is unreadable; only get_status, get_pairing and rebuild_endpoint_map are accepted"
-      }
-    },
-    "attach_all_roles": {
-      "request": {
-        "message_id": "m28",
-        "command": "attach",
-        "args": {
-          "protocolVersion": 1,
-          "pluginVersion": "2026.8.1",
-          "endpoints": [
-            {
-              "indigoDeviceId": 900001,
-              "role": "onOffPlugInUnit",
-              "label": "Hall Plug",
-              "reachable": true,
-              "states": {
-                "onOff": true
-              },
-              "options": {}
-            },
-            {
-              "indigoDeviceId": 900002,
-              "role": "onOffLight",
-              "label": "Porch Light",
-              "reachable": true,
-              "states": {
-                "onOff": true
-              },
-              "options": {}
-            },
-            {
-              "indigoDeviceId": 900003,
-              "role": "dimmableLight",
-              "label": "Lounge Lamp",
-              "reachable": true,
-              "states": {
-                "onOff": true,
-                "level": 60
-              },
-              "options": {}
-            },
-            {
-              "indigoDeviceId": 900004,
-              "role": "colorTemperatureLight",
-              "label": "Study Lamp",
-              "reachable": true,
-              "states": {
-                "onOff": true,
-                "level": 60,
-                "colorTempMireds": 320
-              },
-              "options": {}
-            },
-            {
-              "indigoDeviceId": 900005,
-              "role": "extendedColorLight",
-              "label": "Snug Lamp",
-              "reachable": true,
-              "states": {
-                "onOff": true,
-                "level": 60,
-                "colorTempMireds": 320,
-                "hue": 210,
-                "saturation": 80
-              },
-              "options": {}
-            },
-            {
-              "indigoDeviceId": 900006,
-              "role": "windowCovering",
-              "label": "Kitchen Blind",
-              "reachable": true,
-              "states": {
-                "position": 100
-              },
-              "options": {}
-            },
-            {
-              "indigoDeviceId": 900007,
-              "role": "doorLock",
-              "label": "Back Door",
-              "reachable": true,
-              "states": {
-                "locked": true
-              },
-              "options": {}
-            },
-            {
-              "indigoDeviceId": 900008,
-              "role": "occupancySensor",
-              "label": "Landing Occupancy",
-              "reachable": true,
-              "states": {
-                "occupied": true
-              },
-              "options": {}
-            },
-            {
-              "indigoDeviceId": 900009,
-              "role": "contactSensor",
-              "label": "Garage Contact",
-              "reachable": true,
-              "states": {
-                "contact": true
-              },
-              "options": {}
-            },
-            {
-              "indigoDeviceId": 900010,
-              "role": "temperatureSensor",
-              "label": "Loft Temperature",
-              "reachable": true,
-              "states": {
-                "temperatureC": 21.5
-              },
-              "options": {}
-            },
-            {
-              "indigoDeviceId": 900011,
-              "role": "humiditySensor",
-              "label": "Bathroom Humidity",
-              "reachable": true,
-              "states": {
-                "humidityPct": 48.0
-              },
-              "options": {}
-            },
-            {
-              "indigoDeviceId": 900012,
-              "role": "lightSensor",
-              "label": "Porch Lux",
-              "reachable": true,
-              "states": {
-                "lux": 320.0
-              },
-              "options": {}
-            },
-            {
-              "indigoDeviceId": 900013,
-              "role": "pressureSensor",
-              "label": "Weather Pressure",
-              "reachable": true,
-              "states": {
-                "pressureKPa": 101.3
-              },
-              "options": {}
-            },
-            {
-              "indigoDeviceId": 900014,
-              "role": "flowSensor",
-              "label": "Mains Flow",
-              "reachable": true,
-              "states": {
-                "flowM3h": 1.25
-              },
-              "options": {}
-            },
-            {
-              "indigoDeviceId": 900015,
-              "role": "thermostat",
-              "label": "Hall Thermostat",
-              "reachable": true,
-              "states": {
-                "localTemperatureC": 20.5,
-                "heatingSetpointC": 21.0,
-                "coolingSetpointC": 24.0,
-                "systemMode": "heat"
-              },
-              "options": {}
-            }
-          ]
-        }
-      },
-      "response": {
-        "message_id": "m28",
-        "result": {
-          "commissioned": true,
-          "fabrics": [
-            {
-              "fabricIndex": 1,
-              "label": "Apple Home",
-              "vendorId": 4937
-            }
-          ],
-          "endpointCount": 15,
-          "endpoints": [
-            {
-              "indigoDeviceId": 900001,
-              "endpointNumber": 2,
-              "role": "onOffPlugInUnit"
-            },
-            {
-              "indigoDeviceId": 900002,
-              "endpointNumber": 3,
-              "role": "onOffLight"
-            },
-            {
-              "indigoDeviceId": 900003,
-              "endpointNumber": 4,
-              "role": "dimmableLight"
-            },
-            {
-              "indigoDeviceId": 900004,
-              "endpointNumber": 5,
-              "role": "colorTemperatureLight"
-            },
-            {
-              "indigoDeviceId": 900005,
-              "endpointNumber": 6,
-              "role": "extendedColorLight"
-            },
-            {
-              "indigoDeviceId": 900006,
-              "endpointNumber": 7,
-              "role": "windowCovering"
-            },
-            {
-              "indigoDeviceId": 900007,
-              "endpointNumber": 8,
-              "role": "doorLock"
-            },
-            {
-              "indigoDeviceId": 900008,
-              "endpointNumber": 9,
-              "role": "occupancySensor"
-            },
-            {
-              "indigoDeviceId": 900009,
-              "endpointNumber": 10,
-              "role": "contactSensor"
-            },
-            {
-              "indigoDeviceId": 900010,
-              "endpointNumber": 11,
-              "role": "temperatureSensor"
-            },
-            {
-              "indigoDeviceId": 900011,
-              "endpointNumber": 12,
-              "role": "humiditySensor"
-            },
-            {
-              "indigoDeviceId": 900012,
-              "endpointNumber": 13,
-              "role": "lightSensor"
-            },
-            {
-              "indigoDeviceId": 900013,
-              "endpointNumber": 14,
-              "role": "pressureSensor"
-            },
-            {
-              "indigoDeviceId": 900014,
-              "endpointNumber": 15,
-              "role": "flowSensor"
-            },
-            {
-              "indigoDeviceId": 900015,
-              "endpointNumber": 16,
-              "role": "thermostat"
-            }
-          ],
-          "drift": [],
-          "driftChecked": false
-        }
-      }
-    },
-    "set_state_on_off_plug_in_unit": {
-      "request": {
-        "message_id": "m30",
-        "command": "set_state",
-        "args": {
-          "indigoDeviceId": 900001,
-          "states": {
-            "onOff": true
-          }
-        }
-      },
-      "response": {
-        "message_id": "m30",
-        "result": {}
-      }
-    },
-    "set_state_dimmable_light": {
-      "request": {
-        "message_id": "m31",
-        "command": "set_state",
-        "args": {
-          "indigoDeviceId": 900003,
-          "states": {
-            "onOff": true,
-            "level": 60
-          }
-        }
-      },
-      "response": {
-        "message_id": "m31",
-        "result": {}
-      }
-    },
-    "set_state_color_temperature_light": {
-      "request": {
-        "message_id": "m32",
-        "command": "set_state",
-        "args": {
-          "indigoDeviceId": 900004,
-          "states": {
-            "onOff": true,
-            "level": 60,
-            "colorTempMireds": 320
-          }
-        }
-      },
-      "response": {
-        "message_id": "m32",
-        "result": {}
-      }
-    },
-    "set_state_extended_color_light": {
-      "request": {
-        "message_id": "m33",
-        "command": "set_state",
-        "args": {
-          "indigoDeviceId": 900005,
-          "states": {
-            "onOff": true,
-            "level": 60,
-            "colorTempMireds": 320,
-            "hue": 210,
-            "saturation": 80
-          }
-        }
-      },
-      "response": {
-        "message_id": "m33",
-        "result": {}
-      }
-    },
-    "set_state_window_covering": {
-      "request": {
-        "message_id": "m34",
-        "command": "set_state",
-        "args": {
-          "indigoDeviceId": 900006,
-          "states": {
-            "position": 100
-          }
-        }
-      },
-      "response": {
-        "message_id": "m34",
-        "result": {}
-      }
-    },
-    "set_state_door_lock": {
-      "request": {
-        "message_id": "m35",
-        "command": "set_state",
-        "args": {
-          "indigoDeviceId": 900007,
-          "states": {
-            "locked": true
-          }
-        }
-      },
-      "response": {
-        "message_id": "m35",
-        "result": {}
-      }
-    },
-    "set_state_occupancy_sensor": {
-      "request": {
-        "message_id": "m36",
-        "command": "set_state",
-        "args": {
-          "indigoDeviceId": 900008,
-          "states": {
-            "occupied": true
-          }
-        }
-      },
-      "response": {
-        "message_id": "m36",
-        "result": {}
-      }
-    },
-    "set_state_contact_sensor": {
-      "request": {
-        "message_id": "m37",
-        "command": "set_state",
-        "args": {
-          "indigoDeviceId": 900009,
-          "states": {
-            "contact": true
-          }
-        }
-      },
-      "response": {
-        "message_id": "m37",
-        "result": {}
-      }
-    },
-    "set_state_temperature_sensor": {
-      "request": {
-        "message_id": "m38",
-        "command": "set_state",
-        "args": {
-          "indigoDeviceId": 900010,
-          "states": {
-            "temperatureC": 21.5
-          }
-        }
-      },
-      "response": {
-        "message_id": "m38",
-        "result": {}
-      }
-    },
-    "set_state_humidity_sensor": {
-      "request": {
-        "message_id": "m39",
-        "command": "set_state",
-        "args": {
-          "indigoDeviceId": 900011,
-          "states": {
-            "humidityPct": 48.0
-          }
-        }
-      },
-      "response": {
-        "message_id": "m39",
-        "result": {}
-      }
-    },
-    "set_state_light_sensor": {
-      "request": {
-        "message_id": "m40",
-        "command": "set_state",
-        "args": {
-          "indigoDeviceId": 900012,
-          "states": {
-            "lux": 320.0
-          }
-        }
-      },
-      "response": {
-        "message_id": "m40",
-        "result": {}
-      }
-    },
-    "set_state_pressure_sensor": {
-      "request": {
-        "message_id": "m41",
-        "command": "set_state",
-        "args": {
-          "indigoDeviceId": 900013,
-          "states": {
-            "pressureKPa": 101.3
-          }
-        }
-      },
-      "response": {
-        "message_id": "m41",
-        "result": {}
-      }
-    },
-    "set_state_flow_sensor": {
-      "request": {
-        "message_id": "m42",
-        "command": "set_state",
-        "args": {
-          "indigoDeviceId": 900014,
-          "states": {
-            "flowM3h": 1.25
-          }
-        }
-      },
-      "response": {
-        "message_id": "m42",
-        "result": {}
-      }
-    },
-    "set_state_thermostat": {
-      "request": {
-        "message_id": "m43",
-        "command": "set_state",
-        "args": {
-          "indigoDeviceId": 900015,
-          "states": {
-            "localTemperatureC": 20.5,
-            "heatingSetpointC": 21.0,
-            "coolingSetpointC": 24.0,
-            "systemMode": "heat"
-          }
-        }
-      },
-      "response": {
-        "message_id": "m43",
-        "result": {}
       }
     }
   }

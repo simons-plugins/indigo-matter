@@ -1380,9 +1380,12 @@ class Plugin(indigo.PluginBase):
         pending = sum(1 for entry in self.exports.all()
                       if not export_handlers.is_bridgeable(entry.role))
         if pending:
-            summary += (f" {pending} of them use a role this version cannot bridge yet "
-                        "(sensors, locks, coverings and thermostats arrive in a later "
-                        "release) and will not appear in any ecosystem.")
+            # E4 completed the v1 role table, so this can now only mean an
+            # allow-list written by a NEWER plugin than the one running — the
+            # export blob lives in plugin prefs and survives a downgrade.
+            summary += (f" {pending} of them use a role this version cannot bridge "
+                        "and will not appear in any ecosystem — they were most likely "
+                        "added by a newer version of this plugin.")
         return summary + self._export_bridge_note()
 
     def _export_bridge_note(self) -> str:

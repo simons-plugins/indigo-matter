@@ -21,6 +21,7 @@ from unittest.mock import Mock
 
 import pytest
 
+import bridge_protocol
 import export_catalog
 from export_store import ExportEntry, ExportStore
 from fakes import FakeIndigoDevices, RelayDevice
@@ -412,16 +413,29 @@ class TestDialogNudges:
 
 
 class TestStatusSummary:
-    def test_an_e4_role_is_called_out_in_the_dialog(self, plug):
-        """Otherwise the accessory is simply absent, with no visible cause."""
+    def test_an_unbridgeable_role_is_called_out_in_the_dialog(self, plug, monkeypatch):
+        """Otherwise the accessory is simply absent, with no visible cause.
+
+        E4 made the handler table total over the v1 enum, so the only way to
+        reach this branch is to take a handler away — which is exactly what a
+        downgrade does to an allow-list written by a newer plugin.
+        """
+        import export_handlers
+        monkeypatch.delitem(export_handlers.HANDLERS, "doorLock")
         plug.exports.upsert(ExportEntry(101, "doorLock"))
         summary = plug._export_summary()
-        assert "cannot bridge yet" in summary
+        assert "cannot bridge" in summary
 
     def test_bridgeable_exports_get_no_such_note(self, plug):
         plug.exports.upsert(ExportEntry(101, "onOffLight"))
         plug.export_bridge.active = False
-        assert "cannot bridge yet" not in plug._export_summary()
+        assert "cannot bridge" not in plug._export_summary()
+
+    def test_every_v1_role_is_bridgeable_so_the_note_never_fires(self, plug):
+        """The E4 completion criterion, from the dialog's point of view."""
+        for index, role in enumerate(sorted(bridge_protocol.ROLES)):
+            plug.exports.upsert(ExportEntry(200 + index, role))
+        assert "cannot bridge" not in plug._export_summary()
 
     def _bridge_in(self, plug, **state):
         """A bridge whose client is in some non-serving state."""
