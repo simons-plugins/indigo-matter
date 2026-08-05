@@ -22,7 +22,9 @@ import { after, describe, it } from "node:test";
 import { Endpoint, Environment, Logger, ServerNode, VendorId } from "@matter/main";
 import { BasicInformationServer } from "@matter/main/behaviors/basic-information";
 import { DoorLockServer } from "@matter/main/behaviors/door-lock";
+import { OnOffServer } from "@matter/main/behaviors/on-off";
 import { WindowCoveringServer } from "@matter/main/behaviors/window-covering";
+import { DoorLock } from "@matter/main/clusters/door-lock";
 import { AggregatorEndpoint } from "@matter/main/endpoints/aggregator";
 
 import { endpointIdFor, SUPPORTED_ROLES, uniqueIdFor, watchCommands } from "../src/endpoints.js";
@@ -755,6 +757,11 @@ interface ChangeObservable {
     emit(value: unknown, oldValue: unknown, context: unknown): void;
 }
 
+/** A matter.js cluster *event* observable, as much of it as these tests drive. */
+interface EventObservable {
+    on(handler: (payload: Record<string, unknown>) => void): void;
+}
+
 /**
  * Stand in for a controller writing an attribute.
  *
@@ -1249,6 +1256,46 @@ describe("thermostat commands (§4.2, E4)", () => {
             await h.close();
         }
     });
+
+    it("accepts the setpoints a real house uses, which matter.js's defaults reject", async () => {
+        // PR #125 C2. Un-seeded, matter.js enforces its own 7-30 °C heating and
+        // 16-32 °C cooling limits and answers CONSTRAINT_ERROR (status 135) to
+        // both of these — 5 °C frost protection, and the literal 0 Indigo
+        // reports for `coolSetpoint` on a heat-only thermostat. The write threw,
+        // Indigo did not change, so the next deviceUpdated computed the same
+        // diff and pushed the same rejected value again, forever.
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(5, Role.thermostat)], false);
+            await h.registry.setState(5, { heatingSetpointC: 5 });
+            assert.equal((only(h).stateOf("thermostat") as Record<string, unknown>).occupiedHeatingSetpoint, 500);
+
+            await h.registry.setState(5, { coolingSetpointC: 0 });
+            assert.equal((only(h).stateOf("thermostat") as Record<string, unknown>).occupiedCoolingSetpoint, 0);
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("holds both setpoints exactly as pushed — no deadband rewrite", async () => {
+        // PR #125 C3. `minSetpointDeadBand` defaults to 2 °C and the spec says
+        // the server *adjusts the other setpoint* rather than refusing: heat 21
+        // / cool 21 left the node holding heat 19. That is an offline write, so
+        // it raises no `command` event, so the plugin never learned and never
+        // corrected — the ecosystem showed a setpoint two degrees out, silently
+        // and permanently.
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(5, Role.thermostat)], false);
+            await h.registry.setState(5, { heatingSetpointC: 21, coolingSetpointC: 21 });
+            const state = only(h).stateOf("thermostat") as Record<string, unknown>;
+            assert.equal(state.occupiedHeatingSetpoint, 2100, "the deadband rewrote the heating setpoint");
+            assert.equal(state.occupiedCoolingSetpoint, 2100, "the deadband rewrote the cooling setpoint");
+            assert.deepEqual(h.commands, [], "a deadband adjustment must not look like an ecosystem write");
+        } finally {
+            await h.close();
+        }
+    });
 });
 
 describe("door lock commands (§4.2, §7, E4)", () => {
@@ -1306,12 +1353,18 @@ describe("door lock commands (§4.2, §7, E4)", () => {
         }
     });
 
-    it("stops reporting once the registry lets the endpoint go", async () => {
+    it("stops reporting once the registry lets the endpoint go, and FAILS the invocation", async () => {
         // The invocation roles have no observables, so the COMMAND_SINKS entry
         // is the only thing between a forgotten lock and a command for a device
         // the plugin no longer exports. `close()` rather than `remove()`
         // because a removed endpoint is *closed* and cannot be invoked at all —
         // which is its own guarantee, but tests matter.js, not the teardown.
+        //
+        // PR #125 H2: a lock whose command reaches nothing must *fail*. It used
+        // to warn and return success, so Home showed "Unlocked", the user
+        // walked away, and the bolt had never moved. There is no protocol frame
+        // for "your command was dropped", so the invocation itself is the only
+        // channel back to the person at the door.
         const h = await harness();
         try {
             await h.registry.reconcile([spec(9, Role.doorLock)], false);
@@ -1320,8 +1373,68 @@ describe("door lock commands (§4.2, §7, E4)", () => {
             assert.equal(h.commands.length, 1, "the sink should be live beforehand");
 
             h.registry.close();
-            await endpoint.act(agent => agent.get(DoorLockServer).unlockDoor({}));
+            await assert.rejects(
+                async () => endpoint.act(agent => agent.get(DoorLockServer).unlockDoor({})),
+                /not connected/,
+                "an undeliverable unlock reported success",
+            );
             assert.equal(h.commands.length, 1, "a released lock still reported");
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("leaves the other roles warning-and-returning, not failing", async () => {
+        // PR #125 H2 is doorLock-only, deliberately. A lamp whose command
+        // reaches nothing is recovered by the next attach pushing the truth
+        // back, and nobody was misled about anything that matters — so an
+        // ecosystem error there would be noise. This is the control case for
+        // the assertion above.
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(1, Role.onOffLight)], false);
+            const endpoint = only(h);
+            h.registry.close();
+            await endpoint.act(agent => agent.get(OnOffServer).on());
+            assert.deepEqual(h.commands, [], "a released light still reported");
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("emits LockOperation when — and only when — a push moves the bolt", async () => {
+        // PR #125 H3. The event is spec-mandatory and is what an ecosystem's
+        // activity history and lock notifications are built on.
+        // IndigoDoorLockServer removed matter.js's emission along with its
+        // auto-confirmation, which was right (the stock server fires it when the
+        // *command* arrives, before Indigo or the bolt agree) but left the
+        // bridge silent. It is raised on the plugin's set_state instead, which
+        // is when the bolt is known to have actually moved.
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(9, Role.doorLock, { states: { locked: false } })], false);
+            const events: Record<string, unknown>[] = [];
+            const observable = (only(h).eventsOf("doorLock") as unknown as Record<string, EventObservable>)
+                .lockOperation;
+            assert.ok(observable !== undefined, "doorLock exposes no lockOperation event");
+            observable.on(payload => events.push(payload));
+
+            await h.registry.setState(9, { locked: true });
+            assert.equal(events.length, 1, "locking the bolt raised no LockOperation");
+            assert.equal(events[0]?.lockOperationType, DoorLock.LockOperationType.Lock);
+            // Unspecified, not Manual or Remote: by the time Indigo reports a
+            // lock state change, what caused it has been flattened to a boolean.
+            assert.equal(events[0]?.operationSource, DoorLock.OperationSource.Unspecified);
+            assert.equal(events[0]?.fabricIndex, null);
+            assert.equal(events[0]?.sourceNode, null);
+
+            // A push that repeats what the bolt already says is not an operation.
+            await h.registry.setState(9, { locked: true });
+            assert.equal(events.length, 1, "an unchanged lockState raised a LockOperation");
+
+            await h.registry.setState(9, { locked: false });
+            assert.equal(events.length, 2);
+            assert.equal(events[1]?.lockOperationType, DoorLock.LockOperationType.Unlock);
         } finally {
             await h.close();
         }

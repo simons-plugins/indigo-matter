@@ -51,6 +51,7 @@ import { PressureSensorDevice } from "@matter/main/devices/pressure-sensor";
 import { TemperatureSensorDevice } from "@matter/main/devices/temperature-sensor";
 import { ThermostatDevice } from "@matter/main/devices/thermostat";
 import { WindowCoveringDevice } from "@matter/main/devices/window-covering";
+import { Status, StatusResponseError } from "@matter/main/types";
 
 import {
     type CommandEventData,
@@ -121,9 +122,20 @@ function clampLogged(value: number, min: number, max: number, what: string): num
 }
 
 /**
- * Round half away from zero. `Math.round` is half-*up* (−0.5 → −0), which
- * differs for negatives; every quantity here is non-negative, but naming the
- * rule keeps §4.2's "round-half-up" honest if a signed unit ever arrives.
+ * Round half **up**, meaning toward +∞ — `Math.floor(v + 0.5)`, which is also
+ * exactly what `Math.round` does. §4.2's "round-half-up" for level/position is
+ * the same rule, so the two agree on every value.
+ *
+ * The distinction is not academic any more: an earlier version of this comment
+ * called it "round half away from zero" and excused itself on the grounds that
+ * "every quantity here is non-negative". Since E4 that is false —
+ * {@link celsiusToMatter} carries signed temperatures, and a signed unit is the
+ * only place the two rules differ. Half-up means a negative exact-half rounds
+ * *toward zero*: −5.005 °C is −500.5 in centidegrees and comes out as **−500**
+ * (−5.00 °C), not −501. That is a hundredth of a degree in the warmer
+ * direction, which is the behaviour, not an accident — but it must be the
+ * documented behaviour, because a reader who believed the old comment would
+ * expect −501 and go looking for a bug.
  */
 function roundHalfUp(value: number): number {
     return Math.floor(value + 0.5);
@@ -245,6 +257,54 @@ export function celsiusToMatter(celsius: number): number {
     return clamp(roundHalfUp(celsius * CENTI), TEMPERATURE_CENTI_MIN, INT16_MAX);
 }
 
+/**
+ * The setpoint band this bridge advertises, in Matter centidegrees: **0 °C to
+ * 50 °C**.
+ *
+ * matter.js applies the Thermostat cluster's own defaults when these limits are
+ * not seeded, and those defaults are a *product* claim, not a protocol one:
+ * heating 7–30 °C and cooling 16–32 °C, i.e. the range of a typical American
+ * wall thermostat. A bridge has no such range — it is fronting whatever the
+ * user exported — and the defaults reject values that are entirely routine in
+ * the houses this plugin runs in:
+ *
+ * * **5 °C frost protection.** Below `minHeatSetpointLimit` (700), so every
+ *   push of it failed `CONSTRAINT_ERROR` (status 135);
+ * * **a heat-only thermostat.** Indigo reports `coolSetpoint` 0 on one, which
+ *   is below `minCoolSetpointLimit` (1600), so *every* `set_state` from such a
+ *   device failed — the common case, not an edge.
+ *
+ * And the failure did not settle: the write threw, nothing in Indigo changed,
+ * so the next `deviceUpdated` computed the same diff and pushed the same
+ * rejected value again, forever.
+ *
+ * 0–50 °C spans domestic heating, cooling and frost protection with room to
+ * spare, and is narrow enough that {@link clampSetpoint} still catches a
+ * genuine unit error (a °F thermostat pushing 68 lands on 50 with a debug line
+ * naming it, rather than being silently believed).
+ */
+export const SETPOINT_CENTI_MIN = 0;
+export const SETPOINT_CENTI_MAX = 5000;
+
+/**
+ * A §4.2 setpoint, in the band this bridge advertises.
+ *
+ * Mirrors {@link clampMireds}: the limits above are what the cluster *says* it
+ * accepts, and a value outside them is refused by matter.js with a
+ * `CONSTRAINT_ERROR` that fails the whole `set_state`. Clamping keeps the
+ * ecosystem showing the nearest thing to the truth we are allowed to say, and
+ * the debug line is the fingerprint of the plugin-side unit bug that produced
+ * it.
+ */
+export function clampSetpoint(celsius: number): number {
+    return clampLogged(
+        celsiusToMatter(celsius),
+        SETPOINT_CENTI_MIN,
+        SETPOINT_CENTI_MAX,
+        "thermostat setpoint (0.01 °C)",
+    );
+}
+
 /** Matter 0.01 °C → °C. Exact for every value {@link celsiusToMatter} produces. */
 export function matterToCelsius(centi: number): number {
     return centi / CENTI;
@@ -336,9 +396,16 @@ export function matterToCubicMetresPerHour(deci: number): number {
  * means. Per-export polarity (`options.invert`) is applied **plugin-side**,
  * before the value reaches this protocol: by the time a `position` is on the
  * wire it always means "100 = open", whatever the physical device does.
+ *
+ * Rounded like every sibling converter. §4.2 types `position` as an integer, so
+ * the multiply is exact for every lawful input — but `…LiftPercent100ths` is a
+ * `uint16` and matter.js validates it, so a fractional position arriving from a
+ * newer plugin (or from a handler that stopped rounding) would fail the write
+ * outright rather than losing a fraction of a percent. Rounding here is the
+ * same "the node owns the wire conversion" rule the other twelve follow.
  */
 export function positionToPercent100ths(position: number): number {
-    return (100 - clampLogged(position, 0, 100, "covering position")) * 100;
+    return roundHalfUp((100 - clampLogged(position, 0, 100, "covering position")) * 100);
 }
 
 /** Matter `…LiftPercent100ths` → §4.2 `position` (100 = open). Inverse of the above. */
@@ -433,17 +500,41 @@ const COMMAND_SINKS = new Map<string, CommandSink>();
 /**
  * Raise a §5 `command` from inside a behaviour override.
  *
- * Never throws. This runs inside matter.js's handling of a remote invocation;
- * a throw here would fail the ecosystem's command — which is arguably correct —
- * but the failure modes worth guarding are "the endpoint was removed a
- * microsecond ago" and "the plugin's socket closed mid-command", neither of
- * which the ecosystem can do anything with. Mirrors the same decision in
- * {@link watchCommands}.
+ * Never throws once a sink exists. This runs inside matter.js's handling of a
+ * remote invocation; a throw there would fail the ecosystem's command — which
+ * is arguably correct — but the failure modes worth guarding are "the endpoint
+ * was removed a microsecond ago" and "the plugin's socket closed mid-command",
+ * neither of which the ecosystem can do anything with. Mirrors the same
+ * decision in {@link watchCommands}.
+ *
+ * **`failWithoutSink` is the deliberate exception, and it is for `doorLock`
+ * only.** A missing sink means the plugin is gone (Indigo reloading it, the
+ * socket down mid-invocation) so the command reaches nothing at all. For a lamp
+ * that is a warn-and-return: the ecosystem shows the light on, the next attach
+ * pushes the truth back, and nobody was misled about anything that matters. For
+ * a **lock** it is different in kind — Home reports "Unlocked", the user walks
+ * away, and the bolt never moved. There is no protocol frame for "your command
+ * was dropped" (the plugin cannot be told about invocations that arrived while
+ * it was away; that is a §3.1 addition, noted in `docs/HANDOVER.md` and
+ * deliberately not made here), so failing the invocation is the only way the
+ * truth reaches the person standing at the door. A Matter status error makes
+ * Home say the accessory did not respond, which is exactly what happened.
  */
-function emitCommand(endpointId: string, command: string, args: Record<string, unknown>): void {
+function emitCommand(
+    endpointId: string,
+    command: string,
+    args: Record<string, unknown>,
+    failWithoutSink = false,
+): void {
     const sink = COMMAND_SINKS.get(endpointId);
     if (sink === undefined) {
         logger.warn(`Dropped ${command} for ${endpointId}: no command sink is registered for that endpoint`);
+        if (failWithoutSink) {
+            throw new StatusResponseError(
+                `${command} cannot be delivered: the Indigo plugin is not connected to this bridge`,
+                Status.Failure,
+            );
+        }
         return;
     }
     try {
@@ -473,14 +564,21 @@ function emitCommand(endpointId: string, command: string, args: Record<string, u
  * already the default; it is not — the stock server enables `pinCredential`,
  * `rfidCredential`, `user`, the schedules and `unbolting`, which would have the
  * bridge advertise a credential database it has no way to honour.
+ *
+ * Two things the stock server does that this one still must, and does
+ * elsewhere: it **fails** an invocation it cannot deliver (the `true` argument
+ * to {@link emitCommand} — see there for why a lock is the one role that gets
+ * that), and it emits the spec-mandatory `LockOperation` event. The event is
+ * raised from {@link emitLockOperation}, on the plugin's `set_state` rather
+ * than on the invocation, because that is when the bolt actually moved.
  */
 class IndigoDoorLockServer extends DoorLockServer.with() {
     override lockDoor(): MaybePromise {
-        emitCommand(this.endpoint.id, "lock", {});
+        emitCommand(this.endpoint.id, "lock", {}, true);
     }
 
     override unlockDoor(): MaybePromise {
-        emitCommand(this.endpoint.id, "unlock", {});
+        emitCommand(this.endpoint.id, "unlock", {}, true);
     }
 }
 
@@ -496,6 +594,19 @@ class IndigoDoorLockServer extends DoorLockServer.with() {
  * `currentPositionLiftPercent100ths` follows the plugin's `set_state`.
  *
  * Only **Lift** is wired: §4.2 has one `position` key and no tilt vocabulary.
+ *
+ * **What a stop does here, end to end, because it is not what it looks like.**
+ * `handleStopMovement` settles `targetPosition…` onto `currentPosition…` so the
+ * ecosystem stops animating the blind, and reports `stopMotion` to the plugin.
+ * That settled position is the *last one Indigo told us*, not where the blind
+ * came to rest — the node has no way to know that, and neither does Indigo
+ * until the driver reports the move finished. The true position arrives on the
+ * next `set_state`, which is also when the accessory stops showing a number
+ * that was only ever a statement about the request. And on the plugin side a
+ * dimmer-modelled covering has no stop action at all
+ * (`export_handlers.WindowCoveringExport._stop_motion`), so for the common case
+ * the blind keeps travelling to its original target and the "settled" position
+ * is superseded within seconds.
  */
 class IndigoWindowCoveringServer extends WindowCoveringServer.with("Lift", "PositionAwareLift") {
     override handleMovement(
@@ -612,6 +723,21 @@ interface RoleDefinition {
     statePatch: (states: Record<string, unknown>) => Record<string, unknown>;
     /** Attribute → `command` event, for changes an ecosystem made (§4.2). */
     watch: readonly WatchSpec[];
+    /**
+     * Cluster *events* the role owes the ecosystem once a `set_state` has
+     * landed, given the patch that was written and the behaviour state as it
+     * was before. Only `doorLock` has one; see {@link emitLockOperation}.
+     *
+     * Separate from {@link statePatch} because an event is not a state: it
+     * needs the endpoint, it needs the previous value to know whether anything
+     * moved, and it must be raised *after* the write so an ecosystem reading
+     * the attribute back in response sees the new value.
+     */
+    afterApply?: (
+        endpoint: Endpoint,
+        patch: Record<string, unknown>,
+        before: Record<string, unknown>,
+    ) => Promise<void>;
     /**
      * The matter.js device type, already `.with()`-ed for a bridged child.
      *
@@ -785,10 +911,10 @@ function thermostatPatch(states: Record<string, unknown>): Record<string, unknow
         thermostat.localTemperature = celsiusToMatter(states.localTemperatureC);
     }
     if (typeof states.heatingSetpointC === "number") {
-        thermostat.occupiedHeatingSetpoint = celsiusToMatter(states.heatingSetpointC);
+        thermostat.occupiedHeatingSetpoint = clampSetpoint(states.heatingSetpointC);
     }
     if (typeof states.coolingSetpointC === "number") {
-        thermostat.occupiedCoolingSetpoint = celsiusToMatter(states.coolingSetpointC);
+        thermostat.occupiedCoolingSetpoint = clampSetpoint(states.coolingSetpointC);
     }
     const systemMode = systemModeToMatter(states.systemMode);
     if (systemMode !== undefined) {
@@ -823,6 +949,59 @@ function doorLockPatch(states: Record<string, unknown>): Record<string, unknown>
     return typeof states.locked === "boolean"
         ? { [DOOR_LOCK]: { lockState: states.locked ? DoorLock.LockState.Locked : DoorLock.LockState.Unlocked } }
         : {};
+}
+
+/**
+ * Raise the spec-mandatory `LockOperation` event when a push moved the bolt.
+ *
+ * Matter requires a DoorLock server to report operations as events, and
+ * ecosystems use them for their activity history and for lock notifications —
+ * Home's "the front door was unlocked" line is this event, not the `lockState`
+ * attribute. {@link IndigoDoorLockServer} removed matter.js's emission along
+ * with its auto-confirmation, which was right (the stock server fires it the
+ * instant the *command* arrives, i.e. before Indigo, the mesh or the bolt have
+ * agreed on anything) but left the bridge silent where the spec says it must
+ * speak.
+ *
+ * So it is raised **here**, on the plugin's `set_state`, which is the moment
+ * the bolt is known to have actually moved. That is the honest timing and it is
+ * the only timing a bridge can offer.
+ *
+ * `operationSource` is `Unspecified`, not `Manual` or `Remote`, and every id
+ * field is null. By the time Indigo reports a lock state change, what caused it
+ * — an ecosystem command we forwarded, a key in the door, a schedule in another
+ * plugin — has been flattened into one boolean. The enum has a value for "we do
+ * not know" and using it beats naming a source we would be guessing at; the
+ * `fabricIndex`/`sourceNode` "shall NOT be null" rule applies only to
+ * `operationSource: Remote`, which is exactly the claim we are declining to
+ * make.
+ */
+async function emitLockOperation(
+    endpoint: Endpoint,
+    patch: Record<string, unknown>,
+    before: Record<string, unknown>,
+): Promise<void> {
+    const next = (patch[DOOR_LOCK] as Record<string, unknown> | undefined)?.lockState;
+    const previous = (before[DOOR_LOCK] as Record<string, unknown> | undefined)?.lockState;
+    if (next === undefined || next === previous) {
+        return;
+    }
+    await endpoint.act(agent => {
+        agent.get(IndigoDoorLockServer).events.lockOperation.emit(
+            {
+                lockOperationType:
+                    next === DoorLock.LockState.Locked
+                        ? DoorLock.LockOperationType.Lock
+                        : DoorLock.LockOperationType.Unlock,
+                operationSource: DoorLock.OperationSource.Unspecified,
+                userIndex: null,
+                fabricIndex: null,
+                sourceNode: null,
+                credentials: null,
+            },
+            agent.context,
+        );
+    });
 }
 
 /** `occupiedHeatingSetpoint` → §4.2 `setHeatingSetpoint {"valueC": float}`. */
@@ -886,11 +1065,43 @@ const THERMOSTAT_FEATURES = ["Heating", "Cooling", "AutoMode"] as const;
  * `CoolingAndHeating` is the sequence that matches the feature set above; the
  * initial `Off` is a statement about knowing nothing yet, and the plugin's
  * first `set_state` replaces it.
+ *
+ * **The setpoint limits and the deadband are seeded for the same reason the
+ * enums are — matter.js's fallback is wrong for a bridge — but they fail far
+ * more quietly, so they are worth their own paragraph.**
+ *
+ * The four `abs…SetpointLimit` attributes are a *manufacturer* claim about a
+ * physical thermostat's capability, and the `min…`/`max…` pair is the user
+ * narrowing it. Left unset, matter.js applies the cluster defaults (7–30 °C
+ * heating, 16–32 °C cooling) and enforces them, which is a claim this bridge
+ * has no business making about someone else's hardware — see
+ * {@link SETPOINT_CENTI_MIN}. All eight are seeded so the advertised band and
+ * {@link clampSetpoint} are the same band, stated once.
+ *
+ * `minSetpointDeadBand` is the AutoMode rule that heating and cooling stay at
+ * least N apart, and its default is 2 °C. **matter.js does not refuse a write
+ * that breaks it — it silently rewrites the other setpoint** (per the spec:
+ * "the value of OccupiedHeatingSetpoint shall be adjusted"). Pushing a
+ * thermostat Indigo reports as heat 21 / cool 21 therefore left the node
+ * holding heat 19, an offline write that raises no `command` event, so the
+ * plugin never learned and never corrected: the ecosystem showed a setpoint
+ * two degrees below the real one, permanently, with nothing in any log. A
+ * bridge does not schedule anything and has no HVAC of its own to protect from
+ * short-cycling, so the honest deadband is 0 — report what Indigo says, exactly.
  */
 function thermostatDefaults(): Record<string, unknown> {
     return {
         systemMode: Thermostat.SystemMode.Off,
         controlSequenceOfOperation: Thermostat.ControlSequenceOfOperation.CoolingAndHeating,
+        absMinHeatSetpointLimit: SETPOINT_CENTI_MIN,
+        absMaxHeatSetpointLimit: SETPOINT_CENTI_MAX,
+        minHeatSetpointLimit: SETPOINT_CENTI_MIN,
+        maxHeatSetpointLimit: SETPOINT_CENTI_MAX,
+        absMinCoolSetpointLimit: SETPOINT_CENTI_MIN,
+        absMaxCoolSetpointLimit: SETPOINT_CENTI_MAX,
+        minCoolSetpointLimit: SETPOINT_CENTI_MIN,
+        maxCoolSetpointLimit: SETPOINT_CENTI_MAX,
+        minSetpointDeadBand: 0,
     };
 }
 
@@ -1050,6 +1261,7 @@ const ROLE_DEFINITIONS: Record<RoleValue, RoleDefinition> = {
         deviceType: () => DoorLockDevice.with(BridgedDeviceBasicInformationServer, IndigoDoorLockServer),
         initialState: () => ({ [DOOR_LOCK]: doorLockDefaults() }),
         statePatch: doorLockPatch,
+        afterApply: emitLockOperation,
         // `lockState` is deliberately NOT watched. It only ever moves because
         // we pushed it (the overrides never write it), so a watcher would see
         // nothing an ecosystem did — and if it ever did fire it would echo our
@@ -1184,7 +1396,27 @@ export async function applyStates(
     if (Object.keys(patch).length === 0) {
         return;
     }
+    const { afterApply } = definitionFor(role);
+    if (afterApply === undefined) {
+        await endpoint.set(patch as never);
+        return;
+    }
+    // Read before the write, or "did this actually change anything" cannot be
+    // answered — and only for the one role that asks, so no other push pays for
+    // a state copy it would ignore. Keyed by behaviour like the patch itself,
+    // and derived from the patch's own keys rather than a second table of
+    // role → behaviour that could drift from `statePatch`.
+    //
+    // **Spread, not the object.** `stateOf` hands back a live view: hold onto it
+    // across `set()` and "before" reads back as "after", every comparison finds
+    // nothing changed, and the event this exists to raise never fires. Caught by
+    // the LockOperation test, which is the only thing that would ever notice.
+    const before: Record<string, unknown> = {};
+    for (const behavior of Object.keys(patch)) {
+        before[behavior] = { ...(endpoint.stateOf(behavior) as object) };
+    }
     await endpoint.set(patch as never);
+    await afterApply(endpoint, patch, before);
 }
 
 /**

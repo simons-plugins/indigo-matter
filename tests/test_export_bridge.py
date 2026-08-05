@@ -861,14 +861,124 @@ class TestSilentFailures:
         """F6/F7: a bare traceback per state change tells you nothing and never stops."""
         h = self._bridge(bridge_mod, mock_logger, devices)
         handler = bridge_mod.export_handlers.handler_for("onOffLight")
-        original = handler.diff
-        handler.diff = lambda _o, _n: (_ for _ in ()).throw(RuntimeError("bad device"))
+        original = handler.diff_with_gaps
+        handler.diff_with_gaps = lambda _o, _n, _opt=None: (
+            _ for _ in ()).throw(RuntimeError("bad device"))
         try:
             for _ in range(10):
                 h.bridge.device_updated(RelayDevice(101, "Study Plug", onState=False),
                                         RelayDevice(101, "Study Plug", onState=True))
         finally:
-            handler.diff = original
+            handler.diff_with_gaps = original
         assert mock_logger.exception.call_count == 1
         assert "Study Plug" in errors_of(mock_logger)
         assert "101" in errors_of(mock_logger)
+
+    def test_a_failed_dispatch_corrects_with_the_exports_own_options(
+            self, bridge_mod, mock_logger, devices, mock_indigo_base):
+        """PR #125 C1: the corrective push used to drop the export's §4.1 options.
+
+        A covering whose motor is wired backwards carries ``invert``. Read
+        WITHOUT it, ``states_for`` answers ``100 - actual`` — so a failed
+        ``goToPosition`` on such a blind "corrected" the ecosystem to the mirror
+        image of where the blind really is. That is worse than the stale value it
+        replaced: it is a wrong answer pushed with the authority of a fresh
+        reading, and nothing later contradicts it.
+
+        Brightness 30 with ``invert`` is §4.2 position 70. The bug pushed 30.
+        """
+        dev = DimmerDevice(700, "Back Blind", onState=True, brightness=30)
+        devices.add(dev)
+        mock_indigo_base.dimmer.setBrightness.side_effect = RuntimeError("motor jammed")
+        h = Harness(bridge_mod, mock_logger, devices,
+                    [ExportEntry(700, "windowCovering", options={"invert": True})])
+        h.start()
+        h.bridge.on_command(bridge_protocol.BridgeCommand(
+            indigo_device_id=700, command="goToPosition", args={"position": 90}))
+        assert h.client.only("set_state") == ("set_state", 700, {"position": 70})
+
+    def test_a_correction_with_nothing_readable_says_so_rather_than_returning(
+            self, bridge_mod, mock_logger, devices, mock_indigo_base):
+        """PR #125 H1: the error line one above promises "pushing the real one back".
+
+        A lock whose ``onState`` has gone ``None`` has no truth to push, so
+        ``states_for`` is empty and the push never happened — after the log had
+        already said it would. Silence there is the worst possible outcome for
+        the one role where the user is standing at the door.
+        """
+        dev = RelayDevice(701, "Front Door", onState=None)
+        devices.add(dev)
+        mock_indigo_base.device.lock.side_effect = RuntimeError("mesh unreachable")
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(701, "doorLock")])
+        h.start()
+        h.bridge.on_command(bridge_protocol.BridgeCommand(
+            indigo_device_id=701, command="lock", args={}))
+        assert h.client.names() == []
+        assert "cannot push truth" in warnings_of(mock_logger)
+
+    def test_a_device_that_stops_reporting_a_key_is_named_once_per_streak(
+            self, bridge_mod, mock_logger, devices):
+        """PR #125 C4: the ONLY trace of a published key vanishing.
+
+        ``diff`` iterates the new snapshot, so a key that disappeared produced
+        no push and no log — and a reconnect does not heal it either, because
+        ``attach`` sends the same partial snapshot and §3.4 leaves absent keys
+        untouched. The ecosystem shows the last value it was told, indefinitely.
+        Keeping that value is the decision; being quiet about it was the bug.
+        """
+        devices.add(RelayDevice(702, "Front Door", onState=True))
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(702, "doorLock")])
+        h.start()
+        for _ in range(6):
+            h.bridge.device_updated(RelayDevice(702, "Front Door", onState=True),
+                                    RelayDevice(702, "Front Door", onState=None))
+        assert mock_logger.warning.call_count == 1
+        warnings = warnings_of(mock_logger)
+        assert "702" in warnings and "locked" in warnings
+        assert "last known value" in warnings
+        assert h.client.names() == [], "an absent key must not be fabricated onto the wire"
+
+    def test_a_key_that_starts_reporting_again_re_arms_the_latch(
+            self, bridge_mod, mock_logger, devices):
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(703, "doorLock")])
+        devices.add(RelayDevice(703, "Side Door", onState=True))
+        h.start()
+        h.bridge.device_updated(RelayDevice(703, "Side Door", onState=True),
+                                RelayDevice(703, "Side Door", onState=None))
+        h.bridge.device_updated(RelayDevice(703, "Side Door", onState=None),
+                                RelayDevice(703, "Side Door", onState=True))
+        h.bridge.device_updated(RelayDevice(703, "Side Door", onState=True),
+                                RelayDevice(703, "Side Door", onState=None))
+        assert mock_logger.warning.call_count == 2
+
+    def test_a_command_that_lawfully_did_nothing_is_named_once_per_streak(
+            self, bridge_mod, mock_logger, devices, mock_indigo_base):
+        """PR #125 M1: ``stopMotion`` on a dimmer-modelled blind.
+
+        Neither an error (§4.2 declares the command for this role) nor a
+        success worth being silent about: the user pressed stop and the blind
+        kept going. It used to be a debug line from a stateless handler that
+        could not name the device.
+        """
+        devices.add(DimmerDevice(704, "Landing Blind", onState=True, brightness=50))
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(704, "windowCovering")])
+        h.start()
+        for _ in range(4):
+            h.bridge.on_command(bridge_protocol.BridgeCommand(
+                indigo_device_id=704, command="stopMotion", args={}))
+        assert mock_logger.warning.call_count == 1
+        assert "704" in warnings_of(mock_logger)
+        assert "changed nothing" in warnings_of(mock_logger)
+        mock_indigo_base.dimmer.setBrightness.assert_not_called()
+
+    def test_a_command_that_did_something_clears_the_no_op_latch(
+            self, bridge_mod, mock_logger, devices):
+        devices.add(DimmerDevice(705, "Landing Blind", onState=True, brightness=50))
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(705, "windowCovering")])
+        h.start()
+        stop = bridge_protocol.BridgeCommand(indigo_device_id=705, command="stopMotion", args={})
+        h.bridge.on_command(stop)
+        h.bridge.on_command(bridge_protocol.BridgeCommand(
+            indigo_device_id=705, command="goToPosition", args={"position": 40}))
+        h.bridge.on_command(stop)
+        assert mock_logger.warning.call_count == 2

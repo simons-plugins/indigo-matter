@@ -584,9 +584,28 @@ class TestWindowCovering:
         limitation it is.
         """
         dev = DimmerDevice(1, "Blind", brightness=50)
-        assert self._handler(handlers).dispatch("stopMotion", {}, dev) is True
+        assert self._handler(handlers).dispatch("stopMotion", {}, dev) is not False
         mock_indigo_base.dimmer.setBrightness.assert_not_called()
         mock_indigo_base.device.turnOff.assert_not_called()
+
+    def test_stop_motion_returns_a_reason_rather_than_a_bare_success(self, handlers):
+        """PR #125 M1: "accepted" and "did something" are not the same outcome.
+
+        It used to answer ``True``, which is what a ``setBrightness`` answers, so
+        the one thing the user needed — that the blind is going to finish its
+        travel because Indigo has no stop for a dimmer — reached nobody. The
+        string is truthy, so every ``if not dispatch(...)`` call site is
+        unaffected; ``export_bridge`` is what turns it into a log line.
+        """
+        outcome = self._handler(handlers).dispatch("stopMotion", {}, DimmerDevice(1, "Blind"))
+        assert isinstance(outcome, str) and "no stop action" in outcome
+
+    def test_a_command_that_did_something_still_answers_plain_true(self, handlers):
+        """The tri-state's other two legs, so "truthy" is not the whole contract."""
+        handler = self._handler(handlers)
+        dev = DimmerDevice(1, "Blind", brightness=0)
+        assert handler.dispatch("goToPosition", {"position": 65}, dev) is True
+        assert handler.dispatch("lock", {}, dev) is False
 
 
 # ---------------------------------------------------------------------------
@@ -753,12 +772,28 @@ class TestSensors:
 
     @pytest.mark.parametrize("role,key", [
         ("temperatureSensor", "temperatureC"), ("humiditySensor", "humidityPct"),
-        ("lightSensor", "lux"), ("pressureSensor", "pressureKPa"),
-        ("flowSensor", "flowM3h"),
+        ("lightSensor", "lux"), ("flowSensor", "flowM3h"),
     ])
     def test_a_numeric_sensor_reads_sensor_value_under_its_own_key(self, handlers, role, key):
+        """``pressureSensor`` is deliberately absent — it is the one that converts."""
         handler = handlers.HANDLERS[role]
         assert handler.states_for(SensorDevice(1, "S", sensorValue=101.3)) == {key: 101.3}
+
+    def test_pressure_converts_indigos_hpa_to_the_wire_s_kpa(self, handlers):
+        """PR #125 H4: the factor of ten that still renders plausibly.
+
+        Indigo's barometer unit is hPa — this plugin's own inbound handler
+        writes ``sensorValue`` in hPa and labels it " hPa", and
+        ``export_catalog`` routes ``hpa``/``mbar`` device names to this role —
+        while §4.2 names the wire key ``pressureKPa``. Passing the reading
+        through unconverted sent sea-level 1013 hPa out as 1013 kPa, which the
+        node scaled to 10130 and every ecosystem drew as ten atmospheres.
+        """
+        handler = handlers.HANDLERS["pressureSensor"]
+        assert handler.states_for(SensorDevice(1, "S", sensorValue=1013)) == {"pressureKPa": 101.3}
+        # Rounded to the 0.1 kPa the wire actually carries, not beyond it.
+        assert handler.states_for(SensorDevice(1, "S", sensorValue=1013.7)) == {"pressureKPa": 101.4}
+        assert handler.states_for(SensorDevice(1, "S", sensorValue=None)) == {}
 
     def test_an_integer_reading_is_reported_as_a_float(self, handlers):
         """§4.2 types these as float; the node's converters take numbers either way."""
@@ -787,3 +822,62 @@ class TestSensors:
                      "humiditySensor", "lightSensor", "pressureSensor", "flowSensor"):
             assert handlers.HANDLERS[role].dispatch("onOff", {"value": True},
                                                     SensorDevice(1, "S")) is False
+
+
+# ---------------------------------------------------------------------------
+# A published key that VANISHES (PR #125 C4)
+# ---------------------------------------------------------------------------
+class TestKeysThatStopBeingReported:
+    """A device that stops answering a key it used to publish.
+
+    ``states_for`` correctly omits it — §3.4 maps are partial and a fabricated
+    0/False would be pushed to every ecosystem as fact — so ``diff`` iterating
+    ``after`` finds nothing to say. §4.2 has no spelling for "I no longer know",
+    and a reconnect does not heal it (``attach`` sends the same partial snapshot
+    and §3.4 leaves absent keys untouched), so the ecosystem keeps the last
+    value it was told forever.
+
+    The decision is to keep that last known good value and make the *gap*
+    visible instead. These pin both halves.
+    """
+
+    def test_a_sensor_going_quiet_pushes_nothing(self, handlers):
+        """A flat battery: pushing a fabricated 0 °C would be worse than stale."""
+        handler = handlers.HANDLERS["temperatureSensor"]
+        before = SensorDevice(1, "S", sensorValue=21.5)
+        after = SensorDevice(1, "S", sensorValue=None)
+        assert handler.diff(before, after) == {}
+
+    def test_a_lock_going_quiet_pushes_nothing(self, handlers):
+        """The one that matters: no invented "Unlocked" for a bolt nobody can read."""
+        handler = handlers.HANDLERS["doorLock"]
+        before = RelayDevice(1, "Front Door", onState=True)
+        after = RelayDevice(1, "Front Door", onState=None)
+        assert handler.diff(before, after) == {}
+
+    @pytest.mark.parametrize("role,dev_before,dev_after,key", [
+        ("temperatureSensor", lambda: SensorDevice(1, "S", sensorValue=21.5),
+         lambda: SensorDevice(1, "S", sensorValue=None), "temperatureC"),
+        ("doorLock", lambda: RelayDevice(1, "D", onState=True),
+         lambda: RelayDevice(1, "D", onState=None), "locked"),
+    ])
+    def test_the_gap_is_reported_to_the_caller(self, handlers, role, dev_before, dev_after, key):
+        """Silent is the failure mode; ``diff_with_gaps`` is the way out of it."""
+        changed, stopped = handlers.HANDLERS[role].diff_with_gaps(dev_before(), dev_after())
+        assert changed == {}
+        assert stopped == frozenset({key})
+
+    def test_a_key_that_came_back_is_not_a_gap(self, handlers):
+        handler = handlers.HANDLERS["temperatureSensor"]
+        changed, stopped = handler.diff_with_gaps(SensorDevice(1, "S", sensorValue=None),
+                                                  SensorDevice(1, "S", sensorValue=4.0))
+        assert changed == {"temperatureC": 4.0}
+        assert stopped == frozenset()
+
+    def test_an_ordinary_change_reports_no_gap(self, handlers):
+        """The common path must not start claiming devices have gone quiet."""
+        handler = handlers.HANDLERS["dimmableLight"]
+        changed, stopped = handler.diff_with_gaps(DimmerDevice(1, "L", onState=True, brightness=40),
+                                                  DimmerDevice(1, "L", onState=True, brightness=75))
+        assert changed == {"level": 75}
+        assert stopped == frozenset()

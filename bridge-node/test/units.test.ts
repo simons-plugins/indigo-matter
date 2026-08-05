@@ -13,6 +13,7 @@ import { describe, it } from "node:test";
 import {
     celsiusToMatter,
     clampMireds,
+    clampSetpoint,
     cubicMetresPerHourToMatter,
     degreesToMatterHue,
     HUE_DEGREES_MAX,
@@ -40,6 +41,8 @@ import {
     percentToCurrentLevel,
     percentToMatter,
     positionToPercent100ths,
+    SETPOINT_CENTI_MAX,
+    SETPOINT_CENTI_MIN,
     systemModeToMatter,
     TEMPERATURE_CENTI_MIN,
 } from "../src/endpoints.js";
@@ -166,6 +169,10 @@ describe("temperature conversion (§4.2, E4)", () => {
         // temperature is the first signed unit in the file.
         assert.equal(celsiusToMatter(-18.4), -1840);
         assert.equal(celsiusToMatter(-0.005), 0);
+        // Half-UP (toward +∞), NOT half-away-from-zero, which the converter's
+        // own comment used to claim on the grounds that nothing here was signed.
+        // -5.005 °C is -500.5 centi: half-up gives -500, away-from-zero -501.
+        assert.equal(celsiusToMatter(-5.005), -500);
     });
 
     it("clamps to the cluster's absolute-zero floor rather than emitting an illegal int16", () => {
@@ -296,6 +303,39 @@ describe("window-covering position (§4.2, E4)", () => {
         assert.equal(positionToPercent100ths(180), PERCENT100THS_OPEN);
         assert.equal(percent100thsToPosition(-1), 100);
         assert.equal(percent100thsToPosition(99_999), 0);
+    });
+
+    it("rounds like every sibling converter rather than emitting a fraction", () => {
+        // `…LiftPercent100ths` is a uint16 and matter.js validates it, so a
+        // fractional position — from a newer plugin, or one that stopped
+        // rounding — used to fail the whole write instead of losing a
+        // hundredth of a percent.
+        assert.equal(positionToPercent100ths(70.004), 3000);
+        assert.equal(positionToPercent100ths(69.996), 3000);
+        assert.ok(Number.isInteger(positionToPercent100ths(33.333)), "emitted a fractional percent100ths");
+    });
+});
+
+describe("thermostat setpoint limits (§4.2, PR #125 C2)", () => {
+    it("advertises a band wide enough for the values a house actually uses", () => {
+        // matter.js's own defaults are 7-30 °C heating and 16-32 °C cooling —
+        // an American wall thermostat's range, imposed on a bridge that is
+        // fronting somebody else's hardware. 5 °C frost protection and the 0 an
+        // Indigo heat-only thermostat reports for `coolSetpoint` both sit
+        // outside it, and both were rejected with CONSTRAINT_ERROR on every
+        // push, forever.
+        assert.ok(SETPOINT_CENTI_MIN <= 0, "0 °C must be inside the advertised band");
+        assert.ok(SETPOINT_CENTI_MAX >= 3000, "the band must cover ordinary heating setpoints");
+        assert.equal(clampSetpoint(5), 500);
+        assert.equal(clampSetpoint(0), 0);
+        assert.equal(clampSetpoint(21.5), 2150);
+    });
+
+    it("clamps outside the band it advertises, like clampMireds", () => {
+        // A °F thermostat pushing 68 lands on the top of the band with a debug
+        // line naming it, rather than failing the write or being believed.
+        assert.equal(clampSetpoint(-40), SETPOINT_CENTI_MIN);
+        assert.equal(clampSetpoint(68), SETPOINT_CENTI_MAX);
     });
 });
 

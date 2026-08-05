@@ -118,6 +118,13 @@ class ExportBridge:
         #: Device ids whose ``device_updated`` is currently failing, so a stuck
         #: device does not write a traceback per state change.
         self._update_failed: set[int] = set()
+        #: ``device id → the §4.2 keys it has stopped reporting``. Same latch
+        #: shape, because the condition persists: a dead battery does not
+        #: un-die, and every subsequent change of that device would say it again.
+        self._stopped_keys: dict[int, frozenset] = {}
+        #: ``device id → the last no-op reason its role gave``, so a command an
+        #: ecosystem repeats (a user pressing stop three times) says it once.
+        self._no_op_reported: dict[int, str] = {}
         #: The allow-list size as of the last :meth:`exports_changed`. The
         #: un-export path needs it: by the time it runs the store is already
         #: empty, and its attach deadline has to cover REMOVING that many
@@ -330,7 +337,7 @@ class ExportBridge:
             self._fire(client.set_reachable(new_dev.id, reachable_of(new_dev)),
                        f"set_reachable dev {new_dev.id}")
         try:
-            states = handler.diff(orig_dev, new_dev, entry.options)
+            states, stopped = handler.diff_with_gaps(orig_dev, new_dev, entry.options)
         except Exception as exc:  # pylint: disable=broad-except
             # Once per device per streak: this fires on every change of an
             # exported device, so a lamp on a dimmer ramp would otherwise write
@@ -345,8 +352,36 @@ class ExportBridge:
                 self._logger.exception(exc)
             return
         self._update_failed.discard(new_dev.id)
+        self._report_stopped_keys(new_dev, entry.role, stopped)
         if states:
             self._fire(client.set_state(new_dev.id, states), f"set_state dev {new_dev.id}")
+
+    def _report_stopped_keys(self, dev: Any, role: str, stopped: frozenset) -> None:
+        """Say once when a device stops answering a key it used to publish.
+
+        The protocol has no way to *push* an absence (see
+        ``export_handlers.ExportHandler.diff_with_gaps`` for the full reasoning),
+        so the ecosystem keeps the last value it was given — a sensor that has
+        gone flat reads as its final temperature and a lock whose driver has
+        lost the device reads "Locked" indefinitely. Keeping the last known good
+        value is the least-bad answer; being quiet about it is not, because the
+        symptom is a number that simply never changes again, which looks like
+        nothing at all.
+
+        Latched on the key SET, not merely on "there is a gap": a device that
+        loses its temperature and then also loses its humidity has told us
+        something new, and should say so.
+        """
+        if not stopped:
+            self._stopped_keys.pop(dev.id, None)
+            return
+        if self._stopped_keys.get(dev.id) == stopped:
+            return
+        self._stopped_keys[dev.id] = stopped
+        self._logger.warning(
+            "Matter export: device %s (id %s, exported as %s) stopped reporting %s — paired "
+            "ecosystems will keep showing the last known value for it until it reports again.",
+            getattr(dev, "name", ""), dev.id, role, ", ".join(sorted(stopped)))
 
     def _live_client(self, what: str, device_id: int) -> Optional[BridgeClient]:
         """The client, but only while it can actually take an endpoint command.
@@ -416,6 +451,8 @@ class ExportBridge:
         """Drop one endpoint (§3.3). Fire-and-forget; idempotent on the node."""
         self._skipped.pop(device_id, None)
         self._update_failed.discard(device_id)
+        self._stopped_keys.pop(device_id, None)
+        self._no_op_reported.pop(device_id, None)
         client = self._live_client("remove_endpoint", device_id)
         if client is None:
             return
@@ -482,19 +519,47 @@ class ExportBridge:
                 "ignoring.", command.command, device_id)
             return
         try:
-            if not handler.dispatch(command.command, command.args, dev, entry.options):
-                self._logger.warning(
-                    "Matter export: the bridge node sent %r for device %s (%s), which that role "
-                    "does not define — ignoring.", command.command, device_id, entry.role)
+            outcome = handler.dispatch(command.command, command.args, dev, entry.options)
         except Exception as exc:  # pylint: disable=broad-except
             self._logger.error(
                 "Matter export: %r failed for device %s (%s) with args %r — %s. The ecosystem "
                 "still shows the state it asked for; pushing the real one back.",
                 command.command, device_id, entry.role, command.args, exc)
             self._logger.exception(exc)
-            self._correct(handler, dev, device_id)
+            self._correct(handler, dev, device_id, entry.options)
+            return
+        if outcome is False:
+            self._logger.warning(
+                "Matter export: the bridge node sent %r for device %s (%s), which that role "
+                "does not define — ignoring.", command.command, device_id, entry.role)
+        elif isinstance(outcome, str):
+            self._report_no_op(command.command, device_id, entry.role, outcome)
+        else:
+            self._no_op_reported.pop(device_id, None)
 
-    def _correct(self, handler, dev: Any, device_id: int) -> None:
+    def _report_no_op(self, command: str, device_id: int, role: str, reason: str) -> None:
+        """Say once when a command was accepted and lawfully changed nothing.
+
+        The third dispatch outcome (``export_handlers.ExportHandler.dispatch``).
+        It is neither an error — the role declares the command and §4.2 says it
+        must — nor a success worth being silent about: the user pressed
+        something in an ecosystem and the house did not move, and until now the
+        only trace was a debug line from a stateless handler that could not name
+        the device.
+
+        Latched on the *reason* rather than the command name so the message a
+        user can act on is said once per streak, however many times the
+        ecosystem repeats the request.
+        """
+        if self._no_op_reported.get(device_id) == reason:
+            return
+        self._no_op_reported[device_id] = reason
+        self._logger.warning(
+            "Matter export: %r reached device %s (exported as %s) but changed nothing — %s.",
+            command, device_id, role, reason)
+
+    def _correct(self, handler, dev: Any, device_id: int,
+                 options: Optional[dict] = None) -> None:
         """Push the device's real state after a command we could not apply (F5).
 
         An ecosystem applies a command optimistically the moment it sends it —
@@ -504,20 +569,37 @@ class ExportBridge:
         pushing the truth is the only thing that closes that gap, and it is safe
         to do unconditionally: ``set_state`` is fire-and-forget and the node
         echo-guards its own writes (§6.4).
+
+        **``options`` is not optional in practice, whatever the signature says.**
+        The export's §4.1 options are what a role's snapshot *means*: read an
+        inverted covering without them and ``states_for`` returns ``100 -
+        actual``, so a failed ``goToPosition`` on a blind wired backwards
+        "corrected" the ecosystem to the mirror image of where the blind really
+        is — a wrong answer pushed with the full authority of the truth, and
+        stickier than the stale value it replaced because it looks like a fresh
+        report. Every caller threads the entry's options through.
         """
         client = self._live_client("the corrective state push", device_id)
         if client is None:
             return
         try:
-            states = handler.states_for(dev)
+            states = handler.states_for(dev, options)
         except Exception as exc:  # pylint: disable=broad-except
             self._logger.warning(
                 "Matter export: could not read device %s back to correct the ecosystem (%s) — "
                 "it will show the failed command's state until the next attach.", device_id, exc)
             return
-        if states:
-            self._fire(client.set_state(device_id, states),
-                       f"corrective set_state dev {device_id}")
+        if not states:
+            # The promise was made one line up ("pushing the real one back"), so
+            # the case where there is no real one to push cannot be a silent
+            # return. It is the same absence `diff_with_gaps` reports: a lock
+            # whose `onState` is None has no truth to tell.
+            self._logger.warning(
+                "Matter export: cannot push truth for device %s — it reports no readable state "
+                "at all, so the ecosystem keeps showing the command that failed.", device_id)
+            return
+        self._fire(client.set_state(device_id, states),
+                   f"corrective set_state dev {device_id}")
 
     # ------------------------------------------------------------------
     # Client callbacks

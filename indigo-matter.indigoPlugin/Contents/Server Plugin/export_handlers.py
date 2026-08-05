@@ -16,7 +16,9 @@ Each handler owns three things, and no more:
 * :meth:`ExportHandler.diff` — the *changed* subset of that snapshot, which is
   what ``deviceUpdated`` actually pushes. An empty dict means "nothing to say";
 * :meth:`ExportHandler.dispatch` — one §4.2 ``command`` event turned into a real
-  ``indigo.*`` call.
+  ``indigo.*`` call. Its return is a **tri-state** (``False`` / ``True`` / a
+  reason string) so a command this role accepts but cannot act on is neither
+  reported as a protocol error nor swallowed — see the method.
 
 **E4 completed the table**: every role in ``bridge_protocol.ROLES`` now has a
 handler, so :data:`BRIDGEABLE_ROLES` and that set are the same thing. The
@@ -52,20 +54,31 @@ records nothing about what it means. §4.2 names its keys in °C, %RH, lux, kPa
 and m³/h, so this module **treats the Indigo reading as already being in the
 protocol's unit** and converts nothing — the same assumption the inbound half
 already documents ("Indigo values are treated as Celsius",
-``matter_handlers/thermostat.py``), so both directions of the plugin agree. A
-°F thermostat or an hPa barometer will therefore export a wrong-looking number.
-That is not fixable from the device model: it needs a declared unit per export,
-which belongs with the role/polarity data ``indigo-device-catalog`` is the
-long-term home for (PRD §5.2 cross-repo note). It is deliberately NOT inferred
-from ``export_catalog``'s unit heuristic — that regex is a *default for the role
-picker*, and silently rescaling someone's reading because their device is named
-"Attic Temp" would be far worse than a number they can see is wrong.
+``matter_handlers/thermostat.py``). A °F thermostat will therefore export a
+wrong-looking number. That is not fixable from the device model: it needs a
+declared unit per export, which belongs with the role/polarity data
+``indigo-device-catalog`` is the long-term home for (PRD §5.2 cross-repo note).
+It is deliberately NOT inferred from ``export_catalog``'s unit heuristic — that
+regex is a *default for the role picker*, and silently rescaling someone's
+reading because their device is named "Attic Temp" would be far worse than a
+number they can see is wrong.
+
+**Pressure is the one documented exception, and it is not an exception to that
+rule — it is the rule applied honestly.** The claim "both directions agree" was
+true of every key but this one. Indigo's convention for a barometer, set by the
+*inbound* half of this same plugin (``matter_handlers/sensors.py`` writes
+``sensorValue`` in hPa and labels it " hPa") is hPa, and ``export_catalog``'s
+own role heuristic routes ``\\bhpa\\b``/``\\bmbar\\b`` device names here. §4.2
+names the wire key ``pressureKPa``. Those differ by exactly 10, so passing the
+reading through unconverted was a factor-of-ten error that still renders
+plausibly in an ecosystem — 1013 hPa arriving as 1013 kPa, ten atmospheres. See
+:class:`PressureSensorExport`.
 """
 from __future__ import annotations
 
 import colorsys
 import logging
-from typing import Any, Callable, Optional
+from typing import Any, Callable, NamedTuple, Optional, Union
 
 import indigo  # provided by the Indigo runtime
 
@@ -160,6 +173,24 @@ SATURATION_HUE_FLOOR = 20
 #: Sentinel for "this key was absent before", which is a change, not a match.
 _MISSING = object()
 
+#: §4.2 ``pressureKPa`` per Indigo hPa. Indigo's barometer convention is hPa
+#: (set by this plugin's own inbound half, ``matter_handlers/sensors.py``) and
+#: the wire key is kPa; 1 hPa is 0.1 kPa. See the module docstring.
+HPA_PER_KPA = 10.0
+
+
+class StateDiff(NamedTuple):
+    """What :meth:`ExportHandler.diff_with_gaps` found between two snapshots.
+
+    ``changed`` is what goes on the wire. ``stopped`` is the keys the device
+    *used* to answer and no longer does, which is not a value and so cannot be
+    pushed — see :meth:`ExportHandler.diff_with_gaps` for why that is a
+    decision rather than an omission.
+    """
+
+    changed: dict
+    stopped: frozenset
+
 
 # --------------------------------------------------------------------------
 # Colour conversion (pure)
@@ -214,6 +245,17 @@ def _first_number(values: Any) -> Optional[float]:
     ``dev.temperatures`` is a list on a real thermostat and a MagicMock on a
     mocked one, so the iteration is guarded rather than assumed — the same
     reason :func:`_number` type-checks instead of calling ``bool``.
+
+    **A literal ``[0.0]`` is reported, not treated as "no sensor".** It was
+    proposed that it should be: some drivers do leave ``temperatures`` at
+    ``[0.0]`` before their first poll, and exporting that reads as a house at
+    freezing. The trade-off runs the other way, though — 0 °C is a real reading
+    a real outdoor or unheated-room thermostat gives every winter, and
+    suppressing it would silently freeze the ecosystem's display at whatever it
+    last saw on exactly the days the number matters. A pre-poll zero corrects
+    itself on the next update; a value this module refuses to report never
+    arrives at all. Distinguishing the two needs a "has this device reported
+    yet" signal the IOM does not offer.
     """
     if not isinstance(values, (list, tuple)):
         return None
@@ -312,13 +354,48 @@ class ExportHandler:
         property of the export, not of a moment, so comparing an inverted
         reading against a non-inverted one would report a change on every
         config edit and, worse, push the wrong one.
+
+        A key the device has **stopped** answering produces nothing here; see
+        :meth:`diff_with_gaps`, which is the seam callers that need to notice
+        should use.
+        """
+        return self.diff_with_gaps(orig_dev, new_dev, options).changed
+
+    def diff_with_gaps(self, orig_dev: Any, new_dev: Any,
+                       options: Optional[dict] = None) -> StateDiff:
+        """:meth:`diff`, plus the keys that stopped being reported at all.
+
+        **The decision, because it is not obvious and it is not free.** A
+        published key can *vanish*: a battery sensor whose ``sensorValue`` goes
+        ``None`` on a dead cell, a lock whose ``onState`` goes ``None`` when its
+        driver loses the device. ``states_for`` correctly omits it — §3.4 state
+        maps are partial by design and a fabricated 0/False would be pushed to
+        every ecosystem as fact — so ``after`` simply has one fewer key, and
+        iterating ``after`` finds nothing to say.
+
+        §4.2 has **no spelling for "I no longer know"**: every state key is a
+        value, and ``set_state`` cannot carry an absence. Nor does a reconnect
+        heal it — ``attach`` sends the same partial snapshot and §3.4 leaves
+        keys it was not given untouched. So the ecosystem keeps the last value
+        it was told, forever, and a lock that stopped reporting shows "Locked"
+        long after nobody knows whether it is.
+
+        Keeping the last known good value is still the *right* answer — the
+        alternatives are inventing a state or flapping the accessory — but it
+        must not be a **silent** one. The gap is returned rather than logged
+        here (handlers are stateless singletons with no device context and no
+        latch), so ``export_bridge`` can say it once per device per streak.
+        Spelling an explicit "unknown" on the wire would be a protocol
+        addition; it is noted in ``docs/HANDOVER.md`` and deliberately not made
+        here.
         """
         before = self.states_for(orig_dev, options)
         after = self.states_for(new_dev, options)
-        return {
+        changed = {
             key: value for key, value in after.items()
             if self._changed(key, before.get(key, _MISSING), value)
         }
+        return StateDiff(changed, frozenset(before) - frozenset(after))
 
     def _changed(self, key: str, before: Any, after: Any) -> bool:
         if before is _MISSING:
@@ -330,28 +407,41 @@ class ExportHandler:
         return before != after
 
     # -- commands (node → plugin) ---------------------------------------
-    def commands(self) -> dict[str, Callable[[dict, Any, dict], None]]:
+    def commands(self) -> dict[str, Callable[[dict, Any, dict], Optional[str]]]:
         """``command name → handler``. Subclasses extend, never replace.
 
         Each handler takes ``(args, dev, options)``. Most ignore the third —
         naming it ``_options`` there — but the signature is uniform so a role
         that needs the export's configuration does not have to be a special
         case in :meth:`dispatch`.
+
+        A handler returns ``None`` when it did something, or a short reason
+        string when it lawfully did **nothing** (see
+        :meth:`WindowCoveringExport._stop_motion`, the only one today).
         """
         return {}
 
     def dispatch(self, command: str, args: dict, dev: Any,
-                 options: Optional[dict] = None) -> bool:
-        """Run one §4.2 command against ``dev``. ``False`` = not our command.
+                 options: Optional[dict] = None) -> Union[bool, str]:
+        """Run one §4.2 command against ``dev``. Tri-state.
 
-        The caller logs the ``False`` case: only it knows which device and which
-        role were involved, which is the version of that line worth having.
+        * ``False`` — not this role's command. The caller logs it: only it
+          knows which device and which role were involved, which is the version
+          of that line worth having;
+        * ``True`` — dispatched to Indigo;
+        * a **reason string** — the command is this role's, was accepted, and
+          changed nothing. That is a third outcome and it used to be squashed
+          into ``True``: ``stopMotion`` on a dimmer-modelled blind returned
+          "handled" and vanished, so a user pressing stop in the Home app saw
+          the blind carry on with nothing anywhere to explain it. A truthy
+          string keeps every existing ``if not dispatch(...)`` call site correct
+          while giving the caller — which owns the device, the log and the
+          once-per-streak latch — something to say.
         """
         handler = self.commands().get(command)
         if handler is None:
             return False
-        handler(dict(args or {}), dev, dict(options or {}))
-        return True
+        return handler(dict(args or {}), dev, dict(options or {})) or True
 
 
 class OnOffExport(ExportHandler):
@@ -362,7 +452,7 @@ class OnOffExport(ExportHandler):
     def states_for(self, dev: Any, options: Optional[dict] = None) -> dict:
         return {STATE_ON_OFF: bool(getattr(dev, "onState", False))}
 
-    def commands(self) -> dict[str, Callable[[dict, Any, dict], None]]:
+    def commands(self) -> dict[str, Callable[[dict, Any, dict], Optional[str]]]:
         return {**super().commands(), COMMAND_ON_OFF: self._on_off}
 
     @staticmethod
@@ -391,7 +481,7 @@ class DimmableLightExport(OnOffExport):
             states[STATE_LEVEL] = int(_clamp(round(brightness), 0, 100))
         return states
 
-    def commands(self) -> dict[str, Callable[[dict, Any, dict], None]]:
+    def commands(self) -> dict[str, Callable[[dict, Any, dict], Optional[str]]]:
         return {**super().commands(), COMMAND_SET_LEVEL: self._set_level}
 
     @staticmethod
@@ -415,7 +505,7 @@ class ColorTemperatureLightExport(DimmableLightExport):
                 _clamp(kelvin_to_mireds(kelvin), MIREDS_MIN, MIREDS_MAX))
         return states
 
-    def commands(self) -> dict[str, Callable[[dict, Any, dict], None]]:
+    def commands(self) -> dict[str, Callable[[dict, Any, dict], Optional[str]]]:
         return {**super().commands(), COMMAND_SET_COLOR_TEMP: self._set_color_temp}
 
     @staticmethod
@@ -487,7 +577,7 @@ class ExtendedColorLightExport(ColorTemperatureLightExport):
                 states[STATE_HUE] = hue
         return states
 
-    def commands(self) -> dict[str, Callable[[dict, Any, dict], None]]:
+    def commands(self) -> dict[str, Callable[[dict, Any, dict], Optional[str]]]:
         return {**super().commands(), COMMAND_SET_COLOR: self._set_color}
 
     @staticmethod
@@ -546,7 +636,7 @@ class WindowCoveringExport(ExportHandler):
             return {}
         return {STATE_POSITION: _position_from_brightness(brightness, options)}
 
-    def commands(self) -> dict[str, Callable[[dict, Any, dict], None]]:
+    def commands(self) -> dict[str, Callable[[dict, Any, dict], Optional[str]]]:
         return {
             **super().commands(),
             COMMAND_GO_TO_POSITION: self._go_to_position,
@@ -562,7 +652,7 @@ class WindowCoveringExport(ExportHandler):
             dev, value=_position_from_brightness(_clamp(round(position), 0, 100), options))
 
     @staticmethod
-    def _stop_motion(_args: dict, dev: Any, _options: dict) -> None:
+    def _stop_motion(_args: dict, _dev: Any, _options: dict) -> Optional[str]:
         """Declared, honoured by doing nothing, and that is the correct answer.
 
         A covering exported through a *dimmer* has no stop: Indigo's dimmer
@@ -579,9 +669,15 @@ class WindowCoveringExport(ExportHandler):
         undeclared command makes ``export_bridge`` log "a command that role does
         not define" — which reads like a protocol bug rather than a known
         limitation of modelling a blind as a dimmer.
+
+        It returns the reason rather than writing a debug line of its own. A
+        module-level debug from a stateless singleton could not name the export
+        or throttle itself, so the one person who needs it — a user who pressed
+        stop in the Home app and watched the blind keep going — would never see
+        it. ``export_bridge`` says it once per device per streak instead.
         """
-        _LOG.debug("stopMotion ignored: device %s is a dimmer-modelled covering and Indigo "
-                   "has no stop action for one", getattr(dev, "id", "?"))
+        return ("Indigo offers no stop action for a covering modelled as a dimmer, "
+                "so the blind will finish its travel")
 
 
 class DoorLockExport(ExportHandler):
@@ -605,7 +701,7 @@ class DoorLockExport(ExportHandler):
         # lock whose state is unknown must not be reported as unlocked.
         return {} if on_state is None else {STATE_LOCKED: bool(on_state)}
 
-    def commands(self) -> dict[str, Callable[[dict, Any, dict], None]]:
+    def commands(self) -> dict[str, Callable[[dict, Any, dict], Optional[str]]]:
         return {
             **super().commands(),
             COMMAND_LOCK: self._lock,
@@ -660,7 +756,7 @@ class ThermostatExport(ExportHandler):
             states[STATE_SYSTEM_MODE] = mode
         return states
 
-    def commands(self) -> dict[str, Callable[[dict, Any, dict], None]]:
+    def commands(self) -> dict[str, Callable[[dict, Any, dict], Optional[str]]]:
         return {
             **super().commands(),
             COMMAND_SET_HEATING_SETPOINT: self._set_heating_setpoint,
@@ -761,10 +857,30 @@ class LightSensorExport(NumericSensorExport):
 
 
 class PressureSensorExport(NumericSensorExport):
-    """``pressureSensor`` — ``sensorValue`` read as kPa (the node scales to 0.1 kPa)."""
+    """``pressureSensor`` — ``sensorValue`` read as **hPa**, sent as §4.2 kPa.
+
+    The only sensor role that converts, and the module docstring says why at
+    length: Indigo's barometer unit is hPa — that is what this plugin's own
+    *inbound* handler writes (``matter_handlers/sensors.py``, unit label
+    ``" hPa"``) and what ``export_catalog``'s role heuristic matches on — while
+    §4.2 names the wire key ``pressureKPa``. 1 hPa is 0.1 kPa.
+
+    Skipping the divide sent sea-level 1013 hPa out as 1013 kPa, which the node
+    faithfully scaled to 10130 (0.1 kPa) and every ecosystem rendered as a
+    perfectly believable pressure ten times too high. Rounded to 0.1 kPa
+    because that is the resolution the wire actually has (``kilopascalsToMatter``
+    multiplies by 10 into an int16), so keeping more would be inventing digits
+    the ecosystem cannot show.
+    """
 
     role = export_catalog.ROLE_PRESSURE_SENSOR
     state_key = STATE_PRESSURE_KPA
+
+    def states_for(self, dev: Any, options: Optional[dict] = None) -> dict:
+        states = super().states_for(dev, options)
+        if self.state_key in states:
+            states[self.state_key] = round(states[self.state_key] / HPA_PER_KPA, 1)
+        return states
 
 
 class FlowSensorExport(NumericSensorExport):
