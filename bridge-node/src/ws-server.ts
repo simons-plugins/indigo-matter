@@ -189,28 +189,45 @@ export class BridgeWsServer {
 
         // §2: a connection that handshakes but never attaches is closed.
         const timeoutMs = this.options.unattachedTimeoutMs ?? UNATTACHED_TIMEOUT_MS;
-        state.unattachedTimer = setTimeout(() => {
-            if (state.attached) {
-                return;
-            }
-            // Disarmed while we are refusing. In that state the node itself is
-            // what stops this client attaching (§1.1 refuses `attach`), and the
-            // plugin deliberately HOLDS the socket open un-attached because it
-            // is the only route to the §3.11 rebuild. Closing it anyway put the
-            // two in a fight: refuse, close, reconnect, refuse — every 10s, and
-            // a rebuild the user had just confirmed could be cut off mid-flight
-            // by our own timer.
-            if (this.options.bridge.endpointMapRefusal() !== undefined) {
-                this.#log(
-                    "Holding an un-attached connection open: the node is refusing to serve endpoints " +
-                        "and this socket is the client's only route to rebuild_endpoint_map (§1.1)",
-                );
-                return;
-            }
-            this.#log(`Closing connection that did not attach within ${timeoutMs}ms`);
-            socket.close();
-        }, timeoutMs);
-        state.unattachedTimer.unref?.();
+        // Said once per socket, not once per period: while the node is refusing
+        // the plugin holds this connection open indefinitely, and a line every
+        // 10s for the life of the process buries everything else in the log.
+        let announcedHold = false;
+        const armUnattachedTimer = (): void => {
+            state.unattachedTimer = setTimeout(() => {
+                if (state.attached) {
+                    return;
+                }
+                // Deferred, not disarmed, while we are refusing. In that state
+                // the node itself is what stops this client attaching (§1.1
+                // refuses `attach`), and the plugin deliberately HOLDS the
+                // socket open un-attached because it is the only route to the
+                // §3.11 rebuild. Closing it anyway put the two in a fight:
+                // refuse, close, reconnect, refuse — every 10s, and a rebuild
+                // the user had just confirmed could be cut off mid-flight by
+                // our own timer. Re-arming rather than returning bare is what
+                // keeps the check alive AFTER the rebuild clears the refusal:
+                // a one-shot timer had already fired by then, so a client that
+                // still never attached was never reaped again for the life of
+                // the process.
+                if (this.options.bridge.endpointMapRefusal() !== undefined) {
+                    if (!announcedHold) {
+                        announcedHold = true;
+                        this.#log(
+                            "Holding an un-attached connection open: the node is refusing to serve " +
+                                "endpoints and this socket is the client's only route to " +
+                                "rebuild_endpoint_map (§1.1)",
+                        );
+                    }
+                    armUnattachedTimer();
+                    return;
+                }
+                this.#log(`Closing connection that did not attach within ${timeoutMs}ms`);
+                socket.close();
+            }, timeoutMs);
+            state.unattachedTimer.unref?.();
+        };
+        armUnattachedTimer();
 
         socket.on("message", (data, isBinary) => {
             if (isBinary) {

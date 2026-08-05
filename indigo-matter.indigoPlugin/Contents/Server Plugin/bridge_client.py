@@ -84,6 +84,24 @@ def attach_timeout_for(endpoint_count: int) -> float:
     return max(ATTACH_TIMEOUT,
                ATTACH_TIMEOUT_BASE + ATTACH_TIMEOUT_PER_ENDPOINT * max(0, int(endpoint_count)))
 
+
+#: Slack on top of the work a §3.11 rebuild can actually do, so the *caller's*
+#: deadline is never the tighter of the two.
+REBUILD_TIMEOUT_HEADROOM = 5.0
+
+
+def rebuild_timeout_for(endpoint_count: int) -> float:
+    """Wall-clock ceiling for one §3.11 rebuild **including its re-attach**.
+
+    A caller that waits on ``rebuild_endpoint_map`` is waiting on two deadlines
+    in series — :data:`LONG_TIMEOUT` for the rebuild itself, then a full
+    :func:`attach_timeout_for` for the re-attach — and a flat number chosen
+    without reference to either is a trap the moment the export list is large:
+    the menu's own 45s expired mid-re-attach on ~90 endpoints and reported a
+    failure over a rebuild that had already succeeded and could not be undone.
+    """
+    return LONG_TIMEOUT + attach_timeout_for(endpoint_count) + REBUILD_TIMEOUT_HEADROOM
+
 #: Attach refusals that reconnecting cannot fix, with the remedy the user needs.
 #: Everything NOT listed here (``internal``, ``malformed_args``, …) is treated as
 #: transient and retried on the normal backoff — retrying these three instead
@@ -103,6 +121,26 @@ TERMINAL_ATTACH_ERRORS = {
         "in already-paired ecosystems"
     ),
 }
+
+#: The remedy when an ``endpoint_map_invalid`` refusal is really about the
+#: IDENTITY file. §1.1 has one code for every refuse-to-start reason, and the
+#: reason text is the only thing that distinguishes them — so the map remedy
+#: above is not merely unhelpful here, it points at the §3.11 rebuild, which the
+#: node refuses outright for this reason (it cannot fix an identity, and
+#: clearing the refusal would serve endpoints under a serial nobody has seen).
+IDENTITY_REFUSAL_REMEDY = (
+    "the node's identity file is unreadable, so it is serving nothing — a rebuild CANNOT fix "
+    "this and the node will refuse one. The unusable file was moved aside as "
+    "identity.json.unreadable-<timestamp>; restore or repair it and restart the bridge node"
+)
+
+
+def remedy_for(code: str, details: str) -> Optional[str]:
+    """The user-facing remedy for a terminal refusal, or ``None`` if untriaged."""
+    if (code == bridge_protocol.ERR_ENDPOINT_MAP_INVALID
+            and bridge_protocol.REFUSE_IDENTITY_UNREADABLE in (details or "")):
+        return IDENTITY_REFUSAL_REMEDY
+    return TERMINAL_ATTACH_ERRORS.get(code)
 
 #: The subset of :data:`TERMINAL_ATTACH_ERRORS` that halts the client outright.
 #: ``endpoint_map_invalid`` is the exception: §1.1 keeps the connection usable
@@ -160,7 +198,7 @@ class BridgeClient(WsJsonClient):
         self._endpoint_provider = endpoint_provider or (lambda: [])
         #: How many endpoints an un-export still owes the node — 0 for none.
         #: Non-zero makes the *handshake's* attach carry §3.1's `replace_all`
-        #: and sizes its deadline (``export_bridge._owes_replace_all``, XAC7).
+        #: and sizes its deadline (``export_bridge._pending_replace_all``, XAC7).
         #: The user emptied the allow-list, the node was unreachable, and
         #: without this the accessories stay in every paired ecosystem for good,
         #: because nothing else ever attaches with an empty set again.
@@ -299,7 +337,7 @@ class BridgeClient(WsJsonClient):
           but log *which* error it was rather than dumping a traceback.
         """
         code = str(exc.code)
-        remedy = TERMINAL_ATTACH_ERRORS.get(code)
+        remedy = remedy_for(code, exc.details)
         if remedy is None:
             self._notify(self._on_attach_refused, code, exc.details)
             raise HandshakeFailed(f"bridge node refused attach: {code} ({exc.details})")
@@ -617,16 +655,68 @@ class BridgeClient(WsJsonClient):
         When it is called from the recovery state (the node refused our attach)
         it also re-attaches: the map is valid again, so the connection can stop
         being a three-command lifeline and go back to being an export.
+
+        **The rebuild and the re-attach are two outcomes, not one.** By the time
+        the node answers this command it has already written the new map and
+        stopped refusing — that is what its StatusReport *means*, and it is the
+        irreversible half. Letting a failure of the re-attach after it propagate
+        as though the whole thing failed produced a menu that told the user "the
+        bridge node is unchanged and still refusing to export" when neither
+        clause was true, left ``recovery`` set so every state push went on being
+        dropped, and invited them to repeat an operation that duplicates
+        accessories in every paired ecosystem.
+
+        So the recovery flag is cleared the moment the report lands, and the
+        re-attach goes through the same triage as any other refused attach
+        (:meth:`_handle_attach_refused`) rather than bypassing it. Its failure
+        is reported and swallowed here: the caller gets the rebuild's status,
+        and whether the connection came back is readable from :attr:`attached`.
         """
         result = await self._request_frame(self.proto.build_rebuild_endpoint_map(), timeout)
         self.status = bridge_protocol.parse_status(result)
-        if self.recovery:
-            self.logger.info("endpoint map rebuilt; re-attaching to the bridge node")
-            # The debt outlives the refusal: a node that was refusing never took
-            # our un-export either, so the re-attach has to carry the same opt-in
-            # the handshake would have.
-            replace_all = self._replace_all(self._owed_removals())
+        if not self.recovery:
+            return self.status
+        # The node has rebuilt and stopped refusing. Whatever happens next, THAT
+        # is now the truth about it, and nothing below may make it look otherwise.
+        self.recovery = False
+        rebuilt = self.status
+        self.logger.info("endpoint map rebuilt; re-attaching to the bridge node")
+        # The debt outlives the refusal: a node that was refusing never took
+        # our un-export either, so the re-attach has to carry the same opt-in
+        # the handshake would have.
+        replace_all = self._replace_all(self._owed_removals())
+        try:
             status = await self.attach(replace_all=replace_all)
-            self._notify(self._on_attached, status, replace_all)
-            return status
-        return self.status
+        except BridgeProtocolError as exc:
+            self._triage_rebuilt_reattach(exc)
+            return rebuilt
+        self._notify(self._on_attached, status, replace_all)
+        return status
+
+    def _triage_rebuilt_reattach(self, exc: BridgeProtocolError) -> None:
+        """Handle a refusal of the post-rebuild re-attach, without unwinding.
+
+        :meth:`_handle_attach_refused` is written for the handshake, where the
+        run loop is the thing that catches what it raises — it is what turns a
+        :class:`ClientHalted` into the :attr:`halted` latch and a
+        :class:`HandshakeFailed` into a backoff. Here there is no run loop above
+        us: we are on a live connection, called from a menu. Re-using the triage
+        is still right (a refusal means the same thing whoever asked), so the
+        two states it can only signal by raising are applied here instead, and
+        the exception stops — the rebuild it followed genuinely happened and
+        must not be reported as a failure.
+        """
+        try:
+            self._handle_attach_refused(exc)
+        except ClientHalted as halt:
+            # Exactly what WsJsonClient.run does with one, because nothing else
+            # is going to see this one.
+            self.halted = True
+            self.halted_reason = halt.reason or None
+            self.logger.error(
+                "the endpoint map was rebuilt, but re-attaching HALTED the bridge client (%s); "
+                "nothing is being exported and it will not retry on its own", halt)
+        except HandshakeFailed as failed:
+            self.logger.warning(
+                "the endpoint map was rebuilt, but re-attaching was refused (%s); the ordinary "
+                "reconnect will try again", failed)

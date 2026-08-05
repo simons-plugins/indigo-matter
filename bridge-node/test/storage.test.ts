@@ -14,6 +14,7 @@ import {
     DISCRIMINATOR_MAX,
     generateDiscriminator,
     generatePasscode,
+    identityFileProblem,
     identityProblem,
     INVALID_PASSCODES,
     isValidPasscode,
@@ -258,6 +259,103 @@ describe("identityProblem — the E5 refuse-to-start guard", () => {
         try {
             identityProblem(dir);
             assert.deepEqual(readdirSync(dir), [], "the guard must be a pure read");
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+});
+
+describe("the identity refusal is sticky — it must outlive the restart (E5 R4)", () => {
+    it("still refuses when the identity is gone but its quarantine marker is not", () => {
+        // ⊗ The refusal used to last exactly one restart. Start one moves the
+        // unusable file aside and mints a replacement in MEMORY; start two then
+        // finds no identity.json at all, reads that as a first run, and mints
+        // AND WRITES one — so the bridge comes up serving under a SerialNumber
+        // and UniqueID no paired ecosystem has ever seen, with the routine
+        // "minting new bridge identity" line to show for it. The marker lying
+        // beside it is the evidence that nobody has resolved this yet.
+        const dir = scratch();
+        try {
+            writeFileSync(join(dir, "identity.json.unreadable-2026-08-05T10-00-00-000Z"), "{truncated");
+
+            const problem = identityProblem(dir);
+
+            assert.ok(problem !== undefined, "a quarantined identity must keep the node refusing");
+            // The message has to be a recovery instruction: this is the only
+            // place the user is told which file to put back, and that deleting
+            // them is a decision rather than tidying up.
+            assert.match(problem, /identity\.json\.unreadable-2026-08-05T10-00-00-000Z/);
+            assert.match(problem, /[Rr]estore or repair/);
+            assert.match(problem, /brand-new bridge/);
+            assert.match(problem, /loses every pairing/);
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    it("names every marker when more than one has accumulated", () => {
+        const dir = scratch();
+        try {
+            writeFileSync(join(dir, "identity.json.unreadable-2026-08-05T10-00-00-000Z"), "{a");
+            writeFileSync(join(dir, "identity.json.unreadable-2026-08-06T10-00-00-000Z"), "{b");
+
+            const problem = identityProblem(dir) ?? "";
+
+            assert.match(problem, /2026-08-05T10-00-00-000Z/);
+            assert.match(problem, /2026-08-06T10-00-00-000Z/);
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    it("stops refusing once the identity is restored, marker or no marker", () => {
+        const dir = scratch();
+        try {
+            writeFileSync(join(dir, "identity.json.unreadable-2026-08-05T10-00-00-000Z"), "{truncated");
+            loadOrCreateIdentity(dir);
+            // The marker is evidence, not a lock: a user who has put a usable
+            // identity back must not have to sweep up before the bridge starts.
+            assert.equal(identityProblem(dir), undefined);
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    it("is still a plain first run when there is no marker at all", () => {
+        // The other half of the rule, and the one that would break every fresh
+        // install if the directory listing were read as evidence on its own.
+        const dir = scratch();
+        try {
+            writeFileSync(join(dir, "endpoint-map.json"), JSON.stringify({ version: 1, endpoints: {} }));
+            assert.equal(identityProblem(dir), undefined);
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    it("falls back to the old answer when the directory cannot even be listed", () => {
+        // Never-throwing is the contract. A storage dir we cannot read is not
+        // evidence of a quarantine, and inventing a refusal out of a failed
+        // readdir would block a first run over a transient permissions problem.
+        const dir = scratch();
+        try {
+            assert.equal(identityProblem(join(dir, "does-not-exist")), undefined);
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    it("does not make identityFileProblem refuse — §3.10 needs the narrow answer", () => {
+        // `factoryReset` reads this one back to check the commissioning witness
+        // is gone. An absent identity.json means it certainly is, marker or no
+        // marker, and warning there would report a failure that did not happen.
+        const dir = scratch();
+        try {
+            writeFileSync(join(dir, "identity.json.unreadable-2026-08-05T10-00-00-000Z"), "{truncated");
+            assert.equal(identityFileProblem(dir), undefined);
+
+            writeFileSync(join(dir, "identity.json"), "{ not json");
+            assert.ok(identityFileProblem(dir) !== undefined, "a file that IS there and unreadable still counts");
         } finally {
             rmSync(dir, { recursive: true, force: true });
         }

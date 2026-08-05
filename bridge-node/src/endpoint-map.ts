@@ -207,10 +207,21 @@ export class EndpointMapStore {
     #dirty = false;
     /** Persistence failures worth putting in `StatusReport.warnings` (§4.3). */
     #warnings = new Map<string, string>();
+    /**
+     * True once the file {@link load} found unusable has been copied aside.
+     *
+     * Both {@link rebuild} and {@link persist} quarantine before overwriting,
+     * and without this the two would each take a copy of the same bytes — which
+     * is worse than it sounds now that the copies are timestamped, because
+     * every one of them is a file a human has to look at and decide about.
+     */
+    #quarantined = false;
 
     constructor(
         private readonly storagePath: string,
         private readonly log: (message: string) => void = () => {},
+        /** Injectable so the timestamped quarantine name is testable. */
+        private readonly now: () => Date = () => new Date(),
     ) {}
 
     /** Read the file into memory. Idempotent; the last read wins. */
@@ -221,6 +232,7 @@ export class EndpointMapStore {
         this.#problem = loaded.problem;
         this.#checked = false;
         this.#dirty = false;
+        this.#quarantined = false;
         this.#warnings.clear();
         if (loaded.problem !== undefined) {
             this.log(`Endpoint map unusable: ${loaded.problem}`);
@@ -311,7 +323,16 @@ export class EndpointMapStore {
         if (added > 0 || this.#dirty) {
             this.persist(added > 0 ? `recorded ${added} new endpoint number(s)` : "retried after a failed write");
         }
-        this.#checked = true;
+        // An empty comparison compared nothing, so it cannot make `driftChecked`
+        // true — the same rule {@link seed} already applies. §4.3 says
+        // `driftChecked: true` means "checked, nothing moved", and a `check([])`
+        // (a reconcile that removed the last endpoint, a remove on a node that
+        // never attached) would otherwise turn "there was nothing to look at"
+        // into an all-clear. It only ever raises the flag: a real comparison
+        // that has already happened is not un-done by a later empty one.
+        if (live.length > 0) {
+            this.#checked = true;
+        }
         return drift;
     }
 
@@ -361,19 +382,35 @@ export class EndpointMapStore {
         this.#numbers = new Map(live.map(({ uniqueId, endpointNumber }) => [uniqueId, endpointNumber]));
         this.#problem = undefined;
         const persisted = this.persist(`rebuilt from ${this.#numbers.size} live endpoint(s)`);
-        this.#checked = persisted;
+        // Same rule as `check`: a rebuild from zero live endpoints — which is
+        // the *normal* rebuild, since §1.1 keeps `attach` out of the recovery
+        // commands — has compared nothing, and the baseline it wrote is empty.
+        // Claiming `driftChecked` there says an all-clear about a comparison
+        // that never happened; the reconcile that follows is what records the
+        // real numbers and earns the flag.
+        this.#checked = persisted && live.length > 0;
         return persisted;
     }
 
-    /** Copy a present-but-unusable map to `<file>.corrupt` before it is lost. */
+    /**
+     * Copy a present-but-unusable map to `<file>.corrupt-<stamp>` before it is
+     * lost.
+     *
+     * Timestamped like `identity.json.unreadable-<stamp>`, and for the same
+     * reason: a fixed name means the *second* thing to go wrong overwrites the
+     * evidence of the first, and these bytes are the only surviving record of
+     * what the endpoint numbers used to be.
+     */
     private quarantineUnusable(): void {
-        if (this.#problem === undefined) {
+        if (this.#problem === undefined || this.#quarantined) {
             return;
         }
+        this.#quarantined = true;
         const file = join(this.storagePath, ENDPOINT_MAP_FILE);
+        const target = `${file}.corrupt-${this.now().toISOString().replace(/[:.]/g, "-")}`;
         try {
-            copyFileSync(file, `${file}.corrupt`);
-            this.log(`Unusable endpoint map copied to ${file}.corrupt before rebuilding`);
+            copyFileSync(file, target);
+            this.log(`Unusable endpoint map copied to ${target} before it is overwritten`);
         } catch (error) {
             this.log(`Could not copy the unusable endpoint map aside: ${describeError(error)}`);
         }
@@ -418,6 +455,14 @@ export class EndpointMapStore {
      * the answer.
      */
     private persist(why: string): boolean {
+        // Not only `rebuild`'s job. `refuseReasonFor` deliberately does NOT
+        // refuse a corrupt map on a bridge that has never been commissioned —
+        // there is no accessory identity to protect — so the first `check` on
+        // such a bridge walks straight in here and writes over the unusable
+        // file. That file may be a truncation a human could have repaired, and
+        // once it is gone the numbers it held cannot be recovered; the same
+        // copy-first care `rebuild` takes costs nothing here.
+        this.quarantineUnusable();
         const file: EndpointMapFile = {
             version: ENDPOINT_MAP_VERSION,
             endpoints: Object.fromEntries(this.#numbers),

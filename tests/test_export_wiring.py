@@ -65,6 +65,7 @@ def plug(plugin_mod, devices):  # noqa: ARG001 - devices installs indigo.devices
     p._device_updates_seen = False
     p._no_update_ticks = 0
     p._resubscribe_attempts = 0
+    p._resubscribe_gave_up = False
     p._export_callback_failed = set()
     p.runtime = None
     return p
@@ -563,6 +564,23 @@ class TestLifecycleWiring:
         plug.matter = None
         plug._health_tick()   # must not raise
 
+    def test_the_watchdog_actually_drives_the_resubscribe_watchdog(self, plug, monkeypatch):
+        """⊗ The resubscribe watchdog's ONLY production caller.
+
+        Deleting ``self._resubscribe_tick()`` from ``_health_tick`` left the
+        whole suite green, because every resubscribe test called the tick by
+        hand. The feature exists to break a silence, so an unwired one is worth
+        nothing at all — and nothing would ever have said so.
+        """
+        called = []
+        monkeypatch.setattr(type(plug), "_resubscribe_tick",
+                            lambda self: called.append(1), raising=False)
+        plug.export_bridge = None
+        plug.runtime = Mock(is_running=True)
+        plug.matter = None
+        plug._health_tick()
+        assert called, "the watchdog tick must drive the resubscribe watchdog"
+
 
 class TestResubscribeWatchdog:
     """E5: the belt and braces under an assumption the docs do not confirm.
@@ -609,6 +627,37 @@ class TestResubscribeWatchdog:
         for _ in range(4 * 10):
             plug._resubscribe_tick()
         assert subscribe.call_count == 3
+
+    def test_the_re_issues_are_a_minute_apart_not_back_to_back(
+            self, plug, mock_indigo_base):
+        """⊗ The streak counter must RESTART after a re-issue.
+
+        Only the total was pinned, so deleting ``self._no_update_ticks = 0``
+        survived: attempts 2 and 3 then fire on the two ticks immediately after
+        the first, spending the whole bounded budget inside ~30s instead of
+        giving the subscription three separate minutes to prove itself.
+        """
+        subscribe = self._exporting(plug, mock_indigo_base)
+        for _ in range(4):
+            plug._resubscribe_tick()
+        assert subscribe.call_count == 1
+        plug._resubscribe_tick()          # one tick later — must NOT re-issue
+        assert subscribe.call_count == 1
+
+    def test_giving_up_says_so_once_and_names_the_consequence(
+            self, plug, mock_indigo_base):
+        """⊗ It used to give up with a bare ``return`` at no log level at all.
+
+        The one feature whose purpose is to break a silence ended by going
+        silent, in exactly the house where it had failed to help.
+        """
+        self._exporting(plug, mock_indigo_base)
+        for _ in range(4 * 10):
+            plug._resubscribe_tick()
+        giving_up = [c for c in plug.logger.warning.call_args_list
+                     if "NOT following Indigo state" in str(c.args[0])]
+        assert len(giving_up) == 1, "said once per streak, not once per tick"
+        assert "reload the plugin" in str(giving_up[0].args[0])
 
     def test_it_stays_quiet_while_nothing_is_exported(self, plug, mock_indigo_base):
         subscribe = Mock()

@@ -107,6 +107,20 @@ ERROR_CODES = frozenset({
     ERR_ENDPOINT_MAP_INVALID, ERR_COMMISSIONING_WINDOW_FAILED, ERR_INTERNAL,
 })
 
+#: The ``details`` prefix a §1.1 refusal carries when the fault is an unusable
+#: ``identity.json`` rather than an unusable endpoint map (``RefuseReason``
+#: in ``bridge-node/src/protocol.ts``, mirrored here per BRIDGE_PROTOCOL §1.1).
+#:
+#: One error CODE covers every refuse-to-start reason — §1.1 defines the state,
+#: not the cause — so the reason text is the only thing on the wire that says
+#: which remedy applies, and the two are opposites. An unreadable MAP is fixed
+#: by §3.11's rebuild. An unreadable IDENTITY is not, and cannot be: the node
+#: refuses that rebuild outright, because clearing the refusal would leave the
+#: bridge serving under a ``SerialNumber`` no paired ecosystem has ever seen —
+#: the exact harm the refusal exists to prevent. Telling the user to rebuild
+#: there sends them at the one door that is deliberately locked.
+REFUSE_IDENTITY_UNREADABLE = "the bridge identity file is present but unreadable"
+
 # --------------------------------------------------------------------------
 # Events (§5)
 # --------------------------------------------------------------------------

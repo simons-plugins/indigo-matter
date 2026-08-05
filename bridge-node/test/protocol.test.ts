@@ -989,6 +989,40 @@ describe("the endpoint_map_invalid refuse-to-start state (§1.1, PRD §7)", () =
             await coldServer.close();
         }
     });
+
+    it("reaps a socket that still never attaches once the refusal has cleared", async () => {
+        // ⊗ The §2 timer fired once. Holding the socket open while refusing is
+        // right, but returning bare left nothing armed — so after a
+        // `rebuild_endpoint_map` cleared the refusal, a client that STILL never
+        // attached was never reaped again for the life of the process. Every
+        // half-open socket a crashed plugin left behind accumulated there, and
+        // the one check that reclaims them had already been spent.
+        const cold = new StubBridge();
+        cold.refusal = "endpoint map is unreadable";
+        const coldServer = new BridgeWsServer({
+            port: 0,
+            bridge: cold,
+            bridgeVersion: BRIDGE_VERSION,
+            matterJsVersion: MATTER_JS_VERSION,
+            log: () => {},
+            unattachedTimeoutMs: 20,
+        });
+        await coldServer.listen();
+        try {
+            const client = await TestClient.connect(coldServer.port);
+            await client.next(); // handshake
+            // Comfortably several periods, so the one-shot timer is long spent.
+            await new Promise(resolve => setTimeout(resolve, 120));
+            assert.equal(client.closed, false, "the socket must be held open while refusing");
+
+            // The documented exit, which is exactly why the socket was held.
+            await client.request(golden.rebuild_endpoint_map.request);
+
+            await client.waitForClose(1000);
+        } finally {
+            await coldServer.close();
+        }
+    });
 });
 
 describe("drift_detected event (§5)", () => {

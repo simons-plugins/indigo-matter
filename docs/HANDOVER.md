@@ -1,6 +1,9 @@
 # indigo-matter — Build Handover
 
-**Last updated:** 2026-08-03 16:34 UTC
+**Last updated:** 2026-08-05 18:58 UTC
+**Active work:** `feat/e5-persistence-hardening` (PR #126) — see the two E5
+sections below; the `main` summary in this header describes the last merge, not
+that branch.
 **Branch:** `main` — PRs #106, #107, #108 all merged.
 **Version:** `2026.7.13`
 **Tests:** 1005 passing (`cd indigo-matter && /Library/Frameworks/Python.framework/Versions/Current/bin/python3 -m pytest -q`)
@@ -9,11 +12,143 @@
 
 ---
 
+## 2026-08-05 — E5 hardening, ROUND TWO: the PR #126 whole-PR reviews
+
+Plugin `2026.8.0`, bridge-node `0.4.0`. Suites: **2056 Python**, **344 TS**
+(from 2025/316 at the round-one batch below).
+
+Three independent expert reviews of the **whole** PR — code correctness, silent
+failures, and test coverage measured by 136 mutations, of which **37 survived**.
+The theme of the survivors is one shape, and it is worth naming because it will
+recur: **the helper is covered, the real caller is not.** `fabric_backup` has a
+thorough suite and its only call site was unpinned. `_resubscribe_tick` has four
+tests and nothing called it from `_health_tick`. The queue counters had tests
+that set them by hand and nothing drove them through a dispatch. In every case
+deleting the wiring left the suite green and the feature dead.
+
+The five that would have hurt a real user:
+
+1. **The confirm gates were inert *in the tests*, live in production.** Deleting
+   the confirm check from either recovery menu left the suite green — and with a
+   live client the destructive action really ran on an unticked box. The gates
+   themselves were correct; the tests never set `plug.export_bridge`, so the
+   connection check one line below filled the same `errors` key and the
+   assertion could not tell the two apart. Now asserted against the client
+   (`factory_reset.assert_not_called()`), which is the only question that
+   matters.
+2. **`replace_all_provider` was a `bool` where a count is required.**
+   `BridgeClient` declares `Callable[[], int]` and sizes the discharge attach's
+   deadline from it, because that attach sends *nothing* while removing
+   *everything* — so `len(specs)` is the wrong number by construction.
+   `_owes_replace_all` returned `bool`, and `int(True) == 1` sailed through
+   silently: every discharge got the 8s floor, an 80-accessory un-export timed
+   out mid-reconcile, tore down the socket and retried forever — the exact
+   regression the deadline formula was added to prevent. The wrapper is gone;
+   `_pending_replace_all` (a count) *is* the provider. The two "un-export of %d
+   accessory record(s)" log lines told the truth for the first time as a
+   side effect.
+3. **The §4.3 warnings channel had no reader.** `BridgeClient.get_status` had
+   zero production callers, `health_tick` was explicitly "no I/O", and four
+   docstrings plus BRIDGE_PROTOCOL §4.3 all said it was polled. Three of the
+   four faults it exists for happen *after* the attach — the identity witness
+   write on first commissioning, the witness clear on `factory_reset`, the map
+   write from `upsert`/`remove`'s drift check — so they reached the user as
+   nothing at all. `health_tick` now polls `get_status` once per ~15s tick while
+   attached, fire-and-forget, and surfaces warnings once per streak.
+4. **The identity refusal lasted exactly one restart.** `quarantineIdentity`
+   renames `identity.json` aside; the next start saw ENOENT, read it as a first
+   run, minted and **wrote** a new identity, and served under a `SerialNumber`
+   no ecosystem has ever seen — with only the routine first-run log line.
+   `identityProblem` now also refuses when the file is absent *and* a sibling
+   `identity.json.unreadable-*` exists, so the refusal is sticky until a human
+   restores, repairs or deliberately deletes it. Relatedly, `refuse()` printed
+   "until the endpoint map is rebuilt" for **every** reason including
+   `identityUnreadable`, where the rebuild explicitly throws — one error code,
+   two opposite remedies (now a table in BRIDGE_PROTOCOL §1.1, mirrored as
+   `bridge_protocol.REFUSE_IDENTITY_UNREADABLE` and branched on in
+   `_on_attach_refused`).
+5. **`rebuild_endpoint_map` reported the opposite of what happened.** The node
+   writes the map and clears its refusal *before* answering, so by the time the
+   inline re-attach runs the irreversible half is done. If that attach failed,
+   the menu said "FAILED — the bridge node is unchanged and still refusing to
+   export" (both clauses false), `self.recovery` was never cleared so every push
+   went on being dropped, and the user was invited to repeat an operation that
+   duplicates accessories in every paired ecosystem. Recovery is now cleared the
+   moment the report lands; the re-attach is triaged through
+   `_handle_attach_refused` instead of bypassing it; and the two outcomes are
+   reported separately. The menu deadline is `rebuild_timeout_for(n)` rather
+   than a flat 45s that expired mid-re-attach past ~90 endpoints.
+
+Also fixed:
+
+- **The un-export debt accounting.** `_last_export_count` overwrote rather than
+  accumulated, and `_record_pending_replace_all(0)` **popped** the pref — so an
+  add-then-remove cycle after a debt-driven reconnect erased an outstanding debt
+  of 5 with nothing having discharged it. Recording now takes the max and never
+  writes 0; clearing is a separate `_clear_pending_replace_all`, reachable only
+  from the two places that watched an intent-carrying attach succeed. An
+  unreadable pref value is logged rather than silently read as "nothing owed".
+- **The resubscribe watchdog gave up with a bare `return`, at no log level.**
+  The one feature whose purpose is to break a silence ended by going silent. It
+  now says so once, naming the consequence. `_device_updates_seen` still never
+  re-arms — documented as a deliberate limit, because re-arming would make every
+  quiet house warn that export is broken.
+- **`noteFabrics`' bare `catch { return }`** swallowed the failure, stranded
+  `commissionedAt` (so a later deliberate last-fabric unpair refuses with
+  "fabric storage is gone") and dropped every `fabrics_changed` /
+  `commissioned` / `decommissioned` event. It logs now, in the voice of
+  `node.ts:208`, and still never rethrows.
+- **M11:** the rebuild menu gated only on `client.connected`. Run against a
+  healthy node it silently discarded the retained endpoint-number allocations of
+  every non-live export — the ones that make re-adding a device restore the same
+  accessory. It now requires a refusal to be in force, and the dialog says so.
+- Plus the M-series: ignored `persist()`/`seed()`/`discard()` return values,
+  `factory_reset`'s witness verification passing on an *unreadable* identity,
+  `driftChecked` going true off an empty comparison, the corrupt-map quarantine
+  gaps (`persist()` overwriting without one; a fixed `.corrupt` name that a
+  second quarantine overwrote), the command deadline saying out loud that it
+  does not correct the ecosystem, and the ws-server's unattached timer never
+  re-arming after a refusal clears.
+
+### Deferred, with reasons
+
+- **`COMMAND_TIMEOUT` / `COMMAND_QUEUE_WARN` constant-scaling mutants are not
+  pinned** (30s → 10 hours; 3 → 100000). The only test that distinguishes them
+  is a wall-clock assertion, which trades a real flake for a synthetic mutant.
+  The *logic* around them — the `shield`, and both queue counters — is now
+  driven through the real dispatch path and dies on mutation.
+- **`get_status` is polled, not threaded through the `factory_reset` /
+  `upsert` / `remove` responses.** Those are protocol shape changes (§3.2/§3.10
+  return `{endpointNumber}` and `{}`) needing golden-frame and doc churn on both
+  suites, and the 15s poll already reaches every fault they would carry.
+- **`main.ts`'s `clearTimeout(escapeHatch)` is an equivalent mutant.** Deleting
+  it keeps the suite green, and correctly so: the hatch is `unref()`'d and
+  `process.exit(0)` runs synchronously on the next line, so cleared-vs-uncleared
+  has no observable difference. The only way to expose it is to also delete the
+  exit — which is a *different* mutation, and that one dies. `main.ts` was not
+  refactored to manufacture a seam for a line with no behaviour.
+- **A5's last-fabric path and the `commissionedAt` write remain hardware-gated**
+  end-to-end — unchanged from round one, and still on the jarvis script. The A1
+  bootstrap is no longer among them: `PosedNode` (a read-only Proxy over the two
+  things `node.ts` actually reads about commissioning — `lifecycle.isCommissioned`
+  and `state.commissioning.fabrics`) covers it at node level without a fabric.
+- **One pre-existing test was wrong and is corrected.** `"runs after a reconcile
+  that failed part-way through"` never part-applied anything: `reconcileNow`
+  validates every role up front, so its `role: "notARole"` threw before a single
+  endpoint was created, and it passed only because `check([])` flipped
+  `driftChecked` — the exact bug M3 fixes. It now uses an over-long `NodeLabel`,
+  which genuinely builds endpoint 1 and throws on endpoint 2.
+- **Still open from earlier:** #105 (bridged-endpoint real-bridge validation),
+  #83, #84, #62 follow-up, plus the older #43, #46, #21–#24. `remove_fabric`
+  still has no UI; it needs E6's fabric readout to pick an index from.
+
+---
+
 ## 2026-08-05 — E5 hardening: the PR #126 three-review batch
 
 Applied on `feat/e5-persistence-hardening` on top of the E5 commit below.
-Plugin `2026.7.31`, bridge-node `0.4.0`. Suites: **2025 Python**, **316 TS**
-(from 1978/291 at the E5 commit).
+Plugin `2026.7.31`, bridge-node `0.4.0`. Suites at this commit: **2025 Python**,
+**316 TS** (from 1978/291 at the E5 commit).
 
 Two independent expert reviews plus a test-coverage review; 5 Criticals, ~10
 Highs, 5 Mediums and 9 coverage gaps. The five that would have hurt a real user:

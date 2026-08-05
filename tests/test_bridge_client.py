@@ -772,6 +772,109 @@ class TestEndpointMapInvalid:
             task.cancel()
         run(scenario())
 
+    def test_an_unreadable_IDENTITY_is_not_offered_the_rebuild_remedy(self, mock_logger):
+        """⊗ One error code, two opposite remedies (§1.1).
+
+        `endpoint_map_invalid` covers every refuse-to-start reason, so the
+        reason text is the only thing on the wire that distinguishes them. The
+        map remedy tells the user to confirm a §3.11 rebuild — which the node
+        refuses outright for an unreadable identity, because clearing that
+        refusal would serve endpoints under a serial no ecosystem has seen. So
+        it is not merely unhelpful here; it points at the one door deliberately
+        locked, and promises duplicated accessories on the way through it.
+        """
+        async def scenario():
+            fake, client = self._recovering(mock_logger, overrides={
+                bridge_protocol.CMD_ATTACH: error_response(
+                    bridge_protocol.ERR_ENDPOINT_MAP_INVALID,
+                    f"{bridge_protocol.REFUSE_IDENTITY_UNREADABLE}; only get_status...")})
+            task = asyncio.create_task(client.run())
+            await settle(lambda: client.recovery)
+
+            errors = logged(mock_logger, "error")
+            assert "identity file is unreadable" in errors
+            assert "CANNOT fix this" in errors
+            assert "confirm the rebuild" not in errors
+
+            await client.close()
+            task.cancel()
+        run(scenario())
+
+    def test_the_post_rebuild_re_attach_CARRIES_the_outstanding_intent(self, mock_logger):
+        """⊗ A node that was refusing never took our un-export either.
+
+        Only `client.attach()` with no arguments was pinned, so dropping the
+        intent survived — and the very first thing the rebuilt node would then
+        see is an attach that empties its live set with no §3.1 opt-in, which
+        it refuses with `mass_removal_refused`. That refusal HALTS, so the
+        rebuild the user had just confirmed ends in a permanently dead client
+        behind a message blaming an allow-list that was never the problem.
+        """
+        async def scenario():
+            answers = {bridge_protocol.CMD_ATTACH: error_response(
+                bridge_protocol.ERR_ENDPOINT_MAP_INVALID, "map unreadable")}
+            sent_intents: list = []
+
+            def responder(frame):
+                command = frame["command"]
+                if command == bridge_protocol.CMD_REBUILD_ENDPOINT_MAP:
+                    answers[bridge_protocol.CMD_ATTACH] = FRAMES["attach"]["response"]
+                if command == bridge_protocol.CMD_ATTACH:
+                    sent_intents.append(frame["args"].get(bridge_protocol.ARG_INTENT))
+                body = {**RESPONSES, **answers}.get(command)
+                return [{**body, "message_id": frame["message_id"]}]
+
+            fake = _fake(responder=responder)
+            client = _client(mock_logger, fake, replace_all_provider=lambda: 7)
+            task = asyncio.create_task(client.run())
+            await settle(lambda: client.recovery)
+
+            await client.rebuild_endpoint_map()
+
+            assert sent_intents[-1] == bridge_protocol.INTENT_REPLACE_ALL, (
+                "the re-attach must carry the debt the refusal never discharged")
+            await client.close()
+            task.cancel()
+        run(scenario())
+
+    def test_a_rebuild_whose_re_attach_FAILS_is_still_a_completed_rebuild(self, mock_logger):
+        """⊗ The node writes the map and stops refusing BEFORE it answers us.
+
+        Letting a re-attach failure after that propagate made the menu report
+        "the bridge node is unchanged and still refusing to export" — both
+        clauses false — leave `recovery` set so every state push went on being
+        dropped, and invite the user to repeat an operation that duplicates
+        accessories in every paired ecosystem.
+        """
+        async def scenario():
+            answers = {bridge_protocol.CMD_ATTACH: error_response(
+                bridge_protocol.ERR_ENDPOINT_MAP_INVALID, "map unreadable")}
+
+            def responder(frame):
+                command = frame["command"]
+                if command == bridge_protocol.CMD_REBUILD_ENDPOINT_MAP:
+                    # The rebuild worked; the re-attach after it does not.
+                    answers[bridge_protocol.CMD_ATTACH] = error_response(
+                        bridge_protocol.ERR_INTERNAL, "node is busy")
+                body = {**RESPONSES, **answers}.get(command)
+                return [{**body, "message_id": frame["message_id"]}]
+
+            fake = _fake(responder=responder)
+            client = _client(mock_logger, fake)
+            task = asyncio.create_task(client.run())
+            await settle(lambda: client.recovery)
+
+            status = await client.rebuild_endpoint_map()
+
+            assert status is not None, "the rebuild's own report, not an exception"
+            assert not client.recovery, (
+                "the node has stopped refusing; leaving this set drops every push")
+            assert not client.attached
+            assert "re-attaching was refused" in logged(mock_logger, "warning")
+            await client.close()
+            task.cancel()
+        run(scenario())
+
     def test_state_pushes_are_dropped_while_un_attached(self, mock_logger):
         # `connected` is true here, so a transport-level check would have posted
         # state into a node that is serving no endpoints at all.

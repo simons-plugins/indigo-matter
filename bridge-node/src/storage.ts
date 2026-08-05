@@ -10,7 +10,7 @@
  */
 
 import { randomInt, randomUUID } from "node:crypto";
-import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { describeError } from "./protocol.js";
@@ -32,6 +32,16 @@ export const INVALID_PASSCODES: readonly number[] = [
 export const DISCRIMINATOR_MAX = 0xfff;
 
 const IDENTITY_FILE = "identity.json";
+
+/**
+ * What {@link quarantineIdentity} names the files it moves aside.
+ *
+ * Shared with {@link identityProblem} on purpose: the refusal is only sticky
+ * because it can recognise its own leavings, and two independently written
+ * copies of this string would drift apart in exactly the release where the
+ * refusal stopped firing and nobody noticed.
+ */
+const QUARANTINE_PREFIX = `${IDENTITY_FILE}.unreadable-`;
 
 export interface BridgeIdentity {
     /** Stable install id; seeds `serialNumber` and `uniqueId`. */
@@ -128,9 +138,43 @@ function writeIdentity(file: string, identity: BridgeIdentity): void {
     writeJsonAtomic(file, identity);
 }
 
+/** Absent, fine, or there-and-unusable — the three answers that differ. */
+type IdentityFileState = { kind: "absent" } | { kind: "usable" } | { kind: "unusable"; problem: string };
+
+function inspectIdentityFile(storagePath: string): IdentityFileState {
+    const file = join(storagePath, IDENTITY_FILE);
+    try {
+        const parsed: unknown = JSON.parse(readFileSync(file, "utf8"));
+        return isUsableIdentity(parsed)
+            ? { kind: "usable" }
+            : {
+                  kind: "unusable",
+                  problem: `${file} is present but not a usable identity (missing or out-of-range fields)`,
+              };
+    } catch (error) {
+        return isNotFound(error)
+            ? { kind: "absent" }
+            : { kind: "unusable", problem: `${file} is unreadable (${describeError(error)})` };
+    }
+}
+
 /**
- * Why a *present* `identity.json` cannot be used, or `undefined` when the file
- * is absent (first run) or fine.
+ * Why the identity file that is *there* cannot be used, ignoring any
+ * quarantined siblings — `undefined` when it is fine **or absent**.
+ *
+ * The narrow half of {@link identityProblem}, for the one caller that must not
+ * confuse "there is no file" with "there is a file I cannot read": §3.10's
+ * factory reset reads this back to confirm the commissioning witness is gone,
+ * and an absent file means it certainly is.
+ */
+export function identityFileProblem(storagePath: string): string | undefined {
+    const state = inspectIdentityFile(storagePath);
+    return state.kind === "unusable" ? state.problem : undefined;
+}
+
+/**
+ * Why this storage directory cannot hand back a usable identity, or
+ * `undefined` when it can (or when this is a genuine first run).
  *
  * This is the E5 half of {@link loadOrCreateIdentity}'s replace-it behaviour,
  * split out rather than folded in so the mint path stays exactly what it was.
@@ -141,17 +185,52 @@ function writeIdentity(file: string, identity: BridgeIdentity): void {
  * silently un-pairing the lot. `main.ts` calls this first and refuses to serve
  * endpoints when it answers, which is the same loud-refusal posture PRD §7
  * requires of a lost endpoint map.
+ *
+ * **A quarantined sibling counts, which is what makes the refusal survive a
+ * restart.** The first start over an unusable file moves it to
+ * `identity.json.unreadable-<stamp>` and mints a replacement in memory only —
+ * so the *second* start finds no `identity.json` at all, and reading that as a
+ * first run would mint AND WRITE one, serving under a `SerialNumber` no paired
+ * ecosystem has ever seen, with a routine first-run log line to show for it.
+ * The refusal has to last until a human resolves it, and the evidence that one
+ * has not is the marker still lying there.
  */
 export function identityProblem(storagePath: string): string | undefined {
-    const file = join(storagePath, IDENTITY_FILE);
-    try {
-        const parsed: unknown = JSON.parse(readFileSync(file, "utf8"));
-        return isUsableIdentity(parsed)
-            ? undefined
-            : `${file} is present but not a usable identity (missing or out-of-range fields)`;
-    } catch (error) {
-        return isNotFound(error) ? undefined : `${file} is unreadable (${describeError(error)})`;
+    const state = inspectIdentityFile(storagePath);
+    if (state.kind !== "absent") {
+        return state.kind === "unusable" ? state.problem : undefined;
     }
+    return quarantinedIdentityProblem(storagePath);
+}
+
+/**
+ * The refusal a leftover quarantine marker carries, naming the way out.
+ *
+ * A listing we cannot take is deliberately *not* a refusal: this function is
+ * part of a never-throwing guard, and inventing one out of a failed `readdir`
+ * would block a first run over a transient permissions problem — the opposite
+ * of the trade the refusal is making everywhere else.
+ */
+function quarantinedIdentityProblem(storagePath: string): string | undefined {
+    let markers: string[];
+    try {
+        markers = readdirSync(storagePath)
+            .filter(name => name.startsWith(QUARANTINE_PREFIX))
+            .sort();
+    } catch {
+        return undefined;
+    }
+    if (markers.length === 0) {
+        return undefined;
+    }
+    return (
+        `${join(storagePath, IDENTITY_FILE)} is missing, but ${markers.length === 1 ? "a" : markers.length} ` +
+        `quarantined identit${markers.length === 1 ? "y" : "ies"} (${markers.join(", ")}) still ` +
+        `sit${markers.length === 1 ? "s" : ""} beside it — an earlier start could not read the identity ` +
+        `and moved it aside. Restore or repair one of them as ${IDENTITY_FILE} in ${storagePath} and ` +
+        "restart. Deleting them all is the deliberate \"start fresh as a brand-new bridge\" choice, and " +
+        "it loses every pairing this bridge already has."
+    );
 }
 
 /**
@@ -275,7 +354,7 @@ export function quarantineIdentity(
 ): string | undefined {
     const file = join(storagePath, IDENTITY_FILE);
     const stamp = now().toISOString().replace(/[:.]/g, "-");
-    const target = `${file}.unreadable-${stamp}`;
+    const target = join(storagePath, `${QUARANTINE_PREFIX}${stamp}`);
     try {
         renameSync(file, target);
         return target;

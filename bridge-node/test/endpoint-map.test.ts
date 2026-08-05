@@ -8,7 +8,7 @@
  */
 
 import assert from "node:assert/strict";
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
@@ -89,6 +89,28 @@ describe("loadEndpointMap", () => {
             assert.equal(loaded.numbers.size, 0, "a broken map must never be half-adopted");
         });
     }
+
+    it("reports a read error that is NOT a missing file as present-but-unusable", () => {
+        // ⊗ Returning `present: false` for every read error would read a
+        // genuine fault — a permissions problem, an unreadable disk, the path
+        // taken over by a directory — as a first run, and a first run never
+        // refuses. The one signal that stops a commissioned bridge duplicating
+        // every accessory would be off precisely when the disk is misbehaving.
+        const dir = storage();
+        // A directory where the file should be: `readFileSync` fails with
+        // EISDIR, which is emphatically not ENOENT.
+        mkdirSync(join(dir, ENDPOINT_MAP_FILE));
+
+        const loaded = loadEndpointMap(dir);
+
+        assert.equal(loaded.present, true, "something IS there — it just cannot be read");
+        assert.ok(loaded.problem !== undefined);
+        assert.equal(
+            refuseReasonFor({ commissioned: true, mapProblem: loaded.problem }),
+            RefuseReason.mapUnreadable,
+            "and it must be the kind of answer a commissioned bridge refuses on",
+        );
+    });
 });
 
 describe("EndpointMapStore.check — the drift detector (PRD §4.3)", () => {
@@ -178,6 +200,29 @@ describe("EndpointMapStore.check — the drift detector (PRD §4.3)", () => {
         assert.deepEqual(logged.filter(line => line.startsWith("Endpoint map recorded")), []);
     });
 
+    it("does NOT call an empty comparison a clean bill of health", () => {
+        // ⊗ `#checked` was set unconditionally at the end of `check`, so a
+        // comparison against nothing at all — a reconcile that removed the last
+        // endpoint, a `remove_endpoint` on a node that never attached — flipped
+        // §4.3's `driftChecked` to true. The two readings of `drift: []` are
+        // opposites, and this is the one that means "there was nothing to look
+        // at"; `seed()` has always had the rule right.
+        const dir = storage();
+        const store = new EndpointMapStore(dir);
+        store.load();
+
+        assert.deepEqual(store.check([]), []);
+        assert.equal(store.checked, false, "nothing was compared, so nothing was verified");
+
+        // And it only ever raises the flag: a real comparison that has already
+        // happened is not un-done by a later empty one, or a bridge whose last
+        // export was removed would forget it had ever checked.
+        store.check([{ uniqueId: "indigo-1", endpointNumber: 2 }]);
+        assert.equal(store.checked, true);
+        store.check([]);
+        assert.equal(store.checked, true);
+    });
+
     it("stays usable and says so loudly when the map cannot be written", () => {
         const dir = storage();
         const logged: string[] = [];
@@ -254,6 +299,68 @@ describe("EndpointMapStore.discard (§3.10 preserveEndpointNumbers: false)", () 
         store.discard();
         assert.equal(deleteEndpointMap(dir), false);
     });
+
+    it("reports a deletion it could not do, and warns instead of claiming success", () => {
+        // ⊗ Three ways this went wrong at once: the `false` was returned but
+        // never propagated, the §4.3 warning was the only trace, and
+        // `factory_reset` logged "complete" over the top of both. What survives
+        // a failed discard is a stale file the NEXT start loads as a baseline
+        // for numbers that no longer mean anything.
+        const dir = storage();
+        const store = new EndpointMapStore(dir);
+        store.load();
+        store.check([{ uniqueId: "indigo-1", endpointNumber: 2 }]);
+        // A directory in its place: `unlinkSync` fails with EPERM/EISDIR, which
+        // `deleteEndpointMap` rethrows because it is not "already gone".
+        rmSync(join(dir, ENDPOINT_MAP_FILE));
+        mkdirSync(join(dir, ENDPOINT_MAP_FILE));
+
+        assert.equal(store.discard(), false, "a discard that did not happen must not answer true");
+        assert.equal(store.warnings.length, 1);
+        assert.match(store.warnings[0]!, /Could not delete the endpoint map/);
+    });
+
+    it("clears the persistence warnings a successful discard has settled", () => {
+        // §4.3: warnings are current, not historical. A map that could not be
+        // written and is now deleted has no outstanding problem to report, and
+        // a stale warning is one a user cannot make go away by doing anything.
+        const dir = storage();
+        const store = new EndpointMapStore(dir);
+        store.load();
+        chmodSync(dir, 0o500);
+        try {
+            store.check([{ uniqueId: "indigo-1", endpointNumber: 2 }]);
+            assert.equal(store.warnings.length, 1, "the failed write must warn first");
+        } finally {
+            chmodSync(dir, 0o700);
+        }
+
+        assert.equal(store.discard(), true);
+        assert.deepEqual(store.warnings, []);
+    });
+});
+
+describe("EndpointMapStore.load resets the warnings it is about to re-derive", () => {
+    it("drops a stale warning rather than carrying it across a re-read", () => {
+        // ⊗ `load()` is "the last read wins" for everything else it touches, and
+        // a warning it did not clear outlives the state that produced it — so a
+        // `get_status` after a successful reload would still be telling the user
+        // to free disk space over a write that has since landed.
+        const dir = storage();
+        const store = new EndpointMapStore(dir);
+        store.load();
+        chmodSync(dir, 0o500);
+        try {
+            store.check([{ uniqueId: "indigo-1", endpointNumber: 2 }]);
+            assert.equal(store.warnings.length, 1);
+        } finally {
+            chmodSync(dir, 0o700);
+        }
+
+        store.load();
+
+        assert.deepEqual(store.warnings, [], "the reload re-derives everything, warnings included");
+    });
 });
 
 describe("a write that did not land (E5 B1/B2)", () => {
@@ -301,7 +408,14 @@ describe("a write that did not land (E5 B1/B2)", () => {
 });
 
 describe("rebuild preserves the evidence (E5 C2)", () => {
-    it("copies an unusable map to .corrupt before overwriting it", () => {
+    /** The `.corrupt-<stamp>` copies sitting in a storage dir, oldest first. */
+    function quarantinedMaps(dir: string): string[] {
+        return readdirSync(dir)
+            .filter(name => name.startsWith(`${ENDPOINT_MAP_FILE}.corrupt-`))
+            .sort();
+    }
+
+    it("copies an unusable map aside before overwriting it", () => {
         const dir = storage();
         writeFileSync(join(dir, ENDPOINT_MAP_FILE), "{not json", "utf8");
         const store = new EndpointMapStore(dir);
@@ -311,9 +425,61 @@ describe("rebuild preserves the evidence (E5 C2)", () => {
 
         // The unusable bytes are the only surviving record of the old numbers,
         // and "unusable" is often a truncation a human can read.
-        assert.equal(readFileSync(join(dir, `${ENDPOINT_MAP_FILE}.corrupt`), "utf8"), "{not json");
+        const copies = quarantinedMaps(dir);
+        assert.equal(copies.length, 1, `expected one quarantined map, got ${copies.join(", ")}`);
+        assert.equal(readFileSync(join(dir, copies[0]!), "utf8"), "{not json");
         assert.deepEqual(mapFileIn(dir).endpoints, { "indigo-1": 7 });
         assert.equal(store.problem, undefined, "a successful write settles the question");
+    });
+
+    it("quarantines on the plain persist path too, not only on a rebuild", () => {
+        // ⊗ `refuseReasonFor` deliberately does not refuse a corrupt map on a
+        // bridge that has never been commissioned — there is nothing paired to
+        // protect — so the first `check` walked straight into `persist` and
+        // wrote over the file with no copy taken. That is the one route where
+        // the old numbers were destroyed silently, and it is the route every
+        // never-paired install with a bad map takes.
+        const dir = storage();
+        writeFileSync(join(dir, ENDPOINT_MAP_FILE), "{truncated", "utf8");
+        const store = new EndpointMapStore(dir);
+        assert.notEqual(store.load().problem, undefined);
+
+        assert.deepEqual(store.check([{ uniqueId: "indigo-1", endpointNumber: 2 }]), []);
+
+        const copies = quarantinedMaps(dir);
+        assert.equal(copies.length, 1, `expected one quarantined map, got ${copies.join(", ")}`);
+        assert.equal(readFileSync(join(dir, copies[0]!), "utf8"), "{truncated");
+        assert.deepEqual(mapFileIn(dir).endpoints, { "indigo-1": 2 });
+        // Once per loaded file: `persist` runs on every check, and a copy per
+        // reconcile would bury the one that matters in a directory of clones.
+        store.check([{ uniqueId: "indigo-2", endpointNumber: 3 }]);
+        assert.deepEqual(quarantinedMaps(dir), copies);
+    });
+
+    it("timestamps each copy, so a second failure cannot erase the first", () => {
+        // ⊗ The name used to be a fixed `<file>.corrupt`, so the second thing to
+        // go wrong overwrote the evidence of the first — and these bytes are the
+        // only surviving record of what the endpoint numbers used to be.
+        // `identity.json.unreadable-<stamp>` has always got this right.
+        const dir = storage();
+        let clock = new Date("2026-08-05T10:00:00Z");
+        const store = new EndpointMapStore(dir, () => {}, () => clock);
+
+        writeFileSync(join(dir, ENDPOINT_MAP_FILE), "{first", "utf8");
+        store.load();
+        assert.equal(store.rebuild([{ uniqueId: "indigo-1", endpointNumber: 2 }]), true);
+
+        clock = new Date("2026-08-06T11:30:00Z");
+        writeFileSync(join(dir, ENDPOINT_MAP_FILE), "{second", "utf8");
+        store.load();
+        assert.equal(store.rebuild([{ uniqueId: "indigo-1", endpointNumber: 3 }]), true);
+
+        assert.deepEqual(quarantinedMaps(dir), [
+            `${ENDPOINT_MAP_FILE}.corrupt-2026-08-05T10-00-00-000Z`,
+            `${ENDPOINT_MAP_FILE}.corrupt-2026-08-06T11-30-00-000Z`,
+        ]);
+        assert.equal(readFileSync(join(dir, quarantinedMaps(dir)[0]!), "utf8"), "{first");
+        assert.equal(readFileSync(join(dir, quarantinedMaps(dir)[1]!), "utf8"), "{second");
     });
 
     it("says so when it rebuilds from zero endpoints", () => {

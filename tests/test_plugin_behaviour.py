@@ -559,6 +559,36 @@ def test_menu_export_fabric_backup_writes_real_zip(plug, plugin_mod, tmp_path, m
     plug.logger.info.assert_called()
 
 
+def test_menu_export_fabric_backup_archives_the_BRIDGE_storage_too(
+        plug, tmp_path, monkeypatch):
+    """⊗ `create_backup`'s only real caller, and its most valuable argument.
+
+    `fabric_backup` is thoroughly tested as a function, but nothing pinned the
+    one call site — so deleting `bridge_storage_path=` left the suite green
+    while every backup silently lost the export bridge's `identity.json` and
+    `endpoint-map.json`. Those are the accessory identities every paired
+    ecosystem remembers, and a backup that omits them looks exactly like one
+    that does not.
+    """
+    import fabric_backup
+    seen: dict = {}
+
+    def fake_create_backup(storage_path, *, now, logger=None, bridge_storage_path=None):
+        seen["bridge"] = bridge_storage_path
+        archive = tmp_path / "fabric-x.zip"
+        archive.write_bytes(b"x")
+        return str(archive)
+
+    monkeypatch.setattr(fabric_backup, "create_backup", fake_create_backup)
+    plug.server_process = SimpleNamespace(storage_path=_storage_with_fabric(tmp_path))
+    plug.pluginPrefs = {}
+
+    plug.menuExportFabricBackup()
+
+    assert seen.get("bridge"), "the bridge node's storage dir must be archived too"
+    assert seen["bridge"].endswith("bridge-node")
+
+
 def test_menu_export_fabric_backup_logs_error_on_no_fabric(plug, tmp_path):
     # storage dir missing → create_backup raises FileNotFoundError → handler logs
     # an explicit "no fabric to back up" ERROR and never raises (H5).

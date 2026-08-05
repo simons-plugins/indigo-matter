@@ -115,9 +115,17 @@ from the controller agent:
   removed. Therefore: `id` = the immutable Indigo device ID (sanitised),
   supplied explicitly, never reused, never mutated.
 - **Drift detection.** The bridge node persists a `UniqueID → endpoint number`
-  map and warns loudly if any mapping changes at startup (matterbridge's
+  map and warns loudly if any mapping changes (matterbridge's
   `checkEndpointNumbers()` pattern) — the only way to make "is it us or the
-  controller?" falsifiable in the field.
+  controller?" falsifiable in the field. The check runs **wherever a number can
+  first be wrong**, not at startup: at startup there are no endpoints yet (the
+  live set is created by the first `attach`), so a startup-only check would
+  compare an empty set against the baseline and report a clean bridge every
+  time. It therefore runs at the end of every operation that reshapes the live
+  set — the first attach's reconcile, and every `upsert_endpoint` /
+  `remove_endpoint` after it. Drift is **reported, never repaired**: an
+  auto-repair would bless the storage loss that caused it and make the next
+  occurrence invisible too.
 - **Storage loss is the #1 real-world accessory-duplication cause** (not logic
   bugs): a missing/relocated storage dir reallocates every endpoint number and
   every ecosystem re-creates every accessory, losing names, rooms and
@@ -326,7 +334,10 @@ not slot arithmetic. Per-export settings live in the §5.1 dialog.
 | Allow-list emptied | Endpoints removed (the deliberate `intent: "replace_all"` path, BRIDGE_PROTOCOL §3.1); agent stopped; pairings retained unless explicitly reset |
 | Lock command | Never auto-confirm destructive state changes; honour the inbound lock conventions |
 | Matter UDP port (5540) already bound | Another Matter device stack (Homebridge 2.x, matterbridge, HA) holds it; surface the error naming the holder; the port pref is the escape hatch (§4.4) |
-| Endpoint map lost/corrupt | Refuse to auto-reallocate; surface an error and require an explicit rebuild (`rebuild_endpoint_map`, BRIDGE_PROTOCOL §3.11), since silent reallocation duplicates accessories in every paired ecosystem |
+| Endpoint map **corrupt** (present, unreadable) on a commissioned bridge | Refuse to serve endpoints; surface an error and require an explicit rebuild (`rebuild_endpoint_map`, BRIDGE_PROTOCOL §3.11), since silent reallocation duplicates accessories in every paired ecosystem. The unusable file is copied aside first — it is the only surviving record of the old numbers |
+| Endpoint map **absent** on a commissioned bridge | **Bootstrap a baseline and serve** — do *not* refuse. matter.js owns the numbers (keyed on `Endpoint.id` in its own store) and this map is only the independent witness, so a missing witness renumbers nothing; it means we cannot yet *check*. Every install commissioned before the map existed is in exactly this state, and refusing there would take working exports offline on upgrade to fix a file that never existed |
+| Endpoint map missing/corrupt on a bridge that has **never** been commissioned | Serve normally. Endpoint numbers only matter to somebody who is paired |
+| Bridge `identity.json` present but unreadable | Refuse to serve endpoints, and **a rebuild cannot fix it** — the node refuses one. Minting a replacement would change the `SerialNumber`/`UniqueID` every paired ecosystem remembers, silently un-pairing the lot. The file is moved aside as `identity.json.unreadable-<stamp>`; the refusal is sticky across restarts until it is restored, repaired, or deliberately deleted |
 
 ## 8. Acceptance criteria
 

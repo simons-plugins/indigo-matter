@@ -246,6 +246,10 @@ class FakeBridgeClient:
         self.attach_timeouts: list = []
         #: command name → exception to raise instead of succeeding.
         self.fail: dict = {}
+        #: What ``get_status`` answers. The §4.3 warnings channel has exactly
+        #: one reader — the watchdog's poll — so a fake without this cannot
+        #: exercise the only path a node's persistence failure has to a user.
+        self.status = None
 
     # -- the recorded surface -------------------------------------------
     async def run(self):
@@ -266,6 +270,10 @@ class FakeBridgeClient:
 
     async def set_reachable(self, device_id, reachable, timeout=None):
         return self._record("set_reachable", device_id, reachable)
+
+    async def get_status(self, timeout=None):
+        self._record("get_status")
+        return self.status
 
     async def close(self):
         self.closed = True

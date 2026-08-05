@@ -224,7 +224,7 @@ class ExportBridge:
             self._logger, self._prefs_getter(),
             plugin_version=self._plugin_version,
             endpoint_provider=self.endpoint_specs,
-            replace_all_provider=self._owes_replace_all,
+            replace_all_provider=self._pending_replace_all,
             on_command=self.on_command,
             on_attached=self._on_attached,
             on_attach_refused=self._on_attach_refused,
@@ -305,7 +305,7 @@ class ExportBridge:
             # needs the §3.1 opt-in for that, so it is a deliberate attach
             # rather than a disconnect — and only THEN do we close.
             self._replace_all_then_stop(removing)
-        elif self._owes_replace_all():
+        elif self._pending_replace_all():
             # Nothing is exported and there is no client — but the node is still
             # holding accessories from a previous session whose un-export never
             # landed. XG5 says no client while nothing is exported; this is the
@@ -317,68 +317,120 @@ class ExportBridge:
             self.start()
 
     def _pending_replace_all(self) -> int:
-        """How many endpoints an un-export still owes the node, from prefs."""
+        """**How many** endpoints an un-export still owes the node (XAC7).
+
+        This is :class:`bridge_client.BridgeClient`'s ``replace_all_provider``,
+        read on every (re)connect, and it answers the DEBT question and nothing
+        else: how much un-export is there that the node has not been told about?
+
+        **A count, not a flag, and the difference is a real outage.** The client
+        feeds this answer to :func:`bridge_client.attach_timeout_for` to size the
+        discharge attach's deadline, because the node paces bulk removals ~100ms
+        apart (§3.3) and the discharge attach sends *nothing* while removing
+        *everything* — so its own ``len(specs)`` is exactly the wrong number. A
+        wrapper here used to return ``bool``, and ``int(True) == 1`` sailed
+        silently through the client's ``int()``: every discharge got the 8s
+        floor, an 80-accessory un-export timed out mid-reconcile, the socket was
+        torn down and retried, forever, with the accessories still in every
+        ecosystem — the precise regression the deadline formula exists to stop.
+        It also made the client's two "un-export of %d accessory record(s)" log
+        lines say 1, whatever the truth was.
+
+        It is still truth-tested in two places (here and in the client), which a
+        count supports perfectly well: 0 debts is falsy.
+
+        **The debt is never ANDed with an empty allow-list, and that used to
+        produce a permanent halt.** The reasoning was that a re-populated
+        allow-list supersedes the debt — but the two are not alternatives, they
+        compose. Empty the list while the node is down (debt = 5), then export
+        one different device: the next attach carries ``[B]``, so the AND said
+        "no intent needed", and the node's §3.1 guard saw five removals against
+        zero survivors, refused with ``mass_removal_refused``, and the client
+        HALTED — forever, with a message telling the user to check an allow-list
+        that was not the problem. Carrying the intent whenever a debt exists
+        costs nothing in the ordinary case: the node's guard only fires when the
+        result would be empty, so a legitimate non-empty attach is unaffected.
+
+        A prefs value that is not a number is 0 **and says so**: the debt is the
+        only thing that makes an un-export recoverable at all, so silently
+        reading it as "nothing owed" is how every exported accessory is stranded
+        in every paired ecosystem with nothing left anywhere that knows it.
+        """
+        raw = self._prefs_getter().get(PREF_PENDING_REPLACE_ALL)
         try:
-            return int(self._prefs_getter().get(PREF_PENDING_REPLACE_ALL) or 0)
-        except (TypeError, ValueError):
+            return int(raw or 0)
+        except (TypeError, ValueError) as exc:
+            self._logger.warning(
+                "Matter export: the outstanding un-export count in prefs is unreadable (%r: %s) — "
+                "treating it as nothing owed. If accessories from a previous session are still "
+                "showing in a paired ecosystem, re-export one device and remove it again to "
+                "re-record the removal.", raw, exc)
             return 0
 
-    def _owes_replace_all(self) -> bool:
-        """§3.1 ``intent: replace_all`` on the next attach? (XAC7)
-
-        Read by :class:`bridge_client.BridgeClient` on every (re)connect, and it
-        answers the DEBT question and nothing else: is there an un-export the
-        node has not been told about?
-
-        **It used to be ANDed with an empty allow-list, and that produced a
-        permanent halt.** The reasoning was that a re-populated allow-list
-        supersedes the debt — but the two are not alternatives, they compose.
-        Empty the list while the node is down (debt = 5), then export one
-        different device: the next attach carries ``[B]``, so the AND said "no
-        intent needed", and the node's §3.1 guard saw five removals against zero
-        survivors, refused with ``mass_removal_refused``, and the client HALTED
-        — forever, with a message telling the user to check an allow-list that
-        was not the problem. Carrying the intent whenever a debt exists costs
-        nothing in the ordinary case: the node's guard only fires when the
-        result would be empty, so a legitimate non-empty attach is unaffected by
-        it either way.
-        """
-        return self._pending_replace_all() > 0
-
     def _record_pending_replace_all(self, removing: int) -> None:
-        """Persist (or clear) the un-export debt.
+        """Record an un-export attempt — **accumulating**, never clearing.
 
         Written to prefs rather than held in memory because the failure it
         covers is precisely the one that outlives the process: the node is down
         or the plugin is reloading, the attach never lands, and every accessory
         stays in every paired ecosystem forever with nothing left anywhere that
-        knows it should not (XAC7). A flush failure is logged, not raised —
-        losing the flag is the pre-E5 behaviour, and it must not take the
-        un-export attempt down with it.
+        knows it should not (XAC7).
+
+        **It takes the larger of the old debt and the new one, and it never
+        writes 0.** Overwriting was wrong in both directions, and the second one
+        destroyed the record outright:
+
+        * *Under-sizing.* A debt of 80 sits unpaid because the node is down. The
+          user exports one device and removes it again; this was called with 1
+          and the pref became 1. The node still holds 81 records, so the
+          discharge attach still has to remove 81 — but its deadline was sized
+          for 1, which is the 8s floor, so it times out mid-reconcile and
+          retries forever. The count is what buys the deadline (§3.3 pacing),
+          so it has to describe everything the node might still be holding.
+        * *Erasure.* ``exports_changed`` reconnects with no exports purely to
+          discharge a debt, which sets ``_last_export_count`` to 0 — so the very
+          next empty↔empty transition arrived here with ``removing == 0`` and
+          POPPED a debt of 5 that nothing had discharged. If the attach then
+          failed, the only surviving record that five accessories should be gone
+          was gone with it, and no later attach would ever carry the intent.
+
+        Clearing is therefore a separate, deliberate act with a separate name —
+        :meth:`_clear_pending_replace_all` — reached only from the two places
+        that have watched an attach *carrying the intent* succeed.
         """
+        owed = max(self._pending_replace_all(), int(removing))
+        if owed <= 0:
+            return
         try:
-            prefs = self._prefs_getter()
-            if removing > 0:
-                prefs[PREF_PENDING_REPLACE_ALL] = removing
-            else:
-                prefs.pop(PREF_PENDING_REPLACE_ALL, None)
+            self._prefs_getter()[PREF_PENDING_REPLACE_ALL] = owed
             if self._save_prefs is not None:
                 self._save_prefs()
         except Exception as exc:  # pylint: disable=broad-except
-            if removing > 0:
-                self._logger.warning(
-                    "Matter export: could not record that the un-export is outstanding (%s). "
-                    "If it does not complete now, exported accessories may linger.", exc)
-            else:
-                # The opposite direction, and the message used to be the same
-                # one — which described a risk that no longer exists. What a
-                # failed CLEAR means is that the debt is still on disk after it
-                # has been paid, so the next attach will carry `replace_all`
-                # again for an un-export that already happened.
-                self._logger.warning(
-                    "Matter export: the un-export completed but the outstanding-work flag could "
-                    "not be cleared (%s). A later reconnect may repeat the removal request; "
-                    "nothing extra is removed by it.", exc)
+            self._logger.warning(
+                "Matter export: could not record that the un-export is outstanding (%s). "
+                "If it does not complete now, exported accessories may linger.", exc)
+
+    def _clear_pending_replace_all(self) -> None:
+        """The debt has been paid — an attach that CARRIED the intent landed.
+
+        Split from :meth:`_record_pending_replace_all` so that clearing can only
+        ever be the answer to a discharge somebody watched happen, rather than a
+        side effect of passing 0 to a recorder (see there for what that cost).
+        """
+        try:
+            self._prefs_getter().pop(PREF_PENDING_REPLACE_ALL, None)
+            if self._save_prefs is not None:
+                self._save_prefs()
+        except Exception as exc:  # pylint: disable=broad-except
+            # The opposite direction from a failed record, and the message used
+            # to be the same one — which described a risk that no longer exists.
+            # What a failed CLEAR means is that the debt is still on disk after
+            # it has been paid, so the next attach will carry `replace_all`
+            # again for an un-export that already happened.
+            self._logger.warning(
+                "Matter export: the un-export completed but the outstanding-work flag could "
+                "not be cleared (%s). A later reconnect may repeat the removal request; "
+                "nothing extra is removed by it.", exc)
 
     def _replace_all_then_stop(self, removing: int) -> None:
         """Un-export everything with the §3.1 intent, then drop the client.
@@ -416,9 +468,11 @@ class ExportBridge:
 
         async def _un_export() -> None:
             try:
+                # Sized over everything the node may be holding, which after an
+                # earlier failed un-export is more than this one emptied.
                 await client.attach([], replace_all=True,
-                                    timeout=attach_timeout_for(removing))
-                self._record_pending_replace_all(0)
+                                    timeout=attach_timeout_for(self._pending_replace_all()))
+                self._clear_pending_replace_all()
             except Exception as exc:  # pylint: disable=broad-except
                 self._logger.warning(
                     "Matter export: could not tell the bridge node the export list is empty "
@@ -795,6 +849,16 @@ class ExportBridge:
         the call, and there is no way to interrupt it — so this is not a
         recovery. It is the thing that makes the failure *nameable*: which
         command, on which device, is the one that stopped.
+
+        **And it deliberately does not correct the ecosystem.** :meth:`_correct`
+        is the answer to a dispatch that *returned* a failure; there is no
+        version of it that helps here. Reading the device back is itself Indigo
+        IPC, so it would either queue behind the very call that is wedged (the
+        worker is single-threaded, which is the whole point) or run on the loop
+        — the one thing E5 moved off it — and the device it would be reading is
+        the one that has stopped answering. So the ecosystem goes on showing the
+        command it optimistically applied, and the log says so out loud rather
+        than leaving the user to infer it.
         """
         worker = self._command_worker()
         if worker is None:
@@ -815,7 +879,9 @@ class ExportBridge:
             self._logger.error(
                 "Matter export: %r for device %s (%s) has not returned after %.0fs. The command "
                 "worker is single-threaded, so every §5 command after it is queued behind this "
-                "one — check whether that Indigo device or its plugin is responding.",
+                "one — check whether that Indigo device or its plugin is responding. The "
+                "ecosystem that sent it already shows it as done and NOTHING will correct that "
+                "until the device next reports or the bridge re-attaches.",
                 command.command, command.indigo_device_id, entry.role, COMMAND_TIMEOUT)
 
     def _note_command_done(self, future) -> None:
@@ -968,7 +1034,7 @@ class ExportBridge:
         self._report_node_warnings(status)
         if carried_replace_all and self._pending_replace_all():
             owed = self._pending_replace_all()
-            self._record_pending_replace_all(0)
+            self._clear_pending_replace_all()
             self._logger.info(
                 "Matter export: the outstanding un-export completed — %d accessory record(s) "
                 "removed from the bridge node; paired ecosystems will drop them.", owed)
@@ -1014,6 +1080,21 @@ class ExportBridge:
         succeeds.
         """
         if code == bridge_protocol.ERR_ENDPOINT_MAP_INVALID:
+            # One code, two opposite remedies — see REFUSE_IDENTITY_UNREADABLE.
+            # This branch used to hard-code the map wording for both, so a user
+            # whose identity.json was unreadable was sent to a rebuild the node
+            # refuses by design, and told it would duplicate their accessories
+            # on the way.
+            if bridge_protocol.REFUSE_IDENTITY_UNREADABLE in details:
+                self._logger.error(
+                    "Matter export: the bridge node is serving NOTHING because its identity file "
+                    "is unreadable (%s). Rebuilding the endpoint map will NOT fix this and the "
+                    "node refuses to try — the unusable file was moved aside as "
+                    "identity.json.unreadable-<timestamp> in the bridge storage folder. Restore "
+                    "or repair it and restart the bridge node. Deleting it instead starts a "
+                    "brand-new bridge, which every paired ecosystem sees as a different device.",
+                    details)
+                return
             self._logger.error(
                 "Matter export: the bridge node is serving NOTHING because its endpoint-number "
                 "map is unreadable (%s). Nothing will be exported until it is rebuilt — and a "
@@ -1071,7 +1152,34 @@ class ExportBridge:
     # Watchdog
     # ------------------------------------------------------------------
     def health_tick(self) -> None:
-        """One watchdog pass. No I/O — it only reads client state and logs."""
+        """One watchdog pass: read client state, log, and poll the node (§4.3).
+
+        **The poll is the only reader the §4.3 ``warnings`` channel has.** Every
+        docstring around it — and BRIDGE_PROTOCOL §4.3 itself — says the node's
+        persistence failures reach a user because ``get_status`` is polled, and
+        for one review cycle nothing polled it: :meth:`_report_node_warnings`
+        ran on the attach response and nowhere else. Three of the four faults it
+        was built for cannot happen at attach time and so reached the user as
+        precisely nothing —
+
+        * the identity witness write on FIRST commissioning (§4.3
+          ``identity-write``), which happens when a fabric appears, long after
+          the attach;
+        * the witness clear on ``factory_reset``, whose failure means the very
+          next start refuses to serve and blames lost storage for the reset the
+          user asked for;
+        * the endpoint-map write from ``upsert``/``remove``'s ``checkDrift``,
+          which is a full disk quietly costing the ability to detect that every
+          accessory has been renumbered.
+
+        The node's own log is stdout, and in this milestone the node is started
+        **by hand** — so stdout is a terminal that closed hours ago. There is no
+        other channel.
+
+        One WS round-trip per ~15s tick against a loopback socket, fire-and-
+        forget like every other push here, so it costs Indigo's watchdog thread
+        nothing: this method still does no blocking I/O of its own.
+        """
         self._check_command_queue()
         client = self.client
         if client is None:
@@ -1095,6 +1203,7 @@ class ExportBridge:
             return
         if client.attached:
             self._disconnect_ticks = 0
+            self._poll_node_status(client)
             return
         self._disconnect_ticks += 1
         if self._disconnect_ticks == DISCONNECT_WARN_TICKS:
@@ -1102,6 +1211,30 @@ class ExportBridge:
                                  "~1 min")
         else:
             self._logger.debug("Matter export: bridge node not currently attached")
+
+    def _poll_node_status(self, client) -> None:
+        """Ask the node how it is, and say what it answers (§3.6 → §4.3).
+
+        Only while attached: the recovery and halted states return above, and in
+        both of them the node has already said the one thing that matters, at
+        error level, through :meth:`_on_attach_refused`.
+
+        The answer is handled in the coroutine rather than by awaiting it here,
+        because this runs on Indigo's watchdog thread and nothing on that thread
+        may block on the node (the whole reason ``health_tick`` was "no I/O").
+        A failed poll is not itself news — the socket being gone is what
+        ``_disconnect_ticks`` is for — so it goes to debug and the next tick
+        tries again.
+        """
+        async def _poll() -> None:
+            try:
+                status = await client.get_status()
+            except Exception as exc:  # pylint: disable=broad-except
+                self._logger.debug("Matter export: status poll failed (%s)", exc)
+                return
+            self._report_node_warnings(status)
+
+        self._fire(_poll(), "the bridge node status poll")
 
     def _check_command_queue(self) -> None:
         """Say once when §5 dispatches are stacking up on the single worker.

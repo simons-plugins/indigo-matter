@@ -171,7 +171,9 @@
 
 WARNING: this WILL duplicate accessories in ecosystems that are already paired (Apple Home, Alexa, Google). The old accessories do not disappear — they stop working and you have to delete them by hand, and any names, rooms, scenes and automations built on them are lost.
 
-Your pairings themselves are NOT touched, and no Indigo device is changed.</Label>
+Your pairings themselves are NOT touched, and no Indigo device is changed.
+
+If the bridge node is NOT refusing, this does nothing useful and is refused: there is no fault to recover from, and a rebuild would discard the retained endpoint numbers of every device you are not currently exporting — the ones that make re-adding a device restore the same accessory rather than create a second one.</Label>
             </Field>
             <Field id="confirm" type="checkbox" defaultValue="false">
                 <Label>I understand this may duplicate accessories in paired ecosystems.</Label>

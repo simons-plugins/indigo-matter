@@ -15,12 +15,20 @@
  */
 
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+    chmodSync,
+    existsSync,
+    mkdirSync,
+    mkdtempSync,
+    readFileSync,
+    rmSync,
+    writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
 
-import { Logger } from "@matter/main";
+import { Logger, type ServerNode } from "@matter/main";
 
 import { ENDPOINT_MAP_FILE, type EndpointMapFile } from "../src/endpoint-map.js";
 import { uniqueIdFor } from "../src/endpoints.js";
@@ -74,6 +82,102 @@ const ENDPOINTS = [
         options: {},
     },
 ];
+
+/**
+ * A {@link BridgeNode} that can be posed as commissioned.
+ *
+ * Three of the decisions this file is about only ever run once a fabric
+ * exists — the E5 migration bootstrap, the commissioning witness, and §3.11
+ * leaving that witness alone on a bridge that is still paired — and a fabric
+ * cannot be manufactured in a test: commissioning needs a controller, real
+ * certificates and a real network. That is why `refuseReasonFor` was extracted
+ * as a pure function in the first place; this is the same problem one layer up,
+ * where the code under test is `node.ts` and a real ServerNode has to be there.
+ *
+ * What is posed is only matter.js's *answer about its own commissioning state*:
+ * the two properties `node.ts` reads, `lifecycle.isCommissioned` and
+ * `state.commissioning.fabrics`. Everything underneath is the real stack doing
+ * the real work, so the endpoint map, the identity file and the log are all
+ * genuine — which is the point, because they are what these tests assert on.
+ */
+class PosedNode extends BridgeNode {
+    /** The fabric table the node will see. Empty means never paired. */
+    posedFabrics: { fabricIndex: number; label: string; rootVendorId: number }[] = [];
+
+    override get server(): ServerNode {
+        const real = super.server;
+        if (this.posedFabrics.length === 0) {
+            return real;
+        }
+        // `isCommissioned` is a getter on the lifecycle object's prototype, so
+        // an own data property shadows it. The fabric table is NOT
+        // configurable — matter.js seals it — hence the read-through Proxy for
+        // that one and only that one.
+        Object.defineProperty(real.lifecycle, "isCommissioned", { value: true, configurable: true });
+        const fabrics = Object.fromEntries(this.posedFabrics.map(fabric => [fabric.fabricIndex, fabric]));
+        return new Proxy(real, {
+            get(target, prop) {
+                if (prop !== "state") {
+                    const value: unknown = Reflect.get(target, prop, target);
+                    // Bound, or a method reached through the proxy would run
+                    // with the proxy as `this` and fail on matter.js's own
+                    // private fields.
+                    return typeof value === "function" ? value.bind(target) : value;
+                }
+                const state = Reflect.get(target, prop, target) as Record<string, unknown>;
+                return new Proxy(state, {
+                    get(stateTarget, stateProp) {
+                        if (stateProp !== "commissioning") {
+                            return Reflect.get(stateTarget, stateProp, stateTarget);
+                        }
+                        const commissioning = Reflect.get(stateTarget, stateProp, stateTarget) as Record<
+                            string,
+                            unknown
+                        >;
+                        return new Proxy(commissioning, {
+                            get: (target_, prop_) =>
+                                prop_ === "fabrics" ? fabrics : Reflect.get(target_, prop_, target_),
+                        });
+                    },
+                });
+            },
+        });
+    }
+}
+
+/** One posed fabric, shaped as matter.js's own `state.commissioning.fabrics` entries. */
+const POSED_FABRIC = { fabricIndex: 1, label: "Apple Home", rootVendorId: 4937 };
+
+interface PosedSession {
+    bridge: PosedNode;
+    /** Everything the node logged, which is where several of these answers live. */
+    logged: string[];
+    close: () => Promise<void>;
+}
+
+/** Start a posed node — `commissioned: true` gives it one fabric from the off. */
+async function bootPosed(
+    storagePath: string,
+    options: { commissioned: boolean; commissionedAt?: string },
+): Promise<PosedSession> {
+    const logged: string[] = [];
+    const bridge = new PosedNode(
+        { storagePath, matterPort: 0, wsPort: 0 },
+        options.commissionedAt === undefined
+            ? { ...IDENTITY }
+            : { ...IDENTITY, commissionedAt: options.commissionedAt },
+        BRIDGE_VERSION,
+        message => logged.push(message),
+    );
+    // Before `start()`: the migration decision is taken during it.
+    bridge.posedFabrics = options.commissioned ? [POSED_FABRIC] : [];
+    await bridge.start();
+    return { bridge, logged, close: () => bridge.close() };
+}
+
+function migrationLines(logged: readonly string[]): string[] {
+    return logged.filter(line => line.startsWith("MIGRATION"));
+}
 
 interface Session {
     bridge: BridgeNode;
@@ -411,16 +515,21 @@ describe("the drift check runs on every path that can move a number", () => {
                 session.bridge.reconcile(
                     [
                         ENDPOINTS[0]!,
-                        // A role outside the §4.2 enum: the registry builds the
-                        // first endpoint, then throws on this one.
-                        { ...ENDPOINTS[1]!, role: "notARole" },
+                        // A label past Matter's NodeLabel limit: the registry
+                        // builds the first endpoint, then throws while building
+                        // this one. A bad *role* would not do — `reconcileNow`
+                        // validates every role up front, so nothing is created
+                        // and there is no part-applied set to check.
+                        { ...ENDPOINTS[1]!, label: "x".repeat(300) },
                     ] as never,
                     false,
                 ),
             );
 
-            // `driftChecked` is the observable: on the success path only, the
-            // throw skips the detector entirely and it stays false forever.
+            // The first endpoint IS there, and `driftChecked` is the
+            // observable: on the success path only, the throw skips the
+            // detector entirely and it stays false forever.
+            assert.equal(session.bridge.getStatus().endpointCount, 1, "the reconcile must have part-applied");
             assert.equal(
                 session.bridge.getStatus().driftChecked,
                 true,
@@ -435,18 +544,32 @@ describe("the drift check runs on every path that can move a number", () => {
         // §3.3 was the one operation that reshapes the live set and never
         // looked, so a surviving endpoint whose number had moved stayed
         // unreported until something else happened to create one.
+        //
+        // The observable is the drift being RECOMPUTED rather than
+        // `driftChecked` flipping: an empty comparison no longer claims to have
+        // checked anything (§4.3), so a remove on a node that never attached —
+        // which is what this test used to do — verifies nothing at all now.
+        // Poisoning one number and watching the removal clear the report is the
+        // same assertion against a live set that actually exists.
         const storagePath = storage();
+        writeFileSync(
+            join(storagePath, ENDPOINT_MAP_FILE),
+            JSON.stringify({ version: 1, endpoints: { [uniqueIdFor(LOUNGE)]: 99 } }),
+        );
         const session = await boot(storagePath);
         try {
             assert.equal(session.bridge.getStatus().driftChecked, false, "nothing checked yet");
+            await attach(session.client, "d1");
+            assert.equal(session.bridge.getStatus().drift.length, 1, "the poisoned number must be reported");
 
-            await session.bridge.removeEndpoint(KITCHEN);
+            await session.bridge.removeEndpoint(LOUNGE);
 
-            assert.equal(
-                session.bridge.getStatus().driftChecked,
-                true,
-                "remove_endpoint must run the detector",
+            assert.deepEqual(
+                session.bridge.getStatus().drift,
+                [],
+                "remove_endpoint must re-run the detector, not leave the last answer standing",
             );
+            assert.equal(session.bridge.getStatus().driftChecked, true);
         } finally {
             await session.close();
         }
@@ -465,6 +588,147 @@ describe("the drift check runs on every path that can move a number", () => {
             await session.bridge.upsertEndpoint({ ...ENDPOINTS[0]!, role: "dimmableLight" } as never);
 
             assert.deepEqual(session.bridge.getStatus().drift, []);
+        } finally {
+            await session.close();
+        }
+    });
+});
+
+describe("the E5 migration bootstrap, on a node (PRD §7, §4.3)", () => {
+    it("adopts a baseline and serves when a commissioned bridge has no map at all", async () => {
+        // ⊗ Skipping the bootstrap leaves a commissioned bridge serving with no
+        // baseline whatsoever: `driftChecked` never becomes meaningful, and the
+        // one fault this milestone exists to catch — matter.js's own allocation
+        // being lost — has nothing to be compared against, forever.
+        const storagePath = storage();
+        const session = await bootPosed(storagePath, { commissioned: true });
+        try {
+            assert.equal(session.bridge.endpointMapRefusal(), undefined, "the upgrade path must SERVE");
+            assert.equal(migrationLines(session.logged).length, 1, session.logged.join("\n"));
+            // The baseline is empty and on disk: the first reconcile fills it
+            // from the live set, which IS matter.js's persisted allocation.
+            assert.deepEqual(readMap(storagePath), { version: 1, endpoints: {} });
+        } finally {
+            await session.close();
+        }
+    });
+
+    it("leaves a map that IS there completely alone", async () => {
+        // ⊗ Bootstrapping on `commissioned` alone re-seeds an empty baseline
+        // over a good map on EVERY start — which does not renumber anything,
+        // and is far worse than that: it silently throws away the only record
+        // of what the numbers were, so the storage loss it exists to detect
+        // becomes undetectable on the very next boot.
+        const storagePath = storage();
+        const existing: EndpointMapFile = { version: 1, endpoints: { [uniqueIdFor(KITCHEN)]: 7 } };
+        writeFileSync(join(storagePath, ENDPOINT_MAP_FILE), JSON.stringify(existing));
+
+        const session = await bootPosed(storagePath, { commissioned: true });
+        try {
+            // The file itself, not just the log line: a re-seed writes a
+            // perfectly valid map and logs a perfectly reassuring line.
+            assert.deepEqual(readMap(storagePath), existing);
+            assert.deepEqual(migrationLines(session.logged), []);
+        } finally {
+            await session.close();
+        }
+    });
+
+    it("says nothing about a migration on a bridge that has never been paired", async () => {
+        // ⊗ A never-commissioned bridge has no map because it has never needed
+        // one. Announcing a MIGRATION there tells every fresh install that
+        // something was recovered, which is the log line a user reads when they
+        // are trying to work out whether their accessories moved.
+        const storagePath = storage();
+        const session = await bootPosed(storagePath, { commissioned: false });
+        try {
+            assert.equal(session.bridge.endpointMapRefusal(), undefined);
+            assert.deepEqual(migrationLines(session.logged), []);
+            assert.ok(!existsSync(join(storagePath, ENDPOINT_MAP_FILE)), "and it writes no baseline");
+        } finally {
+            await session.close();
+        }
+    });
+
+    it("does not claim the migration happened when the baseline could not be written", async t => {
+        if (process.getuid?.() === 0) {
+            t.skip("root ignores directory permissions");
+            return;
+        }
+        // ⊗ The MIGRATION line is written before the answer is known, and
+        // `seed()`'s return was dropped on the floor — so a bridge that could
+        // not write the baseline reported the migration as done, and the next
+        // start bootstrapped again over a log that said it never needed to.
+        const storagePath = storage();
+        // One clean run first, so matter.js's own storage subdirectory already
+        // exists: the read-only directory below must block OUR new file, not
+        // the Matter stack's startup.
+        await (await bootPosed(storagePath, { commissioned: true })).close();
+        rmSync(join(storagePath, ENDPOINT_MAP_FILE));
+
+        chmodSync(storagePath, 0o500);
+        try {
+            const session = await bootPosed(storagePath, { commissioned: true });
+            try {
+                assert.equal(migrationLines(session.logged).length, 2, session.logged.join("\n"));
+                assert.ok(
+                    session.logged.some(line => line.startsWith("MIGRATION NOT RECORDED")),
+                    session.logged.join("\n"),
+                );
+                assert.ok(!existsSync(join(storagePath, ENDPOINT_MAP_FILE)));
+            } finally {
+                await session.close();
+            }
+        } finally {
+            chmodSync(storagePath, 0o700);
+        }
+    });
+
+    it("surfaces a commissioning witness that could not be written as a §4.3 warning", async () => {
+        // ⊗ Two mutations live here: `applyWitness` recording the failure as a
+        // *cleared* warning, and `noteCommissioningWitness` taking the identity
+        // back without going through it at all. Either way the bridge comes up
+        // looking healthy while the witness that arms PRD §7's refuse-to-start
+        // is quietly absent — and nobody finds out until the fabric storage is
+        // lost and nothing refuses.
+        const storagePath = storage();
+        // A directory where identity.json goes: the atomic write's `rename`
+        // cannot land on it, which is a write failure the node must survive.
+        mkdirSync(join(storagePath, "identity.json"));
+
+        const session = await bootPosed(storagePath, { commissioned: true });
+        try {
+            const warnings = session.bridge.getStatus().warnings;
+            assert.ok(
+                warnings.some(warning => warning.includes("Could not record the commissioning marker")),
+                `expected the witness failure in warnings, got ${JSON.stringify(warnings)}`,
+            );
+        } finally {
+            await session.close();
+        }
+    });
+});
+
+describe("§3.11 on a bridge that is still paired", () => {
+    it("leaves the commissioning witness alone while fabrics remain", async () => {
+        // ⊗ The witness is cleared by a rebuild only when the fabrics are
+        // already gone — that is the user accepting a loss. Clearing it
+        // unconditionally disarms PRD §7's refuse-to-start on a bridge that is
+        // still paired: the NEXT time matter.js's storage vanishes there is no
+        // evidence it was ever commissioned, so the node serves happily and
+        // duplicates every accessory in every ecosystem.
+        const storagePath = storage();
+        const witness = "2026-08-01T00:00:00.000Z";
+        writeFileSync(join(storagePath, "identity.json"), JSON.stringify({ ...IDENTITY, commissionedAt: witness }));
+
+        const session = await bootPosed(storagePath, { commissioned: true, commissionedAt: witness });
+        try {
+            assert.equal(session.bridge.endpointMapRefusal(), undefined);
+
+            await session.bridge.rebuildEndpointMap();
+
+            const onDisk = JSON.parse(readFileSync(join(storagePath, "identity.json"), "utf8"));
+            assert.equal(onDisk.commissionedAt, witness, "a rebuild must not un-witness a live pairing");
         } finally {
             await session.close();
         }
@@ -511,5 +775,217 @@ describe("refuse-to-start: previously commissioned, fabric storage gone (PRD §7
 
         assert.equal(refusal, undefined);
         assert.deepEqual(driftOf(again.status), []);
+    });
+});
+
+describe("refusing for an unusable identity is a different refusal (E5 R4)", () => {
+    /** Reach the private refusal directly: it needs no Matter stack to speak. */
+    function refusalLineFor(reason: string): string {
+        const logged: string[] = [];
+        const bridge = new BridgeNode(
+            { storagePath: storage(), matterPort: 0, wsPort: 0 },
+            { ...IDENTITY },
+            BRIDGE_VERSION,
+            message => logged.push(message),
+        );
+        (bridge as unknown as { refuse(reason: string): void }).refuse(reason);
+        assert.equal(logged.length, 1, logged.join("\n"));
+        return logged[0]!;
+    }
+
+    it("does not send the user to rebuild the map, which cannot fix it", () => {
+        // ⊗ One remedy sentence was printed for every reason, and for this one
+        // it names the single command guaranteed to refuse them: §3.11 THROWS
+        // on `identityUnreadable` by design, because rebuilding the map would
+        // leave the bridge serving under a SerialNumber no paired ecosystem has
+        // ever seen. Following the log line got the user nowhere and left the
+        // file that actually needs restoring unmentioned.
+        const line = refusalLineFor(RefuseReason.identityUnreadable);
+
+        assert.match(line, /REFUSING to serve endpoints/);
+        assert.doesNotMatch(line, /§3\.11/);
+        assert.doesNotMatch(line, /map is rebuilt/);
+        assert.match(line, /identity\.json\.unreadable-<stamp>/);
+        assert.match(line, /restart/);
+    });
+
+    it("still sends a map refusal to §3.11, which is where that one is fixed", () => {
+        const line = refusalLineFor(RefuseReason.mapUnreadable);
+
+        assert.match(line, /endpoint map is unreadable/);
+        assert.match(line, /BRIDGE_PROTOCOL §3\.11/);
+        assert.match(line, /duplicate accessories/);
+    });
+
+    it("carries a refusal decided before the node existed all the way in", async () => {
+        // ⊗ `main.ts` takes the identity decision before this object can be
+        // built, because loading the identity is what would overwrite it. The
+        // constructor argument is the only route that reason has into the node,
+        // and dropping the hand-off leaves a bridge that refuses silently —
+        // with nothing in the launchd log to say why anything stopped working.
+        const storagePath = storage();
+        const logged: string[] = [];
+        const bridge = new BridgeNode(
+            { storagePath, matterPort: 0, wsPort: 0 },
+            { ...IDENTITY },
+            BRIDGE_VERSION,
+            message => logged.push(message),
+            RefuseReason.identityUnreadable,
+        );
+        await bridge.start();
+        try {
+            assert.equal(bridge.endpointMapRefusal(), RefuseReason.identityUnreadable);
+            assert.ok(
+                logged.some(line => line.startsWith("REFUSING to serve endpoints")),
+                `the refusal never reached the log: ${logged.join("\n")}`,
+            );
+        } finally {
+            await bridge.close();
+        }
+    });
+});
+
+describe("the §4.3 warnings channel actually reaches the plugin", () => {
+    it("puts an endpoint-map write failure on the wire, not just in the store", async t => {
+        if (process.getuid?.() === 0) {
+            t.skip("root ignores directory permissions");
+            return;
+        }
+        // ⊗ Nothing read this channel end to end: every assertion on `warnings`
+        // was that it is EMPTY, so dropping either half of the merge in
+        // `getStatus` — the node's own identity warnings or the endpoint map's —
+        // passed the whole suite. `warnings` is the only channel that reaches a
+        // user in this milestone; the node's other one is a stdout nobody is
+        // watching.
+        const storagePath = storage();
+        const session = await boot(storagePath);
+        // After `start()`: matter.js creates its own storage subdirectory under
+        // this path, and it must be allowed to. What the read-only directory
+        // blocks is OUR new file — the endpoint map's temp-plus-rename write.
+        chmodSync(storagePath, 0o500);
+        try {
+            await attach(session.client, "w1");
+
+            const status = await session.client.request({ message_id: "w2", command: "get_status", args: {} });
+            const warnings = (status.result as { warnings: string[] }).warnings;
+
+            assert.ok(
+                warnings.some(warning => warning.includes("Could not write the endpoint map")),
+                `expected the write failure on the wire, got ${JSON.stringify(warnings)}`,
+            );
+            // §4.3: an unwritten baseline has verified nothing durable.
+            assert.equal((status.result as { driftChecked: boolean }).driftChecked, false);
+        } finally {
+            chmodSync(storagePath, 0o700);
+            await session.close();
+        }
+    });
+});
+
+describe("factory_reset tells the truth about what it could not do (§3.10)", () => {
+    it("warns that the witness could not be VERIFIED when identity.json is unreadable", async () => {
+        // ⊗ The verification read answers `undefined` both for "the file is
+        // gone, so the witness certainly is" and for "the file is there and I
+        // cannot parse it" — so a reset over a corrupt identity reported the
+        // witness verified when nothing had been verified at all. If that file
+        // does still carry `commissionedAt`, the next start refuses to serve
+        // anything and blames lost fabric storage for the reset the user asked
+        // for; being told is the difference between a two-minute fix and a
+        // bridge that will not come back.
+        const storagePath = storage();
+        const session = await boot(storagePath);
+        try {
+            await attach(session.client, "v1");
+            writeFileSync(join(storagePath, "identity.json"), "{ truncated", "utf8");
+
+            await session.client.request(
+                { message_id: "v2", command: "factory_reset", args: { preserveEndpointNumbers: true } },
+                RESET_TIMEOUT_MS,
+            );
+            const status = await session.client.request({ message_id: "v3", command: "get_status", args: {} });
+
+            const warnings = (status.result as { warnings: string[] }).warnings;
+            assert.ok(
+                warnings.some(warning => warning.includes("could NOT verify")),
+                `expected an unverifiable-witness warning, got ${JSON.stringify(warnings)}`,
+            );
+            assert.ok(
+                warnings.some(warning => warning.includes("identity.json")),
+                "and it must name the file the user has to look at",
+            );
+        } finally {
+            await session.close();
+        }
+    });
+
+    it("says the endpoint map survived a discard it could not perform", async () => {
+        // ⊗ `discard()` returns whether the file went, and `factoryReset`
+        // ignored it before logging "Factory reset complete" — so a map that
+        // outlived `preserveEndpointNumbers: false` was reported as discarded,
+        // and the next start loaded it as a baseline for numbers that no longer
+        // mean anything.
+        const storagePath = storage();
+        const logged: string[] = [];
+        const bridge = new BridgeNode(
+            { storagePath, matterPort: 0, wsPort: 0 },
+            { ...IDENTITY },
+            BRIDGE_VERSION,
+            message => logged.push(message),
+        );
+        await bridge.start();
+        try {
+            await bridge.reconcile(ENDPOINTS as never, false);
+            assert.ok(existsSync(join(storagePath, ENDPOINT_MAP_FILE)));
+            // A directory in its place: `unlinkSync` cannot remove it, which is
+            // the shape of every real deletion failure (a locked file, a
+            // read-only volume) without needing either.
+            rmSync(join(storagePath, ENDPOINT_MAP_FILE));
+            mkdirSync(join(storagePath, ENDPOINT_MAP_FILE));
+
+            await bridge.factoryReset(false);
+
+            assert.ok(
+                logged.some(line => line.includes("endpoint map file survived the reset")),
+                `the ignored discard failure never surfaced: ${logged.join("\n")}`,
+            );
+            assert.ok(
+                bridge.getStatus().warnings.some(warning => warning.includes("Could not delete the endpoint map")),
+                "§4.3: and the plugin has to be told, not just the log",
+            );
+        } finally {
+            await bridge.close();
+        }
+    });
+});
+
+describe("noteFabrics never swallows the read it depends on (E5 S2)", () => {
+    it("logs what a failed fabric read costs, and does not rethrow", () => {
+        // ⊗ A bare `catch { return }` hid three things at once: the failure
+        // itself, every §5 fabrics_changed / commissioned / decommissioned
+        // event, and — worst because it is silent and delayed — the clearing of
+        // `commissionedAt` when the last fabric leaves. A deliberate unpair
+        // whose read failed here strands the witness, and the NEXT start refuses
+        // to serve anything, reporting lost fabric storage for something the
+        // user did on purpose.
+        //
+        // A node that was never started reproduces exactly the read this catch
+        // exists for: `fabrics()` throws on a stack that is not there, which is
+        // what the teardown paths hand it.
+        const logged: string[] = [];
+        const bridge = new BridgeNode(
+            { storagePath: storage(), matterPort: 0, wsPort: 0 },
+            { ...IDENTITY },
+            BRIDGE_VERSION,
+            message => logged.push(message),
+        );
+
+        assert.doesNotThrow(() =>
+            (bridge as unknown as { noteFabrics(change?: string): void }).noteFabrics("removed"),
+        );
+
+        assert.equal(logged.length, 1, logged.join("\n"));
+        assert.match(logged[0]!, /Fabric list unavailable/);
+        assert.match(logged[0]!, /commissioning witness has NOT been cleared/);
+        assert.match(logged[0]!, /fabrics_changed/);
     });
 });

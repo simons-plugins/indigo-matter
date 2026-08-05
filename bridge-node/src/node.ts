@@ -14,6 +14,8 @@
  * is testable on its own.
  */
 
+import { join } from "node:path";
+
 import { Endpoint, Environment, ServerNode, VendorId, version as matterJsVersion } from "@matter/main";
 import { BasicInformationServer } from "@matter/main/behaviors/basic-information";
 import { AggregatorEndpoint } from "@matter/main/endpoints/aggregator";
@@ -27,7 +29,7 @@ import {
 } from "@matter/main/types";
 
 import type { BridgeConfig } from "./config.js";
-import { EndpointMapStore, type LiveEndpointNumber, refuseReasonFor } from "./endpoint-map.js";
+import { ENDPOINT_MAP_FILE, EndpointMapStore, type LiveEndpointNumber, refuseReasonFor } from "./endpoint-map.js";
 import { uniqueIdFor } from "./endpoints.js";
 import {
     type BridgeFacade,
@@ -52,6 +54,7 @@ import { EndpointRegistry } from "./registry.js";
 import {
     type BridgeIdentity,
     clearCommissioned,
+    identityFileProblem,
     markCommissioned,
     nodeUniqueIdFor,
     readIdentity,
@@ -323,16 +326,37 @@ export class BridgeNode implements BridgeFacade {
                 `created now rather than refused. Nothing is renumbered: matter.js owns the numbers ` +
                 `and this file only witnesses them (${source}).`,
         );
-        this.#endpointMap.seed([], source);
+        // The line above is written before the answer is known, because it
+        // explains what is being attempted — but it must not be left standing
+        // as the last word when the attempt failed. A migration that never
+        // reached disk has not happened: `present` is still false at the next
+        // start, which bootstraps again, and saying otherwise would have the
+        // log claiming a baseline that no restart can find.
+        if (!this.#endpointMap.seed([], source)) {
+            this.log(
+                "MIGRATION NOT RECORDED: the endpoint-map baseline could not be written, so no " +
+                    "baseline exists yet — the next start will bootstrap again. Drift cannot be " +
+                    "detected until it lands.",
+            );
+        }
     }
 
     private refuse(reason: string): void {
         this.#refusal = reason;
-        this.log(
-            `REFUSING to serve endpoints — ${reason}. Nothing will be exported until the endpoint ` +
-                "map is rebuilt (BRIDGE_PROTOCOL §3.11), which WILL duplicate accessories in " +
-                "already-paired ecosystems.",
-        );
+        // The remedy is not the same for every reason, and printing the map one
+        // for all of them sent the identity case somewhere that cannot help:
+        // `rebuildEndpointMap` explicitly THROWS for `identityUnreadable` (see
+        // §3.11), so a user following that sentence would run the one command
+        // guaranteed to refuse them, and still be no closer to the file that
+        // actually needs restoring.
+        const remedy =
+            reason === RefuseReason.identityUnreadable
+                ? "Nothing will be exported until the quarantined identity.json.unreadable-<stamp> is " +
+                  "restored or repaired as identity.json and the bridge restarted; rebuilding the " +
+                  "endpoint map CANNOT fix this."
+                : "Nothing will be exported until the endpoint map is rebuilt (BRIDGE_PROTOCOL §3.11), " +
+                  "which WILL duplicate accessories in already-paired ecosystems.";
+        this.log(`REFUSING to serve endpoints — ${reason}. ${remedy}`);
     }
 
     /** §1.1 — the reason we are refusing, or `undefined` while serving. */
@@ -392,7 +416,28 @@ export class BridgeNode implements BridgeFacade {
         let fabrics: FabricInfo[];
         try {
             fabrics = this.fabrics();
-        } catch {
+        } catch (error) {
+            // One `catch` used to swallow three separate things, and the worst
+            // of them was silent and delayed: `commissionedAt` is cleared from
+            // here (via noteLastFabricGone), so a read that fails on the way
+            // out of a deliberate last-fabric unpair strands the witness — and
+            // the NEXT start refuses to serve anything, blaming lost fabric
+            // storage for something the user did on purpose. The §5 events go
+            // with it, so an ecosystem pairing or unpairing lands in the plugin
+            // as nothing at all. Log-only: this runs inside matter.js's own
+            // observable and on teardown paths where the read legitimately
+            // fails, and a throw there takes the stack down with it.
+            try {
+                this.log(
+                    `Fabric list unavailable (${describeError(error)}); no fabrics_changed / ` +
+                        "commissioned / decommissioned event will be raised for this change, and if " +
+                        "this was the last fabric leaving, the commissioning witness has NOT been " +
+                        "cleared — the next start would then refuse to serve endpoints, reporting " +
+                        "lost fabric storage.",
+                );
+            } catch {
+                // The logger itself failed; there is nowhere left to report.
+            }
             return;
         }
         if (change !== undefined) {
@@ -712,8 +757,17 @@ export class BridgeNode implements BridgeFacade {
             WARN_IDENTITY_WRITE,
             clearCommissioned(this.config.storagePath, this.identity, message => this.log(message)),
         );
-        if (!preserveEndpointNumbers) {
-            this.#endpointMap.discard();
+        if (!preserveEndpointNumbers && !this.#endpointMap.discard()) {
+            // The in-memory map is empty either way, so the node behaves as
+            // asked — but the file the user asked to be rid of is still there,
+            // and the next start would load it as a baseline for numbers that
+            // no longer mean anything. `discard()` has always reported this;
+            // nobody was reading it, under a "Factory reset complete" line that
+            // said the opposite.
+            this.log(
+                `The endpoint map file survived the reset — ${join(this.config.storagePath, ENDPOINT_MAP_FILE)} ` +
+                    "could not be deleted, so the next start will load it as a baseline. Delete it by hand.",
+            );
         }
         this.#drift = [];
         // A reset node is un-commissioned, so nothing it could have refused for
@@ -733,8 +787,22 @@ export class BridgeNode implements BridgeFacade {
         // exact `fabricStorageLost` signature, so the next boot refuses to
         // serve anything and blames lost storage for the reset the user asked
         // for. Verified by reading it back rather than asserted.
+        //
+        // `readIdentity` alone cannot do the verifying: it answers `undefined`
+        // both for "the file is gone, so the witness certainly is" and for "the
+        // file is there and I cannot parse it", and reading the second as the
+        // first reports a verification that never happened over the one file
+        // that might still be carrying the marker.
+        const unverifiable = identityFileProblem(this.config.storagePath);
         const onDisk = readIdentity(this.config.storagePath);
-        if (onDisk?.commissionedAt !== undefined) {
+        if (unverifiable !== undefined) {
+            const message =
+                "Factory reset could NOT verify that the commissioning marker is gone, because " +
+                `${unverifiable}. If that file still carries "commissionedAt", the next start will ` +
+                "refuse to serve endpoints and report lost fabric storage — check it by hand.";
+            this.log(message);
+            this.#warnings.set(WARN_IDENTITY_WRITE, message);
+        } else if (onDisk?.commissionedAt !== undefined) {
             const message =
                 "Factory reset could NOT clear the commissioning marker in identity.json — the next " +
                 "start will refuse to serve endpoints, reporting lost fabric storage. Delete " +

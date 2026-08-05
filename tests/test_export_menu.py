@@ -965,9 +965,20 @@ def _status(endpoint_count=2, warnings=()):
 
 class TestRebuildMenuCallback:
     def test_it_refuses_without_the_tick(self, plug):
-        plug.runtime = _FakeRuntime()
+        """⊗ The gate is asserted against THE CLIENT, with a client present.
+
+        This test used to leave ``plug.export_bridge`` at ``None``, so deleting
+        the confirm check entirely left it green: the connection gate one line
+        further down filled the same ``errors["confirm"]`` key, and the
+        assertion could not tell the two apart. With a live client the mutation
+        is what it is in the field — the irreversible rebuild REALLY RUNS on an
+        unticked box.
+        """
+        client = _bridge_with(plug, recovery=True)
+        plug.runtime = _FakeRuntime(result=_status())
         ok, _values_out, errors = plug.menuRebuildEndpointMap({"confirm": False})
         assert ok is False and "confirm" in errors
+        client.rebuild_endpoint_map.assert_not_called()
 
     def test_it_refuses_when_there_is_no_bridge_connection(self, plug):
         plug.runtime = _FakeRuntime()
@@ -976,7 +987,7 @@ class TestRebuildMenuCallback:
         assert ok is False and "confirm" in errors
 
     def test_it_calls_the_client_and_names_the_outcome(self, plug):
-        client = _bridge_with(plug)
+        client = _bridge_with(plug, recovery=True, attached=True)
         plug.runtime = _FakeRuntime(result=_status(endpoint_count=3))
 
         ok, _values_out = plug.menuRebuildEndpointMap({"confirm": True})
@@ -994,6 +1005,71 @@ class TestRebuildMenuCallback:
         ok, _values_out = plug.menuRebuildEndpointMap({"confirm": True})
         assert ok is True
         client.rebuild_endpoint_map.assert_called_once()
+
+    def test_it_refuses_to_rebuild_a_node_that_is_NOT_refusing(self, plug):
+        """⊗ M11: `connected` gates reaching the node, not rebuilding it.
+
+        Run against a healthy bridge, §3.11 silently discards the retained
+        endpoint-number allocation of every export that is not currently live —
+        and §3.3 keeps exactly those so that re-adding a device restores its
+        accessory rather than creating a second one.
+        """
+        client = _bridge_with(plug, recovery=False)
+        plug.runtime = _FakeRuntime(result=_status())
+        ok, _values_out, errors = plug.menuRebuildEndpointMap({"confirm": True})
+        assert ok is False and "confirm" in errors
+        client.rebuild_endpoint_map.assert_not_called()
+
+    def test_a_rebuild_whose_re_attach_failed_is_still_a_rebuild(self, plug):
+        """⊗ The two outcomes are reported separately.
+
+        By the time the node answers, the map has been rewritten and the
+        refusal is gone — the irreversible half is done. Reporting the pair as
+        one told the user their node was "unchanged and still refusing" over a
+        map that no longer existed, and invited them to repeat an operation
+        that duplicates accessories in every paired ecosystem.
+        """
+        client = _bridge_with(plug, recovery=True, attached=False)
+        plug.runtime = _FakeRuntime(result=_status(endpoint_count=0))
+
+        ok, _values_out = plug.menuRebuildEndpointMap({"confirm": True})
+
+        assert ok is True, "the rebuild happened; it is not a failure"
+        said = " ".join(str(c.args[0]) for c in plug.logger.warning.call_args_list)
+        assert "REBUILT" in said
+        assert "does NOT need repeating" in said
+        errors = " ".join(str(c.args[0]) for c in plug.logger.error.call_args_list)
+        assert "still refusing" not in errors
+
+    def test_the_menu_deadline_covers_the_rebuild_AND_its_re_attach(self, plug):
+        """⊗ A flat 45s expired mid-re-attach on a large export list.
+
+        The call waits on two deadlines in series — LONG_TIMEOUT for the
+        rebuild, then a full `attach_timeout_for` for the re-attach — so a
+        number chosen without reference to either reports a failure over a
+        rebuild that already succeeded and cannot be undone.
+        """
+        import bridge_client
+        plug.pluginPrefs = {}
+        plug.exports = ExportStore(lambda: plug.pluginPrefs, plug.logger)
+        for device_id in range(1, 91):
+            plug.exports.upsert(ExportEntry(device_id, "onOffLight"))
+        _bridge_with(plug, recovery=True, attached=True)
+        runtime = _FakeRuntime(result=_status())
+        plug.runtime = runtime
+        seen: dict = {}
+
+        def _result(timeout=None):
+            seen["timeout"] = timeout
+            return _status()
+
+        runtime.result = _result
+
+        plug.menuRebuildEndpointMap({"confirm": True})
+
+        expected = bridge_client.rebuild_timeout_for(90)
+        assert seen["timeout"] == expected
+        assert seen["timeout"] > bridge_client.LONG_TIMEOUT + bridge_client.attach_timeout_for(90)
 
     def test_a_failed_rebuild_is_reported_as_a_failure_not_a_success(self, plug):
         """The node answers with an error when the new map could not be
@@ -1019,11 +1095,39 @@ class TestRebuildMenuCallback:
 
 
 class TestResetPairingsMenuCallback:
+    """⊗ Every gate here is asserted against the CLIENT, with a client present.
+
+    These tests used to run with ``plug.export_bridge`` at ``None``, which made
+    all three confirm mutations survive: the connection check immediately after
+    the gate fills the same ``errors`` key, so "an error was reported" was true
+    either way. What it could not see is the only thing that matters — whether
+    the destructive command reached the node — and with a live client it does:
+    unticked, ``factory_reset`` must never be called.
+    """
+
     def test_one_tick_is_not_enough(self, plug):
+        client = _bridge_with(plug)
         plug.runtime = _FakeRuntime()
         ok, _values_out, errors = plug.menuResetBridgePairings(
             {"confirm": True, "confirmAgain": False})
         assert ok is False and "confirmAgain" in errors
+        client.factory_reset.assert_not_called()
+
+    def test_the_second_tick_alone_is_not_enough_either(self, plug):
+        client = _bridge_with(plug)
+        plug.runtime = _FakeRuntime()
+        ok, _values_out, errors = plug.menuResetBridgePairings(
+            {"confirm": False, "confirmAgain": True})
+        assert ok is False and "confirm" in errors
+        client.factory_reset.assert_not_called()
+
+    def test_neither_tick_wipes_nothing(self, plug):
+        client = _bridge_with(plug)
+        plug.runtime = _FakeRuntime()
+        ok, _values_out, _errors = plug.menuResetBridgePairings(
+            {"confirm": False, "confirmAgain": False})
+        assert ok is False
+        client.factory_reset.assert_not_called()
 
     def test_both_ticks_reset_and_preserve_endpoint_numbers(self, plug):
         client = _bridge_with(plug)

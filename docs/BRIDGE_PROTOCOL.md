@@ -57,6 +57,22 @@ bug in the node.
 | `role_change` | `upsert_endpoint` tried to change an existing endpoint's role (§4.1) |
 | `mass_removal_refused` | `attach` would remove every live endpoint without `"intent": "replace_all"` (§3.1) |
 | `endpoint_map_invalid` | Node is in the refuse-to-start state (PRD §7); only `get_status`, `get_pairing` and `rebuild_endpoint_map` are accepted |
+
+`endpoint_map_invalid` covers **every** refuse-to-start reason, not only a bad
+map: the code names the *state* (which commands are accepted), and `details`
+opens with the *reason*, which is what selects the remedy. The reasons are a
+closed set (`RefuseReason` in `bridge-node/src/protocol.ts`, mirrored as
+constants in `bridge_protocol.py`), and two of them need opposite advice:
+
+| `details` prefix | Remedy |
+|---|---|
+| `endpoint map is unreadable` | §3.11 `rebuild_endpoint_map`, user-confirmed — it WILL duplicate accessories in already-paired ecosystems |
+| `this bridge was commissioned but its Matter fabric storage is gone…` | Restore a backup, or accept the loss via §3.11 |
+| `the bridge identity file is present but unreadable` | **§3.11 will not help and the node refuses it.** Restore or repair `identity.json.unreadable-<stamp>` and restart the bridge |
+
+A client that shows the map remedy for all three sends the identity case at the
+one door deliberately locked against it — and promises duplicated accessories on
+the way through. Clients MUST branch on the reason.
 | `commissioning_window_failed` | Matter stack refused to open the enhanced commissioning window |
 | `internal` | Unexpected node-side failure; `details` carries the message |
 
@@ -269,8 +285,13 @@ Two refusals of its own:
   `identity.json.unreadable-<stamp>`), and clearing the refusal for it would
   serve endpoints under a `SerialNumber` no ecosystem has ever seen.
 
-A present-but-unusable map is copied to `endpoint-map.json.corrupt` before it is
-replaced.
+A present-but-unusable map is copied to `endpoint-map.json.corrupt-<stamp>`
+before it is replaced — by the plain `persist()` path as well as by the rebuild,
+since a corrupt map on a bridge that has never been commissioned is served past
+rather than refused (§7) and would otherwise be overwritten with no copy at all.
+The name is timestamped for the same reason `identity.json.unreadable-<stamp>`
+is: a fixed name means the second quarantine silently destroys the first, and
+the first is the one nearest the original truth.
 
 ## 4. Shapes
 
@@ -374,10 +395,18 @@ error, never auto-repaired. Each entry is a `DriftEntry`:
   moment the operation it describes succeeds.
 
   This exists because the node's only other channel is stdout, and while the
-  node is started by hand that is a terminal nobody is watching. `get_status` is
-  polled by the plugin's watchdog, so a client SHOULD surface a non-empty
-  `warnings` at warning level — once per streak, since these persist until a
-  human acts — and show it wherever it summarises export health.
+  node is started by hand that is a terminal nobody is watching. A client MUST
+  therefore **poll** `get_status` while attached — this plugin does it once per
+  ~15s watchdog tick — and surface a non-empty `warnings` at warning level, once
+  per streak, since these persist until a human acts.
+
+  Polling is not optional decoration: most of these faults happen *after* the
+  attach and so appear in no attach response. The commissioning witness is
+  written when a fabric first appears, the witness is cleared by a
+  `factory_reset`, and the endpoint map is written by the drift check inside
+  `upsert_endpoint`/`remove_endpoint`. A client that only reads the `warnings`
+  it gets back from `attach` sees none of them, and the user is told nothing at
+  all — which is the state this channel was invented to end.
 
 `endpoints[].role` is one of the §4.2 enum; `endpointCount` is
 `endpoints.length` (it is sent explicitly so a client can log the size without

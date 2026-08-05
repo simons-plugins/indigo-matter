@@ -23,6 +23,9 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { after, describe, it } from "node:test";
 
+import { ErrorCode, PROTOCOL_VERSION } from "../src/protocol.js";
+import { TestClient } from "./client.js";
+
 /**
  * `.test-build/test/` at run time, so the compiled entry point is two levels up
  * in `dist/`. Built by `npm run build`, which `npm test` does not run — hence
@@ -98,6 +101,11 @@ function ports(offset: number): string[] {
     return ["--matter-port", String(base), "--ws-port", String(base + 1)];
 }
 
+/** The protocol port {@link ports} handed the child, so a test can dial it. */
+function wsPort(offset: number): number {
+    return Number(ports(offset)[3]);
+}
+
 describe("main.ts as a process", { skip: existsSync(ENTRY) ? false : "run `npm run build` first" }, () => {
     it("exits 0 on SIGTERM, so launchd does not read a clean stop as a crash", async () => {
         const dir = storage();
@@ -153,6 +161,119 @@ describe("main.ts as a process", { skip: existsSync(ENTRY) ? false : "run `npm r
         const quarantined = files.find(name => name.startsWith("identity.json.unreadable-"));
         assert.ok(quarantined, `nothing was moved aside: ${files.join(", ")}`);
         assert.equal(readFileSync(join(dir, quarantined), "utf8"), '{"installId": "truncated');
+    });
+
+    it("refuses to serve endpoints over an unusable identity, and stays refusing", async () => {
+        // ⊗ The whole refuse-to-start path for an unreadable `identity.json`,
+        // end to end and over the wire, because nothing exercised it: the
+        // hand-off from `main.ts` to the node, the node's refusal, §1.1's
+        // recovery trio, and §3.11 declining to pretend it can help. Dropping
+        // any one of them leaves a bridge that serves accessories under a
+        // SerialNumber and UniqueID no paired ecosystem has ever seen.
+        const dir = storage();
+        writeFileSync(join(dir, "identity.json"), '{"installId": "truncated', "utf8");
+
+        const { child, output } = await start(["--storage-path", dir, ...ports(4)]);
+        const client = await TestClient.connect(wsPort(4));
+        try {
+            await client.next(); // §2 handshake
+
+            const refused = await client.request({
+                message_id: "e1",
+                command: "attach",
+                args: { protocolVersion: PROTOCOL_VERSION, pluginVersion: "test", endpoints: [] },
+            });
+            assert.equal(refused.error_code, ErrorCode.endpointMapInvalid, JSON.stringify(refused));
+            assert.match(String(refused.details), /identity file is present but unreadable/);
+
+            // §1.1: the recovery trio still answers, or the plugin has no way
+            // to see the state it is in.
+            for (const command of ["get_status", "get_pairing"] as const) {
+                const response = await client.request({ message_id: `e-${command}`, command, args: {} });
+                assert.ok(response.result !== undefined, `${command} was refused: ${JSON.stringify(response)}`);
+            }
+
+            // ...and the third one refuses on purpose. Rebuilding the map here
+            // would clear the refusal without touching the identity, which is
+            // the exact harm the refusal exists to prevent.
+            const rebuild = await client.request({ message_id: "e2", command: "rebuild_endpoint_map", args: {} });
+            assert.equal(rebuild.error_code, ErrorCode.endpointMapInvalid, JSON.stringify(rebuild));
+            assert.match(String(rebuild.details), /cannot fix/);
+        } finally {
+            client.close();
+            await stopAndWait(child);
+        }
+
+        assert.match(output(), /NOTHING has been written to identity\.json/);
+        // The original bytes are the only surviving record of an identity that
+        // cannot be regenerated, and exactly one copy of them must exist.
+        const files = readdirSync(dir).filter(name => name.startsWith("identity.json"));
+        assert.deepEqual(
+            files.filter(name => name === "identity.json"),
+            [],
+            "a replacement identity must NOT be written while the node is refusing",
+        );
+        const quarantined = files.filter(name => name.startsWith("identity.json.unreadable-"));
+        assert.equal(quarantined.length, 1, `expected exactly one quarantined identity, got ${files.join(", ")}`);
+        assert.equal(readFileSync(join(dir, quarantined[0]!), "utf8"), '{"installId": "truncated');
+    });
+
+    it("keeps refusing on the NEXT start, when only the quarantine marker is left", async () => {
+        // ⊗ The refusal used to last exactly one restart. Start one moves the
+        // file aside; start two finds no identity.json at all, reads that as a
+        // first run, and mints AND WRITES a replacement — so the bridge comes
+        // up serving under a brand-new SerialNumber with nothing but the
+        // routine "minting new bridge identity" line to show for it.
+        const dir = storage();
+        writeFileSync(join(dir, "identity.json"), "{ not json", "utf8");
+
+        const first = await start(["--storage-path", dir, ...ports(5)]);
+        await stopAndWait(first.child);
+
+        const second = await start(["--storage-path", dir, ...ports(5)]);
+        const restarted = second.output();
+        await stopAndWait(second.child);
+
+        assert.match(restarted, /Bridge identity unusable/, `the second start did not refuse:\n${restarted}`);
+        assert.match(restarted, /identity\.json\.unreadable-/, "and it must name the file to restore");
+        assert.doesNotMatch(restarted, /minting new bridge identity/);
+        assert.ok(!existsSync(join(dir, "identity.json")), "still nothing written over the quarantined identity");
+    });
+
+    it("exits 0 on a clean stop AFTER a factory reset", async () => {
+        // ⊗ `ServerNode.erase()` leaves a ref'd timer that `close()` never
+        // clears, so this path — and only this path — used to sit until the
+        // escape hatch fired and then exit 1. launchd runs the agent with
+        // `KeepAlive { SuccessfulExit: false }`, so that number is the
+        // difference between "stay stopped" and an immediate respawn. Both the
+        // explicit `exit(0)` and the `clearTimeout` that disarms the hatch are
+        // load-bearing here and nowhere else.
+        const dir = storage();
+        const { child, output } = await start(["--storage-path", dir, ...ports(6)]);
+        const client = await TestClient.connect(wsPort(6));
+        try {
+            await client.next(); // §2 handshake
+            await client.request({
+                message_id: "s1",
+                command: "attach",
+                args: { protocolVersion: PROTOCOL_VERSION, pluginVersion: "test", endpoints: [] },
+            });
+            const reset = await client.request(
+                { message_id: "s2", command: "factory_reset", args: { preserveEndpointNumbers: true } },
+                30_000,
+            );
+            assert.deepEqual(reset.result, {}, JSON.stringify(reset));
+        } finally {
+            client.close();
+        }
+
+        const code = await stopAndWait(child);
+
+        assert.equal(code, 0, `a clean stop after a reset must exit 0. Output:\n${output()}`);
+        assert.match(output(), /Shutdown complete/);
+        // The escape hatch is a forced exit(1); leaving it armed turns a clean
+        // stop into a 10-second stall and then a lie to launchd.
+        assert.doesNotMatch(output(), /Shutdown stalled/);
     });
 
     it("prints usage and exits 0 for --help", async () => {
