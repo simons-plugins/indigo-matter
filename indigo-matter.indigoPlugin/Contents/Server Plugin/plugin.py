@@ -51,6 +51,22 @@ PLUGIN_NAME = "indigo-matter"
 COMMAND_TIMEOUT = 5.0
 DECOMMISSION_TIMEOUT = 15.0
 
+#: Deadlines for the export/pairing menu actions, which block the **Indigo UI
+#: thread** on a WS round trip: without one, a bridge node that accepts the
+#: socket and then stops answering hangs the dialog — and Indigo's client — with
+#: no way out but force-quitting it. Named rather than inline because a `.result()`
+#: with no timeout looks like an ordinary call at a glance, so nothing about the
+#: absence of one is visible at the call site.
+#:
+#: PAIRING_READ_TIMEOUT covers a plain read (`get_pairing`). The other two are
+#: long because the node does real Matter work behind them: opening an enhanced
+#: window derives a fresh passcode and re-advertises, and removing a fabric
+#: flushes subscriptions and — on the last one — factory-resets the whole stack.
+PAIRING_READ_TIMEOUT = 15.0
+WINDOW_OPEN_TIMEOUT = 45.0
+UNPAIR_TIMEOUT = 45.0
+FACTORY_RESET_TIMEOUT = 45.0
+
 #: Watchdog ticks (~15s each) of an active export with no ``deviceUpdated`` at
 #: all before ``subscribeToChanges`` is re-issued — see
 #: ``Plugin._resubscribe_tick``. ~1 minute, the same shape as every other streak
@@ -63,6 +79,10 @@ MAX_RESUBSCRIBE_ATTEMPTS = 3
 #: Menu id of the export dialog (MenuItems.xml) — matched in
 #: ``get_menu_action_config_ui_values`` so other menus are never seeded.
 MENU_MANAGE_EXPORTS = "manageMatterExports"
+#: Menu id of the unpair dialog. Seeded for the same reason the export dialog is
+#: — Indigo pre-selects the first row of a picker, and this picker's rows are
+#: real ecosystems whose Execute button removes them.
+MENU_UNPAIR_ECOSYSTEM = "unpairEcosystem"
 #: Option-id prefix marking a picker row the user may look at but not choose
 #: (PRD §5.2: excluded devices are shown *with a reason*, never hidden — XAC9).
 EXCLUDED_OPTION_PREFIX = "x-"
@@ -174,6 +194,13 @@ def _pairing_html(pairing, message: str) -> str:
         # a silently truncated payload — a QR that scans and means the wrong thing.
         viewer = f"{QR_VIEWER_URL}?data={quote(str(getattr(pairing, 'qr_pairing_code', '') or ''), safe='')}"
         codes = f"""
+    <p class="warn"><strong>This page shows a live commissioning passcode.</strong>
+       Anyone who can reach this URL can add the bridge — and every Indigo device you
+       export — to <em>their</em> Apple Home, Alexa or Google account, for as long as the
+       window is open. The Indigo Web Server only asks for a password if you have turned
+       authentication on, so if you have not, treat this URL as the code itself: do not
+       put it in a chat or an email, and close the window when you are done (it also
+       expires on its own).</p>
     <h2>Manual pairing code</h2>
     <p class="code">{manual}</p>
     <h2>QR payload</h2>
@@ -200,11 +227,14 @@ def _pairing_html(pairing, message: str) -> str:
  .payload {{ font: .85rem ui-monospace, Menlo, monospace; word-break: break-all;
              background: #f4f4f6; padding: .6rem; border-radius: .4rem; }}
  .msg {{ background: #fff6d6; border: 1px solid #e8d48a; padding: .7rem; border-radius: .4rem; }}
+ .warn {{ background: #fdeaea; border: 1px solid #d99; padding: .7rem; border-radius: .4rem;
+          font-size: .92rem; }}
  .expiry {{ color: #a33; }}
  footer {{ margin-top: 2rem; font-size: .85rem; color: #777; }}
  @media (prefers-color-scheme: dark) {{
    body {{ background: #16171a; color: #e6e6e6; }} h2 {{ color: #aaa; }}
    .payload {{ background: #26272b; }} .msg {{ background: #3a3320; border-color: #6b5c2e; }}
+   .warn {{ background: #3a2222; border-color: #7a4444; }}
  }}
 </style></head><body>
 <h1>Indigo Matter bridge</h1>
@@ -798,13 +828,59 @@ class Plugin(indigo.PluginBase):
         if not bridge.active:
             return (f"{exported} device(s) exported; the bridge node is not running."
                     if exported else "Nothing is exported yet, so the bridge node is not running.")
+        # ⊗ `active` means "a client OBJECT exists" — it is set the moment the
+        # engine builds one and stays set through every reconnect attempt. Read as
+        # "the bridge node is running", it told a user whose node had been
+        # crash-looping for a day "3 device(s) exported. Paired with: Apple",
+        # which is the readout PRD §5.5 exists to make impossible. The client's
+        # own socket state is the fact; `attached` narrows it further, because a
+        # connected-but-refusing node (§1.1) serves no accessories at all.
+        client = bridge.client
+        if client is None or not getattr(client, "connected", False):
+            return (f"{exported} device(s) exported, but the plugin is NOT connected to the bridge "
+                    f"node — exported accessories are unavailable right now. See the Event Log.")
         fabrics = bridge.fabrics
         if fabrics is None:
             return f"{exported} device(s) exported; not yet connected to the bridge node."
         paired = ", ".join(export_bridge.describe_fabric(f) for f in fabrics) or "nothing yet"
-        window = (f" A pairing window is open until {bridge.window_expires_at}."
-                  if bridge.window_expires_at else "")
-        return f"{exported} device(s) exported. Paired with: {paired}.{window}"
+        # Said as "last reported" because it is: this list is the one the last
+        # attach or §5 event left behind, deliberately not a WS round trip (this
+        # runs while the dialog is opening). An ecosystem that dropped us a
+        # second ago is still in it.
+        window = self._window_readout(bridge)
+        serving = ("" if getattr(client, "attached", False) else
+                   " The node is connected but not serving accessories — see the Event Log.")
+        return (f"{exported} device(s) exported. Paired with (last reported): {paired}."
+                f"{serving}{window}")
+
+    @staticmethod
+    def _window_readout(bridge) -> str:
+        """The pairing-window sentence, or "" — and never a window that has passed.
+
+        ⊗ ``window_expires_at`` is set by the pairing menu and cleared only by
+        the §5 ``window_closed`` event, which the node does not send on shutdown.
+        So a node that was restarted (or a plugin that was) left the timestamp
+        standing and the readout claimed an open window indefinitely — including
+        for a time hours in the past. Comparing it against now costs one parse
+        and turns a permanent false claim into an expiry the user can read.
+        """
+        raw = getattr(bridge, "window_expires_at", None)
+        if not raw:
+            return ""
+        try:
+            # The node sends RFC 3339 with a `Z`; `fromisoformat` learned `Z` in
+            # 3.11 but the substitution costs nothing and works on 3.10 too.
+            expires = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            # Unparseable: report it as-is rather than dropping it. A timestamp
+            # we cannot compare is still the only thing we know.
+            return f" A pairing window was opened, expiring {raw}."
+        if expires.tzinfo is None:
+            expires = expires.replace(tzinfo=timezone.utc)
+        if expires <= datetime.now(timezone.utc):
+            return (f" The last pairing window expired at {raw} — open a new one with "
+                    "Plugins ▸ Matter ▸ Pair Matter Bridge….")
+        return f" A pairing window is open until {raw}."
 
     def closedPrefsConfigUi(self, valuesDict, userCancelled):  # noqa: N802
         if userCancelled:
@@ -821,11 +897,25 @@ class Plugin(indigo.PluginBase):
         # ticking or unticking "Enable Matter export". Re-running the transition
         # applies it without a reload — and, because the transition is the same
         # code the allow-list uses, it also brings the agent up or down.
-        if self.export_bridge is not None:
-            try:
-                self.export_bridge.exports_changed()
-            except Exception as exc:  # noqa: BLE001
-                self.logger.exception(exc)
+        #
+        # This call is the ONLY thing that makes that switch act without a plugin
+        # reload, which is what PluginConfig.xml promises the user in prose. It
+        # is three lines with no local symptom if they go, so it has its own test
+        # (⊗ `test_saving_config_applies_the_export_switch_immediately`).
+        if self.export_bridge is None:
+            self.logger.debug(
+                "Matter export: the export engine is not running, so the export switch will take "
+                "effect when the plugin next starts.")
+            return
+        try:
+            self.export_bridge.exports_changed()
+        except Exception as exc:  # noqa: BLE001
+            # A bare traceback here reads as a crash in "save settings". Say what
+            # did not happen and what to do instead — the prefs ARE saved.
+            self.logger.error(
+                "Matter export: your settings were saved, but applying the export switch "
+                "immediately FAILED (%s). Reload the plugin to apply it.", exc)
+            self.logger.exception(exc)
 
     # ------------------------------------------------------------------
     # Device lifecycle
@@ -1251,7 +1341,14 @@ class Plugin(indigo.PluginBase):
                 # matter-server that won't start after an upgrade.
                 self.logger.info("Removing the installed matter-server for a clean "
                                  "reinstall (your devices/pairings are kept)…")
-                sp.remove_package()
+                if not sp.remove_package():
+                    # remove_package has already said what is still there. Do NOT
+                    # install over it: a clean reinstall that quietly became a
+                    # plain reinstall leaves the wedge the user came here for.
+                    self.logger.error(
+                        "Clean reinstall ABANDONED — the old package could not be removed, so "
+                        "nothing was reinstalled over it. Nothing was changed.")
+                    return
             if not sp.install():
                 self.logger.error(
                     "Install/update matter-server did not complete — see the error "
@@ -1689,13 +1786,20 @@ class Plugin(indigo.PluginBase):
         return ""
 
     def get_menu_action_config_ui_values(self, menu_id):
-        """Seed the export dialog (menu dialogs never remember their values).
+        """Seed the export and unpair dialogs (menu dialogs never remember values).
 
-        Only the export menu is seeded — this callback fires for EVERY menu
-        item that has a ConfigUI, and returning values for another one would
-        overwrite its defaults.
+        Only those two are seeded — this callback fires for EVERY menu item that
+        has a ConfigUI, and returning values for another one would overwrite its
+        defaults.
         """
         values = indigo.Dict()
+        if menu_id == MENU_UNPAIR_ECOSYSTEM:
+            # The picker leads with a no-selection row; seed the field to match
+            # it, or Indigo renders the seeded-but-unmatched value as a blank
+            # first item and the user is one click from unpairing whatever
+            # happens to be second.
+            values["fabric"] = NO_SELECTION_ID
+            return values
         if menu_id != MENU_MANAGE_EXPORTS:
             return values
         values["exportFilter"] = ""
@@ -2172,7 +2276,7 @@ class Plugin(indigo.PluginBase):
             # preserve_endpoint_numbers=True: a user resetting to re-pair the
             # same ecosystems should not also lose accessory identity. The
             # "the map itself is corrupt" path is the rebuild above.
-            self.runtime.submit(client.factory_reset(True)).result(timeout=45)
+            self.runtime.submit(client.factory_reset(True)).result(timeout=FACTORY_RESET_TIMEOUT)
         except Exception as exc:  # noqa: BLE001
             self.logger.error("Matter export: resetting the bridge pairings FAILED — %s. "
                               "Pairings are unchanged.", exc)
@@ -2188,22 +2292,6 @@ class Plugin(indigo.PluginBase):
     # ------------------------------------------------------------------
     # The export bridge node's LaunchAgent (E7 — PRD §4.2, XG5, XAC1)
     # ------------------------------------------------------------------
-    def _bridge_agent(self):
-        """The bridge :class:`~bridge_agent.BridgeProcess`, built on first use.
-
-        Cached on the plugin so the applied-plist digest and the resolved node
-        path are computed once, and rebuilt from CURRENT prefs by the two paths
-        that change them (the install action and a config save) — the same
-        discipline ``menuRestartMatterServer`` learned the hard way, where a
-        ``ServerProcess`` snapshotted at startup silently served stale settings.
-
-        Constructing one writes nothing. That is what lets this be lazy at all
-        and what keeps a fresh install inert (XAC1).
-        """
-        if self.bridge_process is None:
-            self.bridge_process = bridge_agent.BridgeProcess(dict(self.pluginPrefs), self.logger)
-        return self.bridge_process
-
     def _start_bridge_agent(self) -> None:
         """Install (if needed) and start the bridge node's LaunchAgent.
 
@@ -2226,24 +2314,79 @@ class Plugin(indigo.PluginBase):
             # Preflight failed; the plist has been torn down and the reason
             # logged. Nothing to start, and starting would only crash-loop.
             return
-        self.logger.info("Matter export: bridge node LaunchAgent is running (protocol port %s, "
-                         "Matter port %s)", agent.ws_port, agent.matter_port)
+        # ``ensure_installed() is not None`` is NOT the process being up. It is
+        # False for "the current definition was already loaded and healthy" AND
+        # for "bootout succeeded but neither bootstrap nor load did" AND for "the
+        # job is loaded with a pid line we could not parse" — and the middle one
+        # was reported here as "bridge node LaunchAgent is running". Ask launchd.
+        state = agent.run_state()
+        if state == agent.RUNNING:
+            self.logger.info("Matter export: bridge node LaunchAgent is running (protocol port %s, "
+                             "Matter port %s)", agent.ws_port, agent.matter_port)
+        elif state == agent.UNKNOWN:
+            # A pid line we could not parse. It may well be serving; what we must
+            # not do is assert either way.
+            self.logger.info(
+                "Matter export: the bridge node's LaunchAgent is loaded (protocol port %s, Matter "
+                "port %s); launchd did not report a readable pid, so whether the process is up "
+                "will show as the plugin connects — or fails to.", agent.ws_port, agent.matter_port)
+        else:
+            self.logger.error(
+                "Matter export: the bridge node's LaunchAgent %s. Exported accessories will be "
+                "unavailable until it does. %s",
+                "did not start" if state == agent.LOADED_NOT_RUNNING
+                else "could not be loaded by launchd",
+                self._bridge_agent_diagnosis())
 
     def _stop_bridge_agent(self) -> None:
-        """Stop the bridge agent, keeping its plist and its storage.
+        """Stop the bridge agent and REMOVE its plist. The storage is untouched.
 
         The ``agent_stop`` seam, called only once there is genuinely nothing to
-        serve. ``stop()`` rather than ``uninstall()``: the plist is cheap to keep
-        and re-exporting a device should not have to re-derive it, and the
-        storage dir — every ecosystem pairing plus the endpoint-number witness —
-        is never touched by either.
+        serve.
+
+        **``uninstall()`` rather than ``stop()``, and that is a correction.**
+        ``stop()`` boots the job out and keeps the plist, which reads as a
+        thrifty choice until you notice the plist carries ``RunAtLoad: True``:
+        at the next login launchd started an *unpaired* bridge node with an
+        EMPTY allow-list, advertising on the Matter port, that this plugin never
+        started and — because ``_agent_started`` is false in a session that
+        never brought it up (XAC1) — would never stop. XG5's guarantee is that a
+        fresh or emptied install runs no bridge process, and a guarantee that
+        does not survive a reboot is not one. Re-deriving the plist costs one
+        ``ensure_installed`` on the next export.
+
+        The storage dir — every ecosystem pairing plus the endpoint-number
+        witness — is never touched by either (PRD §5.4).
         """
         agent = self.bridge_process
         if agent is None:
             return
-        if agent.stop():
-            self.logger.info("Matter export: nothing is exported — the bridge node has been "
-                             "stopped. Its pairings are kept.")
+        was_loaded = agent.is_running()      # "is there a job on the books"
+        agent.uninstall()                    # bootout + remove the plist
+        if agent.is_running() or os.path.exists(agent.plist_path):
+            # ⊗ The silent branch. stop() returning False used to say nothing at
+            # all, and `_agent_started` had already been cleared, so nothing
+            # retried: the node kept serving every paired ecosystem with the log
+            # asserting the opposite by omission.
+            self.logger.warning(
+                "Matter export: nothing is exported, but the bridge node's LaunchAgent could not "
+                "be %s (%s). It keeps running and serving every paired ecosystem, and NOTHING "
+                "retries this on its own — reload the plugin, or run 'launchctl bootout "
+                "gui/$(id -u)/%s' and delete that file by hand.",
+                "stopped" if agent.is_running() else "removed", agent.plist_path,
+                bridge_agent.LABEL)
+            return
+        if was_loaded:
+            self.logger.info(
+                "Matter export: nothing is exported — the bridge node has been stopped and its "
+                "LaunchAgent removed, so a restart of this Mac cannot bring it back. Its pairings "
+                "are kept.")
+        else:
+            # The two Falses `stop()` conflated: this one is "there was no job",
+            # which is not a failure and must not be reported as one.
+            self.logger.debug(
+                "Matter export: nothing is exported and no bridge node LaunchAgent was loaded; "
+                "any plist has been removed. Pairings are kept.")
 
     def _bridge_agent_diagnosis(self) -> Optional[str]:
         """Why is the bridge node not answering? The ``agent_diagnose`` seam.
@@ -2263,12 +2406,27 @@ class Plugin(indigo.PluginBase):
         if agent is None:
             return ("The bridge node's LaunchAgent has not been started by this plugin session — "
                     "export at least one device, or reload the plugin.")
+        # ⊗ Asked FIRST, and it was not asked at all. preflight() holds the
+        # actual fact — is the node interpreter there, is the package installed —
+        # while the old code guessed at it from an empty error log and then said
+        # "checked {project_dir}", which it had not looked at. A missing package
+        # is also the case where the error log is empty *for the right reason*:
+        # launchd never got far enough to write one.
+        problem = agent.preflight()
+        if problem:
+            return f"The bridge node cannot start: {problem}"
         tail = agent.tail_error_log()
         if tail:
-            return f"Recent bridge node errors:\n{tail}"
-        return (f"Its error log is empty — the {bridge_agent.BRIDGE_PACKAGE} package may not be "
-                f"installed (checked {agent.project_dir}). Use Plugins ▸ Matter ▸ "
-                f"Install/update the Matter export bridge.")
+            # NOT "recent". The file is appended to and never truncated, so the
+            # last 20 lines can be from a crash-loop days ago that has since been
+            # fixed — naming the file is what lets the user check the timestamps.
+            return (f"The last lines of {os.path.join(agent.log_dir, bridge_agent.BRIDGE_ERR_LOG)} "
+                    f"(appended to since the bridge was first started, so these may be old):\n"
+                    f"{tail}")
+        return (f"The {bridge_agent.BRIDGE_PACKAGE} package is installed and its error log "
+                f"({os.path.join(agent.log_dir, bridge_agent.BRIDGE_ERR_LOG)}) is empty, so the "
+                f"node is failing without saying why — check that nothing else on this Mac holds "
+                f"Matter port {agent.matter_port} or protocol port {agent.ws_port}.")
 
     def menuInstallBridgeNode(self):  # noqa: N802
         """Install/update the ``indigo-matter-bridge`` npm package.
@@ -2280,25 +2438,101 @@ class Plugin(indigo.PluginBase):
         thread because ``~/indigo-matter`` is one npm root and two concurrent
         ``npm install``s into it corrupt each other.
         """
+        self._run_bridge_install(clean=False)
+
+    def menuReinstallBridgeNodeClean(self, valuesDict, menuId=""):  # noqa: N802, ARG002
+        """Remove the bridge package and install it fresh (the controller's twin).
+
+        The controller has had this exit since 2026.7; the bridge shipped without
+        it, so a user whose bridge install was wedged had a menu that reinstalled
+        *over* the wedge and no way to clear it. ``remove_package`` is per-package
+        since E7, which is what makes this safe to offer at all — it used to
+        rmtree the shared ``node_modules`` and take the controller with it.
+
+        Pairings are untouched: they live in the storage dir, which nothing in
+        the install path goes near.
+        """
+        errors = indigo.Dict()
+        if not self._truthy(valuesDict.get("confirm")):
+            errors["confirm"] = "Tick the box to confirm."
+            return (False, valuesDict, errors)
+        if not self._run_bridge_install(clean=True):
+            errors["confirm"] = "An npm install is already running — wait for it to finish."
+            return (False, valuesDict, errors)
+        return (True, valuesDict)
+
+    def _run_bridge_install(self, *, clean: bool) -> bool:
+        """Start the background bridge install. False if one is already running."""
         if self._install_thread is not None and self._install_thread.is_alive():
             self.logger.warning("An npm install is already in progress — wait for it to finish.")
-            return
-        self.logger.info("Installing the Matter export bridge node in the background — watch the "
-                         "log for progress; this can take a minute.")
+            return False
+        self.logger.info(
+            "%s the Matter export bridge node in the background — watch the log for progress; "
+            "this can take a minute.",
+            "Removing and reinstalling" if clean else "Installing")
         self._install_thread = threading.Thread(
-            target=self._install_bridge_node, name="matter-bridge-install", daemon=True)
+            target=self._install_bridge_node, args=(clean,),
+            name="matter-bridge-install", daemon=True)
         self._install_thread.start()
+        return True
 
-    def _install_bridge_node(self) -> None:
+    def menuStopBridgeNode(self, valuesDict, menuId=""):  # noqa: N802, ARG002
+        """Stop the bridge node and remove its LaunchAgent, by hand.
+
+        The controller has "Restart matter-server"; the bridge had nothing at
+        all, because it is started and stopped by the allow-list. That leaves one
+        state with no UI: a user who disables the plugin (or whose plugin dies
+        mid-session) has a node still running and still serving every paired
+        ecosystem, and the only lever is ``launchctl``. Exporting nothing is not
+        that lever — it needs the plugin to be running to notice.
+
+        Exports are NOT changed. The next export starts the node again, which is
+        exactly XG5 and is why this is safe to hand a user: the worst outcome is
+        a bridge that comes back.
+        """
+        errors = indigo.Dict()
+        if not self._truthy(valuesDict.get("confirm")):
+            errors["confirm"] = "Tick the box to confirm."
+            return (False, valuesDict, errors)
+        # Built from CURRENT prefs rather than reused: this must work in a
+        # session that never started the agent, which is the whole point of it.
+        self.bridge_process = bridge_agent.BridgeProcess(dict(self.pluginPrefs), self.logger)
+        self._stop_bridge_agent()
+        if self.export_bridge is not None:
+            # The plugin no longer has an agent it started, so the XAC1 latch
+            # must not go on claiming it does.
+            self.export_bridge.note_agent_stopped()
+        return (True, valuesDict)
+
+    def _install_bridge_node(self, clean: bool = False) -> None:
         """npm-install the bridge package, then restart it if anything is exported.
 
         The restart is conditional on there being something to export, which is
         the difference from the controller's install: bringing the agent up
         because a package was updated would violate XG5 on an install with an
         empty allow-list, and leave a bridge process running for nothing.
+
+        **``ensure_installed()`` before ``restart()``, and its absence was the
+        first-run dead end.** The bridge's plist is written by exactly one place
+        — ``_start_bridge_agent`` — and on a machine where the package has never
+        been installed that place cannot get past its own preflight, so it writes
+        no plist and (correctly) tears any stale one down. The user's route out
+        of that is this menu; it then went install() → restart(), restart found
+        no plist, and printed "nothing to restart. Fix the problem reported
+        above" (there was no problem above — the install had just SUCCEEDED)
+        followed by "the restart FAILED — the old version may still be running"
+        (nothing was running). Two wrong messages, no bridge, and the only real
+        remedy — write the plist now that the package exists — never attempted.
         """
         try:
             agent = bridge_agent.BridgeProcess(dict(self.pluginPrefs), self.logger)
+            if clean and not agent.remove_package():
+                # remove_package has said what is still there. Installing over a
+                # wedged install is what the clean variant exists to avoid.
+                self.logger.error(
+                    "Clean reinstall of the Matter export bridge ABANDONED — the old package "
+                    "could not be removed, so nothing was reinstalled over it.")
+                return
             if not agent.install():
                 self.logger.error(
                     "Install/update of the Matter export bridge did not complete — see the error "
@@ -2313,13 +2547,25 @@ class Plugin(indigo.PluginBase):
                     "yet, and the bridge only runs while the export list is non-empty. Add a "
                     "device in 'Manage Matter Exports…' and it will start itself.")
                 return
-            # A running LaunchAgent does not pick up new files on disk, so the
-            # freshly-installed version only takes effect on a real restart.
-            if not self.bridge_process.restart():
+            # Write (or refresh) the plist first. On the first-run path there is
+            # none — this is where it comes from — and `ensure_installed` returning
+            # True means launchd has already bootstrapped the NEW files, so there
+            # is nothing left for restart() to do and bouncing again would be a
+            # second gratuitous outage.
+            applied = self.bridge_process.ensure_installed()
+            if applied is None:
+                self.logger.error(
+                    "The Matter export bridge was installed, but its LaunchAgent could not be "
+                    "written — see the reason above. The package is on disk; fix that and reload "
+                    "the plugin.")
+                return
+            # A running LaunchAgent does not pick up new files on disk, so a job
+            # left alone by ensure_installed is still executing the OLD version.
+            if applied is False and not self.bridge_process.restart():
                 self.logger.error(
                     "The Matter export bridge was installed but the restart onto the new version "
-                    "FAILED — the old version may still be running. Check "
-                    "~/Library/Logs/indigo-matter/%s.", bridge_agent.BRIDGE_ERR_LOG)
+                    "FAILED — the old version may still be running. Check %s.",
+                    os.path.join(self.bridge_process.log_dir, bridge_agent.BRIDGE_ERR_LOG))
                 return
             self.logger.info("Matter export bridge installed and restarted onto the new version — "
                              "the plugin reconnects automatically.")
@@ -2383,7 +2629,7 @@ class Plugin(indigo.PluginBase):
         if client is None:
             return (False, valuesDict, errors)
         try:
-            pairing = self.runtime.submit(client.get_pairing()).result(timeout=15)
+            pairing = self.runtime.submit(client.get_pairing()).result(timeout=PAIRING_READ_TIMEOUT)
         except Exception as exc:  # noqa: BLE001
             self.logger.error("Matter export: could not read the bridge node's pairing state — %s. "
                               "No pairing window was opened.", exc)
@@ -2402,7 +2648,7 @@ class Plugin(indigo.PluginBase):
             return (True, valuesDict)
         try:
             window = self.runtime.submit(
-                client.open_commissioning_window(duration)).result(timeout=45)
+                client.open_commissioning_window(duration)).result(timeout=WINDOW_OPEN_TIMEOUT)
         except Exception as exc:  # noqa: BLE001
             self.logger.error(
                 "Matter export: opening a pairing window FAILED — %s. Nothing was changed and "
@@ -2453,7 +2699,12 @@ class Plugin(indigo.PluginBase):
             "    QR code page: %s\n"
             "Add the bridge in your ecosystem's app as you would any Matter accessory, and type "
             "the manual code if it asks for one. Expect an 'uncertified accessory' warning — that "
-            "is normal for a bridge like this one; choose Add Anyway.",
+            "is normal for a bridge like this one; choose Add Anyway.\n"
+            "SECURITY: while this window is open, anyone who can reach that page (or read this "
+            "code) can add your exported Indigo devices to THEIR Apple Home, Alexa or Google "
+            "account. The page is served by the Indigo Web Server, which asks for a password only "
+            "if you have switched authentication on — turn it on before using this over anything "
+            "but a network you trust, and do not share the URL.",
             opening, when, manual or "(none)", qr or "(none)", self._pairing_page_url())
 
     def _pairing_page_url(self) -> str:
@@ -2480,7 +2731,16 @@ class Plugin(indigo.PluginBase):
         §5 ``fabrics_changed``), never from a fresh WS round trip: a dynamic list
         callback runs on the Indigo UI's thread while the dialog is opening, and
         blocking it on a node that may be down would hang the dialog rather than
-        render an empty one.
+        render an empty one. That is a deliberate trade and the reason
+        :meth:`menuUnpairEcosystem` re-reads the set *after* it acts, and the
+        reason §3.9 now reports whether it removed anything: the list can be
+        stale, so nothing downstream may assume it is not.
+
+        **The first row is always "(select an ecosystem)".** Indigo pre-selects
+        row one, so without it the dialog opened with a real ecosystem already
+        chosen on a menu whose Execute button removes it — every other picker in
+        this plugin (device, node, backup) leads with a no-selection row for
+        exactly this reason, and the one destructive picker did not.
         """
         try:
             bridge = self.export_bridge
@@ -2491,8 +2751,9 @@ class Plugin(indigo.PluginBase):
                 return [(NO_SELECTION_ID,
                          "(no paired ecosystems)" if fabrics == []
                          else "(not connected to the bridge node)")]
-            return [(str(fabric.fabric_index), export_bridge.describe_fabric(fabric))
-                    for fabric in fabrics]
+            return [(NO_SELECTION_ID, "(select an ecosystem)")] + [
+                (str(fabric.fabric_index), export_bridge.describe_fabric(fabric))
+                for fabric in fabrics]
         except Exception as exc:  # pylint: disable=broad-except
             self.logger.exception(exc)
             return [LIST_ERROR_OPTION]
@@ -2523,15 +2784,35 @@ class Plugin(indigo.PluginBase):
         client = self._pairing_client(errors, "confirmAgain")
         if client is None:
             return (False, valuesDict, errors)
-        last = self._is_last_fabric(fabric_index)
+        cached_last = self._is_last_fabric(fabric_index)
         try:
-            self.runtime.submit(client.remove_fabric(fabric_index)).result(timeout=45)
+            removal = self.runtime.submit(
+                client.remove_fabric(fabric_index)).result(timeout=UNPAIR_TIMEOUT)
         except Exception as exc:  # noqa: BLE001
             self.logger.error("Matter export: unpairing ecosystem %s FAILED — %s. Pairings are "
                               "unchanged.", fabric_index, exc)
             self.logger.exception(exc)
             errors["confirmAgain"] = "Unpair failed — see the log. Nothing was changed."
             return (False, valuesDict, errors)
+        # The picker is built from a CACHED fabric list, so the ecosystem may
+        # have unpaired itself since — which the node reports as a successful
+        # no-op. Re-read before saying anything, so the picker cannot keep
+        # offering a ghost and the sentence below is about the real outcome.
+        self._refresh_fabric_cache(client)
+        if not removal.removed:
+            # ⊗ This used to be indistinguishable from a real removal: the node
+            # answered `{}` either way and the menu logged "has been unpaired.
+            # Every accessory has been removed" over a node-side no-op.
+            self.logger.warning(
+                "Matter export: ecosystem %s was ALREADY gone from the bridge node — nothing was "
+                "removed by this action, because there was nothing there to remove. It had most "
+                "likely unpaired itself since this dialog was opened. The ecosystem list has been "
+                "refreshed%s.", fabric_index,
+                f"; {removal.remaining} pairing(s) remain" if removal.remaining is not None else "")
+            return (True, valuesDict)
+        # `remaining` is the node's own post-removal count and beats the cache;
+        # the cache is only the fallback for a node that could not read it.
+        last = cached_last if removal.remaining is None else removal.remaining == 0
         if last:
             # §3.9: matter.js factory-resets itself when the fabric set empties,
             # and the node clears its commissioning witness to match. Say what
@@ -2548,6 +2829,27 @@ class Plugin(indigo.PluginBase):
                 "has been removed from it; remove any leftover 'Indigo' bridge entry in that "
                 "ecosystem's app by hand.", fabric_index)
         return (True, valuesDict)
+
+    def _refresh_fabric_cache(self, client) -> None:
+        """Re-read the fabric set from the node after an unpair. Never raises.
+
+        The §5 ``fabrics_changed`` that follows a removal is asynchronous, and
+        the picker is built from the cache it updates — so without this a user
+        who unpairs and immediately re-opens the dialog is offered the ecosystem
+        they just removed. Blocking is fine HERE (a menu Execute already blocked
+        on the removal itself); it is not fine in the picker callback, which runs
+        on the UI thread while the dialog opens.
+        """
+        bridge = self.export_bridge
+        if bridge is None:
+            return
+        try:
+            pairing = self.runtime.submit(client.get_pairing()).result(timeout=PAIRING_READ_TIMEOUT)
+            bridge.note_fabrics(pairing.fabrics)
+        except Exception as exc:  # noqa: BLE001
+            # The removal itself already succeeded or was already true; failing
+            # to re-read the list afterwards is not worth reporting as a failure.
+            self.logger.debug("Matter export: could not refresh the ecosystem list (%s)", exc)
 
     def _is_last_fabric(self, fabric_index: int) -> bool:
         """Whether removing ``fabric_index`` empties the fabric set.
@@ -2600,7 +2902,7 @@ class Plugin(indigo.PluginBase):
             return _pairing_html(None, "The plugin is not connected to the Matter bridge node. "
                                        "Export at least one device, then reload this page.")
         try:
-            pairing = self.runtime.submit(client.get_pairing()).result(timeout=15)
+            pairing = self.runtime.submit(client.get_pairing()).result(timeout=PAIRING_READ_TIMEOUT)
         except Exception as exc:  # noqa: BLE001
             self.logger.exception(exc)
             return _pairing_html(None, f"Could not read the bridge node's pairing state: {exc}")

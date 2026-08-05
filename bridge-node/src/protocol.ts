@@ -231,6 +231,28 @@ export interface FabricInfo {
     vendorId: number;
 }
 
+/**
+ * §3.9's answer — what the removal actually DID, not merely that it returned.
+ *
+ * `remove_fabric` used to answer `{}` whether it dropped a fabric or found
+ * nothing at the index, and the plugin then told the user "that ecosystem has
+ * been unpaired. Every accessory has been removed" over a node-side no-op. The
+ * stale-index case is not an edge: the plugin's picker is built from a CACHED
+ * fabric list, so an ecosystem that unpaired *us* between the last event and
+ * the dialog opening is the designed way to land here.
+ *
+ * `remaining` is `null` — never a number — when the count could not be read.
+ * The fabric set is legitimately mid-rebuild after a last-fabric leave
+ * (matter.js factory-resets itself), and reporting a made-up `0` there would
+ * be the same class of lie this type exists to end.
+ */
+export interface RemoveFabricResult {
+    /** False when there was no fabric at that index: the request was already true. */
+    removed: boolean;
+    /** Fabrics the node holds now, or `null` when the count could not be read. */
+    remaining: number | null;
+}
+
 /** §4.3 */
 export interface StatusReport {
     commissioned: boolean;
@@ -347,7 +369,7 @@ export interface BridgeFacade {
      */
     endpointMapRefusal(): string | undefined;
     /** §3.9 — drop one ecosystem's fabric. */
-    removeFabric(fabricIndex: number): Promise<void>;
+    removeFabric(fabricIndex: number): Promise<RemoveFabricResult>;
     /** §3.10 — wipe commissioning credentials and advertise fresh. */
     factoryReset(preserveEndpointNumbers: boolean): Promise<void>;
     /** §3.11 — adopt the live endpoint numbers as the new persisted map. */

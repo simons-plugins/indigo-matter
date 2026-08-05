@@ -19,6 +19,7 @@ import {
     type FabricInfo,
     type PairingReport,
     ProtocolError,
+    type RemoveFabricResult,
     type RemoveResult,
     type RoleValue,
     type StatusReport,
@@ -101,6 +102,8 @@ export interface GoldenFrames {
      * of them are about.
      */
     remove_fabric: GoldenExchange;
+    /** §3.9 over a stale index — the outcome `{}` used to hide. */
+    remove_fabric_already_gone: GoldenExchange;
     factory_reset: GoldenExchange;
     factory_reset_discard_map: GoldenExchange;
     rebuild_endpoint_map: GoldenExchange;
@@ -277,8 +280,9 @@ export class StubBridge implements BridgeFacade {
         return this.refusal;
     }
 
-    async removeFabric(fabricIndex: number): Promise<void> {
+    async removeFabric(fabricIndex: number): Promise<RemoveFabricResult> {
         this.removedFabrics.push(fabricIndex);
+        return structuredClone(golden.remove_fabric.response.result) as RemoveFabricResult;
     }
 
     async factoryReset(preserveEndpointNumbers: boolean): Promise<void> {

@@ -1,6 +1,6 @@
 # indigo-matter — Build Handover
 
-**Last updated:** 2026-08-05 20:11 UTC
+**Last updated:** 2026-08-05 23:21 UTC
 **Active work:** `feat/e6-e7-pairing-and-agent` — E6 + E7, the last functional
 export milestones (E8 is docs only). See the section immediately below; the
 `main` summary in this header describes the last merge, not that branch.
@@ -14,8 +14,98 @@ export milestones (E8 is docs only). See the section immediately below; the
 
 ## 2026-08-05 — E6 + E7: pairing UX, fabric management, the bridge LaunchAgent
 
-Plugin `2026.8.1`, bridge-node `0.5.0`. Suites: **2171 Python**, **345 TS**
+Plugin `2026.8.3`, bridge-node `0.5.0`. Suites: **2243 Python**, **348 TS**
 (from 2056/344). pylint 9.41.
+
+> The counts above are the ones this branch actually produces. Two earlier
+> numbers here were wrong and both were wrong the *reassuring* way: the TS suite
+> was recorded as 345 (`npm test` reported 347 before this batch, 348 after) and
+> the plugin version as `2026.8.1` while `Info.plist` said `2026.8.3`. A suite
+> count is a claim about coverage and a version is what a user reads back to you
+> in a bug report — both are only useful if they are measured.
+
+### The PR #128 review batch (2026-08-05) — read this before touching E6/E7
+
+Three reviewers converged on one family of faults, and it is worth naming
+because it will recur: **claiming success from the wrong signal.** Every one of
+these shipped a message that was true of some *nearby* fact and false of the
+thing the user was told.
+
+| Signal that was read | What it actually means | What was claimed |
+|---|---|---|
+| `ensure_installed() is not None` | "preflight passed" | "the LaunchAgent is running" |
+| `is_running()` | "launchd knows this label" | "the process is up" |
+| `bridge.active` | "a client object exists" | "the bridge node is running" |
+| `remove_fabric` returned | "the frame came back" | "that ecosystem has been unpaired" |
+| `remove_package` returned | it ran | "Removed the … package" |
+
+The corrections, in case any of them looks like an over-reaction later:
+
+* **`LaunchAgent.run_state()`** now returns four distinguishable states and
+  `is_alive()` is the positive one. `is_running()` keeps its old name **and its
+  old meaning** ("is loaded") because the bootout/leave-alone callers want
+  exactly that — a loaded-but-DEAD job (issue #104's fault 2) passes it, which is
+  the whole point of the split.
+* **The first-run dead end.** The bridge's plist is written by exactly one place
+  (`_start_bridge_agent`), which cannot get past its own preflight before the
+  package exists. So on a fresh machine: export → preflight fails → no plist →
+  Install/update → npm succeeds → `restart()` finds no plist → "nothing to
+  restart, fix the problem reported above" (there was none) → "the restart
+  FAILED — the old version may still be running" (nothing was). `menuInstallBridgeNode`
+  now calls `ensure_installed()` first and only `restart()`s when it returns
+  `False` (i.e. launchd left an old job alone). The old test could not catch it:
+  it asserted against `Mock(restart=…True)`, which has a plist by virtue of being
+  a Mock. It is now a real `BridgeProcess` on a `tmp_path` home.
+* **`_stop_bridge_agent` uninstalls rather than stops.** Keeping the plist looked
+  thrifty until you notice it carries `RunAtLoad: True`: after the next login
+  launchd started an unpaired bridge node, with an EMPTY allow-list, advertising
+  on 5540, that the plugin never started and — because the XAC1 latch is false in
+  a session that never brought it up — would never stop. XG5's guarantee has to
+  survive a reboot. Re-deriving the plist costs one `ensure_installed`.
+* **§3.9 answers `{removed, remaining}`** on both sides (protocol, fixtures,
+  docs). The already-gone case is not an edge: the unpair picker is built from
+  the *cached* fabric list, so an ecosystem that unpaired us since the dialog
+  opened is the designed way to reach it. The node also emits `fabrics_changed`
+  (`change: "unchanged"`) on that path, because a caller asking to remove a
+  fabric that is not there is demonstrably holding a stale list and this is the
+  only moment the node knows.
+* **The vendor-ID table was wrong on the destructive picker.** `0x1075` is not an
+  issued vendor id at all (SmartThings is `0x110A`) and `0x100B` is Signify, not
+  Google (`0x6006`). Apple's *second* fabric (`0x1384`, "Apple Keychain" — the
+  one ADR-0005 predicted from the observed three-fabric count) was missing
+  entirely. Every entry is now verified against the CSA's Distributed Compliance
+  Ledger, and `test_export_agent_wiring.py` pins the overlap against the
+  **vendored matter.js source** rather than mirroring our own table. On a picker
+  whose Execute button removes every exported accessory from the chosen
+  ecosystem, a wrong name reads as the right ecosystem.
+
+**Scope note, so it is not attributed to the wrong milestone later:**
+`bridgedInfoFor`'s identity expansion — every bridged child publishing the full
+`BridgedIdentity` (vendor name/id, product name, hardware and software versions)
+rather than just label/serial/uniqueId/reachable — arrived in **this PR (#128,
+E6+E7)**, not in E4 with the role factories it sits beside in `endpoints.ts`.
+Until this batch nothing pinned it to the root node's `BasicInformation`:
+`registry.test.ts` asserted a hand-written copy of the same literal (its comment
+claimed otherwise and has been corrected), so publishing Apple's vendor id on
+every child left the suite green. `integration.test.ts` now compares each child
+against a real `ServerNode`'s own `basicInformation`.
+
+**Security note, and it needs a decision from Simon, not from the code.** The
+pairing page serves a **live commissioning passcode** over IWS, which
+authenticates only if the user has switched authentication on. While a window is
+open, anyone who can reach that URL can commission the bridge — and every
+exported Indigo device — onto *their* Apple Home, Alexa or Google account.
+Building auth into the handler was deliberately **not** attempted (IWS owns
+authentication; a second scheme underneath it is worse than none). What this
+batch does instead is say so, prominently, on the page itself and in the menu's
+log line. See `docs/INSTALL.md` → "Before you pair the export bridge".
+
+**Two new bridge menu items** close the gap where the controller had recovery
+exits and the bridge had none: "Reinstall the Matter export bridge (clean)…"
+(safe only because `remove_package` became per-package in E7) and "Stop the
+Matter export bridge…" — for the user who disables the plugin and is otherwise
+left with a running node and no UI at all, since the allow-list lever needs the
+plugin to be running.
 
 These are the last two *functional* milestones. E8 is docs.
 
@@ -278,12 +368,14 @@ was **removed** (flagged deliberately — it is what blocks `npm publish`),
 `files` is limited to `dist`, `main` is `dist/main.js` (which is what
 `bridge_agent.DEFAULT_BRIDGE_ENTRY` expects), `engines.node` is `>=22.13.0`, and
 a `prepublishOnly` script runs `clean` then `build` so a stale `dist` can never
-ship. `npm pack --dry-run` produces 34 files / ~112kB.
+ship. `npm pack --dry-run` produces 35 files / ~116kB — the extra one is
+`README.md`, which npm always includes regardless of `files` and which was
+missing until this batch (the package's npm page was blank).
 
 ```sh
 cd bridge-node
 npm login                 # Simon's npm account — nobody else can do this step
-npm test                  # 345 tests; publishing an untested build is the one unrecoverable mistake
+npm test                  # 348 tests; publishing an untested build is the one unrecoverable mistake
 npm publish --access public
 ```
 
@@ -348,7 +440,7 @@ the next:
 
 1. **Publish `indigo-matter-bridge@0.5.0`** (above). Without it step 4 fails.
    For a dry run, use the local-install workaround instead.
-2. **Install the plugin bundle** — `2026.8.1`. This is an *update* to an
+2. **Install the plugin bundle** — `2026.8.3`. This is an *update* to an
    existing install, so a copy of the changed files plus a plugin restart is
    enough; only a first-time install needs the double-click.
 3. **Configure ▸ Matter export.** Confirm the new Export section renders, that

@@ -89,10 +89,12 @@ export class BridgeWsServer {
         );
         this.#handlers.set("set_state", async args => this.handleSetState(args));
         this.#handlers.set("set_reachable", async args => this.handleSetReachable(args));
-        this.#handlers.set("remove_fabric", async args => {
-            await this.options.bridge.removeFabric(parseFabricIndex(args.fabricIndex));
-            return {};
-        });
+        // Returns the node's own outcome rather than a blanket `{}`: the plugin
+        // reports this removal to the user in the past tense, and "there was no
+        // fabric at that index" has to be able to reach it (§3.9).
+        this.#handlers.set("remove_fabric", async args =>
+            this.options.bridge.removeFabric(parseFabricIndex(args.fabricIndex)),
+        );
         this.#handlers.set("factory_reset", async args => {
             await this.options.bridge.factoryReset(parsePreserveEndpointNumbers(args.preserveEndpointNumbers));
             return {};

@@ -68,6 +68,14 @@ DEFAULT_BRIDGE_ENTRY = "dist/main.js"
 BRIDGE_OUT_LOG = "bridge-node.log"
 BRIDGE_ERR_LOG = "bridge-node.err.log"
 
+#: The EXACT wording of ``MenuItems.xml``'s ``installBridgeNode`` item. Every
+#: message that sends a user there used to interpolate the package name instead,
+#: producing "Plugins ▸ Matter ▸ Install/update indigo-matter-bridge" — a menu
+#: that does not exist. It fires on the first-run path (no package, so no plist,
+#: so the preflight error), where a name the user cannot find in the menu is the
+#: difference between a fixable state and giving up.
+BRIDGE_INSTALL_MENU = "Install/update the Matter export bridge"
+
 #: Matter UDP port the node binds (PRD §4.4). 5540 is Matter's default and the
 #: one matter.js's ECOSYSTEMS.md records as Alexa's hard requirement; the pref is
 #: the escape hatch when another Matter stack on the same Mac already holds it.
@@ -198,6 +206,7 @@ class BridgeProcess(LaunchAgent):
                 # 5581. 5540 is UDP and a clash there is the node's own
                 # first-class §7 failure, reported by the node at startup.
                 port=int(ws_port),
+                install_menu=BRIDGE_INSTALL_MENU,
             ),
             prefs, logger,
             home=resolved_home, npx_path=npx_path,

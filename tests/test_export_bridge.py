@@ -362,7 +362,11 @@ class TestLifecycle:
         h.store.remove(101)
         h.bridge.exports_changed()
         assert h.bridge.active is False
-        assert "will linger" in warnings_of(mock_logger)
+        # The warning must name what actually resumes it. "It will retry on its
+        # own" was false: nothing retries until the client next comes up.
+        said = warnings_of(mock_logger)
+        assert "LINGER" in said
+        assert "no retry loop" in said
         # F4: the socket must still be released — the client is unreachable from
         # here on, so a skipped close() leaks it until the plugin reloads.
         assert client.closed is True

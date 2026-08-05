@@ -252,6 +252,134 @@ def test_remove_package_fallback_deletes_only_its_own_package_dir(tmp_path, mock
 
 
 # ---------------------------------------------------------------------------
+# remove_package's outcome — it used to be the same sentence whatever happened
+# ---------------------------------------------------------------------------
+
+def test_remove_package_reports_TRUE_only_when_the_package_is_actually_gone(tmp_path,
+                                                                            mock_logger):
+    agent = _agent(tmp_path / "home", _spec("com.example.a", "pkg-a", str(tmp_path / "s")),
+                   mock_logger)
+    assert agent.ensure_installed() is True
+    npm = os.path.join(agent.resolved_bin_dir, "npm")
+    agent._exists = lambda path: path != npm and os.path.exists(path)
+    assert agent.remove_package() is True
+    assert "Removed the pkg-a package" in _infos(mock_logger)
+
+
+def test_a_REFUSED_npm_uninstall_falls_back_and_the_package_still_goes(tmp_path,
+                                                                       mock_logger):
+    """⊗ Replacing `_npm_uninstall`'s non-zero-exit branch with `return True` left
+    the suite green: nothing exercised a *present* npm that fails, so the
+    fallback that actually removes the directory was never reached in a test.
+    """
+    home = tmp_path / "home"
+    agent = _agent(home, _spec("com.example.a", "pkg-a", str(tmp_path / "s")), mock_logger,
+                   runner=FakeRunner())
+    assert agent.ensure_installed() is True
+    with open(os.path.join(agent.resolved_bin_dir, "npm"), "w", encoding="utf-8") as handle:
+        handle.write("#!/bin/sh\n")
+    ours = os.path.join(agent.project_dir, "node_modules", "pkg-a")
+    assert os.path.isdir(ours)
+
+    class _NpmRefuses(FakeRunner):
+        def __call__(self, cmd, **kwargs):
+            result = super().__call__(cmd, **kwargs)
+            if "uninstall" in cmd:
+                result.returncode = 1
+                result.stderr = "npm ERR! code EBUSY"
+            return result
+
+    agent._run = _NpmRefuses()
+    assert agent.remove_package() is True
+    assert not os.path.exists(ours), \
+        "npm refused, so the directory fallback had to run — and did not"
+
+
+def test_remove_package_says_so_when_it_could_NOT_remove_it(tmp_path, mock_logger,
+                                                            monkeypatch):
+    """⊗ Replacing `_npm_uninstall`'s non-zero-exit branch with `return True` left
+    the suite green, because every route out of here logged "Removed the …
+    package" regardless: npm missing, npm refusing, an OSError starting it and an
+    `rmtree` that raised were all reported as a completed removal — and the
+    caller then reinstalled on top of the wedge, saying it had cleared it.
+    """
+    import shutil
+
+    agent = _agent(tmp_path / "home", _spec("com.example.a", "pkg-a", str(tmp_path / "s")),
+                   mock_logger)
+    assert agent.ensure_installed() is True
+    npm = os.path.join(agent.resolved_bin_dir, "npm")
+    agent._exists = lambda path: path != npm and os.path.exists(path)
+    # The fallback's own failure mode: a directory rmtree cannot remove.
+    monkeypatch.setattr(shutil, "rmtree",
+                        lambda *_a, **_k: (_ for _ in ()).throw(OSError("permission denied")))
+
+    assert agent.remove_package() is False
+    said = " ".join(str(c.args[0]) % c.args[1:] if len(c.args) > 1 else str(c.args[0])
+                    for c in mock_logger.error.call_args_list)
+    assert "Could NOT remove" in said
+    assert "Removed the pkg-a package" not in _infos(mock_logger)
+
+
+def _infos(logger) -> str:
+    return " ".join(str(c.args[0]) % c.args[1:] if len(c.args) > 1 else str(c.args[0])
+                    for c in logger.info.call_args_list)
+
+
+# ---------------------------------------------------------------------------
+# run_state — "loaded" is not "running", and the difference is #104's fault 2
+# ---------------------------------------------------------------------------
+
+def test_run_state_distinguishes_the_four_things_launchd_can_say(tmp_path, mock_logger):
+    """⊗ `ensure_installed() is not None` was being printed as "the LaunchAgent
+    is running", and `is_running()` (which means "launchd knows this label")
+    passes for a job that is loaded and DEAD — the state this file already
+    recovers from at `_apply_plist`, and the one launchd will not respawn."""
+    home = tmp_path / "home"
+    spec = _spec("com.example.a", "pkg-a", str(tmp_path / "s"))
+
+    running = _agent(home, spec, mock_logger, runner=FakeRunner(pid=1234))
+    assert running.run_state() == LaunchAgent.RUNNING
+    assert running.is_alive() is True
+    assert running.is_running() is True
+
+    # Loaded, `launchctl print` succeeds, but there is no `pid =` line at all.
+    dead = _agent(home, spec, mock_logger, runner=FakeRunner(pid=None))
+    assert dead.run_state() == LaunchAgent.LOADED_NOT_RUNNING
+    assert dead.is_alive() is False
+    assert dead.is_running() is True, "still 'loaded' — that is what is_running means"
+
+    absent = _agent(home, spec, mock_logger, runner=FakeRunner(returncode=1))
+    assert absent.run_state() == LaunchAgent.NOT_LOADED
+    assert absent.is_alive() is False
+
+
+def test_an_unparseable_pid_line_is_UNKNOWN_and_counts_as_alive(tmp_path, mock_logger):
+    """We cannot prove it either way; reporting failure would call a healthy
+    server stopped, and killing it would be worse."""
+    class _GarbledPid(FakeRunner):
+        def __call__(self, cmd, **kwargs):
+            result = super().__call__(cmd, **kwargs)
+            if len(cmd) >= 2 and cmd[0] == "launchctl" and cmd[1] == "print":
+                result.stdout = "\tstate = running\n\tpid = not-a-number\n"
+            return result
+
+    agent = _agent(tmp_path / "home", _spec("com.example.a", "pkg-a", str(tmp_path / "s")),
+                   mock_logger, runner=_GarbledPid())
+    assert agent.run_state() == LaunchAgent.UNKNOWN
+    assert agent.is_alive() is True
+
+
+def test_start_over_a_loaded_but_dead_job_does_not_report_success(tmp_path, mock_logger):
+    """`start()` is what fabric restore believes, and it used to answer
+    `is_running()` — "launchd knows this label" — after installing."""
+    agent = _agent(tmp_path / "home", _spec("com.example.a", "pkg-a", str(tmp_path / "s")),
+                   mock_logger, runner=FakeRunner(pid=None))
+    assert not os.path.exists(agent.plist_path)   # the ensure_installed branch
+    assert agent.start() is False
+
+
+# ---------------------------------------------------------------------------
 # Reaping is per-agent: an agent must never signal the other agent's process
 # ---------------------------------------------------------------------------
 

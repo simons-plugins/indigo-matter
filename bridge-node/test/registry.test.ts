@@ -44,8 +44,14 @@ const PRODUCT_NAME = "Indigo Matter Bridge";
 /**
  * The bridge identity every child endpoint publishes, as node.ts builds it.
  * Spelled out here rather than imported from node.ts so these tests keep their
- * distance from the ServerNode wiring — and so a field going missing from the
- * real one is a test failure rather than a silently-shared blank.
+ * distance from the ServerNode wiring.
+ *
+ * **This literal pins nothing about node.ts, and used to claim it did.** It is a
+ * hand-written copy, so it and `node.ts`'s `bridgedIdentity` agreed with each
+ * other and with nothing else — publishing Apple's vendor id on every bridged
+ * accessory left this suite green. What these tests actually pin is that the
+ * registry PROPAGATES whatever identity it is given; that the identity is the
+ * root node's own is pinned in `integration.test.ts`, against a real ServerNode.
  */
 const BRIDGE_IDENTITY = {
     vendorName: "simons-plugins",

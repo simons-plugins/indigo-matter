@@ -472,6 +472,17 @@ class ExportBridge:
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, self._stop_agent)
 
+    def note_agent_stopped(self) -> None:
+        """Clear the XAC1 latch: something outside this engine stopped the agent.
+
+        The latch means "this plugin session brought the agent up and is
+        therefore entitled to take it down". A user who stops the bridge from the
+        menu has made that false, and leaving it set would have the next
+        empty-transition bootout a job the *user* may have started again by hand
+        — the exact thing the latch exists to prevent.
+        """
+        self._agent_started = False
+
     def _pending_replace_all(self) -> int:
         """**How many** endpoints an un-export still owes the node (XAC7).
 
@@ -632,8 +643,11 @@ class ExportBridge:
             except Exception as exc:  # pylint: disable=broad-except
                 self._logger.warning(
                     "Matter export: could not tell the bridge node the export list is empty "
-                    "(%s). Accessories will linger in paired ecosystems until the plugin can "
-                    "reach the node again — it will retry on its own.", exc)
+                    "(%s). Accessories will LINGER in paired ecosystems until this is finished. "
+                    "It is recorded and will be finished automatically the next time the plugin "
+                    "connects to the node — which is when you next export a device, or when the "
+                    "plugin next starts up. Nothing happens before then; there is no retry loop.",
+                    exc)
             finally:
                 # The socket must be released whatever happened above —
                 # including a CancelledError at shutdown, which is a
@@ -1206,6 +1220,14 @@ class ExportBridge:
         # been paired for months emits nothing at all and the §5.5 readout would
         # sit on "not known yet" forever.
         self.fabrics = list(getattr(status, "fabrics", ()) or [])
+        # ⊗ The §5.5 window readout's other half. `window_expires_at` is written
+        # by the pairing menu and cleared only by the §5 `window_closed` event,
+        # which the node does NOT send on shutdown — so a plugin reload during a
+        # real window left it None and the readout HID an open window, while a
+        # node restart after one left it set forever. An attach is the one moment
+        # both sides are present and the node can simply be asked. Fire-and-
+        # forget: a readout is not worth blocking a handshake for.
+        self._fire(self._refresh_pairing_window(), "reading the bridge node's pairing window")
         self._logger.info("Matter export: bridge node attached — %d endpoint(s) live, %s",
                           status.endpoint_count,
                           "commissioned" if status.commissioned else "not yet paired")
@@ -1372,6 +1394,33 @@ class ExportBridge:
     def note_window_opened(self, expires_at: str) -> None:
         """Record a window the pairing menu just opened, for the §5.5 readout."""
         self.window_expires_at = expires_at
+
+    async def _refresh_pairing_window(self) -> None:
+        """Re-derive :attr:`window_expires_at` from the node (§3.7).
+
+        The node is the only thing that knows; the plugin's copy is a cache with
+        two failure directions (see the caller in :meth:`_on_attached`). Silent
+        on failure at anything above debug: this is a config-dialog readout, and
+        a warning about one would out-shout the outage that caused it.
+        """
+        client = self.client
+        if client is None:
+            return
+        try:
+            pairing = await client.get_pairing()
+        except Exception as exc:  # pylint: disable=broad-except
+            self._logger.debug("Matter export: could not read the pairing window (%s)", exc)
+            return
+        self.window_expires_at = pairing.window_expires_at if pairing.window_open else None
+
+    def note_fabrics(self, fabrics: list) -> None:
+        """Replace the cached fabric set from a fresh authoritative read.
+
+        The unpair menu's after-the-fact ``get_pairing`` uses this: a removal
+        that the §5 event has not landed for yet must not leave the picker
+        offering a fabric that has just gone.
+        """
+        self.fabrics = list(fabrics)
 
     def _on_unreachable(self, attempts: int) -> None:
         """The node is not answering — and since E7 the agent is asked why.
@@ -1557,16 +1606,43 @@ class ExportBridge:
             self._logger.warning("Matter export: %s failed — %s", what, exc)
 
 
-#: Matter vendor IDs whose ecosystems a user is likely to recognise. Purely
-#: cosmetic: a fabric's own ``label`` is whatever the commissioner wrote there,
-#: which for Apple is a UUID-ish string that tells nobody anything. Unknown ids
-#: are rendered as hex, never guessed at.
+#: Matter vendor IDs whose ecosystems a user is likely to recognise.
+#:
+#: **Not cosmetic, whatever the previous version of this comment said.** These
+#: names are what the "Unpair an Ecosystem…" picker shows, and that picker
+#: destroys every exported accessory in the ecosystem the user selects. A wrong
+#: name there does not read as a wrong name; it reads as the right ecosystem,
+#: and the user removes Apple Home believing they are removing Google.
+#:
+#: Every entry is verified against the CSA's Distributed Compliance Ledger
+#: (``https://on.dcl.csa-iot.org/dcl/vendorinfo/vendors/<decimal id>``), which is
+#: the registry that issues them, and the three matter.js also names agree with
+#: it (``@matter/node``'s ``IcdMultiAdminError.TRUSTED_ECOSYSTEM_VENDORS``:
+#: 0x1384, 0x110A, 0x134B). Two entries were WRONG before that check:
+#:
+#:   * ``0x100B`` was labelled "Google". The DCL says Signify (Philips Hue).
+#:   * ``0x1075`` was labelled "SmartThings" and is not an issued vendor id at
+#:     all; Samsung SmartThings is ``0x110A``.
+#:
+#: Apple appears TWICE by design, and the second one is not a duplicate: an
+#: Apple Home pairing creates an ``Apple Home`` fabric AND an ``Apple Keychain``
+#: fabric, which is the second Apple fabric ADR-0005 predicted from the observed
+#: three-fabric count. A user seeing "vendor 0x1384" beside "Apple Home" cannot
+#: tell it is theirs, and unpairing the wrong one of the pair is the same
+#: accident as unpairing the wrong ecosystem.
+#:
+#: Unknown ids are rendered as hex, never guessed at — which is why an entry
+#: that cannot be verified is removed rather than left in: hex is a question,
+#: a wrong name is a false answer.
 VENDOR_NAMES = {
-    0x1349: "Apple",
-    0x100B: "Google",
-    0x1217: "Amazon",
-    0x1075: "SmartThings",
-    0xFFF1: "test vendor",
+    0x1349: "Apple Home",
+    0x1384: "Apple Keychain",       # Apple's SECOND fabric, alongside Apple Home
+    0x1217: "Amazon Alexa",
+    0x6006: "Google",
+    0x110A: "Samsung SmartThings",
+    0x134B: "Home Assistant",
+    0x100B: "Signify (Philips Hue)",
+    0xFFF1: "test vendor",          # the spec's reserved test id; not in the DCL
 }
 
 

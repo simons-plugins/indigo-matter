@@ -217,7 +217,21 @@ commissioner completes.
 {"command": "remove_fabric", "args": {"fabricIndex": 2}}
 ```
 
-Result: `{}`. Emits `fabrics_changed` (§5).
+Result: `{"removed": true, "remaining": 1}`. Emits `fabrics_changed` (§5).
+
+**`removed` is the point of the result.** An index with no fabric behind it
+answers `{"removed": false, "remaining": N}` rather than failing — the caller's
+index comes from a `get_pairing` readout that is by definition a moment old, and
+the way it goes stale is the ecosystem unpairing *itself*, so "it is already
+gone" is the request being granted. It is not the same thing as removing a live
+fabric, though, and a caller that reports this to a user in the past tense must
+be able to tell them apart. `remaining` is the fabric count after the call, or
+`null` when server state could not be read (legitimate mid-reset).
+
+`fabrics_changed` is emitted **either way** — with `change: "unchanged"` on the
+already-gone path. Nothing changed on the node, but a caller that asked to
+remove a fabric that is not there is demonstrably holding a stale list, and this
+is the only moment the node knows that.
 
 **Removing the last fabric is a factory reset the node did not ask for.**
 matter.js watches its own `commissioned` state and, when the fabric set

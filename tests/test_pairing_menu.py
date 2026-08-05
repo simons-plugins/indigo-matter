@@ -24,7 +24,9 @@ same ``errors`` key and the assertion could not tell the two apart.
 from __future__ import annotations
 
 import importlib
+import os
 import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -113,6 +115,100 @@ def _pairing(commissioned=True, window_open=True, manual="1234-567-8901",
 
 def _fabric(index, vendor=0x1349, label=""):
     return bridge_protocol.FabricInfo(fabric_index=index, label=label, vendor_id=vendor)
+
+
+def _iso(*, minutes: int) -> str:
+    """An RFC 3339 stamp `minutes` from now — never a literal date.
+
+    The readout compares against the clock, so a hard-coded timestamp is a test
+    that starts failing on a date nobody wrote down.
+    """
+    when = datetime.now(timezone.utc) + timedelta(minutes=minutes)
+    return when.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _removal(removed=True, remaining=1):
+    return bridge_protocol.FabricRemoval(removed=removed, remaining=remaining)
+
+
+def _unpair_bridge(plug, *, fabrics, removal):
+    """A bridge wired for the unpair path: removal result, then the cache re-read.
+
+    The menu makes two round trips — ``remove_fabric`` and the ``get_pairing``
+    that refreshes the picker's cache — so the fake runtime has to answer both,
+    in order.
+    """
+    client = _bridge_with(plug, fabrics=fabrics)
+    plug.runtime = _FakeRuntime([removal, _pairing(fabrics=fabrics[:-1])])
+    return plug.export_bridge, client
+
+
+def _first_run_agent(tmp_path, logger):
+    """A REAL :class:`BridgeProcess` on a machine that has never installed the package.
+
+    Faithful where a ``Mock`` is not, which is the whole point: the first-run
+    dead end lives in the interaction between ``ensure_installed`` (writes the
+    plist, but only once preflight passes) and ``restart`` (which needs a plist
+    to exist on disk). A ``Mock(restart=…True)`` has a plist by virtue of being a
+    Mock, so the old test asserted the bug away.
+
+    Only ``install`` is replaced, and it does what npm would: plant the package
+    entry. launchctl is a FakeRunner; the filesystem is really written to.
+    """
+    import bridge_agent as bridge_agent_mod
+    from test_server_process import FakeRunner
+
+    home = tmp_path / "home"
+    bindir = home / "bin"
+    bindir.mkdir(parents=True, exist_ok=True)
+    (bindir / "npx").write_text("#!/bin/sh\n")
+    (bindir / "node").write_text("#!/bin/sh\n")
+
+    class _FirstRunBridge(bridge_agent_mod.BridgeProcess):
+        def install(self, install_spec=bridge_agent_mod.DEFAULT_INSTALL_SPEC):  # noqa: ARG002
+            entry = Path(self.project_dir) / "node_modules" / self.spec.package / "dist" / "main.js"
+            entry.parent.mkdir(parents=True, exist_ok=True)
+            entry.write_text("// installed by the fake npm\n")
+            return True
+
+    return _FirstRunBridge({}, logger, home=str(home), npx_path=str(bindir / "npx"),
+                           runner=FakeRunner(), sleep=lambda *_a: None)
+
+
+def _running_agent(state="running"):
+    """An agent double whose `run_state()` answers `state`, with the real names."""
+    from launch_agent import LaunchAgent
+
+    return Mock(ensure_installed=Mock(return_value=False), ws_port="5581",
+                matter_port="5540", run_state=Mock(return_value=state),
+                RUNNING=LaunchAgent.RUNNING, UNKNOWN=LaunchAgent.UNKNOWN,
+                NOT_LOADED=LaunchAgent.NOT_LOADED,
+                LOADED_NOT_RUNNING=LaunchAgent.LOADED_NOT_RUNNING,
+                preflight=Mock(return_value=None),
+                tail_error_log=Mock(return_value=None),
+                log_dir="/tmp/logs", project_dir="/tmp/proj")
+
+
+def _healthy_agent(**overrides):
+    """A bridge agent double whose preflight PASSES (so the log tail is reached).
+
+    `Mock()` alone will not do since the diagnosis learned to ask preflight
+    first: a bare Mock returns a truthy Mock, which reads as "it cannot start".
+    """
+    agent = Mock(project_dir="/Users/x/indigo-matter",
+                 log_dir="/Users/x/Library/Logs/indigo-matter",
+                 matter_port="5540", ws_port="5581", **overrides)
+    agent.preflight.return_value = None
+    return agent
+
+
+def indigo_dict(plugin_mod):
+    return plugin_mod.indigo.Dict()
+
+
+def plugin_module_no_selection_id() -> str:
+    import plugin as plugin_module
+    return plugin_module.NO_SELECTION_ID
 
 
 def _logged(logger) -> str:
@@ -335,8 +431,27 @@ class TestFabricPicker:
     def test_it_lists_each_fabric_by_vendor_and_index(self, plug):
         _bridge_with(plug, fabrics=[_fabric(1), _fabric(2, vendor=0x1217)])
         rows = dict(plug.getBridgeFabrics())
-        assert rows["1"] == "Apple (index 1)"
-        assert rows["2"] == "Amazon (index 2)"
+        assert rows["1"] == "Apple Home (index 1)"
+        assert rows["2"] == "Amazon Alexa (index 2)"
+
+    def test_the_first_row_is_a_no_selection_row(self, plug):
+        """⊗ Indigo pre-selects row one. Without this the destructive dialog
+        opened with a real ecosystem already chosen and its Execute button one
+        click away — and this was the ONE picker in the plugin without it."""
+        _bridge_with(plug, fabrics=[_fabric(1), _fabric(2, vendor=0x1217)])
+        rows = plug.getBridgeFabrics()
+        assert rows[0][0] == plugin_module_no_selection_id()
+        assert "select an ecosystem" in rows[0][1]
+
+    def test_the_unpair_dialog_is_seeded_with_the_no_selection_row(self, plug):
+        """A picker row is only half of it: an unseeded field still lands on the
+        first row, and a seeded value with no matching row renders blank."""
+        values = plug.get_menu_action_config_ui_values("unpairEcosystem")
+        assert values["fabric"] == plugin_module_no_selection_id()
+
+    def test_seeding_the_unpair_dialog_does_not_seed_other_menus(self, plug):
+        """This callback fires for EVERY menu with a ConfigUI."""
+        assert dict(plug.get_menu_action_config_ui_values("resetBridgePairings")) == {}
 
     def test_never_connected_and_not_paired_are_DIFFERENT_answers(self, plug):
         """Both are unpickable, but only one of them means "you are not paired"."""
@@ -393,24 +508,83 @@ class TestUnpairMenu:
         client.remove_fabric.assert_not_called()
 
     def test_both_ticks_call_remove_fabric_with_the_picked_index(self, plug):
-        client = _bridge_with(plug, fabrics=[_fabric(1), _fabric(2, vendor=0x100B)])
+        bridge, client = _unpair_bridge(plug, fabrics=[_fabric(1), _fabric(2, vendor=0x6006)],
+                                        removal=_removal(True, 1))
         ok, _values = plug.menuUnpairEcosystem(
             {"fabric": "2", "confirm": True, "confirmAgain": True})
         assert ok is True
         client.remove_fabric.assert_called_once_with(2)
         assert "has been unpaired" in _logged(plug.logger)
+        # The picker's cache must not keep offering what was just removed.
+        bridge.note_fabrics.assert_called_once()
 
     def test_removing_the_LAST_fabric_says_the_bridge_has_reset_itself(self, plug):
         """⊗ E5's hardened case. matter.js factory-resets when the fabric set
         empties, so the user has just reset the whole bridge without using the
         reset menu — reporting a routine removal would be a lie."""
-        client = _bridge_with(plug, fabrics=[_fabric(1)])
+        _bridge, client = _unpair_bridge(plug, fabrics=[_fabric(1)], removal=_removal(True, 0))
         ok, _values = plug.menuUnpairEcosystem(
             {"fabric": "1", "confirm": True, "confirmAgain": True})
         assert ok is True
         client.remove_fabric.assert_called_once_with(1)
         said = _logged(plug.logger)
         assert "LAST one paired" in said and "reset itself" in said
+
+    def test_the_NODES_count_beats_the_stale_cache_for_last_fabric(self, plug):
+        """⊗ The cache said one fabric was left; the node says none are.
+
+        `_is_last_fabric` reads a list that can be a session old, and it selects
+        between "routine removal" and "your bridge has just factory-reset
+        itself". The node's own post-removal count is the answer when it has one.
+        """
+        _bridge, _client = _unpair_bridge(plug, fabrics=[_fabric(1), _fabric(2)],
+                                          removal=_removal(True, 0))
+        ok, _values = plug.menuUnpairEcosystem(
+            {"fabric": "2", "confirm": True, "confirmAgain": True})
+        assert ok is True
+        assert "LAST one paired" in _logged(plug.logger)
+
+    def test_an_already_gone_fabric_is_NOT_reported_as_an_unpairing(self, plug):
+        """⊗ The node-side no-op the menu reported as a completed removal.
+
+        `remove_fabric` early-returns when the index holds nothing, and used to
+        answer `{}` — the same frame a real removal produced — so the menu logged
+        "has been unpaired. Every accessory Indigo exports has been removed from
+        it" over an operation that did nothing at all. The picker is built from a
+        CACHED fabric list, so this is the designed way to get here, not a typo.
+        """
+        _bridge, client = _unpair_bridge(plug, fabrics=[_fabric(1), _fabric(2)],
+                                         removal=_removal(False, 2))
+        ok, _values = plug.menuUnpairEcosystem(
+            {"fabric": "2", "confirm": True, "confirmAgain": True})
+        assert ok is True
+        client.remove_fabric.assert_called_once_with(2)
+        said = _logged(plug.logger)
+        assert "ALREADY gone" in said
+        assert "has been unpaired" not in said
+        assert "LAST one paired" not in said
+
+    def test_a_node_that_cannot_count_falls_back_to_the_cache(self, plug):
+        """`remaining` is null when the node could not read its own fabric set —
+        legitimate mid-reset. A fabricated 0 there would claim a factory reset."""
+        _bridge, _client = _unpair_bridge(plug, fabrics=[_fabric(1), _fabric(2)],
+                                          removal=_removal(True, None))
+        ok, _values = plug.menuUnpairEcosystem(
+            {"fabric": "2", "confirm": True, "confirmAgain": True})
+        assert ok is True
+        said = _logged(plug.logger)
+        assert "has been unpaired" in said and "LAST one paired" not in said
+
+    def test_a_failed_cache_refresh_does_not_fail_the_unpairing(self, plug):
+        """The removal already happened; failing to re-read the list afterwards
+        is not a reason to tell the user it did not."""
+        bridge, _client = _unpair_bridge(plug, fabrics=[_fabric(1), _fabric(2)],
+                                         removal=_removal(True, 1))
+        bridge.note_fabrics.side_effect = RuntimeError("gone")
+        ok, _values = plug.menuUnpairEcosystem(
+            {"fabric": "2", "confirm": True, "confirmAgain": True})
+        assert ok is True
+        assert "has been unpaired" in _logged(plug.logger)
 
     def test_a_failed_removal_says_pairings_are_unchanged(self, plug):
         _bridge_with(plug, fabrics=[_fabric(1), _fabric(2)])
@@ -425,6 +599,47 @@ class TestUnpairMenu:
         ok, _values, errors = plug.menuUnpairEcosystem(
             {"fabric": "1", "confirm": True, "confirmAgain": True})
         assert ok is False and "confirmAgain" in errors
+
+    def test_a_DISCONNECTED_client_is_never_handed_remove_fabric(self, plug):
+        """⊗ The fixture has carried `connected=False` since E6 and no test used
+        it. `_pairing_client` checks it; nothing proved so, and this is the
+        destructive one."""
+        client = _bridge_with(plug, connected=False, fabrics=[_fabric(1)])
+        ok, _values, errors = plug.menuUnpairEcosystem(
+            {"fabric": "1", "confirm": True, "confirmAgain": True})
+        assert ok is False and "confirmAgain" in errors
+        client.remove_fabric.assert_not_called()
+
+
+class TestPairingClientGate:
+    """⊗ `_pairing_client` refuses a client that exists but is not connected.
+
+    Every pairing action goes through it, and a disconnected client accepts the
+    call and then blocks the Indigo UI thread until the deadline. The fixture has
+    carried `connected=False` since E6 without a single test using it.
+    """
+
+    def test_the_pair_menu_refuses_a_disconnected_client(self, plug):
+        client = _bridge_with(plug, connected=False)
+        ok, _values, errors = plug.menuPairMatterBridge({"duration": "900"})
+        assert ok is False and "duration" in errors
+        client.get_pairing.assert_not_called()
+        client.open_commissioning_window.assert_not_called()
+
+    def test_it_names_the_real_precondition_when_nothing_is_exported(self, plug,
+                                                                     plugin_mod):
+        """XAC2's ordering: the client exists only while something is exported,
+        so "pair the bridge" is genuinely unreachable until then."""
+        _bridge_with(plug, connected=False)
+        plug.exports = ExportStore(lambda: {}, plug.logger)
+        plug._pairing_client(indigo_dict(plugin_mod), "duration")
+        assert "Export at least one device" in _logged(plug.logger)
+
+    def test_it_says_the_node_is_not_answering_when_something_IS_exported(self, plug,
+                                                                          plugin_mod):
+        _bridge_with(plug, connected=False)
+        plug._pairing_client(indigo_dict(plugin_mod), "duration")
+        assert "not answering" in _logged(plug.logger)
 
 
 # ---------------------------------------------------------------------------
@@ -460,7 +675,7 @@ class TestPairingPage:
                                               fabrics=[_fabric(1)])])
         body = plug.http_pairing(self._action())["content"]
         assert "No pairing window is open" in body
-        assert "Apple (index 1)" in body, "still say who is paired"
+        assert "Apple Home (index 1)" in body, "still say who is paired"
 
     def test_it_renders_a_page_even_with_no_bridge_at_all(self, plug):
         """A blank page over a bridge that is merely not running is
@@ -468,6 +683,37 @@ class TestPairingPage:
         plug.export_bridge = None
         body = plug.http_pairing(self._action())["content"]
         assert "not connected to the Matter bridge node" in body
+
+    def test_a_DISCONNECTED_client_is_never_asked_for_a_page(self, plug):
+        """⊗ The fixture has carried `connected=False` since E6 and no test used
+        it. A disconnected client handed `get_pairing` blocks the IWS handler on
+        a socket that is not there until the 15s deadline expires."""
+        client = _bridge_with(plug, connected=False)
+        body = plug.http_pairing(self._action())["content"]
+        client.get_pairing.assert_not_called()
+        assert "not connected to the Matter bridge node" in body
+
+    def test_the_page_says_the_code_is_a_LIVE_credential(self, plug):
+        """The page is served by IWS, which authenticates only if the user has
+        switched authentication on — so while a window is open, anyone on the LAN
+        who can reach this URL can commission the bridge onto their own fabric."""
+        _bridge_with(plug)
+        plug.runtime = _FakeRuntime([_pairing()])
+        body = plug.http_pairing(self._action())["content"]
+        assert "live commissioning passcode" in body
+        assert "authentication" in body
+
+    def test_the_log_line_carries_the_same_warning(self, plug):
+        _bridge_with(plug)
+        plug.runtime = _FakeRuntime([_pairing(window_open=False, manual=None, qr=None),
+                                     bridge_protocol.CommissioningWindow(
+                                         manual_pairing_code="1234-567-8901",
+                                         qr_pairing_code="MT:X",
+                                         window_expires_at=_iso(minutes=+15))])
+        ok, _values = plug.menuPairMatterBridge({"duration": "900"})
+        assert ok is True
+        said = _logged(plug.logger)
+        assert "SECURITY" in said and "THEIR Apple Home" in said
 
     def test_a_failed_get_pairing_becomes_a_page_not_a_500(self, plug):
         _bridge_with(plug)
@@ -531,51 +777,146 @@ class TestBridgeAgentWiring:
         assert "export at least one device" in plug._bridge_agent_diagnosis().lower()
 
     def test_the_diagnosis_reads_the_agents_own_error_log(self, plug):
-        plug.bridge_process = Mock()
+        plug.bridge_process = _healthy_agent()
         plug.bridge_process.tail_error_log.return_value = "listen EADDRINUSE :::5540"
         assert "EADDRINUSE" in plug._bridge_agent_diagnosis()
+
+    def test_the_diagnosis_asks_PREFLIGHT_before_guessing_at_the_log(self, plug):
+        """⊗ It said "the package may not be installed (checked {project_dir})"
+        having checked only the error log — and preflight() holds that exact
+        fact. An uninstalled package is also the case where the log is empty for
+        the right reason: launchd never got far enough to write one."""
+        plug.bridge_process = _healthy_agent()
+        plug.bridge_process.preflight.return_value = (
+            "the indigo-matter-bridge package is not installed (…/dist/main.js is missing)")
+        plug.bridge_process.tail_error_log.return_value = "some ancient unrelated crash"
+        said = plug._bridge_agent_diagnosis()
+        assert "not installed" in said
+        assert "ancient" not in said, "the real cause must not be buried under a stale log tail"
 
     def test_the_diagnosis_never_restarts_anything(self, plug):
         """launchd owns respawn; a diagnostic that bounced the agent on every
         failure streak would turn a crash-loop into an unreadable one."""
-        plug.bridge_process = Mock()
+        plug.bridge_process = _healthy_agent()
         plug.bridge_process.tail_error_log.return_value = "boom"
         plug._bridge_agent_diagnosis()
         plug.bridge_process.restart.assert_not_called()
         plug.bridge_process.ensure_installed.assert_not_called()
         plug.bridge_process.stop.assert_not_called()
 
-    def test_an_empty_error_log_points_at_the_bridge_install_menu(self, plug):
-        plug.bridge_process = Mock()
-        plug.bridge_process.tail_error_log.return_value = None
-        plug.bridge_process.project_dir = "/Users/x/indigo-matter"
+    def test_the_log_tail_is_not_called_RECENT(self, plug):
+        """The file is appended to and never truncated, so the last 20 lines can
+        be a crash-loop from days ago that has since been fixed."""
+        plug.bridge_process = _healthy_agent()
+        plug.bridge_process.tail_error_log.return_value = "boom"
         said = plug._bridge_agent_diagnosis()
-        assert "indigo-matter-bridge" in said and "export bridge" in said
+        assert "Recent" not in said
+        assert "may be old" in said
+        assert "bridge-node.err.log" in said, "name the file so timestamps can be checked"
 
-    def test_stop_is_a_stop_not_an_uninstall(self, plug):
-        """The plist is cheap to keep and re-exporting should not re-derive it;
-        the storage dir is never touched by either."""
-        plug.bridge_process = Mock()
-        plug.bridge_process.stop.return_value = True
+    def test_an_empty_error_log_with_the_package_present_says_so(self, plug):
+        """Preflight passed, so "may not be installed" is no longer a guess that
+        is even available — it is installed. Point at the other cause."""
+        plug.bridge_process = _healthy_agent()
+        plug.bridge_process.tail_error_log.return_value = None
+        said = plug._bridge_agent_diagnosis()
+        assert "is installed" in said and "port" in said
+
+    def test_stop_removes_the_plist_so_a_REBOOT_cannot_restart_it(self, plug, tmp_path):
+        """⊗ XG5/XAC1 across a reboot.
+
+        `stop()` kept the plist, and the plist carries `RunAtLoad: True` — so at
+        the next login launchd started an unpaired bridge node with an EMPTY
+        allow-list, advertising on the Matter port, that this plugin never
+        started and (XAC1's latch) would never stop. The guarantee is "a fresh or
+        emptied install runs no bridge process", and it has to survive a restart.
+        """
+        plist = tmp_path / "com.simons-plugins.indigo-matter.bridge.plist"
+        plist.write_text("<plist/>")
+        agent = Mock(plist_path=str(plist))
+        agent.is_running.side_effect = [True, False]
+        agent.uninstall.side_effect = lambda: plist.unlink()
+        plug.bridge_process = agent
         plug._stop_bridge_agent()
-        plug.bridge_process.stop.assert_called_once()
-        plug.bridge_process.uninstall.assert_not_called()
+        agent.uninstall.assert_called_once()
+        assert not plist.exists(), "the plist must be gone, not merely booted out"
+        assert "cannot bring it back" in _logged(plug.logger)
 
-    def test_start_rebuilds_the_agent_from_CURRENT_prefs(self, plug, plugin_mod,
-                                                         monkeypatch):
+    def test_a_stop_that_did_not_work_is_LOUD(self, plug, tmp_path):
+        """⊗ The silent branch. `stop()` returning False said nothing at all and
+        `_agent_started` had already been cleared, so nothing retried: the node
+        kept serving every paired ecosystem with the log asserting the opposite
+        by omission."""
+        plist = tmp_path / "bridge.plist"
+        plist.write_text("<plist/>")
+        agent = Mock(plist_path=str(plist))
+        agent.is_running.return_value = True          # still loaded afterwards
+        plug.bridge_process = agent
+        plug._stop_bridge_agent()
+        said = _logged(plug.logger)
+        assert "could not be stopped" in said
+        assert "NOTHING retries" in said
+        assert "launchctl bootout" in said
+
+    def test_stopping_when_nothing_was_loaded_is_not_reported_as_a_failure(self, plug,
+                                                                          tmp_path):
+        """The other False `stop()` conflated: "there was no such job"."""
+        agent = Mock(plist_path=str(tmp_path / "absent.plist"))
+        agent.is_running.return_value = False
+        plug.bridge_process = agent
+        plug._stop_bridge_agent()
+        assert "could not be" not in _logged(plug.logger)
+
+    def test_the_stop_menu_exists_and_clears_the_XAC1_latch(self, plug, plugin_mod,
+                                                            monkeypatch, tmp_path):
+        """A user who disables the plugin otherwise leaves the node running with
+        no UI at all — the allow-list lever needs the plugin to be running."""
+        agent = Mock(plist_path=str(tmp_path / "absent.plist"))
+        agent.is_running.return_value = False
+        monkeypatch.setattr(plugin_mod.bridge_agent, "BridgeProcess",
+                            lambda *_a, **_k: agent)
+        bridge = Mock()
+        plug.export_bridge = bridge
+        ok, _values = plug.menuStopBridgeNode({"confirm": True})
+        assert ok is True
+        agent.uninstall.assert_called_once()
+        bridge.note_agent_stopped.assert_called_once()
+
+    def test_the_stop_menu_needs_the_tick(self, plug, plugin_mod, monkeypatch):
+        built = []
+        monkeypatch.setattr(plugin_mod.bridge_agent, "BridgeProcess",
+                            lambda *_a, **_k: built.append(1))
+        ok, _values, errors = plug.menuStopBridgeNode({"confirm": False})
+        assert ok is False and "confirm" in errors
+        assert built == []
+
+    def test_start_rebuilds_the_agent_from_CURRENT_prefs_EVERY_TIME(self, plug, plugin_mod,
+                                                                    monkeypatch):
         """A snapshotted agent writes yesterday's ports while reporting success —
-        the fault menuRestartMatterServer learned the hard way."""
+        the fault menuRestartMatterServer learned the hard way.
+
+        Called TWICE with changed prefs in between: called once from a
+        `bridge_process is None` fixture, this test could not tell "rebuilds on
+        every call" from "builds once and caches", which is the thing it exists
+        to pin.
+        """
         built = []
 
         def _factory(prefs, _logger):
             built.append(dict(prefs))
-            return Mock(ensure_installed=Mock(return_value=True), ws_port="5581",
-                        matter_port="5540")
+            return _running_agent()
 
         monkeypatch.setattr(plugin_mod.bridge_agent, "BridgeProcess", _factory)
         plug.pluginPrefs["bridgeMatterPort"] = "5541"
         plug._start_bridge_agent()
         assert built[-1]["bridgeMatterPort"] == "5541"
+        # The agent now exists and is cached on the plugin — a build-once
+        # implementation passes everything above and fails from here.
+        assert plug.bridge_process is not None
+        plug.pluginPrefs["bridgeMatterPort"] = "5542"
+        plug._start_bridge_agent()
+        assert len(built) == 2, "a cached agent would serve yesterday's ports"
+        assert built[-1]["bridgeMatterPort"] == "5542"
 
     def test_start_says_nothing_reassuring_when_preflight_failed(self, plug, plugin_mod,
                                                                  monkeypatch):
@@ -585,6 +926,50 @@ class TestBridgeAgentWiring:
                             lambda *_a, **_k: Mock(ensure_installed=Mock(return_value=None)))
         plug._start_bridge_agent()
         assert "LaunchAgent is running" not in _logged(plug.logger)
+
+    def test_start_does_not_claim_RUNNING_when_launchd_never_loaded_it(self, plug,
+                                                                       plugin_mod,
+                                                                       monkeypatch):
+        """⊗ The wrong signal.
+
+        `ensure_installed()` returns False for "already loaded and healthy" AND
+        for "bootout worked, bootstrap and load both failed" — and this printed
+        "bridge node LaunchAgent is running" for both, over a job launchd has
+        never heard of.
+        """
+        agent = _running_agent(state="not_loaded")
+        monkeypatch.setattr(plugin_mod.bridge_agent, "BridgeProcess", lambda *_a, **_k: agent)
+        plug._start_bridge_agent()
+        said = _logged(plug.logger)
+        assert "LaunchAgent is running" not in said
+        assert "could not be loaded" in said
+
+    def test_start_does_not_claim_RUNNING_over_a_loaded_but_DEAD_job(self, plug, plugin_mod,
+                                                                     monkeypatch):
+        """The #104 fault-2 state: loaded, no pid, and launchd will not respawn it."""
+        agent = _running_agent(state="loaded_not_running")
+        monkeypatch.setattr(plugin_mod.bridge_agent, "BridgeProcess", lambda *_a, **_k: agent)
+        plug._start_bridge_agent()
+        said = _logged(plug.logger)
+        assert "LaunchAgent is running" not in said
+        assert "did not start" in said
+
+    def test_start_reports_an_UNPARSEABLE_pid_as_neither_success_nor_failure(
+            self, plug, plugin_mod, monkeypatch):
+        """A pid line we could not read is not evidence of death; claiming the
+        job failed would report a healthy bridge as stopped."""
+        agent = _running_agent(state="unknown")
+        monkeypatch.setattr(plugin_mod.bridge_agent, "BridgeProcess", lambda *_a, **_k: agent)
+        plug._start_bridge_agent()
+        said = _logged(plug.logger)
+        assert "is loaded" in said and "readable pid" in said
+        assert not plug.logger.error.call_args_list
+
+    def test_start_announces_a_genuinely_running_agent(self, plug, plugin_mod, monkeypatch):
+        agent = _running_agent()
+        monkeypatch.setattr(plugin_mod.bridge_agent, "BridgeProcess", lambda *_a, **_k: agent)
+        plug._start_bridge_agent()
+        assert "LaunchAgent is running" in _logged(plug.logger)
 
     def test_the_install_action_refuses_a_concurrent_npm_run(self, plug):
         """One npm root; two concurrent installs into it corrupt each other."""
@@ -608,12 +993,85 @@ class TestBridgeAgentWiring:
     def test_installing_with_an_export_restarts_onto_the_new_version(self, plug,
                                                                      plugin_mod,
                                                                      monkeypatch):
-        """A running LaunchAgent does not pick up new files on disk."""
-        agent = Mock(install=Mock(return_value=True), restart=Mock(return_value=True))
+        """A running LaunchAgent does not pick up new files on disk.
+
+        ``ensure_installed`` returning False is "the current definition was
+        already loaded and left alone" — i.e. still running the OLD code — which
+        is exactly when a restart is needed.
+        """
+        agent = Mock(install=Mock(return_value=True), restart=Mock(return_value=True),
+                     ensure_installed=Mock(return_value=False))
         monkeypatch.setattr(plugin_mod.bridge_agent, "BridgeProcess", lambda *_a, **_k: agent)
         plug._install_bridge_node()
         agent.restart.assert_called_once()
         assert "restarted onto the new version" in _logged(plug.logger)
+
+    def test_installing_writes_the_plist_BEFORE_restarting(self, plug, plugin_mod,
+                                                           monkeypatch, tmp_path):
+        """⊗ The first-run dead end, against an agent that behaves like the real one.
+
+        The bridge's plist is written by exactly ONE place — `_start_bridge_agent`
+        — and on a machine where the package has never been installed that place
+        cannot get past its own preflight, so it writes nothing and tears any
+        stale plist down. The user's route out is this menu; it went install() →
+        restart(), restart found no plist, and logged "nothing to restart. Fix
+        the problem reported above" (the install had just SUCCEEDED) followed by
+        "the restart FAILED — the old version may still be running" (nothing was
+        running). The old test could not catch it: it asserted against a
+        `Mock(restart=…True)`, which has a plist by virtue of being a Mock.
+        """
+        agent = _first_run_agent(tmp_path, plug.logger)
+        monkeypatch.setattr(plugin_mod.bridge_agent, "BridgeProcess", lambda *_a, **_k: agent)
+        assert not os.path.exists(agent.plist_path), "the premise: a machine with no plist"
+        plug._install_bridge_node()
+        said = _logged(plug.logger)
+        assert os.path.exists(agent.plist_path), \
+            "nothing ever wrote the plist, so nothing can ever run"
+        assert "nothing to restart" not in said
+        assert "FAILED" not in said
+
+    def test_installing_does_not_bounce_a_job_ensure_installed_just_bootstrapped(
+            self, plug, plugin_mod, monkeypatch):
+        """`ensure_installed` returning True means launchd has already loaded the
+        NEW files. Restarting again is a second outage for nothing."""
+        agent = Mock(install=Mock(return_value=True), restart=Mock(return_value=True),
+                     ensure_installed=Mock(return_value=True))
+        monkeypatch.setattr(plugin_mod.bridge_agent, "BridgeProcess", lambda *_a, **_k: agent)
+        plug._install_bridge_node()
+        agent.restart.assert_not_called()
+
+    def test_installing_says_so_when_the_plist_could_not_be_written(self, plug, plugin_mod,
+                                                                    monkeypatch):
+        agent = Mock(install=Mock(return_value=True), restart=Mock(return_value=True),
+                     ensure_installed=Mock(return_value=None))
+        monkeypatch.setattr(plugin_mod.bridge_agent, "BridgeProcess", lambda *_a, **_k: agent)
+        plug._install_bridge_node()
+        agent.restart.assert_not_called()
+        assert "LaunchAgent could not be written" in _logged(plug.logger)
+
+    def test_the_clean_reinstall_menu_removes_the_package_first(self, plug, plugin_mod,
+                                                               monkeypatch):
+        """The bridge shipped without the exit the controller has had since
+        2026.7, so a wedged install had a menu that reinstalled OVER the wedge."""
+        order = []
+        agent = Mock(
+            remove_package=Mock(side_effect=lambda: (order.append("remove"), True)[1]),
+            install=Mock(side_effect=lambda: (order.append("install"), True)[1]),
+            ensure_installed=Mock(return_value=True))
+        monkeypatch.setattr(plugin_mod.bridge_agent, "BridgeProcess", lambda *_a, **_k: agent)
+        plug._install_bridge_node(clean=True)
+        assert order == ["remove", "install"]
+
+    def test_a_clean_reinstall_that_cannot_remove_does_NOT_install_over_it(
+            self, plug, plugin_mod, monkeypatch):
+        """⊗ `remove_package` used to log "Removed the … package" whatever
+        happened, so a failed removal became a plain reinstall on top of the
+        wedge the user came here to clear — reported as a clean one."""
+        agent = Mock(remove_package=Mock(return_value=False), install=Mock(return_value=True))
+        monkeypatch.setattr(plugin_mod.bridge_agent, "BridgeProcess", lambda *_a, **_k: agent)
+        plug._install_bridge_node(clean=True)
+        agent.install.assert_not_called()
+        assert "ABANDONED" in _logged(plug.logger)
 
     def test_a_failed_install_changes_nothing(self, plug, plugin_mod, monkeypatch):
         agent = Mock(install=Mock(return_value=False))
@@ -644,11 +1102,46 @@ class TestConfigReadout:
         interesting number — WHICH ecosystems hold one is."""
         _bridge_with(plug, fabrics=[_fabric(1), _fabric(2, vendor=0x1217)])
         readout = plug._export_readout()
-        assert "Apple (index 1)" in readout and "Amazon (index 2)" in readout
+        assert "Apple Home (index 1)" in readout and "Amazon Alexa (index 2)" in readout
+        # The list is a cache the §5 events maintain, never a WS round trip on a
+        # dialog open — so it must not be presented as this instant's truth.
+        assert "last reported" in readout
 
     def test_it_reports_an_open_window(self, plug):
-        _bridge_with(plug, fabrics=[_fabric(1)], window="2026-08-05T12:00:00Z")
-        assert "window is open until 2026-08-05T12:00:00Z" in plug._export_readout()
+        soon = _iso(minutes=+10)
+        _bridge_with(plug, fabrics=[_fabric(1)], window=soon)
+        assert f"window is open until {soon}" in plug._export_readout()
+
+    def test_a_window_whose_time_has_PASSED_is_not_reported_as_open(self, plug):
+        """⊗ `window_expires_at` is cleared only by the §5 `window_closed` event,
+        which the node does NOT send on shutdown — so a node (or plugin) restart
+        left the timestamp standing and the readout claimed an open window
+        indefinitely, including for a time hours in the past."""
+        gone = _iso(minutes=-30)
+        _bridge_with(plug, fabrics=[_fabric(1)], window=gone)
+        readout = plug._export_readout()
+        assert "is open until" not in readout
+        assert f"expired at {gone}" in readout
+
+    def test_an_unparseable_expiry_is_reported_rather_than_dropped(self, plug):
+        _bridge_with(plug, fabrics=[_fabric(1)], window="whenever")
+        assert "expiring whenever" in plug._export_readout()
+
+    def test_a_CRASH_LOOPING_node_is_not_reported_as_paired(self, plug):
+        """⊗ `active` means "a client OBJECT exists" and is set for the life of
+        the engine, reconnect attempts included. Read as "the node is running" it
+        told a user whose bridge had been down for a day "3 device(s) exported.
+        Paired with: Apple Home" — the readout PRD §5.5 exists to prevent."""
+        _bridge_with(plug, fabrics=[_fabric(1)], connected=False)
+        readout = plug._export_readout()
+        assert "NOT connected" in readout
+        assert "Paired with" not in readout
+
+    def test_connected_but_not_serving_says_so(self, plug):
+        """§1.1: a node that is refusing answers the socket and serves nothing."""
+        client = _bridge_with(plug, fabrics=[_fabric(1)])
+        client.attached = False
+        assert "not serving accessories" in plug._export_readout()
 
     def test_it_reports_the_switch_being_off(self, plug):
         _bridge_with(plug, fabrics=[_fabric(1)], enabled=False)
@@ -670,3 +1163,132 @@ class TestConfigReadout:
     def test_it_survives_the_plugin_not_having_started(self, plug):
         plug.export_bridge = None
         assert "still starting" in plug._export_readout()
+
+
+class TestSavingConfig:
+    """⊗ ``closedPrefsConfigUi``'s ``exports_changed()`` re-run.
+
+    Three lines with no local symptom, and the ONLY path that makes the "Enable
+    Matter export" switch act without a plugin reload — which PluginConfig.xml
+    promises the user in prose. Deleting them left the whole suite green.
+    """
+
+    def test_saving_config_applies_the_export_switch_immediately(self, plug):
+        bridge = Mock()
+        plug.export_bridge = bridge
+        plug.closedPrefsConfigUi({"verboseLogging": False}, False)
+        bridge.exports_changed.assert_called_once()
+
+    def test_cancelling_changes_nothing(self, plug):
+        bridge = Mock()
+        plug.export_bridge = bridge
+        plug.closedPrefsConfigUi({"verboseLogging": False}, True)
+        bridge.exports_changed.assert_not_called()
+
+    def test_a_failure_to_apply_it_gets_a_SENTENCE_not_a_bare_traceback(self, plug):
+        """The user's mental model is "I clicked Save"; a stack trace under that
+        reads as a crash in saving, which is the one thing that did work."""
+        bridge = Mock()
+        bridge.exports_changed.side_effect = RuntimeError("launchd said no")
+        plug.export_bridge = bridge
+        plug.closedPrefsConfigUi({"verboseLogging": False}, False)
+        said = " ".join(str(c.args[0]) % c.args[1:] if len(c.args) > 1 else str(c.args[0])
+                        for c in plug.logger.error.call_args_list)
+        assert "settings were saved" in said and "Reload the plugin" in said
+
+    def test_the_no_engine_path_says_something(self, plug):
+        """Switched off with no client: silence here reads as "applied"."""
+        plug.export_bridge = None
+        plug.closedPrefsConfigUi({"verboseLogging": False}, False)
+        assert plug.logger.debug.called
+
+
+class TestPairingPageUrl:
+    def test_it_uses_the_INDIGO_web_server_url_not_localhost(self, plug, plugin_mod):
+        """⊗ Deleting the `getWebServerURL()` call survived, even though the
+        fixture stubs it to jarvis.local — and a localhost URL is useless on the
+        phone the user is holding, which is the only device this page is for."""
+        url = plug._pairing_page_url()
+        plugin_mod.indigo.server.getWebServerURL.assert_called()
+        assert url.startswith("http://jarvis.local:8176/")
+        assert "localhost" not in url
+
+    def test_a_failure_falls_back_to_loopback_rather_than_no_url(self, plug, plugin_mod):
+        """A wrong-host URL a user can edit beats no URL at all."""
+        plugin_mod.indigo.server.getWebServerURL.side_effect = RuntimeError("no reflector")
+        try:
+            assert plug._pairing_page_url().startswith("http://localhost:8176/")
+        finally:
+            plugin_mod.indigo.server.getWebServerURL.side_effect = None
+
+    def test_it_points_at_this_plugins_pairing_handler(self, plug):
+        assert plug._pairing_page_url().endswith(f"/message/{OURS}/pairing/")
+
+
+class TestEscaping:
+    def test_none_becomes_empty_not_the_word_None(self, plugin_mod):
+        """⊗ The reason `_escape` is hand-rolled rather than `html.escape`, named
+        in its own docstring and asserted by nothing: every value on the page
+        comes from the node or an exception, and an absent one must not render
+        the word "None" into a field the user is about to type into a phone."""
+        assert plugin_mod._escape(None) == ""
+        assert "None" not in plugin_mod._pairing_html(None, "")
+
+    def test_it_escapes_the_five_characters_that_matter(self, plugin_mod):
+        assert plugin_mod._escape('<a href="x">&</a>') == \
+            "&lt;a href=&quot;x&quot;&gt;&amp;&lt;/a&gt;"
+
+
+class TestUiThreadDeadlines:
+    """⊗ Every `.result()` on the Indigo UI thread carries a timeout.
+
+    Removing one is invisible: a node that accepts the socket and then stops
+    answering hangs the dialog — and the Indigo client — with no way out but
+    force-quitting it. Nothing about a missing `timeout=` is visible at the call
+    site, so it is pinned here by value.
+    """
+
+    class _TimeoutSpy:
+        def __init__(self, results):
+            self.results = list(results)
+            self.timeouts: list = []
+
+        def submit(self, coro):
+            coro.close()
+            return self
+
+        def result(self, timeout=None):
+            self.timeouts.append(timeout)
+            return self.results.pop(0) if self.results else None
+
+    def test_get_pairing_and_open_window_are_bounded(self, plug, plugin_mod):
+        _bridge_with(plug)
+        spy = self._TimeoutSpy([_pairing(window_open=False, manual=None, qr=None),
+                                bridge_protocol.CommissioningWindow(
+                                    manual_pairing_code="1", qr_pairing_code="MT:1",
+                                    window_expires_at=_iso(minutes=+15))])
+        plug.runtime = spy
+        plug.menuPairMatterBridge({"duration": "900"})
+        assert spy.timeouts == [plugin_mod.PAIRING_READ_TIMEOUT,
+                                plugin_mod.WINDOW_OPEN_TIMEOUT]
+
+    def test_unpair_and_its_cache_refresh_are_bounded(self, plug, plugin_mod):
+        _bridge_with(plug, fabrics=[_fabric(1), _fabric(2)])
+        spy = self._TimeoutSpy([_removal(True, 1), _pairing()])
+        plug.runtime = spy
+        plug.menuUnpairEcosystem({"fabric": "2", "confirm": True, "confirmAgain": True})
+        assert spy.timeouts == [plugin_mod.UNPAIR_TIMEOUT, plugin_mod.PAIRING_READ_TIMEOUT]
+
+    def test_the_pairing_page_read_is_bounded(self, plug, plugin_mod):
+        _bridge_with(plug)
+        spy = self._TimeoutSpy([_pairing()])
+        plug.runtime = spy
+        plug.http_pairing(Mock(props={"incoming_request_method": "GET", "file_path": [],
+                                      "url_query_args": {}}))
+        assert spy.timeouts == [plugin_mod.PAIRING_READ_TIMEOUT]
+
+    def test_every_deadline_is_a_real_positive_number(self, plugin_mod):
+        for name in ("PAIRING_READ_TIMEOUT", "WINDOW_OPEN_TIMEOUT", "UNPAIR_TIMEOUT",
+                     "FACTORY_RESET_TIMEOUT"):
+            value = getattr(plugin_mod, name)
+            assert isinstance(value, (int, float)) and value > 0, name

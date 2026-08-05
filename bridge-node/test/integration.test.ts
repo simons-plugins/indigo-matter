@@ -24,7 +24,15 @@ import { after, describe, it } from "node:test";
 import { type Endpoint, Logger } from "@matter/main";
 
 import { endpointIdFor } from "../src/endpoints.js";
-import { BridgeNode, matterJsVersion } from "../src/node.js";
+import {
+    BridgeNode,
+    HARDWARE_VERSION,
+    HARDWARE_VERSION_STRING,
+    matterJsVersion,
+    PRODUCT_NAME,
+    VENDOR_ID,
+    VENDOR_NAME,
+} from "../src/node.js";
 import { PROTOCOL_VERSION } from "../src/protocol.js";
 import { BridgeWsServer } from "../src/ws-server.js";
 import { TestClient } from "./client.js";
@@ -147,6 +155,41 @@ describe("plugin ⇄ node, end to end", () => {
             const lounge = [...aggregator.parts].find(part => part.id === endpointIdFor(LOUNGE));
             assert.ok(lounge !== undefined, "the attach did not build the lounge endpoint");
             assert.equal((lounge.stateOf("levelControl") as Record<string, unknown>).currentLevel, 254);
+            const kitchen = [...aggregator.parts].find(part => part.id === endpointIdFor(KITCHEN));
+            assert.ok(kitchen !== undefined, "the attach did not build the kitchen endpoint");
+
+            // PRD §5.3 — every bridged child publishes the ROOT's identity.
+            //
+            // ⊗ This is the only test that can fail on `node.ts`'s
+            // `bridgedIdentity`. `registry.test.ts` asserts a hand-written copy
+            // of the same object literal, so the two agreed with each other and
+            // with nothing else: publishing Apple's vendor id (0x1349) on every
+            // bridged accessory left the whole suite green. Here the child is
+            // read off a REAL ServerNode and compared with that node's own
+            // BasicInformation, which is the property the docstring claims —
+            // "an ecosystem is never shown two answers".
+            const root = bridge.server.state.basicInformation as Record<string, unknown>;
+            assert.equal(root.vendorName, VENDOR_NAME);
+            assert.equal(Number(root.vendorId), VENDOR_ID);
+            assert.equal(root.productName, PRODUCT_NAME);
+            assert.equal(root.hardwareVersion, HARDWARE_VERSION);
+            assert.equal(root.hardwareVersionString, HARDWARE_VERSION_STRING);
+            assert.equal(root.softwareVersionString, BRIDGE_VERSION);
+            for (const child of [kitchen, lounge]) {
+                const info = child.stateOf("bridgedDeviceBasicInformation") as Record<string, unknown>;
+                for (const field of [
+                    "vendorName",
+                    "productName",
+                    "hardwareVersion",
+                    "hardwareVersionString",
+                    "softwareVersion",
+                    "softwareVersionString",
+                ] as const) {
+                    assert.equal(info[field], root[field], `${child.id}.${field} must equal the root's`);
+                }
+                // Branded on both sides; compare the numbers they carry.
+                assert.equal(Number(info.vendorId), Number(root.vendorId), `${child.id}.vendorId`);
+            }
 
             // §6.4: our own write must not come back as a command.
             await assert.rejects(client.next(200), "a local set_state echoed onto the wire");
@@ -164,6 +207,24 @@ describe("plugin ⇄ node, end to end", () => {
             assert.deepEqual(await client.next(), {
                 event: "command",
                 data: { indigoDeviceId: LOUNGE, command: "onOff", args: { value: false } },
+            });
+
+            // §3.9 over an index that holds nothing — the ONE removal outcome a
+            // never-commissioned node can reach, and the one that mattered:
+            // ⊗ this used to answer `{}`, indistinguishable from a real removal,
+            // and the plugin reported "that ecosystem has been unpaired. Every
+            // accessory has been removed" over a node-side no-op. It also used
+            // to return before `noteFabrics`, so the caller's stale list — which
+            // is what its picker is built from — was never corrected.
+            client.send({ message_id: "i4", command: "remove_fabric", args: { fabricIndex: 7 } });
+            assert.deepEqual(
+                await client.next(),
+                { event: "fabrics_changed", data: { fabrics: [], change: "unchanged" } },
+                "an already-gone index must still re-publish the fabric set",
+            );
+            assert.deepEqual(await client.next(), {
+                message_id: "i4",
+                result: { removed: false, remaining: 0 },
             });
         } finally {
             client.close();

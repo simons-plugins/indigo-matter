@@ -90,6 +90,11 @@ def test_the_default_entry_matches_the_packages_main(tmp_path, mock_logger):
 
     manifest = json.loads((Path(__file__).parent.parent / "bridge-node" / "package.json")
                           .read_text(encoding="utf-8"))
+    # ⊗ The `name` was the one field of the three left unasserted, and it is the
+    # one `npm install <spec>` resolves, `ps` is matched against when reaping
+    # orphans, and `node_modules/<name>` is looked up under. A rename on either
+    # side would install one package and look for another.
+    assert manifest["name"] == bridge_agent.BRIDGE_PACKAGE
     assert manifest["main"] == bridge_agent.DEFAULT_BRIDGE_ENTRY
     assert manifest["version"] == bridge_agent.DEFAULT_INSTALL_SPEC.partition("@")[2]
     bridge = _bridge(tmp_path, mock_logger)
@@ -224,6 +229,54 @@ def test_preflight_names_the_bridge_install_action_when_the_package_is_missing(t
     assert problem is not None
     assert bridge_agent.BRIDGE_PACKAGE in problem
     assert bridge_agent.DEFAULT_INSTALL_SPEC in problem
+
+
+def _menu_names() -> set:
+    """Every ``<Name>`` in MenuItems.xml, as the Plugins ▸ Matter menu shows it."""
+    import xml.etree.ElementTree as ET
+    from pathlib import Path
+
+    root = ET.parse(Path(__file__).parent.parent / "indigo-matter.indigoPlugin"
+                    / "Contents" / "Server Plugin" / "MenuItems.xml").getroot()
+    return {item.findtext("Name") for item in root.findall("MenuItem")}
+
+
+def test_the_messages_name_a_menu_item_that_actually_EXISTS(tmp_path, mock_logger):
+    """⊗ They named the npm package instead.
+
+    ``preflight`` and ``abi_warning`` both interpolated ``spec.package``,
+    producing "Plugins ▸ Matter ▸ Install/update indigo-matter-bridge" — there
+    is no such menu item. This fires on the first-run path, where the user is
+    already stuck, so a name they cannot find in the menu is the difference
+    between a fixable state and giving up.
+    """
+    bridge = _bridge(tmp_path, mock_logger, installed=False)
+    problem = bridge.preflight()
+    assert bridge.spec.install_menu_name in problem
+    assert bridge.spec.install_menu_name in _menu_names(), \
+        "the message sends the user at a menu item that does not exist"
+    assert f"Install/update {bridge_agent.BRIDGE_PACKAGE}" not in problem
+
+
+def test_the_controllers_message_names_ITS_menu_item(tmp_path, mock_logger):
+    from server_process import INSTALL_MENU
+
+    controller = ServerProcess({}, mock_logger, home=str(tmp_path / "nowhere"),
+                               npx_path=str(tmp_path / "nowhere" / "bin" / "npx"),
+                               runner=FakeRunner())
+    assert controller.spec.install_menu_name == INSTALL_MENU
+    assert INSTALL_MENU in _menu_names()
+
+
+def test_an_agent_with_no_menu_still_gets_a_usable_sentence():
+    """The fallback is the old wording, which is right for an agent that has no
+    Install/update menu at all."""
+    from launch_agent import AgentSpec
+
+    spec = AgentSpec(label="l", package="some-pkg", install_spec="some-pkg@1",
+                     default_entry="m.js", storage_path="/s", out_log="o", err_log="e",
+                     argv=lambda _agent: [])
+    assert spec.install_menu_name == "Install/update some-pkg"
 
 
 def test_uninstall_never_touches_the_storage(tmp_path, mock_logger):
