@@ -49,9 +49,30 @@ class _IndigoPluginBaseStub:
     """Stand-in for ``indigo.PluginBase`` at ``class Plugin`` definition time.
 
     Real Indigo's ``PluginBase`` does server-bound init the tests don't need;
-    subclassing this empty stub lets ``class Plugin(indigo.PluginBase):``
+    subclassing this stub lets ``class Plugin(indigo.PluginBase):``
     import-succeed under MagicMock test doubles.
+
+    The device callbacks are here because the real base class **does real work**
+    in them (``deviceStartComm``/``deviceStopComm`` for our own devices), so any
+    override has to call ``super()`` — the SDK's most-broken rule. Each records
+    the call in ``base_calls`` so a test can assert the chain-up actually
+    happened rather than merely not crashing.
     """
+
+    def _record_base_call(self, name, *args):
+        calls = getattr(self, "base_calls", None)
+        if calls is None:
+            calls = self.base_calls = []
+        calls.append((name, *args))
+
+    def deviceCreated(self, dev):  # noqa: N802
+        self._record_base_call("deviceCreated", dev)
+
+    def deviceUpdated(self, origDev, newDev):  # noqa: N802
+        self._record_base_call("deviceUpdated", origDev, newDev)
+
+    def deviceDeleted(self, dev):  # noqa: N802
+        self._record_base_call("deviceDeleted", dev)
 
 
 @pytest.fixture

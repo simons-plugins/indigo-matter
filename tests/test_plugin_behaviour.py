@@ -37,6 +37,9 @@ def plug(plugin_mod):
     p.http = Mock()
     p.jobs = None
     p.pluginPrefs = {}
+    p.export_bridge = None
+    p._exported_ids = frozenset()
+    p._subscribed_to_devices = False
     return p
 
 
@@ -423,6 +426,8 @@ def test_startup_passes_test_net_dcl_through_unpinned(plugin_mod, monkeypatch):
         seen.clear()
         p = plugin_mod.Plugin.__new__(plugin_mod.Plugin)
         p.logger = Mock()
+        p._version = "2026.0.1"
+        p._subscribed_to_devices = False
         p.pluginPrefs = {"serverLocation": "local", "enableTestNetDcl": value}
         p.proto = object()
         p.registry = object()
@@ -474,6 +479,8 @@ def test_startup_wires_connect_and_disconnect_callbacks(plugin_mod, monkeypatch)
 
     p = plugin_mod.Plugin.__new__(plugin_mod.Plugin)
     p.logger = Mock()
+    p._version = "2026.0.1"
+    p._subscribed_to_devices = False
     p.pluginPrefs = {}
     p.proto = object()
     p.registry = object()

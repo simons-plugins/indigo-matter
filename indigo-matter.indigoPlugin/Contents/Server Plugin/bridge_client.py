@@ -47,8 +47,42 @@ DEFAULT_TIMEOUT = 10.0
 #: derives a fresh passcode (crypto), and a factory reset rebuilds the node.
 LONG_TIMEOUT = 30.0
 
-#: The attach must complete inside the node's 10s unattached timeout (§2).
+#: Floor for the attach deadline. The node's own 10s timer (§2) bounds how long
+#: we may take to *send* an attach, not how long it may take to answer one, so
+#: this deadline is free to exceed it — and has to (see below).
 ATTACH_TIMEOUT = 8.0
+#: Fixed cost of an attach: one round trip plus the node's own bookkeeping.
+ATTACH_TIMEOUT_BASE = 2.0
+#: Marginal cost per endpoint in the desired set. An ``attach`` reconciles by
+#: removing what is no longer wanted before it answers, and the node paces bulk
+#: removals ~100ms apart (§3.3) — so the answer to a large attach arrives on the
+#: far side of ``0.1s × removals`` (E3a, measured). 0.15 leaves headroom for the
+#: creates in the same reconcile without making a hung node cost minutes.
+ATTACH_TIMEOUT_PER_ENDPOINT = 0.15
+
+
+def attach_timeout_for(endpoint_count: int) -> float:
+    """The deadline for one ``attach`` carrying ``endpoint_count`` endpoints.
+
+    THE formula (E3a decision, zero protocol change): ~80 endpoints lands just
+    over 8s of pacing alone, so a fixed deadline would time out exactly on the
+    databases that most need export to work. Everything smaller keeps the flat
+    :data:`ATTACH_TIMEOUT` floor, so the common case is unchanged.
+
+    **The count is asymmetric, and callers have to know which one they mean.**
+    What the node spends its time on is the ~100ms-paced REMOVALS (§3.3), not
+    the creates — and an attach's removals are everything it holds that the
+    desired set omits. For an ordinary reconnect the two counts track each
+    other: the node's set came from our last attach, so drift is bounded by
+    whatever the user changed while the socket was down, and ``len(specs)`` is
+    a fine proxy. For the ONE caller that deliberately sends nothing —
+    ``export_bridge._replace_all_then_stop``, the §3.1 un-export — they are
+    opposites: zero sent, *everything* removed. That caller passes its own
+    ``timeout`` over the removal count; defaulting would hand a 60-device
+    un-export the 8s floor and time it out mid-reconcile.
+    """
+    return max(ATTACH_TIMEOUT,
+               ATTACH_TIMEOUT_BASE + ATTACH_TIMEOUT_PER_ENDPOINT * max(0, int(endpoint_count)))
 
 #: Attach refusals that reconnecting cannot fix, with the remedy the user needs.
 #: Everything NOT listed here (``internal``, ``malformed_args``, …) is treated as
@@ -177,10 +211,16 @@ class BridgeClient(WsJsonClient):
             "connected to bridge node (bridge %s, matter.js %s), attaching",
             hello.bridge_version, hello.matter_js_version,
         )
+        # The desired set is read BEFORE the connection is declared usable. It
+        # is blocking Indigo IPC (see :meth:`_attach`) so it happens off the
+        # loop either way, but doing the hop here keeps ``connected`` meaning
+        # "the attach is on its way" rather than "we are still deciding what to
+        # send" — which is what every waiter on ``wait_connected`` assumes.
+        specs = await self._gather_endpoints()
         # Requests are legal from here on: attach is one.
         self._mark_connected()
         try:
-            status = await self._attach(None, replace_all=False, timeout=ATTACH_TIMEOUT, inline=True)
+            status = await self._attach(specs, replace_all=False, timeout=None, inline=True)
         except BridgeProtocolError as exc:
             self._handle_attach_refused(exc)
             return
@@ -303,7 +343,7 @@ class BridgeClient(WsJsonClient):
     # Commands (§3)
     # ------------------------------------------------------------------
     async def attach(self, endpoints: Optional[list] = None, *, replace_all: bool = False,
-                     timeout: float = ATTACH_TIMEOUT) -> StatusReport:
+                     timeout: Optional[float] = None) -> StatusReport:
         """Declare this client and deliver the full desired endpoint set (§3.1).
 
         Called by the handshake on every (re)connect, which is what makes a fresh
@@ -314,19 +354,43 @@ class BridgeClient(WsJsonClient):
         ``replace_all`` is the §3.1 opt-in required to empty a non-empty live set;
         the plugin passes it only on the deliberate allow-list-emptied path
         (PRD §7), so a stale client can never un-export everything by default.
+
+        ``timeout`` defaults to :func:`attach_timeout_for` over the set actually
+        being sent — which is why it cannot be a default argument value.
         """
         return await self._attach(endpoints, replace_all=replace_all, timeout=timeout, inline=False)
 
+    async def _gather_endpoints(self) -> list:
+        """Read the injected endpoint provider, OFF the loop.
+
+        The provider is ``export_bridge.endpoint_specs``, which does one
+        synchronous ``indigo.devices[id]`` IPC copy PER exported device — 60
+        exports is 60 blocking round trips to IndigoServer. This loop is shared
+        with the inbound matter-server client, so running that inline would
+        stall live Matter device updates behind an export reconcile every time
+        the bridge reconnects.
+
+        The provider itself deliberately stays an ordinary blocking callable:
+        it is the injected seam's public shape, and making it a coroutine would
+        push the same problem into every implementation instead of solving it
+        once here.
+        """
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self._endpoint_provider)
+
     async def _attach(self, endpoints: Optional[list], *, replace_all: bool,
-                      timeout: float, inline: bool) -> StatusReport:
+                      timeout: Optional[float], inline: bool) -> StatusReport:
         """The attach itself. ``inline`` selects how the response is waited for.
 
         The handshake issues its attach before the run loop's listen loop owns
         the socket, so there is no dispatcher to resolve a pending future — it
         pumps the socket itself. A caller re-attaching on a live connection goes
         through the normal correlated path.
+
         """
-        specs = self._endpoint_provider() if endpoints is None else endpoints
+        specs = await self._gather_endpoints() if endpoints is None else endpoints
+        if timeout is None:
+            timeout = attach_timeout_for(len(specs))
         frame = self.proto.build_attach(self.plugin_version, specs, replace_all=replace_all)
         if inline:
             result = await self._handshake_request(frame, timeout, bridge_protocol.CMD_ATTACH)

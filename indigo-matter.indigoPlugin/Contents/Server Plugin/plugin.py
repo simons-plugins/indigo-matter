@@ -19,6 +19,7 @@ import time
 from concurrent.futures import CancelledError as FuturesCancelledError
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from datetime import datetime, timezone
+from typing import Optional
 
 import indigo  # provided by the Indigo runtime
 
@@ -26,7 +27,9 @@ import fabric_backup
 from async_runtime import AsyncRuntime
 from commission_jobs import CommissionJobs, node_id_to_str
 from device_sync import DeviceSync
+from export_bridge import ExportBridge
 import export_catalog
+import export_handlers
 from export_store import ExportEntry, ExportStore, OPTION_INVERT
 from http_handlers import HttpApi, MatterUnavailable
 from matter_client import MatterClient
@@ -135,6 +138,22 @@ class Plugin(indigo.PluginBase):
         # can consult it; None means "the plugin has not started yet", which
         # every export callback checks rather than assuming.
         self.exports: ExportStore | None = None
+        # The outbound export engine (PRD-indigo-matter-export §5.4). Built in
+        # startup; it owns the bridge client and starts one only when something
+        # is actually exported (XG5).
+        self.export_bridge: ExportBridge | None = None
+        #: The allow-listed device ids, cached as a plain frozenset attribute.
+        #: ``deviceUpdated`` fires for EVERY device on the server, so its guard
+        #: has to be one attribute load and one hash lookup — no lock, no
+        #: rebuild, no allocation. Refreshed only by :meth:`_exports_changed`.
+        self._exported_ids: frozenset[int] = frozenset()
+        #: Whether ``indigo.devices.subscribeToChanges()`` has been issued.
+        self._subscribed_to_devices = False
+        #: Device ids whose export callback is currently failing. This callback
+        #: fires on every change of an exported device, so a stuck failure would
+        #: otherwise write one traceback per dimmer-ramp step; cleared on the
+        #: first success so a second, later outage is still heard.
+        self._export_callback_failed: set[int] = set()
         self._install_thread: threading.Thread | None = None
         self._stopping = False
         # When WE restart matter-server (menu / post-install), the client sees a brief
@@ -229,6 +248,14 @@ class Plugin(indigo.PluginBase):
             diagnostics_provider=self._diagnostics_sync,
         )
 
+        # Export (outbound) — built unconditionally, started only if the
+        # allow-list is non-empty. Both decisions live in _exports_changed.
+        self.export_bridge = ExportBridge(
+            self.exports, self.runtime, self.logger, lambda: self.pluginPrefs,
+            plugin_version=self._version, plugin_id=self._export_plugin_id(),
+        )
+        self._exports_changed()
+
         run_future = self.runtime.submit(self.matter.run())
         # if the run-loop coroutine ever dies, surface it rather than parking the
         # exception on an unretrieved future.
@@ -244,6 +271,128 @@ class Plugin(indigo.PluginBase):
         if exc is not None:
             self.logger.exception(exc)
 
+    # ------------------------------------------------------------------
+    # Export wiring (PRD-indigo-matter-export §5.4)
+    # ------------------------------------------------------------------
+    def _exports_changed(self) -> None:
+        """THE seam for "the allow-list changed" — call it after every write.
+
+        Refreshes the hot-path id set, subscribes to device changes if this is
+        the first export, and lets the bridge start or stop itself (XG5).
+        """
+        self._exported_ids = self.exports.ids() if self.exports is not None else frozenset()
+        if self._exported_ids:
+            self._subscribe_to_device_changes()
+        if self.export_bridge is not None:
+            self.export_bridge.exports_changed()
+
+    def _subscribe_to_device_changes(self) -> None:
+        """Ask the server for every device change — once, and only if we need it.
+
+        Three findings settle the shape of this, all from the Indigo docs rather
+        than from what was convenient:
+
+        * ``indigo.devices.subscribeToChanges()`` subscribes to **every device
+          on the server**, not ours, and the IOM reference is explicit that it
+          "causes a significant amount of traffic between IndigoServer and your
+          plugin". The default posture of this plugin is an empty allow-list
+          (XG5), so subscribing unconditionally would tax every existing user
+          who never exports anything — for callbacks that would return on their
+          first line every single time.
+        * It is a plain request to the server, not a startup-only registration.
+          Issuing it from a menu callback the first time a user exports a device
+          works exactly as it does from ``startup``, which is what makes the
+          conditional subscription safe: the first export in a session turns it
+          on, and every later ``deviceUpdated`` arrives.
+        * There is **no unsubscribe** in the canonical scripting reference (only
+          ``subscribeToChanges``), so this is a one-way door. We therefore never
+          try to turn it off when the allow-list empties again; the hot-path
+          guard below already makes a stale subscription free, and a
+          "clever" unsubscribe against an undocumented API is exactly the sort
+          of thing that fails silently on an Indigo upgrade.
+
+        Note there is deliberately **no ``pluginId`` self-loop guard** here (the
+        usual companion to this subscription). It would be dead code: our own
+        devices are excluded by the catalog's loop guard, so they can never
+        reach the allow-list, and the id-set check below already refuses them.
+        The dispatch→state→push path does not loop either — the node
+        echo-guards its own writes (§6.4) and a push produces no Indigo change.
+        """
+        if self._subscribed_to_devices:
+            return
+        try:
+            indigo.devices.subscribeToChanges()
+        except Exception as exc:  # noqa: BLE001
+            self.logger.error("Matter export: could not subscribe to Indigo device changes — "
+                              "exported accessories will not follow Indigo state. %s", exc)
+            self.logger.exception(exc)
+            return
+        self._subscribed_to_devices = True
+        self.logger.debug("subscribed to Indigo device changes (export is active)")
+
+    def deviceUpdated(self, origDev, newDev):  # noqa: N802
+        """Push an exported device's change outward.
+
+        This runs for **every device on the server** (see
+        :meth:`_subscribe_to_device_changes`), so the second statement is the
+        whole performance story: a frozenset membership test on an int, against
+        an attribute the plugin already holds. Nothing is classified, nothing is
+        locked and nothing is allocated for a device nobody exported.
+        """
+        super().deviceUpdated(origDev, newDev)
+        if newDev.id not in self._exported_ids:
+            return
+        if self.export_bridge is None:
+            return
+        try:
+            self.export_bridge.device_updated(origDev, newDev)
+        except Exception as exc:  # noqa: BLE001 - never let export break Indigo's callback
+            # Named and rate-limited: a bare traceback here says a device broke
+            # but not which one, and this callback fires often enough that a
+            # stuck device would bury the rest of the event log.
+            if newDev.id not in self._export_callback_failed:
+                self._export_callback_failed.add(newDev.id)
+                self.logger.error(
+                    "Matter export: the update of %s (id %s) could not be handed to the bridge "
+                    "— %s. Its accessory will show stale state until this clears.",
+                    getattr(newDev, "name", ""), newDev.id, exc)
+                self.logger.exception(exc)
+        else:
+            self._export_callback_failed.discard(newDev.id)
+
+    def deviceDeleted(self, dev):  # noqa: N802
+        """A deleted device leaves the allow-list and the bridge (PRD §5.4)."""
+        super().deviceDeleted(dev)
+        if dev.id not in self._exported_ids or self.exports is None:
+            return
+        try:
+            self.exports.remove(dev.id)
+            self.logger.info("Removed Matter export: %s (id %s) — the Indigo device was deleted",
+                             getattr(dev, "name", ""), dev.id)
+        except Exception as exc:  # noqa: BLE001
+            # The store rolled back, so the entry survives; the endpoint removal
+            # below is still right (the device is gone either way) and the
+            # startup sweep will report the orphan.
+            self.logger.error("Matter export: removing the deleted device %s from the export "
+                              "list FAILED — %s", dev.id, exc)
+            self.logger.exception(exc)
+        self._export_callback_failed.discard(dev.id)
+        try:
+            if self.export_bridge is not None:
+                self.export_bridge.remove(dev.id)
+        except Exception as exc:  # noqa: BLE001
+            self.logger.exception(exc)
+        finally:
+            # In a finally because the endpoint removal above can raise (the
+            # socket is the bridge's, not ours) and the id-set cache has no
+            # other way back in sync: leaving a deleted device in it makes
+            # deviceUpdated hand a ghost to the bridge on every later change,
+            # and deviceDeleted will never fire for it again.
+            try:
+                self._exports_changed()
+            except Exception as exc:  # noqa: BLE001
+                self.logger.exception(exc)
+
     def shutdown(self) -> None:
         self.logger.debug("%s shutting down", PLUGIN_NAME)
         # Signal any in-flight background install to skip its post-npm plugin-state
@@ -257,6 +406,13 @@ class Plugin(indigo.PluginBase):
                 self.runtime.submit(self.matter.close()).result(timeout=4)
             except Exception as exc:  # noqa: BLE001
                 self.logger.debug("matter close error: %s", exc)
+        # Same ordering rule as the controller client: close the socket while the
+        # loop still exists to close it on. The bridge *agent* is deliberately
+        # left running (PRD §5.4 / PM-B) — a plugin reload must not un-pair
+        # anyone's ecosystems.
+        if self.runtime is not None and self.runtime.is_running and self.export_bridge is not None:
+            self.export_bridge.stop()
+        self.export_bridge = None
         if self.runtime is not None:
             self.runtime.stop()
             self.runtime = None
@@ -386,6 +542,12 @@ class Plugin(indigo.PluginBase):
                 self.logger.debug("matter-server not currently connected")
         else:
             self._disconnect_ticks = 0
+        # The export side keeps its OWN counter (E1 audit note): the two clients
+        # talk to different processes and fail independently, so a shared streak
+        # counter would let a healthy bridge silence a dead matter-server, or
+        # the reverse.
+        if self.export_bridge is not None:
+            self.export_bridge.health_tick()
 
     # ------------------------------------------------------------------
     # Config
@@ -1207,10 +1369,47 @@ class Plugin(indigo.PluginBase):
         # scratch, and the rebuild's first save overwrites the rescue copy.
         error = self.exports.load_error
         if error:
-            return error if not count else f"{error} {count} device(s) exported."
+            return error if not count else \
+                f"{error} {count} device(s) exported.{self._export_bridge_note()}"
         if not count:
             return "Nothing is exported yet."
-        return f"{count} device(s) exported."
+        summary = f"{count} device(s) exported."
+        # An export whose role this version cannot bridge is silently absent
+        # from every ecosystem otherwise — the dialog is the only place the user
+        # would ever look for the reason.
+        pending = sum(1 for entry in self.exports.all()
+                      if not export_handlers.is_bridgeable(entry.role))
+        if pending:
+            summary += (f" {pending} of them use a role this version cannot bridge yet "
+                        "(sensors, locks, coverings and thermostats arrive in a later "
+                        "release) and will not appear in any ecosystem.")
+        return summary + self._export_bridge_note()
+
+    def _export_bridge_note(self) -> str:
+        """One sentence when the exports exist but are not actually live.
+
+        "3 device(s) exported." is true and useless while the bridge client is
+        halted on a version skew: the user is looking at this dialog precisely
+        because a light is missing from the Home app, and every state below
+        answers that question. Reported as a suffix so a load error — which is
+        about rescuing the user's list, and outranks everything — still leads.
+        """
+        bridge = self.export_bridge
+        if bridge is None or not bridge.active:
+            # No client is the CORRECT state for an empty allow-list (XG5), and
+            # the count above already says the list is not empty — so this is a
+            # plugin still starting, which its own log line covers.
+            return ""
+        client = bridge.client
+        if client.halted:
+            return (f" Bridge client halted ({client.halted_reason or 'no reason recorded'}) "
+                    "— restart the bridge node.")
+        if client.recovery:
+            return (" The bridge node is waiting for an endpoint-map rebuild — exports are not "
+                    "live until it is done.")
+        if not client.attached:
+            return " Not connected to the bridge node — exports are not live."
+        return ""
 
     def get_menu_action_config_ui_values(self, menu_id):
         """Seed the export dialog (menu dialogs never remember their values).
@@ -1496,7 +1695,9 @@ class Plugin(indigo.PluginBase):
         options = {}
         if role == export_catalog.ROLE_WINDOW_COVERING and self._truthy(values.get("exportInvert")):
             options[OPTION_INVERT] = True
-        existed = device_id in self.exports
+        previous = self.exports.get(device_id)
+        existed = previous is not None
+        role_changed = existed and previous.role != role
         try:
             self.exports.upsert(ExportEntry(
                 indigo_device_id=device_id, role=role,
@@ -1513,9 +1714,41 @@ class Plugin(indigo.PluginBase):
         self.logger.info("%s Matter export: %s (id %s) as %s%s",
                          verb, dev.name, device_id, role,
                          f' named "{name_override}"' if name_override else "")
+        self._nudge_export(device_id, role_changed=role_changed)
         values["exportStatus"] = f"{verb} {dev.name} as {export_catalog.role_label(role)}. " \
-                                 f"{self._export_summary()}"
+                                 f"{self._role_change_warning(role_changed)}{self._export_summary()}"
         return values
+
+    @staticmethod
+    def _role_change_warning(role_changed: bool) -> str:
+        """What a role change actually costs the user, said before they find out.
+
+        BRIDGE_PROTOCOL §4.1 rejects changing an existing endpoint's role, so the
+        plugin removes and re-adds it. Ecosystems treat that as a brand-new
+        accessory: the name and room it was given in Apple Home are gone.
+        """
+        if not role_changed:
+            return ""
+        return ("Changing the role RE-CREATES the accessory, so it loses the name and room "
+                "you gave it in Apple Home and any other paired ecosystem. ")
+
+    def _nudge_export(self, device_id: int, *, role_changed: bool = False) -> None:
+        """Tell the bridge about one changed export, without a full reconnect.
+
+        A role change is the one case that cannot be an ``upsert``: §4.1 refuses
+        it with ``role_change``, so it becomes remove-then-add.
+        """
+        self._exports_changed()
+        bridge = self.export_bridge
+        if bridge is None:
+            return
+        try:
+            if role_changed:
+                bridge.replace(device_id)
+            else:
+                bridge.upsert(device_id)
+        except Exception as exc:  # pylint: disable=broad-except
+            self.logger.exception(exc)
 
     def exportRemove(self, valuesDict, typeId="", devId=0):
         # pylint: disable=unused-argument
@@ -1541,6 +1774,15 @@ class Plugin(indigo.PluginBase):
         dev = self._indigo_device(device_id)
         name = str(getattr(dev, "name", "") or "") if dev is not None else f"device {device_id}"
         self.logger.info("Removed Matter export: %s (id %s)", name, device_id)
+        # XAC7: the accessory has to leave every paired ecosystem, not just the
+        # allow-list. Order matters — remove the endpoint BEFORE the empty
+        # allow-list stops the client out from under it.
+        if self.export_bridge is not None:
+            try:
+                self.export_bridge.remove(device_id)
+            except Exception as exc:  # pylint: disable=broad-except
+                self.logger.exception(exc)
+        self._exports_changed()
         values["exportRole"] = ""
         values["exportName"] = ""
         values["exportInvert"] = False

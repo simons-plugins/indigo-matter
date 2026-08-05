@@ -75,6 +75,11 @@ def plug(plugin_mod, devices):  # noqa: ARG001 - devices installs indigo.devices
     p.pluginId = OURS
     p.pluginPrefs = {}
     p.exports = ExportStore(lambda: p.pluginPrefs, p.logger)
+    # Post-startup shape: the dialog callbacks nudge the export bridge and
+    # refresh the deviceUpdated fast-path id set (E3b).
+    p.export_bridge = None
+    p._exported_ids = frozenset()
+    p._subscribed_to_devices = False
     return p
 
 
@@ -765,6 +770,10 @@ def started(plugin_mod, devices, monkeypatch):  # noqa: ARG001 - devices install
         p = plugin_mod.Plugin.__new__(plugin_mod.Plugin)
         p.logger = Mock()
         p.pluginId = OURS
+        p._version = "2026.0.1"
+        p._subscribed_to_devices = False
+        p._exported_ids = frozenset()
+        p.export_bridge = None
         p.pluginPrefs = {} if prefs is None else prefs
         p.proto = object()
         p.registry = object()
