@@ -26,6 +26,8 @@ import fabric_backup
 from async_runtime import AsyncRuntime
 from commission_jobs import CommissionJobs, node_id_to_str
 from device_sync import DeviceSync
+import export_catalog
+from export_store import ExportEntry, ExportStore, OPTION_INVERT
 from http_handlers import HttpApi, MatterUnavailable
 from matter_client import MatterClient
 from matter_handlers.boolean_state_config import (
@@ -40,6 +42,35 @@ from server_process import ServerProcess
 PLUGIN_NAME = "indigo-matter"
 COMMAND_TIMEOUT = 5.0
 DECOMMISSION_TIMEOUT = 15.0
+
+#: Menu id of the export dialog (MenuItems.xml) — matched in
+#: ``get_menu_action_config_ui_values`` so other menus are never seeded.
+MENU_MANAGE_EXPORTS = "manageMatterExports"
+#: Option-id prefix marking a picker row the user may look at but not choose
+#: (PRD §5.2: excluded devices are shown *with a reason*, never hidden — XAC9).
+EXCLUDED_OPTION_PREFIX = "x-"
+#: The "nothing selected" sentinel. Never "": Indigo rejects an empty list id
+#: with "UI dynamic list function returned illegal ID string" and silently
+#: drops the option. The picker always emits a REAL row carrying this id
+#: (:data:`NO_SELECTION_LABEL`), because the dialog is seeded with it — a
+#: seeded value with no matching row renders as a blank first item.
+NO_SELECTION_ID = "0"
+NO_SELECTION_LABEL = "— select a device —"
+#: Informational rows. They get their own ids so :data:`NO_SELECTION_ID` stays
+#: unique, and the ``x-`` prefix keeps them unpickable through the same door
+#: excluded devices use.
+TRUNCATED_OPTION = (f"{EXCLUDED_OPTION_PREFIX}truncated",
+                    "…too many matches — narrow the filter")
+NO_MATCH_OPTION = (f"{EXCLUDED_OPTION_PREFIX}nomatch", "(no devices match the filter)")
+#: What a list callback returns when it fails outright. An empty list would
+#: render as an empty popup the user cannot tell from "nothing to choose".
+LIST_ERROR_OPTION = (NO_SELECTION_ID, "(error building list — see Event Log)")
+#: One unreadable device inside an otherwise fine list (D3): the row is kept so
+#: the count is honest, but it is not selectable.
+ROW_ERROR_LABEL = "(error reading device — see Event Log)"
+#: Picker cap. Past this the tail row asks the user to narrow the filter — a
+#: 2000-device database would otherwise build an unusable popup menu.
+EXPORT_PICKER_LIMIT = 300
 
 
 def server_location(prefs: dict) -> str:
@@ -100,6 +131,10 @@ class Plugin(indigo.PluginBase):
         self.jobs: CommissionJobs | None = None
         self.http: HttpApi | None = None
         self.server_process: ServerProcess | None = None
+        # The export allow-list (PRD §5.1). Built in startup, before anything
+        # can consult it; None means "the plugin has not started yet", which
+        # every export callback checks rather than assuming.
+        self.exports: ExportStore | None = None
         self._install_thread: threading.Thread | None = None
         self._stopping = False
         # When WE restart matter-server (menu / post-install), the client sees a brief
@@ -144,6 +179,24 @@ class Plugin(indigo.PluginBase):
         # (also migrates pre-2026.6 prefs that had no serverLocation key).
         self.pluginPrefs["serverLocation"] = location
         self.pluginPrefs["manageLaunchAgent"] = managed
+
+        # Load the export allow-list first: it is pure prefs I/O, and E3's
+        # bridge wiring will need it already populated when it starts. An
+        # unreadable list must not stop the (inbound) plugin starting, so
+        # ExportStore degrades to empty and preserves the blob rather than
+        # raising — see export_store._corrupt.
+        # prefs are read through a getter, not captured: Indigo can rebind
+        # self.pluginPrefs when the user saves the PluginConfig dialog, and a
+        # store holding the old mapping would write to an orphan. savePluginPrefs
+        # is the flush the store commits through before it trusts a write.
+        self.exports = ExportStore(
+            lambda: self.pluginPrefs, self.logger,
+            save_prefs=self._save_plugin_prefs,
+            entry_validator=self._reject_unexportable_entry,
+        )
+        if len(self.exports):
+            self.logger.info("Matter export allow-list: %d device(s) exported", len(self.exports))
+        self._reconcile_exports()
 
         self.runtime = AsyncRuntime(self.logger)
         self.runtime.start()
@@ -1032,6 +1085,467 @@ class Plugin(indigo.PluginBase):
                           "in matter-server and will reappear at the next reconcile (plugin restart "
                           "or reconnect). Retry once the device is powered and reachable.")
         return (False, valuesDict, errors)
+
+    # ------------------------------------------------------------------
+    # Matter export allow-list — the "Manage Matter Exports…" dialog
+    # (PRD-indigo-matter-export §5.1 UI-D; roles per BRIDGE_PROTOCOL §4.2)
+    # ------------------------------------------------------------------
+    def _export_plugin_id(self) -> str:
+        """This plugin's id, for the loop guard (XNG3/XAC6).
+
+        Read from the running plugin rather than hardcoded, so the guard can
+        never drift from the bundle it is protecting; the catalog constant is
+        only the fallback for a plugin object built without one (tests).
+        """
+        return getattr(self, "pluginId", "") or export_catalog.DEFAULT_PLUGIN_ID
+
+    @staticmethod
+    def _truthy(value) -> bool:
+        """Indigo checkboxes arrive as bools or as "true"/"false" strings."""
+        if isinstance(value, str):
+            return value.strip().lower() in ("true", "yes", "1")
+        return bool(value)
+
+    @staticmethod
+    def _indigo_device(device_id):
+        """``indigo.devices[device_id]`` or None — a stale id is never fatal."""
+        try:
+            return indigo.devices[int(device_id)]
+        except Exception:  # pylint: disable=broad-except  # KeyError/ValueError/Indigo's own
+            return None
+
+    def _export_selection(self, values_dict) -> tuple[str, int]:
+        """Decode the picker value into ``(kind, device_id)``.
+
+        ``kind`` is ``"none"`` (nothing chosen, or one of the informational
+        rows — the "select a device" seed, the truncation tail, the no-match
+        note), ``"excluded"`` (an ``x-`` row the user may see but not pick), or
+        ``"device"``.
+        """
+        raw = str((values_dict or {}).get("exportDevice", "") or "")
+        if not raw or raw == NO_SELECTION_ID or raw in (TRUNCATED_OPTION[0], NO_MATCH_OPTION[0]):
+            return ("none", 0)
+        excluded = raw.startswith(EXCLUDED_OPTION_PREFIX)
+        if excluded:
+            raw = raw[len(EXCLUDED_OPTION_PREFIX):]
+        try:
+            device_id = int(raw)
+        except (TypeError, ValueError):
+            return ("none", 0)
+        return ("excluded" if excluded else "device", device_id)
+
+    def _save_plugin_prefs(self) -> None:
+        """Flush pluginPrefs to Indigo's database (the store's commit step)."""
+        indigo.server.savePluginPrefs()
+
+    def _reject_unexportable_entry(self, entry) -> str | None:
+        """Validator for entries restored from prefs — the loop guard, re-run.
+
+        Load is the one write path the dialog's guards never see: a blob
+        restored from a backup, or hand-edited in the ``.indiPref``, can name a
+        device this plugin created. Only the loop guard is enforced here.
+        Ordinary ineligibility is *reported* by the startup reconcile and left
+        alone, because a device can be temporarily odd (a plugin still
+        starting) and silently deleting the user's export would be worse than
+        an accessory that fails to build.
+        """
+        dev = self._indigo_device(entry.indigo_device_id)
+        if dev is None:
+            return None
+        verdict = export_catalog.classify(dev, self._export_plugin_id())
+        if isinstance(verdict, export_catalog.Excluded) \
+                and verdict.reason == export_catalog.REASON_LOOP_GUARD:
+            return export_catalog.REASON_LOOP_GUARD
+        return None
+
+    def _reconcile_exports(self) -> None:
+        """Report-only startup sweep of the allow-list (never edits it).
+
+        An export whose device has been deleted, or which no longer classifies
+        as exportable, is a real problem the user should hear about at startup
+        rather than discovering as a missing accessory. It is NOT auto-removed:
+        the allow-list is the user's declaration, and E3 re-classifies at
+        endpoint-build time anyway.
+        """
+        if self.exports is None:
+            return
+        try:
+            plugin_id = self._export_plugin_id()
+            for entry in self.exports.all():
+                dev = self._indigo_device(entry.indigo_device_id)
+                if dev is None:
+                    self.logger.warning(
+                        "Matter export allow-list: device %s is exported as %s but no longer "
+                        "exists in Indigo — it will not be bridged. Remove it in "
+                        "'Manage Matter Exports…'.",
+                        entry.indigo_device_id, entry.role)
+                    continue
+                verdict = export_catalog.classify(dev, plugin_id)
+                if isinstance(verdict, export_catalog.Excluded):
+                    self.logger.warning(
+                        "Matter export allow-list: %s (id %s) is exported as %s but is no longer "
+                        "exportable: %s. It will not be bridged.",
+                        getattr(dev, "name", ""), entry.indigo_device_id, entry.role,
+                        verdict.reason)
+                elif entry.role not in verdict.eligible_roles:
+                    self.logger.warning(
+                        "Matter export allow-list: %s (id %s) is exported as %s, which this "
+                        "device no longer offers (%s). Re-pick its role in "
+                        "'Manage Matter Exports…'.",
+                        getattr(dev, "name", ""), entry.indigo_device_id, entry.role,
+                        ", ".join(verdict.eligible_roles))
+        except Exception as exc:  # pylint: disable=broad-except
+            # A diagnostic sweep must never be the thing that fails startup.
+            self.logger.exception(exc)
+
+    def _export_summary(self) -> str:
+        if self.exports is None:
+            return "Plugin still starting — reopen this dialog in a moment."
+        count = len(self.exports)
+        # A load failure has to lead. Reporting "Nothing is exported yet." over
+        # a blob we could not read invites the user to rebuild the list from
+        # scratch, and the rebuild's first save overwrites the rescue copy.
+        error = self.exports.load_error
+        if error:
+            return error if not count else f"{error} {count} device(s) exported."
+        if not count:
+            return "Nothing is exported yet."
+        return f"{count} device(s) exported."
+
+    def get_menu_action_config_ui_values(self, menu_id):
+        """Seed the export dialog (menu dialogs never remember their values).
+
+        Only the export menu is seeded — this callback fires for EVERY menu
+        item that has a ConfigUI, and returning values for another one would
+        overwrite its defaults.
+        """
+        values = indigo.Dict()
+        if menu_id != MENU_MANAGE_EXPORTS:
+            return values
+        values["exportFilter"] = ""
+        values["exportDevice"] = NO_SELECTION_ID
+        values["exportRole"] = ""
+        values["exportName"] = ""
+        values["exportInvert"] = False
+        values["exportStatus"] = self._export_summary()
+        return values
+
+    def _log_row_failure(self, exc, first: bool) -> None:
+        """Log one unreadable picker row — stack for the first, one line after.
+
+        A database with fifty broken proxies must not write fifty tracebacks
+        into the event log, but the first one has to carry enough to debug.
+        """
+        if first:
+            self.logger.exception(exc)
+        else:
+            self.logger.error("Matter export: another device could not be read — %s", exc)
+
+    @staticmethod
+    def _candidate_row(dev, name: str, plugin_id: str, exported) -> Optional[tuple[str, str]]:
+        """One picker row for ``dev``, or None to omit it. May raise — the caller contains it.
+
+        Loop-guard devices (created by this plugin) return None: XAC6 requires
+        them ABSENT from the picker, not merely unpickable — every one of them
+        shadows a device the user already sees, so listing them as excluded
+        would only add noise. Every OTHER exclusion is listed with its reason
+        (XAC9); hiding those would leave a user hunting for a device that never
+        appears.
+        """
+        device_id = dev.id
+        # An excluded device that IS exported keeps its marker: the pair
+        # "excluded" + "exported" is exactly the state the user has to know
+        # about, and hiding half of it reads as a picker bug rather than the
+        # stale export it actually is.
+        mark = "● " if device_id in exported else ""
+        verdict = export_catalog.classify(dev, plugin_id)
+        if isinstance(verdict, export_catalog.Excluded):
+            if verdict.reason == export_catalog.REASON_LOOP_GUARD:
+                return None
+            return (f"{EXCLUDED_OPTION_PREFIX}{device_id}",
+                    f"{mark}{name} — not exportable: {verdict.reason}")
+        return (str(device_id), f"{mark}{name}")
+
+    def getExportCandidates(self, filter="", valuesDict=None, typeId="", targetId=0):
+        # pylint: disable=redefined-builtin, unused-argument
+        """Picker rows: every Indigo device, exportable or not (XAC9).
+
+        Excluded devices are listed **with the reason in the label** and an
+        ``x-``-prefixed id so the callbacks can reject the pick cleanly —
+        hiding them would leave a user hunting for a device that will never
+        appear. ``filter`` here is the XML's static filter attribute, NOT the
+        user's text: textfields have no callbacks, so the typed filter arrives
+        in ``valuesDict`` and the Apply-filter button drives the reload.
+
+        One device that cannot be read costs one row, not the whole list: the
+        try/except is INSIDE the loop, because the alternative is a dialog that
+        renders empty the moment any device in the database misbehaves.
+        """
+        try:
+            text = str((valuesDict or {}).get("exportFilter", "") or "").strip().lower()
+            exported = self.exports.ids() if self.exports is not None else frozenset()
+            plugin_id = self._export_plugin_id()
+            # Always a real row for the seeded value, and always first.
+            options: list[tuple[str, str]] = [(NO_SELECTION_ID, NO_SELECTION_LABEL)]
+            matched = 0
+            truncated = 0
+            failures = 0
+            for dev in indigo.devices:
+                try:
+                    name = str(getattr(dev, "name", "") or "")
+                    if text and text not in name.lower():
+                        continue
+                    matched += 1
+                    if matched > EXPORT_PICKER_LIMIT:
+                        truncated += 1
+                        continue
+                    row = self._candidate_row(dev, name, plugin_id, exported)
+                    if row is None:               # loop guard: absent, not excluded (XAC6)
+                        matched -= 1              # our own devices never consume the cap
+                        continue
+                    options.append(row)
+                except Exception as exc:  # pylint: disable=broad-except
+                    self._log_row_failure(exc, first=not failures)
+                    failures += 1
+                    # Position-keyed id: the device's own id is one of the
+                    # things we could not read.
+                    options.append((f"{EXCLUDED_OPTION_PREFIX}err{len(options)}",
+                                    f"— {ROW_ERROR_LABEL}"))
+            if truncated:
+                options.append(TRUNCATED_OPTION)
+            if len(options) == 1:
+                options.append(NO_MATCH_OPTION)
+            return options
+        except Exception as exc:  # pylint: disable=broad-except
+            self.logger.exception(exc)
+            return [LIST_ERROR_OPTION]
+
+    def getExportRoles(self, filter="", valuesDict=None, typeId="", targetId=0):
+        # pylint: disable=redefined-builtin, unused-argument
+        """Roles the picked device may legitimately be exported as (§5.2).
+
+        Empty for no selection or an excluded pick — an empty role menu is the
+        honest rendering of "there is nothing you may choose here". An outright
+        failure is NOT empty: it says so, so the user does not read a broken
+        callback as "this device offers no roles".
+        """
+        try:
+            kind, device_id = self._export_selection(valuesDict)
+            if kind != "device":
+                return []
+            dev = self._indigo_device(device_id)
+            if dev is None:
+                return []
+            verdict = export_catalog.classify(dev, self._export_plugin_id())
+            if isinstance(verdict, export_catalog.Excluded):
+                return []
+            options = []
+            for role in verdict.eligible_roles:
+                try:
+                    options.append((role, export_catalog.role_label(role)))
+                except Exception as exc:  # pylint: disable=broad-except
+                    self._log_row_failure(exc, first=not options)
+            return options
+        except Exception as exc:  # pylint: disable=broad-except
+            self.logger.exception(exc)
+            return [LIST_ERROR_OPTION]
+
+    def getCurrentExports(self, filter="", valuesDict=None, typeId="", targetId=0):
+        # pylint: disable=redefined-builtin, unused-argument
+        """Read-only summary of the allow-list (one row per export)."""
+        try:
+            if self.exports is None:
+                return [(NO_SELECTION_ID, "(plugin still starting)")]
+            options = []
+            failures = 0
+            for entry in self.exports.all():
+                try:
+                    dev = self._indigo_device(entry.indigo_device_id)
+                    name = str(getattr(dev, "name", "") or "") if dev is not None else ""
+                    if not name:
+                        name = f"(deleted device {entry.indigo_device_id})"
+                    label = f"{name} → {export_catalog.role_label(entry.role)}"
+                    if entry.name_override:
+                        label += f' · shown as "{entry.name_override}"'
+                    if entry.options.get(OPTION_INVERT):
+                        label += " · inverted"
+                    options.append((str(entry.indigo_device_id), label))
+                except Exception as exc:  # pylint: disable=broad-except
+                    self._log_row_failure(exc, first=not failures)
+                    failures += 1
+                    options.append((f"{EXCLUDED_OPTION_PREFIX}err{len(options)}",
+                                    f"— {ROW_ERROR_LABEL}"))
+            return options or [(NO_SELECTION_ID, "(nothing exported yet)")]
+        except Exception as exc:  # pylint: disable=broad-except
+            self.logger.exception(exc)
+            return [LIST_ERROR_OPTION]
+
+    def _exported_warning(self, device_id: int) -> str:
+        """Suffix warning shown when an EXCLUDED device is nonetheless exported.
+
+        This is the incoherent state worth naming out loud: the allow-list says
+        export it, the catalog says it cannot be. Left alone it becomes an
+        accessory that never appears, with no visible cause.
+        """
+        if self.exports is not None and device_id in self.exports:
+            return " — but this device IS currently exported — remove it or it will fail to bridge"
+        return ""
+
+    def exportReloadPicker(self, valuesDict, typeId="", devId=0):
+        # pylint: disable=unused-argument
+        """Apply-filter button: the return trip is what reloads the lists."""
+        values = valuesDict
+        text = str(values.get("exportFilter", "") or "").strip()
+        values["exportStatus"] = (f'Filtered on "{text}". {self._export_summary()}' if text
+                                  else self._export_summary())
+        return values
+
+    def exportDeviceChanged(self, valuesDict, typeId="", devId=0):
+        # pylint: disable=unused-argument
+        """Picker selection changed: load that device's saved export, or defaults.
+
+        Menu callbacks return a valuesDict, not an error dict (the SDK's menu
+        contract), so an excluded pick is reported in the read-only status
+        field here — and refused again by the Add/update button below. Both
+        paths are covered by tests.
+        """
+        values = valuesDict
+        kind, device_id = self._export_selection(values)
+        if kind == "none":
+            values["exportRole"] = ""
+            values["exportName"] = ""
+            values["exportInvert"] = False
+            values["exportStatus"] = self._export_summary()
+            return values
+        dev = self._indigo_device(device_id)
+        if kind == "excluded" or dev is None:
+            reason = "that device no longer exists"
+            if dev is not None:
+                verdict = export_catalog.classify(dev, self._export_plugin_id())
+                reason = verdict.reason if isinstance(verdict, export_catalog.Excluded) \
+                    else "that device is not exportable"
+            values["exportRole"] = ""
+            values["exportName"] = ""
+            values["exportInvert"] = False
+            values["exportStatus"] = (f"Not exportable: {reason}"
+                                      f"{self._exported_warning(device_id)}")
+            return values
+        verdict = export_catalog.classify(dev, self._export_plugin_id())
+        if isinstance(verdict, export_catalog.Excluded):
+            values["exportRole"] = ""
+            values["exportName"] = ""
+            values["exportInvert"] = False
+            values["exportStatus"] = (f"Not exportable: {verdict.reason}"
+                                      f"{self._exported_warning(device_id)}")
+            return values
+        entry = self.exports.get(device_id) if self.exports is not None else None
+        if entry is not None:
+            values["exportRole"] = entry.role
+            values["exportName"] = entry.name_override or ""
+            values["exportInvert"] = bool(entry.options.get(OPTION_INVERT, False))
+            values["exportStatus"] = f"{dev.name} is exported as {export_catalog.role_label(entry.role)}."
+        else:
+            values["exportRole"] = verdict.default_role
+            values["exportName"] = ""
+            values["exportInvert"] = False
+            values["exportStatus"] = f"{dev.name} is not exported yet."
+        return values
+
+    def exportAddOrUpdate(self, valuesDict, typeId="", devId=0):
+        # pylint: disable=unused-argument
+        """Add or update one export. Validates the role against the catalog.
+
+        A role the catalog does not offer for this device is refused here
+        rather than by the bridge node, which would only reject it with
+        ``unknown_role``/``role_change`` long after the user could connect the
+        failure to what they did (BRIDGE_PROTOCOL §1.1).
+
+        Returns **the values dict only**. A ``(valuesDict, errorsDict)`` tuple
+        is the documented contract for *validation* methods, not for button
+        ``CallbackMethod``s — the SDK's button reference says a button callback
+        returns a dictionary of field changes, and the field carrying a button's
+        outcome is read-only, so it cannot hold an error message anyway. Every
+        refusal therefore lands in ``exportStatus``, which is what the dialog
+        actually shows.
+        """
+        values = valuesDict
+        if self.exports is None:
+            values["exportStatus"] = "Plugin still starting — try again in a moment."
+            return values
+        kind, device_id = self._export_selection(values)
+        if kind == "none":
+            values["exportStatus"] = "Select a device to export."
+            return values
+        dev = self._indigo_device(device_id)
+        if dev is None:
+            values["exportStatus"] = "That device no longer exists — refresh the list."
+            return values
+        verdict = export_catalog.classify(dev, self._export_plugin_id())
+        if kind == "excluded" or isinstance(verdict, export_catalog.Excluded):
+            reason = verdict.reason if isinstance(verdict, export_catalog.Excluded) \
+                else "not exportable"
+            values["exportStatus"] = (f"{dev.name} cannot be exported: {reason}"
+                                      f"{self._exported_warning(device_id)}")
+            return values
+        role = str(values.get("exportRole", "") or "")
+        if role not in verdict.eligible_roles:
+            values["exportStatus"] = ("Choose how this device should appear "
+                                      f"({', '.join(verdict.eligible_roles)}).")
+            return values
+        name_override = str(values.get("exportName", "") or "").strip() or None
+        options = {}
+        if role == export_catalog.ROLE_WINDOW_COVERING and self._truthy(values.get("exportInvert")):
+            options[OPTION_INVERT] = True
+        existed = device_id in self.exports
+        try:
+            self.exports.upsert(ExportEntry(
+                indigo_device_id=device_id, role=role,
+                name_override=name_override, options=options,
+            ))
+        except Exception as exc:  # pylint: disable=broad-except
+            # The store rolled back, so nothing was saved — say so rather than
+            # reporting the success the old code reported unconditionally.
+            self.logger.error("Matter export: saving the export list FAILED — %s", exc)
+            self.logger.exception(exc)
+            values["exportStatus"] = "FAILED to save the export list — see Event Log"
+            return values
+        verb = "Updated" if existed else "Added"
+        self.logger.info("%s Matter export: %s (id %s) as %s%s",
+                         verb, dev.name, device_id, role,
+                         f' named "{name_override}"' if name_override else "")
+        values["exportStatus"] = f"{verb} {dev.name} as {export_catalog.role_label(role)}. " \
+                                 f"{self._export_summary()}"
+        return values
+
+    def exportRemove(self, valuesDict, typeId="", devId=0):
+        # pylint: disable=unused-argument
+        """Drop the picked device from the allow-list. Returns values only (see above)."""
+        values = valuesDict
+        if self.exports is None:
+            values["exportStatus"] = "Plugin still starting — try again in a moment."
+            return values
+        kind, device_id = self._export_selection(values)
+        if kind == "none":
+            values["exportStatus"] = "Select a device to remove from the export list."
+            return values
+        try:
+            removed = self.exports.remove(device_id)
+        except Exception as exc:  # pylint: disable=broad-except
+            self.logger.error("Matter export: saving the export list FAILED — %s", exc)
+            self.logger.exception(exc)
+            values["exportStatus"] = "FAILED to save the export list — see Event Log"
+            return values
+        if not removed:
+            values["exportStatus"] = "That device is not exported."
+            return values
+        dev = self._indigo_device(device_id)
+        name = str(getattr(dev, "name", "") or "") if dev is not None else f"device {device_id}"
+        self.logger.info("Removed Matter export: %s (id %s)", name, device_id)
+        values["exportRole"] = ""
+        values["exportName"] = ""
+        values["exportInvert"] = False
+        values["exportStatus"] = f"Removed {name}. {self._export_summary()}"
+        return values
 
     def _resolve_storage_path(self) -> str:
         """Storage dir path in BOTH managed and manual modes.

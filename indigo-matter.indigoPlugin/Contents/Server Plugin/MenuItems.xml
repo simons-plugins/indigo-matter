@@ -57,6 +57,101 @@
             </Field>
         </ConfigUI>
     </MenuItem>
+    <!--
+        Manage Matter Exports (PRD-indigo-matter-export §5.1, UI-D).
+
+        Deliberately has NO <CallbackMethod>: with one, the dialog gets
+        Execute/Cancel and every action has to funnel through Execute. Without
+        one it gets a single Close button and the buttons below do the work —
+        which is what the SDK recommends for a multi-action dialog, and what a
+        master-detail pane needs.
+
+        Shape is dictated by what Indigo's dialogs can actually do: a multi-
+        select `list` has no CallbackMethod (no selection events) and a
+        `textfield` has none either, so the master-detail is a filter textfield
+        + a reload button + a SINGLE-select `menu` picker (menus DO have
+        CallbackMethod) whose callback loads the picked device's saved settings
+        into the sibling fields. Labels are static in Indigo, so runtime
+        feedback goes in the read-only `exportStatus` textfield.
+    -->
+    <MenuItem id="manageMatterExports">
+        <Name>Manage Matter Exports…</Name>
+        <ConfigUI>
+            <Field id="exportIntro" type="label">
+                <Label>Choose which Indigo devices are exported to Apple Home and other ecosystems as Matter accessories. Nothing is exported until you add it here. Devices this plugin created itself, and device types Matter cannot represent faithfully, are listed with the reason they cannot be exported.</Label>
+            </Field>
+
+            <Field id="exportPickerHeading" type="label" fontColor="darkgray">
+                <Label>1 · Pick a device</Label>
+            </Field>
+            <!--
+                Textfields carry only <Label> (SDK: ConfigUI → Text Field);
+                <Description> is documented for checkboxes and menus, NOT for
+                textfields, so the guidance that used to live inside these two
+                fields sits in its own label field instead. The <Description>
+                elements on the menus below are documented and stay put.
+            -->
+            <Field id="exportFilter" type="textfield">
+                <Label>Filter by name:</Label>
+            </Field>
+            <Field id="exportFilterHelp" type="label" fontColor="darkgray">
+                <Label>Type part of a device name, then click Apply filter. Leave empty to list everything.</Label>
+            </Field>
+            <Field id="exportReload" type="button">
+                <Label></Label>
+                <Title>Apply filter / refresh</Title>
+                <CallbackMethod>exportReloadPicker</CallbackMethod>
+            </Field>
+            <Field id="exportDevice" type="menu">
+                <Label>Device:</Label>
+                <List class="self" method="getExportCandidates" dynamicReload="true"/>
+                <CallbackMethod>exportDeviceChanged</CallbackMethod>
+                <Description>A ● marks a device that is already exported.</Description>
+            </Field>
+
+            <Field id="exportDetailHeading" type="label" fontColor="darkgray">
+                <Label>2 · How it should appear</Label>
+            </Field>
+            <Field id="exportRole" type="menu">
+                <Label>Export as:</Label>
+                <List class="self" method="getExportRoles" dynamicReload="true"/>
+                <Description>Indigo cannot tell a plug from a lamp or a lock, so you declare it. The first option is the safest default.</Description>
+            </Field>
+            <Field id="exportName" type="textfield">
+                <Label>Name in ecosystems:</Label>
+            </Field>
+            <Field id="exportNameHelp" type="label" fontColor="darkgray">
+                <Label>Optional. Leave empty to use the Indigo device name.</Label>
+            </Field>
+            <Field id="exportInvert" type="checkbox" defaultValue="false"
+                   visibleBindingId="exportRole" visibleBindingValue="windowCovering"
+                   alwaysUseInDialogHeightCalc="true">
+                <Label>Invert position (0% = open):</Label>
+                <Description>Matter's convention is 100% = fully open. Tick this if your Indigo device is the other way round.</Description>
+            </Field>
+            <Field id="exportAdd" type="button">
+                <Label></Label>
+                <Title>Add / update export</Title>
+                <CallbackMethod>exportAddOrUpdate</CallbackMethod>
+            </Field>
+            <Field id="exportDelete" type="button">
+                <Label></Label>
+                <Title>Remove export</Title>
+                <CallbackMethod>exportRemove</CallbackMethod>
+            </Field>
+            <Field id="exportStatus" type="textfield" readonly="true">
+                <Label>Status:</Label>
+            </Field>
+
+            <Field id="exportListHeading" type="label" fontColor="darkgray">
+                <Label>Currently exported</Label>
+            </Field>
+            <Field id="exportList" type="list" rows="6" readonly="true">
+                <Label></Label>
+                <List class="self" method="getCurrentExports" dynamicReload="true"/>
+            </Field>
+        </ConfigUI>
+    </MenuItem>
     <MenuItem id="exportFabricBackup">
         <Name>Export fabric backup…</Name>
         <CallbackMethod>menuExportFabricBackup</CallbackMethod>
