@@ -54,7 +54,8 @@
         "fabrics": [],
         "endpointCount": 0,
         "endpoints": [],
-        "drift": []
+        "drift": [],
+        "driftChecked": false
       }
     }
   },
@@ -128,7 +129,8 @@
             "role": "dimmableLight"
           }
         ],
-        "drift": []
+        "drift": [],
+        "driftChecked": false
       }
     }
   },
@@ -313,7 +315,8 @@
             "role": "dimmableLight"
           }
         ],
-        "drift": []
+        "drift": [],
+        "driftChecked": false
       }
     }
   },
@@ -341,7 +344,8 @@
         ],
         "endpointCount": 0,
         "endpoints": [],
-        "drift": []
+        "drift": [],
+        "driftChecked": false
       }
     }
   },
@@ -409,6 +413,27 @@
       "details": "endpoint 123456789 is onOffLight; remove and re-add to change role"
     }
   },
+  "upsert_endpoint_unknown_role": {
+    "request": {
+      "message_id": "m29",
+      "command": "upsert_endpoint",
+      "args": {
+        "endpoint": {
+          "indigoDeviceId": 900099,
+          "role": "airPurifier",
+          "label": "Bedroom Purifier",
+          "reachable": true,
+          "states": {},
+          "options": {}
+        }
+      }
+    },
+    "response": {
+      "message_id": "m29",
+      "error_code": "unknown_role",
+      "details": "role airPurifier is not in the v1 role enum (§4.2)"
+    }
+  },
   "remove_endpoint": {
     "request": {
       "message_id": "m15",
@@ -470,6 +495,23 @@
       "message_id": "m18",
       "error_code": "unknown_device",
       "details": "no live endpoint for indigoDeviceId 123456791"
+    }
+  },
+  "set_state_bad_keys": {
+    "request": {
+      "message_id": "m44",
+      "command": "set_state",
+      "args": {
+        "indigoDeviceId": 123456789,
+        "states": {
+          "level": 55
+        }
+      }
+    },
+    "response": {
+      "message_id": "m44",
+      "error_code": "malformed_args",
+      "details": "role onOffLight consumed none of the states given; rejected key(s): level (§4.2)"
     }
   },
   "set_reachable": {
@@ -738,7 +780,8 @@
               "role": "dimmableLight"
             }
           ],
-          "drift": []
+          "drift": [],
+          "driftChecked": false
         }
       }
     },
@@ -1025,29 +1068,9 @@
               "role": "thermostat"
             }
           ],
-          "drift": []
+          "drift": [],
+          "driftChecked": false
         }
-      }
-    },
-    "upsert_endpoint_unknown_role": {
-      "request": {
-        "message_id": "m29",
-        "command": "upsert_endpoint",
-        "args": {
-          "endpoint": {
-            "indigoDeviceId": 900099,
-            "role": "airPurifier",
-            "label": "Bedroom Purifier",
-            "reachable": true,
-            "states": {},
-            "options": {}
-          }
-        }
-      },
-      "response": {
-        "message_id": "m29",
-        "error_code": "unknown_role",
-        "details": "role airPurifier is not in the v1 role enum (§4.2)"
       }
     },
     "set_state_on_off_plug_in_unit": {

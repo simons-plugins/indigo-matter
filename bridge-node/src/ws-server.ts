@@ -85,13 +85,19 @@ export class BridgeWsServer {
     }
 
     /**
-     * Push an unsolicited event (§1/§5) to the attached client. Dropped silently
-     * when nobody is attached: the plugin re-`attach`es on reconnect and gets a
-     * full reconcile, so a missed event has nothing to recover.
+     * Push an unsolicited event (§1/§5) to the attached client.
+     *
+     * Dropped when nobody is attached — the plugin re-`attach`es on reconnect
+     * and gets a full reconcile, so a missed event has nothing to recover — but
+     * never dropped *silently*: a run of these is how "I pressed the switch in
+     * Apple Home and Indigo did nothing" looks from the node's side, and
+     * without the line there is no way to tell it from a broken listener.
      */
     sendEvent(event: EventNameValue, data: Record<string, unknown>): void {
         const socket = this.#attached;
         if (socket === undefined) {
+            const device = typeof data.indigoDeviceId === "number" ? ` for device ${data.indigoDeviceId}` : "";
+            this.#log(`Dropping ${event} event${device}: no client is attached`);
             return;
         }
         const frame: EventFrame = { event, data };
@@ -235,7 +241,13 @@ export class BridgeWsServer {
 
         try {
             const result = await handler(commandArgs, socket, state);
-            this.send(socket, { message_id: messageId, result });
+            if (!this.send(socket, { message_id: messageId, result })) {
+                // §1 promises exactly one response per request. A result we
+                // could not put on the wire — a value that will not stringify,
+                // a socket that failed mid-write — still owes the plugin an
+                // answer, and `message_id` is still in scope to address it.
+                this.sendError(socket, messageId, ErrorCode.internal, `Could not send the result of ${command}`);
+            }
         } catch (error) {
             if (error instanceof ProtocolError) {
                 this.sendError(socket, messageId, error.code, error.message);
@@ -340,9 +352,28 @@ export class BridgeWsServer {
         this.send(socket, { message_id: messageId, error_code: code, details });
     }
 
-    private send(socket: WebSocket, frame: unknown): void {
-        if (socket.readyState === socket.OPEN) {
+    /**
+     * Write one frame, reporting whether it went.
+     *
+     * Never throws: a serialisation failure here would otherwise escape into
+     * whatever was mid-flight (an observable, a handler chain) rather than into
+     * the response the caller is trying to send.
+     */
+    private send(socket: WebSocket, frame: unknown): boolean {
+        if (socket.readyState !== socket.OPEN) {
+            // Almost always the superseded incumbent: §2 closes it the moment a
+            // new client attaches, and anything already queued for it lands in
+            // that CLOSING window. Worth a line — it is also what a genuinely
+            // wedged socket looks like.
+            this.#log(`Dropping a frame for a socket in readyState ${socket.readyState} (not OPEN)`);
+            return false;
+        }
+        try {
             socket.send(JSON.stringify(frame));
+            return true;
+        } catch (error) {
+            this.#log(`Failed to send frame: ${describeErrorWithStack(error)}`);
+            return false;
         }
     }
 }

@@ -51,6 +51,9 @@ export const status = {
         { indigoDeviceId: 123456790, endpointNumber: 3, role: "dimmableLight" },
     ],
     drift: [],
+    // §4.3: false until E5 persists the endpoint-number map — an empty `drift`
+    // on its own would read as an all-clear nobody has actually checked.
+    driftChecked: false,
 } satisfies StatusReport;
 
 /**
@@ -64,6 +67,7 @@ export const statusEmpty = {
     endpointCount: 0,
     endpoints: [],
     drift: [],
+    driftChecked: false,
 } satisfies StatusReport;
 
 /** §3.1 with `intent: "replace_all"`: the live set is emptied deliberately. */
@@ -73,6 +77,7 @@ export const statusReplaceAll = {
     endpointCount: 0,
     endpoints: [],
     drift: [],
+    driftChecked: false,
 } satisfies StatusReport;
 
 /** §3.2 — the live endpoint's Matter number, for the plugin's own records. */
@@ -104,6 +109,29 @@ export const setStateUnknownDevice = {
     message_id: "m18",
     error_code: "unknown_device",
     details: "no live endpoint for indigoDeviceId 123456791",
+} satisfies ErrorFrame;
+
+/**
+ * §3.4 against a live device, with keys its role does not speak.
+ *
+ * The sibling of {@link setStateUnknownDevice}, and the more dangerous of the
+ * two: the device exists, so nothing looks wrong. Answering `{}` here would
+ * report success for a write that produced no patch at all, and the plugin —
+ * which does not await `set_state` — would never find out. `level` on an
+ * `onOffLight` is the shape of it that actually happens: a role edited in the
+ * export dialog while the plugin keeps pushing the old role's states.
+ */
+export const setStateBadKeys = {
+    message_id: "m44",
+    error_code: "malformed_args",
+    details: "role onOffLight consumed none of the states given; rejected key(s): level (§4.2)",
+} satisfies ErrorFrame;
+
+/** §4.2/§1.1: a lawful frame naming a role outside the v1 enum. */
+export const upsertUnknownRole = {
+    message_id: "m29",
+    error_code: "unknown_role",
+    details: "role airPurifier is not in the v1 role enum (§4.2)",
 } satisfies ErrorFrame;
 
 /** §3.7 state 1: never commissioned — the basic window with the persisted codes. */

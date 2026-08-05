@@ -56,7 +56,9 @@ UNBUILDABLE = {
 
 #: Endpoint specs that deliberately carry a role outside the §4.2 enum, to pin
 #: the node's ``unknown_role`` refusal. Everything else must be a v1 role.
-UNLAWFUL_ROLE_FIXTURES = {"pending:upsert_endpoint_unknown_role"}
+#: (No ``pending:`` prefix any more — the node's ``upsert_endpoint`` handler
+#: rejects this frame today, so it graduated to a live exchange.)
+UNLAWFUL_ROLE_FIXTURES = {"upsert_endpoint_unknown_role"}
 
 
 def _build(proto: BridgeProtocol, request: dict):

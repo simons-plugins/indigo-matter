@@ -173,6 +173,17 @@ export interface StatusReport {
     endpointCount: number;
     endpoints: EndpointSummary[];
     drift: DriftEntry[];
+    /**
+     * Whether `drift` is an answer or an absence.
+     *
+     * `drift: []` alone is ambiguous, and the two readings could not be further
+     * apart: "checked, nothing has moved" versus "there is no persisted map to
+     * check against yet". Until E5 builds that map this is always `false`, and
+     * saying so is what stops an empty list being read as an all-clear. The
+     * plugin ignores unknown fields (§1), so it can start honouring this in E3b
+     * without a protocol version bump.
+     */
+    driftChecked: boolean;
 }
 
 export interface EndpointSummary {

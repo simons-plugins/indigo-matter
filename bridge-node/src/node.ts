@@ -204,8 +204,11 @@ export class BridgeNode implements BridgeFacade {
             endpointCount: endpoints.length,
             endpoints,
             // E5 introduces the persisted endpoint-number map and its drift
-            // detector; until then there is no baseline to drift from.
+            // detector; until then there is no baseline to drift from, which is
+            // what `driftChecked: false` says out loud (§4.3). An empty `drift`
+            // here means "not looked", never "looked and found nothing".
             drift: [],
+            driftChecked: false,
         };
     }
 

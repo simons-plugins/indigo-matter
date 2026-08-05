@@ -65,10 +65,12 @@ export interface GoldenFrames {
     attach_mass_removal_refused: GoldenExchange;
     upsert_endpoint: GoldenExchange;
     upsert_endpoint_role_change: GoldenExchange;
+    upsert_endpoint_unknown_role: GoldenExchange;
     remove_endpoint: GoldenExchange;
     remove_endpoint_absent: GoldenExchange;
     set_state: GoldenExchange;
     set_state_unknown_device: GoldenExchange;
+    set_state_bad_keys: GoldenExchange;
     set_reachable: GoldenExchange;
     /** §3.9-§3.11 and the E4 roles — exchanges awaiting node-side handlers. */
     pending: Record<string, GoldenExchange>;
@@ -96,12 +98,19 @@ export const golden: GoldenFrames = JSON.parse(
  *
  * It reuses the production planner (`planReconcile`) on purpose: the §3.1
  * mass-removal guard and the §4.1 role rules are decided once, in `src/`, and
- * the double inherits them. What it fakes is only the Matter part — endpoint
- * numbers are handed out in creation order from 2, exactly as matter.js does
- * for a freshly built aggregator.
+ * the double inherits them. What it fakes is only the Matter part — a *first*
+ * endpoint number is handed out in creation order from 2, as matter.js does for
+ * a freshly built aggregator, and thereafter the number belongs to the device id
+ * for good ({@link #allocated}), as matter.js's persisted `Endpoint.id` map does.
+ * Retention is not a detail: it is what makes a role-change recreate keep its
+ * accessory identity (`registry.test.ts` asserts exactly that against the real
+ * stack), and a double that renumbered would have quietly disagreed with the
+ * thing it stands in for.
  */
 class EndpointModel {
     readonly #endpoints = new Map<number, { role: RoleValue; endpointNumber: number }>();
+    /** Every number ever handed out, by device id. Never pruned — see above. */
+    readonly #allocated = new Map<number, number>();
     #next = 2;
 
     roles(): Map<number, RoleValue> {
@@ -157,7 +166,8 @@ class EndpointModel {
     }
 
     private add(spec: EndpointSpec): number {
-        const endpointNumber = this.#next++;
+        const endpointNumber = this.#allocated.get(spec.indigoDeviceId) ?? this.#next++;
+        this.#allocated.set(spec.indigoDeviceId, endpointNumber);
         this.#endpoints.set(spec.indigoDeviceId, { role: spec.role, endpointNumber });
         return endpointNumber;
     }
@@ -189,7 +199,19 @@ export class StubBridge implements BridgeFacade {
     #windowClosed?: (reason: WindowClosedReason) => void;
     #command?: (data: CommandEventData) => void;
 
+    /**
+     * Makes `get_status` answer something `JSON.stringify` cannot encode, so
+     * the §1 "exactly one response" guarantee can be tested against a result
+     * that fails on the way *out* rather than on the way in.
+     */
+    poisonStatus = false;
+
     getStatus(): StatusReport {
+        if (this.poisonStatus) {
+            const circular: Record<string, unknown> = {};
+            circular.self = circular;
+            return circular as unknown as StatusReport;
+        }
         const endpoints = this.model.summaries();
         return {
             commissioned: this.statusCommissioned,
@@ -197,6 +219,7 @@ export class StubBridge implements BridgeFacade {
             endpointCount: endpoints.length,
             endpoints,
             drift: [],
+            driftChecked: false,
         };
     }
 
