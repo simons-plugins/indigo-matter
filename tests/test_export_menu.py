@@ -185,11 +185,20 @@ def test_xac9_excluded_devices_are_listed_with_their_reason(plug):
     assert export_catalog.REASON_SPRINKLER in labels["x-104"]
 
 
-def test_xac6_our_own_device_is_shown_as_excluded_not_hidden(plug):
-    """The loop-guarded device stays visible so the user can see WHY."""
+def test_xac6_our_own_device_is_absent_from_the_picker(plug):
+    """XAC6: loop-guarded devices are ABSENT, not listed-as-excluded.
+
+    Every device this plugin created shadows a real device the user already
+    sees in the picker, so a visible "not exportable" row would be pure noise.
+    All OTHER exclusions stay visible with reasons (XAC9) — absence is reserved
+    for the loop guard. Defense in depth is unchanged: classify() still returns
+    Excluded for these ids, so the store validator and the exportDeviceChanged /
+    exportAddOrUpdate callbacks reject a crafted pick anyway.
+    """
     labels = _labels(plug.getExportCandidates(valuesDict=_values()))
     assert "105" not in labels                       # not selectable
-    assert export_catalog.REASON_LOOP_GUARD in labels["x-105"]
+    assert "x-105" not in labels                     # and not even shown
+    assert not any("105" in option_id for option_id in labels)
 
 
 def test_picker_ids_are_never_empty_strings(plug):

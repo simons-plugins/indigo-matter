@@ -1242,8 +1242,16 @@ class Plugin(indigo.PluginBase):
             self.logger.error("Matter export: another device could not be read — %s", exc)
 
     @staticmethod
-    def _candidate_row(dev, name: str, plugin_id: str, exported) -> tuple[str, str]:
-        """One picker row for ``dev``. May raise — the caller contains it."""
+    def _candidate_row(dev, name: str, plugin_id: str, exported) -> Optional[tuple[str, str]]:
+        """One picker row for ``dev``, or None to omit it. May raise — the caller contains it.
+
+        Loop-guard devices (created by this plugin) return None: XAC6 requires
+        them ABSENT from the picker, not merely unpickable — every one of them
+        shadows a device the user already sees, so listing them as excluded
+        would only add noise. Every OTHER exclusion is listed with its reason
+        (XAC9); hiding those would leave a user hunting for a device that never
+        appears.
+        """
         device_id = dev.id
         # An excluded device that IS exported keeps its marker: the pair
         # "excluded" + "exported" is exactly the state the user has to know
@@ -1252,6 +1260,8 @@ class Plugin(indigo.PluginBase):
         mark = "● " if device_id in exported else ""
         verdict = export_catalog.classify(dev, plugin_id)
         if isinstance(verdict, export_catalog.Excluded):
+            if verdict.reason == export_catalog.REASON_LOOP_GUARD:
+                return None
             return (f"{EXCLUDED_OPTION_PREFIX}{device_id}",
                     f"{mark}{name} — not exportable: {verdict.reason}")
         return (str(device_id), f"{mark}{name}")
@@ -1289,7 +1299,11 @@ class Plugin(indigo.PluginBase):
                     if matched > EXPORT_PICKER_LIMIT:
                         truncated += 1
                         continue
-                    options.append(self._candidate_row(dev, name, plugin_id, exported))
+                    row = self._candidate_row(dev, name, plugin_id, exported)
+                    if row is None:               # loop guard: absent, not excluded (XAC6)
+                        matched -= 1              # our own devices never consume the cap
+                        continue
+                    options.append(row)
                 except Exception as exc:  # pylint: disable=broad-except
                     self._log_row_failure(exc, first=not failures)
                     failures += 1
