@@ -39,12 +39,19 @@ wire and Kelvin in Indigo. The node owns every Matter wire conversion.
 from __future__ import annotations
 
 import colorsys
+import logging
 from typing import Any, Callable, Optional
 
 import indigo  # provided by the Indigo runtime
 
 import export_catalog
 from matter_handlers.color_control import kelvin_to_mireds, mireds_to_kelvin
+
+#: Handlers are stateless singletons in :data:`HANDLERS` with no plugin logger
+#: injected, so the one line they need to say goes to the module logger — the
+#: same posture ``export_catalog`` takes. It is debug-only by design: everything
+#: a user must act on is logged by ``export_bridge``, which knows the device.
+_LOG = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------------
 # §4.2 state keys and command names. Spelled once here; the zoo test pins each
@@ -78,6 +85,27 @@ MIREDS_MAX = 500
 #: Saturation deliberately has NO tolerance: 0–100 → 0–254 → 0–100 is a
 #: widening then a narrowing, so it round-trips exactly.
 HUE_TOLERANCE_DEGREES = 1
+
+#: Saturation below which ``hue`` is OMITTED from the state snapshot entirely.
+#:
+#: Indigo stores colour as three integer 0–100 channels, so hue is recovered
+#: from them rather than stored — and near the grey axis those integers carry
+#: almost no angular information. Measured worst-case round-trip error over all
+#: 360 degrees (``rgb → hue,sat → rgb → hue``):
+#:
+#: ===========  =====  ====  ====  ====  ====  ====  ====  =====
+#: saturation       0     1     2     3     5    10    15    20+
+#: max hue error  180°   30°   15°   10°    6°    3°    2°     1°
+#: ===========  =====  ====  ====  ====  ====  ====  ====  =====
+#:
+#: :data:`HUE_TOLERANCE_DEGREES` only absorbs the last column, so below 20 every
+#: pastel change pushed a ``hue`` the ecosystem never asked for. It converges —
+#: ``setColorLevels`` is absolute — but the Home colour wheel visibly jumps
+#: while it does. At saturation 0 hue is not merely noisy but undefined (grey
+#: reads back as hue 0 whatever was sent), so omitting is the honest answer:
+#: §3.4 state maps are partial by design, and an absent key means "not telling
+#: you", which is exactly the truth here.
+SATURATION_HUE_FLOOR = 20
 
 #: Sentinel for "this key was absent before", which is a change, not a match.
 _MISSING = object()
@@ -252,18 +280,45 @@ class ColorTemperatureLightExport(DimmableLightExport):
         with* whiteLevel, so sending the temperature alone risks a driver
         reading whiteLevel as 0 and turning the lamp off — a colour tweak that
         blacks out the room is a worse bug than a colour tweak that misses.
+
+        Three guards, all about not depending on someone else to be careful:
+
+        * **the mireds are clamped here.** The node clamps too, but that is the
+          *other process*: an unclamped 1 mired is a 1,000,000 K write and 10000
+          mireds is 100 K, both outside Indigo's own 1200–15000 domain, and both
+          would reach the driver if the node ever stopped clamping or a command
+          arrived from anywhere else. ``round`` rather than ``int`` because
+          truncating 369.9 to 369 is a different colour, not a rounding detail;
+        * **no white channel means no command.** ``whiteLevel is None`` is real
+          Indigo for "this device has no white channel at all" — inventing 100
+          for it asks its driver to drive something it does not have. A
+          whiteLevel of *0* is different: the channel exists and is off, and
+          that IS the blacked-out-room case the default is for;
+        * **RGB is zeroed alongside.** Matter's ``colorMode`` is one-of, and the
+          node's push side picks hue/saturation over colour temperature when a
+          device reports both (``bridge-node/src/endpoints.ts`` ``colorPatch``).
+          An RGBW lamp left holding stale RGB levels would therefore report a
+          colour we did not set, and the node would believe it over the
+          temperature we just wrote. Only touched when the device actually has
+          RGB channels — an all-zero RGB write to a CT-only driver is its own
+          way to black out the room.
         """
         mireds = args.get(STATE_COLOR_TEMP_MIREDS)
         if not isinstance(mireds, (int, float)) or isinstance(mireds, bool) or not mireds:
             raise ValueError(f"setColorTemp without usable mireds: {args!r}")
         white_level = _number(dev, "whiteLevel")
-        if not white_level:
-            white_level = 100
-        indigo.dimmer.setColorLevels(
-            dev,
-            whiteLevel=int(_clamp(round(white_level), 0, 100)),
-            whiteTemperature=mireds_to_kelvin(int(mireds)),
-        )
+        if white_level is None:
+            _LOG.debug("setColorTemp skipped: device %s has no white channel",
+                       getattr(dev, "id", "?"))
+            return
+        levels: dict[str, int] = {
+            "whiteLevel": int(_clamp(round(white_level or 100), 0, 100)),
+            "whiteTemperature": mireds_to_kelvin(
+                int(_clamp(round(mireds), MIREDS_MIN, MIREDS_MAX))),
+        }
+        if _number(dev, "redLevel") is not None:
+            levels.update(redLevel=0, greenLevel=0, blueLevel=0)
+        indigo.dimmer.setColorLevels(dev, **levels)
 
 
 class ExtendedColorLightExport(ColorTemperatureLightExport):
@@ -279,8 +334,11 @@ class ExtendedColorLightExport(ColorTemperatureLightExport):
         blue = _number(dev, "blueLevel")
         if None not in (red, green, blue):
             hue, saturation = rgb_to_hue_saturation(red, green, blue)
-            states[STATE_HUE] = hue
             states[STATE_SATURATION] = saturation
+            # Below the floor the recovered hue is noise, not colour — see
+            # SATURATION_HUE_FLOOR for the measured error table.
+            if saturation >= SATURATION_HUE_FLOOR:
+                states[STATE_HUE] = hue
         return states
 
     def commands(self) -> dict[str, Callable[[dict, Any], None]]:
@@ -297,6 +355,13 @@ class ExtendedColorLightExport(ColorTemperatureLightExport):
         suppressing it on "we already believe that" would silently skip the
         first call too whenever Indigo's belief has drifted from the hardware.
         Idempotent beats clever.
+
+        The white channel is zeroed with the same colour-mode reasoning as
+        :meth:`ColorTemperatureLightExport._set_color_temp` — an RGBW lamp
+        holding both a colour and a white level reports both, and the node has
+        to pick. It picks the colour, so leaving white lit means the lamp and
+        the ecosystem disagree about what "the colour" is. Only sent when the
+        device has a white channel to zero.
         """
         hue = args.get(STATE_HUE)
         saturation = args.get(STATE_SATURATION)
@@ -304,7 +369,10 @@ class ExtendedColorLightExport(ColorTemperatureLightExport):
             if not isinstance(value, (int, float)) or isinstance(value, bool):
                 raise ValueError(f"setColor without a numeric {name}: {args!r}")
         red, green, blue = hue_saturation_to_rgb(hue, saturation)
-        indigo.dimmer.setColorLevels(dev, redLevel=red, greenLevel=green, blueLevel=blue)
+        levels = {"redLevel": red, "greenLevel": green, "blueLevel": blue}
+        if _number(dev, "whiteLevel") is not None:
+            levels["whiteLevel"] = 0
+        indigo.dimmer.setColorLevels(dev, **levels)
 
 
 # --------------------------------------------------------------------------

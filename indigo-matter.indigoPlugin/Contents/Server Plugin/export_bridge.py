@@ -34,6 +34,13 @@ Four disciplines worth knowing before editing:
   callback thread for *every* device on the server. State pushes are submitted
   to the loop and never awaited (§3.4); the result is logged by a done-callback
   so a failed push is never silent.
+
+* **...and nothing here may block the loop either.** The reverse direction has
+  the same rule and one fewer guarantee: whether ``indigo.*`` device *commands*
+  are safe from a non-Indigo thread is unverified from the docs. Bulk Indigo IPC
+  is kept off the loop (:meth:`ExportBridge.endpoint_specs` runs in an executor),
+  and :meth:`ExportBridge.on_command` is deliberately the single remaining seam
+  — one method, so it can follow the day the loop is seen stalling.
 """
 from __future__ import annotations
 
@@ -42,7 +49,7 @@ from typing import Any, Callable, Optional
 import bridge_protocol
 import export_catalog
 import export_handlers
-from bridge_client import BridgeClient
+from bridge_client import TERMINAL_ATTACH_ERRORS, BridgeClient, attach_timeout_for
 from bridge_protocol import EndpointSpec
 
 #: How many consecutive watchdog ticks a disconnected bridge client tolerates
@@ -94,6 +101,26 @@ class ExportBridge:
         #: Set once the "the node is not running" line has been said for this
         #: outage, so a manually-started-later node does not fill the log first.
         self._unreachable_reported = False
+        #: Same latch shape, one per condition that persists until a human or a
+        #: reconnect changes it. Each is cleared by :meth:`_on_attached`, which
+        #: is the only event that means "whatever that was, it is over".
+        #: Without them the watchdog says the same sentence every 15s forever,
+        #: and a halted bridge says it again for every device change in the
+        #: house — burying the one line that would explain the outage.
+        self._halted_reported = False
+        self._recovery_reported = False
+        #: The last attach-refusal code reported, so a *transient* refusal —
+        #: which reconnects on the normal backoff and refuses again — is said
+        #: once per streak rather than once per cycle.
+        self._refusal_reported: Optional[str] = None
+        #: Device ids whose ``device_updated`` is currently failing, so a stuck
+        #: device does not write a traceback per state change.
+        self._update_failed: set[int] = set()
+        #: The allow-list size as of the last :meth:`exports_changed`. The
+        #: un-export path needs it: by the time it runs the store is already
+        #: empty, and its attach deadline has to cover REMOVING that many
+        #: endpoints (see :func:`bridge_client.attach_timeout_for`).
+        self._last_export_count = len(store)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -120,7 +147,8 @@ class ExportBridge:
         )
         self._unreachable_reported = False
         self._disconnect_ticks = 0
-        self._fire(self.client.run(), "bridge client run loop")
+        self._fire(self.client.run(), "bridge client run loop",
+                   lost="nothing will be exported until the plugin is reloaded")
         self._logger.info(
             "Matter export: connecting to the bridge node (%d device(s) exported)",
             len(self._store))
@@ -143,15 +171,20 @@ class ExportBridge:
         only the empty↔non-empty transition.
         """
         self._skipped.clear()
-        if len(self._store):
+        count = len(self._store)
+        # Captured BEFORE it is overwritten: the un-export below has to size its
+        # deadline over what the node is about to remove, and the store that
+        # would have told it is already empty by the time we get here.
+        removing, self._last_export_count = self._last_export_count, count
+        if count:
             self.start()
         elif self.client is not None:
             # PRD §7 "allow-list emptied": endpoints go, pairings stay. The node
             # needs the §3.1 opt-in for that, so it is a deliberate attach
             # rather than a disconnect — and only THEN do we close.
-            self._replace_all_then_stop()
+            self._replace_all_then_stop(removing)
 
-    def _replace_all_then_stop(self) -> None:
+    def _replace_all_then_stop(self, removing: int) -> None:
         """Un-export everything with the §3.1 intent, then drop the client.
 
         The attach and the close are one coroutine rather than two awaited
@@ -159,6 +192,18 @@ class ExportBridge:
         would lose the un-export entirely, and *waiting* for the attach would
         block whichever Indigo thread emptied the list — which can be the
         device-delete callback, not just a menu click.
+
+        ``removing`` is the size of the allow-list *before* it was emptied, and
+        it — not the empty list being sent — is what the deadline is built from.
+        The node answers an attach only after its ~100ms-paced removals (§3.3),
+        so this one request costs `0.1s × every endpoint it holds`. Letting the
+        client default from ``len([])`` gave it the 8s floor, which a set of
+        much over 60 blows straight through: the attach "fails" on a timeout
+        while the node is still working, the user is told accessories "may
+        linger", and then ``close()`` pulls the socket out mid-reconcile — the
+        one outcome the warning was describing. The count is an upper bound (a
+        skipped export was never sent, so is not there to remove), which is the
+        safe direction for a deadline.
         """
         client = self.client
         if client is None:
@@ -169,14 +214,20 @@ class ExportBridge:
 
         async def _un_export() -> None:
             try:
-                await client.attach([], replace_all=True)
+                await client.attach([], replace_all=True,
+                                    timeout=attach_timeout_for(removing))
             except Exception as exc:  # pylint: disable=broad-except
                 self._logger.warning(
                     "Matter export: could not tell the bridge node the export list is empty "
                     "(%s). Accessories may linger in paired ecosystems until it restarts.", exc)
-            await client.close()
+            finally:
+                # The socket must be released whatever happened above —
+                # including a CancelledError at shutdown, which is a
+                # BaseException and so walks straight past the handler.
+                await client.close()
 
-        self._fire(_un_export(), "un-exporting everything")
+        self._fire(_un_export(), "un-exporting everything",
+                   lost="exported accessories will linger in paired ecosystems")
 
     # ------------------------------------------------------------------
     # The endpoint provider (§3.1 attach reconcile source)
@@ -186,6 +237,13 @@ class ExportBridge:
 
         Read fresh on every (re)connect, never cached: ``attach`` is a full
         reconcile and the allow-list may have changed while the socket was down.
+
+        **Blocking, and called off the loop on purpose.** Each entry costs one
+        synchronous ``indigo.devices[id]`` IPC copy, so a 60-device allow-list
+        is 60 round trips to IndigoServer. ``bridge_client._attach`` runs this
+        in an executor for that reason — the loop it would otherwise occupy is
+        shared with the inbound matter-server client, and a slow Indigo server
+        would stall live Matter device updates behind an export reconcile.
         """
         specs = []
         for entry in self._store.all():
@@ -214,7 +272,11 @@ class ExportBridge:
             states = handler.states_for(dev)
         except Exception as exc:  # pylint: disable=broad-except
             self._logger.exception(exc)
-            return self._skip(device_id, f"its state could not be read ({exc})")
+            # The exception TEXT is deliberately not part of the dedupe key: a
+            # message carrying a timestamp, an address or an attempt counter
+            # differs on every attach and would defeat the latch entirely,
+            # turning a permanently-broken device into a warning per reconnect.
+            return self._skip(device_id, "its state could not be read", detail=str(exc))
         self._skipped.pop(device_id, None)
         return EndpointSpec(
             indigo_device_id=device_id,
@@ -225,13 +287,18 @@ class ExportBridge:
             options=dict(entry.options),
         )
 
-    def _skip(self, device_id: int, why: str) -> None:
-        """Warn once per reason, then keep quiet — the provider runs per connect."""
+    def _skip(self, device_id: int, why: str, detail: str = "") -> None:
+        """Warn once per reason, then keep quiet — the provider runs per connect.
+
+        ``why`` is the dedupe key and must be stable for a stable cause;
+        ``detail`` is free-form context that goes in the line but never in the
+        key (see the ``states_for`` call site for why that distinction exists).
+        """
         if self._skipped.get(device_id) != why:
             self._skipped[device_id] = why
             self._logger.warning(
-                "Matter export: device %s is in the export list but will NOT be bridged — %s.",
-                device_id, why)
+                "Matter export: device %s is in the export list but will NOT be bridged — %s%s.",
+                device_id, why, f" ({detail})" if detail else "")
 
     # ------------------------------------------------------------------
     # Indigo → node
@@ -248,7 +315,7 @@ class ExportBridge:
         handler = export_handlers.handler_for(entry.role)
         if handler is None:
             return                             # already warned by the provider
-        client = self._live_client()
+        client = self._live_client("the state update", new_dev.id)
         if client is None:
             return
         # Order matters only in that frames are applied in receipt order (§1):
@@ -263,25 +330,76 @@ class ExportBridge:
         try:
             states = handler.diff(orig_dev, new_dev)
         except Exception as exc:  # pylint: disable=broad-except
-            self._logger.exception(exc)
+            # Once per device per streak: this fires on every change of an
+            # exported device, so a lamp on a dimmer ramp would otherwise write
+            # one traceback per step — and a traceback with no device in it is
+            # not a lead anyway.
+            if new_dev.id not in self._update_failed:
+                self._update_failed.add(new_dev.id)
+                self._logger.error(
+                    "Matter export: could not work out what changed about %s (id %s, exported "
+                    "as %s) — %s. Its accessory will show stale state until this clears.",
+                    getattr(new_dev, "name", ""), new_dev.id, entry.role, exc)
+                self._logger.exception(exc)
             return
+        self._update_failed.discard(new_dev.id)
         if states:
             self._fire(client.set_state(new_dev.id, states), f"set_state dev {new_dev.id}")
 
-    def _live_client(self) -> Optional[BridgeClient]:
+    def _live_client(self, what: str, device_id: int) -> Optional[BridgeClient]:
         """The client, but only while it can actually take an endpoint command.
 
         An incremental CRUD frame sent before ``attach`` completes is refused
         with ``not_attached`` (§1.1) — and would be pointless anyway, because
         the attach that is about to happen carries the full desired set and
         reconciles it (§3.1). So "not attached yet" is a no-op, not an error.
+
+        Two of the three ways to be un-attached are NOT that, though, and both
+        used to leave through this same silent ``return``:
+
+        * **halted** — no reconnect is coming and no attach will reconcile
+          anything, so the ecosystem shows stale state until a human acts;
+        * **recovery** — the node is serving nothing at all until its
+          endpoint-number map is rebuilt (§1.1).
+
+        ``BridgeClient._log_dropped_state_push`` says exactly this, loudly, and
+        is unreachable from here: the gate happens before ``set_state`` is ever
+        called. So the message is replicated rather than routed through — the
+        client's version cannot name the operation, and this one can.
         """
         client = self.client
-        return client if client is not None and client.attached else None
+        if client is None:
+            self._logger.debug(
+                "Matter export: no bridge client; dropping %s for device %s", what, device_id)
+            return None
+        if client.attached:
+            return client
+        if client.halted:
+            self._logger.debug("Matter export: bridge client halted; dropping %s for device %s",
+                               what, device_id)
+            if not self._halted_reported:
+                self._halted_reported = True
+                self._logger.warning(
+                    "Matter export: the bridge client is HALTED (%s) — device %s and everything "
+                    "after it is NOT reaching any ecosystem, and nothing will retry on its own.",
+                    client.halted_reason or "no reason recorded", device_id)
+        elif client.recovery:
+            self._logger.debug("Matter export: bridge in recovery; dropping %s for device %s",
+                               what, device_id)
+            if not self._recovery_reported:
+                self._recovery_reported = True
+                self._logger.warning(
+                    "Matter export: the bridge node is awaiting an endpoint-map rebuild — "
+                    "device %s and everything after it is NOT reaching any ecosystem.", device_id)
+        else:
+            self._logger.debug(
+                "Matter export: bridge node not attached; dropping %s for device %s "
+                "(the next attach reconciles it)", what, device_id)
+        return None
 
     def upsert(self, device_id: int) -> None:
         """(Re)send one endpoint's full spec (§3.2). Fire-and-forget."""
-        client = self._live_client()
+        client = self._live_client("upsert_endpoint", device_id)
         if client is None:
             return
         entry = self._store.get(device_id)
@@ -295,7 +413,8 @@ class ExportBridge:
     def remove(self, device_id: int) -> None:
         """Drop one endpoint (§3.3). Fire-and-forget; idempotent on the node."""
         self._skipped.pop(device_id, None)
-        client = self._live_client()
+        self._update_failed.discard(device_id)
+        client = self._live_client("remove_endpoint", device_id)
         if client is None:
             return
         self._fire(client.remove_endpoint(device_id), f"remove_endpoint dev {device_id}")
@@ -310,7 +429,7 @@ class ExportBridge:
         there, which is why the dialog says so out loud rather than letting the
         user discover it in the Home app.
         """
-        client = self._live_client()
+        client = self._live_client("the role change", device_id)
         if client is None:
             return
 
@@ -331,12 +450,13 @@ class ExportBridge:
     def on_command(self, command: bridge_protocol.BridgeCommand) -> None:
         """Apply one ecosystem-originated action to its Indigo device.
 
-        Called from the client's frame loop, i.e. on the asyncio thread. That is
-        the same discipline ``device_sync.apply_states`` already follows for the
-        inbound direction: Indigo's ``indigo.*`` calls are thread-safe IPC and
-        may be made from the loop. Keeping it in one method here preserves the
-        single-seam property — if the loop is ever seen stalling on Indigo IPC,
-        this is the only place that has to move to ``run_in_executor``.
+        Called from the client's frame loop, i.e. on the asyncio thread.
+        ``indigo.*`` device commands being safe to issue from a non-Indigo
+        thread is **unverified from the docs** — ``device_sync.apply_states``'s
+        precedent covers state *writes* on our own devices, which is not the
+        same claim. It is kept here rather than hedged because this is the
+        single seam: one method, one call, so moving it to ``run_in_executor``
+        is a local change the day the loop is seen stalling on Indigo IPC.
         """
         device_id = command.indigo_device_id
         entry = self._store.get(device_id)
@@ -366,22 +486,62 @@ class ExportBridge:
                     "does not define — ignoring.", command.command, device_id, entry.role)
         except Exception as exc:  # pylint: disable=broad-except
             self._logger.error(
-                "Matter export: %r failed for device %s (%s) with args %r — %s",
+                "Matter export: %r failed for device %s (%s) with args %r — %s. The ecosystem "
+                "still shows the state it asked for; pushing the real one back.",
                 command.command, device_id, entry.role, command.args, exc)
             self._logger.exception(exc)
+            self._correct(handler, dev, device_id)
+
+    def _correct(self, handler, dev: Any, device_id: int) -> None:
+        """Push the device's real state after a command we could not apply (F5).
+
+        An ecosystem applies a command optimistically the moment it sends it —
+        the Home tile flips before anything reaches Indigo. If the dispatch then
+        fails, logging and returning leaves Home showing "on" and the lamp off,
+        permanently, until something else happens to that device. Re-reading and
+        pushing the truth is the only thing that closes that gap, and it is safe
+        to do unconditionally: ``set_state`` is fire-and-forget and the node
+        echo-guards its own writes (§6.4).
+        """
+        client = self._live_client("the corrective state push", device_id)
+        if client is None:
+            return
+        try:
+            states = handler.states_for(dev)
+        except Exception as exc:  # pylint: disable=broad-except
+            self._logger.warning(
+                "Matter export: could not read device %s back to correct the ecosystem (%s) — "
+                "it will show the failed command's state until the next attach.", device_id, exc)
+            return
+        if states:
+            self._fire(client.set_state(device_id, states),
+                       f"corrective set_state dev {device_id}")
 
     # ------------------------------------------------------------------
     # Client callbacks
     # ------------------------------------------------------------------
     def _on_attached(self, status) -> None:
+        """A successful attach ends every outage, so it clears every latch."""
         self._disconnect_ticks = 0
         self._unreachable_reported = False
+        self._halted_reported = False
+        self._recovery_reported = False
+        self._refusal_reported = None
         self._logger.info("Matter export: bridge node attached — %d endpoint(s) live, %s",
                           status.endpoint_count,
                           "commissioned" if status.commissioned else "not yet paired")
 
     def _on_attach_refused(self, code: str, details: str) -> None:
-        """Surface a refusal with its remedy. The client has already triaged it."""
+        """Surface a refusal with its remedy. The client has already triaged it.
+
+        Terminal refusals (:data:`bridge_client.TERMINAL_ATTACH_ERRORS`) are
+        said every time: each one is a distinct decision the node made and the
+        client either halts or parks in recovery, so there is no loop to
+        throttle. Everything else is retried on the ordinary backoff and will
+        refuse again in ~30s, forever — so those get the same once-per-streak
+        latch as ``_on_unreachable``, cleared by the attach that eventually
+        succeeds.
+        """
         if code == bridge_protocol.ERR_ENDPOINT_MAP_INVALID:
             self._logger.error(
                 "Matter export: the bridge node is serving NOTHING because its endpoint-number "
@@ -389,6 +549,10 @@ class ExportBridge:
                 "rebuild WILL duplicate accessories in ecosystems that are already paired.",
                 details)
             return
+        if code not in TERMINAL_ATTACH_ERRORS:
+            if self._refusal_reported == code:
+                return
+            self._refusal_reported = code
         self._logger.error("Matter export: the bridge node refused the connection (%s: %s). "
                            "Nothing is being exported.", code, details)
 
@@ -426,14 +590,22 @@ class ExportBridge:
         client = self.client
         if client is None:
             return
+        # Both of these persist until a human acts, so the tick that notices
+        # them is a tick that will notice them again in 15s, and in 15s after
+        # that — the same latch the drop path uses, for the same reason.
         if client.halted:
-            self._logger.warning(
-                "Matter export: the bridge client is HALTED (%s) — nothing is being exported "
-                "and it will not retry on its own.", client.halted_reason or "no reason recorded")
+            if not self._halted_reported:
+                self._halted_reported = True
+                self._logger.warning(
+                    "Matter export: the bridge client is HALTED (%s) — nothing is being exported "
+                    "and it will not retry on its own.",
+                    client.halted_reason or "no reason recorded")
             return
         if client.recovery:
-            self._logger.warning("Matter export: the bridge node is awaiting an endpoint-map "
-                                 "rebuild; nothing is being exported.")
+            if not self._recovery_reported:
+                self._recovery_reported = True
+                self._logger.warning("Matter export: the bridge node is awaiting an endpoint-map "
+                                     "rebuild; nothing is being exported.")
             return
         if client.attached:
             self._disconnect_ticks = 0
@@ -448,18 +620,30 @@ class ExportBridge:
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
-    def _fire(self, coro, what: str) -> None:
+    def _fire(self, coro, what: str, lost: str = "") -> None:
         """Schedule ``coro`` on the loop and never wait for it.
 
         The result is still collected by a done-callback: a ``set_state`` that
         failed looks exactly like "the ecosystem is showing stale state", so it
         must never be silent (§3.4). An un-retrieved future would swallow it.
+
+        ``lost`` names the standing consequence of the coroutine never running
+        at all, and its presence is what promotes a scheduling failure from
+        debug to warning. Most callers have none: a dropped ``set_state`` or
+        ``upsert_endpoint`` is re-delivered by the next attach, so the loop
+        being down is a transient the system already recovers from. The run
+        loop and the un-export have no such backstop — if those are never
+        scheduled, nothing later puts them right.
         """
         try:
             future = self._runtime.submit(coro)
         except Exception as exc:  # pylint: disable=broad-except
             coro.close()
-            self._logger.debug("Matter export: could not schedule %s (%s)", what, exc)
+            if lost:
+                self._logger.warning("Matter export: could not schedule %s (%s) — %s.",
+                                     what, exc, lost)
+            else:
+                self._logger.debug("Matter export: could not schedule %s (%s)", what, exc)
             return
         future.add_done_callback(lambda fut: self._log_future(fut, what))
 

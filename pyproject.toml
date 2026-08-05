@@ -21,7 +21,9 @@ ignore-paths = ["tests", "__pycache__"]
 max-line-length = 120
 
 [tool.pylint.design]
-max-attributes = 20
+# The Plugin class holds one attribute per subsystem it owns plus the
+# rate-limit latches its Indigo callbacks need; 21 is what that currently is.
+max-attributes = 21
 max-args = 8
 
 [tool.pylint."messages control"]

@@ -174,6 +174,13 @@ class TestDimmable:
         handlers.handler_for("dimmableLight").dispatch("setLevel", {"level": 140}, dev)
         mock_indigo_base.dimmer.setBrightness.assert_called_once_with(dev, value=100)
 
+    def test_dispatch_of_level_zero_is_an_off_not_a_missing_level(self, handlers,
+                                                                  mock_indigo_base):
+        """T3: 0 is falsy, and the guard has to be a type check, not a truth test."""
+        dev = DimmerDevice(1, "Lamp")
+        assert handlers.handler_for("dimmableLight").dispatch("setLevel", {"level": 0}, dev)
+        mock_indigo_base.dimmer.setBrightness.assert_called_once_with(dev, value=0)
+
     def test_dispatch_without_a_level_raises_rather_than_guessing(self, handlers):
         with pytest.raises(ValueError):
             handlers.handler_for("dimmableLight").dispatch("setLevel", {}, DimmerDevice(1, "L"))
@@ -207,13 +214,78 @@ class TestColorTemperature:
         mock_indigo_base.dimmer.setColorLevels.assert_called_once_with(
             dev, whiteLevel=40, whiteTemperature=2703)
 
-    def test_dispatch_defaults_a_missing_white_level_to_full(self, handlers, mock_indigo_base):
-        """A colour tweak must never be the thing that blacks out the room."""
+    def test_a_1800k_lamp_is_clamped_to_the_declared_maximum(self, handlers):
+        """T3: the other end of the domain. 1800K → 556 mireds → clamped to 500.
+
+        The MIREDS_MIN side has a test above; without this one the ``_clamp``
+        call could lose its upper bound and nothing would notice until a warm
+        lamp pushed an out-of-domain value the node then had to clamp for us.
+        """
+        dev = DimmerDevice(1, "Lamp", onState=True, brightness=50, whiteTemperature=1800)
+        states = handlers.handler_for("colorTemperatureLight").states_for(dev)
+        assert states["colorTempMireds"] == handlers.MIREDS_MAX == 500
+
+    def test_a_device_with_no_white_channel_is_skipped_not_guessed_at(
+            self, handlers, mock_indigo_base):
+        """X4: ``whiteLevel is None`` means there is no white channel at all.
+
+        Inventing ``whiteLevel=100`` for such a device asks its driver to drive a
+        channel it does not have — and the previous "default to full" rule was
+        written for a device that HAS the channel and reports it off.
+        """
         dev = DimmerDevice(1, "Lamp", whiteLevel=None)
+        handlers.handler_for("colorTemperatureLight").dispatch(
+            "setColorTemp", {"colorTempMireds": 250}, dev)
+        mock_indigo_base.dimmer.setColorLevels.assert_not_called()
+
+    def test_a_white_channel_reporting_off_still_gets_full_level(
+            self, handlers, mock_indigo_base):
+        """A colour tweak must never be the thing that blacks out the room."""
+        dev = DimmerDevice(1, "Lamp", whiteLevel=0)
         handlers.handler_for("colorTemperatureLight").dispatch(
             "setColorTemp", {"colorTempMireds": 250}, dev)
         _args, kwargs = mock_indigo_base.dimmer.setColorLevels.call_args
         assert kwargs["whiteLevel"] == 100
+
+    @pytest.mark.parametrize("mireds,expected_kelvin", [
+        (1, 6536),        # → clamped up to MIREDS_MIN 153
+        (10000, 2000),    # → clamped down to MIREDS_MAX 500
+    ])
+    def test_out_of_domain_mireds_are_clamped_before_the_indigo_write(
+            self, handlers, mock_indigo_base, mireds, expected_kelvin):
+        """X2: the node clamps too — but our Indigo write must not depend on it.
+
+        Unclamped, 1 mired writes 1,000,000 K and 10000 mireds writes 100 K.
+        Indigo's own whiteTemperature domain is 1200–15000, so both are values
+        the driver has to reject or silently mangle, in the OTHER process.
+        """
+        dev = DimmerDevice(1, "Lamp", whiteLevel=40)
+        handlers.handler_for("colorTemperatureLight").dispatch(
+            "setColorTemp", {"colorTempMireds": mireds}, dev)
+        _args, kwargs = mock_indigo_base.dimmer.setColorLevels.call_args
+        assert kwargs["whiteTemperature"] == expected_kelvin
+        assert 1200 <= kwargs["whiteTemperature"] <= 15000
+
+    def test_fractional_mireds_round_rather_than_truncate(self, handlers, mock_indigo_base):
+        """X2: ``int()`` on 369.9 is 369, which is a different colour."""
+        dev = DimmerDevice(1, "Lamp", whiteLevel=40)
+        handlers.handler_for("colorTemperatureLight").dispatch(
+            "setColorTemp", {"colorTempMireds": 369.9}, dev)
+        _args, kwargs = mock_indigo_base.dimmer.setColorLevels.call_args
+        assert kwargs["whiteTemperature"] == 2703          # 1e6 / 370, not 1e6 / 369
+
+    def test_setting_a_temperature_zeroes_the_rgb_channels(self, handlers, mock_indigo_base):
+        """X4: Matter ``colorMode`` is one-of, and the node picks hue/sat over CT.
+
+        An RGBW lamp left with live RGB levels alongside a new white temperature
+        reports both, and the node's push side then believes the stale colour.
+        """
+        dev = DimmerDevice(1, "Lamp", whiteLevel=40, redLevel=100, greenLevel=0, blueLevel=0)
+        handlers.handler_for("colorTemperatureLight").dispatch(
+            "setColorTemp", {"colorTempMireds": 370}, dev)
+        mock_indigo_base.dimmer.setColorLevels.assert_called_once_with(
+            dev, whiteLevel=40, whiteTemperature=2703,
+            redLevel=0, greenLevel=0, blueLevel=0)
 
 
 # ---------------------------------------------------------------------------
@@ -268,6 +340,61 @@ class TestExtendedColor:
         after = DimmerDevice(1, "L", onState=True, brightness=50,
                              redLevel=100, greenLevel=1, blueLevel=1)
         assert handler.diff(before, after) == {"saturation": 99}
+
+    def test_hue_is_omitted_below_the_saturation_floor(self, handlers):
+        """X3: at sat 5 the integer-RGB round trip moves hue by up to 6°.
+
+        The ±1° tolerance cannot absorb that, so every pastel nudge pushed a
+        ``hue`` the ecosystem had not asked for and the Home wheel jumped.
+        """
+        handler = handlers.handler_for("extendedColorLight")
+        dev = DimmerDevice(1, "L", onState=True, brightness=50,
+                           redLevel=100, greenLevel=95, blueLevel=95)
+        states = handler.states_for(dev)
+        assert states["saturation"] == 5
+        assert "hue" not in states
+
+    def test_a_pastel_hue_wobble_pushes_nothing(self, handlers):
+        handler = handlers.handler_for("extendedColorLight")
+        before = DimmerDevice(1, "L", onState=True, brightness=50,
+                              redLevel=100, greenLevel=95, blueLevel=95)      # hue 0
+        after = DimmerDevice(1, "L", onState=True, brightness=50,
+                             redLevel=100, greenLevel=95, blueLevel=100)      # hue 300
+        assert handler.states_for(before)["saturation"] == \
+            handler.states_for(after)["saturation"] == 5, "only hue may move here"
+        assert handler.diff(before, after) == {}
+
+    def test_a_fully_desaturated_device_reports_no_hue(self, handlers):
+        """At sat 0 hue is not merely noisy, it is undefined — RGB says 0 always."""
+        handler = handlers.handler_for("extendedColorLight")
+        dev = DimmerDevice(1, "L", onState=True, brightness=50,
+                           redLevel=100, greenLevel=100, blueLevel=100)
+        assert handler.states_for(dev) == {"onOff": True, "level": 50, "saturation": 0}
+
+    def test_at_the_floor_itself_hue_is_reported_again(self, handlers):
+        """sat 20 is where the measured error falls to the ±1° tolerance."""
+        handler = handlers.handler_for("extendedColorLight")
+        dev = DimmerDevice(1, "L", onState=True, brightness=50,
+                           redLevel=100, greenLevel=80, blueLevel=80)
+        states = handler.states_for(dev)
+        assert states["saturation"] == handlers.SATURATION_HUE_FLOOR == 20
+        assert states["hue"] == 0
+
+    def test_a_saturated_hue_move_is_unaffected_by_the_floor(self, handlers):
+        handler = handlers.handler_for("extendedColorLight")
+        before = DimmerDevice(1, "L", onState=True, brightness=50,
+                              redLevel=100, greenLevel=80, blueLevel=80)      # sat 20, hue 0
+        after = DimmerDevice(1, "L", onState=True, brightness=50,
+                             redLevel=100, greenLevel=80, blueLevel=100)      # sat 20, hue 300
+        assert handler.diff(before, after) == {"hue": 300}
+
+    def test_setting_a_colour_zeroes_the_white_channel(self, handlers, mock_indigo_base):
+        """X4: the mirror of the CT path — colourMode is one-of."""
+        dev = DimmerDevice(1, "Lamp", whiteLevel=80)
+        handlers.handler_for("extendedColorLight").dispatch(
+            "setColor", {"hue": 240, "saturation": 100}, dev)
+        mock_indigo_base.dimmer.setColorLevels.assert_called_once_with(
+            dev, redLevel=0, greenLevel=0, blueLevel=100, whiteLevel=0)
 
     def test_dispatch_writes_rgb_levels(self, handlers, mock_indigo_base):
         dev = DimmerDevice(1, "Lamp")

@@ -19,6 +19,7 @@ import time
 from concurrent.futures import CancelledError as FuturesCancelledError
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from datetime import datetime, timezone
+from typing import Optional
 
 import indigo  # provided by the Indigo runtime
 
@@ -148,6 +149,11 @@ class Plugin(indigo.PluginBase):
         self._exported_ids: frozenset[int] = frozenset()
         #: Whether ``indigo.devices.subscribeToChanges()`` has been issued.
         self._subscribed_to_devices = False
+        #: Device ids whose export callback is currently failing. This callback
+        #: fires on every change of an exported device, so a stuck failure would
+        #: otherwise write one traceback per dimmer-ramp step; cleared on the
+        #: first success so a second, later outage is still heard.
+        self._export_callback_failed: set[int] = set()
         self._install_thread: threading.Thread | None = None
         self._stopping = False
         # When WE restart matter-server (menu / post-install), the client sees a brief
@@ -341,7 +347,18 @@ class Plugin(indigo.PluginBase):
         try:
             self.export_bridge.device_updated(origDev, newDev)
         except Exception as exc:  # noqa: BLE001 - never let export break Indigo's callback
-            self.logger.exception(exc)
+            # Named and rate-limited: a bare traceback here says a device broke
+            # but not which one, and this callback fires often enough that a
+            # stuck device would bury the rest of the event log.
+            if newDev.id not in self._export_callback_failed:
+                self._export_callback_failed.add(newDev.id)
+                self.logger.error(
+                    "Matter export: the update of %s (id %s) could not be handed to the bridge "
+                    "— %s. Its accessory will show stale state until this clears.",
+                    getattr(newDev, "name", ""), newDev.id, exc)
+                self.logger.exception(exc)
+        else:
+            self._export_callback_failed.discard(newDev.id)
 
     def deviceDeleted(self, dev):  # noqa: N802
         """A deleted device leaves the allow-list and the bridge (PRD §5.4)."""
@@ -359,12 +376,22 @@ class Plugin(indigo.PluginBase):
             self.logger.error("Matter export: removing the deleted device %s from the export "
                               "list FAILED — %s", dev.id, exc)
             self.logger.exception(exc)
+        self._export_callback_failed.discard(dev.id)
         try:
             if self.export_bridge is not None:
                 self.export_bridge.remove(dev.id)
-            self._exports_changed()
         except Exception as exc:  # noqa: BLE001
             self.logger.exception(exc)
+        finally:
+            # In a finally because the endpoint removal above can raise (the
+            # socket is the bridge's, not ours) and the id-set cache has no
+            # other way back in sync: leaving a deleted device in it makes
+            # deviceUpdated hand a ghost to the bridge on every later change,
+            # and deviceDeleted will never fire for it again.
+            try:
+                self._exports_changed()
+            except Exception as exc:  # noqa: BLE001
+                self.logger.exception(exc)
 
     def shutdown(self) -> None:
         self.logger.debug("%s shutting down", PLUGIN_NAME)
@@ -1342,7 +1369,8 @@ class Plugin(indigo.PluginBase):
         # scratch, and the rebuild's first save overwrites the rescue copy.
         error = self.exports.load_error
         if error:
-            return error if not count else f"{error} {count} device(s) exported."
+            return error if not count else \
+                f"{error} {count} device(s) exported.{self._export_bridge_note()}"
         if not count:
             return "Nothing is exported yet."
         summary = f"{count} device(s) exported."
@@ -1355,7 +1383,33 @@ class Plugin(indigo.PluginBase):
             summary += (f" {pending} of them use a role this version cannot bridge yet "
                         "(sensors, locks, coverings and thermostats arrive in a later "
                         "release) and will not appear in any ecosystem.")
-        return summary
+        return summary + self._export_bridge_note()
+
+    def _export_bridge_note(self) -> str:
+        """One sentence when the exports exist but are not actually live.
+
+        "3 device(s) exported." is true and useless while the bridge client is
+        halted on a version skew: the user is looking at this dialog precisely
+        because a light is missing from the Home app, and every state below
+        answers that question. Reported as a suffix so a load error — which is
+        about rescuing the user's list, and outranks everything — still leads.
+        """
+        bridge = self.export_bridge
+        if bridge is None or not bridge.active:
+            # No client is the CORRECT state for an empty allow-list (XG5), and
+            # the count above already says the list is not empty — so this is a
+            # plugin still starting, which its own log line covers.
+            return ""
+        client = bridge.client
+        if client.halted:
+            return (f" Bridge client halted ({client.halted_reason or 'no reason recorded'}) "
+                    "— restart the bridge node.")
+        if client.recovery:
+            return (" The bridge node is waiting for an endpoint-map rebuild — exports are not "
+                    "live until it is done.")
+        if not client.attached:
+            return " Not connected to the bridge node — exports are not live."
+        return ""
 
     def get_menu_action_config_ui_values(self, menu_id):
         """Seed the export dialog (menu dialogs never remember their values).

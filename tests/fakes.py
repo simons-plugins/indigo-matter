@@ -168,6 +168,11 @@ class FakeBridgeClient:
         self.recovery = False
         self.closed = False
         self.ran = False
+        #: The ``timeout`` of each attach, in order. Kept OUT of ``calls`` so the
+        #: existing tuple assertions stay readable — but recorded, because the
+        #: deadline an un-export is given is the whole of X1: the empty endpoint
+        #: list says nothing about how many endpoints the node has to remove.
+        self.attach_timeouts: list = []
         #: command name → exception to raise instead of succeeding.
         self.fail: dict = {}
 
@@ -176,6 +181,7 @@ class FakeBridgeClient:
         self.ran = True
 
     async def attach(self, endpoints=None, *, replace_all=False, timeout=None):
+        self.attach_timeouts.append(timeout)
         return self._record("attach", endpoints, replace_all)
 
     async def upsert_endpoint(self, spec, timeout=None):

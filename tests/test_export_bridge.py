@@ -125,6 +125,15 @@ class TestAttachTimeout:
     """E3a's pacing×count interaction, answered without a protocol change."""
 
     def test_small_sets_keep_the_flat_floor(self):
+        """The floor is over the count SENT — which is not always the count paced.
+
+        ``attach_timeout_for(0)`` returning the floor is correct arithmetic and
+        wrong as a deadline for the ONE caller that sends zero endpoints on
+        purpose: the §3.1 ``replace_all`` un-export sends nothing and makes the
+        node remove everything. That path must size its own deadline over the
+        removals — see
+        ``TestLifecycle.test_the_un_export_deadline_is_sized_by_the_removals``.
+        """
         assert bridge_client.attach_timeout_for(0) == bridge_client.ATTACH_TIMEOUT
         assert bridge_client.attach_timeout_for(20) == bridge_client.ATTACH_TIMEOUT
 
@@ -133,6 +142,16 @@ class TestAttachTimeout:
         # alone — precisely the flat deadline it would otherwise be given.
         assert bridge_client.attach_timeout_for(80) > 80 * 0.1
         assert bridge_client.attach_timeout_for(80) == pytest.approx(14.0)
+
+    def test_the_crossover_off_the_floor_is_where_the_arithmetic_says(self):
+        """T3: 2.0 + 0.15n passes 8.0 between 40 and 41, and nowhere else.
+
+        Pinned because the crossover is the only observable consequence of the
+        two constants — tune either and this is the test that notices.
+        """
+        assert bridge_client.attach_timeout_for(40) == bridge_client.ATTACH_TIMEOUT
+        assert bridge_client.attach_timeout_for(41) > bridge_client.ATTACH_TIMEOUT
+        assert bridge_client.attach_timeout_for(41) == pytest.approx(8.15)
 
     def test_it_is_monotonic_and_never_negative(self):
         values = [bridge_client.attach_timeout_for(n) for n in range(0, 200, 10)]
@@ -264,6 +283,36 @@ class TestLifecycle:
         assert client.closed is True
         assert h.bridge.active is False
 
+    def test_the_un_export_deadline_is_sized_by_the_removals_not_the_empty_send(
+            self, bridge_mod, mock_logger, devices):
+        """X1: attach latency is dominated by REMOVALS, and this path removes all.
+
+        The endpoint list sent is ``[]``, so letting the client derive the
+        deadline from it hands the un-export of a 60-device database the flat 8s
+        floor — while the node paces those 60 removals ~100ms apart (§3.3). It
+        times out, warns that accessories "may linger", and then ``close()``
+        yanks the socket out from under a reconcile that was going fine.
+        """
+        entries = [ExportEntry(200 + n, "onOffLight") for n in range(60)]
+        h = Harness(bridge_mod, mock_logger, devices, entries)
+        client = h.start()
+        for entry in entries:
+            h.store.remove(entry.indigo_device_id)
+        h.bridge.exports_changed()
+
+        assert client.attach_timeouts == [bridge_client.attach_timeout_for(60)]
+        assert client.attach_timeouts[0] > 60 * 0.1, "must outlast the node's pacing"
+        assert client.attach_timeouts[0] > bridge_client.ATTACH_TIMEOUT
+        assert "may linger" not in warnings_of(mock_logger)
+
+    def test_a_small_un_export_still_gets_the_floor(self, bridge_mod, mock_logger, devices):
+        """Sizing by removals must not make the ordinary case slower to fail."""
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(101, "onOffLight")])
+        client = h.start()
+        h.store.remove(101)
+        h.bridge.exports_changed()
+        assert client.attach_timeouts == [bridge_client.ATTACH_TIMEOUT]
+
     def test_the_client_is_dropped_even_if_the_final_attach_fails(
             self, bridge_mod, mock_logger, devices):
         h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(101, "onOffLight")])
@@ -273,6 +322,9 @@ class TestLifecycle:
         h.bridge.exports_changed()
         assert h.bridge.active is False
         assert "may linger" in warnings_of(mock_logger)
+        # F4: the socket must still be released — the client is unreachable from
+        # here on, so a skipped close() leaks it until the plugin reloads.
+        assert client.closed is True
 
     def test_stop_is_idempotent(self, bridge_mod, mock_logger, devices):
         h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(101, "onOffLight")])
@@ -339,6 +391,27 @@ class TestDeviceUpdated:
         after = RelayDevice(101, "Study Plug", enabled=False)
         h.bridge.device_updated(before, after)
         assert h.client.only("set_reachable") == ("set_reachable", 101, False)
+
+    def test_re_enabling_a_device_sets_reachable_true(self, bridge_mod, mock_logger, devices):
+        """T3: the other direction of XAC8 — a device that comes back must say so.
+
+        A one-way ``set_reachable`` leaves the accessory greyed out in every
+        ecosystem forever, which looks exactly like a dead device.
+        """
+        h = self._harness(bridge_mod, mock_logger, devices, ExportEntry(101, "onOffLight"))
+        before = RelayDevice(101, "Study Plug", enabled=False)
+        after = RelayDevice(101, "Study Plug", enabled=True)
+        h.bridge.device_updated(before, after)
+        assert h.client.only("set_reachable") == ("set_reachable", 101, True)
+
+    def test_an_e4_role_update_is_skipped_silently(self, bridge_mod, mock_logger, devices):
+        """T3: the provider already warned; repeating it per state change is noise."""
+        h = self._harness(bridge_mod, mock_logger, devices, ExportEntry(101, "doorLock"))
+        mock_logger.reset_mock()
+        h.bridge.device_updated(RelayDevice(101, "P", onState=False),
+                                RelayDevice(101, "P", onState=True))
+        assert h.client.names() == []
+        assert mock_logger.warning.call_count == 0
 
     def test_a_device_removed_between_the_guard_and_here_is_dropped(self, bridge_mod,
                                                                     mock_logger, devices):
@@ -564,17 +637,197 @@ class TestHealthTick:
         assert mock_logger.warning.call_count == 1
         assert "~1 min" in warnings_of(mock_logger)
 
-    def test_a_halted_client_says_so_every_tick(self, bridge_mod, mock_logger, devices):
-        """Halted is not transient: nothing is coming to fix it on its own."""
+    def test_a_halted_client_says_so_once_per_streak(self, bridge_mod, mock_logger, devices):
+        """Halted is not transient: nothing is coming to fix it on its own.
+
+        F9: which is exactly why it must not be said every 15s tick, forever —
+        the state never changes, so the repeat carries no new information and
+        buries everything else in the event log.
+        """
         h = self._bridge(bridge_mod, mock_logger, devices)
         h.client.halted = True
         h.client.halted_reason = "version_skew"
-        h.bridge.health_tick()
+        for _ in range(20):
+            h.bridge.health_tick()
+        assert mock_logger.warning.call_count == 1
         assert "HALTED" in warnings_of(mock_logger)
+        assert "version_skew" in warnings_of(mock_logger)
 
-    def test_the_recovery_state_says_nothing_is_exported(self, bridge_mod, mock_logger, devices):
+    def test_a_recovered_client_can_warn_again(self, bridge_mod, mock_logger, devices):
+        """Once per STREAK, not once per process: a second outage must be heard."""
+        h = self._bridge(bridge_mod, mock_logger, devices)
+        h.client.halted = True
+        h.bridge.health_tick()
+        h.client.halted = False
+        h.bridge._on_attached(bridge_protocol.StatusReport(
+            commissioned=True, fabrics=[], endpoint_count=1, endpoints=[], drift=[]))
+        h.client.halted = True
+        h.bridge.health_tick()
+        assert mock_logger.warning.call_count == 2
+
+    def test_the_recovery_state_says_nothing_is_exported_once(self, bridge_mod, mock_logger,
+                                                               devices):
         h = self._bridge(bridge_mod, mock_logger, devices)
         h.client.attached = False
         h.client.recovery = True
-        h.bridge.health_tick()
+        for _ in range(20):
+            h.bridge.health_tick()
+        assert mock_logger.warning.call_count == 1
         assert "rebuild" in warnings_of(mock_logger)
+
+
+# ---------------------------------------------------------------------------
+# Nothing that stops export may be silent (the PR #124 silent-failure sweep)
+# ---------------------------------------------------------------------------
+class TestSilentFailures:
+    """Every path here used to `return` with no trace of what was dropped."""
+
+    def _bridge(self, bridge_mod, mock_logger, devices, role="onOffLight"):
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(101, role)])
+        h.start()
+        return h
+
+    def test_a_drop_while_merely_unattached_names_the_device_at_debug(
+            self, bridge_mod, mock_logger, devices):
+        """F1: attach WILL reconcile this, so it is debug — but not silence."""
+        h = self._bridge(bridge_mod, mock_logger, devices)
+        h.client.attached = False
+        h.bridge.upsert(101)
+        debug = " ".join(str(call.args[0]) % call.args[1:] if len(call.args) > 1
+                         else str(call.args[0])
+                         for call in mock_logger.debug.call_args_list)
+        assert "101" in debug
+        assert mock_logger.warning.call_count == 0
+
+    @pytest.mark.parametrize("state,expected", [
+        ("halted", "HALTED (version_skew)"),
+        ("recovery", "endpoint-map"),
+    ])
+    def test_a_drop_while_halted_or_in_recovery_is_a_warning_with_the_reason(
+            self, bridge_mod, mock_logger, devices, state, expected):
+        """F1: the client's own loud path is unreachable from here — replicate it.
+
+        ``_live_client`` gates before ``set_state`` is ever called, so
+        ``BridgeClient._log_dropped_state_push``'s warning is dead code on this
+        route: a halted bridge dropped every push in total silence.
+        """
+        h = self._bridge(bridge_mod, mock_logger, devices)
+        h.client.attached = False
+        setattr(h.client, state, True)
+        h.client.halted_reason = "version_skew"
+        h.bridge.device_updated(RelayDevice(101, "P", onState=False),
+                                RelayDevice(101, "P", onState=True))
+        assert expected in warnings_of(mock_logger)
+        assert "101" in warnings_of(mock_logger)
+
+    def test_the_halted_drop_warning_is_once_per_streak(self, bridge_mod, mock_logger, devices):
+        h = self._bridge(bridge_mod, mock_logger, devices)
+        h.client.attached = False
+        h.client.halted = True
+        for _ in range(10):
+            h.bridge.device_updated(RelayDevice(101, "P", onState=False),
+                                    RelayDevice(101, "P", onState=True))
+        assert mock_logger.warning.call_count == 1
+
+    def test_a_failed_run_loop_schedule_is_a_warning_not_a_debug_line(
+            self, bridge_mod, mock_logger, devices):
+        """F2: if run() never got scheduled, NOTHING is exported, ever."""
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(101, "onOffLight")])
+        h.runtime.is_running = False
+        h.bridge.start()
+        assert "bridge client run loop" in warnings_of(mock_logger)
+
+    def test_a_failed_un_export_schedule_is_a_warning(self, bridge_mod, mock_logger, devices):
+        """F2: the accessories stay in every paired ecosystem, unexplained."""
+        h = self._bridge(bridge_mod, mock_logger, devices)
+        h.runtime.is_running = False
+        h.store.remove(101)
+        h.bridge.exports_changed()
+        assert "un-exporting everything" in warnings_of(mock_logger)
+
+    def test_an_ordinary_push_that_cannot_be_scheduled_stays_at_debug(
+            self, bridge_mod, mock_logger, devices):
+        """F2: a set_state is re-delivered by the next attach; it is not a loss."""
+        h = self._bridge(bridge_mod, mock_logger, devices)
+        h.runtime.is_running = False
+        h.bridge.device_updated(RelayDevice(101, "P", onState=False),
+                                RelayDevice(101, "P", onState=True))
+        assert mock_logger.warning.call_count == 0
+        assert mock_logger.debug.called
+
+    def test_a_failed_dispatch_corrects_the_ecosystem_back_to_the_truth(
+            self, bridge_mod, mock_logger, devices, mock_indigo_base):
+        """F5: otherwise Home shows the light the user asked for and Indigo does not.
+
+        The ecosystem applied the command optimistically the moment it sent it.
+        Logging and returning leaves those two beliefs permanently split until
+        something else happens to that device.
+        """
+        devices.add(RelayDevice(123456789, "Golden Plug", onState=False))
+        mock_indigo_base.device.turnOn.side_effect = RuntimeError("server said no")
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(123456789, "onOffLight")])
+        h.start()
+        h.bridge.on_command(bridge_protocol.parse_command(FRAMES["command_on_off"]["data"]))
+        assert h.client.only("set_state") == ("set_state", 123456789, {"onOff": False})
+        assert "still shows" in errors_of(mock_logger)
+
+    def test_a_state_read_failure_dedupes_on_the_reason_not_the_message(
+            self, bridge_mod, mock_logger, devices):
+        """F8b: a varying ``str(exc)`` in the key defeats the dedupe entirely."""
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(101, "onOffLight")])
+        calls = {"n": 0}
+
+        def exploding_states_for(_dev):
+            calls["n"] += 1
+            raise RuntimeError(f"transient read error #{calls['n']}")
+
+        handler = bridge_mod.export_handlers.handler_for("onOffLight")
+        original, handler.states_for = handler.states_for, exploding_states_for
+        try:
+            for _ in range(5):
+                h.bridge.endpoint_specs()
+        finally:
+            handler.states_for = original
+        assert mock_logger.warning.call_count == 1
+        assert "transient read error #1" in warnings_of(mock_logger), \
+            "the varying detail belongs in the LINE, just not in the key"
+
+    def test_a_non_terminal_attach_refusal_is_reported_once_per_streak(
+            self, bridge_mod, mock_logger, devices):
+        """F8c: a transient refusal reconnects on backoff — this fires every cycle."""
+        h = self._bridge(bridge_mod, mock_logger, devices)
+        for _ in range(10):
+            h.bridge._on_attach_refused(bridge_protocol.ERR_INTERNAL, "node is confused")
+        assert mock_logger.error.call_count == 1
+
+    def test_a_terminal_refusal_is_still_said_every_time(self, bridge_mod, mock_logger, devices):
+        """Terminal refusals do not loop, and each one is a distinct decision."""
+        h = self._bridge(bridge_mod, mock_logger, devices)
+        h.bridge._on_attach_refused(bridge_protocol.ERR_ENDPOINT_MAP_INVALID, "unreadable")
+        h.bridge._on_attach_refused(bridge_protocol.ERR_ENDPOINT_MAP_INVALID, "unreadable")
+        assert mock_logger.error.call_count == 2
+
+    def test_a_reattach_lets_a_refusal_be_reported_again(self, bridge_mod, mock_logger, devices):
+        h = self._bridge(bridge_mod, mock_logger, devices)
+        h.bridge._on_attach_refused(bridge_protocol.ERR_INTERNAL, "node is confused")
+        h.bridge._on_attached(bridge_protocol.StatusReport(
+            commissioned=True, fabrics=[], endpoint_count=1, endpoints=[], drift=[]))
+        h.bridge._on_attach_refused(bridge_protocol.ERR_INTERNAL, "node is confused again")
+        assert mock_logger.error.call_count == 2
+
+    def test_a_failing_diff_names_the_device_and_repeats_once_per_streak(
+            self, bridge_mod, mock_logger, devices):
+        """F6/F7: a bare traceback per state change tells you nothing and never stops."""
+        h = self._bridge(bridge_mod, mock_logger, devices)
+        handler = bridge_mod.export_handlers.handler_for("onOffLight")
+        original = handler.diff
+        handler.diff = lambda _o, _n: (_ for _ in ()).throw(RuntimeError("bad device"))
+        try:
+            for _ in range(10):
+                h.bridge.device_updated(RelayDevice(101, "Study Plug", onState=False),
+                                        RelayDevice(101, "Study Plug", onState=True))
+        finally:
+            handler.diff = original
+        assert mock_logger.exception.call_count == 1
+        assert "Study Plug" in errors_of(mock_logger)
+        assert "101" in errors_of(mock_logger)

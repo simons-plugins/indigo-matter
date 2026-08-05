@@ -68,6 +68,18 @@ def attach_timeout_for(endpoint_count: int) -> float:
     over 8s of pacing alone, so a fixed deadline would time out exactly on the
     databases that most need export to work. Everything smaller keeps the flat
     :data:`ATTACH_TIMEOUT` floor, so the common case is unchanged.
+
+    **The count is asymmetric, and callers have to know which one they mean.**
+    What the node spends its time on is the ~100ms-paced REMOVALS (§3.3), not
+    the creates — and an attach's removals are everything it holds that the
+    desired set omits. For an ordinary reconnect the two counts track each
+    other: the node's set came from our last attach, so drift is bounded by
+    whatever the user changed while the socket was down, and ``len(specs)`` is
+    a fine proxy. For the ONE caller that deliberately sends nothing —
+    ``export_bridge._replace_all_then_stop``, the §3.1 un-export — they are
+    opposites: zero sent, *everything* removed. That caller passes its own
+    ``timeout`` over the removal count; defaulting would hand a 60-device
+    un-export the 8s floor and time it out mid-reconcile.
     """
     return max(ATTACH_TIMEOUT,
                ATTACH_TIMEOUT_BASE + ATTACH_TIMEOUT_PER_ENDPOINT * max(0, int(endpoint_count)))
@@ -199,10 +211,16 @@ class BridgeClient(WsJsonClient):
             "connected to bridge node (bridge %s, matter.js %s), attaching",
             hello.bridge_version, hello.matter_js_version,
         )
+        # The desired set is read BEFORE the connection is declared usable. It
+        # is blocking Indigo IPC (see :meth:`_attach`) so it happens off the
+        # loop either way, but doing the hop here keeps ``connected`` meaning
+        # "the attach is on its way" rather than "we are still deciding what to
+        # send" — which is what every waiter on ``wait_connected`` assumes.
+        specs = await self._gather_endpoints()
         # Requests are legal from here on: attach is one.
         self._mark_connected()
         try:
-            status = await self._attach(None, replace_all=False, timeout=None, inline=True)
+            status = await self._attach(specs, replace_all=False, timeout=None, inline=True)
         except BridgeProtocolError as exc:
             self._handle_attach_refused(exc)
             return
@@ -342,6 +360,24 @@ class BridgeClient(WsJsonClient):
         """
         return await self._attach(endpoints, replace_all=replace_all, timeout=timeout, inline=False)
 
+    async def _gather_endpoints(self) -> list:
+        """Read the injected endpoint provider, OFF the loop.
+
+        The provider is ``export_bridge.endpoint_specs``, which does one
+        synchronous ``indigo.devices[id]`` IPC copy PER exported device — 60
+        exports is 60 blocking round trips to IndigoServer. This loop is shared
+        with the inbound matter-server client, so running that inline would
+        stall live Matter device updates behind an export reconcile every time
+        the bridge reconnects.
+
+        The provider itself deliberately stays an ordinary blocking callable:
+        it is the injected seam's public shape, and making it a coroutine would
+        push the same problem into every implementation instead of solving it
+        once here.
+        """
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self._endpoint_provider)
+
     async def _attach(self, endpoints: Optional[list], *, replace_all: bool,
                       timeout: Optional[float], inline: bool) -> StatusReport:
         """The attach itself. ``inline`` selects how the response is waited for.
@@ -350,8 +386,9 @@ class BridgeClient(WsJsonClient):
         the socket, so there is no dispatcher to resolve a pending future — it
         pumps the socket itself. A caller re-attaching on a live connection goes
         through the normal correlated path.
+
         """
-        specs = self._endpoint_provider() if endpoints is None else endpoints
+        specs = await self._gather_endpoints() if endpoints is None else endpoints
         if timeout is None:
             timeout = attach_timeout_for(len(specs))
         frame = self.proto.build_attach(self.plugin_version, specs, replace_all=replace_all)
