@@ -8,6 +8,15 @@ on:
 
 jobs:
   create-release:
+    # Opt-out marker. A merge whose commit message contains [no-release] is
+    # skipped entirely — no tag, no release, no bundle. Intended for the
+    # intermediate merges of a multi-PR feature arc, where every merge would
+    # otherwise mint a release nobody installs. Put the marker in the PR TITLE:
+    # GitHub's default merge commit is "Merge pull request #N from …" followed
+    # by the PR title, so the title is what lands in the message this reads.
+    # A release still needs its own PluginVersion bump — version-check is
+    # unaffected by this marker and continues to require one on every PR.
+    if: ${{ !contains(github.event.head_commit.message, '[no-release]') }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
