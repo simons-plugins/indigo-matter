@@ -46,6 +46,15 @@ PLUGIN_NAME = "indigo-matter"
 COMMAND_TIMEOUT = 5.0
 DECOMMISSION_TIMEOUT = 15.0
 
+#: Watchdog ticks (~15s each) of an active export with no ``deviceUpdated`` at
+#: all before ``subscribeToChanges`` is re-issued — see
+#: ``Plugin._resubscribe_tick``. ~1 minute, the same shape as every other streak
+#: counter here.
+RESUBSCRIBE_TICKS = 4
+#: How many times, at most. Bounded because a house where nothing changes looks
+#: identical to a subscription that never registered.
+MAX_RESUBSCRIBE_ATTEMPTS = 3
+
 #: Menu id of the export dialog (MenuItems.xml) — matched in
 #: ``get_menu_action_config_ui_values`` so other menus are never seeded.
 MENU_MANAGE_EXPORTS = "manageMatterExports"
@@ -149,6 +158,13 @@ class Plugin(indigo.PluginBase):
         self._exported_ids: frozenset[int] = frozenset()
         #: Whether ``indigo.devices.subscribeToChanges()`` has been issued.
         self._subscribed_to_devices = False
+        #: Whether a ``deviceUpdated`` has arrived since the subscription was
+        #: issued — the only observable evidence that it actually took.
+        self._device_updates_seen = False
+        #: How many watchdog ticks have passed with a subscription and no
+        #: ``deviceUpdated``, and how many times we have re-issued it.
+        self._no_update_ticks = 0
+        self._resubscribe_attempts = 0
         #: Device ids whose export callback is currently failing. This callback
         #: fires on every change of an exported device, so a stuck failure would
         #: otherwise write one traceback per dimmer-ramp step; cleared on the
@@ -253,6 +269,10 @@ class Plugin(indigo.PluginBase):
         self.export_bridge = ExportBridge(
             self.exports, self.runtime, self.logger, lambda: self.pluginPrefs,
             plugin_version=self._version, plugin_id=self._export_plugin_id(),
+            # The un-export debt (XAC7) is written to prefs and has to reach
+            # disk to be worth writing: the failure it covers is the plugin
+            # never getting another chance to say it.
+            save_prefs=self._save_plugin_prefs,
         )
         self._exports_changed()
 
@@ -320,15 +340,54 @@ class Plugin(indigo.PluginBase):
         """
         if self._subscribed_to_devices:
             return
+        self._issue_device_subscription()
+
+    def _issue_device_subscription(self) -> bool:
+        """The bare call, without the once-only guard. True if it did not raise."""
         try:
             indigo.devices.subscribeToChanges()
         except Exception as exc:  # noqa: BLE001
             self.logger.error("Matter export: could not subscribe to Indigo device changes — "
                               "exported accessories will not follow Indigo state. %s", exc)
             self.logger.exception(exc)
-            return
+            return False
         self._subscribed_to_devices = True
         self.logger.debug("subscribed to Indigo device changes (export is active)")
+        return True
+
+    def _resubscribe_tick(self) -> None:
+        """Re-issue ``subscribeToChanges`` if it looks like it never took.
+
+        **Why this exists.** The whole outbound push path rests on one
+        undocumented assumption: that ``subscribeToChanges`` works the same
+        issued from a menu callback as from ``startup``. The canonical reference
+        describes it as a request to the server, which is why it is safe to make
+        conditional (see :meth:`_subscribe_to_device_changes`) — but it does not
+        *say* so, there is no acknowledgement to check, and no unsubscribe to
+        compare against. If the assumption is ever wrong on some Indigo build,
+        the symptom is silence: exported accessories simply stop following
+        Indigo, with no error anywhere.
+        """
+        if not self._exported_ids or not self._subscribed_to_devices:
+            return
+        if self._device_updates_seen or self._resubscribe_attempts >= MAX_RESUBSCRIBE_ATTEMPTS:
+            return
+        self._no_update_ticks += 1
+        if self._no_update_ticks < RESUBSCRIBE_TICKS:
+            return
+        self._no_update_ticks = 0
+        self._resubscribe_attempts += 1
+        # **Bounded, because "no updates" is also what a quiet house looks
+        # like.** A device that nobody touches genuinely produces no callback,
+        # so this cannot be a permanent retry loop without being permanent
+        # noise. A handful of re-issues covers the case it is for — a
+        # subscription that never registered — and after that the evidence is
+        # indistinguishable from nothing having happened.
+        self.logger.debug(
+            "Matter export: no device updates since subscribing; re-issuing "
+            "subscribeToChanges (attempt %d of %d)",
+            self._resubscribe_attempts, MAX_RESUBSCRIBE_ATTEMPTS)
+        self._issue_device_subscription()
 
     def deviceUpdated(self, origDev, newDev):  # noqa: N802
         """Push an exported device's change outward.
@@ -340,6 +399,12 @@ class Plugin(indigo.PluginBase):
         locked and nothing is allocated for a device nobody exported.
         """
         super().deviceUpdated(origDev, newDev)
+        # Set for ANY device, before the allow-list gate: the flag is evidence
+        # that the *subscription* is alive, and the subscription covers every
+        # device on the server. Gating it on an exported device would leave the
+        # watchdog re-issuing a perfectly good subscription in any house where
+        # the exported devices happen to be idle.
+        self._device_updates_seen = True
         if newDev.id not in self._exported_ids:
             return
         if self.export_bridge is None:
@@ -548,6 +613,7 @@ class Plugin(indigo.PluginBase):
         # the reverse.
         if self.export_bridge is not None:
             self.export_bridge.health_tick()
+        self._resubscribe_tick()
 
     # ------------------------------------------------------------------
     # Config
@@ -1804,6 +1870,20 @@ class Plugin(indigo.PluginBase):
             return self.server_process.storage_path
         return ServerProcess(self._server_prefs(), self.logger).storage_path
 
+    def _bridge_storage_path(self) -> str:
+        """The **export** bridge node's storage dir — sibling of the controller's.
+
+        Hard-coded relative to the controller's rather than read from a pref
+        because there is no pref: E3's node is started by hand and E7 owns the
+        agent that will have one. The path is the PRD §4.3 default
+        (``…/com.simons-plugins.indigo-matter/bridge-node``), which is also
+        `bridge-node/src/config.ts`'s `DEFAULT_STORAGE_PATH`. A user who moved
+        it gets a backup without those members and a log line saying so, which
+        is the same outcome as not having exported anything.
+        """
+        controller = os.path.normpath(self._resolve_storage_path())
+        return os.path.join(os.path.dirname(controller), "bridge-node")
+
     @staticmethod
     def _human_size(num_bytes: int) -> str:
         size = float(num_bytes)
@@ -1822,6 +1902,10 @@ class Plugin(indigo.PluginBase):
             storage_path = self._resolve_storage_path()
             archive = fabric_backup.create_backup(
                 storage_path, now=datetime.now(timezone.utc), logger=self.logger,
+                # PRD-indigo-matter-export §4.3: the bridge node's storage is
+                # backed up alongside the controller's. Losing it costs every
+                # ecosystem pairing AND every exported accessory's identity.
+                bridge_storage_path=self._bridge_storage_path(),
             )
             size = self._human_size(os.path.getsize(archive))
             self.logger.info(

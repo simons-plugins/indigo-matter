@@ -475,3 +475,119 @@ def test_prune_logs_undeletable_backup(tmp_path, monkeypatch):
     removed = fabric_backup.prune_backups(storage, keep=1, logger=logger)
     assert removed == []  # nothing actually removed
     assert "Could not prune" in logger.text("warning")
+
+
+def _make_bridge_storage(tmp_path, *, files: dict[str, str] | None = None):
+    """The export bridge node's storage dir — a SIBLING of the controller's."""
+    storage = tmp_path / "appsupport" / "bridge-node"
+    storage.mkdir(parents=True)
+    files = files or {
+        "identity.json": '{"installId": "abc", "passcode": 20202021, "discriminator": 3840}',
+        "endpoint-map.json": '{"version": 1, "endpoints": {"indigo-101": 2}}',
+        "node-indigo-matter-bridge/state.json": "{}",
+    }
+    for rel, content in files.items():
+        path = storage / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+    return str(storage)
+
+
+class TestBridgeStorageInBackups:
+    """PRD-indigo-matter-export §4.3: back the bridge node's storage up too.
+
+    Losing that one directory costs two irreplaceable things at once — the
+    operational credentials for every ecosystem the bridge is paired into, and
+    the ``endpoint-map.json`` whose loss duplicates every exported accessory in
+    every one of them.
+    """
+
+    def _archive(self, tmp_path, bridge=True):
+        storage = _make_storage(tmp_path)
+        bridge_path = _make_bridge_storage(tmp_path) if bridge else None
+        archive = fabric_backup.create_backup(
+            storage, now=datetime(2026, 8, 5, tzinfo=timezone.utc),
+            bridge_storage_path=bridge_path)
+        return storage, archive
+
+    def test_the_bridge_dir_is_archived_under_its_own_prefix(self, tmp_path):
+        _storage, archive = self._archive(tmp_path)
+        with zipfile.ZipFile(archive) as zf:
+            names = zf.namelist()
+        assert f"{fabric_backup.BRIDGE_MEMBER_PREFIX}identity.json" in names
+        assert f"{fabric_backup.BRIDGE_MEMBER_PREFIX}endpoint-map.json" in names
+        # The prefix is what keeps two sibling directories apart in one archive —
+        # and what lets an old, controller-only backup still restore cleanly.
+        assert "config" in names
+        assert not any(name.startswith(fabric_backup.BRIDGE_MEMBER_PREFIX)
+                       for name in ["config", "certificates/root.pem"])
+
+    def test_the_endpoint_map_survives_the_round_trip_byte_for_byte(self, tmp_path):
+        _storage, archive = self._archive(tmp_path)
+        with zipfile.ZipFile(archive) as zf:
+            body = zf.read(f"{fabric_backup.BRIDGE_MEMBER_PREFIX}endpoint-map.json")
+        assert b'"indigo-101": 2' in body
+
+    def test_a_missing_bridge_dir_is_skipped_not_fatal(self, tmp_path):
+        """A user who exports nothing has no bridge storage — and still needs a backup."""
+        storage = _make_storage(tmp_path)
+        archive = fabric_backup.create_backup(
+            storage, now=datetime(2026, 8, 5, tzinfo=timezone.utc),
+            bridge_storage_path=str(tmp_path / "nope"))
+        with zipfile.ZipFile(archive) as zf:
+            assert zf.namelist()
+            assert fabric_backup.bridge_members_in(archive) == []
+
+    def test_omitting_the_argument_reproduces_the_old_archive(self, tmp_path):
+        _storage, archive = self._archive(tmp_path, bridge=False)
+        assert fabric_backup.bridge_members_in(archive) == []
+
+    def test_restore_leaves_the_bridge_members_alone_and_says_so(self, tmp_path):
+        """A half-restore nobody mentioned is the worst of the three options.
+
+        Extracting them under the CONTROLLER's storage dir would put a second
+        Matter node's credentials where nothing will ever read them; doing it in
+        place needs the bridge node stopped, and there is no stop seam until E7.
+        So: restore the fabric, and name the files, the prefix and the manual
+        recipe.
+        """
+        storage, archive = self._archive(tmp_path)
+        logger = _RecordingLogger()
+
+        fabric_backup.restore_backup(
+            archive, storage, FakeControl(),
+            now=datetime(2026, 8, 6, tzinfo=timezone.utc), logger=logger)
+
+        assert not os.path.exists(os.path.join(storage, "bridge-node"))
+        assert os.path.isfile(os.path.join(storage, "config"))
+        warning = " ".join(logger.warnings)
+        assert "bridge node" in warning
+        assert fabric_backup.BRIDGE_MEMBER_PREFIX in warning
+
+    def test_restoring_a_controller_only_backup_says_nothing_about_the_bridge(self, tmp_path):
+        storage, archive = self._archive(tmp_path, bridge=False)
+        logger = _RecordingLogger()
+        fabric_backup.restore_backup(
+            archive, storage, FakeControl(),
+            now=datetime(2026, 8, 6, tzinfo=timezone.utc), logger=logger)
+        assert "bridge node" not in " ".join(logger.warnings)
+
+
+class _RecordingLogger:
+    def __init__(self):
+        self.warnings: list[str] = []
+
+    def _record(self, target, message, *args):
+        target.append(str(message) % args if args else str(message))
+
+    def warning(self, message, *args):
+        self._record(self.warnings, message, *args)
+
+    def info(self, message, *args):
+        pass
+
+    def error(self, message, *args):
+        pass
+
+    def debug(self, message, *args):
+        pass

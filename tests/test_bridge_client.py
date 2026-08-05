@@ -1027,3 +1027,91 @@ class TestResultValidation:
             await client.close()
             task.cancel()
         run(scenario())
+
+
+class TestHandshakeReplaceAll:
+    """E5/XAC7: the handshake attach can carry §3.1's opt-in, on request.
+
+    An un-export that never landed leaves the node holding accessories nobody
+    will ever ask it to remove again — the allow-list is empty, so XG5 says no
+    client, so there is no attach. ``export_bridge`` reconnects on purpose for
+    exactly that, and the attach it makes has to carry the intent or the node
+    answers ``mass_removal_refused`` every time.
+    """
+
+    def test_an_empty_set_carries_the_intent_when_the_provider_says_so(self, mock_logger):
+        async def scenario():
+            attached = []
+            fake = _fake()
+            client = _client(mock_logger, fake,
+                             endpoint_provider=lambda: [],
+                             replace_all_provider=lambda: True,
+                             on_attached=attached.append)
+            task = asyncio.create_task(client.run())
+            await client.wait_connected(timeout=2)
+            await settle(lambda: attached)
+            frame = sent(fake, bridge_protocol.CMD_ATTACH)
+            assert frame["args"][bridge_protocol.ARG_INTENT] == bridge_protocol.INTENT_REPLACE_ALL
+            await client.close()
+            task.cancel()
+
+        asyncio.run(scenario())
+
+    def test_a_non_empty_set_never_carries_it_however_the_provider_answers(self, mock_logger):
+        """Belt and braces on the one flag that can un-export a whole house.
+
+        A `replace_all` alongside real endpoints is meaningless — §3.1's guard
+        cannot fire against a non-empty desired set — and a mis-set flag would
+        otherwise be a standing licence renewed on every single reconnect.
+        """
+        async def scenario():
+            attached = []
+            fake = _fake()
+            client = _client(mock_logger, fake,
+                             endpoint_provider=lambda: [KITCHEN_LAMP],
+                             replace_all_provider=lambda: True,
+                             on_attached=attached.append)
+            task = asyncio.create_task(client.run())
+            await client.wait_connected(timeout=2)
+            await settle(lambda: attached)
+            assert bridge_protocol.ARG_INTENT not in sent(fake, bridge_protocol.CMD_ATTACH)["args"]
+            await client.close()
+            task.cancel()
+
+        asyncio.run(scenario())
+
+    def test_a_raising_provider_attaches_without_the_intent(self, mock_logger):
+        """Fail safe: the destructive reading of a broken flag is the wrong one."""
+        def _boom():
+            raise RuntimeError("prefs are unreadable")
+
+        async def scenario():
+            attached = []
+            fake = _fake()
+            client = _client(mock_logger, fake,
+                             endpoint_provider=lambda: [],
+                             replace_all_provider=_boom,
+                             on_attached=attached.append)
+            task = asyncio.create_task(client.run())
+            await client.wait_connected(timeout=2)
+            await settle(lambda: attached)
+            assert bridge_protocol.ARG_INTENT not in sent(fake, bridge_protocol.CMD_ATTACH)["args"]
+            await client.close()
+            task.cancel()
+
+        asyncio.run(scenario())
+
+    def test_the_default_is_no_intent(self, mock_logger):
+        async def scenario():
+            attached = []
+            fake = _fake()
+            client = _client(mock_logger, fake, endpoint_provider=lambda: [],
+                             on_attached=attached.append)
+            task = asyncio.create_task(client.run())
+            await client.wait_connected(timeout=2)
+            await settle(lambda: attached)
+            assert bridge_protocol.ARG_INTENT not in sent(fake, bridge_protocol.CMD_ATTACH)["args"]
+            await client.close()
+            task.cancel()
+
+        asyncio.run(scenario())

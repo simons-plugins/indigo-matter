@@ -9,16 +9,16 @@
     "Shapes only — bridgeVersion/matterJsVersion are substituted at assert time,",
     "since they track package.json and the pinned matter.js release.",
     "",
-    "Top level: the handshake, the exchanges the node implements, and every §5",
-    "event. 'pending' holds exchanges for commands the node does not implement",
-    "yet (§3.9-§3.11); the TS suite skips those, the Python client suite does",
-    "not — the plugin half shipped at E1.",
+    "Top level: the handshake, every exchange the node implements, and every §5",
+    "event. 'pending' is the holding pen for commands the node does not implement",
+    "yet — the TS suite skips those, the Python client suite does not — and since",
+    "E5 it is EMPTY: every frame here is answered by a real handler on both sides.",
     "",
-    "E4 completed the §4.2 role table, so 'attach_all_roles' and the whole",
-    "'set_state_*' family graduated out of 'pending' and are asserted by both",
-    "suites. What is left there is the fabric/reset/rebuild family only.",
+    "E4 graduated 'attach_all_roles' and the whole 'set_state_*' family; E5",
+    "graduated the last five, the fabric/reset/rebuild family (§3.9-§3.11) plus",
+    "the endpoint_map_invalid refusal.",
     "",
-    "Two frames are deliberately not what a live node produces from a cold start,",
+    "Three frames are deliberately not what a live node produces from a cold start,",
     "and the suites know it:",
     " - 'attach' answers with an EMPTY endpoint set, because the request it",
     "   answers carries `endpoints: []`. That is the lawful §3.1 pair, and it is",
@@ -27,6 +27,13 @@
     " - 'unknown_command' uses a name that is not in §3 at all. It used to use",
     "   upsert_endpoint 'because the node does not know it yet', which made the",
     "   fixture expire the moment the handler landed.",
+    " - 'rebuild_endpoint_map' answers with endpoint numbers that differ from every",
+    "   other status frame (4 and 5, not 2 and 3), because §3.11 exists precisely",
+    "   for the case where the numbers moved and the user has accepted it. Its",
+    "   driftChecked was 'false' while this frame was pending and is 'true' since",
+    "   E5: §4.3's rule is 'false until the node persists the map', and a rebuild",
+    "   persists one. drift is then empty because the map was just written FROM the",
+    "   live set — trivially true, not an all-clear about anything that came before.",
     "",
     "'get_status' carries the same StatusReport 'attach_with_endpoints' returns:",
     "§6.2's invariant is that attach answers with exactly what get_status would,",
@@ -1198,116 +1205,115 @@
       "result": {}
     }
   },
-  "pending": {
-    "_comment": [
-      "Commands the bridge node does not implement yet (§3.9-§3.11: remove_fabric,",
-      "factory_reset, rebuild_endpoint_map and the endpoint_map_invalid refusal).",
-      "The TS suite skips these (and asserts they are skipped for a reason); the",
-      "Python client suite asserts them in full, because the plugin side ships first.",
-      "",
-      "'attach_all_roles' and the 'set_state_*' family used to live here. They",
-      "graduated at E4, when the node grew the sensor, thermostat, doorLock and",
-      "windowCovering role factories — every §4.2 role, state key and command name",
-      "is now carried by a live frame, and tests/test_bridge_protocol_frames.py",
-      "enumerates the vocabularies from bridge_protocol.ROLE_STATE_KEYS /",
-      "ROLE_COMMANDS and fails if any of them has no frame."
-    ],
-    "remove_fabric": {
-      "request": {
-        "message_id": "m20",
-        "command": "remove_fabric",
-        "args": {
-          "fabricIndex": 2
-        }
-      },
-      "response": {
-        "message_id": "m20",
-        "result": {}
+  "remove_fabric": {
+    "request": {
+      "message_id": "m20",
+      "command": "remove_fabric",
+      "args": {
+        "fabricIndex": 2
       }
     },
-    "factory_reset": {
-      "request": {
-        "message_id": "m21",
-        "command": "factory_reset",
-        "args": {
-          "preserveEndpointNumbers": true
-        }
-      },
-      "response": {
-        "message_id": "m21",
-        "result": {}
+    "response": {
+      "message_id": "m20",
+      "result": {}
+    }
+  },
+  "factory_reset": {
+    "request": {
+      "message_id": "m21",
+      "command": "factory_reset",
+      "args": {
+        "preserveEndpointNumbers": true
       }
     },
-    "factory_reset_discard_map": {
-      "request": {
-        "message_id": "m22",
-        "command": "factory_reset",
-        "args": {
-          "preserveEndpointNumbers": false
-        }
-      },
-      "response": {
-        "message_id": "m22",
-        "result": {}
+    "response": {
+      "message_id": "m21",
+      "result": {}
+    }
+  },
+  "factory_reset_discard_map": {
+    "request": {
+      "message_id": "m22",
+      "command": "factory_reset",
+      "args": {
+        "preserveEndpointNumbers": false
       }
     },
-    "rebuild_endpoint_map": {
-      "request": {
-        "message_id": "m23",
-        "command": "rebuild_endpoint_map",
-        "args": {}
-      },
-      "response": {
-        "message_id": "m23",
-        "result": {
-          "commissioned": true,
-          "fabrics": [
-            {
-              "fabricIndex": 1,
-              "label": "Apple Home",
-              "vendorId": 4937
-            }
-          ],
-          "endpointCount": 2,
-          "endpoints": [
-            {
-              "indigoDeviceId": 123456789,
-              "endpointNumber": 4,
-              "role": "onOffLight"
-            },
-            {
-              "indigoDeviceId": 123456790,
-              "endpointNumber": 5,
-              "role": "dimmableLight"
-            }
-          ],
-          "drift": [],
-          "driftChecked": false
-        }
-      }
+    "response": {
+      "message_id": "m22",
+      "result": {}
+    }
+  },
+  "rebuild_endpoint_map": {
+    "request": {
+      "message_id": "m23",
+      "command": "rebuild_endpoint_map",
+      "args": {}
     },
-    "endpoint_map_invalid": {
-      "request": {
-        "message_id": "m24",
-        "command": "upsert_endpoint",
-        "args": {
-          "endpoint": {
-            "indigoDeviceId": 123456789,
-            "role": "onOffLight",
-            "label": "Kitchen Lamp",
-            "reachable": true,
-            "states": {
-              "onOff": true
-            },
-            "options": {}
+    "response": {
+      "message_id": "m23",
+      "result": {
+        "commissioned": true,
+        "fabrics": [
+          {
+            "fabricIndex": 1,
+            "label": "Apple Home",
+            "vendorId": 4937
           }
-        }
-      },
-      "response": {
-        "message_id": "m24",
-        "error_code": "endpoint_map_invalid",
-        "details": "endpoint map is unreadable; only get_status, get_pairing and rebuild_endpoint_map are accepted"
+        ],
+        "endpointCount": 2,
+        "endpoints": [
+          {
+            "indigoDeviceId": 123456789,
+            "endpointNumber": 4,
+            "role": "onOffLight"
+          },
+          {
+            "indigoDeviceId": 123456790,
+            "endpointNumber": 5,
+            "role": "dimmableLight"
+          }
+        ],
+        "drift": [],
+        "driftChecked": true
       }
     }
+  },
+  "endpoint_map_invalid": {
+    "request": {
+      "message_id": "m24",
+      "command": "upsert_endpoint",
+      "args": {
+        "endpoint": {
+          "indigoDeviceId": 123456789,
+          "role": "onOffLight",
+          "label": "Kitchen Lamp",
+          "reachable": true,
+          "states": {
+            "onOff": true
+          },
+          "options": {}
+        }
+      }
+    },
+    "response": {
+      "message_id": "m24",
+      "error_code": "endpoint_map_invalid",
+      "details": "endpoint map is unreadable; only get_status, get_pairing and rebuild_endpoint_map are accepted"
+    }
+  },
+  "pending": {
+    "_comment": [
+      "EMPTY, and asserted empty by both suites — E5 graduated the last five",
+      "(remove_fabric, factory_reset x2, rebuild_endpoint_map and the",
+      "endpoint_map_invalid refusal), so every frame in this file is now answered",
+      "by a real node handler and asserted shape-for-shape on both sides.",
+      "",
+      "The key is kept rather than deleted because it is the mechanism, not a",
+      "backlog: the next protocol addition lands its frames here first, the TS",
+      "suite skips them with a named reason, and the Python client suite asserts",
+      "them from day one — which is what let the plugin half of §3.9-§3.11 ship at",
+      "E1 and sit correct until the node caught up."
+    ]
   }
 }

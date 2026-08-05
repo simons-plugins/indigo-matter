@@ -10,12 +10,15 @@ import { join } from "node:path";
 import { describe, it } from "node:test";
 
 import {
+    clearCommissioned,
     DISCRIMINATOR_MAX,
     generateDiscriminator,
     generatePasscode,
+    identityProblem,
     INVALID_PASSCODES,
     isValidPasscode,
     loadOrCreateIdentity,
+    markCommissioned,
     nodeUniqueIdFor,
     PASSCODE_MAX,
     PASSCODE_MIN,
@@ -200,6 +203,131 @@ describe("loadOrCreateIdentity", () => {
             // Matter requires UniqueID and SerialNumber to differ.
             assert.notEqual(serial, unique);
         } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+});
+
+describe("identityProblem — the E5 refuse-to-start guard", () => {
+    it("answers undefined when there is no identity yet (a first run)", () => {
+        const dir = scratch();
+        try {
+            // Minting over an absent file is the only correct thing to do, and
+            // the guard must not turn a fresh install into a refusal.
+            assert.equal(identityProblem(dir), undefined);
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    it("answers undefined for an identity that is fine", () => {
+        const dir = scratch();
+        try {
+            loadOrCreateIdentity(dir);
+            assert.equal(identityProblem(dir), undefined);
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    for (const [name, body] of [
+        ["unparseable", "{ not json"],
+        ["missing installId", JSON.stringify({ passcode: 20202021, discriminator: 3840 })],
+        ["a trivial passcode", JSON.stringify({ installId: "x", passcode: 11111111, discriminator: 3840 })],
+        ["an out-of-range discriminator", JSON.stringify({ installId: "x", passcode: 20202021, discriminator: 99999 })],
+    ] as const) {
+        it(`reports a present-but-${name} identity`, () => {
+            const dir = scratch();
+            try {
+                writeFileSync(join(dir, "identity.json"), body);
+                // Not "replace it": regenerating changes the SerialNumber and
+                // UniqueID that every paired ecosystem remembers us by, which
+                // un-pairs the lot without a word. main.ts refuses instead.
+                assert.ok(identityProblem(dir) !== undefined);
+            } finally {
+                rmSync(dir, { recursive: true, force: true });
+            }
+        });
+    }
+
+    it("does not itself modify or create the file", () => {
+        const dir = scratch();
+        try {
+            identityProblem(dir);
+            assert.deepEqual(readdirSync(dir), [], "the guard must be a pure read");
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+});
+
+describe("the commissioning witness (PRD §7)", () => {
+    it("stamps commissionedAt once and keeps the first value", () => {
+        const dir = scratch();
+        try {
+            const identity = loadOrCreateIdentity(dir);
+            assert.equal(identity.commissionedAt, undefined, "a fresh identity has never been paired");
+
+            const first = markCommissioned(dir, identity, () => {}, () => new Date("2026-08-01T10:00:00Z"));
+            const again = markCommissioned(dir, first, () => {}, () => new Date("2026-09-09T10:00:00Z"));
+
+            assert.equal(first.commissionedAt, "2026-08-01T10:00:00.000Z");
+            assert.equal(again, first, "a second fabric must not restamp the witness");
+            const onDisk = JSON.parse(readFileSync(join(dir, "identity.json"), "utf8"));
+            assert.equal(onDisk.commissionedAt, "2026-08-01T10:00:00.000Z");
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    it("survives a reload — that is the entire point of it", () => {
+        const dir = scratch();
+        try {
+            markCommissioned(dir, loadOrCreateIdentity(dir), () => {}, () => new Date("2026-08-01T10:00:00Z"));
+            // The witness has to outlive the process, because the failure it
+            // witnesses (matter.js's storage vanishing) is only visible at the
+            // NEXT start.
+            assert.equal(loadOrCreateIdentity(dir).commissionedAt, "2026-08-01T10:00:00.000Z");
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    it("clears on a factory reset, so the reset does not refuse to itself", () => {
+        const dir = scratch();
+        try {
+            const paired = markCommissioned(dir, loadOrCreateIdentity(dir), () => {});
+
+            const reset = clearCommissioned(dir, paired, () => {});
+
+            assert.equal(reset.commissionedAt, undefined);
+            assert.equal(loadOrCreateIdentity(dir).commissionedAt, undefined);
+            // Everything that IS the identity must survive the clear.
+            assert.equal(reset.installId, paired.installId);
+            assert.equal(reset.passcode, paired.passcode);
+            assert.equal(reset.discriminator, paired.discriminator);
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    it("keeps the bridge running when the witness cannot be written", () => {
+        const dir = scratch();
+        try {
+            const identity = loadOrCreateIdentity(dir);
+            chmodSync(dir, 0o500);
+            const logged: string[] = [];
+
+            const marked = markCommissioned(dir, identity, message => logged.push(message));
+
+            chmodSync(dir, 0o700);
+            // Failing the commissioning that just succeeded, over a marker for a
+            // hypothetical future start, would be the worse trade — but it has
+            // to be loud, because the refusal it enables is now unarmed.
+            assert.ok(marked.commissionedAt !== undefined);
+            assert.ok(logged.some(line => line.includes("Could not record the commissioning marker")));
+        } finally {
+            chmodSync(dir, 0o700);
             rmSync(dir, { recursive: true, force: true });
         }
     });

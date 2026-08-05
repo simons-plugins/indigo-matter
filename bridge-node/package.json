@@ -1,8 +1,8 @@
 {
   "name": "indigo-matter-bridge",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "private": true,
-  "description": "Matter bridge node for the indigo-matter Indigo plugin — exports selected Indigo devices as Matter accessories.",
+  "description": "Matter bridge node for the indigo-matter Indigo plugin \u2014 exports selected Indigo devices as Matter accessories.",
   "license": "MIT",
   "type": "module",
   "main": "dist/main.js",
@@ -15,7 +15,7 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/main.js",
-    "test": "tsc -p tsconfig.test.json && rm -rf .test-build/test/fixtures && mkdir -p .test-build/test/fixtures && cp -R ../tests/fixtures/bridge_protocol .test-build/test/fixtures/bridge_protocol && node --test \".test-build/test/*.test.js\"",
+    "test": "tsc -p tsconfig.test.json && rm -rf .test-build/test/fixtures && mkdir -p .test-build/test/fixtures && cp -R ../tests/fixtures/bridge_protocol .test-build/test/fixtures/bridge_protocol && node --test --test-force-exit \".test-build/test/*.test.js\"",
     "clean": "rm -rf dist .test-build"
   },
   "dependencies": {

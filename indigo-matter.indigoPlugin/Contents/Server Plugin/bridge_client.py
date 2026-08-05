@@ -130,6 +130,7 @@ class BridgeClient(WsJsonClient):
         *,
         plugin_version: str = "unknown",
         endpoint_provider: Optional[Callable[[], list]] = None,
+        replace_all_provider: Optional[Callable[[], bool]] = None,
         connect: Optional[Callable[[str], Awaitable]] = None,
         on_attached: Optional[Callable[[StatusReport], None]] = None,
         on_attach_refused: Optional[Callable[[str, str], None]] = None,
@@ -157,6 +158,14 @@ class BridgeClient(WsJsonClient):
         )
         self.plugin_version = plugin_version
         self._endpoint_provider = endpoint_provider or (lambda: [])
+        #: Whether the *handshake's* attach must carry §3.1's `replace_all`.
+        #: Normally no: emptying the live set by default is the exact thing the
+        #: mass-removal guard exists to refuse. The one caller that says yes is
+        #: an un-export that never landed (``export_bridge._owes_replace_all``,
+        #: XAC7) — the user emptied the allow-list, the node was unreachable,
+        #: and without this the accessories stay in every paired ecosystem for
+        #: good, because nothing else ever attaches with an empty set again.
+        self._replace_all_provider = replace_all_provider or (lambda: False)
         self._on_attached = on_attached
         self._on_attach_refused = on_attach_refused
         self._on_version_skew = on_version_skew
@@ -217,16 +226,41 @@ class BridgeClient(WsJsonClient):
         # "the attach is on its way" rather than "we are still deciding what to
         # send" — which is what every waiter on ``wait_connected`` assumes.
         specs = await self._gather_endpoints()
+        replace_all = self._replace_all(len(specs))
         # Requests are legal from here on: attach is one.
         self._mark_connected()
         try:
-            status = await self._attach(specs, replace_all=False, timeout=None, inline=True)
+            status = await self._attach(specs, replace_all=replace_all, timeout=None, inline=True)
         except BridgeProtocolError as exc:
             self._handle_attach_refused(exc)
             return
         self._attached = True
         self.recovery = False
         self._notify(self._on_attached, status)
+
+    def _replace_all(self, spec_count: int) -> bool:
+        """Ask the injected provider, and refuse to believe a dangerous yes.
+
+        The provider is consulted only when the desired set is **empty**. A
+        `replace_all` alongside real endpoints would be meaningless at best —
+        §3.1's guard cannot fire against a non-empty desired set — and at worst
+        it would be a standing licence to empty the bridge, carried by every
+        reconnect for as long as the flag was mis-set. Belt and braces on the
+        one flag in this protocol that can un-export a whole house.
+        """
+        if spec_count:
+            return False
+        try:
+            wanted = bool(self._replace_all_provider())
+        except Exception as exc:  # pylint: disable=broad-except
+            self.logger.warning("could not read the pending un-export flag (%s); "
+                                "attaching without it", exc)
+            return False
+        if wanted:
+            self.logger.info(
+                "attaching with intent: replace_all — finishing an un-export that did not "
+                "complete earlier")
+        return wanted
 
     def _handle_attach_refused(self, exc: BridgeProtocolError) -> None:
         """Decide what an ``attach`` the node refused means (§1.1).

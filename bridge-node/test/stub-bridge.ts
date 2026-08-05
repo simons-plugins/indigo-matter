@@ -13,6 +13,7 @@ import {
     type BridgeFacade,
     type CommandEventData,
     type CommissioningWindowResult,
+    type DriftEntry,
     type EndpointSpec,
     ErrorCode,
     type FabricInfo,
@@ -56,6 +57,8 @@ export interface GoldenFrames {
     open_window_internal: GoldenExchange;
     window_closed_expired: GoldenEvent;
     window_closed_commissioned: GoldenEvent;
+    /** §5/§4.3 — the endpoint-number drift report, emitted since E5. */
+    drift_detected: GoldenEvent & { data: { drift: unknown[] } };
     command_on_off: GoldenEvent;
     command_set_level: GoldenEvent;
     command_set_color_temp: GoldenEvent;
@@ -92,7 +95,21 @@ export interface GoldenFrames {
     set_state_pressure_sensor: GoldenExchange;
     set_state_flow_sensor: GoldenExchange;
     set_state_thermostat: GoldenExchange;
-    /** §3.9-§3.11 — exchanges awaiting node-side handlers. */
+    /**
+     * §3.9-§3.11 plus the §1.1 refuse-to-start refusal. Graduated out of
+     * `pending` at E5, when the node grew the endpoint-number map that all four
+     * of them are about.
+     */
+    remove_fabric: GoldenExchange;
+    factory_reset: GoldenExchange;
+    factory_reset_discard_map: GoldenExchange;
+    rebuild_endpoint_map: GoldenExchange;
+    endpoint_map_invalid: GoldenExchange;
+    /**
+     * The holding pen for commands the node does not implement yet — EMPTY
+     * since E5, and asserted empty. Kept because it is the mechanism the next
+     * protocol addition uses, not a backlog.
+     */
     pending: Record<string, GoldenExchange>;
     /**
      * §5 event frames the node does not emit yet — they exist so the plugin can
@@ -226,6 +243,16 @@ export class StubBridge implements BridgeFacade {
      */
     poisonStatus = false;
 
+    /** §4.3 — what `get_status` reports; the drift tests set these. */
+    drift: DriftEntry[] = [];
+    driftChecked = false;
+    /** §1.1 — non-undefined puts the double in the refuse-to-start state. */
+    refusal?: string;
+    /** Calls recorded by the §3.9/§3.10/§3.11 tests. */
+    readonly removedFabrics: number[] = [];
+    readonly factoryResets: boolean[] = [];
+    rebuilds = 0;
+
     getStatus(): StatusReport {
         if (this.poisonStatus) {
             const circular: Record<string, unknown> = {};
@@ -238,10 +265,39 @@ export class StubBridge implements BridgeFacade {
             fabrics: structuredClone(this.statusFabrics),
             endpointCount: endpoints.length,
             endpoints,
-            drift: [],
-            driftChecked: false,
+            drift: structuredClone(this.drift),
+            driftChecked: this.driftChecked,
         };
     }
+
+    endpointMapRefusal(): string | undefined {
+        return this.refusal;
+    }
+
+    async removeFabric(fabricIndex: number): Promise<void> {
+        this.removedFabrics.push(fabricIndex);
+    }
+
+    async factoryReset(preserveEndpointNumbers: boolean): Promise<void> {
+        this.factoryResets.push(preserveEndpointNumbers);
+    }
+
+    async rebuildEndpointMap(): Promise<StatusReport> {
+        this.rebuilds += 1;
+        this.refusal = undefined;
+        return structuredClone(golden.rebuild_endpoint_map.response.result) as StatusReport;
+    }
+
+    onDriftDetected(listener: (drift: DriftEntry[]) => void): void {
+        this.#drift = listener;
+    }
+
+    /** Stand in for the detector finding a moved endpoint number. */
+    emitDrift(drift: DriftEntry[]): void {
+        this.#drift?.(drift);
+    }
+
+    #drift?: (drift: DriftEntry[]) => void;
 
     async reconcile(endpoints: readonly EndpointSpec[], replaceAll: boolean): Promise<StatusReport> {
         this.model.reconcile(endpoints, replaceAll);

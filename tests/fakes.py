@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from concurrent.futures import Future
 from typing import Callable, Optional
 
@@ -142,10 +143,73 @@ class RecordingRuntime:
             raise RuntimeError("asyncio runtime is not running")
         future: Future = Future()
         try:
-            future.set_result(asyncio.run(coro))
+            future.set_result(_run_to_completion(coro))
         except Exception as exc:  # the client's own errors reach the callback
             future.set_exception(exc)
         return future
+
+
+def _run_to_completion(coro):
+    """Run ``coro`` now, whether or not we are already inside a loop.
+
+    ``asyncio.run`` refuses to nest, and since E5 the export engine genuinely
+    nests: a §5 command is dispatched onto the loop, its blocking half runs in
+    an executor, and a failure there fires a corrective ``set_state`` back at
+    the runtime. In the plugin those are two different threads and
+    ``run_coroutine_threadsafe`` handles it as a matter of course. Here they are
+    one thread, so the inner coroutine is given a loop of its own on a worker we
+    join — which keeps the tests synchronous and deterministic without pretending
+    the nesting does not happen.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+
+    outcome: dict = {}
+
+    def _worker():
+        try:
+            outcome["value"] = asyncio.run(coro)
+        except BaseException as exc:  # pylint: disable=broad-except
+            outcome["error"] = exc
+
+    thread = threading.Thread(target=_worker, name="fake-runtime-nested")
+    thread.start()
+    thread.join()
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome["value"]
+
+
+class InlineExecutor:
+    """A ``concurrent.futures.Executor`` that runs work on the calling thread.
+
+    ``ExportBridge`` dispatches §5 commands through ``run_in_executor`` (E5), and
+    a real thread pool would make every command assertion a race. This satisfies
+    the slice ``run_in_executor`` uses — ``submit`` returning a future — while
+    keeping the tests deterministic, exactly as :class:`RecordingRuntime` does
+    for the loop.
+    """
+
+    def __init__(self):
+        self.shutdown_calls: list = []
+        #: How many pieces of work were handed over — the observable that says
+        #: the loop was left, and that a command nobody exports never even
+        #: reached the hop.
+        self.submitted = 0
+
+    def submit(self, fn, *args, **kwargs):
+        self.submitted += 1
+        future: Future = Future()
+        try:
+            future.set_result(fn(*args, **kwargs))
+        except BaseException as exc:  # pylint: disable=broad-except
+            future.set_exception(exc)
+        return future
+
+    def shutdown(self, wait: bool = True):
+        self.shutdown_calls.append(wait)
 
 
 class FakeBridgeClient:
@@ -369,6 +433,10 @@ class FakeIndigoDevices:
     def add(self, device):
         self._devices.append(device)
         return device
+
+    def drop(self, device_id):
+        """Delete a device, for the paths that must survive one vanishing."""
+        self._devices = [dev for dev in self._devices if dev.id != device_id]
 
     def __iter__(self):
         return iter(self._devices)

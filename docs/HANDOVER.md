@@ -9,6 +9,155 @@
 
 ---
 
+## 2026-08-05 — E5 (endpoint persistence), branch `feat/e5-persistence-hardening`
+
+Plugin `2026.7.30`, bridge-node `0.4.0`. Suites: **1978 Python**, **291 TS**
+(from 1947/239). `tests/fixtures/bridge_protocol/frames.json`'s `pending`
+section is now **EMPTY** and both suites assert that it is.
+
+### The shape of the thing, because it is not what the protocol implies
+
+**Our endpoint map does not allocate endpoint numbers. matter.js does.** It
+keys its own persisted numbers on the string `Endpoint.id`, which
+`endpointIdFor` makes a pure function of the Indigo device id, and that is what
+actually holds identity together across a restart. `endpoint-map.json` is an
+independent **witness** of what those numbers were last time, so that the one
+failure that silently duplicates every accessory in every paired ecosystem —
+matter.js's storage being lost, moved or reset underneath us — becomes a
+sentence in the log instead of a mystery in someone's Home app. Report-only, per
+§4.3, and the baseline is deliberately **not** updated when drift is found: move
+it to match and the next pass calls the same fault clean.
+
+**Identified and NOT taken: pinning the numbers.** `Endpoint.Configuration` in
+matter.js 0.17.8 accepts a `number`, so the map *could* be authoritative rather
+than a witness — which would make `factory_reset preserveEndpointNumbers: true`
+mean what its name suggests, since `erase()` wipes matter.js's own allocation
+and the preserved map currently only preserves the ability to *notice*. Not done
+here because §4.3 says drift is never auto-repaired and pinning is auto-repair
+by another name; it would hide the storage loss that caused it. Worth revisiting
+as a deliberate protocol decision, not as an implementation detail.
+
+**Refusing is a protocol state, not a process exit.** The Matter stack still
+starts, so `get_pairing` answers and the user can see where they are; what is
+refused is `attach`, which is what actually prevents the duplication — no
+attach, no endpoint created. Three ways in, and the third needed a new durable
+fact:
+
+| Condition | Reason |
+|---|---|
+| fabrics exist, `endpoint-map.json` unreadable or absent | the numbers being served cannot be checked against anything |
+| `identity.commissionedAt` set, no fabrics | PRD §7 "storage missing but previously commissioned" |
+| `identity.json` present but unusable | minting over it changes the `SerialNumber` every ecosystem knows us by |
+
+`commissionedAt` is a new optional field on `identity.json`, stamped the first
+time a fabric is observed. It has to live there because the failure it witnesses
+*is* matter.js's storage having vanished — anything stored inside that storage
+cannot tell "never paired" from "paired, then the directory was lost". Absent on
+pre-E5 identities, which reads correctly as "no evidence", so an upgrade never
+refuses. Cleared by `factory_reset` and by `rebuild_endpoint_map`, or the reset
+would refuse to itself on the next start.
+
+The refusal decision is `endpoint-map.ts`'s `refuseReasonFor` — one pure
+function, no matter.js — because the case that matters most (fabrics exist +
+broken map) cannot be reached in a test without commissioning real hardware.
+
+### Two matter.js 0.17.8 findings
+
+- **`ServerNode.erase()` leaves a ref'd timer that `close()` never clears.**
+  Measured with `process.getActiveResourcesInfo()`: without an erase, close
+  leaves only unref'd UDP handles and the process exits; with one, a `Timeout`
+  survives and it does not. Consequence in production: a *clean* shutdown after
+  a factory reset would have sat until `main.ts`'s escape hatch fired and then
+  exited **1**, telling launchd a successful stop was a crash. `main.ts` now
+  `process.exit(0)`s once both ordered closes have returned; the escape hatch
+  still owns every path where a close does not return. Same cause, test side:
+  `npm test` now passes `--test-force-exit`.
+- **`OperationalCredentialsServer.removeFabric` asserts a remote actor**, exactly
+  as `AdministratorCommissioning` does for §3.8, so §3.9 drives `FabricManager`
+  → `fabric.leave()` directly. `leave` rather than `delete`: it flushes
+  subscriptions and emits the leave event, so a controller learns it was removed
+  instead of just losing the node.
+
+### Plugin side — the #124 review carry-overs
+
+- **Diffs are measured against the last state PUSHED, not against `orig_dev`**
+  (`ExportHandler.diff_from`, `ExportBridge._pushed`). A tolerance compared
+  against the previous *Indigo reading* only ever bounds one step: hue's ±1°
+  meant a ramp of 1° per step reported "unchanged" every single time, so the
+  accessory stayed where the ramp began while the lamp walked arbitrarily far
+  away — no error, no log line, no bound. Against the last pushed value the same
+  tolerance bounds the *total* error at 1°. Snapshots are seeded when a spec is
+  built (an attach/upsert IS a push), merged rather than replaced on each
+  `set_state` (§3.4 maps are partial), and dropped with the export.
+- **`pendingReplaceAll` is persisted** (`matterExportPendingReplaceAll` in
+  prefs, XAC7). Emptying the allow-list is the only moment the plugin ever says
+  "remove everything"; if that attach did not land, nothing said it again —
+  empty list → XG5 → no client → no attach → the accessories stayed in every
+  ecosystem for good. The flag is written *before* the attempt (the ways it does
+  not land include a reload and a power cut, neither of which reaches an
+  `except`), reconnects on its own with an empty allow-list, and is discharged by
+  the one successful attach, which then drops the client again.
+- **§5 commands leave the loop** — `run_in_executor` on a **single** worker.
+  One, not a pool: two commands for the same accessory running concurrently lets
+  a `setLevel 20` overtake a `setLevel 80` and both "succeed".
+- **`start()` is gated** while an un-export is in flight, and the deferred start
+  is picked up by that coroutine's `finally` — refused, not dropped.
+- **`_set_color_temp`'s `whiteLevel or 100` caught a real 0** (`0.0` is falsy).
+  `None` means no white channel and skips the write; **0** means the channel
+  exists and is off, and defaulting it turned "set the colour temperature" into
+  "…and switch the white channel to full" — a bridge turning a lamp on nobody
+  asked it to, in response to a command Matter defines as orthogonal to on/off.
+- **`subscribeToChanges` gets a bounded watchdog.** The whole push path rests on
+  one undocumented assumption (that it works the same from a menu callback as
+  from `startup`), and if that is ever wrong the symptom is silence. Re-issued
+  after ~1 min with an active export and no `deviceUpdated` *at all*, at most 3
+  times — bounded because "no updates" is also exactly what a quiet house looks
+  like.
+- **Fabric backup now includes the bridge-node storage dir** under a reserved
+  `bridge-node/` archive prefix (so an old controller-only archive still
+  restores). Live-snapshot safety: `identity.json` and `endpoint-map.json` are
+  written temp-plus-`rename`, so a reader sees one whole version or the other;
+  matter.js's own store under that dir carries the same caveat the controller's
+  already does. **Restore deliberately does not extract them** — that needs the
+  bridge node stopped and there is no stop seam until E7 — so it warns with the
+  member count, the prefix and the manual recipe rather than half-restoring in
+  silence.
+
+### Deferred items — the current state of the list
+
+Still deferred, unchanged, both needing a `BRIDGE_PROTOCOL.md` change:
+
+1. **No spelling for "I no longer know" (§3.4/§4.2).** A published state key can
+   vanish and `set_state` cannot carry an absence, so the ecosystem keeps the
+   last value indefinitely. The decision stands: keep last-known-good and make
+   the gap visible (`diff_with_gaps`/`diff_from` return it, `_report_stopped_keys`
+   says it once per device per streak). A real fix is a §4.2 "unknown" value or a
+   §3.x `clear_state`. **Unchanged by E5** — `diff_from` reports the gap against
+   what was pushed, which is if anything the more accurate question, but it still
+   has nowhere to put the answer on the wire.
+2. **Dropped invocations are not reported to the plugin.** A `lock`/`unlock`
+   arriving while the plugin is away reaches no sink and there is no frame for
+   telling the plugin what it missed on the next `attach`. `doorLock` still fails
+   the Matter invocation so Home says the accessory did not respond; every other
+   role still warns and returns. **Unchanged by E5.**
+
+New, and deferred on purpose:
+
+3. **Restoring the bridge-node storage from a backup** needs a bridge `stop()`/
+   `start()` control — E7's launchd agent. Backup is done; restore reports and
+   skips (above).
+4. **Pinning endpoint numbers from the map** (the `Endpoint.Configuration.number`
+   finding above) — a protocol-level decision about what `preserveEndpointNumbers`
+   promises, not a patch.
+
+### Still open from before
+
+`bridgeWsPort` is still not in `PluginConfig.xml` (E6/E7 own the Export panel),
+the bridge node is still started by hand, and **none of E5 has been deployed to
+jarvis** — the XAC5 validation script is in the PR description.
+
+---
+
 ## 2026-08-05 — PR #125 (E4) three-review hardening batch
 
 Applied on `feat/e4-remaining-roles`. Nine findings across `export_bridge.py`,

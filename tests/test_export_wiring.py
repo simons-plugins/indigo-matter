@@ -62,6 +62,9 @@ def plug(plugin_mod, devices):  # noqa: ARG001 - devices installs indigo.devices
     p.export_bridge.active = False
     p._exported_ids = frozenset()
     p._subscribed_to_devices = False
+    p._device_updates_seen = False
+    p._no_update_ticks = 0
+    p._resubscribe_attempts = 0
     p._export_callback_failed = set()
     p.runtime = None
     return p
@@ -520,3 +523,57 @@ class TestLifecycleWiring:
         plug.runtime = Mock(is_running=True)
         plug.matter = None
         plug._health_tick()   # must not raise
+
+
+class TestResubscribeWatchdog:
+    """E5: the belt and braces under an assumption the docs do not confirm.
+
+    The whole outbound push path rests on ``subscribeToChanges`` behaving the
+    same issued from a menu callback as from ``startup``. The canonical
+    reference calls it a request to the server — which is why the conditional
+    subscription is safe — but there is no acknowledgement to check and no
+    unsubscribe to compare against, so if that is ever wrong the symptom is
+    silence: exported accessories simply stop following Indigo.
+    """
+
+    def _exporting(self, plug, mock_indigo_base):
+        subscribe = Mock()
+        mock_indigo_base.devices.subscribeToChanges = subscribe
+        plug.exports.upsert(ExportEntry(101, "onOffLight"))
+        plug._exports_changed()
+        subscribe.reset_mock()
+        return subscribe
+
+    def test_it_re_issues_after_a_minute_with_no_device_updates_at_all(
+            self, plug, mock_indigo_base):
+        subscribe = self._exporting(plug, mock_indigo_base)
+        for _ in range(4):
+            plug._resubscribe_tick()
+        subscribe.assert_called_once_with()
+
+    def test_one_device_update_disarms_it_for_good(self, plug, mock_indigo_base):
+        """Evidence the subscription took. Any device counts — it is server-wide."""
+        subscribe = self._exporting(plug, mock_indigo_base)
+        plug.deviceUpdated(RelayDevice(999, "Someone Else's Lamp"),
+                           RelayDevice(999, "Someone Else's Lamp"))
+        for _ in range(20):
+            plug._resubscribe_tick()
+        subscribe.assert_not_called()
+
+    def test_it_gives_up_rather_than_nagging_forever(self, plug, mock_indigo_base):
+        """"No updates" is also exactly what a quiet house looks like.
+
+        An unbounded retry would be a permanent debug line for every user whose
+        exported devices happen not to change, which is not a diagnostic.
+        """
+        subscribe = self._exporting(plug, mock_indigo_base)
+        for _ in range(4 * 10):
+            plug._resubscribe_tick()
+        assert subscribe.call_count == 3
+
+    def test_it_stays_quiet_while_nothing_is_exported(self, plug, mock_indigo_base):
+        subscribe = Mock()
+        mock_indigo_base.devices.subscribeToChanges = subscribe
+        for _ in range(20):
+            plug._resubscribe_tick()
+        subscribe.assert_not_called()

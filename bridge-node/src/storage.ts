@@ -40,6 +40,19 @@ export interface BridgeIdentity {
     passcode: number;
     /** 12-bit commissioning discriminator. */
     discriminator: number;
+    /**
+     * ISO 8601 UTC instant this bridge first observed a fabric, or absent if it
+     * never has (E5).
+     *
+     * The witness for PRD §7's "storage missing but previously commissioned".
+     * It has to live *here* rather than in matter.js's storage, because the
+     * whole failure it describes is matter.js's storage having vanished: a node
+     * whose fabrics are gone cannot tell "never paired" from "paired, then the
+     * fabric directory was lost" from anything inside the directory that is
+     * missing. Absent on identities written before E5, which reads — correctly
+     * — as "no evidence of commissioning", so an upgrade never refuses to start.
+     */
+    commissionedAt?: string;
 }
 
 /** True for a passcode inside the legal range and not on the trivial list. */
@@ -87,15 +100,19 @@ function isNotFound(error: unknown): boolean {
 }
 
 /**
- * Write `identity.json` atomically: a temp file in the *same* directory (so the
- * rename stays within one filesystem and is therefore atomic), then `rename`.
- * A crash mid-write must never leave a half-written identity behind, because a
- * half-written identity reads as corrupt and gets regenerated.
+ * Write JSON atomically: a temp file in the *same* directory (so the rename
+ * stays within one filesystem and is therefore atomic), then `rename`.
+ *
+ * A crash mid-write must never leave a half-written file behind, because a
+ * half-written file reads as corrupt — and for both files that go through here
+ * (`identity.json` and E5's `endpoint-map.json`) "corrupt" is the state that
+ * costs a user every accessory they have paired. Exported so the endpoint map
+ * is written the same way rather than by a second copy of this.
  */
-function writeIdentity(file: string, identity: BridgeIdentity): void {
+export function writeJsonAtomic(file: string, value: unknown): void {
     const temp = `${file}.${process.pid}.tmp`;
     try {
-        writeFileSync(temp, `${JSON.stringify(identity, null, 2)}\n`, { mode: 0o600 });
+        writeFileSync(temp, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
         renameSync(temp, file);
     } catch (error) {
         try {
@@ -107,14 +124,94 @@ function writeIdentity(file: string, identity: BridgeIdentity): void {
     }
 }
 
+function writeIdentity(file: string, identity: BridgeIdentity): void {
+    writeJsonAtomic(file, identity);
+}
+
+/**
+ * Why a *present* `identity.json` cannot be used, or `undefined` when the file
+ * is absent (first run) or fine.
+ *
+ * This is the E5 half of {@link loadOrCreateIdentity}'s replace-it behaviour,
+ * split out rather than folded in so the mint path stays exactly what it was.
+ * The two answers must drive opposite decisions: a *missing* identity is a
+ * first run and minting is the only thing to do, while a *present but corrupt*
+ * one belongs to an install that may well be paired, and minting over it
+ * changes the `SerialNumber` and `UniqueID` every ecosystem remembers us by —
+ * silently un-pairing the lot. `main.ts` calls this first and refuses to serve
+ * endpoints when it answers, which is the same loud-refusal posture PRD §7
+ * requires of a lost endpoint map.
+ */
+export function identityProblem(storagePath: string): string | undefined {
+    const file = join(storagePath, IDENTITY_FILE);
+    try {
+        const parsed: unknown = JSON.parse(readFileSync(file, "utf8"));
+        return isUsableIdentity(parsed)
+            ? undefined
+            : `${file} is present but not a usable identity (missing or out-of-range fields)`;
+    } catch (error) {
+        return isNotFound(error) ? undefined : `${file} is unreadable (${describeError(error)})`;
+    }
+}
+
+/**
+ * Record that this bridge has been commissioned, if it is not recorded already.
+ *
+ * Called the first time a fabric is observed. Returns the identity to keep
+ * using — the same object when nothing needed writing, so the caller can hold
+ * one reference. A write failure is reported and swallowed: losing the witness
+ * degrades a future refuse-to-start into a silent re-init, which is bad, but
+ * failing the commissioning that just succeeded is worse and immediate.
+ */
+export function markCommissioned(
+    storagePath: string,
+    identity: BridgeIdentity,
+    log: (message: string) => void = () => {},
+    now: () => Date = () => new Date(),
+): BridgeIdentity {
+    if (identity.commissionedAt !== undefined) {
+        return identity;
+    }
+    const updated: BridgeIdentity = { ...identity, commissionedAt: now().toISOString() };
+    try {
+        writeIdentity(join(storagePath, IDENTITY_FILE), updated);
+    } catch (error) {
+        log(`Could not record the commissioning marker in identity.json: ${describeError(error)}`);
+    }
+    return updated;
+}
+
+/**
+ * Drop the commissioning witness — the §3.10 factory-reset counterpart of
+ * {@link markCommissioned}. Without this a reset node would start once, see no
+ * fabrics against a set `commissionedAt`, and refuse to serve anything on the
+ * grounds that its own reset had lost the fabric storage.
+ */
+export function clearCommissioned(
+    storagePath: string,
+    identity: BridgeIdentity,
+    log: (message: string) => void = () => {},
+): BridgeIdentity {
+    if (identity.commissionedAt === undefined) {
+        return identity;
+    }
+    const { commissionedAt: _dropped, ...rest } = identity;
+    try {
+        writeIdentity(join(storagePath, IDENTITY_FILE), rest);
+    } catch (error) {
+        log(`Could not clear the commissioning marker in identity.json: ${describeError(error)}`);
+    }
+    return rest;
+}
+
 /**
  * Read `identity.json` from {@link storagePath}, creating it (and the directory)
- * with freshly randomised values on first run. An unreadable or invalid file is
- * replaced — a bridge that cannot advertise is worse than one that needs
- * re-pairing, and nothing is paired to protect until the first commissioning.
+ * with freshly randomised values on first run.
  *
- * TODO(E5): a corrupt-but-present identity must refuse to start (PRD §4.3) —
- * regeneration un-pairs every ecosystem. Only the missing-file branch may mint.
+ * An unreadable or invalid file is replaced here. That is only safe because
+ * `main.ts` calls {@link identityProblem} *first* and refuses to serve endpoints
+ * when a present file is unusable (E5) — reaching this function's replace branch
+ * therefore means the caller has already decided the loss is acceptable.
  */
 export function loadOrCreateIdentity(
     storagePath: string,

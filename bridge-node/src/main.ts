@@ -12,8 +12,8 @@ import { networkInterfaces } from "node:os";
 
 import { assertMdnsInterface, parseArgs, USAGE } from "./config.js";
 import { BridgeNode, matterJsVersion } from "./node.js";
-import { describeError, describeErrorWithStack } from "./protocol.js";
-import { loadOrCreateIdentity } from "./storage.js";
+import { describeError, describeErrorWithStack, RefuseReason } from "./protocol.js";
+import { identityProblem, loadOrCreateIdentity } from "./storage.js";
 import { BridgeWsServer } from "./ws-server.js";
 
 const bridgeVersion: string = createRequire(import.meta.url)("../package.json").version;
@@ -63,9 +63,24 @@ async function main(): Promise<void> {
         );
     }
 
+    // Asked BEFORE the identity is loaded, because loading it is what would
+    // replace an unusable one — and replacing it mints a new `SerialNumber` and
+    // `UniqueID`, which every paired ecosystem reads as a different accessory
+    // (E5 / PRD §4.3). A missing file is a first run and answers `undefined`.
+    const identityFault = await phase("identity check failed", () => identityProblem(config.storagePath));
+    if (identityFault !== undefined) {
+        log(`Bridge identity unusable: ${identityFault}`);
+    }
+
     const identity = await phase("identity load failed", () => loadOrCreateIdentity(config.storagePath, log));
 
-    const bridge = new BridgeNode(config, identity, bridgeVersion, log);
+    const bridge = new BridgeNode(
+        config,
+        identity,
+        bridgeVersion,
+        log,
+        identityFault === undefined ? undefined : RefuseReason.identityUnreadable,
+    );
     await phase(`Matter node start failed (matter port ${config.matterPort}, storage ${config.storagePath})`, () =>
         bridge.start(),
     );
@@ -113,8 +128,17 @@ async function main(): Promise<void> {
             } catch (error) {
                 log(`Error closing Matter node: ${describeErrorWithStack(error)}`);
             }
-            pending = "event loop drain";
+            clearTimeout(escapeHatch);
             log("Shutdown complete");
+            // Both closes returned, in order, so everything that is ours is
+            // down — and what is left on the loop is not ours to wait for.
+            // matter.js 0.17.8's `ServerNode.erase()` (§3.10) leaves a ref'd
+            // timer behind that `close()` does not clear, measured at 0.17.8:
+            // without this, a perfectly clean shutdown *after a factory reset*
+            // would sit until the escape hatch fired and then exit 1, telling
+            // launchd a successful stop was a crash. Exit 0 here; the escape
+            // hatch still owns every path where a close does NOT return.
+            process.exit(0);
         })();
     };
     process.on("SIGTERM", () => shutdown("SIGTERM"));

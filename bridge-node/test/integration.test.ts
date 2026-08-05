@@ -118,7 +118,11 @@ describe("plugin ⇄ node, end to end", () => {
             });
             const status = attached.result as Record<string, unknown>;
             assert.equal(status.endpointCount, 2);
-            assert.equal(status.driftChecked, false, "§4.3: an empty drift is not an all-clear");
+            // E5: the attach ran the detector, so the empty `drift` beside this
+            // IS an all-clear — the two endpoints were recorded against a fresh
+            // map on a storage dir this test made a moment ago (§4.3).
+            assert.deepEqual(status.drift, []);
+            assert.equal(status.driftChecked, true, "§4.3: attach runs the drift check");
             assert.deepEqual(
                 (status.endpoints as { indigoDeviceId: number }[]).map(endpoint => endpoint.indigoDeviceId),
                 [KITCHEN, LOUNGE],

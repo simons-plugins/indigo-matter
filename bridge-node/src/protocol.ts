@@ -130,6 +130,54 @@ export function isRole(value: unknown): value is RoleValue {
  */
 export const INTENT_REPLACE_ALL = "replace_all";
 
+/**
+ * The only commands accepted while the node is in the `endpoint_map_invalid`
+ * refuse-to-start state (§1.1).
+ *
+ * `attach` is deliberately *not* here. A node that cannot vouch for its own
+ * endpoint numbers must not create endpoints — creating them is precisely how a
+ * lost map duplicates every accessory in every paired ecosystem — so the
+ * reconcile that would create them is refused like everything else. The three
+ * that remain are the ones a user needs to see the damage (`get_status`), keep
+ * pairing readable (`get_pairing`), and choose the way out (§3.11).
+ */
+export const RECOVERY_COMMANDS: ReadonlySet<string> = new Set([
+    "get_status",
+    "get_pairing",
+    "rebuild_endpoint_map",
+]);
+
+/** The `details` tail every `endpoint_map_invalid` refusal carries (§1.1). */
+export const ENDPOINT_MAP_INVALID_SUFFIX =
+    "; only get_status, get_pairing and rebuild_endpoint_map are accepted";
+
+/**
+ * Why the node is refusing. Kept as distinct reasons rather than one string
+ * because they need different remedies: an unreadable map is fixed by §3.11,
+ * while lost fabric storage is fixed by restoring a backup — and §3.11 there
+ * means "accept that the pairings are gone".
+ */
+export const RefuseReason = {
+    /** `endpoint-map.json` is present but not usable. */
+    mapUnreadable: "endpoint map is unreadable",
+    /** Fabrics exist, but there is no map to check their numbers against. */
+    mapMissingWhileCommissioned:
+        "this bridge is commissioned but has no endpoint-number map to check its endpoints against",
+    /** The commissioning witness says paired; matter.js says no fabrics (PRD §7). */
+    fabricStorageLost:
+        "this bridge was commissioned but its Matter fabric storage is gone, so every endpoint " +
+        "number would be reallocated",
+    /** `identity.json` is present but unusable — a new one would change our serial. */
+    identityUnreadable: "the bridge identity file is present but unreadable",
+} as const;
+
+export type RefuseReasonValue = (typeof RefuseReason)[keyof typeof RefuseReason];
+
+/** The full `details` for an `endpoint_map_invalid` refusal. */
+export function endpointMapInvalidDetails(reason: string): string {
+    return `${reason}${ENDPOINT_MAP_INVALID_SUFFIX}`;
+}
+
 /** §4.1 — the desired state of one exported device, as the plugin declares it. */
 export interface EndpointSpec {
     indigoDeviceId: number;
@@ -166,7 +214,7 @@ export interface FabricInfo {
     vendorId: number;
 }
 
-/** §4.3. `drift` is always empty until E5 adds the persisted endpoint-number map. */
+/** §4.3 */
 export interface StatusReport {
     commissioned: boolean;
     fabrics: FabricInfo[];
@@ -178,10 +226,9 @@ export interface StatusReport {
      *
      * `drift: []` alone is ambiguous, and the two readings could not be further
      * apart: "checked, nothing has moved" versus "there is no persisted map to
-     * check against yet". Until E5 builds that map this is always `false`, and
-     * saying so is what stops an empty list being read as an all-clear. The
-     * plugin ignores unknown fields (§1), so it can start honouring this in E3b
-     * without a protocol version bump.
+     * check against yet". Since E5 this is `true` once the detector has run
+     * against a persisted baseline, and `false` before — on a fresh install,
+     * and on any status read before the first reconcile.
      */
     driftChecked: boolean;
 }
@@ -245,6 +292,23 @@ export interface BridgeFacade {
     onWindowClosed(listener: (reason: WindowClosedReason) => void): void;
     /** The same seam for §5 `command`, emitted when an ecosystem acts. */
     onCommand(listener: (data: CommandEventData) => void): void;
+    /** The same seam for §5 `drift_detected` (§4.3). */
+    onDriftDetected(listener: (drift: DriftEntry[]) => void): void;
+    /**
+     * The reason this node is refusing everything outside
+     * {@link RECOVERY_COMMANDS}, or `undefined` when it is serving normally.
+     *
+     * A getter rather than a constructor flag because §3.11 clears it: the
+     * protocol server reads it per frame, so the command that fixes the state
+     * takes effect on the very next one.
+     */
+    endpointMapRefusal(): string | undefined;
+    /** §3.9 — drop one ecosystem's fabric. */
+    removeFabric(fabricIndex: number): Promise<void>;
+    /** §3.10 — wipe commissioning credentials and advertise fresh. */
+    factoryReset(preserveEndpointNumbers: boolean): Promise<void>;
+    /** §3.11 — adopt the live endpoint numbers as the new persisted map. */
+    rebuildEndpointMap(): Promise<StatusReport>;
 }
 
 /** A protocol-level failure a command handler can throw to shape its response. */
