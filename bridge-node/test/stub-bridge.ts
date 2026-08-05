@@ -72,7 +72,27 @@ export interface GoldenFrames {
     set_state_unknown_device: GoldenExchange;
     set_state_bad_keys: GoldenExchange;
     set_reachable: GoldenExchange;
-    /** §3.9-§3.11 and the E4 roles — exchanges awaiting node-side handlers. */
+    /**
+     * The whole §4.2 role table in one `attach`, plus the per-role `set_state`
+     * family. Graduated out of `pending` at E4, when the node grew the last of
+     * the role factories.
+     */
+    attach_all_roles: GoldenExchange;
+    set_state_on_off_plug_in_unit: GoldenExchange;
+    set_state_dimmable_light: GoldenExchange;
+    set_state_color_temperature_light: GoldenExchange;
+    set_state_extended_color_light: GoldenExchange;
+    set_state_window_covering: GoldenExchange;
+    set_state_door_lock: GoldenExchange;
+    set_state_occupancy_sensor: GoldenExchange;
+    set_state_contact_sensor: GoldenExchange;
+    set_state_temperature_sensor: GoldenExchange;
+    set_state_humidity_sensor: GoldenExchange;
+    set_state_light_sensor: GoldenExchange;
+    set_state_pressure_sensor: GoldenExchange;
+    set_state_flow_sensor: GoldenExchange;
+    set_state_thermostat: GoldenExchange;
+    /** §3.9-§3.11 — exchanges awaiting node-side handlers. */
     pending: Record<string, GoldenExchange>;
     /**
      * §5 event frames the node does not emit yet — they exist so the plugin can

@@ -9,6 +9,62 @@
 
 ---
 
+## 2026-08-05 — PR #125 (E4) three-review hardening batch
+
+Applied on `feat/e4-remaining-roles`. Nine findings across `export_bridge.py`,
+`export_handlers.py` and `bridge-node/src/endpoints.ts`; each carries its own
+regression test. The three worth carrying forward as *context* rather than as
+diff:
+
+- **matter.js's thermostat defaults are a product claim, not a protocol one.**
+  Un-seeded, `ThermostatServer` enforces 7–30 °C heating and 16–32 °C cooling
+  and answers `CONSTRAINT_ERROR` (status 135) outside them — so 5 °C frost
+  protection and the literal `0` Indigo reports for `coolSetpoint` on a
+  heat-only thermostat both failed on *every* push, forever (nothing in Indigo
+  changed, so the next diff pushed the same rejected value). `thermostatDefaults`
+  now seeds all eight `abs…`/`min…`/`max…SetpointLimit` attributes to 0–50 °C
+  and `thermostatPatch` clamps to the same band. Related and nastier:
+  `minSetpointDeadBand` defaults to 2 °C and matter.js does **not** refuse a
+  write that breaks it — per spec it silently rewrites the *other* setpoint, as
+  an offline write, so no `command` event is raised and the plugin never learns.
+  Seeded to 0. A bridge schedules nothing and has no compressor to protect.
+- **Two protocol additions were identified and deliberately NOT made.** Both
+  are v2 candidates and both need a `docs/BRIDGE_PROTOCOL.md` change, which is
+  why they are here rather than in the code:
+  1. **No spelling for "I no longer know" (§3.4/§4.2).** A published state key
+     can vanish — `sensorValue` going `None` on a dead battery, a lock's
+     `onState` going `None` when its driver loses the device. `states_for`
+     correctly omits it, `set_state` cannot carry an absence, and a reconnect
+     does not heal it (`attach` sends the same partial snapshot; §3.4 leaves
+     absent keys untouched). So the ecosystem keeps the last value it was told,
+     indefinitely — a lock reading "Locked" long after nobody knows. The
+     decision taken is **keep last-known-good and make the gap visible**:
+     `ExportHandler.diff_with_gaps` returns the vanished keys and
+     `export_bridge._report_stopped_keys` says it once per device per streak.
+     A real fix is a §4.2 "unknown" value or a §3.x `clear_state`.
+  2. **Dropped invocations are not reported to the plugin.** A `lock`/`unlock`
+     arriving while the plugin is away reaches no sink, and there is no frame
+     for telling the plugin on the next `attach` what it missed. For `doorLock`
+     only, the node now **fails** the Matter invocation
+     (`StatusResponseError`/`Status.Failure`) so Home says the accessory did not
+     respond instead of showing a bolt that never moved; every other role keeps
+     warn-and-return, because a lamp is recovered by the next attach and an
+     ecosystem error there would be noise. Reporting them on attach is the
+     protocol addition, deferred.
+- **`endpoint.stateOf()` hands back a live view, not a snapshot.** Held across
+  an `endpoint.set()`, "before" reads back as "after". Caught while wiring the
+  `LockOperation` event (`applyStates` now spreads it); worth knowing before
+  writing any other before/after comparison against a matter.js behaviour.
+
+Also in the batch: the corrective push after a failed dispatch now carries the
+export's §4.1 `options` (an inverted covering was being "corrected" to the
+mirror image of its real position), `PressureSensorExport` converts Indigo's hPa
+to §4.2's kPa (a factor of ten that rendered perfectly plausibly), and
+`stopMotion` on a dimmer-modelled blind is surfaced through a new tri-state
+`dispatch` return rather than vanishing into a `True`.
+
+---
+
 ## 2026-08-03 session (afternoon) — #105 diagnostic, domio #236, and a live Thread outage
 
 **Merged:** #107 (server supervision, v2026.7.12), #108 (empty-bridge warning, v2026.7.13),

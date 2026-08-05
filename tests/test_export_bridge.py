@@ -6,9 +6,13 @@ What is pinned here, and why each earns its place:
   made in the past, so a device that has since been deleted, disabled, taken
   over by this plugin, or re-typed must be skipped with a warning rather than
   sent as a stale spec (the E2 handover's standing requirement);
-* **an E4 role is skipped, not sent** — an unknown role fails the WHOLE attach
-  on the node (E3a), so one un-bridgeable export would silently un-export every
-  working one;
+* **a role this version cannot bridge is skipped, not sent** — an unknown role
+  fails the WHOLE attach on the node (E3a), so one un-bridgeable export would
+  silently un-export every working one. E4 made the handler table total over the
+  v1 enum, so the tests that exercise this path now *remove* a handler
+  (:func:`unbridgeable_role`) rather than naming a role that has none: the
+  behaviour still has to work, because it is what protects an old plugin from an
+  allow-list written by a newer one;
 * **the attach deadline scales with the endpoint count** — the node paces bulk
   removals ~100ms apart, so a fixed 8s deadline times out on exactly the large
   databases that most need export to work;
@@ -106,6 +110,22 @@ def errors_of(logger) -> str:
     return " ".join(str(call.args[0]) % call.args[1:] if len(call.args) > 1
                     else str(call.args[0])
                     for call in logger.error.call_args_list)
+
+
+@pytest.fixture
+def unbridgeable_role(bridge_mod, monkeypatch):
+    """Make ``doorLock`` a role this build has no handler for, and return it.
+
+    E4 completed the §4.2 table, so there is no longer a real role without a
+    handler — but the skip path is not dead code. It is what a plugin does with
+    an allow-list entry written by a *newer* version of itself (the export blob
+    lives in plugin prefs and survives a downgrade), and with any role a future
+    protocol version adds. Removing a real handler is the only honest way to
+    reach it.
+    """
+    import export_handlers
+    monkeypatch.delitem(export_handlers.HANDLERS, "doorLock")
+    return "doorLock"
 
 
 @pytest.fixture
@@ -225,24 +245,25 @@ class TestEndpointProvider:
         assert h.bridge.endpoint_specs() == []
         assert "no longer offers" in warnings_of(mock_logger)
 
-    def test_an_e4_role_is_skipped_rather_than_failing_the_whole_attach(
-            self, bridge_mod, mock_logger, devices):
+    def test_an_unbridgeable_role_is_skipped_rather_than_failing_the_whole_attach(
+            self, bridge_mod, mock_logger, devices, unbridgeable_role):
         """E3a: an unknown role fails the ENTIRE attach with ``internal``."""
         h = Harness(bridge_mod, mock_logger, devices,
-                    [ExportEntry(101, "doorLock"), ExportEntry(102, "dimmableLight")])
+                    [ExportEntry(101, unbridgeable_role), ExportEntry(102, "dimmableLight")])
         specs = h.bridge.endpoint_specs()
         assert [s.indigo_device_id for s in specs] == [102], "the good export must survive"
-        assert "cannot be bridged yet" in warnings_of(mock_logger)
+        assert "not one this plugin version can bridge" in warnings_of(mock_logger)
 
     def test_the_same_skip_is_warned_once_not_once_per_reconnect(self, bridge_mod, mock_logger,
-                                                                 devices):
-        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(101, "doorLock")])
+                                                                 devices, unbridgeable_role):
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(101, unbridgeable_role)])
         for _ in range(5):
             h.bridge.endpoint_specs()
         assert mock_logger.warning.call_count == 1
 
-    def test_a_changed_skip_reason_is_warned_again(self, bridge_mod, mock_logger, devices):
-        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(101, "doorLock")])
+    def test_a_changed_skip_reason_is_warned_again(self, bridge_mod, mock_logger, devices,
+                                                   unbridgeable_role):
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(101, unbridgeable_role)])
         h.bridge.endpoint_specs()
         h.store.upsert(ExportEntry(101, "dimmableLight"))   # now a different failure
         h.bridge.endpoint_specs()
@@ -404,9 +425,11 @@ class TestDeviceUpdated:
         h.bridge.device_updated(before, after)
         assert h.client.only("set_reachable") == ("set_reachable", 101, True)
 
-    def test_an_e4_role_update_is_skipped_silently(self, bridge_mod, mock_logger, devices):
+    def test_an_unbridgeable_role_update_is_skipped_silently(self, bridge_mod, mock_logger,
+                                                             devices, unbridgeable_role):
         """T3: the provider already warned; repeating it per state change is noise."""
-        h = self._harness(bridge_mod, mock_logger, devices, ExportEntry(101, "doorLock"))
+        h = self._harness(bridge_mod, mock_logger, devices,
+                          ExportEntry(101, unbridgeable_role))
         mock_logger.reset_mock()
         h.bridge.device_updated(RelayDevice(101, "P", onState=False),
                                 RelayDevice(101, "P", onState=True))
@@ -450,8 +473,8 @@ class TestIncrementalCrud:
         assert spec.indigo_device_id == 102 and spec.role == "dimmableLight"
 
     def test_upsert_of_an_unbridgeable_export_sends_nothing(self, bridge_mod, mock_logger,
-                                                            devices):
-        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(101, "doorLock")])
+                                                            devices, unbridgeable_role):
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(101, unbridgeable_role)])
         h.start()
         h.bridge.upsert(101)
         assert h.client.names() == []
@@ -551,15 +574,33 @@ class TestOnCommand:
         assert "does not define" in warnings_of(mock_logger)
         mock_indigo_base.dimmer.setBrightness.assert_not_called()
 
-    def test_a_command_for_an_e4_role_is_refused_not_attempted(self, bridge_mod, mock_logger,
-                                                               devices, mock_indigo_base):
-        """The lock seam: E4 owns it, and nothing here may auto-confirm it."""
+    def test_a_command_for_an_unbridgeable_role_is_refused_not_attempted(
+            self, bridge_mod, mock_logger, devices, mock_indigo_base, unbridgeable_role):
+        """A command must never be attempted for a role this build cannot serve."""
         lock_id = FRAMES["command_lock"]["data"]["indigoDeviceId"]
         devices.add(RelayDevice(lock_id, "Front Door"))
-        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(lock_id, "doorLock")])
+        h = Harness(bridge_mod, mock_logger, devices,
+                    [ExportEntry(lock_id, unbridgeable_role)])
         h.bridge.on_command(bridge_protocol.parse_command(FRAMES["command_lock"]["data"]))
         assert "cannot bridge" in warnings_of(mock_logger)
         mock_indigo_base.device.lock.assert_not_called()
+
+    def test_a_lock_command_reaches_indigo_and_confirms_nothing(
+            self, bridge_mod, mock_logger, devices, mock_indigo_base):
+        """PRD §7: dispatch the lock, then stop. No optimistic state write."""
+        lock_id = FRAMES["command_lock"]["data"]["indigoDeviceId"]
+        dev = RelayDevice(lock_id, "Front Door", onState=False)
+        devices.add(dev)
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(lock_id, "doorLock")])
+        h.start()
+        h.bridge.on_command(bridge_protocol.parse_command(FRAMES["command_lock"]["data"]))
+        mock_indigo_base.device.lock.assert_called_once_with(dev)
+        # Nothing was pushed back: the ecosystem's `lockState` moves when the
+        # real device does and `deviceUpdated` says so, not because we asked.
+        assert h.client.names() == []
+
+        h.bridge.on_command(bridge_protocol.parse_command(FRAMES["command_unlock"]["data"]))
+        mock_indigo_base.device.unlock.assert_called_once_with(dev)
 
     def test_a_failing_dispatch_is_logged_not_raised(self, bridge_mod, mock_logger, devices,
                                                      mock_indigo_base):
@@ -777,7 +818,7 @@ class TestSilentFailures:
         h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(101, "onOffLight")])
         calls = {"n": 0}
 
-        def exploding_states_for(_dev):
+        def exploding_states_for(_dev, _options=None):
             calls["n"] += 1
             raise RuntimeError(f"transient read error #{calls['n']}")
 
@@ -820,14 +861,124 @@ class TestSilentFailures:
         """F6/F7: a bare traceback per state change tells you nothing and never stops."""
         h = self._bridge(bridge_mod, mock_logger, devices)
         handler = bridge_mod.export_handlers.handler_for("onOffLight")
-        original = handler.diff
-        handler.diff = lambda _o, _n: (_ for _ in ()).throw(RuntimeError("bad device"))
+        original = handler.diff_with_gaps
+        handler.diff_with_gaps = lambda _o, _n, _opt=None: (
+            _ for _ in ()).throw(RuntimeError("bad device"))
         try:
             for _ in range(10):
                 h.bridge.device_updated(RelayDevice(101, "Study Plug", onState=False),
                                         RelayDevice(101, "Study Plug", onState=True))
         finally:
-            handler.diff = original
+            handler.diff_with_gaps = original
         assert mock_logger.exception.call_count == 1
         assert "Study Plug" in errors_of(mock_logger)
         assert "101" in errors_of(mock_logger)
+
+    def test_a_failed_dispatch_corrects_with_the_exports_own_options(
+            self, bridge_mod, mock_logger, devices, mock_indigo_base):
+        """PR #125 C1: the corrective push used to drop the export's §4.1 options.
+
+        A covering whose motor is wired backwards carries ``invert``. Read
+        WITHOUT it, ``states_for`` answers ``100 - actual`` — so a failed
+        ``goToPosition`` on such a blind "corrected" the ecosystem to the mirror
+        image of where the blind really is. That is worse than the stale value it
+        replaced: it is a wrong answer pushed with the authority of a fresh
+        reading, and nothing later contradicts it.
+
+        Brightness 30 with ``invert`` is §4.2 position 70. The bug pushed 30.
+        """
+        dev = DimmerDevice(700, "Back Blind", onState=True, brightness=30)
+        devices.add(dev)
+        mock_indigo_base.dimmer.setBrightness.side_effect = RuntimeError("motor jammed")
+        h = Harness(bridge_mod, mock_logger, devices,
+                    [ExportEntry(700, "windowCovering", options={"invert": True})])
+        h.start()
+        h.bridge.on_command(bridge_protocol.BridgeCommand(
+            indigo_device_id=700, command="goToPosition", args={"position": 90}))
+        assert h.client.only("set_state") == ("set_state", 700, {"position": 70})
+
+    def test_a_correction_with_nothing_readable_says_so_rather_than_returning(
+            self, bridge_mod, mock_logger, devices, mock_indigo_base):
+        """PR #125 H1: the error line one above promises "pushing the real one back".
+
+        A lock whose ``onState`` has gone ``None`` has no truth to push, so
+        ``states_for`` is empty and the push never happened — after the log had
+        already said it would. Silence there is the worst possible outcome for
+        the one role where the user is standing at the door.
+        """
+        dev = RelayDevice(701, "Front Door", onState=None)
+        devices.add(dev)
+        mock_indigo_base.device.lock.side_effect = RuntimeError("mesh unreachable")
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(701, "doorLock")])
+        h.start()
+        h.bridge.on_command(bridge_protocol.BridgeCommand(
+            indigo_device_id=701, command="lock", args={}))
+        assert h.client.names() == []
+        assert "cannot push truth" in warnings_of(mock_logger)
+
+    def test_a_device_that_stops_reporting_a_key_is_named_once_per_streak(
+            self, bridge_mod, mock_logger, devices):
+        """PR #125 C4: the ONLY trace of a published key vanishing.
+
+        ``diff`` iterates the new snapshot, so a key that disappeared produced
+        no push and no log — and a reconnect does not heal it either, because
+        ``attach`` sends the same partial snapshot and §3.4 leaves absent keys
+        untouched. The ecosystem shows the last value it was told, indefinitely.
+        Keeping that value is the decision; being quiet about it was the bug.
+        """
+        devices.add(RelayDevice(702, "Front Door", onState=True))
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(702, "doorLock")])
+        h.start()
+        for _ in range(6):
+            h.bridge.device_updated(RelayDevice(702, "Front Door", onState=True),
+                                    RelayDevice(702, "Front Door", onState=None))
+        assert mock_logger.warning.call_count == 1
+        warnings = warnings_of(mock_logger)
+        assert "702" in warnings and "locked" in warnings
+        assert "last known value" in warnings
+        assert h.client.names() == [], "an absent key must not be fabricated onto the wire"
+
+    def test_a_key_that_starts_reporting_again_re_arms_the_latch(
+            self, bridge_mod, mock_logger, devices):
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(703, "doorLock")])
+        devices.add(RelayDevice(703, "Side Door", onState=True))
+        h.start()
+        h.bridge.device_updated(RelayDevice(703, "Side Door", onState=True),
+                                RelayDevice(703, "Side Door", onState=None))
+        h.bridge.device_updated(RelayDevice(703, "Side Door", onState=None),
+                                RelayDevice(703, "Side Door", onState=True))
+        h.bridge.device_updated(RelayDevice(703, "Side Door", onState=True),
+                                RelayDevice(703, "Side Door", onState=None))
+        assert mock_logger.warning.call_count == 2
+
+    def test_a_command_that_lawfully_did_nothing_is_named_once_per_streak(
+            self, bridge_mod, mock_logger, devices, mock_indigo_base):
+        """PR #125 M1: ``stopMotion`` on a dimmer-modelled blind.
+
+        Neither an error (§4.2 declares the command for this role) nor a
+        success worth being silent about: the user pressed stop and the blind
+        kept going. It used to be a debug line from a stateless handler that
+        could not name the device.
+        """
+        devices.add(DimmerDevice(704, "Landing Blind", onState=True, brightness=50))
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(704, "windowCovering")])
+        h.start()
+        for _ in range(4):
+            h.bridge.on_command(bridge_protocol.BridgeCommand(
+                indigo_device_id=704, command="stopMotion", args={}))
+        assert mock_logger.warning.call_count == 1
+        assert "704" in warnings_of(mock_logger)
+        assert "changed nothing" in warnings_of(mock_logger)
+        mock_indigo_base.dimmer.setBrightness.assert_not_called()
+
+    def test_a_command_that_did_something_clears_the_no_op_latch(
+            self, bridge_mod, mock_logger, devices):
+        devices.add(DimmerDevice(705, "Landing Blind", onState=True, brightness=50))
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(705, "windowCovering")])
+        h.start()
+        stop = bridge_protocol.BridgeCommand(indigo_device_id=705, command="stopMotion", args={})
+        h.bridge.on_command(stop)
+        h.bridge.on_command(bridge_protocol.BridgeCommand(
+            indigo_device_id=705, command="goToPosition", args={"position": 40}))
+        h.bridge.on_command(stop)
+        assert mock_logger.warning.call_count == 2
