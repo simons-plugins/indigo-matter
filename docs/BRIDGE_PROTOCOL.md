@@ -201,33 +201,76 @@ commissioner completes.
 {"command": "remove_fabric", "args": {"fabricIndex": 2}}
 ```
 
-Result: `{}`.
+Result: `{}`. Emits `fabrics_changed` (§5).
+
+**Removing the last fabric is a factory reset the node did not ask for.**
+matter.js watches its own `commissioned` state and, when the fabric set
+empties, factory-resets itself (`doFactoryReset()` → `erase()`). The node
+therefore clears its commissioning witness whenever the fabric count reaches
+zero — by this command, by §3.10, or by an ecosystem removing *us* from its
+side — and emits `decommissioned`. Without that, the next start would see
+"witness says paired, stack says no fabrics", which is the `fabricStorageLost`
+refusal signature, and refuse to serve anything on the grounds of a storage
+loss that was actually a deliberate unpairing.
 
 ### 3.10 `factory_reset`
 
 Wipes commissioning credentials and starts advertising fresh (PRD §6 "reset
-all pairings"). The endpoint-number map is **preserved by default** — a reset
-must not scramble identities if the user re-pairs the same ecosystems. This
-requires the map to be persisted **outside** the matter.js storage context
-that its factory reset wipes: the node keeps it in its own file
-(`endpoint-map.json`) in the bridge storage dir, written through the same
-persistence layer as the drift detector's baseline.
+all pairings"). The endpoint-number map is **preserved by default**: it is
+persisted **outside** the matter.js storage context that the reset wipes, in
+the node's own `endpoint-map.json` in the bridge storage dir.
 
 ```json
 {"command": "factory_reset", "args": {"preserveEndpointNumbers": true}}
 ```
 
-Passing `false` wipes the map too — the "explicit rebuild" of PRD §7, for the
-case where the map itself is what's corrupt.
+**What `preserveEndpointNumbers: true` preserves is the ability to NOTICE, not
+the numbers.** matter.js owns the allocation, keyed on `Endpoint.id` in the
+storage context `erase()` wipes — so the numbers themselves are gone either
+way, and the endpoints will be re-created at whatever matter.js hands out next.
+What survives is the *baseline*: the map still says what each `UniqueID` used
+to be, so the renumbering is reported as drift (§4.3) instead of happening
+silently. Passing `false` discards the baseline too — the "explicit rebuild" of
+PRD §7, for the case where the map itself is what is corrupt. The node re-runs
+the drift check at the end of a preserving reset and says what it found, so the
+consequence is in the log rather than waiting to surprise the next attach.
+
+The commissioning witness is cleared either way, and the node **verifies** it
+by reading `identity.json` back before reporting completion: a witness that
+survived the erase is the exact `fabricStorageLost` signature, so failing to
+clear it would make the next start refuse and blame lost storage for the reset
+the user asked for. A failure to clear it appears in `StatusReport.warnings`.
+
+Emits `decommissioned` and `fabrics_changed` (§5) when it takes the fabric
+count to zero.
 
 ### 3.11 `rebuild_endpoint_map`
 
 The recovery path out of the `endpoint_map_invalid` refuse-to-start state
-(PRD §7 "Endpoint map lost/corrupt"). Reallocates endpoint numbers for the
-current endpoint set from scratch and persists a new map. This **will**
-duplicate accessories in paired ecosystems — that is exactly why it is a
-separate, explicit command that the plugin only issues after the user
-confirms via a warning dialog. Result: `<StatusReport>`.
+(PRD §7 "Endpoint map lost/corrupt"). Discards the persisted baseline and
+**adopts the numbers the live endpoints currently have** as the new one. It
+reallocates nothing — by the time a user is asked to confirm it, whatever
+duplication a lost map implies has already happened in the ecosystems; what
+changes is that the node stops refusing and starts telling the truth about the
+numbers that now exist. This **will** duplicate accessories in paired
+ecosystems, which is exactly why it is a separate, explicit command that the
+plugin only issues after the user confirms via a warning dialog
+("Rebuild Matter Endpoint Map…"). Result: `<StatusReport>`.
+
+Two refusals of its own:
+
+- if the new map **cannot be written**, the command fails with `internal` and
+  the refuse-to-start state stays in force. Answering with a `StatusReport` over
+  a map that never reached disk would tell the user the rebuild they confirmed
+  had worked, and then refuse again on the next start for the same reason;
+- if the refusal is an unusable `identity.json` rather than an unusable map, it
+  fails with `endpoint_map_invalid` and does nothing. That is a different loss
+  with a different remedy (restore the file — the unusable one is moved aside as
+  `identity.json.unreadable-<stamp>`), and clearing the refusal for it would
+  serve endpoints under a `SerialNumber` no ecosystem has ever seen.
+
+A present-but-unusable map is copied to `endpoint-map.json.corrupt` before it is
+replaced.
 
 ## 4. Shapes
 
@@ -299,7 +342,8 @@ ecosystem acts. Both are enumerated here in full; there is no other source.
  "endpointCount": 12,
  "endpoints": [{"indigoDeviceId": 123456789, "endpointNumber": 2, "role": "onOffLight"}],
  "drift": [],
- "driftChecked": false}
+ "driftChecked": false,
+ "warnings": []}
 ```
 
 `drift` lists any `UniqueID → endpointNumber` mappings that changed since last
@@ -320,21 +364,45 @@ error, never auto-repaired. Each entry is a `DriftEntry`:
   its own is ambiguous, and the two readings are opposites: "checked, nothing
   moved" versus "there is nothing to check against yet". The node sends `false`
   until it persists the endpoint-number map, so a client must not treat an empty
-  `drift` as an all-clear unless `driftChecked` is `true`.
+  `drift` as an all-clear unless `driftChecked` is `true`. It is also `false`
+  while the map is held **in memory only** because a write failed — a baseline
+  the next restart cannot find has not verified anything durable.
+- `warnings` — persistence failures the node has hit and cannot fix on its own:
+  the endpoint map could not be written or deleted, the commissioning witness
+  could not be cleared, `identity.json` could not be saved. Empty is the normal
+  state, and entries are **current, not historical** — a warning disappears the
+  moment the operation it describes succeeds.
+
+  This exists because the node's only other channel is stdout, and while the
+  node is started by hand that is a terminal nobody is watching. `get_status` is
+  polled by the plugin's watchdog, so a client SHOULD surface a non-empty
+  `warnings` at warning level — once per streak, since these persist until a
+  human acts — and show it wherever it summarises export health.
 
 `endpoints[].role` is one of the §4.2 enum; `endpointCount` is
 `endpoints.length` (it is sent explicitly so a client can log the size without
 walking the list).
+
+`drift` is populated by every operation that can change the live endpoint set —
+`attach`/`reconcile`, `upsert_endpoint` and `remove_endpoint` — and **on the
+first such operation**, not "at startup": before one has run there are no live
+endpoints to compare, which is precisely what `driftChecked: false` says. A
+node that starts commissioned with no `endpoint-map.json` at all (every install
+that predates the map) **bootstraps** a baseline from matter.js's own persisted
+allocation and serves normally; it does not refuse. Refusing would take working
+exports offline on upgrade, and would buy nothing — matter.js owns the numbers,
+the map only witnesses them, and a missing witness renumbers nothing. A map that
+is present and unreadable is a different matter and still refuses (§1.1).
 
 ## 5. Events (node → plugin)
 
 | Event | `data` | Meaning |
 |---|---|---|
 | `command` | `{"indigoDeviceId", "command", "args"}` | Ecosystem-originated action; names and args exactly as enumerated per role in §4.2 |
-| `fabrics_changed` | `{"fabrics": […], "change": "added"\|"deleted"\|"updated"}` | Pairing/unpairing activity |
-| `commissioned` / `decommissioned` | `{}` | First fabric added / last removed |
+| `fabrics_changed` | `{"fabrics": […], "change": "added"\|"deleted"\|"updated"}` | Pairing/unpairing activity, including the changes §3.9/§3.10 cause themselves. `fabrics` is the set *after* the change |
+| `commissioned` / `decommissioned` | `{}` | The fabric count went zero → non-zero / non-zero → zero. Transitions, not repeats: a second ecosystem pairing raises `fabrics_changed` only |
 | `window_closed` | `{"reason": "expired"\|"commissioned"}` | The enhanced commissioning window ended |
-| `drift_detected` | `{"drift": […]}` | Endpoint-number drift found at startup |
+| `drift_detected` | `{"drift": […]}` | Endpoint-number drift found by a reconcile, upsert or remove |
 
 The plugin resolves `indigoDeviceId` through the allow-list before acting; a
 command for a device no longer exported gets no action and a warning (PRD §7

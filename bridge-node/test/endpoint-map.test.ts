@@ -256,33 +256,108 @@ describe("EndpointMapStore.discard (§3.10 preserveEndpointNumbers: false)", () 
     });
 });
 
+describe("a write that did not land (E5 B1/B2)", () => {
+    it("never claims driftChecked over a RAM-only baseline", () => {
+        // ⊗ `#checked` used to be set unconditionally. A `driftChecked: true`
+        // over a map that never reached disk asserts an all-clear about a
+        // baseline the next restart cannot find — so that device's reallocated
+        // number gets recorded as the truth and the real renumbering is never
+        // reported by anybody, ever.
+        const dir = storage();
+        const store = new EndpointMapStore(dir);
+        store.load();
+        chmodSync(dir, 0o500);
+        try {
+            assert.deepEqual(store.check([{ uniqueId: "indigo-1", endpointNumber: 2 }]), []);
+            assert.equal(store.checked, false, "the write failed, so nothing durable was checked");
+        } finally {
+            chmodSync(dir, 0o700);
+        }
+
+        // And the retry: the next check re-attempts the write even though it
+        // adds nothing, because the map still owes the disk what it holds.
+        assert.deepEqual(store.check([{ uniqueId: "indigo-1", endpointNumber: 2 }]), []);
+        assert.equal(store.checked, true);
+        assert.deepEqual(mapFileIn(dir).endpoints, { "indigo-1": 2 });
+    });
+
+    it("tells the caller a rebuild did not persist, and warns", () => {
+        const dir = storage();
+        const store = new EndpointMapStore(dir);
+        store.load();
+        chmodSync(dir, 0o500);
+        try {
+            assert.equal(store.rebuild([{ uniqueId: "indigo-1", endpointNumber: 2 }]), false);
+            // §4.3 `warnings`: the node's log is a stdout nobody is watching in
+            // this milestone, so a failed write has to reach get_status.
+            assert.equal(store.warnings.length, 1);
+            assert.match(store.warnings[0]!, /Could not write the endpoint map/);
+        } finally {
+            chmodSync(dir, 0o700);
+        }
+        assert.equal(store.rebuild([{ uniqueId: "indigo-1", endpointNumber: 2 }]), true);
+        assert.deepEqual(store.warnings, [], "a warning is current, not historical");
+    });
+});
+
+describe("rebuild preserves the evidence (E5 C2)", () => {
+    it("copies an unusable map to .corrupt before overwriting it", () => {
+        const dir = storage();
+        writeFileSync(join(dir, ENDPOINT_MAP_FILE), "{not json", "utf8");
+        const store = new EndpointMapStore(dir);
+        assert.notEqual(store.load().problem, undefined);
+
+        assert.equal(store.rebuild([{ uniqueId: "indigo-1", endpointNumber: 7 }]), true);
+
+        // The unusable bytes are the only surviving record of the old numbers,
+        // and "unusable" is often a truncation a human can read.
+        assert.equal(readFileSync(join(dir, `${ENDPOINT_MAP_FILE}.corrupt`), "utf8"), "{not json");
+        assert.deepEqual(mapFileIn(dir).endpoints, { "indigo-1": 7 });
+        assert.equal(store.problem, undefined, "a successful write settles the question");
+    });
+
+    it("says so when it rebuilds from zero endpoints", () => {
+        // §1.1 excludes `attach` from the recovery commands, so in the refusal
+        // state there are never any live endpoints to rebuild FROM. That is
+        // correct behaviour with a log line that used to describe the opposite.
+        const logged: string[] = [];
+        const store = new EndpointMapStore(storage(), message => logged.push(message));
+        store.load();
+        assert.equal(store.rebuild([]), true);
+        assert.ok(logged.some(line => line.includes("ZERO live endpoints")));
+    });
+});
+
 describe("refuseReasonFor — the PRD §7 decision", () => {
     it("serves a fresh install with no map at all", () => {
         // XAC1: a fresh install is inert but WORKING. Refusing here would break
         // every user who has never paired anything.
-        assert.equal(refuseReasonFor({ commissioned: false, mapPresent: false }), undefined);
+        assert.equal(refuseReasonFor({ commissioned: false }), undefined);
     });
 
     it("serves an uncommissioned bridge even with an unreadable map", () => {
         // Nothing is paired, so there is no accessory identity to protect and
         // the first reconcile will simply write a new map.
-        assert.equal(
-            refuseReasonFor({ commissioned: false, mapPresent: false, mapProblem: "corrupt" }),
-            undefined,
-        );
+        assert.equal(refuseReasonFor({ commissioned: false, mapProblem: "corrupt" }), undefined);
     });
 
     it("refuses a commissioned bridge whose map is unreadable", () => {
         assert.equal(
-            refuseReasonFor({ commissioned: true, mapPresent: true, mapProblem: "corrupt" }),
+            refuseReasonFor({ commissioned: true, mapProblem: "corrupt" }),
             RefuseReason.mapUnreadable,
         );
     });
 
-    it("refuses a commissioned bridge with no map at all", () => {
+    it("SERVES a commissioned bridge with no map at all — the upgrade path", () => {
+        // ⊗ The deploy blocker. Every bridge commissioned before E5 shipped is
+        // in exactly this state: fabrics, endpoints, and no endpoint-map.json,
+        // because the file did not exist yet. Refusing here took every working
+        // export offline the moment the node was updated — and bought nothing,
+        // because matter.js owns the numbers and this map is only the witness:
+        // a missing witness renumbers precisely nothing.
         assert.equal(
-            refuseReasonFor({ commissioned: true, mapPresent: false }),
-            RefuseReason.mapMissingWhileCommissioned,
+            refuseReasonFor({ commissioned: true, commissionedAt: "2026-08-01T00:00:00.000Z" }),
+            undefined,
         );
     });
 
@@ -291,15 +366,57 @@ describe("refuseReasonFor — the PRD §7 decision", () => {
         // #1 real-world accessory-duplication cause, and the only reason it is
         // detectable at all is that the witness lives outside matter.js storage.
         assert.equal(
-            refuseReasonFor({ commissioned: false, mapPresent: true, commissionedAt: "2026-08-01T00:00:00.000Z" }),
+            refuseReasonFor({ commissioned: false, commissionedAt: "2026-08-01T00:00:00.000Z" }),
             RefuseReason.fabricStorageLost,
         );
     });
 
     it("serves a commissioned bridge with a usable map", () => {
         assert.equal(
-            refuseReasonFor({ commissioned: true, mapPresent: true, commissionedAt: "2026-08-01T00:00:00.000Z" }),
+            refuseReasonFor({ commissioned: true, commissionedAt: "2026-08-01T00:00:00.000Z" }),
             undefined,
         );
+    });
+});
+
+describe("bootstrapping a baseline instead of refusing (E5 upgrade path)", () => {
+    it("seeds from numbers that already exist and serves", () => {
+        const dir = storage();
+        const store = new EndpointMapStore(dir);
+        store.load();
+        assert.equal(store.present, false, "the pre-E5 state: no map on disk");
+
+        const persisted = store.seed(
+            [
+                { uniqueId: "indigo-1", endpointNumber: 2 },
+                { uniqueId: "indigo-2", endpointNumber: 3 },
+            ],
+            "adopted from matter.js",
+        );
+
+        assert.equal(persisted, true);
+        assert.equal(store.present, true);
+        assert.equal(store.numberFor("indigo-1"), 2);
+        // Seeded numbers are a baseline like any other: the very next check
+        // must report a device that has since moved, not bless it.
+        assert.deepEqual(store.check([{ uniqueId: "indigo-1", endpointNumber: 9 }]), [
+            { uniqueId: "indigo-1", expected: 2, actual: 9 },
+        ]);
+    });
+
+    it("falls back to an empty baseline the first reconcile then fills", () => {
+        // The other half of the migration: matter.js's own store could not be
+        // read, so there is nothing to adopt — but a bridge that serves and
+        // records the live set is strictly better than one that refuses.
+        const dir = storage();
+        const store = new EndpointMapStore(dir);
+        store.load();
+
+        assert.equal(store.seed([], "unreadable"), true);
+        assert.equal(store.checked, false, "an empty seed has checked nothing");
+
+        assert.deepEqual(store.check([{ uniqueId: "indigo-1", endpointNumber: 2 }]), []);
+        assert.equal(store.checked, true);
+        assert.equal(new EndpointMapStore(dir).load().numbers.get("indigo-1"), 2);
     });
 });

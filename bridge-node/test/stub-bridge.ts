@@ -246,6 +246,8 @@ export class StubBridge implements BridgeFacade {
     /** §4.3 — what `get_status` reports; the drift tests set these. */
     drift: DriftEntry[] = [];
     driftChecked = false;
+    /** §4.3 — persistence failures the node wants the plugin to surface. */
+    warnings: string[] = [];
     /** §1.1 — non-undefined puts the double in the refuse-to-start state. */
     refusal?: string;
     /** Calls recorded by the §3.9/§3.10/§3.11 tests. */
@@ -267,6 +269,7 @@ export class StubBridge implements BridgeFacade {
             endpoints,
             drift: structuredClone(this.drift),
             driftChecked: this.driftChecked,
+            warnings: [...this.warnings],
         };
     }
 
@@ -298,6 +301,35 @@ export class StubBridge implements BridgeFacade {
     }
 
     #drift?: (drift: DriftEntry[]) => void;
+
+    onFabricsChanged(listener: (fabrics: FabricInfo[], change: string) => void): void {
+        this.#fabrics = listener;
+    }
+
+    onCommissioned(listener: () => void): void {
+        this.#commissioned = listener;
+    }
+
+    onDecommissioned(listener: () => void): void {
+        this.#decommissioned = listener;
+    }
+
+    /** Stand in for the Matter stack observing a pairing change (§5). */
+    emitFabricsChanged(fabrics: FabricInfo[], change: string): void {
+        this.#fabrics?.(fabrics, change);
+    }
+
+    emitCommissioned(): void {
+        this.#commissioned?.();
+    }
+
+    emitDecommissioned(): void {
+        this.#decommissioned?.();
+    }
+
+    #fabrics?: (fabrics: FabricInfo[], change: string) => void;
+    #commissioned?: () => void;
+    #decommissioned?: () => void;
 
     async reconcile(endpoints: readonly EndpointSpec[], replaceAll: boolean): Promise<StatusReport> {
         this.model.reconcile(endpoints, replaceAll);

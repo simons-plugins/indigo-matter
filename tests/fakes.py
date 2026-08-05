@@ -192,24 +192,31 @@ class InlineExecutor:
     for the loop.
     """
 
-    def __init__(self):
+    def __init__(self, hang: bool = False):
         self.shutdown_calls: list = []
         #: How many pieces of work were handed over — the observable that says
         #: the loop was left, and that a command nobody exports never even
         #: reached the hop.
         self.submitted = 0
+        #: Stand in for a wedged ``indigo.*`` call: the work is accepted and the
+        #: future never resolves, which is exactly what a Z-Wave device that has
+        #: stopped answering looks like from the executor's side. Deterministic
+        #: — no sleeping — so the timeout test does not race a clock.
+        self.hang = hang
 
     def submit(self, fn, *args, **kwargs):
         self.submitted += 1
         future: Future = Future()
+        if self.hang:
+            return future
         try:
             future.set_result(fn(*args, **kwargs))
         except BaseException as exc:  # pylint: disable=broad-except
             future.set_exception(exc)
         return future
 
-    def shutdown(self, wait: bool = True):
-        self.shutdown_calls.append(wait)
+    def shutdown(self, wait: bool = True, cancel_futures: bool = False):
+        self.shutdown_calls.append((wait, cancel_futures))
 
 
 class FakeBridgeClient:

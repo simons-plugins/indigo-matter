@@ -13,7 +13,13 @@ import { networkInterfaces } from "node:os";
 import { assertMdnsInterface, parseArgs, USAGE } from "./config.js";
 import { BridgeNode, matterJsVersion } from "./node.js";
 import { describeError, describeErrorWithStack, RefuseReason } from "./protocol.js";
-import { identityProblem, loadOrCreateIdentity } from "./storage.js";
+import {
+    type BridgeIdentity,
+    identityProblem,
+    loadOrCreateIdentity,
+    mintIdentity,
+    quarantineIdentity,
+} from "./storage.js";
 import { BridgeWsServer } from "./ws-server.js";
 
 const bridgeVersion: string = createRequire(import.meta.url)("../package.json").version;
@@ -68,11 +74,29 @@ async function main(): Promise<void> {
     // `UniqueID`, which every paired ecosystem reads as a different accessory
     // (E5 / PRD §4.3). A missing file is a first run and answers `undefined`.
     const identityFault = await phase("identity check failed", () => identityProblem(config.storagePath));
-    if (identityFault !== undefined) {
-        log(`Bridge identity unusable: ${identityFault}`);
-    }
 
-    const identity = await phase("identity load failed", () => loadOrCreateIdentity(config.storagePath, log));
+    // The two answers take opposite paths, and running the mint unconditionally
+    // — as the first cut of E5 did — destroyed the file the refusal below exists
+    // to protect, one line before refusing to protect it. `loadOrCreateIdentity`
+    // writes through `rename`, so the unusable original was gone by the time
+    // anybody was told there had been a problem.
+    let identity: BridgeIdentity;
+    if (identityFault === undefined) {
+        identity = await phase("identity load failed", () => loadOrCreateIdentity(config.storagePath, log));
+    } else {
+        log(`Bridge identity unusable: ${identityFault}`);
+        const movedTo = quarantineIdentity(config.storagePath, log);
+        if (movedTo !== undefined) {
+            log(`Moved the unusable identity to ${movedTo} — repair or restore it, then restart`);
+        }
+        // In memory only. The node needs *an* identity to build a ServerNode at
+        // all (that is what keeps `get_pairing` answering, §1.1), but nothing
+        // durable may be written over an identity we could not read: no
+        // endpoints are served while refusing, so this one is never anybody's
+        // accessory and must not outlive the process.
+        identity = mintIdentity();
+        log("Using a temporary in-memory bridge identity; NOTHING has been written to identity.json");
+    }
 
     const bridge = new BridgeNode(
         config,

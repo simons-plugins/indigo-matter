@@ -155,30 +155,52 @@ export function identityProblem(storagePath: string): string | undefined {
 }
 
 /**
+ * The outcome of moving the commissioning witness.
+ *
+ * The identity is still returned — the caller has to keep using one whatever
+ * happened — but `persisted` is now an answer rather than a silence. A caller
+ * that reports success over a witness that never reached disk is describing a
+ * different bridge from the one that will boot next: `factory_reset` leaving
+ * `commissionedAt` behind makes the very next start refuse with
+ * `fabricStorageLost`, blaming lost storage for the reset the user asked for.
+ */
+export interface WitnessWrite {
+    identity: BridgeIdentity;
+    /** False when the change was made in memory only. */
+    persisted: boolean;
+    /** Why it did not reach disk, when it did not. */
+    problem?: string;
+}
+
+/**
  * Record that this bridge has been commissioned, if it is not recorded already.
  *
  * Called the first time a fabric is observed. Returns the identity to keep
  * using — the same object when nothing needed writing, so the caller can hold
- * one reference. A write failure is reported and swallowed: losing the witness
- * degrades a future refuse-to-start into a silent re-init, which is bad, but
- * failing the commissioning that just succeeded is worse and immediate.
+ * one reference. A write failure is reported and **not** thrown: losing the
+ * witness degrades a future refuse-to-start into a silent re-init, which is
+ * bad, but failing the commissioning that just succeeded is worse and
+ * immediate. It is reported to the caller as well as to the log, because the
+ * log in this milestone is a terminal somebody closed (§4.3 `warnings`).
  */
 export function markCommissioned(
     storagePath: string,
     identity: BridgeIdentity,
     log: (message: string) => void = () => {},
     now: () => Date = () => new Date(),
-): BridgeIdentity {
+): WitnessWrite {
     if (identity.commissionedAt !== undefined) {
-        return identity;
+        return { identity, persisted: true };
     }
     const updated: BridgeIdentity = { ...identity, commissionedAt: now().toISOString() };
     try {
         writeIdentity(join(storagePath, IDENTITY_FILE), updated);
     } catch (error) {
-        log(`Could not record the commissioning marker in identity.json: ${describeError(error)}`);
+        const problem = `Could not record the commissioning marker in identity.json: ${describeError(error)}`;
+        log(problem);
+        return { identity: updated, persisted: false, problem };
     }
-    return updated;
+    return { identity: updated, persisted: true };
 }
 
 /**
@@ -191,27 +213,90 @@ export function clearCommissioned(
     storagePath: string,
     identity: BridgeIdentity,
     log: (message: string) => void = () => {},
-): BridgeIdentity {
+): WitnessWrite {
     if (identity.commissionedAt === undefined) {
-        return identity;
+        return { identity, persisted: true };
     }
     const { commissionedAt: _dropped, ...rest } = identity;
     try {
         writeIdentity(join(storagePath, IDENTITY_FILE), rest);
     } catch (error) {
-        log(`Could not clear the commissioning marker in identity.json: ${describeError(error)}`);
+        const problem = `Could not clear the commissioning marker in identity.json: ${describeError(error)}`;
+        log(problem);
+        return { identity: rest, persisted: false, problem };
     }
-    return rest;
+    return { identity: rest, persisted: true };
+}
+
+/**
+ * `identity.json` exactly as it is on disk right now, or `undefined` when it is
+ * absent or unusable.
+ *
+ * The verification half of {@link clearCommissioned}: §3.10 promises the
+ * witness is gone, and the only way to say that truthfully is to go and look.
+ * A write can report success and still not be what the next start reads.
+ */
+export function readIdentity(storagePath: string): BridgeIdentity | undefined {
+    try {
+        const parsed: unknown = JSON.parse(readFileSync(join(storagePath, IDENTITY_FILE), "utf8"));
+        return isUsableIdentity(parsed) ? parsed : undefined;
+    } catch {
+        return undefined;
+    }
+}
+
+/** Fresh random identity values. Pure — nothing is written. */
+export function mintIdentity(): BridgeIdentity {
+    return {
+        installId: randomUUID(),
+        passcode: generatePasscode(),
+        discriminator: generateDiscriminator(),
+    };
+}
+
+/**
+ * Move an unusable `identity.json` aside instead of writing over it (E5).
+ *
+ * This file holds the `SerialNumber` and `UniqueID` every paired ecosystem
+ * remembers us by. When it cannot be parsed, the *last* thing to do is replace
+ * it: the bytes on disk may be a truncation, a stray edit or a half-finished
+ * copy that a human can repair, and they are the only surviving record of an
+ * identity that cannot be regenerated. Renaming rather than deleting means the
+ * refusal that follows is recoverable; minting over it was not.
+ *
+ * Returns where it went, or `undefined` if there was nothing to move (or the
+ * move itself failed — which is reported, not thrown, because the node is about
+ * to refuse to serve endpoints either way).
+ */
+export function quarantineIdentity(
+    storagePath: string,
+    log: (message: string) => void = () => {},
+    now: () => Date = () => new Date(),
+): string | undefined {
+    const file = join(storagePath, IDENTITY_FILE);
+    const stamp = now().toISOString().replace(/[:.]/g, "-");
+    const target = `${file}.unreadable-${stamp}`;
+    try {
+        renameSync(file, target);
+        return target;
+    } catch (error) {
+        if (!isNotFound(error)) {
+            log(`Could not move the unusable identity aside: ${describeError(error)}`);
+        }
+        return undefined;
+    }
 }
 
 /**
  * Read `identity.json` from {@link storagePath}, creating it (and the directory)
  * with freshly randomised values on first run.
  *
- * An unreadable or invalid file is replaced here. That is only safe because
- * `main.ts` calls {@link identityProblem} *first* and refuses to serve endpoints
- * when a present file is unusable (E5) — reaching this function's replace branch
- * therefore means the caller has already decided the loss is acceptable.
+ * **Only ever called when there is no usable file to lose.** `main.ts` calls
+ * {@link identityProblem} first, and a present-but-unusable file goes down the
+ * {@link quarantineIdentity} + {@link mintIdentity} path instead, which writes
+ * nothing. The `problem !== undefined` branch below therefore survives only for
+ * the race where the file becomes unreadable between those two reads — a case
+ * where there is no original left to preserve anyway.
  */
 export function loadOrCreateIdentity(
     storagePath: string,
@@ -240,11 +325,7 @@ export function loadOrCreateIdentity(
         log(`Replacing bridge identity at ${file}: ${problem}`);
     }
 
-    const identity: BridgeIdentity = {
-        installId: randomUUID(),
-        passcode: generatePasscode(),
-        discriminator: generateDiscriminator(),
-    };
+    const identity = mintIdentity();
     writeIdentity(file, identity);
     return identity;
 }

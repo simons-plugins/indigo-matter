@@ -442,7 +442,8 @@ class TestStatusSummary:
 
     def _bridge_in(self, plug, **state):
         """A bridge whose client is in some non-serving state."""
-        client = Mock(halted=False, halted_reason=None, recovery=False, attached=True)
+        client = Mock(halted=False, halted_reason=None, recovery=False, attached=True,
+                      status=None)
         for key, value in state.items():
             setattr(client, key, value)
         plug.export_bridge.active = True
@@ -475,6 +476,44 @@ class TestStatusSummary:
     def test_a_healthy_bridge_adds_nothing(self, plug):
         plug.exports.upsert(ExportEntry(101, "onOffLight"))
         self._bridge_in(plug)
+        assert plug._export_summary() == "1 device(s) exported."
+
+    def _status(self, **kw):
+        import bridge_protocol
+        base = dict(commissioned=True, fabrics=[], endpoint_count=1, endpoints=[],
+                    drift=[], drift_checked=True, warnings=[])
+        base.update(kw)
+        return bridge_protocol.StatusReport(**base)
+
+    def test_node_warnings_reach_the_dialog(self, plug):
+        """§4.3 `warnings` were parsed and read by nobody.
+
+        A map the node could not write showed up in the log at the moment it
+        happened and nowhere afterwards — and this dialog is where a user goes
+        when an accessory is behaving oddly.
+        """
+        plug.exports.upsert(ExportEntry(101, "onOffLight"))
+        self._bridge_in(plug, status=self._status(warnings=["disk is full"]))
+        assert "disk is full" in plug._export_summary()
+
+    def test_drift_reaches_the_dialog(self, plug):
+        import bridge_protocol
+        plug.exports.upsert(ExportEntry(101, "onOffLight"))
+        drift = bridge_protocol.parse_drift([{"uniqueId": "indigo-101", "expected": 2, "actual": 5}])
+        self._bridge_in(plug, status=self._status(drift=drift))
+        summary = plug._export_summary()
+        assert "DRIFTED" in summary
+        assert "never repaired automatically" in summary
+
+    def test_an_unchecked_baseline_is_not_reported_as_an_all_clear(self, plug):
+        """`drift: []` with `driftChecked: false` is an absence, not an answer."""
+        plug.exports.upsert(ExportEntry(101, "onOffLight"))
+        self._bridge_in(plug, status=self._status(drift_checked=False))
+        assert "have not been checked" in plug._export_summary()
+
+    def test_a_healthy_status_still_adds_nothing(self, plug):
+        plug.exports.upsert(ExportEntry(101, "onOffLight"))
+        self._bridge_in(plug, status=self._status())
         assert plug._export_summary() == "1 device(s) exported."
 
     def test_a_load_error_still_leads(self, plug):

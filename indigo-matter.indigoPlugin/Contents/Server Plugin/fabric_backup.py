@@ -133,9 +133,24 @@ def create_backup(storage_path: str, *, now: datetime, logger: Optional[Any] = N
     try:
         with zipfile.ZipFile(tmp_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
             members_written = _add_tree(zf, root)
-            if bridge_storage_path and _is_nonempty_dir(bridge_storage_path):
-                bridge_members = _add_tree(zf, bridge_storage_path, BRIDGE_MEMBER_PREFIX)
-                members_written += bridge_members
+            if bridge_storage_path:
+                if _is_nonempty_dir(bridge_storage_path):
+                    bridge_members = _add_tree(zf, bridge_storage_path, BRIDGE_MEMBER_PREFIX)
+                    members_written += bridge_members
+                else:
+                    # The promise the docstring makes ("a missing directory is
+                    # skipped") only holds up if the skip is AUDIBLE. The path
+                    # is derived, not configured, so the way this goes wrong in
+                    # the field is that it points somewhere the node is not —
+                    # and the user gets a plausible success line for an archive
+                    # with no identity.json and no endpoint-map.json in it,
+                    # which is exactly the archive they will reach for after
+                    # losing those two files.
+                    log.warning(
+                        "Fabric backup: no Matter export bridge storage at %s, so this backup "
+                        "does NOT contain identity.json or endpoint-map.json. That is expected "
+                        "if you export nothing; if you do export devices, check where the "
+                        "bridge node's --storage-path actually points.", bridge_storage_path)
 
         # Validate the snapshot before it can ever be offered for restore. A
         # truncated/corrupt archive that looks like a valid filename is worse
@@ -159,8 +174,12 @@ def create_backup(storage_path: str, *, now: datetime, logger: Optional[Any] = N
         raise
 
     if bridge_members:
+        # The path is named on success too: it is derived from the controller's
+        # rather than configured, so "which directory did this actually cover?"
+        # is a question the log should answer without anybody having to guess.
         log.info("Fabric backup written: %s (%d member(s), including %d from the Matter "
-                 "export bridge node)", archive_path, members_written, bridge_members)
+                 "export bridge node at %s)", archive_path, members_written, bridge_members,
+                 bridge_storage_path)
     else:
         log.info("Fabric backup written: %s (%d member(s))", archive_path, members_written)
     prune_backups(storage_path, keep=DEFAULT_KEEP, logger=log)

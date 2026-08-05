@@ -882,3 +882,166 @@ def test_reconcile_never_fails_startup(started, monkeypatch):
     monkeypatch.setattr(export_catalog, "classify", Mock(side_effect=RuntimeError("boom")))
     p.startup()                              # must not raise
     assert p.exports.ids() == frozenset({101})
+
+
+# ---------------------------------------------------------------------------
+# The two recovery exits (BRIDGE_PROTOCOL §3.10/§3.11) — A2
+# ---------------------------------------------------------------------------
+def _menu_item_by_id(item_id: str):
+    root = ET.parse(MENU_ITEMS_XML).getroot()
+    for item in root.findall("MenuItem"):
+        if item.get("id") == item_id:
+            return item
+    raise AssertionError(f"{item_id} menu item missing")
+
+
+class TestRecoveryMenusExist:
+    """⊗ `rebuild_endpoint_map` had NO caller anywhere in the plugin.
+
+    Three user-facing strings told the user to confirm a rebuild "in the
+    plugin" — the attach-refusal error, `TERMINAL_ATTACH_ERRORS`' remedy text
+    and the export dialog's status line — and there was nothing to confirm. The
+    only real way out of the refuse-to-start state was to hand-edit JSON in the
+    storage directory.
+    """
+
+    def test_the_rebuild_menu_exists_and_is_wired_to_a_callback(self, plugin_mod):
+        item = _menu_item_by_id("rebuildEndpointMap")
+        assert item.findtext("CallbackMethod") == "menuRebuildEndpointMap"
+        assert hasattr(plugin_mod.Plugin, "menuRebuildEndpointMap")
+
+    def test_the_rebuild_menu_warns_about_duplication_and_demands_a_tick(self):
+        item = _menu_item_by_id("rebuildEndpointMap")
+        fields = {f.get("id"): f for f in item.find("ConfigUI").findall("Field")}
+        assert fields["confirm"].get("type") == "checkbox"
+        assert fields["confirm"].get("defaultValue") == "false"
+        warning = fields["warning"].findtext("Label")
+        assert "duplicate accessories" in warning
+        assert "pairings themselves are NOT touched" in warning
+
+    def test_the_reset_menu_exists_and_is_wired_to_a_callback(self, plugin_mod):
+        item = _menu_item_by_id("resetBridgePairings")
+        assert item.findtext("CallbackMethod") == "menuResetBridgePairings"
+        assert hasattr(plugin_mod.Plugin, "menuResetBridgePairings")
+
+    def test_the_reset_menu_demands_TWO_ticks(self):
+        """The only plugin action that destroys every pairing at once."""
+        item = _menu_item_by_id("resetBridgePairings")
+        fields = {f.get("id"): f for f in item.find("ConfigUI").findall("Field")}
+        for name in ("confirm", "confirmAgain"):
+            assert fields[name].get("type") == "checkbox"
+            assert fields[name].get("defaultValue") == "false"
+
+
+class _FakeRuntime:
+    def __init__(self, result=None, error=None):
+        self.result_value = result
+        self.error = error
+        self.submitted: list = []
+
+    def submit(self, coro):
+        self.submitted.append(coro)
+        coro.close()
+        return self
+
+    def result(self, timeout=None):  # noqa: ARG002
+        if self.error is not None:
+            raise self.error
+        return self.result_value
+
+
+def _bridge_with(plug, **client_state):
+    client = Mock(connected=True, **client_state)
+    plug.export_bridge = Mock(client=client)
+    return client
+
+
+def _status(endpoint_count=2, warnings=()):
+    import bridge_protocol
+    return bridge_protocol.StatusReport(
+        commissioned=True, fabrics=[], endpoint_count=endpoint_count,
+        endpoints=[], drift=[], drift_checked=True, warnings=list(warnings))
+
+
+class TestRebuildMenuCallback:
+    def test_it_refuses_without_the_tick(self, plug):
+        plug.runtime = _FakeRuntime()
+        ok, _values_out, errors = plug.menuRebuildEndpointMap({"confirm": False})
+        assert ok is False and "confirm" in errors
+
+    def test_it_refuses_when_there_is_no_bridge_connection(self, plug):
+        plug.runtime = _FakeRuntime()
+        plug.export_bridge = None
+        ok, _values_out, errors = plug.menuRebuildEndpointMap({"confirm": True})
+        assert ok is False and "confirm" in errors
+
+    def test_it_calls_the_client_and_names_the_outcome(self, plug):
+        client = _bridge_with(plug)
+        plug.runtime = _FakeRuntime(result=_status(endpoint_count=3))
+
+        ok, _values_out = plug.menuRebuildEndpointMap({"confirm": True})
+
+        assert ok is True
+        client.rebuild_endpoint_map.assert_called_once()
+        said = " ".join(str(c.args[0]) for c in plug.logger.warning.call_args_list)
+        assert "REBUILT" in said and "duplicated accessories" in said
+
+    def test_it_works_from_the_RECOVERY_state_where_no_attach_ever_happened(self, plug):
+        """`connected`, not `attached`: §1.1 holds the socket open un-attached,
+        and that is the only state in which a rebuild is ever needed."""
+        client = _bridge_with(plug, attached=False, recovery=True)
+        plug.runtime = _FakeRuntime(result=_status())
+        ok, _values_out = plug.menuRebuildEndpointMap({"confirm": True})
+        assert ok is True
+        client.rebuild_endpoint_map.assert_called_once()
+
+    def test_a_failed_rebuild_is_reported_as_a_failure_not_a_success(self, plug):
+        """The node answers with an error when the new map could not be
+        written, and the refusal is still in force. Reporting success there
+        tells the user the rebuild they confirmed worked, and the next start
+        refuses again for the same reason."""
+        _bridge_with(plug)
+        plug.runtime = _FakeRuntime(error=RuntimeError("map could not be written"))
+
+        ok, _values_out, errors = plug.menuRebuildEndpointMap({"confirm": True})
+
+        assert ok is False and "confirm" in errors
+        said = " ".join(str(c.args[0]) for c in plug.logger.error.call_args_list)
+        assert "FAILED" in said and "still refusing" in said
+
+    def test_node_warnings_are_surfaced(self, plug):
+        _bridge_with(plug)
+        plug.runtime = _FakeRuntime(result=_status(warnings=["disk is full"]))
+        plug.menuRebuildEndpointMap({"confirm": True})
+        said = " ".join(str(c.args[0]) % c.args[1:] if len(c.args) > 1 else str(c.args[0])
+                        for c in plug.logger.warning.call_args_list)
+        assert "disk is full" in said
+
+
+class TestResetPairingsMenuCallback:
+    def test_one_tick_is_not_enough(self, plug):
+        plug.runtime = _FakeRuntime()
+        ok, _values_out, errors = plug.menuResetBridgePairings(
+            {"confirm": True, "confirmAgain": False})
+        assert ok is False and "confirmAgain" in errors
+
+    def test_both_ticks_reset_and_preserve_endpoint_numbers(self, plug):
+        client = _bridge_with(plug)
+        plug.runtime = _FakeRuntime()
+
+        ok, _values_out = plug.menuResetBridgePairings(
+            {"confirm": True, "confirmAgain": True})
+
+        assert ok is True
+        # preserve=True: a user re-pairing the same ecosystems must not also
+        # lose accessory identity. The "the map is corrupt" path is the rebuild.
+        client.factory_reset.assert_called_once_with(True)
+
+    def test_a_failed_reset_says_pairings_are_unchanged(self, plug):
+        _bridge_with(plug)
+        plug.runtime = _FakeRuntime(error=RuntimeError("node is gone"))
+        ok, _values_out, errors = plug.menuResetBridgePairings(
+            {"confirm": True, "confirmAgain": True})
+        assert ok is False and "confirmAgain" in errors
+        said = " ".join(str(c.args[0]) for c in plug.logger.error.call_args_list)
+        assert "Pairings are unchanged" in said

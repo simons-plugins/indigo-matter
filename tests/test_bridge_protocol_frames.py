@@ -285,6 +285,26 @@ class TestCoverage:
     deleting the frame that carries one fails it again.
     """
 
+    def test_the_pending_section_is_empty(self):
+        """E5 graduated the last five frames; both suites must say so.
+
+        The TS side has asserted this since E5 and the Python side did not,
+        which meant a frame quietly pushed back into ``pending`` would have
+        failed exactly one of the two suites that share this file — and §7's
+        whole point is that a one-sided change fails the side that made it.
+        """
+        assert PENDING == {}
+
+    def test_every_status_report_carries_the_warnings_field(self):
+        """§4.3 ``warnings``. Empty is normal; absent is a client parsing a
+        report from a node that could not tell it about a failed write."""
+        for name, exchange in EXCHANGES.items():
+            result = exchange["response"].get("result")
+            if not isinstance(result, dict) or "endpointCount" not in result:
+                continue
+            assert "warnings" in result, f"{name} is a StatusReport without warnings"
+            assert isinstance(result["warnings"], list)
+
     def test_every_command_has_a_golden_frame(self):
         covered = {exchange["request"]["command"] for exchange in EXCHANGES.values()}
         assert bridge_protocol.COMMANDS - covered == set()

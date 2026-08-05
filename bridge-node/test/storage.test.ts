@@ -19,7 +19,10 @@ import {
     isValidPasscode,
     loadOrCreateIdentity,
     markCommissioned,
+    mintIdentity,
     nodeUniqueIdFor,
+    quarantineIdentity,
+    readIdentity,
     PASSCODE_MAX,
     PASSCODE_MIN,
     serialNumberFor,
@@ -261,6 +264,56 @@ describe("identityProblem — the E5 refuse-to-start guard", () => {
     });
 });
 
+describe("an unusable identity.json is moved aside, never minted over (E5 A3)", () => {
+    it("preserves the original bytes and writes nothing in its place", () => {
+        // ⊗ main.ts called identityProblem() and then loadOrCreateIdentity()
+        // unconditionally — and the mint writes through `rename`, so the
+        // unreadable file was destroyed one line BEFORE the refusal that exists
+        // to protect it. Those bytes carry the SerialNumber and UniqueID every
+        // paired ecosystem knows this bridge by, and they cannot be regenerated.
+        const dir = scratch();
+        try {
+            writeFileSync(join(dir, "identity.json"), "{truncated", "utf8");
+            assert.notEqual(identityProblem(dir), undefined);
+
+            const movedTo = quarantineIdentity(dir, () => {}, () => new Date("2026-08-05T10:00:00Z"));
+
+            assert.equal(movedTo, join(dir, "identity.json.unreadable-2026-08-05T10-00-00-000Z"));
+            assert.equal(readFileSync(movedTo!, "utf8"), "{truncated");
+            assert.deepEqual(
+                readdirSync(dir),
+                ["identity.json.unreadable-2026-08-05T10-00-00-000Z"],
+                "no replacement may be written while we are refusing to serve",
+            );
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    it("mints in memory only", () => {
+        const dir = scratch();
+        try {
+            const identity = mintIdentity();
+            assert.ok(isValidPasscode(identity.passcode));
+            assert.ok(identity.discriminator <= DISCRIMINATOR_MAX);
+            assert.deepEqual(readdirSync(dir), [], "mintIdentity must touch no disk at all");
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    it("is a silent no-op when there is nothing to move", () => {
+        const dir = scratch();
+        try {
+            const logged: string[] = [];
+            assert.equal(quarantineIdentity(dir, message => logged.push(message)), undefined);
+            assert.deepEqual(logged, []);
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+});
+
 describe("the commissioning witness (PRD §7)", () => {
     it("stamps commissionedAt once and keeps the first value", () => {
         const dir = scratch();
@@ -269,10 +322,11 @@ describe("the commissioning witness (PRD §7)", () => {
             assert.equal(identity.commissionedAt, undefined, "a fresh identity has never been paired");
 
             const first = markCommissioned(dir, identity, () => {}, () => new Date("2026-08-01T10:00:00Z"));
-            const again = markCommissioned(dir, first, () => {}, () => new Date("2026-09-09T10:00:00Z"));
+            const again = markCommissioned(dir, first.identity, () => {}, () => new Date("2026-09-09T10:00:00Z"));
 
-            assert.equal(first.commissionedAt, "2026-08-01T10:00:00.000Z");
-            assert.equal(again, first, "a second fabric must not restamp the witness");
+            assert.equal(first.persisted, true);
+            assert.equal(first.identity.commissionedAt, "2026-08-01T10:00:00.000Z");
+            assert.equal(again.identity, first.identity, "a second fabric must not restamp the witness");
             const onDisk = JSON.parse(readFileSync(join(dir, "identity.json"), "utf8"));
             assert.equal(onDisk.commissionedAt, "2026-08-01T10:00:00.000Z");
         } finally {
@@ -296,16 +350,20 @@ describe("the commissioning witness (PRD §7)", () => {
     it("clears on a factory reset, so the reset does not refuse to itself", () => {
         const dir = scratch();
         try {
-            const paired = markCommissioned(dir, loadOrCreateIdentity(dir), () => {});
+            const paired = markCommissioned(dir, loadOrCreateIdentity(dir), () => {}).identity;
 
             const reset = clearCommissioned(dir, paired, () => {});
 
-            assert.equal(reset.commissionedAt, undefined);
+            assert.equal(reset.persisted, true);
+            assert.equal(reset.identity.commissionedAt, undefined);
             assert.equal(loadOrCreateIdentity(dir).commissionedAt, undefined);
+            // §3.10 promises the witness is GONE; verify it by reading it back,
+            // which is what factoryReset now does before it reports completion.
+            assert.equal(readIdentity(dir)?.commissionedAt, undefined);
             // Everything that IS the identity must survive the clear.
-            assert.equal(reset.installId, paired.installId);
-            assert.equal(reset.passcode, paired.passcode);
-            assert.equal(reset.discriminator, paired.discriminator);
+            assert.equal(reset.identity.installId, paired.installId);
+            assert.equal(reset.identity.passcode, paired.passcode);
+            assert.equal(reset.identity.discriminator, paired.discriminator);
         } finally {
             rmSync(dir, { recursive: true, force: true });
         }
@@ -324,7 +382,11 @@ describe("the commissioning witness (PRD §7)", () => {
             // Failing the commissioning that just succeeded, over a marker for a
             // hypothetical future start, would be the worse trade — but it has
             // to be loud, because the refusal it enables is now unarmed.
-            assert.ok(marked.commissionedAt !== undefined);
+            assert.ok(marked.identity.commissionedAt !== undefined);
+            // ⊗ B1: the caller used to get only the identity back and could not
+            // tell this from a write that landed.
+            assert.equal(marked.persisted, false);
+            assert.match(marked.problem ?? "", /Could not record the commissioning marker/);
             assert.ok(logged.some(line => line.includes("Could not record the commissioning marker")));
         } finally {
             chmodSync(dir, 0o700);

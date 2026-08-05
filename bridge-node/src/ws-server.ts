@@ -101,6 +101,11 @@ export class BridgeWsServer {
         options.bridge.onWindowClosed(reason => this.sendEvent(EventName.windowClosed, { reason }));
         options.bridge.onCommand(data => this.sendEvent(EventName.command, data));
         options.bridge.onDriftDetected(drift => this.sendEvent(EventName.driftDetected, { drift }));
+        options.bridge.onFabricsChanged((fabrics, change) =>
+            this.sendEvent(EventName.fabricsChanged, { fabrics, change }),
+        );
+        options.bridge.onCommissioned(() => this.sendEvent(EventName.commissioned, {}));
+        options.bridge.onDecommissioned(() => this.sendEvent(EventName.decommissioned, {}));
     }
 
     /**
@@ -185,10 +190,25 @@ export class BridgeWsServer {
         // §2: a connection that handshakes but never attaches is closed.
         const timeoutMs = this.options.unattachedTimeoutMs ?? UNATTACHED_TIMEOUT_MS;
         state.unattachedTimer = setTimeout(() => {
-            if (!state.attached) {
-                this.#log(`Closing connection that did not attach within ${timeoutMs}ms`);
-                socket.close();
+            if (state.attached) {
+                return;
             }
+            // Disarmed while we are refusing. In that state the node itself is
+            // what stops this client attaching (§1.1 refuses `attach`), and the
+            // plugin deliberately HOLDS the socket open un-attached because it
+            // is the only route to the §3.11 rebuild. Closing it anyway put the
+            // two in a fight: refuse, close, reconnect, refuse — every 10s, and
+            // a rebuild the user had just confirmed could be cut off mid-flight
+            // by our own timer.
+            if (this.options.bridge.endpointMapRefusal() !== undefined) {
+                this.#log(
+                    "Holding an un-attached connection open: the node is refusing to serve endpoints " +
+                        "and this socket is the client's only route to rebuild_endpoint_map (§1.1)",
+                );
+                return;
+            }
+            this.#log(`Closing connection that did not attach within ${timeoutMs}ms`);
+            socket.close();
         }, timeoutMs);
         state.unattachedTimer.unref?.();
 

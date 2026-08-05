@@ -268,6 +268,16 @@ class StatusReport:
     endpoint_count: int
     endpoints: list
     drift: list
+    #: Whether ``drift`` is an answer or an absence. ``drift: []`` alone is
+    #: ambiguous — "checked, nothing moved" and "there is no baseline to check
+    #: against" are opposites — so an empty ``drift`` is only an all-clear when
+    #: this is true. Defaulted so a report from a pre-warnings node still parses.
+    drift_checked: bool = False
+    #: §4.3 — persistence failures the node hit and cannot fix on its own. The
+    #: node's only other channel is stdout, and in this milestone it is started
+    #: by hand, so stdout is a terminal nobody is watching. Current, not
+    #: historical: an entry disappears when the operation it describes succeeds.
+    warnings: list = field(default_factory=list)
 
 
 @dataclass
@@ -355,6 +365,8 @@ def parse_status(result: Any) -> StatusReport:
             for item in (data.get("endpoints") or [])
         ],
         drift=parse_drift(data.get("drift")),
+        drift_checked=bool(data.get("driftChecked", False)),
+        warnings=[str(item) for item in (data.get("warnings") or [])],
     )
 
 

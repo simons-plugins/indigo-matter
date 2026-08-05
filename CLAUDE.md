@@ -53,10 +53,26 @@ loop→Indigo writes go straight through `device_sync.apply_states` (thread-safe
 | `server_process.py` | `ServerProcess` = the matter-server (controller) specialisation of `LaunchAgent`: its prefs, its argv, its pinned version. Gated by the `serverLocation` pref — the config asks "is matter-server on this Mac?"; `local` (turnkey default) manages it here on loopback, `remote` connects to a server elsewhere. `manageLaunchAgent`/host/port are derived from that in `startup` (see `plugin.py:server_location`) |
 | `commission_jobs.py` | Commissioning job state machine (API.md §3.2/§3.3) |
 | `device_sync.py` | Node↔Indigo reconciliation + state/command seams |
-| `fabric_backup.py` | Fabric backup/restore for the matter-server storage dir (issue #26) — zip snapshots into a sibling `backups/`, move-aside restore, retention prune. Pure + injectable (paths, clock, `stop()/start()` control) so it unit-tests against `tmp_path` |
+| `fabric_backup.py` | Fabric backup/restore for the matter-server storage dir (issue #26) — zip snapshots into a sibling `backups/`, move-aside restore, retention prune. **Since E5 it also covers the export bridge node's storage dir** (`identity.json` + `endpoint-map.json`) under a reserved `bridge-node/` archive prefix, so an old controller-only archive still restores; a missing/empty bridge dir is skipped **with a WARNING naming the path**, because that path is derived from the controller's rather than configured. **Restore deliberately does not extract the bridge members** — that needs the node stopped and there is no stop seam until E7 — so it reports and skips. Pure + injectable (paths, clock, `stop()/start()` control) so it unit-tests against `tmp_path` |
 | `http_handlers.py` | Domio API routing (served over IWS, not aiohttp) |
 | `matter_model.py` | Parse matter-server node dict → node/endpoint objects |
 | `matter_handlers/` | One `ClusterHandler` per cluster + registry (OnOff in v1) |
+
+### The bridge node (`bridge-node/src/`, TypeScript)
+
+The export side's other half — a separate Node process, the **only** place
+matter.js is imported (ADR-0006). Its wire contract is `docs/BRIDGE_PROTOCOL.md`.
+
+| Module | Role |
+|---|---|
+| `main.ts` | Entry point: arg parsing, identity load, ordered SIGTERM shutdown. Exits **0** on a clean stop (launchd's `KeepAlive SuccessfulExit:false` reads the number) — `ServerNode.erase()` leaves a ref'd timer `close()` never clears, so a clean stop after a factory reset used to exit 1. An unusable `identity.json` is moved aside to `identity.json.unreadable-<stamp>` and a replacement is minted **in memory only** — never written over the `SerialNumber`/`UniqueID` every paired ecosystem knows |
+| `node.ts` | The `ServerNode` + aggregator, the PRD §7 refuse-to-start decision, §3.9–§3.11, and the §5 event sinks |
+| `endpoint-map.ts` | `endpoint-map.json` — the persisted `UniqueID → endpoint number` map and its drift detector (PRD §4.3). **It does not allocate anything: matter.js owns the numbers**, keyed on `Endpoint.id` in its own store; this file is the independent *witness*, so a lost/reset matter.js storage becomes a log line instead of silently duplicating every accessory. Lives OUTSIDE matter.js's storage context on purpose (§3.10's reset wipes that). Report-only — drift is never repaired, or the next pass would call the same fault clean. A **commissioned bridge with no map at all bootstraps** a baseline from matter.js's own persisted numbers and serves (every pre-E5 install is in that state); only a *present-but-unreadable* map refuses. `refuseReasonFor` is a pure function with no matter.js import, because the case that matters most cannot be reached in a test without real hardware |
+| `storage.ts` | `identity.json`: install id, passcode, discriminator, and the `commissionedAt` witness for §7's "storage missing but previously commissioned". Atomic temp-plus-`rename` writes; witness writes report whether they landed |
+| `registry.ts` / `endpoints.ts` | The live endpoint set and one Matter device-type factory per §4.2 role |
+| `ws-server.ts` | The loopback protocol server (§1–§3). Holds an un-attached socket OPEN while the node is refusing — it is the client's only route to the §3.11 rebuild |
+| `protocol.ts` | The wire contract as types + the §1.1 error/refusal domains. No matter.js import, so the protocol is testable without a Matter stack |
+| `reconcile.ts` / `window.ts` / `config.ts` | §3.1 planning + arg validation, the enhanced commissioning window, CLI flags |
 
 **HTTP transport:** the Domio API is served by the **Indigo Web Server** as
 `<Action uiPath="hidden">` handlers at `…/message/com.simons-plugins.indigo-matter/{handler}`,

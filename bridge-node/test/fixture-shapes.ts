@@ -54,6 +54,10 @@ export const status = {
     // §4.3: false until E5 persists the endpoint-number map — an empty `drift`
     // on its own would read as an all-clear nobody has actually checked.
     driftChecked: false,
+    // §4.3: empty is the healthy state. Non-empty means a persistence failure
+    // the node could not fix, surfaced here because the node's only other
+    // channel is a stdout nobody is watching.
+    warnings: [],
 } satisfies StatusReport;
 
 /**
@@ -68,6 +72,7 @@ export const statusEmpty = {
     endpoints: [],
     drift: [],
     driftChecked: false,
+    warnings: [],
 } satisfies StatusReport;
 
 /** §3.1 with `intent: "replace_all"`: the live set is emptied deliberately. */
@@ -78,6 +83,7 @@ export const statusReplaceAll = {
     endpoints: [],
     drift: [],
     driftChecked: false,
+    warnings: [],
 } satisfies StatusReport;
 
 /** §3.2 — the live endpoint's Matter number, for the plugin's own records. */
@@ -247,6 +253,7 @@ export const rebuiltStatus = {
     ],
     drift: [],
     driftChecked: true,
+    warnings: [],
 } satisfies StatusReport;
 
 /**

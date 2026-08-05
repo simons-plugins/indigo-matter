@@ -17,7 +17,7 @@
 import { Endpoint, Environment, ServerNode, VendorId, version as matterJsVersion } from "@matter/main";
 import { BasicInformationServer } from "@matter/main/behaviors/basic-information";
 import { AggregatorEndpoint } from "@matter/main/endpoints/aggregator";
-import { Crypto } from "@matter/main";
+import { Crypto, ServerNodeStore } from "@matter/main";
 import { DeviceCommissioner, FabricManager, PaseClient, PaseServer, SessionManager } from "@matter/main/protocol";
 import {
     CommissioningFlowType,
@@ -36,6 +36,7 @@ import {
     describeError,
     describeErrorWithStack,
     type DriftEntry,
+    endpointMapInvalidDetails,
     type EndpointSpec,
     ErrorCode,
     type FabricInfo,
@@ -53,7 +54,9 @@ import {
     clearCommissioned,
     markCommissioned,
     nodeUniqueIdFor,
+    readIdentity,
     serialNumberFor,
+    type WitnessWrite,
 } from "./storage.js";
 import { CommissioningWindow } from "./window.js";
 
@@ -66,6 +69,9 @@ export const PRODUCT_NAME = "Indigo Matter Bridge";
 /** PRD §5.3: no hard cap, but past this many exports the log says so. */
 export const ENDPOINT_COUNT_WARNING = 100;
 
+/** §4.3 `warnings` key for identity-file writes. Stable, so it replaces itself. */
+const WARN_IDENTITY_WRITE = "identity-write";
+
 /** PBKDF iteration count for enhanced-window verifiers. Spec floor is 1000. */
 const PBKDF_ITERATIONS = 1000;
 const PBKDF_SALT_BYTES = 32;
@@ -77,6 +83,11 @@ export class BridgeNode implements BridgeFacade {
     #registry?: EndpointRegistry;
     #command?: (data: CommandEventData) => void;
     #driftListener?: (drift: DriftEntry[]) => void;
+    #fabricsListener?: (fabrics: FabricInfo[], change: string) => void;
+    #commissionedListener?: () => void;
+    #decommissionedListener?: () => void;
+    /** Last observed fabric count — what turns a change into a §5 transition. */
+    #fabricCount = 0;
     readonly #window: CommissioningWindow;
     readonly #endpointMap: EndpointMapStore;
     /** The identity, rebound by {@link markCommissioned}/{@link clearCommissioned}. */
@@ -85,6 +96,13 @@ export class BridgeNode implements BridgeFacade {
     #refusal: string | undefined;
     /** The drift the last {@link checkDrift} found; what §4.3 reports. */
     #drift: DriftEntry[] = [];
+    /**
+     * §4.3 `warnings` this object owns — the identity-file ones. The endpoint
+     * map keeps its own and {@link getStatus} merges them, so each warning is
+     * cleared by whatever succeeded rather than by a central bookkeeper that
+     * would have to know when that happened.
+     */
+    readonly #warnings = new Map<string, string>();
 
     /**
      * @param initialRefusal a refuse-to-start reason decided before the node was
@@ -186,6 +204,7 @@ export class BridgeNode implements BridgeFacade {
             try {
                 this.log(`Fabric ${action}: index ${fabricIndex} (${this.fabrics().length} total)`);
                 this.noteCommissioningWitness();
+                this.noteFabrics(String(action));
             } catch (error) {
                 try {
                     this.log(`Fabric ${action}: index ${fabricIndex} (count unavailable: ${describeError(error)})`);
@@ -200,6 +219,10 @@ export class BridgeNode implements BridgeFacade {
         this.#endpointMap.load();
 
         await server.start();
+
+        // The §5 transition baseline. Taken before the identity assertion so a
+        // fabric that arrives during it is a transition rather than the start.
+        this.#fabricCount = this.fabrics().length;
 
         this.assertEndpointIdentity();
 
@@ -237,13 +260,16 @@ export class BridgeNode implements BridgeFacade {
             this.refuse(this.#refusal);
             return;
         }
+        const commissioned = this.server.lifecycle.isCommissioned;
         const reason = refuseReasonFor({
-            commissioned: this.server.lifecycle.isCommissioned,
-            mapPresent: this.#endpointMap.present,
+            commissioned,
             mapProblem: this.#endpointMap.problem,
             commissionedAt: this.identity.commissionedAt,
         });
         if (reason === undefined) {
+            if (commissioned && !this.#endpointMap.present) {
+                this.bootstrapEndpointMap();
+            }
             this.noteCommissioningWitness();
             return;
         }
@@ -254,6 +280,82 @@ export class BridgeNode implements BridgeFacade {
             );
         }
         this.refuse(reason);
+    }
+
+    /**
+     * A commissioned bridge with no `endpoint-map.json` at all: adopt the
+     * numbers matter.js has already been persisting, and serve.
+     *
+     * This is the upgrade path, and it is the common case rather than an edge
+     * one — **every** bridge commissioned before E5 shipped has fabrics,
+     * endpoints and no map, because the file did not exist. The first cut of E5
+     * refused there, which would have stopped serving every already-paired
+     * accessory the moment the node was updated.
+     *
+     * Seeding is legitimate precisely because our map does not allocate
+     * anything: matter.js keys the real numbers on `Endpoint.id` in its own
+     * store, this file is the independent witness, and writing down numbers
+     * that are already true is not blessing anything — the number a
+     * not-yet-created endpoint will get is already determined. That is the
+     * difference from a **rebuild**, which discards a baseline that disagreed.
+     *
+     * Two sources, in order. matter.js's persisted allocation covers every
+     * endpoint it knows, including ones this attach happens not to export; if it
+     * cannot be read (a storage layout we do not recognise, a driver that is not
+     * file-backed) the empty baseline is filled by the first attach's `check`
+     * from the live set, which is the same numbers for everything we do export.
+     */
+    private bootstrapEndpointMap(): void {
+        const persisted = this.persistedEndpointNumbers();
+        const source =
+            persisted === undefined
+                ? "matter.js's persisted numbers could not be read, so the first reconcile will record the live set"
+                : "adopted from matter.js's own persisted endpoint numbers";
+        this.log(
+            "MIGRATION: this bridge is commissioned but has no endpoint-number map — one is being " +
+                `created now rather than refused. Nothing is renumbered: matter.js owns the numbers ` +
+                `and this file only witnesses them (${source}).`,
+        );
+        this.#endpointMap.seed(persisted ?? [], source);
+    }
+
+    /**
+     * matter.js's own `Endpoint.id → number` allocation, read straight out of
+     * its store, or `undefined` if it cannot be.
+     *
+     * Best-effort by construction. It reaches through `ServerNodeStore` into the
+     * storage-context names matter.js uses internally (`root` → `parts` →
+     * `<id>` → `__number__`), which is not a contract — so every step is guarded
+     * and the one caller has a working fallback. `Endpoint.id` and `UniqueID`
+     * are the same string here ({@link uniqueIdFor}), which is what makes the
+     * part ids directly usable as map keys.
+     */
+    private persistedEndpointNumbers(): LiveEndpointNumber[] | undefined {
+        try {
+            const parts = this.server.env
+                .get(ServerNodeStore)
+                .storage.createContext("root")
+                .createContext("parts")
+                .createContext("aggregator")
+                .createContext("parts");
+            const ids = parts.contexts();
+            if (!Array.isArray(ids)) {
+                // The API is MaybePromise; a promise here means an async driver
+                // we cannot await from this synchronous path. Fall back.
+                return undefined;
+            }
+            const numbers: LiveEndpointNumber[] = [];
+            for (const uniqueId of ids) {
+                const number = parts.createContext(uniqueId).get("__number__", -1);
+                if (typeof number === "number" && Number.isInteger(number) && number > 0) {
+                    numbers.push({ uniqueId, endpointNumber: number });
+                }
+            }
+            return numbers;
+        } catch (error) {
+            this.log(`Could not read matter.js's persisted endpoint numbers: ${describeError(error)}`);
+            return undefined;
+        }
     }
 
     private refuse(reason: string): void {
@@ -282,9 +384,92 @@ export class BridgeNode implements BridgeFacade {
         if (this.identity.commissionedAt !== undefined || this.fabrics().length === 0) {
             return;
         }
-        this.#identity = markCommissioned(this.config.storagePath, this.identity, message =>
-            this.log(message),
+        this.applyWitness(
+            WARN_IDENTITY_WRITE,
+            markCommissioned(this.config.storagePath, this.identity, message => this.log(message)),
         );
+    }
+
+    /**
+     * Adopt a {@link WitnessWrite}'s identity and record (or clear) its warning.
+     *
+     * The whole point of B1: these writes used to return only the identity, so
+     * a caller could not tell a witness that reached disk from one that did not
+     * — and both `factory_reset` and the drift baseline report success in a
+     * voice that assumes it did.
+     */
+    private applyWitness(key: string, write: WitnessWrite): boolean {
+        this.#identity = write.identity;
+        if (write.persisted) {
+            this.#warnings.delete(key);
+        } else {
+            this.#warnings.set(key, write.problem ?? "identity.json could not be written");
+        }
+        return write.persisted;
+    }
+
+    /**
+     * §5 `fabrics_changed` / `commissioned` / `decommissioned`.
+     *
+     * One place, because the three are one fact seen at three grains and
+     * deriving them separately is how they drift apart. `change` is `undefined`
+     * for the callers that only want the transition re-checked — §3.9's last
+     * leave and §3.10's erase both move the count without necessarily producing
+     * an observable we saw.
+     *
+     * Never throws: it is called from inside matter.js's own observable and
+     * from teardown paths where `fabrics()` legitimately fails.
+     */
+    private noteFabrics(change?: string): void {
+        let fabrics: FabricInfo[];
+        try {
+            fabrics = this.fabrics();
+        } catch {
+            return;
+        }
+        if (change !== undefined) {
+            this.#fabricsListener?.(fabrics, change);
+        }
+        const was = this.#fabricCount;
+        this.#fabricCount = fabrics.length;
+        if (was === 0 && fabrics.length > 0) {
+            this.#commissionedListener?.();
+        } else if (was > 0 && fabrics.length === 0) {
+            this.noteLastFabricGone();
+            this.#decommissionedListener?.();
+        }
+    }
+
+    /**
+     * The fabric set has just emptied — which means matter.js has already
+     * factory-reset itself, whoever caused it.
+     *
+     * `CommissioningServer` watches `commissioned` and calls `doFactoryReset()`
+     * → `erase()` when the last fabric leaves. Our commissioning witness knows
+     * nothing about that, so leaving it set makes the very NEXT start see
+     * "witness says paired, stack says no fabrics" — the `fabricStorageLost`
+     * signature — and refuse to serve anything, telling the user their Matter
+     * storage was lost when in fact they deliberately unpaired their last
+     * ecosystem.
+     *
+     * Deliberately here rather than in {@link removeFabric}: §3.9 is only one of
+     * the ways to get here. An ecosystem that removes *us* from its side does it
+     * too, and that route never touches our command handler at all.
+     */
+    private noteLastFabricGone(): void {
+        if (this.identity.commissionedAt === undefined) {
+            return;
+        }
+        this.log(
+            "The last fabric has gone — matter.js factory-resets itself when the fabric set empties, " +
+                "so the commissioning witness is being cleared to match. Without this the next start " +
+                "would refuse to serve endpoints, blaming lost storage for a deliberate unpairing.",
+        );
+        this.applyWitness(
+            WARN_IDENTITY_WRITE,
+            clearCommissioned(this.config.storagePath, this.identity, message => this.log(message)),
+        );
+        this.#drift = [];
     }
 
     /** Print the pairing codes the way an operator (and the plugin log) needs them. */
@@ -333,6 +518,7 @@ export class BridgeNode implements BridgeFacade {
             // would re-emit `drift_detected` every 15s for one unchanged fault.
             drift: [...this.#drift],
             driftChecked: this.#endpointMap.checked,
+            warnings: [...this.#warnings.values(), ...this.#endpointMap.warnings],
         };
     }
 
@@ -394,9 +580,22 @@ export class BridgeNode implements BridgeFacade {
         }
     }
 
-    /** §3.3 */
+    /**
+     * §3.3
+     *
+     * The drift check runs here too, even though a removal creates nothing.
+     * matter.js re-allocates while endpoints come and go, and a removal is one
+     * of the moments a *surviving* endpoint's number could differ from what the
+     * map says — leaving the one operation that reshapes the live set as the
+     * only one that never looked would have made that invisible until the next
+     * upsert happened to notice.
+     */
     async removeEndpoint(indigoDeviceId: number): Promise<RemoveResult> {
-        return this.registry.remove(indigoDeviceId);
+        try {
+            return await this.registry.remove(indigoDeviceId);
+        } finally {
+            this.checkDrift();
+        }
     }
 
     /** §3.4 */
@@ -440,6 +639,21 @@ export class BridgeNode implements BridgeFacade {
         this.#driftListener = listener;
     }
 
+    /** §5: the sink for `fabrics_changed`. */
+    onFabricsChanged(listener: (fabrics: FabricInfo[], change: string) => void): void {
+        this.#fabricsListener = listener;
+    }
+
+    /** §5: the sink for `commissioned`. */
+    onCommissioned(listener: () => void): void {
+        this.#commissionedListener = listener;
+    }
+
+    /** §5: the sink for `decommissioned`. */
+    onDecommissioned(listener: () => void): void {
+        this.#decommissionedListener = listener;
+    }
+
     /**
      * §3.9 — drop one ecosystem's fabric.
      *
@@ -453,6 +667,17 @@ export class BridgeNode implements BridgeFacade {
      * it goes stale is the ecosystem unpairing itself — so "it is already gone"
      * is the request being granted, not refused. Said out loud rather than
      * silently, because the other way to get here is a typo.
+     *
+     * **Removing the LAST fabric is a factory reset that we did not perform.**
+     * matter.js's `CommissioningServer` watches `commissioned` and, when the
+     * final fabric leaves, calls `doFactoryReset()` → `erase()` on its own. Our
+     * commissioning witness knows nothing about that, so leaving it set made
+     * the very next start see "witness says paired, no fabrics" — the
+     * `fabricStorageLost` signature — and refuse to serve anything, telling the
+     * user their Matter storage had been lost when in fact they had just
+     * unpaired their last ecosystem on purpose. {@link noteLastFabricGone}
+     * handles it, from {@link noteFabrics}, so the route where an ecosystem
+     * unpairs *us* is covered too.
      */
     async removeFabric(fabricIndex: number): Promise<void> {
         const fabrics = this.server.env.get(FabricManager);
@@ -465,7 +690,25 @@ export class BridgeNode implements BridgeFacade {
         // leave event first, which is how a controller learns it was removed
         // instead of simply losing the node.
         await fabric.leave();
-        this.log(`Removed fabric ${fabricIndex} (${this.fabrics().length} remaining)`);
+
+        // Inside a try: the leave has already happened and succeeded, and a
+        // read of server state that a self-reset is concurrently rebuilding
+        // must not turn a completed removal into a failed command.
+        let remaining: number;
+        try {
+            remaining = this.fabrics().length;
+        } catch (error) {
+            this.log(
+                `Removed fabric ${fabricIndex}; the remaining fabric count is unavailable ` +
+                    `(${describeError(error)})`,
+            );
+            return;
+        }
+        this.log(`Removed fabric ${fabricIndex} (${remaining} remaining)`);
+        // Re-checked rather than assumed: `fabric.leave()` does not necessarily
+        // produce a `fabricsChanged` observation we saw, and the empty-set case
+        // is the one that matters (see noteLastFabricGone).
+        this.noteFabrics();
     }
 
     /**
@@ -497,17 +740,60 @@ export class BridgeNode implements BridgeFacade {
                 `${preserveEndpointNumbers ? "preserved" : "DISCARDED"})`,
         );
         await this.server.erase();
-        this.#identity = clearCommissioned(this.config.storagePath, this.identity, message =>
-            this.log(message),
+        this.applyWitness(
+            WARN_IDENTITY_WRITE,
+            clearCommissioned(this.config.storagePath, this.identity, message => this.log(message)),
         );
         if (!preserveEndpointNumbers) {
             this.#endpointMap.discard();
         }
         this.#drift = [];
         // A reset node is un-commissioned, so nothing it could have refused for
-        // is still true — and refusing after the user has just accepted the
-        // reset would be an outage with no remaining cause.
+        // is still true. Belt and braces rather than the main path: §1.1 keeps
+        // `factory_reset` OUT of the recovery commands (see RECOVERY_COMMANDS —
+        // §3.11 is the non-destructive exit and it already covers every refusal
+        // state), so a reset cannot normally be reached while refusing. It can
+        // still be reached in the other order — a refusal raised by a check
+        // between the erase and here — and leaving one set would be an outage
+        // with no remaining cause.
         this.#refusal = undefined;
+        this.noteFabrics();
+
+        // §3.10 promises the witness is gone. A write can report success and
+        // still not be what the next start reads, and the failure mode is
+        // specific and nasty: a `commissionedAt` that survived an erase is the
+        // exact `fabricStorageLost` signature, so the next boot refuses to
+        // serve anything and blames lost storage for the reset the user asked
+        // for. Verified by reading it back rather than asserted.
+        const onDisk = readIdentity(this.config.storagePath);
+        if (onDisk?.commissionedAt !== undefined) {
+            const message =
+                "Factory reset could NOT clear the commissioning marker in identity.json — the next " +
+                "start will refuse to serve endpoints, reporting lost fabric storage. Delete " +
+                `"commissionedAt" from ${this.config.storagePath}/identity.json by hand.`;
+            this.log(message);
+            this.#warnings.set(WARN_IDENTITY_WRITE, message);
+        }
+
+        // What preservation actually bought, checked rather than claimed.
+        // `erase()` wipes matter.js's OWN allocation, so a preserved map is a
+        // baseline for numbers that are about to be handed out afresh — it
+        // preserves the ability to NOTICE, not the numbers (see §3.10). Running
+        // the detector here is what turns that into a statement in the log
+        // instead of a surprise on the next attach.
+        if (preserveEndpointNumbers) {
+            this.checkDrift();
+            this.log(
+                this.#drift.length === 0
+                    ? "Endpoint-number map preserved; no drift against the live endpoints yet — note " +
+                          "that matter.js's own allocation was wiped by the reset, so drift is expected " +
+                          "as endpoints are re-created and is what the preserved map exists to report"
+                    : `Endpoint-number map preserved and ${this.#drift.length} endpoint(s) already ` +
+                          "differ from it — that is the reset's own renumbering, reported exactly as " +
+                          "designed; rebuild the map (§3.11) to accept it",
+            );
+        }
+
         this.log("Factory reset complete; advertising for commissioning again");
         this.logPairing();
     }
@@ -527,19 +813,54 @@ export class BridgeNode implements BridgeFacade {
      * loss they have already acknowledged.
      */
     async rebuildEndpointMap(): Promise<StatusReport> {
+        // §3.11 is the way out of a MAP problem and nothing else. An unusable
+        // `identity.json` is a different loss with a different remedy (restore
+        // the file), and clearing the refusal for it would put a bridge serving
+        // endpoints under a `SerialNumber` nobody has ever seen — which is the
+        // exact harm the refusal exists to prevent.
+        if (this.#refusal === RefuseReason.identityUnreadable) {
+            throw new ProtocolError(
+                ErrorCode.endpointMapInvalid,
+                endpointMapInvalidDetails(
+                    `${RefuseReason.identityUnreadable}, and rebuilding the endpoint map cannot fix ` +
+                        "that — the unusable file was moved aside as identity.json.unreadable-<stamp>; " +
+                        "restore or repair it and restart the bridge",
+                ),
+            );
+        }
+
         const live: LiveEndpointNumber[] = (this.#registry?.summaries() ?? []).map(summary => ({
             uniqueId: uniqueIdFor(summary.indigoDeviceId),
             endpointNumber: summary.endpointNumber,
         }));
-        this.#endpointMap.rebuild(live);
+        if (!this.#endpointMap.rebuild(live)) {
+            // The refusal deliberately stays. Answering with a StatusReport here
+            // told the user "serving normally again" over a map that never
+            // reached the disk, so the next start would refuse for the same
+            // reason and the rebuild they confirmed would have to be confirmed
+            // again — after they had been told it worked.
+            throw new ProtocolError(
+                ErrorCode.internal,
+                "the rebuilt endpoint map could not be written, so nothing has changed — free some " +
+                    `space in ${this.config.storagePath} and try again`,
+            );
+        }
         this.#drift = [];
         this.#refusal = undefined;
         if (!this.server.lifecycle.isCommissioned) {
-            this.#identity = clearCommissioned(this.config.storagePath, this.identity, message =>
-                this.log(message),
+            this.applyWitness(
+                WARN_IDENTITY_WRITE,
+                clearCommissioned(this.config.storagePath, this.identity, message => this.log(message)),
             );
         }
-        this.log(`Endpoint map rebuilt from ${live.length} live endpoint(s); serving normally again`);
+        this.log(
+            live.length === 0
+                ? "Endpoint map rebuilt from 0 live endpoints — the node was refusing, and §1.1 " +
+                      "excludes attach from the recovery commands, so there were none to read. The " +
+                      "baseline is now empty and the reconcile that follows records the real numbers; " +
+                      "serving normally again"
+                : `Endpoint map rebuilt from ${live.length} live endpoint(s); serving normally again`,
+        );
         return this.getStatus();
     }
 

@@ -140,6 +140,17 @@ export const INTENT_REPLACE_ALL = "replace_all";
  * reconcile that would create them is refused like everything else. The three
  * that remain are the ones a user needs to see the damage (`get_status`), keep
  * pairing readable (`get_pairing`), and choose the way out (§3.11).
+ *
+ * **`factory_reset` is not here either, and that is a decision rather than an
+ * oversight.** It is arguably a legitimate exit — `preserveEndpointNumbers:
+ * false` would discard the corrupt map along with everything else — but it is
+ * strictly the bigger hammer: it destroys every ecosystem pairing, which §3.11
+ * does not, and §3.11 already exits every refusal state there is. Admitting a
+ * pairing-wiping command *alongside* a non-destructive one that solves the same
+ * problem invites a user staring at a scary error to reach for the wrong one.
+ * It is not a dead end: once §3.11 has run the node serves normally and
+ * `factory_reset` is available like any other command, so the sequence costs
+ * one extra step and nothing else.
  */
 export const RECOVERY_COMMANDS: ReadonlySet<string> = new Set([
     "get_status",
@@ -158,11 +169,17 @@ export const ENDPOINT_MAP_INVALID_SUFFIX =
  * means "accept that the pairings are gone".
  */
 export const RefuseReason = {
-    /** `endpoint-map.json` is present but not usable. */
+    /**
+     * `endpoint-map.json` is present but not usable.
+     *
+     * There is deliberately **no** reason for a map that is merely *absent* on a
+     * commissioned bridge: matter.js owns the numbers and this file is only the
+     * witness, so a missing witness renumbers nothing — it is bootstrapped from
+     * matter.js's own persisted allocation instead (see `refuseReasonFor`).
+     * Every pre-E5 install is in that state, and refusing there would have taken
+     * working exports offline on upgrade to fix a file that never existed.
+     */
     mapUnreadable: "endpoint map is unreadable",
-    /** Fabrics exist, but there is no map to check their numbers against. */
-    mapMissingWhileCommissioned:
-        "this bridge is commissioned but has no endpoint-number map to check its endpoints against",
     /** The commissioning witness says paired; matter.js says no fabrics (PRD §7). */
     fabricStorageLost:
         "this bridge was commissioned but its Matter fabric storage is gone, so every endpoint " +
@@ -231,6 +248,21 @@ export interface StatusReport {
      * and on any status read before the first reconcile.
      */
     driftChecked: boolean;
+    /**
+     * Persistence failures the node has hit and cannot fix on its own.
+     *
+     * The node's only other channel is stdout, and in this milestone it is
+     * **started by hand** — so stdout is a terminal that was closed hours ago.
+     * A map that could not be written, a commissioning witness that could not
+     * be cleared, an identity that could not be saved: each of those is exactly
+     * the class of fault this milestone exists to make visible, and each would
+     * otherwise be visible nowhere at all. `get_status` is polled by the
+     * plugin's watchdog, so this is the one path to a user's log.
+     *
+     * Empty is the normal state. Entries are current, not historical: a warning
+     * disappears the moment the operation it describes succeeds.
+     */
+    warnings: string[];
 }
 
 export interface EndpointSummary {
@@ -294,6 +326,17 @@ export interface BridgeFacade {
     onCommand(listener: (data: CommandEventData) => void): void;
     /** The same seam for §5 `drift_detected` (§4.3). */
     onDriftDetected(listener: (drift: DriftEntry[]) => void): void;
+    /**
+     * The same seam for §5 `fabrics_changed`. Fires on every pairing or
+     * unpairing the Matter stack observes, including the ones §3.9 and §3.10
+     * cause themselves — a fabric the *plugin* removed still changed the set,
+     * and the plugin's readout has no other way to learn it landed.
+     */
+    onFabricsChanged(listener: (fabrics: FabricInfo[], change: string) => void): void;
+    /** §5 `commissioned` — the fabric count went from zero to non-zero. */
+    onCommissioned(listener: () => void): void;
+    /** §5 `decommissioned` — the last fabric went (§3.9's final leave, §3.10). */
+    onDecommissioned(listener: () => void): void;
     /**
      * The reason this node is refusing everything outside
      * {@link RECOVERY_COMMANDS}, or `undefined` when it is serving normally.

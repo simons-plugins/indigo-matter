@@ -30,7 +30,7 @@
  * pairs; deriving `uniqueId` from an Indigo device id is `endpoints.ts`'s job.
  */
 
-import { readFileSync, unlinkSync } from "node:fs";
+import { copyFileSync, readFileSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 
 import { describeError, type DriftEntry, RefuseReason } from "./protocol.js";
@@ -40,9 +40,14 @@ import { writeJsonAtomic } from "./storage.js";
 export interface EndpointIdentityState {
     /** Does the Matter stack hold at least one fabric right now? */
     commissioned: boolean;
-    /** Is there a usable persisted endpoint map? */
-    mapPresent: boolean;
-    /** Why a *present* map is unusable, if it is. */
+    /**
+     * Why a *present* map is unusable, if it is.
+     *
+     * Deliberately the only map input. An **absent** map is not a fault — see
+     * {@link refuseReasonFor} — so `present` has no say in the decision and is
+     * not passed here; the caller uses it to choose between bootstrapping a
+     * baseline and simply loading one.
+     */
     mapProblem?: string;
     /** `identity.commissionedAt` — the witness that we have ever been paired. */
     commissionedAt?: string;
@@ -54,25 +59,34 @@ export interface EndpointIdentityState {
  * Endpoint numbers only matter to somebody who is *paired*, and that asymmetry
  * is the whole rule: on a bridge nothing has ever commissioned, a missing or
  * unreadable map costs precisely nothing, so a fresh install must never be
- * blocked by one. Once a fabric has existed, both directions of the loss are
- * fatal to accessory identity and neither may be papered over:
+ * blocked by one. Two conditions remain fatal once a fabric has existed:
  *
- * * **fabrics but no usable map** — the numbers being served cannot be checked
- *   against anything, and silently re-recording them would bless whatever
- *   matter.js happens to hand out this boot as the truth;
+ * * **a map that is there and cannot be read** — the numbers being served
+ *   cannot be checked against a baseline we know exists, and silently
+ *   re-recording them would bless whatever matter.js happens to hand out this
+ *   boot as the truth over a file that says something else;
  * * **the witness but no fabrics** — PRD §7's "storage missing but previously
  *   commissioned". matter.js's storage has gone, and its own `Endpoint.id →
  *   number` allocation went with it, so every accessory is about to be
  *   re-created in every ecosystem the user paired.
  *
+ * **A commissioned bridge with no map at all is NOT one of them, and the first
+ * cut of E5 had that wrong.** Every bridge commissioned before E5 shipped is in
+ * exactly that state — fabrics, endpoints, no `endpoint-map.json`, because the
+ * file did not exist yet — so refusing would have taken every already-working
+ * export offline on upgrade. And the refusal buys nothing even in principle:
+ * **matter.js owns the numbers**, keyed on `Endpoint.id` in its own store, and
+ * this map is only the independent witness of what they were. A missing witness
+ * renumbers precisely nothing; it means we cannot yet *check*, which is what
+ * bootstrapping a baseline fixes and what refusing does not. The one thing a
+ * missing map must never do is silently paper over a *present* one, which is
+ * why `mapProblem` still refuses.
+ *
  * Returns the reason to refuse, or `undefined` to serve normally.
  */
 export function refuseReasonFor(state: EndpointIdentityState): string | undefined {
     if (state.commissioned) {
-        if (state.mapProblem !== undefined) {
-            return RefuseReason.mapUnreadable;
-        }
-        return state.mapPresent ? undefined : RefuseReason.mapMissingWhileCommissioned;
+        return state.mapProblem === undefined ? undefined : RefuseReason.mapUnreadable;
     }
     return state.commissionedAt === undefined ? undefined : RefuseReason.fabricStorageLost;
 }
@@ -82,6 +96,10 @@ export const ENDPOINT_MAP_FILE = "endpoint-map.json";
 
 /** Schema version of the persisted file. Bump only on an incompatible change. */
 export const ENDPOINT_MAP_VERSION = 1;
+
+/** Stable keys so a repeated failure replaces its warning rather than stacking. */
+const WARN_PERSIST = "endpoint-map-persist";
+const WARN_DELETE = "endpoint-map-delete";
 
 /** The on-disk shape. */
 export interface EndpointMapFile {
@@ -176,6 +194,19 @@ export class EndpointMapStore {
     #present = false;
     #problem: string | undefined;
     #checked = false;
+    /**
+     * True when the in-memory map holds something the disk does not.
+     *
+     * Set by a failed {@link persist}, cleared by a successful one. It is what
+     * stops {@link checked} claiming an all-clear over a baseline that exists
+     * only in RAM: a `driftChecked: true` there asserts that the numbers were
+     * verified against something durable, and the next restart would find no
+     * such thing, adopt whatever matter.js reallocates as the new truth, and
+     * report a permanently clean bridge across a real renumbering.
+     */
+    #dirty = false;
+    /** Persistence failures worth putting in `StatusReport.warnings` (§4.3). */
+    #warnings = new Map<string, string>();
 
     constructor(
         private readonly storagePath: string,
@@ -189,6 +220,8 @@ export class EndpointMapStore {
         this.#present = loaded.present;
         this.#problem = loaded.problem;
         this.#checked = false;
+        this.#dirty = false;
+        this.#warnings.clear();
         if (loaded.problem !== undefined) {
             this.log(`Endpoint map unusable: ${loaded.problem}`);
         } else if (!loaded.present) {
@@ -218,7 +251,20 @@ export class EndpointMapStore {
      * them apart reads a fresh install's silence as an all-clear.
      */
     get checked(): boolean {
-        return this.#checked;
+        return this.#checked && !this.#dirty;
+    }
+
+    /**
+     * §4.3 `warnings` — the persistence failures a client has to be told about.
+     *
+     * The node's log is stdout, and in this milestone the node is started **by
+     * hand**, so stdout is a terminal somebody closed. A map that cannot be
+     * written is exactly the fault this file exists to make visible, and it
+     * would otherwise be visible only there. `get_status` is polled, so this is
+     * the channel that actually reaches a user.
+     */
+    get warnings(): string[] {
+        return [...this.#warnings.values()];
     }
 
     /** The recorded number for a `UniqueID`, if there is one. */
@@ -257,11 +303,35 @@ export class EndpointMapStore {
                 drift.push({ uniqueId, expected, actual: endpointNumber });
             }
         }
-        if (added > 0) {
-            this.persist(`recorded ${added} new endpoint number(s)`);
+        // `#dirty` is the retry: a write that failed last time leaves the map
+        // owing the disk something even when this pass added nothing, and the
+        // steady state (`added === 0`, clean) still costs no I/O. Without it a
+        // full disk at the moment of the first check would never be revisited,
+        // and `checked` — see the `#dirty` field — would never come true again.
+        if (added > 0 || this.#dirty) {
+            this.persist(added > 0 ? `recorded ${added} new endpoint number(s)` : "retried after a failed write");
         }
         this.#checked = true;
         return drift;
+    }
+
+    /**
+     * Adopt a baseline for a bridge that is already commissioned but has no map
+     * — the E5 upgrade path (PRD §7).
+     *
+     * Not a rebuild: there is nothing to discard. A pre-E5 install has fabrics,
+     * endpoints and numbers that matter.js has been persisting all along, and
+     * the only thing missing is our witness of them. Recording what is already
+     * true is the migration; refusing to serve until a human confirms a
+     * *rebuild* would take a working bridge offline to fix a file it never had.
+     *
+     * Returns whether the baseline reached disk.
+     */
+    seed(numbers: readonly LiveEndpointNumber[], why: string): boolean {
+        this.#numbers = new Map(numbers.map(({ uniqueId, endpointNumber }) => [uniqueId, endpointNumber]));
+        this.#problem = undefined;
+        this.#checked = numbers.length > 0;
+        return this.persist(`seeded with ${this.#numbers.size} endpoint number(s) — ${why}`);
     }
 
     /**
@@ -273,11 +343,40 @@ export class EndpointMapStore {
      * user is asked to confirm this, and what the rebuild does is stop refusing
      * and start telling the truth about the numbers that now exist.
      */
-    rebuild(live: readonly LiveEndpointNumber[]): void {
+    rebuild(live: readonly LiveEndpointNumber[]): boolean {
+        // The unusable file is COPIED aside before it is overwritten. It is the
+        // only surviving record of what the numbers used to be, and the reason
+        // it is unusable may be a truncation or a bad byte that a human can
+        // repair — whereas the rebuild is about to replace it with the numbers
+        // that exist *now*, which is a different and irreversible answer.
+        this.quarantineUnusable();
+        if (live.length === 0) {
+            this.log(
+                "Rebuilding the endpoint map from ZERO live endpoints — the node refuses to " +
+                    "create any while it is refusing to serve (§1.1 excludes attach), so this " +
+                    "records an empty baseline and stops refusing; the numbers themselves are " +
+                    "recorded by the reconcile that follows.",
+            );
+        }
         this.#numbers = new Map(live.map(({ uniqueId, endpointNumber }) => [uniqueId, endpointNumber]));
         this.#problem = undefined;
-        this.persist(`rebuilt from ${this.#numbers.size} live endpoint(s)`);
-        this.#checked = true;
+        const persisted = this.persist(`rebuilt from ${this.#numbers.size} live endpoint(s)`);
+        this.#checked = persisted;
+        return persisted;
+    }
+
+    /** Copy a present-but-unusable map to `<file>.corrupt` before it is lost. */
+    private quarantineUnusable(): void {
+        if (this.#problem === undefined) {
+            return;
+        }
+        const file = join(this.storagePath, ENDPOINT_MAP_FILE);
+        try {
+            copyFileSync(file, `${file}.corrupt`);
+            this.log(`Unusable endpoint map copied to ${file}.corrupt before rebuilding`);
+        } catch (error) {
+            this.log(`Could not copy the unusable endpoint map aside: ${describeError(error)}`);
+        }
     }
 
     /**
@@ -285,24 +384,40 @@ export class EndpointMapStore {
      * everything. The "explicit rebuild" of PRD §7, for when the map itself is
      * what is corrupt.
      */
-    discard(): void {
+    discard(): boolean {
         this.#numbers = new Map();
         this.#problem = undefined;
         this.#checked = false;
+        this.#dirty = false;
         try {
             const removed = deleteEndpointMap(this.storagePath);
             this.#present = false;
+            this.#warnings.delete(WARN_DELETE);
+            this.#warnings.delete(WARN_PERSIST);
             this.log(removed ? "Endpoint map discarded" : "No endpoint map to discard");
+            return true;
         } catch (error) {
             // The in-memory map is already empty, so the node behaves as asked;
             // what survives is a stale file that the next start would load as a
             // baseline for numbers that no longer mean anything. Say so.
-            this.log(`Could not delete the endpoint map: ${describeError(error)}`);
+            const message = `Could not delete the endpoint map: ${describeError(error)}`;
+            this.log(message);
+            this.#warnings.set(WARN_DELETE, message);
+            return false;
         }
     }
 
-    /** Write the current map. Never throws — a failed write is loud, not fatal. */
-    private persist(why: string): void {
+    /**
+     * Write the current map, reporting whether it landed.
+     *
+     * Never throws — refusing to serve endpoints because a *witness* could not
+     * be written would take down a working bridge over a disk problem. But it
+     * is no longer silent to its callers either: an unwritten map means the
+     * next start has no baseline, and the two callers that must not report
+     * success over that (§3.11's rebuild and §4.3's `driftChecked`) both read
+     * the answer.
+     */
+    private persist(why: string): boolean {
         const file: EndpointMapFile = {
             version: ENDPOINT_MAP_VERSION,
             endpoints: Object.fromEntries(this.#numbers),
@@ -310,16 +425,21 @@ export class EndpointMapStore {
         try {
             writeJsonAtomic(join(this.storagePath, ENDPOINT_MAP_FILE), file);
             this.#present = true;
+            this.#dirty = false;
+            // A write that succeeded is the definitive answer about the file's
+            // usability: whatever was wrong with the old one is gone with it.
+            this.#problem = undefined;
+            this.#warnings.delete(WARN_PERSIST);
             this.log(`Endpoint map ${why}`);
+            return true;
         } catch (error) {
-            // Deliberately not fatal: refusing to serve endpoints because a
-            // *witness* could not be written would take down a working bridge
-            // over a disk problem. But an unwritten map means the next start
-            // has no baseline, so this cannot be quiet either.
-            this.log(
+            this.#dirty = true;
+            const message =
                 `Could not write the endpoint map (${why}): ${describeError(error)}. ` +
-                    "Endpoint-number drift will not be detectable after a restart.",
-            );
+                "Endpoint-number drift will not be detectable after a restart.";
+            this.log(message);
+            this.#warnings.set(WARN_PERSIST, message);
+            return false;
         }
     }
 }

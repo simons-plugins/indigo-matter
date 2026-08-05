@@ -904,6 +904,91 @@ describe("the endpoint_map_invalid refuse-to-start state (§1.1, PRD §7)", () =
             client.close();
         });
     });
+
+    it("refuses EVERY command outside the trio, by name", async () => {
+        // Table-driven because the gate is a set-membership test: widening it
+        // by one entry is a one-character change with no local symptom, and
+        // three of these four would un-export or re-pair a whole house.
+        //
+        // `factory_reset` is on this list on purpose (see RECOVERY_COMMANDS):
+        // it is arguably an exit, but it is the destructive one, and §3.11
+        // already exits every refusal state without touching a pairing.
+        const refusable = [
+            { command: "attach", args: { protocolVersion: PROTOCOL_VERSION, endpoints: [] } },
+            { command: "factory_reset", args: { preserveEndpointNumbers: false } },
+            { command: "remove_fabric", args: { fabricIndex: 1 } },
+            { command: "set_state", args: { indigoDeviceId: 123456789, states: { onOff: true } } },
+            { command: "remove_endpoint", args: { indigoDeviceId: 123456789 } },
+            { command: "upsert_endpoint", args: golden.upsert_endpoint.request.args },
+            { command: "set_reachable", args: { indigoDeviceId: 123456789, reachable: false } },
+            { command: "open_commissioning_window", args: { durationSeconds: 900 } },
+        ];
+        await withColdBridge(async (cold, connectCold) => {
+            cold.refusal = "endpoint map is unreadable";
+            const client = await connectCold();
+            for (const { command, args } of refusable) {
+                const response = await client.request({ message_id: `gate-${command}`, command, args });
+                assert.equal(
+                    response.error_code,
+                    ErrorCode.endpointMapInvalid,
+                    `${command} was NOT refused while the node is refusing to serve`,
+                );
+            }
+            assert.deepEqual(cold.factoryResets, [], "no reset may run while refusing");
+            assert.deepEqual(cold.removedFabrics, [], "no fabric may be dropped while refusing");
+            client.close();
+        });
+    });
+
+    it("does not close an un-attached socket while it is refusing", async () => {
+        // The plugin deliberately HOLDS this socket open un-attached: §1.1 makes
+        // it the only route to the rebuild. Closing it on the §2 timer put the
+        // two in a fight — refuse, close, reconnect, refuse, every 10s — and a
+        // rebuild the user had just confirmed could be cut off mid-flight by
+        // our own timer.
+        const cold = new StubBridge();
+        cold.refusal = "endpoint map is unreadable";
+        const coldServer = new BridgeWsServer({
+            port: 0,
+            bridge: cold,
+            bridgeVersion: BRIDGE_VERSION,
+            matterJsVersion: MATTER_JS_VERSION,
+            log: () => {},
+            unattachedTimeoutMs: 20,
+        });
+        await coldServer.listen();
+        try {
+            const client = await TestClient.connect(coldServer.port);
+            await client.next(); // handshake
+            await new Promise(resolve => setTimeout(resolve, 80));
+
+            const rebuilt = await client.request(golden.rebuild_endpoint_map.request);
+            assert.deepEqual(rebuilt, golden.rebuild_endpoint_map.response);
+            client.close();
+        } finally {
+            await coldServer.close();
+        }
+    });
+
+    it("still closes an un-attached socket when it is NOT refusing", async () => {
+        const cold = new StubBridge();
+        const coldServer = new BridgeWsServer({
+            port: 0,
+            bridge: cold,
+            bridgeVersion: BRIDGE_VERSION,
+            matterJsVersion: MATTER_JS_VERSION,
+            log: () => {},
+            unattachedTimeoutMs: 20,
+        });
+        await coldServer.listen();
+        try {
+            const client = await TestClient.connect(coldServer.port);
+            await client.next(); // handshake
+            await client.waitForClose(1000);
+        } finally {
+            await coldServer.close();
+        }
+    });
 });
 
 describe("drift_detected event (§5)", () => {
@@ -915,6 +1000,40 @@ describe("drift_detected event (§5)", () => {
             cold.emitDrift(golden.drift_detected.data.drift as never);
 
             assert.deepEqual(await client.next(), golden.drift_detected);
+            client.close();
+        });
+    });
+});
+
+describe("fabric events (§5 / §3.9 / §3.10)", () => {
+    // All three were declared in the event enum, documented in §5, carried by
+    // golden frames and consumed by the plugin's client — and emitted by
+    // nothing. A user unpairing an ecosystem produced no event at all.
+    it("emits fabrics_changed with the set AFTER the change", async () => {
+        await withColdBridge(async (cold, connectCold) => {
+            const client = await connectCold();
+            await client.request(golden.attach_with_endpoints.request);
+
+            cold.emitFabricsChanged([APPLE_HOME], "added");
+
+            assert.deepEqual(await client.next(), {
+                event: "fabrics_changed",
+                data: { fabrics: [APPLE_HOME], change: "added" },
+            });
+            client.close();
+        });
+    });
+
+    it("emits commissioned and decommissioned", async () => {
+        await withColdBridge(async (cold, connectCold) => {
+            const client = await connectCold();
+            await client.request(golden.attach_with_endpoints.request);
+
+            cold.emitCommissioned();
+            assert.deepEqual(await client.next(), { event: "commissioned", data: {} });
+
+            cold.emitDecommissioned();
+            assert.deepEqual(await client.next(), { event: "decommissioned", data: {} });
             client.close();
         });
     });

@@ -310,6 +310,27 @@ class TestColorTemperature:
             "setColorTemp", {"colorTempMireds": 250}, dev)
         mock_indigo_base.dimmer.setColorLevels.assert_not_called()
 
+    def test_the_skip_is_REPORTED_as_a_no_op_rather_than_as_a_success(
+            self, handlers, mock_indigo_base):
+        """The tri-state, or the caller latches nothing and says nothing.
+
+        ``dispatch`` ends in ``handler(...) or True``, so a bare ``None`` from
+        the skip above reported SUCCESS for a command that did nothing at all —
+        the ecosystem had already flipped its tile to the new colour
+        temperature, the lamp never moved, and the only trace was a debug line
+        from a static method that cannot name the device.
+        """
+        dev = DimmerDevice(1, "Lamp", whiteLevel=None)
+        outcome = handlers.handler_for("colorTemperatureLight").dispatch(
+            "setColorTemp", {"colorTempMireds": 250}, dev)
+        assert isinstance(outcome, str), f"expected a no-op reason, got {outcome!r}"
+        assert "no white channel" in outcome
+
+    def test_a_real_write_still_reports_plain_success(self, handlers, mock_indigo_base):
+        dev = DimmerDevice(1, "Lamp", whiteLevel=50)
+        assert handlers.handler_for("colorTemperatureLight").dispatch(
+            "setColorTemp", {"colorTempMireds": 250}, dev) is True
+
     def test_a_white_channel_reporting_off_keeps_its_real_level(
             self, handlers, mock_indigo_base):
         """E5: `whiteLevel or 100` caught the real 0 — `0.0` is falsy.

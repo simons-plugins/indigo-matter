@@ -311,6 +311,164 @@ describe("factory_reset (§3.10) and the endpoint map", () => {
         await restarted.close();
         assert.equal(refusal, undefined);
     });
+
+    it("leaves a fresh commissionable pairing state behind (§3.10's whole point)", async () => {
+        // The user-visible outcome, and nothing asserted it: the reset exists so
+        // the bridge can be paired again, and a node that wiped its credentials
+        // but stopped advertising would have "succeeded" identically.
+        const storagePath = storage();
+        const session = await boot(storagePath);
+        await attach(session.client, "f7");
+
+        await session.client.request({
+            message_id: "f8",
+            command: "factory_reset",
+            args: { preserveEndpointNumbers: true },
+        }, RESET_TIMEOUT_MS);
+        const pairing = await session.client.request({ message_id: "f9", command: "get_pairing", args: {} });
+        await session.close();
+
+        const report = pairing.result as {
+            commissioned: boolean;
+            windowOpen: boolean;
+            manualPairingCode: string | null;
+            qrPairingCode: string | null;
+        };
+        assert.equal(report.commissioned, false);
+        assert.equal(report.windowOpen, true, "a reset bridge must be advertising again");
+        assert.ok(report.manualPairingCode, "and it must hand back a usable code");
+        assert.match(String(report.qrPairingCode), /^MT:/);
+    });
+
+    it("is REFUSED while the node is refusing — §3.11 is the exit, not this", async () => {
+        // The design call behind RECOVERY_COMMANDS, pinned. `factory_reset` is
+        // arguably an exit from a corrupt map, but it is the destructive one:
+        // it drops every ecosystem pairing, which §3.11 does not, and §3.11
+        // already exits every refusal state. A user staring at a scary error
+        // must not be offered the bigger hammer as an alternative to the
+        // smaller one that works.
+        const storagePath = storage();
+        const session = await boot(storagePath, "2026-08-01T00:00:00.000Z");
+        assert.equal(session.bridge.endpointMapRefusal(), RefuseReason.fabricStorageLost);
+
+        const refused = await session.client.request({
+            message_id: "f10",
+            command: "factory_reset",
+            args: { preserveEndpointNumbers: true },
+        }, RESET_TIMEOUT_MS);
+
+        assert.equal(refused.error_code, ErrorCode.endpointMapInvalid);
+        assert.equal(session.bridge.endpointMapRefusal(), RefuseReason.fabricStorageLost);
+
+        // And the documented sequence — rebuild, attach, then reset — works.
+        await session.client.request({ message_id: "f10a", command: "rebuild_endpoint_map", args: {} });
+        await attach(session.client, "f10c");
+        const reset = await session.client.request({
+            message_id: "f10b",
+            command: "factory_reset",
+            args: { preserveEndpointNumbers: true },
+        }, RESET_TIMEOUT_MS);
+        await session.close();
+        assert.deepEqual(reset.result, {});
+    });
+
+    it("verifies the witness is really gone before reporting completion", async () => {
+        const storagePath = storage();
+        const session = await boot(storagePath, "2026-08-01T00:00:00.000Z");
+        await session.client.request({ message_id: "f11", command: "rebuild_endpoint_map", args: {} });
+        await attach(session.client, "f11a");
+
+        await session.client.request({
+            message_id: "f12",
+            command: "factory_reset",
+            args: { preserveEndpointNumbers: true },
+        }, RESET_TIMEOUT_MS);
+        const status = await session.client.request({ message_id: "f13", command: "get_status", args: {} });
+        await session.close();
+
+        // §4.3 `warnings`: a witness that survived the erase is the exact
+        // fabricStorageLost signature, so it must be reported, not assumed.
+        assert.deepEqual((status.result as { warnings: string[] }).warnings, []);
+        assert.equal(
+            JSON.parse(readFileSync(join(storagePath, "identity.json"), "utf8")).commissionedAt,
+            undefined,
+        );
+    });
+});
+
+describe("the drift check runs on every path that can move a number", () => {
+    it("runs after a reconcile that failed part-way through", async () => {
+        // The `finally` is load-bearing and nothing held it there: moving the
+        // check onto the success path broke no test at all. A part-applied
+        // reconcile (registry.ts is explicit that there is no transaction
+        // across several adds) has still CREATED endpoints, and those are
+        // exactly the numbers most worth checking — skipping the check on the
+        // failure path leaves the likeliest drift un-looked-at.
+        const storagePath = storage();
+        const session = await boot(storagePath);
+        try {
+            await assert.rejects(
+                session.bridge.reconcile(
+                    [
+                        ENDPOINTS[0]!,
+                        // A role outside the §4.2 enum: the registry builds the
+                        // first endpoint, then throws on this one.
+                        { ...ENDPOINTS[1]!, role: "notARole" },
+                    ] as never,
+                    false,
+                ),
+            );
+
+            // `driftChecked` is the observable: on the success path only, the
+            // throw skips the detector entirely and it stays false forever.
+            assert.equal(
+                session.bridge.getStatus().driftChecked,
+                true,
+                "the failed reconcile must still have run the detector",
+            );
+        } finally {
+            await session.close();
+        }
+    });
+
+    it("runs after a remove, not only after a create", async () => {
+        // §3.3 was the one operation that reshapes the live set and never
+        // looked, so a surviving endpoint whose number had moved stayed
+        // unreported until something else happened to create one.
+        const storagePath = storage();
+        const session = await boot(storagePath);
+        try {
+            assert.equal(session.bridge.getStatus().driftChecked, false, "nothing checked yet");
+
+            await session.bridge.removeEndpoint(KITCHEN);
+
+            assert.equal(
+                session.bridge.getStatus().driftChecked,
+                true,
+                "remove_endpoint must run the detector",
+            );
+        } finally {
+            await session.close();
+        }
+    });
+
+    it("raises no drift when a role change re-creates an endpoint", async () => {
+        // §3.3 retains the allocation, so a remove-then-add restores the same
+        // number. The retention is pinned by registry.test.ts; the *absence* of
+        // a drift event was not, and a regression there would tell every user
+        // their accessories had swapped identities on an ordinary role edit.
+        const storagePath = storage();
+        const session = await boot(storagePath);
+        try {
+            await attach(session.client, "d2");
+            await session.bridge.removeEndpoint(KITCHEN);
+            await session.bridge.upsertEndpoint({ ...ENDPOINTS[0]!, role: "dimmableLight" } as never);
+
+            assert.deepEqual(session.bridge.getStatus().drift, []);
+        } finally {
+            await session.close();
+        }
+    });
 });
 
 describe("refuse-to-start: previously commissioned, fabric storage gone (PRD §7)", () => {

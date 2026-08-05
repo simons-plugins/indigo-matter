@@ -130,9 +130,9 @@ class BridgeClient(WsJsonClient):
         *,
         plugin_version: str = "unknown",
         endpoint_provider: Optional[Callable[[], list]] = None,
-        replace_all_provider: Optional[Callable[[], bool]] = None,
+        replace_all_provider: Optional[Callable[[], int]] = None,
         connect: Optional[Callable[[str], Awaitable]] = None,
-        on_attached: Optional[Callable[[StatusReport], None]] = None,
+        on_attached: Optional[Callable[[StatusReport, bool], None]] = None,
         on_attach_refused: Optional[Callable[[str, str], None]] = None,
         on_version_skew: Optional[Callable[[bridge_protocol.Hello], None]] = None,
         on_command: Optional[Callable[[bridge_protocol.BridgeCommand], None]] = None,
@@ -158,14 +158,13 @@ class BridgeClient(WsJsonClient):
         )
         self.plugin_version = plugin_version
         self._endpoint_provider = endpoint_provider or (lambda: [])
-        #: Whether the *handshake's* attach must carry §3.1's `replace_all`.
-        #: Normally no: emptying the live set by default is the exact thing the
-        #: mass-removal guard exists to refuse. The one caller that says yes is
-        #: an un-export that never landed (``export_bridge._owes_replace_all``,
-        #: XAC7) — the user emptied the allow-list, the node was unreachable,
-        #: and without this the accessories stay in every paired ecosystem for
-        #: good, because nothing else ever attaches with an empty set again.
-        self._replace_all_provider = replace_all_provider or (lambda: False)
+        #: How many endpoints an un-export still owes the node — 0 for none.
+        #: Non-zero makes the *handshake's* attach carry §3.1's `replace_all`
+        #: and sizes its deadline (``export_bridge._owes_replace_all``, XAC7).
+        #: The user emptied the allow-list, the node was unreachable, and
+        #: without this the accessories stay in every paired ecosystem for good,
+        #: because nothing else ever attaches with an empty set again.
+        self._replace_all_provider = replace_all_provider or (lambda: 0)
         self._on_attached = on_attached
         self._on_attach_refused = on_attach_refused
         self._on_version_skew = on_version_skew
@@ -226,41 +225,62 @@ class BridgeClient(WsJsonClient):
         # "the attach is on its way" rather than "we are still deciding what to
         # send" — which is what every waiter on ``wait_connected`` assumes.
         specs = await self._gather_endpoints()
-        replace_all = self._replace_all(len(specs))
+        owed = self._owed_removals()
+        replace_all = self._replace_all(owed)
         # Requests are legal from here on: attach is one.
         self._mark_connected()
         try:
             status = await self._attach(specs, replace_all=replace_all, timeout=None, inline=True)
         except BridgeProtocolError as exc:
+            if str(exc.code) == bridge_protocol.ERR_MASS_REMOVAL_REFUSED and not replace_all:
+                try:
+                    if await self._retry_with_intent():
+                        return
+                except BridgeProtocolError as retried:
+                    exc = retried
             self._handle_attach_refused(exc)
             return
         self._attached = True
         self.recovery = False
-        self._notify(self._on_attached, status)
+        self._notify(self._on_attached, status, replace_all)
 
-    def _replace_all(self, spec_count: int) -> bool:
-        """Ask the injected provider, and refuse to believe a dangerous yes.
+    def _owed_removals(self) -> int:
+        """How many endpoints an un-export still owes the node, per the provider.
 
-        The provider is consulted only when the desired set is **empty**. A
-        `replace_all` alongside real endpoints would be meaningless at best —
-        §3.1's guard cannot fire against a non-empty desired set — and at worst
-        it would be a standing licence to empty the bridge, carried by every
-        reconnect for as long as the flag was mis-set. Belt and braces on the
-        one flag in this protocol that can un-export a whole house.
+        The provider answers with a count rather than a flag because the two
+        questions it feeds need different halves of it: *whether* to carry
+        §3.1's opt-in, and *how long* the resulting attach may take (the node
+        paces bulk removals ~100ms apart, §3.3).
         """
-        if spec_count:
-            return False
         try:
-            wanted = bool(self._replace_all_provider())
+            return max(0, int(self._replace_all_provider() or 0))
         except Exception as exc:  # pylint: disable=broad-except
             self.logger.warning("could not read the pending un-export flag (%s); "
                                 "attaching without it", exc)
+            return 0
+
+    def _replace_all(self, owed: int) -> bool:
+        """Whether this attach carries §3.1's ``intent: replace_all``.
+
+        **The desired set's size is deliberately not consulted.** It used to
+        gate this — "a `replace_all` alongside real endpoints is meaningless, so
+        only ask when we are sending nothing" — and that turned a debt plus a
+        *disjoint* re-add into a permanent halt: the removals still emptied the
+        node's live set, the guard still fired, and the attach that carried no
+        intent was refused with ``mass_removal_refused``, which halts.
+
+        Carrying the intent whenever a debt exists is safe in the direction that
+        matters. §3.1's guard fires only when the reconcile would leave the live
+        set EMPTY, so on any attach carrying real endpoints the flag is inert —
+        it cannot license a removal the desired set was not already asking for.
+        What it does is stop the one refusal that has no retry behind it.
+        """
+        if owed <= 0:
             return False
-        if wanted:
-            self.logger.info(
-                "attaching with intent: replace_all — finishing an un-export that did not "
-                "complete earlier")
-        return wanted
+        self.logger.info(
+            "attaching with intent: replace_all — finishing an un-export of %d accessory "
+            "record(s) that did not complete earlier", owed)
+        return True
 
     def _handle_attach_refused(self, exc: BridgeProtocolError) -> None:
         """Decide what an ``attach`` the node refused means (§1.1).
@@ -289,6 +309,37 @@ class BridgeClient(WsJsonClient):
             raise ClientHalted(f"attach refused: {code} ({exc.details})", reason=code)
         # endpoint_map_invalid: stay connected, un-attached, in recovery.
         self.recovery = True
+
+    async def _retry_with_intent(self) -> bool:
+        """Answer a ``mass_removal_refused`` by re-attaching WITH the opt-in.
+
+        Belt and braces behind :meth:`_replace_all`, and the belt is the part
+        that matters: ``mass_removal_refused`` HALTS, and a halted client never
+        retries anything. If we reach it while a debt is recorded then the
+        removal the node refused is one the user genuinely asked for — that is
+        what the debt IS — and halting there strands every exported accessory in
+        every ecosystem permanently, behind a message blaming the allow-list.
+
+        Exactly once, and only when a debt says so. A blind retry-with-intent
+        would turn the §3.1 guard into a speed bump; this cannot fire for a
+        client that was never told to un-export anything.
+        """
+        # RE-read, deliberately: the only way to be here at all is that the
+        # first read did not see a debt (a debt always carries the intent), so
+        # the interesting case is precisely the one where that read was wrong —
+        # a prefs read that glitched, or a debt written between the two.
+        owed = self._owed_removals()
+        if owed <= 0:
+            return False
+        self.logger.warning(
+            "the bridge node refused the attach as a mass removal, but an un-export of %d "
+            "accessory record(s) IS outstanding — retrying once with intent: replace_all "
+            "rather than halting", owed)
+        status = await self._attach(None, replace_all=True, timeout=None, inline=True)
+        self._attached = True
+        self.recovery = False
+        self._notify(self._on_attached, status, True)
+        return True
 
     def _is_event(self, frame: dict) -> bool:
         return self.proto.is_event(frame)
@@ -424,7 +475,14 @@ class BridgeClient(WsJsonClient):
         """
         specs = await self._gather_endpoints() if endpoints is None else endpoints
         if timeout is None:
-            timeout = attach_timeout_for(len(specs))
+            # Sized over whichever count the node will actually spend time on.
+            # An attach's cost is its ~100ms-paced REMOVALS (§3.3), and for the
+            # discharge attach those are the opposite of what is sent: nothing
+            # goes, everything owed comes back off. `len(specs)` alone handed an
+            # 80-accessory un-export the 8s floor, timed it out mid-reconcile,
+            # then tore the socket down and retried — forever, with the
+            # accessories still in every ecosystem.
+            timeout = attach_timeout_for(max(len(specs), self._owed_removals()))
         frame = self.proto.build_attach(self.plugin_version, specs, replace_all=replace_all)
         if inline:
             result = await self._handshake_request(frame, timeout, bridge_protocol.CMD_ATTACH)
@@ -564,7 +622,11 @@ class BridgeClient(WsJsonClient):
         self.status = bridge_protocol.parse_status(result)
         if self.recovery:
             self.logger.info("endpoint map rebuilt; re-attaching to the bridge node")
-            status = await self.attach()
-            self._notify(self._on_attached, status)
+            # The debt outlives the refusal: a node that was refusing never took
+            # our un-export either, so the re-attach has to carry the same opt-in
+            # the handshake would have.
+            replace_all = self._replace_all(self._owed_removals())
+            status = await self.attach(replace_all=replace_all)
+            self._notify(self._on_attached, status, replace_all)
             return status
         return self.status

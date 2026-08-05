@@ -1475,9 +1475,33 @@ class Plugin(indigo.PluginBase):
                     "— restart the bridge node.")
         if client.recovery:
             return (" The bridge node is waiting for an endpoint-map rebuild — exports are not "
-                    "live until it is done.")
+                    "live until it is done. Use 'Rebuild Matter Endpoint Map…' in the plugin "
+                    "menu.")
         if not client.attached:
             return " Not connected to the bridge node — exports are not live."
+        return self._export_health_note(client.status)
+
+    @staticmethod
+    def _export_health_note(status) -> str:
+        """The §4.3 facts the dialog is the only place a user would look for.
+
+        `drift` and `warnings` were parsed and then read by nobody: an endpoint
+        number that had moved, or a map the node could not write, showed up in
+        the log at the moment it happened and nowhere at all afterwards. This
+        dialog is where somebody goes when an accessory is behaving oddly.
+        """
+        if status is None:
+            return ""
+        if status.warnings:
+            return (f" The bridge node reports {len(status.warnings)} persistence problem(s): "
+                    f"{'; '.join(status.warnings)}")
+        if status.drift:
+            return (f" WARNING: {len(status.drift)} exported accessory number(s) have DRIFTED — "
+                    "they may have swapped identities in paired ecosystems. See the log; this is "
+                    "never repaired automatically.")
+        if not status.drift_checked:
+            return (" Endpoint numbers have not been checked against a saved map yet — that "
+                    "happens on the first reconcile.")
         return ""
 
     def get_menu_action_config_ui_values(self, menu_id):
@@ -1857,6 +1881,88 @@ class Plugin(indigo.PluginBase):
         values["exportInvert"] = False
         values["exportStatus"] = f"Removed {name}. {self._export_summary()}"
         return values
+
+    # ------------------------------------------------------------------
+    # Export-bridge recovery menus (BRIDGE_PROTOCOL §3.10/§3.11)
+    # ------------------------------------------------------------------
+    def _recovery_client(self, errors, field: str):
+        """The bridge client, or ``None`` with ``errors`` filled in.
+
+        Both recovery commands need a live socket, and the state they exist to
+        fix is exactly the one where the plugin holds the connection open
+        UN-attached (§1.1 recovery). So `connected`, not `attached`, is the
+        right gate — requiring an attach would make the rebuild unreachable in
+        the only situation that needs it.
+        """
+        bridge = self.export_bridge
+        client = bridge.client if bridge is not None else None
+        if client is None or not client.connected:
+            msg = ("Not connected to the Matter export bridge node. Start it (it is launched by "
+                   "hand in this build), export at least one device so the plugin connects, then "
+                   "try again.")
+            self.logger.warning(msg)
+            errors[field] = "Not connected to the bridge node — see the log."
+            return None
+        return client
+
+    def menuRebuildEndpointMap(self, valuesDict, menuId=""):  # noqa: N802, ARG002
+        """§3.11 — the way out of the endpoint_map_invalid refuse-to-start state."""
+        errors = indigo.Dict()
+        if not self._truthy(valuesDict.get("confirm")):
+            errors["confirm"] = "Tick the box — a rebuild can duplicate paired accessories."
+            return (False, valuesDict, errors)
+        client = self._recovery_client(errors, "confirm")
+        if client is None:
+            return (False, valuesDict, errors)
+        try:
+            status = self.runtime.submit(client.rebuild_endpoint_map()).result(timeout=45)
+        except Exception as exc:  # noqa: BLE001
+            # Never report success over a rebuild that did not persist: the node
+            # answers with an error rather than a StatusReport when the new map
+            # could not be written, and the refusal is still in force.
+            self.logger.error("Matter export: rebuilding the endpoint map FAILED — %s. The bridge "
+                              "node is unchanged and still refusing to export.", exc)
+            self.logger.exception(exc)
+            errors["confirm"] = "Rebuild failed — see the log. Nothing was changed."
+            return (False, valuesDict, errors)
+        self.logger.warning(
+            "Matter export: endpoint map REBUILT — the bridge node is serving %d endpoint(s) "
+            "again. Check every paired ecosystem for duplicated accessories and delete the dead "
+            "ones by hand.", status.endpoint_count)
+        for warning in status.warnings:
+            self.logger.warning("Matter export: the bridge node reports — %s", warning)
+        return (True, valuesDict)
+
+    def menuResetBridgePairings(self, valuesDict, menuId=""):  # noqa: N802, ARG002
+        """§3.10 — wipe the export bridge's commissioning and re-advertise."""
+        errors = indigo.Dict()
+        # Two boxes, deliberately. This is the only plugin action that destroys
+        # every ecosystem pairing at once, and it is irreversible without
+        # re-pairing each ecosystem by hand.
+        if not self._truthy(valuesDict.get("confirm")) \
+                or not self._truthy(valuesDict.get("confirmAgain")):
+            field = "confirm" if not self._truthy(valuesDict.get("confirm")) else "confirmAgain"
+            errors[field] = "Tick BOTH boxes — this removes every ecosystem pairing."
+            return (False, valuesDict, errors)
+        client = self._recovery_client(errors, "confirmAgain")
+        if client is None:
+            return (False, valuesDict, errors)
+        try:
+            # preserve_endpoint_numbers=True: a user resetting to re-pair the
+            # same ecosystems should not also lose accessory identity. The
+            # "the map itself is corrupt" path is the rebuild above.
+            self.runtime.submit(client.factory_reset(True)).result(timeout=45)
+        except Exception as exc:  # noqa: BLE001
+            self.logger.error("Matter export: resetting the bridge pairings FAILED — %s. "
+                              "Pairings are unchanged.", exc)
+            self.logger.exception(exc)
+            errors["confirmAgain"] = "Reset failed — see the log. Pairings were not changed."
+            return (False, valuesDict, errors)
+        self.logger.warning(
+            "Matter export: the bridge node's pairings have been RESET. It is advertising for "
+            "commissioning again — pair it from each ecosystem, and remove the now-dead Indigo "
+            "bridge from any ecosystem that still lists it.")
+        return (True, valuesDict)
 
     def _resolve_storage_path(self) -> str:
         """Storage dir path in BOTH managed and manual modes.

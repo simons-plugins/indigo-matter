@@ -14,6 +14,7 @@ import asyncio
 
 import pytest
 
+import bridge_client
 import bridge_protocol
 from bridge_client import BridgeClient
 from bridge_protocol import EndpointSpec
@@ -113,7 +114,7 @@ class TestHandshake:
             fake = _fake()
             client = _client(mock_logger, fake,
                              endpoint_provider=lambda: [KITCHEN_LAMP],
-                             on_attached=attached.append)
+                             on_attached=lambda status, _intent=False: attached.append(status))
             task = asyncio.create_task(client.run())
             await client.wait_connected(timeout=2)
             await settle(lambda: attached)
@@ -755,7 +756,7 @@ class TestEndpointMapInvalid:
                 return [{**body, "message_id": frame["message_id"]}]
 
             fake = _fake(responder=responder)
-            client = _client(mock_logger, fake, on_attached=attached.append)
+            client = _client(mock_logger, fake, on_attached=lambda status, _intent=False: attached.append(status))
             task = asyncio.create_task(client.run())
             await settle(lambda: client.recovery)
             assert not client.attached
@@ -880,7 +881,7 @@ class TestHandshakeInterleaving:
             fake = _fake(responder=responder)
             client = _client(mock_logger, fake,
                              on_command=lambda cmd: order.append(("command", cmd.command)),
-                             on_attached=lambda _s: order.append(("attached", None)))
+                             on_attached=lambda _s, _i=False: order.append(("attached", None)))
             task = asyncio.create_task(client.run())
             await client.wait_connected(timeout=2)
             await settle(lambda: len(order) == 2)
@@ -912,7 +913,7 @@ class TestHaltAndResume:
 
             attached = []
             client = _client(mock_logger, sockets[0], connect=connect, sleep=fake_sleep,
-                             on_attached=attached.append)
+                             on_attached=lambda status, _intent=False: attached.append(status))
 
             await asyncio.wait_for(client.run(), timeout=2)
             assert client.halted and client.halted_reason == "version_skew"
@@ -1046,7 +1047,7 @@ class TestHandshakeReplaceAll:
             client = _client(mock_logger, fake,
                              endpoint_provider=lambda: [],
                              replace_all_provider=lambda: True,
-                             on_attached=attached.append)
+                             on_attached=lambda status, _intent=False: attached.append(status))
             task = asyncio.create_task(client.run())
             await client.wait_connected(timeout=2)
             await settle(lambda: attached)
@@ -1057,20 +1058,50 @@ class TestHandshakeReplaceAll:
 
         asyncio.run(scenario())
 
-    def test_a_non_empty_set_never_carries_it_however_the_provider_answers(self, mock_logger):
-        """Belt and braces on the one flag that can un-export a whole house.
+    def test_a_debt_carries_the_intent_even_beside_a_DISJOINT_re_add(self, mock_logger):
+        """⊗ The permanent halt. The desired set's size must not gate the intent.
 
-        A `replace_all` alongside real endpoints is meaningless — §3.1's guard
-        cannot fire against a non-empty desired set — and a mis-set flag would
-        otherwise be a standing licence renewed on every single reconnect.
+        The old rule was "only ask the provider when we are sending nothing",
+        on the reasoning that a `replace_all` beside real endpoints is
+        meaningless. It is not meaningless — it is the difference between
+        recovering and halting forever. Empty the allow-list while the node is
+        down (debt = 5), then export a *different* device: the attach carries
+        one endpoint, so the intent was withheld, but the node's §3.1 guard
+        still saw five removals against zero survivors, refused with
+        `mass_removal_refused` — which HALTS — and told the user to go and check
+        an allow-list that was never the problem. Nothing retries a halt.
+
+        Carrying it is safe in the only direction that matters: §3.1's guard
+        fires solely when the reconcile would leave the live set EMPTY, so on an
+        attach carrying real endpoints the flag licenses nothing the desired set
+        was not already asking for.
         """
         async def scenario():
             attached = []
             fake = _fake()
             client = _client(mock_logger, fake,
                              endpoint_provider=lambda: [KITCHEN_LAMP],
-                             replace_all_provider=lambda: True,
-                             on_attached=attached.append)
+                             replace_all_provider=lambda: 5,
+                             on_attached=lambda status, _intent=False: attached.append(status))
+            task = asyncio.create_task(client.run())
+            await client.wait_connected(timeout=2)
+            await settle(lambda: attached)
+            args = sent(fake, bridge_protocol.CMD_ATTACH)["args"]
+            assert args[bridge_protocol.ARG_INTENT] == bridge_protocol.INTENT_REPLACE_ALL
+            await client.close()
+            task.cancel()
+
+        asyncio.run(scenario())
+
+    def test_no_debt_means_no_intent_however_big_the_set(self, mock_logger):
+        """The flag is still a debt receipt, not a standing licence."""
+        async def scenario():
+            attached = []
+            fake = _fake()
+            client = _client(mock_logger, fake,
+                             endpoint_provider=lambda: [KITCHEN_LAMP],
+                             replace_all_provider=lambda: 0,
+                             on_attached=lambda status, _intent=False: attached.append(status))
             task = asyncio.create_task(client.run())
             await client.wait_connected(timeout=2)
             await settle(lambda: attached)
@@ -1091,7 +1122,7 @@ class TestHandshakeReplaceAll:
             client = _client(mock_logger, fake,
                              endpoint_provider=lambda: [],
                              replace_all_provider=_boom,
-                             on_attached=attached.append)
+                             on_attached=lambda status, _intent=False: attached.append(status))
             task = asyncio.create_task(client.run())
             await client.wait_connected(timeout=2)
             await settle(lambda: attached)
@@ -1106,7 +1137,7 @@ class TestHandshakeReplaceAll:
             attached = []
             fake = _fake()
             client = _client(mock_logger, fake, endpoint_provider=lambda: [],
-                             on_attached=attached.append)
+                             on_attached=lambda status, _intent=False: attached.append(status))
             task = asyncio.create_task(client.run())
             await client.wait_connected(timeout=2)
             await settle(lambda: attached)
@@ -1115,3 +1146,135 @@ class TestHandshakeReplaceAll:
             task.cancel()
 
         asyncio.run(scenario())
+
+
+def _refuse_first_attach(error_code: str, details: str):
+    """Answer the FIRST attach with ``error_code``, then behave normally."""
+    base = golden_responder()
+    seen: list = []
+
+    def _respond(frame: dict) -> list:
+        if frame["command"] == bridge_protocol.CMD_ATTACH and not seen:
+            seen.append(1)
+            return [{"message_id": frame["message_id"],
+                     "error_code": error_code, "details": details}]
+        return base(frame)
+
+    return _respond
+
+
+class TestMassRemovalBeltAndBraces:
+    """`mass_removal_refused` HALTS, and a halted client retries nothing.
+
+    Reaching it while an un-export is genuinely outstanding strands every
+    exported accessory in every ecosystem permanently, behind a message telling
+    the user to check an allow-list that was never the problem.
+    """
+
+    def test_a_refusal_with_a_debt_recorded_retries_once_with_the_intent(self, mock_logger):
+        """The belt behind `_replace_all`'s braces.
+
+        A debt normally carries the intent outright, so this fires only when the
+        first read of the flag did not see one — a prefs read that glitched, or
+        a debt written between the two. That is exactly when halting would be
+        unrecoverable, because a halted client retries nothing ever again.
+        """
+        reads: list = []
+
+        def _flaky_provider():
+            reads.append(1)
+            if len(reads) == 1:
+                raise RuntimeError("prefs are momentarily unreadable")
+            return 5
+
+        async def scenario():
+            attached = []
+            fake = _fake(responder=_refuse_first_attach(
+                bridge_protocol.ERR_MASS_REMOVAL_REFUSED,
+                "attach would remove all 5 live endpoints"))
+            client = _client(mock_logger, fake,
+                             endpoint_provider=lambda: [],
+                             replace_all_provider=_flaky_provider,
+                             on_attached=lambda status, _intent=False: attached.append(status))
+            task = asyncio.create_task(client.run())
+            await client.wait_connected(timeout=2)
+            await settle(lambda: attached)
+
+            assert client.attached, "a debt-backed refusal must not halt the client"
+            assert not client.halted
+            attaches = [f for f in fake.sent if f.get("command") == bridge_protocol.CMD_ATTACH]
+            assert len(attaches) == 2, "exactly one retry, not a loop"
+            assert bridge_protocol.ARG_INTENT not in attaches[0]["args"]
+            assert attaches[1]["args"][bridge_protocol.ARG_INTENT] == \
+                bridge_protocol.INTENT_REPLACE_ALL
+            await client.close()
+            task.cancel()
+
+        asyncio.run(scenario())
+
+    def test_a_refusal_with_NO_debt_still_halts(self, mock_logger):
+        """The §3.1 guard must not become a speed bump.
+
+        A client that was never told to un-export anything has no business
+        retrying its way past a refusal that exists to stop exactly that.
+        """
+        async def scenario():
+            fake = _fake(responder=_refuse_first_attach(
+                bridge_protocol.ERR_MASS_REMOVAL_REFUSED,
+                "attach would remove all 5 live endpoints"))
+            client = _client(mock_logger, fake,
+                             endpoint_provider=lambda: [],
+                             replace_all_provider=lambda: 0)
+            task = asyncio.create_task(client.run())
+            await settle(lambda: client.halted)
+            assert client.halted
+            assert client.halted_reason == bridge_protocol.ERR_MASS_REMOVAL_REFUSED
+            attaches = [f for f in fake.sent if f.get("command") == bridge_protocol.CMD_ATTACH]
+            assert len(attaches) == 1, "no debt, no retry"
+            await client.close()
+            task.cancel()
+
+        asyncio.run(scenario())
+
+
+class TestAttachDeadlineSizing:
+    """The discharge attach sends nothing and removes everything.
+
+    `attach_timeout_for(len(specs))` on an empty set is the 8s floor, while the
+    node is paced at ~100ms per removal (§3.3) — so ~80 exports timed out
+    mid-reconcile, the socket was torn down, and the retry did the same thing
+    forever. The accessories never left.
+    """
+
+    def _sizes(self, mock_logger, monkeypatch, specs, owed):
+        counts: list = []
+        real = bridge_client.attach_timeout_for
+        monkeypatch.setattr(bridge_client, "attach_timeout_for",
+                            lambda n: counts.append(n) or real(n))
+
+        async def scenario():
+            attached = []
+            fake = _fake()
+            client = _client(mock_logger, fake,
+                             endpoint_provider=lambda: specs,
+                             replace_all_provider=lambda: owed,
+                             on_attached=lambda status, _intent=False: attached.append(status))
+            task = asyncio.create_task(client.run())
+            await client.wait_connected(timeout=2)
+            await settle(lambda: attached)
+            await client.close()
+            task.cancel()
+
+        asyncio.run(scenario())
+        return counts
+
+    def test_the_deadline_is_sized_from_the_DEBT_when_nothing_is_sent(
+            self, mock_logger, monkeypatch):
+        counts = self._sizes(mock_logger, monkeypatch, [], 80)
+        assert 80 in counts, f"the discharge attach was sized from {counts}"
+        assert bridge_client.attach_timeout_for(80) > bridge_client.ATTACH_TIMEOUT, \
+            "80 removals must exceed the flat floor, or this proves nothing"
+
+    def test_the_larger_of_the_two_counts_wins(self, mock_logger, monkeypatch):
+        counts = self._sizes(mock_logger, monkeypatch, [KITCHEN_LAMP], 0)
+        assert counts == [1]

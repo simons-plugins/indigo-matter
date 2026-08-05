@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import zipfile
 from datetime import datetime, timezone
+from unittest.mock import Mock
 
 import pytest
 
@@ -591,3 +592,62 @@ class _RecordingLogger:
 
     def debug(self, message, *args):
         pass
+
+
+class TestBridgeStorageIsAudible:
+    """The bridge dir is DERIVED, not configured, so a wrong path is silent.
+
+    The docstring promised "a missing directory is skipped rather than raising",
+    and the skip had no log line at all — so a user whose node runs with a
+    different `--storage-path` got a plausible success message for an archive
+    containing neither `identity.json` nor `endpoint-map.json`. That is exactly
+    the archive they will reach for after losing those two files.
+    """
+
+    def _storage(self, tmp_path):
+        storage = tmp_path / "matter" / "storage"
+        storage.mkdir(parents=True)
+        (storage / "fabric.json").write_text("{}")
+        return storage
+
+    def test_a_missing_bridge_dir_warns_and_names_the_path(self, tmp_path):
+        logger = Mock()
+        storage = self._storage(tmp_path)
+        missing = tmp_path / "matter" / "bridge-node"
+
+        fabric_backup.create_backup(
+            str(storage), now=datetime(2026, 8, 5, tzinfo=timezone.utc), logger=logger,
+            bridge_storage_path=str(missing))
+
+        said = " ".join(str(call.args[0]) % call.args[1:] if len(call.args) > 1
+                        else str(call.args[0]) for call in logger.warning.call_args_list)
+        assert str(missing) in said
+        assert "identity.json" in said and "endpoint-map.json" in said
+
+    def test_an_empty_bridge_dir_warns_too(self, tmp_path):
+        logger = Mock()
+        storage = self._storage(tmp_path)
+        empty = tmp_path / "matter" / "bridge-node"
+        empty.mkdir()
+
+        fabric_backup.create_backup(
+            str(storage), now=datetime(2026, 8, 5, tzinfo=timezone.utc), logger=logger,
+            bridge_storage_path=str(empty))
+
+        assert logger.warning.called
+
+    def test_the_success_line_names_the_directory_it_covered(self, tmp_path):
+        logger = Mock()
+        storage = self._storage(tmp_path)
+        bridge = tmp_path / "matter" / "bridge-node"
+        bridge.mkdir()
+        (bridge / "identity.json").write_text("{}")
+
+        fabric_backup.create_backup(
+            str(storage), now=datetime(2026, 8, 5, tzinfo=timezone.utc), logger=logger,
+            bridge_storage_path=str(bridge))
+
+        said = " ".join(str(call.args[0]) % call.args[1:] if len(call.args) > 1
+                        else str(call.args[0]) for call in logger.info.call_args_list)
+        assert str(bridge) in said
+        assert not logger.warning.called

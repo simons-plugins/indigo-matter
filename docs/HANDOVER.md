@@ -9,11 +9,103 @@
 
 ---
 
+## 2026-08-05 — E5 hardening: the PR #126 three-review batch
+
+Applied on `feat/e5-persistence-hardening` on top of the E5 commit below.
+Plugin `2026.7.31`, bridge-node `0.4.0`. Suites: **2025 Python**, **316 TS**
+(from 1978/291 at the E5 commit).
+
+Two independent expert reviews plus a test-coverage review; 5 Criticals, ~10
+Highs, 5 Mediums and 9 coverage gaps. The five that would have hurt a real user:
+
+1. **A1 — the deploy blocker.** `refuseReasonFor` refused a commissioned bridge
+   with **no** `endpoint-map.json`, and that is the state of *every* install
+   commissioned before E5, because the file did not exist yet. jarvis today has
+   2 fabrics, 4 endpoints and no map: deploying E5 as written would have refused
+   the attach and stopped serving all four accessories. And it bought nothing —
+   **matter.js owns the numbers**, this map only witnesses them, so a missing
+   witness renumbers precisely nothing. Absent-on-commissioned is now a
+   **BOOTSTRAP**: seed the baseline from matter.js's own persisted allocation
+   (read through `ServerNodeStore`, guarded, falling back to the first attach's
+   live set) and serve, logged as a migration. Only a *present-but-unreadable*
+   map still refuses.
+2. **A2 — the recovery exits did not exist.** `rebuild_endpoint_map` had no
+   caller anywhere in the plugin, while three user-facing strings told the user
+   to confirm the rebuild "in the plugin". Two menu items now exist:
+   **"Rebuild Matter Endpoint Map…"** (§3.11, one confirm + the duplication
+   warning) and **"Reset Matter Export Pairings…"** (§3.10 `preserve=true`, two
+   confirms). Both gate on `client.connected`, not `attached` — §1.1 holds the
+   socket open un-attached and that is the only state a rebuild is needed in.
+   `remove_fabric` still has no UI; it needs E6's fabric readout to pick an
+   index from, and is deliberately deferred there.
+3. **A3 — the refusal destroyed the thing it protects.** `main.ts` called
+   `identityProblem()` and then `loadOrCreateIdentity()` unconditionally, and
+   the mint writes through `rename` — so an unreadable `identity.json` (the
+   `SerialNumber`/`UniqueID` every ecosystem knows us by, unregenerable) was
+   obliterated one line *before* the refusal that exists to protect it. Now:
+   move it aside to `identity.json.unreadable-<stamp>`, mint **in memory only**,
+   write nothing. `rebuildEndpointMap` also refuses to clear an
+   `identityUnreadable` refusal — different loss, different remedy.
+4. **A4 — pending debt + a disjoint re-add was a permanent halt.**
+   `_owes_replace_all` was ANDed with an empty allow-list. Empty the list while
+   the node is down (debt = 5), export a *different* device: the attach carried
+   no intent, the node's §3.1 guard saw 5 removals / 0 survivors, answered
+   `mass_removal_refused` — which HALTS — and blamed an allow-list that was
+   never the problem. Nothing retries a halt. The debt now answers
+   independently of store emptiness, and a `mass_removal_refused` reached while
+   a debt is recorded retries **once** with the intent instead of halting.
+5. **A5 — `remove_fabric` on the last fabric.** matter.js self-factory-resets
+   when the fabric set empties (`CommissioningServer` → `doFactoryReset()` →
+   `erase()`), and we never cleared our witness — so the next boot refused with
+   `fabricStorageLost`, blaming lost storage for a deliberate unpairing. Handled
+   in `noteFabrics`/`noteLastFabricGone` rather than in the command, so the
+   route where an *ecosystem* unpairs us is covered too.
+
+Also worth carrying forward:
+
+- **`StatusReport.warnings: string[]` is new in §4.3.** The node writes to
+  stdout and in this milestone is started **by hand**, so stdout is a terminal
+  nobody is watching — a map it could not write was invisible. The plugin
+  surfaces warnings once per streak on attach and in the export dialog.
+  `persist()`/`markCommissioned()`/`clearCommissioned()` now report whether the
+  write landed; `rebuild_endpoint_map` **fails** rather than answering
+  "serving normally again" over a map that never reached disk; `factory_reset`
+  re-reads `identity.json` to verify the witness is gone before reporting
+  completion.
+- **`driftChecked` no longer lies over a RAM-only baseline.** A `#dirty` flag
+  keeps it false while the map owes the disk something, and the next `check()`
+  retries the write even when it added nothing.
+- **§5 `fabrics_changed` / `commissioned` / `decommissioned` are actually
+  emitted.** All three were declared, documented, carried by golden frames and
+  consumed by the plugin's client — and sent by nothing.
+- **The §5 command executor has a 30s deadline, submitted/completed counters
+  and a queue-depth warning.** One wedged Z-Wave call used to block every
+  command for every device with zero log output.
+- **`preserveEndpointNumbers: true` preserves the ability to NOTICE, not the
+  numbers** — `erase()` wipes matter.js's own allocation. §3.10 now says so, and
+  the reset re-runs the drift check and reports what preservation bought.
+
+### Where the coverage still is not
+
+- **A5's last-fabric path has no automated test.** Reaching it needs a real
+  commissioned fabric, which the suite cannot create without hardware — the same
+  constraint that made `refuseReasonFor` a pure function. It is on the jarvis
+  script.
+- **`commissionedAt` is only ever written by the live fabric-changed listener**
+  (`node.ts`). Every refuse test injects it into the constructed identity, so
+  only a real pairing exercises the write.
+- **`mapUnreadable` and the A1 bootstrap are unreachable end-to-end** without a
+  real fabric: the unit tests cover `refuseReasonFor` and `EndpointMapStore.seed`
+  directly, and `persistence.test.ts` covers everything a test *can* commission.
+
+---
+
 ## 2026-08-05 — E5 (endpoint persistence), branch `feat/e5-persistence-hardening`
 
-Plugin `2026.7.30`, bridge-node `0.4.0`. Suites: **1978 Python**, **291 TS**
-(from 1947/239). `tests/fixtures/bridge_protocol/frames.json`'s `pending`
-section is now **EMPTY** and both suites assert that it is.
+Plugin `2026.7.30`, bridge-node `0.4.0`. Suites at this commit: **1978 Python**,
+**291 TS** (from 1947/239). `tests/fixtures/bridge_protocol/frames.json`'s
+`pending` section is now **EMPTY**; the TS suite asserted it here and the Python
+suite gained the matching assertion in the hardening batch above.
 
 ### The shape of the thing, because it is not what the protocol implies
 
@@ -45,17 +137,26 @@ fact:
 
 | Condition | Reason |
 |---|---|
-| fabrics exist, `endpoint-map.json` unreadable or absent | the numbers being served cannot be checked against anything |
+| fabrics exist, `endpoint-map.json` **present and unreadable** | the numbers being served cannot be checked against a baseline we know exists |
 | `identity.commissionedAt` set, no fabrics | PRD §7 "storage missing but previously commissioned" |
 | `identity.json` present but unusable | minting over it changes the `SerialNumber` every ecosystem knows us by |
+
+> **Corrected by the #126 batch.** The first row originally read "unreadable **or
+> absent**", and that was wrong in the direction that breaks deployments: every
+> bridge commissioned before E5 has fabrics and no map file, so an upgrade
+> refused and stopped serving working accessories. Absent-on-commissioned is now
+> a bootstrap, not a refusal. The claim below that "an upgrade never refuses"
+> was true only of the `commissionedAt` field, never of the map.
 
 `commissionedAt` is a new optional field on `identity.json`, stamped the first
 time a fabric is observed. It has to live there because the failure it witnesses
 *is* matter.js's storage having vanished — anything stored inside that storage
 cannot tell "never paired" from "paired, then the directory was lost". Absent on
-pre-E5 identities, which reads correctly as "no evidence", so an upgrade never
-refuses. Cleared by `factory_reset` and by `rebuild_endpoint_map`, or the reset
-would refuse to itself on the next start.
+pre-E5 identities, which reads correctly as "no evidence of *commissioning*" —
+though on its own that was never enough to stop an upgrade refusing, because the
+missing **map** did it instead (see the correction above). Cleared by
+`factory_reset`, by `rebuild_endpoint_map`, and — since the #126 batch — whenever
+the fabric set empties, or the reset would refuse to itself on the next start.
 
 The refusal decision is `endpoint-map.ts`'s `refuseReasonFor` — one pure
 function, no matter.js — because the case that matters most (fabrics exist +
@@ -135,6 +236,17 @@ Still deferred, unchanged, both needing a `BRIDGE_PROTOCOL.md` change:
    §3.x `clear_state`. **Unchanged by E5** — `diff_from` reports the gap against
    what was pushed, which is if anything the more accurate question, but it still
    has nowhere to put the answer on the wire.
+
+   **And since E5 the detection is process-scoped** (#126 C4). `diff_from`
+   compares against `_pushed`, and `_pushed` is seeded from `states_for`, which
+   *omits* a key that is already absent — so a sensor that was already flat when
+   the plugin loaded has no baseline entry for the key it stopped reporting, and
+   `_report_stopped_keys` therefore says nothing. The practical shape: a
+   dead-battery sensor warns **once**, at the moment it goes quiet, and never
+   again after a plugin reload. That is not a regression from anything (there
+   was no report at all before E5) and it is arguably the right noise level, but
+   it means "no stopped-key warnings since the reload" is not evidence that
+   every sensor is reporting. A real fix rides with the §4.2 "unknown" value.
 2. **Dropped invocations are not reported to the plugin.** A `lock`/`unlock`
    arriving while the plugin is away reaches no sink and there is no frame for
    telling the plugin what it missed on the next `attach`. `doorLock` still fails

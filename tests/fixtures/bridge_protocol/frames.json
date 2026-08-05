@@ -66,7 +66,8 @@
         "endpointCount": 0,
         "endpoints": [],
         "drift": [],
-        "driftChecked": false
+        "driftChecked": false,
+        "warnings": []
       }
     }
   },
@@ -141,7 +142,8 @@
           }
         ],
         "drift": [],
-        "driftChecked": false
+        "driftChecked": false,
+        "warnings": []
       }
     }
   },
@@ -327,7 +329,8 @@
           }
         ],
         "drift": [],
-        "driftChecked": false
+        "driftChecked": false,
+        "warnings": []
       }
     }
   },
@@ -356,7 +359,8 @@
         "endpointCount": 0,
         "endpoints": [],
         "drift": [],
-        "driftChecked": false
+        "driftChecked": false,
+        "warnings": []
       }
     }
   },
@@ -967,7 +971,8 @@
           }
         ],
         "drift": [],
-        "driftChecked": false
+        "driftChecked": false,
+        "warnings": []
       }
     }
   },
@@ -1275,7 +1280,8 @@
           }
         ],
         "drift": [],
-        "driftChecked": true
+        "driftChecked": true,
+        "warnings": []
       }
     }
   },

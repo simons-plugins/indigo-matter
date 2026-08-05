@@ -530,7 +530,7 @@ class ColorTemperatureLightExport(DimmableLightExport):
         return {**super().commands(), COMMAND_SET_COLOR_TEMP: self._set_color_temp}
 
     @staticmethod
-    def _set_color_temp(args: dict, dev: Any, _options: dict) -> None:
+    def _set_color_temp(args: dict, dev: Any, _options: dict) -> Optional[str]:
         """Set white temperature, preserving the white channel's own level.
 
         ``setColorLevels`` documents whiteTemperature as used *in combination
@@ -573,9 +573,14 @@ class ColorTemperatureLightExport(DimmableLightExport):
             raise ValueError(f"setColorTemp without usable mireds: {args!r}")
         white_level = _number(dev, "whiteLevel")
         if white_level is None:
-            _LOG.debug("setColorTemp skipped: device %s has no white channel",
-                       getattr(dev, "id", "?"))
-            return
+            # The tri-state reason, not a bare `return`. `dispatch` ends in
+            # `handler(...) or True`, so returning None reported SUCCESS for a
+            # command that did nothing at all — the ecosystem had already
+            # flipped its tile to the new colour temperature, the lamp never
+            # moved, and the only trace was a debug line from a static method
+            # that cannot name the device. The caller latches this per device.
+            return ("the Indigo device has no white channel, so there is no colour "
+                    "temperature to set")
         levels: dict[str, int] = {
             "whiteLevel": int(_clamp(round(white_level), 0, 100)),
             "whiteTemperature": mireds_to_kelvin(
@@ -584,6 +589,7 @@ class ColorTemperatureLightExport(DimmableLightExport):
         if _number(dev, "redLevel") is not None:
             levels.update(redLevel=0, greenLevel=0, blueLevel=0)
         indigo.dimmer.setColorLevels(dev, **levels)
+        return None
 
 
 class ExtendedColorLightExport(ColorTemperatureLightExport):
