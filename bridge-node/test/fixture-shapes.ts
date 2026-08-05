@@ -1,6 +1,7 @@
 /**
- * Compile-time mirror of the E0 half of `../tests/fixtures/bridge_protocol/frames.json`
- * — the repo-root golden file shared with the Python suite (§7 testing contract).
+ * Compile-time mirror of the implemented half of
+ * `../tests/fixtures/bridge_protocol/frames.json` — the repo-root golden file
+ * shared with the Python suite (§7 testing contract).
  *
  * `JSON.parse` erases types, so the golden file alone cannot fail `tsc` when a
  * shape in `protocol.ts` drifts. Each payload is restated here bound with
@@ -17,10 +18,16 @@ import type {
     CommissioningWindowResult,
     ErrorFrame,
     EventFrame,
+    FabricInfo,
     HandshakeFrame,
     PairingReport,
+    RemoveResult,
     StatusReport,
+    UpsertResult,
 } from "../src/protocol.js";
+
+/** The one paired ecosystem the populated fixtures assume. */
+const APPLE_HOME = { fabricIndex: 1, label: "Apple Home", vendorId: 4937 } satisfies FabricInfo;
 
 /** Versions are placeholders: the real ones track package.json / matter.js. */
 export const handshake = {
@@ -29,22 +36,30 @@ export const handshake = {
     matterJsVersion: "0.0.0-test",
 } satisfies HandshakeFrame;
 
-/** What the E0 node actually serves: one hard-coded endpoint, ignoring `attach`. */
+/**
+ * The status of a bridge that has reconciled the {@link attachWithEndpoints}
+ * set — what `get_status` answers once `attach` has run. Both frames share it,
+ * which is exactly the §6.2 invariant: `attach` returns the same StatusReport
+ * `get_status` would.
+ */
 export const status = {
-    commissioned: false,
-    fabrics: [],
-    endpointCount: 1,
-    endpoints: [{ indigoDeviceId: 999001, endpointNumber: 2, role: "onOffPlugInUnit" }],
+    commissioned: true,
+    fabrics: [APPLE_HOME],
+    endpointCount: 2,
+    endpoints: [
+        { indigoDeviceId: 123456789, endpointNumber: 2, role: "onOffLight" },
+        { indigoDeviceId: 123456790, endpointNumber: 3, role: "dimmableLight" },
+    ],
     drift: [],
+    // §4.3: false until E5 persists the endpoint-number map — an empty `drift`
+    // on its own would read as an all-clear nobody has actually checked.
+    driftChecked: false,
 } satisfies StatusReport;
 
 /**
- * The lawful §3.1 answer to the golden `attach` REQUEST, which carries
- * `endpoints: []` — an empty desired set reconciles to an empty live set.
- *
- * The E0 node does not reconcile yet (it ignores the requested set and serves
- * {@link status}), so `protocol.test.ts` asserts attach against the live status
- * instead. The two converge when E2 makes `attach` do the reconcile for real.
+ * The §3.1 answer to an `attach` carrying `endpoints: []` against a node with
+ * nothing live — an empty desired set reconciles to an empty live set. The
+ * mass-removal guard does not fire: there was nothing to remove.
  */
 export const statusEmpty = {
     commissioned: false,
@@ -52,7 +67,72 @@ export const statusEmpty = {
     endpointCount: 0,
     endpoints: [],
     drift: [],
+    driftChecked: false,
 } satisfies StatusReport;
+
+/** §3.1 with `intent: "replace_all"`: the live set is emptied deliberately. */
+export const statusReplaceAll = {
+    commissioned: true,
+    fabrics: [APPLE_HOME],
+    endpointCount: 0,
+    endpoints: [],
+    drift: [],
+    driftChecked: false,
+} satisfies StatusReport;
+
+/** §3.2 — the live endpoint's Matter number, for the plugin's own records. */
+export const upsertResult = { endpointNumber: 2 } satisfies UpsertResult;
+
+/** §3.3 — the two idempotent outcomes. */
+export const removeResult = { removed: true } satisfies RemoveResult;
+export const removeAbsentResult = { removed: false } satisfies RemoveResult;
+
+/** §3.4/§3.5 both answer with an empty result on success. */
+export const emptyResult = {};
+
+/** §3.1: emptying a non-empty live set needs `intent: "replace_all"`. */
+export const massRemovalRefused = {
+    message_id: "m12",
+    error_code: "mass_removal_refused",
+    details: "attach would remove all 2 live endpoints without intent: replace_all",
+} satisfies ErrorFrame;
+
+/** §4.1: ecosystems cache device types per endpoint, so a role change is a refusal. */
+export const roleChange = {
+    message_id: "m14",
+    error_code: "role_change",
+    details: "endpoint 123456789 is onOffLight; remove and re-add to change role",
+} satisfies ErrorFrame;
+
+/** §3.4 against a device with no live endpoint. */
+export const setStateUnknownDevice = {
+    message_id: "m18",
+    error_code: "unknown_device",
+    details: "no live endpoint for indigoDeviceId 123456791",
+} satisfies ErrorFrame;
+
+/**
+ * §3.4 against a live device, with keys its role does not speak.
+ *
+ * The sibling of {@link setStateUnknownDevice}, and the more dangerous of the
+ * two: the device exists, so nothing looks wrong. Answering `{}` here would
+ * report success for a write that produced no patch at all, and the plugin —
+ * which does not await `set_state` — would never find out. `level` on an
+ * `onOffLight` is the shape of it that actually happens: a role edited in the
+ * export dialog while the plugin keeps pushing the old role's states.
+ */
+export const setStateBadKeys = {
+    message_id: "m44",
+    error_code: "malformed_args",
+    details: "role onOffLight consumed none of the states given; rejected key(s): level (§4.2)",
+} satisfies ErrorFrame;
+
+/** §4.2/§1.1: a lawful frame naming a role outside the v1 enum. */
+export const upsertUnknownRole = {
+    message_id: "m29",
+    error_code: "unknown_role",
+    details: "role airPurifier is not in the v1 role enum (§4.2)",
+} satisfies ErrorFrame;
 
 /** §3.7 state 1: never commissioned — the basic window with the persisted codes. */
 export const pairingUncommissioned = {

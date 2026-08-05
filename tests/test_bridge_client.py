@@ -24,7 +24,15 @@ from conftest import load_bridge_frames
 from fakes import FakeWebSocket, returns
 
 FRAMES = load_bridge_frames()
-PENDING = FRAMES["pending"]
+#: Every request/response exchange in the golden file, keyed by name.
+#: Which section a frame sits in ("pending" or top level) is a statement about
+#: what the BRIDGE NODE implements — E3 promoted the endpoint-CRUD frames when
+#: it grew their handlers — and says nothing about the plugin-side client these
+#: tests drive, which has spoken all of them since E1.
+EXCHANGES = {
+    **{k: v for k, v in FRAMES.items() if isinstance(v, dict) and "request" in v},
+    **{k: v for k, v in FRAMES["pending"].items() if not k.startswith("_")},
+}
 
 HELLO = FRAMES["handshake"]
 SKEWED_HELLO = {**HELLO, "protocolVersion": bridge_protocol.PROTOCOL_VERSION + 1}
@@ -35,13 +43,13 @@ RESPONSES = {
     bridge_protocol.CMD_GET_STATUS: FRAMES["get_status"]["response"],
     bridge_protocol.CMD_GET_PAIRING: FRAMES["get_pairing_commissioned"]["response"],
     bridge_protocol.CMD_OPEN_WINDOW: FRAMES["open_commissioning_window"]["response"],
-    bridge_protocol.CMD_UPSERT_ENDPOINT: PENDING["upsert_endpoint"]["response"],
-    bridge_protocol.CMD_REMOVE_ENDPOINT: PENDING["remove_endpoint"]["response"],
-    bridge_protocol.CMD_SET_STATE: PENDING["set_state"]["response"],
-    bridge_protocol.CMD_SET_REACHABLE: PENDING["set_reachable"]["response"],
-    bridge_protocol.CMD_REMOVE_FABRIC: PENDING["remove_fabric"]["response"],
-    bridge_protocol.CMD_FACTORY_RESET: PENDING["factory_reset"]["response"],
-    bridge_protocol.CMD_REBUILD_ENDPOINT_MAP: PENDING["rebuild_endpoint_map"]["response"],
+    bridge_protocol.CMD_UPSERT_ENDPOINT: EXCHANGES["upsert_endpoint"]["response"],
+    bridge_protocol.CMD_REMOVE_ENDPOINT: EXCHANGES["remove_endpoint"]["response"],
+    bridge_protocol.CMD_SET_STATE: EXCHANGES["set_state"]["response"],
+    bridge_protocol.CMD_SET_REACHABLE: EXCHANGES["set_reachable"]["response"],
+    bridge_protocol.CMD_REMOVE_FABRIC: EXCHANGES["remove_fabric"]["response"],
+    bridge_protocol.CMD_FACTORY_RESET: EXCHANGES["factory_reset"]["response"],
+    bridge_protocol.CMD_REBUILD_ENDPOINT_MAP: EXCHANGES["rebuild_endpoint_map"]["response"],
 }
 
 KITCHEN_LAMP = EndpointSpec(
@@ -248,23 +256,23 @@ class TestCommands:
 
     def test_upsert_endpoint(self, mock_logger):
         result = self._exchange(
-            mock_logger, lambda c: c.upsert_endpoint(KITCHEN_LAMP), "upsert_endpoint", PENDING)
+            mock_logger, lambda c: c.upsert_endpoint(KITCHEN_LAMP), "upsert_endpoint", EXCHANGES)
         assert result == 2
 
     def test_upsert_endpoint_accepts_a_wire_dict(self, mock_logger):
-        wire = PENDING["upsert_endpoint"]["request"]["args"]["endpoint"]
+        wire = EXCHANGES["upsert_endpoint"]["request"]["args"]["endpoint"]
         assert self._exchange(mock_logger, lambda c: c.upsert_endpoint(wire),
-                              "upsert_endpoint", PENDING) == 2
+                              "upsert_endpoint", EXCHANGES) == 2
 
     def test_remove_endpoint(self, mock_logger):
         assert self._exchange(mock_logger, lambda c: c.remove_endpoint(123456789),
-                              "remove_endpoint", PENDING) is True
+                              "remove_endpoint", EXCHANGES) is True
 
     def test_remove_endpoint_absent_is_not_an_error(self, mock_logger):
         # §3.3: idempotent — removing what is not there succeeds with removed=false.
         async def scenario():
             fake = _fake(responder=golden_responder(
-                {bridge_protocol.CMD_REMOVE_ENDPOINT: PENDING["remove_endpoint_absent"]["response"]}))
+                {bridge_protocol.CMD_REMOVE_ENDPOINT: EXCHANGES["remove_endpoint_absent"]["response"]}))
             client = _client(mock_logger, fake)
             task = asyncio.create_task(client.run())
             await client.wait_connected(timeout=2)
@@ -275,12 +283,12 @@ class TestCommands:
 
     def test_set_reachable(self, mock_logger):
         self._exchange(mock_logger, lambda c: c.set_reachable(123456789, False),
-                       "set_reachable", PENDING)
+                       "set_reachable", EXCHANGES)
 
     def test_get_status(self, mock_logger):
         status = self._exchange(mock_logger, lambda c: c.get_status(), "get_status", FRAMES)
-        assert status.endpoint_count == 1
-        assert status.endpoints[0].role == "onOffPlugInUnit"
+        assert status.endpoint_count == 2
+        assert status.endpoints[0].role == "onOffLight"
 
     def test_get_pairing(self, mock_logger):
         pairing = self._exchange(mock_logger, lambda c: c.get_pairing(),
@@ -299,18 +307,18 @@ class TestCommands:
                        "open_commissioning_window", FRAMES)
 
     def test_remove_fabric(self, mock_logger):
-        self._exchange(mock_logger, lambda c: c.remove_fabric(2), "remove_fabric", PENDING)
+        self._exchange(mock_logger, lambda c: c.remove_fabric(2), "remove_fabric", EXCHANGES)
 
     def test_factory_reset_preserves_endpoint_numbers_by_default(self, mock_logger):
-        self._exchange(mock_logger, lambda c: c.factory_reset(), "factory_reset", PENDING)
+        self._exchange(mock_logger, lambda c: c.factory_reset(), "factory_reset", EXCHANGES)
 
     def test_factory_reset_can_discard_the_map(self, mock_logger):
         self._exchange(mock_logger, lambda c: c.factory_reset(False),
-                       "factory_reset_discard_map", PENDING)
+                       "factory_reset_discard_map", EXCHANGES)
 
     def test_rebuild_endpoint_map(self, mock_logger):
         status = self._exchange(mock_logger, lambda c: c.rebuild_endpoint_map(),
-                                "rebuild_endpoint_map", PENDING)
+                                "rebuild_endpoint_map", EXCHANGES)
         assert status.endpoint_count == 2
         # §3.11 REallocates — the numbers differ from the ones attach reported.
         assert status.endpoints[1].endpoint_number == 5
@@ -318,7 +326,7 @@ class TestCommands:
     def test_error_response_raises(self, mock_logger):
         async def scenario():
             fake = _fake(responder=golden_responder(
-                {bridge_protocol.CMD_UPSERT_ENDPOINT: PENDING["upsert_endpoint_role_change"]["response"]}))
+                {bridge_protocol.CMD_UPSERT_ENDPOINT: EXCHANGES["upsert_endpoint_role_change"]["response"]}))
             client = _client(mock_logger, fake)
             task = asyncio.create_task(client.run())
             await client.wait_connected(timeout=2)
@@ -344,7 +352,7 @@ class TestSetState:
 
             await asyncio.wait_for(client.set_state(123456789, {"onOff": True}), timeout=0.5)
             frame = sent(fake, bridge_protocol.CMD_SET_STATE)
-            assert frame["args"] == PENDING["set_state"]["request"]["args"]
+            assert frame["args"] == EXCHANGES["set_state"]["request"]["args"]
             assert client._pending == {}, "set_state must not register a pending future"
 
             await client.close()
@@ -356,7 +364,7 @@ class TestSetState:
         # unnoticed failure looks exactly like "the ecosystem shows stale state".
         async def scenario():
             fake = _fake(responder=golden_responder(
-                {bridge_protocol.CMD_SET_STATE: PENDING["set_state_unknown_device"]["response"]}))
+                {bridge_protocol.CMD_SET_STATE: EXCHANGES["set_state_unknown_device"]["response"]}))
             client = _client(mock_logger, fake)
             task = asyncio.create_task(client.run())
             await client.wait_connected(timeout=2)
@@ -423,7 +431,7 @@ class TestEvents:
         assert [(c.indigo_device_id, c.command, c.args) for c in received] == [
             (123456789, "onOff", {"value": True}),
             (123456789, "setLevel", {"level": 60}),
-            (123456790, "lock", {}),
+            (900007, "lock", {}),
         ]
 
     def test_fabric_events(self, mock_logger):
@@ -691,7 +699,7 @@ class TestEndpointMapInvalid:
     def _recovering(self, mock_logger, overrides=None):
         table = {bridge_protocol.CMD_ATTACH: error_response(
             bridge_protocol.ERR_ENDPOINT_MAP_INVALID,
-            PENDING["endpoint_map_invalid"]["response"]["details"])}
+            EXCHANGES["endpoint_map_invalid"]["response"]["details"])}
         table.update(overrides or {})
         fake = _fake(responder=golden_responder(table))
         return fake, _client(mock_logger, fake)
@@ -723,7 +731,7 @@ class TestEndpointMapInvalid:
             task = asyncio.create_task(client.run())
             await settle(lambda: client.recovery)
 
-            assert (await client.get_status()).endpoint_count == 1
+            assert (await client.get_status()).endpoint_count == 2
             assert (await client.get_pairing()).commissioned is True
 
             await client.close()
@@ -831,7 +839,7 @@ class TestSetStateFailurePaths:
         # bare message_id is not something a user can act on.
         async def scenario():
             fake = _fake(responder=golden_responder(
-                {bridge_protocol.CMD_SET_STATE: PENDING["set_state_unknown_device"]["response"]}))
+                {bridge_protocol.CMD_SET_STATE: EXCHANGES["set_state_unknown_device"]["response"]}))
             client = _client(mock_logger, fake)
             task = asyncio.create_task(client.run())
             await client.wait_connected(timeout=2)
@@ -942,7 +950,7 @@ class TestReattach:
             assert client.status.endpoint_count == 0
 
             # The node now serves the two-endpoint set.
-            answers[bridge_protocol.CMD_ATTACH] = PENDING["attach_with_endpoints"]["response"]
+            answers[bridge_protocol.CMD_ATTACH] = EXCHANGES["attach_with_endpoints"]["response"]
             refreshed = await client.attach([KITCHEN_LAMP])
 
             assert client.status is refreshed

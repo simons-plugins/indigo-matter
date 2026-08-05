@@ -9,25 +9,28 @@
     "Shapes only — bridgeVersion/matterJsVersion are substituted at assert time,",
     "since they track package.json and the pinned matter.js release.",
     "",
-    "Top level: the handshake, the exchanges the E0 node implements, and every",
-    "§5 event. 'pending' holds exchanges for commands the node does not implement",
-    "yet (endpoint CRUD, §3.2-§3.5, plus §3.9-§3.11 and the §3.1 mass-removal",
-    "guard); the TS suite skips those, the Python client suite does not — the",
-    "plugin half of E1 is what this PR builds.",
+    "Top level: the handshake, the exchanges the node implements, and every §5",
+    "event. 'pending' holds exchanges for commands the node does not implement",
+    "yet (the E4 roles' set_state family, §3.9-§3.11); the TS suite skips those,",
+    "the Python client suite does not — the plugin half shipped at E1.",
     "",
-    "Three frames are deliberately not what the live E0 node produces, and the",
-    "suites know it:",
+    "Two frames are deliberately not what a live node produces from a cold start,",
+    "and the suites know it:",
     " - 'attach' answers with an EMPTY endpoint set, because the request it",
-    "   answers carries `endpoints: []`. That is the lawful §3.1 pair. The E0",
-    "   node ignores the requested set and serves its hard-coded 999001 endpoint",
-    "   (see 'get_status'), so its attach test asserts the live status instead;",
-    "   the two converge when E2 makes attach reconcile for real.",
+    "   answers carries `endpoints: []`. That is the lawful §3.1 pair, and it is",
+    "   also what a node with nothing live does — the mass-removal guard only",
+    "   fires against a non-empty live set.",
     " - 'unknown_command' uses a name that is not in §3 at all. It used to use",
     "   upsert_endpoint 'because the node does not know it yet', which made the",
-    "   fixture expire the moment E1 landed the handler.",
-    " - 'command_unexported_device' targets an indigoDeviceId in no endpoint set,",
-    "   for the E3 path where the allow-list no longer contains the device an",
-    "   ecosystem just acted on (§5 / PRD §7 race row): no action, one warning."
+    "   fixture expire the moment the handler landed.",
+    "",
+    "'get_status' carries the same StatusReport 'attach_with_endpoints' returns:",
+    "§6.2's invariant is that attach answers with exactly what get_status would,",
+    "so the two frames sharing a payload is the contract, not a copy-paste.",
+    "",
+    "'command_unexported_device' targets an indigoDeviceId in no endpoint set, for",
+    "the path where the allow-list no longer contains the device an ecosystem just",
+    "acted on (§5 / PRD §7 race row): no action, one warning."
   ],
   "handshake": {
     "protocolVersion": 1,
@@ -51,7 +54,8 @@
         "fabrics": [],
         "endpointCount": 0,
         "endpoints": [],
-        "drift": []
+        "drift": [],
+        "driftChecked": false
       }
     }
   },
@@ -104,17 +108,29 @@
     "response": {
       "message_id": "m5",
       "result": {
-        "commissioned": false,
-        "fabrics": [],
-        "endpointCount": 1,
-        "endpoints": [
+        "commissioned": true,
+        "fabrics": [
           {
-            "indigoDeviceId": 999001,
-            "endpointNumber": 2,
-            "role": "onOffPlugInUnit"
+            "fabricIndex": 1,
+            "label": "Apple Home",
+            "vendorId": 4937
           }
         ],
-        "drift": []
+        "endpointCount": 2,
+        "endpoints": [
+          {
+            "indigoDeviceId": 123456789,
+            "endpointNumber": 2,
+            "role": "onOffLight"
+          },
+          {
+            "indigoDeviceId": 123456790,
+            "endpointNumber": 3,
+            "role": "dimmableLight"
+          }
+        ],
+        "drift": [],
+        "driftChecked": false
       }
     }
   },
@@ -243,6 +259,275 @@
       "details": "mDNS advertiser is down"
     }
   },
+  "attach_with_endpoints": {
+    "request": {
+      "message_id": "m10",
+      "command": "attach",
+      "args": {
+        "protocolVersion": 1,
+        "pluginVersion": "2026.8.1",
+        "endpoints": [
+          {
+            "indigoDeviceId": 123456789,
+            "role": "onOffLight",
+            "label": "Kitchen Lamp",
+            "reachable": true,
+            "states": {
+              "onOff": true
+            },
+            "options": {}
+          },
+          {
+            "indigoDeviceId": 123456790,
+            "role": "dimmableLight",
+            "label": "Lounge Lamp",
+            "reachable": true,
+            "states": {
+              "onOff": true,
+              "level": 60
+            },
+            "options": {}
+          }
+        ]
+      }
+    },
+    "response": {
+      "message_id": "m10",
+      "result": {
+        "commissioned": true,
+        "fabrics": [
+          {
+            "fabricIndex": 1,
+            "label": "Apple Home",
+            "vendorId": 4937
+          }
+        ],
+        "endpointCount": 2,
+        "endpoints": [
+          {
+            "indigoDeviceId": 123456789,
+            "endpointNumber": 2,
+            "role": "onOffLight"
+          },
+          {
+            "indigoDeviceId": 123456790,
+            "endpointNumber": 3,
+            "role": "dimmableLight"
+          }
+        ],
+        "drift": [],
+        "driftChecked": false
+      }
+    }
+  },
+  "attach_replace_all": {
+    "request": {
+      "message_id": "m11",
+      "command": "attach",
+      "args": {
+        "protocolVersion": 1,
+        "pluginVersion": "2026.8.1",
+        "endpoints": [],
+        "intent": "replace_all"
+      }
+    },
+    "response": {
+      "message_id": "m11",
+      "result": {
+        "commissioned": true,
+        "fabrics": [
+          {
+            "fabricIndex": 1,
+            "label": "Apple Home",
+            "vendorId": 4937
+          }
+        ],
+        "endpointCount": 0,
+        "endpoints": [],
+        "drift": [],
+        "driftChecked": false
+      }
+    }
+  },
+  "attach_mass_removal_refused": {
+    "request": {
+      "message_id": "m12",
+      "command": "attach",
+      "args": {
+        "protocolVersion": 1,
+        "pluginVersion": "2026.8.1",
+        "endpoints": []
+      }
+    },
+    "response": {
+      "message_id": "m12",
+      "error_code": "mass_removal_refused",
+      "details": "attach would remove all 2 live endpoints without intent: replace_all"
+    }
+  },
+  "upsert_endpoint": {
+    "request": {
+      "message_id": "m13",
+      "command": "upsert_endpoint",
+      "args": {
+        "endpoint": {
+          "indigoDeviceId": 123456789,
+          "role": "onOffLight",
+          "label": "Kitchen Lamp",
+          "reachable": true,
+          "states": {
+            "onOff": true
+          },
+          "options": {}
+        }
+      }
+    },
+    "response": {
+      "message_id": "m13",
+      "result": {
+        "endpointNumber": 2
+      }
+    }
+  },
+  "upsert_endpoint_role_change": {
+    "request": {
+      "message_id": "m14",
+      "command": "upsert_endpoint",
+      "args": {
+        "endpoint": {
+          "indigoDeviceId": 123456789,
+          "role": "dimmableLight",
+          "label": "Kitchen Lamp",
+          "reachable": true,
+          "states": {
+            "onOff": true,
+            "level": 60
+          },
+          "options": {}
+        }
+      }
+    },
+    "response": {
+      "message_id": "m14",
+      "error_code": "role_change",
+      "details": "endpoint 123456789 is onOffLight; remove and re-add to change role"
+    }
+  },
+  "upsert_endpoint_unknown_role": {
+    "request": {
+      "message_id": "m29",
+      "command": "upsert_endpoint",
+      "args": {
+        "endpoint": {
+          "indigoDeviceId": 900099,
+          "role": "airPurifier",
+          "label": "Bedroom Purifier",
+          "reachable": true,
+          "states": {},
+          "options": {}
+        }
+      }
+    },
+    "response": {
+      "message_id": "m29",
+      "error_code": "unknown_role",
+      "details": "role airPurifier is not in the v1 role enum (§4.2)"
+    }
+  },
+  "remove_endpoint": {
+    "request": {
+      "message_id": "m15",
+      "command": "remove_endpoint",
+      "args": {
+        "indigoDeviceId": 123456789
+      }
+    },
+    "response": {
+      "message_id": "m15",
+      "result": {
+        "removed": true
+      }
+    }
+  },
+  "remove_endpoint_absent": {
+    "request": {
+      "message_id": "m16",
+      "command": "remove_endpoint",
+      "args": {
+        "indigoDeviceId": 123456791
+      }
+    },
+    "response": {
+      "message_id": "m16",
+      "result": {
+        "removed": false
+      }
+    }
+  },
+  "set_state": {
+    "request": {
+      "message_id": "m17",
+      "command": "set_state",
+      "args": {
+        "indigoDeviceId": 123456789,
+        "states": {
+          "onOff": true
+        }
+      }
+    },
+    "response": {
+      "message_id": "m17",
+      "result": {}
+    }
+  },
+  "set_state_unknown_device": {
+    "request": {
+      "message_id": "m18",
+      "command": "set_state",
+      "args": {
+        "indigoDeviceId": 123456791,
+        "states": {
+          "onOff": true
+        }
+      }
+    },
+    "response": {
+      "message_id": "m18",
+      "error_code": "unknown_device",
+      "details": "no live endpoint for indigoDeviceId 123456791"
+    }
+  },
+  "set_state_bad_keys": {
+    "request": {
+      "message_id": "m44",
+      "command": "set_state",
+      "args": {
+        "indigoDeviceId": 123456789,
+        "states": {
+          "level": 55
+        }
+      }
+    },
+    "response": {
+      "message_id": "m44",
+      "error_code": "malformed_args",
+      "details": "role onOffLight consumed none of the states given; rejected key(s): level (§4.2)"
+    }
+  },
+  "set_reachable": {
+    "request": {
+      "message_id": "m19",
+      "command": "set_reachable",
+      "args": {
+        "indigoDeviceId": 123456789,
+        "reachable": false
+      }
+    },
+    "response": {
+      "message_id": "m19",
+      "result": {}
+    }
+  },
   "window_closed_expired": {
     "event": "window_closed",
     "data": {
@@ -278,7 +563,7 @@
   "command_lock": {
     "event": "command",
     "data": {
-      "indigoDeviceId": 123456790,
+      "indigoDeviceId": 900007,
       "command": "lock",
       "args": {}
     }
@@ -412,245 +697,20 @@
   },
   "pending": {
     "_comment": [
-      "E1 commands the bridge node does not implement yet. The TS suite skips",
-      "these (and asserts they are skipped for a reason); the Python client",
-      "suite asserts them in full, because the plugin side ships now.",
+      "Commands and roles the bridge node does not implement yet. The TS suite skips",
+      "these (and asserts they are skipped for a reason); the Python client suite",
+      "asserts them in full, because the plugin side ships first.",
       "",
       "'attach_all_roles' and the 'set_state_*' family exist so every §4.2 role,",
       "state key and command name is carried by a real frame rather than a list in",
       "a test file — tests/test_bridge_protocol_frames.py enumerates the",
       "vocabularies from bridge_protocol.ROLE_STATE_KEYS / ROLE_COMMANDS and fails",
       "if any of them has no frame. onOffLight's set_state is the plain 'set_state'",
-      "entry above; the rest are named per role."
+      "entry at the top level; the rest are named per role.",
+      "",
+      "E3 implements the relay/dimmer/colour roles only, so attach_all_roles stays",
+      "here until E4 adds sensors, thermostat, doorLock and windowCovering."
     ],
-    "attach_with_endpoints": {
-      "request": {
-        "message_id": "m10",
-        "command": "attach",
-        "args": {
-          "protocolVersion": 1,
-          "pluginVersion": "2026.8.1",
-          "endpoints": [
-            {
-              "indigoDeviceId": 123456789,
-              "role": "onOffLight",
-              "label": "Kitchen Lamp",
-              "reachable": true,
-              "states": {
-                "onOff": true
-              },
-              "options": {}
-            },
-            {
-              "indigoDeviceId": 123456790,
-              "role": "doorLock",
-              "label": "Front Door",
-              "reachable": true,
-              "states": {
-                "locked": true
-              },
-              "options": {}
-            }
-          ]
-        }
-      },
-      "response": {
-        "message_id": "m10",
-        "result": {
-          "commissioned": true,
-          "fabrics": [
-            {
-              "fabricIndex": 1,
-              "label": "Apple Home",
-              "vendorId": 4937
-            }
-          ],
-          "endpointCount": 2,
-          "endpoints": [
-            {
-              "indigoDeviceId": 123456789,
-              "endpointNumber": 2,
-              "role": "onOffLight"
-            },
-            {
-              "indigoDeviceId": 123456790,
-              "endpointNumber": 3,
-              "role": "doorLock"
-            }
-          ],
-          "drift": []
-        }
-      }
-    },
-    "attach_replace_all": {
-      "request": {
-        "message_id": "m11",
-        "command": "attach",
-        "args": {
-          "protocolVersion": 1,
-          "pluginVersion": "2026.8.1",
-          "endpoints": [],
-          "intent": "replace_all"
-        }
-      },
-      "response": {
-        "message_id": "m11",
-        "result": {
-          "commissioned": true,
-          "fabrics": [
-            {
-              "fabricIndex": 1,
-              "label": "Apple Home",
-              "vendorId": 4937
-            }
-          ],
-          "endpointCount": 0,
-          "endpoints": [],
-          "drift": []
-        }
-      }
-    },
-    "attach_mass_removal_refused": {
-      "request": {
-        "message_id": "m12",
-        "command": "attach",
-        "args": {
-          "protocolVersion": 1,
-          "pluginVersion": "2026.8.1",
-          "endpoints": []
-        }
-      },
-      "response": {
-        "message_id": "m12",
-        "error_code": "mass_removal_refused",
-        "details": "attach would remove all 2 live endpoints without intent: replace_all"
-      }
-    },
-    "upsert_endpoint": {
-      "request": {
-        "message_id": "m13",
-        "command": "upsert_endpoint",
-        "args": {
-          "endpoint": {
-            "indigoDeviceId": 123456789,
-            "role": "onOffLight",
-            "label": "Kitchen Lamp",
-            "reachable": true,
-            "states": {
-              "onOff": true
-            },
-            "options": {}
-          }
-        }
-      },
-      "response": {
-        "message_id": "m13",
-        "result": {
-          "endpointNumber": 2
-        }
-      }
-    },
-    "upsert_endpoint_role_change": {
-      "request": {
-        "message_id": "m14",
-        "command": "upsert_endpoint",
-        "args": {
-          "endpoint": {
-            "indigoDeviceId": 123456789,
-            "role": "dimmableLight",
-            "label": "Kitchen Lamp",
-            "reachable": true,
-            "states": {
-              "onOff": true,
-              "level": 60
-            },
-            "options": {}
-          }
-        }
-      },
-      "response": {
-        "message_id": "m14",
-        "error_code": "role_change",
-        "details": "endpoint 123456789 is onOffLight; remove and re-add to change role"
-      }
-    },
-    "remove_endpoint": {
-      "request": {
-        "message_id": "m15",
-        "command": "remove_endpoint",
-        "args": {
-          "indigoDeviceId": 123456789
-        }
-      },
-      "response": {
-        "message_id": "m15",
-        "result": {
-          "removed": true
-        }
-      }
-    },
-    "remove_endpoint_absent": {
-      "request": {
-        "message_id": "m16",
-        "command": "remove_endpoint",
-        "args": {
-          "indigoDeviceId": 123456791
-        }
-      },
-      "response": {
-        "message_id": "m16",
-        "result": {
-          "removed": false
-        }
-      }
-    },
-    "set_state": {
-      "request": {
-        "message_id": "m17",
-        "command": "set_state",
-        "args": {
-          "indigoDeviceId": 123456789,
-          "states": {
-            "onOff": true
-          }
-        }
-      },
-      "response": {
-        "message_id": "m17",
-        "result": {}
-      }
-    },
-    "set_state_unknown_device": {
-      "request": {
-        "message_id": "m18",
-        "command": "set_state",
-        "args": {
-          "indigoDeviceId": 123456791,
-          "states": {
-            "onOff": true
-          }
-        }
-      },
-      "response": {
-        "message_id": "m18",
-        "error_code": "unknown_device",
-        "details": "no live endpoint for indigoDeviceId 123456791"
-      }
-    },
-    "set_reachable": {
-      "request": {
-        "message_id": "m19",
-        "command": "set_reachable",
-        "args": {
-          "indigoDeviceId": 123456789,
-          "reachable": false
-        }
-      },
-      "response": {
-        "message_id": "m19",
-        "result": {}
-      }
-    },
     "remove_fabric": {
       "request": {
         "message_id": "m20",
@@ -717,10 +777,11 @@
             {
               "indigoDeviceId": 123456790,
               "endpointNumber": 5,
-              "role": "doorLock"
+              "role": "dimmableLight"
             }
           ],
-          "drift": []
+          "drift": [],
+          "driftChecked": false
         }
       }
     },
@@ -1007,29 +1068,9 @@
               "role": "thermostat"
             }
           ],
-          "drift": []
+          "drift": [],
+          "driftChecked": false
         }
-      }
-    },
-    "upsert_endpoint_unknown_role": {
-      "request": {
-        "message_id": "m29",
-        "command": "upsert_endpoint",
-        "args": {
-          "endpoint": {
-            "indigoDeviceId": 900099,
-            "role": "airPurifier",
-            "label": "Bedroom Purifier",
-            "reachable": true,
-            "states": {},
-            "options": {}
-          }
-        }
-      },
-      "response": {
-        "message_id": "m29",
-        "error_code": "unknown_role",
-        "details": "role airPurifier is not in the v1 role enum (§4.2)"
       }
     },
     "set_state_on_off_plug_in_unit": {

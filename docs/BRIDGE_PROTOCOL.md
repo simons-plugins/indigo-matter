@@ -249,6 +249,10 @@ confirms via a warning dialog. Result: `<StatusReport>`.
   endpoint is **rejected** (`error_code: "role_change"`); the plugin must
   remove and re-add, because ecosystems cache device types per endpoint.
 - `label` — Bridged Device Basic Information `NodeLabel`.
+- `reachable` — Bridged Device Basic Information `Reachable`. **Omitting it
+  means `true`.** An absent flag says nothing about availability, and the other
+  reading — an accessory that greys itself out in every ecosystem because the
+  plugin left a field off — is the worse default by far.
 - `options` — role-specific extras (e.g. window-covering polarity).
 
 ### 4.2 Roles: state keys and commands (v1)
@@ -294,7 +298,8 @@ ecosystem acts. Both are enumerated here in full; there is no other source.
  "fabrics": [{"fabricIndex": 1, "label": "Apple Home", "vendorId": 4937}],
  "endpointCount": 12,
  "endpoints": [{"indigoDeviceId": 123456789, "endpointNumber": 2, "role": "onOffLight"}],
- "drift": []}
+ "drift": [],
+ "driftChecked": false}
 ```
 
 `drift` lists any `UniqueID → endpointNumber` mappings that changed since last
@@ -310,6 +315,12 @@ error, never auto-repaired. Each entry is a `DriftEntry`:
   reported against it rather than against the device id.
 - `expected` — the endpoint number the persisted map says this `uniqueId` has.
 - `actual` — the endpoint number it currently has.
+
+- `driftChecked` — whether `drift` is an answer or an absence. `drift: []` on
+  its own is ambiguous, and the two readings are opposites: "checked, nothing
+  moved" versus "there is nothing to check against yet". The node sends `false`
+  until it persists the endpoint-number map, so a client must not treat an empty
+  `drift` as an all-clear unless `driftChecked` is `true`.
 
 `endpoints[].role` is one of the §4.2 enum; `endpointCount` is
 `endpoints.length` (it is sent explicitly so a client can log the size without

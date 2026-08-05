@@ -72,10 +72,10 @@ export interface ErrorFrame {
 export type WindowClosedReason = "expired" | "commissioned";
 
 /**
- * The complete §5 event name domain. Only `window_closed` is *emitted* in E0 —
- * the rest arrive with endpoint CRUD — but the whole set is declared here so the
- * fixture mirror can catch a misspelt name at compile time rather than shipping
- * an event the plugin logs as unknown and drops.
+ * The complete §5 event name domain. `window_closed` and `command` are emitted
+ * today; the rest arrive with fabric/drift reporting. The whole set is declared
+ * here so the fixture mirror can catch a misspelt name at compile time rather
+ * than shipping an event the plugin logs as unknown and drops.
  */
 export const EventName = {
     command: "command",
@@ -119,6 +119,46 @@ export const Role = {
 
 export type RoleValue = (typeof Role)[keyof typeof Role];
 
+/** Runtime membership test for the §4.2 role enum — the `unknown_role` gate. */
+export function isRole(value: unknown): value is RoleValue {
+    return typeof value === "string" && Object.prototype.hasOwnProperty.call(Role, value);
+}
+
+/**
+ * §3.1's opt-in for a reconcile that would empty the live endpoint set. The
+ * literal is named because both the guard and its refusal message quote it.
+ */
+export const INTENT_REPLACE_ALL = "replace_all";
+
+/** §4.1 — the desired state of one exported device, as the plugin declares it. */
+export interface EndpointSpec {
+    indigoDeviceId: number;
+    role: RoleValue;
+    label: string;
+    reachable: boolean;
+    /** Role-specific state keys (§4.2). Values are Indigo-natural units. */
+    states: Record<string, unknown>;
+    /** Role-specific extras (e.g. window-covering polarity). Unused by E3 roles. */
+    options: Record<string, unknown>;
+}
+
+/** §3.2 */
+export interface UpsertResult {
+    endpointNumber: number;
+}
+
+/** §3.3 */
+export interface RemoveResult {
+    removed: boolean;
+}
+
+/** §5 `command` — the `data` of an ecosystem-originated action. */
+export interface CommandEventData extends Record<string, unknown> {
+    indigoDeviceId: number;
+    command: string;
+    args: Record<string, unknown>;
+}
+
 /** §4.3 */
 export interface FabricInfo {
     fabricIndex: number;
@@ -126,13 +166,24 @@ export interface FabricInfo {
     vendorId: number;
 }
 
-/** §4.3 — the E0 subset; `drift` is always empty until E6 adds the allocator. */
+/** §4.3. `drift` is always empty until E5 adds the persisted endpoint-number map. */
 export interface StatusReport {
     commissioned: boolean;
     fabrics: FabricInfo[];
     endpointCount: number;
     endpoints: EndpointSummary[];
     drift: DriftEntry[];
+    /**
+     * Whether `drift` is an answer or an absence.
+     *
+     * `drift: []` alone is ambiguous, and the two readings could not be further
+     * apart: "checked, nothing has moved" versus "there is no persisted map to
+     * check against yet". Until E5 builds that map this is always `false`, and
+     * saying so is what stops an empty list being read as an all-clear. The
+     * plugin ignores unknown fields (§1), so it can start honouring this in E3b
+     * without a protocol version bump.
+     */
+    driftChecked: boolean;
 }
 
 export interface EndpointSummary {
@@ -173,11 +224,27 @@ export interface BridgeFacade {
     getPairing(): PairingReport;
     openCommissioningWindow(durationSeconds: number): Promise<CommissioningWindowResult>;
     /**
+     * §3.1's reconcile. `replaceAll` is the parsed `intent: "replace_all"`; the
+     * mass-removal guard lives behind this seam because only the implementation
+     * knows the live set.
+     */
+    reconcile(endpoints: readonly EndpointSpec[], replaceAll: boolean): Promise<StatusReport>;
+    /** §3.2 — create-or-update. Rejects a role change with `role_change` (§4.1). */
+    upsertEndpoint(spec: EndpointSpec): Promise<UpsertResult>;
+    /** §3.3 — idempotent; `{removed: false}` for a device with no live endpoint. */
+    removeEndpoint(indigoDeviceId: number): Promise<RemoveResult>;
+    /** §3.4 — local (offline-context) writes, so they do not echo as `command`. */
+    setState(indigoDeviceId: number, states: Record<string, unknown>): Promise<void>;
+    /** §3.5 — Bridged Device Basic Information `Reachable`. */
+    setReachable(indigoDeviceId: number, reachable: boolean): Promise<void>;
+    /**
      * Register the sink for `window_closed` (§3.8/§5). One listener, last
      * registration wins — this seam is what lets the protocol server emit the
      * event without importing the Matter stack, and lets tests fire it.
      */
     onWindowClosed(listener: (reason: WindowClosedReason) => void): void;
+    /** The same seam for §5 `command`, emitted when an ecosystem acts. */
+    onCommand(listener: (data: CommandEventData) => void): void;
 }
 
 /** A protocol-level failure a command handler can throw to shape its response. */

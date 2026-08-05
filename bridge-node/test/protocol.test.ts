@@ -1,6 +1,6 @@
 /**
- * BRIDGE_PROTOCOL.md conformance for the E0 command subset, run against the
- * real ws-server with the Matter node stubbed out.
+ * BRIDGE_PROTOCOL.md conformance for the implemented command set, run against
+ * the real ws-server with the Matter node stubbed out.
  */
 
 import assert from "node:assert/strict";
@@ -14,6 +14,9 @@ import { golden, StubBridge } from "./stub-bridge.js";
 const BRIDGE_VERSION = "0.1.0-test";
 const MATTER_JS_VERSION = "0.17.8";
 
+/** The paired ecosystem the populated golden statuses assume. */
+const APPLE_HOME = { fabricIndex: 1, label: "Apple Home", vendorId: 4937 };
+
 const bridge = new StubBridge();
 const server = new BridgeWsServer({
     port: 0,
@@ -23,31 +26,54 @@ const server = new BridgeWsServer({
     log: () => {},
 });
 
+/**
+ * A second server on its own double, for the tests that need a *cold* endpoint
+ * set. The shared one above is deliberately kept warm at the
+ * `attach_with_endpoints` set — that is what makes `get_status` answer the
+ * golden populated StatusReport — so a test about an empty or emptied bridge
+ * cannot use it without wrecking the ones around it.
+ */
+async function withColdBridge<T>(
+    run: (bridge: StubBridge, connect: () => Promise<TestClient>) => Promise<T>,
+): Promise<T> {
+    const cold = new StubBridge();
+    const coldServer = new BridgeWsServer({
+        port: 0,
+        bridge: cold,
+        bridgeVersion: BRIDGE_VERSION,
+        matterJsVersion: MATTER_JS_VERSION,
+        log: () => {},
+    });
+    await coldServer.listen();
+    try {
+        return await run(cold, async () => {
+            const client = await TestClient.connect(coldServer.port);
+            await client.next(); // handshake
+            return client;
+        });
+    } finally {
+        await coldServer.close();
+    }
+}
+
 async function connect(): Promise<TestClient> {
     const client = await TestClient.connect(server.port);
     await client.next(); // consume the handshake
     return client;
 }
 
-async function attach(client: TestClient): Promise<Record<string, unknown>> {
-    return client.request(golden.attach.request);
-}
-
 /**
- * What the E0 node answers an `attach` with.
- *
- * NOT `golden.attach.response`: that frame is the lawful §3.1 pair for a request
- * carrying `endpoints: []` (empty desired set → empty live set), which is what
- * the plugin asserts against. E0 does not reconcile the requested set at all —
- * it serves one hard-coded endpoint and returns that status — so this is the
- * live truth until E2 makes attach reconcile. Deliberate, and the fixture's
- * _comment says so.
+ * The shared server's `attach` — the populated one, so the live endpoint set
+ * matches `golden.get_status`. §3.1 makes attach a full reconcile, and
+ * re-sending the same set is all-updates, so this is safe to call repeatedly.
  */
-function e0AttachResponse(messageId: string): Record<string, unknown> {
-    return { message_id: messageId, result: golden.get_status.response.result };
+async function attach(client: TestClient): Promise<Record<string, unknown>> {
+    return client.request(golden.attach_with_endpoints.request);
 }
 
 before(async () => {
+    bridge.statusCommissioned = true;
+    bridge.statusFabrics = [APPLE_HOME];
     await server.listen();
 });
 
@@ -70,11 +96,137 @@ describe("handshake (§2)", () => {
 });
 
 describe("attach (§3.1)", () => {
-    it("accepts a matching protocol version and returns a StatusReport", async () => {
+    it("accepts a matching protocol version and reconciles the endpoint set", async () => {
         const client = await connect();
         const response = await attach(client);
-        assert.deepEqual(response, e0AttachResponse(golden.attach.request.message_id as string));
+        assert.deepEqual(response, golden.attach_with_endpoints.response);
         client.close();
+    });
+
+    it("answers an empty desired set with an empty live set", async () => {
+        // The golden `attach` pair: nothing live, nothing desired. The
+        // mass-removal guard cannot fire — there is nothing to remove.
+        await withColdBridge(async (_cold, connectCold) => {
+            const client = await connectCold();
+            assert.deepEqual(await client.request(golden.attach.request), golden.attach.response);
+            client.close();
+        });
+    });
+
+    it("refuses an attach that would remove every live endpoint", async () => {
+        await withColdBridge(async (cold, connectCold) => {
+            cold.statusCommissioned = true;
+            cold.statusFabrics = [APPLE_HOME];
+            const client = await connectCold();
+            await client.request(golden.attach_with_endpoints.request);
+
+            assert.deepEqual(
+                await client.request(golden.attach_mass_removal_refused.request),
+                golden.attach_mass_removal_refused.response,
+            );
+            // §3.1 is a gate, not a rollback: the live set is untouched, and the
+            // client is still attached so it can retry with the intent.
+            assert.deepEqual(
+                await client.request(golden.get_status.request),
+                golden.get_status.response,
+            );
+            client.close();
+        });
+    });
+
+    it("empties the live set when the client says intent: replace_all", async () => {
+        await withColdBridge(async (cold, connectCold) => {
+            cold.statusCommissioned = true;
+            cold.statusFabrics = [APPLE_HOME];
+            const client = await connectCold();
+            await client.request(golden.attach_with_endpoints.request);
+
+            assert.deepEqual(
+                await client.request(golden.attach_replace_all.request),
+                golden.attach_replace_all.response,
+            );
+            client.close();
+        });
+    });
+
+    it("keeps an endpoint's number across a removal and a role change", async () => {
+        // The double models this because the real registry does: matter.js keys
+        // its persisted number on `Endpoint.id`, so a device that goes away and
+        // comes back — or changes role, which §3.1 implements as remove+re-add —
+        // comes back as the same accessory number. A double that renumbered
+        // would have made the golden StatusReports true only on a cold bridge.
+        await withColdBridge(async (cold, connectCold) => {
+            cold.statusCommissioned = true;
+            cold.statusFabrics = [APPLE_HOME];
+            const client = await connectCold();
+            await client.request(golden.attach_with_endpoints.request);
+
+            // Empty it, then bring the same two devices back — with the first
+            // one's role changed, which is the recreate path.
+            await client.request(golden.attach_replace_all.request);
+            const specs = golden.attach_with_endpoints.request.args as { endpoints: Record<string, unknown>[] };
+            const rerun = await client.request({
+                message_id: "renumber",
+                command: "attach",
+                args: {
+                    protocolVersion: PROTOCOL_VERSION,
+                    pluginVersion: "t",
+                    endpoints: [{ ...specs.endpoints[0], role: "dimmableLight", states: {} }, specs.endpoints[1]],
+                },
+            });
+            const endpoints = (rerun.result as { endpoints: { indigoDeviceId: number; endpointNumber: number }[] })
+                .endpoints;
+            assert.deepEqual(
+                endpoints.map(endpoint => [endpoint.indigoDeviceId, endpoint.endpointNumber]),
+                [
+                    [123456789, 2],
+                    [123456790, 3],
+                ],
+            );
+            client.close();
+        });
+    });
+
+    it("rejects a malformed endpoint set without disturbing the live one", async () => {
+        await withColdBridge(async (cold, connectCold) => {
+            cold.statusCommissioned = true;
+            cold.statusFabrics = [APPLE_HOME];
+            const client = await connectCold();
+            await client.request(golden.attach_with_endpoints.request);
+
+            for (const endpoints of [
+                "not-an-array",
+                [{ role: "onOffLight", label: "x" }], // no indigoDeviceId
+                [{ indigoDeviceId: 1, role: "onOffLight" }], // no label
+                [{ indigoDeviceId: 1, role: 7, label: "x" }],
+                [
+                    { indigoDeviceId: 1, role: "onOffLight", label: "a" },
+                    { indigoDeviceId: 1, role: "onOffLight", label: "b" },
+                ],
+            ]) {
+                const response = await client.request({
+                    message_id: "bad-set",
+                    command: "attach",
+                    args: { protocolVersion: PROTOCOL_VERSION, pluginVersion: "t", endpoints },
+                });
+                assert.equal(response.error_code, ErrorCode.malformedArgs, JSON.stringify(endpoints));
+            }
+
+            // §1.1: a lawful shape carrying a role outside §4.2 is its own code.
+            const unknownRole = await client.request({
+                message_id: "bad-role",
+                command: "attach",
+                args: {
+                    protocolVersion: PROTOCOL_VERSION,
+                    pluginVersion: "t",
+                    endpoints: [{ indigoDeviceId: 1, role: "airPurifier", label: "x" }],
+                },
+            });
+            assert.equal(unknownRole.error_code, ErrorCode.unknownRole);
+
+            assert.deepEqual(await client.request(golden.get_status.request), golden.get_status.response);
+            client.close();
+        });
     });
 
     it("rejects a mismatched protocolVersion and closes the socket", async () => {
@@ -111,6 +263,46 @@ describe("attach (§3.1)", () => {
         second.close();
     });
 
+    it("keeps the incumbent when a second socket's attach is refused", async () => {
+        // §3.1 parses the endpoint set *before* attaching state changes hands.
+        // If that order ever inverts, a plugin sending one bad spec would hang
+        // up on the healthy connection currently carrying every command event
+        // and then fail to attach itself, leaving the bridge with no client at
+        // all — worse than the malformed attach it was rejecting.
+        await withColdBridge(async (cold, connectCold) => {
+            cold.statusCommissioned = true;
+            cold.statusFabrics = [APPLE_HOME];
+            const incumbent = await connectCold();
+            await incumbent.request(golden.attach_with_endpoints.request);
+
+            const usurper = await connectCold();
+            for (const endpoints of [
+                [{ indigoDeviceId: 1, role: "airPurifier", label: "x" }], // unknown_role
+                "not-an-array", // malformed_args
+            ]) {
+                const refusal = await usurper.request({
+                    message_id: "usurp",
+                    command: "attach",
+                    args: { protocolVersion: PROTOCOL_VERSION, pluginVersion: "t", endpoints },
+                });
+                assert.ok(refusal.error_code !== undefined, JSON.stringify(endpoints));
+                assert.equal(incumbent.closed, false, "the incumbent was hung up on by a refused attach");
+            }
+
+            // Still *the* attached client: events go to it, and commands work.
+            cold.emitCommand(golden.command_on_off.data as never);
+            assert.deepEqual(await incumbent.next(), golden.command_on_off);
+            assert.deepEqual(await incumbent.request(golden.get_status.request), golden.get_status.response);
+
+            // And the refused socket never became attached in passing.
+            const gated = await usurper.request({ message_id: "g", command: "get_status", args: {} });
+            assert.equal(gated.error_code, ErrorCode.notAttached);
+
+            usurper.close();
+            incumbent.close();
+        });
+    });
+
     it("re-attaches the same socket without closing it", async () => {
         // §2 supersession must not fire on the incumbent when it *is* the
         // socket attaching: a plugin that re-attaches to refresh its endpoint
@@ -118,7 +310,7 @@ describe("attach (§3.1)", () => {
         const client = await connect();
         await attach(client);
         const again = await attach(client);
-        assert.deepEqual(again, e0AttachResponse(golden.attach.request.message_id as string));
+        assert.deepEqual(again, golden.attach_with_endpoints.response);
         assert.equal(client.closed, false);
 
         const status = await client.request(golden.get_status.request);
@@ -151,6 +343,29 @@ describe("gating (§1.1)", () => {
         client.close();
     });
 
+    it("refuses every §3 command before attach, not just the one with a golden frame", async () => {
+        // Enumerated rather than spot-checked: `not_attached` is a per-command
+        // gate in `onMessage`, and a command added to the handler map without a
+        // thought for the gate would otherwise be reachable on an un-attached
+        // socket. Every §3 command the node implements, minus `attach` itself.
+        const gated: [string, Record<string, unknown>][] = [
+            ["get_status", {}],
+            ["get_pairing", {}],
+            ["open_commissioning_window", { durationSeconds: 900 }],
+            ["upsert_endpoint", golden.upsert_endpoint.request.args as Record<string, unknown>],
+            ["remove_endpoint", { indigoDeviceId: 123456789 }],
+            ["set_state", { indigoDeviceId: 123456789, states: { onOff: true } }],
+            ["set_reachable", { indigoDeviceId: 123456789, reachable: false }],
+        ];
+        const client = await connect();
+        for (const [command, args] of gated) {
+            const response = await client.request({ message_id: `gate-${command}`, command, args });
+            assert.equal(response.error_code, ErrorCode.notAttached, `${command} answered before attach`);
+            assert.equal(response.message_id, `gate-${command}`);
+        }
+        client.close();
+    });
+
     it("returns malformed_args when command is missing", async () => {
         const client = await connect();
         const response = await client.request({ message_id: "nocmd" });
@@ -167,6 +382,114 @@ describe("gating (§1.1)", () => {
             args: {},
         });
         assert.equal(response.message_id, "an-opaque-🔑-id");
+        client.close();
+    });
+});
+
+describe("endpoint CRUD (§3.2-§3.5)", () => {
+    /**
+     * One walk of the golden sequence on a cold bridge: attach the two-endpoint
+     * set, then every CRUD frame in the order that makes its payload true. They
+     * share a bridge because they *are* a sequence — `upsert_endpoint`'s
+     * `{endpointNumber: 2}` is only correct for the endpoint `attach` created,
+     * and `remove_endpoint` only returns `{removed: true}` once.
+     */
+    it("answers every golden endpoint exchange verbatim", async () => {
+        await withColdBridge(async (cold, connectCold) => {
+            cold.statusCommissioned = true;
+            cold.statusFabrics = [APPLE_HOME];
+            const client = await connectCold();
+            await client.request(golden.attach_with_endpoints.request);
+
+            // §3.2 idempotent update of a live endpoint, answering with its number.
+            assert.deepEqual(await client.request(golden.upsert_endpoint.request), golden.upsert_endpoint.response);
+            // §4.1: ecosystems cache device types, so a role change is refused.
+            assert.deepEqual(
+                await client.request(golden.upsert_endpoint_role_change.request),
+                golden.upsert_endpoint_role_change.response,
+            );
+            // §1.1: a lawfully-shaped endpoint naming a role outside §4.2 gets
+            // its own code, decided in `parseEndpointSpec` before the facade is
+            // reached — which is why the live set is untouched below.
+            assert.deepEqual(
+                await client.request(golden.upsert_endpoint_unknown_role.request),
+                golden.upsert_endpoint_unknown_role.response,
+            );
+            assert.equal(cold.model.has(900099), false, "an unknown role must not create an endpoint");
+            // §3.4/§3.5 against a live device, and against one that is not.
+            assert.deepEqual(await client.request(golden.set_state.request), golden.set_state.response);
+            assert.deepEqual(
+                await client.request(golden.set_state_unknown_device.request),
+                golden.set_state_unknown_device.response,
+            );
+            assert.deepEqual(await client.request(golden.set_reachable.request), golden.set_reachable.response);
+            assert.equal(cold.lastReachable, false);
+            // §3.3, then the same removal again — idempotent both ways.
+            assert.deepEqual(await client.request(golden.remove_endpoint.request), golden.remove_endpoint.response);
+            assert.deepEqual(
+                await client.request(golden.remove_endpoint_absent.request),
+                golden.remove_endpoint_absent.response,
+            );
+            assert.deepEqual(
+                await client.request({ ...golden.remove_endpoint.request, message_id: "again" }),
+                { message_id: "again", result: { removed: false } },
+            );
+            client.close();
+        });
+    });
+
+    it("creates an absent endpoint on upsert and reports its new number", async () => {
+        await withColdBridge(async (_cold, connectCold) => {
+            const client = await connectCold();
+            await client.request(golden.attach.request); // empty live set
+            const response = await client.request(golden.upsert_endpoint.request);
+            assert.deepEqual(response.result, { endpointNumber: 2 });
+            client.close();
+        });
+    });
+
+    it("refuses malformed CRUD args (§1.1)", async () => {
+        await withColdBridge(async (_cold, connectCold) => {
+            const client = await connectCold();
+            await client.request(golden.attach.request);
+
+            const malformed: [string, Record<string, unknown>][] = [
+                ["upsert_endpoint", {}],
+                ["upsert_endpoint", { endpoint: 7 }],
+                ["remove_endpoint", {}],
+                ["remove_endpoint", { indigoDeviceId: "123" }],
+                ["set_state", { indigoDeviceId: 1 }],
+                ["set_state", { indigoDeviceId: 1, states: [] }],
+                ["set_reachable", { indigoDeviceId: 1 }],
+                ["set_reachable", { indigoDeviceId: 1, reachable: "no" }],
+            ];
+            for (const [command, args] of malformed) {
+                const response = await client.request({ message_id: `bad-${command}`, command, args });
+                assert.equal(
+                    response.error_code,
+                    ErrorCode.malformedArgs,
+                    `${command} ${JSON.stringify(args)} was accepted`,
+                );
+            }
+            client.close();
+        });
+    });
+});
+
+describe("command event (§5)", () => {
+    it("forwards every §4.2 command payload to the attached client", async () => {
+        const client = await connect();
+        await attach(client);
+
+        for (const frame of [
+            golden.command_on_off,
+            golden.command_set_level,
+            golden.command_set_color_temp,
+            golden.command_set_color,
+        ]) {
+            bridge.emitCommand(frame.data as never);
+            assert.deepEqual(await client.next(), frame);
+        }
         client.close();
     });
 });
@@ -323,6 +646,31 @@ describe("frame hygiene (§1)", () => {
     });
 });
 
+describe("exactly one response (§1)", () => {
+    it("answers internal when the result itself cannot be put on the wire", async () => {
+        // A handler can succeed and the response still fail — a value that will
+        // not serialise, a socket that dies mid-write. §1 promises one response
+        // per request either way, and the plugin correlates on message_id, so
+        // silence here would strand a future until its timeout.
+        const client = await connect();
+        await attach(client);
+        bridge.poisonStatus = true;
+        try {
+            const response = await client.request({ message_id: "poison", command: "get_status", args: {} });
+            assert.deepEqual(response, {
+                message_id: "poison",
+                error_code: ErrorCode.internal,
+                details: "Could not send the result of get_status",
+            });
+        } finally {
+            bridge.poisonStatus = false;
+        }
+        // And the socket is still usable afterwards.
+        assert.deepEqual(await client.request(golden.get_status.request), golden.get_status.response);
+        client.close();
+    });
+});
+
 describe("ordering (§1)", () => {
     it("answers pipelined frames in receipt order even when the first awaits", async () => {
         // open_commissioning_window genuinely awaits (crypto); a get_pairing
@@ -371,12 +719,13 @@ describe("window_closed event (§3.8/§5)", () => {
         // Its own server and stub: `#attached` is server-wide state, and the
         // shared server has attached clients throughout this file.
         const lonelyBridge = new StubBridge();
+        const logs: string[] = [];
         const lonely = new BridgeWsServer({
             port: 0,
             bridge: lonelyBridge,
             bridgeVersion: BRIDGE_VERSION,
             matterJsVersion: MATTER_JS_VERSION,
-            log: () => {},
+            log: message => logs.push(message),
         });
         await lonely.listen();
         try {
@@ -393,5 +742,31 @@ describe("window_closed event (§3.8/§5)", () => {
         } finally {
             await lonely.close();
         }
+
+        // Dropped, but not in silence: a run of these is what "the ecosystem
+        // does nothing" looks like from here, and it must be distinguishable
+        // from a listener that was never wired up.
+        assert.equal(logs.filter(line => line.includes("Dropping window_closed event")).length, 2, logs.join("\n"));
+    });
+
+    it("names the device when it drops a command event with nobody attached", async () => {
+        const orphanBridge = new StubBridge();
+        const logs: string[] = [];
+        const orphan = new BridgeWsServer({
+            port: 0,
+            bridge: orphanBridge,
+            bridgeVersion: BRIDGE_VERSION,
+            matterJsVersion: MATTER_JS_VERSION,
+            log: message => logs.push(message),
+        });
+        await orphan.listen();
+        try {
+            orphanBridge.emitCommand(golden.command_on_off.data as never);
+        } finally {
+            await orphan.close();
+        }
+        const dropped = logs.filter(line => line.includes("Dropping command event"));
+        assert.equal(dropped.length, 1, logs.join("\n"));
+        assert.match(dropped[0] ?? "", /for device 123456789/);
     });
 });
