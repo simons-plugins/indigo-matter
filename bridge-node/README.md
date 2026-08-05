@@ -4,8 +4,9 @@ The Matter **bridge node** for the
 [indigo-matter](https://github.com/simons-plugins/indigo-matter) Indigo plugin.
 
 It exports selected [Indigo](https://www.indigodomo.com) devices as Matter
-accessories, so Apple Home, Alexa, Google Home and SmartThings see them as
-ordinary Matter devices on a bridge.
+accessories, so an ecosystem sees them as ordinary Matter devices on a bridge.
+**Apple Home** is the ecosystem this is built and documented for; Alexa, Google
+Home and SmartThings are untested and unclaimed.
 
 > **This package is not useful on its own.** It has no configuration of its own,
 > no discovery, and no idea what an Indigo device is. It is one half of a pair:
