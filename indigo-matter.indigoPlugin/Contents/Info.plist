@@ -20,11 +20,7 @@
 	<key>IwsApiVersion</key>
 	<string>1.0.0</string>
 	<key>PluginVersion</key>
-<<<<<<< HEAD
-	<string>2026.8.2</string>
-=======
-	<string>2026.8.1</string>
->>>>>>> feat(export): E6+E7 — pairing UX, fabric management, bridge LaunchAgent
+	<string>2026.8.3</string>
 	<key>ServerApiVersion</key>
 	<string>3.6</string>
 </dict>
