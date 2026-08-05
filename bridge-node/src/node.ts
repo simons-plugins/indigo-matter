@@ -17,7 +17,7 @@
 import { Endpoint, Environment, ServerNode, VendorId, version as matterJsVersion } from "@matter/main";
 import { BasicInformationServer } from "@matter/main/behaviors/basic-information";
 import { AggregatorEndpoint } from "@matter/main/endpoints/aggregator";
-import { Crypto, ServerNodeStore } from "@matter/main";
+import { Crypto } from "@matter/main";
 import { DeviceCommissioner, FabricManager, PaseClient, PaseServer, SessionManager } from "@matter/main/protocol";
 import {
     CommissioningFlowType,
@@ -299,63 +299,31 @@ export class BridgeNode implements BridgeFacade {
      * not-yet-created endpoint will get is already determined. That is the
      * difference from a **rebuild**, which discards a baseline that disagreed.
      *
-     * Two sources, in order. matter.js's persisted allocation covers every
-     * endpoint it knows, including ones this attach happens not to export; if it
-     * cannot be read (a storage layout we do not recognise, a driver that is not
-     * file-backed) the empty baseline is filled by the first attach's `check`
-     * from the live set, which is the same numbers for everything we do export.
+     * The baseline starts empty and is filled by the first attach's `check`
+     * from the live set. Those live numbers ARE matter.js's persisted ones —
+     * it restores each `Endpoint.id`'s number from its own store as the
+     * endpoint is created — so the witness this records is the pre-upgrade
+     * truth, not a fresh allocation.
+     *
+     * An earlier cut read matter.js's store directly here, to also cover
+     * endpoints it knows about but this attach does not export. It was deleted
+     * after verification against a real pre-E5 storage directory: the chain
+     * (`root`→`parts`→`aggregator`→`parts`, `contexts()`) enumerates only
+     * subcontexts already materialised in memory, and at bootstrap time none
+     * are, so it returned an empty list while reporting that it had adopted
+     * numbers — a false success in a migration path. The numbers live in flat
+     * on-disk keys whose layout is matter.js-internal. Not worth re-deriving:
+     * a not-yet-exported endpoint's number is decided by `Endpoint.id`
+     * whenever it IS created, so an entry for it buys nothing.
      */
     private bootstrapEndpointMap(): void {
-        const persisted = this.persistedEndpointNumbers();
-        const source =
-            persisted === undefined
-                ? "matter.js's persisted numbers could not be read, so the first reconcile will record the live set"
-                : "adopted from matter.js's own persisted endpoint numbers";
+        const source = "the first reconcile records the live set, which is matter.js's own persisted numbers";
         this.log(
             "MIGRATION: this bridge is commissioned but has no endpoint-number map — one is being " +
                 `created now rather than refused. Nothing is renumbered: matter.js owns the numbers ` +
                 `and this file only witnesses them (${source}).`,
         );
-        this.#endpointMap.seed(persisted ?? [], source);
-    }
-
-    /**
-     * matter.js's own `Endpoint.id → number` allocation, read straight out of
-     * its store, or `undefined` if it cannot be.
-     *
-     * Best-effort by construction. It reaches through `ServerNodeStore` into the
-     * storage-context names matter.js uses internally (`root` → `parts` →
-     * `<id>` → `__number__`), which is not a contract — so every step is guarded
-     * and the one caller has a working fallback. `Endpoint.id` and `UniqueID`
-     * are the same string here ({@link uniqueIdFor}), which is what makes the
-     * part ids directly usable as map keys.
-     */
-    private persistedEndpointNumbers(): LiveEndpointNumber[] | undefined {
-        try {
-            const parts = this.server.env
-                .get(ServerNodeStore)
-                .storage.createContext("root")
-                .createContext("parts")
-                .createContext("aggregator")
-                .createContext("parts");
-            const ids = parts.contexts();
-            if (!Array.isArray(ids)) {
-                // The API is MaybePromise; a promise here means an async driver
-                // we cannot await from this synchronous path. Fall back.
-                return undefined;
-            }
-            const numbers: LiveEndpointNumber[] = [];
-            for (const uniqueId of ids) {
-                const number = parts.createContext(uniqueId).get("__number__", -1);
-                if (typeof number === "number" && Number.isInteger(number) && number > 0) {
-                    numbers.push({ uniqueId, endpointNumber: number });
-                }
-            }
-            return numbers;
-        } catch (error) {
-            this.log(`Could not read matter.js's persisted endpoint numbers: ${describeError(error)}`);
-            return undefined;
-        }
+        this.#endpointMap.seed([], source);
     }
 
     private refuse(reason: string): void {
