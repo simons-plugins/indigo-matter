@@ -47,13 +47,16 @@ MIN_NODE_VERSION = (22, 13)
 # DELIBERATELY SHARED between agents (not per-label): project_dir holds ONE node_modules
 # installed by ONE node, and every agent's LaunchAgent runs that same node. A per-agent
 # stamp would claim they can diverge, which is exactly the ABI crash this guards against.
-# CAVEAT the sharing does not cover: if nodeBinDir is repointed BETWEEN two agents'
-# installs, the later install rewrites the stamp with the new node and the earlier
-# agent's already-built native bindings go unwarned (npm install of package B does not
-# rebuild package A's bindings). Single-agent today this cannot happen (its own install
-# always rewrites the stamp). TODO(E7): when the bridge agent lands, either record
-# per-package node versions inside the one stamp or re-install both packages on a
-# nodeBinDir change.
+# CAVEAT the sharing does not cover, REVIEWED AT E7 AND KEPT: if nodeBinDir is repointed
+# BETWEEN two agents' installs, the later install rewrites the stamp with the new node and
+# the earlier agent's already-built native bindings go unwarned (npm install of package B
+# does not rebuild package A's bindings). Kept shared because the alternative — per-package
+# versions inside one stamp — would make `abi_warning` claim the two agents CAN legitimately
+# run on different nodes, which is the opposite of true: both LaunchAgents run whatever
+# single node this plugin resolved, so a per-package stamp that disagreed with the other
+# would be describing a state that cannot exist. The residual risk is one stale ADVISORY
+# warning after a manual nodeBinDir change, and the remedy is in the message the warning
+# already prints: run both Install/update menu actions.
 INSTALL_NODE_STAMP = ".indigo-node"
 
 
@@ -726,31 +729,88 @@ class LaunchAgent:
             pass
 
     def remove_package(self) -> None:
-        """Delete the installed npm package for a clean reinstall.
+        """Uninstall THIS agent's npm package for a clean reinstall.
 
         Stops the managed job and reaps any orphan first (so nothing holds the files or
-        the storage lock), then removes ``node_modules`` and ``package-lock.json`` under
-        project_dir and drops the applied-plist marker so the next ensure_installed
-        re-bootstraps. The storage dir is SACRED and never touched — commissioned devices
-        and pairings survive a clean reinstall. Blocking; run off the Indigo main thread.
+        the storage lock), then removes the package, then drops this agent's
+        applied-plist marker so the next ensure_installed re-bootstraps. The storage dir
+        is SACRED and never touched — commissioned devices and pairings survive a clean
+        reinstall. Blocking; run off the Indigo main thread.
+
+        **Per-package since E7, and it had to become so.** This used to ``rmtree`` the
+        whole shared ``node_modules`` and delete ``package-lock.json``, which was
+        tolerable while exactly one agent existed and destructive the moment a second one
+        did: the sibling's package vanished underneath a launchd job that was still
+        loaded and still pointing at it, so the next respawn crash-looped on
+        module-not-found, its applied marker still matched, and nothing in the plugin
+        ever said why. The lock file goes the same way — it describes the whole install
+        root, not one package, so deleting it on behalf of one agent unpins the other's
+        transitive dependency tree at its next install.
+
+        ``npm uninstall`` is preferred over deleting the directory because it is the only
+        thing that also prunes the transitive dependencies this package brought in and
+        nothing else needs — matter.js is ~40MB of them. Removing the package directory
+        is the fallback for a project dir npm cannot operate on at all.
+
+        **The trade this makes explicit:** wiping ``node_modules`` wholesale also fixed a
+        corrupt *shared* dependency, and this no longer does. That was never what the
+        menu action claimed to do, and rebuilding a sibling agent's install as a side
+        effect of recovering this one is worse than the fault it happened to cure.
         """
         self._bootout()
         self.reap_orphan_servers()
-        for name in ("node_modules", "package-lock.json"):
-            target = os.path.join(self.project_dir, name)
-            try:
-                if os.path.isdir(target):
-                    shutil.rmtree(target)
-                elif os.path.exists(target):
-                    os.remove(target)
-            except OSError as exc:
-                self.logger.warning("could not remove %s: %s", target, exc)
+        if not self._npm_uninstall():
+            self._remove_package_dir()
         try:
             os.remove(self._applied_marker_path())
         except OSError:
             pass
         self.logger.info("Removed the %s package under %s (storage left intact)",
                          self.spec.package, self.project_dir)
+
+    def _npm_uninstall(self) -> bool:
+        """``npm uninstall`` this agent's package. True if npm reported success.
+
+        Returns False — quietly, at debug — when npm is absent or refuses, because the
+        caller has a working fallback and a warning here would name a problem the user
+        does not have.
+        """
+        npm = os.path.join(self.resolved_bin_dir, "npm")
+        if not self._exists(npm):
+            self.logger.debug("npm not found at %s; removing the package directory instead", npm)
+            return False
+        env = dict(os.environ)
+        env["PATH"] = self.resolved_bin_dir + os.pathsep + env.get("PATH", "")
+        try:
+            result = self._run([npm, "uninstall", "--prefix", self.project_dir, self.spec.package],
+                               capture_output=True, text=True, check=False, env=env)
+        except OSError as exc:
+            self.logger.debug("npm uninstall %s could not start (%s)", self.spec.package, exc)
+            return False
+        if result is None or result.returncode != 0:
+            detail = "" if result is None else (result.stderr or result.stdout or "").strip()
+            self.logger.debug("npm uninstall %s exited non-zero (%s); removing the package "
+                              "directory instead", self.spec.package, detail[:500])
+            return False
+        return True
+
+    def _remove_package_dir(self) -> None:
+        """Delete ``node_modules/<package>`` and nothing else.
+
+        The fallback when npm cannot run. Scoped to this agent's own directory: the
+        sibling's package, the shared transitive dependencies it may also be using, and
+        ``package-lock.json`` are all left alone. Some of this package's own transitive
+        deps are therefore orphaned in ``node_modules`` — harmless, and the next
+        ``npm install`` reconciles them.
+        """
+        target = os.path.join(self.project_dir, "node_modules", self.spec.package)
+        try:
+            if os.path.isdir(target):
+                shutil.rmtree(target)
+            elif os.path.exists(target):
+                os.remove(target)
+        except OSError as exc:
+            self.logger.warning("could not remove %s: %s", target, exc)
 
     def stop(self) -> bool:
         """Stop the agent (bootout) but keep the plist so ``start`` can reload it.

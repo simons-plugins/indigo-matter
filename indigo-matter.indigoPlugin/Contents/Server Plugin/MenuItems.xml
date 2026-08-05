@@ -199,6 +199,67 @@ Endpoint numbers are kept, so re-pairing the same ecosystems restores the same a
             </Field>
         </ConfigUI>
     </MenuItem>
+    <!--
+        Pairing and fabric management (PRD-indigo-matter-export §6, E6).
+
+        "Pair" is deliberately "open a pairing window", not "show the code": a
+        Matter passcode is not durable, so once the first ecosystem commissions
+        there IS no standing code, and every further admin needs a freshly
+        derived one (BRIDGE_PROTOCOL §3.8).
+
+        The codes go to the EVENT LOG, not into this dialog. Indigo dialogs have
+        no dynamic labels and no image fields, so a value computed by the
+        callback cannot be shown in the dialog that produced it. The QR lives on
+        an IWS-served page whose URL is logged beside the codes.
+    -->
+    <MenuItem id="pairMatterBridge">
+        <Name>Pair Matter Bridge…</Name>
+        <CallbackMethod>menuPairMatterBridge</CallbackMethod>
+        <ButtonTitle>Open pairing window</ButtonTitle>
+        <ConfigUI>
+            <Field id="pairIntro" type="label">
+                <Label>Opens a pairing window so an ecosystem (Apple Home, Alexa, Google, SmartThings) can add the devices Indigo exports as Matter accessories.
+
+The pairing code and a link to a QR page are written to the Indigo EVENT LOG when you click below — Indigo dialogs cannot display a code that is generated as you press the button.
+
+A Matter pairing code is not permanent: once the first ecosystem has paired, that code stops working and each further ecosystem needs a new window. Expect an "uncertified accessory" warning in every ecosystem — that is normal, and the same warning Homebridge produces.
+
+The bridge only runs while at least one device is exported, so add something in "Manage Matter Exports…" first.</Label>
+            </Field>
+            <Field id="duration" type="textfield" defaultValue="900">
+                <Label>Window stays open for (seconds):</Label>
+                <Description>Matter allows 180 to 900 (3 to 15 minutes). 900 is the maximum and the default.</Description>
+            </Field>
+        </ConfigUI>
+    </MenuItem>
+    <MenuItem id="unpairEcosystem">
+        <Name>Unpair an Ecosystem…</Name>
+        <CallbackMethod>menuUnpairEcosystem</CallbackMethod>
+        <ConfigUI>
+            <Field id="unpairWarning" type="label">
+                <Label>Removes ONE ecosystem's pairing from the Matter export bridge. Every accessory Indigo exports disappears from that ecosystem, along with the names, rooms, scenes and automations you built on them there. Other ecosystems are unaffected.
+
+This is the export side only. Matter devices that Indigo CONTROLS are not affected, and no Indigo device is changed or deleted.
+
+If you unpair the LAST ecosystem the bridge resets itself completely and starts advertising for commissioning again — the same outcome as "Reset Matter Export Pairings…".</Label>
+            </Field>
+            <Field id="fabric" type="menu">
+                <Label>Ecosystem:</Label>
+                <List class="self" method="getBridgeFabrics" dynamicReload="true"/>
+                <Description>The index is the bridge node's own fabric number, shown so this matches the Event Log.</Description>
+            </Field>
+            <Field id="confirm" type="checkbox" defaultValue="false">
+                <Label>I understand every exported accessory will be removed from that ecosystem.</Label>
+            </Field>
+            <Field id="confirmAgain" type="checkbox" defaultValue="false">
+                <Label>I have read the warning above and want to unpair it now.</Label>
+            </Field>
+        </ConfigUI>
+    </MenuItem>
+    <MenuItem id="installBridgeNode">
+        <Name>Install/update the Matter export bridge</Name>
+        <CallbackMethod>menuInstallBridgeNode</CallbackMethod>
+    </MenuItem>
     <MenuItem id="exportFabricBackup">
         <Name>Export fabric backup…</Name>
         <CallbackMethod>menuExportFabricBackup</CallbackMethod>

@@ -98,6 +98,50 @@
         <Label>matter-server's control API is UNAUTHENTICATED. Only connect over a network you trust.</Label>
     </Field>
 
+    <!-- ================= EXPORT (PRD-indigo-matter-export §5.5) =================
+         Indigo as a Matter BRIDGE: selected Indigo devices published outward as
+         Matter accessories. Which devices, and how each one appears, is the
+         separate "Manage Matter Exports…" dialog — only the wholesale switch,
+         the two ports and a read-only readout belong here.
+
+         `exportReadout` is written by getPrefsConfigUiValues on every open;
+         labels are static in Indigo, so a read-only textfield is the only way to
+         show a value computed at open time. -->
+    <Field id="exportSep" type="separator"/>
+    <Field id="exportHeader" type="label" fontColor="blue">
+        <Label>Matter export (Indigo as a bridge)</Label>
+    </Field>
+    <Field id="exportEnabled" type="checkbox" defaultValue="true">
+        <Label>Enable Matter export:</Label>
+        <Description>Publishes the devices listed in "Manage Matter Exports…" to Apple Home
+            and other ecosystems. Unticking this stops the bridge and its accessories go
+            unavailable — it does NOT unpair anything or delete accessories, so ticking it
+            again brings them straight back. Nothing runs until at least one device is
+            exported.</Description>
+    </Field>
+    <Field id="exportReadout" type="textfield" readonly="true">
+        <Label>Status:</Label>
+    </Field>
+    <Field id="showExportAdvanced" type="checkbox" defaultValue="false">
+        <Label>Show export port settings</Label>
+    </Field>
+    <Field id="bridgeWsPort" type="textfield" defaultValue="5581"
+           visibleBindingId="showExportAdvanced" visibleBindingValue="true"
+           alwaysUseInDialogHeightCalc="true">
+        <Label>Bridge control port (loopback):</Label>
+        <Description>How the plugin talks to the bridge node. Loopback only — nothing outside
+            this Mac can reach it. Change it only if something else already uses 5581.</Description>
+    </Field>
+    <Field id="bridgeMatterPort" type="textfield" defaultValue="5540"
+           visibleBindingId="showExportAdvanced" visibleBindingValue="true"
+           alwaysUseInDialogHeightCalc="true">
+        <Label>Matter port:</Label>
+        <Description>The port ecosystems reach the bridge on. 5540 is the Matter default and
+            is what Alexa expects; move it only if another Matter stack on this Mac
+            (Homebridge 2.x, matterbridge, Home Assistant) already holds it — the bridge's
+            log will say so. Changing it takes effect on the next plugin reload.</Description>
+    </Field>
+
     <!-- Always shown -->
     <Field id="fabricSep" type="separator"/>
     <Field id="fabricLabel" type="textfield" defaultValue="Indigo">

@@ -674,7 +674,10 @@ class TestFailureSurfacing:
         for attempt in range(1, 6):
             h.bridge._on_unreachable(attempt)
         assert mock_logger.warning.call_count == 1
-        assert "started by hand" in warnings_of(mock_logger)
+        said = warnings_of(mock_logger)
+        assert "not responding" in said
+        # E7: Indigo control must never be implicated by an export-side fault.
+        assert "Indigo devices and inbound Matter control are unaffected" in said
 
 
 class TestHealthTick:

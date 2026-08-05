@@ -56,4 +56,12 @@
         <Name>matter device diagnostics</Name>
         <CallbackMethod>http_diagnostics</CallbackMethod>
     </Action>
+    <!-- The export bridge's pairing page (PRD-indigo-matter-export §6). The one
+         handler here that returns HTML rather than JSON: it exists because the
+         event log can carry a pairing code but not a QR code. Same IWS auth as
+         the Domio handlers above. -->
+    <Action id="pairing" uiPath="hidden">
+        <Name>matter export pairing page</Name>
+        <CallbackMethod>http_pairing</CallbackMethod>
+    </Action>
 </Actions>

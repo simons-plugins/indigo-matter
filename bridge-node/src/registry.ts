@@ -13,6 +13,7 @@ import {
     applyLabel,
     applyReachable,
     applyStates,
+    type BridgedIdentity,
     createEndpoint,
     isSupportedRole,
     UNSUPPORTED_ROLE_DETAILS,
@@ -51,8 +52,12 @@ export interface EndpointRegistryOptions {
     /** Sink for §5 `command` events. */
     emit: (data: CommandEventData) => void;
     log?: (message: string) => void;
-    /** `ProductName` on every child's Bridged Device Basic Information. */
-    productName: string;
+    /**
+     * The identity fields every child's Bridged Device Basic Information carries
+     * — vendor, product, hardware and software versions. Bridge-wide, not
+     * per-device: Indigo does not know who made a relay.
+     */
+    bridgeIdentity: BridgedIdentity;
     /** Injectable so the pacing test does not take a real 100ms per removal. */
     removalPacingMs?: number;
     /**
@@ -295,7 +300,7 @@ export class EndpointRegistry {
     }
 
     private async create(spec: EndpointSpec): Promise<Endpoint> {
-        const endpoint = createEndpoint(spec, this.options.productName);
+        const endpoint = createEndpoint(spec, this.options.bridgeIdentity);
         await this.options.aggregator.add(endpoint);
         let unwatch: () => void;
         try {

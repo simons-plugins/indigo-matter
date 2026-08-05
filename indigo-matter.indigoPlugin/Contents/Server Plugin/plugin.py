@@ -19,15 +19,19 @@ import time
 from concurrent.futures import CancelledError as FuturesCancelledError
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Optional
+from urllib.parse import quote
 
 import indigo  # provided by the Indigo runtime
 
+import bridge_agent
 import bridge_client
+import bridge_protocol
 import fabric_backup
 from async_runtime import AsyncRuntime
 from commission_jobs import CommissionJobs, node_id_to_str
 from device_sync import DeviceSync
+import export_bridge
 from export_bridge import ExportBridge
 import export_catalog
 import export_handlers
@@ -127,6 +131,89 @@ def sanitize_host(raw: str) -> str:
     return host
 
 
+#: Where the raw ``MT:`` payload can be rendered as a scannable QR code. The
+#: CHIP project's own tool, which is the reference implementation of the payload
+#: format — so a code it cannot render is a code no commissioner would accept
+#: either. Linked rather than embedded: see :meth:`Plugin._pairing_page` for why
+#: no QR is generated locally.
+QR_VIEWER_URL = "https://project-chip.github.io/connectedhomeip/qrcode.html"
+
+
+def _escape(text: Any) -> str:
+    """Minimal HTML escaping for the pairing page.
+
+    Hand-rolled rather than ``html.escape`` only in that it also handles a
+    ``None`` — every value on that page comes from the bridge node or from an
+    exception string, and one of them being absent must not render the word
+    "None" into a field a user is about to type into their phone.
+    """
+    if text is None:
+        return ""
+    return (str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            .replace('"', "&quot;"))
+
+
+def _pairing_html(pairing, message: str) -> str:
+    """The pairing page (PRD §6). Self-contained: no scripts, no assets.
+
+    ``pairing`` may be ``None`` when there is nothing to report — the page still
+    renders, carrying ``message``, because a blank page over a bridge that is
+    merely not running is indistinguishable from a broken handler.
+    """
+    manual = _escape(getattr(pairing, "manual_pairing_code", None))
+    qr_payload = _escape(getattr(pairing, "qr_pairing_code", None))
+    expires = _escape(getattr(pairing, "window_expires_at", None))
+    fabrics = list(getattr(pairing, "fabrics", ()) or [])
+    paired = ", ".join(_escape(export_bridge.describe_fabric(f)) for f in fabrics) or "none yet"
+    banner = f'<p class="msg">{_escape(message)}</p>' if message else ""
+    codes = ""
+    if manual:
+        # The payload is URL-encoded into the viewer link because an `MT:` string
+        # is base-38 and can legitimately contain characters that would otherwise
+        # end the query (`+`, `/`, `%`), producing a link that opens the tool with
+        # a silently truncated payload — a QR that scans and means the wrong thing.
+        viewer = f"{QR_VIEWER_URL}?data={quote(str(getattr(pairing, 'qr_pairing_code', '') or ''), safe='')}"
+        codes = f"""
+    <h2>Manual pairing code</h2>
+    <p class="code">{manual}</p>
+    <h2>QR payload</h2>
+    <p class="payload">{qr_payload}</p>
+    <p><a href="{_escape(viewer)}" rel="noreferrer noopener" target="_blank">
+       Render this payload as a scannable QR code</a> (opens the Matter project's own
+       viewer — it needs internet access, and the payload is sent to it).</p>
+    {f'<p class="expiry">This code stops working at {expires}.</p>' if expires else ''}
+    <h2>What to expect</h2>
+    <p>Add the bridge in your ecosystem's app as you would any Matter accessory. Every
+       ecosystem will warn that it is an <strong>uncertified accessory</strong> — that is
+       normal for a bridge like this one, and the same warning Homebridge and Home Assistant
+       produce. Choose "Add Anyway".</p>"""
+    return f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Indigo Matter bridge — pairing</title>
+<style>
+ body {{ font: 16px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        margin: 0 auto; max-width: 34rem; padding: 1.5rem; color: #222; }}
+ h1 {{ font-size: 1.3rem; }} h2 {{ font-size: 1rem; margin-bottom: .2rem; color: #555; }}
+ .code {{ font: 700 2.1rem/1.2 ui-monospace, Menlo, monospace; letter-spacing: .08em;
+          margin: .2rem 0 1rem; word-break: break-all; }}
+ .payload {{ font: .85rem ui-monospace, Menlo, monospace; word-break: break-all;
+             background: #f4f4f6; padding: .6rem; border-radius: .4rem; }}
+ .msg {{ background: #fff6d6; border: 1px solid #e8d48a; padding: .7rem; border-radius: .4rem; }}
+ .expiry {{ color: #a33; }}
+ footer {{ margin-top: 2rem; font-size: .85rem; color: #777; }}
+ @media (prefers-color-scheme: dark) {{
+   body {{ background: #16171a; color: #e6e6e6; }} h2 {{ color: #aaa; }}
+   .payload {{ background: #26272b; }} .msg {{ background: #3a3320; border-color: #6b5c2e; }}
+ }}
+</style></head><body>
+<h1>Indigo Matter bridge</h1>
+{banner}{codes}
+<footer>Paired ecosystems: {paired}.<br>
+This page is served by the Indigo Web Server from the Matter plugin.</footer>
+</body></html>"""
+
+
 class Plugin(indigo.PluginBase):
     """Matter plugin entry point."""
 
@@ -144,6 +231,11 @@ class Plugin(indigo.PluginBase):
         self.jobs: CommissionJobs | None = None
         self.http: HttpApi | None = None
         self.server_process: ServerProcess | None = None
+        # The EXPORT bridge node's LaunchAgent (E7). Built lazily and only ever
+        # by a path that means to run it: a fresh install must be inert (XAC1),
+        # and constructing this in startup would be one `ensure_installed` away
+        # from a plist for a bridge nobody has asked for.
+        self.bridge_process = None
         # The export allow-list (PRD §5.1). Built in startup, before anything
         # can consult it; None means "the plugin has not started yet", which
         # every export callback checks rather than assuming.
@@ -277,6 +369,13 @@ class Plugin(indigo.PluginBase):
             # disk to be worth writing: the failure it covers is the plugin
             # never getting another chance to say it.
             save_prefs=self._save_plugin_prefs,
+            # E7's LaunchAgent seams. Passed unconditionally — the bridge is
+            # gated by the ALLOW-LIST, not by startup, so handing them over here
+            # installs nothing (XAC1). ExportBridge calls them on the
+            # empty↔non-empty transitions and nowhere else.
+            agent_start=self._start_bridge_agent,
+            agent_stop=self._stop_bridge_agent,
+            agent_diagnose=self._bridge_agent_diagnosis,
         )
         self._exports_changed()
 
@@ -661,6 +760,52 @@ class Plugin(indigo.PluginBase):
                 return (False, valuesDict, errors)
         return (True, valuesDict)
 
+    def getPrefsConfigUiValues(self):  # noqa: N802
+        """Seed the plugin config dialog, computing the PRD §5.5 export readout.
+
+        Indigo has no dynamic labels, so the readout is a **read-only textfield**
+        written here — the same shape the export dialog's status line already
+        uses. Every value comes from state the plugin already holds (the last
+        attach or 15-second status poll, and the §5 fabric events); nothing here
+        does I/O, because this runs while the dialog is opening.
+        """
+        values = indigo.Dict(self.pluginPrefs)
+        values["exportReadout"] = self._export_readout()
+        return (values, indigo.Dict())
+
+    # Indigo 2025.2's PluginBase carries snake_case aliases for the ConfigUI
+    # pre-population callbacks alongside the camelCase names, and which one it
+    # dispatches on is not documented. Both are defined so the readout cannot be
+    # silently empty on a build that prefers the other spelling.
+    def get_prefs_config_ui_values(self):
+        return self.getPrefsConfigUiValues()
+
+    def _export_readout(self) -> str:
+        """One line describing the export bridge for the config dialog (PRD §5.5).
+
+        What the PRD asks for is *which* ecosystems hold a fabric and whether a
+        window is open — not slot arithmetic. matter.js allows 254 fabrics, so
+        the count is never the interesting number; the identity of the peers is,
+        because "why has Alexa stopped working" is answered by seeing that Alexa
+        is not in this list.
+        """
+        bridge = self.export_bridge
+        if bridge is None:
+            return "Plugin still starting."
+        exported = len(self.exports) if self.exports is not None else 0
+        if not bridge.enabled:
+            return f"Export is switched off. {exported} device(s) would be exported."
+        if not bridge.active:
+            return (f"{exported} device(s) exported; the bridge node is not running."
+                    if exported else "Nothing is exported yet, so the bridge node is not running.")
+        fabrics = bridge.fabrics
+        if fabrics is None:
+            return f"{exported} device(s) exported; not yet connected to the bridge node."
+        paired = ", ".join(export_bridge.describe_fabric(f) for f in fabrics) or "nothing yet"
+        window = (f" A pairing window is open until {bridge.window_expires_at}."
+                  if bridge.window_expires_at else "")
+        return f"{exported} device(s) exported. Paired with: {paired}.{window}"
+
     def closedPrefsConfigUi(self, valuesDict, userCancelled):  # noqa: N802
         if userCancelled:
             return
@@ -671,6 +816,16 @@ class Plugin(indigo.PluginBase):
             "matter-server settings saved — reload the plugin (or Plugins ▸ Matter ▸ "
             "Restart matter-server) to apply them"
         )
+        # Export is the exception: its switch and its ports are read on every
+        # connect, and the ONE change a user expects to act immediately is
+        # ticking or unticking "Enable Matter export". Re-running the transition
+        # applies it without a reload — and, because the transition is the same
+        # code the allow-list uses, it also brings the agent up or down.
+        if self.export_bridge is not None:
+            try:
+                self.export_bridge.exports_changed()
+            except Exception as exc:  # noqa: BLE001
+                self.logger.exception(exc)
 
     # ------------------------------------------------------------------
     # Device lifecycle
@@ -2030,6 +2185,432 @@ class Plugin(indigo.PluginBase):
             "bridge from any ecosystem that still lists it.")
         return (True, valuesDict)
 
+    # ------------------------------------------------------------------
+    # The export bridge node's LaunchAgent (E7 — PRD §4.2, XG5, XAC1)
+    # ------------------------------------------------------------------
+    def _bridge_agent(self):
+        """The bridge :class:`~bridge_agent.BridgeProcess`, built on first use.
+
+        Cached on the plugin so the applied-plist digest and the resolved node
+        path are computed once, and rebuilt from CURRENT prefs by the two paths
+        that change them (the install action and a config save) — the same
+        discipline ``menuRestartMatterServer`` learned the hard way, where a
+        ``ServerProcess`` snapshotted at startup silently served stale settings.
+
+        Constructing one writes nothing. That is what lets this be lazy at all
+        and what keeps a fresh install inert (XAC1).
+        """
+        if self.bridge_process is None:
+            self.bridge_process = bridge_agent.BridgeProcess(dict(self.pluginPrefs), self.logger)
+        return self.bridge_process
+
+    def _start_bridge_agent(self) -> None:
+        """Install (if needed) and start the bridge node's LaunchAgent.
+
+        The ``agent_start`` seam. Called by :class:`export_bridge.ExportBridge`
+        on the empty→non-empty allow-list transition, on whichever Indigo thread
+        made that change — never on the loop. Blocking, but only by a couple of
+        ``launchctl`` calls; ``install`` is deliberately NOT attempted here (npm
+        takes a minute and this can run from ``deviceDeleted``), so a missing
+        package surfaces as ``ensure_installed``'s actionable preflight error
+        naming the install menu.
+
+        Rebuilt from current prefs on every call rather than cached: the ports
+        and the mDNS interface are prefs, ``ensure_installed`` only reloads
+        launchd when the resulting plist actually differs, and a stale
+        ``BridgeProcess`` would write yesterday's ports while reporting success.
+        """
+        self.bridge_process = bridge_agent.BridgeProcess(dict(self.pluginPrefs), self.logger)
+        agent = self.bridge_process
+        if agent.ensure_installed() is None:
+            # Preflight failed; the plist has been torn down and the reason
+            # logged. Nothing to start, and starting would only crash-loop.
+            return
+        self.logger.info("Matter export: bridge node LaunchAgent is running (protocol port %s, "
+                         "Matter port %s)", agent.ws_port, agent.matter_port)
+
+    def _stop_bridge_agent(self) -> None:
+        """Stop the bridge agent, keeping its plist and its storage.
+
+        The ``agent_stop`` seam, called only once there is genuinely nothing to
+        serve. ``stop()`` rather than ``uninstall()``: the plist is cheap to keep
+        and re-exporting a device should not have to re-derive it, and the
+        storage dir — every ecosystem pairing plus the endpoint-number witness —
+        is never touched by either.
+        """
+        agent = self.bridge_process
+        if agent is None:
+            return
+        if agent.stop():
+            self.logger.info("Matter export: nothing is exported — the bridge node has been "
+                             "stopped. Its pairings are kept.")
+
+    def _bridge_agent_diagnosis(self) -> Optional[str]:
+        """Why is the bridge node not answering? The ``agent_diagnose`` seam.
+
+        Reads the agent's own error log, which is the only place the real cause
+        appears: a Matter port already bound by another stack (PRD §7), a package
+        that was never installed, an ABI mismatch. The socket sees "connection
+        refused" for all of them.
+
+        **Read-only.** It deliberately does not restart anything. launchd already
+        owns respawn via ``KeepAlive``, the loaded-but-dead revival lives in
+        ``ensure_installed``, and a diagnostic that quietly bounced the agent on
+        every failure streak would turn a crash-loop into a crash-loop nobody can
+        read the log of.
+        """
+        agent = self.bridge_process
+        if agent is None:
+            return ("The bridge node's LaunchAgent has not been started by this plugin session — "
+                    "export at least one device, or reload the plugin.")
+        tail = agent.tail_error_log()
+        if tail:
+            return f"Recent bridge node errors:\n{tail}"
+        return (f"Its error log is empty — the {bridge_agent.BRIDGE_PACKAGE} package may not be "
+                f"installed (checked {agent.project_dir}). Use Plugins ▸ Matter ▸ "
+                f"Install/update the Matter export bridge.")
+
+    def menuInstallBridgeNode(self):  # noqa: N802
+        """Install/update the ``indigo-matter-bridge`` npm package.
+
+        The export-side twin of ``menuInstallMatterServer``, and a sibling rather
+        than an extension of it: the two agents are separately versioned, and a
+        user recovering a wedged bridge must not also be made to reinstall a
+        controller that is working (or the reverse). They share the install
+        thread because ``~/indigo-matter`` is one npm root and two concurrent
+        ``npm install``s into it corrupt each other.
+        """
+        if self._install_thread is not None and self._install_thread.is_alive():
+            self.logger.warning("An npm install is already in progress — wait for it to finish.")
+            return
+        self.logger.info("Installing the Matter export bridge node in the background — watch the "
+                         "log for progress; this can take a minute.")
+        self._install_thread = threading.Thread(
+            target=self._install_bridge_node, name="matter-bridge-install", daemon=True)
+        self._install_thread.start()
+
+    def _install_bridge_node(self) -> None:
+        """npm-install the bridge package, then restart it if anything is exported.
+
+        The restart is conditional on there being something to export, which is
+        the difference from the controller's install: bringing the agent up
+        because a package was updated would violate XG5 on an install with an
+        empty allow-list, and leave a bridge process running for nothing.
+        """
+        try:
+            agent = bridge_agent.BridgeProcess(dict(self.pluginPrefs), self.logger)
+            if not agent.install():
+                self.logger.error(
+                    "Install/update of the Matter export bridge did not complete — see the error "
+                    "above. Nothing was changed; retry when resolved.")
+                return
+            if self._stopping:  # plugin is tearing down — don't mutate its state
+                return
+            self.bridge_process = bridge_agent.BridgeProcess(dict(self.pluginPrefs), self.logger)
+            if self.exports is None or not len(self.exports):
+                self.logger.info(
+                    "Matter export bridge installed. It is NOT being started: nothing is exported "
+                    "yet, and the bridge only runs while the export list is non-empty. Add a "
+                    "device in 'Manage Matter Exports…' and it will start itself.")
+                return
+            # A running LaunchAgent does not pick up new files on disk, so the
+            # freshly-installed version only takes effect on a real restart.
+            if not self.bridge_process.restart():
+                self.logger.error(
+                    "The Matter export bridge was installed but the restart onto the new version "
+                    "FAILED — the old version may still be running. Check "
+                    "~/Library/Logs/indigo-matter/%s.", bridge_agent.BRIDGE_ERR_LOG)
+                return
+            self.logger.info("Matter export bridge installed and restarted onto the new version — "
+                             "the plugin reconnects automatically.")
+        except Exception as exc:  # noqa: BLE001
+            self.logger.exception(exc)
+            self.logger.error(
+                "Install of the Matter export bridge did not complete after the npm step — the "
+                "package may be installed but the agent was not restarted. See the trace above, "
+                "then retry Plugins ▸ Matter ▸ Install/update the Matter export bridge.")
+
+    # ------------------------------------------------------------------
+    # Pairing and fabric management (PRD §6, BRIDGE_PROTOCOL §3.7-§3.9)
+    # ------------------------------------------------------------------
+    def _pairing_client(self, errors, field: str):
+        """The bridge client for a pairing action, or ``None`` with ``errors`` set.
+
+        ``connected`` rather than ``attached``, for the same §1.1 reason the
+        recovery menus use it: the node answers ``get_pairing`` while refusing to
+        serve endpoints, and a user whose bridge is in that state still needs to
+        be able to see and manage their pairings.
+
+        The message names the real precondition, which is not obvious: the client
+        exists only while something is exported (XG5), so "pair the bridge" is
+        genuinely unreachable until the user has exported a device. That is XAC2's
+        ordering, not an accident — a bridge with no accessories is nothing worth
+        pairing, and Apple Home would show an empty one.
+        """
+        bridge = self.export_bridge
+        client = bridge.client if bridge is not None else None
+        if client is None or not client.connected:
+            exported = len(self.exports) if self.exports is not None else 0
+            why = ("Export at least one device in 'Manage Matter Exports…' first — the bridge only "
+                   "runs while something is exported." if not exported else
+                   "The bridge node is not answering; see the log for what its own error log says.")
+            self.logger.warning("Matter export: cannot reach the bridge node for pairing. %s", why)
+            errors[field] = "Not connected to the bridge node — see the log."
+            return None
+        return client
+
+    def menuPairMatterBridge(self, valuesDict, menuId=""):  # noqa: N802, ARG002
+        """Open a pairing window and put the codes where the user can read them.
+
+        **Why this is "open a window" and not "show the code" (PRD §6).** A Matter
+        commissioning passcode is not durable: the moment the first ecosystem
+        commissions, the basic window closes and the original code stops working.
+        Every ecosystem after that needs an *enhanced* window with a freshly
+        derived code (§3.8), so there is no such thing as "the" pairing code to
+        display.
+
+        **Why the event log.** Indigo dialogs have no dynamic labels and no image
+        fields, so a runtime string cannot be shown in the dialog that produced
+        it. The log is this plugin's established channel for exactly that, and it
+        is also the one place the codes survive being scrolled past — a window
+        lasts up to 15 minutes and users do not type 11 digits first time.
+        """
+        errors = indigo.Dict()
+        duration = self._window_duration(valuesDict, errors)
+        if duration is None:
+            return (False, valuesDict, errors)
+        client = self._pairing_client(errors, "duration")
+        if client is None:
+            return (False, valuesDict, errors)
+        try:
+            pairing = self.runtime.submit(client.get_pairing()).result(timeout=15)
+        except Exception as exc:  # noqa: BLE001
+            self.logger.error("Matter export: could not read the bridge node's pairing state — %s. "
+                              "No pairing window was opened.", exc)
+            self.logger.exception(exc)
+            errors["duration"] = "Could not reach the bridge node — see the log."
+            return (False, valuesDict, errors)
+        # Two states already have a usable code, and opening a window in either
+        # would be actively harmful: §3.8's `assertClosed` refuses a second one,
+        # and on a never-commissioned node the basic window is ALREADY open with
+        # the persisted originals (§3.7) — deriving a fresh enhanced code there
+        # would invalidate a code the user may already be typing.
+        if pairing.window_open and pairing.manual_pairing_code:
+            self._log_pairing_codes(pairing.manual_pairing_code, pairing.qr_pairing_code,
+                                    pairing.window_expires_at,
+                                    already_open=not pairing.commissioned)
+            return (True, valuesDict)
+        try:
+            window = self.runtime.submit(
+                client.open_commissioning_window(duration)).result(timeout=45)
+        except Exception as exc:  # noqa: BLE001
+            self.logger.error(
+                "Matter export: opening a pairing window FAILED — %s. Nothing was changed and "
+                "existing pairings are untouched. If the bridge says a window is already open, "
+                "wait for it to expire (up to 15 minutes) and try again.", exc)
+            self.logger.exception(exc)
+            errors["duration"] = "Could not open a pairing window — see the log."
+            return (False, valuesDict, errors)
+        if self.export_bridge is not None:
+            self.export_bridge.note_window_opened(window.window_expires_at)
+        self._log_pairing_codes(window.manual_pairing_code, window.qr_pairing_code,
+                                window.window_expires_at, already_open=False)
+        return (True, valuesDict)
+
+    @staticmethod
+    def _window_duration(values_dict, errors) -> Optional[int]:
+        """Validate the duration field against §3.8's 180-900s band.
+
+        Rejected in the dialog rather than clamped silently by the node: the
+        number is how long the user has to walk to another room with a phone, and
+        being given 900 when they asked for 60 is a difference they should be
+        told about while the dialog is still open.
+        """
+        raw = str((values_dict or {}).get("duration", "") or "").strip()
+        if not raw:
+            return bridge_protocol.DEFAULT_WINDOW_SECONDS
+        try:
+            duration = int(raw)
+        except (TypeError, ValueError):
+            errors["duration"] = "Enter a whole number of seconds between 180 and 900."
+            return None
+        if not 180 <= duration <= 900:
+            errors["duration"] = "Matter allows 180 to 900 seconds (3 to 15 minutes)."
+            return None
+        return duration
+
+    def _log_pairing_codes(self, manual: Optional[str], qr: Optional[str],
+                           expires_at: Optional[str], *, already_open: bool) -> None:
+        """Write the codes, the expiry and the QR page URL to the event log."""
+        when = f" It expires at {expires_at}." if expires_at else ""
+        opening = ("The bridge has never been paired, so it is ALREADY advertising with its "
+                   "original code — no new window was opened." if already_open else
+                   "A pairing window is now open.")
+        self.logger.info(
+            "Matter export — %s%s\n"
+            "    Manual pairing code: %s\n"
+            "    QR payload: %s\n"
+            "    QR code page: %s\n"
+            "Add the bridge in your ecosystem's app as you would any Matter accessory, and type "
+            "the manual code if it asks for one. Expect an 'uncertified accessory' warning — that "
+            "is normal for a bridge like this one; choose Add Anyway.",
+            opening, when, manual or "(none)", qr or "(none)", self._pairing_page_url())
+
+    def _pairing_page_url(self) -> str:
+        """The IWS URL of the QR page (Actions.xml ``pairing``).
+
+        ``getWebServerURL`` picks the reflector, then the Bonjour name, then
+        localhost — so this is reachable from the phone the user is holding
+        whenever a reflector or a ``.local`` name exists, which is the case the
+        page is FOR. A failure falls back to the loopback default rather than
+        omitting the line: a wrong-host URL a user can edit beats no URL.
+        """
+        base = "http://localhost:8176"
+        try:
+            base = str(indigo.server.getWebServerURL() or base)
+        except Exception as exc:  # noqa: BLE001
+            self.logger.debug("could not resolve the Indigo web server URL (%s)", exc)
+        return f"{base}/message/{self._export_plugin_id()}/pairing/"
+
+    def getBridgeFabrics(self, filter="", valuesDict=None, typeId="", targetId=0):
+        # pylint: disable=redefined-builtin, unused-argument
+        """Picker rows for the unpair menu: one per commissioned ecosystem.
+
+        Built from the fabric set the bridge already reported (attach, then every
+        §5 ``fabrics_changed``), never from a fresh WS round trip: a dynamic list
+        callback runs on the Indigo UI's thread while the dialog is opening, and
+        blocking it on a node that may be down would hang the dialog rather than
+        render an empty one.
+        """
+        try:
+            bridge = self.export_bridge
+            fabrics = bridge.fabrics if bridge is not None else None
+            if not fabrics:
+                # None and [] are different facts, and both are un-pickable, but
+                # only one of them should read as "you are not paired".
+                return [(NO_SELECTION_ID,
+                         "(no paired ecosystems)" if fabrics == []
+                         else "(not connected to the bridge node)")]
+            return [(str(fabric.fabric_index), export_bridge.describe_fabric(fabric))
+                    for fabric in fabrics]
+        except Exception as exc:  # pylint: disable=broad-except
+            self.logger.exception(exc)
+            return [LIST_ERROR_OPTION]
+
+    def menuUnpairEcosystem(self, valuesDict, menuId=""):  # noqa: N802, ARG002
+        """§3.9 — remove one ecosystem's fabric from the bridge.
+
+        Two gates, like the reset menu, because the outcome is the same size for
+        the ecosystem being removed: every accessory Indigo exports disappears
+        from it, with the names, rooms and automations built on them.
+        """
+        errors = indigo.Dict()
+        selected = str(valuesDict.get("fabric", "") or "")
+        if not selected or selected == NO_SELECTION_ID:
+            errors["fabric"] = "Select an ecosystem to unpair."
+            return (False, valuesDict, errors)
+        try:
+            fabric_index = int(selected)
+        except (TypeError, ValueError):
+            errors["fabric"] = "Invalid selection."
+            return (False, valuesDict, errors)
+        if not self._truthy(valuesDict.get("confirm")) \
+                or not self._truthy(valuesDict.get("confirmAgain")):
+            field = "confirm" if not self._truthy(valuesDict.get("confirm")) else "confirmAgain"
+            errors[field] = "Tick BOTH boxes — this removes every exported accessory from that "\
+                            "ecosystem."
+            return (False, valuesDict, errors)
+        client = self._pairing_client(errors, "confirmAgain")
+        if client is None:
+            return (False, valuesDict, errors)
+        last = self._is_last_fabric(fabric_index)
+        try:
+            self.runtime.submit(client.remove_fabric(fabric_index)).result(timeout=45)
+        except Exception as exc:  # noqa: BLE001
+            self.logger.error("Matter export: unpairing ecosystem %s FAILED — %s. Pairings are "
+                              "unchanged.", fabric_index, exc)
+            self.logger.exception(exc)
+            errors["confirmAgain"] = "Unpair failed — see the log. Nothing was changed."
+            return (False, valuesDict, errors)
+        if last:
+            # §3.9: matter.js factory-resets itself when the fabric set empties,
+            # and the node clears its commissioning witness to match. Say what
+            # that actually means rather than reporting a routine removal, because
+            # the user has just reset the whole bridge without using the reset menu.
+            self.logger.warning(
+                "Matter export: ecosystem %s was the LAST one paired, so the bridge node has "
+                "reset itself and is advertising for commissioning again — exactly as 'Reset "
+                "Matter Export Pairings…' would have done. Nothing in Indigo changed. Use "
+                "'Pair Matter Bridge…' to pair it again.", fabric_index)
+        else:
+            self.logger.warning(
+                "Matter export: ecosystem %s has been unpaired. Every accessory Indigo exports "
+                "has been removed from it; remove any leftover 'Indigo' bridge entry in that "
+                "ecosystem's app by hand.", fabric_index)
+        return (True, valuesDict)
+
+    def _is_last_fabric(self, fabric_index: int) -> bool:
+        """Whether removing ``fabric_index`` empties the fabric set.
+
+        Read BEFORE the removal, from the set the bridge last reported: the §5
+        ``fabrics_changed`` that follows arrives asynchronously, so asking
+        afterwards races it. Unknown (nothing reported yet) reads as False —
+        the message it selects is only the difference between two warnings.
+        """
+        bridge = self.export_bridge
+        fabrics = bridge.fabrics if bridge is not None else None
+        if not fabrics:
+            return False
+        return [f.fabric_index for f in fabrics] == [fabric_index]
+
+    # ------------------------------------------------------------------
+    # The QR page (IWS hidden action — PRD §6 "display mechanism")
+    # ------------------------------------------------------------------
+    def http_pairing(self, action, dev=None, caller_waiting_for_result=None):  # noqa: N802, ARG002
+        """Serve the pairing page. GET only; authenticated by IWS before we run.
+
+        This is the *only* handler here that returns HTML rather than JSON, and
+        it exists because the one thing the event log cannot carry is a QR code.
+        """
+        method, _path_args, _query = self._parse_request(action)
+        if method.upper() != "GET":
+            return self._reply(405, {"error": "method_not_allowed"})
+        reply = indigo.Dict()
+        reply["status"] = 200
+        reply["headers"] = indigo.Dict({"Content-Type": "text/html; charset=utf-8"})
+        reply["content"] = self._pairing_page()
+        return reply
+
+    def _pairing_page(self) -> str:
+        """Build the pairing page's HTML from a live ``get_pairing``.
+
+        **No QR is generated here, and that is a deliberate choice.** Rendering
+        one needs either a Python dependency (Indigo's framework Python has no
+        image stack and this plugin ships none) or a hand-written JS encoder —
+        a few hundred lines of Reed-Solomon and bit-masking whose failure mode is
+        a plausible-looking square that no phone can read. Neither is worth it
+        for a code that Apple Home, Alexa and Google all accept *typed in*: the
+        page therefore shows the manual code at a size you can read across a
+        room, the raw ``MT:`` payload for copying, and a link to the CHIP
+        project's own QR viewer for anyone who wants to scan. The tradeoff is
+        recorded in ``docs/HANDOVER.md`` rather than only in this docstring.
+        """
+        client = self.export_bridge.client if self.export_bridge is not None else None
+        if client is None or not client.connected:
+            return _pairing_html(None, "The plugin is not connected to the Matter bridge node. "
+                                       "Export at least one device, then reload this page.")
+        try:
+            pairing = self.runtime.submit(client.get_pairing()).result(timeout=15)
+        except Exception as exc:  # noqa: BLE001
+            self.logger.exception(exc)
+            return _pairing_html(None, f"Could not read the bridge node's pairing state: {exc}")
+        if not pairing.manual_pairing_code:
+            return _pairing_html(
+                pairing,
+                "No pairing window is open, so there is no code to show. Open one with "
+                "Plugins ▸ Matter ▸ Pair Matter Bridge… in Indigo.")
+        return _pairing_html(pairing, "")
+
     def _resolve_storage_path(self) -> str:
         """Storage dir path in BOTH managed and manual modes.
 
@@ -2045,16 +2626,14 @@ class Plugin(indigo.PluginBase):
     def _bridge_storage_path(self) -> str:
         """The **export** bridge node's storage dir — sibling of the controller's.
 
-        Hard-coded relative to the controller's rather than read from a pref
-        because there is no pref: E3's node is started by hand and E7 owns the
-        agent that will have one. The path is the PRD §4.3 default
-        (``…/com.simons-plugins.indigo-matter/bridge-node``), which is also
-        `bridge-node/src/config.ts`'s `DEFAULT_STORAGE_PATH`. A user who moved
-        it gets a backup without those members and a log line saying so, which
-        is the same outcome as not having exported anything.
+        Derived rather than read from a pref, and derived by the module that also
+        hands it to the agent as ``--storage-path`` (E7), so the directory this
+        backs up and the directory the node actually writes cannot disagree. The
+        path is the PRD §4.3 default (``…/com.simons-plugins.indigo-matter/
+        bridge-node``), which is also ``bridge-node/src/config.ts``'s
+        ``DEFAULT_STORAGE_PATH``.
         """
-        controller = os.path.normpath(self._resolve_storage_path())
-        return os.path.join(os.path.dirname(controller), "bridge-node")
+        return bridge_agent.bridge_storage_path(self._resolve_storage_path())
 
     @staticmethod
     def _human_size(num_bytes: int) -> str:

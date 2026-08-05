@@ -30,7 +30,7 @@ import {
 
 import type { BridgeConfig } from "./config.js";
 import { ENDPOINT_MAP_FILE, EndpointMapStore, type LiveEndpointNumber, refuseReasonFor } from "./endpoint-map.js";
-import { uniqueIdFor } from "./endpoints.js";
+import { type BridgedIdentity, uniqueIdFor } from "./endpoints.js";
 import {
     type BridgeFacade,
     type CommandEventData,
@@ -68,6 +68,11 @@ export const VENDOR_ID = 0xfff1;
 export const PRODUCT_ID = 0x8000;
 export const VENDOR_NAME = "simons-plugins";
 export const PRODUCT_NAME = "Indigo Matter Bridge";
+
+/** A bridge has no hardware. Constant rather than invented, but present rather
+ * than absent: ecosystems render the attribute, and an absent one reads blank. */
+export const HARDWARE_VERSION = 1;
+export const HARDWARE_VERSION_STRING = "1";
 
 /** PRD §5.3: no hard cap, but past this many exports the log says so. */
 export const ENDPOINT_COUNT_WARNING = 100;
@@ -141,6 +146,23 @@ export class BridgeNode implements BridgeFacade {
     }
 
     /**
+     * The identity every bridged child publishes on its Bridged Device Basic
+     * Information. Derived here, from the same constants and the same
+     * `softwareVersion` the root node uses, so the two can never drift.
+     */
+    private get bridgedIdentity(): BridgedIdentity {
+        return {
+            vendorName: VENDOR_NAME,
+            vendorId: VENDOR_ID,
+            productName: PRODUCT_NAME,
+            hardwareVersion: HARDWARE_VERSION,
+            hardwareVersionString: HARDWARE_VERSION_STRING,
+            softwareVersion: this.softwareVersion,
+            softwareVersionString: this.bridgeVersion,
+        };
+    }
+
+    /**
      * Build the node and bring it online. The aggregator is added first so it
      * takes endpoint 1; bridged children land at 2 and up, in the order the
      * first `attach` creates them (and thereafter at whatever number matter.js
@@ -181,8 +203,8 @@ export class BridgeNode implements BridgeFacade {
                 productId: PRODUCT_ID,
                 serialNumber: serialNumberFor(this.identity),
                 uniqueId: nodeUniqueIdFor(this.identity),
-                hardwareVersion: 1,
-                hardwareVersionString: "1",
+                hardwareVersion: HARDWARE_VERSION,
+                hardwareVersionString: HARDWARE_VERSION_STRING,
                 softwareVersion: this.softwareVersion,
                 softwareVersionString: this.bridgeVersion,
             },
@@ -194,7 +216,10 @@ export class BridgeNode implements BridgeFacade {
 
         this.#registry = new EndpointRegistry({
             aggregator,
-            productName: PRODUCT_NAME,
+            // Deliberately the SAME values the root node's BasicInformation
+            // carries above: an ecosystem that shows the bridge's manufacturer
+            // and firmware alongside a child's should not be shown two answers.
+            bridgeIdentity: this.bridgedIdentity,
             log: message => this.log(message),
             emit: data => this.#command?.(data),
             onConfigurationChange: () => this.bumpConfigurationVersion(),

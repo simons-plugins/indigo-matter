@@ -194,16 +194,15 @@ def test_preflight_fail_returns_none_and_spares_the_sibling(tmp_path, mock_logge
     assert all("com.example.a" not in " ".join(call) for call in broken._run.calls)
 
 
-def test_remove_package_pins_the_shared_destruction_semantics(tmp_path, mock_logger):
-    """TODO(E7): remove_package() destroys the SIBLING's package too. Pinned, not endorsed.
+def test_remove_package_leaves_the_sibling_agent_entirely_alone(tmp_path, mock_logger):
+    """E7 closed the deferred hazard: remove_package() is now PER PACKAGE.
 
-    It rmtree's the shared node_modules wholesale while booting out only its own
-    label — so the sibling keeps a loaded job definition and a stale applied marker
-    pointing at a package that no longer exists (crash-loop on next respawn).
-    Tolerable while exactly one agent exists; NOT tolerable once the bridge agent
-    lands. E7 must make this per-package (npm-uninstall semantics) or sibling-aware,
-    and this test exists so that change is deliberate: when E7 fixes the semantics,
-    rewrite these assertions to pin the new isolation instead.
+    It used to ``rmtree`` the shared ``node_modules`` wholesale while booting out only
+    its own label — so the sibling kept a loaded job definition and a matching applied
+    marker pointing at a package that no longer existed, and crash-looped on the next
+    respawn with nothing in the plugin log saying why. That was pinned-not-endorsed
+    while exactly one agent existed. This now pins the isolation instead: npm is asked
+    to uninstall one package by name, and the fallback (below) removes one directory.
     """
     home = tmp_path / "home"
     controller = _agent(home, _spec("com.example.a", "pkg-a", str(tmp_path / "a-store")), mock_logger)
@@ -211,15 +210,45 @@ def test_remove_package_pins_the_shared_destruction_semantics(tmp_path, mock_log
     assert controller.ensure_installed() is True
     assert sibling.ensure_installed() is True
     sibling_entry = os.path.join(sibling.project_dir, "node_modules", "pkg-b", "dist", "Main.js")
+    sibling_digest = sibling._read_applied_digest()
     assert os.path.exists(sibling_entry)
+    with open(os.path.join(controller.resolved_bin_dir, "npm"), "w", encoding="utf-8") as handle:
+        handle.write("#!/bin/sh\n")
 
     controller._run = FakeRunner()
     controller.remove_package()
-    assert not os.path.exists(sibling_entry)        # sibling's package gone (today's semantics)
-    assert sibling.preflight() is not None          # so its preflight now fails
-    assert os.path.exists(sibling.plist_path)       # while its job definition remains
-    assert sibling._read_applied_digest()           # with a stale-but-present marker
+
+    assert os.path.exists(sibling_entry)            # ⊗ the whole point
+    assert sibling.preflight() is None              # so the sibling still passes preflight
+    assert os.path.exists(sibling.plist_path)
+    assert sibling._read_applied_digest() == sibling_digest
+    # And it is still a targeted npm call, naming only our package.
+    npm_calls = [call for call in controller._run.calls if "uninstall" in call]
+    assert npm_calls and "pkg-a" in npm_calls[0] and "pkg-b" not in " ".join(npm_calls[0])
     assert all("com.example.b" not in " ".join(call) for call in controller._run.calls)
+    # Our own marker is dropped, so the next ensure_installed re-bootstraps.
+    assert controller._read_applied_digest() is None
+
+
+def test_remove_package_fallback_deletes_only_its_own_package_dir(tmp_path, mock_logger):
+    """No npm available: the directory delete is scoped to our package too."""
+    home = tmp_path / "home"
+    controller = _agent(home, _spec("com.example.a", "pkg-a", str(tmp_path / "a-store")), mock_logger)
+    sibling = _agent(home, _spec("com.example.b", "pkg-b", str(tmp_path / "b-store")), mock_logger)
+    assert controller.ensure_installed() is True
+    assert sibling.ensure_installed() is True
+    ours = os.path.join(controller.project_dir, "node_modules", "pkg-a")
+    theirs = os.path.join(sibling.project_dir, "node_modules", "pkg-b")
+
+    controller._run = FakeRunner()
+    # `exists` is the injected seam preflight uses; make npm specifically absent.
+    npm = os.path.join(controller.resolved_bin_dir, "npm")
+    controller._exists = lambda path: path != npm and os.path.exists(path)
+    controller.remove_package()
+
+    assert not os.path.exists(ours)
+    assert os.path.exists(theirs)
+    assert not any("uninstall" in call for call in controller._run.calls)
 
 
 # ---------------------------------------------------------------------------

@@ -85,6 +85,18 @@ COMMAND_QUEUE_WARN = 3
 #: deadline over the removals — see :func:`bridge_client.attach_timeout_for`.
 PREF_PENDING_REPLACE_ALL = "matterExportPendingReplaceAll"
 
+#: PRD §5.5's wholesale export switch. **Absent means ON**, because it arrived in
+#: E6 and every install that predates it already has a working allow-list; a
+#: missing key reading as "off" would silently un-run everyone's export on
+#: upgrade. Explicitly off means: build no client, start no agent, and — the
+#: part that is easy to get wrong — **un-export nothing**. Turning a switch off
+#: is not the same statement as emptying the allow-list (PRD §7), and answering
+#: it with the §3.1 mass removal would delete every accessory from every paired
+#: ecosystem, taking their names, rooms and automations with them. Off means the
+#: accessories stop being *updated* and go unreachable, which is recoverable by
+#: ticking the box again.
+PREF_EXPORT_ENABLED = "exportEnabled"
+
 
 class ExportBridge:
     """Owns the bridge client and everything the Indigo callbacks mean for it.
@@ -105,6 +117,16 @@ class ExportBridge:
         ``ExportStore`` takes one.
     :param executor_factory: builds the command executor; injected so tests can
         run dispatches inline instead of on a thread.
+    :param agent_start: called on the empty→non-empty transition, before the
+        client is built — the E7 LaunchAgent seam (XG5/XAC1). Blocking (launchctl
+        and file I/O), so it runs on whichever Indigo thread changed the
+        allow-list, never on the loop.
+    :param agent_stop: called after an un-export has actually landed and the
+        socket is closed. Awaited off the loop by the un-export coroutine.
+    :param agent_diagnose: called when the node stops answering; returns a
+        sentence naming what the agent found (and may revive a dead job), or
+        ``None`` when it has nothing to add. Purely advisory — export degrades,
+        the inbound controller is untouched.
     """
 
     # The seams ARE the API, exactly as BridgeClient's callbacks are.
@@ -115,7 +137,10 @@ class ExportBridge:
                  device_getter: Optional[Callable[[int], Any]] = None,
                  client_factory: Optional[Callable[..., BridgeClient]] = None,
                  save_prefs: Optional[Callable[[], None]] = None,
-                 executor_factory: Optional[Callable[[], Any]] = None) -> None:
+                 executor_factory: Optional[Callable[[], Any]] = None,
+                 agent_start: Optional[Callable[[], None]] = None,
+                 agent_stop: Optional[Callable[[], None]] = None,
+                 agent_diagnose: Optional[Callable[[], Optional[str]]] = None) -> None:
         self._store = store
         self._runtime = runtime
         self._logger = logger
@@ -126,6 +151,13 @@ class ExportBridge:
         self._client_factory = client_factory or BridgeClient
         self._save_prefs = save_prefs
         self._executor_factory = executor_factory or _command_executor
+        self._agent_start = agent_start
+        self._agent_stop = agent_stop
+        self._agent_diagnose = agent_diagnose
+        #: Whether THIS plugin session has brought the bridge agent up. Gates
+        #: the stop (see :meth:`_stop_agent`) so a session that never started it
+        #: never boots one out.
+        self._agent_started = False
 
         #: The live client, or ``None`` while nothing is exported (XG5).
         self.client: Optional[BridgeClient] = None
@@ -194,6 +226,16 @@ class ExportBridge:
         #: The last drift set reported, for the same reason — see
         #: :meth:`_on_drift_detected`.
         self._drift_reported: frozenset = frozenset()
+        #: ISO 8601 expiry of the commissioning window the pairing menu opened,
+        #: or ``None``. Held here rather than re-read from the node because the
+        #: PRD §5.5 config readout is a dialog-open, and a dialog must not block
+        #: on a WS round trip. Cleared by the §5 ``window_closed`` event, which
+        #: fires on expiry AND on a commissioner completing.
+        self.window_expires_at: Optional[str] = None
+        #: The fabric set as of the last §5 ``fabrics_changed`` (or attach), for
+        #: the same readout. ``None`` means "nothing has told us yet", which the
+        #: readout must not render as "no ecosystems are paired".
+        self.fabrics: Optional[list] = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -202,6 +244,11 @@ class ExportBridge:
     def active(self) -> bool:
         """True while a client exists (whether or not it is connected)."""
         return self.client is not None
+
+    @property
+    def enabled(self) -> bool:
+        """PRD §5.5's wholesale export switch, as the config readout reads it."""
+        return self._export_enabled()
 
     def start(self) -> None:
         """Create and run the client. Idempotent.
@@ -220,6 +267,20 @@ class ExportBridge:
             return
         if self.client is not None:
             return
+        if not self._export_enabled():
+            # Not an error and not a latch: the user has turned export off in
+            # Configure…, and every caller of start() is a path that would
+            # ordinarily bring it up. Saying so once per attempt at debug is
+            # enough — the config dialog's own readout is where this belongs.
+            self._logger.debug("Matter export: export is switched off in Configure…; "
+                               "not connecting to the bridge node")
+            return
+        # The agent BEFORE the client, and deliberately not conditional on it
+        # having worked: a bridge that will not start is an export outage, and
+        # the client's own unreachable path is what reports it with the node's
+        # error log attached. Refusing to build the client here would replace one
+        # diagnosis with none.
+        self._ensure_agent()
         self.client = self._client_factory(
             self._logger, self._prefs_getter(),
             plugin_version=self._plugin_version,
@@ -230,6 +291,10 @@ class ExportBridge:
             on_attach_refused=self._on_attach_refused,
             on_version_skew=self._on_version_skew,
             on_drift_detected=self._on_drift_detected,
+            on_fabrics_changed=self._on_fabrics_changed,
+            on_commissioned=self._on_commissioned,
+            on_decommissioned=self._on_decommissioned,
+            on_window_closed=self._on_window_closed,
             on_repeated_failure=self._on_unreachable,
         )
         self._unreachable_reported = False
@@ -298,6 +363,19 @@ class ExportBridge:
         # deadline over what the node is about to remove, and the store that
         # would have told it is already empty by the time we get here.
         removing, self._last_export_count = self._last_export_count, count
+        if not self._export_enabled():
+            # PRD §5.5's switch, and the ONE branch that must not un-export. See
+            # PREF_EXPORT_ENABLED: off is "stop updating the accessories", not
+            # "delete them from every ecosystem". Drop the socket and stop the
+            # agent; the endpoints, the pairings and the allow-list all stand.
+            if self.client is not None:
+                self._logger.info("Matter export: export is switched off — disconnecting from the "
+                                  "bridge node. Exported accessories are LEFT paired and will show "
+                                  "as unavailable until export is switched back on.")
+                self.stop()
+                self._stopped = False   # a config change is not a shutdown
+            self._stop_agent()
+            return
         if count:
             self.start()
         elif self.client is not None:
@@ -315,6 +393,84 @@ class ExportBridge:
                 "earlier (%d accessory record(s) still owed removal)",
                 self._pending_replace_all())
             self.start()
+
+    def _export_enabled(self) -> bool:
+        """PRD §5.5's wholesale switch. Absent, blank or unparseable means ON.
+
+        Only an explicit, recognisable negative turns export off. Indigo
+        checkboxes arrive as real bools once saved but as ``"true"``/``"false"``
+        strings from other write paths, and ``bool("false")`` is ``True`` — so a
+        string is parsed strictly and anything else falls back to *enabled*.
+        Failing open is the right direction here and the opposite of the
+        controller's attestation flag (``server_process._pref_flag``, which fails
+        closed): the harm of misreading this one is un-running a working export
+        for every user whose prefs predate the key.
+        """
+        raw = self._prefs_getter().get(PREF_EXPORT_ENABLED)
+        if raw is None:
+            # Absent, or present-and-null. `.get(key, True)` covers only the
+            # first, and a null is what a hand-edited .indiPref or a partial
+            # restore leaves behind — reading it as "off" would un-run the
+            # export of anyone whose prefs file has been through either.
+            return True
+        if isinstance(raw, str):
+            return raw.strip().lower() not in ("false", "no", "off", "0")
+        return bool(raw)
+
+    # ------------------------------------------------------------------
+    # The bridge LaunchAgent (PRD §4.2 / XG5 / XAC1)
+    # ------------------------------------------------------------------
+    def _ensure_agent(self) -> None:
+        """Bring the bridge agent up, if there is one injected. Never raises.
+
+        Contained here rather than at the seam's implementation because the
+        caller is an Indigo callback: a launchd fault, a full disk, a missing
+        node — none of them may escape into ``deviceDeleted`` or a menu handler.
+        The consequence of failing is an export outage, which the client's
+        unreachable path already reports with the node's own error log attached.
+        """
+        if self._agent_start is None:
+            return
+        # Latched BEFORE the attempt: a start that raised may still have written
+        # a plist and bootstrapped a job, so "we have not touched launchd" would
+        # be a claim we cannot make afterwards — and the stop that would clear it
+        # up is the thing this flag gates.
+        self._agent_started = True
+        try:
+            self._agent_start()
+        except Exception as exc:  # pylint: disable=broad-except
+            self._logger.error(
+                "Matter export: could not start the bridge node's LaunchAgent (%s). Indigo "
+                "devices and inbound Matter control are unaffected; exported accessories will "
+                "not be reachable until this is fixed.", exc)
+            self._logger.exception(exc)
+
+    def _stop_agent(self) -> None:
+        """Take the bridge agent down. Never raises; same containment reasoning.
+
+        Called only once there is genuinely nothing to serve — the allow-list is
+        empty AND the un-export has landed, or export has been switched off. The
+        pairings live in the node's storage dir, which stopping does not touch
+        (PRD §5.4: a plugin reload must never un-pair anyone).
+        """
+        if self._agent_stop is None or not self._agent_started:
+            # ⊗ XAC1. Nothing this plugin session started, nothing it stops: a
+            # bootout issued by a plugin that never brought the agent up would
+            # take down a bridge the *user* started by hand, and would run on
+            # every reload of an install that has never exported anything.
+            return
+        self._agent_started = False
+        try:
+            self._agent_stop()
+        except Exception as exc:  # pylint: disable=broad-except
+            self._logger.warning(
+                "Matter export: could not stop the bridge node's LaunchAgent (%s). It will keep "
+                "running with nothing to export, which is harmless — pairings are untouched.", exc)
+
+    async def _stop_agent_off_loop(self) -> None:
+        """:meth:`_stop_agent` from a loop-thread caller, without blocking the loop."""
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._stop_agent)
 
     def _pending_replace_all(self) -> int:
         """**How many** endpoints an un-export still owes the node (XAC7).
@@ -487,6 +643,23 @@ class ExportBridge:
                 if self._start_after_un_export:
                     self._start_after_un_export = False
                     self.start()
+                else:
+                    # **After** the un-export, never before it (XG5's other
+                    # half). Stopping the agent first would take the node down
+                    # with the removal request still unsent, and the debt in
+                    # prefs would then have to reach a node the plugin has just
+                    # switched off — which is only recoverable by exporting
+                    # something again. Off the loop, because launchctl is
+                    # subprocess I/O and this coroutine shares its loop with the
+                    # inbound matter-server client.
+                    #
+                    # Deliberately runs even when the attach FAILED: the socket
+                    # is closed either way, the allow-list is empty either way,
+                    # and the debt is what carries the un-export forward — it
+                    # survives in prefs and is discharged the next time anything
+                    # brings the client back up.
+                    loop = asyncio.get_running_loop()
+                    await loop.run_in_executor(None, self._stop_agent)
 
         if not self._fire(_un_export(), "un-exporting everything",
                           lost="exported accessories will linger in paired ecosystems"):
@@ -1028,6 +1201,11 @@ class ExportBridge:
         self._halted_reported = False
         self._recovery_reported = False
         self._refusal_reported = None
+        # The attach's own §4.3 report is the fabric set's only source on a fresh
+        # connection: `fabrics_changed` fires on CHANGES, so a bridge that has
+        # been paired for months emits nothing at all and the §5.5 readout would
+        # sit on "not known yet" forever.
+        self.fabrics = list(getattr(status, "fabrics", ()) or [])
         self._logger.info("Matter export: bridge node attached — %d endpoint(s) live, %s",
                           status.endpoint_count,
                           "commissioned" if status.commissioned else "not yet paired")
@@ -1039,11 +1217,14 @@ class ExportBridge:
                 "Matter export: the outstanding un-export completed — %d accessory record(s) "
                 "removed from the bridge node; paired ecosystems will drop them.", owed)
             if len(self._store) == 0:
-                # XG5 again: nothing is exported, so nothing needs a socket.
-                # Only when the list is still empty — a debt discharged by an
-                # attach that also carried real endpoints is an export we must
-                # keep serving, not one to hang up on.
+                # XG5 again: nothing is exported, so nothing needs a socket —
+                # and, since E7, nothing needs an agent either. Only when the
+                # list is still empty: a debt discharged by an attach that also
+                # carried real endpoints is an export we must keep serving, not
+                # one to hang up on.
                 self._stop_soon("closing the bridge client after the outstanding un-export")
+                self._fire(self._stop_agent_off_loop(),
+                           "stopping the bridge agent after the outstanding un-export")
 
     def _report_node_warnings(self, status) -> None:
         """Say what the node could not persist (§4.3 ``warnings``).
@@ -1135,18 +1316,96 @@ class ExportBridge:
             "swapped identities in paired ecosystems. This is never repaired automatically.",
             ", ".join(f"{d.unique_id}: expected {d.expected}, got {d.actual}" for d in drift))
 
+    # ------------------------------------------------------------------
+    # §5 pairing activity — the events that make the bridge's own state visible
+    # ------------------------------------------------------------------
+    def _on_fabrics_changed(self, fabrics: list, change: str) -> None:
+        """An ecosystem was added, removed or renamed (§5 ``fabrics_changed``).
+
+        Surfaced at INFO rather than debug, and unlatched, because every one of
+        these is a discrete user-visible act — somebody paired Apple Home,
+        somebody's Alexa dropped us — and there is no polling loop that would
+        otherwise notice. The node emits it for the changes §3.9/§3.10 cause
+        themselves as well as for ecosystem-originated ones, so this is also the
+        acknowledgement the unpair menu reports against.
+        """
+        self.fabrics = list(fabrics)
+        described = ", ".join(_describe_fabric(fabric) for fabric in fabrics) or "none"
+        self._logger.info(
+            "Matter export: the bridge node's paired ecosystems changed (%s) — now paired with: %s",
+            change or "changed", described)
+
+    def _on_commissioned(self) -> None:
+        """First fabric (§5 ``commissioned``) — a transition, not a repeat."""
+        self._logger.info(
+            "Matter export: the Matter bridge has been PAIRED for the first time. Exported "
+            "accessories should now appear in that ecosystem. To add a second ecosystem, use "
+            "Plugins ▸ Matter ▸ Pair Matter Bridge… — the original pairing code no longer works.")
+
+    def _on_decommissioned(self) -> None:
+        """Last fabric gone (§5 ``decommissioned``).
+
+        Worth a warning rather than an info: the fabric set emptying makes
+        matter.js factory-reset itself, so every exported accessory has just
+        disappeared from everywhere — and if the user did not do it deliberately
+        (an ecosystem removed *us*), this line is the only notice they get.
+        """
+        self.fabrics = []
+        self.window_expires_at = None
+        self._logger.warning(
+            "Matter export: the Matter bridge is no longer paired with ANY ecosystem. Every "
+            "exported accessory has gone with the last fabric. Indigo devices are unaffected; "
+            "use Plugins ▸ Matter ▸ Pair Matter Bridge… to pair it again.")
+
+    def _on_window_closed(self, reason: str) -> None:
+        """The commissioning window ended (§5 ``window_closed``)."""
+        self.window_expires_at = None
+        if reason == "commissioned":
+            self._logger.info("Matter export: the pairing window closed — an ecosystem completed "
+                              "commissioning.")
+            return
+        self._logger.info(
+            "Matter export: the pairing window has expired without an ecosystem completing "
+            "commissioning. Open a new one with Plugins ▸ Matter ▸ Pair Matter Bridge… — the "
+            "code it showed is now dead.")
+
+    def note_window_opened(self, expires_at: str) -> None:
+        """Record a window the pairing menu just opened, for the §5.5 readout."""
+        self.window_expires_at = expires_at
+
     def _on_unreachable(self, attempts: int) -> None:
-        """The node is not answering. In E3 that usually means it is not running."""
+        """The node is not answering — and since E7 the agent is asked why.
+
+        The diagnosis matters more here than for the controller, because the
+        bridge agent is started and stopped by the allow-list rather than at
+        plugin startup: "not running" can mean launchd never got it up, that it
+        is crash-looping on a bound Matter port, or that its package was never
+        installed. All three present identically at the socket as "connection
+        refused". The seam returns the agent's own error-log tail; a failure
+        inside it is contained there and costs only the extra sentence.
+        """
         if self._unreachable_reported:
             return
         self._unreachable_reported = True
         self._logger.warning(
             "Matter export: the bridge node is not responding after %d attempts on port %s. "
-            "In this build the node is started by hand — check it is running. Indigo devices "
-            "are unaffected; exported accessories will show as unavailable.",
+            "Indigo devices and inbound Matter control are unaffected; exported accessories "
+            "will show as unavailable.%s",
             attempts,
             str(self._prefs_getter().get(bridge_protocol.PREF_WS_PORT)
-                or bridge_protocol.DEFAULT_WS_PORT))
+                or bridge_protocol.DEFAULT_WS_PORT),
+            self._agent_diagnosis())
+
+    def _agent_diagnosis(self) -> str:
+        """Ask the agent seam why the node is quiet. Never raises; may be empty."""
+        if self._agent_diagnose is None:
+            return ""
+        try:
+            detail = self._agent_diagnose()
+        except Exception as exc:  # pylint: disable=broad-except
+            self._logger.debug("Matter export: the bridge agent diagnostic failed (%s)", exc)
+            return ""
+        return f" {detail}" if detail else ""
 
     # ------------------------------------------------------------------
     # Watchdog
@@ -1296,6 +1555,39 @@ class ExportBridge:
         exc = future.exception()
         if exc is not None:
             self._logger.warning("Matter export: %s failed — %s", what, exc)
+
+
+#: Matter vendor IDs whose ecosystems a user is likely to recognise. Purely
+#: cosmetic: a fabric's own ``label`` is whatever the commissioner wrote there,
+#: which for Apple is a UUID-ish string that tells nobody anything. Unknown ids
+#: are rendered as hex, never guessed at.
+VENDOR_NAMES = {
+    0x1349: "Apple",
+    0x100B: "Google",
+    0x1217: "Amazon",
+    0x1075: "SmartThings",
+    0xFFF1: "test vendor",
+}
+
+
+def _describe_fabric(fabric: Any) -> str:
+    """One fabric as a human would name it: ``Apple (index 1)``.
+
+    The index is always shown because it is what §3.9 removes a fabric BY, so a
+    user reading the log and a user picking from the unpair menu are looking at
+    the same identifier.
+    """
+    vendor_id = int(getattr(fabric, "vendor_id", 0) or 0)
+    name = VENDOR_NAMES.get(vendor_id) or f"vendor 0x{vendor_id:04X}"
+    label = str(getattr(fabric, "label", "") or "").strip()
+    index = getattr(fabric, "fabric_index", "?")
+    return f"{name} (index {index})" if not label else f"{name} — {label} (index {index})"
+
+
+def describe_fabric(fabric: Any) -> str:
+    """Public alias of :func:`_describe_fabric` — the menu and the config readout
+    render fabrics the same way the log does, so a user matches one to the other."""
+    return _describe_fabric(fabric)
 
 
 def reachable_of(dev: Any) -> bool:
