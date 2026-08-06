@@ -114,6 +114,18 @@ Result: `<StatusReport>` (§4.3). The node reconciles its live endpoint set
 against `endpoints` — creating, updating and removing as needed — so a fresh
 connection is always a full reconcile (PRD §5.4 `startup`).
 
+**The live set is not empty at first attach.** Since bridge-node 0.6.0 the node
+rebuilds its last-known endpoint set from `endpoint-map.json` *before* it goes
+online (§4.3), so the first `attach` of a session reconciles against restored
+endpoints rather than against nothing. Nothing about the command changes — the
+plugin remains the source of truth (§6.2), and an endpoint that is restored but
+absent from `endpoints` is removed, which is exactly right for a device
+un-exported while the plugin was away. Two consequences worth stating:
+
+- restored endpoints are **unreachable** until the attach (or a `set_reachable`,
+  §3.5) says otherwise, and carry no state the plugin has not sent;
+- the mass-removal guard below is armed from the very first attach.
+
 **Mass-removal guard.** If `endpoints` is empty (or would remove every live
 endpoint) while the node currently serves a non-empty set, the node refuses
 with `error_code: "mass_removal_refused"` unless the args carry
@@ -425,6 +437,46 @@ error, never auto-repaired. Each entry is a `DriftEntry`:
 `endpoints[].role` is one of the §4.2 enum; `endpointCount` is
 `endpoints.length` (it is sent explicitly so a client can log the size without
 walking the list).
+
+#### `endpoint-map.json` — contents, and restore-on-start
+
+The map is a sibling of `identity.json` in the bridge storage directory (outside
+matter.js's own storage context, so §3.10's reset cannot wipe it). **Schema
+version 2** since bridge-node 0.6.0:
+
+```json
+{"version": 2,
+ "endpoints": {
+   "indigo-123456789": {"number": 2, "role": "onOffLight", "label": "Kitchen Lamp"}
+ }}
+```
+
+- `number` — the endpoint number matter.js assigned. The witness half; this is
+  what drift is reported against, and it is never rewritten by a drift report.
+- `role`, `label` — the *restoration* half, added by version 2. Together with
+  the `UniqueID` key they are everything `createEndpoint` needs, which is what
+  lets the node rebuild an accessory without the plugin. `options` is **not**
+  stored: nothing in the node reads it (window-covering polarity is applied
+  plugin-side, §4.1).
+
+**Version 1 files are read, migrated in place, and never treated as corrupt.**
+A v1 entry is a bare number; it keeps that number, is simply not restorable
+until the next `attach` records a role and label, and the file is rewritten as
+v2 by the first drift check. A v2 entry whose `role`/`label` are malformed keeps
+its number the same way — the number is the part that cannot be re-derived.
+
+**Restore-on-start.** At startup the node rebuilds every restorable entry —
+through the ordinary `createEndpoint` path, at the same `Endpoint.id` and
+therefore the same persisted number, with `reachable: false` and the role's own
+default state — **before** `server.start()`. A bridge that came online with a
+childless aggregator and waited for the plugin told every paired ecosystem that
+every accessory had gone; Apple then re-added them as new accessories in the
+bridge's own room, destroying the user's room assignments on every restart
+(issue #141). The restore is not drift: these are the map's own numbers being
+re-used, and `driftChecked` stays `false` until a real comparison runs. A node
+in a refuse-to-start state (§1.1 `endpoint_map_invalid`) restores **nothing** —
+it cannot trust the map, and creating endpoints is precisely what the refusal
+exists to prevent.
 
 `drift` is populated by every operation that can change the live endpoint set —
 `attach`/`reconcile`, `upsert_endpoint` and `remove_endpoint` — and **on the

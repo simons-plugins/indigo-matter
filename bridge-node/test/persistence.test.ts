@@ -30,7 +30,12 @@ import { after, describe, it } from "node:test";
 
 import { Logger, type ServerNode } from "@matter/main";
 
-import { ENDPOINT_MAP_FILE, type EndpointMapFile } from "../src/endpoint-map.js";
+import {
+    ENDPOINT_MAP_FILE,
+    ENDPOINT_MAP_VERSION,
+    type EndpointMapFile,
+    type EndpointMapFileV1,
+} from "../src/endpoint-map.js";
 import { uniqueIdFor } from "../src/endpoints.js";
 import { BridgeNode, matterJsVersion } from "../src/node.js";
 import { ErrorCode, PROTOCOL_VERSION, RefuseReason } from "../src/protocol.js";
@@ -271,9 +276,11 @@ describe("XAC5: endpoint identity across a bridge-node restart", () => {
         const persisted = readMap(storagePath);
         await first.close();
 
+        // Since #141 the entry carries the role and label too — that is what
+        // lets the next start rebuild the accessory before it goes online.
         assert.deepEqual(persisted.endpoints, {
-            [uniqueIdFor(KITCHEN)]: before[KITCHEN],
-            [uniqueIdFor(LOUNGE)]: before[LOUNGE],
+            [uniqueIdFor(KITCHEN)]: { number: before[KITCHEN], role: "onOffLight", label: "Kitchen Lamp" },
+            [uniqueIdFor(LOUNGE)]: { number: before[LOUNGE], role: "dimmableLight", label: "Lounge Lamp" },
         });
 
         const second = await boot(storagePath);
@@ -297,9 +304,13 @@ describe("XAC5: endpoint identity across a bridge-node restart", () => {
         // is the only way to produce it deterministically — the real cause is
         // matter.js's storage being lost, which is exactly what we cannot ask a
         // test to arrange without also losing the fabric.
+        const current = readMap(storagePath);
         const poisoned: EndpointMapFile = {
-            version: 1,
-            endpoints: { ...readMap(storagePath).endpoints, [uniqueIdFor(KITCHEN)]: 99 },
+            ...current,
+            endpoints: {
+                ...current.endpoints,
+                [uniqueIdFor(KITCHEN)]: { ...current.endpoints[uniqueIdFor(KITCHEN)]!, number: 99 },
+            },
         };
         writeFileSync(join(storagePath, ENDPOINT_MAP_FILE), JSON.stringify(poisoned));
 
@@ -317,7 +328,7 @@ describe("XAC5: endpoint identity across a bridge-node restart", () => {
         assert.deepEqual((events[0]?.data as { drift: unknown[] }).drift, driftOf(status));
         // §4.3: never auto-repaired. If the baseline moved to match, the next
         // start would call the same fault clean.
-        assert.equal(afterMap.endpoints[uniqueIdFor(KITCHEN)], 99);
+        assert.equal(afterMap.endpoints[uniqueIdFor(KITCHEN)]?.number, 99);
     });
 
     it("stops reporting drift once the user rebuilds the map (§3.11)", async () => {
@@ -346,8 +357,8 @@ describe("XAC5: endpoint identity across a bridge-node restart", () => {
         assert.equal((status.result as { driftChecked: boolean }).driftChecked, true);
         assert.deepEqual(driftOf(status), []);
         assert.deepEqual(readMap(storagePath).endpoints, {
-            [uniqueIdFor(KITCHEN)]: before[KITCHEN],
-            [uniqueIdFor(LOUNGE)]: before[LOUNGE],
+            [uniqueIdFor(KITCHEN)]: { number: before[KITCHEN], role: "onOffLight", label: "Kitchen Lamp" },
+            [uniqueIdFor(LOUNGE)]: { number: before[LOUNGE], role: "dimmableLight", label: "Lounge Lamp" },
         });
     });
 });
@@ -607,7 +618,7 @@ describe("the E5 migration bootstrap, on a node (PRD §7, §4.3)", () => {
             assert.equal(migrationLines(session.logged).length, 1, session.logged.join("\n"));
             // The baseline is empty and on disk: the first reconcile fills it
             // from the live set, which IS matter.js's persisted allocation.
-            assert.deepEqual(readMap(storagePath), { version: 1, endpoints: {} });
+            assert.deepEqual(readMap(storagePath), { version: ENDPOINT_MAP_VERSION, endpoints: {} });
         } finally {
             await session.close();
         }
@@ -620,14 +631,16 @@ describe("the E5 migration bootstrap, on a node (PRD §7, §4.3)", () => {
         // of what the numbers were, so the storage loss it exists to detect
         // becomes undetectable on the very next boot.
         const storagePath = storage();
-        const existing: EndpointMapFile = { version: 1, endpoints: { [uniqueIdFor(KITCHEN)]: 7 } };
+        // A v1 (numbers-only) file on purpose: the migration path must leave a
+        // legacy map exactly as it found it too.
+        const existing: EndpointMapFileV1 = { version: 1, endpoints: { [uniqueIdFor(KITCHEN)]: 7 } };
         writeFileSync(join(storagePath, ENDPOINT_MAP_FILE), JSON.stringify(existing));
 
         const session = await bootPosed(storagePath, { commissioned: true });
         try {
             // The file itself, not just the log line: a re-seed writes a
             // perfectly valid map and logs a perfectly reassuring line.
-            assert.deepEqual(readMap(storagePath), existing);
+            assert.deepEqual(readMap(storagePath), existing as unknown as EndpointMapFile);
             assert.deepEqual(migrationLines(session.logged), []);
         } finally {
             await session.close();

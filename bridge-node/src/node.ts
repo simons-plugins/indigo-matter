@@ -2,11 +2,17 @@
  * The Matter side of the bridge: a ServerNode with an Aggregator at endpoint 1
  * and one bridged child endpoint per exported Indigo device.
  *
- * The child set is entirely protocol-driven (§3.1-§3.3) and lives in
- * {@link EndpointRegistry}; a node that has never been attached to serves an
- * empty aggregator. Endpoint *numbers* are persisted by matter.js against
- * `Endpoint.id`, so a device that comes back with the same id comes back with
- * the same number — presence in the running set is not what preserves identity.
+ * The child set is owned by {@link EndpointRegistry} and is authoritative from
+ * the plugin (§3.1-§3.3) — but it is **rebuilt from `endpoint-map.json` before
+ * the stack goes online** (issue #141), so only a bridge that has never
+ * exported anything serves an empty aggregator. A node that came online empty
+ * and waited for the plugin told every paired ecosystem that every accessory
+ * had gone, and Apple re-created them as new ones in its own room.
+ *
+ * Endpoint *numbers* are persisted by matter.js against `Endpoint.id`, so a
+ * device that comes back with the same id comes back with the same number —
+ * presence in the running set is not what preserves identity, and the restore
+ * therefore renumbers nothing.
  *
  * All matter.js coupling lives here, in `endpoints.ts`/`registry.ts` and in
  * main.ts — ADR-0006's binding constraint keeps it out of the Indigo plugin
@@ -30,7 +36,7 @@ import {
 
 import type { BridgeConfig } from "./config.js";
 import { ENDPOINT_MAP_FILE, EndpointMapStore, type LiveEndpointNumber, refuseReasonFor } from "./endpoint-map.js";
-import { type BridgedIdentity, uniqueIdFor } from "./endpoints.js";
+import { type BridgedIdentity, indigoDeviceIdFrom, isSupportedRole, uniqueIdFor } from "./endpoints.js";
 import {
     type BridgeFacade,
     type CommandEventData,
@@ -42,6 +48,7 @@ import {
     type EndpointSpec,
     ErrorCode,
     type FabricInfo,
+    isRole,
     type PairingReport,
     ProtocolError,
     RefuseReason,
@@ -247,6 +254,11 @@ export class BridgeNode implements BridgeFacade {
         // client can ask — and so the log reads in the order things happened.
         this.#endpointMap.load();
 
+        // …and before `server.start()`, which is the whole of issue #141: the
+        // aggregator must already have its children the first time a controller
+        // can read `PartsList`.
+        await this.restoreEndpoints();
+
         await server.start();
 
         // The §5 transition baseline. Taken before the identity assertion so a
@@ -254,9 +266,141 @@ export class BridgeNode implements BridgeFacade {
         this.#fabricCount = this.fabrics().length;
 
         this.assertEndpointIdentity();
+        await this.withdrawRestoredIfRefusing();
 
         this.log(`Matter node online on port ${this.config.matterPort}, storage ${this.config.storagePath}`);
         this.logPairing();
+    }
+
+    /**
+     * Issue #141 — rebuild the last-known endpoint set from `endpoint-map.json`
+     * **before** the Matter stack goes online.
+     *
+     * The defect this closes was measured on real hardware: after any restart
+     * the node called `server.start()` with a childless aggregator and stayed
+     * that way until the plugin connected and attached — 23 seconds on the
+     * reference server after a reboot. Apple reconnects inside that window,
+     * reads an empty `PartsList`, concludes every accessory has gone, and when
+     * they reappear treats them as NEW accessories: dumped in the bridge's own
+     * room with metadata the user can no longer edit. Every restart therefore
+     * destroyed the user's room assignments for every exported device.
+     *
+     * Everything restored comes up **unreachable** (§3.5, PRD XAC8). The plugin
+     * has confirmed nothing yet, and "present but not currently driven" is
+     * exactly what `Reachable: false` means — an ecosystem greys the accessory
+     * out, which is honest, and the first `attach`/`set_state` supplies the
+     * truth. No state value is invented: each endpoint is built with its role's
+     * defaults.
+     *
+     * **`attach` stays authoritative.** This restores a *set*, not a decision:
+     * the plugin's next attach reconciles against it exactly as it always has,
+     * creating what is missing, updating labels and state, and removing
+     * anything genuinely un-exported while the plugin was away.
+     *
+     * Nothing is restored while refusing (PRD §7): a node that cannot trust its
+     * map, or its identity, must not create endpoints at all — that refusal is
+     * the only thing standing between a lost `Endpoint.id → number` allocation
+     * and every accessory being duplicated in every paired ecosystem.
+     */
+    private async restoreEndpoints(): Promise<void> {
+        if (this.#refusal !== undefined) {
+            this.log(`Not restoring any endpoints from the map — ${this.#refusal}`);
+            return;
+        }
+        if (this.#endpointMap.problem !== undefined) {
+            // `load()` has already said what is wrong with the file; the point
+            // worth adding is what that costs, which is this.
+            this.log("Not restoring any endpoints from the map — it could not be read");
+            return;
+        }
+        const restorable = this.#endpointMap.restorable();
+        if (restorable.length === 0) {
+            if (this.#endpointMap.size > 0) {
+                // A v1 map, or one written before an endpoint was ever created.
+                // Not a fault, but it IS the reason the bridge is about to come
+                // up empty, and that is worth saying once rather than leaving
+                // the user to infer it from silence.
+                this.log(
+                    `The endpoint map holds ${this.#endpointMap.size} number(s) but no role/label yet, so ` +
+                        "nothing can be rebuilt before the plugin attaches — this start is the one that " +
+                        "records them, and the next restart will restore.",
+                );
+            }
+            return;
+        }
+
+        const specs: EndpointSpec[] = [];
+        for (const entry of restorable) {
+            const indigoDeviceId = indigoDeviceIdFrom(entry.uniqueId);
+            if (indigoDeviceId === undefined || !isRole(entry.role) || !isSupportedRole(entry.role)) {
+                // A map written by a NEWER node, or hand-edited. Skipped rather
+                // than fatal: the plugin's attach still knows how to create it
+                // if this build can, and refusing to start over one entry would
+                // take every other accessory down with it.
+                this.log(
+                    `Endpoint map entry ${entry.uniqueId} (role ${entry.role}) cannot be rebuilt by this ` +
+                        "bridge version; leaving it to the plugin's attach",
+                );
+                continue;
+            }
+            specs.push({
+                indigoDeviceId,
+                role: entry.role,
+                label: entry.label,
+                // §3.5/XAC8: nothing has confirmed this device's state yet.
+                reachable: false,
+                // Deliberately empty. The role's own defaults are the honest
+                // starting point; inventing an `onOff` here would have the
+                // ecosystem show a value nobody has read.
+                states: {},
+                options: {},
+            });
+        }
+        if (specs.length === 0) {
+            return;
+        }
+
+        const restored = await this.registry.restore(specs);
+        this.log(
+            `Restored ${restored} of ${specs.length} endpoint(s) from the endpoint map before going ` +
+                "online, all unreachable until the plugin attaches — the bridge is never online with an " +
+                "empty accessory list (issue #141)",
+        );
+    }
+
+    /**
+     * Take the restored endpoints back out if the post-start identity check
+     * refused (issue #141 meeting PRD §7).
+     *
+     * The refusal decision needs `lifecycle.isCommissioned` and the fabric
+     * table, so it cannot be taken before the stack is up — but the restore has
+     * to happen before it, or there is no point to the restore at all. The one
+     * refusal that can be raised *after* a restore is `fabricStorageLost`, and
+     * it is by definition a node with **no fabrics**: there is no controller
+     * attached to see the endpoints that briefly existed, and the invariant the
+     * refusal actually protects ("nothing is created while refusing") is
+     * restored here.
+     *
+     * A `mapUnreadable` refusal cannot reach this: an unreadable map restores
+     * nothing in the first place.
+     */
+    private async withdrawRestoredIfRefusing(): Promise<void> {
+        if (this.#refusal === undefined || this.registry.size === 0) {
+            return;
+        }
+        const count = this.registry.size;
+        this.log(
+            `Withdrawing the ${count} endpoint(s) restored from the map — the node is refusing to serve ` +
+                `(${this.#refusal}), and nothing may be created while it does`,
+        );
+        try {
+            await this.registry.reconcile([], true);
+        } catch (error) {
+            this.log(
+                `Could not withdraw the restored endpoints (${describeError(error)}); ${this.registry.size} ` +
+                    "remain in the Matter tree even though the node is refusing to serve",
+            );
+        }
     }
 
     /**
@@ -562,6 +706,19 @@ export class BridgeNode implements BridgeFacade {
     }
 
     /**
+     * The live set as `endpoint-map.json` records it: the number, plus the
+     * `role`/`label` that let it be rebuilt at the next start (issue #141).
+     */
+    private liveIdentities(): LiveEndpointNumber[] {
+        return (this.#registry?.identities() ?? []).map(identity => ({
+            uniqueId: uniqueIdFor(identity.indigoDeviceId),
+            endpointNumber: identity.endpointNumber,
+            role: identity.role,
+            label: identity.label,
+        }));
+    }
+
+    /**
      * Compare the live endpoint numbers against the persisted map (PRD §4.3).
      *
      * Run at the end of every operation that can create an endpoint, which is
@@ -571,11 +728,7 @@ export class BridgeNode implements BridgeFacade {
      * rather than being blessed into the truth on the next pass.
      */
     private checkDrift(): void {
-        const live: LiveEndpointNumber[] = (this.#registry?.summaries() ?? []).map(summary => ({
-            uniqueId: uniqueIdFor(summary.indigoDeviceId),
-            endpointNumber: summary.endpointNumber,
-        }));
-        const drift = this.#endpointMap.check(live);
+        const drift = this.#endpointMap.check(this.liveIdentities());
         this.#drift = drift;
         if (drift.length === 0) {
             return;
@@ -917,10 +1070,7 @@ export class BridgeNode implements BridgeFacade {
             );
         }
 
-        const live: LiveEndpointNumber[] = (this.#registry?.summaries() ?? []).map(summary => ({
-            uniqueId: uniqueIdFor(summary.indigoDeviceId),
-            endpointNumber: summary.endpointNumber,
-        }));
+        const live = this.liveIdentities();
         if (!this.#endpointMap.rebuild(live)) {
             // The refusal deliberately stays. Answering with a StatusReport here
             // told the user "serving normally again" over a map that never
