@@ -5,8 +5,9 @@
 **Governing ADR:** [`../../docs/adr/0006-indigo-as-matter-bridge.md`](../../docs/adr/0006-indigo-as-matter-bridge.md) (accepted 2026-08-03; workspace-level — the path resolves in the multi-repo workspace checkout, not on GitHub), as amended by ADR-0007 (validation-evidence criterion)
 **Companion PRD:** [`PRD-indigo-matter-plugin.md`](./PRD-indigo-matter-plugin.md) (historical — the inbound/controller build)
 **Local protocol spec:** [`BRIDGE_PROTOCOL.md`](./BRIDGE_PROTOCOL.md)
-**Last updated:** 2026-08-04 (research pass: matter.js 0.17.8 verified by execution; scope and
-packaging decisions taken — see §5.2 exclusions, §10, §11)
+**Last updated:** 2026-08-05 (E8 docs pass: §5.2's sensor rows, §5.3's distribution
+wording and §9's E7/E8 rows corrected against the shipped code — see the marked
+rows. Earlier: 2026-08-04 research pass, matter.js 0.17.8 verified by execution)
 
 ## 1. Summary
 
@@ -213,16 +214,14 @@ safest interpretation (plug/light) rather than guessing.
 | Relay | Valve | *Not exportable in v1* | Descoped 2026-08-04; see below |
 | Relay | Garage door | *Not exportable in v1* | Polarity + safety; see below |
 | Dimmer | Light | Dimmable Light | |
-| Dimmer (colour) | Light | Extended Color Light | Colour-temp-only devices → Color Temperature Light |
+| Dimmer (colour) | Light | Extended Color Light | Colour-temp-only devices → Color Temperature Light. A colour-capable dimmer is *also* offered the colour-temp-only role, so a user can downgrade a bulb an ecosystem renders badly |
 | Dimmer | Window covering | Window Covering | Polarity declared per export (100% = open, inbound convention). Must implement `handleMovement()` — matter.js's default snaps to target instantly |
 | Dimmer | Fan | *Not exportable in v1* | Descoped 2026-08-04; see below |
-| Sensor (binary, motion) | — | Occupancy Sensor | |
-| Sensor (binary, contact) | — | Contact Sensor | |
-| Sensor (numeric, °C) | — | Temperature Sensor | |
-| Sensor (numeric, %RH) | — | Humidity Sensor | |
-| Sensor (numeric, lux) | — | Light Sensor | |
-| Sensor (numeric, pressure) | — | Pressure Sensor | Apple Home ignores this type (Google supports it); exported anyway, documented |
-| Sensor (numeric, flow) | — | Flow Sensor | Apple Home ignores this type (Google supports it); exported anyway, documented |
+| Sensor (binary) | Occupancy *(default)* | Occupancy Sensor | Indigo does not distinguish motion from contact any more than it distinguishes a plug from a lamp, so this is declared too. Corrected 2026-08-05 (E8): the row used to read "—" in both directions, implying a mapping the code does not make |
+| Sensor (binary) | Contact | Contact Sensor | |
+| Sensor (numeric) | Temperature / Humidity / Light / Pressure / Flow | the matching Matter sensor type | **All five are offered for any numeric sensor**; the unit heuristic (pluginProps, then the formatted UI value, then the device name) picks only the *default*, and a sensor no hint matches is the "units outside the table" exclusion below. Corrected 2026-08-05 (E8): the rows used to read as one unit → one type |
+| Sensor (numeric, pressure) | Pressure | Pressure Sensor | Apple Home ignores this type (Google supports it); exported anyway, documented. Indigo's barometer convention is hPa and §4.2's key is kPa, so this is the one unit the handler converts |
+| Sensor (numeric, flow) | Flow | Flow Sensor | Apple Home ignores this type (Google supports it); exported anyway, documented |
 | Thermostat | — | Thermostat | Setpoints, modes. No fan in v1 (the FanControl descope applies here too); v2 candidate. matter.js provides the cluster machinery; the HVAC logic is ours |
 | SpeedControl | Fan | *Not exportable in v1* | Descoped 2026-08-04; see below |
 
@@ -242,6 +241,7 @@ them into a PRD where they can rot.
 | `custom` devices with no resolvable role | Includes the plugin's own energy-meter type |
 | Garage doors | Needs the polarity handling the catalog doesn't yet carry (`onState` true = closed, turnOn = close), and mis-mapping is a physical-safety issue. Blocked on the catalog role/polarity work |
 | Sensors with units outside the table | No faithful Matter sensor type |
+| Sensors reporting neither an on/off state nor a value | Nothing to publish (`export_catalog.REASON_SENSOR_NO_VALUE`; added to this table 2026-08-05, E8 — it was always in the code) |
 
 Excluded devices must **appear in the picker as excluded, with reasons** (XAC9),
 not silently missing.
@@ -255,10 +255,11 @@ topology the plugin already consumes inbound (the "Bridges" section of
 `MATTER.md`; in code, `matter_model.py`'s BridgedDeviceBasicInformation
 handling and `device_sync.py`'s `DEVICE_TYPE_AGGREGATOR`).
 
-- **Distribution:** the bridge node is a **published npm package**
+- **Distribution:** the bridge node is distributed as an **npm package**
   (`indigo-matter-bridge`, TypeScript, decided 2026-08-04), exact-pinned by the
   plugin the same way `matter-server@1.2.2` is — the existing
-  `npm install --prefix` machinery works unchanged. matter.js itself is
+  `npm install --prefix` machinery works unchanged. It is **not on the registry
+  yet** (§9 E7); until it is, the install action cannot resolve the pin. matter.js itself is
   **exact-pinned** (no caret): patch releases have changed what Apple Home
   renders with zero code change on the bridge side.
 - **Max fabrics:** matter.js defaults `supportedFabrics` to 254, so ≥5
@@ -367,15 +368,15 @@ not slot arithmetic. Per-export settings live in the §5.1 dialog.
 
 | # | Milestone | Gating criterion |
 |---|---|---|
-| E0 | Bridge node skeleton — **the validation gate** | Node process starts, exposes an aggregator with one hard-coded endpoint, and **pairs into Apple Home**. If an uncertified bridge will not pair here, the design is dead and nothing after this matters |
+| E0 | Bridge node skeleton — **the validation gate** · **GATE PASSED (2026-08-04)** | Node process starts, exposes an aggregator with one hard-coded endpoint, and **pairs into Apple Home**. If an uncertified bridge will not pair here, the design is dead and nothing after this matters. **Done on jarvis 2026-08-04: an uncertified bridge was commissioned into a real Apple Home and the uncertified-accessory prompt accepted.** The pairing was driven from the bridge node's own console, before E6's menu existed — so pairing through the plugin's menu is still unproven |
 | E1 | Local protocol + plugin client | Plugin drives endpoint create/remove over WS |
 | E2 | Allow-list + UI-D dialog | Devices selectable with role; loop guard live (XAC6, XAC9) |
-| E3 | Relay + dimmer export | XAC4 both directions, and XAC3's Apple Home control, against a manually started bridge node (start-on-export is E7's; the code display is E6's) |
+| E3 | Relay + dimmer export — **LIVE E2E PASSED (2026-08-05)** | XAC4 both directions, and XAC3's Apple Home control, against a manually started bridge node (start-on-export is E7's; the code display is E6's). **Done on jarvis 2026-08-05: an on/off light and a dimmer, exported via "Manage Matter Exports…", controlled from Apple Home and from Indigo with each change appearing on the other side** |
 | E4 | Sensors + thermostat export | Mapping table complete for v1 |
-| E5 | Endpoint persistence | XAC5 — the highest-risk correctness requirement |
-| E6 | Pairing/unpairing UX + fabric readout — **BUILT** (2026-08-05, plugin `2026.8.3`) | §6 complete, including XAC3's displayed-code pairing flow. "Pair Matter Bridge…" (§3.8, duration 180–900s), the QR page over IWS, "Unpair an Ecosystem…" (§3.9, two gates), the §5.5 Export config section, and the §5 pairing events surfaced in the log. **XAC3's live pairing is unverified** — it needs jarvis and a real ecosystem |
-| E7 | launchd agent + failure recovery — **BUILT** (2026-08-05, plugin `2026.8.3`, bridge `0.5.0`) | §7, XAC1, XAC2, XAC7, XAC8. `bridge_agent.BridgeProcess` is the second `AgentSpec`; it is installed and started by the empty→non-empty allow-list transition and stopped after the un-export lands. `remove_package` is per-package. **`indigo-matter-bridge` is not yet on the npm registry** — publishing is Simon's action (`docs/HANDOVER.md` → "Publishing the bridge node"), and until then the install action cannot resolve the pinned spec |
-| E8 | Docs | `INSTALL.md` export section, uncertified-prompt explanation, ecosystems-untested note (§10), `MATTER.md` outbound architecture |
+| E5 | Endpoint persistence — **DEPLOYED to jarvis 2026-08-05; upgrade leg PASSED** | XAC5 — the highest-risk correctness requirement. **Upgrade migration observed on jarvis 2026-08-05: three exported accessories kept endpoint numbers 3, 5 and 4 across a plugin and bridge-node upgrade — their pre-upgrade values, deliberately not in creation order — with no duplicates in Apple Home.** XAC5's **reboot** leg is still outstanding: a plugin reload and a bridge-node restart have been survived, a full Mac reboot has not |
+| E6 | Pairing/unpairing UX + fabric readout — **BUILT** (2026-08-05, plugin `2026.8.3`) | §6 complete, including XAC3's displayed-code pairing flow. "Pair Matter Bridge…" (§3.8, duration 180–900s), the QR page over IWS, "Unpair an Ecosystem…" (§3.9, two gates), the §5.5 Export config section, and the §5 pairing events surfaced in the log. **XAC3 is part-verified:** the pairing gate itself passed on jarvis (E0 row), but that pairing was driven from the node's console — *pairing through this menu* is unverified, as is the second-admin half |
+| E7 | launchd agent + failure recovery — **BUILT** (2026-08-05, plugin `2026.8.3`, bridge `0.5.0`) | §7, XAC1, XAC2, XAC7, XAC8. `bridge_agent.BridgeProcess` is the second `AgentSpec`; it is installed and started by the empty→non-empty allow-list transition and stopped after the un-export lands. `remove_package` is per-package. Three lifecycle menu items land with it — "Install/update the Matter export bridge", "Reinstall the Matter export bridge (clean)…" and "Stop the Matter export bridge…" — the last two added in the PR #128 review batch to close the gap where the controller had recovery exits and the bridge had none. **`indigo-matter-bridge` is not yet on the npm registry** — publishing is Simon's action (`docs/HANDOVER.md` → "Publishing the bridge node"), and until then the install action cannot resolve the pinned spec |
+| E8 | Docs — **BUILT** (2026-08-05) | `INSTALL.md` retitled for both runtimes, with a contents list and an export section (prerequisites, first export, pairing, the uncertified prompt, removal/unpairing, the two destructive recovery actions ordered by recoverability, bridge-storage backups, uninstall) plus an export-bridge troubleshooting table split into observable symptoms and verbatim log strings; `MATTER.md` outbound architecture, with the v1 role table and the excluded set hoisted to the front; `README.md` two-role lede. The ecosystems-untested note (§10 / ADR-0007) is stated in all three. The docs state the live-validation position **as it actually stands** — E0's pairing gate and E3's two-way control passed, E5 deployed and its upgrade leg observed, with pairing-through-the-menu, the second admin, the reboot leg and E6/E7 end-to-end still marked outstanding — plus the unpublished npm package, the IWS-auth caveat on the pairing page, and the unit assumption |
 
 **E0 is the whole validation loop.** It answers the only question that can kill
 the feature — *will any ecosystem pair an uncertified bridge?* — on hardware

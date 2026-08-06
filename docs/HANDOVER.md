@@ -1,14 +1,15 @@
 # indigo-matter — Build Handover
 
-**Last updated:** 2026-08-05 23:21 UTC
-**Active work:** `feat/e6-e7-pairing-and-agent` — E6 + E7, the last functional
-export milestones (E8 is docs only). See the section immediately below; the
-`main` summary in this header describes the last merge, not that branch.
+**Last updated:** 2026-08-05 23:58 UTC
+**Active work:** `docs/e8-export-documentation` (PR #129, stacked on
+`feat/e6-e7-pairing-and-agent` / PR #128) — E8, docs only. See the E6+E7 section
+immediately below; the `main` summary in this header describes the last merge,
+not those branches.
 **Branch:** `main` — PRs #106, #107, #108 all merged.
 **Version:** `2026.7.13`
 **Tests:** 1005 passing (`cd indigo-matter && /Library/Frameworks/Python.framework/Versions/Current/bin/python3 -m pytest -q`)
-**Deployed:** jarvis is **unchanged** — still running the #103 code (v2026.7.10 era). **Nothing from #106/#107/#108 has been deployed**, so the #104 supervision fixes are NOT yet live on jarvis.
-**Status:** **Wi-Fi AND Thread validated with real hardware.** #104's three server-supervision faults are fixed and merged (#107). #105's diagnostic is merged (#108) but **#105 stays open** — the bridged-endpoint path still has no real-bridge validation. `domio-code` #236 is fixed and closed (domio-code PR #237). Known-open: #105, plus the older #43, #46, #21–#24.
+**Deployed:** jarvis is running the #103-era plugin (v2026.7.10) plus **E5's export half, deployed 2026-08-05 with 3 accessories live in Apple Home**. **Nothing from #106/#107/#108, and no part of E6 or E7, has been deployed** — so the #104 supervision fixes are NOT yet live on jarvis.
+**Status:** **Wi-Fi AND Thread validated with real hardware**, and the **export half's E0 pairing gate PASSED on 2026-08-04** with live two-way control on 2026-08-05 (see *Live validation on jarvis*). #104's three server-supervision faults are fixed and merged (#107). #105's diagnostic is merged (#108) but **#105 stays open** — the bridged-endpoint path still has no real-bridge validation. `domio-code` #236 is fixed and closed (domio-code PR #237). Known-open: #105, plus the older #43, #46, #21–#24.
 
 ---
 
@@ -396,10 +397,55 @@ exactly where `LaunchAgent._server_entry()` looks for it. `npm link` works too.
 Do this and everything in E7 runs unchanged; just remember the plugin's install
 menu will still try the registry spec.
 
+**So the managed LaunchAgent is not, strictly, blocked on `npm publish`.** It is
+blocked on the package being *installed*, and the local-install recipe above
+installs it. What the publish unblocks is the shipped route — the
+"Install/update the Matter export bridge" menu item — which is what a user would
+use and is therefore what "end to end" means. Do not restate the blocker as
+"npm" when the distinction matters.
+
+### Live validation on jarvis — what has actually happened
+
+Recorded here because README, MATTER.md and INSTALL.md all point at this file
+for the specifics. Dates are the observation dates, not the write-up dates.
+
+**E0's gate: PASSED (2026-08-04).** An uncertified bridge was commissioned into
+a real Apple Home and the uncertified-accessory prompt was accepted. This is the
+question that could have killed the feature outright — *will any ecosystem pair
+an uncertified test-VID bridge?* — and the answer is yes. Note the pairing was
+driven from the **bridge node's own console**, before the plugin's pairing menu
+existed; see the outstanding list below.
+
+**E3's live E2E: PASSED (2026-08-05).** An on/off light and a dimmer, exported
+through the **Manage Matter Exports…** dialog, controlled from Apple Home and
+from Indigo, each direction showing up on the other side. That is XAC4 in both
+directions and XAC3's Apple Home control.
+
+**E5 deployed to jarvis (2026-08-05), and the upgrade migration observed.**
+Three exported accessories kept endpoint numbers **3, 5 and 4** across a plugin
+and bridge-node upgrade — their pre-upgrade values, and deliberately *not* in
+creation order, which is what makes the observation worth anything. No duplicates
+appeared in Apple Home. That is XAC5's upgrade leg.
+
+**Still outstanding, and it must stay marked so:**
+
+- **Pairing through the plugin's own menu.** E0's pairing was driven from the
+  node's console. *Pair Matter Bridge…* → the IWS code page → Apple Home has not
+  been walked end to end.
+- **The second-admin / multi-fabric proof** — XAC3's second half. No second
+  controller has been added alongside Apple Home.
+- **XAC5's reboot leg.** A plugin reload and a bridge-node restart have both been
+  survived; a full Mac reboot has not.
+- **E6 and E7 end to end**, which need the install menu and therefore the npm
+  publish (or the local-install recipe above for a dry run).
+
 ### Deferred / not done
 
-- **XAC3's live pairing is unverified.** Every code path is unit-tested, but
-  nothing here has met a real ecosystem. That is the jarvis script below.
+- **XAC3 is PART-verified — do not read this list as "nothing has been
+  validated".** The pairing gate and live two-way control have both been done on
+  jarvis (see the section immediately above); what is unverified is pairing
+  driven from the *plugin's own menu*, and the second-admin half. The jarvis
+  script below is still the route for those.
 - **A locally-opened commissioning window still does not update the
   `AdministratorCommissioning` cluster's `windowStatus`/`adminFabricIndex`.**
   Unchanged from E5: matter.js 0.17.8's cluster command asserts a remote
@@ -413,13 +459,21 @@ menu will still try the registry spec.
   gives the stop/start seam the E5 note said was missing) but is **not wired**:
   `fabric_backup.restore_backup` still reports and skips the `bridge-node/`
   members. Wiring it is a small, self-contained follow-up.
+- **The published Field Notes site does not know export exists.**
+  `docs/matter.html` is a hand-built page generated from an earlier `MATTER.md`
+  and carries **zero** export content, and `docs/index.html`'s standfirst still
+  offers "two long reads" with no route to the export material or to
+  `INSTALL.md`. E8 therefore points README's export lede at `docs/MATTER.md`
+  directly rather than at `matter.html`. **Regenerating both pages is
+  outstanding**, and until it is done the GitHub Pages site under-sells the
+  feature to anyone who starts there.
 - **Still open from earlier:** #105, #83, #84, #62 follow-up, #43, #46, #21–#24.
 
 ### Open, unexplained, and Apple-side: room changes in Apple Home
 
-Observed on jarvis with E5 deployed and 3 accessories live: on/off control works,
-but Apple Home refuses to change an accessory's **room** ("can't change
-settings"). Simon had changed those same accessories' rooms successfully before,
+Observed on jarvis with E5 deployed and 3 accessories live (2026-08-05): on/off
+control works, but Apple Home refuses to change an accessory's **room** ("can't
+change settings"). Simon had changed those same accessories' rooms successfully before,
 so this is a change in Apple-side state, not in bridge behaviour.
 
 **No bridge-side change can address this, and the reasoning matters.** Room
@@ -435,8 +489,9 @@ presented as a remedy for it.
 
 ### Deploying E6 + E7 to jarvis
 
-Nothing in E5, E6 or E7 has been deployed. In order, because each step gates
-the next:
+**E5 is deployed** (2026-08-05, with three accessories live — see *Live
+validation on jarvis* above). **E6 and E7 are not.** In order, because each step
+gates the next:
 
 1. **Publish `indigo-matter-bridge@0.5.0`** (above). Without it step 4 fails.
    For a dry run, use the local-install workaround instead.
@@ -1441,3 +1496,76 @@ Domio no longer commissions; it relays a **share code** (Apple Home is admin 1; 
 - `domio-code/docs/API.md` (v1.1 contract mirror) — untracked in that repo.
 - workspace `docs/plans/PRD-indigo-matter-plugin.md` mirror — untracked.
 - ADR Thread caveat + Domio PRD edits — flagged to Simon, not auto-applied (ADR is `accepted`/immutable).
+
+---
+
+# 2026-08-06 — end-of-session handover: export v1 built, live-validated, open items
+
+**Where the export half stands: feature-complete and substantially proven on
+jarvis.** Ten PRs merged (#118–#128 plus the CI marker), one open (#130, E8
+docs). `indigo-matter-bridge@0.5.0` is **published to npm**. The plugin on jarvis
+is 2026.8.3 with the bridge running under launchd.
+
+## Validated live on jarvis (dates are real, evidence in this session's logs)
+
+| What | When | Evidence |
+|---|---|---|
+| E0 gate — uncertified bridge paired into Apple Home | 08-04 | "Add Anyway" accepted; the question that could have killed the feature |
+| E3 — on/off light + dimmer, both directions | 08-05 | via the Manage Matter Exports dialog |
+| E5 — upgrade keeps identity | 08-05 | 3 accessories returned at numbers 3/5/4, *out of creation order* = proof the map held; no duplicates |
+| E5 — drift detector fires for real | 08-06 | genuine mismatch after a factory reset, reported and NOT auto-repaired |
+| E6 — pairing from the plugin's own menu | 08-06 | window opened, code to log, paired in Apple Home |
+| E6 — unpair + last-fabric self-reset | 08-06 | witness cleared, endpoint map preserved, node self-recovered in 200ms |
+| E7 — the whole install chain from one click | 08-06 | npm install → plist → launchd bootstrap → node online → attach → reconcile |
+
+## Still unproven (do not claim these)
+
+- **XAC5's reboot leg.** Plugin reload and node restart pass; a full Mac reboot
+  has not been done. → issue #139
+- **Second admin.** No controller other than Apple has ever commissioned the
+  bridge. Apple's 2-fabric count is main + iCloud Keychain, *not* multi-admin
+  evidence. ADR-0007 requires this. → #139
+- **IWS auth posture** for the pairing page. → #139
+
+## The room mystery — SOLVED
+
+Apple refusing room edits on exported accessories was **stale Apple-side
+records**, not a bridge fault (room assignment never crosses Matter). Remedy,
+verified: remove the bridge in Home → clear the leftover keychain fabric with
+*Unpair an Ecosystem…* (Apple only removes one of its two) → re-pair. Rooms work
+again. Full writeup and the docs task: **#139/#141**. Three of my theories were
+wrong before this one — no-Matter-traffic, un-export identity reuse, and a
+`configurationVersion` reset that a probe disproved (matter.js *does* persist and
+restore it). Don't re-derive them.
+
+## Open issues filed this session
+
+| # | What |
+|---|---|
+| #131 | Sort exported devices to the top of the export picker |
+| #132 | Rebuild dialog's "will duplicate" warning overstates what it does |
+| #133 | `get_pairing` races the last-fabric self-reset → spurious error |
+| #134 | Group the two Install/update menu items (11 apart, confusable) |
+| #135 | Reset reconnect backoff after a successful install (29s dead wait) |
+| #136 | Wire bridge-storage restore (E7 gave it the stop seam it needed) |
+| #137 | Docs site has no route to the export half (matter.html/index.html) |
+| #138 | Three screenshots wanted for the walkthrough |
+| #139 | Live validation tracker + the solved room remedy |
+| #140 | **No way to clear a drift report on a healthy node** — Rebuild is gated on the refusal state |
+
+**#140 is the one to fix first.** It is reachable by following our own
+documentation: a factory reset makes drift expected, and the user is then left
+with a permanent warning and no supported way to clear it.
+
+## Process notes worth keeping
+
+- Every PR got a three-agent battery (code / silent-failure / test-coverage). The
+  test reviewer's **mutation** method earned its keep repeatedly — it found ~7
+  load-bearing lines whose deletion broke zero tests, a confirm dialog whose gate
+  was inert, and a bridged-identity producer where publishing *Apple's* vendor ID
+  passed all 346 tests.
+- **Recurring defect shape, six occurrences:** a helper superbly unit-tested
+  while its only production caller is untested. Brief future reviewers to hunt
+  that first.
+- Live testing found things no review did: the wrong-menu click, the 29s attach
+  wait, the unusable QR payload, and #140. Deploy early next time.

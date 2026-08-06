@@ -1,12 +1,21 @@
 # indigo-matter
 
-Matter device support for the [Indigo](https://www.indigodomo.com) home automation server.
+Matter device support for the [Indigo](https://www.indigodomo.com) home automation server —
+**in both directions**.
 
-Add Matter devices from the **Domio** iOS app or the plugin's own menu; control them as
-first-class Indigo devices (triggers, schedules, action groups, control pages, API). The
-plugin manages a [`matter-server`](https://github.com/matter-js/matterjs-server) instance,
-holds the Indigo-owned Matter fabric, translates Matter clusters ↔ Indigo device types,
-and owns runtime control for each device's lifetime.
+**Matter in (the controller).** Add Matter devices from the **Domio** iOS app or the
+plugin's own menu; control them as first-class Indigo devices (triggers, schedules, action
+groups, control pages, API). The plugin manages a
+[`matter-server`](https://github.com/matter-js/matterjs-server) instance, holds the
+Indigo-owned Matter fabric, translates Matter clusters ↔ Indigo device types, and owns
+runtime control for each device's lifetime.
+
+**Matter out (the bridge).** Publish selected *Indigo* devices — Z-Wave, Insteon, Zigbee,
+MQTT, anything with a device record — outward as Matter accessories, so Apple Home can see
+and control them locally. Opt-in per device, nothing exported by default, from a second
+managed process. Apple Home is the ecosystem this is built and documented for; Alexa,
+Google Home and SmartThings are untested and unclaimed. See
+[Exporting Indigo devices](#exporting-indigo-devices-matter-out).
 
 > **This is an independent, uncertified implementation.** It is not certified by the
 > Connectivity Standards Alliance (CSA), and is not affiliated with or endorsed by them.
@@ -17,7 +26,9 @@ and owns runtime control for each device's lifetime.
 ```text
 Domio (iOS) ─┐
              ├── setup code ──▶ indigo-matter ──WebSocket──▶ matter-server ──IP──▶ Wi-Fi + Thread devices
-plugin menu ─┘
+plugin menu ─┘                       │
+                                     └──WebSocket──▶ bridge node ──Matter──▶ Apple Home
+                                        (export, opt-in)
 ```
 
 ## Adding devices
@@ -34,9 +45,39 @@ device reaches one of them:
 - **Already on your network, never commissioned** — its printed code works directly, from
   either entry point.
 
+## Exporting Indigo devices (Matter out)
+
+The plugin can also wear the Matter **device** role: a set of Indigo devices you choose is
+published as accessories on a Matter bridge that Apple Home commissions like any other
+accessory. One bridge, one pairing, however many devices.
+
+- **Opt-in per device, default empty.** A fresh install exports nothing, pairs nothing and
+  runs no bridge process. Exporting is publishing — the device becomes operable from every
+  ecosystem the bridge is paired with — so it is always a deliberate act.
+- **You declare what each device is.** Indigo cannot tell a plug from a lamp from a lock,
+  so the export dialog asks, and defaults to the safest reading. Relays, dimmers, colour
+  and colour-temperature lights, window coverings, locks, the seven sensor types and
+  thermostats are supported; valves, fans, garage doors, sprinklers and MultiIO are not,
+  and appear in the picker **with the reason**.
+- **Expect an "uncertified accessory" prompt** and choose *Add Anyway*. The bridge presents
+  a development attestation certificate — as Homebridge, matterbridge and Home Assistant's
+  bridge all do — and outbound attestation is the commissioning ecosystem's policy, not
+  something this plugin can change.
+- **Apple Home only, as a claim.** Alexa, Google Home and SmartThings are untested and
+  unclaimed; nothing here says they will or won't work.
+- **A second npm package** (`indigo-matter-bridge`), installed from its own menu item.
+  Note it is **not on the npm registry yet**, so export cannot be brought up until it is.
+
+Setup, pairing, recovery and troubleshooting:
+[full install guide](https://simons-plugins.github.io/indigo-matter/INSTALL.html). How it
+works and what it can represent:
+[MATTER.md → Indigo as a Matter bridge](docs/MATTER.md#indigo-as-a-matter-bridge--the-other-direction).
+(The typeset [Field Notes № 1](https://simons-plugins.github.io/indigo-matter/matter.html)
+page predates the export half and does not cover it yet.)
+
 ## Status
 
-**Built and live-validated, including with real hardware.** The full device-class
+**Matter in — built and live-validated, including with real hardware.** The full device-class
 catalogue is shipped — lighting (on/off/dimmer/colour), sensors, thermostats, fans,
 window coverings, locks, valves, buttons, smoke/CO, air quality, energy metering,
 battery levels, and bridges — plus failure hardening, fabric backup/restore, and a
@@ -51,6 +92,22 @@ during the Domio flow); the plugin then joins over IP via that ecosystem's borde
 [Field Notes № 1](https://simons-plugins.github.io/indigo-matter/matter.html) for how the pieces
 fit; validation specifics live in
 [Handover](https://simons-plugins.github.io/indigo-matter/HANDOVER.html).
+
+**Matter out — built, unit-tested on both sides, partly validated live.** The allow-list,
+the role mapping, endpoint persistence, pairing and fabric management, and the managed
+LaunchAgent are all in place, and the bridge node's own suite stands up a real Matter stack.
+On live hardware the bridge **has** been commissioned into Apple Home (uncertified prompt
+and all), an on/off light and a dimmer **have** been controlled in both directions, and
+accessory identity **has** survived an upgrade without duplicating (2026-08-04 / 05, on
+the reference server). Still outstanding: pairing through the plugin's own menu rather
+than the node's console, a second controller alongside Apple Home, the reboot leg of the
+identity check, and the managed LaunchAgent end to end — that last one needs the package
+installed, which until `indigo-matter-bridge` is published means the local-install
+workaround rather than the shipped install menu. Treat the export half as new. See
+[MATTER.md](docs/MATTER.md#indigo-as-a-matter-bridge--the-other-direction) for how it
+works, and
+[Handover](https://simons-plugins.github.io/indigo-matter/HANDOVER.html) for the
+validation specifics.
 
 ## Setup
 
@@ -86,12 +143,19 @@ reconciled N Matter node(s)
 manual mode, fabric backups, upgrading and uninstalling, is covered in the
 [full install guide](https://simons-plugins.github.io/indigo-matter/INSTALL.html).
 
+To **export** Indigo devices as well, add a fourth step — **Plugins ▸ Matter ▸
+Install/update the Matter export bridge** — and then pick your devices in *Manage Matter
+Exports…*. The bridge starts itself once something is exported. Full walkthrough in the
+install guide.
+
 ## Requirements
 
 - Indigo 2025.2+ on macOS.
 - **Node.js ≥ 22.13.0** (Homebrew is the paved road; nvm works too) and the `matter-server`
   npm package — Beta, **exact-pinned to 1.2.2** (`DEFAULT_INSTALL_SPEC`; the Install action
   uses this).
+- For export only: a second npm package, `indigo-matter-bridge`, exact-pinned and installed
+  by its own menu item. Not yet on the npm registry.
 - Python dep: `websockets` (see `Contents/Server Plugin/requirements.txt`).
 - The **Domio** iOS app for adding devices — optional: the plugin menu's *Commission
   device by setup code…* does the same job from Indigo.
@@ -122,7 +186,10 @@ Developer reference, in the repo — not intended as user documentation:
 
 - [`docs/IMPLEMENTATION.md`](https://github.com/simons-plugins/indigo-matter/blob/main/docs/IMPLEMENTATION.md) — protocols, scaffold, cluster handlers.
 - [`docs/API.md`](https://github.com/simons-plugins/indigo-matter/blob/main/docs/API.md) — the Domio ↔ plugin HTTP contract (v1.3).
-- [`docs/PRD-indigo-matter-plugin.md`](https://github.com/simons-plugins/indigo-matter/blob/main/docs/PRD-indigo-matter-plugin.md) — product requirements and milestones.
+- [`docs/BRIDGE_PROTOCOL.md`](https://github.com/simons-plugins/indigo-matter/blob/main/docs/BRIDGE_PROTOCOL.md) — the plugin ⇄ bridge-node local protocol (export side).
+- [`docs/PRD-indigo-matter-plugin.md`](https://github.com/simons-plugins/indigo-matter/blob/main/docs/PRD-indigo-matter-plugin.md) — product requirements and milestones (inbound).
+- [`docs/PRD-indigo-matter-export.md`](https://github.com/simons-plugins/indigo-matter/blob/main/docs/PRD-indigo-matter-export.md) — the same for the export bridge.
+- [`bridge-node/`](https://github.com/simons-plugins/indigo-matter/tree/main/bridge-node) — the bridge node itself (TypeScript; the only place matter.js is imported). `npm run build && npm test`.
 - [`CLAUDE.md`](https://github.com/simons-plugins/indigo-matter/blob/main/CLAUDE.md) — architecture and workspace conventions.
 
 ## Trademarks and certification
@@ -150,6 +217,12 @@ What that means in practice:
   attestation so uncertified devices (development boards, Homebridge/Matterbridge
   bridges) can be commissioned. It is off by default, warns on every start, and should
   be turned off once the device is paired.
+- **The export bridge is uncertified in the other direction, and visibly so.** It
+  advertises with the specification's test vendor ID, so every ecosystem shows an
+  "uncertified accessory" warning when you add it and you choose *Add Anyway*. That is the
+  normal state for this class of software — Homebridge, matterbridge and Home Assistant's
+  bridge all ship the same way — and it is not something the plugin can change: outbound,
+  the trust policy belongs to the ecosystem doing the commissioning.
 
 The icon bundles the Matter symbol from
 [Wikimedia Commons](https://commons.wikimedia.org/wiki/File:Logo_of_Matter_connectivity_standard.svg),
@@ -159,4 +232,3 @@ which is public domain for copyright purposes. See
 ## License
 
 MIT — see [LICENSE](https://github.com/simons-plugins/indigo-matter/blob/main/LICENSE).
-</content>
