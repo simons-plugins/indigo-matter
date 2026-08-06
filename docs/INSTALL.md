@@ -456,10 +456,10 @@ the code".
 
 ### Step E4 — Add the bridge in Apple Home, and expect the uncertified prompt
 
-In the Home app, add an accessory and take the option to enter a code by hand
-(or scan the QR from the page), then type the manual pairing code from the Event
-Log. Apple Home finds the accessory as **Indigo Matter Bridge** — and then warns
-you that it is an **uncertified accessory**.
+In the Home app, add an accessory, take the option to enter a code by hand, and
+type the manual pairing code from the Event Log — eleven digits, and the only
+thing you need. Apple Home finds the accessory as **Indigo Matter Bridge** — and
+then warns you that it is an **uncertified accessory**.
 
 **That warning is expected. Choose "Add Anyway".**
 
