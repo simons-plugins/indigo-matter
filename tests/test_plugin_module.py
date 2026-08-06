@@ -106,6 +106,94 @@ def test_dynamic_list_methods_exist_on_plugin(plugin_cls):
     assert checked >= 2  # getFabricBackups + getMatterNodes at minimum
 
 
+# ---------------------------------------------------------------------------
+# issue #134 — the Plugins ▸ Matter menu's five sections
+# ---------------------------------------------------------------------------
+
+MENU_SECTIONS = [
+    # 1 · Matter devices Indigo controls
+    ["Commission device by setup code (advanced)…",
+     "Decommission Matter device…"],
+    # 2 · Matter devices Indigo publishes
+    ["Manage Matter Exports…",
+     "Pair Matter Bridge…",
+     "Unpair an Ecosystem…"],
+    # 3 · matter-server
+    ["Install/update matter-server",
+     "Restart matter-server",
+     "Reinstall matter-server (clean)…",
+     "Open matter-server log…"],
+    # 4 · the export bridge node
+    ["Install/update the Matter export bridge",
+     "Reinstall the Matter export bridge (clean)…",
+     "Stop the Matter export bridge…"],
+    # 5 · backup and recovery
+    ["Back up the Matter fabric…",
+     "Restore a fabric backup…",
+     "Rebuild Matter Endpoint Map…",
+     "Reset Matter Export Pairings…"],
+]
+
+
+def _menu_items():
+    return ET.parse(SERVER_PLUGIN / "MenuItems.xml").getroot().findall("MenuItem")
+
+
+def _menu_sections() -> list[list[str]]:
+    """MenuItems.xml split on its separators.
+
+    A separator is an EMPTY, self-closing ``<MenuItem id="…"/>`` — undocumented
+    (the canonical reference lists ``<Name>`` as required) but what Perceptive
+    Automation's own bundled plugins use.
+    """
+    sections: list[list[str]] = [[]]
+    for item in _menu_items():
+        name = item.findtext("Name")
+        if name is None:
+            sections.append([])
+        else:
+            sections[-1].append(name)
+    return sections
+
+
+def test_menu_is_grouped_into_the_documented_sections():
+    """The ORDER is the change (#134), so the order is what is asserted.
+
+    A membership-only check would pass just as happily with all sixteen items
+    back in one flat list, which is the state this exists to prevent.
+    """
+    assert _menu_sections() == MENU_SECTIONS
+
+
+def test_the_two_install_items_are_separated():
+    """#134: 'Install/update matter-server' and 'Install/update the Matter
+    export bridge' sat eleven apart in one flat list and were clicked for one
+    another live — reinstalling the inbound controller when the outbound
+    bridge was meant. They are separately versioned, separately installed npm
+    packages, so they must not share a section."""
+    sections = _menu_sections()
+    controller = next(i for i, s in enumerate(sections) if "Install/update matter-server" in s)
+    bridge = next(i for i, s in enumerate(sections)
+                  if "Install/update the Matter export bridge" in s)
+    assert controller != bridge
+
+
+def test_separators_carry_nothing_but_a_unique_id():
+    """Give a separator a <Name> and it becomes a clickable item that does
+    nothing; give it a CallbackMethod and the wiring test above starts
+    demanding a method that should not exist."""
+    separators = [i for i in _menu_items() if i.findtext("Name") is None]
+    assert len(separators) == len(MENU_SECTIONS) - 1
+    for sep in separators:
+        assert sep.get("id"), "a separator still needs an id"
+        assert list(sep) == [], f"separator {sep.get('id')} must be empty"
+
+
+def test_every_menu_item_id_is_unique():
+    ids = [i.get("id") for i in _menu_items()]
+    assert len(ids) == len(set(ids)), f"duplicate MenuItem ids: {ids}"
+
+
 def test_relay_devices_do_not_redefine_native_onoffstate():
     """onOffState is native to the relay base type — redefining it in <States>
     makes Indigo reject the device ("native state keys cannot be overriden").
