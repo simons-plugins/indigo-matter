@@ -16,12 +16,64 @@ release remains v2026.7.23.
 defect B was investigated hard today and the leading theory was **withdrawn**,
 so read that before touching it.
 
-**NEXT UP (Simon, 2026-08-06):** tidy `MenuItems.xml` into groups — server /
-export / normal use / debug. 16 flat items today. Constraint to verify first:
-the canonical MenuItems.xml reference documents **no separator and no submenu**
-element, so grouping may be ordering + name prefixes only. UI work, so agree
-the layout with Simon before editing (there is an existing menu-grouping issue
-in the #131–#139 batch — find it rather than duplicate).
+**NEXT UP (Simon, 2026-08-06):** ~~tidy `MenuItems.xml` into groups~~ — **done**,
+see the §#134 section immediately below. The constraint it warned about was
+wrong in the useful direction: **separators do exist**.
+
+---
+
+## 2026-08-06 — issue #134: the menu, and the separator the docs deny
+
+Plugin `2026.8.5`. Suites: **2256 Python** (from 2252), pylint **9.42**
+unchanged. Branch `feat/134-menu-sections`. TS untouched.
+
+**An empty, self-closing `<MenuItem id="…"/>` renders as a menu separator.**
+The canonical `MenuItems.xml` reference lists `<Name>` as *required* and
+documents neither separators nor submenus, which is why the note this replaces
+said grouping could only be ordering plus name prefixes. It is wrong — or at
+least incomplete. Perceptive Automation's own bundled plugins use the form
+(**Timers and Pesters**, **Timed Devices**, **Virtual Devices**, **Alexa**),
+`Actions.xml` takes it too (`<Action id="sep1" uiPath="DeviceActions"/>`), and
+**15 of the plugins installed on jarvis** rely on it. Simon knew from the
+Timers and Pesters *action* list that sections were possible; the docs alone
+would never have said so.
+
+Worth generalising: the canonical docs are the authority on what is
+*supported*, not on what *works*. When a UI affordance is missing from them,
+grep the installed plugins before concluding it does not exist —
+`grep -rlE "<MenuItem[^>]*/>" …/Plugins/*/Contents/Server\ Plugin/MenuItems.xml`
+answered this in one command.
+
+**Five sections**, everyday first, destructive last: devices Indigo controls ·
+devices Indigo publishes · matter-server plumbing · export-bridge plumbing ·
+backup and recovery. The two `Install/update` items — #134's actual complaint,
+clicked for one another live — now sit in **different** sections rather than
+merely adjacent, because they are separately versioned, separately installed
+npm packages.
+
+**`Export fabric backup…` → `Back up the Matter fabric…`** (and `Restore
+fabric backup…` → `Restore a fabric backup…`). "Export" meant save-to-disk in
+one item and the outbound bridge in eight others. Menu **ids and callback
+methods are unchanged**, so nothing in `plugin.py`, `bridge_agent.py` or
+`server_process.py` moved; `spec.install_menu_name` still matches a real
+`<Name>`, which `test_bridge_agent.py` pins.
+
+**The tests assert the ORDER**, for the same reason #141's do: a membership
+check passes just as happily with all sixteen items back in one flat list.
+Mutation-verified both ways — deleting the four separators, and deleting only
+`sepServerFromBridge` so the two install sections merge, each fail exactly the
+three layout tests and nothing else.
+
+**Not done here, deliberately:** #132 (the Rebuild Endpoint Map warning
+overstates what the action does) is dialog *text* in the same file and a
+separate bug — reordering it and rewriting it in one commit would have made
+the diff unreviewable. #131 (sort exported devices to the top of the picker)
+is untouched.
+
+**Stale, spotted in passing, not fixed:** `docs/INSTALL.md` §Overview still
+says the bridge package "is not on the npm registry yet, so this half cannot
+be installed today". `indigo-matter-bridge@0.7.0` is published. That sentence
+belongs to the E8 docs pass, along with #137/#138.
 
 ---
 
