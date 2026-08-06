@@ -25,14 +25,17 @@ Three differences from the controller agent, all of them deliberate:
   module can reach it. Callers wrap agent operations so that a launchd fault
   never propagates into an Indigo callback.
 
-**Distribution.** ``indigo-matter-bridge`` is a published npm package, exact-
-pinned by :data:`DEFAULT_INSTALL_SPEC` exactly as ``matter-server@1.2.2`` is —
-which is precisely the parameterisation the ``AgentSpec`` extraction was for:
+**Distribution.** ``indigo-matter-bridge`` is an npm package, exact-pinned by
+:data:`DEFAULT_INSTALL_SPEC` exactly as ``matter-server@1.2.2`` is — which is
+precisely the parameterisation the ``AgentSpec`` extraction was for:
 installing it is ``npm install --prefix ~/indigo-matter <spec>`` with a
 different string. The plugin bundle ships **no JavaScript**; ``bridge-node/`` is
-a top-level source directory in the repo and is published from there. See
+a top-level source directory in the repo and is published from there.
+
+**It is not on the registry yet**, so :meth:`BridgeProcess.install` cannot
+resolve :data:`DEFAULT_INSTALL_SPEC` on any machine today. See
 ``docs/HANDOVER.md`` → "Publishing the bridge node" for the release steps and
-for the local-install recipe that stands in before a version is on the registry.
+for the local-install recipe that stands in until then.
 """
 from __future__ import annotations
 

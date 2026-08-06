@@ -1,12 +1,52 @@
-# Installing matter-server for indigo-matter
+# Installing indigo-matter's two Node runtimes
 
-This guide walks through installing the **matter-server** runtime that the
-`indigo-matter` plugin drives, and configuring the plugin to connect to it. It is
-derived from the live managed-LaunchAgent bring-up on the reference Indigo server.
+The plugin has two halves, and each one is a **separate Node process with its own
+npm package**. This guide covers both:
+
+- **matter-server** — the inbound controller. The plugin drives it so that Matter
+  devices in your house become Indigo devices. **Steps 1–4**, and this is what a
+  normal install needs. These steps are derived from the live
+  managed-LaunchAgent bring-up on the reference Indigo server.
+- **the Matter export bridge** — the optional outbound half, which publishes
+  selected *Indigo* devices to Apple Home as Matter accessories. **Steps E1–E4**.
+  **It cannot be installed today**: its npm package has not been published — see
+  [Exporting Indigo devices](#exporting-indigo-devices-indigo-as-a-matter-bridge).
 
 If you just installed the plugin and Indigo is logging
 `Connect call failed ('127.0.0.1', 5580)`, you are in the right place — the plugin is
 running but matter-server is not.
+
+## Contents
+
+- [Overview](#overview)
+- [Prerequisites](#prerequisites)
+- [Step 1 — Install Node.js 22](#step-1--install-nodejs-22)
+- [Step 2 — Install matter-server](#step-2--install-matter-server)
+- [Step 3 — Configure the plugin](#step-3--configure-the-plugin)
+- [Step 4 — Verify](#step-4--verify)
+- [**Exporting Indigo devices (Indigo as a Matter bridge)**](#exporting-indigo-devices-indigo-as-a-matter-bridge)
+  - [Export prerequisites](#export-prerequisites)
+  - [Step E1 — Install the export bridge](#step-e1--install-the-export-bridge)
+  - [Step E2 — Export your first device](#step-e2--export-your-first-device)
+  - [Step E3 — Open a pairing window](#step-e3--open-a-pairing-window)
+  - [Step E4 — Add the bridge in Apple Home](#step-e4--add-the-bridge-in-apple-home-and-expect-the-uncertified-prompt)
+  - [The export settings in Configure…](#the-export-settings-in-configure)
+  - [Removing an export, unpairing, and stopping the bridge](#removing-an-export-unpairing-and-stopping-the-bridge)
+  - [The two destructive recovery actions](#the-two-destructive-recovery-actions)
+- [Backups](#backups) — and, for exporters,
+  [back up the bridge's storage too](#if-you-export-devices-back-up-the-bridges-storage-too)
+- [Security](#security) — and, before exporting,
+  [before you pair the export bridge](#before-you-pair-the-export-bridge)
+- [Troubleshooting](#troubleshooting) —
+  [the controller](#the-controller-matter-server) ·
+  [the export bridge](#the-export-bridge)
+- [Upgrading matter-server](#upgrading-matter-server)
+- [Uninstall](#uninstall)
+
+> Export material deliberately appears in four places: the walkthrough below,
+> plus its own subsection under Backups, under Security, and under
+> Troubleshooting. The links above are the shortcuts to the three that are not
+> under the export heading.
 
 ---
 
@@ -15,9 +55,16 @@ running but matter-server is not.
 The `indigo-matter` plugin does not speak Matter directly. It manages a separate
 Node.js process — **matter-server** (npm package
 [`matter-server`](https://github.com/matter-js/matterjs-server), currently **Beta
-1.2.2**) — which holds the Indigo-owned Matter fabric and exposes a WebSocket control
+1.2.2**) — which holds the Indigo-owned Matter **fabric** and exposes a WebSocket control
 API. The plugin connects to that WebSocket and translates Matter clusters into
 first-class Indigo devices.
+
+> **Fabric** is the word that recurs throughout this guide. A fabric is one
+> controller's trust domain: the set of cryptographic credentials that controller
+> installs on a device. A Matter device can belong to several at once — that is
+> what lets Apple Home and Indigo both control the same plug, independently. Full
+> explanation in
+> [MATTER.md → Fabrics and multi-admin](./MATTER.md#fabrics-and-multi-admin-one-device-many-controllers).
 
 A few things to know before you start:
 
@@ -42,8 +89,10 @@ A few things to know before you start:
   occasional rough edges.
 - **There is a second, optional half.** The plugin can also work the other way round and
   publish selected *Indigo* devices to Apple Home as Matter accessories, from a separate
-  bridge process with its own npm package. It is off until you switch it on, and it needs
-  everything below working first — see
+  bridge process with its own npm package. **That package is not on the npm registry yet,
+  so this half cannot be installed today.** When it is: nothing is exported and no bridge
+  process runs until you add a device to the export list, and it needs Node (Step 1) and
+  a storage path (Step 3) — *not* a working matter-server. See
   [Exporting Indigo devices](#exporting-indigo-devices-indigo-as-a-matter-bridge).
 
 ---
@@ -232,43 +281,76 @@ Commission device by setup code…** — and it will appear as a native Indigo d
 
 ## Exporting Indigo devices (Indigo as a Matter bridge)
 
+> **You cannot install this yet.** The export bridge needs a second npm package,
+> `indigo-matter-bridge`, and it **has not been published to the npm registry**.
+> Until it is, **Install/update the Matter export bridge** cannot resolve the
+> version the plugin pins, and the install fails. Nothing else in the plugin is
+> affected — the inbound controller, your commissioned devices and every Indigo
+> device carry on as normal — but export cannot be brought up. Everything below
+> is what you are waiting for.
+
 Everything above is the plugin's **inbound** half: Matter devices becoming Indigo
 devices. The plugin also runs the opposite direction — a selected set of your
 *existing* Indigo devices (Z-Wave, Insteon, Zigbee, MQTT, anything a plugin owns)
 published outward as Matter accessories on a bridge, so Apple Home can see and
 control them. No cloud, no second bridge app.
 
-This is entirely optional and **off until you switch it on**: a fresh install
-exports nothing, pairs nothing, and runs no bridge process. See
-[MATTER.md](./MATTER.md) → *Indigo as a Matter bridge* for how it works and what
-it can and cannot represent; this section is the setup.
+**This adds a second Node process, and almost everything doubles.** The export
+bridge is not matter-server doing extra work. It is its own npm package, its own
+launchd job, its own storage directory, its own log files, its own two ports and
+its own menu items. One can be broken while the other works, and an export
+failure never touches the Matter devices Indigo controls. Wherever this guide
+names a log, a port, a backup or a LaunchAgent from here on, check which of the
+two it belongs to.
 
-Two things to know before you start:
+Export is opt-in per device: **nothing is exported and no bridge process runs
+until you add a device** to the list in *Manage Matter Exports…*. (The
+**Enable Matter export** tickbox in Configure… is on by default. It is a master
+*off*-switch, not the thing that starts anything — an empty export list is what
+keeps a fresh install inert.) See [MATTER.md](./MATTER.md) → *Indigo as a Matter
+bridge* for how it works and what it can and cannot represent; this section is
+the setup.
 
+Three things to know before you start:
+
+- **Some of this has been proven on real hardware, and some has not.** What has:
+  the bridge **has** been commissioned into Apple Home and the uncertified prompt
+  accepted; an on/off light and a dimmer **have** been controlled from Apple Home
+  and from Indigo, each direction showing up on the other side; and three
+  exported accessories **kept their identities** across a plugin and bridge-node
+  upgrade, with no duplicates in Apple Home. What has not: pairing driven from
+  the plugin's own menu (the pairing above was driven from the bridge node's
+  console), a second ecosystem alongside Apple Home, a full Mac reboot, and the
+  managed LaunchAgent end to end. Treat the export half as new.
 - **Apple Home is the ecosystem this is built and documented for.** Alexa, Google
   Home and SmartThings are **untested and unclaimed** — the bridge is a standard
   multi-admin Matter bridge and there is no reason they should not work, but
   nobody here has hardware to try them on, so nothing is promised. If you pair
   one, please say so on the forum.
 - **The bridge is not certified**, and every ecosystem will say so when you add
-  it. That is expected, not a fault — see *Expect the "uncertified accessory"
-  prompt* below.
+  it. That is expected, not a fault — see
+  [Step E4](#step-e4--add-the-bridge-in-apple-home-and-expect-the-uncertified-prompt).
 
 ### Export prerequisites
 
-- Everything in Steps 1–4 above, working. The export bridge is a **second**
-  process alongside matter-server, and it uses the same Node you installed in
-  Step 1 (**Node ≥ 22.13.0**).
-- A **second npm package**, `indigo-matter-bridge`. It is not part of the plugin
+- **Node.js ≥ 22.13.0** — the same Node you installed in Step 1. The bridge runs
+  on it, and the plugin resolves it exactly as it does for matter-server
+  (auto-detect, or the **Node bin directory** you pinned).
+- **A storage path** (Step 3). The bridge's own storage directory is *derived*
+  from the controller's — it is the `bridge-node/` folder beside it — so the
+  **matter-server storage path** field decides where the bridge keeps its
+  ecosystem pairings and its endpoint map, whether or not you run matter-server.
+- **A second npm package**, `indigo-matter-bridge`. It is not part of the plugin
   bundle — the plugin ships no JavaScript — and it is not the same package as
-  `matter-server`. It is installed from its own menu item (Step E1).
+  `matter-server`. It is installed from its own menu item (Step E1), once it is
+  published.
 
-> **Known gap at the time of writing: `indigo-matter-bridge` has not been
-> published to the npm registry yet.** Until it is, **Install/update the Matter
-> export bridge** cannot resolve the version the plugin pins and the install will
-> fail. Nothing else in the plugin is affected — the inbound controller, your
-> commissioned devices and every Indigo device carry on as normal — but export
-> cannot be brought up until the package is on the registry.
+What export does **not** need is a working matter-server. The two are separate
+processes with separate packages, ports, storage directories and launchd jobs,
+and nothing in the export path talks to the controller. So if you only want to
+publish Indigo devices outward, Step 2 is not yours — Steps 1 and 3 are. The
+plugin will go on reporting that it cannot reach matter-server, which is log
+noise in that configuration, not an export fault.
 
 ### Step E1 — Install the export bridge
 
@@ -295,8 +377,9 @@ The dialog is a picker plus a detail pane, and it has no Execute button — the
 buttons inside it do the work, and **Close** when you are done.
 
 1. **Filter by name** (optional), then click **Apply filter / refresh**. The
-   picker lists every Indigo device, and a `●` marks one that is already
-   exported. Devices that cannot be exported are listed too, reading
+   picker lists **up to 300 matching Indigo devices** — past that a tail row says
+   so, and narrowing the filter is how you reach the rest. A `●` marks one that
+   is already exported. Devices that cannot be exported are listed too, reading
    *"— not exportable: …"* **with the reason**, rather than being quietly
    omitted and left to hunt for. The one exception is devices this plugin
    created itself: those are absent altogether, because a Matter device is never
@@ -323,6 +406,14 @@ Matter export: bridge node attached — 1 endpoint(s) live, not yet paired
 <!-- SCREENSHOT WANTED: the "Manage Matter Exports…" dialog with a device
      selected, showing the role menu open and an excluded device visible in the
      picker with its reason. -->
+
+> **You only pair the bridge once per ecosystem.** There is one bridge
+> accessory, and every export is an endpoint on it — so devices you export
+> *later* appear in every already-paired ecosystem automatically, with no action
+> from you. Do **not** open a fresh pairing window to add a device: a pairing
+> window is a live credential that exposes everything you export to anyone who
+> can read it (see [Security](#before-you-pair-the-export-bridge)). You open one
+> only to add a *new ecosystem*.
 
 > **Changing a device's role later re-creates the accessory.** Matter does not
 > allow an endpoint to change device type, so the plugin removes it and adds it
@@ -367,21 +458,23 @@ the code".
 
 In the Home app, add an accessory and take the option to enter a code by hand
 (or scan the QR from the page), then type the manual pairing code from the Event
-Log. Apple Home finds "Indigo" as a Matter accessory — and then warns you that it
-is an **uncertified accessory**.
+Log. Apple Home finds the accessory as **Indigo Matter Bridge** — and then warns
+you that it is an **uncertified accessory**.
 
 **That warning is expected. Choose "Add Anyway".**
 
-It is not a fault, and it is not something the plugin can suppress or work
-around. Matter device attestation runs one way — the *commissioner* checks the
-*device's* certificate — so the trust policy here belongs to Apple, not to
-Indigo. The bridge presents a development/test attestation certificate, which is
-exactly what **Homebridge**, **matterbridge** and **Home Assistant's** own bridge
-present, and shipping uncertified is the normal state for this class of software:
-a CSA certificate requires paid membership plus per-product certification, which
-is not proportionate for a free community plugin. (The decision and its reasoning
-are in workspace ADR-0006; the plugin is uncertified in *both* directions and
-says so in the README.)
+Read what the warning actually asserts. It does not say the accessory may be
+hostile, or that Apple has found anything wrong with it. It says that nobody has
+paid the Connectivity Standards Alliance to certify this product — that is the
+entire claim. Matter device attestation runs one way, the *commissioner*
+checking the *device's* certificate against the CSA's list, so the trust policy
+here belongs to Apple, not to Indigo. The bridge presents a development/test
+attestation certificate, which is exactly what **Homebridge**, **matterbridge**
+and **Home Assistant's** own bridge present, and shipping uncertified is the
+normal state for this class of software: a CSA certificate requires paid
+membership plus per-product certification, which is not proportionate for a free
+community plugin. The plugin can neither suppress the prompt nor work around it;
+it is uncertified in *both* directions and says so in the README.
 
 Once you accept it, every device on your export list appears in Apple Home as an
 accessory of the role you declared.
@@ -407,7 +500,9 @@ the Matter export section names what you are paired with.
 | **Matter port** | `5540` | The UDP port ecosystems reach the bridge on. 5540 is the Matter default. Move it only if another Matter stack on this Mac already holds it (see Troubleshooting). |
 
 **Changing either port needs a plugin reload** — they are read when the bridge
-node and its LaunchAgent are built. The dialog says so.
+node and its LaunchAgent are built. The **Matter port** field says so in its own
+description; the **Bridge control port** field does not, but the same is true
+of it.
 
 ### Removing an export, unpairing, and stopping the bridge
 
@@ -416,8 +511,8 @@ node and its LaunchAgent are built. The dialog says so.
 | Stop exporting one device | *Manage Matter Exports…* → pick it → **Remove export** | Its endpoint goes, and the accessory disappears from every paired ecosystem. Your pairings stand. |
 | Stop exporting everything | Remove every export | All the endpoints go, the bridge node is stopped and its LaunchAgent removed (so a reboot cannot bring it back), and **your pairings are kept**. Re-export anything and it all comes back. |
 | Pause export without unpairing | *Configure…* → untick **Enable Matter export** | The bridge stops and accessories show as unavailable. Nothing is unpaired, nothing is deleted, and the allow-list is untouched. |
-| Remove one ecosystem | *Plugins ▸ Matter ▸ Unpair an Ecosystem…* | Every accessory Indigo exports leaves **that** ecosystem, with the names, rooms, scenes and automations you built on them there. Other ecosystems are unaffected. Two confirmation boxes. |
-| Get the bridge process gone right now | *Plugins ▸ Matter ▸ Stop the Matter export bridge…* | Stops the node and removes its LaunchAgent. Your pairings and export list are unchanged; accessories show as unavailable until the bridge runs again, which it does by itself the next time you add or change an export. You normally never need this — it is for the case where you are about to disable the plugin, which would otherwise leave the node running with nothing to control it. |
+| Remove one ecosystem | *Plugins ▸ Matter ▸ Unpair an Ecosystem…* | Every accessory Indigo exports leaves **that** ecosystem, with the names, rooms, scenes and automations you built on them there. Other ecosystems are unaffected — **but if it is your only one, this factory-resets the whole bridge** (see below the table). Two confirmation boxes. |
+| Get the bridge process gone right now | *Plugins ▸ Matter ▸ Stop the Matter export bridge…* | Stops the node and removes its LaunchAgent. Pairings and export list are unchanged; accessories go unavailable until the next export change starts the bridge again by itself. Mainly for when you are about to disable the plugin, which would otherwise leave the node running with nothing supervising it. |
 
 Two notes on unpairing. The picker names the *vendor* and the fabric index
 (`Apple Home (index 1)`) because that is what the bridge removes a pairing by,
@@ -432,30 +527,33 @@ Matter Export Pairings…*.
 
 Both are in the plugin menu, both make you tick a box (or two), and neither is
 something you should reach for casually. They are described here in the same
-words the dialogs use.
+words the dialogs use, **worse one first** — the difference between them is
+whether the damage can be undone.
 
-**Reset Matter Export Pairings…** — *removes **every** ecosystem pairing from the
-Matter export bridge and starts advertising for commissioning again.* Apple Home,
-and anything else you have paired, lose all of the accessories Indigo exports,
-and you have to pair the bridge again from scratch. This is the export side only:
-Matter devices that Indigo **controls** are not affected, and no Indigo device is
-changed or deleted. Endpoint numbers are kept, so re-pairing the same ecosystems
-restores the same accessory identities where it can. Use it when you want a clean
-start on the pairing side, or when the bridge's pairings are in a state you can't
-otherwise clear.
+**Rebuild Matter Endpoint Map… — UNRECOVERABLE.** What it destroys cannot be put
+back by repeating any step. Use it **only** when the plugin says the bridge node
+is refusing to export because its endpoint-number map is unreadable. The map
+records which Matter accessory number belongs to which Indigo device; rebuilding
+it accepts whatever numbers exist now as correct. *This **will** duplicate
+accessories in ecosystems that are already paired.* The old accessories do not
+disappear — they stop working, you have to delete them by hand, and any names,
+rooms, scenes and automations built on them are lost. Your pairings themselves
+are not touched and no Indigo device is changed. If the bridge is **not**
+refusing, the plugin refuses the rebuild: there is no fault to recover from, and
+a rebuild would throw away the retained endpoint numbers of every device you are
+not currently exporting — the ones that make re-adding a device restore the same
+accessory rather than create a second one.
 
-**Rebuild Matter Endpoint Map…** — use this **only** when the plugin says the
-bridge node is refusing to export because its endpoint-number map is unreadable.
-The map records which Matter accessory number belongs to which Indigo device;
-rebuilding it accepts whatever numbers exist now as correct. *This **will**
-duplicate accessories in ecosystems that are already paired.* The old accessories
-do not disappear — they stop working, you have to delete them by hand, and any
-names, rooms, scenes and automations built on them are lost. Your pairings
-themselves are not touched and no Indigo device is changed. If the bridge is
-**not** refusing, the plugin refuses the rebuild: there is no fault to recover
-from, and a rebuild would throw away the retained endpoint numbers of every
-device you are not currently exporting — the ones that make re-adding a device
-restore the same accessory rather than create a second one.
+**Reset Matter Export Pairings… — recoverable, at the cost of pairing again.**
+It *removes **every** ecosystem pairing from the Matter export bridge and starts
+advertising for commissioning again.* Apple Home, and anything else you have
+paired, lose all of the accessories Indigo exports, and you have to pair the
+bridge again from scratch. This is the export side only: Matter devices that
+Indigo **controls** are not affected, and no Indigo device is changed or deleted.
+Endpoint numbers are kept, so re-pairing the same ecosystems restores the same
+accessory identities where it can. Use it when you want a clean start on the
+pairing side, or when the bridge's pairings are in a state you can't otherwise
+clear.
 
 ---
 
@@ -478,6 +576,12 @@ Use **Plugins ▸ Matter ▸ Export fabric backup…**. It writes a timestamped 
 **Restore fabric backup…** puts one back (moving the current fabric aside first, so a
 bad restore is reversible). Copy the zips somewhere off-machine as well — a backup on
 the same disk is not a backup.
+
+> **Restore has a precondition, and its dialog states it: *"Requires 'Manage
+> LaunchAgent' to be on."*** Restoring stops matter-server, swaps the storage
+> directory and starts it again, so it needs the plugin to be the thing that
+> runs matter-server. In Mode B (manual) the restore is refused — stop
+> matter-server yourself and swap the directory by hand instead.
 
 If you would rather do it by hand, stop the plugin (or matter-server) and copy the
 directory:
@@ -589,33 +693,44 @@ quotes their tail into the Indigo log when it cannot reach the node.
 Everything below fails **export only**. Your Indigo devices, and the Matter devices
 Indigo controls, are never affected by any of it.
 
+**What you can see.** Symptoms that show up in an ecosystem app or in the export
+dialog, most-likely-first — the top two are what a first export usually hits.
+
 | Symptom | Cause | Fix |
 |---|---|---|
-| `Matter export: the bridge node is not responding after N attempts on port 5581` | The node is not running, is crash-looping, or was never installed. All three look identical at the socket, so the plugin appends what the LaunchAgent found. | Read the sentence that follows it in the log — it names the real cause. Then: install the package (below), free the Matter port (below), or check `bridge-node.err.log`. |
+| You exported a device and **nothing appeared** in Apple Home | The bridge has never been paired. Exporting publishes a device *on* the bridge; an ecosystem sees nothing at all until the bridge itself has been added to it. | Do Step E3 then Step E4. You do this **once per ecosystem** — after that, later exports appear by themselves with no further pairing. |
+| Apple Home's **Add Accessory** cannot find the bridge | One of three: nothing is exported (the bridge only runs while the export list is non-empty), or no pairing window is open, or **Primary network interface** in Configure… names an interface this Mac is not actually using. That field is shared with matter-server and the bridge pins its mDNS advertising to it, so a wrong value advertises where nobody is listening. Matter discovery is also mDNS + link-local IPv6, so the phone must be on the same subnet as the Mac. | Export at least one device; open a window with **Pair Matter Bridge…**; check the interface with `ifconfig \| grep "status: active"` and **reload the plugin** after changing it; put the phone on the same subnet/VLAN as the Indigo Mac. |
+| An accessory shows as **unavailable** in Apple Home | Either the Indigo device is disabled or unconfigured (the bridge deliberately marks it unreachable rather than letting the ecosystem time out), or export is switched off, or the bridge node is not running. | Re-enable the Indigo device; or Configure… ▸ **Enable Matter export**; or work the log rows below. |
+| Accessories **stay** in Apple Home after you stopped exporting them | The removal never reached the node — it was down, or the plugin was reloaded mid-request. | It is recorded and finished automatically the next time the plugin connects to the node: export a device again, or reload the plugin. There is no retry loop in between, so nothing happens before then. |
+| A thermostat or sensor exports numbers that look wrong | Indigo records no units anywhere in its device model, so the bridge takes each reading as already being in the unit Matter wants (°C, %RH, lux, m³/h). A °F thermostat therefore exports the Fahrenheit number labelled as Celsius. **Barometric pressure is the one exception**: Indigo's convention is hPa, and the bridge divides by 10 to reach Matter's kPa — so a barometer reading in hPa is already correct. Do **not** "fix" it to report kPa; that is what produces a reading ten times too high. | Not fixable from Indigo's device model today — it needs a declared unit per export. Export devices that already read in metric (and leave barometers in hPa), or leave that one un-exported. |
+| A **pressure or flow** sensor never appears in Apple Home | Apple Home has no UI for those Matter device types. | **Nothing is broken and there is nothing to fix.** The accessories exist on the bridge and other ecosystems can use them; Apple simply does not render them. If Apple Home is all you run, don't export those sensors. |
+| Apple Home refuses to change an exported accessory's **room** | Room assignment is a HomeKit/iCloud home-database concept. It never crosses Matter and never reaches the bridge. | **Nothing the bridge can do, and nothing worth trying.** No bridge-side setting, restart or re-export affects it, and the node log showing no traffic at the moment of the attempt is the expected state rather than evidence of a fault. It is Apple's to fix. |
+
+**What the log says.** Verbatim strings from the Indigo Event Log and
+`bridge-node.err.log`.
+
+| Log line | Cause | Fix |
+|---|---|---|
+| `Matter export: the bridge node is not responding after N attempts on port 5581` | The node is not running, is crash-looping, or was never installed. All three look identical at the socket, so the plugin appends what the LaunchAgent found. | Read the sentence that follows it in the log — it names the real cause. Then: install the package (below), free the port (below), or check `bridge-node.err.log`. |
 | The log names **Install/update the Matter export bridge** | The `indigo-matter-bridge` package is not installed, so no LaunchAgent was written. This is the normal first-run state. | Run that menu item. Note it cannot succeed until the package is published to npm — see *Export prerequisites*. |
-| An `EADDRINUSE` / address-already-in-use failure in `bridge-node.err.log`. The node labels which startup step failed, so the line says whether it was the Matter port or the loopback protocol port | For the Matter port: another Matter **device** stack on this Mac already holds UDP 5540 — Homebridge 2.x, matterbridge, or a Home Assistant container in host mode. | Either stop the other stack, or Configure… ▸ **Show export port settings** ▸ **Matter port**, pick another, and **reload the plugin**. Find the holder with `lsof -nP -iUDP:5540`. Moving off 5540 is a real trade: it is the port ecosystems expect. |
+| An `EADDRINUSE` / address-already-in-use failure in `bridge-node.err.log`. The node labels which startup step failed, so the line says whether it was the Matter port or the loopback protocol port | **Matter port (UDP 5540):** another Matter *device* stack on this Mac already holds it — Homebridge 2.x, matterbridge, or a Home Assistant container in host mode. **Protocol port (TCP 5581):** an orphaned bridge node from an earlier LaunchAgent is still running, or an unrelated service has the port. | **Matter port:** stop the other stack, or Configure… ▸ **Show export port settings** ▸ **Matter port**, pick another, and **reload the plugin**. Find the holder with `lsof -nP -iUDP:5540`. Moving off 5540 is a real trade — it is the port ecosystems expect. **Protocol port:** **Stop the Matter export bridge…** then re-save an export (the plugin reaps its own orphans on start). If something else holds it, find it with `lsof -nP -iTCP:5581 -sTCP:LISTEN`, and either stop it or change **Bridge control port** and reload the plugin. |
 | `Matter export: the bridge node's LaunchAgent did not start` / `could not be loaded by launchd` | launchd accepted the job and the process died, or refused the plist. | Check `bridge-node.err.log` first. Then `launchctl print gui/$(id -u)/com.simons-plugins.indigo-matter.bridge`. **Stop the Matter export bridge…** followed by re-saving an export rebuilds the plist from scratch. |
 | `Matter export: the bridge node is serving NOTHING because its endpoint-number map is unreadable` | The bridge's `endpoint-map.json` is present but corrupt. It refuses to serve rather than silently renumber every accessory. | **Rebuild Matter Endpoint Map…** — and read what it costs first (above). The unusable file is kept as `endpoint-map.json.corrupt-<timestamp>` in the bridge storage folder; if you have a backup of the original, restoring it is better than rebuilding. |
 | `…because its identity file is unreadable` | `identity.json` is corrupt. This is a *different* fault with a different remedy, and the node refuses a rebuild for it. | Restore or repair `identity.json.unreadable-<timestamp>` from the bridge storage folder and restart the bridge. **Deleting it starts a brand-new bridge**, which every paired ecosystem sees as a different device. |
 | The node reports it was commissioned but its Matter fabric storage is gone | The bridge storage directory was moved, restored partially, or lost. | Restore the whole `bridge-node/` directory from a backup. If you have none, accept the loss: reset the pairings and pair each ecosystem again. |
-| `Matter export: endpoint-number DRIFT detected` | Accessory numbers no longer match the recorded ones — usually storage loss on the bridge side. Exported accessories may have swapped identities in paired ecosystems. | It is **never repaired automatically**, deliberately: an auto-repair would bless the loss and hide the next one. Check the named accessories in each ecosystem, and restore the bridge storage from a backup if you have one. |
+| `Matter export: endpoint-number DRIFT detected` | **Most likely: you have just reset the pairings, or unpaired the last ecosystem.** Both factory-reset the bridge, which wipes matter.js's own endpoint allocation — so the numbers are handed out afresh and no longer match the preserved map. That is *expected*, and saying so is exactly what the preserved map is for. **Otherwise:** storage loss on the bridge side, in which case exported accessories may have swapped identities in paired ecosystems. | **After a reset or a last-ecosystem unpair: no action.** The map is reporting what it exists to report, and re-pairing proceeds normally. **Otherwise:** drift is never repaired automatically, deliberately — an auto-repair would bless the loss and hide the next one. Check the named accessories in each ecosystem, and restore the bridge storage from a backup if you have one. |
 | `Matter export: the bridge client is HALTED` | Either the node speaks a different protocol version than this plugin (an old node left running across a plugin upgrade), or it refused a request that would have removed every accessory at once. | Nothing retries on its own. For version skew: **Stop the Matter export bridge…**, then **Install/update the Matter export bridge**, then re-save an export. The reason is on the line itself. |
 | `Matter export: the pairing window has expired without an ecosystem completing commissioning` | Nobody paired within the window (up to 15 minutes). The code it showed is now dead. | Open a new one: **Pair Matter Bridge…**. Have the phone in your hand first. |
 | The pairing menu says the bridge is *already advertising with its original code* | The bridge has never been paired, so its first commissioning window is already open with its own code — deriving a new one would kill a code you may already be typing. | Use the code in the log. This is not an error. |
 | `Matter export: device N is in the export list but will NOT be bridged` | That Indigo device was deleted, disabled beyond recognition, re-typed, or no longer offers the role you exported it as. The rest of the export list is unaffected. | Open **Manage Matter Exports…**, pick the device, and either re-choose a role or **Remove export**. |
 | `Matter export: … stopped reporting <state>` | The Indigo device has gone quiet — a flat battery, a plugin that lost it. Matter has no way to say "I no longer know", so the ecosystem keeps showing the last value it was given, indefinitely. | Fix the underlying device. Note this warning is said **once**, when it happens; it is not repeated after a plugin reload, so its absence is not evidence that everything is reporting. |
-| An accessory shows as unavailable in Apple Home | Either the Indigo device is disabled or unconfigured (the bridge deliberately marks it unreachable rather than letting the ecosystem time out), or export is switched off, or the bridge node is not running. | Re-enable the Indigo device; or Configure… ▸ **Enable Matter export**; or work the bridge-not-running rows above. |
-| Accessories stay in Apple Home after you stopped exporting them | The removal never reached the node — it was down, or the plugin was reloaded mid-request. | It is recorded and finished automatically the next time the plugin connects to the node: export a device again, or reload the plugin. There is no retry loop in between, so nothing happens before then. |
 | `Matter export: '<command>' for device N has not returned after 30s` | Something you pressed in Apple Home reached an Indigo device that is not answering. Commands run one at a time, so everything behind it is queued. | Fix that device or its plugin. The ecosystem already shows the command as done and nothing corrects that until the device next reports. |
-| A thermostat or sensor exports numbers that look wrong | Indigo records no units anywhere in its device model, so the bridge takes the reading as already being in the unit Matter wants (°C, %RH, lux, kPa, m³/h). A °F thermostat therefore exports the Fahrenheit number labelled as Celsius. | Not fixable from Indigo's device model today — it needs a declared unit per export. Export devices that already read in metric, or leave that one un-exported. |
-| A pressure or flow sensor never appears in Apple Home | Apple Home has no UI for those Matter device types. They are exported anyway so other ecosystems can use them. (Not verified in this house — reported behaviour.) | Nothing to fix. |
-| Apple Home refuses to change an exported accessory's **room** | Observed and unexplained, and it is Apple-side: room assignment is a HomeKit/iCloud concept that never crosses Matter and never reaches the bridge. | No bridge-side change can affect it. Recorded as something to watch. |
 
 ---
 
 ## Upgrading matter-server
 
-matter-server is Alpha; test before adopting a new version. With the plugin (or
+matter-server is Beta; test before adopting a new version. With the plugin (or
 matter-server) stopped, and after **backing up the fabric** (above):
 
 ```bash

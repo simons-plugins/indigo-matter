@@ -64,7 +64,7 @@ multi-sensor (Thread, via a HomePod border router).
 
 Here's why. The one Thread operation the plugin's controller stack
 ([`matter-server`](https://github.com/matter-js/matterjs-server), matter.js,
-Alpha) can't do is *first-admin* commissioning — handing a factory-fresh
+Beta) can't do is *first-admin* commissioning — handing a factory-fresh
 device the Thread network credentials over BLE. In the share model that step
 is always the admin-1 ecosystem's job: Apple Home (or Alexa, or Google Home —
 see below) provisions the device onto **its own** Thread mesh using its own
@@ -73,8 +73,8 @@ ecosystem's border router routes IPv6 between the Thread mesh and the LAN and
 proxies the device's mDNS records, so when the plugin joins as a second admin
 over IP it neither knows nor cares that the last hop is Thread.
 
-Practical caveats: matter-server is Alpha, and battery Thread devices are
-"sleepy" (they wake on long intervals), which is where an alpha controller is
+Practical caveats: matter-server is Beta, and battery Thread devices are
+"sleepy" (they wake on long intervals), which is where a beta controller is
 most likely to be flaky — though the first validated Thread device was exactly
 such a sleepy battery sensor and behaved (live unprompted attribute reports). Thread devices *bridged* into Matter by a
 hub you own (Aqara, Hue, SwitchBot) are a separate, hub-dependent route — see
@@ -295,7 +295,82 @@ If you have run Homebridge, this is the same idea over Matter's protocol instead
 of HomeKit's — with the difference that Matter is one implementation reaching
 every ecosystem that speaks it, rather than one bridge per ecosystem.
 
-Setup steps are in [INSTALL.md](./INSTALL.md); this section is the shape of it.
+**It is not installable yet.** The bridge is a second npm package,
+`indigo-matter-bridge`, and it has not been published to the npm registry — so
+the plugin's install menu item cannot resolve it, and export cannot be brought
+up on any machine today. Everything below describes what is built and waiting on
+that. Setup steps, for when it lands, are in [INSTALL.md](./INSTALL.md); this
+section is the shape of it.
+
+The two questions this page gets asked most are "can I export my lock?" and "why
+isn't my *X* in the list?", so those tables come first; the reasoning follows
+them.
+
+### What can be exported (v1)
+
+Indigo does not record what a device *is*. A relay may be a lamp, a plug, a lock,
+a valve, a fan or a garage door, and nothing in the device model tells them
+apart. So export asks you to **declare a role** per device, and defaults to the
+safest reading rather than guessing. Only roles a device can legitimately take
+are offered.
+
+| Indigo device | Roles offered | Appears in ecosystems as |
+| --- | --- | --- |
+| Relay | **Plug** *(default)*, Light, Lock | On/Off Plug-in Unit · On/Off Light · Door Lock |
+| Dimmer | **Dimmable light** *(default)*, Window covering | Dimmable Light · Window Covering |
+| Dimmer, colour-temperature capable | **Colour-temperature light** *(default)*, Dimmable light, Window covering | Color Temperature Light |
+| Dimmer, full colour | **Full-colour light** *(default)*, Dimmable light, Colour-temperature light, Window covering | Extended Color Light |
+| Sensor, on/off | **Occupancy** *(default)*, Contact | Occupancy Sensor · Contact Sensor |
+| Sensor, numeric | Temperature, Humidity, Light (lux), Pressure, Flow — the default is guessed from the device's units, and you can correct it | the matching Matter sensor type |
+| Thermostat | Thermostat | Thermostat (setpoints and modes; no fan in v1) |
+
+Two notes on that table. **Window covering** is offered for any dimmer because
+Indigo represents blinds as dimmers; Matter's convention is 100 % = fully open,
+and there is a per-export tick-box if your device runs the other way. And the
+**numeric sensor** guess reads whatever unit hints the device carries (its
+plugin's properties, its displayed value, then its name) — it is only a default,
+and all five roles stay selectable.
+
+**Locks export, and they do not auto-confirm anything.** A lock or unlock from an
+ecosystem is passed to Indigo and nothing else: no optimistic state, no
+synthesised confirmation. What the ecosystem shows moves only when Indigo's own
+state moves, because the bolt is the authority.
+
+### What cannot be exported, and why
+
+Excluded devices still **appear in the picker with their reason** — they are
+never silently missing, so you are never left hunting for a device that will
+never show up. (The picker shows up to 300 matching devices at a time; past that
+it says so and asks you to narrow the name filter.)
+
+| Not exportable | Why |
+| --- | --- |
+| Anything this plugin created — including its own energy-meter devices | Loop guard: a Matter device is not re-exported over Matter. Checked on the owning plugin id, before the device's type is looked at, so it catches every one of the plugin's device types alike. These are filtered out of the picker entirely rather than shown with a reason. |
+| **Valves** (as a relay role) | matter.js's valve cluster is an empty stub — the whole command surface would have to be written from scratch — and ecosystem support for the type is poor. v2 candidate. |
+| **Fans** — both dimmer-backed and speed-control devices | Same reason: matter.js's fan cluster only seeds a default mode, so all fan behaviour would be ours to implement. v2 candidate. This is also why the exported thermostat has no fan control. |
+| **Garage doors** (as a relay role) | Needs polarity data Indigo does not carry (`onState` true meaning *closed*, "on" meaning *close*), and getting it backwards is a physical-safety problem, not a cosmetic one. Blocked on the device-catalog work. |
+| **Sprinkler** devices | Matter has no irrigation-controller type. Per-zone water valves would be a lossy fit, and water valves are descoped anyway. |
+| **MultiIO** devices | No coherent way to represent one as a single accessory. |
+| Sensors whose units aren't in the table above | No faithful Matter sensor type to map them to. |
+| Sensors that report neither an on/off state nor a value | Nothing to publish. |
+| Devices with no resolvable role | The device is not a relay, dimmer, sensor, thermostat, speed-control, sprinkler or MultiIO — typically another plugin's custom device class. There is nothing in the Indigo device model to map, so there is no role to offer. |
+
+Beyond the device types, four v1 limits worth knowing up front:
+
+- **Units are taken on trust.** Indigo declares no units anywhere, so a reading
+  is assumed to already be in the unit Matter wants (°C, %RH, lux, m³/h).
+  A Fahrenheit thermostat will export a wrong-looking number, and there is no
+  fix inside Indigo's device model today. **Barometric pressure is the one
+  exception**: Indigo's convention is hPa, the plugin knows it, and it converts
+  to Matter's kPa — so a barometer reading in hPa is right as it stands, and
+  "correcting" it to kPa is what produces a value ten times too high.
+- **Pressure and flow sensors are exported but Apple Home has no UI for those
+  Matter types**, so expect them not to appear there.
+- **Energy and power are not exported.** Matter's electrical-sensor type is
+  ignored by Apple Home's UI, so it buys nothing in the ecosystem this is
+  written for. v2 candidate.
+- **Action groups, schedules, triggers and variables are not exported.** Only
+  devices.
 
 ### Two processes, opposite jobs
 
@@ -323,8 +398,11 @@ TypeScript. Keeping the whole Matter stack behind a process boundary is what let
 the plugin stay plain Python and speak Indigo devices, and it is the same
 discipline the controller side already follows. The two halves talk over a
 loopback WebSocket that nothing outside this Mac can reach, and the protocol is
-versioned: a bridge node from a different plugin version is refused rather than
-guessed at.
+versioned: a bridge node speaking a different **protocol** version is refused
+rather than guessed at. That version is bumped only when the wire contract
+itself changes, so most plugin upgrades need no new bridge node — but when it
+does change, an old node left running across an upgrade is halted with a reason
+rather than talked to on a guess.
 
 Both halves present the bridge as one accessory containing an **aggregator** with
 one child endpoint per exported device — the standard Matter bridge topology, and
@@ -375,6 +453,12 @@ what turns out to be the only one.
 
 ### Accessory identity, and why it must never move
 
+**Back up
+`~/Library/Application Support/com.simons-plugins.indigo-matter/bridge-node/`**,
+and read the recovery notes in [INSTALL.md](./INSTALL.md) before using either of
+the two destructive repair actions. That is the whole practical instruction; the
+rest of this subsection is why it matters more than it looks.
+
 Every exported device gets a stable identity derived from its immutable Indigo
 device ID, and a Matter endpoint number allocated once against that identity —
 never from its position in a list. Ecosystems remember both. The name you gave an accessory in Apple Home,
@@ -390,11 +474,6 @@ it refuses to export anything at all rather than quietly renumbering — silent
 renumbering is how every accessory ends up duplicated in every ecosystem, with
 the originals dead and removable only by hand. (Before the bridge has ever been
 paired there is nothing to protect, so it just carries on.)
-
-The practical version of all that: **back up
-`~/Library/Application Support/com.simons-plugins.indigo-matter/bridge-node/`**,
-and read the recovery notes in [INSTALL.md](./INSTALL.md) before using either of
-the two destructive repair actions.
 
 There is one everyday case that changes identity on purpose: **changing an
 export's role**. Matter does not allow an endpoint to change device type, so the
@@ -419,35 +498,12 @@ Honestly stated, because the difference matters:
 - **Any Matter controller you already own** counts too, including Home Assistant
   and Indigo's own controller — the bridge does not care who commissions it.
 
-**Status at the time of writing.** Every code path is unit-tested on both sides,
-and the bridge node's own suite stands up a real Matter stack. Beyond that, what
-has actually been done on live hardware, and what has not:
-
-*Validated on the reference server, against a real Apple Home:*
-
-- The bridge pairs. An uncertified bridge was commissioned into Apple Home and
-  the uncertified-accessory prompt accepted — the question that could have
-  killed the feature outright.
-- Exported devices work in both directions: an on/off light and a dimmer,
-  controlled from Apple Home and from Indigo, with the change showing up on the
-  other side.
-- Accessory identity survived a plugin and bridge-node upgrade: three exported
-  accessories kept their endpoint numbers across the upgrade with no duplicates
-  in Apple Home.
-
-*Not yet done, and honestly outstanding:*
-
-- Pairing **through the plugin's own menu** (the flow this page describes).
-  The pairing above was driven from the bridge node's console before that menu
-  existed.
-- The **second admin**: multi-fabric operation has not been demonstrated by
-  adding a second controller alongside Apple Home.
-- The **reboot** leg of the identity check — a plugin reload and a bridge-node
-  restart have both been survived, a full Mac reboot has not.
-- The **managed LaunchAgent** end to end, which is blocked on publishing
-  `indigo-matter-bridge` to npm.
-
-Treat the export half as new.
+**What has and has not been proven on live hardware** is stated once, in the
+project [README](../README.md#status), rather than restated here where the two
+copies would drift apart. The short version: the bridge has been commissioned
+into a real Apple Home and exported devices have been controlled both ways, but
+several legs — pairing driven from the plugin's own menu, a second ecosystem, a
+full reboot — are still outstanding. Treat the export half as new.
 
 ### Why every ecosystem calls it "uncertified"
 
@@ -471,68 +527,6 @@ Anyway", and know that it says nothing about whether the bridge works.
 is our controller's fabric identity, the other is the bridge's attestation
 identity — and neither is a claim about the other.)
 
-### What can be exported (v1)
-
-Indigo does not record what a device *is*. A relay may be a lamp, a plug, a lock,
-a valve, a fan or a garage door, and nothing in the device model tells them
-apart. So export asks you to **declare a role** per device, and defaults to the
-safest reading rather than guessing. Only roles a device can legitimately take
-are offered.
-
-| Indigo device | Roles offered | Appears in ecosystems as |
-| --- | --- | --- |
-| Relay | **Plug** *(default)*, Light, Lock | On/Off Plug-in Unit · On/Off Light · Door Lock |
-| Dimmer | **Dimmable light** *(default)*, Window covering | Dimmable Light · Window Covering |
-| Dimmer, colour-temperature capable | **Colour-temperature light** *(default)*, Dimmable light, Window covering | Color Temperature Light |
-| Dimmer, full colour | **Full-colour light** *(default)*, Colour-temperature light, Dimmable light, Window covering | Extended Color Light |
-| Sensor, on/off | **Occupancy** *(default)*, Contact | Occupancy Sensor · Contact Sensor |
-| Sensor, numeric | Temperature, Humidity, Light (lux), Pressure, Flow — the default is guessed from the device's units, and you can correct it | the matching Matter sensor type |
-| Thermostat | Thermostat | Thermostat (setpoints and modes; no fan in v1) |
-
-Two notes on that table. **Window covering** is offered for any dimmer because
-Indigo represents blinds as dimmers; Matter's convention is 100 % = fully open,
-and there is a per-export tick-box if your device runs the other way. And the
-**numeric sensor** guess reads whatever unit hints the device carries (its
-plugin's properties, its displayed value, then its name) — it is only a default,
-and all five roles stay selectable.
-
-**Locks export, and they do not auto-confirm anything.** A lock or unlock from an
-ecosystem is passed to Indigo and nothing else: no optimistic state, no
-synthesised confirmation. What the ecosystem shows moves only when Indigo's own
-state moves, because the bolt is the authority.
-
-### What cannot be exported, and why
-
-Excluded devices still **appear in the picker with their reason** — they are
-never silently missing, so you are never left hunting for a device that will
-never show up.
-
-| Not exportable | Why |
-| --- | --- |
-| Anything this plugin created | Loop guard: a Matter device is not re-exported over Matter. These are filtered out entirely. |
-| **Valves** (as a relay role) | matter.js's valve cluster is an empty stub — the whole command surface would have to be written from scratch — and ecosystem support for the type is poor. v2 candidate. |
-| **Fans** — both dimmer-backed and speed-control devices | Same reason: matter.js's fan cluster only seeds a default mode, so all fan behaviour would be ours to implement. v2 candidate. This is also why the exported thermostat has no fan control. |
-| **Garage doors** (as a relay role) | Needs polarity data Indigo does not carry (`onState` true meaning *closed*, "on" meaning *close*), and getting it backwards is a physical-safety problem, not a cosmetic one. Blocked on the device-catalog work. |
-| **Sprinkler** devices | Matter has no irrigation-controller type. Per-zone water valves would be a lossy fit, and water valves are descoped anyway. |
-| **MultiIO** devices | No coherent way to represent one as a single accessory. |
-| Sensors whose units aren't in the table above | No faithful Matter sensor type to map them to. |
-| Sensors that report neither an on/off state nor a value | Nothing to publish. |
-| Devices with no resolvable role — including this plugin's own energy-meter type | Nothing Matter can represent faithfully. |
-
-Beyond the device types, four v1 limits worth knowing up front:
-
-- **Units are taken on trust.** Indigo declares no units anywhere, so a reading
-  is assumed to already be in the unit Matter wants (°C, %RH, lux, kPa, m³/h).
-  A Fahrenheit thermostat will export a wrong-looking number, and there is no
-  fix inside Indigo's device model today. (Barometric pressure is the one
-  exception the plugin can be sure of, and it is converted.)
-- **Pressure and flow sensors are exported but Apple Home has no UI for those
-  Matter types**, so expect them not to appear there.
-- **Energy and power are not exported.** Matter's electrical-sensor type is
-  ignored by Apple Home's UI, so it buys nothing in the ecosystem this is
-  written for. v2 candidate.
-- **Action groups, schedules, triggers and variables are not exported.** Only
-  devices.
 
 ## Firmware updates (and why they matter more than usual)
 
