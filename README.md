@@ -71,7 +71,9 @@ accessory. One bridge, one pairing, however many devices.
 Setup, pairing, recovery and troubleshooting:
 [full install guide](https://simons-plugins.github.io/indigo-matter/INSTALL.html). How it
 works and what it can represent:
-[Field Notes № 1](https://simons-plugins.github.io/indigo-matter/matter.html).
+[MATTER.md → Indigo as a Matter bridge](docs/MATTER.md#indigo-as-a-matter-bridge--the-other-direction).
+(The typeset [Field Notes № 1](https://simons-plugins.github.io/indigo-matter/matter.html)
+page predates the export half and does not cover it yet.)
 
 ## Status
 
@@ -96,11 +98,16 @@ the role mapping, endpoint persistence, pairing and fabric management, and the m
 LaunchAgent are all in place, and the bridge node's own suite stands up a real Matter stack.
 On live hardware the bridge **has** been commissioned into Apple Home (uncertified prompt
 and all), an on/off light and a dimmer **have** been controlled in both directions, and
-accessory identity **has** survived an upgrade without duplicating. Still outstanding:
-pairing through the plugin's own menu rather than the node's console, a second controller
-alongside Apple Home, the reboot leg of the identity check, and the managed LaunchAgent
-end to end — that last one blocked on publishing `indigo-matter-bridge` to npm. Treat the
-export half as new. See [MATTER.md](docs/MATTER.md) for the full status.
+accessory identity **has** survived an upgrade without duplicating (2026-08-04 / 05, on
+the reference server). Still outstanding: pairing through the plugin's own menu rather
+than the node's console, a second controller alongside Apple Home, the reboot leg of the
+identity check, and the managed LaunchAgent end to end — that last one needs the package
+installed, which until `indigo-matter-bridge` is published means the local-install
+workaround rather than the shipped install menu. Treat the export half as new. See
+[MATTER.md](docs/MATTER.md#indigo-as-a-matter-bridge--the-other-direction) for how it
+works, and
+[Handover](https://simons-plugins.github.io/indigo-matter/HANDOVER.html) for the
+validation specifics.
 
 ## Setup
 
