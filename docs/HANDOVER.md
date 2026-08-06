@@ -1,32 +1,48 @@
 # indigo-matter — Build Handover
 
-**Last updated:** 2026-08-06 14:05 UTC
-**Active work:** `feat/134-menu-sections` — **PR #144 OPEN**, CI green, awaiting
-Simon's go-ahead. Menu grouping only; see the §#134 section below.
-**Branch:** `main` — **PR #142 MERGED** (`3e1229d`, merge commit, `[no-release]`
-so **no GitHub release was cut** — Simon is cutting that himself). Latest
-release remains v2026.7.23.
-**Version:** plugin `2026.8.5` on the open branch (`2026.8.4` on `main`),
-bridge-node `0.7.0` (**published to npm**; `DEFAULT_INSTALL_SPEC` pins it).
-**Tests:** **2256 Python** (2252 on `main`), **383 TS** — both green.
+**Last updated:** 2026-08-06 14:38 UTC
+**Active work:** none — nothing in flight, working tree clean.
+**Branch:** `main` — **PR #144 MERGED** (`08d64dc`, merge commit, issue #134
+closed). Both it and #142 went in under `[no-release]`, so **two merges' worth
+of work is unreleased**: the latest release is still **v2026.7.23**, and the
+only 2026.8 artefact is the `v2026.8.0` *pre-release* Simon cut by hand.
+Whoever cuts the next real release ships #141's endpoint restore **and** #134's
+menu together.
+**Version:** plugin `2026.8.5`, bridge-node `0.7.0` (**published to npm**;
+`DEFAULT_INSTALL_SPEC` pins it).
+**Tests:** **2256 Python**, **383 TS** — both green. pylint 9.42.
 (`python3 -m pytest -q` · `cd bridge-node && npm run build && npm test`)
-**Deployed:** jarvis runs plugin `2026.8.4` + bridge-node `0.7.0`, paired to
-**Apple Home AND Alexa simultaneously** (3 fabrics: 2 Apple, 1 Alexa).
+**Deployed:** jarvis runs plugin `2026.8.5` + bridge-node `0.7.0`, paired to
+**Apple Home AND Alexa simultaneously** (3 fabrics: 2 Apple, 1 Alexa). The
+2026.8.5 deploy was two files (`MenuItems.xml`, `Info.plist`) over SSH plus a
+plugin restart; the install was checksum-compared against the branch first and
+carried **no** hot-patches, so a plain file copy was safe.
 **Status:** export v1 feature-complete and live. #141 **fixed and confirmed**
 (below). **#143 is the open one** — see the 2026-08-06 §#143 section; its
 defect B was investigated hard today and the leading theory was **withdrawn**,
 so read that before touching it.
 
-**NEXT UP (Simon, 2026-08-06):** ~~tidy `MenuItems.xml` into groups~~ — **done**,
-see the §#134 section immediately below. The constraint it warned about was
-wrong in the useful direction: **separators do exist**.
+**NEXT UP:** **#132** — the *Rebuild Matter Endpoint Map…* dialog warns that
+rebuilding WILL duplicate accessories in paired ecosystems, and it cannot; the
+duplication belongs to the drift event that already happened. Same file #134
+just reordered, but it is dialog *text*, which is why it was deliberately left
+out of that PR. Then **#131** (sort exported devices to the top of the picker).
 
 ---
 
 ## 2026-08-06 — issue #134: the menu, and the separator the docs deny
 
 Plugin `2026.8.5`. Suites: **2256 Python** (from 2252), pylint **9.42**
-unchanged. Branch `feat/134-menu-sections`. TS untouched.
+unchanged. PR #144, merged `08d64dc` under `[no-release]`. TS untouched.
+
+**Rendered and confirmed on jarvis (2026-08-06), and that was the only check
+that mattered.** No test can tell you whether Indigo *draws* an empty
+`<MenuItem/>` as a divider — the suite can only pin the file's shape. Deployed
+to jarvis, restarted, and Simon confirmed the five sections render in the
+Indigo client with the two `Install/update` items visibly apart. If a future
+Indigo release stops honouring the form, the suite will stay green and the menu
+will silently flatten; the symptom to look for is a blank clickable row where a
+divider used to be.
 
 **An empty, self-closing `<MenuItem id="…"/>` renders as a menu separator.**
 The canonical `MenuItems.xml` reference lists `<Name>` as *required* and
