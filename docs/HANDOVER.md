@@ -1,14 +1,86 @@
 # indigo-matter — Build Handover
 
-**Last updated:** 2026-08-06 11:01 UTC
-**Active work:** `fix/141-restore-endpoints-at-startup` — issue #141, the
-empty-aggregator restart bug. See the section immediately below; the `main`
-summary in this header describes the last merge, not that branch.
-**Branch:** `main` — PRs #106, #107, #108 all merged.
-**Version:** `2026.7.13`
-**Tests:** 1005 passing (`cd indigo-matter && /Library/Frameworks/Python.framework/Versions/Current/bin/python3 -m pytest -q`)
-**Deployed:** jarvis is running the #103-era plugin (v2026.7.10) plus **E5's export half, deployed 2026-08-05 with 3 accessories live in Apple Home**. **Nothing from #106/#107/#108, and no part of E6 or E7, has been deployed** — so the #104 supervision fixes are NOT yet live on jarvis.
-**Status:** **Wi-Fi AND Thread validated with real hardware**, and the **export half's E0 pairing gate PASSED on 2026-08-04** with live two-way control on 2026-08-05 (see *Live validation on jarvis*). #104's three server-supervision faults are fixed and merged (#107). #105's diagnostic is merged (#108) but **#105 stays open** — the bridged-endpoint path still has no real-bridge validation. `domio-code` #236 is fixed and closed (domio-code PR #237). Known-open: #105, plus the older #43, #46, #21–#24.
+**Last updated:** 2026-08-06 13:35 UTC
+**Active work:** none — nothing in flight, working tree clean.
+**Branch:** `main` — **PR #142 MERGED** (`3e1229d`, merge commit, `[no-release]`
+so **no GitHub release was cut** — Simon is cutting that himself). Latest
+release remains v2026.7.23.
+**Version:** plugin `2026.8.4`, bridge-node `0.7.0` (**published to npm**;
+`DEFAULT_INSTALL_SPEC` pins it).
+**Tests:** **2252 Python**, **383 TS** — both green.
+(`python3 -m pytest -q` · `cd bridge-node && npm run build && npm test`)
+**Deployed:** jarvis runs plugin `2026.8.4` + bridge-node `0.7.0`, paired to
+**Apple Home AND Alexa simultaneously** (3 fabrics: 2 Apple, 1 Alexa).
+**Status:** export v1 feature-complete and live. #141 **fixed and confirmed**
+(below). **#143 is the open one** — see the 2026-08-06 §#143 section; its
+defect B was investigated hard today and the leading theory was **withdrawn**,
+so read that before touching it.
+
+**NEXT UP (Simon, 2026-08-06):** tidy `MenuItems.xml` into groups — server /
+export / normal use / debug. 16 flat items today. Constraint to verify first:
+the canonical MenuItems.xml reference documents **no separator and no submenu**
+element, so grouping may be ordering + name prefixes only. UI work, so agree
+the layout with Simon before editing (there is an existing menu-grouping issue
+in the #131–#139 batch — find it rather than duplicate).
+
+---
+
+## 2026-08-06 (late) — issue #143: state wrong in Alexa. READ THIS BEFORE RESUMING IT
+
+**Status: unresolved, parked for beta testers. The node is EXONERATED.**
+
+Two halves, one root shape — we lean on matter.js's **attribute-change**
+machinery for things that are not changes:
+
+* **Defect A (inbound), still the substantive half.** Ecosystem commands are
+  emitted from `onOff$Changed` listeners, so an invoke matching the endpoint's
+  current state changes nothing and reaches Indigo never. Suspected, **not
+  proven**. Untouched by today's work.
+* **Defect B (outbound).** New exports show stale, then *unresponsive*, in
+  **Alexa only** (Apple is fine) — then **come right on their own after minutes
+  with no intervention**. Best current reading: **Alexa-side convergence lag**,
+  probably not our bug.
+
+**Do NOT re-assert the "born-vs-changed" theory as proven.** It is real in code
+(`createEndpoint` bakes spec states into `initialState`, so an attribute born
+`true` emits no change report) and the fix is cheap — construct from role
+defaults, then `applyStates` after `aggregator.add()`, exactly as `update()`
+already does. But it does **not** explain what was observed: a genuine write
+also failed to move Alexa, and Alexa then fixed itself with no write at all.
+I posted a "B2 CONFIRMED" verdict on the issue and then **withdrew it**; both
+comments are there, read to the end.
+
+**Measured, so don't re-measure it:** a controlled toggle produced `I/ReportData`
+on all three live sessions (1 Apple, 2 Alexa Echo hubs), each acked in ~15ms.
+Alexa = fabric index 4, **two wildcard subscriptions**, maxInterval ≈188s.
+Outbound reporting to Alexa works, *including* for endpoints added after the
+subscription existed.
+
+**Three blind alleys — do not re-walk:**
+1. matter.js does **not** flush a constructor-supplied `initialState` to its
+   store, so `…/indigo-matter-bridge/root.parts.aggregator.parts.<id>.onOff.onOff`
+   is **NOT** a reading of the live attribute. Two said `false` for accessories
+   that were on and correct in both apps. Cost about an hour.
+2. "the node resurrects a stale persisted value on re-export" — tested three
+   ways (in-process, across a restart, via `upsert_endpoint`); **all pass**.
+   Those tests are committed (`e22e861`, `bridge-node/test/restore.test.ts`) and
+   they are what exonerate the node. The stored value was always right; the bug
+   was an *unreported* one, which no assertion on `stateOf` can catch.
+3. **Never credit the last thing you did.** Something here fixes itself on its
+   own timescale. "The plugin restart fixed it" was claimed twice and was wrong
+   both times. Any intervention needs a control before causation is claimed.
+
+**To settle it** (needs beta testers, more than one Alexa setup): export a
+device that is **on**; record Alexa at t+0/+1/+5/+15 min **without touching
+anything**; watch `root.subscriptions.subscriptions` for a re-subscribe at the
+moment it comes right. Then repeat with the create-path fix applied — if Alexa
+is right at t+0 the fix matters, if the curve is unchanged it is cosmetic.
+
+**Also open, adjacent:** #140 — the drift line
+(`indigo-459564566 expected 5, got 2`) now fires on **every** attach after the
+factory reset, and `endpoint-map.json` records number `5` twice (Hallway Lamp
+and Georges Pendant). Harmless — live numbers are unique — but it is the reset's
+fingerprint and belongs in #140.
 
 ---
 
