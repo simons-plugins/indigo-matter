@@ -482,6 +482,59 @@ export class EndpointMapStore {
     }
 
     /**
+     * A device was **un-exported**: keep its number, drop what would rebuild it.
+     *
+     * The other half of {@link restorable}, and without it the restore is a bug
+     * rather than a fix. `check` only ever *adds* and *refreshes*, so once an
+     * entry has carried a `role`/`label` it carries them for ever — and a device
+     * the user deliberately un-exported therefore stayed restorable, was
+     * re-created as a child endpoint on every single boot, and was removed again
+     * by the plugin's next attach seconds later. That is precisely the
+     * appear-then-vanish churn issue #141 exists to eliminate, aimed at the
+     * devices the user had already told us to stop exporting, and it regresses
+     * XAC7's "un-exported accessories are gone".
+     *
+     * **The number stays.** §3.3 retains the allocation on purpose, so re-adding
+     * the same device gets the same endpoint number back and paired ecosystems
+     * see the accessory they already know rather than a new one. Deleting the
+     * entry outright would throw that away to save three fields. Clearing only
+     * the restoration half makes the entry non-restorable — {@link restorable}
+     * filters on `role` **and** `label` — while leaving the identity intact, and
+     * one re-export refills it through the ordinary {@link check}.
+     *
+     * **Only a caller that watched a specific endpoint go may call this.** An
+     * empty live set is not evidence of anything: a node that has never attached
+     * has none, and `seed([])` deliberately knows nothing. So this takes the
+     * uniqueIds that were actually removed rather than inferring them from
+     * whatever happens to be live, and `node.ts` derives them by diffing the
+     * live set across one mutation. A factory reset is deliberately NOT such a
+     * caller: `erase()` wipes matter.js's endpoints, but the user un-exported
+     * nothing and the plugin's re-attach re-creates the same set.
+     *
+     * Returns how many entries actually lost something, so a no-op costs no
+     * disk write.
+     */
+    forget(uniqueIds: readonly string[]): number {
+        let forgotten = 0;
+        for (const uniqueId of uniqueIds) {
+            const record = this.#endpoints.get(uniqueId);
+            if (record === undefined || (record.role === undefined && record.label === undefined)) {
+                continue;
+            }
+            delete record.role;
+            delete record.label;
+            forgotten += 1;
+        }
+        if (forgotten > 0) {
+            this.persist(
+                `cleared the role/label of ${forgotten} un-exported endpoint(s), keeping their ` +
+                    "numbers so a re-export returns the same accessory",
+            );
+        }
+        return forgotten;
+    }
+
+    /**
      * Compare the live endpoint numbers against the map (PRD §4.3).
      *
      * Endpoints the map has never seen are *recorded*; endpoints whose number
@@ -547,9 +600,27 @@ export class EndpointMapStore {
      * true is the migration; refusing to serve until a human confirms a
      * *rebuild* would take a working bridge offline to fix a file it never had.
      *
+     * **This is a full REPLACE, not a merge**, and the next caller has to mean
+     * it: whatever is in memory is dropped, so seeding a partial list silently
+     * discards the numbers of everything absent from it — the one thing in this
+     * file that cannot be re-derived. Today's single caller
+     * (`node.bootstrapEndpointMap`) passes `[]` against a map that is by
+     * definition absent, so it drops nothing; the assertion below is what keeps
+     * that true if a later caller has a map in hand. A caller that wants to add
+     * to a baseline wants {@link check}, and one that wants to replace a
+     * *disagreeing* baseline wants {@link rebuild}, which quarantines first.
+     *
      * Returns whether the baseline reached disk.
      */
     seed(numbers: readonly LiveEndpointNumber[], why: string): boolean {
+        if (this.#endpoints.size > 0 && numbers.length < this.#endpoints.size) {
+            throw new Error(
+                `refusing to seed ${numbers.length} endpoint number(s) over a baseline of ` +
+                    `${this.#endpoints.size}: seed() replaces the whole map, so this would discard ` +
+                    "endpoint numbers paired ecosystems are keyed on — use check() to add, or " +
+                    "rebuild() to deliberately replace",
+            );
+        }
         this.#endpoints = new Map(numbers.map(entry => [entry.uniqueId, recordFor(entry)]));
         this.#problem = undefined;
         this.#checked = numbers.length > 0;

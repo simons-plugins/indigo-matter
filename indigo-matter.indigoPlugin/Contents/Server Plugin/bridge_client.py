@@ -169,6 +169,7 @@ class BridgeClient(WsJsonClient):
         plugin_version: str = "unknown",
         endpoint_provider: Optional[Callable[[], list]] = None,
         replace_all_provider: Optional[Callable[[], int]] = None,
+        export_count_provider: Optional[Callable[[], int]] = None,
         connect: Optional[Callable[[str], Awaitable]] = None,
         on_attached: Optional[Callable[[StatusReport, bool], None]] = None,
         on_attach_refused: Optional[Callable[[str, str], None]] = None,
@@ -203,6 +204,13 @@ class BridgeClient(WsJsonClient):
         #: without this the accessories stay in every paired ecosystem for good,
         #: because nothing else ever attaches with an empty set again.
         self._replace_all_provider = replace_all_provider or (lambda: 0)
+        #: How many entries the export allow-list DECLARES, before the classifier
+        #: has had its say (``export_bridge._declared_export_count``). The gap
+        #: between this and ``len(specs)`` is what :meth:`_replace_all` reads to
+        #: tell "the user exported nothing" apart from "everything the user
+        #: exported turned out to be unbridgeable" — see there for why the
+        #: difference is a permanent halt rather than a nuance.
+        self._export_count_provider = export_count_provider or (lambda: 0)
         self._on_attached = on_attached
         self._on_attach_refused = on_attach_refused
         self._on_version_skew = on_version_skew
@@ -264,7 +272,7 @@ class BridgeClient(WsJsonClient):
         # send" — which is what every waiter on ``wait_connected`` assumes.
         specs = await self._gather_endpoints()
         owed = self._owed_removals()
-        replace_all = self._replace_all(owed)
+        replace_all = self._replace_all(owed, specs)
         # Requests are legal from here on: attach is one.
         self._mark_connected()
         try:
@@ -297,28 +305,76 @@ class BridgeClient(WsJsonClient):
                                 "attaching without it", exc)
             return 0
 
-    def _replace_all(self, owed: int) -> bool:
+    def _replace_all(self, owed: int, specs: Optional[list] = None) -> bool:
         """Whether this attach carries §3.1's ``intent: replace_all``.
 
-        **The desired set's size is deliberately not consulted.** It used to
-        gate this — "a `replace_all` alongside real endpoints is meaningless, so
-        only ask when we are sending nothing" — and that turned a debt plus a
-        *disjoint* re-add into a permanent halt: the removals still emptied the
-        node's live set, the guard still fired, and the attach that carried no
-        intent was refused with ``mass_removal_refused``, which halts.
+        **The desired set's size does not GATE this**, and used to — "a
+        `replace_all` alongside real endpoints is meaningless, so only ask when
+        we are sending nothing" — which turned a debt plus a *disjoint* re-add
+        into a permanent halt: the removals still emptied the node's live set,
+        the guard still fired, and the attach that carried no intent was refused
+        with ``mass_removal_refused``, which halts.
 
         Carrying the intent whenever a debt exists is safe in the direction that
         matters. §3.1's guard fires only when the reconcile would leave the live
         set EMPTY, so on any attach carrying real endpoints the flag is inert —
         it cannot license a removal the desired set was not already asking for.
         What it does is stop the one refusal that has no retry behind it.
+
+        **The second reason is issue #141's restore, and it is new.** An
+        allow-list with entries in it can still produce *zero* specs: every entry
+        is re-classified on every attach (``export_bridge.endpoint_specs``) and
+        each one is skipped if its Indigo device was deleted, stopped being
+        exportable, lost the declared role, or raised out of ``states_for``. A
+        single-device allow-list whose device the user deleted does it on its
+        own. Before the restore that combination was harmless — with nothing
+        ever created before the plugin attached, the node's live set was empty,
+        §3.1's guard was never armed, and the empty attach was a no-op. The node
+        now comes up holding the previously-exported set, so the very same
+        routine restart sends ``[]`` against a NON-empty live set, is refused
+        with ``mass_removal_refused``, and ``mass_removal_refused`` HALTS — every
+        reload, for good, with a message about an allow-list that is not empty.
+
+        Sending the intent is the honest reconcile: the desired set really is
+        empty, and the alternative is a node serving accessories the plugin can
+        neither drive nor push state to. It is not silent — ``endpoint_specs``
+        names every skipped device, and the line below says what is about to
+        happen — and it is not destructive of identity: §3.3 retains each
+        endpoint-number allocation, so fixing whatever broke the devices brings
+        the same accessories back rather than new ones.
         """
-        if owed <= 0:
+        if owed > 0:
+            self.logger.info(
+                "attaching with intent: replace_all — finishing an un-export of %d accessory "
+                "record(s) that did not complete earlier", owed)
+            return True
+        if specs is None or specs:
             return False
-        self.logger.info(
-            "attaching with intent: replace_all — finishing an un-export of %d accessory "
-            "record(s) that did not complete earlier", owed)
+        declared = self._declared_exports()
+        if declared <= 0:
+            # A genuinely empty allow-list. XG5 means the client should not even
+            # exist here, and an empty attach against an empty live set is a
+            # no-op anyway — so no intent, and the §3.1 guard keeps its teeth.
+            return False
+        self.logger.warning(
+            "attaching with intent: replace_all — the export list still has %d entry/entries but "
+            "NONE of them can be bridged right now (see the warnings above naming each one), so "
+            "the desired set is empty. Those accessories are being removed from every paired "
+            "ecosystem; their endpoint numbers are kept, so fixing the devices restores the same "
+            "accessories rather than new ones.", declared)
         return True
+
+    def _declared_exports(self) -> int:
+        """How many entries the allow-list declares, before classification."""
+        try:
+            return max(0, int(self._export_count_provider() or 0))
+        except Exception as exc:  # pylint: disable=broad-except
+            # Nothing that reads this may fail closed onto "0": that is the
+            # value meaning "genuinely empty allow-list", which is exactly the
+            # answer that lets the halt above happen.
+            self.logger.warning("could not read the declared export count (%s); assuming the "
+                                "export list is empty", exc)
+            return 0
 
     def _handle_attach_refused(self, exc: BridgeProtocolError) -> None:
         """Decide what an ``attach`` the node refused means (§1.1).
@@ -520,7 +576,14 @@ class BridgeClient(WsJsonClient):
             # 80-accessory un-export the 8s floor, timed it out mid-reconcile,
             # then tore the socket down and retried — forever, with the
             # accessories still in every ecosystem.
-            timeout = attach_timeout_for(max(len(specs), self._owed_removals()))
+            #
+            # The declared count is the third candidate and covers the same
+            # shape without a debt: when the classifier skips a whole allow-list
+            # (:meth:`_replace_all`) the node removes its entire restored set
+            # against `len(specs) == 0` and `owed == 0`, and the allow-list's own
+            # length is the only proxy for how much that is.
+            timeout = attach_timeout_for(
+                max(len(specs), self._owed_removals(), self._declared_exports()))
         frame = self.proto.build_attach(self.plugin_version, specs, replace_all=replace_all)
         if inline:
             result = await self._handshake_request(frame, timeout, bridge_protocol.CMD_ATTACH)
@@ -691,10 +754,15 @@ class BridgeClient(WsJsonClient):
         self.logger.info("endpoint map rebuilt; re-attaching to the bridge node")
         # The debt outlives the refusal: a node that was refusing never took
         # our un-export either, so the re-attach has to carry the same opt-in
-        # the handshake would have.
-        replace_all = self._replace_all(self._owed_removals())
+        # the handshake would have. The desired set is read HERE rather than
+        # inside `attach`, so this decision sees the same specs the frame will
+        # carry — deciding first and gathering afterwards would judge the
+        # all-skipped case (see :meth:`_replace_all`) on a stale read, or on no
+        # read at all.
+        specs = await self._gather_endpoints()
+        replace_all = self._replace_all(self._owed_removals(), specs)
         try:
-            status = await self.attach(replace_all=replace_all)
+            status = await self.attach(specs, replace_all=replace_all)
         except BridgeProtocolError as exc:
             self._triage_rebuilt_reattach(exc)
             return rebuilt

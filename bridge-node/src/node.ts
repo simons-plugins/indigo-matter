@@ -718,6 +718,49 @@ export class BridgeNode implements BridgeFacade {
         }));
     }
 
+    /** The live set as the map keys it, for the before/after diff below. */
+    private liveUniqueIds(): Set<string> {
+        return new Set(
+            (this.#registry?.identities() ?? []).map(identity => uniqueIdFor(identity.indigoDeviceId)),
+        );
+    }
+
+    /**
+     * Tell the map about endpoints this operation actually took away, so they
+     * stop being restored on every boot (issue #141 follow-up).
+     *
+     * `check` is add-and-refresh only, so without this a device the user
+     * un-exported kept its `role`/`label` for ever, was rebuilt as a child
+     * endpoint before every `server.start()`, and was removed again by the next
+     * attach — the exact appear-then-vanish churn the restore exists to stop,
+     * pointed at the devices the user had already removed. It also cost the
+     * plugin `REMOVAL_PACING_MS` per ghost on every attach while counting
+     * towards neither the desired set nor the un-export debt, so a handful of
+     * accumulated ghosts ate the attach deadline for a set nobody asked for.
+     *
+     * **Measured, not inferred.** The removals are the difference between the
+     * live set before the operation and after it, which is the only honest
+     * source: `attach`'s desired set is a request (a refused or part-applied
+     * reconcile removed less than it asked to), and an empty live set proves
+     * nothing at all. A recreate — removed and re-created in one reconcile — is
+     * in both snapshots, so it is not a removal; and even if it were, the
+     * {@link checkDrift} that follows re-records its role and label.
+     */
+    private forgetRemoved(before: ReadonlySet<string>): void {
+        const after = this.liveUniqueIds();
+        const removed = [...before].filter(uniqueId => !after.has(uniqueId));
+        if (removed.length === 0) {
+            return;
+        }
+        const forgotten = this.#endpointMap.forget(removed);
+        if (forgotten > 0) {
+            this.log(
+                `${forgotten} un-exported endpoint(s) will no longer be restored at startup; their ` +
+                    "endpoint numbers are kept (§3.3) so a re-export returns the same accessory",
+            );
+        }
+    }
+
     /**
      * Compare the live endpoint numbers against the persisted map (PRD §4.3).
      *
@@ -744,9 +787,14 @@ export class BridgeNode implements BridgeFacade {
 
     /** §3.1 — reconcile the live endpoint set, then answer with the new status. */
     async reconcile(endpoints: readonly EndpointSpec[], replaceAll: boolean): Promise<StatusReport> {
+        const before = this.liveUniqueIds();
         try {
             await this.registry.reconcile(endpoints, replaceAll);
         } finally {
+            // Before the drift check, so a recreate — which is a remove and a
+            // create in one plan — has its role and label put straight back by
+            // the `check` below rather than being left as a bare number.
+            this.forgetRemoved(before);
             // In a `finally` because a part-applied reconcile (registry.ts is
             // explicit that there is no transaction across several `add`s) has
             // still created endpoints, and those are exactly the numbers worth
@@ -783,9 +831,11 @@ export class BridgeNode implements BridgeFacade {
      * upsert happened to notice.
      */
     async removeEndpoint(indigoDeviceId: number): Promise<RemoveResult> {
+        const before = this.liveUniqueIds();
         try {
             return await this.registry.remove(indigoDeviceId);
         } finally {
+            this.forgetRemoved(before);
             this.checkDrift();
         }
     }

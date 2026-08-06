@@ -133,6 +133,18 @@ with `error_code: "mass_removal_refused"` unless the args carry
 ecosystem must be deliberate (the §5.1 allow-list being emptied), never the
 side effect of a stale or buggy client attaching with a default state.
 
+Because restore arms that guard from the first attach, the plugin now carries
+the intent in **two** cases, not one: the un-export debt it already tracked
+(XAC7), and an allow-list that is non-empty but whose every entry the classifier
+skipped — a deleted Indigo device, a device that stopped being exportable, a
+role this build cannot bridge, a `states_for` that raised. That second case sends
+`[]` and is genuinely asking for an empty set; without the intent it would meet
+an armed guard on an ordinary restart and be refused, and `mass_removal_refused`
+halts the client permanently. It is announced in the Indigo log with every
+skipped device named. A *genuinely* empty allow-list still carries no intent —
+the guard must keep its teeth against exactly the stale client it was written
+for.
+
 ### 3.2 `upsert_endpoint`
 
 ```json
@@ -473,10 +485,41 @@ childless aggregator and waited for the plugin told every paired ecosystem that
 every accessory had gone; Apple then re-added them as new accessories in the
 bridge's own room, destroying the user's room assignments on every restart
 (issue #141). The restore is not drift: these are the map's own numbers being
-re-used, and `driftChecked` stays `false` until a real comparison runs. A node
-in a refuse-to-start state (§1.1 `endpoint_map_invalid`) restores **nothing** —
-it cannot trust the map, and creating endpoints is precisely what the refusal
-exists to prevent.
+re-used, and `driftChecked` stays `false` until a real comparison runs.
+
+A node in a refuse-to-start state (§1.1 `endpoint_map_invalid`) ends up serving
+**nothing** — it cannot trust its own records, and creating endpoints is
+precisely what the refusal exists to prevent — but *how* it gets there differs
+by reason, and one of the three is observable on the wire:
+
+| Refusal reason | When it is known | What a controller can see |
+|---|---|---|
+| `identityUnreadable` | before the stack starts | nothing is ever built; `PartsList` is empty from the first read |
+| `mapUnreadable` | before the stack starts | as above — an unreadable map restores nothing in the first place |
+| `fabricStorageLost` | only **after** `server.start()`, because it needs the fabric table | the restored set exists briefly and is then **withdrawn** |
+
+`fabricStorageLost` is therefore not silent. The node goes online carrying its
+restored endpoints, reads the fabric table, refuses, and takes them back out —
+so a reader would see a transient non-zero `endpointCount`, a
+`ConfigurationVersion` bump from the withdrawal, and the extra startup latency
+of building and closing the set. That is accepted rather than avoided: by
+definition this node has **no fabrics**, so there is no commissioned controller
+subscribed to see any of it, and the alternative (deferring the restore until
+after the refusal decision) reopens the online-and-empty window for every
+healthy start, which is the bug itself.
+
+**Un-exporting clears an entry's restoration half.** When a reconcile or a
+`remove_endpoint` actually takes an endpoint away, its `role` and `label` are
+dropped from the map while its `number` is kept. Without that, `check`'s
+add-and-refresh-only behaviour left an un-exported device restorable for ever:
+it was rebuilt before every `server.start()` and removed again by the next
+attach — the same appear-then-vanish churn, aimed at devices the user had
+already removed — and each ghost also cost a removal-pacing slot on every
+attach. Keeping the number is §3.3's retained allocation, so a re-export returns
+the *same* accessory rather than a new one. Only a measured removal clears an
+entry: absence from the live set proves nothing (a node that never attached has
+an empty one), so a factory reset, a seed and an entry this build cannot rebuild
+all leave the map alone.
 
 `drift` is populated by every operation that can change the live endpoint set —
 `attach`/`reconcile`, `upsert_endpoint` and `remove_endpoint` — and **on the

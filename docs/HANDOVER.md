@@ -65,9 +65,96 @@ restore does not make it worse — a restore is not a comparison, `driftChecked`
 stays `false` until a real one runs, and re-using the map's own numbers raises
 no drift.
 
-**`indigo-matter-bridge@0.6.0` has to be published to npm** before
-`DEFAULT_INSTALL_SPEC` can resolve. Publishing is Simon's action (see
-*Publishing the bridge node*).
+`indigo-matter-bridge@0.6.0` **is now published** (0.5.0 and 0.6.0 are both on
+the registry; `latest` is 0.6.0), so `DEFAULT_INSTALL_SPEC` resolves off npm.
+The hardening below changes node source *after* that publish — see its last
+paragraph.
+
+### 2026-08-06 (later) — hardening from the two PR #142 reviews
+
+Suites: **2252 Python**, **380 TS** (from 2243/366 on this branch — both
+measured, not carried over). pylint **9.42**, unchanged. One reviewer reported
+353 TS against the same claimed baseline; it is not reproducible here. The only
+reproducible way to lose tests silently is running `node --test` directly
+without `npm run build`, which skips `main.test.ts`'s whole `describe` on
+`existsSync(dist/main.js)` and contributes **0** rather than 8 (→ 358); an
+aborted file under the suite's known mDNS contention would do the same for
+whatever it took with it. `npm test` itself always builds first, so under `npm
+test` the number is 366/380.
+
+**Ghost accessories — the restore's own version of the bug it fixed.** `check()`
+only ever added and refreshed, so once a v2 entry carried `role`/`label` it
+carried them for ever. A device the user *un-exported* therefore stayed
+restorable: rebuilt as a child endpoint before every `server.start()`, removed
+again by the plugin's next attach seconds later. That is exactly the
+appear-then-vanish churn #141 exists to eliminate, aimed at devices the user had
+already removed, and it regressed XAC7. Each ghost also spent a
+`REMOVAL_PACING_MS` (100ms) slot on every attach while counting towards neither
+the desired set nor the un-export debt, so an accumulation of them ate the 8s
+attach floor for accessories nobody had asked for.
+
+*Fix:* on a removal, clear `role`/`label` and **keep `number`** —
+`restorable()` filters on role *and* label, so the entry goes non-restorable
+while §3.3's allocation survives and one re-export refills it at the same
+number, which means the same accessory in every paired ecosystem rather than a
+new one. `node.ts` measures the removals by diffing the live set across one
+mutation (`forgetRemoved`) rather than reading absence: an empty live set proves
+nothing (a node that never attached has one, and `seed([])` knows nothing by
+design), so a factory reset, a seed, and an entry this build cannot rebuild all
+leave the map alone. `withdrawRestoredIfRefusing` goes through
+`registry.reconcile` directly and so does not forget either — correct, since a
+refusal is not an un-export.
+
+**A permanent halt this PR made reachable, and the PR body described it
+backwards.** When the classifier empties a *non-empty* allow-list — every entry
+skipped because the Indigo device was deleted, stopped being exportable, lost
+its declared role, or raised out of `states_for` — `endpoint_specs()` returns
+`[]`, there is no debt, and the attach went out bare. Before the restore that
+was harmless: nothing was ever created before the plugin attached, so the node's
+live set was empty, §3.1's guard was never armed, and the empty attach was a
+no-op. The restore arms the guard from the first attach, so the same routine
+restart is now refused with `mass_removal_refused` — which is in
+`HALTING_ATTACH_ERRORS` and halts the client permanently, every reload, behind a
+message telling the user to check an allow-list that is not the problem. A
+one-device allow-list whose device the user deleted reaches it unaided.
+
+*Fix, plugin-side:* `bridge_client._replace_all` now carries `intent:
+replace_all` in that case too, gated on a new `export_count_provider`
+(`export_bridge._declared_export_count`, the store's own length) so a
+*genuinely* empty allow-list still carries nothing and §3.1 keeps its teeth
+against the stale client it was written for. A provider that raises fails
+towards the guard, not past it. It is announced loudly at WARNING on both sides,
+naming every skipped device — latched per cause like `_skip` is, because the
+provider runs per (re)connect. The declared count also joins the attach-deadline
+`max()`, since it is the only proxy for how much the node is about to remove.
+Chosen over "do not attach at all": the node would otherwise serve accessories
+the plugin can neither drive nor push state to, with nothing to clear it, and
+§3.3's retained numbers make the removal recoverable.
+
+**Mutation survivors closed** (all seven ⊗ verified fail-before by mutating the
+source and re-running): the restored accessory's `label` (came up as "Restored
+Accessory" with the suite green), `registry.restore`'s per-spec `try`/`catch`
+(one corrupt entry aborted the whole restore and the bridge booted empty), the
+`indigoDeviceIdFrom`/`isRole`/`isSupportedRole` skip (helper-tested,
+caller-untested), the `label` half of the `restorable()` predicate (the existing
+test used a bad role *and* a bad label), `check`'s refresh-even-when-the-number-
+drifted branch (its own comment argued for it and nothing pinned it), and
+`states: {}` ("no state value is invented").
+
+**Also:** `bridge_agent.py`'s "not on the registry yet" corrected; §4.3 of
+BRIDGE_PROTOCOL now states that of the three refusal reasons only two restore
+literally nothing — `fabricStorageLost` restores then withdraws, which is
+wire-observable (transient `endpointCount`, a `ConfigurationVersion` bump,
+startup latency) and accepted because that state means no fabrics; `seed()`
+carries an assertion that it is a full replace; `main.test.ts` pins its children
+to the loopback interface and documents the residual UDP 5353 contention it
+cannot fix (the port is protocol-fixed and matter.js exposes no knob).
+
+**Publishing:** these changes are node source *after* `0.6.0` went to npm, so a
+bridge installed from the registry does **not** have them. `package.json` is
+deliberately left at `0.6.0` — bumping it to an unpublished version would break
+`DEFAULT_INSTALL_SPEC` resolution — so releasing this needs a version bump and
+publish together, in that order, plus the matching pin in `bridge_agent.py`.
 
 ---
 

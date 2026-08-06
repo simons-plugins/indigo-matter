@@ -184,9 +184,24 @@ function children(server: ServerNode): Endpoint[] {
     return [];
 }
 
+function childOf(server: ServerNode, indigoDeviceId: number): Endpoint | undefined {
+    return children(server).find(part => part.id === uniqueIdFor(indigoDeviceId));
+}
+
 function reachableOf(server: ServerNode, indigoDeviceId: number): boolean | undefined {
-    const child = children(server).find(part => part.id === uniqueIdFor(indigoDeviceId));
+    const child = childOf(server, indigoDeviceId);
     return (child?.stateOf("bridgedDeviceBasicInformation") as { reachable?: boolean } | undefined)?.reachable;
+}
+
+/** The name the accessory actually publishes — what an ecosystem shows the user. */
+function labelOf(server: ServerNode, indigoDeviceId: number): string | undefined {
+    const child = childOf(server, indigoDeviceId);
+    return (child?.stateOf("bridgedDeviceBasicInformation") as { nodeLabel?: string } | undefined)?.nodeLabel;
+}
+
+function onOffOf(server: ServerNode, indigoDeviceId: number): boolean | undefined {
+    const child = childOf(server, indigoDeviceId);
+    return (child?.stateOf("onOff") as { onOff?: boolean } | undefined)?.onOff;
 }
 
 /**
@@ -437,6 +452,297 @@ describe("issue #141 meets the §3.1 mass-removal guard", () => {
             assert.equal(discharged.status.error_code, undefined, JSON.stringify(discharged.status));
             assert.equal((discharged.status.result as { endpointCount: number }).endpointCount, 0);
             assert.deepEqual(children(session.bridge.server), []);
+        } finally {
+            await session.close();
+        }
+    });
+});
+
+describe("issue #141: an un-exported device stops being restored", () => {
+    it("clears its role/label on removal, keeps its number, and never comes back", async () => {
+        // ⊗ THE ghost. `check` only ever adds and refreshes, so once v2 recorded
+        // a role and label an entry stayed restorable FOR EVER — including for a
+        // device the user deliberately un-exported. Every boot rebuilt it as a
+        // child endpoint before `server.start()` and the plugin's attach removed
+        // it again seconds later: the exact appear-then-vanish churn #141 exists
+        // to eliminate, aimed at the devices the user had already removed, and a
+        // regression of XAC7's "un-exported accessories are gone". Delete the
+        // `forgetRemoved` call in `node.reconcile` and the third boot below
+        // restores 2 and the attach removes one of them again.
+        const storagePath = storage();
+        const numbers = await seedTwoAccessories(storagePath);
+
+        // The user un-exports the lounge lamp.
+        const first = await boot(storagePath);
+        try {
+            await attach(first.client, "u1", [KITCHEN_SPEC]);
+        } finally {
+            await first.close();
+        }
+
+        const afterRemoval = readMap(storagePath);
+        assert.deepEqual(
+            afterRemoval.endpoints[uniqueIdFor(LOUNGE)],
+            { number: numbers[LOUNGE] },
+            "the number survives (§3.3) so a re-export returns the SAME accessory, " +
+                "but nothing is left to rebuild it from",
+        );
+        assert.deepEqual(
+            afterRemoval.endpoints[uniqueIdFor(KITCHEN)],
+            { number: numbers[KITCHEN], role: "onOffLight", label: "Kitchen Lamp" },
+            "and the device that is still exported is untouched",
+        );
+
+        const second = await boot(storagePath);
+        try {
+            assert.deepEqual(
+                second.bridge.getStatus().endpoints.map(endpoint => endpoint.indigoDeviceId),
+                [KITCHEN],
+                "only the still-exported device is restored",
+            );
+
+            // The second-order cost, pinned: a ghost was in neither the desired
+            // set nor the un-export debt, yet the node still spent
+            // REMOVAL_PACING_MS on it at every single attach. No restore, no
+            // removal, no pacing — the reconcile is a pure update.
+            await attach(second.client, "u2", [KITCHEN_SPEC]);
+            assert.deepEqual(
+                second.logged.filter(line => line.startsWith("Reconciled endpoints:")),
+                ["Reconciled endpoints: 0 created, 1 updated, 0 recreated, 0 removed (1 live)"],
+                "no ghost to remove, so no removal pacing is spent on one",
+            );
+        } finally {
+            await second.close();
+        }
+
+        // …and one re-export refills the entry, at the number it kept.
+        const third = await boot(storagePath);
+        try {
+            await attach(third.client, "u3", BOTH);
+            assert.deepEqual(numbersOf(third.bridge), numbers, "the re-export is the same accessory");
+        } finally {
+            await third.close();
+        }
+        assert.deepEqual(readMap(storagePath).endpoints[uniqueIdFor(LOUNGE)], {
+            number: numbers[LOUNGE],
+            role: "dimmableLight",
+            label: "Lounge Lamp",
+        });
+    });
+
+    it("forgets one removed through remove_endpoint too, not just through attach", async () => {
+        // ⊗ §3.3's own removal path is the other way a device leaves the live
+        // set, and a fix wired only into `attach` would leave it making ghosts.
+        const storagePath = storage();
+        const numbers = await seedTwoAccessories(storagePath);
+
+        const session = await boot(storagePath);
+        try {
+            await attach(session.client, "r0", BOTH);
+            session.client.send({
+                message_id: "rm1",
+                command: "remove_endpoint",
+                args: { indigoDeviceId: LOUNGE },
+            });
+            for (;;) {
+                const frame = await session.client.next(10_000);
+                if (frame.message_id === "rm1") {
+                    assert.equal(frame.error_code, undefined, JSON.stringify(frame));
+                    break;
+                }
+            }
+        } finally {
+            await session.close();
+        }
+
+        assert.deepEqual(readMap(storagePath).endpoints[uniqueIdFor(LOUNGE)], { number: numbers[LOUNGE] });
+    });
+
+    it("forgets only what it watched go, never merely what is absent", async () => {
+        // ⊗ The guard rail on the fix, and the reason it diffs the live set
+        // rather than reading `restorable()`. Absence is not evidence: an entry
+        // can be missing from the live set because it was never restorable to
+        // begin with. Here HALL carries a role written by a NEWER node, so the
+        // restore skips it and the attach never mentions it — it is absent from
+        // the live set throughout, and no user un-exported anything.
+        //
+        // Widen `forgetRemoved` to "every restorable entry that is not live" and
+        // this older node silently strips the newer one's entry on the first
+        // attach, which is the v1-migration mistake in the other direction.
+        const storagePath = storage();
+        const numbers = await seedTwoAccessories(storagePath);
+        const fromTheFuture = { number: 903, role: "teleporter", label: "From The Future" };
+        writeFileSync(
+            join(storagePath, ENDPOINT_MAP_FILE),
+            JSON.stringify({
+                version: ENDPOINT_MAP_VERSION,
+                endpoints: {
+                    [uniqueIdFor(KITCHEN)]: {
+                        number: numbers[KITCHEN]!,
+                        role: "onOffLight",
+                        label: "Kitchen Lamp",
+                    },
+                    [uniqueIdFor(LOUNGE)]: {
+                        number: numbers[LOUNGE]!,
+                        role: "dimmableLight",
+                        label: "Lounge Lamp",
+                    },
+                    [uniqueIdFor(HALL)]: fromTheFuture,
+                } satisfies Record<string, unknown>,
+            }),
+        );
+
+        const session = await boot(storagePath);
+        try {
+            await attach(session.client, "n1", BOTH);
+        } finally {
+            await session.close();
+        }
+
+        assert.deepEqual(readMap(storagePath).endpoints, {
+            [uniqueIdFor(KITCHEN)]: { number: numbers[KITCHEN], role: "onOffLight", label: "Kitchen Lamp" },
+            [uniqueIdFor(LOUNGE)]: { number: numbers[LOUNGE], role: "dimmableLight", label: "Lounge Lamp" },
+            [uniqueIdFor(HALL)]: fromTheFuture,
+        });
+    });
+});
+
+describe("issue #141: what a restored endpoint actually publishes", () => {
+    it("comes up under its own recorded name, before any attach", async () => {
+        // ⊗ T1. `label: entry.label` was pinned by nothing: mutate it to a
+        // constant and every test still passed while the accessory really did
+        // come up in the Home app as "Restored Accessory". The name is the whole
+        // point — restoring the SET but not the identity is the same lost
+        // metadata #141 is about, by a slower route.
+        const storagePath = storage();
+        await seedTwoAccessories(storagePath);
+
+        const session = await boot(storagePath);
+        try {
+            assert.equal(labelOf(session.bridge.server, KITCHEN), "Kitchen Lamp");
+            assert.equal(labelOf(session.bridge.server, LOUNGE), "Lounge Lamp");
+        } finally {
+            await session.close();
+        }
+    });
+
+    it("invents no state value — the role's own default stands until the plugin speaks", async () => {
+        // ⊗ T6. `states: {}` is load-bearing: the restore has read nothing from
+        // Indigo, so writing any value would have every ecosystem show a reading
+        // nobody has taken. Mutate it to `{onOff: true}` and a lamp that was off
+        // when the bridge restarted comes back reported as on.
+        const storagePath = storage();
+        const off = { ...KITCHEN_SPEC, states: { onOff: false } };
+        const first = await boot(storagePath);
+        try {
+            await attach(first.client, "s0", [off]);
+            assert.equal(onOffOf(first.bridge.server, KITCHEN), false);
+        } finally {
+            await first.close();
+        }
+
+        const second = await boot(storagePath);
+        try {
+            assert.equal(
+                onOffOf(second.bridge.server, KITCHEN),
+                false,
+                "the restore wrote nothing, so nothing changed",
+            );
+        } finally {
+            await second.close();
+        }
+    });
+});
+
+describe("issue #141: one unusable map entry costs only itself", () => {
+    it("skips a key that is not ours and a role this build does not know", async () => {
+        // ⊗ T3. The `indigoDeviceIdFrom`/`isRole`/`isSupportedRole` skip in
+        // node.ts was tested only through its helpers: collapse the whole
+        // condition to an undefined check and nothing failed. `indigo-1e3` is
+        // the case the strict parse exists for — `Number()` would coerce it to
+        // 1000 and invent a device id, which is a new accessory in every paired
+        // ecosystem — and an unknown role is what a map written by a NEWER node
+        // looks like.
+        const storagePath = storage();
+        const numbers = await seedTwoAccessories(storagePath);
+        const handWritten: EndpointMapFile = {
+            version: ENDPOINT_MAP_VERSION,
+            endpoints: {
+                [uniqueIdFor(KITCHEN)]: {
+                    number: numbers[KITCHEN]!,
+                    role: "onOffLight",
+                    label: "Kitchen Lamp",
+                },
+                "indigo-1e3": { number: 900, role: "onOffLight", label: "Not Ours" },
+                [uniqueIdFor(HALL)]: { number: 901, role: "teleporter", label: "From The Future" },
+            },
+        };
+        writeFileSync(join(storagePath, ENDPOINT_MAP_FILE), JSON.stringify(handWritten));
+
+        const session = await boot(storagePath);
+        try {
+            assert.deepEqual(
+                session.bridge.getStatus().endpoints.map(endpoint => endpoint.indigoDeviceId),
+                [KITCHEN],
+                "the good entry restores and the two bad ones cost it nothing",
+            );
+            for (const uniqueId of ["indigo-1e3", uniqueIdFor(HALL)]) {
+                assert.ok(
+                    session.logged.some(
+                        line =>
+                            line.startsWith(`Endpoint map entry ${uniqueId} `) &&
+                            line.includes("cannot be rebuilt by this bridge version"),
+                    ),
+                    `${uniqueId} must be skipped AND named: ${session.logged.join(" | ")}`,
+                );
+            }
+        } finally {
+            await session.close();
+        }
+    });
+
+    it("restores the rest when one spec throws on its way into the Matter tree", async () => {
+        // ⊗ T2. Deleting `restore()`'s per-spec try/catch survived every test,
+        // and without it one corrupt entry aborts the whole restore — so the
+        // bridge boots empty, which is the bug. `indigo-0123` and `indigo-123`
+        // are different map keys that parse to the SAME device id, so the second
+        // one to be built collides on `Endpoint.id` inside matter.js: a spec
+        // that passes every check node.ts can make and still fails to add.
+        const storagePath = storage();
+        const numbers = await seedTwoAccessories(storagePath);
+        const handWritten: EndpointMapFile = {
+            version: ENDPOINT_MAP_VERSION,
+            endpoints: {
+                [uniqueIdFor(KITCHEN)]: {
+                    number: numbers[KITCHEN]!,
+                    role: "onOffLight",
+                    label: "Kitchen Lamp",
+                },
+                [`indigo-0${KITCHEN}`]: { number: 902, role: "onOffLight", label: "Collides" },
+                [uniqueIdFor(LOUNGE)]: {
+                    number: numbers[LOUNGE]!,
+                    role: "dimmableLight",
+                    label: "Lounge Lamp",
+                },
+            },
+        };
+        writeFileSync(join(storagePath, ENDPOINT_MAP_FILE), JSON.stringify(handWritten));
+
+        const session = await boot(storagePath);
+        try {
+            assert.deepEqual(
+                session.bridge.getStatus().endpoints.map(endpoint => endpoint.indigoDeviceId).sort(),
+                [KITCHEN, LOUNGE].sort(),
+                "serving two of three beats serving none",
+            );
+            assert.ok(
+                session.logged.some(line => line.startsWith("Could not restore endpoint ")),
+                `the failure must be named, not swallowed: ${session.logged.join(" | ")}`,
+            );
+            assert.ok(
+                session.logged.some(line => line.startsWith("Restored 2 of 3 endpoint(s)")),
+                "and counted honestly",
+            );
         } finally {
             await session.close();
         }

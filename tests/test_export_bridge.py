@@ -120,6 +120,18 @@ class Harness:
         return self.client
 
 
+def per_device_warnings(logger) -> int:
+    """How many times the per-DEVICE skip line was printed.
+
+    Narrower than ``logger.warning.call_count`` on purpose: an allow-list that
+    skips entirely also draws the one-per-cause "NONE of them can be bridged"
+    summary (issue #141 follow-up), and the latch these tests pin is the
+    per-device one.
+    """
+    return sum(1 for call in logger.warning.call_args_list
+               if "is in the export list but will NOT be bridged" in str(call.args[0]))
+
+
 def warnings_of(logger) -> str:
     return " ".join(str(call.args[0]) % call.args[1:] if len(call.args) > 1
                     else str(call.args[0])
@@ -279,7 +291,73 @@ class TestEndpointProvider:
         h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(101, unbridgeable_role)])
         for _ in range(5):
             h.bridge.endpoint_specs()
-        assert mock_logger.warning.call_count == 1
+        assert per_device_warnings(mock_logger) == 1
+
+    def test_a_wholly_unbridgeable_list_says_so_once_and_names_the_devices(
+            self, bridge_mod, mock_logger, devices, unbridgeable_role):
+        """⊗ Since #141 this state removes every accessory from every ecosystem.
+
+        The node now restores its last-known endpoint set before going online,
+        so an empty desired set against a non-empty allow-list is no longer the
+        no-op it used to be — it is a full un-export (see
+        ``bridge_client._replace_all``, which carries the §3.1 intent so the node
+        does not refuse and halt the client instead). The user must be told the
+        whole sentence, with the devices named, because the per-device lines are
+        latched and will not re-print on the reconnect that does the removing.
+        """
+        h = Harness(bridge_mod, mock_logger, devices,
+                    [ExportEntry(101, unbridgeable_role), ExportEntry(999, "onOffLight")])
+
+        for _ in range(4):
+            assert h.bridge.endpoint_specs() == []
+
+        summaries = [call for call in mock_logger.warning.call_args_list
+                     if "NONE of the" in str(call.args[0])]
+        assert len(summaries) == 1, "once per cause, not once per reconnect"
+        said = str(summaries[0].args[0]) % summaries[0].args[1:]
+        assert "NONE of the 2 device(s)" in said
+        assert "101:" in said and "999:" in said, "the devices are named, not merely counted"
+        assert "endpoint numbers are kept" in said, "and the state is recoverable"
+
+    def test_the_summary_is_silent_while_anything_at_all_is_bridgeable(
+            self, bridge_mod, mock_logger, devices, unbridgeable_role):
+        """One survivor means the set is not empty, so no accessory is removed."""
+        h = Harness(bridge_mod, mock_logger, devices,
+                    [ExportEntry(101, unbridgeable_role), ExportEntry(102, "dimmableLight")])
+        assert len(h.bridge.endpoint_specs()) == 1
+        assert "NONE of the" not in warnings_of(mock_logger)
+
+    def test_the_summary_latch_clears_so_a_recurrence_is_news_again(
+            self, bridge_mod, mock_logger, devices, unbridgeable_role):
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(101, unbridgeable_role)])
+        h.bridge.endpoint_specs()
+        h.store.upsert(ExportEntry(101, "onOffLight"))       # fixed
+        assert len(h.bridge.endpoint_specs()) == 1
+        h.store.upsert(ExportEntry(101, unbridgeable_role))  # broken again
+        h.bridge.endpoint_specs()
+
+        summaries = [c for c in mock_logger.warning.call_args_list if "NONE of the" in str(c.args[0])]
+        assert len(summaries) == 2
+
+    def test_an_empty_allow_list_draws_no_summary_at_all(self, bridge_mod, mock_logger, devices):
+        """Nothing declared is not "nothing bridgeable" — XG5 means no client."""
+        h = Harness(bridge_mod, mock_logger, devices, [])
+        assert h.bridge.endpoint_specs() == []
+        assert "NONE of the" not in warnings_of(mock_logger)
+
+    def test_the_declared_count_is_the_store_not_the_classifier(
+            self, bridge_mod, mock_logger, devices, unbridgeable_role):
+        """⊗ The one thing that tells the two empty attaches apart.
+
+        `_declared_export_count` must report what the USER asked for, not what
+        survived classification — the client compares the two, and defining it
+        as ``len(endpoint_specs())`` would make them equal by construction and
+        put the halt straight back.
+        """
+        h = Harness(bridge_mod, mock_logger, devices,
+                    [ExportEntry(101, unbridgeable_role), ExportEntry(999, "onOffLight")])
+        assert h.bridge.endpoint_specs() == []
+        assert h.bridge._declared_export_count() == 2
 
     def test_a_changed_skip_reason_is_warned_again(self, bridge_mod, mock_logger, devices,
                                                    unbridgeable_role):
@@ -287,7 +365,7 @@ class TestEndpointProvider:
         h.bridge.endpoint_specs()
         h.store.upsert(ExportEntry(101, "dimmableLight"))   # now a different failure
         h.bridge.endpoint_specs()
-        assert mock_logger.warning.call_count == 2
+        assert per_device_warnings(mock_logger) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -917,7 +995,7 @@ class TestSilentFailures:
                 h.bridge.endpoint_specs()
         finally:
             handler.states_for = original
-        assert mock_logger.warning.call_count == 1
+        assert per_device_warnings(mock_logger) == 1
         assert "transient read error #1" in warnings_of(mock_logger), \
             "the varying detail belongs in the LINE, just not in the key"
 

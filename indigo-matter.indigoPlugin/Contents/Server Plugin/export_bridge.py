@@ -164,6 +164,10 @@ class ExportBridge:
         #: Last reason each device was skipped by the provider, so a permanent
         #: skip (an unbridgeable role) logs once, not on every reconnect.
         self._skipped: dict[int, str] = {}
+        #: The reason set behind the last "NONE of them can be bridged" warning,
+        #: so that state — which since #141 costs every accessory in every paired
+        #: ecosystem — is announced once per cause rather than per reconnect.
+        self._wholly_unbridgeable: str = ""
         #: Consecutive watchdog ticks seen disconnected.
         self._disconnect_ticks = 0
         #: Set once the "the node is not running" line has been said for this
@@ -286,6 +290,7 @@ class ExportBridge:
             plugin_version=self._plugin_version,
             endpoint_provider=self.endpoint_specs,
             replace_all_provider=self._pending_replace_all,
+            export_count_provider=self._declared_export_count,
             on_command=self.on_command,
             on_attached=self._on_attached,
             on_attach_refused=self._on_attach_refused,
@@ -703,12 +708,59 @@ class ExportBridge:
         shared with the inbound matter-server client, and a slow Indigo server
         would stall live Matter device updates behind an export reconcile.
         """
+        entries = self._store.all()
         specs = []
-        for entry in self._store.all():
+        for entry in entries:
             spec = self._spec_for(entry)
             if spec is not None:
                 specs.append(spec)
+        self._warn_if_wholly_unbridgeable(len(entries), specs)
         return specs
+
+    def _warn_if_wholly_unbridgeable(self, declared: int, specs: list) -> None:
+        """Say the thing a warning-per-device does not say.
+
+        Every entry being skipped is not just N independent skips: it means the
+        desired set is EMPTY while the allow-list is not, which since issue #141
+        is the state that makes the node — now holding its restored endpoint set
+        — remove every accessory it has (``bridge_client._replace_all``, which is
+        also what stops this halting the client outright). The user has to hear
+        that whole sentence, and to hear it *with the devices named*, because
+        :meth:`_skip`'s own latch means the per-device lines are not re-printed
+        on the reconnect where the removal actually happens.
+
+        Latched on the set of reasons, exactly as :meth:`_skip` is and for the
+        same reason: the provider runs once per (re)connect, so an un-latched
+        line would turn one permanently broken device into a warning per
+        reconnect. A resolved state clears the latch, so a recurrence is news.
+        """
+        if specs or declared <= 0:
+            self._wholly_unbridgeable = ""
+            return
+        reasons = "; ".join(f"{device_id}: {why}" for device_id, why in sorted(self._skipped.items()))
+        if self._wholly_unbridgeable == reasons:
+            return
+        self._wholly_unbridgeable = reasons
+        self._logger.warning(
+            "Matter export: NONE of the %d device(s) in the export list can be bridged right "
+            "now — %s. Every exported accessory is being removed from paired ecosystems until "
+            "this is fixed; their endpoint numbers are kept, so putting the devices right "
+            "brings the same accessories back rather than new ones.",
+            declared, reasons,
+        )
+
+    def _declared_export_count(self) -> int:
+        """How many entries the allow-list DECLARES, before classification.
+
+        The client's ``export_count_provider``. It is deliberately the store's
+        own length and not ``len(self.endpoint_specs())``: the whole question it
+        answers is what the user asked for, so that the client can tell an empty
+        allow-list ("export nothing", and XG5 means no client at all) apart from
+        a full one that classified down to nothing ("export these, but none of
+        them can be bridged today"). Those two produce the identical empty
+        attach and need opposite handling — see ``bridge_client._replace_all``.
+        """
+        return len(self._store.all())
 
     def _spec_for(self, entry) -> Optional[EndpointSpec]:
         """One §4.1 ``EndpointSpec``, or ``None`` with a warning."""

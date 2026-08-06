@@ -194,6 +194,59 @@ describe("the restoration half of an entry (issue #141)", () => {
         });
     });
 
+    it("needs BOTH halves — a good role with no label rebuilds nothing", () => {
+        // ⊗ T4. The existing malformed-entry test used a bad role AND a bad
+        // label, so dropping the label half of the predicate passed it. An entry
+        // with a role and no label would then be handed to `createEndpoint` as
+        // `label: undefined`, which is either a crash or an unnamed accessory —
+        // and an unnamed accessory in the Home app is the metadata loss #141 is
+        // about.
+        const dir = storage();
+        writeFileSync(
+            join(dir, ENDPOINT_MAP_FILE),
+            JSON.stringify({
+                version: 2,
+                endpoints: {
+                    "indigo-1": { number: 2, role: "onOffLight", label: "" },
+                    "indigo-2": { number: 3, role: "", label: "Named" },
+                },
+            }),
+        );
+        const store = new EndpointMapStore(dir);
+        store.load();
+
+        assert.equal(store.numberFor("indigo-1"), 2, "the number is kept either way");
+        assert.equal(store.numberFor("indigo-2"), 3);
+        assert.deepEqual(store.restorable(), [], "but neither half alone can rebuild an endpoint");
+    });
+
+    it("refreshes the role and label of an entry whose NUMBER has drifted", () => {
+        // ⊗ T5. The comment above this branch argues for it explicitly and
+        // nothing tested it: making the drift case `continue` passed everything.
+        // The number and the name are independent facts. An accessory that was
+        // renamed while its number also moved must still come back under its
+        // current name — and the number must still be left alone and reported,
+        // because repairing it is what would bless the fault as the truth.
+        const dir = storage();
+        const store = new EndpointMapStore(dir);
+        store.load();
+        store.check([{ uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Old" }]);
+
+        const drift = store.check([
+            { uniqueId: "indigo-1", endpointNumber: 9, role: "dimmableLight", label: "New" },
+        ]);
+
+        assert.deepEqual(drift, [{ uniqueId: "indigo-1", expected: 2, actual: 9 }], "still reported");
+        assert.deepEqual(
+            store.restorable(),
+            [{ uniqueId: "indigo-1", endpointNumber: 2, role: "dimmableLight", label: "New" }],
+            "the baseline NUMBER is never repaired, but the name is not held hostage to it",
+        );
+        assert.deepEqual(mapFileIn(dir).endpoints, {
+            "indigo-1": { number: 2, role: "dimmableLight", label: "New" },
+        });
+    });
+
     it("never lets a caller that knows nothing erase what a caller that did recorded", () => {
         // The seed path has no live set at all, and reading its silence as "no
         // role any more" would strip a good entry of the fields that make it
@@ -339,6 +392,95 @@ describe("EndpointMapStore.check — the drift detector (PRD §4.3)", () => {
             logged.some(line => line.includes("Could not write the endpoint map")),
             `expected a write-failure warning, got ${JSON.stringify(logged)}`,
         );
+    });
+});
+
+describe("EndpointMapStore.forget — un-export without losing the number", () => {
+    it("drops the restoration half and keeps the identity half", () => {
+        // ⊗ The other half of `restorable`. Without it a device the user
+        // un-exported stayed restorable for ever and was rebuilt-then-removed on
+        // every boot. Deleting the ENTRY instead would work too and would be
+        // wrong: §3.3 retains the allocation so a re-export comes back as the
+        // same accessory rather than a new one in every paired ecosystem.
+        const dir = storage();
+        const store = new EndpointMapStore(dir);
+        store.load();
+        store.check([
+            { uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Lamp" },
+            { uniqueId: "indigo-2", endpointNumber: 3, role: "dimmableLight", label: "Other" },
+        ]);
+
+        assert.equal(store.forget(["indigo-1"]), 1);
+
+        assert.equal(store.numberFor("indigo-1"), 2, "§3.3 retains the allocation");
+        assert.deepEqual(store.restorable(), [
+            { uniqueId: "indigo-2", endpointNumber: 3, role: "dimmableLight", label: "Other" },
+        ]);
+        assert.deepEqual(mapFileIn(dir).endpoints, {
+            "indigo-1": { number: 2 },
+            "indigo-2": { number: 3, role: "dimmableLight", label: "Other" },
+        });
+    });
+
+    it("re-exporting refills it, at the number it kept", () => {
+        const dir = storage();
+        const store = new EndpointMapStore(dir);
+        store.load();
+        store.check([{ uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Lamp" }]);
+        store.forget(["indigo-1"]);
+
+        store.check([{ uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Lamp" }]);
+
+        assert.deepEqual(store.restorable(), [
+            { uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Lamp" },
+        ]);
+    });
+
+    it("costs no disk write when there was nothing to forget", () => {
+        // Unknown ids and already-bare entries are both no-ops: `forget` is
+        // driven by a diff, and a diff that found nothing must not rewrite the
+        // file (nor make a failed write look like a fresh one).
+        const dir = storage();
+        const store = new EndpointMapStore(dir);
+        store.load();
+        store.check([{ uniqueId: "indigo-1", endpointNumber: 2 }]);
+        const before = readFileSync(join(dir, ENDPOINT_MAP_FILE), "utf8");
+
+        assert.equal(store.forget(["indigo-1", "indigo-nope"]), 0);
+
+        assert.equal(readFileSync(join(dir, ENDPOINT_MAP_FILE), "utf8"), before);
+    });
+});
+
+describe("EndpointMapStore.seed replaces the whole map", () => {
+    it("refuses to seed fewer numbers than the baseline already holds", () => {
+        // ⊗ `seed` is a full replace, and nothing said so. Its one caller
+        // bootstraps against a map that is by definition absent, so it drops
+        // nothing — but a later caller with a map in hand would silently discard
+        // the endpoint numbers of everything absent from its list, which is the
+        // one thing in this file that cannot be re-derived. Fail loudly instead.
+        const dir = storage();
+        const store = new EndpointMapStore(dir);
+        store.load();
+        store.check([
+            { uniqueId: "indigo-1", endpointNumber: 2 },
+            { uniqueId: "indigo-2", endpointNumber: 3 },
+        ]);
+
+        assert.throws(
+            () => store.seed([{ uniqueId: "indigo-1", endpointNumber: 2 }], "a partial list"),
+            /replaces the whole map/,
+        );
+        assert.equal(store.numberFor("indigo-2"), 3, "and nothing was dropped");
+    });
+
+    it("still bootstraps an empty baseline, which is what its caller does", () => {
+        const dir = storage();
+        const store = new EndpointMapStore(dir);
+        store.load();
+
+        assert.equal(store.seed([], "the migration path"), true);
+        assert.equal(store.size, 0);
     });
 });
 
