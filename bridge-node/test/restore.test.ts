@@ -654,6 +654,114 @@ describe("issue #141: what a restored endpoint actually publishes", () => {
     });
 });
 
+describe("issue #143: a created endpoint publishes the state its spec carried", () => {
+    it("does not resurrect the value matter.js persisted for a previously-removed accessory", async () => {
+        // Measured on jarvis, not inferred: three lights were un-exported, then
+        // re-exported while Alexa was still paired, and all three came back
+        // reported OFF while actually on. matter.js keeps
+        // `…parts.<id>.onOff.onOff` in its own store after `endpoint.close()`,
+        // and a persisted value OUTRANKS the `initialState` the constructor was
+        // given — so `create()` handing the spec's states to `createEndpoint`
+        // is not enough on its own for any endpoint id the store has seen
+        // before. `update()` has always followed up with `applyStates`;
+        // `create()` did not.
+        const storagePath = storage();
+        const off = { ...KITCHEN_SPEC, states: { onOff: false } };
+
+        // LOUNGE stays exported throughout, so removing KITCHEN is an ordinary
+        // un-export and not the §3.1 mass removal (which needs an intent).
+        const session = await boot(storagePath);
+        try {
+            await attach(session.client, "a0", [off, LOUNGE_SPEC]);
+            assert.equal(onOffOf(session.bridge.server, KITCHEN), false);
+
+            // Un-export: the endpoint goes, its persisted attribute does not.
+            await attach(session.client, "a1", [LOUNGE_SPEC]);
+            assert.equal(childOf(session.bridge.server, KITCHEN), undefined);
+
+            // Re-export the same device, now genuinely on.
+            await attach(session.client, "a2", [KITCHEN_SPEC, LOUNGE_SPEC]);
+            assert.equal(
+                onOffOf(session.bridge.server, KITCHEN),
+                true,
+                "the re-created accessory must publish the state Indigo just reported, " +
+                    "not the one it had when the user un-exported it",
+            );
+        } finally {
+            await session.close();
+        }
+    });
+
+    it("publishes the spec's state when a RESTARTED node re-creates an un-exported accessory", async () => {
+        // The field sequence exactly: the accessory was off, the user
+        // un-exported it, the node restarted (so matter.js loaded the persisted
+        // `false` from disk rather than carrying a closed endpoint in memory),
+        // and the user then re-exported it while it was on. This is the one the
+        // in-process test above cannot reach.
+        const storagePath = storage();
+        const off = { ...KITCHEN_SPEC, states: { onOff: false } };
+
+        const first = await boot(storagePath);
+        try {
+            await attach(first.client, "c0", [off, LOUNGE_SPEC]);
+            assert.equal(onOffOf(first.bridge.server, KITCHEN), false);
+            await attach(first.client, "c1", [LOUNGE_SPEC]);
+            assert.equal(childOf(first.bridge.server, KITCHEN), undefined);
+        } finally {
+            await first.close();
+        }
+
+        const second = await boot(storagePath);
+        try {
+            await attach(second.client, "c2", [LOUNGE_SPEC]);
+            second.client.send({
+                message_id: "c3",
+                command: "upsert_endpoint",
+                args: { endpoint: KITCHEN_SPEC },
+            });
+            for (;;) {
+                const frame = await second.client.next(10_000);
+                if (frame.message_id === "c3") {
+                    assert.equal(frame.error, undefined, JSON.stringify(frame.error));
+                    break;
+                }
+            }
+            assert.equal(
+                onOffOf(second.bridge.server, KITCHEN),
+                true,
+                "a re-exported accessory must publish the state Indigo just reported",
+            );
+        } finally {
+            await second.close();
+        }
+    });
+
+    it("publishes the spec's state for an accessory the store already knows, across a restart", async () => {
+        // The same fault by the other route, and the one that hits every user
+        // rather than only those who un-export: after a restart the restore
+        // creates the endpoint with `states: {}` (correctly — nothing has been
+        // read from Indigo yet), so the persisted value is what is live. The
+        // plugin's attach then supplies the truth. That lands through
+        // `update()` here, so this passes today and pins it.
+        const storagePath = storage();
+        const off = { ...KITCHEN_SPEC, states: { onOff: false } };
+        const first = await boot(storagePath);
+        try {
+            await attach(first.client, "b0", [off]);
+        } finally {
+            await first.close();
+        }
+
+        const second = await boot(storagePath);
+        try {
+            await attach(second.client, "b1", [KITCHEN_SPEC]);
+            assert.equal(onOffOf(second.bridge.server, KITCHEN), true);
+        } finally {
+            await second.close();
+        }
+    });
+});
+
 describe("issue #141: one unusable map entry costs only itself", () => {
     it("skips a key that is not ours and a role this build does not know", async () => {
         // ⊗ T3. The `indigoDeviceIdFrom`/`isRole`/`isSupportedRole` skip in
