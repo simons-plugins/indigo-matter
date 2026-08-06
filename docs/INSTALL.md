@@ -9,7 +9,8 @@ npm package**. This guide covers both:
   managed-LaunchAgent bring-up on the reference Indigo server.
 - **the Matter export bridge** — the optional outbound half, which publishes
   selected *Indigo* devices to Apple Home as Matter accessories. **Steps E1–E4**.
-  **It cannot be installed today**: its npm package has not been published — see
+  Its npm package (`indigo-matter-bridge`) is on the registry and installs from
+  its own menu item — see
   [Exporting Indigo devices](#exporting-indigo-devices-indigo-as-a-matter-bridge).
 
 If you just installed the plugin and Indigo is logging
@@ -90,10 +91,10 @@ A few things to know before you start:
   occasional rough edges.
 - **There is a second, optional half.** The plugin can also work the other way round and
   publish selected *Indigo* devices to Apple Home as Matter accessories, from a separate
-  bridge process with its own npm package. **That package is not on the npm registry yet,
-  so this half cannot be installed today.** When it is: nothing is exported and no bridge
-  process runs until you add a device to the export list, and it needs Node (Step 1) and
-  a storage path (Step 3) — *not* a working matter-server. See
+  bridge process with its own npm package (`indigo-matter-bridge`), installed from
+  **Plugins ▸ Matter ▸ Install/update the Matter export bridge**. Nothing is exported
+  and no bridge process runs until you add a device to the export list, and it needs
+  Node (Step 1) and a storage path (Step 3) — *not* a working matter-server. See
   [Exporting Indigo devices](#exporting-indigo-devices-indigo-as-a-matter-bridge).
 
 ### The Plugins ▸ Matter menu

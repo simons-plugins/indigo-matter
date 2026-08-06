@@ -65,8 +65,8 @@ accessory. One bridge, one pairing, however many devices.
   something this plugin can change.
 - **Apple Home only, as a claim.** Alexa, Google Home and SmartThings are untested and
   unclaimed; nothing here says they will or won't work.
-- **A second npm package** (`indigo-matter-bridge`), installed from its own menu item.
-  Note it is **not on the npm registry yet**, so export cannot be brought up until it is.
+- **A second npm package** (`indigo-matter-bridge`), on the npm registry and installed
+  from its own menu item.
 
 Setup, pairing, recovery and troubleshooting:
 [full install guide](https://simons-plugins.github.io/indigo-matter/INSTALL.html). How it

@@ -1,13 +1,14 @@
 # indigo-matter — Build Handover
 
-**Last updated:** 2026-08-06 13:35 UTC
-**Active work:** none — nothing in flight, working tree clean.
+**Last updated:** 2026-08-06 14:05 UTC
+**Active work:** `feat/134-menu-sections` — **PR #144 OPEN**, CI green, awaiting
+Simon's go-ahead. Menu grouping only; see the §#134 section below.
 **Branch:** `main` — **PR #142 MERGED** (`3e1229d`, merge commit, `[no-release]`
 so **no GitHub release was cut** — Simon is cutting that himself). Latest
 release remains v2026.7.23.
-**Version:** plugin `2026.8.4`, bridge-node `0.7.0` (**published to npm**;
-`DEFAULT_INSTALL_SPEC` pins it).
-**Tests:** **2252 Python**, **383 TS** — both green.
+**Version:** plugin `2026.8.5` on the open branch (`2026.8.4` on `main`),
+bridge-node `0.7.0` (**published to npm**; `DEFAULT_INSTALL_SPEC` pins it).
+**Tests:** **2256 Python** (2252 on `main`), **383 TS** — both green.
 (`python3 -m pytest -q` · `cd bridge-node && npm run build && npm test`)
 **Deployed:** jarvis runs plugin `2026.8.4` + bridge-node `0.7.0`, paired to
 **Apple Home AND Alexa simultaneously** (3 fabrics: 2 Apple, 1 Alexa).

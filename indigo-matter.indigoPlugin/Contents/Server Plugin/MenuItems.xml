@@ -10,8 +10,9 @@
     same trick (<Action id="sep1" uiPath="…"/>). Fifteen plugins installed on
     jarvis rely on it. Do not "fix" these into named items.
 
-    The ordering is the whole point, so tests/test_export_menu.py asserts the
+    The ordering is the whole point, so tests/test_plugin_module.py asserts the
     ORDER and the separator positions, not just that each item exists.
+    (tests/test_export_menu.py owns the Manage Matter Exports dialog's shape.)
 
     The five sections, everyday work first and the destructive things fenced
     off last:
