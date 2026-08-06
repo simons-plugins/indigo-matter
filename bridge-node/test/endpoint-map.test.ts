@@ -16,6 +16,7 @@ import { after, describe, it } from "node:test";
 import {
     ENDPOINT_MAP_FILE,
     ENDPOINT_MAP_VERSION,
+    type EndpointRecord,
     EndpointMapStore,
     deleteEndpointMap,
     loadEndpointMap,
@@ -44,7 +45,7 @@ function storage(): string {
     return dir;
 }
 
-function mapFileIn(dir: string): { version: number; endpoints: Record<string, number> } {
+function mapFileIn(dir: string): { version: number; endpoints: Record<string, EndpointRecord> } {
     return JSON.parse(readFileSync(join(dir, ENDPOINT_MAP_FILE), "utf8"));
 }
 
@@ -55,7 +56,7 @@ describe("loadEndpointMap", () => {
         const loaded = loadEndpointMap(storage());
         assert.equal(loaded.present, false);
         assert.equal(loaded.problem, undefined);
-        assert.equal(loaded.numbers.size, 0);
+        assert.equal(loaded.endpoints.size, 0);
     });
 
     it("reads a version 1 file into a UniqueID → number map", () => {
@@ -67,9 +68,9 @@ describe("loadEndpointMap", () => {
         const loaded = loadEndpointMap(dir);
         assert.equal(loaded.present, true);
         assert.equal(loaded.problem, undefined);
-        assert.deepEqual([...loaded.numbers.entries()], [
-            ["indigo-123456789", 2],
-            ["indigo-123456790", 3],
+        assert.deepEqual([...loaded.endpoints.entries()], [
+            ["indigo-123456789", { number: 2 }],
+            ["indigo-123456790", { number: 3 }],
         ]);
     });
 
@@ -86,7 +87,7 @@ describe("loadEndpointMap", () => {
             const loaded = loadEndpointMap(dir);
             assert.equal(loaded.present, true, "the file exists, whatever is in it");
             assert.ok(loaded.problem !== undefined, "and it must say why it cannot be used");
-            assert.equal(loaded.numbers.size, 0, "a broken map must never be half-adopted");
+            assert.equal(loaded.endpoints.size, 0, "a broken map must never be half-adopted");
         });
     }
 
@@ -113,6 +114,156 @@ describe("loadEndpointMap", () => {
     });
 });
 
+describe("the restoration half of an entry (issue #141)", () => {
+    it("reads a version 2 file's role and label back", () => {
+        const dir = storage();
+        writeFileSync(
+            join(dir, ENDPOINT_MAP_FILE),
+            JSON.stringify({
+                version: 2,
+                endpoints: { "indigo-1": { number: 2, role: "onOffLight", label: "Kitchen Lamp" } },
+            }),
+        );
+        const store = new EndpointMapStore(dir);
+        store.load();
+
+        assert.deepEqual(store.restorable(), [
+            { uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Kitchen Lamp" },
+        ]);
+    });
+
+    it("keeps the number when only the role or label is malformed", () => {
+        // ⊗ Rejecting the whole file over a bad label would turn a cosmetic
+        // corruption into a refuse-to-start on a paired bridge, and would
+        // discard the numbers — the one part that cannot be re-derived. The
+        // entry loses only what was wrong with it and the next attach fills it
+        // back in.
+        const dir = storage();
+        writeFileSync(
+            join(dir, ENDPOINT_MAP_FILE),
+            JSON.stringify({
+                version: 2,
+                endpoints: { "indigo-1": { number: 2, role: 7, label: "" } },
+            }),
+        );
+        const store = new EndpointMapStore(dir);
+        const loaded = store.load();
+
+        assert.equal(loaded.problem, undefined);
+        assert.equal(store.numberFor("indigo-1"), 2);
+        assert.deepEqual(store.restorable(), [], "but it cannot be rebuilt from");
+    });
+
+    it("leaves a v1 entry restorable-in-waiting rather than treating it as a fault", () => {
+        const dir = storage();
+        writeFileSync(
+            join(dir, ENDPOINT_MAP_FILE),
+            JSON.stringify({ version: 1, endpoints: { "indigo-1": 2 } }),
+        );
+        const store = new EndpointMapStore(dir);
+
+        assert.equal(store.load().problem, undefined);
+        assert.equal(store.numberFor("indigo-1"), 2, "the number is the irreplaceable part");
+        assert.deepEqual(store.restorable(), []);
+
+        // One check with a live set is all it takes to make it restorable.
+        store.check([{ uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Lamp" }]);
+
+        assert.deepEqual(store.restorable(), [
+            { uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Lamp" },
+        ]);
+        assert.deepEqual(mapFileIn(dir), {
+            version: ENDPOINT_MAP_VERSION,
+            endpoints: { "indigo-1": { number: 2, role: "onOffLight", label: "Lamp" } },
+        });
+    });
+
+    it("follows a rename, and persists it", () => {
+        // ⊗ A cached label that lags behind the cluster restores yesterday's
+        // name after a restart, which in an ecosystem reads as the accessory
+        // having been renamed by the bridge.
+        const dir = storage();
+        const store = new EndpointMapStore(dir);
+        store.load();
+        store.check([{ uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Old" }]);
+
+        store.check([{ uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "New" }]);
+
+        assert.deepEqual(mapFileIn(dir).endpoints, {
+            "indigo-1": { number: 2, role: "onOffLight", label: "New" },
+        });
+    });
+
+    it("needs BOTH halves — a good role with no label rebuilds nothing", () => {
+        // ⊗ T4. The existing malformed-entry test used a bad role AND a bad
+        // label, so dropping the label half of the predicate passed it. An entry
+        // with a role and no label would then be handed to `createEndpoint` as
+        // `label: undefined`, which is either a crash or an unnamed accessory —
+        // and an unnamed accessory in the Home app is the metadata loss #141 is
+        // about.
+        const dir = storage();
+        writeFileSync(
+            join(dir, ENDPOINT_MAP_FILE),
+            JSON.stringify({
+                version: 2,
+                endpoints: {
+                    "indigo-1": { number: 2, role: "onOffLight", label: "" },
+                    "indigo-2": { number: 3, role: "", label: "Named" },
+                },
+            }),
+        );
+        const store = new EndpointMapStore(dir);
+        store.load();
+
+        assert.equal(store.numberFor("indigo-1"), 2, "the number is kept either way");
+        assert.equal(store.numberFor("indigo-2"), 3);
+        assert.deepEqual(store.restorable(), [], "but neither half alone can rebuild an endpoint");
+    });
+
+    it("refreshes the role and label of an entry whose NUMBER has drifted", () => {
+        // ⊗ T5. The comment above this branch argues for it explicitly and
+        // nothing tested it: making the drift case `continue` passed everything.
+        // The number and the name are independent facts. An accessory that was
+        // renamed while its number also moved must still come back under its
+        // current name — and the number must still be left alone and reported,
+        // because repairing it is what would bless the fault as the truth.
+        const dir = storage();
+        const store = new EndpointMapStore(dir);
+        store.load();
+        store.check([{ uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Old" }]);
+
+        const drift = store.check([
+            { uniqueId: "indigo-1", endpointNumber: 9, role: "dimmableLight", label: "New" },
+        ]);
+
+        assert.deepEqual(drift, [{ uniqueId: "indigo-1", expected: 2, actual: 9 }], "still reported");
+        assert.deepEqual(
+            store.restorable(),
+            [{ uniqueId: "indigo-1", endpointNumber: 2, role: "dimmableLight", label: "New" }],
+            "the baseline NUMBER is never repaired, but the name is not held hostage to it",
+        );
+        assert.deepEqual(mapFileIn(dir).endpoints, {
+            "indigo-1": { number: 2, role: "dimmableLight", label: "New" },
+        });
+    });
+
+    it("never lets a caller that knows nothing erase what a caller that did recorded", () => {
+        // The seed path has no live set at all, and reading its silence as "no
+        // role any more" would strip a good entry of the fields that make it
+        // restorable — turning every migration into another empty restart.
+        const dir = storage();
+        const store = new EndpointMapStore(dir);
+        store.load();
+        store.check([{ uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Lamp" }]);
+
+        store.check([{ uniqueId: "indigo-1", endpointNumber: 2 }]);
+
+        assert.deepEqual(store.restorable(), [
+            { uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Lamp" },
+        ]);
+    });
+});
+
 describe("EndpointMapStore.check — the drift detector (PRD §4.3)", () => {
     it("records endpoints it has never seen, and says nothing about them", () => {
         const dir = storage();
@@ -129,7 +280,7 @@ describe("EndpointMapStore.check — the drift detector (PRD §4.3)", () => {
         assert.equal(store.checked, true);
         assert.deepEqual(mapFileIn(dir), {
             version: ENDPOINT_MAP_VERSION,
-            endpoints: { "indigo-1": 2, "indigo-2": 3 },
+            endpoints: { "indigo-1": { number: 2 }, "indigo-2": { number: 3 } },
         });
     });
 
@@ -146,7 +297,7 @@ describe("EndpointMapStore.check — the drift detector (PRD §4.3)", () => {
 
         assert.deepEqual(drift, [{ uniqueId: "indigo-1", expected: 2, actual: 5 }]);
         assert.equal(store.numberFor("indigo-1"), 2, "the baseline must not move");
-        assert.deepEqual(mapFileIn(dir).endpoints, { "indigo-1": 2 });
+        assert.deepEqual(mapFileIn(dir).endpoints, { "indigo-1": { number: 2 } });
         assert.deepEqual(
             store.check([{ uniqueId: "indigo-1", endpointNumber: 5 }]),
             [{ uniqueId: "indigo-1", expected: 2, actual: 5 }],
@@ -244,6 +395,95 @@ describe("EndpointMapStore.check — the drift detector (PRD §4.3)", () => {
     });
 });
 
+describe("EndpointMapStore.forget — un-export without losing the number", () => {
+    it("drops the restoration half and keeps the identity half", () => {
+        // ⊗ The other half of `restorable`. Without it a device the user
+        // un-exported stayed restorable for ever and was rebuilt-then-removed on
+        // every boot. Deleting the ENTRY instead would work too and would be
+        // wrong: §3.3 retains the allocation so a re-export comes back as the
+        // same accessory rather than a new one in every paired ecosystem.
+        const dir = storage();
+        const store = new EndpointMapStore(dir);
+        store.load();
+        store.check([
+            { uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Lamp" },
+            { uniqueId: "indigo-2", endpointNumber: 3, role: "dimmableLight", label: "Other" },
+        ]);
+
+        assert.equal(store.forget(["indigo-1"]), 1);
+
+        assert.equal(store.numberFor("indigo-1"), 2, "§3.3 retains the allocation");
+        assert.deepEqual(store.restorable(), [
+            { uniqueId: "indigo-2", endpointNumber: 3, role: "dimmableLight", label: "Other" },
+        ]);
+        assert.deepEqual(mapFileIn(dir).endpoints, {
+            "indigo-1": { number: 2 },
+            "indigo-2": { number: 3, role: "dimmableLight", label: "Other" },
+        });
+    });
+
+    it("re-exporting refills it, at the number it kept", () => {
+        const dir = storage();
+        const store = new EndpointMapStore(dir);
+        store.load();
+        store.check([{ uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Lamp" }]);
+        store.forget(["indigo-1"]);
+
+        store.check([{ uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Lamp" }]);
+
+        assert.deepEqual(store.restorable(), [
+            { uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Lamp" },
+        ]);
+    });
+
+    it("costs no disk write when there was nothing to forget", () => {
+        // Unknown ids and already-bare entries are both no-ops: `forget` is
+        // driven by a diff, and a diff that found nothing must not rewrite the
+        // file (nor make a failed write look like a fresh one).
+        const dir = storage();
+        const store = new EndpointMapStore(dir);
+        store.load();
+        store.check([{ uniqueId: "indigo-1", endpointNumber: 2 }]);
+        const before = readFileSync(join(dir, ENDPOINT_MAP_FILE), "utf8");
+
+        assert.equal(store.forget(["indigo-1", "indigo-nope"]), 0);
+
+        assert.equal(readFileSync(join(dir, ENDPOINT_MAP_FILE), "utf8"), before);
+    });
+});
+
+describe("EndpointMapStore.seed replaces the whole map", () => {
+    it("refuses to seed fewer numbers than the baseline already holds", () => {
+        // ⊗ `seed` is a full replace, and nothing said so. Its one caller
+        // bootstraps against a map that is by definition absent, so it drops
+        // nothing — but a later caller with a map in hand would silently discard
+        // the endpoint numbers of everything absent from its list, which is the
+        // one thing in this file that cannot be re-derived. Fail loudly instead.
+        const dir = storage();
+        const store = new EndpointMapStore(dir);
+        store.load();
+        store.check([
+            { uniqueId: "indigo-1", endpointNumber: 2 },
+            { uniqueId: "indigo-2", endpointNumber: 3 },
+        ]);
+
+        assert.throws(
+            () => store.seed([{ uniqueId: "indigo-1", endpointNumber: 2 }], "a partial list"),
+            /replaces the whole map/,
+        );
+        assert.equal(store.numberFor("indigo-2"), 3, "and nothing was dropped");
+    });
+
+    it("still bootstraps an empty baseline, which is what its caller does", () => {
+        const dir = storage();
+        const store = new EndpointMapStore(dir);
+        store.load();
+
+        assert.equal(store.seed([], "the migration path"), true);
+        assert.equal(store.size, 0);
+    });
+});
+
 describe("EndpointMapStore.rebuild (§3.11)", () => {
     it("adopts the live numbers, clears the problem, and persists", () => {
         const dir = storage();
@@ -259,7 +499,7 @@ describe("EndpointMapStore.rebuild (§3.11)", () => {
 
         assert.equal(store.problem, undefined);
         assert.equal(store.checked, true, "§4.3: a persisted map is a checked one");
-        assert.deepEqual(mapFileIn(dir).endpoints, { "indigo-1": 4, "indigo-2": 5 });
+        assert.deepEqual(mapFileIn(dir).endpoints, { "indigo-1": { number: 4 }, "indigo-2": { number: 5 } });
         assert.deepEqual(store.check([{ uniqueId: "indigo-1", endpointNumber: 4 }]), []);
     });
 
@@ -385,7 +625,7 @@ describe("a write that did not land (E5 B1/B2)", () => {
         // adds nothing, because the map still owes the disk what it holds.
         assert.deepEqual(store.check([{ uniqueId: "indigo-1", endpointNumber: 2 }]), []);
         assert.equal(store.checked, true);
-        assert.deepEqual(mapFileIn(dir).endpoints, { "indigo-1": 2 });
+        assert.deepEqual(mapFileIn(dir).endpoints, { "indigo-1": { number: 2 } });
     });
 
     it("tells the caller a rebuild did not persist, and warns", () => {
@@ -428,7 +668,7 @@ describe("rebuild preserves the evidence (E5 C2)", () => {
         const copies = quarantinedMaps(dir);
         assert.equal(copies.length, 1, `expected one quarantined map, got ${copies.join(", ")}`);
         assert.equal(readFileSync(join(dir, copies[0]!), "utf8"), "{not json");
-        assert.deepEqual(mapFileIn(dir).endpoints, { "indigo-1": 7 });
+        assert.deepEqual(mapFileIn(dir).endpoints, { "indigo-1": { number: 7 } });
         assert.equal(store.problem, undefined, "a successful write settles the question");
     });
 
@@ -449,7 +689,7 @@ describe("rebuild preserves the evidence (E5 C2)", () => {
         const copies = quarantinedMaps(dir);
         assert.equal(copies.length, 1, `expected one quarantined map, got ${copies.join(", ")}`);
         assert.equal(readFileSync(join(dir, copies[0]!), "utf8"), "{truncated");
-        assert.deepEqual(mapFileIn(dir).endpoints, { "indigo-1": 2 });
+        assert.deepEqual(mapFileIn(dir).endpoints, { "indigo-1": { number: 2 } });
         // Once per loaded file: `persist` runs on every check, and a copy per
         // reconcile would bury the one that matters in a directory of clones.
         store.check([{ uniqueId: "indigo-2", endpointNumber: 3 }]);
@@ -583,6 +823,6 @@ describe("bootstrapping a baseline instead of refusing (E5 upgrade path)", () =>
 
         assert.deepEqual(store.check([{ uniqueId: "indigo-1", endpointNumber: 2 }]), []);
         assert.equal(store.checked, true);
-        assert.equal(new EndpointMapStore(dir).load().numbers.get("indigo-1"), 2);
+        assert.equal(new EndpointMapStore(dir).load().endpoints.get("indigo-1")?.number, 2);
     });
 });

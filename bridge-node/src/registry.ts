@@ -42,8 +42,23 @@ export const REMOVAL_PACING_MS = 100;
 interface LiveEndpoint {
     endpoint: Endpoint;
     role: RoleValue;
+    /**
+     * The label this endpoint currently publishes. Held here rather than read
+     * back off the cluster because it is persisted to `endpoint-map.json` on
+     * every drift check (issue #141), and that must not cost a matter.js state
+     * read per endpoint per reconcile.
+     */
+    label: string;
     /** Reassigned when a failed close forces the listeners to be restored. */
     unwatch: () => void;
+}
+
+/** What `endpoint-map.json` needs to know about one live endpoint (issue #141). */
+export interface EndpointIdentity {
+    indigoDeviceId: number;
+    endpointNumber: number;
+    role: RoleValue;
+    label: string;
 }
 
 export interface EndpointRegistryOptions {
@@ -142,6 +157,65 @@ export class EndpointRegistry {
 
     get size(): number {
         return this.#live.size;
+    }
+
+    /**
+     * Everything `endpoint-map.json` records about the live set (issue #141).
+     *
+     * Separate from {@link summaries} on purpose: that is the §4.3 wire shape
+     * and adding `label` to it would change the protocol for the benefit of a
+     * local file. Same order, for a stable readout.
+     */
+    identities(): EndpointIdentity[] {
+        return [...this.#live.entries()]
+            .map(([indigoDeviceId, live]) => ({
+                indigoDeviceId,
+                endpointNumber: Number(live.endpoint.number),
+                role: live.role,
+                label: live.label,
+            }))
+            .sort((a, b) => a.indigoDeviceId - b.indigoDeviceId);
+    }
+
+    /**
+     * Issue #141 — rebuild the last-known endpoint set before the node goes
+     * online, from the persisted map rather than from the plugin.
+     *
+     * **The node must never be online-and-empty.** A bridge that comes up with
+     * a childless aggregator and waits for the plugin tells every paired
+     * ecosystem that every accessory has gone; Apple re-adds them as new
+     * arrivals seconds later, in the bridge's own room, with metadata the user
+     * can no longer edit. Restoring here closes that window: the endpoints are
+     * present from the first moment a controller can read `PartsList`.
+     *
+     * Everything here is the ordinary {@link create} path — same
+     * `createEndpoint`, same `Endpoint.id`, so matter.js hands back the same
+     * persisted number. What is different is only that the specs come from disk
+     * and carry `reachable: false`, because nothing has confirmed any state
+     * yet.
+     *
+     * **A failure restores what it can and says what it could not.** These
+     * specs come from a file, and one unusable entry must not cost the user
+     * every other accessory: serving four of five and naming the fifth is
+     * strictly better than serving none, which is the bug being fixed.
+     */
+    async restore(specs: readonly EndpointSpec[]): Promise<number> {
+        return this.serialize("restore", async () => {
+            let restored = 0;
+            for (const spec of specs) {
+                try {
+                    await this.create(spec);
+                    restored += 1;
+                } catch (error) {
+                    this.#log(
+                        `Could not restore endpoint ${spec.indigoDeviceId} (${spec.role}) from the ` +
+                            `endpoint map; it will be created when the plugin attaches: ` +
+                            describeErrorWithStack(error),
+                    );
+                }
+            }
+            return restored;
+        });
     }
 
     /** The live role of a device, or undefined — what the reconcile planner diffs. */
@@ -313,7 +387,7 @@ export class EndpointRegistry {
             await endpoint.close().catch(() => undefined);
             throw error;
         }
-        this.#live.set(spec.indigoDeviceId, { endpoint, role: spec.role, unwatch });
+        this.#live.set(spec.indigoDeviceId, { endpoint, role: spec.role, label: spec.label, unwatch });
         this.#log(`Endpoint ${spec.indigoDeviceId} (${spec.role}) added as number ${Number(endpoint.number)}`);
         return endpoint;
     }
@@ -331,6 +405,10 @@ export class EndpointRegistry {
         if (info.nodeLabel !== spec.label || info.productLabel !== spec.label) {
             await applyLabel(live.endpoint, spec.label);
         }
+        // Recorded whether or not the write was needed: the cached copy is what
+        // `endpoint-map.json` persists (issue #141), and letting it lag behind
+        // the cluster would restore yesterday's name after a restart.
+        live.label = spec.label;
         await applyReachable(live.endpoint, spec.reachable);
         await applyStates(live.endpoint, live.role, spec.states);
     }

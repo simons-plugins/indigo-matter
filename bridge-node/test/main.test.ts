@@ -13,12 +13,27 @@
  * They are slower than the rest of the suite and they are worth it: a wrong exit
  * code is a restart loop or a bridge that never comes back, and neither shows up
  * in any other test.
+ *
+ * **Parallel safety, and its limit.** The Matter and protocol ports are derived
+ * from the PID ({@link ports}) so concurrent runs cannot collide on them, and
+ * every child is pinned to the loopback interface ({@link LOOPBACK}) so a test
+ * run neither advertises a bridge on the real network nor competes with other
+ * hosts for it. What that does NOT make ephemeral is **mDNS itself**: the
+ * responder binds UDP 5353, the port number is fixed by the protocol, and
+ * matter.js offers no knob to move it. Every other file that stands up a real
+ * `ServerNode` (`registry`, `restore`, `persistence`, `integration`) binds it
+ * too, and node's runner forks test files concurrently — so a run that
+ * interleaves them can still see a bind conflict on 5353. This test file is the
+ * one that surfaces it, because its nodes are separate PROCESSES that fail to
+ * start rather than in-process nodes that share a responder. If it flakes with
+ * an address-in-use or a start timeout, that is what happened; re-run it on its
+ * own (`node --test .test-build/test/main.test.js`) to confirm.
  */
 
 import assert from "node:assert/strict";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { networkInterfaces, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { after, describe, it } from "node:test";
@@ -95,10 +110,30 @@ async function stopAndWait(child: ChildProcessWithoutNullStreams, timeoutMs = 20
     return exited;
 }
 
-/** Two ephemeral-ish ports derived from the PID, so parallel files do not clash. */
+/**
+ * This host's loopback interface, resolved rather than hardcoded — `lo0` on
+ * macOS, `lo` on Linux, and `--mdns-interface` is validated against the real
+ * interface list, so a guess that is wrong for the platform fails the spawn
+ * outright. `undefined` if there is somehow no internal interface, in which case
+ * the flag is simply omitted and the child behaves exactly as it did before.
+ */
+const LOOPBACK = Object.entries(networkInterfaces()).find(
+    ([, addresses]) => addresses?.some(address => address.internal),
+)?.[0];
+
+/**
+ * Two ephemeral-ish ports derived from the PID, so parallel files do not clash,
+ * plus the loopback pin — a test run has no business advertising a Matter bridge
+ * on somebody's actual LAN, and confining the responder is also the only part of
+ * the mDNS contention this file can do anything about (see the header).
+ */
 function ports(offset: number): string[] {
     const base = 41_000 + ((process.pid + offset * 37) % 4_000);
-    return ["--matter-port", String(base), "--ws-port", String(base + 1)];
+    return [
+        "--matter-port", String(base),
+        "--ws-port", String(base + 1),
+        ...(LOOPBACK === undefined ? [] : ["--mdns-interface", LOOPBACK]),
+    ];
 }
 
 /** The protocol port {@link ports} handed the child, so a test can dial it. */

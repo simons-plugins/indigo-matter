@@ -1340,6 +1340,145 @@ class TestMassRemovalBeltAndBraces:
         asyncio.run(scenario())
 
 
+def _guarding_node():
+    """A node that enforces §3.1 against a NON-empty live set, as #141 made it.
+
+    The restore means the node comes up holding the last-known endpoint set, so
+    an emptying attach meets an armed guard on the very first try — which before
+    the restore it never did, because nothing existed until the plugin attached.
+    """
+    base = golden_responder()
+
+    def _respond(frame: dict) -> list:
+        if frame["command"] == bridge_protocol.CMD_ATTACH:
+            args = frame.get("args") or {}
+            empties = not args.get("endpoints")
+            no_intent = args.get(bridge_protocol.ARG_INTENT) != bridge_protocol.INTENT_REPLACE_ALL
+            if empties and no_intent:
+                return [{"message_id": frame["message_id"],
+                         "error_code": bridge_protocol.ERR_MASS_REMOVAL_REFUSED,
+                         "details": "attach would remove all 4 live endpoints"}]
+        return base(frame)
+
+    return _respond
+
+
+class TestAllowListThatClassifiesToNothing:
+    """A non-empty export list that yields NO specs (issue #141 follow-up).
+
+    Every entry is re-classified on every attach, and each is skipped if its
+    Indigo device was deleted, stopped being exportable, lost its declared role,
+    or raised out of `states_for`. A one-device allow-list whose device the user
+    deleted does it unaided.
+
+    That combination was unreachable before the startup restore: with nothing
+    created until the plugin attached, the node's live set was empty, §3.1's
+    guard was never armed, and the empty attach was a harmless no-op. The node
+    now restores its last-known set BEFORE going online, so the same routine
+    restart sends `[]` into an armed guard — and `mass_removal_refused` HALTS.
+    """
+
+    def test_does_not_halt_when_the_classifier_empties_a_non_empty_list(self, mock_logger):
+        """⊗ Before the fix this halted the client permanently, every reload.
+
+        Drop `export_count_provider` (or stop passing `specs` to `_replace_all`)
+        and the attach goes out bare, the node refuses, `mass_removal_refused` is
+        in the halting set, and the user is told to check an export list that has
+        entries in it and is not the problem.
+        """
+        async def scenario():
+            attached = []
+            fake = _fake(responder=_guarding_node())
+            client = _client(mock_logger, fake,
+                             endpoint_provider=lambda: [],
+                             replace_all_provider=lambda: 0,
+                             export_count_provider=lambda: 3,
+                             on_attached=lambda status, _intent=False: attached.append(status))
+            task = asyncio.create_task(client.run())
+            await client.wait_connected(timeout=2)
+            await settle(lambda: attached or client.halted)
+
+            assert not client.halted, "an unbridgeable allow-list must never be terminal"
+            assert client.attached
+            attaches = [f for f in fake.sent if f.get("command") == bridge_protocol.CMD_ATTACH]
+            assert len(attaches) == 1, "the intent goes out first time, not after a refusal"
+            assert attaches[0]["args"][bridge_protocol.ARG_INTENT] == \
+                bridge_protocol.INTENT_REPLACE_ALL
+            await client.close()
+            task.cancel()
+
+        asyncio.run(scenario())
+
+    def test_says_so_loudly_rather_than_removing_everything_quietly(self, mock_logger):
+        """"Everything you exported is unbridgeable" is not a debug-level fact."""
+        async def scenario():
+            attached = []
+            fake = _fake(responder=_guarding_node())
+            client = _client(mock_logger, fake,
+                             endpoint_provider=lambda: [],
+                             replace_all_provider=lambda: 0,
+                             export_count_provider=lambda: 3,
+                             on_attached=lambda status, _intent=False: attached.append(status))
+            task = asyncio.create_task(client.run())
+            await client.wait_connected(timeout=2)
+            await settle(lambda: attached)
+            await client.close()
+            task.cancel()
+
+        asyncio.run(scenario())
+        warned = " ".join(str(call) for call in mock_logger.warning.call_args_list)
+        assert "NONE of them can be bridged" in warned
+        assert "endpoint numbers are kept" in warned, "and that it is recoverable"
+
+    def test_a_genuinely_empty_allow_list_still_carries_no_intent(self, mock_logger):
+        """⊗ The guard rail. The §3.1 opt-in must keep its teeth.
+
+        Nothing declared means nothing was asked for, and XG5 means the client
+        should not even exist. Returning the intent unconditionally on an empty
+        desired set would hand every stale plugin instance a standing licence to
+        un-export the lot — which is the exact thing §3.1 exists to refuse.
+        """
+        async def scenario():
+            fake = _fake(responder=_guarding_node())
+            client = _client(mock_logger, fake,
+                             endpoint_provider=lambda: [],
+                             replace_all_provider=lambda: 0,
+                             export_count_provider=lambda: 0)
+            task = asyncio.create_task(client.run())
+            await settle(lambda: client.halted)
+
+            assert client.halted, "the guard still refuses, and refusing still halts"
+            assert client.halted_reason == bridge_protocol.ERR_MASS_REMOVAL_REFUSED
+            attaches = [f for f in fake.sent if f.get("command") == bridge_protocol.CMD_ATTACH]
+            assert bridge_protocol.ARG_INTENT not in attaches[0]["args"]
+            await client.close()
+            task.cancel()
+
+        asyncio.run(scenario())
+
+    def test_a_declared_count_that_cannot_be_read_does_not_invent_a_licence(self, mock_logger):
+        """A provider that raises must fail towards the guard, not past it."""
+        def _broken():
+            raise RuntimeError("the store is locked")
+
+        async def scenario():
+            fake = _fake(responder=_guarding_node())
+            client = _client(mock_logger, fake,
+                             endpoint_provider=lambda: [],
+                             replace_all_provider=lambda: 0,
+                             export_count_provider=_broken)
+            task = asyncio.create_task(client.run())
+            await settle(lambda: client.halted)
+
+            assert client.halted
+            attaches = [f for f in fake.sent if f.get("command") == bridge_protocol.CMD_ATTACH]
+            assert bridge_protocol.ARG_INTENT not in attaches[0]["args"]
+            await client.close()
+            task.cancel()
+
+        asyncio.run(scenario())
+
+
 class TestAttachDeadlineSizing:
     """The discharge attach sends nothing and removes everything.
 

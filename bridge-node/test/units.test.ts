@@ -21,6 +21,7 @@ import {
     humidityToMatter,
     ILLUMINANCE_MAX,
     ILLUMINANCE_MIN,
+    indigoDeviceIdFrom,
     isEcosystemChange,
     kilopascalsToMatter,
     luxToMatter,
@@ -44,6 +45,7 @@ import {
     SETPOINT_CENTI_MAX,
     SETPOINT_CENTI_MIN,
     systemModeToMatter,
+    uniqueIdFor,
     TEMPERATURE_CENTI_MIN,
 } from "../src/endpoints.js";
 
@@ -380,5 +382,40 @@ describe("echo guard (§6.4)", () => {
         assert.equal(isEcosystemChange({ offline: false }), true);
         assert.equal(isEcosystemChange({}), true);
         assert.equal(isEcosystemChange(undefined), true);
+    });
+});
+
+describe("UniqueID ↔ indigoDeviceId (§6.3, issue #141)", () => {
+    it("round-trips every device id it produced", () => {
+        for (const indigoDeviceId of [0, 1, 42, 123456789, 2147483647]) {
+            assert.equal(indigoDeviceIdFrom(uniqueIdFor(indigoDeviceId)), indigoDeviceId);
+        }
+    });
+
+    it("refuses anything it did not produce, rather than inventing a device id", () => {
+        // ⊗ `Number(uniqueId.slice(7))` would answer 1000 for "indigo-1e3" and
+        // 0 for "indigo- " — and an invented device id is a NEW accessory in
+        // every paired ecosystem, restored from the endpoint map at every start.
+        for (const uniqueId of [
+            "indigo-",
+            "indigo-1e3",
+            "indigo-2.5",
+            "indigo- 1",
+            "indigo-1 ",
+            "indigo-0x10",
+            "indigo-NaN",
+            "matter-1",
+            "1",
+            "",
+        ]) {
+            assert.equal(indigoDeviceIdFrom(uniqueId), undefined, uniqueId);
+        }
+    });
+
+    it("refuses an id too large to be an exact integer", () => {
+        // JSON gives us whatever was written; a value past 2^53 comes back as a
+        // different number than it went in as, which is the same invention by a
+        // quieter route.
+        assert.equal(indigoDeviceIdFrom("indigo-9007199254740993"), undefined);
     });
 });

@@ -1,7 +1,7 @@
 {
   "name": "indigo-matter-bridge",
-  "version": "0.5.0",
-  "description": "Matter bridge node for the indigo-matter Indigo plugin — exports selected Indigo devices as Matter accessories.",
+  "version": "0.7.0",
+  "description": "Matter bridge node for the indigo-matter Indigo plugin \u2014 exports selected Indigo devices as Matter accessories.",
   "license": "MIT",
   "type": "module",
   "main": "dist/main.js",

@@ -70,9 +70,37 @@ import {
  */
 const logger = Logger.get("indigo-matter-endpoints");
 
+/** The one prefix {@link uniqueIdFor} and {@link indigoDeviceIdFrom} share. */
+const UNIQUE_ID_PREFIX = "indigo-";
+
 /** Bridged Device Basic Information `UniqueID`, stable across restarts. */
 export function uniqueIdFor(indigoDeviceId: number): string {
-    return `indigo-${indigoDeviceId}`;
+    return `${UNIQUE_ID_PREFIX}${indigoDeviceId}`;
+}
+
+/**
+ * The inverse of {@link uniqueIdFor}, or `undefined` for anything that is not
+ * one of ours.
+ *
+ * §6.3's "identity flows one way" is about the *protocol*: nothing on the wire
+ * is ever keyed on a derived value. `endpoint-map.json` is not on the wire — it
+ * is keyed by `UniqueID` because that is what drift is reported against — so
+ * restoring an endpoint from it (issue #141) needs the device id back. It lives
+ * next to the forward derivation so the two cannot drift apart, and it is
+ * strict rather than forgiving: `Number("indigo-1e3")`-style coercions would
+ * silently invent a device id, and an invented id is a new accessory in every
+ * paired ecosystem.
+ */
+export function indigoDeviceIdFrom(uniqueId: string): number | undefined {
+    if (!uniqueId.startsWith(UNIQUE_ID_PREFIX)) {
+        return undefined;
+    }
+    const digits = uniqueId.slice(UNIQUE_ID_PREFIX.length);
+    if (!/^-?\d+$/.test(digits)) {
+        return undefined;
+    }
+    const indigoDeviceId = Number(digits);
+    return Number.isSafeInteger(indigoDeviceId) ? indigoDeviceId : undefined;
 }
 
 /**

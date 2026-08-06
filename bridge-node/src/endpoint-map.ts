@@ -25,6 +25,18 @@
  * baseline stays, so the drift keeps being reported until a human resolves it
  * with §3.11.
  *
+ * **It also carries what it takes to REBUILD an endpoint** (issue #141). Numbers
+ * alone were enough while the file was only a witness, but a node that comes
+ * online with an empty aggregator and waits for the plugin tells every paired
+ * ecosystem that every accessory has gone — Apple re-adds them as new arrivals
+ * and the user's room assignments are destroyed on every restart. So each entry
+ * also records the `role` and `label` the endpoint was last created with, which
+ * is exactly (and only) what `createEndpoint` needs; `node.ts` restores the set
+ * from here before the stack goes online. `options` is deliberately NOT stored:
+ * nothing in this node reads it (window-covering polarity is applied
+ * plugin-side), so persisting it would be storing a field to satisfy a sentence
+ * rather than a caller.
+ *
  * Stdlib only — no matter.js import — which is what lets the whole detector be
  * tested without a Matter stack. Callers hand in `{uniqueId, endpointNumber}`
  * pairs; deriving `uniqueId` from an Indigo device id is `endpoints.ts`'s job.
@@ -94,17 +106,49 @@ export function refuseReasonFor(state: EndpointIdentityState): string | undefine
 /** Sibling of `identity.json` in the bridge storage dir. */
 export const ENDPOINT_MAP_FILE = "endpoint-map.json";
 
-/** Schema version of the persisted file. Bump only on an incompatible change. */
-export const ENDPOINT_MAP_VERSION = 1;
+/**
+ * Schema version of the persisted file.
+ *
+ * **2 since issue #141**, which added `role`/`label` to every entry so the
+ * endpoint set can be rebuilt without the plugin. Version 1 files are still
+ * read — see {@link ENDPOINT_MAP_VERSION_LEGACY} — because a v1 file holds the
+ * one thing that can never be re-derived: the numbers paired ecosystems know.
+ */
+export const ENDPOINT_MAP_VERSION = 2;
+
+/** The numbers-only shape shipped by E5. Still read; never written again. */
+export const ENDPOINT_MAP_VERSION_LEGACY = 1;
 
 /** Stable keys so a repeated failure replaces its warning rather than stacking. */
 const WARN_PERSIST = "endpoint-map-persist";
 const WARN_DELETE = "endpoint-map-delete";
 
-/** The on-disk shape. */
+/**
+ * One persisted endpoint.
+ *
+ * `number` is the identity half and is always there. `role`/`label` are the
+ * *restoration* half and are optional, because a v1 file has neither and
+ * discarding a v1 file to get a tidier type would throw away the numbers every
+ * paired ecosystem is keyed on. An entry without them is still a perfectly good
+ * witness; it simply cannot be restored until the plugin next attaches and
+ * fills them in.
+ */
+export interface EndpointRecord {
+    number: number;
+    role?: string;
+    label?: string;
+}
+
+/** The on-disk shape (v2). */
 export interface EndpointMapFile {
     version: number;
-    /** `UniqueID → endpoint number`. */
+    /** `UniqueID → {number, role?, label?}`. */
+    endpoints: Record<string, EndpointRecord>;
+}
+
+/** The v1 on-disk shape — `UniqueID → endpoint number`. Read-only, for tests and migration. */
+export interface EndpointMapFileV1 {
+    version: 1;
     endpoints: Record<string, number>;
 }
 
@@ -112,57 +156,129 @@ export interface EndpointMapFile {
 export interface LiveEndpointNumber {
     uniqueId: string;
     endpointNumber: number;
+    /**
+     * What it would take to rebuild this endpoint at the next start. Optional
+     * so a caller that genuinely does not know (the E5 migration seed, which
+     * has no live set at all) cannot be forced to invent them — an absent
+     * value never erases a recorded one.
+     */
+    role?: string;
+    label?: string;
+}
+
+/** An entry complete enough for `node.ts` to reconstruct before going online. */
+export interface RestorableEndpoint {
+    uniqueId: string;
+    endpointNumber: number;
+    role: string;
+    label: string;
 }
 
 /** The outcome of reading the file: absent, usable, or present-but-broken. */
 export interface EndpointMapLoad {
-    numbers: Map<string, number>;
+    endpoints: Map<string, EndpointRecord>;
     /** True when a file was there at all — absent is a first run, not a fault. */
     present: boolean;
     /** Set only when a file was present and could not be used. */
     problem?: string;
 }
 
-function isEndpointMapFile(value: unknown): value is EndpointMapFile {
-    if (typeof value !== "object" || value === null) {
-        return false;
+function isNonEmptyString(value: unknown): value is string {
+    return typeof value === "string" && value.length > 0;
+}
+
+function isEndpointNumber(value: unknown): value is number {
+    return typeof value === "number" && Number.isInteger(value) && value >= 0;
+}
+
+/**
+ * Read one entry in either schema, or `undefined` if it is not usable.
+ *
+ * A v2 entry with a bad `role`/`label` keeps its number and loses only the
+ * fields that were wrong, for the same reason a v1 file is not discarded: the
+ * number is the irreplaceable part, and refusing the whole file over a label
+ * would turn a cosmetic corruption into a refuse-to-start.
+ */
+function readRecord(value: unknown): EndpointRecord | undefined {
+    if (isEndpointNumber(value)) {
+        return { number: value };
     }
-    const candidate = value as Partial<EndpointMapFile>;
-    if (candidate.version !== ENDPOINT_MAP_VERSION) {
-        return false;
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+        return undefined;
     }
-    const { endpoints } = candidate;
-    if (typeof endpoints !== "object" || endpoints === null || Array.isArray(endpoints)) {
-        return false;
+    const candidate = value as Partial<EndpointRecord>;
+    if (!isEndpointNumber(candidate.number)) {
+        return undefined;
     }
-    return Object.values(endpoints).every(
-        number => typeof number === "number" && Number.isInteger(number) && number >= 0,
-    );
+    const record: EndpointRecord = { number: candidate.number };
+    if (isNonEmptyString(candidate.role)) {
+        record.role = candidate.role;
+    }
+    if (isNonEmptyString(candidate.label)) {
+        record.label = candidate.label;
+    }
+    return record;
+}
+
+/**
+ * Parse the `endpoints` object of either schema version, or `undefined` if the
+ * file is not an endpoint map at all.
+ */
+function readEndpoints(value: unknown): Map<string, EndpointRecord> | undefined {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+        return undefined;
+    }
+    const endpoints = new Map<string, EndpointRecord>();
+    for (const [uniqueId, entry] of Object.entries(value)) {
+        const record = readRecord(entry);
+        if (record === undefined) {
+            return undefined;
+        }
+        endpoints.set(uniqueId, record);
+    }
+    return endpoints;
+}
+
+function isKnownVersion(version: unknown): boolean {
+    return version === ENDPOINT_MAP_VERSION || version === ENDPOINT_MAP_VERSION_LEGACY;
 }
 
 function isNotFound(error: unknown): boolean {
     return (error as NodeJS.ErrnoException | null)?.code === "ENOENT";
 }
 
-/** Read `endpoint-map.json`. Never throws — the caller decides what a fault means. */
+/**
+ * Read `endpoint-map.json`. Never throws — the caller decides what a fault means.
+ *
+ * **A v1 file is migrated, never rejected.** Its entries are numbers-only, so
+ * they load as records with no `role`/`label` and are simply not restorable
+ * until the next attach records them; the numbers themselves are the identity
+ * every paired ecosystem is keyed on and must survive the upgrade untouched.
+ */
 export function loadEndpointMap(storagePath: string): EndpointMapLoad {
     const file = join(storagePath, ENDPOINT_MAP_FILE);
     try {
         const parsed: unknown = JSON.parse(readFileSync(file, "utf8"));
-        if (!isEndpointMapFile(parsed)) {
+        const version = (parsed as { version?: unknown } | null)?.version;
+        const endpoints = isKnownVersion(version)
+            ? readEndpoints((parsed as EndpointMapFile).endpoints)
+            : undefined;
+        if (endpoints === undefined) {
             return {
-                numbers: new Map(),
+                endpoints: new Map(),
                 present: true,
-                problem: `${file} is not a version ${ENDPOINT_MAP_VERSION} endpoint map`,
+                problem:
+                    `${file} is not a version ${ENDPOINT_MAP_VERSION} ` +
+                    `(or legacy version ${ENDPOINT_MAP_VERSION_LEGACY}) endpoint map`,
             };
         }
-        return { numbers: new Map(Object.entries(parsed.endpoints)), present: true };
+        return { endpoints, present: true };
     } catch (error) {
         if (isNotFound(error)) {
-            return { numbers: new Map(), present: false };
+            return { endpoints: new Map(), present: false };
         }
         return {
-            numbers: new Map(),
+            endpoints: new Map(),
             present: true,
             problem: `${file} is unreadable (${describeError(error)})`,
         };
@@ -182,6 +298,52 @@ export function deleteEndpointMap(storagePath: string): boolean {
     }
 }
 
+/** A fresh record from a live endpoint, carrying whatever it could tell us. */
+function recordFor(entry: LiveEndpointNumber): EndpointRecord {
+    const record: EndpointRecord = { number: entry.endpointNumber };
+    if (entry.role !== undefined) {
+        record.role = entry.role;
+    }
+    if (entry.label !== undefined) {
+        record.label = entry.label;
+    }
+    return record;
+}
+
+/**
+ * Refresh an existing record's restoration half from a live endpoint.
+ *
+ * An **absent** value never erases a recorded one: the seed path has no live
+ * set at all, and reading its silence as "this endpoint has no role any more"
+ * would strip a perfectly good entry of the very fields that make it
+ * restorable. Returns whether anything changed, so a steady state still costs
+ * no disk write.
+ */
+function noteRestorable(record: EndpointRecord, entry: LiveEndpointNumber): boolean {
+    let changed = false;
+    if (entry.role !== undefined && record.role !== entry.role) {
+        record.role = entry.role;
+        changed = true;
+    }
+    if (entry.label !== undefined && record.label !== entry.label) {
+        record.label = entry.label;
+        changed = true;
+    }
+    return changed;
+}
+
+/** Why {@link EndpointMapStore.check} is writing, for the log line. */
+function persistReason(added: number, refreshed: number): string {
+    const parts: string[] = [];
+    if (added > 0) {
+        parts.push(`recorded ${added} new endpoint number(s)`);
+    }
+    if (refreshed > 0) {
+        parts.push(`refreshed ${refreshed} endpoint role/label(s)`);
+    }
+    return parts.length === 0 ? "retried after a failed write" : parts.join(" and ");
+}
+
 /**
  * The map plus the operations §3.10/§3.11 and the drift detector need.
  *
@@ -190,7 +352,7 @@ export function deleteEndpointMap(storagePath: string): boolean {
  * if the node serves endpoints at all.
  */
 export class EndpointMapStore {
-    #numbers = new Map<string, number>();
+    #endpoints = new Map<string, EndpointRecord>();
     #present = false;
     #problem: string | undefined;
     #checked = false;
@@ -227,7 +389,7 @@ export class EndpointMapStore {
     /** Read the file into memory. Idempotent; the last read wins. */
     load(): EndpointMapLoad {
         const loaded = loadEndpointMap(this.storagePath);
-        this.#numbers = loaded.numbers;
+        this.#endpoints = loaded.endpoints;
         this.#present = loaded.present;
         this.#problem = loaded.problem;
         this.#checked = false;
@@ -239,7 +401,11 @@ export class EndpointMapStore {
         } else if (!loaded.present) {
             this.log("No endpoint map yet; the first reconcile will record one");
         } else {
-            this.log(`Loaded endpoint map: ${loaded.numbers.size} endpoint number(s)`);
+            const restorable = this.restorable().length;
+            this.log(
+                `Loaded endpoint map: ${loaded.endpoints.size} endpoint number(s), ` +
+                    `${restorable} restorable at startup`,
+            );
         }
         return loaded;
     }
@@ -281,11 +447,91 @@ export class EndpointMapStore {
 
     /** The recorded number for a `UniqueID`, if there is one. */
     numberFor(uniqueId: string): number | undefined {
-        return this.#numbers.get(uniqueId);
+        return this.#endpoints.get(uniqueId)?.number;
     }
 
     get size(): number {
-        return this.#numbers.size;
+        return this.#endpoints.size;
+    }
+
+    /**
+     * The entries complete enough to rebuild before the stack goes online
+     * (issue #141).
+     *
+     * Entries missing `role` or `label` are silently absent rather than
+     * reported as a fault: that is precisely a v1 file's normal state, and one
+     * attach fills it in. Order is the map's own insertion order, which is the
+     * order the numbers were first recorded — irrelevant to matter.js, which
+     * keys each endpoint's number on its `Endpoint.id`, but stable, which makes
+     * the log read the same way twice.
+     */
+    restorable(): RestorableEndpoint[] {
+        const restorable: RestorableEndpoint[] = [];
+        for (const [uniqueId, record] of this.#endpoints) {
+            if (record.role === undefined || record.label === undefined) {
+                continue;
+            }
+            restorable.push({
+                uniqueId,
+                endpointNumber: record.number,
+                role: record.role,
+                label: record.label,
+            });
+        }
+        return restorable;
+    }
+
+    /**
+     * A device was **un-exported**: keep its number, drop what would rebuild it.
+     *
+     * The other half of {@link restorable}, and without it the restore is a bug
+     * rather than a fix. `check` only ever *adds* and *refreshes*, so once an
+     * entry has carried a `role`/`label` it carries them for ever — and a device
+     * the user deliberately un-exported therefore stayed restorable, was
+     * re-created as a child endpoint on every single boot, and was removed again
+     * by the plugin's next attach seconds later. That is precisely the
+     * appear-then-vanish churn issue #141 exists to eliminate, aimed at the
+     * devices the user had already told us to stop exporting, and it regresses
+     * XAC7's "un-exported accessories are gone".
+     *
+     * **The number stays.** §3.3 retains the allocation on purpose, so re-adding
+     * the same device gets the same endpoint number back and paired ecosystems
+     * see the accessory they already know rather than a new one. Deleting the
+     * entry outright would throw that away to save three fields. Clearing only
+     * the restoration half makes the entry non-restorable — {@link restorable}
+     * filters on `role` **and** `label` — while leaving the identity intact, and
+     * one re-export refills it through the ordinary {@link check}.
+     *
+     * **Only a caller that watched a specific endpoint go may call this.** An
+     * empty live set is not evidence of anything: a node that has never attached
+     * has none, and `seed([])` deliberately knows nothing. So this takes the
+     * uniqueIds that were actually removed rather than inferring them from
+     * whatever happens to be live, and `node.ts` derives them by diffing the
+     * live set across one mutation. A factory reset is deliberately NOT such a
+     * caller: `erase()` wipes matter.js's endpoints, but the user un-exported
+     * nothing and the plugin's re-attach re-creates the same set.
+     *
+     * Returns how many entries actually lost something, so a no-op costs no
+     * disk write.
+     */
+    forget(uniqueIds: readonly string[]): number {
+        let forgotten = 0;
+        for (const uniqueId of uniqueIds) {
+            const record = this.#endpoints.get(uniqueId);
+            if (record === undefined || (record.role === undefined && record.label === undefined)) {
+                continue;
+            }
+            delete record.role;
+            delete record.label;
+            forgotten += 1;
+        }
+        if (forgotten > 0) {
+            this.persist(
+                `cleared the role/label of ${forgotten} un-exported endpoint(s), keeping their ` +
+                    "numbers so a re-export returns the same accessory",
+            );
+        }
+        return forgotten;
     }
 
     /**
@@ -304,15 +550,23 @@ export class EndpointMapStore {
     check(live: readonly LiveEndpointNumber[]): DriftEntry[] {
         const drift: DriftEntry[] = [];
         let added = 0;
-        for (const { uniqueId, endpointNumber } of live) {
-            const expected = this.#numbers.get(uniqueId);
-            if (expected === undefined) {
-                this.#numbers.set(uniqueId, endpointNumber);
+        let refreshed = 0;
+        for (const entry of live) {
+            const record = this.#endpoints.get(entry.uniqueId);
+            if (record === undefined) {
+                this.#endpoints.set(entry.uniqueId, recordFor(entry));
                 added += 1;
                 continue;
             }
-            if (expected !== endpointNumber) {
-                drift.push({ uniqueId, expected, actual: endpointNumber });
+            // The restoration half is refreshed even when the number drifted:
+            // a renamed accessory whose number also moved must still come back
+            // under its current name, and role/label are independent facts from
+            // the number. The NUMBER is never touched — see the class comment.
+            if (noteRestorable(record, entry)) {
+                refreshed += 1;
+            }
+            if (record.number !== entry.endpointNumber) {
+                drift.push({ uniqueId: entry.uniqueId, expected: record.number, actual: entry.endpointNumber });
             }
         }
         // `#dirty` is the retry: a write that failed last time leaves the map
@@ -320,8 +574,8 @@ export class EndpointMapStore {
         // steady state (`added === 0`, clean) still costs no I/O. Without it a
         // full disk at the moment of the first check would never be revisited,
         // and `checked` — see the `#dirty` field — would never come true again.
-        if (added > 0 || this.#dirty) {
-            this.persist(added > 0 ? `recorded ${added} new endpoint number(s)` : "retried after a failed write");
+        if (added > 0 || refreshed > 0 || this.#dirty) {
+            this.persist(persistReason(added, refreshed));
         }
         // An empty comparison compared nothing, so it cannot make `driftChecked`
         // true — the same rule {@link seed} already applies. §4.3 says
@@ -346,13 +600,31 @@ export class EndpointMapStore {
      * true is the migration; refusing to serve until a human confirms a
      * *rebuild* would take a working bridge offline to fix a file it never had.
      *
+     * **This is a full REPLACE, not a merge**, and the next caller has to mean
+     * it: whatever is in memory is dropped, so seeding a partial list silently
+     * discards the numbers of everything absent from it — the one thing in this
+     * file that cannot be re-derived. Today's single caller
+     * (`node.bootstrapEndpointMap`) passes `[]` against a map that is by
+     * definition absent, so it drops nothing; the assertion below is what keeps
+     * that true if a later caller has a map in hand. A caller that wants to add
+     * to a baseline wants {@link check}, and one that wants to replace a
+     * *disagreeing* baseline wants {@link rebuild}, which quarantines first.
+     *
      * Returns whether the baseline reached disk.
      */
     seed(numbers: readonly LiveEndpointNumber[], why: string): boolean {
-        this.#numbers = new Map(numbers.map(({ uniqueId, endpointNumber }) => [uniqueId, endpointNumber]));
+        if (this.#endpoints.size > 0 && numbers.length < this.#endpoints.size) {
+            throw new Error(
+                `refusing to seed ${numbers.length} endpoint number(s) over a baseline of ` +
+                    `${this.#endpoints.size}: seed() replaces the whole map, so this would discard ` +
+                    "endpoint numbers paired ecosystems are keyed on — use check() to add, or " +
+                    "rebuild() to deliberately replace",
+            );
+        }
+        this.#endpoints = new Map(numbers.map(entry => [entry.uniqueId, recordFor(entry)]));
         this.#problem = undefined;
         this.#checked = numbers.length > 0;
-        return this.persist(`seeded with ${this.#numbers.size} endpoint number(s) — ${why}`);
+        return this.persist(`seeded with ${this.#endpoints.size} endpoint number(s) — ${why}`);
     }
 
     /**
@@ -379,9 +651,9 @@ export class EndpointMapStore {
                     "recorded by the reconcile that follows.",
             );
         }
-        this.#numbers = new Map(live.map(({ uniqueId, endpointNumber }) => [uniqueId, endpointNumber]));
+        this.#endpoints = new Map(live.map(entry => [entry.uniqueId, recordFor(entry)]));
         this.#problem = undefined;
-        const persisted = this.persist(`rebuilt from ${this.#numbers.size} live endpoint(s)`);
+        const persisted = this.persist(`rebuilt from ${this.#endpoints.size} live endpoint(s)`);
         // Same rule as `check`: a rebuild from zero live endpoints — which is
         // the *normal* rebuild, since §1.1 keeps `attach` out of the recovery
         // commands — has compared nothing, and the baseline it wrote is empty.
@@ -422,7 +694,7 @@ export class EndpointMapStore {
      * what is corrupt.
      */
     discard(): boolean {
-        this.#numbers = new Map();
+        this.#endpoints = new Map();
         this.#problem = undefined;
         this.#checked = false;
         this.#dirty = false;
@@ -465,7 +737,7 @@ export class EndpointMapStore {
         this.quarantineUnusable();
         const file: EndpointMapFile = {
             version: ENDPOINT_MAP_VERSION,
-            endpoints: Object.fromEntries(this.#numbers),
+            endpoints: Object.fromEntries(this.#endpoints),
         };
         try {
             writeJsonAtomic(join(this.storagePath, ENDPOINT_MAP_FILE), file);

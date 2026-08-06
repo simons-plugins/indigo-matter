@@ -1,15 +1,160 @@
 # indigo-matter — Build Handover
 
-**Last updated:** 2026-08-05 23:58 UTC
-**Active work:** `docs/e8-export-documentation` (PR #129, stacked on
-`feat/e6-e7-pairing-and-agent` / PR #128) — E8, docs only. See the E6+E7 section
-immediately below; the `main` summary in this header describes the last merge,
-not those branches.
+**Last updated:** 2026-08-06 11:01 UTC
+**Active work:** `fix/141-restore-endpoints-at-startup` — issue #141, the
+empty-aggregator restart bug. See the section immediately below; the `main`
+summary in this header describes the last merge, not that branch.
 **Branch:** `main` — PRs #106, #107, #108 all merged.
 **Version:** `2026.7.13`
 **Tests:** 1005 passing (`cd indigo-matter && /Library/Frameworks/Python.framework/Versions/Current/bin/python3 -m pytest -q`)
 **Deployed:** jarvis is running the #103-era plugin (v2026.7.10) plus **E5's export half, deployed 2026-08-05 with 3 accessories live in Apple Home**. **Nothing from #106/#107/#108, and no part of E6 or E7, has been deployed** — so the #104 supervision fixes are NOT yet live on jarvis.
 **Status:** **Wi-Fi AND Thread validated with real hardware**, and the **export half's E0 pairing gate PASSED on 2026-08-04** with live two-way control on 2026-08-05 (see *Live validation on jarvis*). #104's three server-supervision faults are fixed and merged (#107). #105's diagnostic is merged (#108) but **#105 stays open** — the bridged-endpoint path still has no real-bridge validation. `domio-code` #236 is fixed and closed (domio-code PR #237). Known-open: #105, plus the older #43, #46, #21–#24.
+
+---
+
+## 2026-08-06 — issue #141: the bridge is never online with an empty accessory list
+
+Plugin `2026.8.4`, bridge-node `0.6.0`. Suites: **2243 Python**, **366 TS**
+(from 2243/347 — `npm test` measured 347 on this branch's base, not the 348 the
+E6/E7 section records; the note there about measuring counts applies to itself).
+pylint 9.42.
+
+**The defect, measured on jarvis after a reboot rather than inferred.** The node
+called `server.start()` with an aggregator that had zero children and stayed
+empty until the plugin connected and attached — 23 seconds. Apple reconnects
+inside that window, reads an empty `PartsList`, concludes every accessory has
+gone, and when they reappear treats them as NEW accessories: dumped in the
+bridge's own room, with metadata the user can no longer edit. Every restart of
+the node — reboot, plugin upgrade, agent restart, crash recovery — therefore
+destroyed the user's room assignments for every exported device, and the only
+remedy was a full unpair/re-pair (#139).
+
+**The fix.** `endpoint-map.json` gains a schema version 2 in which each entry
+carries `role` and `label` alongside `number`, and `BridgeNode.start()` rebuilds
+every restorable entry — ordinary `createEndpoint`, same `Endpoint.id`, same
+persisted number, `reachable: false`, role-default state — **before**
+`server.start()`. `attach` stays authoritative and reconciles against the
+restored set exactly as before.
+
+Four things worth knowing before touching this again:
+
+* **The ordering is the whole fix, so the test asserts the ordering.**
+  `test/restore.test.ts` patches `ServerNode.prototype.start` and snapshots the
+  aggregator's children at the instant it is invoked *and* when
+  `lifecycle.online` fires. Asserting the endpoint set after `BridgeNode.start()`
+  returns would pass just as happily with the restore in the wrong place —
+  verified by mutation: moving the restore below `server.start()` fails that one
+  test and nothing else; deleting it fails 9 of the 11.
+* **A v1 map is migrated, never discarded.** Its entries are bare numbers, which
+  is the one thing that cannot be re-derived and the thing every paired
+  ecosystem is keyed on. They load, they are not restorable, the first attach
+  records role/label, and the start after that one restores. Same rule one level
+  down: a v2 entry with a malformed `role`/`label` keeps its number.
+* **`options` is deliberately not persisted.** Nothing in the node reads it —
+  window-covering polarity is applied plugin-side — so storing it would be
+  satisfying a sentence rather than a caller.
+* **Refusing beats restoring.** A node in a refuse-to-start state creates
+  nothing, restore included. `identityUnreadable` is known before the stack
+  starts and skips the restore outright; `fabricStorageLost` can only be decided
+  *after* `server.start()` (it needs the fabric table), so the restored set is
+  withdrawn there instead — safe by construction, because that state means no
+  fabrics, so nothing was attached to see it.
+
+**Not fixed here, on purpose:** #140 (drift reports cannot be cleared). The
+restore does not make it worse — a restore is not a comparison, `driftChecked`
+stays `false` until a real one runs, and re-using the map's own numbers raises
+no drift.
+
+`indigo-matter-bridge@0.6.0` **is now published** (0.5.0 and 0.6.0 are both on
+the registry; `latest` is 0.6.0), so `DEFAULT_INSTALL_SPEC` resolves off npm.
+The hardening below changes node source *after* that publish — see its last
+paragraph.
+
+### 2026-08-06 (later) — hardening from the two PR #142 reviews
+
+Suites: **2252 Python**, **380 TS** (from 2243/366 on this branch — both
+measured, not carried over). pylint **9.42**, unchanged. One reviewer reported
+353 TS against the same claimed baseline; it is not reproducible here. The only
+reproducible way to lose tests silently is running `node --test` directly
+without `npm run build`, which skips `main.test.ts`'s whole `describe` on
+`existsSync(dist/main.js)` and contributes **0** rather than 8 (→ 358); an
+aborted file under the suite's known mDNS contention would do the same for
+whatever it took with it. `npm test` itself always builds first, so under `npm
+test` the number is 366/380.
+
+**Ghost accessories — the restore's own version of the bug it fixed.** `check()`
+only ever added and refreshed, so once a v2 entry carried `role`/`label` it
+carried them for ever. A device the user *un-exported* therefore stayed
+restorable: rebuilt as a child endpoint before every `server.start()`, removed
+again by the plugin's next attach seconds later. That is exactly the
+appear-then-vanish churn #141 exists to eliminate, aimed at devices the user had
+already removed, and it regressed XAC7. Each ghost also spent a
+`REMOVAL_PACING_MS` (100ms) slot on every attach while counting towards neither
+the desired set nor the un-export debt, so an accumulation of them ate the 8s
+attach floor for accessories nobody had asked for.
+
+*Fix:* on a removal, clear `role`/`label` and **keep `number`** —
+`restorable()` filters on role *and* label, so the entry goes non-restorable
+while §3.3's allocation survives and one re-export refills it at the same
+number, which means the same accessory in every paired ecosystem rather than a
+new one. `node.ts` measures the removals by diffing the live set across one
+mutation (`forgetRemoved`) rather than reading absence: an empty live set proves
+nothing (a node that never attached has one, and `seed([])` knows nothing by
+design), so a factory reset, a seed, and an entry this build cannot rebuild all
+leave the map alone. `withdrawRestoredIfRefusing` goes through
+`registry.reconcile` directly and so does not forget either — correct, since a
+refusal is not an un-export.
+
+**A permanent halt this PR made reachable, and the PR body described it
+backwards.** When the classifier empties a *non-empty* allow-list — every entry
+skipped because the Indigo device was deleted, stopped being exportable, lost
+its declared role, or raised out of `states_for` — `endpoint_specs()` returns
+`[]`, there is no debt, and the attach went out bare. Before the restore that
+was harmless: nothing was ever created before the plugin attached, so the node's
+live set was empty, §3.1's guard was never armed, and the empty attach was a
+no-op. The restore arms the guard from the first attach, so the same routine
+restart is now refused with `mass_removal_refused` — which is in
+`HALTING_ATTACH_ERRORS` and halts the client permanently, every reload, behind a
+message telling the user to check an allow-list that is not the problem. A
+one-device allow-list whose device the user deleted reaches it unaided.
+
+*Fix, plugin-side:* `bridge_client._replace_all` now carries `intent:
+replace_all` in that case too, gated on a new `export_count_provider`
+(`export_bridge._declared_export_count`, the store's own length) so a
+*genuinely* empty allow-list still carries nothing and §3.1 keeps its teeth
+against the stale client it was written for. A provider that raises fails
+towards the guard, not past it. It is announced loudly at WARNING on both sides,
+naming every skipped device — latched per cause like `_skip` is, because the
+provider runs per (re)connect. The declared count also joins the attach-deadline
+`max()`, since it is the only proxy for how much the node is about to remove.
+Chosen over "do not attach at all": the node would otherwise serve accessories
+the plugin can neither drive nor push state to, with nothing to clear it, and
+§3.3's retained numbers make the removal recoverable.
+
+**Mutation survivors closed** (all seven ⊗ verified fail-before by mutating the
+source and re-running): the restored accessory's `label` (came up as "Restored
+Accessory" with the suite green), `registry.restore`'s per-spec `try`/`catch`
+(one corrupt entry aborted the whole restore and the bridge booted empty), the
+`indigoDeviceIdFrom`/`isRole`/`isSupportedRole` skip (helper-tested,
+caller-untested), the `label` half of the `restorable()` predicate (the existing
+test used a bad role *and* a bad label), `check`'s refresh-even-when-the-number-
+drifted branch (its own comment argued for it and nothing pinned it), and
+`states: {}` ("no state value is invented").
+
+**Also:** `bridge_agent.py`'s "not on the registry yet" corrected; §4.3 of
+BRIDGE_PROTOCOL now states that of the three refusal reasons only two restore
+literally nothing — `fabricStorageLost` restores then withdraws, which is
+wire-observable (transient `endpointCount`, a `ConfigurationVersion` bump,
+startup latency) and accepted because that state means no fabrics; `seed()`
+carries an assertion that it is a full replace; `main.test.ts` pins its children
+to the loopback interface and documents the residual UDP 5353 contention it
+cannot fix (the port is protocol-fixed and matter.js exposes no knob).
+
+**Publishing:** these changes are node source *after* `0.6.0` went to npm, so a
+bridge installed from the registry does **not** have them. `package.json` is
+deliberately left at `0.6.0` — bumping it to an unpublished version would break
+`DEFAULT_INSTALL_SPEC` resolution — so releasing this needs a version bump and
+publish together, in that order, plus the matching pin in `bridge_agent.py`.
 
 ---
 
@@ -351,7 +496,9 @@ E6/E7.
 
 ### Distribution: the bridge is an npm package, and it is NOT published yet
 
-`DEFAULT_INSTALL_SPEC = "indigo-matter-bridge@0.5.0"` is a **registry** spec,
+`DEFAULT_INSTALL_SPEC = "indigo-matter-bridge@0.6.0"` is a **registry** spec,
+(`0.5.0` when this section was written; issue #141 bumped it, and **`0.6.0` is
+not published yet**)
 exact-pinned exactly as `matter-server@1.2.2` is, and installing it is
 `npm install --prefix ~/indigo-matter <spec>` with a different string — which is
 precisely the parameterisation the `AgentSpec` extraction bought. The plugin
@@ -469,23 +616,27 @@ appeared in Apple Home. That is XAC5's upgrade leg.
   feature to anyone who starts there.
 - **Still open from earlier:** #105, #83, #84, #62 follow-up, #43, #46, #21–#24.
 
-### Open, unexplained, and Apple-side: room changes in Apple Home
+### ~~Open, unexplained, and Apple-side: room changes in Apple Home~~ — SOLVED, issue #141
 
 Observed on jarvis with E5 deployed and 3 accessories live (2026-08-05): on/off
 control works, but Apple Home refuses to change an accessory's **room** ("can't
 change settings"). Simon had changed those same accessories' rooms successfully before,
 so this is a change in Apple-side state, not in bridge behaviour.
 
-**No bridge-side change can address this, and the reasoning matters.** Room
-assignment is a HomeKit/iCloud home-database concept. It never crosses Matter
-and never reaches our node — so the node log showing no traffic at the moment of
-the attempt is the *expected* state, not evidence of anything. An earlier
-hypothesis about `isBridged`/`uniqueIdentifiersForBridgedAccessories` was raised
-and is **unsupported**; do not carry it forward.
+**This section's conclusion was wrong and is kept for the reasoning, not the
+verdict.** It said no bridge-side change could address it, on the grounds that
+room assignment never crosses Matter and the node log showed no traffic at the
+moment of the attempt. Both facts are true; the inference from them was not.
+The node log was silent because *nothing was being asked of it then* — the
+damage had already been done at the previous restart, when the node came online
+with an empty aggregator and Apple re-created every accessory as new (see the
+2026-08-06 section at the top of this file). "No traffic during the symptom" was
+read as "nothing bridge-side is involved", and the interval that mattered was
+never looked at. Fixed in plugin `2026.8.4` / bridge `0.6.0`.
 
-Recorded as something to watch, not something to fix. The
-`BridgedDeviceBasicInformation` enrichment above is unrelated and is not
-presented as a remedy for it.
+The `isBridged`/`uniqueIdentifiersForBridgedAccessories` hypothesis raised at the
+time is still **unsupported** and was not what fixed it; do not carry it forward.
+The `BridgedDeviceBasicInformation` enrichment above is likewise unrelated.
 
 ### Deploying E6 + E7 to jarvis
 
@@ -493,9 +644,11 @@ presented as a remedy for it.
 validation on jarvis* above). **E6 and E7 are not.** In order, because each step
 gates the next:
 
-1. **Publish `indigo-matter-bridge@0.5.0`** (above). Without it step 4 fails.
+1. **Publish `indigo-matter-bridge@0.6.0`** (above; `0.5.0` is published,
+   `0.6.0` is what `DEFAULT_INSTALL_SPEC` pins since issue #141). Without it
+   step 4 fails.
    For a dry run, use the local-install workaround instead.
-2. **Install the plugin bundle** — `2026.8.3`. This is an *update* to an
+2. **Install the plugin bundle** — `2026.8.4`. This is an *update* to an
    existing install, so a copy of the changed files plus a plugin restart is
    enough; only a first-time install needs the double-click.
 3. **Configure ▸ Matter export.** Confirm the new Export section renders, that
@@ -1504,7 +1657,9 @@ Domio no longer commissions; it relays a **share code** (Apple Home is admin 1; 
 **Where the export half stands: feature-complete and substantially proven on
 jarvis.** Ten PRs merged (#118–#128 plus the CI marker), one open (#130, E8
 docs). `indigo-matter-bridge@0.5.0` is **published to npm**. The plugin on jarvis
-is 2026.8.3 with the bridge running under launchd.
+is 2026.8.3 with the bridge running under launchd. (Superseded later the same
+day by issue #141 — see the top of this file: plugin `2026.8.4`, bridge `0.6.0`,
+which still needs publishing.)
 
 ## Validated live on jarvis (dates are real, evidence in this session's logs)
 
