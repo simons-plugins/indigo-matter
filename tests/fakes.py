@@ -250,6 +250,9 @@ class FakeBridgeClient:
         #: one reader — the watchdog's poll — so a fake without this cannot
         #: exercise the only path a node's persistence failure has to a user.
         self.status = None
+        #: What ``get_pairing`` answers (§3.7). Read on every attach since the
+        #: §5.5 window readout stopped trusting its own cache.
+        self.pairing = None
 
     # -- the recorded surface -------------------------------------------
     async def run(self):
@@ -274,6 +277,12 @@ class FakeBridgeClient:
     async def get_status(self, timeout=None):
         self._record("get_status")
         return self.status
+
+    async def get_pairing(self, timeout=None):
+        self._record("get_pairing")
+        if self.pairing is None:
+            raise ConnectionError("no pairing report configured")
+        return self.pairing
 
     async def close(self):
         self.closed = True

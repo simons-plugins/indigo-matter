@@ -263,6 +263,36 @@ The plugin defaults the managed server to `--listen-address 127.0.0.1` (loopback
 **matter-server listen address** config field. **Keep it on loopback** unless
 matter-server runs on a different host and you have a trusted firewall in front of it.
 
+### Before you pair the export bridge
+
+**Turn on Indigo Web Server authentication first.**
+
+*Plugins ▸ Matter ▸ Pair Matter Bridge…* opens a Matter commissioning window and
+writes a **live pairing passcode** to the Event Log, together with the URL of a
+page that shows the same code and its QR payload. That page is served by the
+Indigo Web Server, which asks for a password **only if you have switched
+authentication on**.
+
+While the window is open — up to 15 minutes — anyone who can reach that URL, or
+who reads that code, can add the bridge to **their own** Apple Home, Alexa or
+Google account. What they get is every Indigo device you export: they can see its
+state and they can operate it. Removing them afterwards means *Plugins ▸ Matter ▸
+Unpair an Ecosystem…*, and you would first have to notice.
+
+So, in order:
+
+1. Turn on authentication in Indigo's Web Server preferences (Indigo ▸
+   Preferences ▸ Web Server), or make sure the reflector is the only route in.
+2. Only then open a pairing window.
+3. Do not paste the pairing URL or the manual code into a chat, an email or a
+   forum post — treat both as the credential they are.
+4. Pair the ecosystem you meant to, and let the window close (it expires by
+   itself; it also closes the moment an ecosystem completes commissioning).
+
+The plugin cannot enforce any of this: authentication belongs to the Indigo Web
+Server, and a second password scheme underneath it would be worse than none. It
+does say so on the page and in the log line.
+
 ---
 
 ## Troubleshooting

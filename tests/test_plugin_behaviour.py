@@ -1008,7 +1008,7 @@ def test_menu_install_refuses_when_already_running(plug):
 def test_install_handler_clean_removes_package_before_reinstall(plug, plugin_mod, monkeypatch):
     order = []
     plug.server_process = SimpleNamespace(
-        remove_package=lambda: order.append("remove"),
+        remove_package=lambda: (order.append("remove"), True)[1],
         install=lambda: (order.append("install"), True)[1],
         resolved_bin_dir="/opt/homebrew/bin")
     plug.pluginPrefs = {"serverLocation": "local"}
@@ -1019,6 +1019,29 @@ def test_install_handler_clean_removes_package_before_reinstall(plug, plugin_mod
     plug._install_matter_server(clean=True)
     assert order == ["remove", "install"]             # package deleted BEFORE reinstalling
     reinstalled.restart.assert_called_once()
+
+
+def test_a_clean_reinstall_that_could_not_remove_does_not_install_over_it(plug, plugin_mod,
+                                                                          monkeypatch):
+    """⊗ `remove_package` used to log "Removed the … package" whatever happened.
+
+    npm missing, npm refusing, an OSError starting it and an rmtree that raised
+    were all reported as a completed removal — so a clean reinstall quietly
+    became a plain reinstall on top of the wedge the user came here to clear,
+    and said it had cleared it.
+    """
+    installed = []
+    plug.server_process = SimpleNamespace(
+        remove_package=lambda: False,
+        install=lambda: installed.append(True) or True,
+        resolved_bin_dir="/x")
+    plug.pluginPrefs = {"serverLocation": "local"}
+    plug._stopping = False
+    plug._restart_expected_until = 0.0
+    plug._install_matter_server(clean=True)
+    assert installed == []
+    said = " ".join(str(c.args[0]) for c in plug.logger.error.call_args_list)
+    assert "ABANDONED" in said
 
 
 def test_install_handler_default_does_not_remove_package(plug, plugin_mod, monkeypatch):

@@ -21,6 +21,7 @@ import { after, describe, it } from "node:test";
 
 import { Endpoint, Environment, Logger, ServerNode, VendorId } from "@matter/main";
 import { BasicInformationServer } from "@matter/main/behaviors/basic-information";
+import { BridgedDeviceBasicInformationServer } from "@matter/main/behaviors/bridged-device-basic-information";
 import { DoorLockServer } from "@matter/main/behaviors/door-lock";
 import { OnOffServer } from "@matter/main/behaviors/on-off";
 import { WindowCoveringServer } from "@matter/main/behaviors/window-covering";
@@ -39,6 +40,28 @@ import {
 import { EndpointRegistry } from "../src/registry.js";
 
 const PRODUCT_NAME = "Indigo Matter Bridge";
+
+/**
+ * The bridge identity every child endpoint publishes, as node.ts builds it.
+ * Spelled out here rather than imported from node.ts so these tests keep their
+ * distance from the ServerNode wiring.
+ *
+ * **This literal pins nothing about node.ts, and used to claim it did.** It is a
+ * hand-written copy, so it and `node.ts`'s `bridgedIdentity` agreed with each
+ * other and with nothing else — publishing Apple's vendor id on every bridged
+ * accessory left this suite green. What these tests actually pin is that the
+ * registry PROPAGATES whatever identity it is given; that the identity is the
+ * root node's own is pinned in `integration.test.ts`, against a real ServerNode.
+ */
+const BRIDGE_IDENTITY = {
+    vendorName: "simons-plugins",
+    vendorId: 0xfff1,
+    productName: PRODUCT_NAME,
+    hardwareVersion: 1,
+    hardwareVersionString: "1",
+    softwareVersion: 500,
+    softwareVersionString: "0.5.0",
+};
 const scratchRoots: string[] = [];
 
 /**
@@ -64,6 +87,7 @@ interface Harness {
     node: ServerNode;
     commands: CommandEventData[];
     logs: string[];
+    storagePath: string;
     close: () => Promise<void>;
 }
 
@@ -107,7 +131,7 @@ async function harness(
     const logs: string[] = [];
     const registry = new EndpointRegistry({
         aggregator,
-        productName: PRODUCT_NAME,
+        bridgeIdentity: BRIDGE_IDENTITY,
         emit: data => {
             commands.push(data);
             if (options.emitThrows === true) {
@@ -129,6 +153,7 @@ async function harness(
         node,
         commands,
         logs,
+        storagePath,
         close: async () => {
             registry.close();
             await node.close();
@@ -735,6 +760,95 @@ describe("set_state (§3.4)", () => {
             assert.equal((dim?.stateOf("onOff") as Record<string, unknown>).onOff, true);
         } finally {
             await h.close();
+        }
+    });
+
+    it("publishes the FULL bridged-accessory identity on every child", async () => {
+        // Every one of these is optional in the cluster (@matter/types 0.17.8:
+        // only `reachable` is mandatory), so nothing enforces their presence
+        // except this test — and left off, an ecosystem's accessory-detail pane
+        // reads blank or "Unknown" for a bridge that does know the answers.
+        // Pinned as a SET so the list cannot silently shrink.
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(1, Role.onOffLight, { label: "Kitchen Lamp" })], false);
+            const endpoint = [...h.aggregator.parts][0];
+            const info = endpoint?.stateOf("bridgedDeviceBasicInformation") as Record<string, unknown>;
+
+            // Per-accessory: from the spec.
+            assert.equal(info.nodeLabel, "Kitchen Lamp");
+            assert.equal(info.productLabel, "Kitchen Lamp");
+            assert.equal(info.uniqueId, uniqueIdFor(1));
+            assert.equal(info.reachable, true);
+            assert.equal(typeof info.serialNumber, "string");
+
+            // Bridge-wide: from the identity, and identical to what the root
+            // node's BasicInformation carries.
+            assert.equal(info.vendorName, BRIDGE_IDENTITY.vendorName);
+            assert.equal(Number(info.vendorId), BRIDGE_IDENTITY.vendorId);
+            assert.equal(info.productName, BRIDGE_IDENTITY.productName);
+            assert.equal(info.hardwareVersion, BRIDGE_IDENTITY.hardwareVersion);
+            assert.equal(info.hardwareVersionString, BRIDGE_IDENTITY.hardwareVersionString);
+            assert.equal(info.softwareVersion, BRIDGE_IDENTITY.softwareVersion);
+            assert.equal(info.softwareVersionString, BRIDGE_IDENTITY.softwareVersionString);
+
+            // Seeded so `increaseConfigurationVersion` has something to bump.
+            assert.equal(info.configurationVersion, 1);
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("matter.js RESTORES a bridged accessory's ConfigurationVersion across a restart", async () => {
+        // Pins a matter.js 0.17.8 behaviour that the data model actively
+        // suggests is false, so nobody re-derives the wrong answer from it.
+        //
+        // The bridged cluster's ConfigurationVersion carries NO data-model
+        // quality (`bridged-device-basic-information.element.js`), unlike the
+        // root's `quality: "N"`, and `BridgedDeviceBasicInformationServer`
+        // extends only `uniqueId` to be persistent. Read that way, the seed in
+        // `bridgedInfoFor` would be the live value on every start and every
+        // accessory would reset to 1 on every restart — a backwards jump on an
+        // attribute Matter defines as monotonic, and one matter.js guards
+        // against only on the root.
+        //
+        // It does not happen. matter.js writes the value into its own store as
+        // `root.parts.aggregator.parts.<id>.bridgedDeviceBasicInformation.configurationVersion`
+        // (measured) and restores it OVER the constructor seed, so the seed
+        // applies only the first time an endpoint id is created. Nothing needs
+        // to persist it alongside the endpoint numbers.
+        const storagePath = mkdtempSync(join(SCRATCH_ROOT, "indigo-matter-configver-"));
+        scratchRoots.push(storagePath);
+        const readVersion = (h: Harness): number => {
+            const endpoint = [...h.aggregator.parts][0];
+            const info = endpoint?.stateOf("bridgedDeviceBasicInformation") as Record<string, unknown>;
+            return info.configurationVersion as number;
+        };
+
+        let raised: number;
+        const first = await harness({ storagePath });
+        try {
+            await first.registry.reconcile([spec(1, Role.onOffLight)], false);
+            assert.equal(readVersion(first), 1, "a brand-new accessory starts at the seed");
+            // Drive it up through matter.js's own API, which is the only thing
+            // that may change it (the value is read-only over the wire).
+            await [...first.aggregator.parts][0]!.act(agent =>
+                agent.get(BridgedDeviceBasicInformationServer).increaseConfigurationVersion(),
+            );
+            raised = readVersion(first);
+            assert.ok(raised > 1, `expected the version to climb, got ${raised}`);
+        } finally {
+            await first.close();
+        }
+
+        // A genuinely new node and a new storage lock on the same directory.
+        const second = await harness({ storagePath });
+        try {
+            await second.registry.reconcile([spec(1, Role.onOffLight)], false);
+            assert.equal(readVersion(second), raised,
+                "matter.js must restore the persisted version over the seed");
+        } finally {
+            await second.close();
         }
     });
 

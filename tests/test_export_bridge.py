@@ -362,7 +362,11 @@ class TestLifecycle:
         h.store.remove(101)
         h.bridge.exports_changed()
         assert h.bridge.active is False
-        assert "will linger" in warnings_of(mock_logger)
+        # The warning must name what actually resumes it. "It will retry on its
+        # own" was false: nothing retries until the client next comes up.
+        said = warnings_of(mock_logger)
+        assert "LINGER" in said
+        assert "no retry loop" in said
         # F4: the socket must still be released — the client is unreachable from
         # here on, so a skipped close() leaks it until the plugin reloads.
         assert client.closed is True
@@ -674,7 +678,10 @@ class TestFailureSurfacing:
         for attempt in range(1, 6):
             h.bridge._on_unreachable(attempt)
         assert mock_logger.warning.call_count == 1
-        assert "started by hand" in warnings_of(mock_logger)
+        said = warnings_of(mock_logger)
+        assert "not responding" in said
+        # E7: Indigo control must never be implicated by an export-side fault.
+        assert "Indigo devices and inbound Matter control are unaffected" in said
 
 
 class TestHealthTick:

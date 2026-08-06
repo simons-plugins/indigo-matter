@@ -1,7 +1,6 @@
 {
   "name": "indigo-matter-bridge",
-  "version": "0.4.0",
-  "private": true,
+  "version": "0.5.0",
   "description": "Matter bridge node for the indigo-matter Indigo plugin — exports selected Indigo devices as Matter accessories.",
   "license": "MIT",
   "type": "module",
@@ -9,11 +8,28 @@
   "bin": {
     "indigo-matter-bridge": "dist/main.js"
   },
+  "files": [
+    "dist"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/simons-plugins/indigo-matter.git",
+    "directory": "bridge-node"
+  },
+  "homepage": "https://github.com/simons-plugins/indigo-matter",
+  "keywords": [
+    "matter",
+    "matter.js",
+    "indigo",
+    "bridge",
+    "home-automation"
+  ],
   "engines": {
     "node": ">=22.13.0"
   },
   "scripts": {
     "build": "tsc",
+    "prepublishOnly": "npm run clean && npm run build",
     "start": "node dist/main.js",
     "test": "tsc && tsc -p tsconfig.test.json && rm -rf .test-build/test/fixtures && mkdir -p .test-build/test/fixtures && cp -R ../tests/fixtures/bridge_protocol .test-build/test/fixtures/bridge_protocol && node --test --test-force-exit \".test-build/test/*.test.js\"",
     "clean": "rm -rf dist .test-build"

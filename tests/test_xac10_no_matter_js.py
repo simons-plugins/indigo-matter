@@ -96,6 +96,53 @@ def test_our_own_matter_prefixed_modules_are_not_flagged():
         assert not any(needle in module for needle in DENIED_SUBSTRINGS), module
 
 
+#: The bundle the release workflow zips and a user double-click-installs.
+PLUGIN_BUNDLE = Path(__file__).parent.parent / "indigo-matter.indigoPlugin"
+
+#: What a JavaScript/TypeScript source or bundle looks like on disk. Node's own
+#: extensions plus the source-map and declaration files that would come with a
+#: vendored build.
+JS_SUFFIXES = frozenset({".js", ".mjs", ".cjs", ".ts", ".mts", ".cts", ".jsx", ".tsx",
+                         ".map"})
+
+
+def test_no_javascript_ships_inside_the_plugin_bundle():
+    """XAC10's other half, and the one E7 actually claims.
+
+    The import check above pins that no Python module *reaches* matter.js. E7's
+    claim is stronger and about the artefact: "the plugin bundle ships **no
+    JavaScript**" (``bridge_agent``'s module docstring, PRD §8) — the node lives
+    in ``bridge-node/`` and is distributed as an npm package installed into
+    ``~/indigo-matter``. Nothing was checking that. Vendoring ``dist/`` into
+    ``Resources/`` to "make install easier" would satisfy every existing test,
+    silently ship a second copy of matter.js on the user's disk, and put a
+    version of the bridge inside the plugin that its own pinned install spec
+    disagrees with.
+    """
+    assert PLUGIN_BUNDLE.is_dir(), f"{PLUGIN_BUNDLE} is missing"
+    offenders = sorted(
+        str(path.relative_to(PLUGIN_BUNDLE))
+        for path in PLUGIN_BUNDLE.rglob("*")
+        if path.is_file() and path.suffix.lower() in JS_SUFFIXES
+    )
+    assert offenders == [], (
+        "these JavaScript/TypeScript files ship inside indigo-matter.indigoPlugin: "
+        f"{offenders}. The bridge node is an npm package (bridge_agent.DEFAULT_INSTALL_SPEC), "
+        "not bundle content — see ADR-0006 and PRD-indigo-matter-export §8 (XAC10/XG6)."
+    )
+
+
+def test_the_bundle_scan_would_actually_catch_a_planted_file(tmp_path):
+    """Pin the check itself: a sweep that found nothing because it looked in the
+    wrong place would pass forever."""
+    planted = tmp_path / "Contents" / "Resources" / "main.js"
+    planted.parent.mkdir(parents=True)
+    planted.write_text("// matter.js bundle\n")
+    found = [p for p in tmp_path.rglob("*")
+             if p.is_file() and p.suffix.lower() in JS_SUFFIXES]
+    assert found == [planted]
+
+
 def test_the_denylist_would_actually_catch_a_matter_js_import(tmp_path):
     """Pin the check itself: a planted violation must fail."""
     planted = tmp_path / "planted.py"

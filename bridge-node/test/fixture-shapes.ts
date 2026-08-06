@@ -225,8 +225,16 @@ export const openWindowInternal = {
     details: "mDNS advertiser is down",
 } satisfies ErrorFrame;
 
-/** §3.9/§3.10 both answer with an empty result; named for what they mean. */
-export const removeFabricResult = {};
+/**
+ * §3.9's two outcomes. It stopped answering `{}` when it turned out that "there
+ * was no fabric at that index" and "the ecosystem has been unpaired" were
+ * reaching the user as the same sentence — over a picker built from a cached
+ * fabric list, which makes the stale index the designed path rather than a typo.
+ */
+export const removeFabricResult = { removed: true, remaining: 1 };
+export const removeFabricAlreadyGone = { removed: false, remaining: 2 };
+
+/** §3.10 still answers with an empty result; named for what it means. */
 export const factoryResetResult = {};
 
 /**

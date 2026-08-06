@@ -630,9 +630,17 @@ class BridgeClient(WsJsonClient):
         result = await self._request_frame(self.proto.build_open_window(duration_seconds), timeout)
         return bridge_protocol.parse_window(result)
 
-    async def remove_fabric(self, fabric_index: int, timeout: float = LONG_TIMEOUT) -> None:
-        """Drop one ecosystem's fabric (§3.9)."""
-        await self._request_frame(self.proto.build_remove_fabric(fabric_index), timeout)
+    async def remove_fabric(self, fabric_index: int,
+                            timeout: float = LONG_TIMEOUT) -> bridge_protocol.FabricRemoval:
+        """Drop one ecosystem's fabric (§3.9). Returns what the node actually did.
+
+        Returning the outcome rather than ``None`` is the whole §3.9 fix: an
+        index with no fabric behind it is a *success* on the wire, and a caller
+        that tells the user "that ecosystem has been unpaired" in the past tense
+        has to be able to tell that apart from a real removal.
+        """
+        result = await self._request_frame(self.proto.build_remove_fabric(fabric_index), timeout)
+        return bridge_protocol.parse_fabric_removal(result)
 
     async def factory_reset(self, preserve_endpoint_numbers: bool = True,
                             timeout: float = LONG_TIMEOUT) -> None:

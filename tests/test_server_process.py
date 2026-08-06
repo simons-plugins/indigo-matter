@@ -1015,15 +1015,49 @@ def test_restart_reaps_orphan_before_bootstrap(tmp_path, mock_logger):
     assert ("TERM", "545") in runner.signals
 
 
-def test_remove_package_deletes_node_modules_but_keeps_storage(sp):
+def test_remove_package_uninstalls_via_npm_and_keeps_storage(sp):
+    """E7: the clean reinstall is `npm uninstall <package>`, not `rm -rf node_modules`.
+
+    The shared install root holds a second agent's package since E7, so the old
+    wholesale delete took the bridge down with the controller. npm is preferred over
+    deleting the directory because it also prunes the transitive deps nothing else
+    needs — see LaunchAgent.remove_package.
+    """
     os.makedirs(sp.storage_path, exist_ok=True)
     node_modules = os.path.join(sp.project_dir, "node_modules")
     assert os.path.isdir(node_modules)
+    with open(os.path.join(sp.resolved_bin_dir, "npm"), "w", encoding="utf-8") as handle:
+        handle.write("#!/bin/sh\n")
     sp._run = FakeRunner()
     sp.remove_package()
-    assert not os.path.exists(node_modules)      # package blown away
+    uninstalls = [call for call in sp._run.calls
+                  if "uninstall" in call and "matter-server" in call]
+    assert uninstalls, f"expected an npm uninstall, got {sp._run.calls}"
+    assert "--prefix" in uninstalls[0] and sp.project_dir in uninstalls[0]
     assert os.path.isdir(sp.storage_path)        # storage is sacred — pairings survive
     assert "bootout" in sp._run.subcommands()    # server stopped first
+
+
+def test_remove_package_falls_back_to_deleting_only_its_own_dir(sp, monkeypatch):
+    """No npm (or npm refuses): delete OUR package dir — never the whole root.
+
+    package-lock.json describes the entire install root, not one package, so it is
+    left alone too: deleting it on behalf of one agent unpins the other's transitive
+    dependency tree at its next install.
+    """
+    ours = os.path.join(sp.project_dir, "node_modules", "matter-server")
+    sibling = os.path.join(sp.project_dir, "node_modules", "indigo-matter-bridge")
+    os.makedirs(sibling, exist_ok=True)
+    lock = os.path.join(sp.project_dir, "package-lock.json")
+    with open(lock, "w", encoding="utf-8") as handle:
+        handle.write("{}")
+    assert os.path.isdir(ours)
+    sp._run = FakeRunner()
+    monkeypatch.setattr(sp, "_npm_uninstall", lambda: False)
+    sp.remove_package()
+    assert not os.path.exists(ours)
+    assert os.path.isdir(sibling)                # the other agent's package survives
+    assert os.path.exists(lock)                  # and so does the shared lock file
 
 
 def test_tail_error_log_returns_last_lines(sp):

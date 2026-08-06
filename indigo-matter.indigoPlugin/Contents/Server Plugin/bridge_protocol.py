@@ -318,6 +318,27 @@ class CommissioningWindow:
 
 
 @dataclass
+class FabricRemoval:
+    """The result of ``remove_fabric`` (§3.9) — what it DID, not that it returned.
+
+    The node used to answer ``{}`` whether it dropped a fabric or found nothing
+    at the index, so the unpair menu reported "that ecosystem has been unpaired.
+    Every accessory has been removed" over a node-side no-op. The stale index is
+    not an edge case: the picker is built from the CACHED fabric list, so an
+    ecosystem that unpaired *us* since the last §5 event is the designed way to
+    land there.
+
+    ``remaining`` is ``None`` — never a number — when the node could not read
+    its own fabric count (legitimate while matter.js rebuilds after a last-fabric
+    leave). Defaulted so a report from a node predating this result still parses,
+    and defaulted to the truthful direction: an old node that answered ``{}``
+    really had removed something.
+    """
+    removed: bool = True
+    remaining: Optional[int] = None
+
+
+@dataclass
 class BridgeCommand:
     """An ecosystem-originated action, from a ``command`` event (§5).
 
@@ -428,6 +449,24 @@ def parse_window(result: Any) -> CommissioningWindow:
         qr_pairing_code=str(data["qrPairingCode"]),
         window_expires_at=str(data["windowExpiresAt"]),
     )
+
+
+def parse_fabric_removal(result: Any) -> FabricRemoval:
+    """Normalise a ``remove_fabric`` payload (§3.9).
+
+    ``removed`` defaults to True and ``remaining`` to None so a node predating
+    this result (which answered ``{}`` and only ever answered it after a real
+    ``leave()``) is read as the removal it was, not as a no-op. A present-but-
+    unreadable ``remaining`` is None for the same reason the node sends null
+    there: a fabricated count is exactly the lie this shape exists to end.
+    """
+    data = result if isinstance(result, dict) else {}
+    raw_remaining = data.get("remaining")
+    try:
+        remaining = None if raw_remaining is None else int(raw_remaining)
+    except (TypeError, ValueError):
+        remaining = None
+    return FabricRemoval(removed=bool(data.get("removed", True)), remaining=remaining)
 
 
 def parse_command(data: Any) -> BridgeCommand:

@@ -373,8 +373,8 @@ not slot arithmetic. Per-export settings live in the §5.1 dialog.
 | E3 | Relay + dimmer export | XAC4 both directions, and XAC3's Apple Home control, against a manually started bridge node (start-on-export is E7's; the code display is E6's) |
 | E4 | Sensors + thermostat export | Mapping table complete for v1 |
 | E5 | Endpoint persistence | XAC5 — the highest-risk correctness requirement |
-| E6 | Pairing/unpairing UX + fabric readout | §6 complete, including XAC3's displayed-code pairing flow |
-| E7 | launchd agent + failure recovery | §7, XAC1, XAC2, XAC7, XAC8 |
+| E6 | Pairing/unpairing UX + fabric readout — **BUILT** (2026-08-05, plugin `2026.8.3`) | §6 complete, including XAC3's displayed-code pairing flow. "Pair Matter Bridge…" (§3.8, duration 180–900s), the QR page over IWS, "Unpair an Ecosystem…" (§3.9, two gates), the §5.5 Export config section, and the §5 pairing events surfaced in the log. **XAC3's live pairing is unverified** — it needs jarvis and a real ecosystem |
+| E7 | launchd agent + failure recovery — **BUILT** (2026-08-05, plugin `2026.8.3`, bridge `0.5.0`) | §7, XAC1, XAC2, XAC7, XAC8. `bridge_agent.BridgeProcess` is the second `AgentSpec`; it is installed and started by the empty→non-empty allow-list transition and stopped after the un-export lands. `remove_package` is per-package. **`indigo-matter-bridge` is not yet on the npm registry** — publishing is Simon's action (`docs/HANDOVER.md` → "Publishing the bridge node"), and until then the install action cannot resolve the pinned spec |
 | E8 | Docs | `INSTALL.md` export section, uncertified-prompt explanation, ecosystems-untested note (§10), `MATTER.md` outbound architecture |
 
 **E0 is the whole validation loop.** It answers the only question that can kill

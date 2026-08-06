@@ -50,6 +50,10 @@ DEFAULT_INSTALL_SPEC = "matter-server@1.2.2"
 DEFAULT_SERVER_ENTRY = "dist/esm/MatterServer.js"
 SERVER_OUT_LOG = "matter-server.log"
 SERVER_ERR_LOG = "matter-server.err.log"
+
+#: The EXACT wording of ``MenuItems.xml``'s ``installMatterServer`` item, for the
+#: messages that tell a user to run it. See ``AgentSpec.install_menu``.
+INSTALL_MENU = "Install/update matter-server"
 # Records the sha256 of the plist launchd was last told to load (bootstrap). launchd
 # caches a job's ProgramArguments at bootstrap time — rewriting the plist FILE does not
 # touch an already-loaded job — so we compare against this to tell "current definition
@@ -188,6 +192,11 @@ class ServerProcess(LaunchAgent):
                 argv=matter_server_arguments,
                 port=_port_number(port),
                 applied_marker=APPLIED_PLIST_MARKER,
+                # The exact wording of MenuItems.xml's `installMatterServer`.
+                # Happens to match the old "Install/update {package}" default —
+                # stated anyway, so a rename of the menu item is a change to one
+                # line rather than a message that silently stops being true.
+                install_menu=INSTALL_MENU,
             ),
             prefs, logger,
             home=resolved_home, npx_path=npx_path,

@@ -26,7 +26,7 @@
  *   through {@link COMMAND_SINKS}.
  */
 
-import { Endpoint, type EndpointType, Logger, type MaybePromise } from "@matter/main";
+import { Endpoint, type EndpointType, Logger, type MaybePromise, VendorId } from "@matter/main";
 import { BridgedDeviceBasicInformationServer } from "@matter/main/behaviors/bridged-device-basic-information";
 import { ColorControlServer } from "@matter/main/behaviors/color-control";
 import { DoorLockServer } from "@matter/main/behaviors/door-lock";
@@ -1319,18 +1319,77 @@ function mergeBehaviors(...patches: Record<string, unknown>[]): Record<string, u
     return merged;
 }
 
-/** The Bridged Device Basic Information every child carries (PRD §5.3). */
-function bridgedInfoFor(spec: EndpointSpec, productName: string): Record<string, unknown> {
+/**
+ * Who the bridge says it is, on every child accessory it publishes.
+ *
+ * The values are the *bridge's* — they are not per-device, and there is nothing
+ * per-device to put there: Indigo does not tell us who made a relay. Passed in
+ * rather than imported so this module keeps no dependency on {@link ../node},
+ * which imports it.
+ */
+export interface BridgedIdentity {
+    vendorName: string;
+    vendorId: number;
+    productName: string;
+    hardwareVersion: number;
+    hardwareVersionString: string;
+    softwareVersion: number;
+    softwareVersionString: string;
+}
+
+/**
+ * The Bridged Device Basic Information every child carries (PRD §5.3).
+ *
+ * **Every field below is optional in the cluster** (verified against
+ * `@matter/types` 0.17.8's `bridged-device-basic-information.d.ts`: only
+ * `reachable` is mandatory) — but populating the identity set is what
+ * matterbridge does and what ecosystems render as an accessory's manufacturer,
+ * model and firmware detail. Left off, those panes read blank or "Unknown",
+ * which is a worse answer than "simons-plugins" for something that genuinely is
+ * a software bridge.
+ *
+ * Note the cluster's optional set is NOT BasicInformation's: it has no
+ * `productId`, no `partNumber`, no `capabilityMinima`. Nothing outside the list
+ * above is added here for that reason.
+ */
+function bridgedInfoFor(spec: EndpointSpec, identity: BridgedIdentity): Record<string, unknown> {
     return {
         nodeLabel: spec.label,
-        productName,
+        productName: identity.productName,
         productLabel: spec.label,
         serialNumber: serialNumberFor(spec.indigoDeviceId),
         uniqueId: uniqueIdFor(spec.indigoDeviceId),
         reachable: spec.reachable,
+        // Branded, not a bare number: matter.js validates the tag at write time,
+        // and the root node's BasicInformation already goes through VendorId().
+        vendorName: identity.vendorName,
+        vendorId: VendorId(identity.vendorId),
+        // A bridge has no hardware, so this is a constant rather than an
+        // invention — but the attributes are what an ecosystem reads for the
+        // "Version" row, and an absent one renders as blank.
+        hardwareVersion: identity.hardwareVersion,
+        hardwareVersionString: identity.hardwareVersionString,
+        // The bridge node's own version, same derivation the root node uses, so
+        // an ecosystem showing a child's firmware and the bridge's own agree.
+        softwareVersion: identity.softwareVersion,
+        softwareVersionString: identity.softwareVersionString,
         // Optional on bridged devices, and matter.js only lets
         // `increaseConfigurationVersion` run when an initial value exists — so
         // it is seeded here rather than discovered as a throw on the first bump.
+        //
+        // **An INITIAL value, not the live one, and that distinction was
+        // measured rather than assumed** (0.17.8, `registry.test.ts`
+        // "restores a bridged accessory's ConfigurationVersion"). The data model
+        // suggests otherwise: the bridged cluster's attribute carries no `N`
+        // quality (`bridged-device-basic-information.element.js`), unlike the
+        // root's, and `BridgedDeviceBasicInformationServer` extends only
+        // `uniqueId` to be persistent — which reads as "matter.js will not
+        // remember this, so every restart resets the accessory to 1". It does
+        // remember it: the value is written to its own store as
+        // `root.parts.aggregator.parts.<id>.bridgedDeviceBasicInformation.configurationVersion`
+        // and restored over whatever is seeded here. So this constant applies
+        // only the first time an endpoint id is ever created, and nothing needs
+        // to persist it alongside the endpoint numbers.
         configurationVersion: 1,
     };
 }
@@ -1340,12 +1399,12 @@ function bridgedInfoFor(spec: EndpointSpec, productName: string): Record<string,
  * `Endpoint.id` is fixed at construction and is the identity matter.js keys its
  * persisted endpoint number on.
  */
-export function createEndpoint(spec: EndpointSpec, productName: string): Endpoint {
+export function createEndpoint(spec: EndpointSpec, identity: BridgedIdentity): Endpoint {
     const definition = definitionFor(spec.role);
     return new Endpoint(definition.deviceType() as never, {
         id: endpointIdFor(spec.indigoDeviceId),
         ...mergeBehaviors(
-            { [BRIDGED_INFO]: bridgedInfoFor(spec, productName) },
+            { [BRIDGED_INFO]: bridgedInfoFor(spec, identity) },
             definition.initialState(),
             statePatchOrRefuse(spec.role, spec.states),
         ),

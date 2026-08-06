@@ -47,13 +47,16 @@ MIN_NODE_VERSION = (22, 13)
 # DELIBERATELY SHARED between agents (not per-label): project_dir holds ONE node_modules
 # installed by ONE node, and every agent's LaunchAgent runs that same node. A per-agent
 # stamp would claim they can diverge, which is exactly the ABI crash this guards against.
-# CAVEAT the sharing does not cover: if nodeBinDir is repointed BETWEEN two agents'
-# installs, the later install rewrites the stamp with the new node and the earlier
-# agent's already-built native bindings go unwarned (npm install of package B does not
-# rebuild package A's bindings). Single-agent today this cannot happen (its own install
-# always rewrites the stamp). TODO(E7): when the bridge agent lands, either record
-# per-package node versions inside the one stamp or re-install both packages on a
-# nodeBinDir change.
+# CAVEAT the sharing does not cover, REVIEWED AT E7 AND KEPT: if nodeBinDir is repointed
+# BETWEEN two agents' installs, the later install rewrites the stamp with the new node and
+# the earlier agent's already-built native bindings go unwarned (npm install of package B
+# does not rebuild package A's bindings). Kept shared because the alternative — per-package
+# versions inside one stamp — would make `abi_warning` claim the two agents CAN legitimately
+# run on different nodes, which is the opposite of true: both LaunchAgents run whatever
+# single node this plugin resolved, so a per-package stamp that disagreed with the other
+# would be describing a state that cannot exist. The residual risk is one stale ADVISORY
+# warning after a manual nodeBinDir change, and the remedy is in the message the warning
+# already prints: run both Install/update menu actions.
 INSTALL_NODE_STAMP = ".indigo-node"
 
 
@@ -115,6 +118,15 @@ class AgentSpec:
         (via :attr:`applied_marker_name`) to a per-label name so two agents
         sharing one project_dir cannot clobber each other's digest and trigger
         spurious bootout/bootstrap cycles.
+    :param install_menu: the EXACT wording of this agent's Install/update menu
+        item. Every message that tells a user to run it interpolated
+        :attr:`package` instead, producing "Plugins ▸ Matter ▸ Install/update
+        indigo-matter-bridge" — a menu that does not exist (the real one is
+        "Install/update the Matter export bridge"). It fires on the first-run
+        path, where the user is already stuck, so a menu name they cannot find
+        is the difference between a fixable state and a support thread. Blank
+        falls back to the old wording via :attr:`install_menu_name`, which is
+        right for an agent that has no menu at all.
     """
 
     label: str
@@ -130,11 +142,17 @@ class AgentSpec:
     argv: Callable[[Any], list[str]]
     port: Optional[int] = None
     applied_marker: Optional[str] = None
+    install_menu: str = ""
 
     @property
     def applied_marker_name(self) -> str:
         """Filename of this agent's applied-plist digest stamp."""
         return self.applied_marker or f".launchagent-{self.label}.sha256"
+
+    @property
+    def install_menu_name(self) -> str:
+        """What to call this agent's Install/update menu item in a message."""
+        return self.install_menu or f"Install/update {self.package}"
 
 
 class LaunchAgent:
@@ -381,7 +399,7 @@ class LaunchAgent:
         if not self._exists(entry):
             return (
                 f"the {self.spec.package} package is not installed ({entry} is missing). "
-                f"Use the plugin menu: Plugins ▸ Matter ▸ Install/update {self.spec.package} "
+                f"Use the plugin menu: Plugins ▸ Matter ▸ {self.spec.install_menu_name} "
                 f"(or run 'npm install {self.spec.install_spec}' in {self.project_dir} "
                 f"with the same node, {self.node_path}), then restart the plugin."
             )
@@ -406,7 +424,7 @@ class LaunchAgent:
         return (
             f"{self.spec.package} was installed with Node {stamped}.x but the resolved node "
             f"({self.node_path}) is {current}.x. If it fails to start, reinstall via "
-            f"Plugins ▸ Matter ▸ Install/update {self.spec.package}, or clear the stale stamp "
+            f"Plugins ▸ Matter ▸ {self.spec.install_menu_name}, or clear the stale stamp "
             f"({self._install_stamp_path()})."
         )
 
@@ -725,32 +743,105 @@ class LaunchAgent:
         except FileNotFoundError:
             pass
 
-    def remove_package(self) -> None:
-        """Delete the installed npm package for a clean reinstall.
+    def remove_package(self) -> bool:
+        """Uninstall THIS agent's npm package for a clean reinstall. True if it went.
 
         Stops the managed job and reaps any orphan first (so nothing holds the files or
-        the storage lock), then removes ``node_modules`` and ``package-lock.json`` under
-        project_dir and drops the applied-plist marker so the next ensure_installed
-        re-bootstraps. The storage dir is SACRED and never touched — commissioned devices
-        and pairings survive a clean reinstall. Blocking; run off the Indigo main thread.
+        the storage lock), then removes the package, then drops this agent's
+        applied-plist marker so the next ensure_installed re-bootstraps. The storage dir
+        is SACRED and never touched — commissioned devices and pairings survive a clean
+        reinstall. Blocking; run off the Indigo main thread.
+
+        **Per-package since E7, and it had to become so.** This used to ``rmtree`` the
+        whole shared ``node_modules`` and delete ``package-lock.json``, which was
+        tolerable while exactly one agent existed and destructive the moment a second one
+        did: the sibling's package vanished underneath a launchd job that was still
+        loaded and still pointing at it, so the next respawn crash-looped on
+        module-not-found, its applied marker still matched, and nothing in the plugin
+        ever said why. The lock file goes the same way — it describes the whole install
+        root, not one package, so deleting it on behalf of one agent unpins the other's
+        transitive dependency tree at its next install.
+
+        ``npm uninstall`` is preferred over deleting the directory because it is the only
+        thing that also prunes the transitive dependencies this package brought in and
+        nothing else needs — matter.js is ~40MB of them. Removing the package directory
+        is the fallback for a project dir npm cannot operate on at all.
+
+        **The trade this makes explicit:** wiping ``node_modules`` wholesale also fixed a
+        corrupt *shared* dependency, and this no longer does. That was never what the
+        menu action claimed to do, and rebuilding a sibling agent's install as a side
+        effect of recovering this one is worse than the fault it happened to cure.
+
+        **The return value is the fix for a message that was always the same.**
+        This used to log "Removed the … package" unconditionally: npm missing,
+        npm refusing, an ``OSError`` starting it and an ``rmtree`` that raised
+        were all reported as a completed removal, and the caller then reinstalled
+        on top of the wedged install the user was trying to clear — with a log
+        saying it had been cleared. The outcome is now decided by looking: the
+        package directory is either gone or it is not.
         """
         self._bootout()
         self.reap_orphan_servers()
-        for name in ("node_modules", "package-lock.json"):
-            target = os.path.join(self.project_dir, name)
-            try:
-                if os.path.isdir(target):
-                    shutil.rmtree(target)
-                elif os.path.exists(target):
-                    os.remove(target)
-            except OSError as exc:
-                self.logger.warning("could not remove %s: %s", target, exc)
+        if not self._npm_uninstall():
+            self._remove_package_dir()
         try:
             os.remove(self._applied_marker_path())
         except OSError:
             pass
+        if os.path.exists(self._package_dir()):
+            self.logger.error(
+                "Could NOT remove the %s package: %s is still there. Nothing was reinstalled over "
+                "it, so the wedged install you are trying to clear is still in place — remove the "
+                "directory by hand (or run 'npm uninstall --prefix %s %s'), then retry.",
+                self.spec.package, self._package_dir(), self.project_dir, self.spec.package)
+            return False
         self.logger.info("Removed the %s package under %s (storage left intact)",
                          self.spec.package, self.project_dir)
+        return True
+
+    def _npm_uninstall(self) -> bool:
+        """``npm uninstall`` this agent's package. True if npm reported success.
+
+        Returns False — quietly, at debug — when npm is absent or refuses, because the
+        caller has a working fallback and a warning here would name a problem the user
+        does not have.
+        """
+        npm = os.path.join(self.resolved_bin_dir, "npm")
+        if not self._exists(npm):
+            self.logger.debug("npm not found at %s; removing the package directory instead", npm)
+            return False
+        env = dict(os.environ)
+        env["PATH"] = self.resolved_bin_dir + os.pathsep + env.get("PATH", "")
+        try:
+            result = self._run([npm, "uninstall", "--prefix", self.project_dir, self.spec.package],
+                               capture_output=True, text=True, check=False, env=env)
+        except OSError as exc:
+            self.logger.debug("npm uninstall %s could not start (%s)", self.spec.package, exc)
+            return False
+        if result is None or result.returncode != 0:
+            detail = "" if result is None else (result.stderr or result.stdout or "").strip()
+            self.logger.debug("npm uninstall %s exited non-zero (%s); removing the package "
+                              "directory instead", self.spec.package, detail[:500])
+            return False
+        return True
+
+    def _remove_package_dir(self) -> None:
+        """Delete ``node_modules/<package>`` and nothing else.
+
+        The fallback when npm cannot run. Scoped to this agent's own directory: the
+        sibling's package, the shared transitive dependencies it may also be using, and
+        ``package-lock.json`` are all left alone. Some of this package's own transitive
+        deps are therefore orphaned in ``node_modules`` — harmless, and the next
+        ``npm install`` reconciles them.
+        """
+        target = os.path.join(self.project_dir, "node_modules", self.spec.package)
+        try:
+            if os.path.isdir(target):
+                shutil.rmtree(target)
+            elif os.path.exists(target):
+                os.remove(target)
+        except OSError as exc:
+            self.logger.warning("could not remove %s: %s", target, exc)
 
     def stop(self) -> bool:
         """Stop the agent (bootout) but keep the plist so ``start`` can reload it.
@@ -766,14 +857,19 @@ class LaunchAgent:
         Part of the ``server_control`` seam used by fabric restore. Returns the
         REAL outcome so callers (notably fabric restore) are never told the server
         started when it did not: a successful ``bootstrap`` on the existing-plist
-        path, or ``is_running()`` after the install path (``ensure_installed`` logs
+        path, or :meth:`is_alive` after the install path (``ensure_installed`` logs
         its own launchctl failure but returns None, so we verify independently).
+
+        :meth:`is_alive`, NOT ``is_running``: the latter means "launchd knows this
+        label", which a loaded-and-dead job satisfies — so a bootstrap that put a
+        job on the books and a crash-loop that never stayed up reported the same
+        success to fabric restore, the one caller least able to afford it.
         """
         if os.path.exists(self.plist_path):
             self.reap_orphan_servers()  # nothing legit runs after stop(); clear any orphan
             return self._bootstrap_and_record()
         self.ensure_installed()
-        return self.is_running()
+        return self.is_alive()
 
     def restart(self) -> bool:
         """Reload the agent from the on-disk plist so the CURRENT args take effect.
@@ -809,11 +905,62 @@ class LaunchAgent:
         self.logger.warning("%s reload failed; falling back to reinstall", self.spec.package)
         self.uninstall()
         self.ensure_installed()
-        return self.is_running()
+        return self.is_alive()   # "loaded" is not "running" — see is_running()
 
     def is_running(self) -> bool:
+        """Whether launchd knows this label. **"Loaded", NOT "alive".**
+
+        Kept under its historical name and its historical meaning because callers
+        that ask "is there a job here to bootout / to leave alone" want exactly
+        this. A job that is loaded and DEAD passes it — the #104 fault-2 state
+        this file already handles at :meth:`_apply_plist` — so anything that
+        wants to report a process as running must use :meth:`run_state`.
+        """
         result = self._launchctl("print", f"gui/{os.getuid()}/{self.spec.label}")
         return bool(result is not None and result.returncode == 0)
+
+    #: :meth:`run_state` outcomes. Four, because collapsing them is how "the
+    #: LaunchAgent is running" gets printed over a job that never started.
+    NOT_LOADED = "not_loaded"
+    RUNNING = "running"
+    LOADED_NOT_RUNNING = "loaded_not_running"
+    UNKNOWN = "unknown"
+
+    def run_state(self) -> str:
+        """What launchd says about the job, as one of four distinguishable facts.
+
+        * :data:`NOT_LOADED` — launchd has no such label.
+        * :data:`RUNNING` — loaded, with a pid we parsed. The ONLY positive
+          signal; nothing may claim the process is up without it.
+        * :data:`LOADED_NOT_RUNNING` — loaded with no ``pid =`` line at all.
+          launchd reports ``state = not running`` and, under our ``KeepAlive
+          {SuccessfulExit: false}``, has decided not to respawn it (a node that
+          exits 0 on a fatal startup error reads as a clean exit). Loaded and
+          dead, indefinitely.
+        * :data:`UNKNOWN` — a ``pid =`` line we could not parse. The job may
+          well be alive and we cannot prove it either way, so callers must
+          neither claim success nor report a failure.
+
+        The facts were already parsed by :meth:`_managed_job`; only the readers
+        were missing, which is why ``ensure_installed() is not None`` was being
+        printed as "the LaunchAgent is running".
+        """
+        job = self._managed_job()
+        if not job["loaded"]:
+            return self.NOT_LOADED
+        if job["pid"] is not None:
+            return self.RUNNING
+        return self.UNKNOWN if job["pid_line"] else self.LOADED_NOT_RUNNING
+
+    def is_alive(self) -> bool:
+        """Whether a process is (or may be) running under this label.
+
+        True for :data:`RUNNING` and for :data:`UNKNOWN` — an unparseable pid
+        line is not evidence of death, and treating it as failure would report a
+        healthy server as stopped. False only when launchd itself says there is
+        no job, or says the job is loaded and not running.
+        """
+        return self.run_state() in (self.RUNNING, self.UNKNOWN)
 
     # ------------------------------------------------------------------
     # Orphan reaping — a server can outlive the LaunchAgent that started it

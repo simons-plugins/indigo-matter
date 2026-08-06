@@ -1,14 +1,480 @@
 # indigo-matter — Build Handover
 
-**Last updated:** 2026-08-05 18:58 UTC
-**Active work:** `feat/e5-persistence-hardening` (PR #126) — see the two E5
-sections below; the `main` summary in this header describes the last merge, not
-that branch.
+**Last updated:** 2026-08-05 23:21 UTC
+**Active work:** `feat/e6-e7-pairing-and-agent` — E6 + E7, the last functional
+export milestones (E8 is docs only). See the section immediately below; the
+`main` summary in this header describes the last merge, not that branch.
 **Branch:** `main` — PRs #106, #107, #108 all merged.
 **Version:** `2026.7.13`
 **Tests:** 1005 passing (`cd indigo-matter && /Library/Frameworks/Python.framework/Versions/Current/bin/python3 -m pytest -q`)
 **Deployed:** jarvis is **unchanged** — still running the #103 code (v2026.7.10 era). **Nothing from #106/#107/#108 has been deployed**, so the #104 supervision fixes are NOT yet live on jarvis.
 **Status:** **Wi-Fi AND Thread validated with real hardware.** #104's three server-supervision faults are fixed and merged (#107). #105's diagnostic is merged (#108) but **#105 stays open** — the bridged-endpoint path still has no real-bridge validation. `domio-code` #236 is fixed and closed (domio-code PR #237). Known-open: #105, plus the older #43, #46, #21–#24.
+
+---
+
+## 2026-08-05 — E6 + E7: pairing UX, fabric management, the bridge LaunchAgent
+
+Plugin `2026.8.3`, bridge-node `0.5.0`. Suites: **2243 Python**, **348 TS**
+(from 2056/344). pylint 9.41.
+
+> The counts above are the ones this branch actually produces. Two earlier
+> numbers here were wrong and both were wrong the *reassuring* way: the TS suite
+> was recorded as 345 (`npm test` reported 347 before this batch, 348 after) and
+> the plugin version as `2026.8.1` while `Info.plist` said `2026.8.3`. A suite
+> count is a claim about coverage and a version is what a user reads back to you
+> in a bug report — both are only useful if they are measured.
+
+### The PR #128 review batch (2026-08-05) — read this before touching E6/E7
+
+Three reviewers converged on one family of faults, and it is worth naming
+because it will recur: **claiming success from the wrong signal.** Every one of
+these shipped a message that was true of some *nearby* fact and false of the
+thing the user was told.
+
+| Signal that was read | What it actually means | What was claimed |
+|---|---|---|
+| `ensure_installed() is not None` | "preflight passed" | "the LaunchAgent is running" |
+| `is_running()` | "launchd knows this label" | "the process is up" |
+| `bridge.active` | "a client object exists" | "the bridge node is running" |
+| `remove_fabric` returned | "the frame came back" | "that ecosystem has been unpaired" |
+| `remove_package` returned | it ran | "Removed the … package" |
+
+The corrections, in case any of them looks like an over-reaction later:
+
+* **`LaunchAgent.run_state()`** now returns four distinguishable states and
+  `is_alive()` is the positive one. `is_running()` keeps its old name **and its
+  old meaning** ("is loaded") because the bootout/leave-alone callers want
+  exactly that — a loaded-but-DEAD job (issue #104's fault 2) passes it, which is
+  the whole point of the split.
+* **The first-run dead end.** The bridge's plist is written by exactly one place
+  (`_start_bridge_agent`), which cannot get past its own preflight before the
+  package exists. So on a fresh machine: export → preflight fails → no plist →
+  Install/update → npm succeeds → `restart()` finds no plist → "nothing to
+  restart, fix the problem reported above" (there was none) → "the restart
+  FAILED — the old version may still be running" (nothing was). `menuInstallBridgeNode`
+  now calls `ensure_installed()` first and only `restart()`s when it returns
+  `False` (i.e. launchd left an old job alone). The old test could not catch it:
+  it asserted against `Mock(restart=…True)`, which has a plist by virtue of being
+  a Mock. It is now a real `BridgeProcess` on a `tmp_path` home.
+* **`_stop_bridge_agent` uninstalls rather than stops.** Keeping the plist looked
+  thrifty until you notice it carries `RunAtLoad: True`: after the next login
+  launchd started an unpaired bridge node, with an EMPTY allow-list, advertising
+  on 5540, that the plugin never started and — because the XAC1 latch is false in
+  a session that never brought it up — would never stop. XG5's guarantee has to
+  survive a reboot. Re-deriving the plist costs one `ensure_installed`.
+* **§3.9 answers `{removed, remaining}`** on both sides (protocol, fixtures,
+  docs). The already-gone case is not an edge: the unpair picker is built from
+  the *cached* fabric list, so an ecosystem that unpaired us since the dialog
+  opened is the designed way to reach it. The node also emits `fabrics_changed`
+  (`change: "unchanged"`) on that path, because a caller asking to remove a
+  fabric that is not there is demonstrably holding a stale list and this is the
+  only moment the node knows.
+* **The vendor-ID table was wrong on the destructive picker.** `0x1075` is not an
+  issued vendor id at all (SmartThings is `0x110A`) and `0x100B` is Signify, not
+  Google (`0x6006`). Apple's *second* fabric (`0x1384`, "Apple Keychain" — the
+  one ADR-0005 predicted from the observed three-fabric count) was missing
+  entirely. Every entry is now verified against the CSA's Distributed Compliance
+  Ledger, and `test_export_agent_wiring.py` pins the overlap against the
+  **vendored matter.js source** rather than mirroring our own table. On a picker
+  whose Execute button removes every exported accessory from the chosen
+  ecosystem, a wrong name reads as the right ecosystem.
+
+**Scope note, so it is not attributed to the wrong milestone later:**
+`bridgedInfoFor`'s identity expansion — every bridged child publishing the full
+`BridgedIdentity` (vendor name/id, product name, hardware and software versions)
+rather than just label/serial/uniqueId/reachable — arrived in **this PR (#128,
+E6+E7)**, not in E4 with the role factories it sits beside in `endpoints.ts`.
+Until this batch nothing pinned it to the root node's `BasicInformation`:
+`registry.test.ts` asserted a hand-written copy of the same literal (its comment
+claimed otherwise and has been corrected), so publishing Apple's vendor id on
+every child left the suite green. `integration.test.ts` now compares each child
+against a real `ServerNode`'s own `basicInformation`.
+
+**Security note, and it needs a decision from Simon, not from the code.** The
+pairing page serves a **live commissioning passcode** over IWS, which
+authenticates only if the user has switched authentication on. While a window is
+open, anyone who can reach that URL can commission the bridge — and every
+exported Indigo device — onto *their* Apple Home, Alexa or Google account.
+Building auth into the handler was deliberately **not** attempted (IWS owns
+authentication; a second scheme underneath it is worse than none). What this
+batch does instead is say so, prominently, on the page itself and in the menu's
+log line. See `docs/INSTALL.md` → "Before you pair the export bridge".
+
+**Two new bridge menu items** close the gap where the controller had recovery
+exits and the bridge had none: "Reinstall the Matter export bridge (clean)…"
+(safe only because `remove_package` became per-package in E7) and "Stop the
+Matter export bridge…" — for the user who disables the plugin and is otherwise
+left with a running node and no UI at all, since the allow-list lever needs the
+plugin to be running.
+
+These are the last two *functional* milestones. E8 is docs.
+
+### E6 — the user surface for protocol that already existed
+
+Everything the node needs for pairing shipped in E5: `get_pairing`,
+`open_commissioning_window`, `remove_fabric`, and the §5 `fabrics_changed` /
+`commissioned` / `decommissioned` / `window_closed` events. **None of it was
+reachable from the plugin**, and the events were consumed by nobody — so a
+bridge could be built, exported to, and never paired, and pairing activity was
+invisible without polling. E6 is the surface.
+
+Four things are shaped by what Indigo dialogs can actually do, not by
+preference, and they are worth knowing before touching any of it:
+
+1. **The pairing codes go to the EVENT LOG.** Indigo dialogs have no dynamic
+   labels, so a value computed *by the callback* cannot be shown in the dialog
+   that produced it. The log is this plugin's established channel for runtime
+   strings, and it is also the only place a code survives being scrolled past —
+   a window lasts up to 15 minutes and nobody types 11 digits right first time.
+2. **The QR goes on an IWS-served page**, because a log line cannot carry an
+   image. `<Action id="pairing" uiPath="hidden">` → `http_pairing`, the one
+   handler in the plugin that returns HTML rather than JSON, at
+   `…/message/com.simons-plugins.indigo-matter/pairing/`. The URL is logged
+   beside the codes and comes from `indigo.server.getWebServerURL()`, which
+   prefers the reflector then the Bonjour name — so it is reachable from the
+   phone the user is holding, which is the case the page exists for.
+3. **The §5.5 config readout is a read-only textfield**, seeded by
+   `getPrefsConfigUiValues`, for the same no-dynamic-labels reason. It does **no
+   I/O**: everything it shows comes from the last attach, the 15-second status
+   poll, or the §5 fabric events. A dialog open must never block on a node that
+   may be down. Both callback spellings are defined (`getPrefsConfigUiValues`
+   and `get_prefs_config_ui_values`) because Indigo 2025.2's `PluginBase`
+   carries snake_case aliases and which one it dispatches on is undocumented —
+   getting it wrong costs a silently blank field, so both is cheap insurance.
+4. **"Pair" is "open a window", not "show the code" (PRD §6).** A Matter
+   passcode is not durable: the moment the first ecosystem commissions, the
+   basic window closes and the original code stops working. There is no such
+   thing as *the* pairing code to display.
+
+Two states the pair action must **not** open a window in, and both would do real
+harm:
+
+- **already open** — §3.8's `assertClosed` refuses a second one, and forcing it
+  would kill the code the user is currently holding;
+- **never commissioned** — §3.7 says the basic window is *already* open with the
+  persisted originals, so deriving a fresh enhanced code there invalidates a
+  code the user may already be typing.
+
+Both are detected by a `get_pairing` before the open, and both report the
+existing code instead.
+
+**Duration is validated, not clamped.** 180–900s is Matter's band and the node
+clamps to it; being silently given 900 when you asked for 60 is a difference the
+user should hear about while the dialog is still open.
+
+**Unpair** is a dynamic fabric picker plus E5's now-verified two-gate pattern.
+The picker is built from the fabric set the bridge already reported — never from
+a fresh WS round trip, because a list callback runs while the dialog is opening.
+Its rows name the *vendor* (`Apple (index 1)`), because a fabric's own `label`
+is whatever the commissioner wrote there and for Apple that is a UUID-ish string
+that tells nobody anything; the index is always shown because that is what §3.9
+removes a fabric **by**. The last-fabric case E5 hardened gets its own message:
+matter.js factory-resets itself when the fabric set empties, so the user has
+just reset the whole bridge without using the reset menu, and reporting a
+routine removal would be a lie.
+
+### E7 — the bridge node as a managed LaunchAgent
+
+`bridge_agent.BridgeProcess` is the second `AgentSpec`, and it is what the XOQ3
+extraction was *for*: label `com.simons-plugins.indigo-matter.bridge`, package
+`indigo-matter-bridge`, entry `dist/main.js`, its own logs, the **default
+per-label** applied-digest marker (the controller keeps its legacy un-suffixed
+one because every existing install has that file), port 5581, and an argv
+builder. The `.indigo-node` install stamp stays **shared** — reviewed again here
+and kept, because both agents run whatever single node this plugin resolved, so
+a per-package stamp would assert a divergence that cannot exist.
+
+**The storage path is derived, not configured, in exactly one place.**
+`bridge_agent.bridge_storage_path()` is called by the agent (which passes it as
+`--storage-path`), by the fabric backup (which archives it), and it must equal
+`config.ts`'s `DEFAULT_STORAGE_PATH`. A disagreement here is silent: a node
+serving from one directory while the plugin backs up another, discovered at
+restore time.
+
+**The lifecycle gate (XG5/XAC1) has an ordering that matters in both
+directions.** The agent starts on the empty→non-empty allow-list transition,
+*before* the client (a client built first spends its whole backoff dialling a
+port nothing is listening on yet). It stops on non-empty→empty **after** the
+un-export has landed and the socket is closed — stopping first would take the
+node down with the §3.1 removal request still unsent, leaving the accessories in
+every paired ecosystem and the debt pointing at a bridge the plugin has just
+switched off. It is stopped even when that attach *failed*, because the socket
+is closed and the list is empty either way and the debt in prefs is what carries
+the un-export forward.
+
+A latch (`_agent_started`) gates the stop: a session that never brought the
+agent up never boots one out, so a plugin reload on an install that has never
+exported anything touches launchd not at all, and a bridge somebody started by
+hand is not taken down by us.
+
+**A bridge-agent failure degrades export only.** The seams are contained in
+`ExportBridge` (an Indigo callback must never see a launchd fault), the client
+is still built when the agent will not start — refusing to build it would
+replace one diagnosis with *none*, since the client's unreachable path is what
+reports the outage with the node's error log attached — and every message says
+in as many words that Indigo devices and inbound Matter control are unaffected.
+
+`_bridge_agent_diagnosis` is deliberately **read-only**: launchd owns respawn
+via `KeepAlive`, the loaded-but-dead revival lives in `ensure_installed`, and a
+diagnostic that quietly bounced the agent on every failure streak would turn a
+crash-loop into a crash-loop nobody can read the log of.
+
+**`remove_package` is now per package** — the `TODO(E7)` in `launch_agent.py`,
+closed. It used to `rmtree` the shared `node_modules` and delete
+`package-lock.json` while booting out only its own label, which with two agents
+meant the sibling's package vanished under a still-loaded job that then
+crash-looped on module-not-found with a *matching* applied marker and nothing in
+the log to say why. It is now `npm uninstall <package>` (preferred, because it
+also prunes the transitive deps nothing else needs — matter.js is ~40MB of
+them), falling back to deleting `node_modules/<package>` alone. The lock file is
+left alone: it describes the whole install root, not one package.
+
+The trade this makes explicit: wiping `node_modules` wholesale also happened to
+fix a corrupt *shared* dependency, and this no longer does. That was never what
+the menu claimed to do, and rebuilding a sibling agent's install as a side
+effect of recovering this one is worse than the fault it incidentally cured.
+
+### PRD §5.5's export switch, and the mistake it would have been easy to make
+
+`exportEnabled` fails **open** — absent, blank, unparseable *or null* all read as
+ON. That is the opposite of the controller's attestation flag, which fails
+closed, and deliberately so: the harm of misreading *that* one is relaxing
+device attestation; the harm of misreading *this* one is un-running a working
+export for every user whose prefs predate the key.
+
+**Switching it off does not un-export.** It drops the socket and stops the
+agent; the endpoints, the pairings and the allow-list all stand, and the
+accessories go unavailable rather than disappearing. Answering the switch with
+the §3.1 mass removal would delete every accessory from every paired ecosystem
+and take their names, rooms, scenes and automations with them — a destructive,
+irreversible answer to a checkbox. Ticking it back on reconnects.
+`closedPrefsConfigUi` re-runs the transition so the switch acts immediately;
+changed **ports** still need a reload, and the config dialog says so.
+
+### The QR: what was chosen and what was not
+
+**No QR is generated.** Rendering one needs either a Python dependency (Indigo's
+framework Python has no image stack and this plugin ships none) or a
+hand-written JS encoder — a few hundred lines of Reed–Solomon and bit-masking
+whose failure mode is a plausible-looking square that no phone can read. Neither
+earns its place for a code that Apple Home, Alexa and Google all accept **typed
+in**.
+
+The page therefore shows the manual code at a size you can read across a room,
+the raw `MT:` payload for copying, and a link to the CHIP project's own QR
+viewer (`project-chip.github.io/connectedhomeip/qrcode.html`) for anyone who
+wants to scan. Two consequences to be honest about: that link needs internet
+access, and it sends the payload to a third-party page — both stated on the page
+itself. The payload is URL-encoded into it, because an `MT:` string is base-38
+and can legitimately contain `+`, `/` or `%`; unencoded, the tool opens on a
+silently truncated payload, which is a QR that scans and means the wrong thing.
+
+If a real QR is ever wanted, the honest options are a bundled pure-Python
+encoder under `Contents/Packages/` or an SVG built server-side — both are new
+dependencies, and neither was worth it here.
+
+### Bridged-accessory identity is now complete
+
+`bridgedInfoFor` populated only `nodeLabel`, `productName`, `productLabel`,
+`serialNumber`, `uniqueId`, `reachable` and `configurationVersion`. It now also
+carries **`vendorName`, `vendorId`, `hardwareVersion` + `hardwareVersionString`,
+`softwareVersion` + `softwareVersionString`** — parity with matterbridge, and
+more accessory detail in every ecosystem's device pane, which otherwise reads
+blank or "Unknown" for facts the bridge does know.
+
+Verified against `@matter/types` 0.17.8's
+`bridged-device-basic-information.d.ts`: **every one of these is optional on the
+bridged cluster** (only `reachable` is mandatory), so all six are permitted.
+Worth knowing for next time: the bridged cluster's optional set is **not**
+`BasicInformation`'s — it has no `productId`, no `partNumber`, no
+`capabilityMinima`, and nothing outside the verified list was added.
+
+The values come from a new `BridgedIdentity` struct built in `node.ts` from the
+same constants and the same `softwareVersion` derivation the root node's
+`BasicInformation` uses, so an ecosystem showing a child's firmware and the
+bridge's own can never be shown two answers. `registry.ts`'s `productName`
+option became `bridgeIdentity`. `registry.test.ts` pins the whole field set so
+it cannot silently shrink. `vendorId` is written through `VendorId()` — matter.js
+validates the brand at write time.
+
+### A matter.js finding worth not re-deriving: ConfigurationVersion IS persisted
+
+While enriching the bridged identity above, the seeded `configurationVersion: 1`
+looked like a bug, and the data model says it is one:
+
+- the **root** node's `BasicInformation.ConfigurationVersion` carries data-model
+  quality `N` (`@matter/model` 0.17.8, `basic-information.element.js`), so
+  matter.js persists it — a live bridge shows it climbing, and jarvis's is at 13;
+- the **bridged** cluster's attribute carries **no quality at all**
+  (`bridged-device-basic-information.element.js`:
+  `Attribute({ name: "ConfigurationVersion", id: 24, conformance: "[Rev >= v6]" })`),
+  and `BridgedDeviceBasicInformationServer.schema` extends only `uniqueId` to be
+  persistent;
+- child endpoints are constructed fresh on every attach.
+
+Read together that says every exported accessory's ConfigurationVersion resets to
+**1** on every node restart — a backwards jump on an attribute Matter defines as
+monotonic (controllers use it to decide whether cached accessory metadata is
+stale), and one matter.js guards against *only* on the root
+(`#preventConfigurationVersionRegression`).
+
+**It was measured, and it does not happen.** matter.js persists the value anyway,
+independent of the declared quality. Its own store contains, verbatim:
+
+```
+root.parts.aggregator.parts.indigo-1.bridgedDeviceBasicInformation.configurationVersion = 2
+```
+
+and on the next start it is restored **over** the constructor seed — seeded `1`,
+read back `2`. So the literal is only an *initial* value for the first creation
+of an endpoint id, which is exactly what it should be, and there is nothing to
+fix.
+
+A persistence layer for it was built and then **reverted**: it added a
+`configurationVersions` map to `endpoint-map.json`, seeded from it, and bumped on
+role change. All of it was machinery for a fault that does not exist, and its
+comments asserted a mechanism that is empirically wrong. What survives is one
+test — `registry.test.ts` → *"matter.js RESTORES a bridged accessory's
+ConfigurationVersion across a restart"* — which pins the measured behaviour
+against a real stack and a real restart, so the data model cannot mislead the
+next person into rebuilding the same thing.
+
+**One genuine gap identified and deliberately not taken:** nothing ever calls the
+*child's* `increaseConfigurationVersion`, so a bridged accessory's version never
+moves after creation. The spec says a bridge SHALL increase it when it detects a
+configuration change on that device (a role change being the obvious one). That
+is a real, small conformance gap — it is not a regression, it costs nothing today
+(controllers re-read on the bridge's own bump, which does fire per batch), and
+fixing it is a scoped change of its own rather than something to smuggle into
+E6/E7.
+
+### Distribution: the bridge is an npm package, and it is NOT published yet
+
+`DEFAULT_INSTALL_SPEC = "indigo-matter-bridge@0.5.0"` is a **registry** spec,
+exact-pinned exactly as `matter-server@1.2.2` is, and installing it is
+`npm install --prefix ~/indigo-matter <spec>` with a different string — which is
+precisely the parameterisation the `AgentSpec` extraction bought. The plugin
+bundle ships **no JavaScript**; `bridge-node/` stays a top-level source
+directory in the repo and is published from there.
+
+**`indigo-matter-bridge` is not on the registry yet.** Until Simon publishes it,
+"Install/update the Matter export bridge" cannot resolve the pin and E7 cannot
+be exercised end to end on jarvis.
+
+#### Publishing the bridge node
+
+`bridge-node/package.json` is publish-ready as of this branch: `"private": true`
+was **removed** (flagged deliberately — it is what blocks `npm publish`),
+`files` is limited to `dist`, `main` is `dist/main.js` (which is what
+`bridge_agent.DEFAULT_BRIDGE_ENTRY` expects), `engines.node` is `>=22.13.0`, and
+a `prepublishOnly` script runs `clean` then `build` so a stale `dist` can never
+ship. `npm pack --dry-run` produces 35 files / ~116kB — the extra one is
+`README.md`, which npm always includes regardless of `files` and which was
+missing until this batch (the package's npm page was blank).
+
+```sh
+cd bridge-node
+npm login                 # Simon's npm account — nobody else can do this step
+npm test                  # 348 tests; publishing an untested build is the one unrecoverable mistake
+npm publish --access public
+```
+
+**Every release bumps two versions in step**, and a mismatch is silent until an
+install fails: `bridge-node/package.json`'s `version`, and
+`bridge_agent.DEFAULT_INSTALL_SPEC` in the plugin. `test_bridge_agent.py` asserts
+they agree, so the mismatch is a test failure rather than a field report.
+
+**Pre-publish testing** (dev workaround, *not* the shipped default): the same
+on-disk layout is reproduced by a local install —
+
+```sh
+npm install --prefix ~/indigo-matter /path/to/indigo-matter/bridge-node
+```
+
+which puts the package at `~/indigo-matter/node_modules/indigo-matter-bridge`
+exactly where `LaunchAgent._server_entry()` looks for it. `npm link` works too.
+Do this and everything in E7 runs unchanged; just remember the plugin's install
+menu will still try the registry spec.
+
+### Deferred / not done
+
+- **XAC3's live pairing is unverified.** Every code path is unit-tested, but
+  nothing here has met a real ecosystem. That is the jarvis script below.
+- **A locally-opened commissioning window still does not update the
+  `AdministratorCommissioning` cluster's `windowStatus`/`adminFabricIndex`.**
+  Unchanged from E5: matter.js 0.17.8's cluster command asserts a remote
+  authenticated session, so §3.8 drives `DeviceCommissioner` directly. A
+  conformance gap, not something the pairing flow depends on — it was listed as
+  "for E7 to close" and is **not** closed, because closing it means either
+  patching matter.js or faking a session, and the flow works without it.
+- **Changing the bridge ports still needs a plugin reload.** The switch acts
+  immediately; the ports are read when the client and the agent are built.
+- **Restoring the bridge-node storage from a backup** is now *possible* (E7
+  gives the stop/start seam the E5 note said was missing) but is **not wired**:
+  `fabric_backup.restore_backup` still reports and skips the `bridge-node/`
+  members. Wiring it is a small, self-contained follow-up.
+- **Still open from earlier:** #105, #83, #84, #62 follow-up, #43, #46, #21–#24.
+
+### Open, unexplained, and Apple-side: room changes in Apple Home
+
+Observed on jarvis with E5 deployed and 3 accessories live: on/off control works,
+but Apple Home refuses to change an accessory's **room** ("can't change
+settings"). Simon had changed those same accessories' rooms successfully before,
+so this is a change in Apple-side state, not in bridge behaviour.
+
+**No bridge-side change can address this, and the reasoning matters.** Room
+assignment is a HomeKit/iCloud home-database concept. It never crosses Matter
+and never reaches our node — so the node log showing no traffic at the moment of
+the attempt is the *expected* state, not evidence of anything. An earlier
+hypothesis about `isBridged`/`uniqueIdentifiersForBridgedAccessories` was raised
+and is **unsupported**; do not carry it forward.
+
+Recorded as something to watch, not something to fix. The
+`BridgedDeviceBasicInformation` enrichment above is unrelated and is not
+presented as a remedy for it.
+
+### Deploying E6 + E7 to jarvis
+
+Nothing in E5, E6 or E7 has been deployed. In order, because each step gates
+the next:
+
+1. **Publish `indigo-matter-bridge@0.5.0`** (above). Without it step 4 fails.
+   For a dry run, use the local-install workaround instead.
+2. **Install the plugin bundle** — `2026.8.3`. This is an *update* to an
+   existing install, so a copy of the changed files plus a plugin restart is
+   enough; only a first-time install needs the double-click.
+3. **Configure ▸ Matter export.** Confirm the new Export section renders, that
+   "Enable Matter export" is ticked, and that the readout line appears. If the
+   readout is blank, Indigo dispatched neither callback spelling — say so, do
+   not guess.
+4. **Plugins ▸ Matter ▸ Install/update the Matter export bridge.** Watch for
+   "Matter export bridge installed"; it will refuse to start anything while
+   nothing is exported, which is correct (XG5).
+5. **Export one relay** in "Manage Matter Exports…". This is XAC2: the agent
+   should install, the LaunchAgent should load, and the log should show
+   "bridge node LaunchAgent is running" followed by "bridge node attached".
+   Verify with `launchctl print gui/$(id -u)/com.simons-plugins.indigo-matter.bridge`.
+6. **Plugins ▸ Matter ▸ Pair Matter Bridge…**, 900s. The log must carry the
+   manual code, the `MT:` payload, an expiry, and the page URL.
+7. **Open the page URL on a phone** and check it renders. Then **add the bridge
+   in Apple Home** from the manual code — expect and accept the uncertified
+   warning. This is **XAC3**, the one thing no test can answer.
+8. **Re-open Configure…** and confirm the readout now names Apple.
+9. **Unpair an Ecosystem…** against a *second* fabric if one exists; against the
+   only one it factory-resets the bridge, which is correct but means re-pairing.
+10. **Empty the allow-list** and confirm the accessories leave Apple Home
+    (XAC7) *and* that the agent stops
+    (`launchctl print …bridge` should report the label as unloaded).
+
+**What Simon must do by hand, and nobody else can:**
+
+- **`npm publish`** — his npm account (step 1). Everything else is blocked on it.
+- **Pairing in Apple Home** (step 7) — the uncertified "Add Anyway" prompt is
+  an interactive decision on his phone.
+- **Deciding whether to keep the bridge paired** before step 9/10, since both
+  are destructive to the pairing he has just made.
+- The plugin bundle install itself, if he would rather not have it copied over a
+  running install.
 
 ---
 

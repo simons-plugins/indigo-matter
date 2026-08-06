@@ -70,6 +70,8 @@ describe("golden fixtures match their typed mirror", () => {
         ["open_commissioning_window internal", golden.open_window_internal.response,
             shapes.openWindowInternal],
         ["remove_fabric result", golden.remove_fabric.response.result, shapes.removeFabricResult],
+        ["remove_fabric (already gone) result", golden.remove_fabric_already_gone.response.result,
+            shapes.removeFabricAlreadyGone],
         ["factory_reset result", golden.factory_reset.response.result, shapes.factoryResetResult],
         ["factory_reset (discard map) result", golden.factory_reset_discard_map.response.result,
             shapes.factoryResetResult],

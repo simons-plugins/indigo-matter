@@ -1220,7 +1220,26 @@
     },
     "response": {
       "message_id": "m20",
-      "result": {}
+      "result": {
+        "removed": true,
+        "remaining": 1
+      }
+    }
+  },
+  "remove_fabric_already_gone": {
+    "request": {
+      "message_id": "m45",
+      "command": "remove_fabric",
+      "args": {
+        "fabricIndex": 7
+      }
+    },
+    "response": {
+      "message_id": "m45",
+      "result": {
+        "removed": false,
+        "remaining": 2
+      }
     }
   },
   "factory_reset": {

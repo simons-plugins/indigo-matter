@@ -30,7 +30,7 @@ import {
 
 import type { BridgeConfig } from "./config.js";
 import { ENDPOINT_MAP_FILE, EndpointMapStore, type LiveEndpointNumber, refuseReasonFor } from "./endpoint-map.js";
-import { uniqueIdFor } from "./endpoints.js";
+import { type BridgedIdentity, uniqueIdFor } from "./endpoints.js";
 import {
     type BridgeFacade,
     type CommandEventData,
@@ -45,6 +45,7 @@ import {
     type PairingReport,
     ProtocolError,
     RefuseReason,
+    type RemoveFabricResult,
     type RemoveResult,
     type StatusReport,
     type UpsertResult,
@@ -68,6 +69,11 @@ export const VENDOR_ID = 0xfff1;
 export const PRODUCT_ID = 0x8000;
 export const VENDOR_NAME = "simons-plugins";
 export const PRODUCT_NAME = "Indigo Matter Bridge";
+
+/** A bridge has no hardware. Constant rather than invented, but present rather
+ * than absent: ecosystems render the attribute, and an absent one reads blank. */
+export const HARDWARE_VERSION = 1;
+export const HARDWARE_VERSION_STRING = "1";
 
 /** PRD §5.3: no hard cap, but past this many exports the log says so. */
 export const ENDPOINT_COUNT_WARNING = 100;
@@ -141,6 +147,23 @@ export class BridgeNode implements BridgeFacade {
     }
 
     /**
+     * The identity every bridged child publishes on its Bridged Device Basic
+     * Information. Derived here, from the same constants and the same
+     * `softwareVersion` the root node uses, so the two can never drift.
+     */
+    private get bridgedIdentity(): BridgedIdentity {
+        return {
+            vendorName: VENDOR_NAME,
+            vendorId: VENDOR_ID,
+            productName: PRODUCT_NAME,
+            hardwareVersion: HARDWARE_VERSION,
+            hardwareVersionString: HARDWARE_VERSION_STRING,
+            softwareVersion: this.softwareVersion,
+            softwareVersionString: this.bridgeVersion,
+        };
+    }
+
+    /**
      * Build the node and bring it online. The aggregator is added first so it
      * takes endpoint 1; bridged children land at 2 and up, in the order the
      * first `attach` creates them (and thereafter at whatever number matter.js
@@ -181,8 +204,8 @@ export class BridgeNode implements BridgeFacade {
                 productId: PRODUCT_ID,
                 serialNumber: serialNumberFor(this.identity),
                 uniqueId: nodeUniqueIdFor(this.identity),
-                hardwareVersion: 1,
-                hardwareVersionString: "1",
+                hardwareVersion: HARDWARE_VERSION,
+                hardwareVersionString: HARDWARE_VERSION_STRING,
                 softwareVersion: this.softwareVersion,
                 softwareVersionString: this.bridgeVersion,
             },
@@ -194,7 +217,10 @@ export class BridgeNode implements BridgeFacade {
 
         this.#registry = new EndpointRegistry({
             aggregator,
-            productName: PRODUCT_NAME,
+            // Deliberately the SAME values the root node's BasicInformation
+            // carries above: an ecosystem that shows the bridge's manufacturer
+            // and firmware alongside a child's should not be shown two answers.
+            bridgeIdentity: this.bridgedIdentity,
             log: message => this.log(message),
             emit: data => this.#command?.(data),
             onConfigurationChange: () => this.bumpConfigurationVersion(),
@@ -675,11 +701,19 @@ export class BridgeNode implements BridgeFacade {
      * `OperationalCredentialsServer.removeFabric` opens with `assertRemoteActor`,
      * so it cannot be invoked from an offline agent at all.
      *
-     * An index with no fabric behind it succeeds. The plugin picks an index out
-     * of a `get_pairing` readout that is by definition a moment old, and the way
-     * it goes stale is the ecosystem unpairing itself — so "it is already gone"
-     * is the request being granted, not refused. Said out loud rather than
-     * silently, because the other way to get here is a typo.
+     * An index with no fabric behind it succeeds — but it succeeds as
+     * `{removed: false}`, and that distinction is the whole reason this returns
+     * anything. The plugin picks an index out of a `get_pairing` readout that is
+     * by definition a moment old, and the way it goes stale is the ecosystem
+     * unpairing itself, so "it is already gone" is the request being granted,
+     * not refused. Answering `{}` for both made the plugin tell the user "that
+     * ecosystem has been unpaired, every accessory has been removed" over a
+     * no-op — and, because the early return also skipped {@link noteFabrics},
+     * no `fabrics_changed` followed and the ghost row stayed in the plugin's
+     * cached list (which is what its picker is built from) forever. Both halves
+     * are fixed here: the outcome is reported, and the fabric set is
+     * re-published either way so a stale cache is corrected by the very request
+     * that tripped over it.
      *
      * **Removing the LAST fabric is a factory reset that we did not perform.**
      * matter.js's `CommissioningServer` watches `commissioned` and, when the
@@ -692,12 +726,17 @@ export class BridgeNode implements BridgeFacade {
      * handles it, from {@link noteFabrics}, so the route where an ecosystem
      * unpairs *us* is covered too.
      */
-    async removeFabric(fabricIndex: number): Promise<void> {
+    async removeFabric(fabricIndex: number): Promise<RemoveFabricResult> {
         const fabrics = this.server.env.get(FabricManager);
         const fabric = fabrics.maybeFor(FabricIndex(fabricIndex));
         if (fabric === undefined) {
             this.log(`No fabric at index ${fabricIndex}; nothing to remove`);
-            return;
+            // Re-publish the set the caller's index came from. Nothing changed
+            // HERE, but the asker demonstrably holds a list that says otherwise,
+            // and this is the only moment we know that. `"unchanged"` names the
+            // §5 `change` for what it is rather than borrowing an action word.
+            this.noteFabrics("unchanged");
+            return { removed: false, remaining: this.fabricCountOrNull() };
         }
         // `leave` rather than `delete`: it flushes subscriptions and emits the
         // leave event first, which is how a controller learns it was removed
@@ -707,21 +746,34 @@ export class BridgeNode implements BridgeFacade {
         // Inside a try: the leave has already happened and succeeded, and a
         // read of server state that a self-reset is concurrently rebuilding
         // must not turn a completed removal into a failed command.
-        let remaining: number;
+        let remaining: number | null;
         try {
             remaining = this.fabrics().length;
+            this.log(`Removed fabric ${fabricIndex} (${remaining} remaining)`);
         } catch (error) {
+            remaining = null;
             this.log(
                 `Removed fabric ${fabricIndex}; the remaining fabric count is unavailable ` +
                     `(${describeError(error)})`,
             );
-            return;
         }
-        this.log(`Removed fabric ${fabricIndex} (${remaining} remaining)`);
         // Re-checked rather than assumed: `fabric.leave()` does not necessarily
         // produce a `fabricsChanged` observation we saw, and the empty-set case
-        // is the one that matters (see noteLastFabricGone).
+        // is the one that matters (see noteLastFabricGone). Runs on the
+        // count-unavailable path too — it is precisely the last-fabric leave
+        // that makes the count unreadable, and that is the case whose witness
+        // must be cleared.
         this.noteFabrics();
+        return { removed: true, remaining };
+    }
+
+    /** The fabric count, or `null` if server state cannot be read right now. */
+    private fabricCountOrNull(): number | null {
+        try {
+            return this.fabrics().length;
+        } catch {
+            return null;
+        }
     }
 
     /**
