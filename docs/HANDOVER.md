@@ -1496,3 +1496,76 @@ Domio no longer commissions; it relays a **share code** (Apple Home is admin 1; 
 - `domio-code/docs/API.md` (v1.1 contract mirror) — untracked in that repo.
 - workspace `docs/plans/PRD-indigo-matter-plugin.md` mirror — untracked.
 - ADR Thread caveat + Domio PRD edits — flagged to Simon, not auto-applied (ADR is `accepted`/immutable).
+
+---
+
+# 2026-08-06 — end-of-session handover: export v1 built, live-validated, open items
+
+**Where the export half stands: feature-complete and substantially proven on
+jarvis.** Ten PRs merged (#118–#128 plus the CI marker), one open (#130, E8
+docs). `indigo-matter-bridge@0.5.0` is **published to npm**. The plugin on jarvis
+is 2026.8.3 with the bridge running under launchd.
+
+## Validated live on jarvis (dates are real, evidence in this session's logs)
+
+| What | When | Evidence |
+|---|---|---|
+| E0 gate — uncertified bridge paired into Apple Home | 08-04 | "Add Anyway" accepted; the question that could have killed the feature |
+| E3 — on/off light + dimmer, both directions | 08-05 | via the Manage Matter Exports dialog |
+| E5 — upgrade keeps identity | 08-05 | 3 accessories returned at numbers 3/5/4, *out of creation order* = proof the map held; no duplicates |
+| E5 — drift detector fires for real | 08-06 | genuine mismatch after a factory reset, reported and NOT auto-repaired |
+| E6 — pairing from the plugin's own menu | 08-06 | window opened, code to log, paired in Apple Home |
+| E6 — unpair + last-fabric self-reset | 08-06 | witness cleared, endpoint map preserved, node self-recovered in 200ms |
+| E7 — the whole install chain from one click | 08-06 | npm install → plist → launchd bootstrap → node online → attach → reconcile |
+
+## Still unproven (do not claim these)
+
+- **XAC5's reboot leg.** Plugin reload and node restart pass; a full Mac reboot
+  has not been done. → issue #139
+- **Second admin.** No controller other than Apple has ever commissioned the
+  bridge. Apple's 2-fabric count is main + iCloud Keychain, *not* multi-admin
+  evidence. ADR-0007 requires this. → #139
+- **IWS auth posture** for the pairing page. → #139
+
+## The room mystery — SOLVED
+
+Apple refusing room edits on exported accessories was **stale Apple-side
+records**, not a bridge fault (room assignment never crosses Matter). Remedy,
+verified: remove the bridge in Home → clear the leftover keychain fabric with
+*Unpair an Ecosystem…* (Apple only removes one of its two) → re-pair. Rooms work
+again. Full writeup and the docs task: **#139/#141**. Three of my theories were
+wrong before this one — no-Matter-traffic, un-export identity reuse, and a
+`configurationVersion` reset that a probe disproved (matter.js *does* persist and
+restore it). Don't re-derive them.
+
+## Open issues filed this session
+
+| # | What |
+|---|---|
+| #131 | Sort exported devices to the top of the export picker |
+| #132 | Rebuild dialog's "will duplicate" warning overstates what it does |
+| #133 | `get_pairing` races the last-fabric self-reset → spurious error |
+| #134 | Group the two Install/update menu items (11 apart, confusable) |
+| #135 | Reset reconnect backoff after a successful install (29s dead wait) |
+| #136 | Wire bridge-storage restore (E7 gave it the stop seam it needed) |
+| #137 | Docs site has no route to the export half (matter.html/index.html) |
+| #138 | Three screenshots wanted for the walkthrough |
+| #139 | Live validation tracker + the solved room remedy |
+| #140 | **No way to clear a drift report on a healthy node** — Rebuild is gated on the refusal state |
+
+**#140 is the one to fix first.** It is reachable by following our own
+documentation: a factory reset makes drift expected, and the user is then left
+with a permanent warning and no supported way to clear it.
+
+## Process notes worth keeping
+
+- Every PR got a three-agent battery (code / silent-failure / test-coverage). The
+  test reviewer's **mutation** method earned its keep repeatedly — it found ~7
+  load-bearing lines whose deletion broke zero tests, a confirm dialog whose gate
+  was inert, and a bridged-identity producer where publishing *Apple's* vendor ID
+  passed all 346 tests.
+- **Recurring defect shape, six occurrences:** a helper superbly unit-tested
+  while its only production caller is untested. Brief future reviewers to hunt
+  that first.
+- Live testing found things no review did: the wrong-menu click, the 29s attach
+  wait, the unusable QR payload, and #140. Deploy early next time.
