@@ -1,29 +1,35 @@
 <?xml version="1.0"?>
+<!--
+    Plugins ▸ Matter, in five sections (issue #134).
+
+    SEPARATORS: an EMPTY, self-closing <MenuItem id="…"/> renders as a menu
+    separator. This is undocumented — the canonical MenuItems.xml reference
+    lists <Name> as required and describes neither separators nor submenus —
+    but it is what Perceptive Automation's own bundled plugins do (Timers and
+    Pesters, Timed Devices, Virtual Devices, Alexa), and Actions.xml uses the
+    same trick (<Action id="sep1" uiPath="…"/>). Fifteen plugins installed on
+    jarvis rely on it. Do not "fix" these into named items.
+
+    The ordering is the whole point, so tests/test_plugin_module.py asserts the
+    ORDER and the separator positions, not just that each item exists.
+    (tests/test_export_menu.py owns the Manage Matter Exports dialog's shape.)
+
+    The five sections, everyday work first and the destructive things fenced
+    off last:
+
+      1. Matter devices Indigo CONTROLS (inbound)  — the everyday actions
+      2. Matter devices Indigo PUBLISHES (export)  — the everyday actions
+      3. matter-server                             — install/restart/logs
+      4. The export bridge node                    — install/restart/stop
+      5. Backup and recovery                       — rare, and some destructive
+
+    Sections 3 and 4 exist as separate blocks because their Install/update
+    items used to sit eleven apart and were clicked for one another (#134):
+    one manages the inbound controller, the other the outbound bridge, and
+    they are separately versioned and separately installed packages.
+-->
 <MenuItems>
-    <MenuItem id="installMatterServer">
-        <Name>Install/update matter-server</Name>
-        <CallbackMethod>menuInstallMatterServer</CallbackMethod>
-    </MenuItem>
-    <MenuItem id="restartMatterServer">
-        <Name>Restart matter-server</Name>
-        <CallbackMethod>menuRestartMatterServer</CallbackMethod>
-    </MenuItem>
-    <MenuItem id="reinstallMatterServerClean">
-        <Name>Reinstall matter-server (clean)…</Name>
-        <CallbackMethod>menuReinstallMatterServerClean</CallbackMethod>
-        <ConfigUI>
-            <Field id="warning" type="label">
-                <Label>Deletes the installed matter-server package (~/indigo-matter/node_modules) and reinstalls it fresh, then restarts. Your commissioned devices are NOT affected — the fabric/storage is left untouched. Use this if matter-server won't start after an upgrade (e.g. a wedged install or a "Storage is locked" error).</Label>
-            </Field>
-            <Field id="confirm" type="checkbox" defaultValue="false">
-                <Label>I understand this reinstalls matter-server (devices/pairings are kept).</Label>
-            </Field>
-        </ConfigUI>
-    </MenuItem>
-    <MenuItem id="showMatterServerLogs">
-        <Name>Open matter-server log…</Name>
-        <CallbackMethod>menuShowMatterServerLogs</CallbackMethod>
-    </MenuItem>
+    <!-- 1 · Matter devices Indigo controls -->
     <MenuItem id="commissionDeviceManually">
         <Name>Commission device by setup code (advanced)…</Name>
         <CallbackMethod>menuCommissionDeviceManually</CallbackMethod>
@@ -57,10 +63,14 @@
             </Field>
         </ConfigUI>
     </MenuItem>
-    <!--
-        Manage Matter Exports (PRD-indigo-matter-export §5.1, UI-D).
 
-        Deliberately has NO <CallbackMethod>: with one, the dialog gets
+    <MenuItem id="sepDevicesFromExport"/>
+
+    <!--
+        2 · Matter devices Indigo publishes (export).
+
+        Manage Matter Exports (PRD-indigo-matter-export §5.1, UI-D)
+        deliberately has NO <CallbackMethod>: with one, the dialog gets
         Execute/Cancel and every action has to funnel through Execute. Without
         one it gets a single Close button and the buttons below do the work —
         which is what the SDK recommends for a multi-action dialog, and what a
@@ -153,53 +163,6 @@
         </ConfigUI>
     </MenuItem>
     <!--
-        The two export-side recovery exits (BRIDGE_PROTOCOL §3.10/§3.11).
-
-        Both existed only as node commands until now: `rebuild_endpoint_map`
-        had NO caller anywhere in the plugin, while three user-facing strings
-        (the attach-refusal error, the client's remedy text and the export
-        dialog's status line) told the user to "confirm the rebuild in the
-        plugin". There was nothing to confirm — the only way out of the
-        refuse-to-start state was to hand-edit a JSON file in the storage dir.
-    -->
-    <MenuItem id="rebuildEndpointMap">
-        <Name>Rebuild Matter Endpoint Map…</Name>
-        <CallbackMethod>menuRebuildEndpointMap</CallbackMethod>
-        <ConfigUI>
-            <Field id="warning" type="label">
-                <Label>Use this ONLY when the plugin says the bridge node is refusing to export because its endpoint-number map is unreadable. The map records which Matter accessory number belongs to which Indigo device; rebuilding it accepts whatever numbers exist now as correct.
-
-WARNING: this WILL duplicate accessories in ecosystems that are already paired (Apple Home, Alexa, Google). The old accessories do not disappear — they stop working and you have to delete them by hand, and any names, rooms, scenes and automations built on them are lost.
-
-Your pairings themselves are NOT touched, and no Indigo device is changed.
-
-If the bridge node is NOT refusing, this does nothing useful and is refused: there is no fault to recover from, and a rebuild would discard the retained endpoint numbers of every device you are not currently exporting — the ones that make re-adding a device restore the same accessory rather than create a second one.</Label>
-            </Field>
-            <Field id="confirm" type="checkbox" defaultValue="false">
-                <Label>I understand this may duplicate accessories in paired ecosystems.</Label>
-            </Field>
-        </ConfigUI>
-    </MenuItem>
-    <MenuItem id="resetBridgePairings">
-        <Name>Reset Matter Export Pairings…</Name>
-        <CallbackMethod>menuResetBridgePairings</CallbackMethod>
-        <ConfigUI>
-            <Field id="warning" type="label">
-                <Label>Removes EVERY ecosystem pairing from the Matter export bridge and starts advertising for commissioning again. Apple Home, Alexa, Google and anything else you have paired will lose all of the accessories Indigo exports, and you will have to pair the bridge again from scratch.
-
-This is the export side only. Matter devices that Indigo CONTROLS are not affected, and no Indigo device is changed or deleted.
-
-Endpoint numbers are kept, so re-pairing the same ecosystems restores the same accessory identities where it can.</Label>
-            </Field>
-            <Field id="confirm" type="checkbox" defaultValue="false">
-                <Label>I understand every ecosystem pairing for exported accessories will be removed.</Label>
-            </Field>
-            <Field id="confirmAgain" type="checkbox" defaultValue="false">
-                <Label>I have read the warning above and want to reset the export bridge now.</Label>
-            </Field>
-        </ConfigUI>
-    </MenuItem>
-    <!--
         Pairing and fabric management (PRD-indigo-matter-export §6, E6).
 
         "Pair" is deliberately "open a pairing window", not "show the code": a
@@ -256,16 +219,54 @@ If you unpair the LAST ecosystem the bridge resets itself completely and starts 
             </Field>
         </ConfigUI>
     </MenuItem>
+
+    <MenuItem id="sepExportFromServer"/>
+
+    <!-- 3 · matter-server — the inbound controller's own plumbing -->
+    <MenuItem id="installMatterServer">
+        <Name>Install/update matter-server</Name>
+        <CallbackMethod>menuInstallMatterServer</CallbackMethod>
+    </MenuItem>
+    <MenuItem id="restartMatterServer">
+        <Name>Restart matter-server</Name>
+        <CallbackMethod>menuRestartMatterServer</CallbackMethod>
+    </MenuItem>
+    <MenuItem id="reinstallMatterServerClean">
+        <Name>Reinstall matter-server (clean)…</Name>
+        <CallbackMethod>menuReinstallMatterServerClean</CallbackMethod>
+        <ConfigUI>
+            <Field id="warning" type="label">
+                <Label>Deletes the installed matter-server package (~/indigo-matter/node_modules) and reinstalls it fresh, then restarts. Your commissioned devices are NOT affected — the fabric/storage is left untouched. Use this if matter-server won't start after an upgrade (e.g. a wedged install or a "Storage is locked" error).</Label>
+            </Field>
+            <Field id="confirm" type="checkbox" defaultValue="false">
+                <Label>I understand this reinstalls matter-server (devices/pairings are kept).</Label>
+            </Field>
+        </ConfigUI>
+    </MenuItem>
+    <MenuItem id="showMatterServerLogs">
+        <Name>Open matter-server log…</Name>
+        <CallbackMethod>menuShowMatterServerLogs</CallbackMethod>
+    </MenuItem>
+
+    <MenuItem id="sepServerFromBridge"/>
+
+    <!--
+        4 · The export bridge node's own plumbing.
+
+        Its install item lives in its own section, one separator below
+        matter-server's (#134): the two are separately versioned, separately
+        installed npm packages, and clicking the wrong one bounces a working
+        half of the plugin for nothing.
+
+        The bridge's two recovery exits: the controller has had a clean
+        reinstall and a restart since 2026.7; the bridge shipped with neither,
+        which left a wedged install with a menu that reinstalls OVER the wedge,
+        and a running node with no UI at all once the plugin is disabled.
+    -->
     <MenuItem id="installBridgeNode">
         <Name>Install/update the Matter export bridge</Name>
         <CallbackMethod>menuInstallBridgeNode</CallbackMethod>
     </MenuItem>
-    <!--
-        The bridge's two missing exits. The controller has had a clean reinstall
-        and a restart since 2026.7; the bridge shipped with neither, which left
-        a wedged install with a menu that reinstalls OVER the wedge, and a
-        running node with no UI at all once the plugin is disabled.
-    -->
     <MenuItem id="reinstallBridgeNodeClean">
         <Name>Reinstall the Matter export bridge (clean)…</Name>
         <CallbackMethod>menuReinstallBridgeNodeClean</CallbackMethod>
@@ -296,12 +297,31 @@ You normally never need this: the bridge starts and stops with your export list.
             </Field>
         </ConfigUI>
     </MenuItem>
+
+    <MenuItem id="sepBridgeFromRecovery"/>
+
+    <!--
+        5 · Backup and recovery — rare, and the last two are destructive.
+
+        "Back up the Matter fabric…" was "Export fabric backup…", where
+        "Export" meant save-to-disk in a menu where it means the outbound
+        bridge everywhere else. The callback names are unchanged.
+
+        The two export-side recovery exits (BRIDGE_PROTOCOL §3.10/§3.11) sit
+        at the bottom. Both existed only as node commands until E6:
+        `rebuild_endpoint_map` had NO caller anywhere in the plugin, while
+        three user-facing strings (the attach-refusal error, the client's
+        remedy text and the export dialog's status line) told the user to
+        "confirm the rebuild in the plugin". There was nothing to confirm —
+        the only way out of the refuse-to-start state was to hand-edit a JSON
+        file in the storage dir.
+    -->
     <MenuItem id="exportFabricBackup">
-        <Name>Export fabric backup…</Name>
+        <Name>Back up the Matter fabric…</Name>
         <CallbackMethod>menuExportFabricBackup</CallbackMethod>
     </MenuItem>
     <MenuItem id="restoreFabricBackup">
-        <Name>Restore fabric backup…</Name>
+        <Name>Restore a fabric backup…</Name>
         <CallbackMethod>menuRestoreFabricBackup</CallbackMethod>
         <ConfigUI>
             <Field id="warning" type="label">
@@ -313,6 +333,43 @@ You normally never need this: the bridge starts and stops with your export list.
             </Field>
             <Field id="confirm" type="checkbox" defaultValue="false">
                 <Label>I understand this replaces the current fabric and will restart matter-server.</Label>
+            </Field>
+        </ConfigUI>
+    </MenuItem>
+    <MenuItem id="rebuildEndpointMap">
+        <Name>Rebuild Matter Endpoint Map…</Name>
+        <CallbackMethod>menuRebuildEndpointMap</CallbackMethod>
+        <ConfigUI>
+            <Field id="warning" type="label">
+                <Label>Use this ONLY when the plugin says the bridge node is refusing to export because its endpoint-number map is unreadable. The map records which Matter accessory number belongs to which Indigo device; rebuilding it accepts whatever numbers exist now as correct.
+
+WARNING: this WILL duplicate accessories in ecosystems that are already paired (Apple Home, Alexa, Google). The old accessories do not disappear — they stop working and you have to delete them by hand, and any names, rooms, scenes and automations built on them are lost.
+
+Your pairings themselves are NOT touched, and no Indigo device is changed.
+
+If the bridge node is NOT refusing, this does nothing useful and is refused: there is no fault to recover from, and a rebuild would discard the retained endpoint numbers of every device you are not currently exporting — the ones that make re-adding a device restore the same accessory rather than create a second one.</Label>
+            </Field>
+            <Field id="confirm" type="checkbox" defaultValue="false">
+                <Label>I understand this may duplicate accessories in paired ecosystems.</Label>
+            </Field>
+        </ConfigUI>
+    </MenuItem>
+    <MenuItem id="resetBridgePairings">
+        <Name>Reset Matter Export Pairings…</Name>
+        <CallbackMethod>menuResetBridgePairings</CallbackMethod>
+        <ConfigUI>
+            <Field id="warning" type="label">
+                <Label>Removes EVERY ecosystem pairing from the Matter export bridge and starts advertising for commissioning again. Apple Home, Alexa, Google and anything else you have paired will lose all of the accessories Indigo exports, and you will have to pair the bridge again from scratch.
+
+This is the export side only. Matter devices that Indigo CONTROLS are not affected, and no Indigo device is changed or deleted.
+
+Endpoint numbers are kept, so re-pairing the same ecosystems restores the same accessory identities where it can.</Label>
+            </Field>
+            <Field id="confirm" type="checkbox" defaultValue="false">
+                <Label>I understand every ecosystem pairing for exported accessories will be removed.</Label>
+            </Field>
+            <Field id="confirmAgain" type="checkbox" defaultValue="false">
+                <Label>I have read the warning above and want to reset the export bridge now.</Label>
             </Field>
         </ConfigUI>
     </MenuItem>

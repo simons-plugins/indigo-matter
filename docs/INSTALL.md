@@ -9,7 +9,8 @@ npm package**. This guide covers both:
   managed-LaunchAgent bring-up on the reference Indigo server.
 - **the Matter export bridge** — the optional outbound half, which publishes
   selected *Indigo* devices to Apple Home as Matter accessories. **Steps E1–E4**.
-  **It cannot be installed today**: its npm package has not been published — see
+  Its npm package (`indigo-matter-bridge`) is on the registry and installs from
+  its own menu item — see
   [Exporting Indigo devices](#exporting-indigo-devices-indigo-as-a-matter-bridge).
 
 If you just installed the plugin and Indigo is logging
@@ -18,7 +19,8 @@ running but matter-server is not.
 
 ## Contents
 
-- [Overview](#overview)
+- [Overview](#overview) — including
+  [the Plugins ▸ Matter menu](#the-plugins--matter-menu)
 - [Prerequisites](#prerequisites)
 - [Step 1 — Install Node.js 22](#step-1--install-nodejs-22)
 - [Step 2 — Install matter-server](#step-2--install-matter-server)
@@ -89,11 +91,26 @@ A few things to know before you start:
   occasional rough edges.
 - **There is a second, optional half.** The plugin can also work the other way round and
   publish selected *Indigo* devices to Apple Home as Matter accessories, from a separate
-  bridge process with its own npm package. **That package is not on the npm registry yet,
-  so this half cannot be installed today.** When it is: nothing is exported and no bridge
-  process runs until you add a device to the export list, and it needs Node (Step 1) and
-  a storage path (Step 3) — *not* a working matter-server. See
+  bridge process with its own npm package (`indigo-matter-bridge`), installed from
+  **Plugins ▸ Matter ▸ Install/update the Matter export bridge**. Nothing is exported
+  and no bridge process runs until you add a device to the export list, and it needs
+  Node (Step 1) and a storage path (Step 3) — *not* a working matter-server. See
   [Exporting Indigo devices](#exporting-indigo-devices-indigo-as-a-matter-bridge).
+
+### The Plugins ▸ Matter menu
+
+The menu is grouped into five sections, separated by dividers. Both halves of the
+plugin have their own install item, and they are **not** interchangeable: they are
+separately versioned npm packages, and running the wrong one restarts a half you
+did not mean to touch.
+
+| Section | Items | What it covers |
+|---|---|---|
+| 1 | *Commission device by setup code (advanced)…*, *Decommission Matter device…* | Matter devices Indigo **controls** — the everyday actions |
+| 2 | *Manage Matter Exports…*, *Pair Matter Bridge…*, *Unpair an Ecosystem…* | Indigo devices Indigo **publishes** — the everyday actions |
+| 3 | *Install/update matter-server*, *Restart…*, *Reinstall (clean)…*, *Open matter-server log…* | The inbound controller's own plumbing |
+| 4 | *Install/update the Matter export bridge*, *Reinstall… (clean)…*, *Stop…* | The outbound bridge node's own plumbing |
+| 5 | *Back up the Matter fabric…*, *Restore a fabric backup…*, *Rebuild Matter Endpoint Map…*, *Reset Matter Export Pairings…* | Backup and recovery. The last two are destructive — see [the two destructive recovery actions](#the-two-destructive-recovery-actions) |
 
 ---
 
@@ -571,9 +588,9 @@ This directory holds the fabric root CA private key and every device's operation
 **Losing it means re-commissioning every Matter device from scratch.** Indigo's own
 database backup does **not** cover it.
 
-Use **Plugins ▸ Matter ▸ Export fabric backup…**. It writes a timestamped zip into a
+Use **Plugins ▸ Matter ▸ Back up the Matter fabric…**. It writes a timestamped zip into a
 `backups/` directory beside the storage dir and prunes old ones, and
-**Restore fabric backup…** puts one back (moving the current fabric aside first, so a
+**Restore a fabric backup…** puts one back (moving the current fabric aside first, so a
 bad restore is reversible). Copy the zips somewhere off-machine as well — a backup on
 the same disk is not a backup.
 
@@ -607,7 +624,7 @@ Losing *that* is the number-one real-world cause of duplicated accessories: ever
 ecosystem re-creates every accessory, and their names, rooms and automations go
 with the old ones.
 
-**Export fabric backup…** includes this directory in the zip. **Restore does not
+**Back up the Matter fabric…** includes this directory in the zip. **Restore does not
 yet put it back** — it reports the bridge files it found and skips them, because
 restoring them safely needs the bridge node stopped and that wiring is a
 follow-up. So for now, if you need to restore the bridge side, copy

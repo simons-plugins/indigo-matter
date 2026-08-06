@@ -121,7 +121,7 @@ leaves the others untouched; only a factory reset wipes them all.
 The plugin's fabric lives inside matter-server's storage directory. It is the
 single point of total loss — if it's destroyed, every device must be
 re-commissioned — which is why the plugin ships fabric **backup and restore**
-(menu items: *Export fabric backup…* / *Restore fabric backup…*).
+(menu items: *Back up the Matter fabric…* / *Restore a fabric backup…*).
 
 > **Why Apple Home calls our fabric "Matter Test" — this is expected.** When the
 > plugin joins a device, Apple Home shows a "joined a new network" notification
@@ -576,7 +576,7 @@ Common failure modes, in rough order of likelihood:
 - **Capability missing (no energy states, no colour, …).** Firmware (see
   above), then diagnostics to inspect advertised clusters.
 
-**Backups.** Export a fabric backup after commissioning anything you'd hate to
+**Backups.** Back up the fabric after commissioning anything you'd hate to
 re-pair. The plugin keeps rotating zips and a restore is menu-driven and
 reversible.
 

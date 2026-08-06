@@ -1,14 +1,139 @@
 # indigo-matter — Build Handover
 
-**Last updated:** 2026-08-06 11:01 UTC
-**Active work:** `fix/141-restore-endpoints-at-startup` — issue #141, the
-empty-aggregator restart bug. See the section immediately below; the `main`
-summary in this header describes the last merge, not that branch.
-**Branch:** `main` — PRs #106, #107, #108 all merged.
-**Version:** `2026.7.13`
-**Tests:** 1005 passing (`cd indigo-matter && /Library/Frameworks/Python.framework/Versions/Current/bin/python3 -m pytest -q`)
-**Deployed:** jarvis is running the #103-era plugin (v2026.7.10) plus **E5's export half, deployed 2026-08-05 with 3 accessories live in Apple Home**. **Nothing from #106/#107/#108, and no part of E6 or E7, has been deployed** — so the #104 supervision fixes are NOT yet live on jarvis.
-**Status:** **Wi-Fi AND Thread validated with real hardware**, and the **export half's E0 pairing gate PASSED on 2026-08-04** with live two-way control on 2026-08-05 (see *Live validation on jarvis*). #104's three server-supervision faults are fixed and merged (#107). #105's diagnostic is merged (#108) but **#105 stays open** — the bridged-endpoint path still has no real-bridge validation. `domio-code` #236 is fixed and closed (domio-code PR #237). Known-open: #105, plus the older #43, #46, #21–#24.
+**Last updated:** 2026-08-06 14:05 UTC
+**Active work:** `feat/134-menu-sections` — **PR #144 OPEN**, CI green, awaiting
+Simon's go-ahead. Menu grouping only; see the §#134 section below.
+**Branch:** `main` — **PR #142 MERGED** (`3e1229d`, merge commit, `[no-release]`
+so **no GitHub release was cut** — Simon is cutting that himself). Latest
+release remains v2026.7.23.
+**Version:** plugin `2026.8.5` on the open branch (`2026.8.4` on `main`),
+bridge-node `0.7.0` (**published to npm**; `DEFAULT_INSTALL_SPEC` pins it).
+**Tests:** **2256 Python** (2252 on `main`), **383 TS** — both green.
+(`python3 -m pytest -q` · `cd bridge-node && npm run build && npm test`)
+**Deployed:** jarvis runs plugin `2026.8.4` + bridge-node `0.7.0`, paired to
+**Apple Home AND Alexa simultaneously** (3 fabrics: 2 Apple, 1 Alexa).
+**Status:** export v1 feature-complete and live. #141 **fixed and confirmed**
+(below). **#143 is the open one** — see the 2026-08-06 §#143 section; its
+defect B was investigated hard today and the leading theory was **withdrawn**,
+so read that before touching it.
+
+**NEXT UP (Simon, 2026-08-06):** ~~tidy `MenuItems.xml` into groups~~ — **done**,
+see the §#134 section immediately below. The constraint it warned about was
+wrong in the useful direction: **separators do exist**.
+
+---
+
+## 2026-08-06 — issue #134: the menu, and the separator the docs deny
+
+Plugin `2026.8.5`. Suites: **2256 Python** (from 2252), pylint **9.42**
+unchanged. Branch `feat/134-menu-sections`. TS untouched.
+
+**An empty, self-closing `<MenuItem id="…"/>` renders as a menu separator.**
+The canonical `MenuItems.xml` reference lists `<Name>` as *required* and
+documents neither separators nor submenus, which is why the note this replaces
+said grouping could only be ordering plus name prefixes. It is wrong — or at
+least incomplete. Perceptive Automation's own bundled plugins use the form
+(**Timers and Pesters**, **Timed Devices**, **Virtual Devices**, **Alexa**),
+`Actions.xml` takes it too (`<Action id="sep1" uiPath="DeviceActions"/>`), and
+**15 of the plugins installed on jarvis** rely on it. Simon knew from the
+Timers and Pesters *action* list that sections were possible; the docs alone
+would never have said so.
+
+Worth generalising: the canonical docs are the authority on what is
+*supported*, not on what *works*. When a UI affordance is missing from them,
+grep the installed plugins before concluding it does not exist —
+`grep -rlE "<MenuItem[^>]*/>" …/Plugins/*/Contents/Server\ Plugin/MenuItems.xml`
+answered this in one command.
+
+**Five sections**, everyday first, destructive last: devices Indigo controls ·
+devices Indigo publishes · matter-server plumbing · export-bridge plumbing ·
+backup and recovery. The two `Install/update` items — #134's actual complaint,
+clicked for one another live — now sit in **different** sections rather than
+merely adjacent, because they are separately versioned, separately installed
+npm packages.
+
+**`Export fabric backup…` → `Back up the Matter fabric…`** (and `Restore
+fabric backup…` → `Restore a fabric backup…`). "Export" meant save-to-disk in
+one item and the outbound bridge in eight others. Menu **ids and callback
+methods are unchanged**, so nothing in `plugin.py`, `bridge_agent.py` or
+`server_process.py` moved; `spec.install_menu_name` still matches a real
+`<Name>`, which `test_bridge_agent.py` pins.
+
+**The tests assert the ORDER**, for the same reason #141's do: a membership
+check passes just as happily with all sixteen items back in one flat list.
+Mutation-verified both ways — deleting the four separators, and deleting only
+`sepServerFromBridge` so the two install sections merge, each fail exactly the
+three layout tests and nothing else.
+
+**Not done here, deliberately:** #132 (the Rebuild Endpoint Map warning
+overstates what the action does) is dialog *text* in the same file and a
+separate bug — reordering it and rewriting it in one commit would have made
+the diff unreviewable. #131 (sort exported devices to the top of the picker)
+is untouched.
+
+**Stale, spotted in passing, not fixed:** `docs/INSTALL.md` §Overview still
+says the bridge package "is not on the npm registry yet, so this half cannot
+be installed today". `indigo-matter-bridge@0.7.0` is published. That sentence
+belongs to the E8 docs pass, along with #137/#138.
+
+---
+
+## 2026-08-06 (late) — issue #143: state wrong in Alexa. READ THIS BEFORE RESUMING IT
+
+**Status: unresolved, parked for beta testers. The node is EXONERATED.**
+
+Two halves, one root shape — we lean on matter.js's **attribute-change**
+machinery for things that are not changes:
+
+* **Defect A (inbound), still the substantive half.** Ecosystem commands are
+  emitted from `onOff$Changed` listeners, so an invoke matching the endpoint's
+  current state changes nothing and reaches Indigo never. Suspected, **not
+  proven**. Untouched by today's work.
+* **Defect B (outbound).** New exports show stale, then *unresponsive*, in
+  **Alexa only** (Apple is fine) — then **come right on their own after minutes
+  with no intervention**. Best current reading: **Alexa-side convergence lag**,
+  probably not our bug.
+
+**Do NOT re-assert the "born-vs-changed" theory as proven.** It is real in code
+(`createEndpoint` bakes spec states into `initialState`, so an attribute born
+`true` emits no change report) and the fix is cheap — construct from role
+defaults, then `applyStates` after `aggregator.add()`, exactly as `update()`
+already does. But it does **not** explain what was observed: a genuine write
+also failed to move Alexa, and Alexa then fixed itself with no write at all.
+I posted a "B2 CONFIRMED" verdict on the issue and then **withdrew it**; both
+comments are there, read to the end.
+
+**Measured, so don't re-measure it:** a controlled toggle produced `I/ReportData`
+on all three live sessions (1 Apple, 2 Alexa Echo hubs), each acked in ~15ms.
+Alexa = fabric index 4, **two wildcard subscriptions**, maxInterval ≈188s.
+Outbound reporting to Alexa works, *including* for endpoints added after the
+subscription existed.
+
+**Three blind alleys — do not re-walk:**
+1. matter.js does **not** flush a constructor-supplied `initialState` to its
+   store, so `…/indigo-matter-bridge/root.parts.aggregator.parts.<id>.onOff.onOff`
+   is **NOT** a reading of the live attribute. Two said `false` for accessories
+   that were on and correct in both apps. Cost about an hour.
+2. "the node resurrects a stale persisted value on re-export" — tested three
+   ways (in-process, across a restart, via `upsert_endpoint`); **all pass**.
+   Those tests are committed (`e22e861`, `bridge-node/test/restore.test.ts`) and
+   they are what exonerate the node. The stored value was always right; the bug
+   was an *unreported* one, which no assertion on `stateOf` can catch.
+3. **Never credit the last thing you did.** Something here fixes itself on its
+   own timescale. "The plugin restart fixed it" was claimed twice and was wrong
+   both times. Any intervention needs a control before causation is claimed.
+
+**To settle it** (needs beta testers, more than one Alexa setup): export a
+device that is **on**; record Alexa at t+0/+1/+5/+15 min **without touching
+anything**; watch `root.subscriptions.subscriptions` for a re-subscribe at the
+moment it comes right. Then repeat with the create-path fix applied — if Alexa
+is right at t+0 the fix matters, if the curve is unchanged it is cosmetic.
+
+**Also open, adjacent:** #140 — the drift line
+(`indigo-459564566 expected 5, got 2`) now fires on **every** attach after the
+factory reset, and `endpoint-map.json` records number `5` twice (Hallway Lamp
+and Georges Pendant). Harmless — live numbers are unique — but it is the reset's
+fingerprint and belongs in #140.
 
 ---
 
