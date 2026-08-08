@@ -96,7 +96,13 @@ def test_the_default_entry_matches_the_packages_main(tmp_path, mock_logger):
     # side would install one package and look for another.
     assert manifest["name"] == bridge_agent.BRIDGE_PACKAGE
     assert manifest["main"] == bridge_agent.DEFAULT_BRIDGE_ENTRY
-    assert manifest["version"] == bridge_agent.DEFAULT_INSTALL_SPEC.partition("@")[2]
+    # The pin may TRAIL package.json (node source is published on its own
+    # schedule; the plugin adopts a published version when it is ready) but must
+    # never be AHEAD of it: a pin newer than the source tree names a version
+    # that cannot have been published from here, and every install would 404.
+    pin = tuple(int(p) for p in bridge_agent.DEFAULT_INSTALL_SPEC.partition("@")[2].split("."))
+    package = tuple(int(p) for p in manifest["version"].split("."))
+    assert pin <= package, "DEFAULT_INSTALL_SPEC must not pin a version ahead of package.json"
     bridge = _bridge(tmp_path, mock_logger)
     assert bridge.spec.default_entry == bridge_agent.DEFAULT_BRIDGE_ENTRY
 
