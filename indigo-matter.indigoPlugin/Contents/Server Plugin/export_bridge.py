@@ -1376,12 +1376,22 @@ class ExportBridge:
         """Report a drift SET once, however many times the node re-reports it.
 
         Drift is by design never repaired, so it is re-detected by every attach
-        and every upsert for as long as it lasts — and after a
-        ``factory_reset preserveEndpointNumbers: true`` that is *every exported
-        device*, on every reconcile, with no way for the user to clear it short
-        of §3.11. Unlatched, the one error that names the problem is buried
-        under its own repetitions. Latched on the set, so a device joining the
-        drift is still news.
+        and every upsert for as long as it lasts. Unlatched, the one error that
+        names the problem is buried under its own repetitions. Latched on the
+        set, so a device joining the drift is still news.
+
+        Since bridge-node 0.8.0 (issue #140) a ``factory_reset
+        preserveEndpointNumbers: true`` no longer lands here at all: the NODE
+        voids its own witness at reset time and silently adopts the renumbering
+        the reset itself causes, because matter.js's allocation was erased
+        along with the fabrics and no paired ecosystem could still be holding
+        the old numbers. Anything that DOES reach this handler from a >=0.8.0
+        node is therefore not the reset renumbering — it is the bridge's
+        storage changing for some other reason, which is exactly the anomaly
+        this detector exists to catch. The adoption lives node-side, which is
+        why the message below names the bridge-node version, not the plugin's:
+        a new plugin driving an old node still gets reset drift here, and
+        claiming it away would be #132's mistake over again.
         """
         seen = frozenset((d.unique_id, d.expected, d.actual) for d in drift)
         if seen == self._drift_reported:
@@ -1389,7 +1399,10 @@ class ExportBridge:
         self._drift_reported = seen
         self._logger.error(
             "Matter export: endpoint-number DRIFT detected — %s. Exported accessories may have "
-            "swapped identities in paired ecosystems. This is never repaired automatically.",
+            "swapped identities in paired ecosystems. Bridge nodes 0.8.0 and newer adopt a "
+            "factory reset's own renumbering automatically, so on a current node persistent "
+            "drift means the bridge's storage changed OUTSIDE any reset — treat it as a real "
+            "anomaly; there is deliberately no dismiss.",
             ", ".join(f"{d.unique_id}: expected {d.expected}, got {d.actual}" for d in drift))
 
     # ------------------------------------------------------------------

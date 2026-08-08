@@ -126,7 +126,11 @@ from the controller agent:
   set — the first attach's reconcile, and every `upsert_endpoint` /
   `remove_endpoint` after it. Drift is **reported, never repaired**: an
   auto-repair would bless the storage loss that caused it and make the next
-  occurrence invisible too.
+  occurrence invisible too. One deliberate exception (issue #140): a
+  renumbering caused by a factory reset is voided and silently adopted rather
+  than reported, because the reset itself already erased matter.js's own
+  allocation with no paired ecosystem left to disagree — everything else still
+  drifts exactly as before.
 - **Storage loss is the #1 real-world accessory-duplication cause** (not logic
   bugs): a missing/relocated storage dir reallocates every endpoint number and
   every ecosystem re-creates every accessory, losing names, rooms and

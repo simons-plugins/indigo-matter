@@ -1,34 +1,98 @@
 # indigo-matter — Build Handover
 
-**Last updated:** 2026-08-08 18:19 UTC
-**Active work:** none — nothing in flight, working tree clean.
-**Branch:** `main` — **PR #148 MERGED** (`775de2e`, issue #132 closed) and
-**release v2026.8.6 CUT** by the workflow on that merge. That was the first
-non-`[no-release]` merge since v2026.7.23, so the release also ships the
-banked #141 endpoint restore and #134 menu sections — the `[no-release]` debt
-recorded here since 2026-08-06 is **cleared**.
-**Version:** plugin `2026.8.7` in tree (v2026.8.6 is the released tag; this
-bump exists because check-version fails on any PR whose version is already a
-tag — docs-only PRs rode the untagged 2026.8.5 before, and the v2026.8.6
-release closed that loophole). Bridge-node `0.7.0` (**published to npm**;
-`DEFAULT_INSTALL_SPEC` pins it).
-**Tests:** **2256 Python**, **383 TS** — both green. pylint 9.42 whole-repo
-baseline. (`python3 -m pytest -q` · `cd bridge-node && npm run build && npm test`)
-**Deployed:** jarvis runs plugin `2026.8.5` + bridge-node `0.7.0`, paired to
-**Apple Home AND Alexa simultaneously** (3 fabrics: 2 Apple, 1 Alexa) — now
-**one patch behind** the v2026.8.6 release. The delta is #132's dialog/log
-strings only, so lagging is harmless; true up with the release bundle (or the
-two changed files `MenuItems.xml` + `Info.plist` plus `bridge_client.py`,
-`export_bridge.py`, `bridge_protocol.py`, `plugin.py` over SSH) whenever
-convenient.
-**Status:** export v1 feature-complete and live. #141 **fixed and confirmed**
-(below). **#143 is the open one** — see the 2026-08-06 §#143 section; its
-defect B was investigated hard and the leading theory was **withdrawn**, so
-read that before touching it.
+**Last updated:** 2026-08-08 21:06 UTC
+**Active work:** `fix/140-adopt-reset-renumbering` — #140 built, PR open,
+awaiting review + Simon's merge go-ahead. See the §#140 section below,
+**including the publish coupling and the jarvis one-time map edit**.
+**Branch:** `main` last merged **PR #150** (`298ee6e`, #131 picker sort →
+release **v2026.8.8**); before it #148 (`775de2e`, #132 → v2026.8.6, which
+also shipped the banked #141+#134 `[no-release]` debt) and #149 (docs,
+`[no-release]`). Releases v2026.8.6/.8.8 exist; 2026.8.7 was never tagged.
+**Version:** plugin `2026.8.9` on the #140 branch (v2026.8.8 released).
+Bridge-node **source is now ahead of the published `0.7.0`** — the #140
+adoption is node-side and reaches installs only when `0.8.0` is published
+(bump `bridge-node/package.json` + `DEFAULT_INSTALL_SPEC` together, then
+`npm publish` — the #141 section's recipe applies verbatim).
+**Tests:** **2265 Python**, **396 TS** — both green.
+(`python3 -m pytest -q` · `cd bridge-node && npm run build && npm test`)
+**Deployed:** jarvis runs plugin **`2026.8.8`** (deployed 2026-08-08 ~20:38
+UTC: 6-file copy over SSH, checksum-verified against clean 2026.8.5 first — no
+hot-patches — then restart; up with 6 endpoints attached) + bridge-node
+`0.7.0`, paired to **Apple Home AND Alexa** (3 fabrics: 2 Apple, 1 Alexa).
+The #140 drift alarm (`indigo-459564566: expected 5, got 2`) fired on the
+deploy's own attach — the live specimen of the issue.
+**Status:** export v1 feature-complete and live. **#143 is the parked one** —
+see the 2026-08-06 §#143 section; its defect B leading theory was
+**withdrawn**, read before touching.
 
-**NEXT UP:** nothing queued. Open issues: #143 (parked for beta testers —
-read its section first), #140, #105, #83, #84, #62 follow-up, #43, #46,
-#21–#24, and the E8 docs pass (#137/#138 + the Field Notes site).
+**NEXT UP:** after #140 merges — publish bridge-node `0.8.0` (needs Simon's
+npm login), deploy plugin `2026.8.9` + node `0.8.0` to jarvis, do the
+one-time jarvis map edit (§#140), and verify the alarm is gone. Then the
+remaining backlog: #133, #135, #84, #105, #101, the E8 docs pass
+(#137/#138/#139), #146/#147.
+
+---
+
+## 2026-08-08 (evening) — issue #140: the reset's own renumbering is adopted, not alarmed about forever
+
+Plugin `2026.8.9`, branch `fix/140-adopt-reset-renumbering`. Suites **2265
+Python** / **396 TS** (from 2264/383; 1 + 13 new). **No wire change — golden
+frames untouched.**
+
+**The defect was two deliberate designs colliding.** A preserving factory
+reset kept the endpoint map *specifically to report* the renumbering the reset
+causes ("preserves the ability to NOTICE"), and its log line told the user to
+clear the report with the §3.11 rebuild — which the plugin's M11 gate
+correctly *refuses* on a healthy node. Permanent alarm, locked door. Observed
+live on jarvis at every attach (`indigo-459564566: expected 5, got 2`).
+
+**The fix is the issue's option (3), node-side only.** At both reset sites —
+§3.10 `factory_reset preserveEndpointNumbers: true` and the last-fabric
+self-reset (`noteLastFabricGone`) — the node now **voids** every map entry's
+number (`numberVoid: true`, per entry); `check()` silently **adopts** the next
+live number for a void entry and clears the marker (even when the numbers
+happen to match — the marker is what must stop being true). The safety
+argument, now in the class comment: matter.js is *always* the allocator (the
+map is witness-only; even the #141 restore takes matter.js's number), and both
+reset sites are reached with an **empty fabric set**, so no paired ecosystem
+exists that could hold the old numbers — adoption is unobservable outside the
+node. An entry that was never voided **still drifts exactly as before**; on a
+current node, surviving drift is now a *stronger* signal (storage changed
+outside any reset), and the plugin's drift error says so.
+
+**Schema stayed at v2, deliberately.** Every reader takes fields by name, so
+an old build reading a file carrying `numberVoid` never looks at the key — a
+version bump would guard nothing. Documented at `ENDPOINT_MAP_VERSION`.
+
+**The version claim in the plugin's drift message names the BRIDGE NODE
+(≥ 0.8.0), not the plugin.** First draft said "since v2026.8.9" — but adoption
+is node-side, and a new plugin driving the published `0.7.0` node still gets
+reset drift; claiming it away would have been #132's mistake over again. The
+test pins "0.8.0".
+
+**Publish coupling (do not forget):** `bridge-node/package.json` is still
+`0.7.0` and `DEFAULT_INSTALL_SPEC` still pins `0.7.0` — correct per the #141
+precedent (never pin an unpublished version). Shipping #140 to installs means:
+bump both to `0.8.0` together, `npm publish` (Simon's npm login),
+`test_bridge_agent.py` asserts the pin matches.
+
+**jarvis needs a one-time hand edit** — its stale entry predates the marker,
+so the fix cannot clear it retroactively. With the bridge node stopped (*Stop
+the Matter export bridge…*), edit
+`~/Library/Application Support/com.simons-plugins.indigo-matter/bridge-node/endpoint-map.json`:
+set `indigo-459564566`'s number to the live `2`, and resolve the duplicate
+number 5 (two entries record it — the reset's fingerprint; the non-live one
+keeps it only if no live endpoint owns 5). Alternative: add `"numberVoid":
+true` to the stale entries and let the new node adopt on its next attach —
+strictly safer, no numbers guessed.
+
+**Mutation-verified:** adopt-without-checking-the-marker fails the
+non-void-still-drifts test (+3 collateral); skipping `voidNumbers` at
+`noteLastFabricGone` fails its dedicated test. The duplicate-number
+fingerprint heals under adoption (tested). One pre-existing test updated
+(`persistence.test.ts` "keeps endpoint-map.json by default" — entries now gain
+the marker after a preserving reset); the known `main.test.ts` spawn flake
+appeared once in three runs, unrelated file, documented before.
 
 ---
 

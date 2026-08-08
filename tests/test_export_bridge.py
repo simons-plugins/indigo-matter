@@ -752,6 +752,22 @@ class TestFailureSurfacing:
         assert "DRIFT" in errors_of(mock_logger)
         assert h.client.names() == [], "drift must not trigger a repair"
 
+    def test_drift_message_says_reset_renumbering_is_adopted_automatically(
+            self, bridge_mod, mock_logger, devices):
+        # #140: a factory-reset renumbering no longer reaches this handler at
+        # all (the node adopts it itself) — so drift that DOES arrive here is a
+        # real anomaly, and the message must say so, not point at the reset.
+        h = self._bridge(bridge_mod, mock_logger, devices)
+        h.bridge._on_drift_detected(bridge_protocol.parse_drift(
+            FRAMES["drift_detected"]["data"]["drift"]))
+        said = errors_of(mock_logger)
+        # The version named is the BRIDGE NODE's, not the plugin's — adoption
+        # lives node-side, and a new plugin driving an old node still gets
+        # reset drift here (claiming otherwise would be #132 again).
+        assert "0.8.0" in said
+        assert "renumbering automatically" in said
+        assert "outside any reset" in said.lower()
+
     def test_an_unreachable_node_is_reported_once_per_outage(self, bridge_mod, mock_logger,
                                                              devices):
         h = self._bridge(bridge_mod, mock_logger, devices)

@@ -25,6 +25,20 @@
  * baseline stays, so the drift keeps being reported until a human resolves it
  * with §3.11.
  *
+ * **One narrow, deliberate exception (issue #140).** An entry the node itself
+ * marked {@link EndpointRecord.numberVoid} is not a drifted entry at all —
+ * {@link EndpointMapStore.voidNumbers} is only ever called at the two points
+ * where matter.js has just erased its OWN number allocation along with every
+ * fabric (§3.10's `factory_reset preserveEndpointNumbers: true`, and the
+ * last-fabric self-reset). matter.js is always the allocator; this map is only
+ * ever its witness (see below), and with no fabric left there is no paired
+ * ecosystem that could still be holding the old numbers to disagree with —
+ * adoption there is unobservable outside this node. {@link
+ * EndpointMapStore.check} adopts a void entry's live number silently instead
+ * of reporting it. An entry that was never voided still drifts exactly as
+ * documented above; only the reset that erased matter.js's own allocation
+ * earns the adoption.
+ *
  * **It also carries what it takes to REBUILD an endpoint** (issue #141). Numbers
  * alone were enough while the file was only a witness, but a node that comes
  * online with an empty aggregator and waits for the plugin tells every paired
@@ -113,6 +127,15 @@ export const ENDPOINT_MAP_FILE = "endpoint-map.json";
  * endpoint set can be rebuilt without the plugin. Version 1 files are still
  * read — see {@link ENDPOINT_MAP_VERSION_LEGACY} — because a v1 file holds the
  * one thing that can never be re-derived: the numbers paired ecosystems know.
+ *
+ * **Still 2 as of issue #140's `numberVoid` marker — not bumped to 3.** A
+ * schema bump exists to protect an OLD build from a NEW file it cannot parse;
+ * `numberVoid` needs no such protection, because every reader here (old and
+ * new) reaches a field by name (`candidate.number`/`.role`/`.label`) rather
+ * than by validating the object shape as a whole, so an old build reading a
+ * file with an unknown extra key simply never looks at it — no throw, no
+ * `readRecord` rejection, the entry loads exactly as it would without the
+ * marker. There is nothing here for a version bump to guard.
  */
 export const ENDPOINT_MAP_VERSION = 2;
 
@@ -137,6 +160,19 @@ export interface EndpointRecord {
     number: number;
     role?: string;
     label?: string;
+    /**
+     * Set by {@link EndpointMapStore.voidNumbers} (issue #140): `number` is a
+     * pre-reset value that {@link EndpointMapStore.check} must silently ADOPT
+     * from the next live number it sees for this `UniqueID`, rather than
+     * report as drift. Absent (not `false`) on every ordinary entry, so a plain
+     * `JSON.stringify` of a non-void record is unchanged from before #140 —
+     * `readRecord` only ever sets this to `true` and never anything else. An
+     * old build reading a file that has it simply never looks at the key: it
+     * destructures `number`/`role`/`label` off the parsed object by name, so
+     * an unrecognised extra property is inert, not a crash — see the schema
+     * version note below, which is why this stays version 2.
+     */
+    numberVoid?: true;
 }
 
 /** The on-disk shape (v2). */
@@ -216,6 +252,11 @@ function readRecord(value: unknown): EndpointRecord | undefined {
     }
     if (isNonEmptyString(candidate.label)) {
         record.label = candidate.label;
+    }
+    // Tolerant, like role/label: anything other than a literal `true` is
+    // simply not a void marker, rather than a reason to reject the entry.
+    if (candidate.numberVoid === true) {
+        record.numberVoid = true;
     }
     return record;
 }
@@ -333,13 +374,16 @@ function noteRestorable(record: EndpointRecord, entry: LiveEndpointNumber): bool
 }
 
 /** Why {@link EndpointMapStore.check} is writing, for the log line. */
-function persistReason(added: number, refreshed: number): string {
+function persistReason(added: number, refreshed: number, adopted: number): string {
     const parts: string[] = [];
     if (added > 0) {
         parts.push(`recorded ${added} new endpoint number(s)`);
     }
     if (refreshed > 0) {
         parts.push(`refreshed ${refreshed} endpoint role/label(s)`);
+    }
+    if (adopted > 0) {
+        parts.push(`adopted ${adopted} renumbered endpoint number(s)`);
     }
     return parts.length === 0 ? "retried after a failed write" : parts.join(" and ");
 }
@@ -464,6 +508,14 @@ export class EndpointMapStore {
      * order the numbers were first recorded — irrelevant to matter.js, which
      * keys each endpoint's number on its `Endpoint.id`, but stable, which makes
      * the log read the same way twice.
+     *
+     * **`numberVoid` is deliberately not part of this filter (issue #140).** A
+     * voided number is still the best guess for `createEndpoint`'s
+     * `Endpoint.id`-keyed restore — matter.js hands back whatever it currently
+     * has for that id regardless of what this map believes, and the {@link
+     * check} that follows `server.start()` is what reconciles the map to
+     * whatever number came back. Excluding void entries here would only widen
+     * the online-and-empty window issue #141 already closed, for no benefit.
      */
     restorable(): RestorableEndpoint[] {
         const restorable: RestorableEndpoint[] = [];
@@ -546,11 +598,19 @@ export class EndpointMapStore {
      * retains the allocation so re-adding the same device restores the same
      * number, and forgetting it here would throw away the very baseline that
      * makes a re-add verifiable.
+     *
+     * **A `numberVoid` entry is adopted, not drift-checked (issue #140).** See
+     * the class comment for why that is safe. The live number is taken as the
+     * new baseline and the marker is cleared — even when the live number
+     * happens to already equal the stale one, because the marker itself is
+     * what has to stop being true, not just the mismatch it was guarding
+     * against.
      */
     check(live: readonly LiveEndpointNumber[]): DriftEntry[] {
         const drift: DriftEntry[] = [];
         let added = 0;
         let refreshed = 0;
+        let adopted = 0;
         for (const entry of live) {
             const record = this.#endpoints.get(entry.uniqueId);
             if (record === undefined) {
@@ -565,17 +625,30 @@ export class EndpointMapStore {
             if (noteRestorable(record, entry)) {
                 refreshed += 1;
             }
+            if (record.numberVoid) {
+                record.number = entry.endpointNumber;
+                delete record.numberVoid;
+                adopted += 1;
+                continue;
+            }
             if (record.number !== entry.endpointNumber) {
                 drift.push({ uniqueId: entry.uniqueId, expected: record.number, actual: entry.endpointNumber });
             }
+        }
+        if (adopted > 0) {
+            this.log(
+                `Adopted ${adopted} endpoint number(s) renumbered by the factory reset; matter.js's ` +
+                    "allocation was erased with the fabrics, so no paired ecosystem holds the old " +
+                    "numbers — this is the reset's own renumbering, not drift.",
+            );
         }
         // `#dirty` is the retry: a write that failed last time leaves the map
         // owing the disk something even when this pass added nothing, and the
         // steady state (`added === 0`, clean) still costs no I/O. Without it a
         // full disk at the moment of the first check would never be revisited,
         // and `checked` — see the `#dirty` field — would never come true again.
-        if (added > 0 || refreshed > 0 || this.#dirty) {
-            this.persist(persistReason(added, refreshed));
+        if (added > 0 || refreshed > 0 || adopted > 0 || this.#dirty) {
+            this.persist(persistReason(added, refreshed, adopted));
         }
         // An empty comparison compared nothing, so it cannot make `driftChecked`
         // true — the same rule {@link seed} already applies. §4.3 says
@@ -588,6 +661,43 @@ export class EndpointMapStore {
             this.#checked = true;
         }
         return drift;
+    }
+
+    /**
+     * §3.10's preserving reset and the last-fabric self-reset (issue #140) —
+     * mark every entry's number as no longer trustworthy, WITHOUT discarding
+     * it, so the next {@link check} adopts whatever number each `UniqueID`
+     * comes back with instead of reporting it as drift forever.
+     *
+     * **Why this is safe — see the class comment for the full argument.** In
+     * one line: matter.js is always the allocator and this map only ever
+     * witnesses it, and both call sites reach this with an empty fabric set,
+     * so nothing paired can still be holding the numbers this call is about
+     * to let move.
+     *
+     * Unlike {@link rebuild}, this keeps every entry (role/label survive
+     * untouched — a void number does not make an endpoint any less
+     * restorable, see {@link restorable}) and unlike {@link discard}, it
+     * throws nothing away: a caller who wants "adopt whatever exists right
+     * now" already has {@link rebuild}, and this is deliberately weaker than
+     * that — it only stops treating the CURRENT numbers as ground truth.
+     *
+     * A no-op on an empty map: nothing to mark is not worth a write, and a
+     * bridge that has never exported anything must not have this manufacture
+     * a baseline out of nothing.
+     *
+     * Returns whether the voided baseline reached disk — `false` on the
+     * empty-map no-op as well as on a failed write, since neither actually
+     * persisted anything new.
+     */
+    voidNumbers(why: string): boolean {
+        if (this.#endpoints.size === 0) {
+            return false;
+        }
+        for (const record of this.#endpoints.values()) {
+            record.numberVoid = true;
+        }
+        return this.persist(`voided every endpoint number — ${why}`);
     }
 
     /**
