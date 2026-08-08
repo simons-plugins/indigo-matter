@@ -1,22 +1,26 @@
 # indigo-matter — Build Handover
 
-**Last updated:** 2026-08-08 17:19 UTC
-**Active work:** `fix/132-rebuild-warning` — #132 fixed, PR open, awaiting
-review + Simon's merge go-ahead.
-**Branch:** `main` last merged **PR #144** (`08d64dc`, issue #134 closed). Both
-it and #142 went in under `[no-release]`, so **two merges' worth of work is
-unreleased**: the latest release is still **v2026.7.23**, and the only 2026.8
-artefact is the `v2026.8.0` *pre-release* Simon cut by hand. Whoever cuts the
-next real release ships #141's endpoint restore **and** #134's menu together.
-**Version:** plugin `2026.8.6` (on the #132 branch), bridge-node `0.7.0`
-(**published to npm**; `DEFAULT_INSTALL_SPEC` pins it).
-**Tests:** **2256 Python**, **383 TS** — both green. pylint 9.52 on the touched
-modules. (`python3 -m pytest -q` · `cd bridge-node && npm run build && npm test`)
+**Last updated:** 2026-08-08 18:19 UTC
+**Active work:** none — nothing in flight, working tree clean.
+**Branch:** `main` — **PR #148 MERGED** (`775de2e`, issue #132 closed) and
+**release v2026.8.6 CUT** by the workflow on that merge. That was the first
+non-`[no-release]` merge since v2026.7.23, so the release also ships the
+banked #141 endpoint restore and #134 menu sections — the `[no-release]` debt
+recorded here since 2026-08-06 is **cleared**.
+**Version:** plugin `2026.8.7` in tree (v2026.8.6 is the released tag; this
+bump exists because check-version fails on any PR whose version is already a
+tag — docs-only PRs rode the untagged 2026.8.5 before, and the v2026.8.6
+release closed that loophole). Bridge-node `0.7.0` (**published to npm**;
+`DEFAULT_INSTALL_SPEC` pins it).
+**Tests:** **2256 Python**, **383 TS** — both green. pylint 9.42 whole-repo
+baseline. (`python3 -m pytest -q` · `cd bridge-node && npm run build && npm test`)
 **Deployed:** jarvis runs plugin `2026.8.5` + bridge-node `0.7.0`, paired to
-**Apple Home AND Alexa simultaneously** (3 fabrics: 2 Apple, 1 Alexa). The
-2026.8.5 deploy was two files (`MenuItems.xml`, `Info.plist`) over SSH plus a
-plugin restart; the install was checksum-compared against the branch first and
-carried **no** hot-patches, so a plain file copy was safe.
+**Apple Home AND Alexa simultaneously** (3 fabrics: 2 Apple, 1 Alexa) — now
+**one patch behind** the v2026.8.6 release. The delta is #132's dialog/log
+strings only, so lagging is harmless; true up with the release bundle (or the
+two changed files `MenuItems.xml` + `Info.plist` plus `bridge_client.py`,
+`export_bridge.py`, `bridge_protocol.py`, `plugin.py` over SSH) whenever
+convenient.
 **Status:** export v1 feature-complete and live. #141 **fixed and confirmed**
 (below). **#143 is the open one** — see the 2026-08-06 §#143 section; its
 defect B was investigated hard and the leading theory was **withdrawn**, so
@@ -28,8 +32,8 @@ read that before touching it.
 
 ## 2026-08-08 — issue #132: the rebuild warning promised harm the action cannot do
 
-Plugin `2026.8.6`, branch `fix/132-rebuild-warning`. Suites unchanged at
-2256/383; strings only, no behaviour.
+Plugin `2026.8.6`. **PR #148, merged `775de2e` — the merge that cut release
+v2026.8.6.** Suites unchanged at 2256/383; strings only, no behaviour.
 
 **The claim was wrong everywhere, not just in the dialog.** The *Rebuild Matter
 Endpoint Map…* dialog warned the rebuild "WILL duplicate accessories in paired
