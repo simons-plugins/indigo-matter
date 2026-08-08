@@ -597,6 +597,55 @@ describe("EndpointMapStore.voidNumbers — reset renumbering adoption (issue #14
             `expected an adoption log line, got ${JSON.stringify(logged)}`,
         );
     });
+
+    it("clears `checked` — a voided baseline has not been verified against anything", () => {
+        // ⊗ `voidNumbers` used to leave `#checked` untouched, so between a
+        // reset and the first post-reset reconcile, `driftChecked: true` /
+        // `drift: []` claimed "checked, nothing moved" over numbers the node
+        // itself had just declared untrustworthy.
+        const dir = storage();
+        const store = new EndpointMapStore(dir);
+        store.load();
+        store.check([{ uniqueId: "indigo-1", endpointNumber: 2 }]);
+        assert.equal(store.checked, true, "sanity: the first check earned the flag");
+
+        store.voidNumbers("factory reset");
+
+        assert.equal(store.checked, false, "a VOID baseline is unverified, whatever it was before");
+
+        store.check([{ uniqueId: "indigo-1", endpointNumber: 9 }]);
+
+        assert.equal(store.checked, true, "the first post-reset check against live entries earns it back");
+    });
+
+    it("reports the write failing, not a no-op, when the void cannot reach disk", () => {
+        // ⊗ The boolean `voidNumbers` returns was discarded at both call sites
+        // in `node.ts`, so a failed write left the VOID markers RAM-only while
+        // the log claimed the opposite — this is the store-level half of that:
+        // the caller has to be able to tell "wrote fine" from "in memory only".
+        const dir = storage();
+        const store = new EndpointMapStore(dir);
+        store.load();
+        store.check([{ uniqueId: "indigo-1", endpointNumber: 2 }]);
+
+        chmodSync(dir, 0o500);
+        try {
+            assert.equal(store.voidNumbers("factory reset"), false, "the write failed");
+            assert.equal(store.warnings.length, 1);
+            assert.match(store.warnings[0]!, /Could not write the endpoint map/);
+        } finally {
+            chmodSync(dir, 0o700);
+        }
+        assert.equal(store.checked, false, "an unwritten baseline still verified nothing durable");
+
+        // The marker survives in memory despite the failed write, and `#dirty`
+        // makes the next successful write retry it — proven by the very next
+        // check() adopting rather than reporting drift.
+        const drift = store.check([{ uniqueId: "indigo-1", endpointNumber: 9 }]);
+
+        assert.deepEqual(drift, [], "the in-memory VOID marker survived the failed write and still adopts");
+        assert.deepEqual(mapFileIn(dir).endpoints, { "indigo-1": { number: 9 } });
+    });
 });
 
 describe("EndpointMapStore.forget — un-export without losing the number", () => {

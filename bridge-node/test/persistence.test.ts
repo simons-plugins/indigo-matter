@@ -562,6 +562,48 @@ describe("factory_reset (preserve: true) voids the map instead of drift-checking
             await bridge.close();
         }
     });
+
+    it("tells the truth when the VOID markers cannot reach disk, instead of claiming success", async t => {
+        // ⊗ `voidNumbers`'s boolean return used to be discarded here, so a
+        // failed write still logged "its numbers are now VOID ... a §3.11
+        // rebuild is not needed" — over markers that existed in memory only.
+        // A crash before the next successful persist would have brought back
+        // #140's forever-drift report after the user was told it was fixed.
+        if (process.getuid?.() === 0) {
+            t.skip("root ignores directory permissions");
+            return;
+        }
+        const storagePath = storage();
+        const logged: string[] = [];
+        const bridge = new BridgeNode(
+            { storagePath, matterPort: 0, wsPort: 0 },
+            { ...IDENTITY },
+            BRIDGE_VERSION,
+            message => logged.push(message),
+        );
+        await bridge.start();
+        try {
+            await bridge.reconcile(ENDPOINTS as never, false);
+
+            chmodSync(storagePath, 0o500);
+            try {
+                await bridge.factoryReset(true);
+            } finally {
+                chmodSync(storagePath, 0o700);
+            }
+
+            assert.ok(
+                logged.some(line => line.includes("VOID markers could NOT be written")),
+                `expected the write-failure branch, got: ${logged.join("\n")}`,
+            );
+            assert.ok(
+                !logged.some(line => line.includes("its numbers are now VOID")),
+                "the success message must not fire over an unwritten baseline",
+            );
+        } finally {
+            await bridge.close();
+        }
+    });
 });
 
 describe("noteLastFabricGone voids the endpoint map too (issue #140)", () => {

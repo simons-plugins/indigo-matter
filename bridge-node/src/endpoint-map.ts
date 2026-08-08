@@ -39,6 +39,18 @@
  * documented above; only the reset that erased matter.js's own allocation
  * earns the adoption.
  *
+ * The marker's lifetime is bounded by when its `UniqueID` next comes back
+ * LIVE, not by the moment of the reset: only entries `check()` actually sees
+ * get to adopt, so a device that stays offline through the first post-reset
+ * reconcile simply keeps its VOID marker — still unadopted — until it next
+ * exports, however much later that is. That is still safe even if fabrics
+ * have been re-paired by then: the number it eventually adopts is the one
+ * matter.js handed out fresh after THIS reset, not a stale one, and no
+ * ecosystem ever saw the old number in between (it was never live to be
+ * observed). The safety argument above just has to be read as "no fabric
+ * survived the reset that erased the allocation", not "no fabric exists at
+ * the moment of adoption".
+ *
  * **It also carries what it takes to REBUILD an endpoint** (issue #141). Numbers
  * alone were enough while the file was only a witness, but a node that comes
  * online with an empty aggregator and waits for the plugin tells every paired
@@ -688,7 +700,15 @@ export class EndpointMapStore {
      *
      * Returns whether the voided baseline reached disk — `false` on the
      * empty-map no-op as well as on a failed write, since neither actually
-     * persisted anything new.
+     * persisted anything new. A caller that has to tell those two apart
+     * (a no-op is not a failure worth warning about) should check {@link size}
+     * before calling, the way both `node.ts` call sites now do.
+     *
+     * Also drops {@link checked}: a baseline the node itself just declared
+     * VOID has not been verified against anything, and leaving the flag set
+     * would have §4.3's `driftChecked: true` claim "checked, nothing moved"
+     * over numbers that are, by construction, not yet trusted. The first
+     * post-reset {@link check} against live entries earns it back.
      */
     voidNumbers(why: string): boolean {
         if (this.#endpoints.size === 0) {
@@ -697,6 +717,7 @@ export class EndpointMapStore {
         for (const record of this.#endpoints.values()) {
             record.numberVoid = true;
         }
+        this.#checked = false;
         return this.persist(`voided every endpoint number — ${why}`);
     }
 
