@@ -329,6 +329,56 @@ def test_current_exports_says_so_when_it_fails_outright(plug, plugin_mod, monkey
     assert plug.getCurrentExports() == [plugin_mod.LIST_ERROR_OPTION]
 
 
+# ---------------------------------------------------------------------------
+# Issue #131 — exported devices sort to the top of the picker
+# ---------------------------------------------------------------------------
+def test_exported_devices_sort_above_non_exported_regardless_of_database_order(
+        plug, devices, plugin_mod):
+    """Exported devices hoist to the top even when added to the DB last."""
+    late = devices.add(RelayDevice(201, "Late Arrival"))
+    plug.exports.upsert(ExportEntry(late.id, "onOffPlugInUnit"))
+    ids = [key for key, _label in plug.getExportCandidates(valuesDict=_values())]
+    assert ids.index("201") < ids.index("101")
+
+
+def test_exported_and_other_groups_each_preserve_database_order(plug, devices):
+    devices.add(RelayDevice(301, "Exported A"))
+    devices.add(RelayDevice(302, "Plain A"))
+    devices.add(RelayDevice(303, "Exported B"))
+    devices.add(RelayDevice(304, "Plain B"))
+    plug.exports.upsert(ExportEntry(301, "onOffPlugInUnit"))
+    plug.exports.upsert(ExportEntry(303, "onOffPlugInUnit"))
+    ids = [key for key, _label in plug.getExportCandidates(valuesDict=_values())]
+    assert ids.index("301") < ids.index("303")   # exported group: DB order
+    assert ids.index("302") < ids.index("304")   # other group: DB order
+
+
+def test_exported_device_past_the_cap_survives(plug, devices, plugin_mod):
+    """An export is the one thing the picker lets you undo — it must never fall off."""
+    for device_id in range(1000, 1000 + plugin_mod.EXPORT_PICKER_LIMIT + 5):
+        devices.add(RelayDevice(device_id, f"Bulk {device_id}"))
+    late = devices.add(RelayDevice(9999, "Late Export"))
+    plug.exports.upsert(ExportEntry(late.id, "onOffPlugInUnit"))
+    options = plug.getExportCandidates(valuesDict=_values())
+    ids = [key for key, _label in options]
+    assert ids[1] == "9999"                       # right after the seed row
+    assert len(ids) == len(set(ids))               # id-uniqueness survives the split
+    # seed + (the exported row + LIMIT-1 others) + the truncated tail
+    assert len(options) == plugin_mod.EXPORT_PICKER_LIMIT + 2
+    assert options[-1] == plugin_mod.TRUNCATED_OPTION
+
+
+def test_excluded_and_exported_device_hoists_too(plug, devices):
+    """D4: an excluded-but-exported device keeps its marker AND hoists (#131)."""
+    plug.exports.upsert(ExportEntry(104, "onOffPlugInUnit"))
+    options = plug.getExportCandidates(valuesDict=_values())
+    ids = [key for key, _label in options]
+    labels = _labels(options)
+    assert ids[1] == "x-104"
+    assert labels["x-104"].startswith("● ")
+    assert ids.index("x-104") < ids.index("101")
+
+
 def test_picker_works_before_the_store_exists(plug):
     plug.exports = None
     assert _labels(plug.getExportCandidates(valuesDict=_values()))["101"] == "Study Plug"

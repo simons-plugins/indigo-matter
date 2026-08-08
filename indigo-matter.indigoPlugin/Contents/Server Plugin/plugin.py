@@ -1847,7 +1847,7 @@ class Plugin(indigo.PluginBase):
         return (str(device_id), f"{mark}{name}")
 
     def getExportCandidates(self, filter="", valuesDict=None, typeId="", targetId=0):
-        # pylint: disable=redefined-builtin, unused-argument
+        # pylint: disable=redefined-builtin, unused-argument, too-many-locals
         """Picker rows: every Indigo device, exportable or not (XAC9).
 
         Excluded devices are listed **with the reason in the label** and an
@@ -1860,6 +1860,14 @@ class Plugin(indigo.PluginBase):
         One device that cannot be read costs one row, not the whole list: the
         try/except is INSIDE the loop, because the alternative is a dialog that
         renders empty the moment any device in the database misbehaves.
+
+        Ordering: the seeded ``(select a device)`` row is always first, then
+        every already-exported device (database order), then everything else
+        (also database order) — never alphabetised. This dialog is the only
+        place a user can remove an export, so an exported device buried past
+        :data:`EXPORT_PICKER_LIMIT` would be effectively stuck there; exported
+        rows are therefore classified and kept unconditionally, and the cap is
+        applied only to the rest, at the end, once the exported count is known.
         """
         try:
             text = str((valuesDict or {}).get("exportFilter", "") or "").strip().lower()
@@ -1867,7 +1875,11 @@ class Plugin(indigo.PluginBase):
             plugin_id = self._export_plugin_id()
             # Always a real row for the seeded value, and always first.
             options: list[tuple[str, str]] = [(NO_SELECTION_ID, NO_SELECTION_LABEL)]
-            matched = 0
+            # One pass, two row lists: exported rows are never truncated (see
+            # docstring), so the cap is applied only to `other_rows`, after the
+            # loop, once `len(exported_rows)` is known.
+            exported_rows: list[tuple[str, str]] = []
+            other_rows: list[tuple[str, str]] = []
             truncated = 0
             failures = 0
             for dev in indigo.devices:
@@ -1875,22 +1887,30 @@ class Plugin(indigo.PluginBase):
                     name = str(getattr(dev, "name", "") or "")
                     if text and text not in name.lower():
                         continue
-                    matched += 1
-                    if matched > EXPORT_PICKER_LIMIT:
+                    is_exported = dev.id in exported
+                    if not is_exported and len(other_rows) >= EXPORT_PICKER_LIMIT:
+                        # Upper bound on what the cap below could ever keep —
+                        # exported rows only shrink that allowance, never
+                        # raise it — so it's safe to stop building rows here.
+                        # Still counted, so the tail stays honest.
                         truncated += 1
                         continue
                     row = self._candidate_row(dev, name, plugin_id, exported)
                     if row is None:               # loop guard: absent, not excluded (XAC6)
-                        matched -= 1              # our own devices never consume the cap
                         continue
-                    options.append(row)
+                    (exported_rows if is_exported else other_rows).append(row)
                 except Exception as exc:  # pylint: disable=broad-except
                     self._log_row_failure(exc, first=not failures)
                     failures += 1
-                    # Position-keyed id: the device's own id is one of the
-                    # things we could not read.
-                    options.append((f"{EXCLUDED_OPTION_PREFIX}err{len(options)}",
-                                    f"— {ROW_ERROR_LABEL}"))
+                    # `dev.id` may be exactly what failed to read, so an
+                    # unreadable device can't be safely tested for membership
+                    # in `exported` — it always lands with the others.
+                    other_rows.append((f"{EXCLUDED_OPTION_PREFIX}err{failures}",
+                                        f"— {ROW_ERROR_LABEL}"))
+            allowance = max(EXPORT_PICKER_LIMIT - len(exported_rows), 0)
+            truncated += max(len(other_rows) - allowance, 0)
+            options.extend(exported_rows)
+            options.extend(other_rows[:allowance])
             if truncated:
                 options.append(TRUNCATED_OPTION)
             if len(options) == 1:
