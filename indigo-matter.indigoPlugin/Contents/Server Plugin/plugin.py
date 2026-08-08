@@ -1859,7 +1859,10 @@ class Plugin(indigo.PluginBase):
 
         One device that cannot be read costs one row, not the whole list: the
         try/except is INSIDE the loop, because the alternative is a dialog that
-        renders empty the moment any device in the database misbehaves.
+        renders empty the moment any device in the database misbehaves. That
+        promise holds below :data:`EXPORT_PICKER_LIMIT`; past it, unreadable
+        devices are counted in the truncation tail like any other row, and the
+        log still carries every one.
 
         Ordering: the seeded ``(select a device)`` row is always first, then
         every already-exported device (database order), then everything else
@@ -1906,7 +1909,7 @@ class Plugin(indigo.PluginBase):
                     # unreadable device can't be safely tested for membership
                     # in `exported` — it always lands with the others.
                     other_rows.append((f"{EXCLUDED_OPTION_PREFIX}err{failures}",
-                                        f"— {ROW_ERROR_LABEL}"))
+                                       f"— {ROW_ERROR_LABEL}"))
             allowance = max(EXPORT_PICKER_LIMIT - len(exported_rows), 0)
             truncated += max(len(other_rows) - allowance, 0)
             options.extend(exported_rows)

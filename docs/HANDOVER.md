@@ -34,8 +34,9 @@ read its section first), #140, #105, #83, #84, #62 follow-up, #43, #46,
 
 ## 2026-08-08 (later) — issue #131: exported devices sort to the top of the picker
 
-Plugin `2026.8.8`, branch `feat/131-picker-sort`. Suites **2260 Python** (from
-2256; 4 new picker tests), 383 TS untouched.
+Plugin `2026.8.8`, branch `feat/131-picker-sort`. Suites **2264 Python** (from
+2256; 8 new picker tests — 4 with the feature, 4 more from the review pass),
+383 TS untouched.
 
 **One pass, two row lists, cap applied at the end.** `getExportCandidates` now
 builds `exported_rows` and `other_rows` and concatenates seed → exported →
@@ -60,6 +61,23 @@ group deliberately: `dev.id` may be exactly what failed, so membership in
 **Mutation-verified both ways:** removing the hoist fails the ordering tests;
 applying the cap before the exported check fails the past-the-cap survival
 test.
+
+**The review pass found the arithmetic softer than it looked** — two more
+*empirically confirmed* surviving mutants, both now killed: the post-loop
+`truncated +=` line was deletable (every truncation test also tripped the
+in-loop counter; a boundary test now drives `other_rows` to exactly the cap
+so the post-loop slice is the only thing that truncates) and both groups
+could be alphabetised (the ordering test's device names happened to
+alphabetise into DB order; they are now reverse-alphabetical, plus an
+inter-group assertion). Also added: filter×hoist (a filtered-out export is
+absent, a matching one still hoists), the allowance floor (shrink
+`EXPORT_PICKER_LIMIT` to 3 via monkeypatch, 4 exports — without `max(…, 0)` a
+negative slice keeps the wrong rows), and error-row id uniqueness (asserted
+on raw options, since `_labels` dict-collapses duplicate ids — the failure
+under test). One deliberate behaviour note, docstring'd: error rows are now
+*bounded* by the cap like any other row — past the cap they join the
+truncation tail (the old code could put 1000 error rows in the menu); the
+log still carries every one.
 
 ---
 

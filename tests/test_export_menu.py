@@ -333,7 +333,7 @@ def test_current_exports_says_so_when_it_fails_outright(plug, plugin_mod, monkey
 # Issue #131 — exported devices sort to the top of the picker
 # ---------------------------------------------------------------------------
 def test_exported_devices_sort_above_non_exported_regardless_of_database_order(
-        plug, devices, plugin_mod):
+        plug, devices):
     """Exported devices hoist to the top even when added to the DB last."""
     late = devices.add(RelayDevice(201, "Late Arrival"))
     plug.exports.upsert(ExportEntry(late.id, "onOffPlugInUnit"))
@@ -342,15 +342,20 @@ def test_exported_devices_sort_above_non_exported_regardless_of_database_order(
 
 
 def test_exported_and_other_groups_each_preserve_database_order(plug, devices):
-    devices.add(RelayDevice(301, "Exported A"))
-    devices.add(RelayDevice(302, "Plain A"))
-    devices.add(RelayDevice(303, "Exported B"))
-    devices.add(RelayDevice(304, "Plain B"))
+    """Names are reverse-alphabetical so an alphabetise-both-groups mutant fails
+    the intra-group assertions too, not just the (missing, until now) inter-group one."""
+    devices.add(RelayDevice(301, "Zed Export"))
+    devices.add(RelayDevice(302, "Zulu Plain"))
+    devices.add(RelayDevice(303, "Alpha Export"))
+    devices.add(RelayDevice(304, "Alpha Plain"))
     plug.exports.upsert(ExportEntry(301, "onOffPlugInUnit"))
     plug.exports.upsert(ExportEntry(303, "onOffPlugInUnit"))
     ids = [key for key, _label in plug.getExportCandidates(valuesDict=_values())]
     assert ids.index("301") < ids.index("303")   # exported group: DB order
     assert ids.index("302") < ids.index("304")   # other group: DB order
+    for exported_id in ("301", "303"):
+        for other_id in ("302", "304"):
+            assert ids.index(exported_id) < ids.index(other_id)
 
 
 def test_exported_device_past_the_cap_survives(plug, devices, plugin_mod):
@@ -377,6 +382,67 @@ def test_excluded_and_exported_device_hoists_too(plug, devices):
     assert ids[1] == "x-104"
     assert labels["x-104"].startswith("● ")
     assert ids.index("x-104") < ids.index("101")
+
+
+def test_the_tail_is_honest_when_only_the_allowance_slice_truncates(plug, devices, plugin_mod):
+    """The in-loop counter never fires here, so this pins the post-loop accounting alone."""
+    non_exported_in_fixture = 4   # 101, 102, 103, x-104 — see test_picker_lists_every_device
+    bulk = plugin_mod.EXPORT_PICKER_LIMIT - non_exported_in_fixture
+    for device_id in range(2000, 2000 + bulk):
+        devices.add(RelayDevice(device_id, f"Bulk {device_id}"))
+    # other_rows now sits at exactly EXPORT_PICKER_LIMIT with zero in-loop truncation.
+    late = devices.add(RelayDevice(9999, "Late Export"))
+    plug.exports.upsert(ExportEntry(late.id, "onOffPlugInUnit"))
+    options = plug.getExportCandidates(valuesDict=_values())
+    assert options[-1] == plugin_mod.TRUNCATED_OPTION
+    assert len(options) == plugin_mod.EXPORT_PICKER_LIMIT + 2
+
+
+def test_exported_devices_are_still_filtered_before_they_can_hoist(plug, devices):
+    devices.add(RelayDevice(401, "Kitchen Export"))    # exported, matches filter
+    devices.add(RelayDevice(402, "Garage Export"))      # exported, filtered out
+    devices.add(RelayDevice(403, "Kitchen Plain"))      # not exported, matches filter
+    plug.exports.upsert(ExportEntry(401, "onOffPlugInUnit"))
+    plug.exports.upsert(ExportEntry(402, "onOffPlugInUnit"))
+    ids = [key for key, _label in
+           plug.getExportCandidates(valuesDict=_values(exportFilter="kitchen"))]
+    assert "401" in ids
+    assert "403" in ids
+    assert "402" not in ids                             # filtered out despite being exported
+    assert ids.index("401") < ids.index("403")           # still hoisted above the plain match
+
+
+def test_allowance_never_goes_negative_when_exports_exceed_the_cap(
+        plug, devices, plugin_mod, monkeypatch):
+    """Exported rows are uncapped by design; without the floor a shrunk limit
+    would slice other_rows with a negative index and keep the wrong rows
+    (a plain device that should have been dropped along with everything else)."""
+    monkeypatch.setattr(plugin_mod, "EXPORT_PICKER_LIMIT", 3)
+    for device_id in range(500, 504):
+        devices.add(RelayDevice(device_id, f"Export {device_id}"))
+        plug.exports.upsert(ExportEntry(device_id, "onOffPlugInUnit"))
+    devices.add(RelayDevice(600, "Plain One"))
+    devices.add(RelayDevice(601, "Plain Two"))
+    options = plug.getExportCandidates(valuesDict=_values())
+    ids = [key for key, _label in options]
+    for device_id in range(500, 504):
+        assert str(device_id) in ids
+    # allowance is 0 (4 exports already exceed the limit of 3), so every plain
+    # device — the two added here and the fixture's own 101/102/103 — is gone.
+    for plain_id in ("101", "102", "103", "600", "601"):
+        assert plain_id not in ids
+    assert options[-1] == plugin_mod.TRUNCATED_OPTION
+    assert len(options) == 1 + 4 + 1               # seed + exported rows + tail
+
+
+def test_unreadable_device_error_rows_carry_distinct_ids(plug, devices, plugin_mod):
+    for _ in range(3):
+        devices.add(HostileDevice())
+    options = plug.getExportCandidates(valuesDict=_values())
+    # Not `_labels()`: it dict-collapses duplicate ids, which is the thing under test.
+    error_rows = [(key, label) for key, label in options if plugin_mod.ROW_ERROR_LABEL in label]
+    assert len(error_rows) == 3
+    assert len({key for key, _label in error_rows}) == 3
 
 
 def test_picker_works_before_the_store_exists(plug):
