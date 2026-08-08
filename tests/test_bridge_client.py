@@ -321,7 +321,8 @@ class TestCommands:
         status = self._exchange(mock_logger, lambda c: c.rebuild_endpoint_map(),
                                 "rebuild_endpoint_map", EXCHANGES)
         assert status.endpoint_count == 2
-        # §3.11 REallocates — the numbers differ from the ones attach reported.
+        # The fixture depicts a post-storage-loss node, so its numbers differ
+        # from attach's — §3.11 records, it does not reallocate.
         assert status.endpoints[1].endpoint_number == 5
 
     def test_error_response_raises(self, mock_logger):
@@ -719,6 +720,7 @@ class TestEndpointMapInvalid:
             assert not client.halted
             assert refusals == [bridge_protocol.ERR_ENDPOINT_MAP_INVALID]
             assert "confirm the rebuild" in logged(mock_logger, "error")
+            assert "renumbers nothing" in logged(mock_logger, "error")
 
             await client.close()
             task.cancel()
@@ -795,6 +797,7 @@ class TestEndpointMapInvalid:
             assert "identity file is unreadable" in errors
             assert "CANNOT fix this" in errors
             assert "confirm the rebuild" not in errors
+            assert "renumbers nothing" not in errors
 
             await client.close()
             task.cancel()

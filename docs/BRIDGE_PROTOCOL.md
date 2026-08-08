@@ -57,6 +57,8 @@ bug in the node.
 | `role_change` | `upsert_endpoint` tried to change an existing endpoint's role (§4.1) |
 | `mass_removal_refused` | `attach` would remove every live endpoint without `"intent": "replace_all"` (§3.1) |
 | `endpoint_map_invalid` | Node is in the refuse-to-start state (PRD §7); only `get_status`, `get_pairing` and `rebuild_endpoint_map` are accepted |
+| `commissioning_window_failed` | Matter stack refused to open the enhanced commissioning window |
+| `internal` | Unexpected node-side failure; `details` carries the message |
 
 `endpoint_map_invalid` covers **every** refuse-to-start reason, not only a bad
 map: the code names the *state* (which commands are accepted), and `details`
@@ -72,8 +74,6 @@ constants in `bridge_protocol.py`), and two of them need opposite advice:
 
 A client that shows the map remedy for all three sends the identity case at the
 one door deliberately locked against it. Clients MUST branch on the reason.
-| `commissioning_window_failed` | Matter stack refused to open the enhanced commissioning window |
-| `internal` | Unexpected node-side failure; `details` carries the message |
 
 ## 2. Handshake
 
@@ -303,12 +303,13 @@ The recovery path out of the `endpoint_map_invalid` refuse-to-start state
 (PRD §7 "Endpoint map lost/corrupt"). Discards the persisted baseline and
 **adopts the numbers the live endpoints currently have** as the new one. It
 reallocates nothing — by the time a user is asked to confirm it, whatever
-duplication a lost map implies has already happened in the ecosystems; what
-changes is that the node stops refusing and starts telling the truth about the
-numbers that now exist. It cannot itself duplicate accessories — but it
-discards the only surviving record of what the numbers used to be (quarantined
-aside, not deleted), which is why it is a separate, explicit command that the
-plugin only issues after the user confirms via a warning dialog
+duplication lost Matter storage implies has already happened in the
+ecosystems; what changes is that the node stops refusing and starts telling
+the truth about the numbers that now exist. It cannot itself duplicate
+accessories — but it discards the only surviving record of what the numbers
+used to be (quarantined aside, not deleted), which is why it is a separate,
+explicit command that the plugin only issues after the user confirms via a
+warning dialog
 ("Rebuild Matter Endpoint Map…"). Result: `<StatusReport>`.
 
 Two refusals of its own:

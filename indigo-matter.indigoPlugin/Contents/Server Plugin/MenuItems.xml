@@ -345,7 +345,7 @@ You normally never need this: the bridge starts and stops with your export list.
 
 Rebuilding renumbers NOTHING, so it cannot itself duplicate accessories. What you see afterwards depends on which fault brought you here:
 
-- If only the map file was damaged, the accessories keep their numbers, no paired ecosystem (Apple Home, Alexa, Google) sees any change, and the rebuild simply clears the refusal.
+- If only the map file was damaged, the accessories keep their numbers, no paired ecosystem (Apple Home, Alexa, Google) sees any further change, and the rebuild simply clears the refusal.
 
 - If the bridge's Matter storage was lost, your ecosystems are ALREADY holding accessories under the old numbers — those are dead, you have to delete them by hand, and any names, rooms, scenes and automations built on them are lost. That damage was done by the storage loss; rebuilding accepts it rather than causing it.
 
@@ -354,7 +354,7 @@ The unreadable file is kept beside the new one as endpoint-map.json.corrupt-&lt;
 If the bridge node is NOT refusing, this does nothing useful and is refused: there is no fault to recover from, and a rebuild would discard the retained endpoint numbers of every device you are not currently exporting — the ones that make re-adding a device restore the same accessory rather than create a second one.</Label>
             </Field>
             <Field id="confirm" type="checkbox" defaultValue="false">
-                <Label>I understand this replaces the endpoint-number record with the numbers that exist now, and cannot be undone.</Label>
+                <Label>I understand this replaces the endpoint-number record and cannot be undone.</Label>
             </Field>
         </ConfigUI>
     </MenuItem>

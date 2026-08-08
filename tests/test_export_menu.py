@@ -922,6 +922,7 @@ class TestRecoveryMenusExist:
         fields = {f.get("id"): f for f in item.find("ConfigUI").findall("Field")}
         assert fields["confirm"].get("type") == "checkbox"
         assert fields["confirm"].get("defaultValue") == "false"
+        assert "cannot be undone" in fields["confirm"].findtext("Label")
         warning = fields["warning"].findtext("Label")
         assert "cannot itself duplicate accessories" in warning
         assert "renumbers NOTHING" in warning
@@ -987,6 +988,7 @@ class TestRebuildMenuCallback:
         plug.runtime = _FakeRuntime(result=_status())
         ok, _values_out, errors = plug.menuRebuildEndpointMap({"confirm": False})
         assert ok is False and "confirm" in errors
+        assert "cannot be undone" in errors["confirm"]
         client.rebuild_endpoint_map.assert_not_called()
 
     def test_it_refuses_when_there_is_no_bridge_connection(self, plug):

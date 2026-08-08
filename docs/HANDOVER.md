@@ -67,6 +67,27 @@ test now asserts `"renumbers nothing" not in said` as its map-remedy-leak
 canary (the old `"duplicate accessories" not in said` would have passed
 trivially once the phrase died).
 
+**The review-pr pass (three agents, post-push) caught what the sweep missed,**
+and the miss has a shape worth remembering: the grep sweep keyed on the
+*phrases* ("WILL duplicate", "duplicate accessories"), so it found every string
+that used them and missed the three places that asserted the same false model
+in *different words* — the docstring of `bridge_client.rebuild_endpoint_map()`
+itself ("This DUPLICATES accessories", "Reallocate … from scratch"), and two
+test comments teaching "§3.11 exists to hand out NEW endpoint numbers". All
+fixed, making it **eight** user-facing/maintainer-facing places, not seven.
+The review also closed the one corrected string with no regression pin (the
+`TERMINAL_ATTACH_ERRORS` map remedy — a revert to the old wording passed the
+whole suite; now pinned with the same leak-canary pair the export_bridge layer
+uses), pinned the confirm-tick label and tick-error text, shortened the
+108-char tick label to one-line length, changed "sees any change" to "sees any
+*further* change" (a case-(a) user may have watched accessories go unavailable
+while the node refused — the #141 condition), repaired BRIDGE_PROTOCOL §1.1's
+two stranded table rows (pre-existing), and re-labelled INSTALL's Reset header
+whose "recoverable, at the cost of…" dangled once its "UNRECOVERABLE"
+counterpart died. Suites 2256/383 after, pylint 9.32 on bridge_client+plugin
+(measured identical on the pre-fix baseline via stash — the 9.52 recorded
+above was a different module set; both numbers are real, neither moved).
+
 ---
 
 ## 2026-08-06 — issue #134: the menu, and the separator the docs deny

@@ -347,10 +347,12 @@ class TestCoverage:
                 assert lawful is (name not in UNLAWFUL_ROLE_FIXTURES), \
                     f"{name} carries role {spec['role']!r}"
 
-    def test_rebuild_reallocates_rather_than_echoing_the_previous_numbers(self):
-        # §3.11 exists to hand out NEW endpoint numbers (that is why it duplicates
-        # accessories). A fixture that echoed attach's numbers demonstrated the
-        # opposite of the command's whole reason to exist.
+    def test_the_rebuild_fixture_depicts_a_post_storage_loss_node(self):
+        # The fixture's numbers differ from attach's because it depicts a node
+        # whose lost Matter storage reallocated them — §3.11 itself records
+        # what exists and reallocates nothing. A rebuild after mere map-file
+        # damage would echo attach's numbers, so the fixture has to show the
+        # case where the witness actually changes.
         before = {ep["indigoDeviceId"]: ep["endpointNumber"]
                   for ep in BY_NAME["attach_with_endpoints"]["response"]["result"]["endpoints"]}
         after = {ep["indigoDeviceId"]: ep["endpointNumber"]

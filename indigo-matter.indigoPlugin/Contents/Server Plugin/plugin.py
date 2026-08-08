@@ -2202,10 +2202,9 @@ class Plugin(indigo.PluginBase):
         that follows it is an ordinary connection step that retries on its own.
         It renumbers nothing, so it cannot itself duplicate accessories — any
         duplication belongs to the storage loss that caused the refusal (#132).
-        Reporting the
-        pair as one used to tell users their node was "unchanged and still
-        refusing" over a map that had already been rewritten — and invite them
-        to do it again.
+        Reporting the pair as one used to tell users their node was "unchanged
+        and still refusing" over a map that had already been rewritten — and
+        invite them to do it again.
         """
         errors = indigo.Dict()
         if not self._truthy(valuesDict.get("confirm")):

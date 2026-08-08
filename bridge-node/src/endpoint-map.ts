@@ -632,9 +632,10 @@ export class EndpointMapStore {
      *
      * The recovery path out of `endpoint_map_invalid`, and the only operation
      * here that discards a mapping. It does not renumber anything in matter.js:
-     * whatever duplication a lost map implies has already happened by the time a
-     * user is asked to confirm this, and what the rebuild does is stop refusing
-     * and start telling the truth about the numbers that now exist.
+     * whatever duplication lost Matter storage implies has already happened by
+     * the time a user is asked to confirm this, and what the rebuild does is
+     * stop refusing and start telling the truth about the numbers that now
+     * exist.
      */
     rebuild(live: readonly LiveEndpointNumber[]): boolean {
         // The unusable file is COPIED aside before it is overwritten. It is the

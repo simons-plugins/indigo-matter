@@ -556,7 +556,8 @@ accessories** — what you see afterwards depends on which fault brought you
 here:
 
 - *only the map file was damaged* — the accessories keep their numbers, no
-  paired ecosystem sees any change, and the rebuild simply clears the refusal;
+  paired ecosystem sees any further change, and the rebuild simply clears the
+  refusal;
 - *the bridge's Matter storage was lost* — every paired ecosystem is already
   holding accessories under the old numbers. Those are dead: you have to delete
   them by hand, and any names, rooms, scenes and automations built on them are
@@ -571,7 +572,7 @@ fault to recover from, and a rebuild would throw away the retained endpoint
 numbers of every device you are not currently exporting — the ones that make
 re-adding a device restore the same accessory rather than create a second one.
 
-**Reset Matter Export Pairings… — recoverable, at the cost of pairing again.**
+**Reset Matter Export Pairings… — recoverable by pairing again.**
 It *removes **every** ecosystem pairing from the Matter export bridge and starts
 advertising for commissioning again.* Apple Home, and anything else you have
 paired, lose all of the accessories Indigo exports, and you have to pair the
