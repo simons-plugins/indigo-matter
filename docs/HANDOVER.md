@@ -26,7 +26,58 @@ convenient.
 defect B was investigated hard and the leading theory was **withdrawn**, so
 read that before touching it.
 
-**NEXT UP:** **#131** (sort exported devices to the top of the picker).
+**NEXT UP:** nothing queued. Open issues: #143 (parked for beta testers —
+read its section first), #140, #105, #83, #84, #62 follow-up, #43, #46,
+#21–#24, and the E8 docs pass (#137/#138 + the Field Notes site).
+
+---
+
+## 2026-08-08 (later) — issue #131: exported devices sort to the top of the picker
+
+Plugin `2026.8.8`, branch `feat/131-picker-sort`. Suites **2264 Python** (from
+2256; 8 new picker tests — 4 with the feature, 4 more from the review pass),
+383 TS untouched.
+
+**One pass, two row lists, cap applied at the end.** `getExportCandidates` now
+builds `exported_rows` and `other_rows` and concatenates seed → exported →
+others. The ordering matters less than the cap interaction: the picker is the
+only place an export can be *removed*, so an exported device past
+`EXPORT_PICKER_LIMIT` (300) would have been effectively stuck. The exported
+id-set is known before the loop, so exported rows are classified and kept
+unconditionally and the cap allowance (`LIMIT − len(exported_rows)`) is
+applied to the others only, once the loop ends. The skip-classifying
+optimisation survives with `len(other_rows) >= LIMIT` as the stop — a safe
+upper bound, since exported rows only ever shrink the allowance.
+
+**Kept semantics, worth knowing:** loop-guard devices below the cap consume
+nothing (as before) but past it they still count as truncated — that
+conflation is pre-existing (the old code also stopped classifying past the
+cap, so it could not tell a guard from a real device there) and the tail row
+carries no count, so it is invisible. Unreadable devices land in the *others*
+group deliberately: `dev.id` may be exactly what failed, so membership in
+`exported` cannot be tested. Excluded-but-exported devices hoist WITH their
+`●` + reason label — that pair is the state a user most needs to act on.
+
+**Mutation-verified both ways:** removing the hoist fails the ordering tests;
+applying the cap before the exported check fails the past-the-cap survival
+test.
+
+**The review pass found the arithmetic softer than it looked** — two more
+*empirically confirmed* surviving mutants, both now killed: the post-loop
+`truncated +=` line was deletable (every truncation test also tripped the
+in-loop counter; a boundary test now drives `other_rows` to exactly the cap
+so the post-loop slice is the only thing that truncates) and both groups
+could be alphabetised (the ordering test's device names happened to
+alphabetise into DB order; they are now reverse-alphabetical, plus an
+inter-group assertion). Also added: filter×hoist (a filtered-out export is
+absent, a matching one still hoists), the allowance floor (shrink
+`EXPORT_PICKER_LIMIT` to 3 via monkeypatch, 4 exports — without `max(…, 0)` a
+negative slice keeps the wrong rows), and error-row id uniqueness (asserted
+on raw options, since `_labels` dict-collapses duplicate ids — the failure
+under test). One deliberate behaviour note, docstring'd: error rows are now
+*bounded* by the cap like any other row — past the cap they join the
+truncation tail (the old code could put 1000 error rows in the menu); the
+log still carries every one.
 
 ---
 
