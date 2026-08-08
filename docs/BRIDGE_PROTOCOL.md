@@ -277,16 +277,24 @@ the node's own `endpoint-map.json` in the bridge storage dir.
 {"command": "factory_reset", "args": {"preserveEndpointNumbers": true}}
 ```
 
-**What `preserveEndpointNumbers: true` preserves is the ability to NOTICE, not
-the numbers.** matter.js owns the allocation, keyed on `Endpoint.id` in the
+**What `preserveEndpointNumbers: true` preserves is the entries, not their
+trustworthiness.** matter.js owns the allocation, keyed on `Endpoint.id` in the
 storage context `erase()` wipes — so the numbers themselves are gone either
 way, and the endpoints will be re-created at whatever matter.js hands out next.
-What survives is the *baseline*: the map still says what each `UniqueID` used
-to be, so the renumbering is reported as drift (§4.3) instead of happening
-silently. Passing `false` discards the baseline too — the "explicit rebuild" of
-PRD §7, for the case where the map itself is what is corrupt. The node re-runs
-the drift check at the end of a preserving reset and says what it found, so the
-consequence is in the log rather than waiting to surprise the next attach.
+What survives is the *map*: role/label and every `UniqueID` stay, but the node
+also **voids** every entry's number (issue #140, since bridge-node 0.8.0)
+rather than leaving the old one standing. A voided number is silently
+**adopted** — not reported as drift —
+the next time `check` (§4.3) sees that `UniqueID` live, because both the reset
+and the last-fabric self-reset are reached with an empty fabric set: matter.js
+just erased its own allocation along with every fabric, so there is no paired
+ecosystem left that could be holding the old numbers to disagree with, and the
+adoption is unobservable outside this node. This is a narrow, deliberate carve-out
+of §4.3's "never auto-repaired" rule (below) for the one case where the
+renumbering is the reset's own, not a genuine anomaly — an entry that was never
+voided still drifts exactly as before. Passing `false` discards the baseline
+too — the "explicit rebuild" of PRD §7, for the case where the map itself is
+what is corrupt.
 
 The commissioning witness is cleared either way, and the node **verifies** it
 by reading `identity.json` back before reporting completion: a witness that
@@ -408,7 +416,15 @@ ecosystem acts. Both are enumerated here in full; there is no other source.
 
 `drift` lists any `UniqueID → endpointNumber` mappings that changed since last
 persist (PRD §4.3 drift detection); non-empty drift is surfaced as a plugin
-error, never auto-repaired. Each entry is a `DriftEntry`:
+error, never auto-repaired. **One narrow, deliberate carve-out (issue #140,
+since bridge-node 0.8.0):** a renumbering caused by §3.10's preserving reset
+(or the last-fabric self-reset) is voided at the reset and then silently
+**adopted**, not reported here — see §3.10 for the safety argument. Voiding
+also drops `driftChecked` back to `false`: a baseline the node just declared
+void has not been verified against anything, and the flag comes back once the
+first post-reset reconcile checks it against live endpoints. Everything else
+about this rule is unchanged: an entry the reset did not touch still drifts
+and is still never repaired. Each entry is a `DriftEntry`:
 
 ```json
 {"uniqueId": "indigo-123456789", "expected": 2, "actual": 5}
@@ -471,6 +487,14 @@ version 2** since bridge-node 0.6.0:
   lets the node rebuild an accessory without the plugin. `options` is **not**
   stored: nothing in the node reads it (window-covering polarity is applied
   plugin-side, §4.1).
+- `numberVoid` — issue #140, since bridge-node 0.8.0, present (`true`) and
+  absent otherwise, never `false`. Set on every entry by §3.10's preserving
+  reset and by the last-fabric self-reset; cleared the next time `number` is
+  silently adopted
+  from a live endpoint rather than compared against it. Still schema version 2
+  — an old build reads a file that has it exactly as it would without it,
+  because every reader here reaches a field by name rather than validating the
+  object as a whole, so the extra key is inert rather than a parse failure.
 
 **Version 1 files are read, migrated in place, and never treated as corrupt.**
 A v1 entry is a bare number; it keeps that number, is simply not restorable

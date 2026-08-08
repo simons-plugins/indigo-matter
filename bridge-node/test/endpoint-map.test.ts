@@ -395,6 +395,259 @@ describe("EndpointMapStore.check — the drift detector (PRD §4.3)", () => {
     });
 });
 
+describe("EndpointMapStore.voidNumbers — reset renumbering adoption (issue #140)", () => {
+    it("marks every entry and persists", () => {
+        const dir = storage();
+        const store = new EndpointMapStore(dir);
+        store.load();
+        store.check([
+            { uniqueId: "indigo-1", endpointNumber: 2 },
+            { uniqueId: "indigo-2", endpointNumber: 3 },
+        ]);
+
+        assert.equal(store.voidNumbers("test"), true);
+
+        assert.deepEqual(mapFileIn(dir).endpoints, {
+            "indigo-1": { number: 2, numberVoid: true },
+            "indigo-2": { number: 3, numberVoid: true },
+        });
+    });
+
+    it("is a no-op — no write — on an empty map", () => {
+        const dir = storage();
+        const store = new EndpointMapStore(dir);
+        store.load();
+
+        assert.equal(store.voidNumbers("test"), false);
+
+        assert.equal(loadEndpointMap(dir).present, false, "an empty map must not manufacture a baseline");
+    });
+
+    it("check() adopts a renumbered void entry: numbers update, no drift, markers clear, persists", () => {
+        const dir = storage();
+        const store = new EndpointMapStore(dir);
+        store.load();
+        store.check([{ uniqueId: "indigo-1", endpointNumber: 2 }]);
+        store.voidNumbers("factory reset");
+
+        const drift = store.check([{ uniqueId: "indigo-1", endpointNumber: 9 }]);
+
+        assert.deepEqual(drift, [], "a voided renumbering must never be reported as drift");
+        assert.equal(store.numberFor("indigo-1"), 9, "the new number is adopted as the baseline");
+        assert.deepEqual(mapFileIn(dir).endpoints, { "indigo-1": { number: 9 } }, "and the marker is gone");
+    });
+
+    it("a second check with the same (already-adopted) set is a quiet steady state", () => {
+        const dir = storage();
+        const store = new EndpointMapStore(dir);
+        store.load();
+        store.check([{ uniqueId: "indigo-1", endpointNumber: 2 }]);
+        store.voidNumbers("factory reset");
+        store.check([{ uniqueId: "indigo-1", endpointNumber: 9 }]);
+        const settled = readFileSync(join(dir, ENDPOINT_MAP_FILE), "utf8");
+
+        const drift = store.check([{ uniqueId: "indigo-1", endpointNumber: 9 }]);
+
+        assert.deepEqual(drift, []);
+        assert.equal(
+            readFileSync(join(dir, ENDPOINT_MAP_FILE), "utf8"),
+            settled,
+            "an already-adopted, unchanged set must cost no further write",
+        );
+    });
+
+    it("clears the marker even when the live number happens to already match", () => {
+        // The marker itself is what must stop being true, not just a mismatch —
+        // otherwise a coincidentally-unchanged number would stay VOID forever,
+        // silently swallowing the very next real drift on that entry.
+        const dir = storage();
+        const store = new EndpointMapStore(dir);
+        store.load();
+        store.check([{ uniqueId: "indigo-1", endpointNumber: 2 }]);
+        store.voidNumbers("factory reset");
+
+        const drift = store.check([{ uniqueId: "indigo-1", endpointNumber: 2 }]);
+
+        assert.deepEqual(drift, []);
+        assert.deepEqual(mapFileIn(dir).endpoints, { "indigo-1": { number: 2 } }, "marker cleared, not left set");
+    });
+
+    it("does NOT adopt a NON-void entry alongside void ones — the never-auto-repaired rule survives", () => {
+        // The critical regression test: without the `numberVoid` guard in
+        // `check`, EVERY entry would adopt its live number regardless of
+        // marker, and genuine drift (a real storage loss, unrelated to a
+        // reset) would stop being reported for ever.
+        const dir = storage();
+        const store = new EndpointMapStore(dir);
+        store.load();
+        store.check([
+            { uniqueId: "indigo-void", endpointNumber: 2 },
+            { uniqueId: "indigo-drifted", endpointNumber: 3 },
+        ]);
+        store.voidNumbers("factory reset");
+        // Un-void the second entry by hand — standing in for an entry that was
+        // never touched by a reset at all (voidNumbers marks the whole map, so
+        // this is how a genuinely mixed map is produced for the test).
+        const file = mapFileIn(dir);
+        delete file.endpoints["indigo-drifted"]!.numberVoid;
+        writeFileSync(join(dir, ENDPOINT_MAP_FILE), JSON.stringify(file));
+        const reloaded = new EndpointMapStore(dir);
+        reloaded.load();
+
+        const drift = reloaded.check([
+            { uniqueId: "indigo-void", endpointNumber: 9 },
+            { uniqueId: "indigo-drifted", endpointNumber: 99 },
+        ]);
+
+        assert.deepEqual(drift, [{ uniqueId: "indigo-drifted", expected: 3, actual: 99 }]);
+        assert.equal(reloaded.numberFor("indigo-void"), 9, "the void entry still adopted");
+        assert.equal(reloaded.numberFor("indigo-drifted"), 3, "the baseline of a real drift must not move");
+    });
+
+    it("the marker survives a persist/load round-trip", () => {
+        const dir = storage();
+        const first = new EndpointMapStore(dir);
+        first.load();
+        first.check([{ uniqueId: "indigo-1", endpointNumber: 2 }]);
+        first.voidNumbers("factory reset");
+
+        const second = new EndpointMapStore(dir);
+        second.load();
+
+        assert.deepEqual(mapFileIn(dir).endpoints, { "indigo-1": { number: 2, numberVoid: true } });
+        // And the reloaded store still adopts rather than reports drift.
+        assert.deepEqual(second.check([{ uniqueId: "indigo-1", endpointNumber: 7 }]), []);
+        assert.equal(second.numberFor("indigo-1"), 7);
+    });
+
+    it("a legacy (pre-#140) file with no markers loads and drifts exactly as before", () => {
+        const dir = storage();
+        writeFileSync(
+            join(dir, ENDPOINT_MAP_FILE),
+            JSON.stringify({ version: ENDPOINT_MAP_VERSION, endpoints: { "indigo-1": { number: 2 } } }),
+        );
+        const store = new EndpointMapStore(dir);
+        store.load();
+
+        const drift = store.check([{ uniqueId: "indigo-1", endpointNumber: 9 }]);
+
+        assert.deepEqual(drift, [{ uniqueId: "indigo-1", expected: 2, actual: 9 }], "unvoided — still real drift");
+        assert.equal(store.numberFor("indigo-1"), 2, "and the baseline must not move");
+    });
+
+    it("heals the reset's duplicate-number fingerprint: two void entries adopt distinct live numbers", () => {
+        // Live example (#140): the witness recorded the SAME number on two
+        // different entries after a reset. Voiding both and letting each adopt
+        // its own live number is what makes the map consistent again.
+        const dir = storage();
+        const store = new EndpointMapStore(dir);
+        store.load();
+        store.check([
+            { uniqueId: "indigo-1", endpointNumber: 5 },
+            { uniqueId: "indigo-2", endpointNumber: 5 },
+        ]);
+        store.voidNumbers("factory reset");
+
+        const drift = store.check([
+            { uniqueId: "indigo-1", endpointNumber: 5 },
+            { uniqueId: "indigo-2", endpointNumber: 2 },
+        ]);
+
+        assert.deepEqual(drift, []);
+        assert.equal(store.numberFor("indigo-1"), 5);
+        assert.equal(store.numberFor("indigo-2"), 2);
+        assert.deepEqual(mapFileIn(dir).endpoints, {
+            "indigo-1": { number: 5 },
+            "indigo-2": { number: 2 },
+        });
+    });
+
+    it("stays restorable while voided — role/label are untouched by voiding", () => {
+        const dir = storage();
+        const store = new EndpointMapStore(dir);
+        store.load();
+        store.check([{ uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Lamp" }]);
+
+        store.voidNumbers("factory reset");
+
+        assert.deepEqual(store.restorable(), [
+            { uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Lamp" },
+        ]);
+    });
+
+    it("logs the adoption once when it happens, naming the count", () => {
+        const dir = storage();
+        const logged: string[] = [];
+        const store = new EndpointMapStore(dir, message => logged.push(message));
+        store.load();
+        store.check([
+            { uniqueId: "indigo-1", endpointNumber: 2 },
+            { uniqueId: "indigo-2", endpointNumber: 3 },
+        ]);
+        store.voidNumbers("factory reset");
+        logged.length = 0;
+
+        store.check([
+            { uniqueId: "indigo-1", endpointNumber: 9 },
+            { uniqueId: "indigo-2", endpointNumber: 8 },
+        ]);
+
+        assert.ok(
+            logged.some(line => line.includes("Adopted 2 endpoint number")),
+            `expected an adoption log line, got ${JSON.stringify(logged)}`,
+        );
+    });
+
+    it("clears `checked` — a voided baseline has not been verified against anything", () => {
+        // ⊗ `voidNumbers` used to leave `#checked` untouched, so between a
+        // reset and the first post-reset reconcile, `driftChecked: true` /
+        // `drift: []` claimed "checked, nothing moved" over numbers the node
+        // itself had just declared untrustworthy.
+        const dir = storage();
+        const store = new EndpointMapStore(dir);
+        store.load();
+        store.check([{ uniqueId: "indigo-1", endpointNumber: 2 }]);
+        assert.equal(store.checked, true, "sanity: the first check earned the flag");
+
+        store.voidNumbers("factory reset");
+
+        assert.equal(store.checked, false, "a VOID baseline is unverified, whatever it was before");
+
+        store.check([{ uniqueId: "indigo-1", endpointNumber: 9 }]);
+
+        assert.equal(store.checked, true, "the first post-reset check against live entries earns it back");
+    });
+
+    it("reports the write failing, not a no-op, when the void cannot reach disk", () => {
+        // ⊗ The boolean `voidNumbers` returns was discarded at both call sites
+        // in `node.ts`, so a failed write left the VOID markers RAM-only while
+        // the log claimed the opposite — this is the store-level half of that:
+        // the caller has to be able to tell "wrote fine" from "in memory only".
+        const dir = storage();
+        const store = new EndpointMapStore(dir);
+        store.load();
+        store.check([{ uniqueId: "indigo-1", endpointNumber: 2 }]);
+
+        chmodSync(dir, 0o500);
+        try {
+            assert.equal(store.voidNumbers("factory reset"), false, "the write failed");
+            assert.equal(store.warnings.length, 1);
+            assert.match(store.warnings[0]!, /Could not write the endpoint map/);
+        } finally {
+            chmodSync(dir, 0o700);
+        }
+        assert.equal(store.checked, false, "an unwritten baseline still verified nothing durable");
+
+        // The marker survives in memory despite the failed write, and `#dirty`
+        // makes the next successful write retry it — proven by the very next
+        // check() adopting rather than reporting drift.
+        const drift = store.check([{ uniqueId: "indigo-1", endpointNumber: 9 }]);
+
+        assert.deepEqual(drift, [], "the in-memory VOID marker survived the failed write and still adopts");
+        assert.deepEqual(mapFileIn(dir).endpoints, { "indigo-1": { number: 9 } });
+    });
+});
+
 describe("EndpointMapStore.forget — un-export without losing the number", () => {
     it("drops the restoration half and keeps the identity half", () => {
         // ⊗ The other half of `restorable`. Without it a device the user

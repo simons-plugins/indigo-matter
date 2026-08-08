@@ -381,8 +381,19 @@ describe("factory_reset (§3.10) and the endpoint map", () => {
         assert.deepEqual(reset.result, {});
         // `ServerNode.erase()` wipes matter.js's own storage context. The map
         // surviving it is the entire reason the file is a sibling of it rather
-        // than a member.
-        assert.deepEqual(after.endpoints, before.endpoints);
+        // than a member. Since issue #140 the numbers themselves are also
+        // marked VOID — matter.js's own allocation was just wiped along with
+        // them — so the entries keep their number/role/label but every one
+        // gains `numberVoid: true`, which the next `check()` clears silently.
+        assert.deepEqual(
+            after.endpoints,
+            Object.fromEntries(
+                Object.entries(before.endpoints).map(([uniqueId, record]) => [
+                    uniqueId,
+                    { ...record, numberVoid: true },
+                ]),
+            ),
+        );
     });
 
     it("deletes it on preserveEndpointNumbers: false — PRD §7's explicit rebuild", async () => {
@@ -508,6 +519,139 @@ describe("factory_reset (§3.10) and the endpoint map", () => {
             JSON.parse(readFileSync(join(storagePath, "identity.json"), "utf8")).commissionedAt,
             undefined,
         );
+    });
+});
+
+describe("factory_reset (preserve: true) voids the map instead of drift-checking it (issue #140)", () => {
+    it("marks every entry VOID and logs the adoption message, not the old §3.11 remedy", async () => {
+        const storagePath = storage();
+        const logged: string[] = [];
+        const bridge = new BridgeNode(
+            { storagePath, matterPort: 0, wsPort: 0 },
+            { ...IDENTITY },
+            BRIDGE_VERSION,
+            message => logged.push(message),
+        );
+        await bridge.start();
+        try {
+            await bridge.reconcile(ENDPOINTS as never, false);
+            const before = readMap(storagePath);
+            assert.ok(Object.keys(before.endpoints).length > 0, "sanity: something was recorded");
+
+            await bridge.factoryReset(true);
+
+            const after = readMap(storagePath);
+            for (const [uniqueId, record] of Object.entries(before.endpoints)) {
+                assert.deepEqual(
+                    after.endpoints[uniqueId],
+                    { ...record, numberVoid: true },
+                    "the reset erased matter.js's own allocation, so the witness must be voided, not left standing",
+                );
+            }
+            assert.ok(
+                logged.some(line => line.includes("now VOID")),
+                `expected the new voiding log line, got: ${logged.join("\n")}`,
+            );
+            // #140's whole complaint: this remedy sent the user to a §3.11
+            // rebuild the plugin refuses on a healthy node.
+            assert.ok(
+                !logged.some(line => line.includes("rebuild the map (§3.11) to accept it")),
+                "the old drift-and-rebuild-remedy line must be gone",
+            );
+        } finally {
+            await bridge.close();
+        }
+    });
+
+    it("tells the truth when the VOID markers cannot reach disk, instead of claiming success", async t => {
+        // ⊗ `voidNumbers`'s boolean return used to be discarded here, so a
+        // failed write still logged "its numbers are now VOID ... a §3.11
+        // rebuild is not needed" — over markers that existed in memory only.
+        // A crash before the next successful persist would have brought back
+        // #140's forever-drift report after the user was told it was fixed.
+        if (process.getuid?.() === 0) {
+            t.skip("root ignores directory permissions");
+            return;
+        }
+        const storagePath = storage();
+        const logged: string[] = [];
+        const bridge = new BridgeNode(
+            { storagePath, matterPort: 0, wsPort: 0 },
+            { ...IDENTITY },
+            BRIDGE_VERSION,
+            message => logged.push(message),
+        );
+        await bridge.start();
+        try {
+            await bridge.reconcile(ENDPOINTS as never, false);
+
+            chmodSync(storagePath, 0o500);
+            try {
+                await bridge.factoryReset(true);
+            } finally {
+                chmodSync(storagePath, 0o700);
+            }
+
+            assert.ok(
+                logged.some(line => line.includes("VOID markers could NOT be written")),
+                `expected the write-failure branch, got: ${logged.join("\n")}`,
+            );
+            assert.ok(
+                !logged.some(line => line.includes("its numbers are now VOID")),
+                "the success message must not fire over an unwritten baseline",
+            );
+        } finally {
+            await bridge.close();
+        }
+    });
+});
+
+describe("noteLastFabricGone voids the endpoint map too (issue #140)", () => {
+    it("marks every entry VOID for the same reason as a preserving factory reset", async () => {
+        // The last-fabric self-reset (§3.9's last unpair, or an ecosystem
+        // removing us) drives matter.js to erase itself exactly as `erase()`
+        // does, so `noteLastFabricGone` carries the same obligation. Reached
+        // directly, the way `noteFabrics never swallows the read` below reaches
+        // its private method: a real self-reset cannot be manufactured without
+        // a real commissioner.
+        const storagePath = storage();
+        writeFileSync(
+            join(storagePath, ENDPOINT_MAP_FILE),
+            JSON.stringify({
+                version: ENDPOINT_MAP_VERSION,
+                endpoints: {
+                    [uniqueIdFor(KITCHEN)]: { number: 2, role: "onOffLight", label: "Kitchen Lamp" },
+                },
+            }),
+        );
+        const witness = "2026-08-01T00:00:00.000Z";
+        const bridge = new BridgeNode(
+            { storagePath, matterPort: 0, wsPort: 0 },
+            { ...IDENTITY, commissionedAt: witness },
+            BRIDGE_VERSION,
+            () => {},
+        );
+        await bridge.start();
+        try {
+            assert.equal(
+                bridge.endpointMapRefusal(),
+                RefuseReason.fabricStorageLost,
+                "sanity: a witness with no real fabric must be refusing",
+            );
+
+            (bridge as unknown as { noteLastFabricGone(): void }).noteLastFabricGone();
+
+            assert.deepEqual(readMap(storagePath).endpoints, {
+                [uniqueIdFor(KITCHEN)]: {
+                    number: 2,
+                    role: "onOffLight",
+                    label: "Kitchen Lamp",
+                    numberVoid: true,
+                },
+            });
+        } finally {
+            await bridge.close();
+        }
     });
 });
 

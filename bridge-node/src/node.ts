@@ -639,6 +639,15 @@ export class BridgeNode implements BridgeFacade {
      * Deliberately here rather than in {@link removeFabric}: §3.9 is only one of
      * the ways to get here. An ecosystem that removes *us* from its side does it
      * too, and that route never touches our command handler at all.
+     *
+     * **The endpoint map's numbers are voided here too (issue #140), for the
+     * same reason as §3.10's preserving reset.** matter.js has just erased
+     * itself, so its own number allocation is gone with the fabrics — the map's
+     * numbers are about to disagree with whatever gets re-created, and with no
+     * fabric left there is no paired ecosystem that could still be holding the
+     * old numbers to disagree with. {@link EndpointMapStore.voidNumbers} is a
+     * no-op on an empty map, so this costs nothing on a bridge that had never
+     * exported anything.
      */
     private noteLastFabricGone(): void {
         if (this.identity.commissionedAt === undefined) {
@@ -653,6 +662,26 @@ export class BridgeNode implements BridgeFacade {
             WARN_IDENTITY_WRITE,
             clearCommissioned(this.config.storagePath, this.identity, message => this.log(message)),
         );
+        // `size > 0` first: `voidNumbers` returns `false` for an empty map too
+        // (nothing to void is not a failure), and this bridge may never have
+        // exported anything.
+        if (
+            this.#endpointMap.size > 0 &&
+            !this.#endpointMap.voidNumbers(
+                "the last fabric left — matter.js factory-reset itself, wiping its own endpoint-number " +
+                    "allocation with it",
+            )
+        ) {
+            // Same risk as the factory-reset branch above: the VOID markers
+            // are RAM-only until a later persist succeeds (`#dirty` makes that
+            // retry automatic), and a restart before then brings back #140's
+            // forever-drift report for this unpairing.
+            this.log(
+                "The endpoint map's VOID markers could NOT be written to disk after the last fabric " +
+                    "left — they exist in memory only for now and will be retried on the next " +
+                    "successful persist; a restart before then will report the old §4.3 drift again.",
+            );
+        }
         this.#drift = [];
     }
 
@@ -1001,6 +1030,16 @@ export class BridgeNode implements BridgeFacade {
      *
      * The live endpoints are deliberately left alone. They are still the set the
      * plugin asked for; what changed is who is allowed to see them.
+     *
+     * **A preserved map has its numbers VOIDED, not drift-checked (issue #140).**
+     * `erase()` wipes matter.js's own allocation, so every endpoint re-created
+     * after this is renumbered from scratch — and the map disagreeing with that
+     * on every future attach is not a real anomaly, it is the reset's own,
+     * expected renumbering. `voidNumbers()` marks every entry so the next
+     * `check()` silently adopts whatever number each `UniqueID` comes back with
+     * instead of reporting it as drift forever; see its doc comment for why that
+     * is safe (the fabric set is empty here, so no paired ecosystem can still be
+     * holding the old numbers to disagree with).
      */
     async factoryReset(preserveEndpointNumbers: boolean): Promise<void> {
         this.#window.clear();
@@ -1070,20 +1109,46 @@ export class BridgeNode implements BridgeFacade {
         // What preservation actually bought, checked rather than claimed.
         // `erase()` wipes matter.js's OWN allocation, so a preserved map is a
         // baseline for numbers that are about to be handed out afresh — it
-        // preserves the ability to NOTICE, not the numbers (see §3.10). Running
-        // the detector here is what turns that into a statement in the log
-        // instead of a surprise on the next attach.
-        if (preserveEndpointNumbers) {
-            this.checkDrift();
-            this.log(
-                this.#drift.length === 0
-                    ? "Endpoint-number map preserved; no drift against the live endpoints yet — note " +
-                          "that matter.js's own allocation was wiped by the reset, so drift is expected " +
-                          "as endpoints are re-created and is what the preserved map exists to report"
-                    : `Endpoint-number map preserved and ${this.#drift.length} endpoint(s) already ` +
-                          "differ from it — that is the reset's own renumbering, reported exactly as " +
-                          "designed; rebuild the map (§3.11) to accept it",
-            );
+        // preserves the ability to NOTICE, not the numbers (see §3.10). Issue
+        // #140: the numbers this map already holds are about to disagree with
+        // matter.js on every single re-created endpoint, and that is not a real
+        // anomaly — it is the reset's own renumbering, guaranteed by the fact
+        // that `erase()` just ran. Voiding them means the next `check()` (the
+        // first reconcile after re-pairing) adopts the fresh numbers silently
+        // instead of reporting the same "drift" on every attach forever, which
+        // is #140's complaint: the plugin refuses the §3.11 rebuild the old log
+        // line pointed at, because the node is otherwise perfectly healthy.
+        if (preserveEndpointNumbers && this.#endpointMap.size > 0) {
+            // `size > 0` gates both the call and the log: `voidNumbers` returns
+            // `false` for an empty map too (nothing to void is not a failure),
+            // and a bridge that had nothing preserved must not be told its
+            // numbers are VOID, nor warned about a persist that never
+            // happened.
+            if (this.#endpointMap.voidNumbers(
+                "factory reset (preserveEndpointNumbers: true) wiped matter.js's own allocation",
+            )) {
+                this.log(
+                    "Endpoint-number map preserved but its numbers are now VOID: matter.js's own " +
+                        "allocation was wiped by the reset, so they will be silently adopted as endpoints " +
+                        "are re-created rather than reported as drift — no fabric survived the reset to " +
+                        "still be holding the old numbers, so nothing outside this node can observe the " +
+                        "difference. A §3.11 rebuild is not needed for this.",
+                );
+            } else {
+                // The void markers exist in memory only — this write failed the
+                // same way `discard()`'s can, and the risk is the mirror image:
+                // a crash before the next successful persist loses the markers,
+                // and the next start reports #140's forever-drift again as if
+                // this reset had never happened. `persist()` already leaves
+                // `#dirty` set on this failure, so the retry is automatic: the
+                // very next successful `check()` or write re-attempts it.
+                this.log(
+                    "Endpoint-number map preserved but its VOID markers could NOT be written to disk " +
+                        "— they exist in memory only for now. The next successful persist will retry " +
+                        "and write them; if the node restarts before then, the old §4.3 drift report " +
+                        "will return once, until this reset's renumbering is adopted again.",
+                );
+            }
         }
 
         this.log("Factory reset complete; advertising for commissioning again");
