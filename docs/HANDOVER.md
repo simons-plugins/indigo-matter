@@ -1,17 +1,17 @@
 # indigo-matter — Build Handover
 
-**Last updated:** 2026-08-06 14:38 UTC
-**Active work:** none — nothing in flight, working tree clean.
-**Branch:** `main` — **PR #144 MERGED** (`08d64dc`, merge commit, issue #134
-closed). Both it and #142 went in under `[no-release]`, so **two merges' worth
-of work is unreleased**: the latest release is still **v2026.7.23**, and the
-only 2026.8 artefact is the `v2026.8.0` *pre-release* Simon cut by hand.
-Whoever cuts the next real release ships #141's endpoint restore **and** #134's
-menu together.
-**Version:** plugin `2026.8.5`, bridge-node `0.7.0` (**published to npm**;
-`DEFAULT_INSTALL_SPEC` pins it).
-**Tests:** **2256 Python**, **383 TS** — both green. pylint 9.42.
-(`python3 -m pytest -q` · `cd bridge-node && npm run build && npm test`)
+**Last updated:** 2026-08-08 17:19 UTC
+**Active work:** `fix/132-rebuild-warning` — #132 fixed, PR open, awaiting
+review + Simon's merge go-ahead.
+**Branch:** `main` last merged **PR #144** (`08d64dc`, issue #134 closed). Both
+it and #142 went in under `[no-release]`, so **two merges' worth of work is
+unreleased**: the latest release is still **v2026.7.23**, and the only 2026.8
+artefact is the `v2026.8.0` *pre-release* Simon cut by hand. Whoever cuts the
+next real release ships #141's endpoint restore **and** #134's menu together.
+**Version:** plugin `2026.8.6` (on the #132 branch), bridge-node `0.7.0`
+(**published to npm**; `DEFAULT_INSTALL_SPEC` pins it).
+**Tests:** **2256 Python**, **383 TS** — both green. pylint 9.52 on the touched
+modules. (`python3 -m pytest -q` · `cd bridge-node && npm run build && npm test`)
 **Deployed:** jarvis runs plugin `2026.8.5` + bridge-node `0.7.0`, paired to
 **Apple Home AND Alexa simultaneously** (3 fabrics: 2 Apple, 1 Alexa). The
 2026.8.5 deploy was two files (`MenuItems.xml`, `Info.plist`) over SSH plus a
@@ -19,14 +19,53 @@ plugin restart; the install was checksum-compared against the branch first and
 carried **no** hot-patches, so a plain file copy was safe.
 **Status:** export v1 feature-complete and live. #141 **fixed and confirmed**
 (below). **#143 is the open one** — see the 2026-08-06 §#143 section; its
-defect B was investigated hard today and the leading theory was **withdrawn**,
-so read that before touching it.
+defect B was investigated hard and the leading theory was **withdrawn**, so
+read that before touching it.
 
-**NEXT UP:** **#132** — the *Rebuild Matter Endpoint Map…* dialog warns that
-rebuilding WILL duplicate accessories in paired ecosystems, and it cannot; the
-duplication belongs to the drift event that already happened. Same file #134
-just reordered, but it is dialog *text*, which is why it was deliberately left
-out of that PR. Then **#131** (sort exported devices to the top of the picker).
+**NEXT UP:** **#131** (sort exported devices to the top of the picker).
+
+---
+
+## 2026-08-08 — issue #132: the rebuild warning promised harm the action cannot do
+
+Plugin `2026.8.6`, branch `fix/132-rebuild-warning`. Suites unchanged at
+2256/383; strings only, no behaviour.
+
+**The claim was wrong everywhere, not just in the dialog.** The *Rebuild Matter
+Endpoint Map…* dialog warned the rebuild "WILL duplicate accessories in paired
+ecosystems". It cannot: `rebuild()` adopts the live numbers and renumbers
+nothing — the duplication belongs to the storage-loss event that already
+happened (the issue's own live observation: post-reset drift where rebuilding
+was the correct, harmless act). The issue named four files; the same false
+claim actually lived in **seven** user-facing places, and fixing only the
+dialog would have left the attach-refusal log — the message the user reads
+immediately *before* opening that dialog — still promising the harm. All
+rewritten: `MenuItems.xml` (dialog + tick label), `plugin.py` (tick error,
+REBUILT log), `bridge_client.py` (`TERMINAL_ATTACH_ERRORS` remedy),
+`export_bridge.py` (map-refusal log), `node.ts` (refusal remedy),
+`BRIDGE_PROTOCOL.md` (§1.1 table + §3.11), `INSTALL.md` (destructive-actions
+section, which also dropped its "worse one first / UNRECOVERABLE" framing).
+
+**The rewrite distinguishes the issue's two cases** in every string long enough
+to carry it: *only the map file was damaged* → accessories keep their numbers,
+no ecosystem sees any change, the rebuild just clears the refusal; *Matter
+storage was lost* → the ecosystems already hold dead accessories under the old
+numbers, and rebuilding accepts that rather than causing it.
+
+**What was deliberately kept:** the confirm tick (the rebuild still discards
+the only repairable record — quarantined aside, not deleted — so it is still
+irreversible and still worth a pause); the healthy-node refusal wording (a
+rebuild against a non-refusing node genuinely would discard §3.3's retained
+numbers); and every claim about **silent reallocation** duplicating accessories
+(`DriftEntry`'s docstring, PRD §338) — that claim is about renumbering, which
+drift auto-repair would do and the confirmed rebuild does not.
+
+**Tests pin the new claim, not the absence of the old one:** the dialog test
+asserts "cannot itself duplicate accessories" / "renumbers NOTHING"; the
+refusal-log tests assert "renumbers nothing" — and the identity-vs-map branch
+test now asserts `"renumbers nothing" not in said` as its map-remedy-leak
+canary (the old `"duplicate accessories" not in said` would have passed
+trivially once the phrase died).
 
 ---
 
