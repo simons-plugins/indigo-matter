@@ -81,7 +81,35 @@ describe("settlePairingRead (§133)", () => {
                 ),
             (thrown: unknown) => thrown === err,
         );
-        assert.ok(calls > 1, "must have retried at least once before giving up");
+        // Exact shape, not "> 1": reads at t=0/50/100/150/200, the last one ON
+        // the deadline (the `>=` edge), with one sleep per retry. A mutation
+        // that shrank the deadline or stopped honouring intervalMs would still
+        // retry "at least once" — this pins the arithmetic itself.
+        assert.equal(calls, 5, "reads at t=0, 50, 100, 150 and 200 — the deadline edge");
+        assert.deepEqual(clock.sleeps, [50, 50, 50, 50]);
+    });
+
+    it("overshoots the deadline by at most one interval when they do not divide evenly", async () => {
+        // 200/75: reads at t=0, 75, 150 — then the next sleep would land at
+        // t=225, past the deadline. The read AT t=150 is still inside it, so
+        // the failure is discovered on the t=225 read and rethrown there:
+        // bounded overshoot of one interval, never a sleep loop past it.
+        const clock = fakeClock();
+        const err = transientError();
+        let calls = 0;
+        await assert.rejects(
+            () =>
+                settlePairingRead(
+                    () => {
+                        calls++;
+                        throw err;
+                    },
+                    { now: clock.now, sleep: clock.sleep, deadlineMs: 200, intervalMs: 75 },
+                ),
+            (thrown: unknown) => thrown === err,
+        );
+        assert.equal(calls, 4, "t=0, 75, 150, then the bounded-overshoot read at t=225");
+        assert.deepEqual(clock.sleeps, [75, 75, 75]);
     });
 
     it("does not retry a non-transient error: called once, no delay", async () => {
