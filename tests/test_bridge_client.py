@@ -781,7 +781,7 @@ class TestEndpointMapInvalid:
         refuses outright for an unreadable identity, because clearing that
         refusal would serve endpoints under a serial no ecosystem has seen. So
         it is not merely unhelpful here; it points at the one door deliberately
-        locked, and promises duplicated accessories on the way through it.
+        locked against this fault.
         """
         async def scenario():
             fake, client = self._recovering(mock_logger, overrides={
@@ -843,8 +843,8 @@ class TestEndpointMapInvalid:
         Letting a re-attach failure after that propagate made the menu report
         "the bridge node is unchanged and still refusing to export" — both
         clauses false — leave `recovery` set so every state push went on being
-        dropped, and invite the user to repeat an operation that duplicates
-        accessories in every paired ecosystem.
+        dropped, and invite the user to repeat an operation that had already
+        discarded the persisted baseline.
         """
         async def scenario():
             answers = {bridge_protocol.CMD_ATTACH: error_response(

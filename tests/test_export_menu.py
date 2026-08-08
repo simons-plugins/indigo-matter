@@ -910,14 +910,23 @@ class TestRecoveryMenusExist:
         assert item.findtext("CallbackMethod") == "menuRebuildEndpointMap"
         assert hasattr(plugin_mod.Plugin, "menuRebuildEndpointMap")
 
-    def test_the_rebuild_menu_warns_about_duplication_and_demands_a_tick(self):
+    def test_the_rebuild_menu_states_what_a_rebuild_does_and_demands_a_tick(self):
+        """#132: the dialog used to warn the rebuild WILL duplicate accessories.
+
+        It cannot — it renumbers nothing. The duplication belongs to the storage
+        loss that already happened, and the dialog now distinguishes the two
+        faults (damaged map file vs lost Matter storage) instead of promising
+        the worst case for both.
+        """
         item = _menu_item_by_id("rebuildEndpointMap")
         fields = {f.get("id"): f for f in item.find("ConfigUI").findall("Field")}
         assert fields["confirm"].get("type") == "checkbox"
         assert fields["confirm"].get("defaultValue") == "false"
         warning = fields["warning"].findtext("Label")
-        assert "duplicate accessories" in warning
-        assert "pairings themselves are NOT touched" in warning
+        assert "cannot itself duplicate accessories" in warning
+        assert "renumbers NOTHING" in warning
+        assert "Matter storage was lost" in warning
+        assert "No pairing is touched" in warning
 
     def test_the_reset_menu_exists_and_is_wired_to_a_callback(self, plugin_mod):
         item = _menu_item_by_id("resetBridgePairings")
@@ -995,7 +1004,7 @@ class TestRebuildMenuCallback:
         assert ok is True
         client.rebuild_endpoint_map.assert_called_once()
         said = " ".join(str(c.args[0]) for c in plug.logger.warning.call_args_list)
-        assert "REBUILT" in said and "duplicated accessories" in said
+        assert "REBUILT" in said and "Nothing was renumbered" in said
 
     def test_it_works_from_the_RECOVERY_state_where_no_attach_ever_happened(self, plug):
         """`connected`, not `attached`: §1.1 holds the socket open un-attached,
@@ -1027,7 +1036,7 @@ class TestRebuildMenuCallback:
         refusal is gone — the irreversible half is done. Reporting the pair as
         one told the user their node was "unchanged and still refusing" over a
         map that no longer existed, and invited them to repeat an operation
-        that duplicates accessories in every paired ecosystem.
+        that had already discarded the persisted baseline.
         """
         client = _bridge_with(plug, recovery=True, attached=False)
         plug.runtime = _FakeRuntime(result=_status(endpoint_count=0))

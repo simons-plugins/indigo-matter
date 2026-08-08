@@ -1352,8 +1352,10 @@ class ExportBridge:
                 return
             self._logger.error(
                 "Matter export: the bridge node is serving NOTHING because its endpoint-number "
-                "map is unreadable (%s). Nothing will be exported until it is rebuilt — and a "
-                "rebuild WILL duplicate accessories in ecosystems that are already paired.",
+                "map is unreadable (%s). Nothing will be exported until it is rebuilt (Plugins "
+                "▸ Matter ▸ Rebuild Matter Endpoint Map…). The rebuild renumbers nothing: if "
+                "only the map file was damaged no paired ecosystem will see any change, and if "
+                "the bridge's Matter storage was lost the duplication has already happened.",
                 details)
             return
         if code not in TERMINAL_ATTACH_ERRORS:

@@ -580,7 +580,7 @@ class BridgeProtocol:
         )
 
     def build_rebuild_endpoint_map(self, message_id: Optional[str] = None) -> dict:
-        """§3.11 — reallocate endpoint numbers from scratch (duplicates accessories)."""
+        """§3.11 — adopt the live endpoint numbers as the new persisted map."""
         return self.build_request(CMD_REBUILD_ENDPOINT_MAP, None, message_id)
 
     # ------------------------------------------------------------------

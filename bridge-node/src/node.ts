@@ -524,8 +524,9 @@ export class BridgeNode implements BridgeFacade {
                 ? "Nothing will be exported until the quarantined identity.json.unreadable-<stamp> is " +
                   "restored or repaired as identity.json and the bridge restarted; rebuilding the " +
                   "endpoint map CANNOT fix this."
-                : "Nothing will be exported until the endpoint map is rebuilt (BRIDGE_PROTOCOL §3.11), " +
-                  "which WILL duplicate accessories in already-paired ecosystems.";
+                : "Nothing will be exported until the endpoint map is rebuilt (BRIDGE_PROTOCOL §3.11). " +
+                  "The rebuild adopts the numbers that exist now and renumbers nothing — any " +
+                  "duplicate accessories were caused by the storage loss itself, not the rebuild.";
         this.log(`REFUSING to serve endpoints — ${reason}. ${remedy}`);
     }
 

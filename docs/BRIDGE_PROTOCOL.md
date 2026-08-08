@@ -66,13 +66,12 @@ constants in `bridge_protocol.py`), and two of them need opposite advice:
 
 | `details` prefix | Remedy |
 |---|---|
-| `endpoint map is unreadable` | §3.11 `rebuild_endpoint_map`, user-confirmed — it WILL duplicate accessories in already-paired ecosystems |
+| `endpoint map is unreadable` | §3.11 `rebuild_endpoint_map`, user-confirmed — it adopts the live numbers and renumbers nothing |
 | `this bridge was commissioned but its Matter fabric storage is gone…` | Restore a backup, or accept the loss via §3.11 |
 | `the bridge identity file is present but unreadable` | **§3.11 will not help and the node refuses it.** Restore or repair `identity.json.unreadable-<stamp>` and restart the bridge |
 
 A client that shows the map remedy for all three sends the identity case at the
-one door deliberately locked against it — and promises duplicated accessories on
-the way through. Clients MUST branch on the reason.
+one door deliberately locked against it. Clients MUST branch on the reason.
 | `commissioning_window_failed` | Matter stack refused to open the enhanced commissioning window |
 | `internal` | Unexpected node-side failure; `details` carries the message |
 
@@ -306,8 +305,9 @@ The recovery path out of the `endpoint_map_invalid` refuse-to-start state
 reallocates nothing — by the time a user is asked to confirm it, whatever
 duplication a lost map implies has already happened in the ecosystems; what
 changes is that the node stops refusing and starts telling the truth about the
-numbers that now exist. This **will** duplicate accessories in paired
-ecosystems, which is exactly why it is a separate, explicit command that the
+numbers that now exist. It cannot itself duplicate accessories — but it
+discards the only surviving record of what the numbers used to be (quarantined
+aside, not deleted), which is why it is a separate, explicit command that the
 plugin only issues after the user confirms via a warning dialog
 ("Rebuild Matter Endpoint Map…"). Result: `<StatusReport>`.
 

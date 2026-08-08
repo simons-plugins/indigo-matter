@@ -117,8 +117,8 @@ TERMINAL_ATTACH_ERRORS = {
     ),
     bridge_protocol.ERR_ENDPOINT_MAP_INVALID: (
         "the node's endpoint-number map is unreadable, so it is serving nothing until it is "
-        "rebuilt — confirm the rebuild in the plugin (PRD §7); it WILL duplicate accessories "
-        "in already-paired ecosystems"
+        "rebuilt — confirm the rebuild in the plugin (PRD §7); it adopts the numbers that "
+        "exist now and renumbers nothing"
     ),
 }
 

@@ -2197,16 +2197,20 @@ class Plugin(indigo.PluginBase):
         """§3.11 — the way out of the endpoint_map_invalid refuse-to-start state.
 
         Two outcomes are reported separately, because they can differ and the
-        expensive one is the first: the rebuild is irreversible (it duplicates
-        accessories in every paired ecosystem) while the re-attach that follows
-        it is an ordinary connection step that retries on its own. Reporting the
+        expensive one is the first: the rebuild is irreversible (it discards
+        the persisted baseline and adopts the live numbers) while the re-attach
+        that follows it is an ordinary connection step that retries on its own.
+        It renumbers nothing, so it cannot itself duplicate accessories — any
+        duplication belongs to the storage loss that caused the refusal (#132).
+        Reporting the
         pair as one used to tell users their node was "unchanged and still
         refusing" over a map that had already been rewritten — and invite them
         to do it again.
         """
         errors = indigo.Dict()
         if not self._truthy(valuesDict.get("confirm")):
-            errors["confirm"] = "Tick the box — a rebuild can duplicate paired accessories."
+            errors["confirm"] = ("Tick the box — a rebuild replaces the endpoint-number record "
+                                 "and cannot be undone.")
             return (False, valuesDict, errors)
         client = self._recovery_client(errors, "confirm")
         if client is None:
@@ -2244,8 +2248,10 @@ class Plugin(indigo.PluginBase):
             return (False, valuesDict, errors)
         self.logger.warning(
             "Matter export: endpoint map REBUILT — the bridge node has stopped refusing and is "
-            "serving %d endpoint(s). Check every paired ecosystem for duplicated accessories and "
-            "delete the dead ones by hand. Do NOT run this again for the same fault.",
+            "serving %d endpoint(s). Nothing was renumbered. If only the map file was damaged, "
+            "no paired ecosystem will see any change; if the bridge's Matter storage was lost, "
+            "your ecosystems already hold dead accessories under the old numbers — delete those "
+            "by hand. Do NOT run this again for the same fault.",
             status.endpoint_count)
         for warning in status.warnings:
             self.logger.warning("Matter export: the bridge node reports — %s", warning)

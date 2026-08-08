@@ -544,22 +544,32 @@ Matter Export Pairings…*.
 
 Both are in the plugin menu, both make you tick a box (or two), and neither is
 something you should reach for casually. They are described here in the same
-words the dialogs use, **worse one first** — the difference between them is
-whether the damage can be undone.
+words the dialogs use.
 
-**Rebuild Matter Endpoint Map… — UNRECOVERABLE.** What it destroys cannot be put
-back by repeating any step. Use it **only** when the plugin says the bridge node
-is refusing to export because its endpoint-number map is unreadable. The map
-records which Matter accessory number belongs to which Indigo device; rebuilding
-it accepts whatever numbers exist now as correct. *This **will** duplicate
-accessories in ecosystems that are already paired.* The old accessories do not
-disappear — they stop working, you have to delete them by hand, and any names,
-rooms, scenes and automations built on them are lost. Your pairings themselves
-are not touched and no Indigo device is changed. If the bridge is **not**
-refusing, the plugin refuses the rebuild: there is no fault to recover from, and
-a rebuild would throw away the retained endpoint numbers of every device you are
-not currently exporting — the ones that make re-adding a device restore the same
-accessory rather than create a second one.
+**Rebuild Matter Endpoint Map… — the way out of an unreadable map.** Use it
+**only** when the plugin says the bridge node is refusing to export because its
+endpoint-number map is unreadable. The map is the bridge's safety record of
+which Matter accessory number belongs to which Indigo device; rebuilding it
+discards the unreadable record and adopts whatever numbers exist now as the new
+one. It renumbers nothing, so **the rebuild itself cannot duplicate
+accessories** — what you see afterwards depends on which fault brought you
+here:
+
+- *only the map file was damaged* — the accessories keep their numbers, no
+  paired ecosystem sees any change, and the rebuild simply clears the refusal;
+- *the bridge's Matter storage was lost* — every paired ecosystem is already
+  holding accessories under the old numbers. Those are dead: you have to delete
+  them by hand, and any names, rooms, scenes and automations built on them are
+  lost. That damage was done by the storage loss; rebuilding accepts it rather
+  than causing it.
+
+The unreadable file is kept as `endpoint-map.json.corrupt-<timestamp>` in the
+bridge storage folder; if you have a backup of the original, restoring that is
+better than rebuilding. No pairing is touched and no Indigo device is changed.
+If the bridge is **not** refusing, the plugin refuses the rebuild: there is no
+fault to recover from, and a rebuild would throw away the retained endpoint
+numbers of every device you are not currently exporting — the ones that make
+re-adding a device restore the same accessory rather than create a second one.
 
 **Reset Matter Export Pairings… — recoverable, at the cost of pairing again.**
 It *removes **every** ecosystem pairing from the Matter export bridge and starts
@@ -732,7 +742,7 @@ dialog, most-likely-first — the top two are what a first export usually hits.
 | The log names **Install/update the Matter export bridge** | The `indigo-matter-bridge` package is not installed, so no LaunchAgent was written. This is the normal first-run state. | Run that menu item. Note it cannot succeed until the package is published to npm — see *Export prerequisites*. |
 | An `EADDRINUSE` / address-already-in-use failure in `bridge-node.err.log`. The node labels which startup step failed, so the line says whether it was the Matter port or the loopback protocol port | **Matter port (UDP 5540):** another Matter *device* stack on this Mac already holds it — Homebridge 2.x, matterbridge, or a Home Assistant container in host mode. **Protocol port (TCP 5581):** an orphaned bridge node from an earlier LaunchAgent is still running, or an unrelated service has the port. | **Matter port:** stop the other stack, or Configure… ▸ **Show export port settings** ▸ **Matter port**, pick another, and **reload the plugin**. Find the holder with `lsof -nP -iUDP:5540`. Moving off 5540 is a real trade — it is the port ecosystems expect. **Protocol port:** **Stop the Matter export bridge…** then re-save an export (the plugin reaps its own orphans on start). If something else holds it, find it with `lsof -nP -iTCP:5581 -sTCP:LISTEN`, and either stop it or change **Bridge control port** and reload the plugin. |
 | `Matter export: the bridge node's LaunchAgent did not start` / `could not be loaded by launchd` | launchd accepted the job and the process died, or refused the plist. | Check `bridge-node.err.log` first. Then `launchctl print gui/$(id -u)/com.simons-plugins.indigo-matter.bridge`. **Stop the Matter export bridge…** followed by re-saving an export rebuilds the plist from scratch. |
-| `Matter export: the bridge node is serving NOTHING because its endpoint-number map is unreadable` | The bridge's `endpoint-map.json` is present but corrupt. It refuses to serve rather than silently renumber every accessory. | **Rebuild Matter Endpoint Map…** — and read what it costs first (above). The unusable file is kept as `endpoint-map.json.corrupt-<timestamp>` in the bridge storage folder; if you have a backup of the original, restoring it is better than rebuilding. |
+| `Matter export: the bridge node is serving NOTHING because its endpoint-number map is unreadable` | The bridge's `endpoint-map.json` is present but corrupt. It refuses to serve rather than silently renumber every accessory. | **Rebuild Matter Endpoint Map…** — and read what it does first (above). The unusable file is kept as `endpoint-map.json.corrupt-<timestamp>` in the bridge storage folder; if you have a backup of the original, restoring it is better than rebuilding. |
 | `…because its identity file is unreadable` | `identity.json` is corrupt. This is a *different* fault with a different remedy, and the node refuses a rebuild for it. | Restore or repair `identity.json.unreadable-<timestamp>` from the bridge storage folder and restart the bridge. **Deleting it starts a brand-new bridge**, which every paired ecosystem sees as a different device. |
 | The node reports it was commissioned but its Matter fabric storage is gone | The bridge storage directory was moved, restored partially, or lost. | Restore the whole `bridge-node/` directory from a backup. If you have none, accept the loss: reset the pairings and pair each ecosystem again. |
 | `Matter export: endpoint-number DRIFT detected` | **Most likely: you have just reset the pairings, or unpaired the last ecosystem.** Both factory-reset the bridge, which wipes matter.js's own endpoint allocation — so the numbers are handed out afresh and no longer match the preserved map. That is *expected*, and saying so is exactly what the preserved map is for. **Otherwise:** storage loss on the bridge side, in which case exported accessories may have swapped identities in paired ecosystems. | **After a reset or a last-ecosystem unpair: no action.** The map is reporting what it exists to report, and re-pairing proceeds normally. **Otherwise:** drift is never repaired automatically, deliberately — an auto-repair would bless the loss and hide the next one. Check the named accessories in each ecosystem, and restore the bridge storage from a backup if you have one. |
