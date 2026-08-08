@@ -321,7 +321,8 @@ class TestCommands:
         status = self._exchange(mock_logger, lambda c: c.rebuild_endpoint_map(),
                                 "rebuild_endpoint_map", EXCHANGES)
         assert status.endpoint_count == 2
-        # §3.11 REallocates — the numbers differ from the ones attach reported.
+        # The fixture depicts a post-storage-loss node, so its numbers differ
+        # from attach's — §3.11 records, it does not reallocate.
         assert status.endpoints[1].endpoint_number == 5
 
     def test_error_response_raises(self, mock_logger):
@@ -719,6 +720,7 @@ class TestEndpointMapInvalid:
             assert not client.halted
             assert refusals == [bridge_protocol.ERR_ENDPOINT_MAP_INVALID]
             assert "confirm the rebuild" in logged(mock_logger, "error")
+            assert "renumbers nothing" in logged(mock_logger, "error")
 
             await client.close()
             task.cancel()
@@ -781,7 +783,7 @@ class TestEndpointMapInvalid:
         refuses outright for an unreadable identity, because clearing that
         refusal would serve endpoints under a serial no ecosystem has seen. So
         it is not merely unhelpful here; it points at the one door deliberately
-        locked, and promises duplicated accessories on the way through it.
+        locked against this fault.
         """
         async def scenario():
             fake, client = self._recovering(mock_logger, overrides={
@@ -795,6 +797,7 @@ class TestEndpointMapInvalid:
             assert "identity file is unreadable" in errors
             assert "CANNOT fix this" in errors
             assert "confirm the rebuild" not in errors
+            assert "renumbers nothing" not in errors
 
             await client.close()
             task.cancel()
@@ -843,8 +846,8 @@ class TestEndpointMapInvalid:
         Letting a re-attach failure after that propagate made the menu report
         "the bridge node is unchanged and still refusing to export" — both
         clauses false — leave `recovery` set so every state push went on being
-        dropped, and invite the user to repeat an operation that duplicates
-        accessories in every paired ecosystem.
+        dropped, and invite the user to repeat an operation that had already
+        discarded the persisted baseline.
         """
         async def scenario():
             answers = {bridge_protocol.CMD_ATTACH: error_response(

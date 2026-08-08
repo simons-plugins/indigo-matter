@@ -341,16 +341,20 @@ You normally never need this: the bridge starts and stops with your export list.
         <CallbackMethod>menuRebuildEndpointMap</CallbackMethod>
         <ConfigUI>
             <Field id="warning" type="label">
-                <Label>Use this ONLY when the plugin says the bridge node is refusing to export because its endpoint-number map is unreadable. The map records which Matter accessory number belongs to which Indigo device; rebuilding it accepts whatever numbers exist now as correct.
+                <Label>Use this ONLY when the plugin says the bridge node is refusing to export because its endpoint-number map is unreadable. The map is the bridge's safety record of which Matter accessory number belongs to which Indigo device; rebuilding it discards the unreadable record and adopts whatever numbers exist now as the new one.
 
-WARNING: this WILL duplicate accessories in ecosystems that are already paired (Apple Home, Alexa, Google). The old accessories do not disappear — they stop working and you have to delete them by hand, and any names, rooms, scenes and automations built on them are lost.
+Rebuilding renumbers NOTHING, so it cannot itself duplicate accessories. What you see afterwards depends on which fault brought you here:
 
-Your pairings themselves are NOT touched, and no Indigo device is changed.
+- If only the map file was damaged, the accessories keep their numbers, no paired ecosystem (Apple Home, Alexa, Google) sees any further change, and the rebuild simply clears the refusal.
+
+- If the bridge's Matter storage was lost, your ecosystems are ALREADY holding accessories under the old numbers — those are dead, you have to delete them by hand, and any names, rooms, scenes and automations built on them are lost. That damage was done by the storage loss; rebuilding accepts it rather than causing it.
+
+The unreadable file is kept beside the new one as endpoint-map.json.corrupt-&lt;timestamp&gt;; if you have a backup of the original, restoring that is better than rebuilding. No pairing is touched, and no Indigo device is changed.
 
 If the bridge node is NOT refusing, this does nothing useful and is refused: there is no fault to recover from, and a rebuild would discard the retained endpoint numbers of every device you are not currently exporting — the ones that make re-adding a device restore the same accessory rather than create a second one.</Label>
             </Field>
             <Field id="confirm" type="checkbox" defaultValue="false">
-                <Label>I understand this may duplicate accessories in paired ecosystems.</Label>
+                <Label>I understand this replaces the endpoint-number record and cannot be undone.</Label>
             </Field>
         </ConfigUI>
     </MenuItem>

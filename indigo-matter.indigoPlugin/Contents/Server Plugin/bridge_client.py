@@ -117,8 +117,8 @@ TERMINAL_ATTACH_ERRORS = {
     ),
     bridge_protocol.ERR_ENDPOINT_MAP_INVALID: (
         "the node's endpoint-number map is unreadable, so it is serving nothing until it is "
-        "rebuilt — confirm the rebuild in the plugin (PRD §7); it WILL duplicate accessories "
-        "in already-paired ecosystems"
+        "rebuilt — confirm the rebuild in the plugin (PRD §7); it adopts the numbers that "
+        "exist now and renumbers nothing"
     ),
 }
 
@@ -717,11 +717,13 @@ class BridgeClient(WsJsonClient):
             self.proto.build_factory_reset(preserve_endpoint_numbers), timeout)
 
     async def rebuild_endpoint_map(self, timeout: float = LONG_TIMEOUT) -> StatusReport:
-        """Reallocate endpoint numbers from scratch (§3.11).
+        """§3.11 — adopt the live endpoint numbers as the new persisted map.
 
-        The recovery path out of ``endpoint_map_invalid``. This DUPLICATES
-        accessories in paired ecosystems, which is why it is a separate command
-        the plugin only issues after the user confirms a warning dialog.
+        The recovery path out of ``endpoint_map_invalid``. It renumbers
+        nothing — any duplication belongs to the storage loss that caused the
+        refusal — but it irreversibly discards the persisted baseline, which
+        is why it is a separate command the plugin only issues after the user
+        confirms a warning dialog.
 
         When it is called from the recovery state (the node refused our attach)
         it also re-attaches: the map is valid again, so the connection can stop
@@ -734,8 +736,8 @@ class BridgeClient(WsJsonClient):
         as though the whole thing failed produced a menu that told the user "the
         bridge node is unchanged and still refusing to export" when neither
         clause was true, left ``recovery`` set so every state push went on being
-        dropped, and invited them to repeat an operation that duplicates
-        accessories in every paired ecosystem.
+        dropped, and invited them to repeat an operation that had already
+        discarded the persisted baseline.
 
         So the recovery flag is cleared the moment the report lands, and the
         re-attach goes through the same triage as any other refused attach

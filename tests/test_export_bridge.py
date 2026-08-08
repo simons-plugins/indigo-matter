@@ -732,11 +732,13 @@ class TestFailureSurfacing:
         h.bridge._on_attach_refused(bridge_protocol.ERR_MASS_REMOVAL_REFUSED, "no intent")
         assert bridge_protocol.ERR_MASS_REMOVAL_REFUSED in errors_of(mock_logger)
 
-    def test_an_invalid_endpoint_map_says_what_a_rebuild_costs(self, bridge_mod, mock_logger,
-                                                               devices):
+    def test_an_invalid_endpoint_map_says_what_a_rebuild_does(self, bridge_mod, mock_logger,
+                                                              devices):
+        # #132: the old line promised the rebuild WILL duplicate accessories.
+        # It cannot — it renumbers nothing.
         h = self._bridge(bridge_mod, mock_logger, devices)
         h.bridge._on_attach_refused(bridge_protocol.ERR_ENDPOINT_MAP_INVALID, "unreadable")
-        assert "duplicate accessories" in errors_of(mock_logger)
+        assert "renumbers nothing" in errors_of(mock_logger)
 
     def test_version_skew_says_restart_the_agent(self, bridge_mod, mock_logger, devices):
         h = self._bridge(bridge_mod, mock_logger, devices)
@@ -1914,7 +1916,7 @@ class TestRefusalRemedies:
         assert "identity file is unreadable" in said
         assert "will NOT fix this" in said
         assert "identity.json.unreadable-" in said
-        assert "duplicate accessories" not in said
+        assert "renumbers nothing" not in said, "the map remedy leaked into the identity case"
 
 
 class TestDriftLatch:

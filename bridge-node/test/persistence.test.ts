@@ -823,11 +823,14 @@ describe("refusing for an unusable identity is a different refusal (E5 R4)", () 
     });
 
     it("still sends a map refusal to §3.11, which is where that one is fixed", () => {
+        // #132: the remedy used to promise the rebuild WILL duplicate
+        // accessories. It cannot — it renumbers nothing; any duplication
+        // belongs to the storage loss that caused the refusal.
         const line = refusalLineFor(RefuseReason.mapUnreadable);
 
         assert.match(line, /endpoint map is unreadable/);
         assert.match(line, /BRIDGE_PROTOCOL §3\.11/);
-        assert.match(line, /duplicate accessories/);
+        assert.match(line, /renumbers nothing/);
     });
 
     it("carries a refusal decided before the node existed all the way in", async () => {
