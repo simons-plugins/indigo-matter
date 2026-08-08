@@ -288,6 +288,9 @@ class FakeBridgeClient:
         self.closed = True
         self._record("close")
 
+    def retry_now(self):
+        self._record("retry_now")
+
     # -- introspection ---------------------------------------------------
     def _record(self, name, *args):
         self.calls.append((name, *args))

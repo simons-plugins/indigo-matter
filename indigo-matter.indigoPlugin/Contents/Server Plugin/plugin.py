@@ -2595,8 +2595,13 @@ class Plugin(indigo.PluginBase):
                     "FAILED — the old version may still be running. Check %s.",
                     os.path.join(self.bridge_process.log_dir, bridge_agent.BRIDGE_ERR_LOG))
                 return
+            # Cuts the reconnect backoff short (issue #135): it grew to its 30s
+            # ceiling while the package was missing, and without this the user
+            # watches out the rest of that delay right after a success message.
+            if self.export_bridge is not None:
+                self.export_bridge.retry_now()
             self.logger.info("Matter export bridge installed and restarted onto the new version — "
-                             "the plugin reconnects automatically.")
+                             "reconnecting now.")
         except Exception as exc:  # noqa: BLE001
             self.logger.exception(exc)
             self.logger.error(

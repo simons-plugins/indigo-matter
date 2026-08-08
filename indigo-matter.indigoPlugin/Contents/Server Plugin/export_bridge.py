@@ -343,6 +343,17 @@ class ExportBridge:
         except Exception as exc:  # pylint: disable=broad-except
             self._logger.debug("bridge client close error: %s", exc)
 
+    def retry_now(self) -> None:
+        """Cut the client's reconnect backoff short (issue #135).
+
+        Pokes the live client, if there is one; a no-op while nothing is
+        exported (XG5, no client to poke) or while the client itself declines
+        (not running, closing, or halted — see :meth:`ws_json_client.WsJsonClient.retry_now`).
+        Safe to call from the ``threading.Thread`` the npm install runs on.
+        """
+        if self.client is not None:
+            self.client.retry_now()
+
     def _stop_soon(self, why: str) -> None:
         """Drop the client without waiting — safe to call ON the loop thread.
 

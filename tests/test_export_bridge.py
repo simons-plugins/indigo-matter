@@ -463,6 +463,22 @@ class TestLifecycle:
 
 
 # ---------------------------------------------------------------------------
+# The E7 post-install poke (issue #135)
+# ---------------------------------------------------------------------------
+class TestRetryNow:
+    def test_retry_now_delegates_to_the_client_when_present(self, bridge_mod, mock_logger, devices):
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(101, "onOffLight")])
+        client = h.start()
+        h.bridge.retry_now()
+        assert client.only("retry_now") == ("retry_now",)
+
+    def test_retry_now_is_a_no_op_while_nothing_is_exported(self, bridge_mod, mock_logger, devices):
+        h = Harness(bridge_mod, mock_logger, devices, [])
+        h.bridge.retry_now()  # no client exists (XG5); must not raise
+        assert h.clients == []
+
+
+# ---------------------------------------------------------------------------
 # Indigo → node
 # ---------------------------------------------------------------------------
 class TestDeviceUpdated:

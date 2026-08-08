@@ -105,7 +105,7 @@ class HandshakeFailed(Exception):
     """
 
 
-class WsJsonClient:
+class WsJsonClient:  # pylint: disable=too-many-instance-attributes
     """A reconnecting WebSocket client that speaks request/response/event JSON."""
 
     #: Peer name used in log lines; subclasses override.
@@ -155,6 +155,11 @@ class WsJsonClient:
         self._running = False
         self._connected_event = asyncio.Event()
         self._reconcile_task: Optional[asyncio.Task] = None
+        # Set by retry_now() to cut the backoff wait in _run_loop short; cleared
+        # the moment it does. The loop this belongs to, captured in run() so
+        # retry_now() can wake it from a plain thread (see there).
+        self._retry_event = asyncio.Event()
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
 
         # liveness flags read by the watchdog (runConcurrentThread)
         self.connected = False
@@ -170,10 +175,14 @@ class WsJsonClient:
         """Connect → listen → reconnect (backoff) until :meth:`close` or a halt."""
         attempt = 0
         self._running = True
+        # Captured so retry_now() — called from a plain thread — has a loop to
+        # hand the wake-up to via call_soon_threadsafe.
+        self._loop = asyncio.get_running_loop()
         try:
             await self._run_loop(attempt)
         finally:
             self._running = False
+            self._loop = None
 
     async def _run_loop(self, attempt: int) -> None:
         while not self._closing:
@@ -228,7 +237,12 @@ class WsJsonClient:
             delay = min(2 ** attempt, MAX_BACKOFF)
             attempt += 1
             self.logger.debug("reconnecting to %s in %.0fs", self.PEER, delay)
-            await self._sleep(delay)
+            if await self._wait_for_retry(delay):
+                # Woken by retry_now() rather than timed out: whatever grew this
+                # backoff (the node was missing, unreachable, …) just changed, so
+                # both this immediate retry and any later failures should start
+                # counting from 1s again — the grown delay is stale history.
+                attempt = 0
 
     def _maybe_report_repeated_failure(self, attempt: int) -> None:
         """Fire ``on_repeated_failure`` once per streak, after ≥2 consecutive fails.
@@ -277,6 +291,68 @@ class WsJsonClient:
                          self.PEER)
         self.halted = False
         self.halted_reason = None
+
+    async def _wait_for_retry(self, delay: float) -> bool:
+        """Wait ``delay`` seconds, or until :meth:`retry_now` wakes us — whichever
+        is first. Returns whether the wake won.
+
+        Races the injected ``self._sleep`` seam against ``_retry_event`` rather
+        than replacing it: the test suite fakes ``sleep`` to control (and end)
+        the backoff wait, and a wait that bypassed it outright would silently
+        strand every one of those tests. Whichever side loses is cancelled.
+        """
+        sleep_task = asyncio.ensure_future(self._sleep(delay))
+        wake_task = asyncio.ensure_future(self._retry_event.wait())
+        done, pending = await asyncio.wait(
+            {sleep_task, wake_task}, return_when=asyncio.FIRST_COMPLETED)
+        for task in pending:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        if sleep_task in done and not sleep_task.cancelled():
+            # Preserve the pre-existing behaviour of a sleep seam that raises —
+            # `await self._sleep(delay)` used to propagate it directly.
+            exc = sleep_task.exception()
+            if exc is not None:
+                raise exc
+        woken = wake_task in done
+        if woken:
+            self._retry_event.clear()
+        return woken
+
+    def retry_now(self) -> None:
+        """Cut the current backoff wait short. Safe to call from any thread.
+
+        For the one caller that needs that: the post-install poke
+        (``export_bridge.ExportBridge.retry_now``) runs on the ``threading.Thread``
+        the npm install happens on, not the asyncio loop. This never touches
+        asyncio state directly — it hands the wake-up to the loop captured in
+        :meth:`run` via ``call_soon_threadsafe`` and returns immediately.
+
+        Ignored (silently — a poke that might be a no-op is not an error) when:
+
+        * the client is not running, or is closing — there is no backoff wait to
+          cut short, and setting the event now would only pre-arm the NEXT
+          run's first wait for no reason;
+        * the client is **halted**. A halt is fail-closed by design (§2/§3.1's
+          terminal refusals): no retry is coming until a human — or
+          :meth:`resume` — says otherwise, and a poke that quietly restarted the
+          loop underneath that would defeat the point of halting at all. This
+          includes the one halt an install actually remedies
+          (``ERR_VERSION_MISMATCH`` — see ``bridge_client.TERMINAL_ATTACH_ERRORS``):
+          :meth:`resume` only clears the latch and its own docstring says the
+          caller must start a fresh ``run()`` task, and nothing in this codebase
+          does that today. Reviving a halted client is a separate, larger change
+          than a backoff reset; this seam does not attempt it.
+        """
+        if not self._running or self._closing or self.halted:
+            return
+        loop = self._loop
+        if loop is None:
+            return
+        loop.call_soon_threadsafe(self._retry_event.set)
 
     async def _connect_once(self) -> None:
         self.logger.debug("connecting to %s", self.uri)
