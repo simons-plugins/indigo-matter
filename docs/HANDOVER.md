@@ -7,8 +7,11 @@
 non-`[no-release]` merge since v2026.7.23, so the release also ships the
 banked #141 endpoint restore and #134 menu sections — the `[no-release]` debt
 recorded here since 2026-08-06 is **cleared**.
-**Version:** plugin `2026.8.6` (released), bridge-node `0.7.0` (**published to
-npm**; `DEFAULT_INSTALL_SPEC` pins it).
+**Version:** plugin `2026.8.7` in tree (v2026.8.6 is the released tag; this
+bump exists because check-version fails on any PR whose version is already a
+tag — docs-only PRs rode the untagged 2026.8.5 before, and the v2026.8.6
+release closed that loophole). Bridge-node `0.7.0` (**published to npm**;
+`DEFAULT_INSTALL_SPEC` pins it).
 **Tests:** **2256 Python**, **383 TS** — both green. pylint 9.42 whole-repo
 baseline. (`python3 -m pytest -q` · `cd bridge-node && npm run build && npm test`)
 **Deployed:** jarvis runs plugin `2026.8.5` + bridge-node `0.7.0`, paired to
