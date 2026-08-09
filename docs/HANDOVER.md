@@ -1,40 +1,71 @@
 # indigo-matter — Build Handover
 
-**Last updated:** 2026-08-09 08:33 UTC
+**Last updated:** 2026-08-09 10:17 UTC
 **Active work:** none — nothing in flight, working tree clean.
-**Branch:** `main` — the 2026-08-08/09 arc is fully landed: #151 (#140
-adoption → **v2026.8.9**), #152 (`[no-release]`, bridge-node 0.8.0 bump +
-pin), #153 (#133, `[no-release]`), #155 (#135, `[no-release]`), #156 (#84 →
-**v2026.8.13**, carrying all three). `indigo-matter-bridge@0.8.0` is
-**published to npm** (Simon, 2026-08-09) and `DEFAULT_INSTALL_SPEC` pins it.
-The pin≤package test relaxation (#152) means future node publishes need no
-plugin PR.
-**Version:** plugin `2026.8.13` (released), bridge-node `0.8.0` (published).
-**Tests:** **2289 Python**, **405 TS** — both green.
+**Branch:** `main` — the 2026-08-09 daytime arc landed six more: #158 (#147
+naming → **v2026.8.15**), #159 (#137+#139 E8 docs, `[no-release]`), #160
+(#154 halt revival → **v2026.8.17**), #161 (#76 pressCount → **v2026.8.18**);
+before those, the overnight arc's #151–#157 (see the sections below).
+`indigo-matter-bridge@0.8.0` published and pinned; the pin≤package relaxation
+means node publishes need no plugin PR.
+**Version:** plugin `2026.8.18` (released), bridge-node `0.8.0` (published).
+**Tests:** **2314 Python**, **405 TS** — both green.
 (`python3 -m pytest -q` · `cd bridge-node && npm run build && npm test`)
-**Deployed & VERIFIED on jarvis (2026-08-09 ~08:30 UTC):** plugin `2026.8.13`
-+ bridge-node `0.8.0`, paired to Apple Home AND Alexa (3 fabrics). The #140
-arc closed live: bridge agent stopped, all 6 map entries hand-voided (the
-one-time edit — backup at `endpoint-map.json.pre-void-backup`), 0.8.0
-installed via `npm install --prefix ~/indigo-matter` (nvm node v22.22.3,
-full path needed over ssh), plugin restarted. The node logged **"Adopted 6
-endpoint number(s) renumbered by the factory reset"**, the map healed
-(Hallway Lamp 5→2, the duplicate-5 fingerprint gone), and the attach line is
-clean — **no DRIFT error for the first time since the 2026-08-06 reset**.
-Note for future deploys: the node takes ~15s from launch to WS-listening
-(post-#141 restore-before-serve), so the plugin logs "not responding after 2
-attempts" + a stale err-log tail before the backoff connects — alarming but
-expected.
-**Status:** export v1 feature-complete, live, and current everywhere.
-**#143 is the parked one** — see the 2026-08-06 §#143 section; its defect B
-leading theory was **withdrawn**, read before touching.
+**Deployed & VERIFIED on jarvis (2026-08-09 ~11:16 UTC):** plugin
+`2026.8.18` + bridge-node `0.8.0`, Apple Home AND Alexa (3 fabrics), bridge
+attached <1s, 4 controller nodes reconciled, no drift, log clean. Deploy
+recipe that works: checksum the delta files against the release tag jarvis
+last got (no hot-patches ever assumed), then `git archive <tag>
+indigo-matter.indigoPlugin | ssh jarvis.local "tar -xf - --strip-components=1
+-C '<live bundle>'"` and restart via MCP. Note: the bridge node takes ~15s
+from cold launch to WS-listening (restore-before-serve); a WARM node
+reattaches in <1s.
+**Status:** export v1 feature-complete, live, current everywhere, and the
+docs site now routes to it (#137). **#143 is the parked one** — see the
+2026-08-06 §#143 section; its defect B leading theory was **withdrawn**, read
+before touching. #138 (screenshots) blocks on Simon's server+phone — the
+three-shot list is on the issue.
 
-**NEXT UP:** nothing queued. Suggested order for the backlog: the E8 docs
-trio (#137/#138/#139 — the feature under-sells itself), then #154 (halt
-survives its own remedy) + #76 (pressCount double-count), then the
-commissioning race quartet #21–#24. Also open: #136, #105, #101, #77, #75,
-#64, #62, #46, #43, device-support #14/#15/#70/#71/#72/#83, refactor #146,
-naming #147.
+**NEXT UP:** the commissioning race quartet **#21–#24** (meaty — start
+fresh). Then: #136, #105, #101, #77, #75, #64, #62, #46, #43,
+device-support #14/#15/#70/#71/#72/#83, refactor #146.
+
+---
+
+## 2026-08-09 (day) — six issues in sequence: #147, #137+#139, #154, #76
+
+One-line records; each PR body carries the detail.
+
+* **#147 naming (PR #158, v2026.8.15)** — "the Matter controller
+  (matter-server)" / "the Matter bridge" across every user surface; 92-line
+  log-prefix sweep; ids/prefs/package names untouched. The review found the
+  sweep's structural blind spot — menu names WRAPPED across source lines,
+  invisible to grep — twice; fixed, and `RETIRED_MENU_NAMES` scan tests
+  (AST string constants + newline-collapsed docs) now make that class of
+  drift impossible. The scan caught an eighth straggler on its first run.
+* **#137+#139 E8 docs (PR #159, `[no-release]`)** — matter.html §12 covers
+  the outbound direction in the page's own typeset idiom; index.html routes
+  to both directions + INSTALL; the room-edits row carries the verified
+  remedy (the Apple-Keychain leftover-fabric step is the one people miss)
+  corrected for #140 — and the DRIFT row two entries down was updated to
+  match, so the table no longer disagrees with itself.
+* **#154 halt revival (PR #160, v2026.8.17)** — `revive_after_install()`
+  gated on BOTH version-skew spellings (`"version_skew"` handshake /
+  `"version_mismatch"` attach-refusal — different paths latch different
+  strings); `mass_removal_refused` excluded by mutation-killed test. Review
+  caught the stale halt-report latches (a failed reinstall re-halted in
+  SILENCE — latches now reset in `start()`: a new client is a new outage
+  history), a shutdown race, and the untested `is client` guard — whose
+  test needed a once-firing DATA descriptor to be genuinely
+  mutation-sensitive (instance attrs outrank non-data descriptors, and a
+  second read healed the mutation).
+* **#76 pressCount (PR #161, v2026.8.18)** — MultiPressComplete count≤1 is
+  the NORMAL close of a single press (the old comment's "unexpected per
+  spec" disproven by the live BILRESA evidence), now suppressed; the exact
+  field sequence is the regression test. Scroll/single-click stay instant;
+  count≥2 unchanged.
+
+---
 
 ---
 
