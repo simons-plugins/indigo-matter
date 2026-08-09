@@ -381,7 +381,7 @@ def _control_is_alive(control: Any, log: Any) -> bool:
     """Whether ``control``'s process is (or may be) up. Defaults to True when unsure.
 
     ``is_alive()`` is an OPTIONAL extension of the ``stop()``/``start()`` seam
-    (:func:`launch_agent.LaunchAgent.is_alive`) — a control without it is
+    (:meth:`launch_agent.LaunchAgent.is_alive`) — a control without it is
     treated as alive. Fail-SAFE, and deliberately asymmetric with the rest of
     this module's failure handling: the cost of stopping an already-stopped
     node is one log line, while the cost of extracting new storage under a
@@ -403,10 +403,10 @@ def _control_is_alive(control: Any, log: Any) -> bool:
 def _restart_bridge(plan: _BridgePlan, log: Any) -> bool:
     """Start the bridge node back up. Never raises; the caller decides what a False means.
 
-    Four different callers use this result, and (since A2) every one of them
-    checks it: the abort path in :func:`_stop_for_restore` (a best-effort
-    restart when the controller failed to stop), the move-aside failure path
-    in :func:`restore_backup` (A1), the post-restore finish step in
+    Four different callers use this result, and every one of them checks it:
+    the abort path in :func:`_stop_for_restore` (a best-effort restart when
+    the controller failed to stop), the move-aside failure path in
+    :func:`restore_backup`, the post-restore finish step in
     :func:`_finish_bridge_restore` (which logs a specific ERROR naming where
     the restored storage sits), and the rollback's bridge-restart step in
     :func:`_rollback` (already escalating loudly and appending to that
@@ -457,8 +457,25 @@ def _stop_for_restore(plan: Optional[_BridgePlan], server_control: Any, log: Any
             raise RuntimeError(
                 "the Matter bridge node failed to stop; aborting restore before touching anything"
             )
-    # C1 (stop half): a False stop() is honoured as an abort.
-    if not server_control.stop():
+    # C1 (stop half): a False stop() is honoured as an abort. A RAISING
+    # stop() must be treated the same way — otherwise a bridge we just
+    # stopped above is left down with no restart attempted and no log line,
+    # because the exception would propagate straight past the bridge-restart
+    # logic below it.
+    try:
+        controller_stopped = server_control.stop()
+    except Exception as stop_exc:  # pylint: disable=broad-except
+        if plan is not None and plan.was_alive and not _restart_bridge(plan, log):
+            log.error(
+                "The Matter bridge node did not restart after the controller's stop() "
+                "raised (%s). Its pairings are intact; exported accessories are "
+                "unavailable until it starts — check the bridge node's error log, then "
+                "reload the plugin.", stop_exc,
+            )
+        raise RuntimeError(
+            "matter-server failed to stop; aborting restore before touching the live fabric"
+        ) from stop_exc
+    if not controller_stopped:
         if plan is not None and plan.was_alive and not _restart_bridge(plan, log):
             # Best-effort: put the bridge back the way we found it before
             # raising — nothing else in this function has touched anything yet.
@@ -476,6 +493,29 @@ def _stop_for_restore(plan: Optional[_BridgePlan], server_control: Any, log: Any
         )
 
 
+class _MoveAsideDoubleFault(OSError):
+    """The bridge rename failed AND undoing the controller's rename also failed.
+
+    Distinct from the single-fault case (a bridge rename failure whose undo
+    of the controller rename succeeded, or never had to happen) so
+    :func:`restore_backup`'s except handler can tell them apart: a double
+    fault leaves the controller fabric stranded at ``moved_aside_to``, not at
+    ``storage_path`` — starting matter-server would recreate ``storage_path``
+    as a fresh, empty fabric (the launch agent's ``ensure_installed`` makes
+    the dir), which then blocks the manual ``mv`` recovery this exception
+    describes. Carries both paths so the handler can name them without
+    re-deriving anything.
+    """
+
+    def __init__(self, moved_aside_to: str, storage_path: str):
+        super().__init__(
+            f"double fault moving storage aside: controller fabric stranded at "
+            f"{moved_aside_to}, not in place at {storage_path}"
+        )
+        self.moved_aside_to = moved_aside_to
+        self.storage_path = storage_path
+
+
 def _move_aside_for_restore(
     storage_path: str, plan: Optional[_BridgePlan], now: datetime, log: Any
 ) -> Optional[str]:
@@ -489,8 +529,10 @@ def _move_aside_for_restore(
     with nothing to show for it, so a failing bridge rename undoes the
     controller rename before re-raising — after this function returns
     normally OR raises, either both sides are aside or neither is, never one.
-    If the undo itself also raises (a double fault, vanishingly rare), both
-    paths are named explicitly so manual recovery is possible.
+    If the undo itself also raises (a double fault, vanishingly rare), it is
+    raised as :class:`_MoveAsideDoubleFault` instead of the bare
+    ``OSError`` — the single-fault case keeps raising the original — so the
+    caller can tell the two apart and respond differently.
     """
     moved_aside_to: Optional[str] = None
     if os.path.isdir(storage_path):
@@ -508,9 +550,11 @@ def _move_aside_for_restore(
                     log.error(
                         "Moving the Matter bridge node's storage aside failed, and undoing "
                         "the controller's move-aside ALSO failed (%s): the controller fabric "
-                        "is at %s, NOT in place at %s — move it back by hand.",
+                        "is at %s, NOT in place at %s — move it back by hand, with "
+                        "matter-server stopped.",
                         undo_exc, moved_aside_to, storage_path,
                     )
+                    raise _MoveAsideDoubleFault(moved_aside_to, storage_path) from undo_exc
             raise
         plan.moved_aside_to = bridge_moved_aside_to
     return moved_aside_to
@@ -595,11 +639,14 @@ def restore_backup(
          <stamp>`` (NEVER delete in place; skipped if a dir does not exist) —
          controller then bridge, as one unit, before either extract.
          All-or-nothing: a failing bridge rename undoes the controller
-         rename first (see :func:`_move_aside_for_restore`), then this
-         step's own failure handler best-effort restarts both daemons and
-         raises a wrapped ``RuntimeError`` — the disk is unchanged in the
-         single-fault case, and this failure never reaches step 7's
-         :func:`_rollback`.
+         rename first (see :func:`_move_aside_for_restore`). This step's own
+         failure handler then raises a wrapped ``RuntimeError`` — in the
+         (near-universal) single-fault case, the disk is unchanged and a
+         restart of both daemons is attempted; in the rare double fault
+         (the undo also failed), the controller fabric is stranded aside and
+         its restart is deliberately skipped instead (starting it would
+         recreate an empty fabric at the original path). Either way this
+         failure never reaches step 7's :func:`_rollback`.
       5. Extract the archive into fresh dir(s) and assert each result is
          non-empty (a validly-zipped but empty backup would silently wipe the
          fabric — treated as a failure and rolled back).
@@ -663,12 +710,46 @@ def restore_backup(
 
     try:
         moved_aside_to = _move_aside_for_restore(storage_path, plan, now, log)
+    except _MoveAsideDoubleFault as exc:
+        # Double fault: the controller fabric is stranded aside, not at
+        # storage_path, and nothing there predates it. Starting matter-server
+        # would recreate storage_path as a FRESH EMPTY fabric (the launch
+        # agent's ensure_installed makedirs), which then blocks the manual
+        # `mv` this message prescribes — so, unlike the single-fault case,
+        # the controller start is deliberately SKIPPED. The bridge's own
+        # directory was never touched by this fault, so it is still
+        # restarted best-effort if we stopped it.
+        if plan is not None and plan.was_alive:
+            if not _restart_bridge(plan, log):
+                log.error(
+                    "The Matter bridge node did not restart after a failed move-aside during "
+                    "restore. Its pairings are intact; exported accessories are unavailable "
+                    "until it starts — check the bridge node's error log, then reload the "
+                    "plugin."
+                )
+        raise RuntimeError(
+            f"Fabric restore from {archive_path} failed while moving the existing storage "
+            f"aside, and undoing that also failed: the controller fabric is at "
+            f"{exc.moved_aside_to}, NOT in place at {exc.storage_path}. matter-server was "
+            "NOT restarted — starting it now would recreate an empty fabric at the original "
+            f"path. To recover manually: stop matter-server if it is running, move "
+            f"{exc.moved_aside_to} back to {exc.storage_path}, then start it."
+        ) from exc
     except OSError as exc:
-        # Best-effort: put both daemons back the way we found them. This is
-        # NOT routed through _rollback — there is nothing for it to undo, the
-        # move-aside itself already did (or explicitly failed to, and logged
-        # why) — this only needs to bring the daemons back up.
-        if not server_control.start():
+        # Single fault: best-effort, put both daemons back the way we found
+        # them. This is NOT routed through _rollback — there is nothing for
+        # it to undo, the move-aside itself already did (or explicitly
+        # failed to, and logged why) — this only needs to bring the daemons
+        # back up. A RAISING start() must be caught here too, or the CRITICAL
+        # log line below and the bridge restart never run and the wrapped
+        # RuntimeError never raises — the caller would see the bare
+        # exception with none of this context.
+        try:
+            started = server_control.start()
+        except Exception as start_exc:  # pylint: disable=broad-except
+            started = False
+            log.error("CRITICAL: matter-server restart raised after a failed move-aside (%s)", start_exc)
+        if not started:
             log.error(
                 "CRITICAL: matter-server is DOWN after a failed move-aside during restore. "
                 "To recover manually: check ~/Library/Logs/indigo-matter/matter-server.err.log "
@@ -685,8 +766,8 @@ def restore_backup(
                 )
         raise RuntimeError(
             f"Fabric restore from {archive_path} failed while moving the existing storage "
-            "aside; the disk is unchanged unless the error above says otherwise — both "
-            "daemons were restarted"
+            "aside; the disk is unchanged unless the error above says otherwise — a restart "
+            "of both daemons was attempted — check the log above for restart failures"
         ) from exc
 
     try:
@@ -721,7 +802,7 @@ def restore_backup(
 
 
 def _bridge_rollback_failure_message(bridge: _BridgePlan, exc: OSError) -> tuple[str, tuple]:
-    """The bridge-rollback-mechanics failure text (F4): two shapes, one cause.
+    """The bridge-rollback-mechanics failure text: two shapes, one cause.
 
     A previous bridge copy exists and could not be put back (the wording
     that shape has always had), or there was never one to put back —

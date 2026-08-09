@@ -1103,6 +1103,79 @@ class TestBridgeRestore:
         assert "matter-server" in err.lower()
         assert "bridge" in err.lower()
 
+    def test_move_aside_single_fault_raising_start_is_still_reported_and_bridge_restarted(self, tmp_path):
+        """F1: server_control.start() in the move-aside except handler was the
+        ONE unguarded start() in the module — a raise there used to propagate
+        straight past the CRITICAL log line, the bridge restart, and the
+        wrapped RuntimeError. It must be caught like _rollback's start() is.
+        """
+        storage, archive = self._archive(tmp_path)
+        bridge_dest = str(tmp_path / "appsupport" / "bridge-node")
+        with open(os.path.join(storage, "config"), "w") as fh:
+            fh.write("ORIGINAL-LIVE")
+        collision = f"{bridge_dest}.pre-restore-{fabric_backup._stamp(_NOW)}"
+        os.makedirs(collision)
+        with open(os.path.join(collision, "stray.txt"), "w") as fh:
+            fh.write("leftover")
+        log: list[str] = []
+        ctl = FakeControl(name="ctl", log=log, fail_start=True)  # start() raises
+        bridge = FakeControl(name="bridge", log=log)
+        logger = FakeLogger()
+
+        with pytest.raises(RuntimeError, match="moving the existing storage aside"):
+            fabric_backup.restore_backup(
+                archive, storage, ctl, now=_NOW, logger=logger,
+                bridge_storage_path=bridge_dest, bridge_control=bridge)
+
+        err = logger.text("error")
+        assert "CRITICAL" in err
+        assert "restart raised" in err
+        # the bridge was still restarted despite the controller's start() raising.
+        ordered = [entry for entry in log if not entry.endswith(".is_alive")]
+        assert ordered[-2:] == ["ctl.start", "bridge.start"]
+
+    def test_move_aside_double_fault_skips_controller_start_and_names_the_aside_path(self, tmp_path, monkeypatch):
+        """F2: the double fault (bridge rename AND its undo both fail) must not
+        be treated like the single fault. Starting matter-server here would
+        recreate storage_path as a FRESH EMPTY fabric, blocking the manual
+        `mv` the error message prescribes — so the controller start must be
+        SKIPPED. The bridge's own dir was never touched, so it still restarts.
+        """
+        storage, archive = self._archive(tmp_path)
+        bridge_dest = str(tmp_path / "appsupport" / "bridge-node")
+        with open(os.path.join(storage, "config"), "w") as fh:
+            fh.write("ORIGINAL-LIVE")
+        log, ctl, bridge = _two_controls()
+        logger = FakeLogger()
+
+        moved_aside_to = f"{storage}.pre-restore-{fabric_backup._stamp(_NOW)}"
+        real_rename = fabric_backup.os.rename
+
+        def flaky_rename(src, dst):
+            if src == bridge_dest:
+                raise OSError("simulated bridge rename failure")
+            if src == moved_aside_to and dst == storage:
+                raise OSError("simulated undo failure")
+            return real_rename(src, dst)
+
+        monkeypatch.setattr(fabric_backup.os, "rename", flaky_rename)
+
+        with pytest.raises(RuntimeError) as excinfo:
+            fabric_backup.restore_backup(
+                archive, storage, ctl, now=_NOW, logger=logger,
+                bridge_storage_path=bridge_dest, bridge_control=bridge)
+
+        msg = str(excinfo.value)
+        assert moved_aside_to in msg
+        assert "stop matter-server" in msg
+        # the controller start must NOT have been attempted.
+        assert "ctl.start" not in log
+        # the bridge's own dir was never touched by this fault, so it still
+        # restarts best-effort.
+        assert "bridge.start" in log
+        err = logger.text("error")
+        assert "with matter-server stopped" in err
+
     # ------------------------------------------------------------------
     # C1 — R1 bridge-rollback-mechanics failure must not abort the
     # controller's rollback, and the two message shapes fire correctly.
@@ -1320,3 +1393,45 @@ class TestBridgeRestore:
         err = logger.text("error")
         assert "CRITICAL" in err
         assert "The Matter bridge node was stopped for this restore and is still stopped." in err
+
+    # ------------------------------------------------------------------
+    # F4 — the no-previous-copy shape of _bridge_rollback_failure_message
+    # had no coverage: deleting that branch left the suite green.
+    # ------------------------------------------------------------------
+    def test_bridge_rollback_message_when_there_was_no_previous_bridge_copy(self, tmp_path, monkeypatch):
+        """A bridge dest that did NOT exist before this restore (so
+        ``moved_aside_to`` is None) whose failed-aside rename during rollback
+        itself fails must report "No previous bridge storage" rather than the
+        other shape's false claim that a previous copy is PRESERVED.
+        """
+        storage, archive = self._archive(tmp_path)
+        bridge_dest = str(tmp_path / "restored" / "bridge-node")  # does NOT pre-exist
+        log, ctl, bridge = _two_controls()
+        logger = FakeLogger()
+
+        real_extract = fabric_backup._safe_extract
+
+        def flaky_extract(archive_path, dest, *, prefix=""):
+            if prefix:
+                raise RuntimeError("boom on bridge extract")
+            return real_extract(archive_path, dest, prefix=prefix)
+
+        monkeypatch.setattr(fabric_backup, "_safe_extract", flaky_extract)
+
+        real_rename = fabric_backup.os.rename
+
+        def flaky_rename(src, dst):
+            if src == bridge_dest and str(dst).startswith(f"{bridge_dest}.failed-"):
+                raise OSError("simulated failed-aside rename failure")
+            return real_rename(src, dst)
+
+        monkeypatch.setattr(fabric_backup.os, "rename", flaky_rename)
+
+        with pytest.raises(RuntimeError, match="rolled back"):
+            fabric_backup.restore_backup(
+                archive, storage, ctl, now=_NOW, logger=logger,
+                bridge_storage_path=bridge_dest, bridge_control=bridge)
+
+        err = logger.text("error")
+        assert "No previous bridge storage predated this restore" in err
+        assert "PRESERVED" not in err
