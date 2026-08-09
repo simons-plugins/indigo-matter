@@ -1,6 +1,20 @@
-# indigo-matter — Build Handover
+# indigo-matter — Build Record (handover, closed)
 
-**Last updated:** 2026-08-09 19:13 UTC
+> **This document is CLOSED as of 2026-08-09.** The main build is complete
+> against both PRDs — the inbound controller (PRD-indigo-matter-plugin:
+> commissioning, device classes, sensors, thermostat, failure hardening) and
+> the outbound export bridge (PRD-indigo-matter-export: E0 gate through E8
+> docs, live and validated on jarvis against Apple Home + Alexa). From here
+> the work is **issues-driven**: the GitHub issue list is the only queue, and
+> new arcs get their rationale in PR bodies, not new sections here. Keep this
+> file as the historical record of how the build went and why the load-bearing
+> decisions were made — the dated sections below are the memory that PR bodies
+> alone don't carry. The one PRD-adjacent item left open is **#105**
+> (bridge-of-bridges edge: a commissioned bridge with no bridged children
+> yields no Indigo devices; bridged-endpoint path unverified E2E) — parked
+> deliberately, tracked as an ordinary issue.
+
+**Closed:** 2026-08-09 19:13 UTC
 **Active work:** none — nothing in flight, working tree clean.
 **Branch:** `main` — the 2026-08-09 evening arc landed **#136 bridge-storage
 restore (PR #169 → v2026.9.0**, minor: user-visible feature**) and the
@@ -32,12 +46,16 @@ docs site now routes to it (#137). **#143 is the parked one** — see the
 before touching. #138 (screenshots) blocks on Simon's server+phone — the
 three-shot list is on the issue.
 
-**NEXT UP:** #105, #101, #77, #75, #64, #62, #46, #43,
-device-support #14/#15/#70/#71/#72/#83, refactor #146. Also open: #167
-(low-priority VID/PID negative filter, filed from the quartet — read its
-"why it wasn't built" before starting it) and the **domio-code API.md v1.4
-mirror** (PR raised there; the contract bump is backward-compatible so it
-can lag).
+**Open work lives in the issue list** (this snapshot is for orientation only —
+trust GitHub, not this line): bugs #101 (stale nodeBinDir pin), #62
+(configured=False after Type change), #77 (host-field hardening), #64 (phantom
+Matter Relay); hardware-dependent/parked #75 (BILRESA idle), #143 (Alexa
+convergence, read its section below first), #105 (bridge-of-bridges);
+device-class features #14/#46/#43/#70/#71/#72 (+ #15/#83 tracking); refactor
+#146 (plugin.py split); #167 (VID/PID filter — read its "why not built"
+first). **Needs Simon, not code:** cut the release (quartet + #136 + hardening
+are coherent; jarvis still runs 2026.8.18), then the #136 restore E2E and the
+late-response experiment on jarvis, and #138 screenshots.
 
 ---
 
