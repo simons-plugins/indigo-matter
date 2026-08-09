@@ -12,6 +12,7 @@ framework Python has no pytest-asyncio). ``§N`` refers to BRIDGE_PROTOCOL.md.
 from __future__ import annotations
 
 import asyncio
+import threading
 
 import pytest
 
@@ -311,6 +312,248 @@ class TestResumeRace:
         client.resume()
         assert not client.halted and client.halted_reason is None
         assert "halt cleared" in logged(mock_logger, "info")
+
+
+class TestRetryNow:
+    """The E7 post-install poke (issue #135) — cutting a grown backoff short.
+
+    ``sleep`` stays the seam of record: every scenario here injects a
+    ``gated_sleep``/``hanging_sleep`` that only ends when the TEST opens a gate
+    it controls, or when ``retry_now()`` does — so a wait that completes is
+    provably one or the other, never a race decided by real wall-clock timing.
+    """
+
+    def _boom_connect(self):
+        def connect(_uri):
+            async def boom():
+                raise ConnectionError("node not there yet")
+            return boom()
+        return connect
+
+    def test_retry_now_cuts_the_wait_short_and_resets_the_next_delay_to_1s(self, mock_logger):
+        # Two waits are let through by hand (proving normal growth to [1, 2, 4]);
+        # the THIRD is never opened — only retry_now() can end it — and the
+        # fourth wait's delay must be back down to 1s, not climbing to 8.
+        async def scenario():
+            delays = []
+            gate = asyncio.Event()
+
+            async def gated_sleep(delay):
+                delays.append(delay)
+                await gate.wait()
+                gate.clear()
+
+            client = bridge_client(mock_logger, None, connect=self._boom_connect(),
+                                   sleep=gated_sleep)
+            task = asyncio.create_task(client.run())
+
+            await settle(lambda: len(delays) >= 1)
+            gate.set()
+            await settle(lambda: len(delays) >= 2)
+            gate.set()
+            await settle(lambda: len(delays) >= 3)
+            assert delays == [1, 2, 4], delays  # grown naturally; nothing poked yet
+
+            client.retry_now()  # the gate for a 4th wait is never opened
+            await settle(lambda: len(delays) >= 4)
+            assert delays == [1, 2, 4, 1], (
+                f"retry_now() must both cut the wait short and reset the backoff "
+                f"(mutation check: a version without `attempt = 0` in the wake path "
+                f"would show 8 here, not 1) — got {delays}")
+
+            await client.close()
+            task.cancel()
+        run(asyncio.wait_for(scenario(), timeout=5))
+
+    def test_poking_a_connected_not_sleeping_client_is_harmless(self, mock_logger):
+        # FIX 3 regression: a poke while connected arms `_retry_event` even
+        # though nothing is waiting on it yet (harmless in the moment — the
+        # original point of this test). Left armed, it used to silently skip
+        # the FIRST backoff after a LATER, wholly unrelated drop — potentially
+        # hours after anyone thought about the poke. `_mark_connected` clears
+        # it, so this continues past the poke through two drops: the first
+        # (the same connected session the poke armed) still gets the one skip
+        # that is a poke's whole point; the reconnect that follows it clears
+        # the stale arm, so the SECOND drop's backoff is a real wait — proven
+        # by requiring the gate before it resolves, not just by the delay it
+        # logged (a skipped wait logs the same delay a real one does).
+        async def scenario():
+            delays = []
+            gate = asyncio.Event()
+            fakes: list[FakeWebSocket] = []
+
+            async def gated_sleep(delay):
+                delays.append(delay)
+                await gate.wait()
+                gate.clear()
+
+            def connect(_uri):
+                fake = FakeWebSocket(
+                    handshake={"protocolVersion": bridge_protocol.PROTOCOL_VERSION,
+                               "bridgeVersion": "1", "matterJsVersion": "1"},
+                    responder=lambda frame: [{"message_id": frame["message_id"],
+                                              "result": {"commissioned": False, "fabrics": [],
+                                                         "endpointCount": 0, "endpoints": [],
+                                                         "drift": []}}])
+                fakes.append(fake)
+                return returns(fake)
+
+            client = bridge_client(mock_logger, None, connect=connect, sleep=gated_sleep)
+            task = asyncio.create_task(client.run())
+            await client.wait_connected(timeout=2)
+
+            client.retry_now()  # nothing is waiting on the backoff event; must not raise
+            assert client.connected
+
+            await fakes[-1].close()  # an unrelated drop, well after the poke above
+            await settle(lambda: len(delays) >= 1)
+            assert delays == [1], "the (skipped) first backoff still logs its intended delay"
+
+            # The reconnect that follows must succeed WITHOUT the gate — the
+            # stale event, not yet cleared by any _mark_connected, wakes it.
+            await client.wait_connected(timeout=2)
+            assert not client._retry_event.is_set(), \
+                "_mark_connected must clear a poke armed while previously connected"
+
+            await fakes[-1].close()  # a second, genuinely unrelated drop
+            await settle(lambda: len(delays) >= 2)
+            assert delays == [1, 1], "the second backoff's delay must still be logged"
+            # And this one must NOT resolve on its own — mutation check: remove
+            # the clear-on-wake in _wait_for_retry and the stale arm survives
+            # the FIRST wait, so this second wait is skipped too and this
+            # wait_connected succeeds instead of timing out. (_mark_connected's
+            # own clear is belt-and-braces for the close()-then-new-run() path,
+            # which no backoff wait ever consumes.)
+            with pytest.raises(asyncio.TimeoutError):
+                await client.wait_connected(timeout=0.1)
+
+            gate.set()
+            await client.wait_connected(timeout=2)
+            assert client.connected
+
+            await client.close()
+            task.cancel()
+        run(asyncio.wait_for(scenario(), timeout=5))
+
+    def test_poking_a_halted_client_does_nothing(self, mock_logger):
+        async def scenario():
+            fake = FakeWebSocket(handshake={"protocolVersion": bridge_protocol.PROTOCOL_VERSION,
+                                            "bridgeVersion": "1", "matterJsVersion": "1"},
+                                 responder=lambda frame: [{"message_id": frame["message_id"],
+                                                           "result": {"commissioned": False,
+                                                                      "fabrics": [],
+                                                                      "endpointCount": 0,
+                                                                      "endpoints": [],
+                                                                      "drift": []}}])
+            client = bridge_client(mock_logger, fake)
+            task = asyncio.create_task(client.run())
+            await client.wait_connected(timeout=2)
+
+            client.halted = True  # as if a halt had just been latched
+            client.retry_now()
+
+            assert client.halted, "a halted client must stay halted after a poke"
+            assert not client._retry_event.is_set(), \
+                "a halted poke must not even arm the wake-up event"
+
+            await client.close()
+            task.cancel()
+        run(scenario())
+
+    def test_retry_now_from_a_foreign_thread_reaches_the_loop(self, mock_logger):
+        # The npm install runs on a plain threading.Thread (E7) — retry_now()
+        # has to reach a loop it does not own.
+        async def scenario():
+            delays = []
+
+            async def hanging_sleep(delay):
+                delays.append(delay)
+                await asyncio.Future()  # only cancellation (via retry_now) ends this
+
+            client = bridge_client(mock_logger, None, connect=self._boom_connect(),
+                                   sleep=hanging_sleep)
+            task = asyncio.create_task(client.run())
+            await settle(lambda: delays)  # the first backoff wait is underway
+
+            thread = threading.Thread(target=client.retry_now, daemon=True)
+            thread.start()
+            thread.join(timeout=2)
+
+            await settle(lambda: len(delays) >= 2)
+            assert len(delays) >= 2, "a poke from a foreign thread must reach the run loop"
+
+            await client.close()
+            task.cancel()
+        run(asyncio.wait_for(scenario(), timeout=5))
+
+    def test_retry_now_returns_false_when_the_loop_closes_out_from_under_it(self, mock_logger):
+        # FIX 4: the loop can close between retry_now() reading self._loop and
+        # calling call_soon_threadsafe on it — plugin shutdown racing an
+        # in-flight install poke. That must decline, not raise, on the install
+        # thread (a raised RuntimeError there would print a wrong install
+        # failure over a poke that simply lost a race).
+        async def scenario():
+            fake = FakeWebSocket(handshake={"protocolVersion": bridge_protocol.PROTOCOL_VERSION,
+                                            "bridgeVersion": "1", "matterJsVersion": "1"},
+                                 responder=lambda frame: [{"message_id": frame["message_id"],
+                                                           "result": {"commissioned": False,
+                                                                      "fabrics": [],
+                                                                      "endpointCount": 0,
+                                                                      "endpoints": [],
+                                                                      "drift": []}}])
+            client = bridge_client(mock_logger, fake)
+            task = asyncio.create_task(client.run())
+            await client.wait_connected(timeout=2)
+
+            closed_loop = asyncio.new_event_loop()
+            closed_loop.close()
+            client._loop = closed_loop  # simulate the shutdown race directly
+
+            assert client.retry_now() is False, "a closed loop must decline, not raise"
+
+            await client.close()
+            task.cancel()
+        run(scenario())
+
+    def test_a_wake_rearms_the_failure_diagnostic_so_continued_failures_refire_it(
+            self, mock_logger):
+        # FIX 6: `attempt = 0` on the wake path rewinds the backoff, but
+        # `_diag_fired` used to stay latched — so "the install succeeded, we
+        # poked, and it STILL won't connect" never surfaced the reason again
+        # for the rest of the (new) streak. This drives two full streaks: the
+        # first fires the diagnostic normally, a poke mid-second-wait cuts the
+        # backoff short (and must rearm), and continued failures after that
+        # must fire it a SECOND time rather than staying silent.
+        async def scenario():
+            calls = []
+            delays = []
+            gate = asyncio.Event()
+
+            async def gated_sleep(delay):
+                delays.append(delay)
+                await gate.wait()
+                gate.clear()
+
+            client = bridge_client(mock_logger, None, connect=self._boom_connect(),
+                                   sleep=gated_sleep, on_repeated_failure=calls.append)
+            task = asyncio.create_task(client.run())
+
+            await settle(lambda: len(delays) >= 1)      # wait #1 (delay=1)
+            gate.set()
+            await settle(lambda: len(delays) >= 2)      # wait #2 (delay=2)
+            assert len(calls) == 1 and calls[0] >= 2, calls
+
+            client.retry_now()                          # cuts wait #2 short; must rearm
+            await settle(lambda: len(delays) >= 3)       # wait #3 (delay=1, backoff reset)
+            gate.set()
+            await settle(lambda: len(delays) >= 4)       # wait #4 (delay=2)
+            assert len(calls) == 2 and calls[1] >= 2, (
+                "the diagnostic must re-fire for the streak after the poke "
+                f"(mutation check: dropping rearm_failure_diagnostic() leaves this at 1) — {calls}")
+
+            await client.close()
+            task.cancel()
+        run(asyncio.wait_for(scenario(), timeout=5))
 
 
 class TestRequestTimeouts:

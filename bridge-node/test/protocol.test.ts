@@ -6,7 +6,7 @@
 import assert from "node:assert/strict";
 import { after, before, describe, it } from "node:test";
 
-import { ErrorCode, PROTOCOL_VERSION, ProtocolError } from "../src/protocol.js";
+import { ErrorCode, type PairingReport, PROTOCOL_VERSION, ProtocolError } from "../src/protocol.js";
 import { BridgeWsServer } from "../src/ws-server.js";
 import { TestClient } from "./client.js";
 import { golden, StubBridge } from "./stub-bridge.js";
@@ -545,6 +545,37 @@ describe("get_pairing (§3.7)", () => {
         bridge.commissioned = false;
         bridge.windowOpen = false;
         client.close();
+    });
+
+    // §133: proves the wire handler calls `getPairingSettled`, not the sync
+    // `getPairing`, without needing a real Matter stack to race — the cold
+    // bridge's `getPairing` is made to throw so a handler that regressed to
+    // calling it directly would answer with an error frame instead of the
+    // settled result. The retry/backoff/deadline behaviour of the settled
+    // variant itself is unit-tested directly in `test/node.test.ts`.
+    it("answers get_pairing from the settled variant, not the sync read", async () => {
+        await withColdBridge(async (cold, connectCold) => {
+            const settledReport = structuredClone(
+                golden.get_pairing_uncommissioned.response.result,
+            ) as PairingReport;
+            let syncCalls = 0;
+            let settledCalls = 0;
+            cold.getPairing = () => {
+                syncCalls++;
+                throw new Error("sync getPairing must not be called by the get_pairing wire handler");
+            };
+            cold.getPairingSettled = async () => {
+                settledCalls++;
+                return settledReport;
+            };
+            const client = await connectCold();
+            await client.request(golden.attach.request);
+            const response = await client.request({ message_id: "gp-settled", command: "get_pairing", args: {} });
+            assert.deepEqual(response, { message_id: "gp-settled", result: settledReport });
+            assert.equal(settledCalls, 1);
+            assert.equal(syncCalls, 0);
+            client.close();
+        });
     });
 });
 

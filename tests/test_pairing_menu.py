@@ -1080,6 +1080,96 @@ class TestBridgeAgentWiring:
         agent.restart.assert_not_called()
         assert "Nothing was changed" in _logged(plug.logger)
 
+    # -- issue #135: the post-install retry_now() poke ----------------------
+
+    def test_the_RESTARTED_success_terminal_pokes_the_export_bridge(self, plug, plugin_mod,
+                                                                    monkeypatch):
+        """One of the two success terminals: applied is False and restart() wins."""
+        agent = Mock(install=Mock(return_value=True), restart=Mock(return_value=True),
+                     ensure_installed=Mock(return_value=False))
+        monkeypatch.setattr(plugin_mod.bridge_agent, "BridgeProcess", lambda *_a, **_k: agent)
+        plug.export_bridge = Mock()
+        plug._install_bridge_node()
+        plug.export_bridge.retry_now.assert_called_once()
+
+    def test_the_FRESH_BOOTSTRAP_success_terminal_pokes_the_export_bridge(self, plug, plugin_mod,
+                                                                         monkeypatch):
+        """The other success terminal: applied is True, so restart() is never
+        called (ensure_installed already bootstrapped launchd) — the poke must
+        still fire, since it means the same thing to the user either way."""
+        agent = Mock(install=Mock(return_value=True), restart=Mock(return_value=True),
+                     ensure_installed=Mock(return_value=True))
+        monkeypatch.setattr(plugin_mod.bridge_agent, "BridgeProcess", lambda *_a, **_k: agent)
+        plug.export_bridge = Mock()
+        plug._install_bridge_node()
+        agent.restart.assert_not_called()
+        plug.export_bridge.retry_now.assert_called_once()
+
+    def test_a_poke_that_LANDED_says_reconnecting_now(self, plug, plugin_mod, monkeypatch):
+        """The message is truthful, not assumed — accepted-poke half."""
+        agent = Mock(install=Mock(return_value=True), restart=Mock(return_value=True),
+                     ensure_installed=Mock(return_value=False))
+        monkeypatch.setattr(plugin_mod.bridge_agent, "BridgeProcess", lambda *_a, **_k: agent)
+        plug.export_bridge = Mock(retry_now=Mock(return_value=True))
+        plug._install_bridge_node()
+        said = _logged(plug.logger)
+        assert "reconnecting now" in said
+        assert "reload the plugin to reconnect" not in said
+
+    def test_a_DECLINED_poke_says_reload_the_plugin_instead(self, plug, plugin_mod, monkeypatch):
+        """⊗ A halted/closing client (or one that is simply absent) declines the
+        poke; the old line claimed "reconnecting now" over a run loop that had
+        exited (#154's shape). The message must follow the poke's answer."""
+        agent = Mock(install=Mock(return_value=True), restart=Mock(return_value=True),
+                     ensure_installed=Mock(return_value=False))
+        monkeypatch.setattr(plugin_mod.bridge_agent, "BridgeProcess", lambda *_a, **_k: agent)
+        plug.export_bridge = Mock(retry_now=Mock(return_value=False))
+        plug._install_bridge_node()
+        said = _logged(plug.logger)
+        assert "reload the plugin to reconnect" in said
+        assert "reconnecting now" not in said
+
+    def test_a_missing_export_bridge_is_not_a_crash(self, plug, plugin_mod, monkeypatch):
+        """A session that has not built one yet (or ever) must not blow up here."""
+        agent = Mock(install=Mock(return_value=True), restart=Mock(return_value=True),
+                     ensure_installed=Mock(return_value=True))
+        monkeypatch.setattr(plugin_mod.bridge_agent, "BridgeProcess", lambda *_a, **_k: agent)
+        assert plug.export_bridge is None
+        plug._install_bridge_node()  # must not raise
+
+    def test_a_failed_install_does_not_poke(self, plug, plugin_mod, monkeypatch):
+        agent = Mock(install=Mock(return_value=False))
+        monkeypatch.setattr(plugin_mod.bridge_agent, "BridgeProcess", lambda *_a, **_k: agent)
+        plug.export_bridge = Mock()
+        plug._install_bridge_node()
+        plug.export_bridge.retry_now.assert_not_called()
+
+    def test_a_failed_restart_does_not_poke(self, plug, plugin_mod, monkeypatch):
+        agent = Mock(install=Mock(return_value=True), restart=Mock(return_value=False),
+                     ensure_installed=Mock(return_value=False))
+        monkeypatch.setattr(plugin_mod.bridge_agent, "BridgeProcess", lambda *_a, **_k: agent)
+        plug.export_bridge = Mock()
+        plug._install_bridge_node()
+        plug.export_bridge.retry_now.assert_not_called()
+
+    def test_the_nothing_exported_branch_does_not_poke(self, plug, plugin_mod, monkeypatch):
+        """⊗ XG5: no client exists on this branch by design — the poke would be
+        inert either way, but it must not even be reached from here."""
+        agent = Mock(install=Mock(return_value=True))
+        monkeypatch.setattr(plugin_mod.bridge_agent, "BridgeProcess", lambda *_a, **_k: agent)
+        plug.pluginPrefs.clear()
+        plug.exports = ExportStore(lambda: plug.pluginPrefs, plug.logger)
+        plug.export_bridge = Mock()
+        plug._install_bridge_node()
+        plug.export_bridge.retry_now.assert_not_called()
+
+    def test_a_missing_plist_does_not_poke(self, plug, plugin_mod, monkeypatch):
+        agent = Mock(install=Mock(return_value=True), ensure_installed=Mock(return_value=None))
+        monkeypatch.setattr(plugin_mod.bridge_agent, "BridgeProcess", lambda *_a, **_k: agent)
+        plug.export_bridge = Mock()
+        plug._install_bridge_node()
+        plug.export_bridge.retry_now.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # The §5.5 readout

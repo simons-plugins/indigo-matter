@@ -79,7 +79,11 @@ export class BridgeWsServer {
         this.#log = options.log ?? console.log;
         this.#handlers.set("attach", (args, socket, state) => this.handleAttach(args, socket, state));
         this.#handlers.set("get_status", async () => this.options.bridge.getStatus());
-        this.#handlers.set("get_pairing", async () => this.options.bridge.getPairing());
+        // §133: the settled variant, not the sync read — it bounded-retries
+        // the transient "not initialized" window a last-fabric unpair leaves
+        // behind, so this handler does not surface a spurious failure moments
+        // after an unpair that already succeeded.
+        this.#handlers.set("get_pairing", async () => this.options.bridge.getPairingSettled());
         this.#handlers.set("open_commissioning_window", async args => this.handleOpenWindow(args));
         this.#handlers.set("upsert_endpoint", async args =>
             this.options.bridge.upsertEndpoint(parseEndpointSpec(args.endpoint)),

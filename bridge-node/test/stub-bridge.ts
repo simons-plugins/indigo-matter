@@ -380,6 +380,16 @@ export class StubBridge implements BridgeFacade {
         return structuredClone(source.response.result) as PairingReport;
     }
 
+    /**
+     * §133: the real `getPairingSettled` bounded-retries `getPairing()` on
+     * matter.js's transient error. The stub has no Matter stack to race, so
+     * it just delegates — the retry/backoff/deadline behaviour itself is
+     * unit-tested directly in `test/node.test.ts` against a fake `read`.
+     */
+    async getPairingSettled(): Promise<PairingReport> {
+        return this.getPairing();
+    }
+
     async openCommissioningWindow(durationSeconds: number): Promise<CommissioningWindowResult> {
         this.openWindowCalls.push(durationSeconds);
         if (this.delayOpenWindowMs > 0) {
