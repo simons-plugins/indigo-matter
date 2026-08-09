@@ -119,19 +119,26 @@ def _node_key(value: Any) -> Any:
     prefixed hex string and a plain decimal one) — but base-0 rejects a
     zero-padded decimal string ("0000000012344321": leading zeros are only
     legal for "0" itself or an "0x"/"0o"/"0b" prefix), so that ValueError
-    falls back to a plain base-10 parse when the string is all digits.
-    An unprefixed hex string ("1234" meaning hex, not decimal 1234) is
-    undisambiguatable and stays a ``str`` key — a one-directional no-match
-    against the equivalent int, never a false collision, and never a form the
-    codebase itself produces: :func:`node_id_to_str` always emits the ``0x``
-    prefix.
+    falls back to a plain base-10 parse when the string is all digits
+    (``.isdecimal()``, not ``.isdigit()`` — the latter accepts characters
+    ``int(s, 10)`` rejects, e.g. the superscript "²", which would otherwise
+    let a ValueError escape instead of falling back to a ``str`` key).
+    An ALL-DIGIT unprefixed hex string ("1234" meaning hex, not decimal
+    1234) parses as DECIMAL via the initial ``int(value, 0)`` call — it
+    never even reaches this fallback — and so CAN in principle falsely
+    collide with decimal 1234; only a LETTER-bearing unprefixed hex string
+    ("1abc") fails both parses and stays a ``str`` key — a one-directional
+    no-match against the equivalent int, never a false collision. The
+    mitigation is that :func:`node_id_to_str` always emits the ``0x``
+    prefix, so the codebase itself never produces an unprefixed hex string
+    in either case.
     """
     if isinstance(value, str):
         try:
             return int(value, 0)
         except ValueError:
             stripped = value.strip()
-            if stripped and stripped.isdigit():
+            if stripped and stripped.isdecimal():
                 return int(stripped, 10)
             return str(value)
     try:
@@ -353,18 +360,7 @@ class CommissionJobs:
         code). Returns the claimed jobId, or None if no job qualified.
         """
         if not isinstance(raw_node, dict) or raw_node.get("node_id") is None:
-            with self._lock:
-                waiting = self._timeout_candidates_locked(self._clock() - RECONCILE_WINDOW)
-                # A8: only an UNIDENTIFIED candidate ever had a shot at this
-                # event — one already identified with a different node never
-                # did, so naming it here would be misleading.
-                unidentified = [c for c in waiting if c.node_id is None]
-            if unidentified:
-                # A claimable job is waiting and this event was its one shot —
-                # leave evidence. (No candidates = routine restart sync; stay quiet.)
-                self.logger.warning(
-                    "node_added event without a usable node_id ignored while "
-                    "commission job %s awaits reconcile", unidentified[-1].job_id)
+            self._log_malformed_node_added()
             return None
         node_id = raw_node.get("node_id")
         stale: Optional[Job] = None
@@ -394,12 +390,24 @@ class CommissionJobs:
                 # A2: this node's own remove_node RPC (from _fail or the #24
                 # watchdog) is out on the loop right now — claiming it here
                 # would flip a job to success out from under a node about to
-                # be deleted off the fabric.
+                # be deleted off the fabric. R5: name the refused
+                # candidate(s) so a compound outcome (this refusal, then a
+                # later failed removal) is traceable back to who wanted the
+                # node — and don't foreclose the future: once the removal
+                # clears and this node's key is discarded, a later
+                # node_added for it CAN still be claimed (reconcile window
+                # permitting), so a fresh commission isn't the only way back.
+                if candidates:
+                    who = "refused candidate job(s): " + ", ".join(c.job_id for c in candidates)
+                else:
+                    who = "no other candidate is currently in the reconcile window"
                 self.logger.warning(
                     "node %s joined while its removal was already in flight "
-                    "— not claimed; if the removal succeeds the node is "
-                    "gone, and a fresh commission is the way back.",
-                    node_id_to_str(node_id),
+                    "— not claimed (%s); if the removal succeeds the node is "
+                    "gone from the fabric for now, but a later node_added for "
+                    "it can still be claimed once the removal clears "
+                    "(reconcile window permitting).",
+                    node_id_to_str(node_id), who,
                 )
             elif stale is not None:
                 self.logger.warning(
@@ -429,6 +437,34 @@ class CommissionJobs:
             )
             return None
         return job.job_id
+
+    def _log_malformed_node_added(self) -> None:
+        """A node_added carried no usable node_id — log evidence if any
+        timeout candidate was waiting, worded differently depending on
+        whether it could have been named directly.
+
+        A8: an UNIDENTIFIED candidate is named directly — this malformed
+        event was its one possible shot. An IDENTIFIED candidate can't be
+        named the same way (it's already attributed to a different node),
+        but R4: the broken event COULD still have been exactly the join it
+        awaits, so it's still worth a (softer, unnamed-node) warning rather
+        than silence. (No candidates at all = routine restart sync; stay
+        quiet.)
+        """
+        with self._lock:
+            waiting = self._timeout_candidates_locked(self._clock() - RECONCILE_WINDOW)
+            unidentified = [c for c in waiting if c.node_id is None]
+        if unidentified:
+            self.logger.warning(
+                "node_added event without a usable node_id ignored while "
+                "commission job %s awaits reconcile", unidentified[-1].job_id)
+        elif waiting:
+            self.logger.warning(
+                "node_added event without a usable node_id ignored; "
+                "commission job(s) %s await reconcile on known nodes — "
+                "if this event was one of theirs it cannot be matched",
+                ", ".join(c.job_id for c in waiting),
+            )
 
     def _log_reconcile_refusal(self, node_id: Any, candidates: list[Job]) -> None:
         """Explain why none of ``candidates`` (all inside the reconcile window)
@@ -484,14 +520,19 @@ class CommissionJobs:
         being deleted, not merely unclaimed). Caller must hold ``self._lock``.
         """
         candidates = self._timeout_candidates_locked(cutoff)
-        if not candidates:
-            return None, candidates, False
         if _node_key(node_id) in self._removing:
             # A2: this node's remove_node RPC (via _fail or the #24 watchdog)
             # is out on the loop right now. Claiming it here — by ANY of the
             # branches below — would flip a job to success out from under a
-            # node about to vanish off the fabric mid-await.
+            # node about to vanish off the fabric mid-await. Checked BEFORE
+            # the empty-candidates return below (R1): in production timing
+            # the #24 watchdog's own job has typically just aged out of the
+            # reconcile window by the time its removal RPC is in flight, so
+            # with no other candidates this gate must still win rather than
+            # going unconsulted.
             return None, candidates, True
+        if not candidates:
+            return None, candidates, False
         # Exact identity wins outright: matter-server has already named this
         # job's node (e.g. a prior partial reconcile).
         exact = [c for c in candidates if c.node_id is not None and _same_node(c.node_id, node_id)]
@@ -547,10 +588,22 @@ class CommissionJobs:
         worth rewriting a timed-out job's error for even after Domio has
         stopped polling it. A late success does NOT revive a failed job
         (that is ``reconcile_node_added``'s job, driven by the node_added
-        event) — it only ever records the node id, but that id feeds #21's
-        ownership guard (``_node_held_by_other_job``) and #22's identity
-        matcher (``_claimable_locked``) the moment it lands, same as it would
-        have if the RPC had answered in time.
+        event) — it only ever records the node id (P4). That id feeds #22's
+        exact-identity attribution (``_claimable_locked``) the moment it
+        lands, and later #24's cleanup (``_remove_orphaned_node``), where
+        the #21 ownership guard (``_node_held_by_other_job``) is consulted
+        WITH the id as its argument — but recording it does NOT itself make
+        the job a #21 *holder*: that guard's holder set only counts
+        non-FAILED jobs, and a job a late success lands on stays FAILED, so
+        it never blocks another job's cleanup the way a timely commission's
+        node_id would while its own job is still non-terminal.
+
+        First-writer-wins (P5): if ``job.node_id`` is already set (a prior
+        reconcile, or an earlier late success) and this late success names a
+        DIFFERENT node, the recorded id is never overwritten — but the
+        disagreement is not silently dropped either;
+        :meth:`_note_late_success_locked` WARNs, so a real #22
+        mis-attribution bug can't hide behind this policy.
 
         Returns the matched job's id, or ``None`` if ``late`` names no job
         this table is still tracking (or names no job at all).
@@ -781,11 +834,15 @@ class CommissionJobs:
         did.
 
         Any exception other than ``CancelledError`` is caught here and
-        logged via ``self.logger.exception`` (A1: this is the one
-        fire-and-forget coroutine in the module with no caller ever
-        retrieving its result, so a raise that escaped — e.g. from
-        ``knows_node`` inside ``_remove_orphaned_node`` — would otherwise
-        vanish silently).
+        logged via ``self.logger.exception`` (A1/P2) — not because this is
+        the only fire-and-forget coroutine in the module (``_run_job`` and
+        ``_reconcile_job`` are scheduled the same way, with no caller ever
+        retrieving their result either), but because THOSE are
+        exception-total by construction: every one of their ``except``
+        clauses lands the job in a terminal state, so nothing can escape
+        past them. This coroutine's body was not written that way, so a
+        raise that escaped — e.g. from ``knows_node`` inside
+        ``_remove_orphaned_node`` — would otherwise vanish silently.
 
         ``CancelledError`` is deliberately allowed to propagate — catching
         ``Exception`` doesn't touch it; it has been a ``BaseException``
@@ -810,16 +867,21 @@ class CommissionJobs:
                 node_id = job.node_id
             if node_id is not None:
                 # A #23 late success named a node for this job AFTER it went
-                # terminal on a bare timeout — matter-server says it DID
-                # join, so this is a leftover fabric entry, not a device
-                # that simply never showed up. Distinct wording (A4): the
-                # bare-case text below is quoted verbatim in docs/MATTER.md.
+                # terminal on a bare timeout. This is only the ANNOUNCE that
+                # the window closed with a fabric entry to check — it must
+                # not claim an outcome, because _remove_orphaned_node's two
+                # veto guards (holder check, Indigo-tracked check) are both
+                # reachable from here via ordinary flows: the verdict
+                # (held / tracked / removed / removal-failed) belongs to
+                # that method's own per-outcome log lines. Distinct wording
+                # (A4) from the bare-case text below, which docs/MATTER.md
+                # quotes (minus the interpolated window length).
                 self.logger.warning(
-                    "commission job %s: the %.0f-minute reconcile window "
-                    "closed without the device ever reaching Indigo — "
-                    "matter-server's late answer says it DID join, so the "
-                    "leftover fabric entry is being cleaned up now.",
-                    job.job_id, RECONCILE_WINDOW.total_seconds() / 60,
+                    "commission job %s: the reconcile window closed; "
+                    "matter-server's late answer had named node %s for "
+                    "this job, so its fabric entry is checked and cleaned "
+                    "up if nothing owns it.",
+                    job.job_id, node_id_to_str(node_id),
                 )
                 await self._remove_orphaned_node(job, node_id)
             else:
@@ -863,11 +925,15 @@ class CommissionJobs:
         # including an exception raised out of the knows_node check.
         try:
             node_int = _node_int(node_id)
-            if node_int is None:
-                self.logger.debug(
-                    "commission job %s: node id %s is not coercible to an "
-                    "int — skipping the Indigo-tracked check; the "
-                    "fabric-removal RPC still runs", job.job_id, node_id,
+            checked = node_int is not None
+            if not checked:
+                # R3: this skip means the destructive remove_node below runs
+                # without the Indigo-tracked safety check ever having run —
+                # worth a WARNING, not DEBUG.
+                self.logger.warning(
+                    "commission job %s: removing node %s without being "
+                    "able to confirm Indigo doesn't track it — id not "
+                    "coercible to an integer", job.job_id, node_id,
                 )
             elif self._knows_node is not None and self._knows_node(node_int):
                 self.logger.info(
@@ -878,11 +944,20 @@ class CommissionJobs:
                 return
             try:
                 await self.matter.remove_node(node_id)
-                self.logger.warning(
-                    "commission job %s: removed orphaned node %s — matter-server "
-                    "reported it joined but it never reached Indigo",
-                    job.job_id, node_id_to_str(node_id),
-                )
+                if checked:
+                    self.logger.warning(
+                        "commission job %s: removed orphaned node %s — "
+                        "matter-server reported it joined but it never "
+                        "reached Indigo",
+                        job.job_id, node_id_to_str(node_id),
+                    )
+                else:
+                    self.logger.warning(
+                        "commission job %s: removed orphaned node %s — "
+                        "matter-server reported it joined; Indigo tracking "
+                        "could not be checked for this id",
+                        job.job_id, node_id_to_str(node_id),
+                    )
             except Exception as exc:  # noqa: BLE001 - A5: loud, cleanup is still best-effort
                 self.logger.warning(
                     "commission job %s: could not remove orphaned node %s "
@@ -954,6 +1029,18 @@ class CommissionJobs:
         concurrent ``reconcile_node_added`` to slip through. The caller must
         discard the key (``self._removing.discard(_node_key(node_id))``,
         under the lock) once its own removal has settled, in a ``finally``.
+
+        R7: this assumes at most one removal of a given node in flight at a
+        time — ``self._removing`` is a plain set, not a refcount, so a
+        SECOND concurrent removal of the same node would discard the key
+        out from under the first when it (the second) finishes, reopening
+        the A2 window early. Currently impossible via the two existing
+        callers (``_fail`` and ``_remove_orphaned_node``): this holder check
+        itself interlocks them, since whichever runs first claims the node
+        as a "holder" (or marks it removing) before the other can reach its
+        own check. A third caller of this method must not widen that to two
+        genuinely concurrent removals of the same node without upgrading
+        ``_removing`` to a refcount.
         """
         with self._lock:
             holders = [

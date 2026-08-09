@@ -260,14 +260,20 @@ that stopped polling should treat `commissioning_timeout` as "may still finish �
 check Indigo", which matches Domio's existing 120s soft-timeout message. The
 plugin's job-level commission deadline is 300s and may legitimately outlive
 Domio's 120s poll window. The plugin reconciles only when the joining node can
-be attributed unambiguously: if two jobs for *different* setup codes are both
-inside their window when a node joins, neither is claimed (the jobs stay
-`failed`, and the devices are created with the device's own product name) —
-and neither is already identified with the joining node (the v1.4 exact-identity
-claim, see "Late failure" below, works regardless of how many setup codes wait).
-Retries of the same setup code are one device and reconcile normally. If the
-window closes with no join, the event log records that definitively — no
-contract change, since a still-`failed` job's payload is unaffected.
+be attributed unambiguously, and the ambiguity check only considers jobs whose
+node is still **unidentified**: a candidate already identified with a
+*different* node drops out of the ambiguity set entirely (e.g. job A is
+already identified with node X and job B is still unidentified, both
+in-window — node Y joins and B alone is claimed, unambiguously). Among the
+still-unidentified in-window jobs, if two of them are for *different* setup
+codes, neither is claimed (both stay `failed`, and the devices are created
+with the device's own product name). Retries of the same setup code are one
+device and reconcile normally. The v1.4 exact-identity claim (see "Late
+failure" below) works regardless of how many setup codes are waiting
+unidentified, because it matches on node id directly rather than by
+elimination. If the window closes with no join, the event log records that
+definitively — no contract change, since a still-`failed` job's payload is
+unaffected.
 
 **Late failure (v1.4):** the commission RPC itself can also answer late — after the
 job has already gone `failed`/`commissioning_timeout` — and say the attempt did not
@@ -280,11 +286,13 @@ the one case where a job's fields change after going terminal *while it stays
 by leaving `failed` for `success`) — this is a `failed` → `failed` transition, never
 `failed` → `success`; a late *success* answer is not surfaced to Domio at all — it
 only helps the plugin attribute a subsequent `node_added` (see the reconcile
-paragraph above), and, internally, feeds the #21 already-claimed-node removal guard
-and the #24 orphan-node cleanup that runs when the reconcile window closes unclaimed
-— neither of which is itself surfaced to Domio. A client that already stopped polling
-a `failed` job will simply never see the correction; one still polling sees the
-`error` fields update in place.
+paragraph above), and, internally, feeds the v1.4 exact-identity attribution and the
+orphan-node cleanup that runs when the reconcile window closes unclaimed — the
+already-claimed-node removal guard is consulted there, with the late id as its
+argument, but recording the id does not by itself make the still-`failed` job hold
+the node (that guard only counts non-`failed` jobs) — neither of which is itself
+surfaced to Domio. A client that already stopped polling a `failed` job will simply
+never see the correction; one still polling sees the `error` fields update in place.
 
 ### 3.4 `POST …/message/com.simons-plugins.indigo-matter/decommission?nodeId={nodeId}`
 

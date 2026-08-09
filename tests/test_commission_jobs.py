@@ -1198,7 +1198,11 @@ def test_removal_in_flight_blocks_reconcile_at_the_fail_site(mock_logger):
         mock_logger.warning.reset_mock()
         assert jobs.reconcile_node_added({"node_id": 7}) is None
         mock_logger.warning.assert_called_once()
-        assert "removal was already in flight" in str(mock_logger.warning.call_args)
+        logged = str(mock_logger.warning.call_args)
+        assert "removal was already in flight" in logged
+        # R5: the refused claimant appears in the log line, not just "not
+        # claimed" — traceable if the removal itself later fails too.
+        assert candidate.job_id in logged
 
         release.set()
         final_b = await task_b
@@ -1209,7 +1213,13 @@ def test_removal_in_flight_blocks_reconcile_at_the_fail_site(mock_logger):
 
 
 def test_removal_in_flight_blocks_reconcile_at_the_watchdog_site(mock_logger):
+    # R1: production timing — by the time the #24 watchdog's own remove_node
+    # RPC is in flight, that job has typically ALSO just aged out of the
+    # reconcile window (no longer a _timeout_candidates_locked candidate). A
+    # fake sleep that never advances the clock can't exercise that; this
+    # test uses the mutable-dict clock idiom so it does.
     async def scenario():
+        clock = {"t": datetime(2026, 6, 10, 12, 0, tzinfo=timezone.utc)}
         window_release = asyncio.Event()
         removal_release = asyncio.Event()
         removal_started = asyncio.Event()
@@ -1225,22 +1235,32 @@ def test_removal_in_flight_blocks_reconcile_at_the_watchdog_site(mock_logger):
 
         matter = GatedMatter()
         jobs = _jobs(matter, mock_logger, schedule=asyncio.ensure_future,
-                     sleep=fake_sleep, knows_node=lambda n: False)
+                     sleep=fake_sleep, knows_node=lambda n: False,
+                     clock=lambda: clock["t"])
         _, body = jobs.create_job({"setupCode": "12345678901", "suggestedName": "X"})
         await _await_terminal(jobs, body["jobId"])()
 
         late = LateResponse(None, CommissionRequest(body["jobId"]), None, {"node_id": 7})
         jobs.note_late_response(late)
 
+        # Advance the clock past the reconcile window while the removal RPC
+        # is about to be held on removal_release: the job's terminal_at is
+        # now outside _timeout_candidates_locked's cutoff, so candidates is
+        # empty by the time the node_added below is handled.
+        clock["t"] += commission_jobs.RECONCILE_WINDOW + timedelta(seconds=1)
         window_release.set()  # let the reconcile window close
         await asyncio.wait_for(removal_started.wait(), timeout=1)
 
-        # The watchdog's own remove_node(7) is in flight — a node_added for
-        # the same node must not resurrect this already-terminal job.
+        # The watchdog's own remove_node(7) is in flight and the job is no
+        # longer a reconcile candidate — the removal-in-flight refusal must
+        # still fire (not the misleading "outside the window" stale
+        # warning), and the node must not be claimed.
         mock_logger.warning.reset_mock()
         assert jobs.reconcile_node_added({"node_id": 7}) is None
         mock_logger.warning.assert_called_once()
-        assert "removal was already in flight" in str(mock_logger.warning.call_args)
+        logged = str(mock_logger.warning.call_args)
+        assert "removal was already in flight" in logged
+        assert "outside the" not in logged
 
         removal_release.set()
         await _pump()
@@ -1265,6 +1285,12 @@ def test_node_key_parses_prefixed_and_zero_padded_strings(value, expected):
 def test_node_key_leaves_unprefixed_non_numeric_string_as_str():
     assert commission_jobs._node_key("deadbeef") == "deadbeef"
     assert not commission_jobs._same_node("deadbeef", 0xDEADBEEF)
+
+
+def test_node_key_falls_back_to_str_for_digit_like_non_decimal_chars():
+    # "²".isdigit() is True but int("²", 10) raises ValueError — _node_key
+    # must use isdecimal() so the fallback doesn't itself blow up (R6).
+    assert commission_jobs._node_key("²") == "²"
 
 
 def test_same_node_matches_zero_padded_string_to_int():
@@ -1355,9 +1381,15 @@ def test_watchdog_skips_knows_node_for_uncoercible_id_but_still_removes(mock_log
 
         assert called == []  # knows_node never invoked with an uncoercible id
         assert matter.removed == ["deadbeef"]  # removal still attempted
-        mock_logger.debug.assert_called()
-        logged = str(mock_logger.debug.call_args_list)
+
+        # R3: skipping the safety check is loud (WARNING, not DEBUG) …
+        logged = str(mock_logger.warning.call_args_list)
         assert "deadbeef" in logged
+        assert "not coercible to an integer" in logged
+        # … and the success message is hedged rather than claiming the
+        # unverified "it never reached Indigo".
+        assert "it never reached Indigo" not in logged
+        assert "Indigo tracking could not be checked for this id" in logged
     asyncio.run(scenario())
 
 
@@ -1532,10 +1564,12 @@ def test_late_success_matching_node_id_is_silent(mock_logger):
 # C9: loudness pins — A4/A5/A6a/A7
 # ----------------------------------------------------------------------
 def test_expiry_node_id_case_message_is_distinct_from_bare_case(mock_logger):
-    # A4: a #23 late success named a node for this job before the window
-    # closed — the warning must say the device DID join, never "never
-    # joined" (the bare-case branch's text, quoted verbatim in MATTER.md,
-    # is asserted unchanged by the existing bare-case tests).
+    # A4/R2: a #23 late success named a node for this job before the window
+    # closed — the announce must say a fabric entry is being checked
+    # (never "never joined", the bare-case branch's text, quoted in
+    # MATTER.md minus the interpolated window length and asserted unchanged
+    # by the existing bare-case tests) and must NOT itself claim an outcome
+    # — that's _remove_orphaned_node's own per-outcome line, logged next.
     async def scenario():
         release = asyncio.Event()
 
@@ -1555,9 +1589,12 @@ def test_expiry_node_id_case_message_is_distinct_from_bare_case(mock_logger):
         release.set()
         await _pump()
 
-        logged = str(mock_logger.warning.call_args_list)
-        assert "never joined" not in logged
-        assert "DID join" in logged
+        calls = mock_logger.warning.call_args_list
+        announce = str(calls[0])
+        assert "never joined" not in announce
+        assert "matter-server's late answer had named node" in announce
+        # the outcome (removed) is a separate, later call
+        assert "removed orphaned node" in str(calls[-1])
     asyncio.run(scenario())
 
 
@@ -1639,7 +1676,10 @@ def test_fail_removal_failure_is_warned_loudly(mock_logger):
 # candidate — one already identified with a different node never had a
 # shot at this event.
 # ----------------------------------------------------------------------
-def test_malformed_node_silent_when_only_candidate_is_already_identified(mock_logger):
+def test_malformed_node_warns_when_only_identified_candidates_wait(mock_logger):
+    # R4: the broken event could still have been exactly the join an
+    # identified candidate awaits — a malformed node_added must not be
+    # consumed silently just because no candidate is unidentified.
     async def scenario():
         jobs = _jobs(TimeoutMatter(), mock_logger, schedule=asyncio.ensure_future)
         _, body = jobs.create_job({"setupCode": "12345678901", "suggestedName": "X"})
@@ -1648,5 +1688,8 @@ def test_malformed_node_silent_when_only_candidate_is_already_identified(mock_lo
 
         mock_logger.warning.reset_mock()
         assert jobs.reconcile_node_added({"weird": True}) is None
-        mock_logger.warning.assert_not_called()
+        mock_logger.warning.assert_called_once()
+        logged = str(mock_logger.warning.call_args)
+        assert body["jobId"] in logged
+        assert "cannot be matched" in logged
     asyncio.run(scenario())

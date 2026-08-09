@@ -178,11 +178,14 @@ class WsJsonClient:  # pylint: disable=too-many-instance-attributes
 
         self._ws = None
         self._pending: dict[str, asyncio.Future] = {}
-        # message_id → short human description of the request, written while
-        # the caller is still awaiting it (#23) so a LATE error response can
-        # still name the device instead of just an id (H4) — the request
-        # only becomes genuinely un-awaited later, if its own wait_for times
-        # out (see _request_frame). Any object str()-ably describable, not
+        # message_id → short human description of the request, covering two
+        # cases (P1): (1) written while the caller is still awaiting a
+        # response (#23) so a LATE answer can still name the device instead
+        # of just an id (H4) — the request only becomes genuinely
+        # un-awaited later, if its own wait_for times out (see
+        # _request_frame); and (2) a request the caller never awaits at all
+        # — e.g. BridgeClient.set_state (§3.4), genuinely fire-and-forget
+        # from the moment it's sent. Any object str()-ably describable, not
         # just str — #23's CommissionRequest
         # is the note AND the correlation key a late response is matched against.
         self._send_context: dict[str, Any] = {}
@@ -545,9 +548,12 @@ class WsJsonClient:  # pylint: disable=too-many-instance-attributes
 
     def _remember_send_context(self, message_id: Optional[str], context: Any) -> None:
         """Note what the request is, for :meth:`_log_unmatched` to describe it
-        if the answer arrives late — called while the caller is still
-        awaiting the response (#23); the request only becomes genuinely
-        un-awaited later, if/when its own ``wait_for`` times out.
+        if the answer arrives late (P1). Two callers, two shapes of "late":
+        called while the caller is still awaiting the response (#23) — the
+        request only becomes genuinely un-awaited later, if/when its own
+        ``wait_for`` times out; or called on a request the caller never
+        awaits at all, e.g. ``BridgeClient.set_state`` (§3.4), which is
+        fire-and-forget from the moment it's sent.
 
         Bounded and FIFO: a peer that never answers would otherwise grow this
         map for the lifetime of the plugin.
