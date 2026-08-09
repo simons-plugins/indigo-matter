@@ -25,11 +25,13 @@ deploy's own attach — the live specimen of the issue.
 see the 2026-08-06 §#143 section; its defect B leading theory was
 **withdrawn**, read before touching.
 
-**NEXT UP:** after #140 merges — publish bridge-node `0.8.0` (needs Simon's
-npm login), deploy plugin `2026.8.9` + node `0.8.0` to jarvis, do the
-one-time jarvis map edit (§#140), and verify the alarm is gone. Then the
-remaining backlog: #133, #135, #84, #105, #101, the E8 docs pass
-(#137/#138/#139), #146/#147.
+**NEXT UP:** publish bridge-node `0.8.0` (needs Simon's npm login + 2FA),
+merge the open PR stack in version order — **#153** (#133, `.11`) → **#155**
+(#135, `.12`) → **#156** (#84, `.13`) — then deploy plugin + node `0.8.0` to
+jarvis, do the one-time jarvis map edit (§#140), and verify the alarm is
+gone. Remaining backlog after that: #154 (halt survives its own remedy,
+found during #135), #105, #101, the E8 docs pass (#137/#138/#139),
+#146/#147.
 
 ---
 

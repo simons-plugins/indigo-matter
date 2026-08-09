@@ -1616,7 +1616,18 @@ class DeviceSync:
             return
         if self._active and dev_id not in self._active:
             return  # gate updates to active devices once any are started
-        dev = indigo.devices[dev_id]
+        try:
+            dev = indigo.devices[dev_id]
+        except KeyError:
+            # Deletion race, same as _on_attribute's paths (#84) — and this is
+            # the chattier route (switch presses, lock operations), where the
+            # unguarded lookup used to put a full traceback in the event log
+            # per event via plugin's _on_matter_event handler.
+            self.logger.debug(
+                "device %s vanished mid-event (deleted?); dropped ep%s cl%s evt%s",
+                dev_id, evt.endpoint, evt.cluster, evt.event_id,
+            )
+            return
         try:
             states = handler.on_node_event(dev, evt.event_id, evt.event_data)
         except Exception as exc:  # noqa: BLE001 - one bad event must not silently freeze the device
@@ -1688,6 +1699,17 @@ class DeviceSync:
                     continue  # gate updates to active devices once any are started
                 try:
                     dev = indigo.devices[dev_id]
+                except KeyError:
+                    # Deletion race (see the non-node-scoped path below) — debug,
+                    # not the "bad update" warning, and keep fanning out to the
+                    # rest of this node's devices (endpoint-narrowed only in the
+                    # multi_power_source branch).
+                    self.logger.debug(
+                        "device %s vanished mid-update (deleted?); dropped ep%s cl%s attr%s",
+                        dev_id, evt.endpoint, evt.cluster, evt.attribute,
+                    )
+                    continue
+                try:
                     states = handler.on_attribute_update(dev, evt.attribute, evt.value)
                     if states:
                         self.apply_states(dev_id, handler.format_kv(states))
@@ -1705,7 +1727,17 @@ class DeviceSync:
             return
         if self._active and dev_id not in self._active:
             return  # gate updates to active devices once any are started
-        dev = indigo.devices[dev_id]
+        try:
+            dev = indigo.devices[dev_id]
+        except KeyError:
+            # The Indigo device was deleted out-of-band while its Matter node
+            # kept reporting — routine deletion race, not a bad value; same
+            # tolerate/debug/move-on idiom as _safe_unreachable/_clear_error.
+            self.logger.debug(
+                "device %s vanished mid-update (deleted?); dropped ep%s cl%s attr%s",
+                dev_id, evt.endpoint, evt.cluster, evt.attribute,
+            )
+            return
         try:
             states = handler.on_attribute_update(dev, evt.attribute, evt.value)
         except Exception as exc:  # noqa: BLE001 - one bad value must not silently freeze the device
@@ -1719,7 +1751,18 @@ class DeviceSync:
 
     def apply_states(self, dev_id: int, kvlist: list) -> None:
         """The single asyncio→Indigo write seam (see module docstring)."""
-        dev = indigo.devices[dev_id]
+        try:
+            dev = indigo.devices[dev_id]
+        except KeyError:
+            # Deletion race — the device vanished between the caller's own
+            # lookup and this write. Tolerate/debug/move-on, same idiom as
+            # _safe_unreachable/_clear_error. updateStatesOnServer failures are
+            # deliberately NOT caught here — this only guards the dict lookup.
+            self.logger.debug(
+                "device %s vanished before state apply (deleted?); dropped %d state(s)",
+                dev_id, len(kvlist),
+            )
+            return
         dev.updateStatesOnServer(kvlist)
         # a fresh value means the device is reachable — clear any stale error
         if getattr(dev, "errorState", ""):
