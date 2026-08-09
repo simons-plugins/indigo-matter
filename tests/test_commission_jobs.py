@@ -955,6 +955,7 @@ def test_the_reconcile_window_expiry_is_logged_once(mock_logger):
         mock_logger.warning.assert_called()
         logged = str(mock_logger.warning.call_args)
         assert body["jobId"] in logged and "never joined" in logged
+        assert jobs._expiry_tasks == set()  # C7: self-cleans, nothing dangling
     asyncio.run(scenario())
 
 
@@ -1053,7 +1054,7 @@ def test_expiry_leaves_a_node_indigo_already_adopted(mock_logger):
         assert matter.removed == []
         mock_logger.info.assert_called()
         logged = str(mock_logger.info.call_args)
-        assert body["jobId"] in logged and "already has Indigo devices" in logged
+        assert body["jobId"] in logged and "already tracked by Indigo" in logged
     asyncio.run(scenario())
 
 
@@ -1151,4 +1152,501 @@ def test_the_expiry_task_is_cancelled_cleanly_at_shutdown(mock_logger):
         _, final = jobs.get_job(body["jobId"])
         assert final["status"] == "failed"
         assert final["error"]["code"] == "commissioning_timeout"  # unchanged
+    asyncio.run(scenario())
+
+
+# ----------------------------------------------------------------------
+# Quartet review hardening (retro on #164-#166 / #21-#24) — A2: a TOCTOU
+# window between a removal RPC in flight and a racing node_added claim.
+# ----------------------------------------------------------------------
+def test_removal_in_flight_blocks_reconcile_at_the_fail_site(mock_logger):
+    async def scenario():
+        release = asyncio.Event()
+        removal_started = asyncio.Event()
+
+        class GatedMatter(FakeMatter):
+            async def remove_node(self, node_id):
+                removal_started.set()
+                await release.wait()
+                self.removed.append(node_id)
+
+        async def failing_create(node, name, room):
+            raise CommissionError("interview_failed", "could not read descriptors")
+
+        matter = GatedMatter(node_id=7)
+        jobs = _jobs(matter, mock_logger, create=failing_create, schedule=asyncio.ensure_future)
+
+        # A timeout candidate identified with node 7 (e.g. a prior partial
+        # reconcile), still waiting inside its reconcile window, while a
+        # SEPARATE job (a retry that also commissioned node 7) is about to
+        # fail and remove that same node.
+        candidate = commission_jobs.Job(
+            job_id="candidate", setup_code="00000000000", suggested_name="A",
+            suggested_room=None, status=commission_jobs.FAILED, node_id=7,
+            error={"code": "commissioning_timeout", "message": "x"},
+            terminal_at=datetime.now(timezone.utc),
+        )
+        jobs._jobs[candidate.job_id] = candidate
+
+        _, body_b = jobs.create_job({"setupCode": "12345678901", "suggestedName": "B"})
+        task_b = asyncio.ensure_future(_await_terminal(jobs, body_b["jobId"])())
+        await asyncio.wait_for(removal_started.wait(), timeout=1)
+
+        # The removal RPC is in flight (node 7 is marked in self._removing)
+        # — a node_added for that SAME node must not be claimed onto the
+        # still-waiting candidate while it's being deleted off the fabric.
+        mock_logger.warning.reset_mock()
+        assert jobs.reconcile_node_added({"node_id": 7}) is None
+        mock_logger.warning.assert_called_once()
+        assert "removal was already in flight" in str(mock_logger.warning.call_args)
+
+        release.set()
+        final_b = await task_b
+        assert final_b["status"] == "failed"
+        assert matter.removed == [7]
+        assert 7 not in jobs._removing  # cleaned up once the RPC settled
+    asyncio.run(scenario())
+
+
+def test_removal_in_flight_blocks_reconcile_at_the_watchdog_site(mock_logger):
+    async def scenario():
+        window_release = asyncio.Event()
+        removal_release = asyncio.Event()
+        removal_started = asyncio.Event()
+
+        async def fake_sleep(seconds):
+            await window_release.wait()
+
+        class GatedMatter(TimeoutMatter):
+            async def remove_node(self, node_id):
+                removal_started.set()
+                await removal_release.wait()
+                self.removed.append(node_id)
+
+        matter = GatedMatter()
+        jobs = _jobs(matter, mock_logger, schedule=asyncio.ensure_future,
+                     sleep=fake_sleep, knows_node=lambda n: False)
+        _, body = jobs.create_job({"setupCode": "12345678901", "suggestedName": "X"})
+        await _await_terminal(jobs, body["jobId"])()
+
+        late = LateResponse(None, CommissionRequest(body["jobId"]), None, {"node_id": 7})
+        jobs.note_late_response(late)
+
+        window_release.set()  # let the reconcile window close
+        await asyncio.wait_for(removal_started.wait(), timeout=1)
+
+        # The watchdog's own remove_node(7) is in flight — a node_added for
+        # the same node must not resurrect this already-terminal job.
+        mock_logger.warning.reset_mock()
+        assert jobs.reconcile_node_added({"node_id": 7}) is None
+        mock_logger.warning.assert_called_once()
+        assert "removal was already in flight" in str(mock_logger.warning.call_args)
+
+        removal_release.set()
+        await _pump()
+        assert matter.removed == [7]
+        assert 7 not in jobs._removing
+    asyncio.run(scenario())
+
+
+# ----------------------------------------------------------------------
+# A3: _node_key must not silently stop matching on zero-padded strings
+# ----------------------------------------------------------------------
+@pytest.mark.parametrize("value,expected", [
+    ("0x1234", 0x1234),
+    ("0X12", 0x12),
+    ("007", 7),
+    ("0000000012344321", 12344321),
+])
+def test_node_key_parses_prefixed_and_zero_padded_strings(value, expected):
+    assert commission_jobs._node_key(value) == expected
+
+
+def test_node_key_leaves_unprefixed_non_numeric_string_as_str():
+    assert commission_jobs._node_key("deadbeef") == "deadbeef"
+    assert not commission_jobs._same_node("deadbeef", 0xDEADBEEF)
+
+
+def test_same_node_matches_zero_padded_string_to_int():
+    assert commission_jobs._same_node("0000000012344321", 12344321)
+
+
+def test_late_success_string_node_id_claims_by_exact_identity(mock_logger):
+    async def scenario():
+        clock = {"t": datetime(2026, 6, 10, 12, 0, tzinfo=timezone.utc)}
+        jobs = _jobs(TimeoutMatter(), mock_logger,
+                     schedule=asyncio.ensure_future, clock=lambda: clock["t"])
+        _, body1 = jobs.create_job({"setupCode": "12345678901", "suggestedName": "A"})
+        await _await_terminal(jobs, body1["jobId"])()
+
+        # Late success names the node as a hex STRING off the wire — the
+        # #21/#22 guards must still see it (A3).
+        late = LateResponse(None, CommissionRequest(body1["jobId"]), None, {"node_id": "0x7"})
+        jobs.note_late_response(late)
+        assert jobs._jobs[body1["jobId"]].node_id == "0x7"
+
+        clock["t"] += timedelta(minutes=2)
+        _, body2 = jobs.create_job({"setupCode": "98765432109", "suggestedName": "B"})
+        await _await_terminal(jobs, body2["jobId"])()  # newer, but unidentified
+
+        # exact identity (int 7 == "0x7") beats recency
+        assert jobs.reconcile_node_added({"node_id": 7}) == body1["jobId"]
+    asyncio.run(scenario())
+
+
+# ----------------------------------------------------------------------
+# A1: the watchdog must coerce a string node id before calling knows_node
+# (device_sync does an unguarded int(node_id)), and must never vanish if
+# knows_node itself raises.
+# ----------------------------------------------------------------------
+def test_watchdog_coerces_string_node_id_before_calling_knows_node(mock_logger):
+    async def scenario():
+        release = asyncio.Event()
+        recorded: list = []
+
+        async def fake_sleep(seconds):
+            await release.wait()
+
+        def recording_knows_node(node_id):
+            recorded.append(node_id)
+            return False
+
+        matter = TimeoutMatter()
+        jobs = _jobs(matter, mock_logger, schedule=asyncio.ensure_future,
+                     sleep=fake_sleep, knows_node=recording_knows_node)
+        _, body = jobs.create_job({"setupCode": "12345678901", "suggestedName": "X"})
+        await _await_terminal(jobs, body["jobId"])()
+
+        late = LateResponse(None, CommissionRequest(body["jobId"]), None, {"node_id": "0x7"})
+        jobs.note_late_response(late)
+        release.set()
+        await _pump()
+
+        assert recorded == [7]  # coerced to int, not the raw "0x7" string
+        assert matter.removed == ["0x7"]  # the RPC itself still gets the wire form
+    asyncio.run(scenario())
+
+
+def test_watchdog_skips_knows_node_for_uncoercible_id_but_still_removes(mock_logger):
+    async def scenario():
+        release = asyncio.Event()
+        called: list = []
+
+        async def fake_sleep(seconds):
+            await release.wait()
+
+        def recording_knows_node(node_id):
+            called.append(node_id)
+            return False
+
+        matter = TimeoutMatter()
+        jobs = _jobs(matter, mock_logger, schedule=asyncio.ensure_future,
+                     sleep=fake_sleep, knows_node=recording_knows_node)
+        _, body = jobs.create_job({"setupCode": "12345678901", "suggestedName": "X"})
+        await _await_terminal(jobs, body["jobId"])()
+
+        # An unprefixed, non-numeric string node id — undisambiguatable hex
+        # per _node_key's documented policy, so not coercible to int.
+        late = LateResponse(None, CommissionRequest(body["jobId"]), None,
+                            {"node_id": "deadbeef"})
+        jobs.note_late_response(late)
+        release.set()
+        await _pump()
+
+        assert called == []  # knows_node never invoked with an uncoercible id
+        assert matter.removed == ["deadbeef"]  # removal still attempted
+        mock_logger.debug.assert_called()
+        logged = str(mock_logger.debug.call_args_list)
+        assert "deadbeef" in logged
+    asyncio.run(scenario())
+
+
+def test_watchdog_survives_knows_node_raising(mock_logger):
+    async def scenario():
+        release = asyncio.Event()
+
+        def boom_knows_node(node_id):
+            raise RuntimeError("device_sync exploded")
+
+        async def fake_sleep(seconds):
+            await release.wait()
+
+        matter = TimeoutMatter()
+        jobs = _jobs(matter, mock_logger, schedule=asyncio.ensure_future,
+                     sleep=fake_sleep, knows_node=boom_knows_node)
+        _, body = jobs.create_job({"setupCode": "12345678901", "suggestedName": "X"})
+        await _await_terminal(jobs, body["jobId"])()
+
+        late = LateResponse(None, CommissionRequest(body["jobId"]), None, {"node_id": 7})
+        jobs.note_late_response(late)
+        release.set()
+        await _pump()
+
+        mock_logger.exception.assert_called_once()
+        assert matter.removed == []  # remove_node was never reached
+        assert jobs._expiry_tasks == set()  # the watchdog still self-cleaned
+    asyncio.run(scenario())
+
+
+# ----------------------------------------------------------------------
+# A late error must not touch a job mid-reconcile (claimed via node_added,
+# not yet landed) — _note_late_error_locked's existing "doesn't apply"
+# branch, pinned so it can't regress into writing job.error.
+# ----------------------------------------------------------------------
+def test_late_error_during_creating_devices_leaves_job_untouched(mock_logger):
+    async def scenario():
+        jobs = _jobs(TimeoutMatter(), mock_logger, schedule=asyncio.ensure_future)
+        _, body = jobs.create_job({"setupCode": "12345678901", "suggestedName": "X"})
+        await _await_terminal(jobs, body["jobId"])()
+
+        release = asyncio.Event()
+
+        async def gated_create(node, name, room):
+            await release.wait()
+            return {"indigoDeviceIds": [1], "primaryDeviceId": 1, "endpointCount": 1}
+
+        jobs._create_devices = gated_create  # gate THIS reconcile's device creation
+        assert jobs.reconcile_node_added({"node_id": 0xAB}) == body["jobId"]
+        # claimed and mid-flight — the scheduled _reconcile_job coroutine
+        # hasn't landed yet, so the job sits in CREATING_DEVICES.
+        _, mid = jobs.get_job(body["jobId"])
+        assert mid["status"] == "creating_devices"
+
+        mock_logger.debug.reset_mock()
+        late = LateResponse(None, CommissionRequest(body["jobId"]), (50, "boom"), None)
+        claimed = jobs.note_late_response(late)
+        assert claimed == body["jobId"]
+
+        _, final = jobs.get_job(body["jobId"])
+        assert final["status"] == "creating_devices"  # untouched
+        assert "error" not in final  # job.error stays None
+        mock_logger.debug.assert_called_once()
+        assert body["jobId"] in str(mock_logger.debug.call_args)
+
+        release.set()
+        final2 = await _await_terminal(jobs, body["jobId"])()
+        assert final2["status"] == "success"
+    asyncio.run(scenario())
+
+
+# ----------------------------------------------------------------------
+# The watchdog's schedule() in production is AsyncRuntime.submit, returning
+# a concurrent.futures.Future — every other test in this file exercises the
+# asyncio.Task double (asyncio.ensure_future). Prove the real bridge works.
+# ----------------------------------------------------------------------
+def test_watchdog_runs_as_a_real_concurrent_futures_future(mock_logger):
+    from async_runtime import AsyncRuntime
+
+    async def scenario():
+        runtime = AsyncRuntime(mock_logger)
+        runtime.start(timeout=5.0)
+        try:
+            naps: list = []
+
+            async def fake_sleep(seconds):
+                naps.append(seconds)
+
+            job = commission_jobs.Job(
+                job_id="j1", setup_code="12345678901", suggested_name="X",
+                suggested_room=None, status=commission_jobs.FAILED,
+                error={"code": "commissioning_timeout", "message": TIMEOUT_MESSAGE},
+                terminal_at=datetime.now(timezone.utc),
+            )
+            jobs = _jobs(FakeMatter(), mock_logger, schedule=runtime.submit, sleep=fake_sleep)
+            jobs._jobs[job.job_id] = job
+
+            jobs._watch_reconcile_window(job)
+
+            for _ in range(200):  # up to ~2s, polled from the test's own loop
+                if not jobs._expiry_tasks:
+                    break
+                await asyncio.sleep(0.01)
+            assert jobs._expiry_tasks == set()  # the real Future self-cleaned
+            assert naps == [300.0]
+            mock_logger.warning.assert_called()
+            logged = str(mock_logger.warning.call_args)
+            assert "j1" in logged and "never joined" in logged
+        finally:
+            runtime.stop(timeout=5.0)
+    asyncio.run(scenario())
+
+
+# ----------------------------------------------------------------------
+# A6b: _note_late_success_locked loudness — no node id, and a mismatched
+# node id (the #22 mis-attribution signal).
+# ----------------------------------------------------------------------
+def test_late_success_with_no_node_id_is_debug_logged(mock_logger):
+    jobs = _jobs(FakeMatter(), mock_logger)
+    job = commission_jobs.Job(
+        job_id="j1", setup_code="12345678901", suggested_name="X",
+        suggested_room=None, status=commission_jobs.FAILED,
+        error={"code": "commissioning_timeout", "message": "x"},
+    )
+    jobs._jobs[job.job_id] = job
+    late = LateResponse(None, CommissionRequest(job.job_id), None, {"node_id": None})
+    jobs.note_late_response(late)
+    mock_logger.debug.assert_called_once()
+    assert job.job_id in str(mock_logger.debug.call_args)
+    assert job.node_id is None
+
+
+def test_late_success_mismatched_node_id_warns_naming_both(mock_logger):
+    async def scenario():
+        matter = FakeMatter(node_id=0xAB)
+        jobs = _jobs(matter, mock_logger, schedule=asyncio.ensure_future)
+        _, body = jobs.create_job({"setupCode": "12345678901", "suggestedName": "X"})
+        final = await _await_terminal(jobs, body["jobId"])()
+        assert final["status"] == "success"
+        assert jobs._jobs[body["jobId"]].node_id == 0xAB
+
+        mock_logger.warning.reset_mock()
+        late = LateResponse(None, CommissionRequest(body["jobId"]), None, {"node_id": 0xFF})
+        jobs.note_late_response(late)
+
+        # the original node_id wins — a late answer never overwrites it
+        assert jobs._jobs[body["jobId"]].node_id == 0xAB
+        mock_logger.warning.assert_called_once()
+        logged = str(mock_logger.warning.call_args)
+        assert "0xAB" in logged and "0xFF" in logged
+    asyncio.run(scenario())
+
+
+def test_late_success_matching_node_id_is_silent(mock_logger):
+    async def scenario():
+        matter = FakeMatter(node_id=0xAB)
+        jobs = _jobs(matter, mock_logger, schedule=asyncio.ensure_future)
+        _, body = jobs.create_job({"setupCode": "12345678901", "suggestedName": "X"})
+        await _await_terminal(jobs, body["jobId"])()
+
+        mock_logger.warning.reset_mock()
+        mock_logger.info.reset_mock()
+        late = LateResponse(None, CommissionRequest(body["jobId"]), None, {"node_id": 0xAB})
+        jobs.note_late_response(late)
+
+        mock_logger.warning.assert_not_called()
+        mock_logger.info.assert_not_called()  # already-set branch stays silent
+    asyncio.run(scenario())
+
+
+# ----------------------------------------------------------------------
+# C9: loudness pins — A4/A5/A6a/A7
+# ----------------------------------------------------------------------
+def test_expiry_node_id_case_message_is_distinct_from_bare_case(mock_logger):
+    # A4: a #23 late success named a node for this job before the window
+    # closed — the warning must say the device DID join, never "never
+    # joined" (the bare-case branch's text, quoted verbatim in MATTER.md,
+    # is asserted unchanged by the existing bare-case tests).
+    async def scenario():
+        release = asyncio.Event()
+
+        async def fake_sleep(seconds):
+            await release.wait()
+
+        matter = TimeoutMatter()
+        jobs = _jobs(matter, mock_logger, schedule=asyncio.ensure_future,
+                     sleep=fake_sleep, knows_node=lambda n: False)
+        _, body = jobs.create_job({"setupCode": "12345678901", "suggestedName": "X"})
+        await _await_terminal(jobs, body["jobId"])()
+
+        late = LateResponse(None, CommissionRequest(body["jobId"]), None, {"node_id": 7})
+        jobs.note_late_response(late)
+
+        mock_logger.warning.reset_mock()
+        release.set()
+        await _pump()
+
+        logged = str(mock_logger.warning.call_args_list)
+        assert "never joined" not in logged
+        assert "DID join" in logged
+    asyncio.run(scenario())
+
+
+def test_orphan_removal_failure_is_warned_loudly(mock_logger):
+    async def scenario():
+        release = asyncio.Event()
+
+        async def fake_sleep(seconds):
+            await release.wait()
+
+        class FailingRemoveMatter(TimeoutMatter):
+            async def remove_node(self, node_id):
+                raise RuntimeError("matter-server unreachable")
+
+        matter = FailingRemoveMatter()
+        jobs = _jobs(matter, mock_logger, schedule=asyncio.ensure_future,
+                     sleep=fake_sleep, knows_node=lambda n: False)
+        _, body = jobs.create_job({"setupCode": "12345678901", "suggestedName": "X"})
+        await _await_terminal(jobs, body["jobId"])()
+
+        late = LateResponse(None, CommissionRequest(body["jobId"]), None, {"node_id": 7})
+        jobs.note_late_response(late)
+        mock_logger.warning.reset_mock()
+        release.set()
+        await _pump()
+
+        mock_logger.warning.assert_called()
+        logged = str(mock_logger.warning.call_args)
+        assert "remains on the fabric" in logged
+        assert 7 not in jobs._removing  # cleaned up despite the failure
+    asyncio.run(scenario())
+
+
+def test_watchdog_unarmed_when_loop_down_logs_debug(mock_logger):
+    async def scenario():
+        calls = {"n": 0}
+
+        def schedule(coro):
+            calls["n"] += 1
+            if calls["n"] == 2:  # the _watch_reconcile_window call
+                raise RuntimeError("asyncio runtime is not running")
+            return asyncio.ensure_future(coro)
+
+        jobs = _jobs(TimeoutMatter(), mock_logger, schedule=schedule)
+        _, body = jobs.create_job({"setupCode": "12345678901", "suggestedName": "X"})
+        final = await _await_terminal(jobs, body["jobId"])()
+
+        assert final["status"] == "failed"
+        mock_logger.debug.assert_called()
+        logged = str(mock_logger.debug.call_args)
+        assert body["jobId"] in logged and "not armed" in logged
+    asyncio.run(scenario())
+
+
+def test_fail_removal_failure_is_warned_loudly(mock_logger):
+    async def scenario():
+        class FailingRemoveMatter(FakeMatter):
+            async def remove_node(self, node_id):
+                raise RuntimeError("matter-server unreachable")
+
+        async def failing_create(node, name, room):
+            raise CommissionError("interview_failed", "could not read descriptors")
+
+        matter = FailingRemoveMatter(node_id=7)
+        jobs = _jobs(matter, mock_logger, create=failing_create, schedule=asyncio.ensure_future)
+        _, body = jobs.create_job({"setupCode": "12345678901", "suggestedName": "X"})
+        final = await _await_terminal(jobs, body["jobId"])()
+
+        assert final["status"] == "failed"
+        mock_logger.warning.assert_called()
+        logged = str(mock_logger.warning.call_args)
+        assert "remains on the fabric" in logged
+        assert 7 not in jobs._removing
+    asyncio.run(scenario())
+
+
+# ----------------------------------------------------------------------
+# A8: the malformed node_added branch must only name an UNIDENTIFIED
+# candidate — one already identified with a different node never had a
+# shot at this event.
+# ----------------------------------------------------------------------
+def test_malformed_node_silent_when_only_candidate_is_already_identified(mock_logger):
+    async def scenario():
+        jobs = _jobs(TimeoutMatter(), mock_logger, schedule=asyncio.ensure_future)
+        _, body = jobs.create_job({"setupCode": "12345678901", "suggestedName": "X"})
+        await _await_terminal(jobs, body["jobId"])()
+        jobs._jobs[body["jobId"]].node_id = 9  # already identified with a DIFFERENT node
+
+        mock_logger.warning.reset_mock()
+        assert jobs.reconcile_node_added({"weird": True}) is None
+        mock_logger.warning.assert_not_called()
     asyncio.run(scenario())

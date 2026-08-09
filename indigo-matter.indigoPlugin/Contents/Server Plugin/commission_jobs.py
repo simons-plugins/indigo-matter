@@ -113,10 +113,28 @@ def _exc_message(exc: BaseException) -> str:
 
 
 def _node_key(value: Any) -> Any:
-    """Normalise a node id (int or hex string on the wire) for comparison."""
-    try:
-        if isinstance(value, str):
+    """Normalise a node id (int or hex string on the wire) for comparison.
+
+    Strings go through base-0 parsing first (handles both a ``0x``/``0X``-
+    prefixed hex string and a plain decimal one) — but base-0 rejects a
+    zero-padded decimal string ("0000000012344321": leading zeros are only
+    legal for "0" itself or an "0x"/"0o"/"0b" prefix), so that ValueError
+    falls back to a plain base-10 parse when the string is all digits.
+    An unprefixed hex string ("1234" meaning hex, not decimal 1234) is
+    undisambiguatable and stays a ``str`` key — a one-directional no-match
+    against the equivalent int, never a false collision, and never a form the
+    codebase itself produces: :func:`node_id_to_str` always emits the ``0x``
+    prefix.
+    """
+    if isinstance(value, str):
+        try:
             return int(value, 0)
+        except ValueError:
+            stripped = value.strip()
+            if stripped and stripped.isdigit():
+                return int(stripped, 10)
+            return str(value)
+    try:
         return int(value)
     except (TypeError, ValueError):
         return str(value)
@@ -124,6 +142,15 @@ def _node_key(value: Any) -> Any:
 
 def _same_node(a: Any, b: Any) -> bool:
     return _node_key(a) == _node_key(b)
+
+
+def _node_int(value: Any) -> Optional[int]:
+    """Coerce a node id to ``int`` via :func:`_node_key`'s policy, or ``None``
+    when it can't be — an unprefixed hex string ``_node_key`` deliberately
+    leaves as ``str`` (#A1: the seam into ``device_sync.knows_node``, which
+    does an unguarded ``int(node_id)``, must never see one of those raw)."""
+    key = _node_key(value)
+    return key if isinstance(key, int) else None
 
 
 def is_valid_setup_code(code: str) -> bool:
@@ -167,10 +194,13 @@ class Job:
     domio_node_id: Optional[str] = None
     expected_fabric_slots: Optional[int] = None
     # The matter-server node this job is holding — set the moment
-    # commission_with_code returns one, and again when a reconcile claims a
-    # node. Distinct from result["nodeId"] (only exists after SUCCESS, and is
-    # a hex string): this is the raw id, live from the moment the fabric has
-    # it, so _fail can tell whether another job now owns it (#21).
+    # commission_with_code returns one, again when a reconcile claims a node,
+    # and (#23) when a late matter-server success names it for a job that
+    # never itself commissioned one — the only writer that can leave a
+    # bare-timeout job carrying a node_id for _remove_orphaned_node to find.
+    # Distinct from result["nodeId"] (only exists after SUCCESS, and is a hex
+    # string): this is the raw id, live from the moment the fabric has it, so
+    # _fail can tell whether another job now owns it (#21).
     node_id: Optional[int] = None
     status: JobStatus = PENDING
     progress: float = 0.0
@@ -229,6 +259,13 @@ class CommissionJobs:
         # mid-sleep (the same trap ws_json_client._reconcile_task guards
         # against) — discarded via their own done callback once each finishes.
         self._expiry_tasks: set = set()
+        # _node_key values of nodes whose remove_node RPC is currently in
+        # flight (from _fail or _remove_orphaned_node) — checked by
+        # _claimable_locked so a node_added racing that RPC can't be claimed
+        # onto a job the instant before the node is deleted off the fabric
+        # (A2: TOCTOU between the "is this node free?" check and the await).
+        # Populated/cleared under self._lock; never held across the await.
+        self._removing: set = set()
 
     # ------------------------------------------------------------------
     # Public API (called from the IWS handler thread)
@@ -318,19 +355,25 @@ class CommissionJobs:
         if not isinstance(raw_node, dict) or raw_node.get("node_id") is None:
             with self._lock:
                 waiting = self._timeout_candidates_locked(self._clock() - RECONCILE_WINDOW)
-            if waiting:
+                # A8: only an UNIDENTIFIED candidate ever had a shot at this
+                # event — one already identified with a different node never
+                # did, so naming it here would be misleading.
+                unidentified = [c for c in waiting if c.node_id is None]
+            if unidentified:
                 # A claimable job is waiting and this event was its one shot —
                 # leave evidence. (No candidates = routine restart sync; stay quiet.)
                 self.logger.warning(
                     "node_added event without a usable node_id ignored while "
-                    "commission job %s awaits reconcile", waiting[-1].job_id)
+                    "commission job %s awaits reconcile", unidentified[-1].job_id)
             return None
         node_id = raw_node.get("node_id")
         stale: Optional[Job] = None
+        removal_in_flight = False
         with self._lock:
-            job, candidates = self._claimable_locked(node_id, self._clock() - RECONCILE_WINDOW)
+            job, candidates, removal_in_flight = self._claimable_locked(
+                node_id, self._clock() - RECONCILE_WINDOW)
             if job is None:
-                if not candidates:
+                if not removal_in_flight and not candidates:
                     expired = self._timeout_candidates_locked(None)
                     stale = expired[-1] if expired else None
             else:
@@ -347,7 +390,18 @@ class CommissionJobs:
                 job.node_id = node_id
                 job.status = CREATING_DEVICES
         if job is None:
-            if stale is not None:
+            if removal_in_flight:
+                # A2: this node's own remove_node RPC (from _fail or the #24
+                # watchdog) is out on the loop right now — claiming it here
+                # would flip a job to success out from under a node about to
+                # be deleted off the fabric.
+                self.logger.warning(
+                    "node %s joined while its removal was already in flight "
+                    "— not claimed; if the removal succeeds the node is "
+                    "gone, and a fresh commission is the way back.",
+                    node_id_to_str(node_id),
+                )
+            elif stale is not None:
                 self.logger.warning(
                     "node %s joined after commission job %s timed out, but outside "
                     "the %.0f-minute reconcile window — suggestedName/suggestedRoom "
@@ -381,8 +435,9 @@ class CommissionJobs:
         could be claimed for ``node_id``. Called outside ``self._lock``."""
         unidentified = [c for c in candidates if c.node_id is None]
         if unidentified:
-            # Branch (d)/(e) of _claimable_locked: two or more different
-            # setup codes are waiting unidentified — the event names neither.
+            # The final refusal branch of _claimable_locked: two or more
+            # different setup codes are waiting unidentified — the event
+            # names neither.
             self.logger.warning(
                 "node %s joined while commission jobs %s were all waiting to "
                 "reconcile — it cannot be told which one it belongs to, so none "
@@ -421,32 +476,40 @@ class CommissionJobs:
 
     def _claimable_locked(
         self, node_id: Any, cutoff: datetime
-    ) -> tuple[Optional[Job], list[Job]]:
-        """Which timeout candidate (if any) may claim ``node_id``, and the
-        full candidate list (for refusal logging). Caller must hold
-        ``self._lock``.
+    ) -> tuple[Optional[Job], list[Job], bool]:
+        """Which timeout candidate (if any) may claim ``node_id``, the full
+        candidate list (for refusal logging), and whether the refusal is
+        specifically because that node's own removal RPC is in flight (A2 —
+        a distinct refusal shape callers must log differently: the node is
+        being deleted, not merely unclaimed). Caller must hold ``self._lock``.
         """
         candidates = self._timeout_candidates_locked(cutoff)
         if not candidates:
-            return None, candidates
+            return None, candidates, False
+        if _node_key(node_id) in self._removing:
+            # A2: this node's remove_node RPC (via _fail or the #24 watchdog)
+            # is out on the loop right now. Claiming it here — by ANY of the
+            # branches below — would flip a job to success out from under a
+            # node about to vanish off the fabric mid-await.
+            return None, candidates, True
         # Exact identity wins outright: matter-server has already named this
         # job's node (e.g. a prior partial reconcile).
         exact = [c for c in candidates if c.node_id is not None and _same_node(c.node_id, node_id)]
         if exact:
-            return exact[-1], candidates
+            return exact[-1], candidates, False
         # A job whose node we KNOW, and it isn't this one, cannot claim this
         # node — only jobs with an unidentified node are still eligible.
         unidentified = [c for c in candidates if c.node_id is None]
         if not unidentified:
-            return None, candidates
+            return None, candidates, False
         # Same setup code among the unidentified = same physical device: retries
         # of one join, and the newest carries the user's latest name/room.
         if len({c.setup_code for c in unidentified}) == 1:
-            return unidentified[-1], candidates
+            return unidentified[-1], candidates, False
         # Two DIFFERENT devices are waiting and this event names neither.
         # Refusing costs a name and a room; guessing wrong flips a job to
         # success carrying another device's nodeId, which Domio then trusts.
-        return None, candidates
+        return None, candidates, False
 
     async def _reconcile_job(self, job: Job, raw_node: dict) -> None:
         node_id = raw_node.get("node_id")
@@ -551,7 +614,25 @@ class CommissionJobs:
     def _note_late_success_locked(self, job: Job, result: Any) -> None:
         """Caller must hold ``self._lock``. See :meth:`note_late_response`."""
         node_id = result.get("node_id") if isinstance(result, dict) else result
-        if node_id is None or job.node_id is not None:
+        if node_id is None:
+            self.logger.debug(
+                "commission job %s: late matter-server success carried no "
+                "node id — nothing to record", job.job_id,
+            )
+            return
+        if job.node_id is not None:
+            if not _same_node(job.node_id, node_id):
+                # #22 mis-attribution signal: the RPC's own late answer and
+                # whatever already set job.node_id (a prior reconcile, or an
+                # earlier late success) disagree about which node this job
+                # is. The original wins — see note_late_response's docstring
+                # — but disagreeing silently would hide a real bug.
+                self.logger.warning(
+                    "commission job %s: late matter-server success names "
+                    "node %s, but the job already recorded node %s — "
+                    "keeping the original", job.job_id,
+                    node_id_to_str(node_id), node_id_to_str(job.node_id),
+                )
             return
         job.node_id = node_id
         self.logger.info(
@@ -639,11 +720,26 @@ class CommissionJobs:
 
     async def _fail(self, job: Job, code: str, message: str,
                     node_id: Any, matter_error_code: Optional[int] = None) -> None:
+        # _node_held_by_other_job, when it returns False (not held), also
+        # marks node_id in-flight in self._removing in the SAME lock
+        # acquisition as the holder check (A2) — closing the gap a separate
+        # add() call afterwards would leave open for a concurrent
+        # reconcile_node_added to claim the node between the two.
         if node_id is not None and not self._node_held_by_other_job(job, node_id):
             try:
                 await self.matter.remove_node(node_id)  # best-effort cleanup
-            except Exception as exc:  # noqa: BLE001
-                self.logger.debug("best-effort remove_node failed: %s", exc)
+            except Exception as exc:  # noqa: BLE001 - A7: loud, cleanup is still best-effort
+                self.logger.warning(
+                    "commission job %s: commissioning failed, and the "
+                    "best-effort cleanup removing node %s from the fabric "
+                    "also failed (%s); it remains on the fabric and may "
+                    "occupy a fabric slot on the device — remove it via "
+                    "matter-server or factory-reset the device before "
+                    "retrying.", job.job_id, node_id_to_str(node_id), exc,
+                )
+            finally:
+                with self._lock:
+                    self._removing.discard(_node_key(node_id))
         error = {"code": code, "message": message}
         if matter_error_code is not None:
             error["matterErrorCode"] = matter_error_code
@@ -668,42 +764,75 @@ class CommissionJobs:
             handle = self._schedule(coro)
         except RuntimeError:
             coro.close()
+            self.logger.debug(
+                "commission job %s: reconcile-window watchdog not armed "
+                "(loop shutting down); the window-expiry log will not fire.",
+                job.job_id,
+            )
             return
         self._expiry_tasks.add(handle)
         handle.add_done_callback(self._expiry_tasks.discard)
 
     async def _expire_reconcile_window(self, job: Job) -> None:
         """Wait out RECONCILE_WINDOW and, if the job is still exactly where
-        the bare timeout left it, log that the window closed for good and
-        best-effort clean up any node a late #23 success recorded for it.
+        the bare timeout left it, log that the window closed for good — with
+        different wording depending on whether a late #23 success ever named
+        a node for this job (A4) — and best-effort clean up that node if it
+        did.
 
-        ``CancelledError`` is deliberately not caught. At shutdown
-        ``AsyncRuntime._drain_and_close`` cancels every outstanding task and
-        awaits them via ``asyncio.gather(..., return_exceptions=True)`` — the
-        gather swallows the exception there, and nothing else is holding the
-        ``Future`` this coroutine runs as (it is fire-and-forget from
-        ``_watch_reconcile_window``), so there is no caller left to see it
-        propagate. The job is already terminal; a cancellation here leaves no
-        state to land.
+        Any exception other than ``CancelledError`` is caught here and
+        logged via ``self.logger.exception`` (A1: this is the one
+        fire-and-forget coroutine in the module with no caller ever
+        retrieving its result, so a raise that escaped — e.g. from
+        ``knows_node`` inside ``_remove_orphaned_node`` — would otherwise
+        vanish silently).
+
+        ``CancelledError`` is deliberately allowed to propagate — catching
+        ``Exception`` doesn't touch it; it has been a ``BaseException``
+        subclass since Python 3.8. At shutdown ``AsyncRuntime._drain_and_close``
+        cancels every outstanding task and awaits them via
+        ``asyncio.gather(..., return_exceptions=True)`` — the gather
+        swallows the exception there, and the only reference to the
+        ``Future`` this coroutine runs as is ``_expiry_tasks``' GC guard (it
+        is fire-and-forget from ``_watch_reconcile_window``) — nothing ever
+        calls ``.result()`` on it, so no caller sees it propagate. The job is
+        already terminal; a cancellation here leaves no state to land.
         """
-        await self._sleep(RECONCILE_WINDOW.total_seconds())
-        with self._lock:
-            current = self._jobs.get(job.job_id)
-            if current is not job:
-                return  # reaped in the meantime
-            if job.status is not FAILED or (job.error or {}).get("code") != "commissioning_timeout":
-                return  # reconciled by node_added, or #23 re-coded the error
-            node_id = job.node_id
-        self.logger.warning(
-            "commission job %s: the %.0f-minute reconcile window closed and "
-            "the device never joined — commissioning did not complete. "
-            "matter-server has no way to cancel a commissioning attempt, so "
-            "nothing further will be done automatically; check the device is "
-            "in pairing mode and retry.",
-            job.job_id, RECONCILE_WINDOW.total_seconds() / 60,
-        )
-        if node_id is not None:
-            await self._remove_orphaned_node(job, node_id)
+        try:
+            await self._sleep(RECONCILE_WINDOW.total_seconds())
+            with self._lock:
+                current = self._jobs.get(job.job_id)
+                if current is not job:
+                    return  # reaped in the meantime
+                if (job.status is not FAILED
+                        or (job.error or {}).get("code") != "commissioning_timeout"):
+                    return  # reconciled by node_added, or #23 re-coded the error
+                node_id = job.node_id
+            if node_id is not None:
+                # A #23 late success named a node for this job AFTER it went
+                # terminal on a bare timeout — matter-server says it DID
+                # join, so this is a leftover fabric entry, not a device
+                # that simply never showed up. Distinct wording (A4): the
+                # bare-case text below is quoted verbatim in docs/MATTER.md.
+                self.logger.warning(
+                    "commission job %s: the %.0f-minute reconcile window "
+                    "closed without the device ever reaching Indigo — "
+                    "matter-server's late answer says it DID join, so the "
+                    "leftover fabric entry is being cleaned up now.",
+                    job.job_id, RECONCILE_WINDOW.total_seconds() / 60,
+                )
+                await self._remove_orphaned_node(job, node_id)
+            else:
+                self.logger.warning(
+                    "commission job %s: the %.0f-minute reconcile window closed and "
+                    "the device never joined — commissioning did not complete. "
+                    "matter-server has no way to cancel a commissioning attempt, so "
+                    "nothing further will be done automatically; check the device is "
+                    "in pairing mode and retry.",
+                    job.job_id, RECONCILE_WINDOW.total_seconds() / 60,
+                )
+        except Exception as exc:  # noqa: BLE001 - A1: nothing else can ever see this raise
+            self.logger.exception(exc)
 
     async def _remove_orphaned_node(self, job: Job, node_id: Any) -> None:
         """Best-effort cleanup of a node a late #23 success recorded for a job
@@ -718,24 +847,53 @@ class CommissionJobs:
         itself and the job reaches SUCCESS, never this path — so a node_id
         surviving to here is strictly the leftover of a join nobody
         completed.
+
+        ``node_id`` may be a string straight off the wire (#23's late
+        success never coerces it) — ``knows_node`` (``device_sync``) does an
+        unguarded ``int(node_id)`` (A1), so it is only called with a value
+        ``_node_int`` could actually coerce; an uncoercible id skips that
+        check (logged) but the fabric-removal RPC below still runs — the
+        other two guards (holder check, reconcile window closed) already
+        cleared it.
         """
         if self._node_held_by_other_job(job, node_id):
-            return  # already logs
-        if self._knows_node is not None and self._knows_node(node_id):
-            self.logger.info(
-                "commission job %s: node %s already has Indigo devices; "
-                "leaving it on the fabric", job.job_id, node_id_to_str(node_id),
-            )
-            return
+            return  # already logs; nothing was marked in-flight
+        # _node_held_by_other_job marks node_id in self._removing (A2) the
+        # moment it returns False — from here on, discard it on every exit,
+        # including an exception raised out of the knows_node check.
         try:
-            await self.matter.remove_node(node_id)
-            self.logger.warning(
-                "commission job %s: removed orphaned node %s — matter-server "
-                "reported it joined but it never reached Indigo",
-                job.job_id, node_id_to_str(node_id),
-            )
-        except Exception as exc:  # noqa: BLE001 - best-effort cleanup only
-            self.logger.debug("best-effort remove_node failed: %s", exc)
+            node_int = _node_int(node_id)
+            if node_int is None:
+                self.logger.debug(
+                    "commission job %s: node id %s is not coercible to an "
+                    "int — skipping the Indigo-tracked check; the "
+                    "fabric-removal RPC still runs", job.job_id, node_id,
+                )
+            elif self._knows_node is not None and self._knows_node(node_int):
+                self.logger.info(
+                    "commission job %s: node %s is already tracked by "
+                    "Indigo; leaving it on the fabric",
+                    job.job_id, node_id_to_str(node_id),
+                )
+                return
+            try:
+                await self.matter.remove_node(node_id)
+                self.logger.warning(
+                    "commission job %s: removed orphaned node %s — matter-server "
+                    "reported it joined but it never reached Indigo",
+                    job.job_id, node_id_to_str(node_id),
+                )
+            except Exception as exc:  # noqa: BLE001 - A5: loud, cleanup is still best-effort
+                self.logger.warning(
+                    "commission job %s: could not remove orphaned node %s "
+                    "(%s); it remains on the fabric and may occupy a fabric "
+                    "slot on the device — remove it via matter-server or "
+                    "factory-reset the device before retrying.",
+                    job.job_id, node_id_to_str(node_id), exc,
+                )
+        finally:
+            with self._lock:
+                self._removing.discard(_node_key(node_id))
 
     def _warn_if_fabric_slots_short(self, job: Job, node: dict, node_id: Any) -> None:
         """API.md §3.2 `expectedFabricSlots`: log a warning (never blocking) if
@@ -788,6 +946,14 @@ class CommissionJobs:
         successful join — it would suppress remove_node on the entire normal
         failure path (a later step failing after a lone job's own commission
         succeeded), contradicting PRD §7's "clean up what we created."
+
+        A2: when this returns ``False`` (not held — the caller is about to
+        remove the node), the holder check and marking ``node_id`` in-flight
+        in ``self._removing`` happen in the SAME lock acquisition, so there
+        is no window between "confirmed free" and "marked in-flight" for a
+        concurrent ``reconcile_node_added`` to slip through. The caller must
+        discard the key (``self._removing.discard(_node_key(node_id))``,
+        under the lock) once its own removal has settled, in a ``finally``.
         """
         with self._lock:
             holders = [
@@ -795,6 +961,8 @@ class CommissionJobs:
                 if j is not job and j.node_id is not None
                 and j.status is not FAILED and _same_node(j.node_id, node_id)
             ]
+            if not holders:
+                self._removing.add(_node_key(node_id))
         if not holders:
             return False
         self.logger.warning(
