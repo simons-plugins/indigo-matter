@@ -1,4 +1,5 @@
-"""matter-server menus, export-bridge recovery, and the bridge node's
+"""matter-server menus (install/restart + manual commission/decommission with
+their pickers), export-bridge recovery, and the bridge node's
 LaunchAgent (PRD §4.2/§4.4, BRIDGE_PROTOCOL §3.10/§3.11, E7 — PRD-indigo-matter-export
 §4.2/XG5/XAC1). Three originally separate sections in one mixin because they share
 one construction rule (ServerProcess only ever from ``self._server_prefs()``) and
@@ -22,8 +23,8 @@ from server_process import ServerProcess
 
 
 class ServerMenuMixin:
-    """matter-server install/restart, export-bridge recovery, and the bridge
-    node's LaunchAgent menus.
+    """matter-server install/restart, manual commission/decommission-device,
+    export-bridge recovery, and bridge-node LaunchAgent menus.
 
     Composed into ``Plugin`` alongside the other three mixins; never
     instantiated on its own and never subclasses ``indigo.PluginBase``.

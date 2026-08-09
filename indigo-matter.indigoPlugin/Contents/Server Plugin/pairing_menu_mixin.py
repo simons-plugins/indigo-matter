@@ -344,6 +344,8 @@ class PairingMenuMixin:
             return self.server_process.storage_path
         # See plugin.py's `_server_prefs` docstring: constructing a ServerProcess
         # from raw prefs skips the local-mode pinning — always go through it.
+        # Tests wanting to intercept THIS construction must patch
+        # pairing_menu_mixin.ServerProcess — patching plugin.ServerProcess misses it.
         return ServerProcess(self._server_prefs(), self.logger).storage_path  # pylint: disable=no-member
 
     def _bridge_storage_path(self) -> str:

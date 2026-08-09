@@ -402,7 +402,7 @@ class DeviceSync:
 
         Every node matter-server has reported is listed, INCLUDING one that
         produced no Indigo devices — its entry carries an empty name list, which
-        ``getMatterNodes`` in ``plugin.py`` renders as "(no Indigo devices)".
+        ``ServerMenuMixin.getMatterNodes`` renders as "(no Indigo devices)".
         See ``_known_nodes`` for why ``_index`` alone could not do this.
 
         Sorted by node id; device names resolved outside the lock so a slow

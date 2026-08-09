@@ -1,7 +1,7 @@
 """The outbound export engine — Indigo device changes ⇄ the bridge node.
 
-``plugin.py`` stays lifecycle glue: it owns the Indigo callbacks and nothing
-else. Everything those callbacks *mean* for export lives here — when the
+``plugin.py`` and its mixins stay UI/lifecycle glue: they own the Indigo
+callbacks and nothing else. Everything those callbacks *mean* for export lives here — when the
 :class:`bridge_client.BridgeClient` exists at all, what the desired endpoint set
 is, how a device change becomes a ``set_state``, and how an ecosystem command
 becomes an ``indigo.*`` call. A bare ``§N`` below is ``docs/BRIDGE_PROTOCOL.md``.

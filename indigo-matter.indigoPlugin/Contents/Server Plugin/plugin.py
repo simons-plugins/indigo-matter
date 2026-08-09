@@ -6,7 +6,9 @@ owned by :class:`AsyncRuntime`; this class wires the async services in
 everything down in ``shutdown``, and bridges Indigo device actions onto the
 loop. Everything Indigo reaches only through XML-named callbacks — the IWS
 HTTP handlers, the export dialog, pairing/fabric management, and the
-matter-server/bridge-node menus — has moved to mixins (issue #146):
+matter-server/bridge-node menus — has moved to mixins (issue #146), except
+the Set Sensitivity Level custom action (``actionSetSensitivityLevel`` and
+its ``getSensitivityLevels`` picker), which stays with the action bridge:
 :class:`HttpApiMixin`, :class:`ExportDialogMixin`, :class:`PairingMenuMixin`,
 :class:`ServerMenuMixin`. ``plugin_constants.py`` holds the shared constants
 and prefs helpers; ``pairing_page.py`` holds the pairing IWS page template.
