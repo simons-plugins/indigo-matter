@@ -288,10 +288,11 @@ class CommissionJobs:
         background: re-open it, apply the user's suggestedName/suggestedRoom,
         and flip it to success so a still-polling client gets the real outcome.
 
-        Candidates are matched by recency: only jobs that went terminal with
-        ``commissioning_timeout`` within RECONCILE_WINDOW qualify, and the most
-        recent one wins (a single rehearsal/retry flow never has two). Returns
-        the claimed jobId, or None if no job qualified.
+        Only jobs that went terminal with ``commissioning_timeout`` within
+        RECONCILE_WINDOW qualify, and a candidate is claimed only when it can
+        be attributed to this node unambiguously (see ``_claimable_locked``:
+        exact node-id identity, or the sole unidentified retry of one setup
+        code). Returns the claimed jobId, or None if no job qualified.
         """
         if not isinstance(raw_node, dict) or raw_node.get("node_id") is None:
             with self._lock:
@@ -306,24 +307,25 @@ class CommissionJobs:
         node_id = raw_node.get("node_id")
         stale: Optional[Job] = None
         with self._lock:
-            cutoff = self._clock() - RECONCILE_WINDOW
-            candidates = self._timeout_candidates_locked(cutoff)
-            if not candidates:
-                expired = self._timeout_candidates_locked(None)
-                stale = expired[-1] if expired else None
+            job, candidates = self._claimable_locked(node_id, self._clock() - RECONCILE_WINDOW)
+            if job is None:
+                if not candidates:
+                    expired = self._timeout_candidates_locked(None)
+                    stale = expired[-1] if expired else None
             else:
-                job = candidates[-1]
                 # Claim it inside the lock (a second node_added must not double-claim):
                 # re-opening to CREATING_DEVICES is honest — that's the work left.
-                # Keep the priors so a failed schedule can restore the terminal
-                # timeout state exactly (including the original terminal_at).
-                prior_error, job.error = job.error, None
-                prior_terminal_at, job.terminal_at = job.terminal_at, None
-                prior_progress, job.progress = job.progress, 0.85
-                prior_message, job.message = job.message, "Device joined after timeout; creating Indigo devices…"
-                prior_node_id, job.node_id = job.node_id, node_id
+                # Keep the priors (one tuple, not five locals) so a failed schedule
+                # can restore the terminal timeout state exactly (including the
+                # original terminal_at).
+                priors = (job.error, job.terminal_at, job.progress, job.message, job.node_id)
+                job.error = None
+                job.terminal_at = None
+                job.progress = 0.85
+                job.message = "Device joined after timeout; creating Indigo devices…"
+                job.node_id = node_id
                 job.status = CREATING_DEVICES
-        if not candidates:
+        if job is None:
             if stale is not None:
                 self.logger.warning(
                     "node %s joined after commission job %s timed out, but outside "
@@ -331,6 +333,8 @@ class CommissionJobs:
                     "were not applied", node_id_to_str(node_id), stale.job_id,
                     RECONCILE_WINDOW.total_seconds() / 60,
                 )
+            elif candidates:
+                self._log_reconcile_refusal(node_id, candidates)
             return None
         coro = self._reconcile_job(job, raw_node)
         try:
@@ -342,11 +346,7 @@ class CommissionJobs:
                 # job. Restore the ORIGINAL terminal_at (not a fresh stamp) so the
                 # documented reconcile-window bound is preserved.
                 job.status = FAILED
-                job.error = prior_error
-                job.progress = prior_progress
-                job.message = prior_message
-                job.terminal_at = prior_terminal_at
-                job.node_id = prior_node_id
+                job.error, job.terminal_at, job.progress, job.message, job.node_id = priors
             self.logger.error(
                 "commission job %s: node %s joined but the reconcile could not be "
                 "scheduled (%s); job restored to its timed-out state",
@@ -354,6 +354,31 @@ class CommissionJobs:
             )
             return None
         return job.job_id
+
+    def _log_reconcile_refusal(self, node_id: Any, candidates: list[Job]) -> None:
+        """Explain why none of ``candidates`` (all inside the reconcile window)
+        could be claimed for ``node_id``. Called outside ``self._lock``."""
+        unidentified = [c for c in candidates if c.node_id is None]
+        if unidentified:
+            # Branch (d)/(e) of _claimable_locked: two or more different
+            # setup codes are waiting unidentified — the event names neither.
+            self.logger.warning(
+                "node %s joined while commission jobs %s were all waiting to "
+                "reconcile — it cannot be told which one it belongs to, so none "
+                "was claimed; suggestedName/suggestedRoom were not applied. "
+                "Rename in Indigo, or commission one device at a time.",
+                node_id_to_str(node_id), ", ".join(c.job_id for c in unidentified),
+            )
+        else:
+            # Every candidate is already identified with a DIFFERENT node.
+            self.logger.info(
+                "node %s joined; no waiting commission job is waiting for it (%s)",
+                node_id_to_str(node_id),
+                ", ".join(
+                    f"job {c.job_id} is waiting for node {node_id_to_str(c.node_id)}"
+                    for c in candidates
+                ),
+            )
 
     def _timeout_candidates_locked(self, cutoff: Optional[datetime]) -> list[Job]:
         """Jobs that failed with commissioning_timeout, oldest→newest.
@@ -372,6 +397,35 @@ class CommissionJobs:
             ),
             key=lambda j: j.terminal_at,
         )
+
+    def _claimable_locked(
+        self, node_id: Any, cutoff: datetime
+    ) -> tuple[Optional[Job], list[Job]]:
+        """Which timeout candidate (if any) may claim ``node_id``, and the
+        full candidate list (for refusal logging). Caller must hold
+        ``self._lock``.
+        """
+        candidates = self._timeout_candidates_locked(cutoff)
+        if not candidates:
+            return None, candidates
+        # Exact identity wins outright: matter-server has already named this
+        # job's node (e.g. a prior partial reconcile).
+        exact = [c for c in candidates if c.node_id is not None and _same_node(c.node_id, node_id)]
+        if exact:
+            return exact[-1], candidates
+        # A job whose node we KNOW, and it isn't this one, cannot claim this
+        # node — only jobs with an unidentified node are still eligible.
+        unidentified = [c for c in candidates if c.node_id is None]
+        if not unidentified:
+            return None, candidates
+        # Same setup code among the unidentified = same physical device: retries
+        # of one join, and the newest carries the user's latest name/room.
+        if len({c.setup_code for c in unidentified}) == 1:
+            return unidentified[-1], candidates
+        # Two DIFFERENT devices are waiting and this event names neither.
+        # Refusing costs a name and a room; guessing wrong flips a job to
+        # success carrying another device's nodeId, which Domio then trusts.
+        return None, candidates
 
     async def _reconcile_job(self, job: Job, raw_node: dict) -> None:
         node_id = raw_node.get("node_id")

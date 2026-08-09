@@ -259,7 +259,11 @@ will therefore see `failed` → (possibly `creating_devices`) → `success`. Cli
 that stopped polling should treat `commissioning_timeout` as "may still finish —
 check Indigo", which matches Domio's existing 120s soft-timeout message. The
 plugin's job-level commission deadline is 300s and may legitimately outlive
-Domio's 120s poll window.
+Domio's 120s poll window. The plugin reconciles only when the joining node can
+be attributed unambiguously: if two jobs for *different* setup codes are both
+inside their window when a node joins, neither is claimed (the jobs stay
+`failed`, and the devices are created with the device's own product name).
+Retries of the same setup code are one device and reconcile normally.
 
 ### 3.4 `POST …/message/com.simons-plugins.indigo-matter/decommission?nodeId={nodeId}`
 

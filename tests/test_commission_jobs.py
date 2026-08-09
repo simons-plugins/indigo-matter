@@ -501,7 +501,27 @@ def test_reconcile_ignores_non_timeout_failures(mock_logger):
     asyncio.run(scenario())
 
 
-def test_reconcile_claims_most_recent_timeout(mock_logger):
+def test_reconcile_claims_the_newest_retry_of_the_same_setup_code(mock_logger):
+    async def scenario():
+        clock = {"t": datetime(2026, 6, 10, 12, 0, tzinfo=timezone.utc)}
+        jobs = _jobs(TimeoutMatter(), mock_logger,
+                     schedule=asyncio.ensure_future, clock=lambda: clock["t"])
+        _, body1 = jobs.create_job({"setupCode": "12345678901", "suggestedName": "A"})
+        await _await_terminal(jobs, body1["jobId"])()
+        clock["t"] += timedelta(minutes=2)
+        # a retry of the SAME setup code — create_job treats it as new because
+        # the prior job is already terminal, not a 409 duplicate
+        _, body2 = jobs.create_job({"setupCode": "12345678901", "suggestedName": "A"})
+        await _await_terminal(jobs, body2["jobId"])()
+
+        assert jobs.reconcile_node_added({"node_id": 7}) == body2["jobId"]
+        await _await_terminal(jobs, body2["jobId"])()
+        _, old = jobs.get_job(body1["jobId"])
+        assert old["status"] == "failed"  # older retry left alone
+    asyncio.run(scenario())
+
+
+def test_reconcile_refuses_two_devices_in_window(mock_logger):
     async def scenario():
         clock = {"t": datetime(2026, 6, 10, 12, 0, tzinfo=timezone.utc)}
         jobs = _jobs(TimeoutMatter(), mock_logger,
@@ -512,10 +532,70 @@ def test_reconcile_claims_most_recent_timeout(mock_logger):
         _, body2 = jobs.create_job({"setupCode": "98765432109", "suggestedName": "B"})
         await _await_terminal(jobs, body2["jobId"])()
 
-        assert jobs.reconcile_node_added({"node_id": 7}) == body2["jobId"]
-        await _await_terminal(jobs, body2["jobId"])()
-        _, old = jobs.get_job(body1["jobId"])
-        assert old["status"] == "failed"  # older timeout left alone
+        mock_logger.warning.reset_mock()
+        # two DIFFERENT setup codes are both waiting — the event names neither,
+        # so nothing is claimed
+        assert jobs.reconcile_node_added({"node_id": 7}) is None
+
+        _, final1 = jobs.get_job(body1["jobId"])
+        _, final2 = jobs.get_job(body2["jobId"])
+        assert final1["status"] == "failed" and final1["error"]["code"] == "commissioning_timeout"
+        assert final2["status"] == "failed" and final2["error"]["code"] == "commissioning_timeout"
+
+        mock_logger.warning.assert_called_once()
+        logged = str(mock_logger.warning.call_args)
+        assert body1["jobId"] in logged and body2["jobId"] in logged
+    asyncio.run(scenario())
+
+
+def test_reconcile_prefers_the_job_whose_node_id_matches(mock_logger):
+    async def scenario():
+        clock = {"t": datetime(2026, 6, 10, 12, 0, tzinfo=timezone.utc)}
+        jobs = _jobs(TimeoutMatter(), mock_logger,
+                     schedule=asyncio.ensure_future, clock=lambda: clock["t"])
+        _, body1 = jobs.create_job({"setupCode": "12345678901", "suggestedName": "A"})
+        await _await_terminal(jobs, body1["jobId"])()
+        jobs._jobs[body1["jobId"]].node_id = 7  # matter-server already named this one
+
+        clock["t"] += timedelta(minutes=2)
+        _, body2 = jobs.create_job({"setupCode": "98765432109", "suggestedName": "B"})
+        await _await_terminal(jobs, body2["jobId"])()  # newer, but unidentified
+
+        # exact identity beats recency
+        assert jobs.reconcile_node_added({"node_id": 7}) == body1["jobId"]
+        await _await_terminal(jobs, body1["jobId"])()
+        _, other = jobs.get_job(body2["jobId"])
+        assert other["status"] == "failed"  # untouched
+    asyncio.run(scenario())
+
+
+def test_reconcile_ignores_a_node_no_waiting_job_expects(mock_logger):
+    async def scenario():
+        jobs = _jobs(TimeoutMatter(), mock_logger, schedule=asyncio.ensure_future)
+        _, body = jobs.create_job({"setupCode": "12345678901", "suggestedName": "X"})
+        await _await_terminal(jobs, body["jobId"])()
+        jobs._jobs[body["jobId"]].node_id = 9  # already claimed a different node
+
+        mock_logger.info.reset_mock()
+        assert jobs.reconcile_node_added({"node_id": 7}) is None
+        _, final = jobs.get_job(body["jobId"])
+        assert final["status"] == "failed"  # untouched
+
+        mock_logger.info.assert_called_once()
+        logged = str(mock_logger.info.call_args)
+        assert body["jobId"] in logged and "0x9" in logged
+    asyncio.run(scenario())
+
+
+def test_reconcile_records_the_claimed_node_id(mock_logger):
+    async def scenario():
+        jobs = _jobs(TimeoutMatter(), mock_logger, schedule=asyncio.ensure_future)
+        _, body = jobs.create_job({"setupCode": "12345678901", "suggestedName": "X"})
+        await _await_terminal(jobs, body["jobId"])()
+
+        assert jobs.reconcile_node_added({"node_id": 7}) == body["jobId"]
+        await _await_terminal(jobs, body["jobId"])()
+        assert jobs._jobs[body["jobId"]].node_id == 7
     asyncio.run(scenario())
 
 
@@ -586,6 +666,7 @@ def test_reconcile_schedule_failure_restores_timeout_state(mock_logger):
         assert job.error == {"code": "commissioning_timeout", "message": TIMEOUT_MESSAGE}
         assert job.message == ""  # claim-time message rolled back
         assert job.terminal_at == original_terminal_at  # NOT refreshed to clock now
+        assert job.node_id is None  # claim-time node_id rolled back too
         mock_logger.error.assert_called()
         assert body["jobId"] in str(mock_logger.error.call_args)
 
