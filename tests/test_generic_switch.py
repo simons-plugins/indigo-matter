@@ -313,6 +313,30 @@ def test_node_event_active_gate_blocks_inactive_device(ds, indigo_env):
     assert devices[dev.id].states.get("lastButtonEvent", "") == ""
 
 
+def test_node_event_deleted_device_debug_not_traceback(ds, indigo_env, mock_logger):
+    """#84: a deletion race on the EVENT path is a debug line, not a KeyError.
+
+    This is the chattier route (switch presses, lock operations) — the
+    unguarded lookup used to put a full traceback in the event log per event
+    via the plugin's _on_matter_event handler.
+    """
+    _indigo, devices = indigo_env
+    dev = _make_button_dev(devices)
+    ds._index[(10, 1)] = {"matterButton": dev.id}
+    del devices._by_id[dev.id]
+
+    ds.handle_event(MatterEvent(
+        kind=protocol.EVT_NODE_EVENT,
+        node_id=10, endpoint=1, cluster=CLUSTER_SWITCH,
+        event_id=EVT_SHORT_RELEASE, event_data=None,
+    ))  # must not raise
+
+    debug_msgs = [c[0][0] % tuple(c[0][1:]) for c in mock_logger.debug.call_args_list]
+    assert any("vanished" in m and str(dev.id) in m for m in debug_msgs)
+    warn_msgs = [c[0][0] for c in mock_logger.warning.call_args_list]
+    assert not any("bad node_event" in m for m in warn_msgs)
+
+
 def test_node_event_unknown_cluster_ignored(ds, indigo_env):
     """node_event for a cluster with no registered handler is silently dropped."""
     _indigo, devices = indigo_env
