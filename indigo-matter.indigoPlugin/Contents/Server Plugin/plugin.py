@@ -1,10 +1,17 @@
 """indigo-matter — Matter device support for the Indigo home automation server.
 
-Lifecycle glue only. All I/O lives on the asyncio loop owned by
-:class:`AsyncRuntime`; this class wires the async services in ``startup``, runs a
-non-I/O watchdog in ``runConcurrentThread``, tears everything down in
-``shutdown``, bridges Indigo device actions onto the loop, and exposes the Domio
-HTTP API as Indigo Web Server hidden-action handlers.
+Lifecycle glue and the device/action bridge. All I/O lives on the asyncio loop
+owned by :class:`AsyncRuntime`; this class wires the async services in
+``startup``, runs a non-I/O watchdog in ``runConcurrentThread``, tears
+everything down in ``shutdown``, and bridges Indigo device actions onto the
+loop. Everything Indigo reaches only through XML-named callbacks — the IWS
+HTTP handlers, the export dialog, pairing/fabric management, and the
+matter-server/bridge-node menus — has moved to mixins (issue #146):
+:class:`HttpApiMixin`, :class:`ExportDialogMixin`, :class:`PairingMenuMixin`,
+:class:`ServerMenuMixin`. ``plugin_constants.py`` holds the shared constants
+and prefs helpers; ``pairing_page.py`` holds the pairing IWS page template.
+``Plugin`` composes all four mixins so every callback still resolves as a
+plain attribute on the ``Plugin`` class, which is how Indigo looks them up.
 
 See ``docs/PRD-indigo-matter-plugin.md``, ``docs/IMPLEMENTATION.md`` (protocol +
 scaffold) and ``docs/API.md`` (the Domio contract). matter-server protocol field
@@ -12,23 +19,19 @@ names are isolated in ``protocol.py``.
 """
 from __future__ import annotations
 
-import json
-import os
 import threading
 import time
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from datetime import datetime, timezone
-from typing import Any, Optional
 
 import indigo  # provided by the Indigo runtime
 
-import bridge_client
 from async_runtime import AsyncRuntime
 from commission_jobs import CommissionJobs
 from device_sync import DeviceSync
 import export_bridge
 from export_bridge import ExportBridge
-import export_dialog_mixin
+import export_dialog_mixin      # noqa: F401  (tests patch export_dialog_mixin.EXPORT_PICKER_LIMIT)
 from export_dialog_mixin import ExportDialogMixin
 from export_store import ExportStore
 from http_api_mixin import HttpApiMixin
@@ -39,12 +42,10 @@ from matter_handlers.boolean_state_config import (
     CLUSTER_BOOLEAN_STATE_CONFIG,
 )
 from matter_handlers.registry import HandlerRegistry
-from pairing_page import _escape, _pairing_html
-import pairing_menu_mixin
 from pairing_menu_mixin import PairingMenuMixin
 import protocol
 from protocol import MatterWrite, Protocol
-import server_menu_mixin
+import server_menu_mixin        # noqa: F401  (tests patch server_menu_mixin.ServerProcess)
 from server_menu_mixin import ServerMenuMixin
 from server_process import ServerProcess
 
