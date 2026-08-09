@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import importlib
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -2423,3 +2424,129 @@ def test_sensitivity_levels_supported_refreshed_on_reconcile(ds, indigo_env):
     changed["attributes"]["1/128/1"] = 5
     ds.reconcile_all([changed])
     assert ds.sensitivity_levels_supported(0x2D, 1) == 5
+
+
+# ===========================================================================
+# issue #84 — KeyError guard: Indigo device deleted out-of-band while its
+# Matter node keeps reporting must not raise/spam warnings on every event.
+# ===========================================================================
+
+def test_attribute_event_deleted_device_debug_not_bad_update_warning(ds, indigo_env, mock_logger):
+    """Non-node-scoped path (_on_attribute): a deletion race is a debug line,
+    not the "bad update" WARNING — and must not raise."""
+    _indigo, devices = indigo_env
+    ds.create_from_raw(RELAY_NODE, "Office Plug")
+    dev_id = ds.lookup(42, 1)
+    del devices._by_id[dev_id]
+
+    ds.handle_event(MatterEvent(
+        kind=protocol.EVT_ATTRIBUTE_UPDATED,
+        node_id=42, endpoint=1, cluster=0x0006, attribute=0x0000, value=True,
+    ))  # must not raise
+
+    debug_msgs = [c[0][0] % tuple(c[0][1:]) for c in mock_logger.debug.call_args_list]
+    assert any("vanished" in m and str(dev_id) in m for m in debug_msgs)
+    warn_msgs = [c[0][0] for c in mock_logger.warning.call_args_list]
+    assert not any("bad update" in m for m in warn_msgs)
+
+
+def test_apply_states_deleted_device_debug_logs_no_raise(ds, indigo_env, mock_logger):
+    """apply_states (the single asyncio→Indigo write seam): a deletion race
+    guards only the dict lookup — debug log, no raise."""
+    _indigo, devices = indigo_env
+    ds.create_from_raw(RELAY_NODE, "Office Plug")
+    dev_id = ds.lookup(42, 1)
+    del devices._by_id[dev_id]
+
+    ds.apply_states(dev_id, [{"key": "onOffState", "value": True}])  # must not raise
+
+    debug_msgs = [c[0][0] % tuple(c[0][1:]) for c in mock_logger.debug.call_args_list]
+    assert any("vanished" in m and str(dev_id) in m for m in debug_msgs)
+
+
+def test_apply_states_non_keyerror_update_failure_still_propagates(ds, indigo_env):
+    """Pins today's behaviour: apply_states' guard is scoped to the dict
+    lookup only. None of apply_states' three callers (_on_attribute's two
+    paths, the reconcile prime path) catch its exceptions today, so an
+    ``updateStatesOnServer`` failure that is NOT a deletion race must keep
+    propagating exactly as before this fix."""
+    _indigo, devices = indigo_env
+    ds.create_from_raw(RELAY_NODE, "Office Plug")
+    dev_id = ds.lookup(42, 1)
+    devices[dev_id].updateStatesOnServer = Mock(side_effect=RuntimeError("server write failed"))
+
+    with pytest.raises(RuntimeError, match="server write failed"):
+        ds.apply_states(dev_id, [{"key": "onOffState", "value": True}])
+
+
+def _create_aq_battery_node(ds, indigo_env, node_id=830):
+    """AQ node (4 additive devices on endpoint 1) + node-scoped PowerSource
+    on endpoint 0 — mirrors test_battery_fanout_reaches_all_devices_on_aq_endpoint."""
+    _indigo, devices = indigo_env
+    node = {
+        "node_id": node_id,
+        "attributes": {
+            "0/47/12": 120,        # PowerSource.BatPercentRemaining = 60 %
+            "1/91/0": 1,           # AirQuality: good
+            "1/1037/0": 400.0,     # CO2
+            "1/1066/0": 5.0,       # PM2.5
+            "1/1070/0": 50.0,      # TVOC
+            "1/29/0": [{"0": 0x0073}],
+        },
+    }
+    original_create = _indigo.device.create
+
+    def create_with_battery(**kw):
+        dev = original_create(**kw)
+        dev.states["batteryLevel"] = 0
+        return dev
+
+    _indigo.device.create = create_with_battery
+    ds.create_from_raw(node, "AQ Sensor")
+    _indigo.device.create = original_create
+    return node_id
+
+
+def test_node_scoped_deleted_device_debug_not_warning(ds, indigo_env, mock_logger):
+    """Node-scoped path (PowerSource fan-out): one sibling device deleted
+    out-of-band must be a debug line, not the "bad update" WARNING, and the
+    fan-out must still reach the surviving siblings on the endpoint."""
+    _indigo, devices = indigo_env
+    node_id = _create_aq_battery_node(ds, indigo_env)
+    victim_id = ds.lookup(node_id, 1, "matterCO2Sensor")
+    del devices._by_id[victim_id]
+
+    ds.handle_event(MatterEvent(
+        kind=protocol.EVT_ATTRIBUTE_UPDATED,
+        node_id=node_id, endpoint=0, cluster=0x002F, attribute=0x000C, value=160,
+    ))  # must not raise
+
+    debug_msgs = [c[0][0] % tuple(c[0][1:]) for c in mock_logger.debug.call_args_list]
+    assert any("vanished" in m and str(victim_id) in m for m in debug_msgs)
+    warn_msgs = [c[0][0] for c in mock_logger.warning.call_args_list]
+    assert not any("bad update" in m for m in warn_msgs)
+    # surviving siblings still received the fan-out
+    for type_id in ("matterAirQualitySensor", "matterPM25Sensor", "matterTVOCSensor"):
+        dev_id = ds.lookup(node_id, 1, type_id)
+        assert devices[dev_id].states.get("batteryLevel") == 80
+
+
+def test_node_scoped_handler_keyerror_still_bad_update_warning(ds, indigo_env, mock_logger, monkeypatch):
+    """Scoping test: the KeyError guard at the node-scoped site covers ONLY
+    the ``indigo.devices[dev_id]`` lookup. A handler that itself raises
+    KeyError (for reasons unrelated to a deleted device) must still hit the
+    broad "bad update" WARNING, not be mistaken for a deletion race."""
+    _indigo, devices = indigo_env
+    node_id = _create_aq_battery_node(ds, indigo_env)
+    handler = ds.registry.handler_for_cluster(0x002F)
+    monkeypatch.setattr(handler, "on_attribute_update", Mock(side_effect=KeyError("unrelated")))
+
+    ds.handle_event(MatterEvent(
+        kind=protocol.EVT_ATTRIBUTE_UPDATED,
+        node_id=node_id, endpoint=0, cluster=0x002F, attribute=0x000C, value=160,
+    ))  # must not raise
+
+    warn_msgs = [c[0][0] % tuple(c[0][1:]) for c in mock_logger.warning.call_args_list]
+    assert any("bad update" in m for m in warn_msgs)
+    debug_msgs = [c[0][0] for c in mock_logger.debug.call_args_list]
+    assert not any("vanished" in m for m in debug_msgs)
