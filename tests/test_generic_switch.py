@@ -463,29 +463,56 @@ def test_on_node_event_multi_press_n_greater_than_3():
     assert result["lastButtonEvent"] == "multiPress5"
 
 
-def test_on_node_event_multi_press_count_1_falls_back_to_short():
-    """totalNumberOfPressesCounted=1 from MultiPressComplete treated as shortPress."""
+def test_on_node_event_multi_press_count_1_is_suppressed():
+    """#76: count=1 is the NORMAL close of a single press — the ShortRelease
+    ~0.5s earlier already surfaced and counted it, so acting here double-bumped
+    pressCount on every clean single click (live BILRESA evidence)."""
     h = _handler()
     dev = _fake_dev_dict()
     result = h.on_node_event(dev, EVT_MULTI_PRESS_COMPLETE,
                               {"totalNumberOfPressesCounted": 1})
-    assert result["lastButtonEvent"] == "shortPress"
+    assert result == {}
 
 
-def test_on_node_event_multi_press_missing_count_defaults_to_1():
-    """Missing totalNumberOfPressesCounted defaults to 1 → shortPress."""
+def test_on_node_event_multi_press_missing_count_defaults_to_1_and_suppresses():
+    """Missing totalNumberOfPressesCounted defaults to 1 → suppressed (#76)."""
     h = _handler()
     dev = _fake_dev_dict()
-    result = h.on_node_event(dev, EVT_MULTI_PRESS_COMPLETE, {})
-    assert result["lastButtonEvent"] == "shortPress"
+    assert h.on_node_event(dev, EVT_MULTI_PRESS_COMPLETE, {}) == {}
 
 
-def test_on_node_event_multi_press_null_data():
-    """data=None for MultiPressComplete: treats as count=1 → shortPress."""
+def test_on_node_event_multi_press_null_data_suppresses():
+    """data=None for MultiPressComplete: treats as count=1 → suppressed (#76)."""
     h = _handler()
     dev = _fake_dev_dict()
-    result = h.on_node_event(dev, EVT_MULTI_PRESS_COMPLETE, None)
-    assert result["lastButtonEvent"] == "shortPress"
+    assert h.on_node_event(dev, EVT_MULTI_PRESS_COMPLETE, None) == {}
+
+
+def test_a_clean_single_press_bumps_press_count_exactly_once():
+    """#76 regression, the BILRESA pair: InitialPress (ignored) → ShortRelease
+    (counts) → MultiPressComplete count=1 (~0.5s later, must NOT count).
+    Before the fix a 3-single-press test produced pressCount += 6, not 3."""
+    h = _handler()
+    dev = _fake_dev_dict()
+    assert h.on_node_event(dev, EVT_INITIAL_PRESS, None) == {}
+    first = h.on_node_event(dev, EVT_SHORT_RELEASE, {"previousPosition": 0})
+    assert first == {"lastButtonEvent": "shortPress", "pressCount": 1}
+    dev.states.update(first)
+    assert h.on_node_event(dev, EVT_MULTI_PRESS_COMPLETE,
+                           {"previousPosition": 0,
+                            "totalNumberOfPressesCounted": 1}) == {}
+    assert dev.states["pressCount"] == 1
+
+
+def test_a_genuine_double_press_still_counts_via_multi_press_complete():
+    """The count >= 2 path is the one MultiPressComplete exists for — it must
+    survive #76's suppression of the count <= 1 close."""
+    h = _handler()
+    dev = _fake_dev_dict()
+    result = h.on_node_event(dev, EVT_MULTI_PRESS_COMPLETE,
+                              {"totalNumberOfPressesCounted": 2})
+    assert result["lastButtonEvent"] == "doublePress"
+    assert result["pressCount"] == 1
 
 
 def test_on_node_event_unknown_event_id_returns_empty():

@@ -129,9 +129,17 @@ class GenericSwitchHandler(ClusterHandler):
             elif count > 3:
                 label = f"multiPress{count}"
             else:
-                # count ≤ 1 from a MultiPressComplete is unexpected per spec
-                # (that would be a ShortRelease); treat it as a short press.
-                label = "shortPress"
+                # count ≤ 1 is the NORMAL close of a single press on a
+                # multi-press-capable switch, not an anomaly: the device
+                # already emitted ShortRelease for it ~0.5s earlier and this
+                # handler already counted that (issue #76 — live BILRESA
+                # evidence: every clean single click emits the pair, so
+                # treating this as a second shortPress double-bumped
+                # pressCount on every press). ShortRelease stays the instant
+                # signal (it is what makes scrolling feel live); this event
+                # only carries new information when it reports a genuine
+                # multi-count.
+                return {}
         else:
             # Unknown event id — unsubscribed events (LongRelease, MultiPressOngoing)
             # or future cluster revisions. Return {} to ignore gracefully.
