@@ -1187,6 +1187,17 @@ def test_removal_in_flight_blocks_reconcile_at_the_fail_site(mock_logger):
             terminal_at=datetime.now(timezone.utc),
         )
         jobs._jobs[candidate.job_id] = candidate
+        # G1: a SECOND timeout candidate, inside the same reconcile window,
+        # but already identified with a DIFFERENT node (99). It was never
+        # eligible to claim node 7 and was never refused — it must not be
+        # named alongside the real candidate.
+        unrelated = commission_jobs.Job(
+            job_id="unrelated", setup_code="00000000099", suggested_name="C",
+            suggested_room=None, status=commission_jobs.FAILED, node_id=99,
+            error={"code": "commissioning_timeout", "message": "x"},
+            terminal_at=datetime.now(timezone.utc),
+        )
+        jobs._jobs[unrelated.job_id] = unrelated
 
         _, body_b = jobs.create_job({"setupCode": "12345678901", "suggestedName": "B"})
         task_b = asyncio.ensure_future(_await_terminal(jobs, body_b["jobId"])())
@@ -1203,6 +1214,9 @@ def test_removal_in_flight_blocks_reconcile_at_the_fail_site(mock_logger):
         # R5: the refused claimant appears in the log line, not just "not
         # claimed" — traceable if the removal itself later fails too.
         assert candidate.job_id in logged
+        # G1: the unrelated candidate (identified with a different node)
+        # must NOT be named as refused.
+        assert unrelated.job_id not in logged
 
         release.set()
         final_b = await task_b

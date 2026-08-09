@@ -124,14 +124,19 @@ def _node_key(value: Any) -> Any:
     ``int(s, 10)`` rejects, e.g. the superscript "²", which would otherwise
     let a ValueError escape instead of falling back to a ``str`` key).
     An ALL-DIGIT unprefixed hex string ("1234" meaning hex, not decimal
-    1234) parses as DECIMAL via the initial ``int(value, 0)`` call — it
-    never even reaches this fallback — and so CAN in principle falsely
-    collide with decimal 1234; only a LETTER-bearing unprefixed hex string
-    ("1abc") fails both parses and stays a ``str`` key — a one-directional
-    no-match against the equivalent int, never a false collision. The
-    mitigation is that :func:`node_id_to_str` always emits the ``0x``
-    prefix, so the codebase itself never produces an unprefixed hex string
-    in either case.
+    1234): an UNPADDED one parses as DECIMAL via the initial ``int(value, 0)``
+    call and never even reaches this fallback; a ZERO-PADDED one ("01234")
+    fails that first parse too (leading zeros are illegal there) and DOES
+    reach this fallback, where it also parses as decimal. Either way it CAN
+    in principle falsely collide with the equivalent decimal id; only a
+    LETTER-bearing unprefixed hex string ("1abc") fails both parses and
+    stays a ``str`` key — a one-directional no-match against the equivalent
+    int, never a false collision. The mitigation is NOT that
+    :func:`node_id_to_str` sanitises this — it only formats ``int`` node ids
+    with the ``0x`` prefix, and a ``str`` node id passes straight through it
+    unchanged — the mitigation is that the codebase never mints an
+    unprefixed hex string by hand in the first place, so no caller
+    constructs one for either function to collide against.
     """
     if isinstance(value, str):
         try:
@@ -153,9 +158,11 @@ def _same_node(a: Any, b: Any) -> bool:
 
 def _node_int(value: Any) -> Optional[int]:
     """Coerce a node id to ``int`` via :func:`_node_key`'s policy, or ``None``
-    when it can't be — an unprefixed hex string ``_node_key`` deliberately
-    leaves as ``str`` (#A1: the seam into ``device_sync.knows_node``, which
-    does an unguarded ``int(node_id)``, must never see one of those raw)."""
+    when it can't be — a LETTER-bearing unprefixed hex string is what
+    ``_node_key`` deliberately leaves as ``str`` (an all-digit unprefixed
+    string parses as decimal instead, per :func:`_node_key`'s own docstring)
+    (#A1: the seam into ``device_sync.knows_node``, which does an unguarded
+    ``int(node_id)``, must never see one of those raw)."""
     key = _node_key(value)
     return key if isinstance(key, int) else None
 
@@ -397,8 +404,14 @@ class CommissionJobs:
                 # clears and this node's key is discarded, a later
                 # node_added for it CAN still be claimed (reconcile window
                 # permitting), so a fresh commission isn't the only way back.
-                if candidates:
-                    who = "refused candidate job(s): " + ", ".join(c.job_id for c in candidates)
+                # Only name candidates that could actually have claimed this
+                # node — an already-identified candidate waiting on a
+                # DIFFERENT node was never eligible and was never refused;
+                # naming it here would be misleading (mirrors the filter
+                # _log_reconcile_refusal already applies).
+                relevant = [c for c in candidates if c.node_id is None or _same_node(c.node_id, node_id)]
+                if relevant:
+                    who = "refused candidate job(s): " + ", ".join(c.job_id for c in relevant)
                 else:
                     who = "no other candidate is currently in the reconcile window"
                 self.logger.warning(
@@ -838,9 +851,16 @@ class CommissionJobs:
         the only fire-and-forget coroutine in the module (``_run_job`` and
         ``_reconcile_job`` are scheduled the same way, with no caller ever
         retrieving their result either), but because THOSE are
-        exception-total by construction: every one of their ``except``
-        clauses lands the job in a terminal state, so nothing can escape
-        past them. This coroutine's body was not written that way, so a
+        exception-total FOR ``Exception``-CLASS RAISES by construction:
+        every one of their ``except`` clauses lands the job in a terminal
+        state. That claim is narrower than "nothing can escape past them"
+        at all: ``_run_job``'s own cancellation clause deliberately
+        RE-RAISES ``CancelledError`` after landing FAILED, by design, and a
+        cancellation landing INSIDE its subsequent ``await self._fail(...)``
+        can still propagate the task out non-terminal — ``CancelledError``
+        has been a ``BaseException`` subclass since Python 3.8, so it was
+        never covered by the "exception-total" claim to begin with. This
+        coroutine's body was not written that way, so an ``Exception``-class
         raise that escaped — e.g. from ``knows_node`` inside
         ``_remove_orphaned_node`` — would otherwise vanish silently.
 
@@ -1034,13 +1054,21 @@ class CommissionJobs:
         time — ``self._removing`` is a plain set, not a refcount, so a
         SECOND concurrent removal of the same node would discard the key
         out from under the first when it (the second) finishes, reopening
-        the A2 window early. Currently impossible via the two existing
-        callers (``_fail`` and ``_remove_orphaned_node``): this holder check
-        itself interlocks them, since whichever runs first claims the node
-        as a "holder" (or marks it removing) before the other can reach its
-        own check. A third caller of this method must not widen that to two
-        genuinely concurrent removals of the same node without upgrading
-        ``_removing`` to a refcount.
+        the A2 window early. This holder check never consults
+        ``self._removing`` — only ``self._jobs``' non-FAILED node_id
+        matches — so it does not interlock the two existing callers
+        symmetrically, and the interlock it DOES provide is directional:
+        if ``_fail`` runs first, its job is still non-FAILED with node_id
+        set, so it IS a holder the second caller's own check would see and
+        back off from; if ``_remove_orphaned_node`` runs first there is no
+        holder-check interlock at all. What actually makes that second
+        ordering unreachable today is not this method — it is that
+        ``_remove_orphaned_node`` only ever runs on a node_id that arrived
+        via a #23 late success, which requires matter-server to name the
+        SAME node in two different commission RPC answers to even set up
+        the race. A third caller of this method, or any change that lets
+        two removals of the same node genuinely race, must not rely on
+        that without upgrading ``_removing`` to a refcount.
         """
         with self._lock:
             holders = [
