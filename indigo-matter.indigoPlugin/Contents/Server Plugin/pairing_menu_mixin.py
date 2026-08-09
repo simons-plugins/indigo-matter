@@ -188,7 +188,7 @@ class PairingMenuMixin:
             self.logger.debug("could not resolve the Indigo web server URL (%s)", exc)
         return f"{base}/message/{self._export_plugin_id()}/pairing/"  # pylint: disable=no-member  # ExportDialogMixin
 
-    def getBridgeFabrics(self, filter="", valuesDict=None, typeId="", targetId=0):
+    def getBridgeFabrics(self, filter="", valuesDict=None, typeId="", targetId=0):  # noqa: N802, A002
         # pylint: disable=redefined-builtin, unused-argument
         """Picker rows for the unpair menu: one per commissioned ecosystem.
 
