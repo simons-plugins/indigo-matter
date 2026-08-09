@@ -40,6 +40,8 @@ class MatterClient(WsJsonClient):
 
     PEER = "matter-server"
 
+    # The callbacks ARE the constructor's arity — same trade BridgeClient makes.
+    # pylint: disable=too-many-arguments,too-many-locals
     def __init__(
         self,
         proto: Protocol,
@@ -51,6 +53,7 @@ class MatterClient(WsJsonClient):
         on_connect: Optional[Callable[[], Awaitable]] = None,
         on_disconnect: Optional[Callable[[], None]] = None,
         on_repeated_failure: Optional[Callable[[int], None]] = None,
+        on_late_response: Optional[Callable[[Any], None]] = None,
         now: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], Awaitable] = asyncio.sleep,
     ) -> None:
@@ -67,7 +70,8 @@ class MatterClient(WsJsonClient):
         super().__init__(
             uri, logger,
             connect=connect, on_connect=on_connect, on_disconnect=on_disconnect,
-            on_repeated_failure=on_repeated_failure, now=now, sleep=sleep,
+            on_repeated_failure=on_repeated_failure, on_late_response=on_late_response,
+            now=now, sleep=sleep,
         )
         self._on_event = on_event
         self.server_info: Optional[dict] = None
@@ -143,13 +147,18 @@ class MatterClient(WsJsonClient):
     async def get_node(self, node_id: int) -> Any:
         return await self.request(protocol.CMD_GET_NODE, {"node_id": node_id})
 
-    async def commission_with_code(self, code: str, timeout: float = COMMISSION_TIMEOUT) -> Any:
+    async def commission_with_code(self, code: str, timeout: float = COMMISSION_TIMEOUT,
+                                   context: Any = None) -> Any:
         # network_only=True → IP discovery (mDNS) + PASE/CASE over IP, no BLE.
         # The plugin only ever joins devices that are ALREADY commissioned and on
         # the network (the "share model": Apple Home is admin 1; we join as a
         # second administrator via an open commissioning window). We never do
         # fresh Wi-Fi/Thread onboarding — that is the controlling app's job.
-        return await self.request(protocol.CMD_COMMISSION, {"code": code, "network_only": True}, timeout)
+        # Built explicitly (not via self.request) because commission is the one
+        # RPC a caller correlates a LATE answer against (#23) — request() has no
+        # context param, and this is COMMISSION_TIMEOUT's one caller anyway.
+        frame = self.proto.build_request(protocol.CMD_COMMISSION, {"code": code, "network_only": True})
+        return await self._request_frame(frame, timeout, context=context or "commission_with_code")
 
     async def remove_node(self, node_id: int) -> Any:
         return await self.request(protocol.CMD_REMOVE_NODE, {"node_id": node_id})

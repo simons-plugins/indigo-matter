@@ -378,6 +378,7 @@ class Plugin(indigo.PluginBase):
             on_connect=self._resync,
             on_disconnect=self._on_disconnected,
             on_repeated_failure=on_repeated_failure,
+            on_late_response=self._on_late_matter_response,
         )
         self.jobs = CommissionJobs(
             self.matter, self.device_sync.create_from_raw, self.logger,
@@ -1156,6 +1157,15 @@ class Plugin(indigo.PluginBase):
             data = evt.raw.get("data") if evt.raw else None
             if isinstance(data, dict):
                 self.jobs.reconcile_node_added(data)
+
+    def _on_late_matter_response(self, late) -> None:
+        # self.jobs is None only in the startup gap between MatterClient's
+        # construction (which wires this hook) and CommissionJobs' own — that
+        # gap never reaches the loop today (matter.run() is not scheduled
+        # until both exist), but this guard costs nothing and keeps the
+        # invariant honest rather than assumed, same as _on_matter_event above.
+        if self.jobs is not None:
+            self.jobs.note_late_response(late)
 
     # ------------------------------------------------------------------
     # HTTP API (IWS hidden-action handlers — API.md v1.1)

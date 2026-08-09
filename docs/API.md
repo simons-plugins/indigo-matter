@@ -1,8 +1,8 @@
 # Matter API Contract — Domio ↔ Indigo Plugin
 
 **Status:** Authoritative for v1
-**Version:** 1.3
-**Last updated:** 2026-06-10
+**Version:** 1.4
+**Last updated:** 2026-08-09
 
 This document is the single source of truth for the HTTP API between Domio (iOS) and the `indigo-matter` plugin running on the Indigo Server. Both Domio and the plugin implementations MUST conform to this spec. Any change requires a co-ordinated update on both sides — treat as a versioned interface, not an implementation detail.
 
@@ -240,7 +240,7 @@ match Matter spec error codes — verify against matter-server's source. The `co
 
 | Code | Meaning |
 |---|---|
-| `commissioning_failed` | matter-server returned a failure during commissioning |
+| `commissioning_failed` | matter-server returned a failure during commissioning. Can also appear on a job that first failed `commissioning_timeout`, if matter-server's own answer to the commission RPC later arrives and says the attempt failed — see "Late failure" below. (v1.4) |
 | `commissioning_timeout` | matter-server did not finish commissioning within the plugin's commission timeout (300s). The device **may still join** — matter-server keeps commissioning in the background. Check Indigo before retrying; see the reconcile note below. (v1.3, additive) |
 | `device_unreachable` | Device couldn't be reached on the network |
 | `pase_failed` | PASE handshake failed (usually wrong setup code or device already commissioned) |
@@ -264,6 +264,19 @@ be attributed unambiguously: if two jobs for *different* setup codes are both
 inside their window when a node joins, neither is claimed (the jobs stay
 `failed`, and the devices are created with the device's own product name).
 Retries of the same setup code are one device and reconcile normally.
+
+**Late failure (v1.4):** the commission RPC itself can also answer late — after the
+job has already gone `failed`/`commissioning_timeout` — and say the attempt did not
+succeed. matter-server has no separate "commissioning failed" event; this RPC answer
+is the only definitive word the plugin will ever get on why a timed-out commission
+actually ended, so the job's error is corrected once it arrives: `error.code` becomes
+`commissioning_failed` and `error.message` explains a late answer arrived. This is the
+one case where a `failed` job's `error` changes after the fact — `status` stays
+`failed` throughout (this is a `failed` → `failed` transition, never `failed` →
+`success`; a late *success* answer is not surfaced to Domio at all — it only helps the
+plugin attribute a subsequent `node_added`, see the reconcile paragraph above). A
+client that already stopped polling a `failed` job will simply never see the
+correction; one still polling sees the `error` fields update in place.
 
 ### 3.4 `POST …/message/com.simons-plugins.indigo-matter/decommission?nodeId={nodeId}`
 
@@ -357,7 +370,16 @@ None in v1. Single-user system. Plugin SHOULD log abnormal traffic patterns but 
 
 ## 7. Versioning
 
-This contract is v1.3. Changes from v1.2 (all clarifications/additive, no transport change):
+This contract is v1.4. Changes from v1.3 (additive, no transport change; the only
+`failed` job whose fields can change after going terminal):
+
+- §3.3: a `failed` job's `error` can now be corrected in place if matter-server's own
+  answer to the commission RPC arrives late and reports the attempt failed —
+  `error.code` becomes `commissioning_failed` (see the error table note and the "Late
+  failure" paragraph). `status` never changes (`failed` stays `failed`); a late
+  *success* answer does not update `error` and is not otherwise surfaced to Domio.
+
+Changes from v1.2 (v1.3, all clarifications/additive, no transport change):
 
 - §3.3: new additive error code **`commissioning_timeout`** — the commission RPC to matter-server timed out (300s) but the device may still join; a job that failed this way can later flip back to `success` when the node arrives (timeout reconcile, see §3.3).
 - §3.3: `result.primaryDeviceId` is documented as **nullable** and `result.indigoDeviceIds` as **possibly empty** — `null`/empty when the commissioned device exposes no cluster the plugin maps yet (the job still reports `success`).
@@ -366,7 +388,10 @@ This contract is v1.3. Changes from v1.2 (all clarifications/additive, no transp
 
 Changes from v1.1 (v1.2): decommission's `nodeId` moved from a path component to a `?nodeId=` query param (the path form never worked — IWS drops trailing path components on POST); diagnostics additionally accepts `?nodeId=`; the local base URL is HTTPS, not HTTP. v1.1 itself was a transport change from v1.0 (semantics unchanged). Breaking changes require a version bump and a transition period where both versions are supported. Additive changes (new optional params, new handlers) do not require a version bump.
 
-Domio includes `X-Matter-API-Version: 1.3` in every request. The plugin SHOULD warn (HTTP 200, with `warning` field) if Domio's version is unrecognised.
+Domio includes `X-Matter-API-Version: 1.4` in every request. The plugin accepts both
+`1.3` and `1.4` (a client not yet mirroring this v1.4 update sends `1.3`, which is
+backward-compatible — see the note above) and SHOULD warn (HTTP 200, with `warning`
+field) if Domio's version is unrecognised.
 
 ## 8. Future Endpoints (Not in v1)
 

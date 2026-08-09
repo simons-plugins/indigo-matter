@@ -492,6 +492,7 @@ def test_startup_wires_connect_and_disconnect_callbacks(plugin_mod, monkeypatch)
     assert captured["on_connect"] == p._resync
     assert captured["on_disconnect"] == p._on_disconnected
     assert captured["on_event"] == p._on_matter_event
+    assert captured["on_late_response"] == p._on_late_matter_response
 
 # ---------------------------------------------------------------------------
 # node_added → commission-job reconcile wiring (#16)
@@ -534,6 +535,23 @@ def test_node_added_event_safe_without_jobs(plug):
     import protocol
     evt = SimpleNamespace(kind=protocol.EVT_NODE_ADDED, raw={"data": {"node_id": 7}})
     plug._on_matter_event(evt)  # no AttributeError
+
+
+# ---------------------------------------------------------------------------
+# late matter-server response → commission-job feedback wiring (#23)
+# ---------------------------------------------------------------------------
+def test_late_matter_response_delegates_to_jobs(plug):
+    plug.jobs = Mock()
+    late = SimpleNamespace(context="commission job abc", error=None, result={"node_id": 7})
+    plug._on_late_matter_response(late)
+    plug.jobs.note_late_response.assert_called_once_with(late)
+
+
+def test_late_matter_response_safe_without_jobs(plug):
+    # startup not finished (jobs None) — must not blow up, same discipline as
+    # _on_matter_event's guard above.
+    late = SimpleNamespace(context="commission job abc", error=None, result=None)
+    plug._on_late_matter_response(late)  # no AttributeError
 
 
 # ---------------------------------------------------------------------------
