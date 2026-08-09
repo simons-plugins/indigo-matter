@@ -1,37 +1,40 @@
 # indigo-matter — Build Handover
 
-**Last updated:** 2026-08-08 21:06 UTC
-**Active work:** `fix/140-adopt-reset-renumbering` — #140 built, PR open,
-awaiting review + Simon's merge go-ahead. See the §#140 section below,
-**including the publish coupling and the jarvis one-time map edit**.
-**Branch:** `main` last merged **PR #150** (`298ee6e`, #131 picker sort →
-release **v2026.8.8**); before it #148 (`775de2e`, #132 → v2026.8.6, which
-also shipped the banked #141+#134 `[no-release]` debt) and #149 (docs,
-`[no-release]`). Releases v2026.8.6/.8.8 exist; 2026.8.7 was never tagged.
-**Version:** plugin `2026.8.9` on the #140 branch (v2026.8.8 released).
-Bridge-node **source is now ahead of the published `0.7.0`** — the #140
-adoption is node-side and reaches installs only when `0.8.0` is published
-(bump `bridge-node/package.json` + `DEFAULT_INSTALL_SPEC` together, then
-`npm publish` — the #141 section's recipe applies verbatim).
-**Tests:** **2265 Python**, **396 TS** — both green.
+**Last updated:** 2026-08-09 08:33 UTC
+**Active work:** none — nothing in flight, working tree clean.
+**Branch:** `main` — the 2026-08-08/09 arc is fully landed: #151 (#140
+adoption → **v2026.8.9**), #152 (`[no-release]`, bridge-node 0.8.0 bump +
+pin), #153 (#133, `[no-release]`), #155 (#135, `[no-release]`), #156 (#84 →
+**v2026.8.13**, carrying all three). `indigo-matter-bridge@0.8.0` is
+**published to npm** (Simon, 2026-08-09) and `DEFAULT_INSTALL_SPEC` pins it.
+The pin≤package test relaxation (#152) means future node publishes need no
+plugin PR.
+**Version:** plugin `2026.8.13` (released), bridge-node `0.8.0` (published).
+**Tests:** **2289 Python**, **405 TS** — both green.
 (`python3 -m pytest -q` · `cd bridge-node && npm run build && npm test`)
-**Deployed:** jarvis runs plugin **`2026.8.8`** (deployed 2026-08-08 ~20:38
-UTC: 6-file copy over SSH, checksum-verified against clean 2026.8.5 first — no
-hot-patches — then restart; up with 6 endpoints attached) + bridge-node
-`0.7.0`, paired to **Apple Home AND Alexa** (3 fabrics: 2 Apple, 1 Alexa).
-The #140 drift alarm (`indigo-459564566: expected 5, got 2`) fired on the
-deploy's own attach — the live specimen of the issue.
-**Status:** export v1 feature-complete and live. **#143 is the parked one** —
-see the 2026-08-06 §#143 section; its defect B leading theory was
-**withdrawn**, read before touching.
+**Deployed & VERIFIED on jarvis (2026-08-09 ~08:30 UTC):** plugin `2026.8.13`
++ bridge-node `0.8.0`, paired to Apple Home AND Alexa (3 fabrics). The #140
+arc closed live: bridge agent stopped, all 6 map entries hand-voided (the
+one-time edit — backup at `endpoint-map.json.pre-void-backup`), 0.8.0
+installed via `npm install --prefix ~/indigo-matter` (nvm node v22.22.3,
+full path needed over ssh), plugin restarted. The node logged **"Adopted 6
+endpoint number(s) renumbered by the factory reset"**, the map healed
+(Hallway Lamp 5→2, the duplicate-5 fingerprint gone), and the attach line is
+clean — **no DRIFT error for the first time since the 2026-08-06 reset**.
+Note for future deploys: the node takes ~15s from launch to WS-listening
+(post-#141 restore-before-serve), so the plugin logs "not responding after 2
+attempts" + a stale err-log tail before the backoff connects — alarming but
+expected.
+**Status:** export v1 feature-complete, live, and current everywhere.
+**#143 is the parked one** — see the 2026-08-06 §#143 section; its defect B
+leading theory was **withdrawn**, read before touching.
 
-**NEXT UP:** publish bridge-node `0.8.0` (needs Simon's npm login + 2FA),
-merge the open PR stack in version order — **#153** (#133, `.11`) → **#155**
-(#135, `.12`) → **#156** (#84, `.13`) — then deploy plugin + node `0.8.0` to
-jarvis, do the one-time jarvis map edit (§#140), and verify the alarm is
-gone. Remaining backlog after that: #154 (halt survives its own remedy,
-found during #135), #105, #101, the E8 docs pass (#137/#138/#139),
-#146/#147.
+**NEXT UP:** nothing queued. Suggested order for the backlog: the E8 docs
+trio (#137/#138/#139 — the feature under-sells itself), then #154 (halt
+survives its own remedy) + #76 (pressCount double-count), then the
+commissioning race quartet #21–#24. Also open: #136, #105, #101, #77, #75,
+#64, #62, #46, #43, device-support #14/#15/#70/#71/#72/#83, refactor #146,
+naming #147.
 
 ---
 
