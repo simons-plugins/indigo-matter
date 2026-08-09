@@ -20,7 +20,6 @@ from concurrent.futures import CancelledError as FuturesCancelledError
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from datetime import datetime, timezone
 from typing import Any, Optional
-from urllib.parse import quote
 
 import indigo  # provided by the Indigo runtime
 
@@ -43,205 +42,31 @@ from matter_handlers.boolean_state_config import (
     CLUSTER_BOOLEAN_STATE_CONFIG,
 )
 from matter_handlers.registry import HandlerRegistry
+from pairing_page import _escape, _pairing_html
 import protocol
 from protocol import MatterWrite, Protocol
 from server_process import ServerProcess
 
-PLUGIN_NAME = "indigo-matter"
-COMMAND_TIMEOUT = 5.0
-DECOMMISSION_TIMEOUT = 15.0
+from plugin_constants import (
+    COMMAND_TIMEOUT, DECOMMISSION_TIMEOUT, MAX_RESUBSCRIBE_ATTEMPTS, PLUGIN_NAME,
+    RESUBSCRIBE_TICKS, sanitize_host, server_location,
+)
 
-#: Deadlines for the export/pairing menu actions, which block the **Indigo UI
-#: thread** on a WS round trip: without one, a bridge node that accepts the
-#: socket and then stops answering hangs the dialog — and Indigo's client — with
-#: no way out but force-quitting it. Named rather than inline because a `.result()`
-#: with no timeout looks like an ordinary call at a glance, so nothing about the
-#: absence of one is visible at the call site.
-#:
-#: PAIRING_READ_TIMEOUT covers a plain read (`get_pairing`). The other two are
-#: long because the node does real Matter work behind them: opening an enhanced
-#: window derives a fresh passcode and re-advertises, and removing a fabric
-#: flushes subscriptions and — on the last one — factory-resets the whole stack.
-PAIRING_READ_TIMEOUT = 15.0
-WINDOW_OPEN_TIMEOUT = 45.0
-UNPAIR_TIMEOUT = 45.0
-FACTORY_RESET_TIMEOUT = 45.0
-
-#: Watchdog ticks (~15s each) of an active export with no ``deviceUpdated`` at
-#: all before ``subscribeToChanges`` is re-issued — see
-#: ``Plugin._resubscribe_tick``. ~1 minute, the same shape as every other streak
-#: counter here.
-RESUBSCRIBE_TICKS = 4
-#: How many times, at most. Bounded because a house where nothing changes looks
-#: identical to a subscription that never registered.
-MAX_RESUBSCRIBE_ATTEMPTS = 3
-
-#: Menu id of the export dialog (MenuItems.xml) — matched in
-#: ``get_menu_action_config_ui_values`` so other menus are never seeded.
-MENU_MANAGE_EXPORTS = "manageMatterExports"
-#: Menu id of the unpair dialog. Seeded for the same reason the export dialog is
-#: — Indigo pre-selects the first row of a picker, and this picker's rows are
-#: real ecosystems whose Execute button removes them.
-MENU_UNPAIR_ECOSYSTEM = "unpairEcosystem"
-#: Option-id prefix marking a picker row the user may look at but not choose
-#: (PRD §5.2: excluded devices are shown *with a reason*, never hidden — XAC9).
-EXCLUDED_OPTION_PREFIX = "x-"
-#: The "nothing selected" sentinel. Never "": Indigo rejects an empty list id
-#: with "UI dynamic list function returned illegal ID string" and silently
-#: drops the option. The picker always emits a REAL row carrying this id
-#: (:data:`NO_SELECTION_LABEL`), because the dialog is seeded with it — a
-#: seeded value with no matching row renders as a blank first item.
-NO_SELECTION_ID = "0"
-NO_SELECTION_LABEL = "— select a device —"
-#: Informational rows. They get their own ids so :data:`NO_SELECTION_ID` stays
-#: unique, and the ``x-`` prefix keeps them unpickable through the same door
-#: excluded devices use.
-TRUNCATED_OPTION = (f"{EXCLUDED_OPTION_PREFIX}truncated",
-                    "…too many matches — narrow the filter")
-NO_MATCH_OPTION = (f"{EXCLUDED_OPTION_PREFIX}nomatch", "(no devices match the filter)")
-#: What a list callback returns when it fails outright. An empty list would
-#: render as an empty popup the user cannot tell from "nothing to choose".
-LIST_ERROR_OPTION = (NO_SELECTION_ID, "(error building list — see Event Log)")
-#: One unreadable device inside an otherwise fine list (D3): the row is kept so
-#: the count is honest, but it is not selectable.
-ROW_ERROR_LABEL = "(error reading device — see Event Log)"
-#: Picker cap. Past this the tail row asks the user to narrow the filter — a
-#: 2000-device database would otherwise build an unusable popup menu.
-EXPORT_PICKER_LIMIT = 300
-
-
-def server_location(prefs: dict) -> str:
-    """Resolve the one user-facing choice: is matter-server on this Mac?
-
-    Returns ``"local"`` (the plugin runs and manages matter-server here on
-    loopback) or ``"remote"`` (connect to a matter-server elsewhere).
-
-    Migrates pre-2026.6 prefs that predate the ``serverLocation`` menu:
-      * a managed LaunchAgent meant the plugin already ran the server here → local;
-      * a host pointed at another machine → remote (keep its host/port);
-      * anything else — a fresh install or a loopback self-run server → local,
-        the turnkey default.
-    """
-    loc = str(prefs.get("serverLocation") or "").strip().lower()
-    if loc in ("local", "remote"):
-        return loc
-    if prefs.get("manageLaunchAgent", False):
-        return "local"
-    host = str(prefs.get("matterServerHost") or "").strip().lower()
-    if host and host not in ("localhost", "127.0.0.1", "::1"):
-        return "remote"
-    return "local"
-
-
-def sanitize_host(raw: str) -> str:
-    """Reduce a user-entered host to a bare hostname / IP.
-
-    Users paste full URLs into the host field (e.g. ``http://jobs2.local:8176``);
-    a scheme, an embedded port, and any path all corrupt ``ws://{host}:{port}{path}``.
-    Strip them so the separate port field stays authoritative. IPv6 literals
-    (multiple colons) are left untouched.
-    """
-    host = str(raw or "").strip()
-    if "://" in host:
-        host = host.split("://", 1)[1]
-    host = host.split("/", 1)[0]  # drop any /path
-    # strip an embedded :PORT (host:1234) but preserve IPv6 literals (many colons)
-    if host.count(":") == 1 and host.rsplit(":", 1)[1].isdigit():
-        host = host.rsplit(":", 1)[0]
-    return host
-
-
-#: Where the raw ``MT:`` payload can be rendered as a scannable QR code. The
-#: CHIP project's own tool, which is the reference implementation of the payload
-#: format — so a code it cannot render is a code no commissioner would accept
-#: either. Linked rather than embedded: see :meth:`Plugin._pairing_page` for why
-#: no QR is generated locally.
-QR_VIEWER_URL = "https://project-chip.github.io/connectedhomeip/qrcode.html"
-
-
-def _escape(text: Any) -> str:
-    """Minimal HTML escaping for the pairing page.
-
-    Hand-rolled rather than ``html.escape`` only in that it also handles a
-    ``None`` — every value on that page comes from the bridge node or from an
-    exception string, and one of them being absent must not render the word
-    "None" into a field a user is about to type into their phone.
-    """
-    if text is None:
-        return ""
-    return (str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-            .replace('"', "&quot;"))
-
-
-def _pairing_html(pairing, message: str) -> str:
-    """The pairing page (PRD §6). Self-contained: no scripts, no assets.
-
-    ``pairing`` may be ``None`` when there is nothing to report — the page still
-    renders, carrying ``message``, because a blank page over a bridge that is
-    merely not running is indistinguishable from a broken handler.
-    """
-    manual = _escape(getattr(pairing, "manual_pairing_code", None))
-    qr_payload = _escape(getattr(pairing, "qr_pairing_code", None))
-    expires = _escape(getattr(pairing, "window_expires_at", None))
-    fabrics = list(getattr(pairing, "fabrics", ()) or [])
-    paired = ", ".join(_escape(export_bridge.describe_fabric(f)) for f in fabrics) or "none yet"
-    banner = f'<p class="msg">{_escape(message)}</p>' if message else ""
-    codes = ""
-    if manual:
-        # The payload is URL-encoded into the viewer link because an `MT:` string
-        # is base-38 and can legitimately contain characters that would otherwise
-        # end the query (`+`, `/`, `%`), producing a link that opens the tool with
-        # a silently truncated payload — a QR that scans and means the wrong thing.
-        viewer = f"{QR_VIEWER_URL}?data={quote(str(getattr(pairing, 'qr_pairing_code', '') or ''), safe='')}"
-        codes = f"""
-    <p class="warn"><strong>This page shows a live commissioning passcode.</strong>
-       Anyone who can reach this URL can add the bridge — and every Indigo device you
-       export — to <em>their</em> Apple Home, Alexa or Google account, for as long as the
-       window is open. The Indigo Web Server only asks for a password if you have turned
-       authentication on, so if you have not, treat this URL as the code itself: do not
-       put it in a chat or an email, and close the window when you are done (it also
-       expires on its own).</p>
-    <h2>Manual pairing code</h2>
-    <p class="code">{manual}</p>
-    <h2>QR payload</h2>
-    <p class="payload">{qr_payload}</p>
-    <p><a href="{_escape(viewer)}" rel="noreferrer noopener" target="_blank">
-       Render this payload as a scannable QR code</a> (opens the Matter project's own
-       viewer — it needs internet access, and the payload is sent to it).</p>
-    {f'<p class="expiry">This code stops working at {expires}.</p>' if expires else ''}
-    <h2>What to expect</h2>
-    <p>Add the bridge in your ecosystem's app as you would any Matter accessory. Every
-       ecosystem will warn that it is an <strong>uncertified accessory</strong> — that is
-       normal for a bridge like this one, and the same warning Homebridge and Home Assistant
-       produce. Choose "Add Anyway".</p>"""
-    return f"""<!DOCTYPE html>
-<html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Indigo Matter bridge — pairing</title>
-<style>
- body {{ font: 16px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-        margin: 0 auto; max-width: 34rem; padding: 1.5rem; color: #222; }}
- h1 {{ font-size: 1.3rem; }} h2 {{ font-size: 1rem; margin-bottom: .2rem; color: #555; }}
- .code {{ font: 700 2.1rem/1.2 ui-monospace, Menlo, monospace; letter-spacing: .08em;
-          margin: .2rem 0 1rem; word-break: break-all; }}
- .payload {{ font: .85rem ui-monospace, Menlo, monospace; word-break: break-all;
-             background: #f4f4f6; padding: .6rem; border-radius: .4rem; }}
- .msg {{ background: #fff6d6; border: 1px solid #e8d48a; padding: .7rem; border-radius: .4rem; }}
- .warn {{ background: #fdeaea; border: 1px solid #d99; padding: .7rem; border-radius: .4rem;
-          font-size: .92rem; }}
- .expiry {{ color: #a33; }}
- footer {{ margin-top: 2rem; font-size: .85rem; color: #777; }}
- @media (prefers-color-scheme: dark) {{
-   body {{ background: #16171a; color: #e6e6e6; }} h2 {{ color: #aaa; }}
-   .payload {{ background: #26272b; }} .msg {{ background: #3a3320; border-color: #6b5c2e; }}
-   .warn {{ background: #3a2222; border-color: #7a4444; }}
- }}
-</style></head><body>
-<h1>Indigo Matter bridge</h1>
-{banner}{codes}
-<footer>Paired ecosystems: {paired}.<br>
-This page is served by the Indigo Web Server from the Matter plugin.</footer>
-</body></html>"""
+# Re-exported for the test suite, which reaches into this module's namespace
+# (tests/test_*.py do `plugin_mod.<name>`) and for backwards compatibility with
+# anything importing these from `plugin`. See issue #146.
+# pylint: disable=unused-import
+import bridge_agent            # noqa: F401  (tests patch bridge_agent.BridgeProcess)
+import export_catalog          # noqa: F401
+import export_handlers         # noqa: F401
+from pairing_page import _escape, _pairing_html   # noqa: F401
+from plugin_constants import (  # noqa: F401
+    EXCLUDED_OPTION_PREFIX, EXPORT_PICKER_LIMIT, FACTORY_RESET_TIMEOUT,
+    LIST_ERROR_OPTION, MENU_MANAGE_EXPORTS, MENU_UNPAIR_ECOSYSTEM,
+    NO_MATCH_OPTION, NO_SELECTION_ID, NO_SELECTION_LABEL,
+    PAIRING_READ_TIMEOUT, ROW_ERROR_LABEL, TRUNCATED_OPTION,
+    UNPAIR_TIMEOUT, WINDOW_OPEN_TIMEOUT,
+)
 
 
 class Plugin(indigo.PluginBase):
