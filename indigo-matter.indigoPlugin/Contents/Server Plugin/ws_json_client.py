@@ -32,7 +32,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from typing import Any, Awaitable, Callable, Optional
+from typing import Any, Awaitable, Callable, NamedTuple, Optional
 
 # Exceptions that mean "the socket dropped, reconnect". websockets raises its own
 # WebSocketException family; we also accept the stdlib connection errors so the
@@ -105,6 +105,24 @@ class HandshakeFailed(Exception):
     """
 
 
+class LateResponse(NamedTuple):
+    """A response that arrived after its request's caller stopped waiting.
+
+    Handed to ``on_late_response`` from :meth:`WsJsonClient._log_unmatched` —
+    the one place that already has both the send-time ``context`` (if any) and
+    the frame's outcome. ``error``/``result`` mirror :meth:`_parse_result`'s two
+    shapes: exactly one is populated, matching whichever :meth:`_error_of`
+    found. A caller with nothing to correlate against (``context`` was never
+    passed, or matching this ``message_id`` failed) still gets a note — it is
+    the caller's job to decide what an untagged late response means, not this
+    transport's.
+    """
+    message_id: Optional[str]
+    context: Any
+    error: Optional[tuple]
+    result: Any
+
+
 class WsJsonClient:  # pylint: disable=too-many-instance-attributes
     """A reconnecting WebSocket client that speaks request/response/event JSON."""
 
@@ -118,6 +136,9 @@ class WsJsonClient:  # pylint: disable=too-many-instance-attributes
     #: a state where ``connected`` is False and no reconnect is ever attempted.
     HELLO_TIMEOUT = 5.0
 
+    # The callbacks ARE the constructor's arity — same trade BridgeClient makes
+    # for its own (larger) callback set.
+    # pylint: disable=too-many-arguments
     def __init__(
         self,
         uri: str,
@@ -127,6 +148,7 @@ class WsJsonClient:  # pylint: disable=too-many-instance-attributes
         on_connect: Optional[Callable[[], Awaitable]] = None,
         on_disconnect: Optional[Callable[[], None]] = None,
         on_repeated_failure: Optional[Callable[[int], None]] = None,
+        on_late_response: Optional[Callable[[LateResponse], None]] = None,
         now: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], Awaitable] = asyncio.sleep,
     ) -> None:
@@ -142,6 +164,10 @@ class WsJsonClient:  # pylint: disable=too-many-instance-attributes
         # consecutive reconnect failures, reset on the next successful connect) so a
         # supervisor can surface WHY the server is unreachable without log spam.
         self._on_repeated_failure = on_repeated_failure
+        # on_late_response: sync, fired from _log_unmatched for a response that
+        # missed its own deadline (issue #23) — the transport stays agnostic
+        # about what a late answer MEANS; that is the caller's call to make.
+        self._on_late_response = on_late_response
         self._diag_fired = False
         self._sleep = sleep
         self._now = now
@@ -150,7 +176,9 @@ class WsJsonClient:  # pylint: disable=too-many-instance-attributes
         self._pending: dict[str, asyncio.Future] = {}
         # message_id → short human description of a request nobody is awaiting,
         # so its error response can name the device instead of just an id (H4).
-        self._send_context: dict[str, str] = {}
+        # Any object str()-ably describable, not just str — #23's CommissionRequest
+        # is the note AND the correlation key a late response is matched against.
+        self._send_context: dict[str, Any] = {}
         self._closing = False
         self._running = False
         self._connected_event = asyncio.Event()
@@ -483,14 +511,32 @@ class WsJsonClient:  # pylint: disable=too-many-instance-attributes
         error = self._error_of(frame)
         if error is None:
             self.logger.debug("%s: unmatched response (%s)", self.PEER, described)
+        else:
+            code, details = error
+            self.logger.warning(
+                "%s error for an un-awaited request [%s]: %s %s",
+                self.PEER, described, code, details,
+            )
+        if self._on_late_response is None:
             return
-        code, details = error
-        self.logger.warning(
-            "%s error for an un-awaited request [%s]: %s %s",
-            self.PEER, described, code, details,
-        )
+        if error is None:
+            try:
+                result = self._parse_result(frame)
+            # pylint: disable-next=broad-exception-caught
+            except Exception:  # pragma: no cover - defensive, frame already logged above
+                self.logger.debug("%s: late response (%s) could not be parsed, dropping",
+                                  self.PEER, described)
+                return
+        else:
+            result = None
+        late = LateResponse(mid, context, error, result)
+        try:
+            self._on_late_response(late)
+        # pylint: disable-next=broad-exception-caught
+        except Exception:  # a caller's late-response handling must not kill the loop
+            self.logger.exception("on_late_response hook raised")
 
-    def _remember_send_context(self, message_id: Optional[str], context: str) -> None:
+    def _remember_send_context(self, message_id: Optional[str], context: Any) -> None:
         """Note what an un-awaited request was, for :meth:`_log_unmatched`.
 
         Bounded and FIFO: a peer that never answers would otherwise grow this
@@ -579,16 +625,25 @@ class WsJsonClient:  # pylint: disable=too-many-instance-attributes
     # ------------------------------------------------------------------
     # Requests
     # ------------------------------------------------------------------
-    async def _request_frame(self, frame: dict, timeout: float) -> Any:
+    async def _request_frame(self, frame: dict, timeout: float, context: Any = None) -> Any:
         if self._ws is None or not self.connected:
             raise ConnectionError(f"{self.PEER} not connected")
         mid = self._message_id_of(frame)
+        # Noted BEFORE the send goes out: an answer that beats this coroutine
+        # back to the loop is still matched by _dispatch (via _pending) and
+        # pops the note there, same as any other response — this only matters
+        # for the answer that arrives AFTER `timeout` gives up below.
+        if context is not None:
+            self._remember_send_context(mid, context)
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
         self._pending[mid] = fut
         try:
             await self._send_frame(frame)
             return await asyncio.wait_for(fut, timeout)
         finally:
+            # Only _pending is unregistered here — _send_context is deliberately
+            # left standing so a late answer to THIS abandoned request still has
+            # its note when _log_unmatched sees it (issue #23).
             self._pending.pop(mid, None)
 
     async def _handshake_request(self, frame: dict, timeout: float,

@@ -338,6 +338,102 @@ def test_commission_timeout_value_reaches_the_wait(mock_logger, monkeypatch):
     run(scenario())
 
 
+def _withheld_commission(mock_logger, **kw):
+    """A connected matter-server client whose commission request never gets
+    an answer (or the fire-and-forget handshake's, so its own unmatched reply
+    doesn't land as a spurious late response first) — everything else is
+    answered immediately."""
+    def responder(frame):
+        if frame.get(protocol.KEY_COMMAND) in (protocol.CMD_COMMISSION, protocol.CMD_START_LISTENING):
+            return []
+        return [{protocol.KEY_MESSAGE_ID: frame[protocol.KEY_MESSAGE_ID], protocol.KEY_RESULT: None}]
+
+    fake = FakeWebSocket(responder=responder)
+    return fake, _client(mock_logger, fake, **kw)
+
+
+def test_late_commission_error_names_the_job_in_the_warning(mock_logger):
+    # #23: the shared unmatched-error warning already fires; commission_with_code
+    # must hand it a context that names the job, not just the bare message_id.
+    async def scenario():
+        fake, client = _withheld_commission(mock_logger)
+        task = asyncio.create_task(client.run())
+        await client.wait_connected(timeout=2)
+
+        with pytest.raises(asyncio.TimeoutError):
+            await client.commission_with_code("MT:Y.TEST", timeout=0.02,
+                                              context="commission job abc-123")
+
+        mid = fake.sent[-1][protocol.KEY_MESSAGE_ID]
+        await fake.push_frame({"message_id": mid, "error_code": 50, "details": "PASE failed"})
+        for _ in range(50):
+            if mock_logger.warning.called:
+                break
+            await asyncio.sleep(0.01)
+
+        warnings = " ".join(str(c) for c in mock_logger.warning.call_args_list)
+        assert "commission job abc-123" in warnings
+        assert "50" in warnings and "PASE failed" in warnings
+
+        await client.close()
+        task.cancel()
+    run(scenario())
+
+
+def test_commission_with_code_default_context_names_itself(mock_logger):
+    # No caller-supplied context (the historical behaviour) still logs SOMETHING
+    # more useful than a bare message_id.
+    async def scenario():
+        fake, client = _withheld_commission(mock_logger)
+        task = asyncio.create_task(client.run())
+        await client.wait_connected(timeout=2)
+
+        with pytest.raises(asyncio.TimeoutError):
+            await client.commission_with_code("MT:Y.TEST", timeout=0.02)
+
+        mid = fake.sent[-1][protocol.KEY_MESSAGE_ID]
+        await fake.push_frame({"message_id": mid, "error_code": 1, "details": "x"})
+        for _ in range(50):
+            if mock_logger.warning.called:
+                break
+            await asyncio.sleep(0.01)
+
+        assert "commission_with_code" in str(mock_logger.warning.call_args)
+
+        await client.close()
+        task.cancel()
+    run(scenario())
+
+
+def test_on_late_response_hook_receives_a_late_response_naming_the_job(mock_logger):
+    async def scenario():
+        seen = []
+        fake, client = _withheld_commission(mock_logger, on_late_response=seen.append)
+        task = asyncio.create_task(client.run())
+        await client.wait_connected(timeout=2)
+
+        with pytest.raises(asyncio.TimeoutError):
+            await client.commission_with_code("MT:Y.TEST", timeout=0.02,
+                                              context="commission job xyz")
+
+        mid = fake.sent[-1][protocol.KEY_MESSAGE_ID]
+        await fake.push_frame({"message_id": mid, "result": {"node_id": 99}})
+        for _ in range(50):
+            if seen:
+                break
+            await asyncio.sleep(0.01)
+
+        assert len(seen) == 1
+        late = seen[0]
+        assert late.context == "commission job xyz"
+        assert late.result == {"node_id": 99}
+        assert late.error is None
+
+        await client.close()
+        task.cancel()
+    run(scenario())
+
+
 class TestUriBuilding:
     """Local mode forces loopback; remote mode uses the fields (blank-safe).
 

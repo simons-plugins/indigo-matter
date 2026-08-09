@@ -17,6 +17,7 @@ import threading
 import pytest
 
 import bridge_protocol
+import protocol
 from bridge_client import BridgeClient
 from matter_client import MatterClient
 from protocol import Protocol
@@ -657,3 +658,153 @@ class TestUnmatchedContext:
         # FIFO: the oldest notes are the ones dropped.
         assert "0" not in client._send_context
         assert str(SEND_CONTEXT_LIMIT + 49) in client._send_context
+
+
+class TestLateResponse:
+    """A response that arrives after its own request gave up (#23).
+
+    The transport stays commissioning-agnostic here: ``context`` is an opaque
+    str-able object, and these tests use plain strings — matter_client and
+    commission_jobs cover what a real caller's context object looks like.
+    """
+
+    def _withheld(self, mock_logger, **kw):
+        """A matter-server client that never answers a ``slow_thing`` request
+        (or the fire-and-forget handshake ``start_listening``, whose own
+        unmatched reply would otherwise land as a spurious late response and
+        confuse these scenarios) but answers everything else immediately — so
+        a scenario can prove the dispatcher survived a late response by
+        sending a normal one after."""
+        def responder(frame):
+            if frame.get(protocol.KEY_COMMAND) in ("slow_thing", protocol.CMD_START_LISTENING):
+                return []
+            return [{protocol.KEY_MESSAGE_ID: frame[protocol.KEY_MESSAGE_ID], protocol.KEY_RESULT: None}]
+
+        fake = FakeWebSocket(responder=responder)
+        client = matter_client(mock_logger, fake, **kw)
+        return fake, client
+
+    def test_a_late_result_reaches_the_hook_with_its_context(self, mock_logger):
+        async def scenario():
+            seen = []
+            fake, client = self._withheld(mock_logger, on_late_response=seen.append)
+            task = asyncio.create_task(client.run())
+            await client.wait_connected(timeout=2)
+
+            frame = client.proto.build_request("slow_thing")
+            mid = frame["message_id"]
+            with pytest.raises(asyncio.TimeoutError):
+                await client._request_frame(frame, 0.02, context="my request")
+
+            await fake.push_frame({"message_id": mid, "result": {"node_id": 7}})
+            await settle(lambda: seen)
+
+            assert len(seen) == 1
+            late = seen[0]
+            assert late.message_id == mid
+            assert late.context == "my request"
+            assert late.error is None
+            assert late.result == {"node_id": 7}
+
+            await client.close()
+            task.cancel()
+        run(scenario())
+
+    def test_a_late_error_reaches_the_hook_with_its_context(self, mock_logger):
+        async def scenario():
+            seen = []
+            fake, client = self._withheld(mock_logger, on_late_response=seen.append)
+            task = asyncio.create_task(client.run())
+            await client.wait_connected(timeout=2)
+
+            frame = client.proto.build_request("slow_thing")
+            mid = frame["message_id"]
+            with pytest.raises(asyncio.TimeoutError):
+                await client._request_frame(frame, 0.02, context="my request")
+
+            await fake.push_frame({"message_id": mid, "error_code": 50, "details": "boom"})
+            await settle(lambda: seen)
+
+            assert len(seen) == 1
+            late = seen[0]
+            assert late.error == (50, "boom")
+            assert late.result is None
+            assert late.context == "my request"
+
+            await client.close()
+            task.cancel()
+        run(scenario())
+
+    def test_a_raising_hook_does_not_kill_the_dispatcher(self, mock_logger):
+        async def scenario():
+            def boom(_late):
+                raise RuntimeError("hook exploded")
+
+            fake, client = self._withheld(mock_logger, on_late_response=boom)
+            task = asyncio.create_task(client.run())
+            await client.wait_connected(timeout=2)
+
+            frame = client.proto.build_request("slow_thing")
+            mid = frame["message_id"]
+            with pytest.raises(asyncio.TimeoutError):
+                await client._request_frame(frame, 0.02, context="my request")
+
+            await fake.push_frame({"message_id": mid, "result": {}})
+            await settle(lambda: mock_logger.exception.called)
+
+            assert client.connected
+            assert "on_late_response hook raised" in str(mock_logger.exception.call_args)
+
+            # the listen loop survives: a fresh, correlated request still
+            # round-trips normally afterwards
+            nodes = await client.request(protocol.CMD_GET_NODES)
+            assert nodes is None  # withheld responder answers unknown commands with None...
+
+            await client.close()
+            task.cancel()
+        run(scenario())
+
+    def test_an_abandoned_request_keeps_its_context_note(self, mock_logger):
+        async def scenario():
+            fake, client = self._withheld(mock_logger)
+            task = asyncio.create_task(client.run())
+            await client.wait_connected(timeout=2)
+
+            frame = client.proto.build_request("slow_thing")
+            mid = frame["message_id"]
+            with pytest.raises(asyncio.TimeoutError):
+                await client._request_frame(frame, 0.02, context="my request")
+
+            assert client._pending == {}, "the pending future is still cleaned up"
+            assert client._send_context.get(mid) == "my request", (
+                "the note must survive the timeout — it is the whole point: a "
+                "later answer still has something to describe itself with")
+
+            await client.close()
+            task.cancel()
+        run(scenario())
+
+    def test_a_request_without_context_notes_nothing_but_the_hook_still_fires(self, mock_logger):
+        async def scenario():
+            seen = []
+            fake, client = self._withheld(mock_logger, on_late_response=seen.append)
+            task = asyncio.create_task(client.run())
+            await client.wait_connected(timeout=2)
+
+            frame = client.proto.build_request("slow_thing")
+            mid = frame["message_id"]
+            with pytest.raises(asyncio.TimeoutError):
+                await client._request_frame(frame, 0.02)  # no context passed
+
+            assert mid not in client._send_context, "nothing was noted to forget"
+
+            await fake.push_frame({"message_id": mid, "result": {"ok": True}})
+            await settle(lambda: seen)
+
+            assert len(seen) == 1
+            assert seen[0].context is None
+            assert seen[0].result == {"ok": True}
+
+            await client.close()
+            task.cancel()
+        run(scenario())
