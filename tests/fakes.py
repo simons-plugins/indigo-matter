@@ -290,6 +290,7 @@ class FakeBridgeClient:
 
     def retry_now(self):
         self._record("retry_now")
+        return True  # mirrors a real WsJsonClient accepting the poke
 
     # -- introspection ---------------------------------------------------
     def _record(self, name, *args):

@@ -1105,6 +1105,30 @@ class TestBridgeAgentWiring:
         agent.restart.assert_not_called()
         plug.export_bridge.retry_now.assert_called_once()
 
+    def test_a_poke_that_LANDED_says_reconnecting_now(self, plug, plugin_mod, monkeypatch):
+        """The message is truthful, not assumed — accepted-poke half."""
+        agent = Mock(install=Mock(return_value=True), restart=Mock(return_value=True),
+                     ensure_installed=Mock(return_value=False))
+        monkeypatch.setattr(plugin_mod.bridge_agent, "BridgeProcess", lambda *_a, **_k: agent)
+        plug.export_bridge = Mock(retry_now=Mock(return_value=True))
+        plug._install_bridge_node()
+        said = _logged(plug.logger)
+        assert "reconnecting now" in said
+        assert "reload the plugin to reconnect" not in said
+
+    def test_a_DECLINED_poke_says_reload_the_plugin_instead(self, plug, plugin_mod, monkeypatch):
+        """⊗ A halted/closing client (or one that is simply absent) declines the
+        poke; the old line claimed "reconnecting now" over a run loop that had
+        exited (#154's shape). The message must follow the poke's answer."""
+        agent = Mock(install=Mock(return_value=True), restart=Mock(return_value=True),
+                     ensure_installed=Mock(return_value=False))
+        monkeypatch.setattr(plugin_mod.bridge_agent, "BridgeProcess", lambda *_a, **_k: agent)
+        plug.export_bridge = Mock(retry_now=Mock(return_value=False))
+        plug._install_bridge_node()
+        said = _logged(plug.logger)
+        assert "reload the plugin to reconnect" in said
+        assert "reconnecting now" not in said
+
     def test_a_missing_export_bridge_is_not_a_crash(self, plug, plugin_mod, monkeypatch):
         """A session that has not built one yet (or ever) must not blow up here."""
         agent = Mock(install=Mock(return_value=True), restart=Mock(return_value=True),

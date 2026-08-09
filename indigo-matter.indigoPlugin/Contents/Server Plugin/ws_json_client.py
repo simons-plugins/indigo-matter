@@ -156,8 +156,11 @@ class WsJsonClient:  # pylint: disable=too-many-instance-attributes
         self._connected_event = asyncio.Event()
         self._reconcile_task: Optional[asyncio.Task] = None
         # Set by retry_now() to cut the backoff wait in _run_loop short; cleared
-        # the moment it does. The loop this belongs to, captured in run() so
-        # retry_now() can wake it from a plain thread (see there).
+        # when a wait consumes it (_wait_for_retry) OR on _mark_connected — a
+        # poke that lands while already connected has nothing to cut short, and
+        # left armed it would silently skip a later, unrelated backoff. The
+        # loop this belongs to is captured in run() so retry_now() can wake it
+        # from a plain thread (see there).
         self._retry_event = asyncio.Event()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
@@ -243,6 +246,11 @@ class WsJsonClient:  # pylint: disable=too-many-instance-attributes
                 # both this immediate retry and any later failures should start
                 # counting from 1s again — the grown delay is stale history.
                 attempt = 0
+                # ...and the failure diagnostic gets the same fresh start:
+                # "the install succeeded, we poked, and it STILL won't connect"
+                # is exactly when the user needs the reason re-surfaced, and a
+                # streak that already fired would otherwise stay latched silent.
+                self.rearm_failure_diagnostic()
 
     def _maybe_report_repeated_failure(self, attempt: int) -> None:
         """Fire ``on_repeated_failure`` once per streak, after ≥2 consecutive fails.
@@ -309,21 +317,34 @@ class WsJsonClient:  # pylint: disable=too-many-instance-attributes
             task.cancel()
             try:
                 await task
+            # The task being awaited is one WE just cancelled — the outer
+            # task's own cancellation propagates from `asyncio.wait` above, so
+            # this is not the swallow-a-real-cancel shape the explicit re-raise
+            # at the top of _run_loop guards against. A sleep seam that refused
+            # this cancellation would wedge here by its own fault, not ours.
             except asyncio.CancelledError:
                 pass
+        woken = wake_task in done
+        if woken:
+            # Cleared BEFORE the sleep-side raise below: both can legitimately
+            # be `done` at once (the poke and the timeout landing together),
+            # and a raise firing first would skip this clear entirely, leaving
+            # the event armed to wrongly skip a FUTURE, unrelated backoff.
+            self._retry_event.clear()
         if sleep_task in done and not sleep_task.cancelled():
             # Preserve the pre-existing behaviour of a sleep seam that raises —
             # `await self._sleep(delay)` used to propagate it directly.
             exc = sleep_task.exception()
             if exc is not None:
                 raise exc
-        woken = wake_task in done
-        if woken:
-            self._retry_event.clear()
         return woken
 
-    def retry_now(self) -> None:
+    def retry_now(self) -> bool:
         """Cut the current backoff wait short. Safe to call from any thread.
+
+        Returns whether the wake-up was actually handed to the run loop — the
+        caller's log line must not claim "reconnecting now" over a poke that
+        was declined (see ``plugin._install_bridge_node``).
 
         For the one caller that needs that: the post-install poke
         (``export_bridge.ExportBridge.retry_now``) runs on the ``threading.Thread``
@@ -331,7 +352,8 @@ class WsJsonClient:  # pylint: disable=too-many-instance-attributes
         asyncio state directly — it hands the wake-up to the loop captured in
         :meth:`run` via ``call_soon_threadsafe`` and returns immediately.
 
-        Ignored (silently — a poke that might be a no-op is not an error) when:
+        Declined (returns False — a poke that might be a no-op is not an
+        error) when:
 
         * the client is not running, or is closing — there is no backoff wait to
           cut short, and setting the event now would only pre-arm the NEXT
@@ -348,11 +370,17 @@ class WsJsonClient:  # pylint: disable=too-many-instance-attributes
           than a backoff reset; this seam does not attempt it.
         """
         if not self._running or self._closing or self.halted:
-            return
+            return False
         loop = self._loop
         if loop is None:
-            return
-        loop.call_soon_threadsafe(self._retry_event.set)
+            return False
+        try:
+            loop.call_soon_threadsafe(self._retry_event.set)
+        except RuntimeError:
+            # The loop closed between reading self._loop and this call —
+            # shutdown racing an install thread. Nothing to wake; not an error.
+            return False
+        return True
 
     async def _connect_once(self) -> None:
         self.logger.debug("connecting to %s", self.uri)
@@ -477,6 +505,12 @@ class WsJsonClient:  # pylint: disable=too-many-instance-attributes
         """Flip the liveness flags. Idempotent — handshake hooks may call it early."""
         self.connected = True
         self._connected_event.set()
+        # A poke armed while we were previously connected has done its job the
+        # moment a connection exists. Usually _wait_for_retry consumed it on
+        # the way here; this covers the path no backoff wait ever consumes —
+        # close() then a fresh run() — where a stale arm would otherwise skip
+        # the new loop's first legitimate backoff.
+        self._retry_event.clear()
 
     def _mark_disconnected(self) -> None:
         was_connected = self.connected
