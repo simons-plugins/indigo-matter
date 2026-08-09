@@ -457,19 +457,43 @@ def _stop_for_restore(plan: Optional[_BridgePlan], server_control: Any, log: Any
         )
 
 
-def _move_aside_for_restore(storage_path: str, plan: Optional[_BridgePlan], now: datetime) -> Optional[str]:
+def _move_aside_for_restore(
+    storage_path: str, plan: Optional[_BridgePlan], now: datetime, log: Any
+) -> Optional[str]:
     """Move existing dir(s) aside as one unit, before either extract runs.
 
     NEVER deletes in place. Controller then bridge, so :func:`_rollback` has
     one uniform shape to undo regardless of which side later fails.
+
+    All-or-nothing: a controller rename that succeeds followed by a bridge
+    rename that raises would otherwise strand the controller fabric aside
+    with nothing to show for it, so a failing bridge rename undoes the
+    controller rename before re-raising — after this function returns
+    normally OR raises, either both sides are aside or neither is, never one.
+    If the undo itself also raises (a double fault, vanishingly rare), both
+    paths are named explicitly so manual recovery is possible.
     """
     moved_aside_to: Optional[str] = None
     if os.path.isdir(storage_path):
         moved_aside_to = f"{storage_path}.pre-restore-{_stamp(now)}"
         os.rename(storage_path, moved_aside_to)
     if plan is not None and os.path.isdir(plan.dest):
-        plan.moved_aside_to = f"{plan.dest}.pre-restore-{_stamp(now)}"
-        os.rename(plan.dest, plan.moved_aside_to)
+        bridge_moved_aside_to = f"{plan.dest}.pre-restore-{_stamp(now)}"
+        try:
+            os.rename(plan.dest, bridge_moved_aside_to)
+        except OSError:
+            if moved_aside_to is not None:
+                try:
+                    os.rename(moved_aside_to, storage_path)
+                except OSError as undo_exc:
+                    log.error(
+                        "Moving the Matter bridge node's storage aside failed, and undoing "
+                        "the controller's move-aside ALSO failed (%s): the controller fabric "
+                        "is at %s, NOT in place at %s — move it back by hand.",
+                        undo_exc, moved_aside_to, storage_path,
+                    )
+            raise
+        plan.moved_aside_to = bridge_moved_aside_to
     return moved_aside_to
 
 
@@ -551,12 +575,18 @@ def restore_backup(
       4. Move the existing storage dir(s) aside to ``<path>.pre-restore-
          <stamp>`` (NEVER delete in place; skipped if a dir does not exist) —
          controller then bridge, as one unit, before either extract.
+         All-or-nothing: a failing bridge rename undoes the controller
+         rename first (see :func:`_move_aside_for_restore`), then this
+         step's own failure handler best-effort restarts both daemons and
+         raises a wrapped ``RuntimeError`` — the disk is unchanged in the
+         single-fault case, and this failure never reaches step 7's
+         :func:`_rollback`.
       5. Extract the archive into fresh dir(s) and assert each result is
          non-empty (a validly-zipped but empty backup would silently wipe the
          fabric — treated as a failure and rolled back).
       6. ``server_control.start()`` — a False return is a failure and triggers
          rollback, same as an exception.
-      7. On ANY failure during 4–6: roll back without ever stranding either
+      7. On ANY failure during 5–6: roll back without ever stranding either
          original — bridge undone first, then the controller (verbatim of the
          controller-only behaviour), then the controller is restarted, then
          (if we stopped it) the bridge. A failing rollback ``start()`` is
@@ -612,7 +642,33 @@ def restore_backup(
 
     _stop_for_restore(plan, server_control, log)
 
-    moved_aside_to = _move_aside_for_restore(storage_path, plan, now)
+    try:
+        moved_aside_to = _move_aside_for_restore(storage_path, plan, now, log)
+    except OSError as exc:
+        # Best-effort: put both daemons back the way we found them. This is
+        # NOT routed through _rollback — there is nothing for it to undo, the
+        # move-aside itself already did (or explicitly failed to, and logged
+        # why) — this only needs to bring the daemons back up.
+        if not server_control.start():
+            log.error(
+                "CRITICAL: matter-server is DOWN after a failed move-aside during restore. "
+                "To recover manually: check ~/Library/Logs/indigo-matter/matter-server.err.log "
+                "and start matter-server (it should pick up the original fabric at %s).",
+                storage_path,
+            )
+        if plan is not None and plan.was_alive:
+            if not _restart_bridge(plan, log):
+                log.error(
+                    "The Matter bridge node did not restart after a failed move-aside during "
+                    "restore. Its pairings are intact; exported accessories are unavailable "
+                    "until it starts — check the bridge node's error log, then reload the "
+                    "plugin."
+                )
+        raise RuntimeError(
+            f"Fabric restore from {archive_path} failed while moving the existing storage "
+            "aside; the disk is unchanged unless the error above says otherwise — both "
+            "daemons were restarted"
+        ) from exc
 
     try:
         _extract_for_restore(archive_path, storage_path, plan)

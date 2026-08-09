@@ -983,3 +983,65 @@ class TestBridgeRestore:
         err = logger.text("error")
         assert "bridge" in err.lower()
         assert "pairings are intact" in err
+
+    def test_a_failing_bridge_move_aside_undoes_the_controller_move_and_restarts_both(self, tmp_path):
+        """F1 (HIGH): move-aside must be all-or-nothing and recoverable.
+
+        A controller rename that succeeds followed by a bridge rename that
+        raises must not strand the controller fabric aside with both daemons
+        stopped — the controller move is undone and both daemons come back.
+        """
+        storage, archive = self._archive(tmp_path)
+        bridge_dest = str(tmp_path / "appsupport" / "bridge-node")
+        with open(os.path.join(storage, "config"), "w") as fh:
+            fh.write("ORIGINAL-LIVE")
+        # Pre-create the bridge's collision dir WITH CONTENT (the fixed clock
+        # makes the stamp deterministic) — an empty dir renames over fine on
+        # some platforms, so this must be non-empty to guarantee the OSError.
+        collision = f"{bridge_dest}.pre-restore-{fabric_backup._stamp(_NOW)}"
+        os.makedirs(collision)
+        with open(os.path.join(collision, "stray.txt"), "w") as fh:
+            fh.write("leftover")
+        log, ctl, bridge = _two_controls()
+        logger = FakeLogger()
+
+        with pytest.raises(RuntimeError, match="moving the existing storage aside"):
+            fabric_backup.restore_backup(
+                archive, storage, ctl, now=_NOW, logger=logger,
+                bridge_storage_path=bridge_dest, bridge_control=bridge)
+
+        # controller storage back IN PLACE with its original content — the
+        # rename was undone, not left aside.
+        with open(os.path.join(storage, "config")) as fh:
+            assert fh.read() == "ORIGINAL-LIVE"
+        parent = os.path.dirname(storage)
+        stem = os.path.basename(storage)
+        assert not any(name.startswith(f"{stem}.pre-restore-") for name in os.listdir(parent))
+        # both daemons were restarted, best-effort, in that order.
+        ordered = [entry for entry in log if not entry.endswith(".is_alive")]
+        assert ordered[-2:] == ["ctl.start", "bridge.start"]
+
+    def test_a_failing_bridge_move_aside_restart_failures_are_logged(self, tmp_path):
+        """Mutation guard: removing the restarts must be caught by a test."""
+        storage, archive = self._archive(tmp_path)
+        bridge_dest = str(tmp_path / "appsupport" / "bridge-node")
+        collision = f"{bridge_dest}.pre-restore-{fabric_backup._stamp(_NOW)}"
+        os.makedirs(collision)
+        with open(os.path.join(collision, "stray.txt"), "w") as fh:
+            fh.write("leftover")
+        log: list[str] = []
+        ctl = FakeControl(name="ctl", log=log, start_always_false=True)
+        bridge = FakeControl(name="bridge", log=log, start_always_false=True)
+        logger = FakeLogger()
+
+        with pytest.raises(RuntimeError, match="moving the existing storage aside"):
+            fabric_backup.restore_backup(
+                archive, storage, ctl, now=_NOW, logger=logger,
+                bridge_storage_path=bridge_dest, bridge_control=bridge)
+
+        # both starts were attempted even though both returned False.
+        ordered = [entry for entry in log if not entry.endswith(".is_alive")]
+        assert ordered[-2:] == ["ctl.start", "bridge.start"]
+        err = logger.text("error")
+        assert "matter-server" in err.lower()
+        assert "bridge" in err.lower()
