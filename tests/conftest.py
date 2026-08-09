@@ -79,7 +79,7 @@ class _IndigoPluginBaseStub:
 #: evicted alongside `plugin` so `importlib.reload(plugin)` re-imports them against the
 #: mock installed for THIS test (issue #146).
 _PLUGIN_MODULES = ("plugin", "plugin_constants", "pairing_page", "http_api_mixin",
-                   "export_dialog_mixin", "pairing_menu_mixin")
+                   "export_dialog_mixin", "pairing_menu_mixin", "server_menu_mixin")
 
 
 @pytest.fixture
