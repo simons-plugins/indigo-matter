@@ -4,11 +4,11 @@
      (local) view and the taller "On another computer" / advanced sections overflow. -->
 <PluginConfig>
     <Field id="introLabel" type="label">
-        <Label>Where is matter-server running? On this Mac, the plugin starts and manages it for you — there is nothing else to set up.</Label>
+        <Label>Where is the Matter controller (matter-server) running? On this Mac, the plugin starts and manages it for you — there is nothing else to set up.</Label>
     </Field>
 
     <Field id="serverLocation" type="menu" defaultValue="local">
-        <Label>matter-server location:</Label>
+        <Label>Matter controller location:</Label>
         <List>
             <Option value="local">On this Mac (recommended)</Option>
             <Option value="remote">On another computer</Option>
@@ -45,7 +45,7 @@
            defaultValue="~/Library/Application Support/com.simons-plugins.indigo-matter/matter-server"
            visibleBindingId="showAdvanced" visibleBindingValue="true"
            alwaysUseInDialogHeightCalc="true">
-        <Label>matter-server storage path:</Label>
+        <Label>Matter controller storage path:</Label>
     </Field>
     <Field id="enableTestNetDcl" type="checkbox" defaultValue="false"
            visibleBindingId="showAdvanced" visibleBindingValue="true"
@@ -58,7 +58,7 @@
             leave it off unless a commissioning attempt fails on device attestation, and
             untick it once that device is paired. Applies to the managed server on this
             Mac; takes effect when the plugin reloads, or via Plugins ▸ Matter ▸ Restart
-            matter-server.</Description>
+            the Matter controller.</Description>
     </Field>
 
     <!-- REMOTE: connect to a matter-server on another computer -->
@@ -73,7 +73,7 @@
     <Field id="matterServerHost" type="textfield" defaultValue="localhost"
            visibleBindingId="serverLocation" visibleBindingValue="remote"
            alwaysUseInDialogHeightCalc="true">
-        <Label>matter-server host:</Label>
+        <Label>Matter controller host:</Label>
     </Field>
     <Field id="matterServerHostHelp" type="label" fontSize="small" fontColor="darkgray"
            alignWithControl="true"
@@ -85,7 +85,7 @@
     <Field id="matterServerPort" type="textfield" defaultValue="5580"
            visibleBindingId="serverLocation" visibleBindingValue="remote"
            alwaysUseInDialogHeightCalc="true">
-        <Label>matter-server port:</Label>
+        <Label>Matter controller port:</Label>
     </Field>
     <Field id="matterServerPath" type="textfield" defaultValue="/ws"
            visibleBindingId="serverLocation" visibleBindingValue="remote"
@@ -95,7 +95,7 @@
     <Field id="remoteWarn" type="label" fontSize="small" fontColor="red"
            visibleBindingId="serverLocation" visibleBindingValue="remote"
            alwaysUseInDialogHeightCalc="true">
-        <Label>matter-server's control API is UNAUTHENTICATED. Only connect over a network you trust.</Label>
+        <Label>The Matter controller's control API (matter-server) is UNAUTHENTICATED. Only connect over a network you trust.</Label>
     </Field>
 
     <!-- ================= EXPORT (PRD-indigo-matter-export §5.5) =================
@@ -109,10 +109,10 @@
          show a value computed at open time. -->
     <Field id="exportSep" type="separator"/>
     <Field id="exportHeader" type="label" fontColor="blue">
-        <Label>Matter export (Indigo as a bridge)</Label>
+        <Label>Matter bridge (Indigo as a bridge)</Label>
     </Field>
     <Field id="exportEnabled" type="checkbox" defaultValue="true">
-        <Label>Enable Matter export:</Label>
+        <Label>Enable Matter export</Label>
         <Description>Publishes the devices listed in "Manage Matter Exports…" to Apple Home
             and other ecosystems. Unticking this stops the bridge and its accessories go
             unavailable — it does NOT unpair anything or delete accessories, so ticking it

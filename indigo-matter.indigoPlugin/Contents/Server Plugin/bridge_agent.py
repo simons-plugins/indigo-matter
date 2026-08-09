@@ -1,4 +1,4 @@
-"""The Matter **export bridge node** LaunchAgent (PRD-indigo-matter-export §4.2).
+"""The Matter **bridge node** LaunchAgent (PRD-indigo-matter-export §4.2).
 
 The second of the plugin's two launchd-managed node processes, and the reason
 :mod:`launch_agent` exists at all: the controller's hard-won recovery machinery
@@ -79,7 +79,7 @@ BRIDGE_ERR_LOG = "bridge-node.err.log"
 #: that does not exist. It fires on the first-run path (no package, so no plist,
 #: so the preflight error), where a name the user cannot find in the menu is the
 #: difference between a fixable state and giving up.
-BRIDGE_INSTALL_MENU = "Install/update the Matter export bridge"
+BRIDGE_INSTALL_MENU = "Install/update the Matter bridge"
 
 #: Matter UDP port the node binds (PRD §4.4). 5540 is Matter's default and the
 #: one matter.js's ECOSYSTEMS.md records as Alexa's hard requirement; the pref is
@@ -159,7 +159,7 @@ def bridge_arguments(agent: "BridgeProcess") -> list[str]:
 
 
 class BridgeProcess(LaunchAgent):
-    """Install / control the Matter export bridge node's LaunchAgent.
+    """Install / control the Matter bridge node's LaunchAgent.
 
     The bridge specialisation of :class:`~launch_agent.LaunchAgent`: it reads the
     export prefs, builds its :class:`~launch_agent.AgentSpec`, and adds nothing

@@ -147,7 +147,7 @@ def create_backup(storage_path: str, *, now: datetime, logger: Optional[Any] = N
                     # which is exactly the archive they will reach for after
                     # losing those two files.
                     log.warning(
-                        "Fabric backup: no Matter export bridge storage at %s, so this backup "
+                        "Fabric backup: no Matter bridge storage at %s, so this backup "
                         "does NOT contain identity.json or endpoint-map.json. That is expected "
                         "if you export nothing; if you do export devices, check where the "
                         "bridge node's --storage-path actually points.", bridge_storage_path)
@@ -178,7 +178,7 @@ def create_backup(storage_path: str, *, now: datetime, logger: Optional[Any] = N
         # rather than configured, so "which directory did this actually cover?"
         # is a question the log should answer without anybody having to guess.
         log.info("Fabric backup written: %s (%d member(s), including %d from the Matter "
-                 "export bridge node at %s)", archive_path, members_written, bridge_members,
+                 "bridge node at %s)", archive_path, members_written, bridge_members,
                  bridge_storage_path)
     else:
         log.info("Fabric backup written: %s (%d member(s))", archive_path, members_written)
@@ -328,7 +328,7 @@ def restore_backup(
     skipped = bridge_members_in(archive_path)
     if skipped:
         log.warning(
-            "This backup also contains %d file(s) from the Matter export bridge node. They are "
+            "This backup also contains %d file(s) from the Matter bridge node. They are "
             "NOT being restored: the bridge node has to be stopped first and this plugin cannot "
             "stop it yet. If you need them, stop the bridge node and extract the '%s' entries of "
             "%s over %s by hand. Restoring the controller fabric only.",

@@ -122,7 +122,7 @@ class AgentSpec:
         item. Every message that tells a user to run it interpolated
         :attr:`package` instead, producing "Plugins ▸ Matter ▸ Install/update
         indigo-matter-bridge" — a menu that does not exist (the real one is
-        "Install/update the Matter export bridge"). It fires on the first-run
+        "Install/update the Matter bridge"). It fires on the first-run
         path, where the user is already stuck, so a menu name they cannot find
         is the difference between a fixable state and a support thread. Blank
         falls back to the old wording via :attr:`install_menu_name`, which is
@@ -1187,7 +1187,7 @@ class LaunchAgent:
             "the running %s was started with different arguments than the "
             "current settings would use — it is serving STALE configuration. Running: "
             "%s. Expected: %s. Reload the plugin (or Plugins ▸ Matter ▸ Restart "
-            "matter-server) to apply the current settings.",
+            "the Matter controller) to apply the current settings.",
             self.spec.package, " ".join(running_args), " ".join(desired),
         )
 

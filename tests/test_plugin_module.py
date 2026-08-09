@@ -118,20 +118,20 @@ MENU_SECTIONS = [
     ["Manage Matter Exports…",
      "Pair Matter Bridge…",
      "Unpair an Ecosystem…"],
-    # 3 · matter-server
-    ["Install/update matter-server",
-     "Restart matter-server",
-     "Reinstall matter-server (clean)…",
-     "Open matter-server log…"],
-    # 4 · the export bridge node
-    ["Install/update the Matter export bridge",
-     "Reinstall the Matter export bridge (clean)…",
-     "Stop the Matter export bridge…"],
+    # 3 · the Matter controller (matter-server)
+    ["Install/update the Matter controller (matter-server)",
+     "Restart the Matter controller",
+     "Reinstall the Matter controller (clean)…",
+     "Open the Matter controller log…"],
+    # 4 · the Matter bridge node
+    ["Install/update the Matter bridge",
+     "Reinstall the Matter bridge (clean)…",
+     "Stop the Matter bridge…"],
     # 5 · backup and recovery
     ["Back up the Matter fabric…",
      "Restore a fabric backup…",
      "Rebuild Matter Endpoint Map…",
-     "Reset Matter Export Pairings…"],
+     "Reset Matter Bridge Pairings…"],
 ]
 
 
@@ -166,15 +166,16 @@ def test_menu_is_grouped_into_the_documented_sections():
 
 
 def test_the_two_install_items_are_separated():
-    """#134: 'Install/update matter-server' and 'Install/update the Matter
-    export bridge' sat eleven apart in one flat list and were clicked for one
-    another live — reinstalling the inbound controller when the outbound
-    bridge was meant. They are separately versioned, separately installed npm
-    packages, so they must not share a section."""
+    """#134: 'Install/update the Matter controller (matter-server)' and
+    'Install/update the Matter bridge' sat eleven apart in one flat list and
+    were clicked for one another live — reinstalling the inbound controller
+    when the outbound bridge was meant. They are separately versioned,
+    separately installed npm packages, so they must not share a section."""
     sections = _menu_sections()
-    controller = next(i for i, s in enumerate(sections) if "Install/update matter-server" in s)
+    controller = next(i for i, s in enumerate(sections)
+                       if "Install/update the Matter controller (matter-server)" in s)
     bridge = next(i for i, s in enumerate(sections)
-                  if "Install/update the Matter export bridge" in s)
+                  if "Install/update the Matter bridge" in s)
     assert controller != bridge
 
 
