@@ -1,19 +1,21 @@
 # indigo-matter — Build Handover
 
-**Last updated:** 2026-08-09 12:48 UTC
+**Last updated:** 2026-08-09 19:13 UTC
 **Active work:** none — nothing in flight, working tree clean.
-**Branch:** `main` — the 2026-08-09 afternoon arc landed the **commissioning
-race quartet #21–#24** as three stacked PRs, merged in order: #164 (#21+#22 →
-**v2026.8.21**), #165 (#23 → **v2026.8.22**, API contract → **v1.4**), #166
-(#24 → **v2026.8.23**). Before those, the daytime arc's #158–#161 and the
-overnight arc's #151–#157 (see the sections below).
+**Branch:** `main` — the 2026-08-09 evening arc landed **#136 bridge-storage
+restore (PR #169 → v2026.9.0**, minor: user-visible feature**) and the
+quartet-hardening follow-up (PR #170 → v2026.9.1**, from the retroactive
+/review-pr over the merged #164–#166)**. Earlier the same day: the
+commissioning race quartet #21–#24 (PRs #164/#165/#166, v2026.8.21–.23, API
+contract → v1.4), the daytime arc's #158–#161, and the overnight #151–#157.
 `indigo-matter-bridge@0.8.0` published and pinned; the pin≤package relaxation
 means node publishes need no plugin PR.
-**Version:** plugin `2026.8.24` on main; **last release/jarvis is still
-`2026.8.18`** — the quartet is merged but unreleased (releases are opt-in; cut
-one via `[release]` or the manual workflow when it should ship). Bridge-node
-`0.8.0` (published; untouched by the quartet).
-**Tests:** **2350 Python**, **405 TS** — both green.
+**Version:** plugin `2026.9.2` on main (this docs PR); **last release/jarvis
+is still `2026.8.18`** — everything since is merged but unreleased (releases
+are opt-in; cut one via `[release]` or the manual workflow when it should
+ship — the quartet + #136 + hardening make a coherent release). Bridge-node
+`0.8.0` (published; untouched by any of it).
+**Tests:** **2410 Python**, **405 TS** — both green.
 (`python3 -m pytest -q` · `cd bridge-node && npm run build && npm test`)
 **Deployed & VERIFIED on jarvis (2026-08-09 ~11:16 UTC):** plugin
 `2026.8.18` + bridge-node `0.8.0`, Apple Home AND Alexa (3 fabrics), bridge
@@ -30,12 +32,78 @@ docs site now routes to it (#137). **#143 is the parked one** — see the
 before touching. #138 (screenshots) blocks on Simon's server+phone — the
 three-shot list is on the issue.
 
-**NEXT UP:** #136, #105, #101, #77, #75, #64, #62, #46, #43,
+**NEXT UP:** #105, #101, #77, #75, #64, #62, #46, #43,
 device-support #14/#15/#70/#71/#72/#83, refactor #146. Also open: #167
 (low-priority VID/PID negative filter, filed from the quartet — read its
 "why it wasn't built" before starting it) and the **domio-code API.md v1.4
 mirror** (PR raised there; the contract bump is backward-compatible so it
 can lag).
+
+---
+
+## 2026-08-09 (evening) — #136 bridge restore + the quartet hardening, and what three review cycles each bought
+
+Two PRs, stacked then merged in order: **#169** (#136 → v2026.9.0) and
+**#170** (quartet follow-up → v2026.9.1). Suites 2350 → **2410**. Both went
+through the full loop three times — build → /review-pr → repair → final
+verification of the repairs themselves — and every cycle caught something the
+previous one could not. The pattern to remember: **mutation-verified tests
+prove what exists is pinned; only an adversarial review sees what is missing.**
+
+* **#169 (#136).** Restore now extracts the bridge node's storage too: stop
+  bridge (only if alive — `_bootout` can't tell "no such job" from failure,
+  and XG5 forbids resurrecting a bridge nothing exports through) → stop
+  controller → move BOTH dirs aside all-or-nothing → extract both → start
+  controller → start bridge (only if we stopped it, OUTSIDE the rollback — a
+  bridge that won't restart is an ERROR, never a reason to undo a good fabric
+  restore). Zip-slip pre-flighted for both destinations BEFORE either daemon
+  stops, on the *written* (prefix-stripped) path. No control ⇒ warn-and-skip
+  with the manual recipe, never refuse. XAC1 latch untouched everywhere
+  (restore uses stop/start; uninstall is menuStopBridgeNode's different
+  answer to a different question).
+  **Review catches worth remembering:** cycle 1 found the HIGH — the
+  move-aside pair sat outside the rollback scope, and doubling it to two
+  renames meant a bridge-rename failure stranded the fabric aside with both
+  daemons stopped and the dialog claiming preservation. Cycle 3 (reviewing
+  the repair itself) found the repair's own two holes: the one unguarded
+  `start()` in the module (a raise = bridge stranded, zero log), and the
+  double-fault path restarting matter-server onto the MISSING storage dir —
+  `ensure_installed` recreates it empty, blocking the exact manual `mv` the
+  error message prescribes (strictly worse than leaving the server down).
+  Now: `_MoveAsideDoubleFault` signals it distinctly and the start is skipped.
+* **#170 (quartet hardening).** From the retroactive /review-pr over the
+  already-merged #164–#166 (three agents converged independently on the
+  race): an in-flight **`_removing` set** closes the TOCTOU where
+  `reconcile_node_added` could claim a node DURING its own `remove_node` RPC
+  (flipping a job to success with devices for a node just deleted) — marked
+  in the SAME lock acquisition as the holder check, discarded in `finally`,
+  gated at the very top of `_claimable_locked` (the gate must beat the
+  empty-candidates return: in production timing the watchdog's own job has
+  just aged out of the window when its removal is in flight). `_node_int`
+  coercion before `knows_node` (whose bare `int()` raised on wire-format
+  "0x…" strings, inside the one unguarded fire-and-forget coroutine whose
+  `concurrent.futures.Future` swallows exceptions silently — both fixed).
+  `_node_key` accepts zero-padded decimal strings (`int(x,0)` rejects leading
+  zeros; the fallback is `.isdecimal()`, not `.isdigit()` — "²" is a digit).
+  Loudness: failed removals WARN with consequences; the expiry message pair
+  no longer contradicts itself (announce, then per-outcome verdicts); a late
+  success naming a DIFFERENT node than recorded WARNs (the #22
+  mis-attribution signal). Docs: BRIDGE_PROTOCOL's stale pre-#23 "drops
+  unmatched responses unlogged" claim rewritten; API.md §7's v1.4
+  parenthetical no longer contradicts v1.3's own reconcile.
+  **Cycle-3 catches on the repair:** the watchdog-site race test passed only
+  because its fake sleep never advanced the clock (rewritten with the
+  mutable-dict clock, now genuinely exercising the aged-out-of-window
+  timing); the refusal log over-named candidates that never had a claim; and
+  one commit MESSAGE claimed a docstring fix that was never applied — commit
+  messages are claims too, verify them.
+
+**Deliberate, flagged, unchanged:** the restore dialog reports success when
+only the bridge *restart* failed (the fabric restored; the ERROR is in the
+log). The #136 E2E needs Simon at the Indigo UI on jarvis: export → back up →
+change → restore → accessories keep their numbers, no ecosystem re-creates.
+Cheap follow-up if wanted: mark bridge-carrying archives in the restore
+picker's labels.
 
 ---
 
