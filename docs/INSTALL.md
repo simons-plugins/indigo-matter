@@ -537,7 +537,7 @@ dropped the bridge since you opened the dialog may still be listed. And
 **unpairing the last remaining ecosystem resets the whole bridge**: Matter's own
 rules mean the node factory-resets itself when its fabric set empties, so it
 starts advertising for commissioning again, exactly as if you had used *Reset
-Matter Export Pairings…*.
+Matter Bridge Pairings…*.
 
 ### The two destructive recovery actions
 

@@ -95,7 +95,7 @@
     <Field id="remoteWarn" type="label" fontSize="small" fontColor="red"
            visibleBindingId="serverLocation" visibleBindingValue="remote"
            alwaysUseInDialogHeightCalc="true">
-        <Label>The Matter controller's control API (matter-server) is UNAUTHENTICATED. Only connect over a network you trust.</Label>
+        <Label>The Matter controller (matter-server) exposes an UNAUTHENTICATED control API. Only connect over a network you trust.</Label>
     </Field>
 
     <!-- ================= EXPORT (PRD-indigo-matter-export §5.5) =================
@@ -109,10 +109,10 @@
          show a value computed at open time. -->
     <Field id="exportSep" type="separator"/>
     <Field id="exportHeader" type="label" fontColor="blue">
-        <Label>Matter bridge (Indigo as a bridge)</Label>
+        <Label>Matter bridge (export)</Label>
     </Field>
     <Field id="exportEnabled" type="checkbox" defaultValue="true">
-        <Label>Enable Matter export</Label>
+        <Label>Enable Matter export:</Label>
         <Description>Publishes the devices listed in "Manage Matter Exports…" to Apple Home
             and other ecosystems. Unticking this stops the bridge and its accessories go
             unavailable — it does NOT unpair anything or delete accessories, so ticking it

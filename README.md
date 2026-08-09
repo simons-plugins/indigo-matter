@@ -126,9 +126,9 @@ node --version          # confirm v22.x
 Leave **Node bin directory** blank in the plugin config — auto-detect finds Homebrew
 first. (nvm works too; pin `nodeBinDir` explicitly if you use it.)
 
-**2. Install matter-server:** **Plugins ▸ Matter ▸ Install/update the Matter controller
-(matter-server)**. This
-installs the pinned version with the *same* Node it will run the server with, and pins
+**2. Install the Matter controller:** **Plugins ▸ Matter ▸ Install/update the Matter
+controller (matter-server)**. This installs the pinned version with the *same* Node it
+will run the server with, and pins
 that Node — which avoids the most common failure, installing with one Node and running
 with another whose native modules won't load.
 

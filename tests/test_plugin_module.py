@@ -515,3 +515,65 @@ class TestSanitizeHost:
 
     def test_blank_stays_blank(self, plugin_module):
         assert plugin_module.sanitize_host("") == ""
+
+
+# ---------------------------------------------------------------------------
+# Issue #147 — retired menu names must not survive anywhere a user reads
+# ---------------------------------------------------------------------------
+
+#: Menu names retired by the #147 terminology sweep. A message or doc that
+#: still uses one sends the user to a menu item that no longer exists — and
+#: the #147 review found exactly that, twice, in strings WRAPPED across
+#: source lines, which no grep of the source text can see. Python strings are
+#: therefore collected from the AST (adjacent literals concatenate) and docs
+#: are scanned with newlines collapsed.
+RETIRED_MENU_NAMES = [
+    "Install/update matter-server",
+    "Restart matter-server",
+    "Reinstall matter-server (clean)…",
+    "Open matter-server log…",
+    "Install/update the Matter export bridge",
+    "Reinstall the Matter export bridge (clean)…",
+    "Stop the Matter export bridge…",
+    "Reset Matter Export Pairings…",
+]
+
+#: Docs a user (or the next session) follows today. The PRDs are deliberately
+#: absent: they are frozen planning records whose milestone tables name the
+#: menus as they were when each milestone landed.
+SCANNED_DOCS = [
+    Path(__file__).parent.parent / "README.md",
+    Path(__file__).parent.parent / "bridge-node" / "README.md",
+    Path(__file__).parent.parent / "docs" / "INSTALL.md",
+    Path(__file__).parent.parent / "docs" / "MATTER.md",
+    Path(__file__).parent.parent / "docs" / "HANDOVER.md",
+]
+
+
+def _py_string_constants(path):
+    import ast
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    return [n.value for n in ast.walk(tree)
+            if isinstance(n, ast.Constant) and isinstance(n.value, str)]
+
+
+@pytest.mark.parametrize("retired", RETIRED_MENU_NAMES)
+def test_no_python_string_names_a_retired_menu_item(retired):
+    offenders = []
+    for py in sorted(SERVER_PLUGIN.glob("*.py")):
+        for value in _py_string_constants(py):
+            if retired in value:
+                offenders.append(py.name)
+                break
+    assert not offenders, (
+        f"{offenders} still reference the retired menu name {retired!r} — "
+        "the menu was renamed in #147; users cannot find the old name")
+
+
+@pytest.mark.parametrize("doc", SCANNED_DOCS, ids=lambda p: p.name)
+def test_no_current_doc_names_a_retired_menu_item(doc):
+    # Newlines collapsed so a name wrapped across lines cannot hide — the
+    # exact way both #147 review criticals escaped the original sweep.
+    text = " ".join(doc.read_text(encoding="utf-8").split())
+    hits = [name for name in RETIRED_MENU_NAMES if name in text]
+    assert not hits, f"{doc.name} still references retired menu name(s): {hits}"

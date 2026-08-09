@@ -2862,7 +2862,7 @@ class Plugin(indigo.PluginBase):
             self.logger.warning(
                 "Matter bridge: ecosystem %s was the LAST one paired, so the bridge node has "
                 "reset itself and is advertising for commissioning again — exactly as 'Reset "
-                "Matter Export Pairings…' would have done. Nothing in Indigo changed. Use "
+                "Matter Bridge Pairings…' would have done. Nothing in Indigo changed. Use "
                 "'Pair Matter Bridge…' to pair it again.", fabric_index)
         else:
             self.logger.warning(
