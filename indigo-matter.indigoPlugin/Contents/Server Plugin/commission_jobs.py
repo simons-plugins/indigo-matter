@@ -112,6 +112,20 @@ def _exc_message(exc: BaseException) -> str:
     return text or type(exc).__name__
 
 
+def _node_key(value: Any) -> Any:
+    """Normalise a node id (int or hex string on the wire) for comparison."""
+    try:
+        if isinstance(value, str):
+            return int(value, 0)
+        return int(value)
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _same_node(a: Any, b: Any) -> bool:
+    return _node_key(a) == _node_key(b)
+
+
 def is_valid_setup_code(code: str) -> bool:
     if not code:
         return False
@@ -139,6 +153,12 @@ class Job:
     discriminator: Optional[int] = None
     domio_node_id: Optional[str] = None
     expected_fabric_slots: Optional[int] = None
+    # The matter-server node this job is holding — set the moment
+    # commission_with_code returns one, and again when a reconcile claims a
+    # node. Distinct from result["nodeId"] (only exists after SUCCESS, and is
+    # a hex string): this is the raw id, live from the moment the fabric has
+    # it, so _fail can tell whether another job now owns it (#21).
+    node_id: Optional[int] = None
     status: JobStatus = PENDING
     progress: float = 0.0
     message: str = ""
@@ -268,10 +288,11 @@ class CommissionJobs:
         background: re-open it, apply the user's suggestedName/suggestedRoom,
         and flip it to success so a still-polling client gets the real outcome.
 
-        Candidates are matched by recency: only jobs that went terminal with
-        ``commissioning_timeout`` within RECONCILE_WINDOW qualify, and the most
-        recent one wins (a single rehearsal/retry flow never has two). Returns
-        the claimed jobId, or None if no job qualified.
+        Only jobs that went terminal with ``commissioning_timeout`` within
+        RECONCILE_WINDOW qualify, and a candidate is claimed only when it can
+        be attributed to this node unambiguously (see ``_claimable_locked``:
+        exact node-id identity, or the sole unidentified retry of one setup
+        code). Returns the claimed jobId, or None if no job qualified.
         """
         if not isinstance(raw_node, dict) or raw_node.get("node_id") is None:
             with self._lock:
@@ -286,23 +307,25 @@ class CommissionJobs:
         node_id = raw_node.get("node_id")
         stale: Optional[Job] = None
         with self._lock:
-            cutoff = self._clock() - RECONCILE_WINDOW
-            candidates = self._timeout_candidates_locked(cutoff)
-            if not candidates:
-                expired = self._timeout_candidates_locked(None)
-                stale = expired[-1] if expired else None
+            job, candidates = self._claimable_locked(node_id, self._clock() - RECONCILE_WINDOW)
+            if job is None:
+                if not candidates:
+                    expired = self._timeout_candidates_locked(None)
+                    stale = expired[-1] if expired else None
             else:
-                job = candidates[-1]
                 # Claim it inside the lock (a second node_added must not double-claim):
                 # re-opening to CREATING_DEVICES is honest — that's the work left.
-                # Keep the priors so a failed schedule can restore the terminal
-                # timeout state exactly (including the original terminal_at).
-                prior_error, job.error = job.error, None
-                prior_terminal_at, job.terminal_at = job.terminal_at, None
-                prior_progress, job.progress = job.progress, 0.85
-                prior_message, job.message = job.message, "Device joined after timeout; creating Indigo devices…"
+                # Keep the priors (one tuple, not five locals) so a failed schedule
+                # can restore the terminal timeout state exactly (including the
+                # original terminal_at).
+                priors = (job.error, job.terminal_at, job.progress, job.message, job.node_id)
+                job.error = None
+                job.terminal_at = None
+                job.progress = 0.85
+                job.message = "Device joined after timeout; creating Indigo devices…"
+                job.node_id = node_id
                 job.status = CREATING_DEVICES
-        if not candidates:
+        if job is None:
             if stale is not None:
                 self.logger.warning(
                     "node %s joined after commission job %s timed out, but outside "
@@ -310,6 +333,8 @@ class CommissionJobs:
                     "were not applied", node_id_to_str(node_id), stale.job_id,
                     RECONCILE_WINDOW.total_seconds() / 60,
                 )
+            elif candidates:
+                self._log_reconcile_refusal(node_id, candidates)
             return None
         coro = self._reconcile_job(job, raw_node)
         try:
@@ -321,10 +346,7 @@ class CommissionJobs:
                 # job. Restore the ORIGINAL terminal_at (not a fresh stamp) so the
                 # documented reconcile-window bound is preserved.
                 job.status = FAILED
-                job.error = prior_error
-                job.progress = prior_progress
-                job.message = prior_message
-                job.terminal_at = prior_terminal_at
+                job.error, job.terminal_at, job.progress, job.message, job.node_id = priors
             self.logger.error(
                 "commission job %s: node %s joined but the reconcile could not be "
                 "scheduled (%s); job restored to its timed-out state",
@@ -332,6 +354,31 @@ class CommissionJobs:
             )
             return None
         return job.job_id
+
+    def _log_reconcile_refusal(self, node_id: Any, candidates: list[Job]) -> None:
+        """Explain why none of ``candidates`` (all inside the reconcile window)
+        could be claimed for ``node_id``. Called outside ``self._lock``."""
+        unidentified = [c for c in candidates if c.node_id is None]
+        if unidentified:
+            # Branch (d)/(e) of _claimable_locked: two or more different
+            # setup codes are waiting unidentified — the event names neither.
+            self.logger.warning(
+                "node %s joined while commission jobs %s were all waiting to "
+                "reconcile — it cannot be told which one it belongs to, so none "
+                "was claimed; suggestedName/suggestedRoom were not applied. "
+                "Rename in Indigo, or commission one device at a time.",
+                node_id_to_str(node_id), ", ".join(c.job_id for c in unidentified),
+            )
+        else:
+            # Every candidate is already identified with a DIFFERENT node.
+            self.logger.info(
+                "node %s joined; no waiting commission job is waiting for it (%s)",
+                node_id_to_str(node_id),
+                ", ".join(
+                    f"job {c.job_id} is waiting for node {node_id_to_str(c.node_id)}"
+                    for c in candidates
+                ),
+            )
 
     def _timeout_candidates_locked(self, cutoff: Optional[datetime]) -> list[Job]:
         """Jobs that failed with commissioning_timeout, oldest→newest.
@@ -350,6 +397,35 @@ class CommissionJobs:
             ),
             key=lambda j: j.terminal_at,
         )
+
+    def _claimable_locked(
+        self, node_id: Any, cutoff: datetime
+    ) -> tuple[Optional[Job], list[Job]]:
+        """Which timeout candidate (if any) may claim ``node_id``, and the
+        full candidate list (for refusal logging). Caller must hold
+        ``self._lock``.
+        """
+        candidates = self._timeout_candidates_locked(cutoff)
+        if not candidates:
+            return None, candidates
+        # Exact identity wins outright: matter-server has already named this
+        # job's node (e.g. a prior partial reconcile).
+        exact = [c for c in candidates if c.node_id is not None and _same_node(c.node_id, node_id)]
+        if exact:
+            return exact[-1], candidates
+        # A job whose node we KNOW, and it isn't this one, cannot claim this
+        # node — only jobs with an unidentified node are still eligible.
+        unidentified = [c for c in candidates if c.node_id is None]
+        if not unidentified:
+            return None, candidates
+        # Same setup code among the unidentified = same physical device: retries
+        # of one join, and the newest carries the user's latest name/room.
+        if len({c.setup_code for c in unidentified}) == 1:
+            return unidentified[-1], candidates
+        # Two DIFFERENT devices are waiting and this event names neither.
+        # Refusing costs a name and a room; guessing wrong flips a job to
+        # success carrying another device's nodeId, which Domio then trusts.
+        return None, candidates
 
     async def _reconcile_job(self, job: Job, raw_node: dict) -> None:
         node_id = raw_node.get("node_id")
@@ -379,6 +455,7 @@ class CommissionJobs:
             node_id = result.get("node_id") if isinstance(result, dict) else result
             if node_id is None:
                 raise CommissionError("commissioning_failed", "matter-server returned no node_id")
+            self._set_node_id(job, node_id)
 
             self._advance(job, READING_DESCRIPTORS, 0.6, "Discovering device capabilities…")
             node = await self.matter.get_node(node_id)
@@ -444,7 +521,7 @@ class CommissionJobs:
 
     async def _fail(self, job: Job, code: str, message: str,
                     node_id: Any, matter_error_code: Optional[int] = None) -> None:
-        if node_id is not None:
+        if node_id is not None and not self._node_held_by_other_job(job, node_id):
             try:
                 await self.matter.remove_node(node_id)  # best-effort cleanup
             except Exception as exc:  # noqa: BLE001
@@ -481,6 +558,46 @@ class CommissionJobs:
             job.message = message
             if status in TERMINAL:
                 job.terminal_at = self._clock()
+
+    def _set_node_id(self, job: Job, node_id: Any) -> None:
+        # get_job reads Job fields under self._lock from the HTTP thread — every
+        # write to node_id must go through the lock too.
+        with self._lock:
+            job.node_id = node_id
+
+    def _node_held_by_other_job(self, job: Job, node_id: Any) -> bool:
+        """Is ``node_id`` currently held by some OTHER (non-failed) job?
+
+        Ownership beats cleanup: this is the #21 scenario — a commission job
+        times out, a node_added reconciles it onto the node (job.node_id set),
+        and then a LATER step in a retry/second job fails and would otherwise
+        remove_node the very node the first job just claimed. If another job
+        holds it and hasn't itself failed, leave it on the fabric.
+
+        A FAILED holder has given the node up — its claim no longer counts,
+        so removal proceeds as normal.
+
+        Deliberately does NOT consult device_sync.knows_node: device_sync
+        creates devices for every node_added, including the one this very job
+        just commissioned, so knows_node is true immediately after every
+        successful join — it would suppress remove_node on the entire normal
+        failure path (a later step failing after a lone job's own commission
+        succeeded), contradicting PRD §7's "clean up what we created."
+        """
+        with self._lock:
+            holders = [
+                j.job_id for j in self._jobs.values()
+                if j is not job and j.node_id is not None
+                and j.status is not FAILED and _same_node(j.node_id, node_id)
+            ]
+        if not holders:
+            return False
+        self.logger.warning(
+            "commission job %s failed, but node %s is held by commission job %s — "
+            "leaving it on the fabric rather than removing a device another job "
+            "just created", job.job_id, node_id_to_str(node_id), ", ".join(holders),
+        )
+        return True
 
     def _reap_locked(self) -> None:
         cutoff = self._clock() - RETENTION
