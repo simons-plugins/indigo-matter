@@ -3147,12 +3147,16 @@ class Plugin(indigo.PluginBase):
                         "come back up. %s", self._bridge_agent_diagnosis() or
                         "Check the bridge node's error log.")
                 else:
+                    # There may have been no pre-existing bridge dir to preserve —
+                    # say nothing rather than "preserved at None".
+                    preserved = (
+                        f" (previous copy preserved at {result['bridge_moved_aside_to']})"
+                        if result["bridge_moved_aside_to"] else "")
                     self.logger.info(
-                        "The Matter bridge node's storage was restored too (previous copy "
-                        "preserved at %s)%s. It now holds the accessory identities and endpoint "
-                        "numbers as of that backup — if a paired ecosystem has changed since, "
-                        "the bridge REPORTS endpoint-map drift in the log and renumbers "
-                        "nothing.", result["bridge_moved_aside_to"],
+                        "The Matter bridge node's storage was restored too%s%s. It now holds "
+                        "the accessory identities and endpoint numbers as of that backup — if "
+                        "a paired ecosystem has changed since, the bridge REPORTS endpoint-map "
+                        "drift in the log and renumbers nothing.", preserved,
                         " and the node has been restarted" if result["bridge_started"] else "")
             return (True, valuesDict)
         except Exception as exc:  # noqa: BLE001
