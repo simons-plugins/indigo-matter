@@ -15,6 +15,9 @@ import pytest
 
 import fabric_backup
 
+_IDENTITY_JSON = '{"installId": "abc", "passcode": 20202021, "discriminator": 3840}'
+_ENDPOINT_MAP_JSON = '{"version": 1, "endpoints": {"indigo-101": 2}}'
+
 
 def _make_storage(tmp_path, *, files: dict[str, str] | None = None):
     """Create a fake matter-server storage dir with some fabric files."""
@@ -41,6 +44,10 @@ class FakeControl:
     makes only the first start() RETURN False (the rollback start succeeds) —
     exercising the bool-False path. ``rollback_start_fails`` makes the SECOND
     (rollback) start() return False — exercising the loud manual-recovery path.
+    ``start_always_false`` makes EVERY start() return False — a never-installed
+    bridge, whose ``start()`` fails by design and must not abort a good restore.
+    ``alive`` is what ``is_alive()`` reports; ``name``/``log`` let a bridge and a
+    controller share one ordered call log across #136's two-control tests.
     """
 
     def __init__(
@@ -50,22 +57,38 @@ class FakeControl:
         stop_returns: bool = True,
         start_returns_false: bool = False,
         rollback_start_fails: bool = False,
+        start_always_false: bool = False,
+        alive: bool = True,
+        name: str = "",
+        log: list[str] | None = None,
     ):
         self.calls: list[str] = []
         self._fail_start = fail_start
         self._stop_returns = stop_returns
         self._start_returns_false = start_returns_false
         self._rollback_start_fails = rollback_start_fails
+        self._start_always_false = start_always_false
+        self._alive = alive
+        self._name = name
+        self._log = log
         self._start_count = 0
+
+    def _note(self, method: str) -> None:
+        if self._log is not None:
+            self._log.append(f"{self._name}.{method}")
 
     def stop(self) -> bool:
         self.calls.append("stop")
+        self._note("stop")
         return self._stop_returns
 
     def start(self) -> bool:
         self.calls.append("start")
+        self._note("start")
         self._start_count += 1
         is_first = self._start_count == 1
+        if self._start_always_false:
+            return False
         if is_first and self._fail_start:
             raise RuntimeError("boom on start")
         if is_first and self._start_returns_false:
@@ -73,6 +96,21 @@ class FakeControl:
         if not is_first and self._rollback_start_fails:
             return False
         return True
+
+    def is_alive(self) -> bool:
+        # Deliberately does NOT append to .calls (it is not stop()/start()) but
+        # DOES append to the shared log, so ordering tests can filter it out.
+        if self._log is not None:
+            self._log.append(f"{self._name}.is_alive")
+        return self._alive
+
+
+def _two_controls(**bridge_kwargs):
+    """A shared ordered-call log plus a named ("ctl", "bridge") FakeControl pair."""
+    log: list[str] = []
+    ctl = FakeControl(name="ctl", log=log)
+    bridge = FakeControl(name="bridge", log=log, **bridge_kwargs)
+    return log, ctl, bridge
 
 
 class FakeLogger:
@@ -548,7 +586,8 @@ class TestBridgeStorageInBackups:
 
         Extracting them under the CONTROLLER's storage dir would put a second
         Matter node's credentials where nothing will ever read them; doing it in
-        place needs the bridge node stopped, and there is no stop seam until E7.
+        place needs the bridge node stopped, and this restore, when the caller
+        supplies no bridge control, has no way to do that.
         So: restore the fabric, and name the files, the prefix and the manual
         recipe.
         """
@@ -651,3 +690,296 @@ class TestBridgeStorageIsAudible:
                         else str(call.args[0]) for call in logger.info.call_args_list)
         assert str(bridge) in said
         assert not logger.warning.called
+
+
+def _bridge_restore_archive(tmp_path, *, bridge=True):
+    """A backup archive over the standard fixtures — optionally with bridge members."""
+    storage = _make_storage(tmp_path)
+    bridge_path = _make_bridge_storage(tmp_path) if bridge else None
+    archive = fabric_backup.create_backup(storage, now=_NOW, bridge_storage_path=bridge_path)
+    return storage, archive
+
+
+class TestBridgeRestore:
+    """#136 — restore now stops/starts the bridge node and extracts its half too.
+
+    ``BridgeProcess`` gives ``restore_backup`` the ``stop()``/``start()`` seam it
+    was missing (E7); this pins the two-control sequence, the extraction, and
+    every way it falls back to the controller-only behaviour these tests'
+    siblings above already pin.
+    """
+
+    def _archive(self, tmp_path, *, bridge=True):
+        return _bridge_restore_archive(tmp_path, bridge=bridge)
+
+    def test_bridge_members_extract_into_the_bridge_dir_with_the_prefix_stripped(self, tmp_path):
+        _storage, archive = self._archive(tmp_path)
+        fresh_storage = str(tmp_path / "restored" / "matter-server")
+        bridge_dest = str(tmp_path / "restored" / "bridge-node")
+        _log, ctl, bridge = _two_controls()
+
+        result = fabric_backup.restore_backup(
+            archive, fresh_storage, ctl, now=_NOW,
+            bridge_storage_path=bridge_dest, bridge_control=bridge)
+
+        assert result["bridge_restored"] is True
+        assert result["bridge_members"] == 3
+        with open(os.path.join(bridge_dest, "identity.json")) as fh:
+            assert fh.read() == _IDENTITY_JSON
+        with open(os.path.join(bridge_dest, "endpoint-map.json")) as fh:
+            assert fh.read() == _ENDPOINT_MAP_JSON
+        with open(os.path.join(bridge_dest, "node-indigo-matter-bridge", "state.json")) as fh:
+            assert fh.read() == "{}"
+
+    def test_nothing_named_bridge_node_appears_under_the_controller_storage(self, tmp_path):
+        _storage, archive = self._archive(tmp_path)
+        fresh_storage = str(tmp_path / "restored" / "matter-server")
+        bridge_dest = str(tmp_path / "restored" / "bridge-node")
+        _log, ctl, bridge = _two_controls()
+
+        fabric_backup.restore_backup(
+            archive, fresh_storage, ctl, now=_NOW,
+            bridge_storage_path=bridge_dest, bridge_control=bridge)
+
+        # Not nested under the controller's storage, and not double-nested under
+        # its own destination either (the prefix-strip pin).
+        assert not os.path.exists(os.path.join(fresh_storage, "bridge-node"))
+        assert not os.path.exists(os.path.join(bridge_dest, "bridge-node"))
+
+    def test_stop_order_is_bridge_then_controller_and_start_order_is_the_reverse(self, tmp_path):
+        _storage, archive = self._archive(tmp_path)
+        fresh_storage = str(tmp_path / "restored" / "matter-server")
+        bridge_dest = str(tmp_path / "restored" / "bridge-node")
+        log, ctl, bridge = _two_controls()
+
+        fabric_backup.restore_backup(
+            archive, fresh_storage, ctl, now=_NOW,
+            bridge_storage_path=bridge_dest, bridge_control=bridge)
+
+        ordered = [entry for entry in log if not entry.endswith(".is_alive")]
+        assert ordered == ["bridge.stop", "ctl.stop", "ctl.start", "bridge.start"]
+
+    def test_bridge_stop_failure_aborts_before_the_controller_is_touched(self, tmp_path):
+        _storage, archive = self._archive(tmp_path)
+        fresh_storage = str(tmp_path / "restored" / "matter-server")
+        bridge_dest = str(tmp_path / "restored" / "bridge-node")
+        log, ctl, bridge = _two_controls(stop_returns=False)
+
+        with pytest.raises(RuntimeError, match="bridge node failed to stop"):
+            fabric_backup.restore_backup(
+                archive, fresh_storage, ctl, now=_NOW,
+                bridge_storage_path=bridge_dest, bridge_control=bridge)
+
+        assert not any(entry.startswith("ctl.") for entry in log)
+        assert not os.path.exists(fresh_storage)
+        assert not os.path.exists(bridge_dest)
+
+    def test_controller_stop_failure_restarts_the_bridge_it_stopped_then_aborts(self, tmp_path):
+        _storage, archive = self._archive(tmp_path)
+        fresh_storage = str(tmp_path / "restored" / "matter-server")
+        bridge_dest = str(tmp_path / "restored" / "bridge-node")
+        log: list[str] = []
+        ctl = FakeControl(name="ctl", log=log, stop_returns=False)
+        bridge = FakeControl(name="bridge", log=log)
+
+        with pytest.raises(RuntimeError, match="failed to stop"):
+            fabric_backup.restore_backup(
+                archive, fresh_storage, ctl, now=_NOW,
+                bridge_storage_path=bridge_dest, bridge_control=bridge)
+
+        ordered = [entry for entry in log if not entry.endswith(".is_alive")]
+        assert ordered == ["bridge.stop", "ctl.stop", "bridge.start"]
+        assert not os.path.exists(fresh_storage)
+        assert not os.path.exists(bridge_dest)
+
+    def test_a_bridge_that_is_not_running_is_neither_stopped_nor_started(self, tmp_path):
+        _storage, archive = self._archive(tmp_path)
+        fresh_storage = str(tmp_path / "restored" / "matter-server")
+        bridge_dest = str(tmp_path / "restored" / "bridge-node")
+        log, ctl, bridge = _two_controls(alive=False)
+        logger = FakeLogger()
+
+        result = fabric_backup.restore_backup(
+            archive, fresh_storage, ctl, now=_NOW, logger=logger,
+            bridge_storage_path=bridge_dest, bridge_control=bridge)
+
+        assert "bridge.stop" not in log
+        assert "bridge.start" not in log
+        assert os.path.isfile(os.path.join(bridge_dest, "identity.json"))
+        assert result["bridge_started"] is None
+        assert "left stopped" in logger.text("info")
+
+    def test_a_bridge_that_cannot_start_does_not_fail_an_otherwise_good_restore(self, tmp_path):
+        _storage, archive = self._archive(tmp_path)
+        fresh_storage = str(tmp_path / "restored" / "matter-server")
+        bridge_dest = str(tmp_path / "restored" / "bridge-node")
+        _log, ctl, bridge = _two_controls(start_always_false=True)
+        logger = FakeLogger()
+
+        result = fabric_backup.restore_backup(
+            archive, fresh_storage, ctl, now=_NOW, logger=logger,
+            bridge_storage_path=bridge_dest, bridge_control=bridge)
+
+        assert result["bridge_restored"] is True
+        assert result["bridge_started"] is False
+        assert os.path.isfile(os.path.join(fresh_storage, "config"))
+        err = logger.text("error")
+        assert bridge_dest in err
+        parent = os.path.dirname(bridge_dest)
+        assert not any(".failed-" in name for name in os.listdir(parent))
+
+    def test_a_failing_bridge_extract_rolls_both_dirs_back(self, tmp_path, monkeypatch):
+        storage, archive = self._archive(tmp_path)
+        bridge_dest = str(tmp_path / "appsupport" / "bridge-node")
+        log, ctl, bridge = _two_controls()
+
+        real_extract = fabric_backup._safe_extract
+
+        def flaky_extract(archive_path, dest, *, prefix=""):
+            if prefix:
+                raise RuntimeError("boom on bridge extract")
+            return real_extract(archive_path, dest, prefix=prefix)
+
+        monkeypatch.setattr(fabric_backup, "_safe_extract", flaky_extract)
+
+        with pytest.raises(RuntimeError, match="rolled back"):
+            fabric_backup.restore_backup(
+                archive, storage, ctl, now=_NOW,
+                bridge_storage_path=bridge_dest, bridge_control=bridge)
+
+        with open(os.path.join(storage, "config")) as fh:
+            assert fh.read() == "fabric-config"
+        with open(os.path.join(bridge_dest, "identity.json")) as fh:
+            assert fh.read() == _IDENTITY_JSON
+        parent = os.path.dirname(bridge_dest)
+        assert any(name.startswith("bridge-node.failed-") for name in os.listdir(parent))
+        ordered = [entry for entry in log if not entry.endswith(".is_alive")]
+        assert ordered[-2:] == ["ctl.start", "bridge.start"]
+
+    def test_a_failing_controller_extract_rolls_the_bridge_back_too(self, tmp_path, monkeypatch):
+        storage, archive = self._archive(tmp_path)
+        bridge_dest = str(tmp_path / "appsupport" / "bridge-node")
+        _log, ctl, bridge = _two_controls()
+
+        real_extract = fabric_backup._safe_extract
+
+        def flaky_extract(archive_path, dest, *, prefix=""):
+            if not prefix:
+                raise RuntimeError("boom on controller extract")
+            return real_extract(archive_path, dest, prefix=prefix)
+
+        monkeypatch.setattr(fabric_backup, "_safe_extract", flaky_extract)
+
+        with pytest.raises(RuntimeError, match="rolled back"):
+            fabric_backup.restore_backup(
+                archive, storage, ctl, now=_NOW,
+                bridge_storage_path=bridge_dest, bridge_control=bridge)
+
+        with open(os.path.join(bridge_dest, "identity.json")) as fh:
+            assert fh.read() == _IDENTITY_JSON
+        parent = os.path.dirname(bridge_dest)
+        assert not any(name.startswith("bridge-node.pre-restore-") for name in os.listdir(parent))
+
+    def test_the_bridge_dir_is_moved_aside_never_deleted(self, tmp_path):
+        storage, archive = self._archive(tmp_path)
+        bridge_dest = str(tmp_path / "appsupport" / "bridge-node")
+        # mutate the live bridge storage so we can prove the backup (not the live
+        # dir) won, same discipline as the controller's move-aside test above.
+        with open(os.path.join(bridge_dest, "identity.json"), "w") as fh:
+            fh.write("MUTATED")
+        _log, ctl, bridge = _two_controls()
+
+        result = fabric_backup.restore_backup(
+            archive, storage, ctl, now=_NOW,
+            bridge_storage_path=bridge_dest, bridge_control=bridge)
+
+        moved = result["bridge_moved_aside_to"]
+        assert moved is not None
+        assert os.path.isdir(moved)
+        with open(os.path.join(moved, "identity.json")) as fh:
+            assert fh.read() == "MUTATED"
+        with open(os.path.join(bridge_dest, "identity.json")) as fh:
+            assert fh.read() == _IDENTITY_JSON
+
+    def test_zip_slip_in_a_bridge_member_is_rejected_before_anything_is_stopped(self, tmp_path):
+        evil = tmp_path / "evil.zip"
+        with zipfile.ZipFile(evil, "w") as zf:
+            zf.writestr("config", "x")
+            zf.writestr(f"{fabric_backup.BRIDGE_MEMBER_PREFIX}../../escape.txt", "pwned")
+        fresh_storage = str(tmp_path / "restored" / "matter-server")
+        bridge_dest = str(tmp_path / "restored" / "bridge-node")
+        log, ctl, bridge = _two_controls()
+
+        with pytest.raises(ValueError, match="zip-slip"):
+            fabric_backup.restore_backup(
+                str(evil), fresh_storage, ctl, now=_NOW,
+                bridge_storage_path=bridge_dest, bridge_control=bridge)
+
+        assert log == []
+        assert not (tmp_path / "escape.txt").exists()
+
+    def test_bridge_members_are_skipped_when_no_bridge_control_is_given(self, tmp_path):
+        storage, archive = self._archive(tmp_path)
+        logger = FakeLogger()
+        control = FakeControl()
+
+        result = fabric_backup.restore_backup(archive, storage, control, now=_NOW, logger=logger)
+
+        assert result["bridge_restored"] is False
+        assert result["bridge_members"] == 3
+        warning = logger.text("warning")
+        assert fabric_backup.BRIDGE_MEMBER_PREFIX in warning
+        assert "Stop the Matter bridge" in warning
+        assert os.path.isfile(os.path.join(storage, "config"))
+
+    def test_a_controller_only_archive_never_touches_the_bridge_control(self, tmp_path):
+        _storage, archive = self._archive(tmp_path, bridge=False)
+        fresh_storage = str(tmp_path / "restored" / "matter-server")
+        bridge_dest = str(tmp_path / "restored" / "bridge-node")
+        log, ctl, bridge = _two_controls()
+        logger = FakeLogger()
+
+        result = fabric_backup.restore_backup(
+            archive, fresh_storage, ctl, now=_NOW, logger=logger,
+            bridge_storage_path=bridge_dest, bridge_control=bridge)
+
+        assert result["bridge_restored"] is False
+        assert not any(entry.startswith("bridge.") for entry in log)  # not even is_alive
+        assert "bridge" not in logger.text("warning").lower()
+
+    def test_a_bridge_dest_inside_the_controller_storage_is_refused_not_extracted(self, tmp_path):
+        storage, archive = self._archive(tmp_path)
+        bridge_dest = os.path.join(storage, "bridge-node")  # INSIDE the controller's storage
+        log, ctl, bridge = _two_controls()
+        logger = FakeLogger()
+
+        result = fabric_backup.restore_backup(
+            archive, storage, ctl, now=_NOW, logger=logger,
+            bridge_storage_path=bridge_dest, bridge_control=bridge)
+
+        assert result["bridge_restored"] is False
+        assert "overlaps" in logger.text("warning")
+        assert not os.path.exists(os.path.join(storage, "bridge-node"))
+        assert not any(entry.startswith("bridge.") for entry in log)
+        assert os.path.isfile(os.path.join(storage, "config"))
+
+    def test_a_failing_bridge_restart_during_rollback_is_loud_but_not_fatal(self, tmp_path):
+        storage, archive = self._archive(tmp_path)
+        bridge_dest = str(tmp_path / "appsupport" / "bridge-node")
+        with open(os.path.join(storage, "config"), "w") as fh:
+            fh.write("ORIGINAL-LIVE")
+        log: list[str] = []
+        ctl = FakeControl(name="ctl", log=log, fail_start=True)
+        bridge = FakeControl(name="bridge", log=log, start_always_false=True)
+        logger = FakeLogger()
+
+        with pytest.raises(RuntimeError, match="rolled back"):
+            fabric_backup.restore_backup(
+                archive, storage, ctl, now=_NOW, logger=logger,
+                bridge_storage_path=bridge_dest, bridge_control=bridge)
+
+        with open(os.path.join(storage, "config")) as fh:
+            assert fh.read() == "ORIGINAL-LIVE"
+        err = logger.text("error")
+        assert "bridge" in err.lower()
+        assert "pairings are intact" in err
