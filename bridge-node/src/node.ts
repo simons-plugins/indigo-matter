@@ -22,7 +22,14 @@
 
 import { join } from "node:path";
 
-import { Endpoint, Environment, ServerNode, VendorId, version as matterJsVersion } from "@matter/main";
+import {
+    Endpoint,
+    Environment,
+    ServerNode,
+    UninitializedDependencyError,
+    VendorId,
+    version as matterJsVersion,
+} from "@matter/main";
 import { BasicInformationServer } from "@matter/main/behaviors/basic-information";
 import { AggregatorEndpoint } from "@matter/main/endpoints/aggregator";
 import { Crypto } from "@matter/main";
@@ -91,6 +98,88 @@ const WARN_IDENTITY_WRITE = "identity-write";
 /** PBKDF iteration count for enhanced-window verifiers. Spec floor is 1000. */
 const PBKDF_ITERATIONS = 1000;
 const PBKDF_SALT_BYTES = 32;
+
+/**
+ * §133 — how long {@link settlePairingRead} keeps retrying. The observed
+ * transient window (`noteLastFabricGone` re-initialising matter.js after the
+ * last fabric leaves) was ~200ms live on 2026-08-06; 3s is ~15x headroom for
+ * a slower box. The number that actually pins it at 3s and not higher: it
+ * must stay comfortably under `bridge_client.py`'s 10s `DEFAULT_TIMEOUT` for
+ * `get_pairing`, so a genuinely broken node fails on OUR deadline and still
+ * says so, rather than the plugin's socket read timing out first and hiding
+ * which error was real.
+ */
+const PAIRING_SETTLE_DEADLINE_MS = 3000;
+/** ~50-100ms per retry: fine-grained enough to catch the ~200ms window
+ * within a couple of attempts, coarse enough not to spin. */
+const PAIRING_SETTLE_INTERVAL_MS = 75;
+
+/**
+ * matter.js 0.17.8 throws this (`Construction#assert` →
+ * `Lifecycle.assertActive`, in `@matter/general/util/Lifecycle`, re-exported
+ * by `@matter/main`'s `export * from "@matter/general"`) for a behavior read
+ * against a subject whose status is `Inactive` — exactly the state
+ * `getPairing()`'s `this.server.state...`/`this.fabrics()` reads land in
+ * during the re-init window. The class is reachable via a normal import, so
+ * `instanceof` is used directly; there is no message-text fallback to keep
+ * in sync.
+ */
+function isTransientUninitialized(error: unknown): boolean {
+    return error instanceof UninitializedDependencyError;
+}
+
+/** Real timer, unref'd: a pending retry must never keep the process alive
+ * past shutdown (same discipline as `window.ts`'s `defaultScheduler`). */
+function defaultPairingSettleSleep(ms: number): Promise<void> {
+    return new Promise(resolve => {
+        const timer = setTimeout(resolve, ms);
+        timer.unref?.();
+    });
+}
+
+/**
+ * §133 — bounded retry around a synchronous `read` (in practice
+ * {@link BridgeNode.getPairing}) that may throw matter.js's transient
+ * "not initialized" error while `noteLastFabricGone` is re-initialising the
+ * stack after the last fabric left. Unpairing the last fabric already
+ * succeeded by the time this races; without the retry the plugin's very next
+ * `get_pairing` read — confirming that success — logs a scary error instead.
+ *
+ * Retries only on {@link isTransientUninitialized}; anything else is
+ * rethrown immediately, no retry, no delay — a different failure is not this
+ * one. Past {@link PAIRING_SETTLE_DEADLINE_MS} the LAST error is rethrown
+ * unchanged (not wrapped): a node that is genuinely broken must still say so.
+ *
+ * `read`/`sleep`/`now`/the deadline and interval are all overridable so the
+ * retry/backoff/deadline behaviour is unit-testable with no live Matter
+ * stack — the same reason `CommissioningWindow` (`window.ts`) injects its
+ * scheduler.
+ */
+export async function settlePairingRead(
+    read: () => PairingReport,
+    options: {
+        deadlineMs?: number;
+        intervalMs?: number;
+        sleep?: (ms: number) => Promise<void>;
+        now?: () => number;
+    } = {},
+): Promise<PairingReport> {
+    const deadlineMs = options.deadlineMs ?? PAIRING_SETTLE_DEADLINE_MS;
+    const intervalMs = options.intervalMs ?? PAIRING_SETTLE_INTERVAL_MS;
+    const sleep = options.sleep ?? defaultPairingSettleSleep;
+    const now = options.now ?? Date.now;
+    const deadline = now() + deadlineMs;
+    for (;;) {
+        try {
+            return read();
+        } catch (error) {
+            if (!isTransientUninitialized(error) || now() >= deadline) {
+                throw error;
+            }
+            await sleep(intervalMs);
+        }
+    }
+}
 
 export { matterJsVersion };
 
@@ -1255,6 +1344,20 @@ export class BridgeNode implements BridgeFacade {
             qrPairingCode: null,
             fabrics: this.fabrics(),
         };
+    }
+
+    /**
+     * §133 — the wire handler's `get_pairing` read. Bounded-retries the
+     * transient "not initialized" window {@link noteLastFabricGone} leaves
+     * behind (see {@link settlePairingRead}), so a `get_pairing` that lands
+     * moments after a successful last-fabric unpair does not log a spurious
+     * failure. Internal callers ({@link logPairing}) stay on the sync
+     * {@link getPairing} — they run either after `server.start()` or at the
+     * tail of a completed `factoryReset()`, both points where the stack is
+     * already up and the race cannot occur.
+     */
+    async getPairingSettled(): Promise<PairingReport> {
+        return settlePairingRead(() => this.getPairing());
     }
 
     /**

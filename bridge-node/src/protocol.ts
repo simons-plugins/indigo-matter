@@ -323,6 +323,13 @@ export interface CommissioningWindowResult {
 export interface BridgeFacade {
     getStatus(): StatusReport;
     getPairing(): PairingReport;
+    /**
+     * §133 — what the `get_pairing` wire handler actually calls: a
+     * bounded-retry wrapper around {@link getPairing} that tolerates
+     * matter.js's transient "not initialized" window after the last fabric
+     * leaves (`noteLastFabricGone`). See `node.ts`'s `settlePairingRead`.
+     */
+    getPairingSettled(): Promise<PairingReport>;
     openCommissioningWindow(durationSeconds: number): Promise<CommissioningWindowResult>;
     /**
      * §3.1's reconcile. `replaceAll` is the parsed `intent: "replace_all"`; the
