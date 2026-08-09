@@ -25,8 +25,9 @@
   </div>
   <h1>Matter, Thread &amp; <em>where Indigo fits</em></h1>
   <p class="standfirst">A plain-English guide to the Matter landscape — and how Indigo, the
-  indigo-matter plugin, matter-server, Domio and Apple Home divide the work between them.
-  This is the “why does it work this way” page.</p>
+  indigo-matter plugin, matter-server, Domio and Apple Home divide the work between them, in
+  both directions: Matter devices becoming Indigo devices, and Indigo devices becoming a
+  Matter bridge of their own. This is the “why does it work this way” page.</p>
   <div class="mast-foot">
     <span class="stamp">Wi-Fi · validated</span>
     <span class="stamp">Thread · validated</span>
@@ -366,6 +367,99 @@
     </ul>
     <p><strong>Backups.</strong> Back up the fabric after commissioning anything you’d hate
     to re-pair. The plugin keeps rotating zips; restore is menu-driven and reversible.</p>
+  </div>
+</section>
+
+<section class="note reveal" id="matter-bridge">
+  <div class="sec-no">§ 12</div>
+  <div class="sec-body">
+    <h2>Indigo as a Matter bridge — the other direction</h2>
+    <p>Everything above is Indigo as a Matter <strong>controller</strong>: other people’s
+    devices becoming Indigo devices. The plugin runs the arrangement backwards too. The very
+    same plugin that joins your ecosystems as a second admin can just as easily be the one
+    that gets joined — publishing a set of Indigo devices you choose as a Matter bridge of its
+    own, so Apple Home sees and controls them like any other Matter accessory. Locally, with no
+    cloud relay and no separate bridge app per ecosystem.</p>
+    <div class="pull">If you’ve run Homebridge, this is the same idea over Matter’s protocol
+    instead of HomeKit’s — one implementation reaching every ecosystem that speaks it, rather
+    than one bridge per ecosystem.<small>The share model, inverted</small></div>
+    <p>Exporting is opt-in, per device, and starts from nothing: a fresh install exports zero
+    devices, pairs nothing, and runs no bridge process at all. You build the list yourself in
+    Plugins ▸ Matter ▸ <em>Manage Matter Exports…</em> — pick a device, and because Indigo
+    doesn’t record what a device <em>is</em> (a relay could be a lamp, a plug, or a lock), you
+    declare a role for it, and the dialog defaults to the safest reading. The picker marks
+    anything already on the list with a <code>●</code>, and shows devices that can’t be
+    exported too, with the reason, rather than leaving you to wonder where they went.</p>
+    <ul class="chips">
+      <li><b>Relay</b> → plug, light, or lock</li>
+      <li><b>Dimmer</b> → dimmable light or window covering</li>
+      <li><b>Colour dimmer</b> → colour-temperature or full-colour light</li>
+      <li><b>Sensor</b> → one of seven Matter sensor types</li>
+      <li><b>Thermostat</b> → thermostat</li>
+    </ul>
+    <div class="flow" role="img" aria-label="Export flow from an Indigo device through the plugin's bridge role, the bridge node, and into Apple Home">
+      <div class="flow-node"><b>An Indigo device</b><span>Z-Wave, Insteon, Zigbee behind a
+      plugin, MQTT — anything with a device record — added to the allow-list</span></div>
+      <div class="flow-link"><i>you declare a role</i></div>
+      <div class="flow-node hero"><b>indigo-matter — the bridge role</b><span>owns the
+      allow-list, translates Indigo device states ↔ Matter clusters, drives the bridge node
+      over a local WebSocket</span></div>
+      <div class="flow-link"><i>loopback WebSocket</i></div>
+      <div class="flow-node"><b>bridge node (Node.js / matter.js)</b><span>a Matter
+      <em>device</em>, not a controller — it holds no fabric of its own, and gets commissioned
+      into every ecosystem that pairs it</span></div>
+      <div class="flow-link"><i>UDP · link-local IPv6 · mDNS</i></div>
+      <div class="flow-node"><b>Apple Home (and any ecosystem you pair)</b><span>sees one
+      bridge accessory, with one child endpoint per exported device</span></div>
+    </div>
+
+    <h3>Pairing the bridge into an ecosystem</h3>
+    <p>Pairing happens once per ecosystem, not once per device — export something new later
+    and it appears in every ecosystem you’ve already paired, with no further action.</p>
+    <ol class="steps">
+      <li><b>Export at least one device first.</b> The bridge process only exists while the
+      export list is non-empty — there’s nothing to pair against an empty list.</li>
+      <li><b>Open a pairing window.</b> Plugins ▸ Matter ▸ <em>Pair Matter Bridge…</em>.
+      Indigo’s own dialogs can’t display a value their own button just computed, so the code
+      doesn’t appear in the dialog — it goes to the Event Log, alongside a link to a page,
+      served over Indigo’s own web server, that shows the same code large enough to read
+      across a room, plus a QR payload.</li>
+      <li><b>Add the accessory</b> in Apple Home (or Alexa, or Google Home), entering the code
+      by hand. It’s found as <em>Indigo Matter Bridge</em> — and immediately flagged as an
+      uncertified accessory.</li>
+      <li><b>Choose Add Anyway.</b> See below for why that’s the right call, every time.</li>
+    </ol>
+    <div class="aside">
+      <span class="tag">Expected behaviour</span>
+      <strong>Why every ecosystem calls the bridge “uncertified”.</strong> Matter attestation
+      runs one way — the <em>commissioner</em> checks the <em>device’s</em> certificate — and
+      out here the bridge is the device. It advertises with the specification’s test vendor ID,
+      the same posture Homebridge, matterbridge and Home Assistant’s own bridge all ship with.
+      A real CSA vendor ID needs paid membership and per-product certification, which isn’t
+      proportionate for a free plugin — so the warning is permanent, not a bug to chase.
+    </div>
+
+    <h3>Accessory identity, and why restarts don’t duplicate anything</h3>
+    <p>Every exported device gets a stable identity tied to its Indigo device ID, and a Matter
+    endpoint number allocated once against that identity — never from its position in a list.
+    Ecosystems remember both: the name you gave the accessory, the room you put it in, the
+    scenes and automations you built on it are all keyed to the identity, not the name.</p>
+    <div class="pull">The endpoint numbers are matter.js’s. The bridge’s own record is a
+    witness, not an allocator — it notices when something’s wrong; it never repairs it, and it
+    never hands out numbers of its own.<small>Why restarts are safe</small></div>
+    <p>That witness record is also what makes a restart harmless. Reboots, plugin upgrades and
+    crash recoveries used to leave the bridge briefly showing ecosystems an empty accessory
+    list, and Apple would treat whatever came back as brand new, stuck in the bridge’s own
+    room. The bridge now rebuilds its accessory list from disk before it ever goes back online,
+    so a restart shows ecosystems accessories that were briefly unavailable, not accessories
+    that vanished — and even a full pairing reset, which used to trip a false drift alarm on
+    the witness record, now just quietly adopts the fresh numbers matter.js hands out.</p>
+    <p>This page is the shape of it. For the walkthrough — installing the bridge package,
+    exporting your first device, opening a pairing window, the recovery actions — see
+    <a href="https://github.com/simons-plugins/indigo-matter/blob/main/docs/INSTALL.md">INSTALL.md</a>.
+    For the full prose — what can and can’t be exported and why, the fabric mechanics, which
+    ecosystems are proven — see
+    <a href="https://github.com/simons-plugins/indigo-matter/blob/main/docs/MATTER.md#indigo-as-a-matter-bridge--the-other-direction">MATTER.md</a>.</p>
   </div>
 </section>
 
