@@ -262,7 +262,9 @@ plugin's job-level commission deadline is 300s and may legitimately outlive
 Domio's 120s poll window. The plugin reconciles only when the joining node can
 be attributed unambiguously: if two jobs for *different* setup codes are both
 inside their window when a node joins, neither is claimed (the jobs stay
-`failed`, and the devices are created with the device's own product name).
+`failed`, and the devices are created with the device's own product name) —
+and neither is already identified with the joining node (the v1.4 exact-identity
+claim, see "Late failure" below, works regardless of how many setup codes wait).
 Retries of the same setup code are one device and reconcile normally. If the
 window closes with no join, the event log records that definitively — no
 contract change, since a still-`failed` job's payload is unaffected.
@@ -272,13 +274,17 @@ job has already gone `failed`/`commissioning_timeout` — and say the attempt di
 succeed. matter-server has no separate "commissioning failed" event; this RPC answer
 is the only definitive word the plugin will ever get on why a timed-out commission
 actually ended, so the job's error is corrected once it arrives: `error.code` becomes
-`commissioning_failed` and `error.message` explains a late answer arrived. This is the
-one case where a `failed` job's `error` changes after the fact — `status` stays
-`failed` throughout (this is a `failed` → `failed` transition, never `failed` →
-`success`; a late *success* answer is not surfaced to Domio at all — it only helps the
-plugin attribute a subsequent `node_added`, see the reconcile paragraph above). A
-client that already stopped polling a `failed` job will simply never see the
-correction; one still polling sees the `error` fields update in place.
+`commissioning_failed` and `error.message` explains a late answer arrived. This is
+the one case where a job's fields change after going terminal *while it stays
+`failed`* (the v1.3 timeout reconcile above also changes a terminal job's fields, but
+by leaving `failed` for `success`) — this is a `failed` → `failed` transition, never
+`failed` → `success`; a late *success* answer is not surfaced to Domio at all — it
+only helps the plugin attribute a subsequent `node_added` (see the reconcile
+paragraph above), and, internally, feeds the #21 already-claimed-node removal guard
+and the #24 orphan-node cleanup that runs when the reconcile window closes unclaimed
+— neither of which is itself surfaced to Domio. A client that already stopped polling
+a `failed` job will simply never see the correction; one still polling sees the
+`error` fields update in place.
 
 ### 3.4 `POST …/message/com.simons-plugins.indigo-matter/decommission?nodeId={nodeId}`
 
@@ -372,8 +378,10 @@ None in v1. Single-user system. Plugin SHOULD log abnormal traffic patterns but 
 
 ## 7. Versioning
 
-This contract is v1.4. Changes from v1.3 (additive, no transport change; the only
-`failed` job whose fields can change after going terminal):
+This contract is v1.4. Changes from v1.3 (additive, no transport change; the one
+case where a job's fields change after going terminal *while it stays* `failed`
+— the v1.3 timeout reconcile below also changes a terminal job, but by leaving
+`failed` for `success`):
 
 - §3.3: a `failed` job's `error` can now be corrected in place if matter-server's own
   answer to the commission RPC arrives late and reports the attempt failed —
@@ -390,10 +398,10 @@ Changes from v1.2 (v1.3, all clarifications/additive, no transport change):
 
 Changes from v1.1 (v1.2): decommission's `nodeId` moved from a path component to a `?nodeId=` query param (the path form never worked — IWS drops trailing path components on POST); diagnostics additionally accepts `?nodeId=`; the local base URL is HTTPS, not HTTP. v1.1 itself was a transport change from v1.0 (semantics unchanged). Breaking changes require a version bump and a transition period where both versions are supported. Additive changes (new optional params, new handlers) do not require a version bump.
 
-Domio includes `X-Matter-API-Version: 1.4` in every request. The plugin accepts both
-`1.3` and `1.4` (a client not yet mirroring this v1.4 update sends `1.3`, which is
-backward-compatible — see the note above) and SHOULD warn (HTTP 200, with `warning`
-field) if Domio's version is unrecognised.
+Domio includes `X-Matter-API-Version: 1.4` in every request. The plugin does not
+currently validate the header; 1.3 and 1.4 clients are wire-compatible (a client
+not yet mirroring this v1.4 update sends `1.3`, which every v1.4 change above is
+backward-compatible with — see the note above).
 
 ## 8. Future Endpoints (Not in v1)
 
