@@ -535,6 +535,69 @@ class TestReviveAfterInstall:
         assert new.ran is True, "the fresh client's run loop must have been started"
         assert h.bridge.client is new
 
+    def test_a_revival_resets_the_halt_report_latches(self, bridge_mod, mock_logger, devices):
+        """⊗ Review finding: the latches survived the swap, so a reinstall that
+        did NOT fix the skew re-halted in silence — the watchdog's standing
+        "nothing is being exported" line stayed suppressed by the OLD client's
+        report. A new client is a new outage history."""
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(101, "onOffLight")])
+        old = h.start()
+        old.halted = True
+        old.halted_reason = "version_skew"
+        h.bridge._halted_reported = True          # the old halt was reported
+        h.bridge._recovery_reported = True
+        h.bridge._refusal_reported = "version_mismatch"
+        assert h.bridge.revive_after_install() is True
+        assert h.bridge._halted_reported is False, "a re-halt of the NEW client must be reportable"
+        assert h.bridge._recovery_reported is False
+        assert h.bridge._refusal_reported is None
+
+    def test_a_successor_client_built_mid_revival_is_not_dropped(
+            self, bridge_mod, mock_logger, devices):
+        """⊗ The `if self.client is client` guard, pinned. An unconditional
+        null survived the whole suite (review mutation). The race window is
+        between the guard's read and the null, so the swap is triggered FROM
+        the guard's own halted_reason read — the only seam that interleaves
+        exactly there.
+        """
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(101, "onOffLight")])
+        old = h.start()
+        old.halted = True
+        successor = h.make_client() if hasattr(h, "make_client") else type(old)(mock_logger, {})
+        bridge = h.bridge
+
+        class _SwapsOnRead:
+            """halted_reason that installs a successor the moment it is read.
+
+            A DATA descriptor (has __set__), deliberately: FakeBridgeClient's
+            __init__ writes an instance attribute, and only a data descriptor
+            outranks the instance dict on reads.
+            """
+            fired = False
+
+            def __get__(self, obj, objtype=None):
+                # Swap ONCE, on the guard's read. The log line reads
+                # halted_reason again after the null — re-installing the
+                # successor there would heal the very mutation this test
+                # exists to kill (unconditional null → start() builds a
+                # third client → caught below).
+                if not _SwapsOnRead.fired:
+                    _SwapsOnRead.fired = True
+                    bridge.client = successor
+                return "version_skew"
+
+            def __set__(self, obj, value):
+                pass  # the fixture's __init__ write; the read above is the law
+
+        type(old).halted_reason = _SwapsOnRead()
+        try:
+            bridge.revive_after_install()
+        finally:
+            del type(old).halted_reason
+        assert bridge.client is successor, (
+            "revival nulled a successor client it never checked — the guard "
+            "must only drop the exact object it validated")
+
     def test_revives_a_client_halted_on_the_attach_time_version_mismatch(
             self, bridge_mod, mock_logger, devices):
         """The other path to the same fact (bridge_client.py:403):

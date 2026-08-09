@@ -327,6 +327,16 @@ class ExportBridge:
         )
         self._unreachable_reported = False
         self._disconnect_ticks = 0
+        # A new client is a new outage history: the halt/recovery/refusal
+        # latches must not carry over, or a client swapped in by
+        # revive_after_install (#154) that halts AGAIN — the reinstall did not
+        # actually fix the skew — re-halts in silence, with the watchdog's
+        # standing "nothing is being exported" line suppressed by the OLD
+        # client's report. _on_attached also resets these on success;
+        # this is the failure-path reset.
+        self._halted_reported = False
+        self._recovery_reported = False
+        self._refusal_reported = None
         self._fire(self.client.run(), "bridge client run loop",
                    lost="nothing will be exported until the plugin is reloaded")
         self._logger.info(

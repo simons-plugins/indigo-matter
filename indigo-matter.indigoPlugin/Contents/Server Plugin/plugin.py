@@ -2597,6 +2597,14 @@ class Plugin(indigo.PluginBase):
                     "FAILED — the old version may still be running. Check %s.",
                     os.path.join(self.bridge_process.log_dir, bridge_agent.BRIDGE_ERR_LOG))
                 return
+            if self._stopping:
+                # Second check, deliberately: ensure_installed()/restart() are
+                # subprocess work that can outlast shutdown()'s 5s thread join,
+                # and revive_after_install is the one caller of start() that
+                # can genuinely race teardown — it would bootstrap launchctl
+                # and then log a scary "could not schedule bridge client run
+                # loop" over a plugin that is simply exiting.
+                return
             # #154: a client HALTED on version skew is not the retry_now() case
             # below — it declines the poke by design (a halt is fail-closed) and
             # nothing revives it on its own, so the reinstall that was SUPPOSED
