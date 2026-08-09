@@ -5,18 +5,26 @@ on:
     branches:
       - main
       - master
+  # Cut a release from whatever main currently holds, on demand — the way to
+  # ship a run of banked merges without needing the marker on any particular
+  # PR. Actions tab → Create Release → Run workflow.
+  workflow_dispatch:
 
 jobs:
   create-release:
-    # Opt-out marker. A merge whose commit message contains [no-release] is
-    # skipped entirely — no tag, no release, no bundle. Intended for the
-    # intermediate merges of a multi-PR feature arc, where every merge would
-    # otherwise mint a release nobody installs. Put the marker in the PR TITLE:
-    # GitHub's default merge commit is "Merge pull request #N from …" followed
-    # by the PR title, so the title is what lands in the message this reads.
-    # A release still needs its own PluginVersion bump — version-check is
-    # unaffected by this marker and continues to require one on every PR.
-    if: ${{ !contains(github.event.head_commit.message, '[no-release]') }}
+    # OPT-IN. Releases are created only when explicitly requested (2026-08-09
+    # policy flip — the opt-out [no-release] marker had become the majority
+    # case, and forgetting it minted releases by accident):
+    #   * put [release] in the PR TITLE — GitHub's default merge commit is
+    #     "Merge pull request #N from …" followed by the title, so the title
+    #     is what lands in the message this reads; or
+    #   * run this workflow manually from the Actions tab (workflow_dispatch),
+    #     which releases main as it stands.
+    # An ordinary merge without the marker does nothing here: no tag, no
+    # release, no bundle. A release still needs its PluginVersion to be
+    # untagged — version-check enforces the bump on every PR regardless, so
+    # the version a [release] merge ships is whatever the branch bumped to.
+    if: ${{ github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[release]') }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
