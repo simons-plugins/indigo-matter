@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import json
+import os
 from pathlib import Path
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from types import SimpleNamespace
@@ -38,6 +39,7 @@ def plug(plugin_mod):
     p.jobs = None
     p.pluginPrefs = {}
     p.export_bridge = None
+    p.bridge_process = None
     p._exported_ids = frozenset()
     p._subscribed_to_devices = False
     return p
@@ -760,6 +762,167 @@ def test_menu_restore_surfaces_error_dict_when_restore_fails(plug, tmp_path):
     plug.logger.error.assert_called()
     # original fabric was preserved (rolled back) — not wiped
     assert (Path(storage) / "config").read_text() == "ORIGINAL-LIVE"
+
+
+# ---------------------------------------------------------------------------
+# Restore now wires the bridge node's stop()/start() seam too (#136)
+# ---------------------------------------------------------------------------
+def _fake_restore_result(archive_path, *, bridge_restored=False, bridge_members=0,
+                          bridge_moved_aside_to=None, bridge_started=None):
+    return {
+        "restored_from": archive_path,
+        "moved_aside_to": None,
+        "bridge_restored": bridge_restored,
+        "bridge_members": bridge_members,
+        "bridge_moved_aside_to": bridge_moved_aside_to,
+        "bridge_started": bridge_started,
+    }
+
+
+def test_menu_restore_passes_the_bridge_control_and_path(plug, tmp_path, monkeypatch):
+    import fabric_backup
+    storage = _storage_with_fabric(tmp_path)
+    seen = {}
+
+    def fake_restore_backup(archive_path, storage_path, server_control, *, now, logger=None,
+                            bridge_storage_path=None, bridge_control=None):
+        seen["bridge_storage_path"] = bridge_storage_path
+        seen["bridge_control"] = bridge_control
+        return _fake_restore_result(archive_path)
+
+    monkeypatch.setattr(fabric_backup, "restore_backup", fake_restore_backup)
+    plug.server_process = SimpleNamespace(storage_path=storage)
+    plug.pluginPrefs = {}
+
+    ok, _vd = plug.menuRestoreFabricBackup({"backup": "/x.zip", "confirm": True}, "restoreFabricBackup")
+
+    assert ok is True
+    bridge_path = seen["bridge_storage_path"]
+    assert bridge_path.endswith("bridge-node")
+    assert os.path.dirname(bridge_path) == os.path.dirname(storage)  # a sibling of storage_path
+    control = seen["bridge_control"]
+    assert hasattr(control, "stop") and hasattr(control, "start") and hasattr(control, "is_alive")
+
+
+def test_menu_restore_builds_a_bridge_control_when_the_session_never_exported(plug, tmp_path, monkeypatch):
+    import bridge_agent
+    import fabric_backup
+    storage = _storage_with_fabric(tmp_path)
+    seen = {}
+
+    def fake_restore_backup(archive_path, storage_path, server_control, *, now, logger=None,
+                            bridge_storage_path=None, bridge_control=None):
+        seen["bridge_control"] = bridge_control
+        return _fake_restore_result(archive_path)
+
+    monkeypatch.setattr(fabric_backup, "restore_backup", fake_restore_backup)
+    plug.server_process = SimpleNamespace(storage_path=storage)
+    plug.pluginPrefs = {}
+    assert plug.bridge_process is None
+
+    plug.menuRestoreFabricBackup({"backup": "/x.zip", "confirm": True}, "restoreFabricBackup")
+
+    assert isinstance(seen["bridge_control"], bridge_agent.BridgeProcess)
+    assert plug.bridge_process is seen["bridge_control"]  # kept, not thrown away
+
+
+def test_menu_restore_reuses_an_existing_bridge_process(plug, tmp_path, monkeypatch):
+    import fabric_backup
+    storage = _storage_with_fabric(tmp_path)
+    sentinel = Mock()
+    plug.bridge_process = sentinel
+    seen = {}
+
+    def fake_restore_backup(archive_path, storage_path, server_control, *, now, logger=None,
+                            bridge_storage_path=None, bridge_control=None):
+        seen["bridge_control"] = bridge_control
+        return _fake_restore_result(archive_path)
+
+    monkeypatch.setattr(fabric_backup, "restore_backup", fake_restore_backup)
+    plug.server_process = SimpleNamespace(storage_path=storage)
+    plug.pluginPrefs = {}
+
+    plug.menuRestoreFabricBackup({"backup": "/x.zip", "confirm": True}, "restoreFabricBackup")
+
+    assert seen["bridge_control"] is sentinel
+
+
+def test_menu_restore_falls_back_to_no_bridge_control_when_one_cannot_be_built(plug, tmp_path, monkeypatch):
+    import bridge_agent
+    import fabric_backup
+    storage = _storage_with_fabric(tmp_path)
+    seen = {}
+
+    def boom(*_a, **_k):
+        raise RuntimeError("no bridge_protocol on this build")
+
+    monkeypatch.setattr(bridge_agent, "BridgeProcess", boom)
+
+    def fake_restore_backup(archive_path, storage_path, server_control, *, now, logger=None,
+                            bridge_storage_path=None, bridge_control=None):
+        seen["bridge_control"] = bridge_control
+        return _fake_restore_result(archive_path)
+
+    monkeypatch.setattr(fabric_backup, "restore_backup", fake_restore_backup)
+    plug.server_process = SimpleNamespace(storage_path=storage)
+    plug.pluginPrefs = {}
+
+    ok, _vd = plug.menuRestoreFabricBackup({"backup": "/x.zip", "confirm": True}, "restoreFabricBackup")
+
+    assert ok is True  # a bridge control we can't build never blocks the controller restore
+    assert seen["bridge_control"] is None
+    plug.logger.warning.assert_called()
+
+
+def test_menu_restore_never_clears_the_XAC1_latch(plug, tmp_path, monkeypatch):
+    """menuRestoreFabricBackup must not call note_agent_stopped() — see plugin.py's
+    call-site comment: restore uses stop()/start(), never uninstall(), so the
+    XAC1 latch's claim ("this session started the bridge agent") stays true
+    whether or not this restore touched a live bridge."""
+    import fabric_backup
+    storage = _storage_with_fabric(tmp_path)
+    plug.export_bridge = Mock()
+    plug.server_process = SimpleNamespace(storage_path=storage)
+    plug.pluginPrefs = {}
+
+    monkeypatch.setattr(fabric_backup, "restore_backup",
+                        lambda archive_path, *_a, **_k: _fake_restore_result(archive_path))
+    plug.menuRestoreFabricBackup({"backup": "/x.zip", "confirm": True}, "restoreFabricBackup")
+    plug.export_bridge.note_agent_stopped.assert_not_called()
+
+    def fake_restore_fail(*_a, **_k):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(fabric_backup, "restore_backup", fake_restore_fail)
+    plug.menuRestoreFabricBackup({"backup": "/x.zip", "confirm": True}, "restoreFabricBackup")
+    plug.export_bridge.note_agent_stopped.assert_not_called()
+
+
+def test_menu_restore_reports_the_bridge_outcome_honestly(plug, tmp_path, monkeypatch):
+    import fabric_backup
+    storage = _storage_with_fabric(tmp_path)
+    plug.server_process = SimpleNamespace(storage_path=storage)
+    plug.pluginPrefs = {}
+
+    monkeypatch.setattr(fabric_backup, "restore_backup",
+                        lambda archive_path, *_a, **_k: _fake_restore_result(
+                            archive_path, bridge_restored=True, bridge_members=3,
+                            bridge_moved_aside_to="/x/bridge-node.pre-restore-1", bridge_started=True))
+    ok, _vd = plug.menuRestoreFabricBackup({"backup": "/x.zip", "confirm": True}, "restoreFabricBackup")
+    assert ok is True
+    msg = " ".join(str(a) for c in plug.logger.info.call_args_list for a in c.args)
+    assert "bridge" in msg.lower()
+    assert "endpoint" in msg.lower()
+    assert "drift" in msg.lower()
+
+    plug.logger.reset_mock()
+    monkeypatch.setattr(fabric_backup, "restore_backup",
+                        lambda archive_path, *_a, **_k: _fake_restore_result(
+                            archive_path, bridge_restored=True, bridge_members=3,
+                            bridge_moved_aside_to="/x/bridge-node.pre-restore-1", bridge_started=False))
+    ok, _vd = plug.menuRestoreFabricBackup({"backup": "/x.zip", "confirm": True}, "restoreFabricBackup")
+    assert ok is True  # the controller fabric still restored — only the bridge didn't come back
+    plug.logger.error.assert_called()
 
 
 # ---------------------------------------------------------------------------
