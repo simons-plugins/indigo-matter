@@ -75,6 +75,12 @@ class _IndigoPluginBaseStub:
         self._record_base_call("deviceDeleted", dev)
 
 
+#: Modules that `plugin` composes and that bind `indigo` at import time. They must be
+#: evicted alongside `plugin` so `importlib.reload(plugin)` re-imports them against the
+#: mock installed for THIS test (issue #146).
+_PLUGIN_MODULES = ("plugin", "plugin_constants", "pairing_page", "http_api_mixin")
+
+
 @pytest.fixture
 def mock_indigo_base(monkeypatch):
     """Install a minimal ``indigo`` module into ``sys.modules``.
@@ -86,5 +92,6 @@ def mock_indigo_base(monkeypatch):
     indigo.PluginBase = _IndigoPluginBaseStub
     indigo.Dict = dict
     monkeypatch.setitem(sys.modules, "indigo", indigo)
-    monkeypatch.delitem(sys.modules, "plugin", raising=False)
+    for name in _PLUGIN_MODULES:
+        monkeypatch.delitem(sys.modules, name, raising=False)
     return indigo
