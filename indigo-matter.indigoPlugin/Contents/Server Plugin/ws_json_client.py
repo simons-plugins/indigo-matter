@@ -289,6 +289,14 @@ class WsJsonClient:  # pylint: disable=too-many-instance-attributes
         calling it while a run loop is live is refused: the running loop would
         not pick it up, and clearing the flag mid-teardown is exactly the race
         the local latch in :meth:`_run_loop` guards against).
+
+        Still zero callers (issue #154): the bridge side's answer to a
+        version-skew halt is ``export_bridge.ExportBridge.revive_after_install``,
+        which does not call this at all — it discards the halted client outright
+        and builds a brand-new one via :meth:`export_bridge.ExportBridge.start`,
+        sidestepping the "caller must start a new run task" contract above
+        rather than satisfying it. This method is kept for a peer that can be
+        resumed on the SAME object; nothing in this codebase is.
         """
         if self._running:
             self.logger.warning(

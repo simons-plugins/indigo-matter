@@ -1088,7 +1088,7 @@ class TestBridgeAgentWiring:
         agent = Mock(install=Mock(return_value=True), restart=Mock(return_value=True),
                      ensure_installed=Mock(return_value=False))
         monkeypatch.setattr(plugin_mod.bridge_agent, "BridgeProcess", lambda *_a, **_k: agent)
-        plug.export_bridge = Mock()
+        plug.export_bridge = Mock(revive_after_install=Mock(return_value=False))
         plug._install_bridge_node()
         plug.export_bridge.retry_now.assert_called_once()
 
@@ -1100,7 +1100,7 @@ class TestBridgeAgentWiring:
         agent = Mock(install=Mock(return_value=True), restart=Mock(return_value=True),
                      ensure_installed=Mock(return_value=True))
         monkeypatch.setattr(plugin_mod.bridge_agent, "BridgeProcess", lambda *_a, **_k: agent)
-        plug.export_bridge = Mock()
+        plug.export_bridge = Mock(revive_after_install=Mock(return_value=False))
         plug._install_bridge_node()
         agent.restart.assert_not_called()
         plug.export_bridge.retry_now.assert_called_once()
@@ -1110,7 +1110,8 @@ class TestBridgeAgentWiring:
         agent = Mock(install=Mock(return_value=True), restart=Mock(return_value=True),
                      ensure_installed=Mock(return_value=False))
         monkeypatch.setattr(plugin_mod.bridge_agent, "BridgeProcess", lambda *_a, **_k: agent)
-        plug.export_bridge = Mock(retry_now=Mock(return_value=True))
+        plug.export_bridge = Mock(revive_after_install=Mock(return_value=False),
+                                  retry_now=Mock(return_value=True))
         plug._install_bridge_node()
         said = _logged(plug.logger)
         assert "reconnecting now" in said
@@ -1123,11 +1124,43 @@ class TestBridgeAgentWiring:
         agent = Mock(install=Mock(return_value=True), restart=Mock(return_value=True),
                      ensure_installed=Mock(return_value=False))
         monkeypatch.setattr(plugin_mod.bridge_agent, "BridgeProcess", lambda *_a, **_k: agent)
-        plug.export_bridge = Mock(retry_now=Mock(return_value=False))
+        plug.export_bridge = Mock(revive_after_install=Mock(return_value=False),
+                                  retry_now=Mock(return_value=False))
         plug._install_bridge_node()
         said = _logged(plug.logger)
         assert "reload the plugin to reconnect" in said
         assert "reconnecting now" not in said
+
+    # -- issue #154: reviving a client halted on version skew ---------------
+
+    def test_a_REVIVED_halt_says_so_and_never_reaches_the_poke(self, plug, plugin_mod,
+                                                               monkeypatch):
+        """Revival is tried FIRST. When it lands, the retry_now() poke — which a
+        halted client would have declined anyway — must not even be attempted."""
+        agent = Mock(install=Mock(return_value=True), restart=Mock(return_value=True),
+                     ensure_installed=Mock(return_value=False))
+        monkeypatch.setattr(plugin_mod.bridge_agent, "BridgeProcess", lambda *_a, **_k: agent)
+        plug.export_bridge = Mock(revive_after_install=Mock(return_value=True))
+        plug._install_bridge_node()
+        plug.export_bridge.retry_now.assert_not_called()
+        said = _logged(plug.logger)
+        assert "halted connection has been replaced" in said
+        assert "reload the plugin to reconnect" not in said
+
+    def test_a_DECLINED_revival_falls_through_to_the_poke(self, plug, plugin_mod, monkeypatch):
+        """The ordinary #135 poke is still reached for every OTHER reason a
+        client is not connected (never built, closing, or halted for a reason
+        revival does not cover) — revival returning False must change nothing
+        about that path."""
+        agent = Mock(install=Mock(return_value=True), restart=Mock(return_value=True),
+                     ensure_installed=Mock(return_value=False))
+        monkeypatch.setattr(plugin_mod.bridge_agent, "BridgeProcess", lambda *_a, **_k: agent)
+        plug.export_bridge = Mock(revive_after_install=Mock(return_value=False),
+                                  retry_now=Mock(return_value=True))
+        plug._install_bridge_node()
+        plug.export_bridge.revive_after_install.assert_called_once()
+        plug.export_bridge.retry_now.assert_called_once()
+        assert "reconnecting now" in _logged(plug.logger)
 
     def test_a_missing_export_bridge_is_not_a_crash(self, plug, plugin_mod, monkeypatch):
         """A session that has not built one yet (or ever) must not blow up here."""

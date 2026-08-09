@@ -492,6 +492,76 @@ class TestRetryNow:
 
 
 # ---------------------------------------------------------------------------
+# #154: reviving a client halted on version skew, after a bridge reinstall
+# ---------------------------------------------------------------------------
+class TestReviveAfterInstall:
+    def test_is_a_no_op_while_nothing_is_exported(self, bridge_mod, mock_logger, devices):
+        h = Harness(bridge_mod, mock_logger, devices, [])
+        assert h.bridge.revive_after_install() is False, "no client (XG5) means nothing to revive"
+        assert h.clients == []
+
+    def test_is_a_no_op_when_the_client_is_not_halted(self, bridge_mod, mock_logger, devices):
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(101, "onOffLight")])
+        client = h.start()
+        assert h.bridge.revive_after_install() is False
+        assert h.bridge.client is client, "a live client must not be discarded"
+
+    def test_is_a_no_op_when_halted_for_a_reason_a_reinstall_cannot_fix(
+            self, bridge_mod, mock_logger, devices):
+        """⊗ The critical gate. ``mass_removal_refused`` also HALTS the client
+        (``bridge_client.HALTING_ATTACH_ERRORS``), but its remedy is the
+        allow-list, not the node process — reviving it here would silently
+        rebuild a client that attaches straight back into the same refusal.
+        """
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(101, "onOffLight")])
+        client = h.start()
+        client.halted = True
+        client.halted_reason = bridge_protocol.ERR_MASS_REMOVAL_REFUSED
+        assert h.bridge.revive_after_install() is False
+        assert h.bridge.client is client, "the wrong-reason halt must be left alone"
+        assert client.closed is False
+
+    def test_revives_a_client_halted_on_the_handshake_version_skew(
+            self, bridge_mod, mock_logger, devices):
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(101, "onOffLight")])
+        old = h.start()
+        old.halted = True
+        old.halted_reason = "version_skew"
+        assert h.bridge.revive_after_install() is True
+        assert old.closed is True, "the halted client's socket must still be released"
+        assert len(h.clients) == 2, "a fresh client must have been built"
+        new = h.clients[-1]
+        assert new is not old
+        assert new.ran is True, "the fresh client's run loop must have been started"
+        assert h.bridge.client is new
+
+    def test_revives_a_client_halted_on_the_attach_time_version_mismatch(
+            self, bridge_mod, mock_logger, devices):
+        """The other path to the same fact (bridge_client.py:403):
+        ``HALTING_ATTACH_ERRORS`` also carries ``ERR_VERSION_MISMATCH``, and
+        that path's ``halted_reason`` is the raw wire code
+        (``"version_mismatch"``), not the handshake's ``"version_skew"``.
+        """
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(101, "onOffLight")])
+        old = h.start()
+        old.halted = True
+        old.halted_reason = bridge_protocol.ERR_VERSION_MISMATCH
+        assert h.bridge.revive_after_install() is True
+        assert h.clients[-1] is not old
+
+    def test_logs_the_replaced_connection_line(self, bridge_mod, mock_logger, devices):
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(101, "onOffLight")])
+        client = h.start()
+        client.halted = True
+        client.halted_reason = "version_skew"
+        h.bridge.revive_after_install()
+        said = " ".join(str(c.args[0]) % c.args[1:] if len(c.args) > 1 else str(c.args[0])
+                        for c in mock_logger.info.call_args_list)
+        assert "reinstalled" in said
+        assert "halted" in said
+
+
+# ---------------------------------------------------------------------------
 # Indigo → node
 # ---------------------------------------------------------------------------
 class TestDeviceUpdated:

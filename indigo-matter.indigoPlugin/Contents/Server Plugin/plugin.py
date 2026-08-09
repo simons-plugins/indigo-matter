@@ -2597,19 +2597,32 @@ class Plugin(indigo.PluginBase):
                     "FAILED — the old version may still be running. Check %s.",
                     os.path.join(self.bridge_process.log_dir, bridge_agent.BRIDGE_ERR_LOG))
                 return
-            # Cuts the reconnect backoff short (issue #135): it grew to its 30s
-            # ceiling while the package was missing, and without this the user
-            # watches out the rest of that delay right after a success message.
-            # `poked` is truthful, not assumed: no bridge, no client, or a
-            # declining client (halted/closing/#154) all mean the poke never
-            # reached a run loop, so the log must not claim it is reconnecting.
-            poked = self.export_bridge is not None and self.export_bridge.retry_now()
-            if poked:
+            # #154: a client HALTED on version skew is not the retry_now() case
+            # below — it declines the poke by design (a halt is fail-closed) and
+            # nothing revives it on its own, so the reinstall that was SUPPOSED
+            # to fix it left the user with no route back except a plugin reload.
+            # Tried first, and only ever replaces a client actually halted for
+            # that reason — see `revive_after_install`'s own reason gate.
+            revived = self.export_bridge is not None and self.export_bridge.revive_after_install()
+            if revived:
                 self.logger.info("Matter bridge installed and restarted onto the new "
-                                 "version — reconnecting now.")
+                                 "version — the halted connection has been replaced; "
+                                 "reconnecting now.")
             else:
-                self.logger.info("Matter bridge installed and restarted onto the new "
-                                 "version — reload the plugin to reconnect.")
+                # Cuts the reconnect backoff short (issue #135): it grew to its
+                # 30s ceiling while the package was missing, and without this
+                # the user watches out the rest of that delay right after a
+                # success message. `poked` is truthful, not assumed: no bridge,
+                # no client, or a declining client (halted/closing/#154) all
+                # mean the poke never reached a run loop, so the log must not
+                # claim it is reconnecting.
+                poked = self.export_bridge is not None and self.export_bridge.retry_now()
+                if poked:
+                    self.logger.info("Matter bridge installed and restarted onto the new "
+                                     "version — reconnecting now.")
+                else:
+                    self.logger.info("Matter bridge installed and restarted onto the new "
+                                     "version — reload the plugin to reconnect.")
         except Exception as exc:  # noqa: BLE001
             self.logger.exception(exc)
             self.logger.error(
