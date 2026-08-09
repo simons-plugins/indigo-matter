@@ -78,7 +78,8 @@ class _IndigoPluginBaseStub:
 #: Modules that `plugin` composes and that bind `indigo` at import time. They must be
 #: evicted alongside `plugin` so `importlib.reload(plugin)` re-imports them against the
 #: mock installed for THIS test (issue #146).
-_PLUGIN_MODULES = ("plugin", "plugin_constants", "pairing_page", "http_api_mixin")
+_PLUGIN_MODULES = ("plugin", "plugin_constants", "pairing_page", "http_api_mixin",
+                   "export_dialog_mixin")
 
 
 @pytest.fixture
