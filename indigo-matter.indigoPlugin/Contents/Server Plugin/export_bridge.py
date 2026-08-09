@@ -85,6 +85,29 @@ COMMAND_QUEUE_WARN = 3
 #: deadline over the removals — see :func:`bridge_client.attach_timeout_for`.
 PREF_PENDING_REPLACE_ALL = "matterExportPendingReplaceAll"
 
+#: Halt reasons a bridge reinstall/restart genuinely fixes (issue #154). Both
+#: name the SAME failure — the plugin and the node's protocol versions disagree
+#: — reached through two different paths that end up latching two different
+#: strings into :attr:`bridge_client.BridgeClient.halted_reason`:
+#:
+#: * the handshake ``hello`` (``bridge_client._handshake``) compares protocol
+#:   versions before an attach is ever sent and raises ``ClientHalted`` with the
+#:   literal ``"version_skew"`` (bridge_client.py:258-262);
+#: * an attach the node refuses with ``bridge_protocol.ERR_VERSION_MISMATCH``
+#:   (its own string, ``"version_mismatch"``) is one of
+#:   :data:`bridge_client.HALTING_ATTACH_ERRORS`, so
+#:   ``_handle_attach_refused`` (bridge_client.py:403) halts with
+#:   ``reason=code`` — i.e. the reason string is ``"version_mismatch"`` itself.
+#:
+#: ``bridge_client.TERMINAL_ATTACH_ERRORS[ERR_VERSION_MISMATCH]``'s own remedy
+#: text is "restart the bridge agent" — exactly what *Install/update the Matter
+#: bridge* does — so both reason strings are revived here. The other member of
+#: ``HALTING_ATTACH_ERRORS``, ``mass_removal_refused``, is deliberately NOT in
+#: this set: its remedy is about the allow-list, not the node process, and
+#: reviving it after an install would silently rebuild a client that attaches
+#: into the exact same refusal a reinstall cannot touch.
+REVIVABLE_HALT_REASONS = frozenset({"version_skew", bridge_protocol.ERR_VERSION_MISMATCH})
+
 #: PRD §5.5's wholesale export switch. **Absent means ON**, because it arrived in
 #: E6 and every install that predates it already has a working allow-list; a
 #: missing key reading as "off" would silently un-run everyone's export on
@@ -304,6 +327,16 @@ class ExportBridge:
         )
         self._unreachable_reported = False
         self._disconnect_ticks = 0
+        # A new client is a new outage history: the halt/recovery/refusal
+        # latches must not carry over, or a client swapped in by
+        # revive_after_install (#154) that halts AGAIN — the reinstall did not
+        # actually fix the skew — re-halts in silence, with the watchdog's
+        # standing "nothing is being exported" line suppressed by the OLD
+        # client's report. _on_attached also resets these on success;
+        # this is the failure-path reset.
+        self._halted_reported = False
+        self._recovery_reported = False
+        self._refusal_reported = None
         self._fire(self.client.run(), "bridge client run loop",
                    lost="nothing will be exported until the plugin is reloaded")
         self._logger.info(
@@ -365,6 +398,58 @@ class ExportBridge:
         if client is None:
             return False
         return client.retry_now()
+
+    def revive_after_install(self) -> bool:
+        """Replace a client halted on version skew, after a bridge reinstall (#154).
+
+        ``TERMINAL_ATTACH_ERRORS[ERR_VERSION_MISMATCH]``'s remedy tells the user
+        to restart the bridge agent — exactly what *Install/update the Matter
+        bridge* just did — but a version-skew halt is fail-closed
+        (``bridge_client.ClientHalted``) and nothing else in this engine revives
+        a halted client: :meth:`ws_json_client.WsJsonClient.resume` only clears
+        the latch and its own docstring says the caller must start a fresh
+        ``run()`` task, and :meth:`start` no-ops while ``self.client is not
+        None`` regardless of its state. So the prescribed remedy used to leave
+        the user stuck until a full plugin reload — this is the seam that fixes
+        that.
+
+        Returns ``False`` (no-op) unless the live client is halted for a reason
+        in :data:`REVIVABLE_HALT_REASONS`. When it is: drop the halted client,
+        close its socket, and call :meth:`start` — the same path the
+        empty→non-empty transition uses, which rebuilds a fresh client with
+        every callback wired. ``_un_exporting``/``_export_enabled`` need no
+        handling here; :meth:`start` already accounts for both.
+
+        **Thread-safety.** Called from the ``threading.Thread`` the npm install
+        runs on, exactly like :meth:`retry_now`. The guard is read from a LOCAL
+        capture rather than a second ``self.client`` lookup, for the same
+        reason :meth:`retry_now` gives: :meth:`stop`/:meth:`_stop_soon` can null
+        ``self.client`` from the loop thread at any point. That still leaves one
+        TOCTOU, same shape as :meth:`retry_now`'s: between the guard read below
+        and the capture-and-null two lines later, a concurrent :meth:`stop`
+        could take the client first. If it wins, the drop-and-close here is
+        harmless (closing an already-closing client is idempotent) and the
+        :meth:`start` that follows is the same no-op :meth:`exports_changed`
+        already tolerates for a stop landing mid-transition.
+        """
+        client = self.client
+        if client is None or not client.halted or client.halted_reason not in REVIVABLE_HALT_REASONS:
+            return False
+        # Null exactly the object the guard checked — NOT a fresh self.client
+        # read: a stop() (or stop+start) racing in between would make a
+        # re-read hand back None (the log line below would raise on the
+        # install thread) or a healthy successor this must not drop.
+        if self.client is client:
+            self.client = None
+        self._logger.info(
+            "Matter bridge: the bridge node was reinstalled/updated — replacing the halted "
+            "connection (%s) with a fresh one", client.halted_reason)
+        try:
+            self._runtime.submit(client.close()).result(timeout=4.0)
+        except Exception as exc:  # pylint: disable=broad-except
+            self._logger.debug("bridge client close error during revival: %s", exc)
+        self.start()
+        return True
 
     def _stop_soon(self, why: str) -> None:
         """Drop the client without waiting — safe to call ON the loop thread.
