@@ -1,15 +1,19 @@
 # indigo-matter — Build Handover
 
-**Last updated:** 2026-08-09 10:17 UTC
+**Last updated:** 2026-08-09 12:48 UTC
 **Active work:** none — nothing in flight, working tree clean.
-**Branch:** `main` — the 2026-08-09 daytime arc landed six more: #158 (#147
-naming → **v2026.8.15**), #159 (#137+#139 E8 docs, `[no-release]`), #160
-(#154 halt revival → **v2026.8.17**), #161 (#76 pressCount → **v2026.8.18**);
-before those, the overnight arc's #151–#157 (see the sections below).
+**Branch:** `main` — the 2026-08-09 afternoon arc landed the **commissioning
+race quartet #21–#24** as three stacked PRs, merged in order: #164 (#21+#22 →
+**v2026.8.21**), #165 (#23 → **v2026.8.22**, API contract → **v1.4**), #166
+(#24 → **v2026.8.23**). Before those, the daytime arc's #158–#161 and the
+overnight arc's #151–#157 (see the sections below).
 `indigo-matter-bridge@0.8.0` published and pinned; the pin≤package relaxation
 means node publishes need no plugin PR.
-**Version:** plugin `2026.8.18` (released), bridge-node `0.8.0` (published).
-**Tests:** **2314 Python**, **405 TS** — both green.
+**Version:** plugin `2026.8.24` on main; **last release/jarvis is still
+`2026.8.18`** — the quartet is merged but unreleased (releases are opt-in; cut
+one via `[release]` or the manual workflow when it should ship). Bridge-node
+`0.8.0` (published; untouched by the quartet).
+**Tests:** **2350 Python**, **405 TS** — both green.
 (`python3 -m pytest -q` · `cd bridge-node && npm run build && npm test`)
 **Deployed & VERIFIED on jarvis (2026-08-09 ~11:16 UTC):** plugin
 `2026.8.18` + bridge-node `0.8.0`, Apple Home AND Alexa (3 fabrics), bridge
@@ -26,9 +30,83 @@ docs site now routes to it (#137). **#143 is the parked one** — see the
 before touching. #138 (screenshots) blocks on Simon's server+phone — the
 three-shot list is on the issue.
 
-**NEXT UP:** the commissioning race quartet **#21–#24** (meaty — start
-fresh). Then: #136, #105, #101, #77, #75, #64, #62, #46, #43,
-device-support #14/#15/#70/#71/#72/#83, refactor #146.
+**NEXT UP:** #136, #105, #101, #77, #75, #64, #62, #46, #43,
+device-support #14/#15/#70/#71/#72/#83, refactor #146. Also open: #167
+(low-priority VID/PID negative filter, filed from the quartet — read its
+"why it wasn't built" before starting it) and the **domio-code API.md v1.4
+mirror** (PR raised there; the contract bump is backward-compatible so it
+can lag).
+
+---
+
+## 2026-08-09 (afternoon) — the commissioning race quartet #21–#24, in three stacked PRs
+
+Plugin `2026.8.21` → `2026.8.23` across PRs #164/#165/#166 (merged in order,
+children retargeted to main before each merge — the stacked-base discipline).
+Suites **2314 → 2350 Python**; TS untouched. All four issues date from the
+PR #20 self-review; every PR body carries the full design rationale.
+
+* **#164 (#21+#22, v2026.8.21).** `Job.node_id` now records the node a job is
+  holding (never serialized — no wire change). `_fail`'s best-effort
+  `remove_node` is guarded by **job-table ownership** — NOT
+  `device_sync.knows_node`, which the issue itself suggested: device_sync
+  creates devices for *every* `node_added` including this very job's own, so
+  knows_node would have suppressed removal on the entire normal failure path.
+  The guard is safe under both answers to the still-unknown "does
+  matter-server reuse node ids on re-commission" question. Reconcile claiming
+  replaced recency-only `candidates[-1]` with discipline: exact node-id
+  identity → same-setup-code recency (the retry UX is unchanged) → **refuse**
+  when two different setup codes wait unidentified. **#22's suggested
+  discriminator match was infeasible** — the joining node's payload carries no
+  discriminator (PASE-time-only, in no parsed cluster or fixture), and
+  `job.discriminator` is nearly always None because API.md §3.2's "extracted
+  from the setup code" was never implemented. Deliberate UX trade, stated in
+  the PR: two *different* devices both in-window used to get one named (50/50
+  right); now neither is. Residual (unchanged from before): one waiting job +
+  one unrelated node_added still mis-claims — #167 tracks the weak VID/PID
+  negative filter that could narrow it; read its "why not built" first.
+* **#165 (#23, v2026.8.22, API → v1.4).** The transport half (unmatched-
+  response logging) already existed since H4 — what was missing was naming
+  and feedback. **The context object IS the correlation**: `_request_frame`
+  grew a `context` param noted in the existing bounded `_send_context`
+  *before* the send and deliberately left standing on timeout;
+  `CommissionRequest(job_id)` (whose `__str__` is the log description) rides
+  along from `_run_job`, so no message_id→job registry exists to leak.
+  `note_late_response`: a late **error** on a `commissioning_timeout` job
+  re-codes it to definitive `commissioning_failed` (the only failed→failed
+  transition; `terminal_at` deliberately not re-stamped; the job drops out of
+  reconcile candidacy automatically) — a late error must never unwind a
+  SUCCESS. A late **success** records `job.node_id` only — the one
+  authoritative job↔node binding, feeding #21's guard and #22's matcher;
+  `node_added` remains the sole device-creation path. If matter-server never
+  actually answers abandoned RPCs, the whole path is a silent no-op.
+  **API.md is now v1.4** ("Late failure" paragraph); the domio-code mirror
+  lags — backward-compatible, PR raised separately.
+* **#166 (#24, v2026.8.23).** A bare-timeout job now arms a reconcile-window
+  watchdog (fire-and-forget task, strong-ref'd like
+  `ws_json_client._reconcile_task`; injected `sleep` seam for tests). On
+  unclaimed expiry: a definitive WARNING (previously the log's last word —
+  "may still join" — stayed wrong forever while `_reap_locked` erased the job
+  in silence). Cleanup is honestly bounded: **matter-server has no
+  cancel-commissioning command**, so the only removal is the one provably
+  safe case — a node named by #23's late success that nothing adopted,
+  triple-guarded (other-job ownership, then `knows_node` — which IS the right
+  test here, unlike in `_fail`; the docstring carries the distinction). If
+  the loop is gone at arming time the timeout state is left untouched;
+  shutdown cancellation is deliberately uncaught (job already terminal,
+  runtime drain gathers with `return_exceptions=True`).
+
+**Verification discipline:** every PR mutation-verified by its builder AND
+one critical mutation per PR independently re-run by the coordinator before
+push. 11 mutations total, each breaking exactly its intended tests.
+
+**Not done, deliberately:** the jarvis late-response experiment (force a
+>300s commission, watch for matter-server's late answer). It needs a real
+device in pairing mode to mean anything — a garbage code fails Verhoeff
+validation client-side, an already-commissioned device's code fails fast —
+and jarvis still runs released `2026.8.18` without the quartet's code anyway.
+Do it opportunistically after the next release lands on jarvis, with a device
+to hand; the existing `_log_unmatched` WARNING is the tell either way.
 
 ---
 
