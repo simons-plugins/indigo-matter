@@ -325,7 +325,7 @@ You normally never need this: the bridge starts and stops with your export list.
         <CallbackMethod>menuRestoreFabricBackup</CallbackMethod>
         <ConfigUI>
             <Field id="warning" type="label">
-                <Label>Restoring REPLACES the current fabric and restarts matter-server. If the backup includes the Matter bridge node's storage, that is restored too — the bridge is stopped first and restarted afterwards. The current fabric (and bridge storage, if restored) is moved aside, not deleted, so a bad restore is reversible. Requires 'Manage LaunchAgent' to be on.</Label>
+                <Label>Restoring REPLACES the current fabric and restarts matter-server. If the backup includes the Matter bridge node's storage, that is restored too — if the bridge node is running it is stopped and started around the swap; a stopped bridge stays stopped. The current fabric (and bridge storage, if restored) is moved aside, not deleted, so a bad restore is reversible. Requires 'Manage LaunchAgent' to be on.</Label>
             </Field>
             <Field id="backup" type="menu">
                 <Label>Backup to restore:</Label>

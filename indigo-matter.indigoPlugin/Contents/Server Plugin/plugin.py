@@ -3115,12 +3115,13 @@ class Plugin(indigo.PluginBase):
             # The bridge control/path are passed in, but the XAC1 latch (which
             # session started the bridge agent) is NEVER touched here in either
             # direction: alive+latched -> stop/start -> unchanged, correct;
-            # alive+unlatched (a prior session's agent) -> unchanged, because
-            # setting it would arm a future bootout of an agent this session
-            # never started; stopped-by-us + restart-failed -> the latch stays
-            # SET, because clearing it would let the next empty-export
-            # transition skip uninstalling a RunAtLoad plist that would
-            # otherwise resurrect the bridge at the next login (XAC1/XG5).
+            # alive+unlatched -> unchanged, because setting it would arm a
+            # future bootout of an agent whose lifecycle this session does not
+            # own; stopped-by-us + restart-failed -> the latch is left EXACTLY
+            # as it was: if this session had started the agent it stays set
+            # (so the next empty-export transition still uninstalls the
+            # RunAtLoad plist); if a prior session's agent, it stays unset —
+            # no worse than before the restore (XAC1/XG5).
             # restore_backup uses stop()/start(), never uninstall(), so the
             # plist survives and the latch's claim stays true throughout.
             result = fabric_backup.restore_backup(

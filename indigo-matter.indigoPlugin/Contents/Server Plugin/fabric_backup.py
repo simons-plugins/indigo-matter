@@ -246,7 +246,7 @@ def bridge_members_in(archive_path: str) -> list[str]:
 class _BridgePlan:
     """Everything a restore needs to know about the bridge half of the archive.
 
-    Bundled rather than five separate parameters: :func:`_rollback` needs the
+    Bundled rather than several separate parameters: :func:`_rollback` needs the
     same set, pylint's ``max-args`` is 8, and "is there bridge work to do at
     all" collapses to one ``is None`` check throughout :func:`restore_backup`.
     """
@@ -276,10 +276,11 @@ def _assert_no_zip_slip(names: list[str], dest: str, prefix: str = "") -> list[s
 
     The path checked is the one that will actually be WRITTEN — prefix
     stripped, exactly as :func:`_safe_extract` writes it — not the raw member
-    name, or a bridge member crafted as ``bridge-node/../../escape.txt`` would
-    look safe under the archive-relative name while still escaping ``dest``
-    once the prefix is removed. Returns the selected members so a caller who
-    already has this list does not have to filter twice.
+    name, or a bridge member crafted as ``bridge-node/../escape.txt`` would
+    look safe under the archive-relative name (it resolves inside the archive
+    root) while still escaping ``dest`` once the prefix is removed. Returns
+    the selected members so a caller who already has this list does not have
+    to filter twice.
     """
     members = _members_for(names, prefix)
     dest_root = os.path.realpath(dest)
@@ -328,10 +329,10 @@ def _safe_extract(archive_path: str, dest: str, *, prefix: str = "") -> None:
                 shutil.copyfileobj(src, out)
 
 
-#: The bridge-skip warning, one shared template for every reason it fires
-#: (§3.3): no control to stop it with, no usable storage path, or a storage
-#: path that overlaps the controller's. Loud on purpose — a half-restore
-#: nobody mentioned is how a user discovers next week that every exported
+#: The bridge-skip warning, one shared template for every reason it fires:
+#: no control to stop it with, no usable storage path, or a storage path
+#: that overlaps the controller's. Loud on purpose — a half-restore nobody
+#: mentioned is how a user discovers next week that every exported
 #: accessory came back as a new one.
 _SKIP_MSG = ("This backup also contains %d file(s) from the Matter bridge node and they are NOT being "
     "restored: %s. To restore them by hand, stop the bridge node (Plugins ▸ Matter ▸ Stop the "
@@ -353,8 +354,8 @@ def _plan_bridge_restore(
     with nothing extra logged. Every OTHER reason to fall back to
     controller-only (no control given, no usable path, an overlapping path) is
     a real member left behind, so it is a WARNING naming the manual recipe —
-    a fallback, never a refusal (§3.3): the controller fabric is the single
-    point of total loss, the bridge storage is recoverable by re-pairing.
+    a fallback, never a refusal: the controller fabric is the single point
+    of total loss, the bridge storage is recoverable by re-pairing.
     """
     members = bridge_members_in(archive_path)
     if not members:
@@ -376,11 +377,11 @@ def _plan_bridge_restore(
     return _BridgePlan(dest, bridge_control, len(members))
 
 
-def _control_is_alive(control: Any) -> bool:
+def _control_is_alive(control: Any, log: Any) -> bool:
     """Whether ``control``'s process is (or may be) up. Defaults to True when unsure.
 
     ``is_alive()`` is an OPTIONAL extension of the ``stop()``/``start()`` seam
-    (:meth:`launch_agent.LaunchAgent.is_alive`) — a control without it is
+    (:func:`launch_agent.LaunchAgent.is_alive`) — a control without it is
     treated as alive. Fail-SAFE, and deliberately asymmetric with the rest of
     this module's failure handling: the cost of stopping an already-stopped
     node is one log line, while the cost of extracting new storage under a
@@ -391,19 +392,28 @@ def _control_is_alive(control: Any) -> bool:
         return True
     try:
         return bool(probe())
-    except Exception:  # pylint: disable=broad-except
-        # A raising is_alive() is not evidence of death.
+    except Exception as exc:  # pylint: disable=broad-except
+        # A raising is_alive() is not evidence of death — but it must not be
+        # silent, or a persistently-raising probe looks indistinguishable
+        # from one that has never been called.
+        log.debug("bridge is_alive() raised, treating as alive: %s", exc)
         return True
 
 
 def _restart_bridge(plan: _BridgePlan, log: Any) -> bool:
     """Start the bridge node back up. Never raises; the caller decides what a False means.
 
-    Two very different callers use this result: the success path (D) logs a
-    specific ERROR naming where the restored storage sits; the rollback path
-    (R4) is already escalating loudly and appends to that message instead.
-    Neither wants this function logging on their behalf and either duplicating
-    or contradicting it — ``log`` is only touched if ``start()`` itself raises.
+    Four different callers use this result, and (since A2) every one of them
+    checks it: the abort path in :func:`_stop_for_restore` (a best-effort
+    restart when the controller failed to stop), the move-aside failure path
+    in :func:`restore_backup` (A1), the post-restore finish step in
+    :func:`_finish_bridge_restore` (which logs a specific ERROR naming where
+    the restored storage sits), and the rollback's bridge-restart step in
+    :func:`_rollback` (already escalating loudly and appending to that
+    message instead). Each logs its own consequence, in its own words — none
+    of them wants this function logging on their behalf and either
+    duplicating or contradicting it — ``log`` is only touched here if
+    ``start()`` itself raises.
     """
     try:
         return bool(plan.control.start())
@@ -442,16 +452,25 @@ def _stop_for_restore(plan: Optional[_BridgePlan], server_control: Any, log: Any
     so an abort here never leaves a bridge we just stopped down for nothing.
     """
     if plan is not None:
-        plan.was_alive = _control_is_alive(plan.control)
+        plan.was_alive = _control_is_alive(plan.control, log)
         if plan.was_alive and not plan.control.stop():
             raise RuntimeError(
                 "the Matter bridge node failed to stop; aborting restore before touching anything"
             )
+    # C1 (stop half): a False stop() is honoured as an abort.
     if not server_control.stop():
-        if plan is not None and plan.was_alive:
+        if plan is not None and plan.was_alive and not _restart_bridge(plan, log):
             # Best-effort: put the bridge back the way we found it before
             # raising — nothing else in this function has touched anything yet.
-            _restart_bridge(plan, log)
+            # A failure here is not fatal to the abort, but it must not be
+            # silent — the same consequence the rollback's bridge-restart
+            # step and the move-aside failure path already spell out.
+            log.error(
+                "The Matter bridge node did not restart after the controller failed to "
+                "stop. Its pairings are intact; exported accessories are unavailable "
+                "until it starts — check the bridge node's error log, then reload the "
+                "plugin."
+            )
         raise RuntimeError(
             "matter-server failed to stop; aborting restore before touching the live fabric"
         )
@@ -566,7 +585,7 @@ def restore_backup(
          and passes ``testzip``; pre-flight the zip-slip guard for BOTH sides.
          All of this happens before either control is touched.
       2. If there is bridge work to do and the bridge is alive, stop it FIRST
-         (:meth:`_control_is_alive`/``bridge_control.stop()``) — cheapest abort
+         (:func:`_control_is_alive`/``bridge_control.stop()``) — cheapest abort
          on the failure-prone control. A False ``stop()`` ABORTS here; nothing
          has moved.
       3. ``server_control.stop()`` — the controller MUST go down before we
@@ -590,9 +609,9 @@ def restore_backup(
          original — bridge undone first, then the controller (verbatim of the
          controller-only behaviour), then the controller is restarted, then
          (if we stopped it) the bridge. A failing rollback ``start()`` is
-         escalated at ERROR/CRITICAL with explicit manual-recovery guidance.
-         The function always ends by raising a wrapped ``RuntimeError`` so the
-         original cause is never masked.
+         escalated at ERROR with explicit manual-recovery guidance and a
+         ``CRITICAL:`` message prefix. The function always ends by raising a
+         wrapped ``RuntimeError`` so the original cause is never masked.
       8. OUTSIDE the try, and NEVER rolled back: if we stopped a live bridge,
          start it again. A False here does not undo a good controller
          restore — rolling back a restored fabric to protect a secondary
@@ -672,8 +691,8 @@ def restore_backup(
 
     try:
         _extract_for_restore(archive_path, storage_path, plan)
-        # C1: start() returns a bool; False (launchctl failed) is a failure that
-        # must trigger rollback exactly like an exception would.
+        # C1 (start half): start() returns a bool; False (launchctl failed) is
+        # a failure that must trigger rollback exactly like an exception would.
         if not server_control.start():
             raise RuntimeError("matter-server failed to start after restore")
     except BaseException as exc:  # noqa: BLE001 — re-raised after rollback
@@ -692,13 +711,37 @@ def restore_backup(
         "moved_aside_to": moved_aside_to,
         "bridge_restored": plan is not None,
         # The count of bridge members the ARCHIVE carries, not how many were
-        # actually restored — a skipped/refused bridge side (§3.3) still tells
-        # the caller how much was left behind, which is what makes the log
+        # actually restored — a skipped/refused bridge side still tells the
+        # caller how much was left behind, which is what makes the log
         # warning's count and this field agree.
         "bridge_members": plan.members if plan is not None else len(bridge_members_in(archive_path)),
         "bridge_moved_aside_to": plan.moved_aside_to if plan is not None else None,
         "bridge_started": plan.started if plan is not None else None,
     }
+
+
+def _bridge_rollback_failure_message(bridge: _BridgePlan, exc: OSError) -> tuple[str, tuple]:
+    """The bridge-rollback-mechanics failure text (F4): two shapes, one cause.
+
+    A previous bridge copy exists and could not be put back (the wording
+    that shape has always had), or there was never one to put back —
+    claiming a "previous copy" in that case would send a user hunting for
+    something that never existed. Returns ``(message, args)`` so the caller
+    logs it in one place.
+    """
+    if bridge.moved_aside_to is not None:
+        return (
+            "Rolling the Matter bridge node's storage back FAILED (%s). Its previous "
+            "storage is PRESERVED at %s but is NOT in place; move it back to %s by "
+            "hand with the bridge node stopped.",
+            (exc, bridge.moved_aside_to, bridge.dest),
+        )
+    return (
+        "The partially-restored Matter bridge storage at %s could not be moved "
+        "aside (%s). No previous bridge storage predated this restore; clean up "
+        "%s by hand with the bridge node stopped.",
+        (bridge.dest, exc, bridge.dest),
+    )
 
 
 def _rollback(
@@ -712,9 +755,10 @@ def _rollback(
 ) -> None:
     """Undo a failed restore without ever stranding or wiping either original.
 
-    Bridge undone FIRST, controller second — the reverse of the stop/extract
-    order, so the controller (the single point of total loss) is always the
-    last, most-supervised step. Each side moves any partial new dir aside
+    Bridge undone FIRST, controller second — the reverse of the extract
+    order (and the same bridge-first order the stops used), so the
+    controller (the single point of total loss) is always the last,
+    most-supervised step. Each side moves any partial new dir aside
     (never relies on a possibly-failing ``rmtree`` to clear the way for the
     rename-back), then renames the original ``*_aside_to`` back into place.
 
@@ -722,16 +766,18 @@ def _rollback(
     NEVER raises — a failure to roll the bridge back must not abort the
     controller's rollback, which is the one that protects the fabric. A
     failure of the controller's rollback mechanics IS re-raised (today's
-    behaviour, unchanged) and is the loudest case: escalated at CRITICAL with
-    manual-recovery guidance, extended with a note that the bridge is still
-    stopped when this restore was the one that stopped it.
+    behaviour, unchanged) and is the loudest case: escalated at ERROR with a
+    ``CRITICAL:`` message prefix and manual-recovery guidance, extended with
+    a note that the bridge is still stopped when this restore was the one
+    that stopped it.
 
     Bringing the controller back up is attempted regardless (verbatim of the
     controller-only behaviour); a failure there is the second-loudest case —
-    server down AND fabric possibly not back — logged at CRITICAL. Only once
-    all of that is settled is the bridge restarted, if we are the one who
-    stopped it (R4) — least critical of the four, because pairings are intact
-    either way and this only delays exported accessories coming back.
+    server down AND fabric possibly not back — logged the same way, at ERROR
+    with a ``CRITICAL:`` prefix. Only once all of that is settled is the
+    bridge restarted, if we are the one who stopped it — the rollback's
+    bridge-restart step, least critical of the four, because pairings are
+    intact either way and this only delays exported accessories coming back.
     """
     if bridge is not None:
         try:
@@ -742,12 +788,8 @@ def _rollback(
             if bridge.moved_aside_to is not None and os.path.isdir(bridge.moved_aside_to):
                 os.rename(bridge.moved_aside_to, bridge.dest)
         except OSError as bridge_rollback_exc:
-            log.error(
-                "Rolling the Matter bridge node's storage back FAILED (%s). Its previous "
-                "storage is PRESERVED at %s but is NOT in place; move it back to %s by hand "
-                "with the bridge node stopped.",
-                bridge_rollback_exc, bridge.moved_aside_to, bridge.dest,
-            )
+            message, args = _bridge_rollback_failure_message(bridge, bridge_rollback_exc)
+            log.error(message, *args)
             # Never raise: must not abort the controller's rollback below.
 
     try:
@@ -794,8 +836,9 @@ def _rollback(
             storage_path, storage_path,
         )
 
-    # R4: the bridge, if we are the one who stopped it. Loud but not fatal —
-    # ERROR, not CRITICAL, because pairings are intact either way.
+    # The rollback's bridge-restart step: the bridge, if we are the one who
+    # stopped it. Loud but not fatal — ERROR, not CRITICAL, because pairings
+    # are intact either way.
     if bridge is not None and bridge.was_alive:
         if not _restart_bridge(bridge, log):
             log.error(

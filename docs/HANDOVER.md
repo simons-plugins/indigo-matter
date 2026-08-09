@@ -1500,7 +1500,7 @@ New, and deferred on purpose:
 
 3. **Restoring the bridge-node storage from a backup** needs a bridge `stop()`/
    `start()` control — E7's launchd agent. Backup is done; restore reports and
-   skips (above).
+   skips (above). [wired by #136, v2026.9.0]
 4. **Pinning endpoint numbers from the map** (the `Endpoint.Configuration.number`
    finding above) — a protocol-level decision about what `preserveEndpointNumbers`
    promises, not a patch.

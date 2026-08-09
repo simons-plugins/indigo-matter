@@ -914,8 +914,14 @@ def test_menu_restore_reports_the_bridge_outcome_honestly(plug, tmp_path, monkey
     assert "bridge" in msg.lower()
     assert "endpoint" in msg.lower()
     assert "drift" in msg.lower()
+    # C6: a pre-existing bridge dir must be named, not silently dropped.
+    assert "/x/bridge-node.pre-restore-1" in msg
 
     plug.logger.reset_mock()
+    # Force the read-only diagnosis to come back empty so this leg pins the
+    # deterministic FALLBACK text rather than a real (environment-dependent)
+    # LaunchAgent diagnosis.
+    monkeypatch.setattr(plug, "_bridge_agent_diagnosis", lambda: None)
     monkeypatch.setattr(fabric_backup, "restore_backup",
                         lambda archive_path, *_a, **_k: _fake_restore_result(
                             archive_path, bridge_restored=True, bridge_members=3,
@@ -923,6 +929,29 @@ def test_menu_restore_reports_the_bridge_outcome_honestly(plug, tmp_path, monkey
     ok, _vd = plug.menuRestoreFabricBackup({"backup": "/x.zip", "confirm": True}, "restoreFabricBackup")
     assert ok is True  # the controller fabric still restored — only the bridge didn't come back
     plug.logger.error.assert_called()
+    err_msg = " ".join(str(a) for c in plug.logger.error.call_args_list for a in c.args)
+    assert "did not come back up" in err_msg
+    assert "Check the bridge node's error log." in err_msg
+
+    # C6 (cb395f8 pin): no pre-existing bridge dir AND the bridge was never
+    # stopped for this restore — the BRIDGE line must say nothing rather
+    # than "preserved at None" and must not mention "restarted" either.
+    # (The FIRST info() call is the pre-existing, out-of-scope controller
+    # line — scope this assertion to the bridge-specific call so it is not
+    # confused by that unrelated "None".)
+    plug.logger.reset_mock()
+    monkeypatch.setattr(fabric_backup, "restore_backup",
+                        lambda archive_path, *_a, **_k: _fake_restore_result(
+                            archive_path, bridge_restored=True, bridge_members=3,
+                            bridge_moved_aside_to=None, bridge_started=None))
+    ok, _vd = plug.menuRestoreFabricBackup({"backup": "/x.zip", "confirm": True}, "restoreFabricBackup")
+    assert ok is True
+    bridge_msg = " ".join(str(a) for a in plug.logger.info.call_args_list[-1].args)
+    assert "None" not in bridge_msg
+    assert "preserved" not in bridge_msg.lower()
+    # C11: bridge_started=None (never stopped, so never restarted) reads
+    # honestly — no claim that it "has been restarted".
+    assert "restarted" not in bridge_msg.lower()
 
 
 # ---------------------------------------------------------------------------
