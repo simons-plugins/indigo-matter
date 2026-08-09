@@ -11,10 +11,12 @@ from commission_jobs import (
     TIMEOUT_MESSAGE,
     CommissionError,
     CommissionJobs,
+    CommissionRequest,
     _exc_message,
     is_valid_setup_code,
     node_id_to_str,
 )
+from ws_json_client import LateResponse
 
 
 class FakeMatter:
@@ -24,7 +26,7 @@ class FakeMatter:
         self.removed: list = []
         self.connected = connected
 
-    async def commission_with_code(self, code):
+    async def commission_with_code(self, code, **_kwargs):
         return {"node_id": self.node_id}
 
     async def get_node(self, node_id):
@@ -154,7 +156,7 @@ def test_fail_skips_remove_node_when_another_job_holds_that_node(mock_logger):
                 super().__init__(node_id=7)
                 self.calls = 0
 
-            async def commission_with_code(self, code):
+            async def commission_with_code(self, code, **_kwargs):
                 self.calls += 1
                 if self.calls == 1:
                     raise TimeoutError  # job A: commission RPC times out
@@ -265,7 +267,7 @@ def test_cancelled_worker_fails_job_and_frees_setup_code(mock_logger):
         started = asyncio.Event()
 
         class HangingMatter(FakeMatter):
-            async def commission_with_code(self, code):
+            async def commission_with_code(self, code, **_kwargs):
                 started.set()
                 await asyncio.Event().wait()  # blocks forever until cancelled
 
@@ -307,7 +309,7 @@ def test_protocol_error_maps_to_commissioning_failed(mock_logger):
 
     async def scenario():
         class PEMatter(FakeMatter):
-            async def commission_with_code(self, code):
+            async def commission_with_code(self, code, **_kwargs):
                 raise ProtocolError(50, "PASE failed")
 
         jobs = _jobs(PEMatter(), mock_logger, schedule=asyncio.ensure_future)
@@ -322,7 +324,7 @@ def test_protocol_error_maps_to_commissioning_failed(mock_logger):
 def test_missing_node_id_maps_to_commissioning_failed(mock_logger):
     async def scenario():
         class NoIdMatter(FakeMatter):
-            async def commission_with_code(self, code):
+            async def commission_with_code(self, code, **_kwargs):
                 return {}  # server returned no node_id (PASE/CASE failure)
 
         jobs = _jobs(NoIdMatter(), mock_logger, schedule=asyncio.ensure_future)
@@ -336,7 +338,7 @@ def test_missing_node_id_maps_to_commissioning_failed(mock_logger):
 def test_generic_exception_maps_to_internal_error(mock_logger):
     async def scenario():
         class BoomMatter(FakeMatter):
-            async def commission_with_code(self, code):
+            async def commission_with_code(self, code, **_kwargs):
                 raise RuntimeError("kaboom")
 
         jobs = _jobs(BoomMatter(), mock_logger, schedule=asyncio.ensure_future)
@@ -357,7 +359,7 @@ def test_exc_message_falls_back_to_type_name():
 def test_bare_exception_failure_has_nonempty_message(mock_logger):
     async def scenario():
         class BareBoomMatter(FakeMatter):
-            async def commission_with_code(self, code):
+            async def commission_with_code(self, code, **_kwargs):
                 raise ValueError  # str() == "" — same class of bug as #17
 
         jobs = _jobs(BareBoomMatter(), mock_logger, schedule=asyncio.ensure_future)
@@ -381,7 +383,7 @@ def test_recommission_allowed_after_terminal(mock_logger):
 
 
 class TimeoutMatter(FakeMatter):
-    async def commission_with_code(self, code):
+    async def commission_with_code(self, code, **_kwargs):
         raise TimeoutError  # asyncio.wait_for expiring (str() == "")
 
 
@@ -489,7 +491,7 @@ def test_reconcile_ignores_timeouts_outside_window(mock_logger):
 def test_reconcile_ignores_non_timeout_failures(mock_logger):
     async def scenario():
         class PEMatter(FakeMatter):
-            async def commission_with_code(self, code):
+            async def commission_with_code(self, code, **_kwargs):
                 from protocol import ProtocolError
                 raise ProtocolError(50, "PASE failed")
 
@@ -763,3 +765,154 @@ def test_terminal_jobs_are_reaped_after_retention(mock_logger):
         clock["t"] = clock["t"] + timedelta(minutes=16)
         assert jobs.get_job(body["jobId"])[0] == 404
     asyncio.run(scenario())
+
+
+# ----------------------------------------------------------------------
+# Late RPC response (#23): matter-server answers commission_with_code after
+# the plugin already gave up waiting on it
+# ----------------------------------------------------------------------
+def test_run_job_passes_a_commission_request_context(mock_logger):
+    # The wiring _log_unmatched needs to name the job in an un-awaited error,
+    # and note_late_response needs to find it again.
+    async def scenario():
+        seen = {}
+
+        class RecordingMatter(FakeMatter):
+            async def commission_with_code(self, code, **kwargs):
+                seen.update(kwargs)
+                return await super().commission_with_code(code, **kwargs)
+
+        jobs = _jobs(RecordingMatter(node_id=0x1), mock_logger, schedule=asyncio.ensure_future)
+        _, body = jobs.create_job({"setupCode": "12345678901", "suggestedName": "X"})
+        await _await_terminal(jobs, body["jobId"])()
+
+        context = seen.get("context")
+        assert isinstance(context, CommissionRequest)
+        assert context.job_id == body["jobId"]
+        assert str(context) == f"commission job {body['jobId']}"
+    asyncio.run(scenario())
+
+
+def test_late_commission_error_converts_a_timed_out_job_to_commissioning_failed(mock_logger):
+    async def scenario():
+        jobs = _jobs(TimeoutMatter(), mock_logger, schedule=asyncio.ensure_future)
+        _, body = jobs.create_job({"setupCode": "12345678901", "suggestedName": "X"})
+        final = await _await_terminal(jobs, body["jobId"])()
+        assert final["error"]["code"] == "commissioning_timeout"
+        original_terminal_at = jobs._jobs[body["jobId"]].terminal_at
+
+        late = LateResponse(message_id="mid-1", context=CommissionRequest(body["jobId"]),
+                            error=(50, "PASE failed"), result=None)
+        claimed = jobs.note_late_response(late)
+        assert claimed == body["jobId"]
+
+        _, final2 = jobs.get_job(body["jobId"])
+        assert final2["status"] == "failed"
+        assert final2["error"]["code"] == "commissioning_failed"
+        assert "PASE failed" in final2["error"]["message"]
+        assert final2["error"]["matterErrorCode"] == 50
+        # terminal_at is NOT re-stamped — the job has been terminal since the
+        # original timeout, only WHY it failed is being corrected
+        assert jobs._jobs[body["jobId"]].terminal_at == original_terminal_at
+
+        mock_logger.warning.assert_called()
+        logged = str(mock_logger.warning.call_args)
+        assert body["jobId"] in logged
+    asyncio.run(scenario())
+
+
+def test_late_converted_job_is_no_longer_a_reconcile_candidate(mock_logger):
+    # Once the error is corrected to commissioning_failed, a later node_added
+    # for the same node must not flip it back to success — that candidacy was
+    # keyed on the (now-superseded) commissioning_timeout code.
+    async def scenario():
+        jobs = _jobs(TimeoutMatter(), mock_logger, schedule=asyncio.ensure_future)
+        _, body = jobs.create_job({"setupCode": "12345678901", "suggestedName": "X"})
+        await _await_terminal(jobs, body["jobId"])()
+
+        late = LateResponse(None, CommissionRequest(body["jobId"]), (50, "boom"), None)
+        jobs.note_late_response(late)
+
+        assert jobs.reconcile_node_added({"node_id": 7}) is None
+        _, final = jobs.get_job(body["jobId"])
+        assert final["status"] == "failed"
+        assert final["error"]["code"] == "commissioning_failed"  # untouched by reconcile
+    asyncio.run(scenario())
+
+
+def test_late_commission_error_does_not_unwind_a_success(mock_logger):
+    async def scenario():
+        matter = FakeMatter(node_id=0xAB)
+        jobs = _jobs(matter, mock_logger, schedule=asyncio.ensure_future)
+        _, body = jobs.create_job({"setupCode": "12345678901", "suggestedName": "X"})
+        final = await _await_terminal(jobs, body["jobId"])()
+        assert final["status"] == "success"
+
+        mock_logger.warning.reset_mock()
+        late = LateResponse(None, CommissionRequest(body["jobId"]), (50, "boom"), None)
+        claimed = jobs.note_late_response(late)
+        assert claimed == body["jobId"]
+
+        _, final2 = jobs.get_job(body["jobId"])
+        assert final2 == final  # completely untouched
+        mock_logger.warning.assert_not_called()
+        mock_logger.info.assert_called()
+        assert body["jobId"] in str(mock_logger.info.call_args)
+    asyncio.run(scenario())
+
+
+def test_late_success_records_node_id_which_the_22_matcher_then_uses(mock_logger):
+    # A late SUCCESS never revives a FAILED job by itself (reconcile_node_added,
+    # driven by node_added, does that) — but the node id it records is exactly
+    # what _claimable_locked's exact-identity branch looks for, so an older job
+    # identified this way is claimed over a newer, still-unidentified one.
+    async def scenario():
+        clock = {"t": datetime(2026, 6, 10, 12, 0, tzinfo=timezone.utc)}
+        jobs = _jobs(TimeoutMatter(), mock_logger,
+                     schedule=asyncio.ensure_future, clock=lambda: clock["t"])
+        _, body1 = jobs.create_job({"setupCode": "12345678901", "suggestedName": "A"})
+        final1 = await _await_terminal(jobs, body1["jobId"])()
+        assert final1["error"]["code"] == "commissioning_timeout"
+
+        late = LateResponse(None, CommissionRequest(body1["jobId"]), None, {"node_id": 7})
+        claimed = jobs.note_late_response(late)
+        assert claimed == body1["jobId"]
+        assert jobs._jobs[body1["jobId"]].node_id == 7
+        assert jobs._jobs[body1["jobId"]].status == "failed"  # status untouched
+
+        clock["t"] += timedelta(minutes=2)
+        _, body2 = jobs.create_job({"setupCode": "98765432109", "suggestedName": "B"})
+        await _await_terminal(jobs, body2["jobId"])()  # newer, but unidentified
+
+        # exact identity (set via the late success) beats recency
+        assert jobs.reconcile_node_added({"node_id": 7}) == body1["jobId"]
+        await _await_terminal(jobs, body1["jobId"])()
+        _, other = jobs.get_job(body2["jobId"])
+        assert other["status"] == "failed"  # untouched
+    asyncio.run(scenario())
+
+
+def test_late_response_for_a_reaped_job_is_ignored(mock_logger):
+    async def scenario():
+        clock = {"t": datetime(2026, 6, 8, 12, 0, tzinfo=timezone.utc)}
+        jobs = _jobs(FakeMatter(), mock_logger,
+                     schedule=asyncio.ensure_future, clock=lambda: clock["t"])
+        _, body = jobs.create_job({"setupCode": "12345678901", "suggestedName": "X"})
+        await _await_terminal(jobs, body["jobId"])()
+        clock["t"] = clock["t"] + timedelta(minutes=16)
+        assert jobs.get_job(body["jobId"])[0] == 404  # reaps it
+
+        late = LateResponse(None, CommissionRequest(body["jobId"]), (1, "x"), None)
+        assert jobs.note_late_response(late) is None
+        mock_logger.debug.assert_called()
+        assert body["jobId"] in str(mock_logger.debug.call_args)
+    asyncio.run(scenario())
+
+
+def test_late_response_with_non_commission_context_is_ignored(mock_logger):
+    jobs = _jobs(FakeMatter(), mock_logger)
+    late = LateResponse(None, "some other request's context string", None, {"node_id": 1})
+    assert jobs.note_late_response(late) is None
+    mock_logger.debug.assert_not_called()
+    mock_logger.info.assert_not_called()
+    mock_logger.warning.assert_not_called()

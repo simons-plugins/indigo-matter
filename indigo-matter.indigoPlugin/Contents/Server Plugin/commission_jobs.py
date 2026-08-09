@@ -144,6 +144,19 @@ class CommissionError(Exception):
         self.matter_error_code = matter_error_code
 
 
+@dataclass(frozen=True)
+class CommissionRequest:
+    """The ``context`` :meth:`CommissionJobs._run_job` hands the transport for
+    its commission RPC (issue #23) — both the correlation key a late response
+    (``ws_json_client.LateResponse.context``) is matched back to a job with,
+    and the human-readable note an un-awaited request's log line shows.
+    """
+    job_id: str
+
+    def __str__(self) -> str:
+        return f"commission job {self.job_id}"
+
+
 @dataclass
 class Job:
     job_id: str
@@ -445,13 +458,109 @@ class CommissionJobs:
             self._advance(job, FAILED, job.progress, "")
 
     # ------------------------------------------------------------------
+    # Late RPC response (issue #23) — matter-server answers the commission
+    # RPC after the plugin already gave up waiting on it.
+    # ------------------------------------------------------------------
+    def note_late_response(self, late: Any) -> Optional[str]:
+        """Fold a late matter-server answer to a commission RPC into the job
+        table. ``late`` is a :class:`ws_json_client.LateResponse`, delivered
+        via ``MatterClient``'s ``on_late_response`` hook — ``late.context`` is
+        the :class:`CommissionRequest` :meth:`_run_job` sent the request with.
+
+        Runs on the loop thread: synchronous, no awaits, and deliberately
+        never calls :meth:`_advance` — this is not a state transition, it is
+        correcting what an ALREADY-terminal job says about why. matter-server
+        has no "commissioning failed" *event* — the RPC's own answer, however
+        late, is the only definitive word this plugin will ever get on a
+        commission attempt's actual outcome, which is why a late error is
+        worth rewriting a timed-out job's error for even after Domio has
+        stopped polling it. A late success does NOT revive a failed job
+        (that is ``reconcile_node_added``'s job, driven by the node_added
+        event) — it only ever records the node id, but that id feeds #21's
+        ownership guard (``_node_held_by_other_job``) and #22's identity
+        matcher (``_claimable_locked``) the moment it lands, same as it would
+        have if the RPC had answered in time.
+
+        Returns the matched job's id, or ``None`` if ``late`` names no job
+        this table is still tracking (or names no job at all).
+        """
+        if not isinstance(late.context, CommissionRequest):
+            return None
+        job_id = late.context.job_id
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                self.logger.debug(
+                    "late matter-server commission response for job %s: no longer "
+                    "tracked (already reaped)", job_id)
+                return None
+            if late.error is not None:
+                self._note_late_error_locked(job, late.error)
+            else:
+                self._note_late_success_locked(job, late.result)
+        return job_id
+
+    def _note_late_error_locked(self, job: Job, error: tuple) -> None:
+        """Caller must hold ``self._lock``. See :meth:`note_late_response`."""
+        code, details = error
+        if job.status is FAILED and (job.error or {}).get("code") == "commissioning_timeout":
+            # The one case this exists for: the RPC gave up waiting (issue #16's
+            # commissioning_timeout) and matter-server's late answer says the
+            # attempt actually failed. terminal_at is deliberately NOT
+            # re-stamped — the job has been terminal since the timeout; only
+            # what it reports about WHY changes.
+            new_error = {
+                "code": "commissioning_failed",
+                "message": (
+                    "matter-server reported the commission failed after the "
+                    f"plugin stopped waiting: {details}"
+                ),
+            }
+            matter_error_code = _opt_int(code)
+            if matter_error_code is not None:
+                new_error["matterErrorCode"] = matter_error_code
+            job.error = new_error
+            self.logger.warning(
+                "commission job %s: matter-server's late answer says the "
+                "commission actually failed (%s: %s) — the recorded error has "
+                "been updated even though the job already timed out",
+                job.job_id, code, details,
+            )
+        elif job.status is SUCCESS:
+            # The job already reached success by another path (a timely commission,
+            # or reconcile_node_added) — a late error must not unwind that.
+            self.logger.info(
+                "commission job %s: matter-server's late answer reports an error "
+                "(%s: %s), but the job already succeeded — leaving it alone",
+                job.job_id, code, details,
+            )
+        else:
+            self.logger.debug(
+                "commission job %s: late matter-server error (%s: %s) does not "
+                "apply to its current state (%s)", job.job_id, code, details, job.status,
+            )
+
+    def _note_late_success_locked(self, job: Job, result: Any) -> None:
+        """Caller must hold ``self._lock``. See :meth:`note_late_response`."""
+        node_id = result.get("node_id") if isinstance(result, dict) else result
+        if node_id is None or job.node_id is not None:
+            return
+        job.node_id = node_id
+        self.logger.info(
+            "commission job %s: matter-server's late answer names node %s — "
+            "recording it (job status unchanged: %s)",
+            job.job_id, node_id_to_str(node_id), job.status,
+        )
+
+    # ------------------------------------------------------------------
     # Async worker (runs on the loop)
     # ------------------------------------------------------------------
     async def _run_job(self, job: Job) -> None:
         node_id: Any = None
         try:
             self._advance(job, COMMISSIONING, 0.2, "Commissioning…")
-            result = await self.matter.commission_with_code(job.setup_code)
+            result = await self.matter.commission_with_code(
+                job.setup_code, context=CommissionRequest(job.job_id))
             node_id = result.get("node_id") if isinstance(result, dict) else result
             if node_id is None:
                 raise CommissionError("commissioning_failed", "matter-server returned no node_id")
