@@ -236,7 +236,7 @@ def classify(dev, plugin_id: str = DEFAULT_PLUGIN_ID) -> Verdict:
             return Excluded(REASON_NO_ROLE)
         return handler(dev)
     except Exception as exc:  # pylint: disable=broad-except
-        _LOG.error("Matter export: could not classify a device for export — %s", exc,
+        _LOG.error("Matter bridge: could not classify a device for export — %s", exc,
                    exc_info=True)
         return Excluded(REASON_DEVICE_ERROR)
 

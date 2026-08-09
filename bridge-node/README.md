@@ -12,7 +12,7 @@ Home and SmartThings are untested and unclaimed.
 > no discovery, and no idea what an Indigo device is. It is one half of a pair:
 > the plugin decides *what* to export and the node makes it a Matter accessory.
 > Install the Indigo plugin; it installs and manages this package for you, via
-> its own **Plugins ▸ Matter ▸ Install/update the Matter export bridge** menu
+> its own **Plugins ▸ Matter ▸ Install/update the Matter bridge** menu
 > item and a launchd LaunchAgent it writes.
 
 ## Why it is a separate process

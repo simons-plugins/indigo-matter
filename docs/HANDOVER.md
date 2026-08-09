@@ -83,7 +83,7 @@ bump both to `0.8.0` together, `npm publish` (Simon's npm login),
 
 **jarvis needs a one-time hand edit** — its stale entry predates the marker,
 so the fix cannot clear it retroactively. With the bridge node stopped (*Stop
-the Matter export bridge…*), edit
+the Matter bridge…*), edit
 `~/Library/Application Support/com.simons-plugins.indigo-matter/bridge-node/endpoint-map.json`:
 set `indigo-459564566`'s number to the live `2`, and resolve the duplicate
 number 5 (two entries record it — the reset's fingerprint; the non-live one
@@ -572,9 +572,9 @@ batch does instead is say so, prominently, on the page itself and in the menu's
 log line. See `docs/INSTALL.md` → "Before you pair the export bridge".
 
 **Two new bridge menu items** close the gap where the controller had recovery
-exits and the bridge had none: "Reinstall the Matter export bridge (clean)…"
+exits and the bridge had none: "Reinstall the Matter bridge (clean)…"
 (safe only because `remove_package` became per-package in E7) and "Stop the
-Matter export bridge…" — for the user who disables the plugin and is otherwise
+Matter bridge…" — for the user who disables the plugin and is otherwise
 left with a running node and no UI at all, since the allow-list lever needs the
 plugin to be running.
 
@@ -831,7 +831,7 @@ bundle ships **no JavaScript**; `bridge-node/` stays a top-level source
 directory in the repo and is published from there.
 
 **`indigo-matter-bridge` is not on the registry yet.** Until Simon publishes it,
-"Install/update the Matter export bridge" cannot resolve the pin and E7 cannot
+"Install/update the Matter bridge" cannot resolve the pin and E7 cannot
 be exercised end to end on jarvis.
 
 #### Publishing the bridge node
@@ -872,7 +872,7 @@ menu will still try the registry spec.
 **So the managed LaunchAgent is not, strictly, blocked on `npm publish`.** It is
 blocked on the package being *installed*, and the local-install recipe above
 installs it. What the publish unblocks is the shipped route — the
-"Install/update the Matter export bridge" menu item — which is what a user would
+"Install/update the Matter bridge" menu item — which is what a user would
 use and is therefore what "end to end" means. Do not restate the blocker as
 "npm" when the distinction matters.
 
@@ -980,7 +980,7 @@ gates the next:
    "Enable Matter export" is ticked, and that the readout line appears. If the
    readout is blank, Indigo dispatched neither callback spelling — say so, do
    not guess.
-4. **Plugins ▸ Matter ▸ Install/update the Matter export bridge.** Watch for
+4. **Plugins ▸ Matter ▸ Install/update the Matter bridge.** Watch for
    "Matter export bridge installed"; it will refuse to start anything while
    nothing is exported, which is correct (XG5).
 5. **Export one relay** in "Manage Matter Exports…". This is XAC2: the agent
@@ -1167,7 +1167,7 @@ Highs, 5 Mediums and 9 coverage gaps. The five that would have hurt a real user:
    caller anywhere in the plugin, while three user-facing strings told the user
    to confirm the rebuild "in the plugin". Two menu items now exist:
    **"Rebuild Matter Endpoint Map…"** (§3.11, one confirm + the duplication
-   warning) and **"Reset Matter Export Pairings…"** (§3.10 `preserve=true`, two
+   warning) and **"Reset Matter Bridge Pairings…"** (§3.10 `preserve=true`, two
    confirms). Both gate on `client.connected`, not `attached` — §1.1 holds the
    socket open un-attached and that is the only state a rebuild is needed in.
    `remove_fabric` still has no UI; it needs E6's fabric readout to pick an
@@ -1838,7 +1838,7 @@ All merged to `main`, all deployed to jarvis. Plugin **2026.0.1 → 2026.1.1** o
 - Two `/review-pr` passes found + fixed real safety holes (ignored stop/start bools → success-over-dead-server; swallowed rollback; unvalidated backup output; empty-archive wipe). **#31** fixed a live-caught menu bug: Indigo passes ConfigUI menu callbacks `(self, valuesDict, menuId)` — handlers were 2-arg.
 - **Live on jarvis:** Export → valid 915-member zip; Restore → server stop → swap (original → `matter-server.pre-restore-…`) → start → reconnect → **5 nodes reconciled** → device toggles. The two `Matter Warning: connection lost` lines during restore are the **expected ~6s reconnect window**, not errors.
 
-**Known polish (not filed):** during an *intentional* matter-server restart (restore / "Restart matter-server"), the reconnect loop logs `connection lost` WARNINGs for ~6s. Consider debouncing — log first attempts at debug, escalate to WARNING only past the normal restart window (`matter_client.py`). Small change + test.
+**Known polish (not filed):** during an *intentional* matter-server restart (restore / "Restart the Matter controller"), the reconnect loop logs `connection lost` WARNINGs for ~6s. Consider debouncing — log first attempts at debug, escalate to WARNING only past the normal restart window (`matter_client.py`). Small change + test.
 
 **Next milestone — device-class gaps:** umbrella **#15**; priority order #3 Power Source/battery (promised in PRD, never wired), #4 Generic Switch (buttons — needs `node_event` plumbing through protocol.py + device_sync), #5 Window Covering, #6 Door Lock, #7 bridges-done-properly, #8 standalone fans (a fan-only endpoint currently creates NO device), #9 energy, #10 smoke/CO, #11 air quality, #12 valve, #13 pressure/flow, #14 RVC (icebox). All follow the handler-registry pattern (one `matter_handlers/*.py` + `Devices.xml` type + one line in `registry.default_handlers()`; `thermostat.py` is the precedent for attribute writes).
 

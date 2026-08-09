@@ -53,7 +53,7 @@ SERVER_ERR_LOG = "matter-server.err.log"
 
 #: The EXACT wording of ``MenuItems.xml``'s ``installMatterServer`` item, for the
 #: messages that tell a user to run it. See ``AgentSpec.install_menu``.
-INSTALL_MENU = "Install/update matter-server"
+INSTALL_MENU = "Install/update the Matter controller (matter-server)"
 # Records the sha256 of the plist launchd was last told to load (bootstrap). launchd
 # caches a job's ProgramArguments at bootstrap time — rewriting the plist FILE does not
 # touch an already-loaded job — so we compare against this to tell "current definition

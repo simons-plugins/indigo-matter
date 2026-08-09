@@ -480,7 +480,7 @@ class Plugin(indigo.PluginBase):
         try:
             indigo.devices.subscribeToChanges()
         except Exception as exc:  # noqa: BLE001
-            self.logger.error("Matter export: could not subscribe to Indigo device changes — "
+            self.logger.error("Matter bridge: could not subscribe to Indigo device changes — "
                               "exported accessories will not follow Indigo state. %s", exc)
             self.logger.exception(exc)
             return False
@@ -525,7 +525,7 @@ class Plugin(indigo.PluginBase):
             if not self._resubscribe_gave_up:
                 self._resubscribe_gave_up = True
                 self.logger.warning(
-                    "Matter export: no Indigo device update has arrived since exporting, after "
+                    "Matter bridge: no Indigo device update has arrived since exporting, after "
                     "re-issuing subscribeToChanges %d times. Unless the house is simply idle, "
                     "exported accessories are NOT following Indigo state and nothing further will "
                     "retry on its own — reload the plugin.", MAX_RESUBSCRIBE_ATTEMPTS)
@@ -542,7 +542,7 @@ class Plugin(indigo.PluginBase):
         # subscription that never registered — and after that the evidence is
         # indistinguishable from nothing having happened.
         self.logger.debug(
-            "Matter export: no device updates since subscribing; re-issuing "
+            "Matter bridge: no device updates since subscribing; re-issuing "
             "subscribeToChanges (attempt %d of %d)",
             self._resubscribe_attempts, MAX_RESUBSCRIBE_ATTEMPTS)
         self._issue_device_subscription()
@@ -576,7 +576,7 @@ class Plugin(indigo.PluginBase):
             if newDev.id not in self._export_callback_failed:
                 self._export_callback_failed.add(newDev.id)
                 self.logger.error(
-                    "Matter export: the update of %s (id %s) could not be handed to the bridge "
+                    "Matter bridge: the update of %s (id %s) could not be handed to the bridge "
                     "— %s. Its accessory will show stale state until this clears.",
                     getattr(newDev, "name", ""), newDev.id, exc)
                 self.logger.exception(exc)
@@ -590,13 +590,13 @@ class Plugin(indigo.PluginBase):
             return
         try:
             self.exports.remove(dev.id)
-            self.logger.info("Removed Matter export: %s (id %s) — the Indigo device was deleted",
+            self.logger.info("Removed Matter export for %s (id %s) — the Indigo device was deleted",
                              getattr(dev, "name", ""), dev.id)
         except Exception as exc:  # noqa: BLE001
             # The store rolled back, so the entry survives; the endpoint removal
             # below is still right (the device is gone either way) and the
             # startup sweep will report the orphan.
-            self.logger.error("Matter export: removing the deleted device %s from the export "
+            self.logger.error("Matter bridge: removing the deleted device %s from the export "
                               "list FAILED — %s", dev.id, exc)
             self.logger.exception(exc)
         self._export_callback_failed.discard(dev.id)
@@ -720,8 +720,8 @@ class Plugin(indigo.PluginBase):
                 # storage lock. The plugin now reaps such strays on start/restart; point
                 # the user at that in case a reap couldn't run (e.g. ps unavailable).
                 hint = ("\nAnother matter-server appears to be holding the storage lock. "
-                        "Use Plugins ▸ Matter ▸ Restart matter-server (it stops stray "
-                        "servers), or reboot the Mac if it persists.")
+                        "Use Plugins ▸ Matter ▸ Restart the Matter controller (it stops "
+                        "stray servers), or reboot the Mac if it persists.")
             self.logger.error(
                 "matter-server is not responding after %d attempts and appears to be "
                 "crashing. Recent matter-server errors:\n%s%s", attempts, tail, hint,
@@ -730,7 +730,8 @@ class Plugin(indigo.PluginBase):
             self.logger.error(
                 "matter-server is not responding after %d attempts and its error log is "
                 "empty — it may not be installed (checked %s). Use Plugins ▸ Matter ▸ "
-                "Install/update matter-server, then restart the plugin.",
+                "Install/update the Matter controller (matter-server), then restart the "
+                "plugin.",
                 attempts, sp.project_dir,
             )
 
@@ -811,7 +812,7 @@ class Plugin(indigo.PluginBase):
         return self.getPrefsConfigUiValues()
 
     def _export_readout(self) -> str:
-        """One line describing the export bridge for the config dialog (PRD §5.5).
+        """One line describing the Matter bridge for the config dialog (PRD §5.5).
 
         What the PRD asks for is *which* ecosystems hold a fabric and whether a
         window is open — not slot arithmetic. matter.js allows 254 fabrics, so
@@ -890,7 +891,7 @@ class Plugin(indigo.PluginBase):
         # snapshot, so a changed location/host only takes effect on reload.
         self.logger.info(
             "matter-server settings saved — reload the plugin (or Plugins ▸ Matter ▸ "
-            "Restart matter-server) to apply them"
+            "Restart the Matter controller) to apply them"
         )
         # Export is the exception: its switch and its ports are read on every
         # connect, and the ONE change a user expects to act immediately is
@@ -904,7 +905,7 @@ class Plugin(indigo.PluginBase):
         # (⊗ `test_saving_config_applies_the_export_switch_immediately`).
         if self.export_bridge is None:
             self.logger.debug(
-                "Matter export: the export engine is not running, so the export switch will take "
+                "Matter bridge: the export engine is not running, so the export switch will take "
                 "effect when the plugin next starts.")
             return
         try:
@@ -913,7 +914,7 @@ class Plugin(indigo.PluginBase):
             # A bare traceback here reads as a crash in "save settings". Say what
             # did not happen and what to do instead — the prefs ARE saved.
             self.logger.error(
-                "Matter export: your settings were saved, but applying the export switch "
+                "Matter bridge: your settings were saved, but applying the export switch "
                 "immediately FAILED (%s). Reload the plugin to apply it.", exc)
             self.logger.exception(exc)
 
@@ -1351,8 +1352,9 @@ class Plugin(indigo.PluginBase):
                     return
             if not sp.install():
                 self.logger.error(
-                    "Install/update matter-server did not complete — see the error "
-                    "above. The server was not (re)installed; retry when resolved."
+                    "Install/update of the Matter controller (matter-server) did not "
+                    "complete — see the error above. The server was not (re)installed; "
+                    "retry when resolved."
                 )
                 return
             if self._stopping:  # plugin is tearing down — don't mutate its state
@@ -1374,8 +1376,8 @@ class Plugin(indigo.PluginBase):
                 self.logger.error(
                     "matter-server was installed and pinned to node at %s, but the "
                     "restart onto the new version FAILED — the old version may still be "
-                    "running. Use Plugins ▸ Matter ▸ Restart matter-server, or reload "
-                    "the plugin.", sp.resolved_bin_dir,
+                    "running. Use Plugins ▸ Matter ▸ Restart the Matter controller, or "
+                    "reload the plugin.", sp.resolved_bin_dir,
                 )
                 return
             self.logger.info(
@@ -1390,7 +1392,7 @@ class Plugin(indigo.PluginBase):
                 "matter-server install did not complete after the npm step — the "
                 "package may be installed but the node was not pinned and the server "
                 "was not (re)started. See the trace above, then retry Plugins ▸ Matter "
-                "▸ Install/update matter-server."
+                "▸ Install/update the Matter controller (matter-server)."
             )
 
     def menuReinstallMatterServerClean(self, valuesDict, menuId=""):  # noqa: N802, ARG002
@@ -1819,7 +1821,7 @@ class Plugin(indigo.PluginBase):
         if first:
             self.logger.exception(exc)
         else:
-            self.logger.error("Matter export: another device could not be read — %s", exc)
+            self.logger.error("Matter bridge: another device could not be read — %s", exc)
 
     @staticmethod
     def _candidate_row(dev, name: str, plugin_id: str, exported) -> Optional[tuple[str, str]]:
@@ -2110,12 +2112,12 @@ class Plugin(indigo.PluginBase):
         except Exception as exc:  # pylint: disable=broad-except
             # The store rolled back, so nothing was saved — say so rather than
             # reporting the success the old code reported unconditionally.
-            self.logger.error("Matter export: saving the export list FAILED — %s", exc)
+            self.logger.error("Matter bridge: saving the export list FAILED — %s", exc)
             self.logger.exception(exc)
             values["exportStatus"] = "FAILED to save the export list — see Event Log"
             return values
         verb = "Updated" if existed else "Added"
-        self.logger.info("%s Matter export: %s (id %s) as %s%s",
+        self.logger.info("%s Matter export for %s (id %s) as %s%s",
                          verb, dev.name, device_id, role,
                          f' named "{name_override}"' if name_override else "")
         self._nudge_export(device_id, role_changed=role_changed)
@@ -2168,7 +2170,7 @@ class Plugin(indigo.PluginBase):
         try:
             removed = self.exports.remove(device_id)
         except Exception as exc:  # pylint: disable=broad-except
-            self.logger.error("Matter export: saving the export list FAILED — %s", exc)
+            self.logger.error("Matter bridge: saving the export list FAILED — %s", exc)
             self.logger.exception(exc)
             values["exportStatus"] = "FAILED to save the export list — see Event Log"
             return values
@@ -2177,7 +2179,7 @@ class Plugin(indigo.PluginBase):
             return values
         dev = self._indigo_device(device_id)
         name = str(getattr(dev, "name", "") or "") if dev is not None else f"device {device_id}"
-        self.logger.info("Removed Matter export: %s (id %s)", name, device_id)
+        self.logger.info("Removed Matter export for %s (id %s)", name, device_id)
         # XAC7: the accessory has to leave every paired ecosystem, not just the
         # allow-list. Order matters — remove the endpoint BEFORE the empty
         # allow-list stops the client out from under it.
@@ -2208,7 +2210,7 @@ class Plugin(indigo.PluginBase):
         bridge = self.export_bridge
         client = bridge.client if bridge is not None else None
         if client is None or not client.connected:
-            msg = ("Not connected to the Matter export bridge node. Start it (it is launched by "
+            msg = ("Not connected to the Matter bridge node. Start it (it is launched by "
                    "hand in this build), export at least one device so the plugin connects, then "
                    "try again.")
             self.logger.warning(msg)
@@ -2244,7 +2246,7 @@ class Plugin(indigo.PluginBase):
             # every export that is not currently live — §3.3 keeps them exactly
             # so that re-adding a device restores its accessory — and there is
             # nothing to recover from in the first place.
-            msg = ("Matter export: the bridge node is NOT refusing to serve endpoints, so there "
+            msg = ("Matter bridge: the bridge node is NOT refusing to serve endpoints, so there "
                    "is nothing to rebuild. Rebuilding anyway would discard the retained endpoint "
                    "numbers of every device that is not currently exported, and those are what "
                    "make re-adding one restore the same accessory.")
@@ -2263,31 +2265,31 @@ class Plugin(indigo.PluginBase):
             # Never report success over a rebuild that did not persist: the node
             # answers with an error rather than a StatusReport when the new map
             # could not be written, and the refusal is still in force.
-            self.logger.error("Matter export: rebuilding the endpoint map FAILED — %s. The bridge "
+            self.logger.error("Matter bridge: rebuilding the endpoint map FAILED — %s. The bridge "
                               "node is unchanged and still refusing to export.", exc)
             self.logger.exception(exc)
             errors["confirm"] = "Rebuild failed — see the log. Nothing was changed."
             return (False, valuesDict, errors)
         self.logger.warning(
-            "Matter export: endpoint map REBUILT — the bridge node has stopped refusing and is "
+            "Matter bridge: endpoint map REBUILT — the bridge node has stopped refusing and is "
             "serving %d endpoint(s). Nothing was renumbered. If only the map file was damaged, "
             "no paired ecosystem will see any change; if the bridge's Matter storage was lost, "
             "your ecosystems already hold dead accessories under the old numbers — delete those "
             "by hand. Do NOT run this again for the same fault.",
             status.endpoint_count)
         for warning in status.warnings:
-            self.logger.warning("Matter export: the bridge node reports — %s", warning)
+            self.logger.warning("Matter bridge: the bridge node reports — %s", warning)
         if not client.attached:
             # The rebuild stands; only the connection step after it did not. The
             # client's own triage has already named the reason at error level.
             self.logger.warning(
-                "Matter export: the rebuild succeeded but re-attaching to the bridge node did "
+                "Matter bridge: the rebuild succeeded but re-attaching to the bridge node did "
                 "not. The rebuild does NOT need repeating — exports resume when the connection "
                 "does, and the reason is logged above.")
         return (True, valuesDict)
 
     def menuResetBridgePairings(self, valuesDict, menuId=""):  # noqa: N802, ARG002
-        """§3.10 — wipe the export bridge's commissioning and re-advertise."""
+        """§3.10 — wipe the Matter bridge's commissioning and re-advertise."""
         errors = indigo.Dict()
         # Two boxes, deliberately. This is the only plugin action that destroys
         # every ecosystem pairing at once, and it is irreversible without
@@ -2306,19 +2308,19 @@ class Plugin(indigo.PluginBase):
             # "the map itself is corrupt" path is the rebuild above.
             self.runtime.submit(client.factory_reset(True)).result(timeout=FACTORY_RESET_TIMEOUT)
         except Exception as exc:  # noqa: BLE001
-            self.logger.error("Matter export: resetting the bridge pairings FAILED — %s. "
+            self.logger.error("Matter bridge: resetting the bridge pairings FAILED — %s. "
                               "Pairings are unchanged.", exc)
             self.logger.exception(exc)
             errors["confirmAgain"] = "Reset failed — see the log. Pairings were not changed."
             return (False, valuesDict, errors)
         self.logger.warning(
-            "Matter export: the bridge node's pairings have been RESET. It is advertising for "
+            "Matter bridge: the bridge node's pairings have been RESET. It is advertising for "
             "commissioning again — pair it from each ecosystem, and remove the now-dead Indigo "
             "bridge from any ecosystem that still lists it.")
         return (True, valuesDict)
 
     # ------------------------------------------------------------------
-    # The export bridge node's LaunchAgent (E7 — PRD §4.2, XG5, XAC1)
+    # The Matter bridge node's LaunchAgent (E7 — PRD §4.2, XG5, XAC1)
     # ------------------------------------------------------------------
     def _start_bridge_agent(self) -> None:
         """Install (if needed) and start the bridge node's LaunchAgent.
@@ -2349,18 +2351,18 @@ class Plugin(indigo.PluginBase):
         # was reported here as "bridge node LaunchAgent is running". Ask launchd.
         state = agent.run_state()
         if state == agent.RUNNING:
-            self.logger.info("Matter export: bridge node LaunchAgent is running (protocol port %s, "
+            self.logger.info("Matter bridge: bridge node LaunchAgent is running (protocol port %s, "
                              "Matter port %s)", agent.ws_port, agent.matter_port)
         elif state == agent.UNKNOWN:
             # A pid line we could not parse. It may well be serving; what we must
             # not do is assert either way.
             self.logger.info(
-                "Matter export: the bridge node's LaunchAgent is loaded (protocol port %s, Matter "
+                "Matter bridge: the bridge node's LaunchAgent is loaded (protocol port %s, Matter "
                 "port %s); launchd did not report a readable pid, so whether the process is up "
                 "will show as the plugin connects — or fails to.", agent.ws_port, agent.matter_port)
         else:
             self.logger.error(
-                "Matter export: the bridge node's LaunchAgent %s. Exported accessories will be "
+                "Matter bridge: the bridge node's LaunchAgent %s. Exported accessories will be "
                 "unavailable until it does. %s",
                 "did not start" if state == agent.LOADED_NOT_RUNNING
                 else "could not be loaded by launchd",
@@ -2397,7 +2399,7 @@ class Plugin(indigo.PluginBase):
             # retried: the node kept serving every paired ecosystem with the log
             # asserting the opposite by omission.
             self.logger.warning(
-                "Matter export: nothing is exported, but the bridge node's LaunchAgent could not "
+                "Matter bridge: nothing is exported, but the bridge node's LaunchAgent could not "
                 "be %s (%s). It keeps running and serving every paired ecosystem, and NOTHING "
                 "retries this on its own — reload the plugin, or run 'launchctl bootout "
                 "gui/$(id -u)/%s' and delete that file by hand.",
@@ -2406,14 +2408,14 @@ class Plugin(indigo.PluginBase):
             return
         if was_loaded:
             self.logger.info(
-                "Matter export: nothing is exported — the bridge node has been stopped and its "
+                "Matter bridge: nothing is exported — the bridge node has been stopped and its "
                 "LaunchAgent removed, so a restart of this Mac cannot bring it back. Its pairings "
                 "are kept.")
         else:
             # The two Falses `stop()` conflated: this one is "there was no job",
             # which is not a failure and must not be reported as one.
             self.logger.debug(
-                "Matter export: nothing is exported and no bridge node LaunchAgent was loaded; "
+                "Matter bridge: nothing is exported and no bridge node LaunchAgent was loaded; "
                 "any plist has been removed. Pairings are kept.")
 
     def _bridge_agent_diagnosis(self) -> Optional[str]:
@@ -2495,7 +2497,7 @@ class Plugin(indigo.PluginBase):
             self.logger.warning("An npm install is already in progress — wait for it to finish.")
             return False
         self.logger.info(
-            "%s the Matter export bridge node in the background — watch the log for progress; "
+            "%s the Matter bridge node in the background — watch the log for progress; "
             "this can take a minute.",
             "Removing and reinstalling" if clean else "Installing")
         self._install_thread = threading.Thread(
@@ -2507,7 +2509,7 @@ class Plugin(indigo.PluginBase):
     def menuStopBridgeNode(self, valuesDict, menuId=""):  # noqa: N802, ARG002
         """Stop the bridge node and remove its LaunchAgent, by hand.
 
-        The controller has "Restart matter-server"; the bridge had nothing at
+        The controller has "Restart the Matter controller"; the bridge had nothing at
         all, because it is started and stopped by the allow-list. That leaves one
         state with no UI: a user who disables the plugin (or whose plugin dies
         mid-session) has a node still running and still serving every paired
@@ -2558,12 +2560,12 @@ class Plugin(indigo.PluginBase):
                 # remove_package has said what is still there. Installing over a
                 # wedged install is what the clean variant exists to avoid.
                 self.logger.error(
-                    "Clean reinstall of the Matter export bridge ABANDONED — the old package "
+                    "Clean reinstall of the Matter bridge ABANDONED — the old package "
                     "could not be removed, so nothing was reinstalled over it.")
                 return
             if not agent.install():
                 self.logger.error(
-                    "Install/update of the Matter export bridge did not complete — see the error "
+                    "Install/update of the Matter bridge did not complete — see the error "
                     "above. Nothing was changed; retry when resolved.")
                 return
             if self._stopping:  # plugin is tearing down — don't mutate its state
@@ -2571,7 +2573,7 @@ class Plugin(indigo.PluginBase):
             self.bridge_process = bridge_agent.BridgeProcess(dict(self.pluginPrefs), self.logger)
             if self.exports is None or not len(self.exports):
                 self.logger.info(
-                    "Matter export bridge installed. It is NOT being started: nothing is exported "
+                    "Matter bridge installed. It is NOT being started: nothing is exported "
                     "yet, and the bridge only runs while the export list is non-empty. Add a "
                     "device in 'Manage Matter Exports…' and it will start itself.")
                 return
@@ -2583,7 +2585,7 @@ class Plugin(indigo.PluginBase):
             applied = self.bridge_process.ensure_installed()
             if applied is None:
                 self.logger.error(
-                    "The Matter export bridge was installed, but its LaunchAgent could not be "
+                    "The Matter bridge was installed, but its LaunchAgent could not be "
                     "written — see the reason above. The package is on disk; fix that and reload "
                     "the plugin.")
                 return
@@ -2591,7 +2593,7 @@ class Plugin(indigo.PluginBase):
             # left alone by ensure_installed is still executing the OLD version.
             if applied is False and not self.bridge_process.restart():
                 self.logger.error(
-                    "The Matter export bridge was installed but the restart onto the new version "
+                    "The Matter bridge was installed but the restart onto the new version "
                     "FAILED — the old version may still be running. Check %s.",
                     os.path.join(self.bridge_process.log_dir, bridge_agent.BRIDGE_ERR_LOG))
                 return
@@ -2603,17 +2605,17 @@ class Plugin(indigo.PluginBase):
             # reached a run loop, so the log must not claim it is reconnecting.
             poked = self.export_bridge is not None and self.export_bridge.retry_now()
             if poked:
-                self.logger.info("Matter export bridge installed and restarted onto the new "
+                self.logger.info("Matter bridge installed and restarted onto the new "
                                  "version — reconnecting now.")
             else:
-                self.logger.info("Matter export bridge installed and restarted onto the new "
+                self.logger.info("Matter bridge installed and restarted onto the new "
                                  "version — reload the plugin to reconnect.")
         except Exception as exc:  # noqa: BLE001
             self.logger.exception(exc)
             self.logger.error(
-                "Install of the Matter export bridge did not complete after the npm step — the "
+                "Install of the Matter bridge did not complete after the npm step — the "
                 "package may be installed but the agent was not restarted. See the trace above, "
-                "then retry Plugins ▸ Matter ▸ Install/update the Matter export bridge.")
+                "then retry Plugins ▸ Matter ▸ Install/update the Matter bridge.")
 
     # ------------------------------------------------------------------
     # Pairing and fabric management (PRD §6, BRIDGE_PROTOCOL §3.7-§3.9)
@@ -2639,7 +2641,7 @@ class Plugin(indigo.PluginBase):
             why = ("Export at least one device in 'Manage Matter Exports…' first — the bridge only "
                    "runs while something is exported." if not exported else
                    "The bridge node is not answering; see the log for what its own error log says.")
-            self.logger.warning("Matter export: cannot reach the bridge node for pairing. %s", why)
+            self.logger.warning("Matter bridge: cannot reach the bridge node for pairing. %s", why)
             errors[field] = "Not connected to the bridge node — see the log."
             return None
         return client
@@ -2670,7 +2672,7 @@ class Plugin(indigo.PluginBase):
         try:
             pairing = self.runtime.submit(client.get_pairing()).result(timeout=PAIRING_READ_TIMEOUT)
         except Exception as exc:  # noqa: BLE001
-            self.logger.error("Matter export: could not read the bridge node's pairing state — %s. "
+            self.logger.error("Matter bridge: could not read the bridge node's pairing state — %s. "
                               "No pairing window was opened.", exc)
             self.logger.exception(exc)
             errors["duration"] = "Could not reach the bridge node — see the log."
@@ -2690,7 +2692,7 @@ class Plugin(indigo.PluginBase):
                 client.open_commissioning_window(duration)).result(timeout=WINDOW_OPEN_TIMEOUT)
         except Exception as exc:  # noqa: BLE001
             self.logger.error(
-                "Matter export: opening a pairing window FAILED — %s. Nothing was changed and "
+                "Matter bridge: opening a pairing window FAILED — %s. Nothing was changed and "
                 "existing pairings are untouched. If the bridge says a window is already open, "
                 "wait for it to expire (up to 15 minutes) and try again.", exc)
             self.logger.exception(exc)
@@ -2828,7 +2830,7 @@ class Plugin(indigo.PluginBase):
             removal = self.runtime.submit(
                 client.remove_fabric(fabric_index)).result(timeout=UNPAIR_TIMEOUT)
         except Exception as exc:  # noqa: BLE001
-            self.logger.error("Matter export: unpairing ecosystem %s FAILED — %s. Pairings are "
+            self.logger.error("Matter bridge: unpairing ecosystem %s FAILED — %s. Pairings are "
                               "unchanged.", fabric_index, exc)
             self.logger.exception(exc)
             errors["confirmAgain"] = "Unpair failed — see the log. Nothing was changed."
@@ -2843,7 +2845,7 @@ class Plugin(indigo.PluginBase):
             # answered `{}` either way and the menu logged "has been unpaired.
             # Every accessory has been removed" over a node-side no-op.
             self.logger.warning(
-                "Matter export: ecosystem %s was ALREADY gone from the bridge node — nothing was "
+                "Matter bridge: ecosystem %s was ALREADY gone from the bridge node — nothing was "
                 "removed by this action, because there was nothing there to remove. It had most "
                 "likely unpaired itself since this dialog was opened. The ecosystem list has been "
                 "refreshed%s.", fabric_index,
@@ -2858,13 +2860,13 @@ class Plugin(indigo.PluginBase):
             # that actually means rather than reporting a routine removal, because
             # the user has just reset the whole bridge without using the reset menu.
             self.logger.warning(
-                "Matter export: ecosystem %s was the LAST one paired, so the bridge node has "
+                "Matter bridge: ecosystem %s was the LAST one paired, so the bridge node has "
                 "reset itself and is advertising for commissioning again — exactly as 'Reset "
-                "Matter Export Pairings…' would have done. Nothing in Indigo changed. Use "
+                "Matter Bridge Pairings…' would have done. Nothing in Indigo changed. Use "
                 "'Pair Matter Bridge…' to pair it again.", fabric_index)
         else:
             self.logger.warning(
-                "Matter export: ecosystem %s has been unpaired. Every accessory Indigo exports "
+                "Matter bridge: ecosystem %s has been unpaired. Every accessory Indigo exports "
                 "has been removed from it; remove any leftover 'Indigo' bridge entry in that "
                 "ecosystem's app by hand.", fabric_index)
         return (True, valuesDict)
@@ -2888,7 +2890,7 @@ class Plugin(indigo.PluginBase):
         except Exception as exc:  # noqa: BLE001
             # The removal itself already succeeded or was already true; failing
             # to re-read the list afterwards is not worth reporting as a failure.
-            self.logger.debug("Matter export: could not refresh the ecosystem list (%s)", exc)
+            self.logger.debug("Matter bridge: could not refresh the ecosystem list (%s)", exc)
 
     def _is_last_fabric(self, fabric_index: int) -> bool:
         """Whether removing ``fabric_index`` empties the fabric set.

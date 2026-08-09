@@ -448,7 +448,7 @@ either is not a tidy-up.
 Unpairing the **last** ecosystem resets the bridge completely: Matter's rules
 make the node factory-reset itself when its fabric set empties, so it goes back
 to advertising for commissioning. That is correct behaviour, and it is the same
-outcome as *Reset Matter Export Pairings…* — worth knowing before you remove
+outcome as *Reset Matter Bridge Pairings…* — worth knowing before you remove
 what turns out to be the only one.
 
 ### Accessory identity, and why it must never move

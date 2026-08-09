@@ -126,8 +126,9 @@ node --version          # confirm v22.x
 Leave **Node bin directory** blank in the plugin config — auto-detect finds Homebrew
 first. (nvm works too; pin `nodeBinDir` explicitly if you use it.)
 
-**2. Install matter-server:** **Plugins ▸ Matter ▸ Install/update matter-server**. This
-installs the pinned version with the *same* Node it will run the server with, and pins
+**2. Install the Matter controller:** **Plugins ▸ Matter ▸ Install/update the Matter
+controller (matter-server)**. This installs the pinned version with the *same* Node it
+will run the server with, and pins
 that Node — which avoids the most common failure, installing with one Node and running
 with another whose native modules won't load.
 
@@ -144,7 +145,7 @@ manual mode, fabric backups, upgrading and uninstalling, is covered in the
 [full install guide](https://simons-plugins.github.io/indigo-matter/INSTALL.html).
 
 To **export** Indigo devices as well, add a fourth step — **Plugins ▸ Matter ▸
-Install/update the Matter export bridge** — and then pick your devices in *Manage Matter
+Install/update the Matter bridge** — and then pick your devices in *Manage Matter
 Exports…*. The bridge starts itself once something is exported. Full walkthrough in the
 install guide.
 
@@ -188,7 +189,7 @@ Developer reference, in the repo — not intended as user documentation:
 - [`docs/API.md`](https://github.com/simons-plugins/indigo-matter/blob/main/docs/API.md) — the Domio ↔ plugin HTTP contract (v1.3).
 - [`docs/BRIDGE_PROTOCOL.md`](https://github.com/simons-plugins/indigo-matter/blob/main/docs/BRIDGE_PROTOCOL.md) — the plugin ⇄ bridge-node local protocol (export side).
 - [`docs/PRD-indigo-matter-plugin.md`](https://github.com/simons-plugins/indigo-matter/blob/main/docs/PRD-indigo-matter-plugin.md) — product requirements and milestones (inbound).
-- [`docs/PRD-indigo-matter-export.md`](https://github.com/simons-plugins/indigo-matter/blob/main/docs/PRD-indigo-matter-export.md) — the same for the export bridge.
+- [`docs/PRD-indigo-matter-export.md`](https://github.com/simons-plugins/indigo-matter/blob/main/docs/PRD-indigo-matter-export.md) — the same for the Matter bridge.
 - [`bridge-node/`](https://github.com/simons-plugins/indigo-matter/tree/main/bridge-node) — the bridge node itself (TypeScript; the only place matter.js is imported). `npm run build && npm test`.
 - [`CLAUDE.md`](https://github.com/simons-plugins/indigo-matter/blob/main/CLAUDE.md) — architecture and workspace conventions.
 
@@ -217,7 +218,7 @@ What that means in practice:
   attestation so uncertified devices (development boards, Homebridge/Matterbridge
   bridges) can be commissioned. It is off by default, warns on every start, and should
   be turned off once the device is paired.
-- **The export bridge is uncertified in the other direction, and visibly so.** It
+- **The Matter bridge is uncertified in the other direction, and visibly so.** It
   advertises with the specification's test vendor ID, so every ecosystem shows an
   "uncertified accessory" warning when you add it and you choose *Add Anyway*. That is the
   normal state for this class of software — Homebridge, matterbridge and Home Assistant's

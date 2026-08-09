@@ -267,7 +267,7 @@ class ExportBridge:
         if self._un_exporting:
             self._start_after_un_export = True
             self._logger.debug(
-                "Matter export: start deferred until the in-flight un-export finishes")
+                "Matter bridge: start deferred until the in-flight un-export finishes")
             return
         if self.client is not None:
             return
@@ -276,7 +276,7 @@ class ExportBridge:
             # Configure…, and every caller of start() is a path that would
             # ordinarily bring it up. Saying so once per attempt at debug is
             # enough — the config dialog's own readout is where this belongs.
-            self._logger.debug("Matter export: export is switched off in Configure…; "
+            self._logger.debug("Matter bridge: export is switched off in Configure…; "
                                "not connecting to the bridge node")
             return
         # The agent BEFORE the client, and deliberately not conditional on it
@@ -307,7 +307,7 @@ class ExportBridge:
         self._fire(self.client.run(), "bridge client run loop",
                    lost="nothing will be exported until the plugin is reloaded")
         self._logger.info(
-            "Matter export: connecting to the bridge node (%d device(s) exported)",
+            "Matter bridge: connecting to the bridge node (%d device(s) exported)",
             len(self._store))
 
     def stop(self, timeout: float = 4.0) -> None:
@@ -323,7 +323,7 @@ class ExportBridge:
                 # is the count of tiles now showing something the house is not
                 # doing — and nothing retries a §5 command.
                 self._logger.warning(
-                    "Matter export: shutting down with %d ecosystem command(s) still queued or "
+                    "Matter bridge: shutting down with %d ecosystem command(s) still queued or "
                     "in flight — they will NOT be applied, and paired ecosystems already show "
                     "them as done.", dropped)
             # Not `wait=True`: a dispatch blocked on a wedged IndigoServer would
@@ -397,7 +397,7 @@ class ExportBridge:
             # "delete them from every ecosystem". Drop the socket and stop the
             # agent; the endpoints, the pairings and the allow-list all stand.
             if self.client is not None:
-                self._logger.info("Matter export: export is switched off — disconnecting from the "
+                self._logger.info("Matter bridge: export is switched off — disconnecting from the "
                                   "bridge node. Exported accessories are LEFT paired and will show "
                                   "as unavailable until export is switched back on.")
                 self.stop()
@@ -417,7 +417,7 @@ class ExportBridge:
             # landed. XG5 says no client while nothing is exported; this is the
             # one exception, and it lasts exactly one successful attach.
             self._logger.info(
-                "Matter export: reconnecting to finish an un-export that did not complete "
+                "Matter bridge: reconnecting to finish an un-export that did not complete "
                 "earlier (%d accessory record(s) still owed removal)",
                 self._pending_replace_all())
             self.start()
@@ -468,7 +468,7 @@ class ExportBridge:
             self._agent_start()
         except Exception as exc:  # pylint: disable=broad-except
             self._logger.error(
-                "Matter export: could not start the bridge node's LaunchAgent (%s). Indigo "
+                "Matter bridge: could not start the bridge node's LaunchAgent (%s). Indigo "
                 "devices and inbound Matter control are unaffected; exported accessories will "
                 "not be reachable until this is fixed.", exc)
             self._logger.exception(exc)
@@ -492,7 +492,7 @@ class ExportBridge:
             self._agent_stop()
         except Exception as exc:  # pylint: disable=broad-except
             self._logger.warning(
-                "Matter export: could not stop the bridge node's LaunchAgent (%s). It will keep "
+                "Matter bridge: could not stop the bridge node's LaunchAgent (%s). It will keep "
                 "running with nothing to export, which is harmless — pairings are untouched.", exc)
 
     async def _stop_agent_off_loop(self) -> None:
@@ -556,7 +556,7 @@ class ExportBridge:
             return int(raw or 0)
         except (TypeError, ValueError) as exc:
             self._logger.warning(
-                "Matter export: the outstanding un-export count in prefs is unreadable (%r: %s) — "
+                "Matter bridge: the outstanding un-export count in prefs is unreadable (%r: %s) — "
                 "treating it as nothing owed. If accessories from a previous session are still "
                 "showing in a paired ecosystem, re-export one device and remove it again to "
                 "re-record the removal.", raw, exc)
@@ -602,7 +602,7 @@ class ExportBridge:
                 self._save_prefs()
         except Exception as exc:  # pylint: disable=broad-except
             self._logger.warning(
-                "Matter export: could not record that the un-export is outstanding (%s). "
+                "Matter bridge: could not record that the un-export is outstanding (%s). "
                 "If it does not complete now, exported accessories may linger.", exc)
 
     def _clear_pending_replace_all(self) -> None:
@@ -623,7 +623,7 @@ class ExportBridge:
             # it has been paid, so the next attach will carry `replace_all`
             # again for an un-export that already happened.
             self._logger.warning(
-                "Matter export: the un-export completed but the outstanding-work flag could "
+                "Matter bridge: the un-export completed but the outstanding-work flag could "
                 "not be cleared (%s). A later reconnect may repeat the removal request; "
                 "nothing extra is removed by it.", exc)
 
@@ -658,7 +658,7 @@ class ExportBridge:
         # not land include the plugin being reloaded and the Mac losing power
         # mid-attach, and neither of those reaches an `except`.
         self._record_pending_replace_all(removing)
-        self._logger.info("Matter export: allow-list is now empty — removing every "
+        self._logger.info("Matter bridge: allow-list is now empty — removing every "
                           "exported accessory (pairings are kept)")
 
         async def _un_export() -> None:
@@ -670,7 +670,7 @@ class ExportBridge:
                 self._clear_pending_replace_all()
             except Exception as exc:  # pylint: disable=broad-except
                 self._logger.warning(
-                    "Matter export: could not tell the bridge node the export list is empty "
+                    "Matter bridge: could not tell the bridge node the export list is empty "
                     "(%s). Accessories will LINGER in paired ecosystems until this is finished. "
                     "It is recorded and will be finished automatically the next time the plugin "
                     "connects to the node — which is when you next export a device, or when the "
@@ -765,7 +765,7 @@ class ExportBridge:
             return
         self._wholly_unbridgeable = reasons
         self._logger.warning(
-            "Matter export: NONE of the %d device(s) in the export list can be bridged right "
+            "Matter bridge: NONE of the %d device(s) in the export list can be bridged right "
             "now — %s. Every exported accessory is being removed from paired ecosystems until "
             "this is fixed; their endpoint numbers are kept, so putting the devices right "
             "brings the same accessories back rather than new ones.",
@@ -841,7 +841,7 @@ class ExportBridge:
         if self._skipped.get(device_id) != why:
             self._skipped[device_id] = why
             self._logger.warning(
-                "Matter export: device %s is in the export list but will NOT be bridged — %s%s.",
+                "Matter bridge: device %s is in the export list but will NOT be bridged — %s%s.",
                 device_id, why, f" ({detail})" if detail else "")
 
     # ------------------------------------------------------------------
@@ -895,7 +895,7 @@ class ExportBridge:
             if new_dev.id not in self._update_failed:
                 self._update_failed.add(new_dev.id)
                 self._logger.error(
-                    "Matter export: could not work out what changed about %s (id %s, exported "
+                    "Matter bridge: could not work out what changed about %s (id %s, exported "
                     "as %s) — %s. Its accessory will show stale state until this clears.",
                     getattr(new_dev, "name", ""), new_dev.id, entry.role, exc)
                 self._logger.exception(exc)
@@ -949,7 +949,7 @@ class ExportBridge:
             return
         self._stopped_keys[dev.id] = stopped
         self._logger.warning(
-            "Matter export: device %s (id %s, exported as %s) stopped reporting %s — paired "
+            "Matter bridge: device %s (id %s, exported as %s) stopped reporting %s — paired "
             "ecosystems will keep showing the last known value for it until it reports again.",
             getattr(dev, "name", ""), dev.id, role, ", ".join(sorted(stopped)))
 
@@ -977,30 +977,30 @@ class ExportBridge:
         client = self.client
         if client is None:
             self._logger.debug(
-                "Matter export: no bridge client; dropping %s for device %s", what, device_id)
+                "Matter bridge: no bridge client; dropping %s for device %s", what, device_id)
             return None
         if client.attached:
             return client
         if client.halted:
-            self._logger.debug("Matter export: bridge client halted; dropping %s for device %s",
+            self._logger.debug("Matter bridge: bridge client halted; dropping %s for device %s",
                                what, device_id)
             if not self._halted_reported:
                 self._halted_reported = True
                 self._logger.warning(
-                    "Matter export: the bridge client is HALTED (%s) — device %s and everything "
+                    "Matter bridge: the bridge client is HALTED (%s) — device %s and everything "
                     "after it is NOT reaching any ecosystem, and nothing will retry on its own.",
                     client.halted_reason or "no reason recorded", device_id)
         elif client.recovery:
-            self._logger.debug("Matter export: bridge in recovery; dropping %s for device %s",
+            self._logger.debug("Matter bridge: bridge in recovery; dropping %s for device %s",
                                what, device_id)
             if not self._recovery_reported:
                 self._recovery_reported = True
                 self._logger.warning(
-                    "Matter export: the bridge node is awaiting an endpoint-map rebuild — "
+                    "Matter bridge: the bridge node is awaiting an endpoint-map rebuild — "
                     "device %s and everything after it is NOT reaching any ecosystem.", device_id)
         else:
             self._logger.debug(
-                "Matter export: bridge node not attached; dropping %s for device %s "
+                "Matter bridge: bridge node not attached; dropping %s for device %s "
                 "(the next attach reconciles it)", what, device_id)
         return None
 
@@ -1083,14 +1083,14 @@ class ExportBridge:
         if entry is None:
             # PRD §7 race row: the endpoint outlived the allow-list entry.
             self._logger.warning(
-                "Matter export: the bridge node sent %r for Indigo device %s, which is not "
+                "Matter bridge: the bridge node sent %r for Indigo device %s, which is not "
                 "exported — ignoring. The accessory should disappear at the next reconnect.",
                 command.command, device_id)
             return
         handler = export_handlers.handler_for(entry.role)
         if handler is None:
             self._logger.warning(
-                "Matter export: %r arrived for device %s exported as %s, a role this version "
+                "Matter bridge: %r arrived for device %s exported as %s, a role this version "
                 "cannot bridge — ignoring.", command.command, device_id, entry.role)
             return
         self._fire(self._dispatch_off_loop(command, entry, handler),
@@ -1139,7 +1139,7 @@ class ExportBridge:
             await asyncio.wait_for(asyncio.shield(future), timeout=COMMAND_TIMEOUT)
         except asyncio.TimeoutError:
             self._logger.error(
-                "Matter export: %r for device %s (%s) has not returned after %.0fs. The command "
+                "Matter bridge: %r for device %s (%s) has not returned after %.0fs. The command "
                 "worker is single-threaded, so every §5 command after it is queued behind this "
                 "one — check whether that Indigo device or its plugin is responding. The "
                 "ecosystem that sent it already shows it as done and NOTHING will correct that "
@@ -1153,7 +1153,7 @@ class ExportBridge:
             return
         exc = future.exception()
         if exc is not None:
-            self._logger.warning("Matter export: a §5 command dispatch failed — %s", exc)
+            self._logger.warning("Matter bridge: a §5 command dispatch failed — %s", exc)
 
     def _command_worker(self):
         """The single thread §5 commands are applied on. Built on first use.
@@ -1171,7 +1171,7 @@ class ExportBridge:
             # A coroutine that was already queued on the loop when `stop()` ran
             # would otherwise build a brand-new worker thread underneath a
             # bridge that has shut down, and nothing would ever join it.
-            self._logger.debug("Matter export: command worker requested after stop; ignoring")
+            self._logger.debug("Matter bridge: command worker requested after stop; ignoring")
             return None
         if self._executor is None:
             self._executor = self._executor_factory()
@@ -1183,14 +1183,14 @@ class ExportBridge:
         dev = self._device_getter(device_id)
         if dev is None:
             self._logger.warning(
-                "Matter export: %r arrived for device %s, which no longer exists in Indigo — "
+                "Matter bridge: %r arrived for device %s, which no longer exists in Indigo — "
                 "ignoring.", command.command, device_id)
             return
         try:
             outcome = handler.dispatch(command.command, command.args, dev, entry.options)
         except Exception as exc:  # pylint: disable=broad-except
             self._logger.error(
-                "Matter export: %r failed for device %s (%s) with args %r — %s. The ecosystem "
+                "Matter bridge: %r failed for device %s (%s) with args %r — %s. The ecosystem "
                 "still shows the state it asked for; pushing the real one back.",
                 command.command, device_id, entry.role, command.args, exc)
             self._logger.exception(exc)
@@ -1198,7 +1198,7 @@ class ExportBridge:
             return
         if outcome is False:
             self._logger.warning(
-                "Matter export: the bridge node sent %r for device %s (%s), which that role "
+                "Matter bridge: the bridge node sent %r for device %s (%s), which that role "
                 "does not define — ignoring.", command.command, device_id, entry.role)
         elif isinstance(outcome, str):
             self._report_no_op(command.command, device_id, entry.role, outcome)
@@ -1223,7 +1223,7 @@ class ExportBridge:
             return
         self._no_op_reported[device_id] = reason
         self._logger.warning(
-            "Matter export: %r reached device %s (exported as %s) but changed nothing — %s.",
+            "Matter bridge: %r reached device %s (exported as %s) but changed nothing — %s.",
             command, device_id, role, reason)
 
     def _correct(self, handler, dev: Any, device_id: int,
@@ -1254,7 +1254,7 @@ class ExportBridge:
             states = handler.states_for(dev, options)
         except Exception as exc:  # pylint: disable=broad-except
             self._logger.warning(
-                "Matter export: could not read device %s back to correct the ecosystem (%s) — "
+                "Matter bridge: could not read device %s back to correct the ecosystem (%s) — "
                 "it will show the failed command's state until the next attach.", device_id, exc)
             return
         if not states:
@@ -1263,7 +1263,7 @@ class ExportBridge:
             # return. It is the same absence `diff_with_gaps` reports: a lock
             # whose `onState` is None has no truth to tell.
             self._logger.warning(
-                "Matter export: cannot push truth for device %s — it reports no readable state "
+                "Matter bridge: cannot push truth for device %s — it reports no readable state "
                 "at all, so the ecosystem keeps showing the command that failed.", device_id)
             return
         self._note_pushed(device_id, states)
@@ -1303,7 +1303,7 @@ class ExportBridge:
         # both sides are present and the node can simply be asked. Fire-and-
         # forget: a readout is not worth blocking a handshake for.
         self._fire(self._refresh_pairing_window(), "reading the bridge node's pairing window")
-        self._logger.info("Matter export: bridge node attached — %d endpoint(s) live, %s",
+        self._logger.info("Matter bridge: bridge node attached — %d endpoint(s) live, %s",
                           status.endpoint_count,
                           "commissioned" if status.commissioned else "not yet paired")
         self._report_node_warnings(status)
@@ -1311,7 +1311,7 @@ class ExportBridge:
             owed = self._pending_replace_all()
             self._clear_pending_replace_all()
             self._logger.info(
-                "Matter export: the outstanding un-export completed — %d accessory record(s) "
+                "Matter bridge: the outstanding un-export completed — %d accessory record(s) "
                 "removed from the bridge node; paired ecosystems will drop them.", owed)
             if len(self._store) == 0:
                 # XG5 again: nothing is exported, so nothing needs a socket —
@@ -1344,7 +1344,7 @@ class ExportBridge:
             return
         self._node_warnings = warnings
         for warning in sorted(warnings):
-            self._logger.warning("Matter export: the bridge node reports — %s", warning)
+            self._logger.warning("Matter bridge: the bridge node reports — %s", warning)
 
     def _on_attach_refused(self, code: str, details: str) -> None:
         """Surface a refusal with its remedy. The client has already triaged it.
@@ -1365,7 +1365,7 @@ class ExportBridge:
             # on the way.
             if bridge_protocol.REFUSE_IDENTITY_UNREADABLE in details:
                 self._logger.error(
-                    "Matter export: the bridge node is serving NOTHING because its identity file "
+                    "Matter bridge: the bridge node is serving NOTHING because its identity file "
                     "is unreadable (%s). Rebuilding the endpoint map will NOT fix this and the "
                     "node refuses to try — the unusable file was moved aside as "
                     "identity.json.unreadable-<timestamp> in the bridge storage folder. Restore "
@@ -1374,7 +1374,7 @@ class ExportBridge:
                     details)
                 return
             self._logger.error(
-                "Matter export: the bridge node is serving NOTHING because its endpoint-number "
+                "Matter bridge: the bridge node is serving NOTHING because its endpoint-number "
                 "map is unreadable (%s). Nothing will be exported until it is rebuilt (Plugins "
                 "▸ Matter ▸ Rebuild Matter Endpoint Map…). The rebuild renumbers nothing: if "
                 "only the map file was damaged no paired ecosystem will see any change, and if "
@@ -1385,12 +1385,12 @@ class ExportBridge:
             if self._refusal_reported == code:
                 return
             self._refusal_reported = code
-        self._logger.error("Matter export: the bridge node refused the connection (%s: %s). "
+        self._logger.error("Matter bridge: the bridge node refused the connection (%s: %s). "
                            "Nothing is being exported.", code, details)
 
     def _on_version_skew(self, hello) -> None:
         self._logger.error(
-            "Matter export: the bridge node speaks protocol version %s, this plugin speaks %s "
+            "Matter bridge: the bridge node speaks protocol version %s, this plugin speaks %s "
             "(node %s). Export is STOPPED and pairings are untouched — restart the bridge agent "
             "so it picks up the node that ships with this plugin.",
             hello.protocol_version, bridge_protocol.PROTOCOL_VERSION, hello.bridge_version)
@@ -1421,7 +1421,7 @@ class ExportBridge:
             return
         self._drift_reported = seen
         self._logger.error(
-            "Matter export: endpoint-number DRIFT detected — %s. Exported accessories may have "
+            "Matter bridge: endpoint-number DRIFT detected — %s. Exported accessories may have "
             "swapped identities in paired ecosystems. Bridge nodes 0.8.0 and newer adopt a "
             "factory reset's own renumbering automatically, so on a current node persistent "
             "drift means the bridge's storage changed OUTSIDE any reset — treat it as a real "
@@ -1444,13 +1444,13 @@ class ExportBridge:
         self.fabrics = list(fabrics)
         described = ", ".join(_describe_fabric(fabric) for fabric in fabrics) or "none"
         self._logger.info(
-            "Matter export: the bridge node's paired ecosystems changed (%s) — now paired with: %s",
+            "Matter bridge: the bridge node's paired ecosystems changed (%s) — now paired with: %s",
             change or "changed", described)
 
     def _on_commissioned(self) -> None:
         """First fabric (§5 ``commissioned``) — a transition, not a repeat."""
         self._logger.info(
-            "Matter export: the Matter bridge has been PAIRED for the first time. Exported "
+            "Matter bridge: the Matter bridge has been PAIRED for the first time. Exported "
             "accessories should now appear in that ecosystem. To add a second ecosystem, use "
             "Plugins ▸ Matter ▸ Pair Matter Bridge… — the original pairing code no longer works.")
 
@@ -1465,7 +1465,7 @@ class ExportBridge:
         self.fabrics = []
         self.window_expires_at = None
         self._logger.warning(
-            "Matter export: the Matter bridge is no longer paired with ANY ecosystem. Every "
+            "Matter bridge: the Matter bridge is no longer paired with ANY ecosystem. Every "
             "exported accessory has gone with the last fabric. Indigo devices are unaffected; "
             "use Plugins ▸ Matter ▸ Pair Matter Bridge… to pair it again.")
 
@@ -1473,11 +1473,11 @@ class ExportBridge:
         """The commissioning window ended (§5 ``window_closed``)."""
         self.window_expires_at = None
         if reason == "commissioned":
-            self._logger.info("Matter export: the pairing window closed — an ecosystem completed "
+            self._logger.info("Matter bridge: the pairing window closed — an ecosystem completed "
                               "commissioning.")
             return
         self._logger.info(
-            "Matter export: the pairing window has expired without an ecosystem completing "
+            "Matter bridge: the pairing window has expired without an ecosystem completing "
             "commissioning. Open a new one with Plugins ▸ Matter ▸ Pair Matter Bridge… — the "
             "code it showed is now dead.")
 
@@ -1499,7 +1499,7 @@ class ExportBridge:
         try:
             pairing = await client.get_pairing()
         except Exception as exc:  # pylint: disable=broad-except
-            self._logger.debug("Matter export: could not read the pairing window (%s)", exc)
+            self._logger.debug("Matter bridge: could not read the pairing window (%s)", exc)
             return
         self.window_expires_at = pairing.window_expires_at if pairing.window_open else None
 
@@ -1527,7 +1527,7 @@ class ExportBridge:
             return
         self._unreachable_reported = True
         self._logger.warning(
-            "Matter export: the bridge node is not responding after %d attempts on port %s. "
+            "Matter bridge: the bridge node is not responding after %d attempts on port %s. "
             "Indigo devices and inbound Matter control are unaffected; exported accessories "
             "will show as unavailable.%s",
             attempts,
@@ -1542,7 +1542,7 @@ class ExportBridge:
         try:
             detail = self._agent_diagnose()
         except Exception as exc:  # pylint: disable=broad-except
-            self._logger.debug("Matter export: the bridge agent diagnostic failed (%s)", exc)
+            self._logger.debug("Matter bridge: the bridge agent diagnostic failed (%s)", exc)
             return ""
         return f" {detail}" if detail else ""
 
@@ -1589,14 +1589,14 @@ class ExportBridge:
             if not self._halted_reported:
                 self._halted_reported = True
                 self._logger.warning(
-                    "Matter export: the bridge client is HALTED (%s) — nothing is being exported "
+                    "Matter bridge: the bridge client is HALTED (%s) — nothing is being exported "
                     "and it will not retry on its own.",
                     client.halted_reason or "no reason recorded")
             return
         if client.recovery:
             if not self._recovery_reported:
                 self._recovery_reported = True
-                self._logger.warning("Matter export: the bridge node is awaiting an endpoint-map "
+                self._logger.warning("Matter bridge: the bridge node is awaiting an endpoint-map "
                                      "rebuild; nothing is being exported.")
             return
         if client.attached:
@@ -1605,10 +1605,10 @@ class ExportBridge:
             return
         self._disconnect_ticks += 1
         if self._disconnect_ticks == DISCONNECT_WARN_TICKS:
-            self._logger.warning("Matter export: still not attached to the bridge node after "
+            self._logger.warning("Matter bridge: still not attached to the bridge node after "
                                  "~1 min")
         else:
-            self._logger.debug("Matter export: bridge node not currently attached")
+            self._logger.debug("Matter bridge: bridge node not currently attached")
 
     def _poll_node_status(self, client) -> None:
         """Ask the node how it is, and say what it answers (§3.6 → §4.3).
@@ -1628,7 +1628,7 @@ class ExportBridge:
             try:
                 status = await client.get_status()
             except Exception as exc:  # pylint: disable=broad-except
-                self._logger.debug("Matter export: status poll failed (%s)", exc)
+                self._logger.debug("Matter bridge: status poll failed (%s)", exc)
                 return
             self._report_node_warnings(status)
 
@@ -1650,7 +1650,7 @@ class ExportBridge:
             return
         self._queue_warned = True
         self._logger.warning(
-            "Matter export: %d ecosystem command(s) are queued on the command worker and not "
+            "Matter bridge: %d ecosystem command(s) are queued on the command worker and not "
             "completing. They run one at a time, so something at the front is not returning — "
             "the timeout line above names it.", outstanding)
 
@@ -1680,10 +1680,10 @@ class ExportBridge:
         except Exception as exc:  # pylint: disable=broad-except
             coro.close()
             if lost:
-                self._logger.warning("Matter export: could not schedule %s (%s) — %s.",
+                self._logger.warning("Matter bridge: could not schedule %s (%s) — %s.",
                                      what, exc, lost)
             else:
-                self._logger.debug("Matter export: could not schedule %s (%s)", what, exc)
+                self._logger.debug("Matter bridge: could not schedule %s (%s)", what, exc)
             return False
         future.add_done_callback(lambda fut: self._log_future(fut, what))
         return True
@@ -1693,7 +1693,7 @@ class ExportBridge:
             return
         exc = future.exception()
         if exc is not None:
-            self._logger.warning("Matter export: %s failed — %s", what, exc)
+            self._logger.warning("Matter bridge: %s failed — %s", what, exc)
 
 
 #: Matter vendor IDs whose ecosystems a user is likely to recognise.
@@ -1798,7 +1798,7 @@ def _indigo_device(device_id: int, logger: Any = None) -> Any:
     except Exception as exc:  # pylint: disable=broad-except
         if logger is not None:
             logger.warning(
-                "Matter export: could not read Indigo device %s (%s: %s). This is NOT the device "
+                "Matter bridge: could not read Indigo device %s (%s: %s). This is NOT the device "
                 "having been deleted — it is Indigo failing to answer.",
                 device_id, type(exc).__name__, exc)
         return None
