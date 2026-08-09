@@ -112,6 +112,20 @@ def _exc_message(exc: BaseException) -> str:
     return text or type(exc).__name__
 
 
+def _node_key(value: Any) -> Any:
+    """Normalise a node id (int or hex string on the wire) for comparison."""
+    try:
+        if isinstance(value, str):
+            return int(value, 0)
+        return int(value)
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _same_node(a: Any, b: Any) -> bool:
+    return _node_key(a) == _node_key(b)
+
+
 def is_valid_setup_code(code: str) -> bool:
     if not code:
         return False
@@ -139,6 +153,12 @@ class Job:
     discriminator: Optional[int] = None
     domio_node_id: Optional[str] = None
     expected_fabric_slots: Optional[int] = None
+    # The matter-server node this job is holding — set the moment
+    # commission_with_code returns one, and again when a reconcile claims a
+    # node. Distinct from result["nodeId"] (only exists after SUCCESS, and is
+    # a hex string): this is the raw id, live from the moment the fabric has
+    # it, so _fail can tell whether another job now owns it (#21).
+    node_id: Optional[int] = None
     status: JobStatus = PENDING
     progress: float = 0.0
     message: str = ""
@@ -301,6 +321,7 @@ class CommissionJobs:
                 prior_terminal_at, job.terminal_at = job.terminal_at, None
                 prior_progress, job.progress = job.progress, 0.85
                 prior_message, job.message = job.message, "Device joined after timeout; creating Indigo devices…"
+                prior_node_id, job.node_id = job.node_id, node_id
                 job.status = CREATING_DEVICES
         if not candidates:
             if stale is not None:
@@ -325,6 +346,7 @@ class CommissionJobs:
                 job.progress = prior_progress
                 job.message = prior_message
                 job.terminal_at = prior_terminal_at
+                job.node_id = prior_node_id
             self.logger.error(
                 "commission job %s: node %s joined but the reconcile could not be "
                 "scheduled (%s); job restored to its timed-out state",
@@ -379,6 +401,7 @@ class CommissionJobs:
             node_id = result.get("node_id") if isinstance(result, dict) else result
             if node_id is None:
                 raise CommissionError("commissioning_failed", "matter-server returned no node_id")
+            self._set_node_id(job, node_id)
 
             self._advance(job, READING_DESCRIPTORS, 0.6, "Discovering device capabilities…")
             node = await self.matter.get_node(node_id)
@@ -444,7 +467,7 @@ class CommissionJobs:
 
     async def _fail(self, job: Job, code: str, message: str,
                     node_id: Any, matter_error_code: Optional[int] = None) -> None:
-        if node_id is not None:
+        if node_id is not None and not self._node_held_by_other_job(job, node_id):
             try:
                 await self.matter.remove_node(node_id)  # best-effort cleanup
             except Exception as exc:  # noqa: BLE001
@@ -481,6 +504,46 @@ class CommissionJobs:
             job.message = message
             if status in TERMINAL:
                 job.terminal_at = self._clock()
+
+    def _set_node_id(self, job: Job, node_id: Any) -> None:
+        # get_job reads Job fields under self._lock from the HTTP thread — every
+        # write to node_id must go through the lock too.
+        with self._lock:
+            job.node_id = node_id
+
+    def _node_held_by_other_job(self, job: Job, node_id: Any) -> bool:
+        """Is ``node_id`` currently held by some OTHER (non-failed) job?
+
+        Ownership beats cleanup: this is the #21 scenario — a commission job
+        times out, a node_added reconciles it onto the node (job.node_id set),
+        and then a LATER step in a retry/second job fails and would otherwise
+        remove_node the very node the first job just claimed. If another job
+        holds it and hasn't itself failed, leave it on the fabric.
+
+        A FAILED holder has given the node up — its claim no longer counts,
+        so removal proceeds as normal.
+
+        Deliberately does NOT consult device_sync.knows_node: device_sync
+        creates devices for every node_added, including the one this very job
+        just commissioned, so knows_node is true immediately after every
+        successful join — it would suppress remove_node on the entire normal
+        failure path (a later step failing after a lone job's own commission
+        succeeded), contradicting PRD §7's "clean up what we created."
+        """
+        with self._lock:
+            holders = [
+                j.job_id for j in self._jobs.values()
+                if j is not job and j.node_id is not None
+                and j.status is not FAILED and _same_node(j.node_id, node_id)
+            ]
+        if not holders:
+            return False
+        self.logger.warning(
+            "commission job %s failed, but node %s is held by commission job %s — "
+            "leaving it on the fabric rather than removing a device another job "
+            "just created", job.job_id, node_id_to_str(node_id), ", ".join(holders),
+        )
+        return True
 
     def _reap_locked(self) -> None:
         cutoff = self._clock() - RETENTION

@@ -134,6 +134,105 @@ def test_commission_failure_removes_node_and_reports_code(mock_logger):
     asyncio.run(scenario())
 
 
+# ----------------------------------------------------------------------
+# #21: _fail must not remove a node another job holds
+# ----------------------------------------------------------------------
+def test_run_job_records_the_node_id_it_commissioned(mock_logger):
+    async def scenario():
+        matter = FakeMatter(node_id=0xABCDEF)
+        jobs = _jobs(matter, mock_logger, schedule=asyncio.ensure_future)
+        _, body = jobs.create_job({"setupCode": "12345678901", "suggestedName": "X"})
+        await _await_terminal(jobs, body["jobId"])()
+        assert jobs._jobs[body["jobId"]].node_id == 0xABCDEF
+    asyncio.run(scenario())
+
+
+def test_fail_skips_remove_node_when_another_job_holds_that_node(mock_logger):
+    async def scenario():
+        class RetryMatter(FakeMatter):
+            def __init__(self):
+                super().__init__(node_id=7)
+                self.calls = 0
+
+            async def commission_with_code(self, code):
+                self.calls += 1
+                if self.calls == 1:
+                    raise TimeoutError  # job A: commission RPC times out
+                return {"node_id": 7}  # job B: commissions the SAME node id
+
+        async def create(node, name, room):
+            if name == "B":
+                raise CommissionError("interview_failed", "could not read descriptors")
+            return {"indigoDeviceIds": [111], "primaryDeviceId": 111, "endpointCount": 1}
+
+        matter = RetryMatter()
+        jobs = _jobs(matter, mock_logger, create=create, schedule=asyncio.ensure_future)
+
+        # Job A: times out, then a late node_added reconciles it onto node 7 —
+        # it now holds that node (job.node_id == 7, status success).
+        _, body_a = jobs.create_job({"setupCode": "12345678901", "suggestedName": "A"})
+        await _await_terminal(jobs, body_a["jobId"])()
+        assert jobs.reconcile_node_added({"node_id": 7}) == body_a["jobId"]
+        final_a = await _await_terminal(jobs, body_a["jobId"])()
+        assert final_a["status"] == "success"
+
+        # Job B: commissions node 7 too and fails a later step. _fail must not
+        # tear down the node job A just claimed.
+        mock_logger.warning.reset_mock()
+        _, body_b = jobs.create_job({"setupCode": "98765432109", "suggestedName": "B"})
+        final_b = await _await_terminal(jobs, body_b["jobId"])()
+        assert final_b["status"] == "failed"
+
+        assert matter.removed == []
+        mock_logger.warning.assert_called()
+        logged = str(mock_logger.warning.call_args)
+        assert body_a["jobId"] in logged and body_b["jobId"] in logged and "0x7" in logged
+    asyncio.run(scenario())
+
+
+def test_fail_still_removes_a_node_no_other_job_holds(mock_logger):
+    async def scenario():
+        async def failing_create(node, name, room):
+            raise CommissionError("interview_failed", "could not read descriptors")
+
+        matter = FakeMatter(node_id=7)
+        jobs = _jobs(matter, mock_logger, create=failing_create, schedule=asyncio.ensure_future)
+        # A holder job, unrelated to this run, holding a DIFFERENT node.
+        holder = commission_jobs.Job(
+            job_id="holder", setup_code="00000000000", suggested_name="Holder",
+            suggested_room=None, status=commission_jobs.SUCCESS, node_id=8,
+        )
+        jobs._jobs[holder.job_id] = holder
+
+        _, body = jobs.create_job({"setupCode": "12345678901", "suggestedName": "X"})
+        final = await _await_terminal(jobs, body["jobId"])()
+        assert final["status"] == "failed"
+        assert matter.removed == [7]
+    asyncio.run(scenario())
+
+
+def test_fail_ignores_a_holder_that_has_itself_failed(mock_logger):
+    async def scenario():
+        async def failing_create(node, name, room):
+            raise CommissionError("interview_failed", "could not read descriptors")
+
+        matter = FakeMatter(node_id=7)
+        jobs = _jobs(matter, mock_logger, create=failing_create, schedule=asyncio.ensure_future)
+        # A holder job that claimed node 7 but has itself since failed — its
+        # claim no longer counts, so removal proceeds normally.
+        holder = commission_jobs.Job(
+            job_id="holder", setup_code="00000000000", suggested_name="Holder",
+            suggested_room=None, status=commission_jobs.FAILED, node_id=7,
+        )
+        jobs._jobs[holder.job_id] = holder
+
+        _, body = jobs.create_job({"setupCode": "12345678901", "suggestedName": "X"})
+        final = await _await_terminal(jobs, body["jobId"])()
+        assert final["status"] == "failed"
+        assert matter.removed == [7]
+    asyncio.run(scenario())
+
+
 def test_create_job_schedule_failure_returns_503_and_frees_code(mock_logger):
     # loop down → schedule raises; must 503 and NOT strand a pending job that
     # would lock the setup code out of all future commissions.
