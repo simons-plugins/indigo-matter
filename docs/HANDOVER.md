@@ -1500,7 +1500,7 @@ New, and deferred on purpose:
 
 3. **Restoring the bridge-node storage from a backup** needs a bridge `stop()`/
    `start()` control — E7's launchd agent. Backup is done; restore reports and
-   skips (above).
+   skips (above). [wired by #136, v2026.9.0]
 4. **Pinning endpoint numbers from the map** (the `Endpoint.Configuration.number`
    finding above) — a protocol-level decision about what `preserveEndpointNumbers`
    promises, not a patch.
@@ -2136,7 +2136,7 @@ restore it). Don't re-derive them.
 | #133 | `get_pairing` races the last-fabric self-reset → spurious error |
 | #134 | Group the two Install/update menu items (11 apart, confusable) |
 | #135 | Reset reconnect backoff after a successful install (29s dead wait) |
-| #136 | Wire bridge-storage restore (E7 gave it the stop seam it needed) |
+| ~~#136~~ | ~~Wire bridge-storage restore (E7 gave it the stop seam it needed)~~ — done, `fabric_backup.restore_backup` takes a second `stop()/start()` control |
 | #137 | Docs site has no route to the export half (matter.html/index.html) |
 | #138 | Three screenshots wanted for the walkthrough |
 | #139 | Live validation tracker + the solved room remedy |

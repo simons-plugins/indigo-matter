@@ -3010,6 +3010,33 @@ class Plugin(indigo.PluginBase):
         """
         return bridge_agent.bridge_storage_path(self._resolve_storage_path())
 
+    def _bridge_restore_control(self) -> Optional["bridge_agent.BridgeProcess"]:
+        """The bridge's ``stop()``/``start()`` seam for :func:`fabric_backup.restore_backup`.
+
+        ``stop()``/``start()``, NOT ``uninstall()``: restore wants the node
+        back in exactly its prior lifecycle state, plist included, so that a
+        reboot afterwards behaves exactly as it would have before the
+        restore. ``uninstall()`` is ``menuStopBridgeNode``'s primitive
+        (:meth:`_stop_bridge_agent`) and answers "make sure a reboot cannot
+        bring this back" — the wrong question here, and why THIS path leaves
+        the XAC1 latch alone (see the call site in ``menuRestoreFabricBackup``).
+
+        Built from CURRENT prefs when no agent object exists yet, exactly as
+        ``menuStopBridgeNode`` does — this must work in a session that never
+        exported anything. Construction writes nothing and runs no launchctl.
+        """
+        if self.bridge_process is not None:
+            return self.bridge_process
+        try:
+            self.bridge_process = bridge_agent.BridgeProcess(dict(self.pluginPrefs), self.logger)
+        except Exception as exc:  # pylint: disable=broad-except
+            self.logger.warning(
+                "Matter bridge: could not build a control for the bridge node (%s), so any "
+                "bridge files in this backup will be reported and skipped. The controller "
+                "fabric restores normally.", exc)
+            return None
+        return self.bridge_process
+
     @staticmethod
     def _human_size(num_bytes: int) -> str:
         size = float(num_bytes)
@@ -3085,9 +3112,23 @@ class Plugin(indigo.PluginBase):
 
         try:
             storage_path = self._resolve_storage_path()
+            # The bridge control/path are passed in, but the XAC1 latch (which
+            # session started the bridge agent) is NEVER touched here in either
+            # direction: alive+latched -> stop/start -> unchanged, correct;
+            # alive+unlatched -> unchanged, because setting it would arm a
+            # future bootout of an agent whose lifecycle this session does not
+            # own; stopped-by-us + restart-failed -> the latch is left EXACTLY
+            # as it was: if this session had started the agent it stays set
+            # (so the next empty-export transition still uninstalls the
+            # RunAtLoad plist); if a prior session's agent, it stays unset —
+            # no worse than before the restore (XAC1/XG5).
+            # restore_backup uses stop()/start(), never uninstall(), so the
+            # plist survives and the latch's claim stays true throughout.
             result = fabric_backup.restore_backup(
                 selected, storage_path, self.server_process,
                 now=datetime.now(timezone.utc), logger=self.logger,
+                bridge_storage_path=self._bridge_storage_path(),
+                bridge_control=self._bridge_restore_control(),
             )
             # restore_backup only returns on success: the server was stopped, the
             # fabric was swapped, the restored dir is non-empty, and start()
@@ -3100,6 +3141,24 @@ class Plugin(indigo.PluginBase):
                 "came back.",
                 result["restored_from"], result["moved_aside_to"],
             )
+            if result["bridge_restored"]:
+                if result["bridge_started"] is False:
+                    self.logger.error(
+                        "The controller fabric restored, but the Matter bridge node did not "
+                        "come back up. %s", self._bridge_agent_diagnosis() or
+                        "Check the bridge node's error log.")
+                else:
+                    # There may have been no pre-existing bridge dir to preserve —
+                    # say nothing rather than "preserved at None".
+                    preserved = (
+                        f" (previous copy preserved at {result['bridge_moved_aside_to']})"
+                        if result["bridge_moved_aside_to"] else "")
+                    self.logger.info(
+                        "The Matter bridge node's storage was restored too%s%s. It now holds "
+                        "the accessory identities and endpoint numbers as of that backup — if "
+                        "a paired ecosystem has changed since, the bridge REPORTS endpoint-map "
+                        "drift in the log and renumbers nothing.", preserved,
+                        " and the node has been restarted" if result["bridge_started"] else "")
             return (True, valuesDict)
         except Exception as exc:  # noqa: BLE001
             # restore_backup rolled back and preserved the original fabric (or
