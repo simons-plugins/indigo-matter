@@ -463,6 +463,35 @@ class TestLifecycle:
 
 
 # ---------------------------------------------------------------------------
+# The E7 post-install poke (issue #135)
+# ---------------------------------------------------------------------------
+class TestRetryNow:
+    def test_retry_now_delegates_to_the_client_when_present(self, bridge_mod, mock_logger, devices):
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(101, "onOffLight")])
+        client = h.start()
+        assert h.bridge.retry_now() is True, "an accepting client's poke must be reported as landed"
+        assert client.only("retry_now") == ("retry_now",)
+
+    def test_retry_now_is_a_no_op_while_nothing_is_exported(self, bridge_mod, mock_logger, devices):
+        h = Harness(bridge_mod, mock_logger, devices, [])
+        assert h.bridge.retry_now() is False, "no client (XG5) means the poke never landed"
+        assert h.clients == []
+
+    def test_retry_now_reports_false_when_the_client_declines(self, bridge_mod, mock_logger, devices):
+        # The TOCTOU race this guards against (self.client nulled by stop() on
+        # another thread between the None-check and the call) is not
+        # deterministically reproducible without patching a property onto
+        # ExportBridge — this instead pins the local-capture code path's other
+        # observable half: whatever the captured client's own retry_now()
+        # answers is threaded straight through, exactly as it would be for a
+        # client that declined because it raced a stop() to False.
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(101, "onOffLight")])
+        client = h.start()
+        client.retry_now = lambda: False
+        assert h.bridge.retry_now() is False
+
+
+# ---------------------------------------------------------------------------
 # Indigo → node
 # ---------------------------------------------------------------------------
 class TestDeviceUpdated:
