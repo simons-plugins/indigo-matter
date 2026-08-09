@@ -71,9 +71,9 @@ accessory. One bridge, one pairing, however many devices.
 Setup, pairing, recovery and troubleshooting:
 [full install guide](https://simons-plugins.github.io/indigo-matter/INSTALL.html). How it
 works and what it can represent:
-[MATTER.md → Indigo as a Matter bridge](docs/MATTER.md#indigo-as-a-matter-bridge--the-other-direction).
-(The typeset [Field Notes № 1](https://simons-plugins.github.io/indigo-matter/matter.html)
-page predates the export half and does not cover it yet.)
+[MATTER.md → Indigo as a Matter bridge](docs/MATTER.md#indigo-as-a-matter-bridge--the-other-direction),
+or the typeset version:
+[Field Notes № 1 → Indigo as a Matter bridge](https://simons-plugins.github.io/indigo-matter/matter.html#matter-bridge).
 
 ## Status
 

@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>indigo-matter — Field Notes</title>
-<meta name="description" content="Matter support for Indigo. The field notes: the landscape, and the proving ground.">
+<meta name="description" content="Matter support for Indigo. The field notes: the landscape, and the proving ground — plus the install guide.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400..700;1,9..144,400..700&display=swap" rel="stylesheet">
@@ -25,8 +25,9 @@
   .issue .kicker { font-size: .74rem; font-weight: 600; letter-spacing: .14em; text-transform: uppercase; }
   .issue h2 { margin: .5rem 0 .5rem; font-size: 1.7rem; }
   .issue p { color: var(--ink-soft); font-size: .95rem; margin: 0; }
-  .issue.one  { --accent: var(--leaf); }
-  .issue.two  { --accent: var(--ochre); }
+  .issue.one   { --accent: var(--leaf); }
+  .issue.two   { --accent: var(--ochre); }
+  .issue.three { --accent: var(--purple); }
   .issue .kicker { color: var(--accent); }
   .issue:hover { border-color: var(--accent); }
 </style>
@@ -41,7 +42,8 @@
   </div>
   <h1>Matter support for <em>Indigo</em></h1>
   <p class="standfirst">Commission with the ecosystem you already own; control everything from
-  Indigo. Two long reads explain the whole thing — the landscape, and how it’s proven.</p>
+  Indigo — and publish it back out as a Matter bridge of your own. Two long reads explain the
+  whole thing — the landscape, and how it’s proven — plus the install guide for hands-on setup.</p>
 </header>
 
 <main>
@@ -50,13 +52,20 @@
       <span class="kicker">№ 1 · for everyone</span>
       <h2>The Landscape</h2>
       <p>Matter, Thread, fabrics and the share model — a plain-English guide to where Indigo,
-      Domio, matter-server and Apple Home each fit, plus adding devices and troubleshooting.</p>
+      Domio, matter-server and Apple Home each fit, plus adding devices, troubleshooting, and
+      publishing Indigo devices back out as a Matter bridge of your own.</p>
     </a>
     <a class="issue two" href="testing.html">
       <span class="kicker">№ 2 · for the curious &amp; plugin devs</span>
       <h2>The Proving Ground</h2>
       <p>Four layers of testing — the unit suite, the device zoo, a fifteen-device virtual
       Matter fleet, and live validation on real hardware over Wi-Fi and Thread.</p>
+    </a>
+    <a class="issue three" href="https://github.com/simons-plugins/indigo-matter/blob/main/docs/INSTALL.md">
+      <span class="kicker">Setup guide</span>
+      <h2>Install &amp; Configure</h2>
+      <p>Step by step: the Matter controller, the export bridge, backups, security, and every
+      troubleshooting table — the reference to keep open while you set things up.</p>
     </a>
   </div>
 </main>
