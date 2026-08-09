@@ -634,10 +634,18 @@ Losing *that* is the number-one real-world cause of duplicated accessories: ever
 ecosystem re-creates every accessory, and their names, rooms and automations go
 with the old ones.
 
-**Back up the Matter fabric…** includes this directory in the zip. **Restore does not
-yet put it back** — it reports the bridge files it found and skips them, because
-restoring them safely needs the bridge node stopped and that wiring is a
-follow-up. So for now, if you need to restore the bridge side, copy
+**Back up the Matter fabric…** includes this directory in the zip, and **Restore a
+fabric backup…** puts it back too: it stops the bridge node (if it is running)
+before restoring, extracts its half of the archive alongside the controller
+fabric, and starts it again afterwards. If the bridge node was not running
+before the restore, it is left stopped — it starts again the next time
+something is exported. Its previous storage is moved aside, never deleted, the
+same as the controller's. The restored storage holds the accessory identities
+and endpoint numbers as of that backup; if a paired ecosystem has changed
+since, the bridge REPORTS the drift in the log rather than renumbering
+anything. If restore has no way to stop the bridge node (for example, no
+LaunchAgent control could be built), it falls back to the old behaviour: it
+reports the bridge files it found and skips them, and you can copy
 `bridge-node/` out of the zip by hand with the bridge stopped (*Stop the Matter
 bridge…*). Your export **list** is not in here at all — it lives in the
 plugin's preferences and rides along with Indigo's own database backup.
