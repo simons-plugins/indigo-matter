@@ -568,7 +568,10 @@ Common failure modes, in rough order of likelihood:
   mDNS snooping/filtering on managed switches also causes this.
 - **Commissioning seems to time out, then the device appears anyway.** LAN
   discovery can exceed 60 s; the plugin waits 300 s and reconciles late joins.
-  Give it the full window before retrying.
+  Give it the full window before retrying. If those five minutes pass with no
+  join, the event log says so definitively ("the reconcile window closed and
+  the device never joined") — nothing is retried automatically, so re-check
+  the device is in pairing mode and try again.
 - **Device unreachable after a vendor-app setup or firmware update.** Normal
   for a minute or two while it reboots and re-announces; the plugin marks it
   unreachable and self-clears on return. Persistently dead usually means a

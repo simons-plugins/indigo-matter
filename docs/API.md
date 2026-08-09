@@ -263,7 +263,9 @@ Domio's 120s poll window. The plugin reconciles only when the joining node can
 be attributed unambiguously: if two jobs for *different* setup codes are both
 inside their window when a node joins, neither is claimed (the jobs stay
 `failed`, and the devices are created with the device's own product name).
-Retries of the same setup code are one device and reconcile normally.
+Retries of the same setup code are one device and reconcile normally. If the
+window closes with no join, the event log records that definitively — no
+contract change, since a still-`failed` job's payload is unaffected.
 
 **Late failure (v1.4):** the commission RPC itself can also answer late — after the
 job has already gone `failed`/`commissioning_timeout` — and say the attempt did not

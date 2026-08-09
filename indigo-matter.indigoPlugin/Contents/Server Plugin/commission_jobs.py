@@ -211,6 +211,8 @@ class CommissionJobs:
         schedule: Callable[[Awaitable], Any],
         clock: Callable[[], datetime] = _now_utc,
         uuid_factory: Callable[[], str] = lambda: str(uuid.uuid4()),
+        knows_node: Optional[Callable[[Any], bool]] = None,
+        sleep: Callable[[float], Awaitable] = asyncio.sleep,
     ) -> None:
         self.matter = matter
         self._create_devices = create_devices
@@ -218,9 +220,15 @@ class CommissionJobs:
         self._schedule = schedule
         self._clock = clock
         self._uuid = uuid_factory
+        self._knows_node = knows_node
+        self._sleep = sleep
         self._lock = threading.Lock()
         self._jobs: dict[str, Job] = {}
         self._by_code: dict[str, str] = {}
+        # Strong refs to the #24 reconcile-window watchdogs so they aren't GC'd
+        # mid-sleep (the same trap ws_json_client._reconcile_task guards
+        # against) — discarded via their own done callback once each finishes.
+        self._expiry_tasks: set = set()
 
     # ------------------------------------------------------------------
     # Public API (called from the IWS handler thread)
@@ -618,6 +626,7 @@ class CommissionJobs:
                 self.logger.warning("commission job %s: %s", job.job_id, TIMEOUT_MESSAGE)
                 job.error = {"code": "commissioning_timeout", "message": TIMEOUT_MESSAGE}
                 self._advance(job, FAILED, job.progress, "")
+                self._watch_reconcile_window(job)
         except ProtocolError as exc:
             # matter-server rejected the commission (bad setup code, window closed,
             # PASE/CASE failure, …) — a device/commissioning failure, not a plugin
@@ -640,6 +649,93 @@ class CommissionJobs:
             error["matterErrorCode"] = matter_error_code
         job.error = error
         self._advance(job, FAILED, job.progress, "")
+
+    # ------------------------------------------------------------------
+    # Reconcile-window expiry (issue #24) — when RECONCILE_WINDOW closes with
+    # no node_added claim, say so definitively instead of reaping in silence.
+    # ------------------------------------------------------------------
+    def _watch_reconcile_window(self, job: Job) -> None:
+        """Schedule the RECONCILE_WINDOW watchdog for a job that just landed
+        in a bare commissioning_timeout.
+
+        Best-effort: if the loop is gone (``schedule`` raises ``RuntimeError``)
+        the job is left exactly as ``_run_job`` just landed it — the timeout
+        itself is already recorded and logged; losing only the later "window
+        closed" log is preferable to disturbing that state.
+        """
+        coro = self._expire_reconcile_window(job)
+        try:
+            handle = self._schedule(coro)
+        except RuntimeError:
+            coro.close()
+            return
+        self._expiry_tasks.add(handle)
+        handle.add_done_callback(self._expiry_tasks.discard)
+
+    async def _expire_reconcile_window(self, job: Job) -> None:
+        """Wait out RECONCILE_WINDOW and, if the job is still exactly where
+        the bare timeout left it, log that the window closed for good and
+        best-effort clean up any node a late #23 success recorded for it.
+
+        ``CancelledError`` is deliberately not caught. At shutdown
+        ``AsyncRuntime._drain_and_close`` cancels every outstanding task and
+        awaits them via ``asyncio.gather(..., return_exceptions=True)`` — the
+        gather swallows the exception there, and nothing else is holding the
+        ``Future`` this coroutine runs as (it is fire-and-forget from
+        ``_watch_reconcile_window``), so there is no caller left to see it
+        propagate. The job is already terminal; a cancellation here leaves no
+        state to land.
+        """
+        await self._sleep(RECONCILE_WINDOW.total_seconds())
+        with self._lock:
+            current = self._jobs.get(job.job_id)
+            if current is not job:
+                return  # reaped in the meantime
+            if job.status is not FAILED or (job.error or {}).get("code") != "commissioning_timeout":
+                return  # reconciled by node_added, or #23 re-coded the error
+            node_id = job.node_id
+        self.logger.warning(
+            "commission job %s: the %.0f-minute reconcile window closed and "
+            "the device never joined — commissioning did not complete. "
+            "matter-server has no way to cancel a commissioning attempt, so "
+            "nothing further will be done automatically; check the device is "
+            "in pairing mode and retry.",
+            job.job_id, RECONCILE_WINDOW.total_seconds() / 60,
+        )
+        if node_id is not None:
+            await self._remove_orphaned_node(job, node_id)
+
+    async def _remove_orphaned_node(self, job: Job, node_id: Any) -> None:
+        """Best-effort cleanup of a node a late #23 success recorded for a job
+        whose reconcile window has now closed unclaimed.
+
+        ``knows_node`` is the right test HERE — unlike ``_fail``'s guard
+        (#21), which deliberately does NOT consult it (device_sync knows
+        about the node this very job just created, so it would suppress
+        every normal-path removal). Here the question is different: did
+        ANYTHING ever adopt this node? ``node_id`` can only be set on a
+        bare-timeout job via #23's late success — a timely join sets it
+        itself and the job reaches SUCCESS, never this path — so a node_id
+        surviving to here is strictly the leftover of a join nobody
+        completed.
+        """
+        if self._node_held_by_other_job(job, node_id):
+            return  # already logs
+        if self._knows_node is not None and self._knows_node(node_id):
+            self.logger.info(
+                "commission job %s: node %s already has Indigo devices; "
+                "leaving it on the fabric", job.job_id, node_id_to_str(node_id),
+            )
+            return
+        try:
+            await self.matter.remove_node(node_id)
+            self.logger.warning(
+                "commission job %s: removed orphaned node %s — matter-server "
+                "reported it joined but it never reached Indigo",
+                job.job_id, node_id_to_str(node_id),
+            )
+        except Exception as exc:  # noqa: BLE001 - best-effort cleanup only
+            self.logger.debug("best-effort remove_node failed: %s", exc)
 
     def _warn_if_fabric_slots_short(self, job: Job, node: dict, node_id: Any) -> None:
         """API.md §3.2 `expectedFabricSlots`: log a warning (never blocking) if

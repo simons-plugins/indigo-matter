@@ -494,6 +494,55 @@ def test_startup_wires_connect_and_disconnect_callbacks(plugin_mod, monkeypatch)
     assert captured["on_event"] == p._on_matter_event
     assert captured["on_late_response"] == p._on_late_matter_response
 
+
+def test_startup_wires_knows_node_into_commission_jobs(plugin_mod, monkeypatch):
+    # #24: _remove_orphaned_node's "did anything ever adopt this node" check
+    # needs device_sync's real knows_node — dropping this wiring would leave
+    # it None and every leftover node would be treated as unclaimed.
+    captured = {}
+
+    class FakeMatter:
+        def __init__(self, proto, logger, prefs, **kw):
+            pass
+
+        def run(self):
+            return None
+
+    class FakeRuntimeObj:
+        is_running = True
+
+        def start(self):
+            pass
+
+        def submit(self, coro):
+            if hasattr(coro, "close"):
+                coro.close()
+            return Mock()
+
+    class FakeCommissionJobs:
+        def __init__(self, *a, **kw):
+            captured.update(kw)
+
+    monkeypatch.setattr(plugin_mod, "MatterClient", FakeMatter)
+    monkeypatch.setattr(plugin_mod, "AsyncRuntime", lambda logger: FakeRuntimeObj())
+    monkeypatch.setattr(plugin_mod, "CommissionJobs", FakeCommissionJobs)
+    monkeypatch.setattr(plugin_mod, "HttpApi", lambda *a, **k: Mock())
+    monkeypatch.setattr(plugin_mod, "ServerProcess", lambda *a, **k: Mock())
+
+    p = plugin_mod.Plugin.__new__(plugin_mod.Plugin)
+    p.logger = Mock()
+    p._version = "2026.0.1"
+    p._subscribed_to_devices = False
+    p.pluginPrefs = {}
+    p.proto = object()
+    p.registry = object()
+    p.device_sync = Mock()
+    p.runtime = None
+    p.server_process = None
+
+    p.startup()
+    assert captured["knows_node"] == p.device_sync.knows_node
+
 # ---------------------------------------------------------------------------
 # node_added → commission-job reconcile wiring (#16)
 # ---------------------------------------------------------------------------
