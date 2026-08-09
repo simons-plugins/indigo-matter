@@ -383,6 +383,7 @@ class Plugin(indigo.PluginBase):
         self.jobs = CommissionJobs(
             self.matter, self.device_sync.create_from_raw, self.logger,
             schedule=self.runtime.submit,
+            knows_node=self.device_sync.knows_node,
         )
         self.http = HttpApi(
             self.jobs, self.logger,

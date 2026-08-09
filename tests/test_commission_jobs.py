@@ -40,11 +40,18 @@ async def _good_create(node, name, room):
     return {"indigoDeviceIds": [111], "primaryDeviceId": 111, "endpointCount": 1}
 
 
-def _jobs(matter, mock_logger, create=_good_create, schedule=None, clock=None):
+def _jobs(matter, mock_logger, create=_good_create, schedule=None, clock=None,
+          knows_node=None, sleep=None):
+    kwargs = {}
+    if knows_node is not None:
+        kwargs["knows_node"] = knows_node
+    if sleep is not None:
+        kwargs["sleep"] = sleep
     return CommissionJobs(
         matter, create, mock_logger,
         schedule=schedule if schedule is not None else (lambda c: c.close()),
         clock=clock or (lambda: datetime.now(timezone.utc)),
+        **kwargs,
     )
 
 
@@ -916,3 +923,232 @@ def test_late_response_with_non_commission_context_is_ignored(mock_logger):
     mock_logger.debug.assert_not_called()
     mock_logger.info.assert_not_called()
     mock_logger.warning.assert_not_called()
+
+
+# ----------------------------------------------------------------------
+# Reconcile-window expiry (#24): the RECONCILE_WINDOW watchdog scheduled by
+# a bare commissioning_timeout
+# ----------------------------------------------------------------------
+async def _pump(n: int = 5) -> None:
+    """Give the loop enough turns to run a fire-and-forget expiry task to
+    completion when its ``sleep`` returns immediately."""
+    for _ in range(n):
+        await asyncio.sleep(0)
+
+
+def test_the_reconcile_window_expiry_is_logged_once(mock_logger):
+    async def scenario():
+        naps: list = []
+
+        async def fake_sleep(seconds):
+            naps.append(seconds)
+
+        jobs = _jobs(TimeoutMatter(), mock_logger, schedule=asyncio.ensure_future,
+                     sleep=fake_sleep)
+        _, body = jobs.create_job({"setupCode": "12345678901", "suggestedName": "X"})
+        await _await_terminal(jobs, body["jobId"])()
+        await _pump()
+
+        # 300.0 = RECONCILE_WINDOW.total_seconds() reaching the wait — asserted
+        # against the literal, not the constant, so a mutated constant is caught.
+        assert naps == [300.0]
+        mock_logger.warning.assert_called()
+        logged = str(mock_logger.warning.call_args)
+        assert body["jobId"] in logged and "never joined" in logged
+    asyncio.run(scenario())
+
+
+def test_expiry_is_silent_when_the_job_reconciled_in_time(mock_logger):
+    async def scenario():
+        release = asyncio.Event()
+
+        async def fake_sleep(seconds):
+            await release.wait()
+
+        jobs = _jobs(TimeoutMatter(), mock_logger, schedule=asyncio.ensure_future,
+                     sleep=fake_sleep)
+        _, body = jobs.create_job({"setupCode": "12345678901", "suggestedName": "X"})
+        await _await_terminal(jobs, body["jobId"])()
+
+        # node joins late; reconcile claims the job before the window closes
+        assert jobs.reconcile_node_added({"node_id": 0xAB}) == body["jobId"]
+        await _await_terminal(jobs, body["jobId"])()
+
+        mock_logger.warning.reset_mock()
+        release.set()
+        await _pump()
+
+        mock_logger.warning.assert_not_called()
+    asyncio.run(scenario())
+
+
+def test_expiry_is_silent_when_a_late_failure_re_coded_the_job(mock_logger):
+    async def scenario():
+        release = asyncio.Event()
+
+        async def fake_sleep(seconds):
+            await release.wait()
+
+        jobs = _jobs(TimeoutMatter(), mock_logger, schedule=asyncio.ensure_future,
+                     sleep=fake_sleep)
+        _, body = jobs.create_job({"setupCode": "12345678901", "suggestedName": "X"})
+        await _await_terminal(jobs, body["jobId"])()
+
+        # #23's late error converts commissioning_timeout -> commissioning_failed
+        # before the window closes
+        late = LateResponse(None, CommissionRequest(body["jobId"]), (50, "boom"), None)
+        jobs.note_late_response(late)
+
+        mock_logger.warning.reset_mock()
+        release.set()
+        await _pump()
+
+        mock_logger.warning.assert_not_called()
+    asyncio.run(scenario())
+
+
+def test_expiry_removes_an_orphaned_node_learned_from_a_late_response(mock_logger):
+    async def scenario():
+        release = asyncio.Event()
+
+        async def fake_sleep(seconds):
+            await release.wait()
+
+        matter = TimeoutMatter()
+        jobs = _jobs(matter, mock_logger, schedule=asyncio.ensure_future,
+                     sleep=fake_sleep, knows_node=lambda node_id: False)
+        _, body = jobs.create_job({"setupCode": "12345678901", "suggestedName": "X"})
+        await _await_terminal(jobs, body["jobId"])()
+
+        late = LateResponse(None, CommissionRequest(body["jobId"]), None, {"node_id": 7})
+        jobs.note_late_response(late)
+        release.set()
+        await _pump()
+
+        assert matter.removed == [7]
+        mock_logger.warning.assert_called()
+        logged = str(mock_logger.warning.call_args)
+        assert body["jobId"] in logged and "removed orphaned node" in logged
+    asyncio.run(scenario())
+
+
+def test_expiry_leaves_a_node_indigo_already_adopted(mock_logger):
+    async def scenario():
+        release = asyncio.Event()
+
+        async def fake_sleep(seconds):
+            await release.wait()
+
+        matter = TimeoutMatter()
+        jobs = _jobs(matter, mock_logger, schedule=asyncio.ensure_future,
+                     sleep=fake_sleep, knows_node=lambda node_id: True)
+        _, body = jobs.create_job({"setupCode": "12345678901", "suggestedName": "X"})
+        await _await_terminal(jobs, body["jobId"])()
+
+        late = LateResponse(None, CommissionRequest(body["jobId"]), None, {"node_id": 7})
+        jobs.note_late_response(late)
+        release.set()
+        await _pump()
+
+        assert matter.removed == []
+        mock_logger.info.assert_called()
+        logged = str(mock_logger.info.call_args)
+        assert body["jobId"] in logged and "already has Indigo devices" in logged
+    asyncio.run(scenario())
+
+
+def test_expiry_leaves_a_node_another_job_holds(mock_logger):
+    async def scenario():
+        release = asyncio.Event()
+
+        async def fake_sleep(seconds):
+            await release.wait()
+
+        matter = TimeoutMatter()
+        jobs = _jobs(matter, mock_logger, schedule=asyncio.ensure_future, sleep=fake_sleep)
+        _, body = jobs.create_job({"setupCode": "12345678901", "suggestedName": "X"})
+        await _await_terminal(jobs, body["jobId"])()
+
+        late = LateResponse(None, CommissionRequest(body["jobId"]), None, {"node_id": 7})
+        jobs.note_late_response(late)
+
+        holder = commission_jobs.Job(
+            job_id="holder", setup_code="00000000000", suggested_name="Holder",
+            suggested_room=None, status=commission_jobs.SUCCESS, node_id=7,
+        )
+        jobs._jobs[holder.job_id] = holder
+
+        release.set()
+        await _pump()
+
+        assert matter.removed == []
+    asyncio.run(scenario())
+
+
+def test_expiry_does_nothing_without_a_node_id(mock_logger):
+    async def scenario():
+        matter = TimeoutMatter()
+        jobs = _jobs(matter, mock_logger, schedule=asyncio.ensure_future,
+                     sleep=lambda s: asyncio.sleep(0))
+        _, body = jobs.create_job({"setupCode": "12345678901", "suggestedName": "X"})
+        await _await_terminal(jobs, body["jobId"])()
+        await _pump()
+
+        assert matter.removed == []
+        mock_logger.warning.assert_called()
+        logged = str(mock_logger.warning.call_args)
+        assert body["jobId"] in logged and "never joined" in logged
+    asyncio.run(scenario())
+
+
+def test_a_timeout_still_lands_when_the_expiry_cannot_be_scheduled(mock_logger):
+    async def scenario():
+        calls = {"n": 0}
+
+        def schedule(coro):
+            calls["n"] += 1
+            if calls["n"] == 2:  # the _watch_reconcile_window call
+                raise RuntimeError("asyncio runtime is not running")
+            return asyncio.ensure_future(coro)
+
+        jobs = _jobs(TimeoutMatter(), mock_logger, schedule=schedule)
+        _, body = jobs.create_job({"setupCode": "12345678901", "suggestedName": "X"})
+        final = await _await_terminal(jobs, body["jobId"])()
+
+        assert final["status"] == "failed"
+        assert final["error"]["code"] == "commissioning_timeout"
+        assert jobs._expiry_tasks == set()  # nothing left dangling
+    asyncio.run(scenario())
+
+
+def test_the_expiry_task_is_cancelled_cleanly_at_shutdown(mock_logger):
+    async def scenario():
+        started = asyncio.Event()
+
+        async def hanging_sleep(seconds):
+            started.set()
+            await asyncio.Event().wait()  # blocks forever until cancelled
+
+        tasks: list = []
+
+        def schedule(coro):
+            task = asyncio.ensure_future(coro)
+            tasks.append(task)
+            return task
+
+        jobs = _jobs(TimeoutMatter(), mock_logger, schedule=schedule, sleep=hanging_sleep)
+        _, body = jobs.create_job({"setupCode": "12345678901", "suggestedName": "X"})
+        await _await_terminal(jobs, body["jobId"])()
+        await asyncio.wait_for(started.wait(), timeout=1)
+
+        mock_logger.warning.reset_mock()
+        expiry_task = tasks[-1]
+        expiry_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await expiry_task
+
+        mock_logger.warning.assert_not_called()
+        _, final = jobs.get_job(body["jobId"])
+        assert final["status"] == "failed"
+        assert final["error"]["code"] == "commissioning_timeout"  # unchanged
+    asyncio.run(scenario())
