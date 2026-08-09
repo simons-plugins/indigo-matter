@@ -57,8 +57,11 @@ MAX_BACKOFF = 30.0
 #: enough to let a peer that is spraying megabytes fill the Indigo event log.
 LOG_FRAME_CHARS = 500
 
-#: How many fire-and-forget sends keep a "what was this?" note (H4). Bounded
-#: because nothing ever pops the entry for a response the peer never sends.
+#: How many outstanding sends keep a "what was this?" note (H4) — every
+#: request that passes a context, whether fire-and-forget or one the caller
+#: is still awaiting (#23: the note is what lets a LATE answer to an
+#: abandoned wait still be described). Bounded because nothing ever pops the
+#: entry for a response the peer never sends.
 SEND_CONTEXT_LIMIT = 256
 
 
@@ -111,10 +114,11 @@ class LateResponse(NamedTuple):
     Handed to ``on_late_response`` from :meth:`WsJsonClient._log_unmatched` —
     the one place that already has both the send-time ``context`` (if any) and
     the frame's outcome. ``error``/``result`` mirror :meth:`_parse_result`'s two
-    shapes: exactly one is populated, matching whichever :meth:`_error_of`
-    found. A caller with nothing to correlate against (``context`` was never
-    passed, or matching this ``message_id`` failed) still gets a note — it is
-    the caller's job to decide what an untagged late response means, not this
+    shapes: at most one is populated — ``result`` is always ``None`` when
+    ``error`` is set, and may itself be a null payload when it isn't. A caller
+    with nothing to correlate against (``context`` was never passed, or
+    matching this ``message_id`` failed) still gets a note — it is the
+    caller's job to decide what an untagged late response means, not this
     transport's.
     """
     message_id: Optional[str]
@@ -174,9 +178,15 @@ class WsJsonClient:  # pylint: disable=too-many-instance-attributes
 
         self._ws = None
         self._pending: dict[str, asyncio.Future] = {}
-        # message_id → short human description of a request nobody is awaiting,
-        # so its error response can name the device instead of just an id (H4).
-        # Any object str()-ably describable, not just str — #23's CommissionRequest
+        # message_id → short human description of the request, covering two
+        # cases (P1): (1) written while the caller is still awaiting a
+        # response (#23) so a LATE answer can still name the device instead
+        # of just an id (H4) — the request only becomes genuinely
+        # un-awaited later, if its own wait_for times out (see
+        # _request_frame); and (2) a request the caller never awaits at all
+        # — e.g. BridgeClient.set_state (§3.4), genuinely fire-and-forget
+        # from the moment it's sent. Any object str()-ably describable, not
+        # just str — #23's CommissionRequest
         # is the note AND the correlation key a late response is matched against.
         self._send_context: dict[str, Any] = {}
         self._closing = False
@@ -537,7 +547,13 @@ class WsJsonClient:  # pylint: disable=too-many-instance-attributes
             self.logger.exception("on_late_response hook raised")
 
     def _remember_send_context(self, message_id: Optional[str], context: Any) -> None:
-        """Note what an un-awaited request was, for :meth:`_log_unmatched`.
+        """Note what the request is, for :meth:`_log_unmatched` to describe it
+        if the answer arrives late (P1). Two callers, two shapes of "late":
+        called while the caller is still awaiting the response (#23) — the
+        request only becomes genuinely un-awaited later, if/when its own
+        ``wait_for`` times out; or called on a request the caller never
+        awaits at all, e.g. ``BridgeClient.set_state`` (§3.4), which is
+        fire-and-forget from the moment it's sent.
 
         Bounded and FIFO: a peer that never answers would otherwise grow this
         map for the lifetime of the plugin.

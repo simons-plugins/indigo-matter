@@ -180,8 +180,10 @@ The plugin sends this **without awaiting the result** — it must never block
 Indigo's device thread. The response still arrives; the client's frame loop
 MUST log any error response it cannot match to a waiting future (rather than
 dropping it silently), because an unnoticed `set_state` failure looks exactly
-like "the ecosystem shows stale state". This is a required behaviour change
-from `matter_client.py`, which drops unmatched responses without a log line.
+like "the ecosystem shows stale state". Both `matter_client.py` and this
+bridge client get this behaviour from the SAME shared transport core
+(`ws_json_client._log_unmatched`): it warns on any unmatched error response
+and debug-logs unmatched results, for both peers.
 
 ### 3.5 `set_reachable`
 
