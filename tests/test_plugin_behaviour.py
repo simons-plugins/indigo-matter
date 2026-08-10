@@ -42,6 +42,10 @@ def plug(plugin_mod):
     p.bridge_process = None
     p._exported_ids = frozenset()
     p._subscribed_to_devices = False
+    # Mirrors Plugin.__init__ (this fixture bypasses it via __new__): the periodic
+    # port-conflict check's interval gate and last-logged verdict (#182).
+    p._next_port_check = 0.0
+    p._last_port_conflict = None
     return p
 
 
@@ -1513,3 +1517,77 @@ def test_menu_restart_clears_window_when_ensure_installed_raises(plug, plugin_mo
     plug.menuRestartMatterServer()                 # must not raise into Indigo's dispatcher
     assert plug._restart_expected_until == 0.0
     plug.logger.exception.assert_called()
+
+
+# ---------------------------------------------------------------------------
+# #182 — the periodic port-conflict check (review finding: _apply alone leaves
+# a multi-day blind spot, because launchd respawns matter-server on its own and
+# the WS client reports "connected" while talking to the wrong server)
+# ---------------------------------------------------------------------------
+
+def _plug_with_server(plug, report):
+    plug.server_process = SimpleNamespace(
+        port_conflict_report=lambda: report() if callable(report) else report,
+        spec=SimpleNamespace(port=5580),
+    )
+    return plug
+
+
+def test_port_conflict_tick_reports_a_conflict(plug):
+    _plug_with_server(plug, "port 5580 is held by pid 659")
+    plug._port_conflict_tick()
+    assert "659" in " ".join(str(c) for c in plug.logger.error.call_args_list)
+
+
+def test_port_conflict_tick_is_silent_when_all_is_well(plug):
+    _plug_with_server(plug, None)
+    plug._port_conflict_tick()
+    assert not plug.logger.error.called
+
+
+def test_a_standing_conflict_is_logged_once_not_every_pass(plug):
+    _plug_with_server(plug, "port 5580 is held by pid 659")
+    for _ in range(5):
+        plug._next_port_check = 0.0          # force the interval open each time
+        plug._port_conflict_tick()
+    assert plug.logger.error.call_count == 1  # 240/hour would bury the log
+
+
+def test_a_resolved_conflict_is_announced_then_stays_quiet(plug):
+    state = {"report": "port 5580 is held by pid 659"}
+    _plug_with_server(plug, lambda: state["report"])
+    plug._port_conflict_tick()
+    state["report"] = None
+    plug._next_port_check = 0.0
+    plug._port_conflict_tick()
+    assert "resolved" in " ".join(str(c) for c in plug.logger.info.call_args_list)
+    plug.logger.info.reset_mock()
+    plug._next_port_check = 0.0
+    plug._port_conflict_tick()
+    assert not plug.logger.info.called
+
+
+def test_port_conflict_tick_respects_its_slow_interval(plug):
+    calls = {"n": 0}
+
+    def report():
+        calls["n"] += 1
+        return None
+    _plug_with_server(plug, report)
+    plug._port_conflict_tick()               # runs (interval starts at 0.0)
+    plug._port_conflict_tick()               # suppressed — shells out to lsof/ps
+    assert calls["n"] == 1
+
+
+def test_port_conflict_tick_is_skipped_for_a_remote_matter_server(plug):
+    plug.server_process = None               # remote: not ours to police
+    plug._port_conflict_tick()
+    assert not plug.logger.error.called
+
+
+def test_a_failing_port_check_never_kills_the_watchdog(plug):
+    def boom():
+        raise OSError("ps exploded")
+    _plug_with_server(plug, boom)
+    plug._port_conflict_tick()               # must not raise
+    assert not plug.logger.error.called      # a diagnostic failure is not a conflict

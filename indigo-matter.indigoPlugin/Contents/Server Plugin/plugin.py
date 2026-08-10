@@ -53,7 +53,7 @@ from server_process import ServerProcess
 
 from plugin_constants import (
     COMMAND_TIMEOUT, MAX_RESUBSCRIBE_ATTEMPTS, PLUGIN_NAME,
-    RESUBSCRIBE_TICKS, sanitize_host, server_location,
+    PORT_CONFLICT_CHECK_INTERVAL, RESUBSCRIBE_TICKS, sanitize_host, server_location,
 )
 
 # Re-exported for the test suite, which reaches into this module's namespace
@@ -90,6 +90,10 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, ServerMenuMixin,
         self.jobs: CommissionJobs | None = None
         self.http: HttpApi | None = None
         self.server_process: ServerProcess | None = None
+        # Periodic port-conflict check (#182): when it may next run, and the last
+        # verdict logged so a standing conflict is reported once, not every pass.
+        self._next_port_check: float = 0.0
+        self._last_port_conflict: str | None = None
         # The EXPORT bridge node's LaunchAgent (E7). Built lazily and only ever
         # by a path that means to run it: a fresh install must be inert (XAC1),
         # and constructing this in startup would be one `ensure_installed` away
@@ -604,6 +608,47 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, ServerMenuMixin,
         if self.export_bridge is not None:
             self.export_bridge.health_tick()
         self._resubscribe_tick()
+        self._port_conflict_tick()
+
+    def _port_conflict_tick(self) -> None:
+        """Periodically re-check that our matter-server still owns its port (#182).
+
+        ``_apply`` already checks this, but only when something calls
+        ``ensure_installed()`` — plugin startup or a menu action. The jarvis incident
+        developed BETWEEN reloads and ran four days: launchd respawns matter-server on
+        its own, and a rival can take the port at any moment, neither of which goes
+        through that path. Worse, the plugin's other health signal cannot see it
+        either, because the WS client is happily *connected* — to the wrong server.
+        Without this tick the diagnosis only ever fires when someone was already about
+        to intervene.
+
+        Runs on its own slow cadence (it shells out to lsof/ps) and logs only when the
+        verdict CHANGES, so a standing conflict is one line rather than 240 an hour.
+        """
+        # getattr for the same reason _disconnect_ticks above uses it: this runs on the
+        # watchdog thread, and a diagnostic must never be the thing that kills the
+        # health loop if it is reached before/without full construction.
+        sp = getattr(self, "server_process", None)
+        if sp is None:                       # remote matter-server: not ours to police
+            return
+        now = time.monotonic()
+        if now < getattr(self, "_next_port_check", 0.0):
+            return
+        self._next_port_check = now + PORT_CONFLICT_CHECK_INTERVAL
+        try:
+            conflict = sp.port_conflict_report()
+        except Exception as exc:  # noqa: BLE001 - a diagnostic must never kill the watchdog
+            self.logger.debug("port conflict check failed: %s", exc)
+            return
+        previous = getattr(self, "_last_port_conflict", None)
+        if conflict == previous:
+            return
+        if conflict:
+            self.logger.error(conflict)
+        elif previous:
+            self.logger.info("matter-server now owns port %s again; the port conflict "
+                             "reported earlier is resolved.", sp.spec.port)
+        self._last_port_conflict = conflict
 
     # ------------------------------------------------------------------
     # Config

@@ -7,6 +7,14 @@ PLUGIN_NAME = "indigo-matter"
 COMMAND_TIMEOUT = 5.0
 DECOMMISSION_TIMEOUT = 15.0
 
+#: Seconds between periodic "does our matter-server still own its port?" checks
+#: (issue #182). Deliberately far coarser than the ~15s health tick: the check
+#: shells out to `lsof` and `ps`, and the fault it looks for takes days to matter,
+#: not seconds. Five minutes bounds the blind spot to minutes instead of "until
+#: somebody reloads the plugin", which is what let the original incident run for
+#: four days, while costing 12 subprocess pairs an hour.
+PORT_CONFLICT_CHECK_INTERVAL = 300.0
+
 #: Deadlines for the export/pairing menu actions, which block the **Indigo UI
 #: thread** on a WS round trip: without one, a bridge node that accepts the
 #: socket and then stops answering hangs the dialog — and Indigo's client — with

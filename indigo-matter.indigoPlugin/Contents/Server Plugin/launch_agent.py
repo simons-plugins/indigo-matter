@@ -36,6 +36,22 @@ from typing import Any, Callable, Optional
 
 DEFAULT_PROJECT_DIRNAME = "indigo-matter"   # ~/indigo-matter (npm install location)
 NPX_CANDIDATES = ("/opt/homebrew/bin/npx", "/usr/local/bin/npx")
+# On macOS lsof ships ONLY in /usr/sbin — there is no /usr/bin/lsof. Invoking it by
+# bare name makes the port probe depend on whatever PATH the Indigo plugin host
+# inherited, and a PATH without /usr/sbin turns the probe into a silent no-op. That is
+# how issue #182's second matter-server went unnoticed for four days. Absolute paths
+# first, bare name last so an unusual install still works.
+LSOF_CANDIDATES = ("/usr/sbin/lsof", "/usr/bin/lsof", "lsof")
+# The substring matter-server logs when it cannot bind its WebSocket port. Used only as
+# an ADVISORY signal (see LaunchAgent.port_conflict_report): the err log is append-only
+# across restarts, so a hit may be ancient history.
+EADDRINUSE_MARKER = "EADDRINUSE"
+# How long a freshly started server is allowed to have no listener before "nothing is
+# listening on our port" counts as a fault. matter-server was observed taking ~9s to
+# reach its bind on jarvis; 120s is generous enough that a slow or loaded Mac never
+# trips it, and short enough to still catch a genuinely headless server on the next
+# plugin reload.
+STARTUP_GRACE_SECONDS = 120
 # matter-server 1.2.2's package.json declares engines node >= 22.13.0. npm's engines
 # check is advisory by default (exits 0 on an older node), so install() gates on this
 # itself — otherwise a too-old node "successfully" installs an unrunnable server.
@@ -177,6 +193,10 @@ class LaunchAgent:
         self._exists = exists
         # Injectable so reap_orphan_servers()'s TERM→KILL grace is instant in tests.
         self._sleep = sleep
+        # "Currently degraded" latches for the two external probes (issue #182). Each
+        # is cleared by the next successful probe so a later failure is reported again.
+        self._port_probe_warned = False
+        self._process_age_warned = False
         self.home = home or os.path.expanduser("~")
         # Optional explicit override: directory containing node/npx. nvm users can
         # pin a specific version here (e.g. ~/.nvm/versions/node/v22.18.0/bin);
@@ -647,6 +667,16 @@ class LaunchAgent:
                 # digest proves the right plist was WRITTEN, not that the live job is
                 # using it, so check the running args before declaring victory.
                 self._warn_on_argument_drift(job["arguments"])
+                # …and a pid does not prove the job is REACHABLE (issue #182). A server
+                # that lost the port race stays alive without a WebSocket listener, so
+                # every signal above still reads "healthy" while the plugin talks to a
+                # foreign server. Deliberately does NOT restart: when someone else owns
+                # the port, restarting ours only fails again and costs every device's
+                # CASE session. The value here is an accurate, actionable diagnosis —
+                # a port holder that IS one of ours was already reaped by the call above.
+                conflict = self.port_conflict_report(managed_pid=managed_pid)
+                if conflict:
+                    self.logger.error(conflict)
                 return False
             # else: an orphan was starving it; fall through to a clean bootout + bootstrap.
         if running and not self._bootout():
@@ -1032,34 +1062,76 @@ class LaunchAgent:
                 continue
         return procs
 
-    def _port_listener_pids(self) -> list[int]:
-        """PIDs listening on our port, via ``lsof`` ([] if it can't tell).
+    def _port_listener_pids(self) -> Optional[list[int]]:
+        """PIDs listening on our port, via ``lsof``.
+
+        Returns a list (possibly empty — "nothing is listening", a real answer) or
+        **None** meaning *we could not tell*. That distinction is the whole point of
+        issue #182: the old signature collapsed "no listener" and "the probe is
+        broken" into the same ``[]``, so when the probe silently failed the plugin
+        concluded nobody held the port and left a foreign server driving the fabric.
+        Callers that only want candidates use ``or []``; callers that diagnose must
+        branch on None.
 
         The port — not the storage path — is the resource a second server actually
         contends for: a stray that holds it makes every fresh instance die with
-        "listen EADDRINUSE" (issue #104). lsof is best-effort; failure just means we
-        fall back to storage-path matching alone, exactly as before. An agent with no
-        port (``spec.port is None``) has nothing to contend for, so we don't look.
+        "listen EADDRINUSE" (issue #104). An agent with no port
+        (``spec.port is None``) has nothing to contend for, so we don't look.
         """
         if self.spec.port is None:
             return []
-        try:
-            result = self._run(
-                ["lsof", "-nP", f"-iTCP:{self.spec.port}", "-sTCP:LISTEN", "-t"],
-                capture_output=True, text=True, check=False,
-            )
-        except OSError:
-            return []
-        # rc 1 simply means "nothing is listening" — not an error worth logging.
-        if result is None or result.returncode not in (0, 1):
-            return []
-        pids: list[int] = []
-        for line in (result.stdout or "").split():
-            try:
-                pids.append(int(line))
-            except ValueError:
+        for candidate in LSOF_CANDIDATES:
+            # Absolute candidates are skipped when absent; the bare name is always
+            # attempted (PATH may still resolve it on an unusual install).
+            if candidate.startswith("/") and not self._exists(candidate):
                 continue
-        return pids
+            try:
+                result = self._run(
+                    [candidate, "-nP", f"-iTCP:{self.spec.port}", "-sTCP:LISTEN", "-t"],
+                    capture_output=True, text=True, check=False,
+                )
+            except OSError:
+                continue
+            # rc 1 is lsof's "nothing matched" — a successful probe with an empty
+            # answer, NOT a failure. Any other non-zero rc means it could not tell us.
+            if result is None or result.returncode not in (0, 1):
+                continue
+            pids: list[int] = []
+            for line in (result.stdout or "").split():
+                try:
+                    pids.append(int(line))
+                except ValueError:
+                    continue
+            # A working probe re-arms the warning, so a LATER failure is reported
+            # again rather than being swallowed by a latch set weeks ago (review of
+            # #183). The flag tracks "currently degraded", not "ever degraded".
+            self._port_probe_warned = False
+            return pids
+        self._warn_port_probe_unusable()
+        return None
+
+    def _warn_port_probe_unusable(self) -> None:
+        """Say once per degradation that we cannot see who holds our port.
+
+        Not once per call: the reap path probes several times per pass and a repeated
+        warning would bury the log. But the latch is cleared by the next SUCCESSFUL
+        probe, so each distinct episode of blindness gets its own warning — a
+        transient failure at startup must not silence the real one a month later.
+        Silence here is what issue #182 was made of, so this must never be downgraded
+        to debug.
+        """
+        if self._port_probe_warned:
+            return
+        self._port_probe_warned = True
+        self.logger.warning(
+            "cannot determine what is listening on port %s: lsof was not runnable "
+            "(tried %s). The check that catches a second %s squatting this port is "
+            "therefore disabled, so a port conflict would show up only as a server "
+            "that behaves as if it never started. Diagnose by hand with: "
+            "lsof -nP -iTCP:%s -sTCP:LISTEN",
+            self.spec.port, ", ".join(LSOF_CANDIDATES), self.spec.package,
+            self.spec.port,
+        )
 
     def _running_server_pids(self, exclude_pid: Optional[int] = None) -> list[int]:
         """PIDs of running processes of this agent's package that it should reap.
@@ -1083,7 +1155,10 @@ class LaunchAgent:
         if not procs:
             return []
         pkg_dir = self._package_dir()
-        port_pids = set(self._port_listener_pids())
+        # None ("could not tell") degrades to the storage-path signal alone, which is
+        # exactly the pre-#104 behaviour — the probe having failed is reported by
+        # _warn_port_probe_unusable, not papered over here.
+        port_pids = set(self._port_listener_pids() or [])
         pids: list[int] = []
         for pid, command in procs.items():
             if pid == exclude_pid:
@@ -1105,7 +1180,7 @@ class LaunchAgent:
         one-line diagnosis into an hour. Say it once per reap, with the pid and command
         so ``lsof``/``kill`` are an obvious next step.
         """
-        holders = [pid for pid in self._port_listener_pids()
+        holders = [pid for pid in (self._port_listener_pids() or [])
                    if pid != exclude_pid and pid not in reapable]
         if not holders:
             return
@@ -1120,6 +1195,167 @@ class LaunchAgent:
                 self.spec.package, self.spec.package,
             )
 
+    def _process_age_seconds(self, pid: int) -> Optional[int]:
+        """Seconds since ``pid`` started, or None if ``ps`` could not tell us.
+
+        Used to separate "still starting up" from "genuinely headless" without
+        consulting the append-only error log. ``ps -o etime=`` prints
+        ``[[DD-]HH:]MM:SS``; anything we cannot parse returns None, and callers must
+        treat None as "do not accuse" rather than as age zero.
+
+        Failure is warned about (once per episode, like the port probe) because the
+        "nothing is listening" diagnosis depends ENTIRELY on this age gate: a broken
+        ``ps`` would silently disable the very check #182 exists to add, which is the
+        shape of bug this whole change set is about.
+        """
+        try:
+            result = self._run(["ps", "-o", "etime=", "-p", str(pid)],
+                               capture_output=True, text=True, check=False)
+        except OSError:
+            self._warn_process_age_unusable(pid, "ps could not be run")
+            return None
+        if result is None or result.returncode != 0:
+            # rc 1 here means "no such process" — the pid died between the launchctl
+            # read and now, which is a real answer but not one we can age.
+            self._warn_process_age_unusable(pid, "ps reported no such process")
+            return None
+        raw = (result.stdout or "").strip()
+        days = 0
+        try:
+            if "-" in raw:
+                day_part, _, raw = raw.partition("-")
+                days = int(day_part)
+            parts = [int(chunk) for chunk in raw.split(":")]
+            if len(parts) == 2:                 # MM:SS — normalise to HH:MM:SS
+                parts.insert(0, 0)
+            hours, minutes, seconds = parts     # ValueError on any other arity
+        except ValueError:
+            # Covers an empty/blank line, a non-numeric field, and a shape we don't
+            # know — all of which mean the same thing to the caller: don't know.
+            self._warn_process_age_unusable(pid, f"could not parse ps etime {raw!r}")
+            return None
+        self._process_age_warned = False        # re-arm: see _port_listener_pids
+        return days * 86400 + hours * 3600 + minutes * 60 + seconds
+
+    def _warn_process_age_unusable(self, pid: int, why: str) -> None:
+        """Say once per degradation that we cannot age our own process.
+
+        Same latch discipline as :meth:`_warn_port_probe_unusable`, and warning rather
+        than staying quiet for the same reason: without an age we can never conclude
+        "running but nothing is listening", so this failing silently would disable that
+        diagnosis with no operator-visible symptom at all.
+        """
+        if self._process_age_warned:
+            return
+        self._process_age_warned = True
+        self.logger.warning(
+            "cannot determine how long %s (pid %s) has been running: %s. The check for "
+            "a server that is alive but has no listener on port %s needs that age, so "
+            "it is disabled until this works again.",
+            self.spec.package, pid, why, self.spec.port,
+        )
+
+    def _err_log_mentions_port_conflict(self) -> bool:
+        """True if the agent's error log tail mentions an EADDRINUSE fatal.
+
+        Corroboration only, never proof: the log is append-only across restarts, so a
+        hit may be weeks stale. 200 lines because matter-server emits a multi-line
+        stack trace after the fatal and then chats steadily, so the marker scrolls out
+        of a 20-line tail within seconds.
+        """
+        return EADDRINUSE_MARKER in (self.tail_error_log(max_lines=200) or "")
+
+    def port_conflict_report(self, managed_pid: Optional[int] = None) -> Optional[str]:
+        """Describe why our managed job is not actually serving our port, else None.
+
+        Issue #182: matter-server 1.2.2 logs a FATAL on ``listen EADDRINUSE`` and then
+        **keeps running** — it holds its Matter operational port, maintains CASE
+        sessions and writes its storage, it just never gets a WebSocket listener. So
+        launchd reports a pid, :meth:`run_state` says ``RUNNING``, and the plugin's WS
+        client connects happily to whatever OTHER server owns the port. On jarvis that
+        state persisted 30 hours and orphaned 14 devices. "Has a pid" is therefore not
+        evidence that our server is reachable, and this is the check that closes the gap.
+        (It also corrects the older assumption, recorded in :meth:`_managed_job`, that
+        such a server exits 0 and leaves the job visibly dead — 1.2.2 does not.)
+
+        Signals, in order of trust:
+
+        * **Authoritative** — the port is held by a pid that is not ours. Whatever our
+          WS client reaches is then definitively not the server we manage.
+        * **Age-gated** — nothing is listening at all, and our process is older than
+          :data:`STARTUP_GRACE_SECONDS`. The age test is what separates this from a
+          server that simply has not bound yet.
+        * **Advisory** — the port probe is unusable but our error log mentions
+          ``EADDRINUSE``. Advisory-only by the same discipline #93 applied to the ABI
+          stamp: the err log is append-only across restarts, so a hit may be from a
+          conflict resolved weeks ago. Report it, never act on it.
+
+        The error log is deliberately NOT what gates the "nothing listening" case. Being
+        append-only, one old ``EADDRINUSE`` would corroborate that accusation on every
+        subsequent startup for ever — the log can establish that a conflict happened
+        once, never that one is happening now.
+
+        Returns a message for the caller to log, or None when nothing is wrong.
+        """
+        if self.spec.port is None:
+            return None
+        if managed_pid is None:
+            managed_pid = self._managed_job()["pid"]
+        if managed_pid is None:
+            # No running managed job. That is a different fault with its own handling
+            # in _apply(); calling it a port conflict would send the user hunting for
+            # the wrong thing.
+            return None
+        holders = self._port_listener_pids()
+        if holders:
+            if managed_pid in holders:
+                return None                     # the common case: all is well
+            procs = self._ps_map()
+            others = ", ".join(f"pid {pid} ({procs.get(pid, 'unknown command')})"
+                               for pid in holders)
+            message = (
+                f"port {self.spec.port} is held by {others}, NOT by the "
+                f"{self.spec.package} this plugin manages (pid {managed_pid}). The "
+                f"plugin is therefore talking to a different server than the one it "
+                f"starts, so its fabric and its devices may not be the ones you "
+                f"configured. Stop the other process (or its LaunchAgent) and reload "
+                f"the plugin."
+            )
+        elif holders is None:
+            # The probe could not tell us anything, so the err log is all we have —
+            # and being append-only it may describe a conflict resolved weeks ago.
+            # Hence advisory wording and a hand-check recipe rather than a verdict.
+            if not self._err_log_mentions_port_conflict():
+                return None
+            message = (
+                f"{self.spec.package} (pid {managed_pid}) is running, but its error "
+                f"log mentions {EADDRINUSE_MARKER} and this Mac cannot tell us who "
+                f"holds port {self.spec.port}. If a second {self.spec.package} is "
+                f"running, the plugin may be talking to THAT one and not to the "
+                f"server it manages. Check: "
+                f"lsof -nP -iTCP:{self.spec.port} -sTCP:LISTEN "
+                f"(advisory — the log line may be from an old conflict)."
+            )
+        else:
+            # Nothing is listening. That is either genuinely headless or simply a
+            # server still inside its startup window, and the two are told apart by
+            # PROCESS AGE — deliberately not by the err log. The log is append-only,
+            # so a single old EADDRINUSE would accuse every future startup for ever
+            # (caught in review of #183). Age uses no historical data at all.
+            age = self._process_age_seconds(managed_pid)
+            if age is None or age < STARTUP_GRACE_SECONDS:
+                return None                     # too young, or we cannot tell → quiet
+            message = (
+                f"{self.spec.package} (pid {managed_pid}) has been running for {age}s "
+                f"but NOTHING is listening on port {self.spec.port}, so the plugin "
+                f"cannot reach it. This is what a lost port race leaves behind: "
+                f"{self.spec.package} logs a fatal '{EADDRINUSE_MARKER}' and keeps "
+                f"running without its WebSocket server. Restart it from "
+                f"Plugins ▸ Matter, and see "
+                f"{os.path.join(self.log_dir, self.spec.err_log)}."
+            )
+        return message
+
     def _managed_job(self) -> dict:
         """Parse ``launchctl print`` once into the three facts callers need.
 
@@ -1133,6 +1369,12 @@ class LaunchAgent:
           {SuccessfulExit: false}`` policy classes it a clean exit and deliberately
           never respawns it — the job sits loaded-and-dead indefinitely. Treating that
           as "healthy, hands off" is why a plugin reload could not recover it either.
+          **Version-dependent, and 1.2.2 does NOT behave this way** (issue #182): it
+          logs the same fatal and keeps running, so the job has a pid and looks
+          perfectly healthy from here while having no WebSocket listener at all. A pid
+          from this method therefore means "launchd has a live process", never "our
+          server is reachable" — :meth:`port_conflict_report` answers that second
+          question. Both behaviours are in the wild, so neither may be assumed.
         * ``arguments`` — the ProgramArguments launchd actually cached at bootstrap,
           which is NOT necessarily what the plist on disk now says (fault 3).
         """

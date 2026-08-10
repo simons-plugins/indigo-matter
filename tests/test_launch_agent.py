@@ -418,7 +418,7 @@ def test_each_agent_only_polices_its_own_port(tmp_path, mock_logger):
     # warned about and never signalled.
     assert first.reap_orphan_servers() == 0
     assert not runner.signals
-    lsof = [c for c in runner.calls if c and c[0] == "lsof"]
+    lsof = [c for c in runner.calls if c and os.path.basename(c[0]) == "lsof"]
     assert lsof and "-iTCP:5580" in lsof[0]           # our port, not the sibling's
 
 
@@ -429,7 +429,182 @@ def test_portless_agent_never_shells_out_to_lsof(tmp_path, mock_logger):
     agent = _agent(home, _spec("com.example.a", "pkg-a", str(tmp_path / "a-store")),
                    mock_logger, runner=runner)
     assert agent.reap_orphan_servers() == 0
-    assert not [c for c in runner.calls if c and c[0] == "lsof"]
+    assert not [c for c in runner.calls if c and os.path.basename(c[0]) == "lsof"]
+
+
+# ---------------------------------------------------------------------------
+# Issue #182 — the port probe must not fail silently, and a pid is not health
+# ---------------------------------------------------------------------------
+
+class NoLsofRunner(ProcRunner):
+    """``lsof`` cannot be executed at all — the #182 PATH failure.
+
+    Python raises OSError when ``subprocess`` cannot find the binary, which the old
+    probe swallowed into an empty list indistinguishable from "nothing is listening".
+    """
+
+    def __call__(self, cmd, **kwargs):
+        if cmd and os.path.basename(cmd[0]) == "lsof":
+            self.calls.append(cmd)
+            raise OSError(2, "No such file or directory: 'lsof'")
+        return super().__call__(cmd, **kwargs)
+
+
+def _portful(tmp_path, mock_logger, runner, port=5580):
+    home = tmp_path / "home"
+    return _agent(home, _spec("com.example.a", "pkg-a", str(tmp_path / "a-store"),
+                              port=port), mock_logger, runner=runner)
+
+
+def test_port_probe_prefers_an_absolute_lsof_over_the_bare_name(tmp_path, mock_logger):
+    # The bare name depends on the plugin host's inherited PATH, and lsof lives only in
+    # /usr/sbin on macOS. Resolving it absolutely is the actual #182 root-cause fix.
+    runner = ProcRunner(listen_pids=[321])
+    agent = _portful(tmp_path, mock_logger, runner)
+    agent._exists = lambda path: path == "/usr/sbin/lsof"
+    assert agent._port_listener_pids() == [321]
+    probes = [c[0] for c in runner.calls if c and os.path.basename(c[0]) == "lsof"]
+    assert probes == ["/usr/sbin/lsof"]
+
+
+def test_port_probe_falls_back_to_bare_name_when_no_absolute_lsof_exists(tmp_path, mock_logger):
+    runner = ProcRunner(listen_pids=[321])
+    agent = _portful(tmp_path, mock_logger, runner)
+    agent._exists = lambda _path: False           # neither absolute candidate present
+    assert agent._port_listener_pids() == [321]
+    probes = [c[0] for c in runner.calls if c and os.path.basename(c[0]) == "lsof"]
+    assert probes == ["lsof"]
+
+
+def test_nothing_listening_is_an_empty_list_not_an_unknown(tmp_path, mock_logger):
+    # lsof exits 1 when nothing matches. That is a SUCCESSFUL probe with a real answer
+    # and must stay distinguishable from a broken probe, or the caller cannot diagnose.
+    agent = _portful(tmp_path, mock_logger, ProcRunner(listen_pids=[]))
+    assert agent._port_listener_pids() == []
+
+
+def test_unusable_port_probe_returns_none_and_warns_once(tmp_path, mock_logger):
+    runner = NoLsofRunner()
+    agent = _portful(tmp_path, mock_logger, runner)
+    assert agent._port_listener_pids() is None        # "could not tell", not "nobody"
+    assert agent._port_listener_pids() is None
+    warnings = [str(c) for c in mock_logger.warning.call_args_list if "lsof" in str(c)]
+    assert len(warnings) == 1                         # once per agent, never per call
+    assert "5580" in warnings[0]                      # names the port and the hand recipe
+    # Every candidate was genuinely attempted before giving up.
+    assert len({c[0] for c in runner.calls
+                if c and os.path.basename(c[0]) == "lsof"}) >= 1
+
+
+def test_reap_still_works_from_storage_path_alone_when_the_probe_is_unusable(tmp_path,
+                                                                            mock_logger):
+    # Degrading to the pre-#104 signal is correct; crashing or reaping nothing is not.
+    runner = NoLsofRunner()
+    agent = _portful(tmp_path, mock_logger, runner)
+    runner.ps_lines = [_proc_line(agent, 111)]
+    assert agent._running_server_pids() == [111]
+    assert agent.reap_orphan_servers() == 1
+    assert ("TERM", "111") in runner.signals
+
+
+def test_no_conflict_reported_when_our_own_pid_holds_the_port(tmp_path, mock_logger):
+    agent = _portful(tmp_path, mock_logger, ProcRunner(listen_pids=[5423]))
+    assert agent.port_conflict_report(managed_pid=5423) is None
+
+
+def test_foreign_port_holder_is_reported_authoritatively(tmp_path, mock_logger):
+    """The exact jarvis incident: our job is alive, someone else owns 5580."""
+    runner = ProcRunner(listen_pids=[659])
+    agent = _portful(tmp_path, mock_logger, runner)
+    runner.ps_lines = ["659 node /elsewhere/matter-server/dist/esm/MatterServer.js"]
+    report = agent.port_conflict_report(managed_pid=43466)
+    assert report is not None
+    assert "659" in report and "43466" in report          # both sides named
+    assert "5580" in report
+    # No err-log corroboration needed: the port is demonstrably held by someone else.
+    assert not agent._err_log_mentions_port_conflict()
+
+
+def _write_stale_eaddrinuse(agent):
+    """An EADDRINUSE line in the append-only err log, e.g. from weeks ago."""
+    os.makedirs(agent.log_dir, exist_ok=True)
+    with open(os.path.join(agent.log_dir, agent.spec.err_log), "w",
+              encoding="utf-8") as handle:
+        handle.write("FATAL WebServer Webserver error on 127.0.0.1:5580 "
+                     "listen EADDRINUSE: address already in use\n")
+
+
+def test_headless_job_is_reported_once_past_the_startup_grace(tmp_path, mock_logger):
+    # Settled process (10:00 by default) + nothing listening = genuinely headless.
+    agent = _portful(tmp_path, mock_logger, ProcRunner(listen_pids=[]))
+    report = agent.port_conflict_report(managed_pid=5423)
+    assert report is not None and "NOTHING is listening" in report
+
+
+def test_young_process_with_no_listener_is_not_accused(tmp_path, mock_logger):
+    # A server that started 5s ago simply has not bound yet (~9s on jarvis).
+    agent = _portful(tmp_path, mock_logger, ProcRunner(listen_pids=[], proc_etime="00:05"))
+    assert agent.port_conflict_report(managed_pid=5423) is None
+
+
+def test_a_stale_eaddrinuse_never_accuses_a_freshly_started_server(tmp_path, mock_logger):
+    """Review of #183: the err log is append-only, so one old EADDRINUSE would
+    corroborate 'nothing is listening' on every future startup for ever. Age, not the
+    log, is what gates that branch — so an ancient marker plus a young process is quiet.
+    """
+    agent = _portful(tmp_path, mock_logger, ProcRunner(listen_pids=[], proc_etime="00:03"))
+    _write_stale_eaddrinuse(agent)
+    assert agent._err_log_mentions_port_conflict()          # the stale marker IS there…
+    assert agent.port_conflict_report(managed_pid=5423) is None   # …and is ignored here
+
+
+def test_unknown_process_age_is_never_accused(tmp_path, mock_logger):
+    # ps could not tell us. Fail closed: "cannot determine" must not become "guilty".
+    agent = _portful(tmp_path, mock_logger, ProcRunner(listen_pids=[], proc_etime=None))
+    _write_stale_eaddrinuse(agent)
+    assert agent.port_conflict_report(managed_pid=5423) is None
+
+
+@pytest.mark.parametrize("etime,expected", [
+    ("00:05", 5), ("10:00", 600), ("01:02:03", 3723), ("01-06:30:50", 109850),
+])
+def test_process_age_parses_every_ps_etime_format(tmp_path, mock_logger, etime, expected):
+    agent = _portful(tmp_path, mock_logger, ProcRunner(proc_etime=etime))
+    assert agent._process_age_seconds(5423) == expected
+
+
+@pytest.mark.parametrize("etime", ["", "not-a-time", "1:2:3:4", "xx-01:02:03"])
+def test_unparseable_process_age_is_none_not_zero(tmp_path, mock_logger, etime):
+    # Zero would read as "just started" and silence a real fault; None is "don't know".
+    agent = _portful(tmp_path, mock_logger, ProcRunner(proc_etime=etime))
+    assert agent._process_age_seconds(5423) is None
+
+
+def test_unusable_probe_reports_advisory_only_with_err_log_corroboration(tmp_path,
+                                                                        mock_logger):
+    agent = _portful(tmp_path, mock_logger, NoLsofRunner())
+    assert agent.port_conflict_report(managed_pid=5423) is None      # clean log → quiet
+
+    os.makedirs(agent.log_dir, exist_ok=True)
+    with open(os.path.join(agent.log_dir, agent.spec.err_log), "w",
+              encoding="utf-8") as handle:
+        handle.write("FATAL MatterServer Server failed to start listen EADDRINUSE\n")
+    report = agent.port_conflict_report(managed_pid=5423)
+    assert report is not None and "advisory" in report
+
+
+def test_no_conflict_reported_when_there_is_no_running_managed_job(tmp_path, mock_logger):
+    # A dead/absent job is a different fault with its own handling; calling it a port
+    # conflict would send the user hunting for a process that isn't there.
+    agent = _portful(tmp_path, mock_logger, ProcRunner(print_pid=None, listen_pids=[659]))
+    assert agent.port_conflict_report() is None
+
+
+def test_portless_agent_never_reports_a_port_conflict(tmp_path, mock_logger):
+    agent = _agent(tmp_path / "home",
+                   _spec("com.example.a", "pkg-a", str(tmp_path / "a-store")),
+                   mock_logger, runner=ProcRunner(listen_pids=[659]))
+    assert agent.port_conflict_report(managed_pid=111) is None
 
 
 # ---------------------------------------------------------------------------
@@ -519,3 +694,71 @@ def test_non_numeric_port_pref_disables_the_port_signal(tmp_path, mock_logger):
     assert sp.port == "not-a-port"              # unchanged: still what the CLI is handed
     assert sp.spec.port is None
     assert sp._port_listener_pids() == []
+
+
+class FlakyLsofRunner(ProcRunner):
+    """lsof fails only while ``broken`` is True — models a transient failure."""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.broken = True
+
+    def __call__(self, cmd, **kwargs):
+        if cmd and os.path.basename(cmd[0]) == "lsof" and self.broken:
+            self.calls.append(cmd)
+            raise OSError(2, "No such file or directory: 'lsof'")
+        return super().__call__(cmd, **kwargs)
+
+
+def test_a_successful_probe_rearms_the_unusable_warning(tmp_path, mock_logger):
+    """Review of #183: the latch was write-once per agent, which lives for the whole
+    plugin session (weeks). One transient lsof failure would then permanently silence
+    the warning — so the REAL blindness, months later, would be reported nowhere.
+    """
+    runner = FlakyLsofRunner(listen_pids=[321])
+    agent = _portful(tmp_path, mock_logger, runner)
+
+    assert agent._port_listener_pids() is None
+    assert len([c for c in mock_logger.warning.call_args_list if "lsof" in str(c)]) == 1
+
+    runner.broken = False                       # lsof works again
+    assert agent._port_listener_pids() == [321]
+
+    runner.broken = True                        # …and breaks again later
+    assert agent._port_listener_pids() is None
+    warnings = [c for c in mock_logger.warning.call_args_list if "lsof" in str(c)]
+    assert len(warnings) == 2                   # the second episode is reported too
+
+
+def test_unusable_ps_is_warned_about_not_silently_disabling_the_age_gate(tmp_path,
+                                                                        mock_logger):
+    # The "nothing is listening" diagnosis depends ENTIRELY on process age, so a
+    # broken ps would disable it with no operator-visible symptom — the shape of bug
+    # this whole change set exists to remove.
+    agent = _portful(tmp_path, mock_logger, ProcRunner(listen_pids=[], proc_etime=None))
+    assert agent._process_age_seconds(5423) is None
+    warnings = [c for c in mock_logger.warning.call_args_list if "how long" in str(c)]
+    assert len(warnings) == 1
+    assert "5580" in str(warnings[0])           # names the check it disables
+
+
+def test_our_pid_among_several_holders_is_treated_as_healthy(tmp_path, mock_logger):
+    """Pins a deliberate decision rather than leaving it accidental.
+
+    Two independent LISTENers on one port needs SO_REUSEPORT, so this is a corner —
+    but if OUR pid is bound, the plugin's actual question ("am I reachable on my own
+    port?") is answered yes, and we do not accuse anyone. Change this only on evidence
+    that a co-holder can steal our connections.
+    """
+    runner = ProcRunner(listen_pids=[5423, 659])
+    agent = _portful(tmp_path, mock_logger, runner)
+    assert agent.port_conflict_report(managed_pid=5423) is None
+
+
+def test_port_probe_tries_the_second_absolute_candidate(tmp_path, mock_logger):
+    runner = ProcRunner(listen_pids=[321])
+    agent = _portful(tmp_path, mock_logger, runner)
+    agent._exists = lambda path: path == "/usr/bin/lsof"      # only the second exists
+    assert agent._port_listener_pids() == [321]
+    probes = [c[0] for c in runner.calls if c and os.path.basename(c[0]) == "lsof"]
+    assert probes == ["/usr/bin/lsof"]

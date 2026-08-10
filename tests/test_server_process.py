@@ -724,8 +724,12 @@ class ProcRunner(FakeRunner):
 
     def __init__(self, ps_lines=None, print_pid=None, ignore_term=False,
                  omit_pid_line=False, garbled_pid=False, listen_pids=None,
-                 job_arguments=None, returncode=0):
+                 job_arguments=None, returncode=0, proc_etime="10:00"):
         super().__init__(returncode)
+        # What `ps -o etime=` reports for any pid. Defaults to 10 minutes — safely past
+        # STARTUP_GRACE_SECONDS, so tests that don't care about age behave as "settled".
+        # None models a ps that cannot tell us.
+        self.proc_etime = proc_etime
         self.ps_lines = list(ps_lines or [])
         self.print_pid = print_pid
         self.ignore_term = ignore_term
@@ -745,8 +749,16 @@ class ProcRunner(FakeRunner):
     def __call__(self, cmd, **kwargs):
         self.calls.append(cmd)
         if cmd and cmd[0] == "ps":
+            if "etime=" in cmd:
+                # `ps -o etime= -p N` — process age, for the #183 startup-grace gate.
+                # None models "ps could not tell us" (rc 1, no such process).
+                if self.proc_etime is None:
+                    return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="")
+                return subprocess.CompletedProcess(cmd, 0, stdout=f"  {self.proc_etime}\n", stderr="")
             return subprocess.CompletedProcess(cmd, 0, stdout="\n".join(self.ps_lines) + "\n", stderr="")
-        if cmd and cmd[0] == "lsof":
+        # Basename, not equality: the port probe resolves lsof by absolute path
+        # (/usr/sbin/lsof) and only falls back to the bare name (#182).
+        if cmd and os.path.basename(cmd[0]) == "lsof":
             out = "".join(f"{pid}\n" for pid in self.listen_pids)
             # lsof exits 1 when nothing matches, which is not an error.
             return subprocess.CompletedProcess(cmd, 0 if self.listen_pids else 1, stdout=out, stderr="")
@@ -926,6 +938,49 @@ def test_reload_leaves_healthy_job_untouched_when_no_orphan(tmp_path, mock_logge
     subs = [c[1] for c in runner.calls if len(c) > 1]
     assert "bootout" not in subs
     assert not runner.signals
+
+
+def test_reload_reports_a_foreign_port_holder_instead_of_declaring_health(tmp_path,
+                                                                         mock_logger):
+    """Issue #182 regression — the jarvis incident, end to end.
+
+    A second matter-server (here pid 659, from a stale LaunchAgent under the pre-rename
+    bundle id) owns 5580. Ours is loaded, has a pid, matches its plist and has no
+    reapable orphan beside it, so every pre-#182 signal said "healthy, hands off" — and
+    the plugin's WS client happily drove the foreign server's fabric for four days.
+
+    The holder is deliberately NOT one of our package's processes, so `reap_orphan_servers`
+    leaves it alone (killing an unrelated listener is worse than the bug); the job must
+    still be left running, since restarting ours cannot win a port someone else holds.
+    """
+    runner = ProcRunner(print_pid=43466, listen_pids=[659])
+    sp = _sp_proc_installed(tmp_path, mock_logger, runner)
+    sp.ensure_installed()                       # records the marker
+    runner.ps_lines = ["659 node /some/other/place/server.js --port 5580"]
+    sp.logger.error.reset_mock()
+    runner.calls.clear()
+
+    assert sp.ensure_installed() is False       # healthy-looking job left running…
+    subs = [c[1] for c in runner.calls if len(c) > 1]
+    assert "bootout" not in subs                # …and deliberately not restarted
+    assert not runner.signals                   # foreign holder is never signalled
+
+    errors = " ".join(str(c) for c in sp.logger.error.call_args_list)
+    assert "659" in errors and "43466" in errors    # …but the conflict is called out
+    assert "5580" in errors
+
+
+def test_reload_stays_quiet_when_our_own_pid_holds_the_port(tmp_path, mock_logger):
+    # The healthy case must not acquire a new false alarm from the #182 check.
+    runner = ProcRunner(print_pid=5423, listen_pids=[5423])
+    sp = _sp_proc_installed(tmp_path, mock_logger, runner)
+    sp.ensure_installed()
+    runner.job_arguments = sp.program_arguments()
+    sp.logger.error.reset_mock()
+    sp.logger.warning.reset_mock()
+    assert sp.ensure_installed() is False
+    assert not sp.logger.error.called
+    assert not sp.logger.warning.called
 
 
 def test_reload_warns_when_the_live_job_runs_stale_arguments(tmp_path, mock_logger):
