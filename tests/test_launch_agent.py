@@ -694,3 +694,71 @@ def test_non_numeric_port_pref_disables_the_port_signal(tmp_path, mock_logger):
     assert sp.port == "not-a-port"              # unchanged: still what the CLI is handed
     assert sp.spec.port is None
     assert sp._port_listener_pids() == []
+
+
+class FlakyLsofRunner(ProcRunner):
+    """lsof fails only while ``broken`` is True — models a transient failure."""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.broken = True
+
+    def __call__(self, cmd, **kwargs):
+        if cmd and os.path.basename(cmd[0]) == "lsof" and self.broken:
+            self.calls.append(cmd)
+            raise OSError(2, "No such file or directory: 'lsof'")
+        return super().__call__(cmd, **kwargs)
+
+
+def test_a_successful_probe_rearms_the_unusable_warning(tmp_path, mock_logger):
+    """Review of #183: the latch was write-once per agent, which lives for the whole
+    plugin session (weeks). One transient lsof failure would then permanently silence
+    the warning — so the REAL blindness, months later, would be reported nowhere.
+    """
+    runner = FlakyLsofRunner(listen_pids=[321])
+    agent = _portful(tmp_path, mock_logger, runner)
+
+    assert agent._port_listener_pids() is None
+    assert len([c for c in mock_logger.warning.call_args_list if "lsof" in str(c)]) == 1
+
+    runner.broken = False                       # lsof works again
+    assert agent._port_listener_pids() == [321]
+
+    runner.broken = True                        # …and breaks again later
+    assert agent._port_listener_pids() is None
+    warnings = [c for c in mock_logger.warning.call_args_list if "lsof" in str(c)]
+    assert len(warnings) == 2                   # the second episode is reported too
+
+
+def test_unusable_ps_is_warned_about_not_silently_disabling_the_age_gate(tmp_path,
+                                                                        mock_logger):
+    # The "nothing is listening" diagnosis depends ENTIRELY on process age, so a
+    # broken ps would disable it with no operator-visible symptom — the shape of bug
+    # this whole change set exists to remove.
+    agent = _portful(tmp_path, mock_logger, ProcRunner(listen_pids=[], proc_etime=None))
+    assert agent._process_age_seconds(5423) is None
+    warnings = [c for c in mock_logger.warning.call_args_list if "how long" in str(c)]
+    assert len(warnings) == 1
+    assert "5580" in str(warnings[0])           # names the check it disables
+
+
+def test_our_pid_among_several_holders_is_treated_as_healthy(tmp_path, mock_logger):
+    """Pins a deliberate decision rather than leaving it accidental.
+
+    Two independent LISTENers on one port needs SO_REUSEPORT, so this is a corner —
+    but if OUR pid is bound, the plugin's actual question ("am I reachable on my own
+    port?") is answered yes, and we do not accuse anyone. Change this only on evidence
+    that a co-holder can steal our connections.
+    """
+    runner = ProcRunner(listen_pids=[5423, 659])
+    agent = _portful(tmp_path, mock_logger, runner)
+    assert agent.port_conflict_report(managed_pid=5423) is None
+
+
+def test_port_probe_tries_the_second_absolute_candidate(tmp_path, mock_logger):
+    runner = ProcRunner(listen_pids=[321])
+    agent = _portful(tmp_path, mock_logger, runner)
+    agent._exists = lambda path: path == "/usr/bin/lsof"      # only the second exists
+    assert agent._port_listener_pids() == [321]
+    probes = [c[0] for c in runner.calls if c and os.path.basename(c[0]) == "lsof"]
+    assert probes == ["/usr/bin/lsof"]

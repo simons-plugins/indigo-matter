@@ -193,8 +193,10 @@ class LaunchAgent:
         self._exists = exists
         # Injectable so reap_orphan_servers()'s TERM→KILL grace is instant in tests.
         self._sleep = sleep
-        # Latch for the once-per-agent "cannot probe the port" warning (issue #182).
+        # "Currently degraded" latches for the two external probes (issue #182). Each
+        # is cleared by the next successful probe so a later failure is reported again.
         self._port_probe_warned = False
+        self._process_age_warned = False
         self.home = home or os.path.expanduser("~")
         # Optional explicit override: directory containing node/npx. nvm users can
         # pin a specific version here (e.g. ~/.nvm/versions/node/v22.18.0/bin);
@@ -1100,16 +1102,23 @@ class LaunchAgent:
                     pids.append(int(line))
                 except ValueError:
                     continue
+            # A working probe re-arms the warning, so a LATER failure is reported
+            # again rather than being swallowed by a latch set weeks ago (review of
+            # #183). The flag tracks "currently degraded", not "ever degraded".
+            self._port_probe_warned = False
             return pids
         self._warn_port_probe_unusable()
         return None
 
     def _warn_port_probe_unusable(self) -> None:
-        """Say once that we cannot see who holds our port.
+        """Say once per degradation that we cannot see who holds our port.
 
-        Once per agent, not per call: the reap path probes several times per pass and
-        a repeated warning would bury the log. Silence here is what issue #182 was
-        made of, so this must never be downgraded to debug.
+        Not once per call: the reap path probes several times per pass and a repeated
+        warning would bury the log. But the latch is cleared by the next SUCCESSFUL
+        probe, so each distinct episode of blindness gets its own warning — a
+        transient failure at startup must not silence the real one a month later.
+        Silence here is what issue #182 was made of, so this must never be downgraded
+        to debug.
         """
         if self._port_probe_warned:
             return
@@ -1193,13 +1202,22 @@ class LaunchAgent:
         consulting the append-only error log. ``ps -o etime=`` prints
         ``[[DD-]HH:]MM:SS``; anything we cannot parse returns None, and callers must
         treat None as "do not accuse" rather than as age zero.
+
+        Failure is warned about (once per episode, like the port probe) because the
+        "nothing is listening" diagnosis depends ENTIRELY on this age gate: a broken
+        ``ps`` would silently disable the very check #182 exists to add, which is the
+        shape of bug this whole change set is about.
         """
         try:
             result = self._run(["ps", "-o", "etime=", "-p", str(pid)],
                                capture_output=True, text=True, check=False)
         except OSError:
+            self._warn_process_age_unusable(pid, "ps could not be run")
             return None
         if result is None or result.returncode != 0:
+            # rc 1 here means "no such process" — the pid died between the launchctl
+            # read and now, which is a real answer but not one we can age.
+            self._warn_process_age_unusable(pid, "ps reported no such process")
             return None
         raw = (result.stdout or "").strip()
         days = 0
@@ -1214,8 +1232,28 @@ class LaunchAgent:
         except ValueError:
             # Covers an empty/blank line, a non-numeric field, and a shape we don't
             # know — all of which mean the same thing to the caller: don't know.
+            self._warn_process_age_unusable(pid, f"could not parse ps etime {raw!r}")
             return None
+        self._process_age_warned = False        # re-arm: see _port_listener_pids
         return days * 86400 + hours * 3600 + minutes * 60 + seconds
+
+    def _warn_process_age_unusable(self, pid: int, why: str) -> None:
+        """Say once per degradation that we cannot age our own process.
+
+        Same latch discipline as :meth:`_warn_port_probe_unusable`, and warning rather
+        than staying quiet for the same reason: without an age we can never conclude
+        "running but nothing is listening", so this failing silently would disable that
+        diagnosis with no operator-visible symptom at all.
+        """
+        if self._process_age_warned:
+            return
+        self._process_age_warned = True
+        self.logger.warning(
+            "cannot determine how long %s (pid %s) has been running: %s. The check for "
+            "a server that is alive but has no listener on port %s needs that age, so "
+            "it is disabled until this works again.",
+            self.spec.package, pid, why, self.spec.port,
+        )
 
     def _err_log_mentions_port_conflict(self) -> bool:
         """True if the agent's error log tail mentions an EADDRINUSE fatal.
