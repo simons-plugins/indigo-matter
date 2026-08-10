@@ -9,7 +9,7 @@ updates for it and keep ``curEnergyLevel`` (Watts) and ``accumEnergyTotal``
 (kWh) in sync. Indigo adds those states automatically when the device's
 ``SupportsPowerMeter`` / ``SupportsEnergyMeter`` props are True — those props
 are injected by the relay/dimmer's ``create_indigo_devices`` at device creation
-(see on_off.py / level_control.py and HANDOVER §4).
+(see on_off.py / level_control.py; the colour-support lesson, issue #56).
 """
 from __future__ import annotations
 

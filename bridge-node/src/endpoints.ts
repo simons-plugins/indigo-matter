@@ -543,9 +543,9 @@ const COMMAND_SINKS = new Map<string, CommandSink>();
  * a **lock** it is different in kind — Home reports "Unlocked", the user walks
  * away, and the bolt never moved. There is no protocol frame for "your command
  * was dropped" (the plugin cannot be told about invocations that arrived while
- * it was away; that is a §3.1 addition, noted in `docs/HANDOVER.md` and
- * deliberately not made here), so failing the invocation is the only way the
- * truth reaches the person standing at the door. A Matter status error makes
+ * it was away; that would be a §3.1 protocol addition, deliberately not made
+ * here), so failing the invocation is the only way the truth reaches the
+ * person standing at the door. A Matter status error makes
  * Home say the accessory did not respond, which is exactly what happened.
  */
 function emitCommand(

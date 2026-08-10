@@ -456,7 +456,7 @@ class DeviceSync:
             plan: list[tuple] = []  # (endpoint, spec)
             # Detect which endpoint(s) carry PowerSource. Indigo applies
             # Supports* via device props at creation, not Devices.xml statics
-            # (the colour-support lesson — see HANDOVER 2026-06-09 item 4).
+            # (the colour-support lesson; issue #56).
             # Single PowerSource-bearing endpoint (the common case — e.g. FP300:
             # battery on ep0, sensor on ep1) keeps the original node-wide
             # behaviour: SupportsBatteryLevel on every device regardless of its

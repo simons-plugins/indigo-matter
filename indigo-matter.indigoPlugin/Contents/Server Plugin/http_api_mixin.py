@@ -219,8 +219,7 @@ class HttpApiMixin:
         for a code that Apple Home, Alexa and Google all accept *typed in*: the
         page therefore shows the manual code at a size you can read across a
         room, the raw ``MT:`` payload for copying, and a link to the CHIP
-        project's own QR viewer for anyone who wants to scan. The tradeoff is
-        recorded in ``docs/HANDOVER.md`` rather than only in this docstring.
+        project's own QR viewer for anyone who wants to scan.
         """
         client = self.export_bridge.client if self.export_bridge is not None else None
         if client is None or not client.connected:

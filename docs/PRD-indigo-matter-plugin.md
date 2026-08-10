@@ -10,8 +10,7 @@
 > [`API.md`](./API.md) for the wire contract (the §5.1 endpoint shapes here
 > are stale — e.g. decommission is now `POST …?nodeId=`, not `DELETE`),
 > [`MATTER.md`](./MATTER.md) for architecture/landscape (incl. the corrected
-> Thread position), [`INSTALL.md`](./INSTALL.md) for setup, and
-> [`HANDOVER.md`](./HANDOVER.md) for current state. The architecture decision
+> Thread position), and [`INSTALL.md`](./INSTALL.md) for setup. The architecture decision
 > (the share model) is summarised in [`MATTER.md`](./MATTER.md), not the 0001 path below.
 >
 > Still genuinely pending from this PRD: **M11 — Plugin Store submission**,

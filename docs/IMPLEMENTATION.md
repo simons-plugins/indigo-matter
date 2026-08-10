@@ -3,7 +3,7 @@
 **Status:** Living reference — pruned 2026-06-10
 **Companion documents:** [`API.md`](./API.md) (Domio wire contract, authoritative),
 [`MATTER.md`](./MATTER.md) (architecture & landscape), [`INSTALL.md`](./INSTALL.md)
-(setup), [`HANDOVER.md`](./HANDOVER.md) (current state),
+(setup),
 [`PRD-indigo-matter-plugin.md`](./PRD-indigo-matter-plugin.md) (historical build spec)
 
 This document keeps only what the shipped code and the other docs don't already

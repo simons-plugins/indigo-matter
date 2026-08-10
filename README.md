@@ -90,8 +90,7 @@ with a BLE radio and the network credentials (an admin-1 ecosystem, or the iPhon
 during the Domio flow); the plugin then joins over IP via that ecosystem's border router
 (HomePod/Apple TV, TBR-capable Echo, Nest Hub). See
 [Field Notes № 1](https://simons-plugins.github.io/indigo-matter/matter.html) for how the pieces
-fit; validation specifics live in
-[Handover](https://simons-plugins.github.io/indigo-matter/HANDOVER.html).
+fit.
 
 **Matter out — built, unit-tested on both sides, partly validated live.** The allow-list,
 the role mapping, endpoint persistence, pairing and fabric management, and the managed
@@ -101,13 +100,11 @@ and all), an on/off light and a dimmer **have** been controlled in both directio
 accessory identity **has** survived an upgrade without duplicating (2026-08-04 / 05, on
 the reference server). Still outstanding: pairing through the plugin's own menu rather
 than the node's console, a second controller alongside Apple Home, the reboot leg of the
-identity check, and the managed LaunchAgent end to end — that last one needs the package
-installed, which until `indigo-matter-bridge` is published means the local-install
-workaround rather than the shipped install menu. Treat the export half as new. See
+identity check, and the managed LaunchAgent end to end — `indigo-matter-bridge` is on the npm
+registry now, so the shipped install menu is the route for that last one.
+Treat the export half as new. See
 [MATTER.md](docs/MATTER.md#indigo-as-a-matter-bridge--the-other-direction) for how it
-works, and
-[Handover](https://simons-plugins.github.io/indigo-matter/HANDOVER.html) for the
-validation specifics.
+works.
 
 ## Setup
 

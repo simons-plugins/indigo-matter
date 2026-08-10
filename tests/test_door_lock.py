@@ -74,7 +74,7 @@ class TestCreateIndigoDevices:
     def test_is_lock_sub_type_prop_set(self):
         # IsLockSubType must be True so Indigo renders lock UI, not switch UI.
         # Indigo ignores static Devices.xml elements for API-created devices —
-        # the prop must be set explicitly in the creation spec (HANDOVER item 4).
+        # the prop must be set explicitly in the creation spec (issue #56).
         node = parse_node(LOCK_NODE, "Front Door")
         handler = DoorLockHandler()
         spec = handler.create_indigo_devices(node, _ep(node, 1))[0]

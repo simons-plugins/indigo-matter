@@ -84,8 +84,7 @@ pgrep -fl "node .*\.mjs"                 # what's running
 cd /tmp/matter-test && node fan.mjs >> fan.log 2>&1 &
 ```
 
-Hard-won rig rules (each cost us a debugging session — full war stories in
-[HANDOVER.md](./HANDOVER.md)):
+Hard-won rig rules (each cost us a debugging session):
 
 - **One UDP port per device** (`network.port`); two devices on one port sends
   PASE to the wrong socket.

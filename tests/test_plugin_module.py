@@ -547,7 +547,6 @@ SCANNED_DOCS = [
     Path(__file__).parent.parent / "bridge-node" / "README.md",
     Path(__file__).parent.parent / "docs" / "INSTALL.md",
     Path(__file__).parent.parent / "docs" / "MATTER.md",
-    Path(__file__).parent.parent / "docs" / "HANDOVER.md",
 ]
 
 

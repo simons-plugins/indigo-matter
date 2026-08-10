@@ -65,8 +65,8 @@ class ClusterHandler(ABC):
     node_scoped: bool = False
     #: Display-capability props every device this handler creates must carry.
     #: Indigo applies Supports*/subtype capabilities via creation props, not
-    #: Devices.xml statics, for API-created devices (the colour lesson —
-    #: HANDOVER 2026-06-09 item 4; issue #56 for the sensor family). These are
+    #: Devices.xml statics, for API-created devices (the colour lesson;
+    #: issue #56 for the sensor family). These are
     #: also re-asserted on existing devices by device_sync's reconcile
     #: self-heal, so they must be static truths of the device type, not
     #: per-node capabilities (those belong in create_indigo_devices).

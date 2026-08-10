@@ -55,7 +55,7 @@ class LevelControlHandler(ClusterHandler):
         }
         # Energy support must be set as device props at creation: Indigo does not
         # apply static <Supports*> Devices.xml elements to API-created devices
-        # (same lesson as colour support, HANDOVER 2026-06-09 item 4). When these
+        # (same lesson as colour support; issue #56). When these
         # props are True, Indigo automatically adds curEnergyLevel / accumEnergyTotal
         # states that ElectricalPowerHandler / ElectricalEnergyHandler then update.
         if endpoint.has(CLUSTER_ELECTRICAL_POWER):
