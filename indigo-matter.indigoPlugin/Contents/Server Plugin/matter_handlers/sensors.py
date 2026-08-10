@@ -8,6 +8,8 @@ Cluster / attribute / encoding (Matter spec):
   TemperatureMeasurement   0x0402  MeasuredValue(0)  int16,   0.01 °C
   RelativeHumidityMeasure  0x0405  MeasuredValue(0)  uint16,  0.01 %RH
   OccupancySensing         0x0406  Occupancy(0)      bitmap8, bit0 = occupied
+                                   HoldTime(3)       uint16,  seconds (writable
+                                                     setting — see settings.py)
   BooleanState             0x0045  StateValue(0)     bool     (contact)
   IlluminanceMeasurement   0x0400  MeasuredValue(0)  uint16,  10000*log10(lux)+1
   PressureMeasurement      0x0403  MeasuredValue(0)  int16,   0.1 kPa (= 1 hPa)
@@ -18,6 +20,7 @@ from __future__ import annotations
 from typing import Any, Optional
 
 from .base import ClusterHandler, IndigoDeviceSpec, MatterCommand
+from .settings import ATTR_HOLD_TIME
 
 ATTR_MEASURED_VALUE = 0x0000
 
@@ -115,6 +118,32 @@ class OccupancyHandler(_SensorHandler):
 
     def transform(self, value: Any) -> bool:
         return bool(int(value) & 0x01)  # bit0 = occupied
+
+    def attributes_to_subscribe(self) -> list[int]:
+        # HoldTime rides along with Occupancy so the Edit Device dialog can show
+        # the CURRENT hold time without a live read: the dialog opens on the
+        # Indigo UI thread, and a read from a sleepy Thread device is seconds
+        # (issue #186). Subscribing keeps the state honest for free — including
+        # when the value is changed from another ecosystem, which for a
+        # multi-admin device happens without Indigo being involved at all.
+        return [self.measured_attr, ATTR_HOLD_TIME]
+
+    def on_attribute_update(self, indigo_dev: Any, attribute_id: int, value: Any) -> dict:
+        if attribute_id == ATTR_HOLD_TIME:
+            if value is None:
+                return {}
+            try:
+                hold = int(value)
+            except (TypeError, ValueError):
+                return {}
+            # Guard: pre-#186 devices have no holdTime state until Indigo
+            # rebuilds their state list (deviceStartComm's
+            # stateListOrDisplayStateIdChanged) — mirrors the sensitivityLevel
+            # guard in boolean_state_config for the same reason.
+            if "holdTime" not in getattr(indigo_dev, "states", {}):
+                return {}
+            return {"holdTime": hold}
+        return super().on_attribute_update(indigo_dev, attribute_id, value)
 
 
 class ContactHandler(_SensorHandler):

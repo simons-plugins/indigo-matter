@@ -30,6 +30,7 @@ import indigo  # provided by the Indigo runtime
 
 from async_runtime import AsyncRuntime
 from commission_jobs import CommissionJobs
+import device_settings
 from device_sync import DeviceSync
 import export_bridge
 from export_bridge import ExportBridge
@@ -39,11 +40,8 @@ from export_store import ExportStore
 from http_api_mixin import HttpApiMixin
 from http_handlers import HttpApi
 from matter_client import MatterClient
-from matter_handlers.boolean_state_config import (
-    ATTR_CURRENT_SENSITIVITY,
-    CLUSTER_BOOLEAN_STATE_CONFIG,
-)
 from matter_handlers.registry import HandlerRegistry
+from matter_handlers.settings import settings_for_type
 from pairing_menu_mixin import PairingMenuMixin
 import protocol
 from protocol import MatterWrite, Protocol
@@ -71,6 +69,13 @@ from plugin_constants import (  # noqa: F401
     PAIRING_READ_TIMEOUT, ROW_ERROR_LABEL, TRUNCATED_OPTION,
     UNPAIR_TIMEOUT, WINDOW_OPEN_TIMEOUT,
 )
+
+#: The sensitivity setting's declaration, resolved once from the registry.
+#: Shared by BOTH entry points that can change it — the Edit Device dialog and
+#: issue #85's "Set Sensitivity Level" action — so the two cannot drift on the
+#: cluster, the attribute, or what counts as a successful write.
+_SENSITIVITY_SETTING = next(
+    s for s in settings_for_type("matterMotionSensor") if s.key == "sensitivityLevel")
 
 
 class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, ServerMenuMixin, indigo.PluginBase):
@@ -823,7 +828,311 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, ServerMenuMixin,
                 "will be recreated from the node's clusters."
             )
             return (False, valuesDict, errors)
+        # Writable device settings (issue #186). Bounds only — cheap, and this
+        # runs on the Indigo UI thread. The write itself is deliberately deferred
+        # to closedDeviceConfigUi, because a write plus its read-back against a
+        # sleepy Thread device is seconds and would freeze the dialog.
+        if not settings_for_type(typeId):
+            return (True, valuesDict)  # most types declare none — nothing to look up
+        setting_errors = device_settings.validate_settings(
+            typeId, valuesDict, self._setting_limits_lookup(valuesDict),
+            self._setting_attribute_list_lookup(valuesDict),
+            self._has_matter_node(valuesDict))
+        if setting_errors:
+            errors = indigo.Dict()
+            for field, message in setting_errors.items():
+                errors[field] = message
+            return (False, valuesDict, errors)
         return (True, valuesDict)
+
+    # ------------------------------------------------------------------
+    # Writable device settings — the Edit Device dialog (issue #186)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _has_matter_node(props) -> bool:
+        """Is there a Matter node behind this Indigo device yet?
+
+        Explicit because it used to be emergent: with every setting taking its
+        bounds from a device attribute, "no node" made the bounds unresolvable
+        and nothing was offered. Spec-fixed bounds resolve with no device at
+        all, so a never-reconciled relay was shown a full settings section it
+        could not save and which threw on the way out.
+        """
+        node_id = str(props.get("nodeId") or "").strip()
+        endpoint_id = props.get("endpointId")
+        if not node_id or endpoint_id in (None, ""):
+            return False
+        try:
+            int(node_id)
+            int(endpoint_id)
+        except (TypeError, ValueError):
+            return False
+        return True
+
+    def _log_setting_skips(self, dev_id):
+        """An ``on_skip`` sink that says out loud what was withheld and why.
+
+        Both bugs that shipped on this branch presented as "the feature is
+        missing" because a setting was dropped in silence. DEBUG is not enough —
+        it is off by default, so the one clue is at a level the affected user
+        does not have on.
+        """
+        def note(setting, reason):
+            self.logger.info('device %s: "%s" not offered — %s',
+                             dev_id, setting.label, reason)
+        return note
+
+    def _setting_limits_lookup(self, props):
+        """A ``(cluster, attribute) -> raw limits`` lookup for one device.
+
+        Closes over the device's node/endpoint so the pure settings layer never
+        has to know what a node id is. Reads props rather than the Indigo device
+        so it works while a dialog is open on a device that has none of this
+        saved yet. A device with no node yet yields a lookup answering None to
+        everything — but that is NOT what stops settings being offered: settings
+        with spec-fixed bounds resolve without any device read, so the gate is
+        the explicit :meth:`_has_matter_node` check, not this lookup's answers.
+        """
+        node_id = props.get("nodeId")
+        endpoint_id = props.get("endpointId")
+        if not self._has_matter_node(props):
+            return lambda cluster, attribute: None
+
+        def lookup(cluster, attribute):
+            try:
+                return self.device_sync.setting_limits(
+                    int(node_id), int(endpoint_id), cluster, attribute)
+            except Exception as exc:  # noqa: BLE001 - a broken lookup hides the field, never breaks the dialog
+                self.logger.debug("setting-limits lookup failed for node %s/%s: %s",
+                                  node_id, endpoint_id, exc)
+                return None
+
+        return lookup
+
+    def _setting_attribute_list_lookup(self, props):
+        """A ``cluster -> AttributeList`` lookup for one device.
+
+        The capability half of offering a setting: the device's own statement
+        of which attributes it implements. Separate from the limits lookup
+        because most settings take their bounds from the spec, so "are the
+        limits readable?" cannot answer "does this unit have the attribute?".
+        """
+        node_id = props.get("nodeId")
+        endpoint_id = props.get("endpointId")
+        if not self._has_matter_node(props):
+            return lambda cluster: None
+
+        def lookup(cluster):
+            try:
+                return self.device_sync.attribute_list(int(node_id), int(endpoint_id), cluster)
+            except Exception as exc:  # noqa: BLE001 - unknown, never "absent"
+                self.logger.debug("attribute-list lookup failed for node %s/%s: %s",
+                                  node_id, endpoint_id, exc)
+                return None
+
+        return lookup
+
+    def getDeviceConfigUiValues(self, pluginProps, typeId, devId):  # noqa: N802
+        """Seed the Edit Device dialog with this device's CURRENT settings.
+
+        Runs every time the dialog opens, and re-seeds from the device's Indigo
+        states rather than from saved props — the device is the source of truth
+        for a setting, not Indigo. That is what keeps the dialog honest when the
+        value was last changed from another ecosystem (these devices are
+        typically multi-admin), and it is why a write that fails does not leave
+        a prop quietly disagreeing with the device forever.
+
+        No live Matter read happens here: this is the Indigo UI thread, and a
+        read from a sleepy device is seconds. See the device_settings docstring.
+        """
+        values = dict(pluginProps)
+        # A brand-new device (devId 0) or one deleted mid-dialog has no states
+        # and no node, so device_known below is False and the section is hidden.
+        # That is an explicit gate, not an emergent one — spec-bounded settings
+        # resolve with no device at all and used to be offered regardless.
+        states = self._device_states(devId)
+        try:
+            values.update(device_settings.config_ui_values(
+                typeId, states, self._setting_limits_lookup(values),
+                attribute_list=self._setting_attribute_list_lookup(values),
+                device_known=self._has_matter_node(values),
+                on_skip=self._log_setting_skips(devId)))
+        except Exception as exc:  # noqa: BLE001 - never block the dialog over the settings section
+            self.logger.exception("could not build device settings for %s: %s", devId, exc)
+        # MUST be indigo.Dict, not a plain dict — the same shape
+        # getPrefsConfigUiValues returns. Returning a plain dict fails INSIDE
+        # Indigo's C++ bridge, which logs
+        #   Error in plugin execution UiGetValues2: No registered converter was
+        #   able to extract a C++ reference to type CXmlDict from this Python
+        #   object of type dict
+        # and then seeds NOTHING. For a section gated on hidden marker fields
+        # that reads as "the feature is missing": the markers keep their
+        # Devices.xml defaultValue of "no" and every field stays invisible, with
+        # the only clue an error naming an internal symbol rather than this
+        # method. Cost an hour on jarvis (#186); the tuple type is load-bearing.
+        return (indigo.Dict(values), indigo.Dict())
+
+    # Indigo 2025.2's PluginBase carries snake_case aliases for these callbacks
+    # alongside the camelCase names and does not document which it dispatches
+    # on — the same hedge getPrefsConfigUiValues above already makes. On this
+    # build the camelCase names ARE the ones called (proven by the UiGetValues2
+    # error above arriving at all), so these are belt-and-braces against a
+    # future build preferring the other spelling, not a fix for anything
+    # observed.
+    def get_device_config_ui_values(self, pluginProps, typeId, devId):
+        return self.getDeviceConfigUiValues(pluginProps, typeId, devId)
+
+    def validate_device_config_ui(self, valuesDict, typeId, devId):
+        return self.validateDeviceConfigUi(valuesDict, typeId, devId)
+
+    def closed_device_config_ui(self, valuesDict, userCancelled, typeId, devId):
+        return self.closedDeviceConfigUi(valuesDict, userCancelled, typeId, devId)
+
+    def getSettingOptions(self, filter="", valuesDict=None, typeId="", targetId=0):  # noqa: N802, A002
+        """Picker rows for ANY menu-rendered setting in the Edit Device dialog.
+
+        One callback for every such field: Indigo tells a list method which
+        field asked via the ``<List filter="…">`` attribute, so the filter
+        carries the setting key and this does not need a method per setting.
+
+        Distinct from :meth:`getSensitivityLevels` (the issue #85 ACTION's
+        picker) because the two degrade differently, and deliberately so. The
+        action's list must always offer something — it is building an automation
+        that may run long before the device is ever reachable. This one is
+        backed by the same bounds that gate the field's visibility, so when the
+        device's values are unknown the field is not shown at all and there is
+        nothing to guess about.
+        """
+        props = dict(valuesDict or {})
+        try:
+            dev = indigo.devices[targetId]
+            props.setdefault("nodeId", dev.pluginProps.get("nodeId"))
+            props.setdefault("endpointId", dev.pluginProps.get("endpointId"))
+        except Exception as exc:  # noqa: BLE001 - fall back to whatever the dialog carries
+            self.logger.debug("getSettingOptions: no device %r: %s", targetId, exc)
+        wanted = str(filter or "").strip()
+        for offer in device_settings.offered_settings(
+                typeId, self._setting_limits_lookup(props),
+                self._setting_attribute_list_lookup(props),
+                self._has_matter_node(props)):
+            if wanted and offer.setting.key != wanted:
+                continue
+            rows = offer.setting.option_rows(offer.bounds)
+            if rows is not None:
+                return rows
+        return []
+
+    def closedDeviceConfigUi(self, valuesDict, userCancelled, typeId, devId):  # noqa: N802
+        """Apply any CHANGED device settings after the dialog closes.
+
+        The write lives here rather than in validation for one reason: a write
+        and its read-back against a sleepy Thread device take seconds, and doing
+        that inside validateDeviceConfigUi would freeze the Indigo UI with no
+        way out. By the time this runs the dialog is gone, so the round trip
+        goes onto the asyncio loop and reports through the event log and the
+        device's error state instead of a dialog.
+
+        The consequence worth knowing: a failure surfaces AFTER the dialog has
+        closed. It is logged as an error, the device is marked in error, and
+        because the dialog re-seeds from device state on every open, reopening
+        it shows what the device actually holds — never the value that failed.
+        """
+        if userCancelled or not settings_for_type(typeId):
+            return
+        try:
+            plans = device_settings.planned_writes(
+                typeId, valuesDict, self._device_states(devId),
+                self._setting_limits_lookup(valuesDict),
+                self._setting_attribute_list_lookup(valuesDict),
+                self._has_matter_node(valuesDict))
+        except Exception as exc:  # noqa: BLE001
+            self.logger.exception("could not work out device setting changes: %s", exc)
+            return
+        if not plans:
+            return
+        if self.runtime is None or self.matter is None:
+            self.logger.error(
+                "cannot apply device settings — the Matter connection is not running; "
+                "no setting was changed")
+            return
+        if not self._has_matter_node(valuesDict):
+            # Belt-and-braces: planned_writes is already gated on the same
+            # check, so reaching here means the two disagree. int() on an
+            # absent node id would throw a raw traceback out of a dialog-close
+            # callback, with no user-facing message and the remaining plans
+            # abandoned.
+            self.logger.error(
+                "cannot apply device settings — device %s has no Matter node yet", devId)
+            return
+        node_id = int(valuesDict.get("nodeId"))
+        endpoint_id = int(valuesDict.get("endpointId"))
+        for plan in plans:
+            self.runtime.submit(self._apply_setting(node_id, endpoint_id, int(devId), plan))
+
+    def _device_states(self, dev_id) -> dict:
+        """This device's states, or {} if it has none we can read.
+
+        {} is not harmless: planned_writes compares against it to decide what
+        CHANGED, so an empty mapping makes every offered setting look changed
+        and turns a dialog opened to read values into a burst of writes to a
+        possibly battery-powered device. Narrow catch and a log line, so that
+        outcome is never silent — KeyError is the one anticipated case (a
+        brand-new devId 0, or a device deleted mid-dialog).
+        """
+        try:
+            return dict(indigo.devices[dev_id].states)
+        except KeyError:
+            self.logger.debug("device %s has no states (new or deleted mid-dialog)", dev_id)
+            return {}
+        except Exception as exc:  # noqa: BLE001 - unexpected, and it changes what we write
+            self.logger.warning(
+                "could not read states for device %s (%s) — every setting will look "
+                "changed, so only settings you actually edited should be saved", dev_id, exc)
+            return {}
+
+    async def _apply_setting(self, node_id, endpoint_id, dev_id, plan) -> None:
+        """Loop-side half of a settings write: send, verify, report.
+
+        Runs on the asyncio loop, so the STATE write goes through
+        ``device_sync.apply_states`` — the same discipline the attribute
+        firehose and the export bridge's command dispatch already use. The error
+        flag is set directly, as ``device_sync``'s own ``_safe_unreachable`` /
+        ``_clear_error`` do from the same thread; the seam rule covers
+        ``updateStatesOnServer``, not every Indigo call.
+        """
+        label = plan.setting.label
+        observed: list = []
+        try:
+            ok, message = await device_settings.apply_setting(
+                self.matter, node_id, endpoint_id, plan,
+                on_observed=observed.append)
+        except Exception as exc:  # noqa: BLE001 - a crash here must not kill the loop
+            self.logger.exception('"%s" could not be applied: %s', label, exc)
+            return
+        if ok:
+            self.logger.info("%s", message)
+            # The read-back already proved this value is on the device, so this
+            # is a confirmed write-through, not the optimistic echo the #85
+            # action does. apply_states also clears any stale error flag.
+            self.device_sync.apply_states(dev_id, [{"key": plan.setting.key,
+                                                    "value": plan.value}])
+            return
+        self.logger.error("%s", message)
+        try:
+            dev = indigo.devices[dev_id]
+            dev.setErrorStateOnServer("setting failed")
+            # A mismatch means the read-back told us what the device ACTUALLY
+            # holds. Recording it keeps the dialog honest on next open — it
+            # re-seeds from state, so leaving the stale value would show the
+            # user a setting the device never adopted, which is the divergence
+            # this whole feature exists to prevent.
+            actual = observed[0] if observed else None
+            if actual is not None:
+                self.device_sync.apply_states(
+                    dev_id, [{"key": plan.setting.key, "value": actual}])
+        except Exception as exc:  # noqa: BLE001
+            self.logger.debug("could not flag failed setting on device %s: %s", dev_id, exc)
 
     def deviceStartComm(self, dev):  # noqa: N802
         # Indigo builds a device's state list at creation and does NOT re-read
@@ -952,16 +1261,27 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, ServerMenuMixin,
                 dev.name, level, supported - 1,
             )
             return
-        write = MatterWrite(int(node_id), int(endpoint_id), CLUSTER_BOOLEAN_STATE_CONFIG,
-                             ATTR_CURRENT_SENSITIVITY, level)
-        if self._send_matter_command(write, dev):
-            # Optimistic echo (precedent: color_control's whiteLevel echo) — the
-            # firehose attribute_updated report will confirm/correct this once
-            # matter-server processes the write.
-            try:
-                dev.updateStateOnServer("sensitivityLevel", level)
-            except Exception as exc:  # noqa: BLE001 - cosmetic echo only, must not fail the action
-                self.logger.debug('optimistic sensitivityLevel echo failed for "%s": %s', dev.name, exc)
+        # Routed through the same verified write path the Edit Device dialog
+        # uses (issue #186): ONE mechanism, two entry points. This action stays
+        # because it serves a job the dialog cannot — changing a setting from an
+        # automation — but it no longer echoes optimistically. A device that ACKs
+        # and ignores would otherwise leave Indigo reporting a sensitivity the
+        # device never adopted, which is precisely the bug #186 exists to kill.
+        #
+        # Fire-and-forget onto the loop rather than blocking: verification is a
+        # second round trip to a device that may be asleep, and this runs on the
+        # thread executing a trigger or action group.
+        if self.runtime is None or self.matter is None:
+            self.logger.error('"%s": cannot set sensitivity — the Matter connection '
+                              'is not running', dev.name)
+            return
+        previous = None
+        try:
+            previous = int(dev.states.get("sensitivityLevel"))
+        except (TypeError, ValueError):
+            pass
+        plan = device_settings.PlannedWrite(_SENSITIVITY_SETTING, level, previous)
+        self.runtime.submit(self._apply_setting(int(node_id), int(endpoint_id), dev.id, plan))
 
     def _refresh_node(self, dev) -> None:
         """Re-interview the device's Matter node so matter-server re-reads its

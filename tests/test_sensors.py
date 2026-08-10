@@ -1,6 +1,8 @@
 """M6: sensor cluster handlers (temperature, humidity, occupancy, contact, lux, pressure, flow)."""
 from __future__ import annotations
 
+import pytest
+
 from matter_model import parse_node
 from matter_handlers.registry import HandlerRegistry
 from matter_handlers.sensors import (
@@ -172,3 +174,43 @@ def test_binary_sensor_format_kv_passes_through_unformatted():
     assert ContactHandler().format_kv({"onOffState": False}) == [
         {"key": "onOffState", "value": False}
     ]
+
+
+# ---------------------------------------------------------------------------
+# OccupancySensing HoldTime (0x0406/0x0003) — issue #186
+# ---------------------------------------------------------------------------
+
+class _HoldTimeDev:
+    """Device stub carrying only a states mapping."""
+    def __init__(self, states):
+        self.states = states
+
+
+def test_occupancy_subscribes_to_hold_time_as_well_as_occupancy():
+    # Subscribed so the Edit Device dialog can show the CURRENT value without a
+    # multi-second read to a sleepy device — and so it stays true when another
+    # ecosystem changes it.
+    assert OccupancyHandler().attributes_to_subscribe() == [0x0000, 0x0003]
+
+
+def test_hold_time_updates_the_hold_time_state():
+    dev = _HoldTimeDev({"onOffState": False, "holdTime": 10})
+    assert OccupancyHandler().on_attribute_update(dev, 0x0003, 30) == {"holdTime": 30}
+
+
+def test_hold_time_is_dropped_on_a_device_that_has_no_such_state_yet():
+    # Devices fielded before #186 have no holdTime until Indigo rebuilds their
+    # state list (deviceStartComm) — writing it would log an Indigo error.
+    dev = _HoldTimeDev({"onOffState": False})
+    assert OccupancyHandler().on_attribute_update(dev, 0x0003, 30) == {}
+
+
+@pytest.mark.parametrize("value", [None, "soon", {}])
+def test_an_unusable_hold_time_is_ignored(value):
+    dev = _HoldTimeDev({"holdTime": 10})
+    assert OccupancyHandler().on_attribute_update(dev, 0x0003, value) == {}
+
+
+def test_occupancy_still_reads_occupancy_after_the_hold_time_addition():
+    dev = _HoldTimeDev({"onOffState": False, "holdTime": 10})
+    assert OccupancyHandler().on_attribute_update(dev, 0x0000, 1) == {"onOffState": True}

@@ -25,9 +25,52 @@
             <Field id="productName" type="textfield" readonly="yes">
                 <Label>Product:</Label>
             </Field>
+            <!-- Writable device settings (issue #186) — OnOff's Lighting-feature
+                 attributes (conformance LT). "Implements the Lighting feature"
+                 is NOT the same as "is a light": of four plugs on the dev
+                 fabric two carry these and two do not, so the hasX markers,
+                 which getDeviceConfigUiValues sets from the device's OWN
+                 AttributeList, are doing real work here. -->
+            <Field id="hasStartUpOnOff" type="textfield" hidden="true" defaultValue="no"/>
+            <Field id="hasOnTime" type="textfield" hidden="true" defaultValue="no"/>
+            <Field id="hasAnySetting" type="textfield" hidden="true" defaultValue="no"/>
+            <Field id="settingsSeparator" type="separator"
+                   visibleBindingId="hasAnySetting" visibleBindingValue="yes"/>
+            <Field id="settingsHeading" type="label" fontColor="darkgray"
+                   visibleBindingId="hasAnySetting" visibleBindingValue="yes">
+                <Label>Device Settings — stored on the device itself, not in Indigo. Changing one changes how the device behaves for EVERY app it is paired with, including Apple Home.</Label>
+            </Field>
+            <Field id="startUpOnOff" type="menu"
+                   visibleBindingId="hasStartUpOnOff" visibleBindingValue="yes">
+                <Label>After a power cut:</Label>
+                <List class="self" method="getSettingOptions" filter="startUpOnOff" dynamicReload="true"/>
+            </Field>
+            <Field id="onTime" type="textfield"
+                   visibleBindingId="hasOnTime" visibleBindingValue="yes">
+                <Label>Auto-off after (tenths of a second, 0 = never):</Label>
+            </Field>
+            <Field id="onTimeRange" type="textfield" readonly="yes"
+                   visibleBindingId="hasOnTime" visibleBindingValue="yes">
+                <Label>Allowed range:</Label>
+            </Field>
         </ConfigUI>
         <!-- onOffState is native to the relay base type — do not redefine it
              (Indigo rejects "native state keys cannot be overriden"). -->
+        <States>
+            <!-- OnOff Lighting-feature settings (issue #186). States rather than
+                 props alone so the dialog can show the current value without a
+                 live read, and so a change made from another ecosystem lands. -->
+            <State id="startUpOnOff">
+                <ValueType>Integer</ValueType>
+                <TriggerLabel>Power-On Behaviour</TriggerLabel>
+                <ControlPageLabel>Power-On Behaviour</ControlPageLabel>
+            </State>
+            <State id="onTime">
+                <ValueType>Integer</ValueType>
+                <TriggerLabel>Auto-Off Timer</TriggerLabel>
+                <ControlPageLabel>Auto-Off Timer</ControlPageLabel>
+            </State>
+        </States>
         <UiDisplayStateId>onOffState</UiDisplayStateId>
     </Device>
 
@@ -173,6 +216,45 @@
             <Field id="productName" type="textfield" readonly="yes">
                 <Label>Product:</Label>
             </Field>
+            <!-- Writable device settings (issue #186). Every field below is
+                 declared in matter_handlers/settings.py; Indigo builds ConfigUI
+                 from static XML per device TYPE and offers no runtime field
+                 injection (unlike states, cf. getDeviceStateList), so the
+                 registry cannot generate these — the two must be kept in step.
+
+                 The hasX markers are set per DEVICE by getDeviceConfigUiValues,
+                 and are "yes" only when BOTH gates pass: the device's own
+                 AttributeList (0xFFFB) does not deny the attribute, and its
+                 permitted values can be resolved. So a pre-1.4 occupancy sensor
+                 with no HoldTime is never shown a hold-time field it would fail
+                 to honour.
+                 NOTE: visibleBindingValue is a CONTAINS match, not equality —
+                 marker values must never be substrings of one another. -->
+            <Field id="hasHoldTime" type="textfield" hidden="true" defaultValue="no"/>
+            <Field id="hasSensitivity" type="textfield" hidden="true" defaultValue="no"/>
+            <Field id="hasAnySetting" type="textfield" hidden="true" defaultValue="no"/>
+            <Field id="settingsSeparator" type="separator"
+                   visibleBindingId="hasAnySetting" visibleBindingValue="yes"/>
+            <Field id="settingsHeading" type="label" fontColor="darkgray"
+                   visibleBindingId="hasAnySetting" visibleBindingValue="yes">
+                <Label>Device Settings — stored on the device itself, not in Indigo. Changing one changes how the device behaves for EVERY app it is paired with, including Apple Home.</Label>
+            </Field>
+            <Field id="holdTime" type="textfield"
+                   visibleBindingId="hasHoldTime" visibleBindingValue="yes">
+                <Label>Presence hold time (seconds):</Label>
+            </Field>
+            <!-- A readonly textfield, not a label, because the range is the
+                 DEVICE's own (HoldTimeLimits) and label text is static — only a
+                 field's VALUE can be set per device by getDeviceConfigUiValues. -->
+            <Field id="holdTimeRange" type="textfield" readonly="yes"
+                   visibleBindingId="hasHoldTime" visibleBindingValue="yes">
+                <Label>Allowed range:</Label>
+            </Field>
+            <Field id="sensitivityLevel" type="menu"
+                   visibleBindingId="hasSensitivity" visibleBindingValue="yes">
+                <Label>Sensitivity:</Label>
+                <List class="self" method="getSettingOptions" filter="sensitivityLevel" dynamicReload="true"/>
+            </Field>
         </ConfigUI>
         <States>
             <State id="batteryLevel">
@@ -186,6 +268,16 @@
                 <ValueType>Integer</ValueType>
                 <TriggerLabel>Sensitivity Level</TriggerLabel>
                 <ControlPageLabel>Sensitivity Level</ControlPageLabel>
+            </State>
+            <!-- OccupancySensing HoldTime (0x0406/0x0003) — issue #186. A state
+                 rather than only a prop so it stays true when another ecosystem
+                 changes it (these devices are multi-admin), and so the Edit
+                 Device dialog can show the current value without blocking the
+                 UI thread on a read to a sleepy device. -->
+            <State id="holdTime">
+                <ValueType>Integer</ValueType>
+                <TriggerLabel>Presence Hold Time</TriggerLabel>
+                <ControlPageLabel>Presence Hold Time</ControlPageLabel>
             </State>
         </States>
         <UiDisplayStateId>onOffState</UiDisplayStateId>
@@ -205,6 +297,22 @@
             </Field>
             <Field id="productName" type="textfield" readonly="yes">
                 <Label>Product:</Label>
+            </Field>
+            <!-- Writable device settings (issue #186) — see the fuller note on
+                 matterMotionSensor above. No hold time here: HoldTime belongs to
+                 OccupancySensing, which a contact sensor does not have. -->
+            <Field id="hasSensitivity" type="textfield" hidden="true" defaultValue="no"/>
+            <Field id="hasAnySetting" type="textfield" hidden="true" defaultValue="no"/>
+            <Field id="settingsSeparator" type="separator"
+                   visibleBindingId="hasAnySetting" visibleBindingValue="yes"/>
+            <Field id="settingsHeading" type="label" fontColor="darkgray"
+                   visibleBindingId="hasAnySetting" visibleBindingValue="yes">
+                <Label>Device Settings — stored on the device itself, not in Indigo. Changing one changes how the device behaves for EVERY app it is paired with, including Apple Home.</Label>
+            </Field>
+            <Field id="sensitivityLevel" type="menu"
+                   visibleBindingId="hasSensitivity" visibleBindingValue="yes">
+                <Label>Sensitivity:</Label>
+                <List class="self" method="getSettingOptions" filter="sensitivityLevel" dynamicReload="true"/>
             </Field>
         </ConfigUI>
         <States>

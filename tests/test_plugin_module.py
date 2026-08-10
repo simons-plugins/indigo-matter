@@ -234,16 +234,19 @@ def test_validate_allows_unchanged_type(plugin_cls, mock_indigo_base):
     assert result[0] is True
 
 
-def test_validate_allows_unstamped_device(plugin_cls, mock_indigo_base):
-    # Pre-guard or manually created device — no stamp, no opinion.
+def test_validate_allows_unstamped_device(plugin_cls, mock_indigo_base, mock_logger):
+    # Pre-guard or manually created device — no stamp, no opinion. matterRelay
+    # carries settings since #186, so this now runs the settings path too.
     mock_indigo_base.devices = {5: _dev({})}
-    result = plugin_cls.validateDeviceConfigUi(None, {}, "matterRelay", 5)
+    stub = _settings_stub(plugin_cls, mock_logger, limits={}, attr_lists={})
+    result = plugin_cls.validateDeviceConfigUi(stub, {}, "matterRelay", 5)
     assert result[0] is True
 
 
-def test_validate_allows_unknown_device_id(plugin_cls, mock_indigo_base):
+def test_validate_allows_unknown_device_id(plugin_cls, mock_indigo_base, mock_logger):
     mock_indigo_base.devices = {}
-    result = plugin_cls.validateDeviceConfigUi(None, {}, "matterRelay", 999)
+    stub = _settings_stub(plugin_cls, mock_logger, limits={}, attr_lists={})
+    result = plugin_cls.validateDeviceConfigUi(stub, {}, "matterRelay", 999)
     assert result[0] is True
 
 
@@ -371,53 +374,66 @@ def test_get_sensitivity_levels_degrades_when_device_lookup_fails(plugin_cls, mo
     assert options == [("0", "Level 0"), ("1", "Level 1"), ("2", "Level 2")]
 
 
-def test_action_set_sensitivity_level_sends_matter_write_and_echoes_state(plugin_cls, mock_logger):
+def _action_stub(mock_logger, supported=3, runtime=None, matter=None):
+    """Stand-in for the #85 action's Plugin. Since #186 the action submits a
+    VERIFIED write onto the loop instead of calling _send_matter_command."""
     from types import SimpleNamespace
     from unittest.mock import MagicMock
-    from protocol import MatterWrite
-    dev = _sensitivity_dev()
     stub = SimpleNamespace(
         device_sync=MagicMock(), logger=mock_logger,
+        runtime=runtime if runtime is not None else MagicMock(),
+        matter=matter if matter is not None else MagicMock(),
         _send_matter_command=MagicMock(return_value=True),
     )
-    stub.device_sync.sensitivity_levels_supported.return_value = 3
-    action = SimpleNamespace(props={"level": "2"})
-    plugin_cls.actionSetSensitivityLevel(stub, action, dev)
-
-    assert stub._send_matter_command.call_count == 1
-    write, sent_dev = stub._send_matter_command.call_args[0]
-    assert isinstance(write, MatterWrite)
-    assert (write.node_id, write.endpoint, write.cluster, write.attribute, write.value) == (45, 1, 0x0080, 0x0000, 2)
-    assert sent_dev is dev
-    dev.updateStateOnServer.assert_called_once_with("sensitivityLevel", 2)
+    stub.device_sync.sensitivity_levels_supported.return_value = supported
+    stub._apply_setting = MagicMock(return_value="coro")
+    return stub
 
 
-def test_action_set_sensitivity_level_no_echo_when_send_fails(plugin_cls, mock_logger):
+def test_action_set_sensitivity_level_submits_a_verified_write(plugin_cls, mock_logger):
+    """Since #186 the action shares the dialog's write-and-verify path — ONE
+    mechanism, two entry points."""
     from types import SimpleNamespace
-    from unittest.mock import MagicMock
     dev = _sensitivity_dev()
-    stub = SimpleNamespace(
-        device_sync=MagicMock(), logger=mock_logger,
-        _send_matter_command=MagicMock(return_value=False),
-    )
-    stub.device_sync.sensitivity_levels_supported.return_value = 3
-    action = SimpleNamespace(props={"level": "1"})
-    plugin_cls.actionSetSensitivityLevel(stub, action, dev)
+    stub = _action_stub(mock_logger)
+    plugin_cls.actionSetSensitivityLevel(stub, SimpleNamespace(props={"level": "2"}), dev)
+
+    assert stub.runtime.submit.call_count == 1
+    node_id, endpoint_id, dev_id, plan = stub._apply_setting.call_args.args
+    assert (node_id, endpoint_id, dev_id) == (45, 1, dev.id)
+    assert (plan.setting.cluster, plan.setting.attribute) == (0x0080, 0x0000)
+    assert (plan.value, plan.previous) == (2, 1)
+
+
+def test_action_set_sensitivity_level_no_longer_echoes_optimistically(plugin_cls, mock_logger):
+    """The echo was the #186 bug in miniature: a device that ACKs and ignores
+    left Indigo reporting a sensitivity it never adopted. The state is now
+    written only after the read-back proves it."""
+    from types import SimpleNamespace
+    dev = _sensitivity_dev()
+    stub = _action_stub(mock_logger)
+    plugin_cls.actionSetSensitivityLevel(stub, SimpleNamespace(props={"level": "1"}), dev)
     dev.updateStateOnServer.assert_not_called()
+
+
+def test_action_set_sensitivity_level_reports_a_down_connection(plugin_cls, mock_logger):
+    from types import SimpleNamespace
+    dev = _sensitivity_dev()
+    stub = _action_stub(mock_logger, runtime=None, matter=None)
+    stub.runtime = None
+    stub.matter = None
+    plugin_cls.actionSetSensitivityLevel(stub, SimpleNamespace(props={"level": "1"}), dev)
+    assert any("not running" in str(c) for c in mock_logger.error.call_args_list)
 
 
 def test_action_set_sensitivity_level_rejects_out_of_range(plugin_cls, mock_logger):
     from types import SimpleNamespace
     from unittest.mock import MagicMock
     dev = _sensitivity_dev()
-    stub = SimpleNamespace(
-        device_sync=MagicMock(), logger=mock_logger,
-        _send_matter_command=MagicMock(return_value=True),
-    )
-    stub.device_sync.sensitivity_levels_supported.return_value = 3
+    stub = _action_stub(mock_logger)
     action = SimpleNamespace(props={"level": "5"})
     plugin_cls.actionSetSensitivityLevel(stub, action, dev)
-    stub._send_matter_command.assert_not_called()
+    stub.runtime.submit.assert_not_called()
     dev.updateStateOnServer.assert_not_called()
     assert mock_logger.error.called
 
@@ -426,11 +442,10 @@ def test_action_set_sensitivity_level_rejects_invalid_level(plugin_cls, mock_log
     from types import SimpleNamespace
     from unittest.mock import MagicMock
     dev = _sensitivity_dev()
-    stub = SimpleNamespace(device_sync=MagicMock(), logger=mock_logger,
-                           _send_matter_command=MagicMock())
+    stub = _action_stub(mock_logger)
     action = SimpleNamespace(props={"level": "not-a-number"})
     plugin_cls.actionSetSensitivityLevel(stub, action, dev)
-    stub._send_matter_command.assert_not_called()
+    stub.runtime.submit.assert_not_called()
     assert mock_logger.error.called
 
 
@@ -450,16 +465,11 @@ def test_action_set_sensitivity_level_allows_any_level_when_support_unknown(plug
     """No confirmed SupportedSensitivityLevels yet — don't block the write;
     matter-server/the device is the final arbiter."""
     from types import SimpleNamespace
-    from unittest.mock import MagicMock
     dev = _sensitivity_dev()
-    stub = SimpleNamespace(
-        device_sync=MagicMock(), logger=mock_logger,
-        _send_matter_command=MagicMock(return_value=True),
-    )
-    stub.device_sync.sensitivity_levels_supported.return_value = None
+    stub = _action_stub(mock_logger, supported=None)
     action = SimpleNamespace(props={"level": "9"})
     plugin_cls.actionSetSensitivityLevel(stub, action, dev)
-    stub._send_matter_command.assert_called_once()
+    stub.runtime.submit.assert_called_once()
 
 
 @pytest.fixture
@@ -606,3 +616,418 @@ def test_plugin_modules_eviction_tuple_matches_real_files():
         assert (SERVER_PLUGIN / f"{name}.py").is_file(), (
             f"conftest._PLUGIN_MODULES entry {name!r} has no matching Server Plugin file"
         )
+
+
+# ---------------------------------------------------------------------------
+# issue #186 — the Edit Device dialog's Device Settings section
+#
+# These exercise the Indigo-facing callbacks; the decision logic they delegate
+# to is covered in test_device_settings.py.
+# ---------------------------------------------------------------------------
+
+async def _async_none(*_args, **_kwargs):
+    return None
+
+
+def _async_value(value):
+    async def _read(*_args, **_kwargs):
+        return value
+    return _read
+
+
+_FP300_LIMITS = {
+    (0x0406, 0x0004): {"0": 1, "1": 300, "2": 10},   # real wire shape
+    (0x0080, 0x0001): 3,
+}
+
+#: AttributeList (0xFFFB) per cluster, as the live FP300 reports it — the
+#: capability gate. Occupancy carries HoldTime (3); BooleanStateConfiguration
+#: carries CurrentSensitivityLevel (0).
+_FP300_ATTR_LISTS = {
+    0x0406: [0, 1, 2, 3, 4, 65528, 65529, 65531, 65532, 65533],
+    0x0080: [0, 1, 2, 65528, 65529, 65531, 65532, 65533],
+}
+
+
+def _settings_stub(plugin_cls, mock_logger, limits=None, runtime=None, matter=None,
+                   attr_lists=None):
+    """A Plugin stand-in wired to a limits table instead of a live node.
+
+    ``_setting_limits_lookup`` is bound from the real class rather than mocked:
+    it is the seam every settings callback goes through, so stubbing it would
+    test nothing.
+    """
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    table = _FP300_LIMITS if limits is None else limits
+    device_sync = MagicMock()
+    device_sync.setting_limits.side_effect = (
+        lambda node, ep, cluster, attr: table.get((cluster, attr)))
+    lists = _FP300_ATTR_LISTS if attr_lists is None else attr_lists
+    device_sync.attribute_list.side_effect = (
+        lambda node, ep, cluster: lists.get(cluster))
+    stub = SimpleNamespace(device_sync=device_sync, logger=mock_logger,
+                           runtime=runtime, matter=matter)
+    stub._setting_limits_lookup = (
+        lambda props: plugin_cls._setting_limits_lookup(stub, props))
+    stub._device_states = lambda dev_id: plugin_cls._device_states(stub, dev_id)
+    stub._setting_attribute_list_lookup = (
+        lambda props: plugin_cls._setting_attribute_list_lookup(stub, props))
+    stub._has_matter_node = plugin_cls._has_matter_node
+    stub._log_setting_skips = lambda dev_id: plugin_cls._log_setting_skips(stub, dev_id)
+    return stub
+
+
+def _fp300_dev(states=None):
+    from types import SimpleNamespace
+    return SimpleNamespace(
+        id=5, name="Landing Presence", deviceTypeId="matterMotionSensor",
+        pluginProps={"nodeId": "56", "endpointId": "1"},
+        states={"holdTime": 10, "sensitivityLevel": 1} if states is None else states,
+    )
+
+
+def test_config_ui_values_seed_the_dialog_from_device_state(plugin_cls, mock_indigo_base, mock_logger):
+    mock_indigo_base.devices = {5: _fp300_dev()}
+    stub = _settings_stub(plugin_cls, mock_logger)
+    values, _errors = plugin_cls.getDeviceConfigUiValues(
+        stub, {"nodeId": "56", "endpointId": "1"}, "matterMotionSensor", 5)
+    assert values["hasHoldTime"] == "yes"
+    assert values["holdTime"] == "10"
+    assert values["holdTimeRange"] == "1-300 seconds"
+
+
+def test_config_ui_values_hide_settings_the_device_lacks(plugin_cls, mock_indigo_base, mock_logger):
+    mock_indigo_base.devices = {5: _fp300_dev()}
+    stub = _settings_stub(plugin_cls, mock_logger, limits={(0x0080, 0x0001): 3})
+    values, _errors = plugin_cls.getDeviceConfigUiValues(
+        stub, {"nodeId": "56", "endpointId": "1"}, "matterMotionSensor", 5)
+    assert values["hasHoldTime"] == "no"
+    assert values["hasSensitivity"] == "yes"
+
+
+def test_config_ui_values_survive_a_device_that_has_no_node_yet(plugin_cls, mock_indigo_base, mock_logger):
+    mock_indigo_base.devices = {}
+    stub = _settings_stub(plugin_cls, mock_logger)
+    values, _errors = plugin_cls.getDeviceConfigUiValues(stub, {}, "matterMotionSensor", 0)
+    assert values["hasAnySetting"] == "no"
+
+
+def test_config_ui_values_keep_the_dialog_alive_if_the_lookup_explodes(plugin_cls, mock_indigo_base, mock_logger):
+    """A broken settings section must never stop a user opening the dialog."""
+    from unittest.mock import MagicMock
+    mock_indigo_base.devices = {5: _fp300_dev()}
+    stub = _settings_stub(plugin_cls, mock_logger)
+    stub.device_sync.setting_limits.side_effect = RuntimeError("boom")
+    values, _errors = plugin_cls.getDeviceConfigUiValues(
+        stub, {"nodeId": "56", "endpointId": "1"}, "matterMotionSensor", 5)
+    assert values["nodeId"] == "56"          # the rest of the dialog is intact
+    assert values["hasHoldTime"] == "no"     # and the settings simply hide
+
+
+def test_validate_rejects_an_out_of_range_hold_time(plugin_cls, mock_indigo_base, mock_logger):
+    mock_indigo_base.devices = {5: _fp300_dev()}
+    stub = _settings_stub(plugin_cls, mock_logger)
+    ok, _values, errors = plugin_cls.validateDeviceConfigUi(
+        stub, {"nodeId": "56", "endpointId": "1", "holdTime": "9999"},
+        "matterMotionSensor", 5)
+    assert ok is False
+    assert "1 and 300" in errors["holdTime"]
+
+
+def test_validate_accepts_an_in_range_hold_time(plugin_cls, mock_indigo_base, mock_logger):
+    mock_indigo_base.devices = {5: _fp300_dev()}
+    stub = _settings_stub(plugin_cls, mock_logger)
+    result = plugin_cls.validateDeviceConfigUi(
+        stub, {"nodeId": "56", "endpointId": "1", "holdTime": "45"},
+        "matterMotionSensor", 5)
+    assert result[0] is True
+
+
+def test_settings_picker_offers_the_devices_own_level_count(plugin_cls, mock_indigo_base, mock_logger):
+    mock_indigo_base.devices = {5: _fp300_dev()}
+    stub = _settings_stub(plugin_cls, mock_logger)
+    rows = plugin_cls.getSettingOptions(
+        stub, filter="sensitivityLevel",
+        valuesDict={"nodeId": "56", "endpointId": "1"},
+        typeId="matterMotionSensor", targetId=5)
+    assert [value for value, _label in rows] == ["0", "1", "2"]
+
+
+def test_settings_picker_is_empty_when_the_device_does_not_support_it(plugin_cls, mock_indigo_base, mock_logger):
+    """Unlike the #85 ACTION's picker, which must always offer something: this
+    field is not shown at all unless the bounds are known, so there is nothing
+    to guess about."""
+    mock_indigo_base.devices = {5: _fp300_dev()}
+    stub = _settings_stub(plugin_cls, mock_logger, limits={})
+    rows = plugin_cls.getSettingOptions(
+        stub, filter="sensitivityLevel",
+        valuesDict={"nodeId": "56", "endpointId": "1"},
+        typeId="matterMotionSensor", targetId=5)
+    assert rows == []
+
+
+def test_closing_the_dialog_submits_only_changed_settings(plugin_cls, mock_indigo_base, mock_logger):
+    from unittest.mock import MagicMock
+    mock_indigo_base.devices = {5: _fp300_dev()}
+    runtime = MagicMock()
+    stub = _settings_stub(plugin_cls, mock_logger, runtime=runtime, matter=MagicMock())
+    stub._apply_setting = MagicMock(return_value="coro")
+    plugin_cls.closedDeviceConfigUi(
+        stub, {"nodeId": "56", "endpointId": "1", "holdTime": "30",
+               "sensitivityLevel": "1"},
+        False, "matterMotionSensor", 5)
+    assert runtime.submit.call_count == 1
+    plan = stub._apply_setting.call_args.args[3]
+    assert (plan.setting.key, plan.value) == ("holdTime", 30)
+
+
+def test_cancelling_the_dialog_writes_nothing(plugin_cls, mock_indigo_base, mock_logger):
+    from unittest.mock import MagicMock
+    mock_indigo_base.devices = {5: _fp300_dev()}
+    runtime = MagicMock()
+    stub = _settings_stub(plugin_cls, mock_logger, runtime=runtime, matter=MagicMock())
+    plugin_cls.closedDeviceConfigUi(
+        stub, {"nodeId": "56", "endpointId": "1", "holdTime": "30"},
+        True, "matterMotionSensor", 5)
+    runtime.submit.assert_not_called()
+
+
+def test_saving_an_unchanged_dialog_writes_nothing(plugin_cls, mock_indigo_base, mock_logger):
+    from unittest.mock import MagicMock
+    mock_indigo_base.devices = {5: _fp300_dev()}
+    runtime = MagicMock()
+    stub = _settings_stub(plugin_cls, mock_logger, runtime=runtime, matter=MagicMock())
+    plugin_cls.closedDeviceConfigUi(
+        stub, {"nodeId": "56", "endpointId": "1", "holdTime": "10",
+               "sensitivityLevel": "1"},
+        False, "matterMotionSensor", 5)
+    runtime.submit.assert_not_called()
+
+
+def test_a_device_type_with_no_settings_never_touches_the_settings_path(plugin_cls, mock_indigo_base, mock_logger):
+    from unittest.mock import MagicMock
+    mock_indigo_base.devices = {}
+    runtime = MagicMock()
+    stub = _settings_stub(plugin_cls, mock_logger, runtime=runtime, matter=MagicMock())
+    plugin_cls.closedDeviceConfigUi(stub, {"nodeId": "56", "endpointId": "1"},
+                                    False, "matterTemperatureSensor", 5)
+    runtime.submit.assert_not_called()
+    stub.device_sync.setting_limits.assert_not_called()
+
+
+def test_settings_are_not_applied_while_the_connection_is_down(plugin_cls, mock_indigo_base, mock_logger):
+    """Better an error naming the reason than a write silently dropped."""
+    mock_indigo_base.devices = {5: _fp300_dev()}
+    stub = _settings_stub(plugin_cls, mock_logger, runtime=None, matter=None)
+    plugin_cls.closedDeviceConfigUi(
+        stub, {"nodeId": "56", "endpointId": "1", "holdTime": "30"},
+        False, "matterMotionSensor", 5)
+    assert any("not running" in str(c) for c in mock_logger.error.call_args_list)
+
+
+def _run_apply(plugin_cls, stub, plan, dev_id=5):
+    import asyncio
+    return asyncio.run(plugin_cls._apply_setting(stub, 56, 1, dev_id, plan))
+
+
+def _hold_time_plan(value=30, previous=10):
+    from matter_handlers.settings import settings_for_type
+    from device_settings import PlannedWrite
+    setting = next(s for s in settings_for_type("matterMotionSensor")
+                   if s.key == "holdTime")
+    return PlannedWrite(setting, value, previous)
+
+
+def test_a_verified_setting_is_written_through_to_the_device_state(plugin_cls, mock_indigo_base, mock_logger):
+    """Not an optimistic echo — the read-back already proved the value is on
+    the device before this state write happens."""
+    from unittest.mock import MagicMock
+    mock_indigo_base.devices = {5: _fp300_dev()}
+    stub = _settings_stub(plugin_cls, mock_logger, matter=MagicMock())
+    stub.matter.write = _async_none
+    stub.matter.read = _async_value(30)
+    _run_apply(plugin_cls, stub, _hold_time_plan())
+    stub.device_sync.apply_states.assert_called_once_with(
+        5, [{"key": "holdTime", "value": 30}])
+    assert mock_logger.info.called
+
+
+def test_a_lying_device_leaves_the_state_alone_and_flags_the_device(plugin_cls, mock_indigo_base, mock_logger):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    dev = _fp300_dev()
+    dev.setErrorStateOnServer = MagicMock()
+    mock_indigo_base.devices = {5: dev}
+    stub = _settings_stub(plugin_cls, mock_logger, matter=MagicMock())
+    stub.matter.write = _async_none
+    stub.matter.read = _async_value(10)     # ACKed the write, kept the old value
+    _run_apply(plugin_cls, stub, _hold_time_plan())
+    assert mock_logger.error.called
+    dev.setErrorStateOnServer.assert_called_once_with("setting failed")
+    # The requested value is NEVER written — that would be the optimistic echo
+    # this feature exists to kill. What IS written is what the read-back proved
+    # the device actually holds, so the dialog (which re-seeds from state)
+    # cannot show a value the device never adopted.
+    stub.device_sync.apply_states.assert_called_once_with(
+        5, [{"key": "holdTime", "value": 10}])
+
+
+def test_a_crash_in_the_write_path_never_kills_the_loop(plugin_cls, mock_indigo_base,
+                                                        mock_logger, monkeypatch):
+    import functools
+    from unittest.mock import MagicMock
+    import device_settings
+    mock_indigo_base.devices = {5: _fp300_dev()}
+    stub = _settings_stub(plugin_cls, mock_logger, matter=MagicMock())
+
+    async def boom(*_args, **_kwargs):
+        raise RuntimeError("nope")
+
+    # Skip the real retry backoff — this test is about the failure being
+    # reported rather than escaping, not about how long we wait first.
+    monkeypatch.setattr(device_settings, "apply_setting",
+                        functools.partial(device_settings.apply_setting, sleep=_async_none))
+    stub.matter.write = boom
+    stub.matter.read = boom
+    _run_apply(plugin_cls, stub, _hold_time_plan())
+    assert mock_logger.exception.called or mock_logger.error.called
+    stub.device_sync.apply_states.assert_not_called()
+
+
+def test_device_config_ui_callbacks_have_snake_case_aliases(plugin_cls):
+    """Indigo 2025.2's PluginBase carries both spellings and does not document
+    which it dispatches on. camelCase is what this build calls, so these aliases
+    guard against a future build preferring the other spelling."""
+    for camel, snake in (
+        ("getDeviceConfigUiValues", "get_device_config_ui_values"),
+        ("validateDeviceConfigUi", "validate_device_config_ui"),
+        ("closedDeviceConfigUi", "closed_device_config_ui"),
+    ):
+        assert hasattr(plugin_cls, camel), f"missing {camel}"
+        assert hasattr(plugin_cls, snake), f"missing snake_case alias {snake}"
+
+
+def test_config_ui_values_are_returned_as_an_indigo_dict(plugin_cls, mock_indigo_base, mock_logger):
+    """Regression, found live on jarvis (#186): returning a plain dict fails
+    inside Indigo's C++ bridge —
+
+        Error in plugin execution UiGetValues2: No registered converter was able
+        to extract a C++ reference to type CXmlDict from this Python object of
+        type dict
+
+    — and seeds NOTHING, so a section gated on hidden marker fields never
+    appears and the only clue names an internal symbol, not this method."""
+    import indigo
+    mock_indigo_base.devices = {5: _fp300_dev()}
+    stub = _settings_stub(plugin_cls, mock_logger)
+    result = plugin_cls.getDeviceConfigUiValues(
+        stub, {"nodeId": "56", "endpointId": "1"}, "matterMotionSensor", 5)
+    assert isinstance(result, tuple) and len(result) == 2
+    for part in result:
+        assert isinstance(part, indigo.Dict)
+
+
+def test_the_snake_case_alias_seeds_the_same_values(plugin_cls, mock_indigo_base, mock_logger):
+    mock_indigo_base.devices = {5: _fp300_dev()}
+    stub = _settings_stub(plugin_cls, mock_logger)
+    stub.getDeviceConfigUiValues = (
+        lambda props, type_id, dev_id: plugin_cls.getDeviceConfigUiValues(
+            stub, props, type_id, dev_id))
+    values, _errors = plugin_cls.get_device_config_ui_values(
+        stub, {"nodeId": "56", "endpointId": "1"}, "matterMotionSensor", 5)
+    assert values["hasHoldTime"] == "yes"
+    assert values["holdTime"] == "10"
+
+
+# ---------------------------------------------------------------------------
+# Registry ↔ Devices.xml parity (issue #186)
+#
+# Indigo builds ConfigUI from static XML per device type with no runtime field
+# injection, so the registry and the XML are kept in step BY HAND. Nothing
+# checked that until now — which is how a renamed picker method shipped, and
+# what settings.py's "the registry can never promise a field the XML does not
+# have" was asserting without enforcing.
+# ---------------------------------------------------------------------------
+
+def _device_config_fields(device_type_id):
+    """{field id: <Field> element} for one <Device>'s ConfigUI."""
+    root = ET.parse(SERVER_PLUGIN / "Devices.xml").getroot()
+    for device in root.findall("Device"):
+        if device.get("id") != device_type_id:
+            continue
+        config = device.find("ConfigUI")
+        return {f.get("id"): f for f in (config.findall("Field") if config is not None else [])}
+    raise AssertionError(f"no <Device id={device_type_id!r}> in Devices.xml")
+
+
+def _device_state_ids(device_type_id):
+    root = ET.parse(SERVER_PLUGIN / "Devices.xml").getroot()
+    for device in root.findall("Device"):
+        if device.get("id") != device_type_id:
+            continue
+        states = device.find("States")
+        return {s.get("id") for s in (states.findall("State") if states is not None else [])}
+    raise AssertionError(f"no <Device id={device_type_id!r}> in Devices.xml")
+
+
+def _declared_settings():
+    from matter_handlers.settings import SETTINGS
+    return SETTINGS
+
+
+def test_every_declared_setting_has_its_configui_field(plugin_cls):
+    from device_settings import _marker_field
+    for setting in _declared_settings():
+        for type_id in sorted(setting.device_types):
+            fields = _device_config_fields(type_id)
+            assert setting.key in fields, \
+                f"{type_id} declares setting {setting.key!r} with no <Field id={setting.key!r}>"
+            marker = _marker_field(setting)
+            assert marker in fields, \
+                f"{type_id}: setting {setting.key!r} needs its hidden marker <Field id={marker!r}>"
+            assert fields[setting.key].get("visibleBindingId") == marker, \
+                f"{type_id}: {setting.key!r} must be gated on {marker!r}"
+
+
+def test_every_declared_setting_has_its_state(plugin_cls):
+    """The dialog seeds current values from device STATE, so a setting with no
+    state can never show what the device holds."""
+    for setting in _declared_settings():
+        for type_id in sorted(setting.device_types):
+            assert setting.key in _device_state_ids(type_id), \
+                f"{type_id} declares setting {setting.key!r} but no <State id={setting.key!r}>"
+
+
+def test_numeric_settings_have_a_range_field_and_choices_have_a_picker(plugin_cls):
+    for setting in _declared_settings():
+        for type_id in sorted(setting.device_types):
+            fields = _device_config_fields(type_id)
+            if setting.is_choice:
+                field = fields[setting.key]
+                assert field.get("type") == "menu", f"{setting.key} should be a menu"
+                lst = field.find("List")
+                assert lst is not None and lst.get("filter") == setting.key, \
+                    f"{setting.key}'s <List> must carry filter={setting.key!r}"
+            else:
+                assert f"{setting.key}Range" in fields, \
+                    f"{type_id}: numeric setting {setting.key!r} needs a {setting.key}Range field"
+
+
+def test_no_orphan_setting_fields_in_the_xml(plugin_cls):
+    """The other direction: an XML field with no declaration behind it renders
+    as a control that does nothing."""
+    from device_settings import _marker_field
+    declared = {}
+    for setting in _declared_settings():
+        for type_id in setting.device_types:
+            declared.setdefault(type_id, set()).update(
+                {setting.key, _marker_field(setting)})
+            if not setting.is_choice:
+                declared[type_id].add(f"{setting.key}Range")
+    for type_id, keys in declared.items():
+        fields = set(_device_config_fields(type_id))
+        settings_fields = {f for f in fields
+                           if f.startswith("has") or f in keys or f.endswith("Range")}
+        orphans = settings_fields - keys - {"hasAnySetting"}
+        assert not orphans, f"{type_id} has settings fields with no declaration: {orphans}"

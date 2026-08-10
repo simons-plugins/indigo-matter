@@ -39,6 +39,7 @@ from matter_handlers.boolean_state_config import (
     ATTR_SUPPORTED_SENSITIVITY_LEVELS,
     CLUSTER_BOOLEAN_STATE_CONFIG,
 )
+from matter_handlers.settings import ATTR_ATTRIBUTE_LIST, SETTINGS
 from matter_handlers.electrical import (
     ATTR_ACTIVE_ENDPOINTS,
     ATTR_AVAILABLE_ENDPOINTS,
@@ -192,12 +193,29 @@ class DeviceSync:
         # on ep1) or must stay confined to its own endpoint (a bridge with
         # more than one battery-bearing child).
         self._power_source_eps: dict[int, set[int]] = {}
-        # BooleanStateConfiguration's SupportedSensitivityLevels (0x0080/0x0001)
-        # per (node_id, endpoint_id) — issue #85. NodeInfo snapshots are
-        # transient (this class holds no other node-attribute cache), so the
-        # Set Sensitivity Level menu callback (plugin.py) needs this value
-        # captured somewhere durable; refreshed on every create/reconcile pass.
-        self._sensitivity_supported: dict[tuple[int, int], int] = {}
+        # The raw LIMITS attribute behind every setting that declares
+        # FromAttribute bounds (most take theirs from the spec and cache nothing
+        # here — matter_handlers.settings.SETTINGS), keyed
+        # (node_id, endpoint_id, cluster, attribute) — issues #85 and #186.
+        # NodeInfo snapshots are transient (this class holds no other
+        # node-attribute cache), so the ConfigUI layer in plugin.py needs these
+        # captured somewhere durable; updated on every create/reconcile pass.
+        # Entries are never EVICTED — see issue #191.
+        #
+        # Cached rather than read live ON PURPOSE, and the distinction matters:
+        # get_node is a CACHE and is the wrong source for a reading that drifts,
+        # but a limits attribute is firmware-fixed structure (HoldTimeLimits,
+        # SupportedSensitivityLevels), which is exactly what a snapshot is good
+        # for. It also keeps the Edit Device dialog from blocking the Indigo UI
+        # thread on a multi-second read to a sleepy device just to draw itself.
+        self._setting_limits: dict[tuple[int, int, int, int], Any] = {}
+        # Each settings-bearing cluster's AttributeList (0xFFFB) per
+        # (node_id, endpoint_id, cluster) — the device's own statement of which
+        # attributes it implements, and THE capability check for whether a
+        # setting may be offered (issue #186). Needed because most settings take
+        # their bounds from the spec rather than from a device attribute, so
+        # "are the limits readable?" cannot stand in for "does it have this?".
+        self._attribute_lists: dict[tuple[int, int, int], Any] = {}
         # Every node id matter-server has told us about this session, whether or
         # not it produced any Indigo device. `_index` cannot serve this purpose:
         # it is keyed by endpoints that HAVE an Indigo device (however the entry
@@ -474,7 +492,7 @@ class DeviceSync:
                     self._power_source_eps[int(node.node_id)] = power_source_eps
                 else:
                     self._power_source_eps.pop(int(node.node_id), None)
-            self._cache_sensitivity_levels(node)
+            self._cache_setting_limits(node)
             # Pass 1: cache every endpoint's handler-produced specs BEFORE any
             # fallback/placeholder decision. Meter-link resolution (issue #79)
             # needs to know which endpoints will host a _METER_CAPABLE_TYPES
@@ -1140,32 +1158,78 @@ class DeviceSync:
             self.apply_states(dev_id, kv)
 
     # ------------------------------------------------------------------
-    # BooleanStateConfiguration sensitivity-level cache (issue #85)
+    # Writable-setting limits cache (issues #85, #186)
     # ------------------------------------------------------------------
 
-    def _cache_sensitivity_levels(self, node: NodeInfo) -> None:
-        """Cache SupportedSensitivityLevels (0x0080/0x0001) per endpoint.
+    def _cache_setting_limits(self, node: NodeInfo) -> None:
+        """Cache what the ConfigUI layer needs to offer settings on this node.
 
-        Read by :meth:`sensitivity_levels_supported`, which the Set
-        Sensitivity Level menu callback (plugin.py) uses to label the picker.
-        Scans the full node snapshot rather than going through a handler,
-        since the value is deliberately NOT an Indigo state (it's a count, not
-        a reading) — there is nothing else to dispatch it to.
+        Two things, both scanned straight off the node snapshot rather than
+        through a handler, because neither is an Indigo state — a limit and a
+        capability are not readings, so there is nothing to dispatch them to:
+
+        * the **limits attribute** behind any setting that declares one, stored
+          RAW because each setting declares its own parser (a struct for
+          HoldTimeLimits, a count for SupportedSensitivityLevels) and parsing
+          at read time keeps the code that knows a limit's SHAPE next to the
+          code that declares it;
+        * each settings-bearing cluster's **AttributeList**, which is the
+          device's own statement of what it implements.
         """
+        wanted = set()
+        for setting in SETTINGS:
+            attribute = getattr(setting.bounds, "attribute", None)
+            if attribute is not None:
+                wanted.add((setting.cluster, int(attribute)))
+        clusters = {s.cluster for s in SETTINGS}
         with self._lock:
             for (ep, cluster, attribute), value in node.attributes.items():
-                if cluster != CLUSTER_BOOLEAN_STATE_CONFIG or attribute != ATTR_SUPPORTED_SENSITIVITY_LEVELS:
-                    continue
-                try:
-                    self._sensitivity_supported[(int(node.node_id), int(ep))] = int(value)
-                except (TypeError, ValueError):
-                    continue
+                if (cluster, attribute) in wanted:
+                    self._setting_limits[
+                        (int(node.node_id), int(ep), int(cluster), int(attribute))] = value
+                elif attribute == ATTR_ATTRIBUTE_LIST and cluster in clusters:
+                    self._attribute_lists[
+                        (int(node.node_id), int(ep), int(cluster))] = value
+
+    def setting_limits(self, node_id: Any, endpoint_id: Any, cluster: Any,
+                       attribute: Any) -> Any:
+        """Raw limits value for a setting on (node, endpoint), or None if
+        unknown — not yet reconciled, or this node does not implement it.
+
+        None is load-bearing for a setting with FromAttribute bounds: the
+        ConfigUI layer treats "no limits" as "do not offer", which is what stops
+        a pre-1.4 occupancy sensor with no HoldTime being shown a field it would
+        fail to honour. A setting whose bounds come from the spec never consults
+        this at all — its capability check is :meth:`attribute_list`.
+        """
+        with self._lock:
+            return self._setting_limits.get(
+                (int(node_id), int(endpoint_id), int(cluster), int(attribute)))
+
+    def attribute_list(self, node_id: Any, endpoint_id: Any, cluster: Any) -> Any:
+        """The cluster's AttributeList on (node, endpoint), or None if unknown.
+
+        None means "not captured", NOT "implements nothing" — callers must not
+        read it as proof a device lacks an attribute (see settings.implements).
+        """
+        with self._lock:
+            return self._attribute_lists.get(
+                (int(node_id), int(endpoint_id), int(cluster)))
 
     def sensitivity_levels_supported(self, node_id: Any, endpoint_id: Any) -> Optional[int]:
-        """SupportedSensitivityLevels for (node, endpoint), or None if unknown
-        (not yet reconciled, or the node doesn't expose the cluster)."""
-        with self._lock:
-            return self._sensitivity_supported.get((int(node_id), int(endpoint_id)))
+        """SupportedSensitivityLevels for (node, endpoint), or None if unknown.
+
+        Kept as a named accessor because the Set Sensitivity Level action's
+        picker (issue #85) reads a COUNT, not a range.
+        """
+        raw = self.setting_limits(node_id, endpoint_id, CLUSTER_BOOLEAN_STATE_CONFIG,
+                                  ATTR_SUPPORTED_SENSITIVITY_LEVELS)
+        if raw is None:
+            return None
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return None
 
     # ------------------------------------------------------------------
     # Capability-prop helpers (issue #45 — self-heal mid-interview creations)
