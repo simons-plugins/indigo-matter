@@ -46,6 +46,12 @@ LSOF_CANDIDATES = ("/usr/sbin/lsof", "/usr/bin/lsof", "lsof")
 # an ADVISORY signal (see LaunchAgent.port_conflict_report): the err log is append-only
 # across restarts, so a hit may be ancient history.
 EADDRINUSE_MARKER = "EADDRINUSE"
+# How long a freshly started server is allowed to have no listener before "nothing is
+# listening on our port" counts as a fault. matter-server was observed taking ~9s to
+# reach its bind on jarvis; 120s is generous enough that a slow or loaded Mac never
+# trips it, and short enough to still catch a genuinely headless server on the next
+# plugin reload.
+STARTUP_GRACE_SECONDS = 120
 # matter-server 1.2.2's package.json declares engines node >= 22.13.0. npm's engines
 # check is advisory by default (exits 0 on an older node), so install() gates on this
 # itself — otherwise a too-old node "successfully" installs an unrunnable server.
@@ -1180,6 +1186,37 @@ class LaunchAgent:
                 self.spec.package, self.spec.package,
             )
 
+    def _process_age_seconds(self, pid: int) -> Optional[int]:
+        """Seconds since ``pid`` started, or None if ``ps`` could not tell us.
+
+        Used to separate "still starting up" from "genuinely headless" without
+        consulting the append-only error log. ``ps -o etime=`` prints
+        ``[[DD-]HH:]MM:SS``; anything we cannot parse returns None, and callers must
+        treat None as "do not accuse" rather than as age zero.
+        """
+        try:
+            result = self._run(["ps", "-o", "etime=", "-p", str(pid)],
+                               capture_output=True, text=True, check=False)
+        except OSError:
+            return None
+        if result is None or result.returncode != 0:
+            return None
+        raw = (result.stdout or "").strip()
+        days = 0
+        try:
+            if "-" in raw:
+                day_part, _, raw = raw.partition("-")
+                days = int(day_part)
+            parts = [int(chunk) for chunk in raw.split(":")]
+            if len(parts) == 2:                 # MM:SS — normalise to HH:MM:SS
+                parts.insert(0, 0)
+            hours, minutes, seconds = parts     # ValueError on any other arity
+        except ValueError:
+            # Covers an empty/blank line, a non-numeric field, and a shape we don't
+            # know — all of which mean the same thing to the caller: don't know.
+            return None
+        return days * 86400 + hours * 3600 + minutes * 60 + seconds
+
     def _err_log_mentions_port_conflict(self) -> bool:
         """True if the agent's error log tail mentions an EADDRINUSE fatal.
 
@@ -1205,16 +1242,20 @@ class LaunchAgent:
 
         Signals, in order of trust:
 
-        * **Authoritative** — the port is held by a pid that is not ours, or is held by
-          nobody at all. Either way what our WS client reaches is not our server.
+        * **Authoritative** — the port is held by a pid that is not ours. Whatever our
+          WS client reaches is then definitively not the server we manage.
+        * **Age-gated** — nothing is listening at all, and our process is older than
+          :data:`STARTUP_GRACE_SECONDS`. The age test is what separates this from a
+          server that simply has not bound yet.
         * **Advisory** — the port probe is unusable but our error log mentions
           ``EADDRINUSE``. Advisory-only by the same discipline #93 applied to the ABI
           stamp: the err log is append-only across restarts, so a hit may be from a
           conflict resolved weeks ago. Report it, never act on it.
 
-        Call this for an **established** job only. A server that started seconds ago has
-        not necessarily bound yet (~9s to the bind on jarvis), and this would read that
-        startup window as "nothing listening".
+        The error log is deliberately NOT what gates the "nothing listening" case. Being
+        append-only, one old ``EADDRINUSE`` would corroborate that accusation on every
+        subsequent startup for ever — the log can establish that a conflict happened
+        once, never that one is happening now.
 
         Returns a message for the caller to log, or None when nothing is wrong.
         """
@@ -1234,7 +1275,7 @@ class LaunchAgent:
             procs = self._ps_map()
             others = ", ".join(f"pid {pid} ({procs.get(pid, 'unknown command')})"
                                for pid in holders)
-            return (
+            message = (
                 f"port {self.spec.port} is held by {others}, NOT by the "
                 f"{self.spec.package} this plugin manages (pid {managed_pid}). The "
                 f"plugin is therefore talking to a different server than the one it "
@@ -1242,15 +1283,12 @@ class LaunchAgent:
                 f"configured. Stop the other process (or its LaunchAgent) and reload "
                 f"the plugin."
             )
-        # Past here `holders` is None ("the probe could not tell us") or [] ("nobody is
-        # listening"). Both are ALSO what entirely benign states look like — a Mac
-        # without a usable lsof, and a server still inside its ~9s startup window before
-        # it binds — so neither may accuse anyone on its own. Require the err log to
-        # corroborate: a freshly started server has logged no EADDRINUSE, which is what
-        # stops a quick double reload from crying wolf.
-        if not self._err_log_mentions_port_conflict():
-            return None
-        if holders is None:
+        elif holders is None:
+            # The probe could not tell us anything, so the err log is all we have —
+            # and being append-only it may describe a conflict resolved weeks ago.
+            # Hence advisory wording and a hand-check recipe rather than a verdict.
+            if not self._err_log_mentions_port_conflict():
+                return None
             message = (
                 f"{self.spec.package} (pid {managed_pid}) is running, but its error "
                 f"log mentions {EADDRINUSE_MARKER} and this Mac cannot tell us who "
@@ -1261,12 +1299,21 @@ class LaunchAgent:
                 f"(advisory — the log line may be from an old conflict)."
             )
         else:
+            # Nothing is listening. That is either genuinely headless or simply a
+            # server still inside its startup window, and the two are told apart by
+            # PROCESS AGE — deliberately not by the err log. The log is append-only,
+            # so a single old EADDRINUSE would accuse every future startup for ever
+            # (caught in review of #183). Age uses no historical data at all.
+            age = self._process_age_seconds(managed_pid)
+            if age is None or age < STARTUP_GRACE_SECONDS:
+                return None                     # too young, or we cannot tell → quiet
             message = (
-                f"{self.spec.package} (pid {managed_pid}) is running but NOTHING is "
-                f"listening on port {self.spec.port}, so the plugin cannot reach it. "
-                f"This is what a lost port race leaves behind: {self.spec.package} "
-                f"logs a fatal '{EADDRINUSE_MARKER}' and keeps running without its "
-                f"WebSocket server. Restart it from Plugins ▸ Matter, and see "
+                f"{self.spec.package} (pid {managed_pid}) has been running for {age}s "
+                f"but NOTHING is listening on port {self.spec.port}, so the plugin "
+                f"cannot reach it. This is what a lost port race leaves behind: "
+                f"{self.spec.package} logs a fatal '{EADDRINUSE_MARKER}' and keeps "
+                f"running without its WebSocket server. Restart it from "
+                f"Plugins ▸ Matter, and see "
                 f"{os.path.join(self.log_dir, self.spec.err_log)}."
             )
         return message

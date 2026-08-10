@@ -724,8 +724,12 @@ class ProcRunner(FakeRunner):
 
     def __init__(self, ps_lines=None, print_pid=None, ignore_term=False,
                  omit_pid_line=False, garbled_pid=False, listen_pids=None,
-                 job_arguments=None, returncode=0):
+                 job_arguments=None, returncode=0, proc_etime="10:00"):
         super().__init__(returncode)
+        # What `ps -o etime=` reports for any pid. Defaults to 10 minutes — safely past
+        # STARTUP_GRACE_SECONDS, so tests that don't care about age behave as "settled".
+        # None models a ps that cannot tell us.
+        self.proc_etime = proc_etime
         self.ps_lines = list(ps_lines or [])
         self.print_pid = print_pid
         self.ignore_term = ignore_term
@@ -745,6 +749,12 @@ class ProcRunner(FakeRunner):
     def __call__(self, cmd, **kwargs):
         self.calls.append(cmd)
         if cmd and cmd[0] == "ps":
+            if "etime=" in cmd:
+                # `ps -o etime= -p N` — process age, for the #183 startup-grace gate.
+                # None models "ps could not tell us" (rc 1, no such process).
+                if self.proc_etime is None:
+                    return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="")
+                return subprocess.CompletedProcess(cmd, 0, stdout=f"  {self.proc_etime}\n", stderr="")
             return subprocess.CompletedProcess(cmd, 0, stdout="\n".join(self.ps_lines) + "\n", stderr="")
         # Basename, not equality: the port probe resolves lsof by absolute path
         # (/usr/sbin/lsof) and only falls back to the bare name (#182).

@@ -525,19 +525,59 @@ def test_foreign_port_holder_is_reported_authoritatively(tmp_path, mock_logger):
     assert not agent._err_log_mentions_port_conflict()
 
 
-def test_headless_job_is_reported_only_with_err_log_corroboration(tmp_path, mock_logger):
-    # Nothing listening + our job alive is ALSO what a server mid-startup looks like,
-    # so the err log has to confirm it before we accuse anyone.
-    agent = _portful(tmp_path, mock_logger, ProcRunner(listen_pids=[]))
-    assert agent.port_conflict_report(managed_pid=5423) is None      # startup window
-
+def _write_stale_eaddrinuse(agent):
+    """An EADDRINUSE line in the append-only err log, e.g. from weeks ago."""
     os.makedirs(agent.log_dir, exist_ok=True)
     with open(os.path.join(agent.log_dir, agent.spec.err_log), "w",
               encoding="utf-8") as handle:
         handle.write("FATAL WebServer Webserver error on 127.0.0.1:5580 "
                      "listen EADDRINUSE: address already in use\n")
+
+
+def test_headless_job_is_reported_once_past_the_startup_grace(tmp_path, mock_logger):
+    # Settled process (10:00 by default) + nothing listening = genuinely headless.
+    agent = _portful(tmp_path, mock_logger, ProcRunner(listen_pids=[]))
     report = agent.port_conflict_report(managed_pid=5423)
     assert report is not None and "NOTHING is listening" in report
+
+
+def test_young_process_with_no_listener_is_not_accused(tmp_path, mock_logger):
+    # A server that started 5s ago simply has not bound yet (~9s on jarvis).
+    agent = _portful(tmp_path, mock_logger, ProcRunner(listen_pids=[], proc_etime="00:05"))
+    assert agent.port_conflict_report(managed_pid=5423) is None
+
+
+def test_a_stale_eaddrinuse_never_accuses_a_freshly_started_server(tmp_path, mock_logger):
+    """Review of #183: the err log is append-only, so one old EADDRINUSE would
+    corroborate 'nothing is listening' on every future startup for ever. Age, not the
+    log, is what gates that branch — so an ancient marker plus a young process is quiet.
+    """
+    agent = _portful(tmp_path, mock_logger, ProcRunner(listen_pids=[], proc_etime="00:03"))
+    _write_stale_eaddrinuse(agent)
+    assert agent._err_log_mentions_port_conflict()          # the stale marker IS there…
+    assert agent.port_conflict_report(managed_pid=5423) is None   # …and is ignored here
+
+
+def test_unknown_process_age_is_never_accused(tmp_path, mock_logger):
+    # ps could not tell us. Fail closed: "cannot determine" must not become "guilty".
+    agent = _portful(tmp_path, mock_logger, ProcRunner(listen_pids=[], proc_etime=None))
+    _write_stale_eaddrinuse(agent)
+    assert agent.port_conflict_report(managed_pid=5423) is None
+
+
+@pytest.mark.parametrize("etime,expected", [
+    ("00:05", 5), ("10:00", 600), ("01:02:03", 3723), ("01-06:30:50", 109850),
+])
+def test_process_age_parses_every_ps_etime_format(tmp_path, mock_logger, etime, expected):
+    agent = _portful(tmp_path, mock_logger, ProcRunner(proc_etime=etime))
+    assert agent._process_age_seconds(5423) == expected
+
+
+@pytest.mark.parametrize("etime", ["", "not-a-time", "1:2:3:4", "xx-01:02:03"])
+def test_unparseable_process_age_is_none_not_zero(tmp_path, mock_logger, etime):
+    # Zero would read as "just started" and silence a real fault; None is "don't know".
+    agent = _portful(tmp_path, mock_logger, ProcRunner(proc_etime=etime))
+    assert agent._process_age_seconds(5423) is None
 
 
 def test_unusable_probe_reports_advisory_only_with_err_log_corroboration(tmp_path,
