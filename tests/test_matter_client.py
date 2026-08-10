@@ -540,3 +540,57 @@ def test_rearm_failure_diagnostic_allows_refire(mock_logger):
     client.rearm_failure_diagnostic()
     client._maybe_report_repeated_failure(3)
     assert calls == [4]               # re-armed → fires again
+
+
+# ---------------------------------------------------------------------------
+# read_attribute — the live single-attribute read (issue #186)
+#
+# CMD_READ_ATTR was defined in protocol.py from the first build with no caller;
+# these pin the arg shape and the result unwrap that were live-verified against
+# matter-server 1.2.2 while surveying the FP300.
+# ---------------------------------------------------------------------------
+
+def test_read_sends_node_id_and_attribute_path(mock_logger):
+    async def scenario():
+        seen = {}
+
+        def read_result(frame):
+            seen["args"] = frame["args"]
+            return {"1/1030/3": 10}   # matter-server keys the result by the path
+
+        fake = FakeWebSocket(responder=scripted_responder(
+            {protocol.CMD_READ_ATTR: read_result}))
+        client = _client(mock_logger, fake)
+        task = asyncio.create_task(client.run())
+        await client.wait_connected(timeout=2)
+
+        value = await client.read(56, 1, 0x0406, 0x0003)
+        assert seen["args"]["node_id"] == 56
+        assert seen["args"]["attribute_path"] == "1/1030/3"
+        assert value == 10          # unwrapped from the path-keyed dict
+
+        await client.close()
+        task.cancel()
+    run(scenario())
+
+
+def test_read_unwraps_the_path_keyed_result():
+    # matter-server answers a single-attribute read with {path: value}, not the
+    # bare value — live-verified against 1.2.2.
+    assert MatterClient._unwrap_attribute({"0/53/7": [1, 2]}, "0/53/7") == [1, 2]
+
+
+def test_read_unwraps_a_lone_path_key_that_is_formatted_differently():
+    assert MatterClient._unwrap_attribute({"0/0x35/7": 4}, "0/53/7") == 4
+
+
+def test_read_does_not_unwrap_an_attribute_whose_VALUE_is_a_struct():
+    # HoldTimeLimits reads as {"min": 1, "max": 300, "default": 10}. A loose
+    # "one key, take the value" unwrap would mangle a single-key variant of it.
+    limits = {"min": 1}
+    assert MatterClient._unwrap_attribute(limits, "1/1030/4") == limits
+
+
+def test_read_passes_a_bare_value_straight_through():
+    # Insurance: a server that starts answering with the value keeps working.
+    assert MatterClient._unwrap_attribute(10, "1/1030/3") == 10

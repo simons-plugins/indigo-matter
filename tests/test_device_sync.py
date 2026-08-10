@@ -36,7 +36,10 @@ _SUPPORTS_TO_STATE = {
 # indigo_dev.states) needs this modelled; matterLock's lockState needs no
 # guard (door_lock.py writes it unconditionally) so it needs no seeding here.
 _STATIC_DEVICE_TYPE_STATES = {
-    "matterMotionSensor": {"sensitivityLevel"},
+    # Mirrors the <States> each type declares in Devices.xml — real Indigo
+    # creates a device with every declared state present, and the handlers'
+    # "is this state on this device?" guards depend on that being true.
+    "matterMotionSensor": {"sensitivityLevel", "holdTime"},
     "matterContactSensor": {"sensitivityLevel"},
 }
 
@@ -2550,3 +2553,85 @@ def test_node_scoped_handler_keyerror_still_bad_update_warning(ds, indigo_env, m
     assert any("bad update" in m for m in warn_msgs)
     debug_msgs = [c[0][0] for c in mock_logger.debug.call_args_list]
     assert not any("vanished" in m for m in debug_msgs)
+
+
+# ===========================================================================
+# issue #186 — the generalised writable-setting limits cache
+# ===========================================================================
+
+#: The FP300 as it actually reports (issue #186 research, node 56): a Matter 1.4
+#: unit, so HoldTime (1030/3) + HoldTimeLimits (1030/4) and NOT the deprecated
+#: 0x0010/0x0011 PIR delays, which this firmware does not implement at all.
+FP300_SETTINGS_NODE = {
+    "node_id": 0x38,
+    "available": True,
+    "attributes": {
+        "0/40/1": "Aqara",
+        "0/40/3": "FP300",
+        "1/29/0": [{"0": 263}],
+        "1/1030/0": 0,
+        "1/1030/3": 10,
+        "1/1030/4": {"min": 1, "max": 300, "default": 10},
+        "1/128/0": 1,
+        "1/128/1": 3,
+    },
+}
+
+
+def test_setting_limits_caches_hold_time_limits(ds, indigo_env):
+    ds.create_from_raw(FP300_SETTINGS_NODE, "Landing Presence")
+    assert ds.setting_limits(0x38, 1, 0x0406, 0x0004) == {"min": 1, "max": 300, "default": 10}
+
+
+def test_setting_limits_caches_the_sensitivity_count_too(ds, indigo_env):
+    ds.create_from_raw(FP300_SETTINGS_NODE, "Landing Presence")
+    assert ds.setting_limits(0x38, 1, 0x0080, 0x0001) == 3
+
+
+def test_setting_limits_stores_the_RAW_value_not_a_parsed_one(ds, indigo_env):
+    """Each setting declares its own parser (a struct here, a count there), so
+    the cache must not presume a shape."""
+    ds.create_from_raw(FP300_SETTINGS_NODE, "Landing Presence")
+    assert isinstance(ds.setting_limits(0x38, 1, 0x0406, 0x0004), dict)
+
+
+def test_setting_limits_is_none_for_an_attribute_the_node_lacks(ds, indigo_env):
+    ds.create_from_raw(OCCUPANCY_SENSITIVITY_NODE, "Landing Presence")
+    # This fixture is a pre-1.4-shaped node: sensitivity but no HoldTimeLimits.
+    assert ds.setting_limits(0x2D, 1, 0x0406, 0x0004) is None
+
+
+def test_setting_limits_is_none_before_any_reconcile(ds, indigo_env):
+    assert ds.setting_limits(0x38, 1, 0x0406, 0x0004) is None
+
+
+def test_setting_limits_refreshed_on_reconcile(ds, indigo_env):
+    """A firmware update can widen a range; the cache must not outlive it."""
+    ds.create_from_raw(FP300_SETTINGS_NODE, "Landing Presence")
+    import copy
+    changed = copy.deepcopy(FP300_SETTINGS_NODE)
+    changed["attributes"]["1/1030/4"] = {"min": 1, "max": 600, "default": 10}
+    ds.reconcile_all([changed])
+    assert ds.setting_limits(0x38, 1, 0x0406, 0x0004)["max"] == 600
+
+
+def test_sensitivity_levels_supported_still_works_off_the_general_cache(ds, indigo_env):
+    """Issue #85's accessor is now a view over the #186 cache — it must not have
+    changed behaviour for the action picker that depends on it."""
+    ds.create_from_raw(FP300_SETTINGS_NODE, "Landing Presence")
+    assert ds.sensitivity_levels_supported(0x38, 1) == 3
+
+
+def test_sensitivity_levels_supported_survives_an_unparseable_count(ds, indigo_env):
+    import copy
+    changed = copy.deepcopy(FP300_SETTINGS_NODE)
+    changed["attributes"]["1/128/1"] = "three"
+    ds.create_from_raw(changed, "Landing Presence")
+    assert ds.sensitivity_levels_supported(0x38, 1) is None
+
+
+def test_hold_time_is_primed_onto_the_device_at_creation(ds, indigo_env):
+    _indigo, devices = indigo_env
+    ds.create_from_raw(FP300_SETTINGS_NODE, "Landing Presence")
+    dev = devices[ds.lookup(0x38, 1)]
+    assert dev.states.get("holdTime") == 10

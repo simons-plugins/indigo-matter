@@ -34,6 +34,15 @@ from ws_json_client import (  # pylint: disable=unused-import
 # other RPC keeps the short default so a wedged matter-server still fails fast.
 COMMISSION_TIMEOUT = 300.0
 
+# A live attribute read/write against a SLEEPY device is seconds, not
+# milliseconds: a Thread SED only hears us when it next polls its parent, and a
+# sibling IKEA sleepy device on the same mesh was measured polling at ~9.5s
+# intervals (issue #186 research). The 5s COMMAND_TIMEOUT the control path uses
+# is therefore too short to be evidence of anything — it would report a healthy
+# device as failed. Used by the settings read/verify path, which is the only
+# caller that must distinguish "the device said no" from "the device is asleep".
+ATTRIBUTE_TIMEOUT = 30.0
+
 
 class MatterClient(WsJsonClient):
     """A reconnecting matter-server WebSocket client."""
@@ -139,6 +148,57 @@ class MatterClient(WsJsonClient):
 
     async def write(self, write: MatterWrite, timeout: float = 5.0) -> Any:
         return await self._request_frame(self.proto.build_write(write), timeout)
+
+    async def read(self, node_id: int, endpoint: int, cluster: int, attribute: int,
+                   timeout: float = ATTRIBUTE_TIMEOUT) -> Any:
+        """Read ONE attribute live from the device.
+
+        The counterpart to :meth:`write`, and the thing ``get_node`` is not:
+        ``get_node`` returns matter-server's **cache**, which for an unsubscribed
+        attribute can be hours stale (proven live in the issue #186 session — a
+        sleepy device's cached entry named a parent router that no longer
+        existed, while this call returned the current value). Anything a decision
+        depends on — above all a write's read-back verification — has to come
+        through here.
+
+        ``CMD_READ_ATTR`` has been defined in :mod:`protocol` since the first
+        build with no caller; the arg shape below is live-verified against
+        matter-server 1.2.2.
+        """
+        path = self.proto.attr_key(endpoint, cluster, attribute)
+        result = await self.request(
+            protocol.CMD_READ_ATTR,
+            {protocol.ARG_NODE_ID: node_id, "attribute_path": path},
+            timeout=timeout,
+        )
+        return self._unwrap_attribute(result, path)
+
+    @staticmethod
+    def _unwrap_attribute(result: Any, path: str) -> Any:
+        """Pull the value out of read_attribute's path-keyed result.
+
+        matter-server answers a single-attribute read with a DICT keyed by the
+        requested path (``{"0/53/7": …}``), not the bare value — live-verified
+        against 1.2.2.
+
+        The unwrap is deliberately narrow rather than "if it's a dict of one,
+        take the value", because plenty of attributes ARE dicts: OccupancySensing's
+        HoldTimeLimits reads as ``{"min": 1, "max": 300, "default": 10}``, and a
+        loose unwrap would hand back ``1`` for a one-key variant of that. So: the
+        exact path wins; failing that, a lone key that looks like an attribute
+        path (matter-server has formatted these differently across versions)
+        wins; anything else is returned untouched, on the grounds that a server
+        which starts replying with the bare value should keep working here.
+        """
+        if not isinstance(result, dict):
+            return result
+        if path in result:
+            return result[path]
+        if len(result) == 1:
+            (only_key, only_value), = result.items()
+            if isinstance(only_key, str) and only_key.count("/") == 2:
+                return only_value
+        return result
 
     # convenience wrappers
     async def get_nodes(self) -> Any:
