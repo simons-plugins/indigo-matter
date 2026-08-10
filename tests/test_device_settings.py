@@ -35,6 +35,9 @@ from device_settings import (
 )
 from matter_handlers.settings import (
     ATTR_CURRENT_SENSITIVITY,
+    EnumValues,
+    StaticRange,
+    implements,
     ATTR_HOLD_TIME,
     ATTR_HOLD_TIME_LIMITS,
     ATTR_SUPPORTED_SENSITIVITY_LEVELS,
@@ -438,3 +441,125 @@ def test_sensitivity_writes_go_to_the_boolean_state_config_cluster():
 
 def test_apply_setting_is_exported_for_the_plugin_layer():
     assert hasattr(device_settings, "apply_setting")
+
+
+# ---------------------------------------------------------------------------
+# Bounds strategies — issue #186 follow-up
+#
+# Enumerating the Matter model showed the FP300's "bounds from a device
+# attribute" pattern is the RARE one: 2 of 57 writable attributes on the
+# clusters this plugin handles. Most take a spec-fixed range or an enum.
+# ---------------------------------------------------------------------------
+
+RELAY = "matterRelay"
+
+#: OnOff AttributeList as reported by the two dev-fabric plugs that implement
+#: the Lighting feature — 16385/16386/16387 present.
+ONOFF_WITH_LIGHTING = [0, 16384, 16385, 16386, 16387, 65528, 65529, 65531, 65532, 65533]
+#: …and by the two that do not. Only OnOff itself.
+ONOFF_WITHOUT_LIGHTING = [0, 65528, 65529, 65531, 65532, 65533]
+
+
+def _attr_lists(table):
+    return lambda cluster: table.get(cluster)
+
+
+def test_from_attribute_resolves_through_the_declared_parser():
+    setting = _setting("holdTime")
+    assert setting.resolve_bounds(_limits()) == Bounds(1, 300)
+
+
+def test_from_attribute_is_unresolved_when_the_device_has_no_limits():
+    assert _setting("holdTime").resolve_bounds(lambda c, a: None) is None
+
+
+def test_static_range_needs_no_device_read():
+    bounds = StaticRange(0, 65534).resolve(0x0006, lambda c, a: None)
+    assert bounds == Bounds(0, 65534)
+
+
+def test_enum_values_bound_the_range_and_restrict_membership():
+    bounds = EnumValues(((0, "Off"), (1, "On"), (2, "Toggle"))).resolve(6, lambda c, a: None)
+    assert (bounds.minimum, bounds.maximum) == (0, 2)
+    assert bounds.contains(1) and not bounds.contains(3)
+
+
+def test_a_non_contiguous_enum_rejects_the_gap():
+    """Range alone would accept 1; the device would not."""
+    bounds = EnumValues(((0, "Off"), (2, "Toggle"))).resolve(6, lambda c, a: None)
+    assert bounds.contains(0) and bounds.contains(2)
+    assert not bounds.contains(1)
+
+
+def test_enum_values_carry_their_own_labels():
+    setting = next(s for s in settings_for_type(RELAY) if s.key == "startUpOnOff")
+    bounds = setting.resolve_bounds(lambda c, a: None)
+    rows = setting.option_rows(bounds)
+    assert [v for v, _ in rows] == ["0", "1", "2"]
+    assert rows[0][1] == "Off"
+
+
+# ---------------------------------------------------------------------------
+# The AttributeList capability gate
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("attribute_list,attribute,expected", [
+    (ONOFF_WITH_LIGHTING, 16387, True),
+    (ONOFF_WITHOUT_LIGHTING, 16387, False),
+    (ONOFF_WITH_LIGHTING, 0, True),
+    (None, 16387, None),        # unknown, NOT absent
+    ([], 16387, None),          # empty list is no evidence either
+    ("nonsense", 16387, None),
+])
+def test_implements_reads_the_devices_own_attribute_list(attribute_list, attribute, expected):
+    assert implements(attribute_list, attribute) is expected
+
+
+def test_a_plug_with_the_lighting_feature_is_offered_the_onoff_settings():
+    offered = offered_settings(RELAY, lambda c, a: None,
+                               _attr_lists({0x0006: ONOFF_WITH_LIGHTING}))
+    assert sorted(o.setting.key for o in offered) == ["onTime", "startUpOnOff"]
+
+
+def test_a_plug_without_the_lighting_feature_is_offered_nothing():
+    """Two of the four dev-fabric plugs are in this state — the gate is not
+    guarding a theoretical case."""
+    assert offered_settings(RELAY, lambda c, a: None,
+                            _attr_lists({0x0006: ONOFF_WITHOUT_LIGHTING})) == []
+
+
+def test_an_unknown_attribute_list_does_not_hide_a_setting():
+    """Unknown is not absent: before the list is captured, a setting still
+    stands or falls on its bounds, which is the pre-existing behaviour."""
+    offered = offered_settings(RELAY, lambda c, a: None, _attr_lists({}))
+    assert sorted(o.setting.key for o in offered) == ["onTime", "startUpOnOff"]
+
+
+def test_the_attribute_list_can_veto_a_setting_whose_bounds_resolve():
+    """StaticRange always resolves, so without the AttributeList gate every
+    relay would be offered these — which is exactly the bug the gate prevents."""
+    with_gate = offered_settings(RELAY, lambda c, a: None,
+                                 _attr_lists({0x0006: ONOFF_WITHOUT_LIGHTING}))
+    without_gate = offered_settings(RELAY, lambda c, a: None)
+    assert with_gate == [] and len(without_gate) == 2
+
+
+def test_the_fp300_gate_still_passes_on_its_real_attribute_lists():
+    lists = {0x0406: [0, 1, 2, 3, 4, 65531], 0x0080: [0, 1, 2, 65531]}
+    offered = offered_settings(MOTION, _limits(), _attr_lists(lists))
+    assert sorted(o.setting.key for o in offered) == ["holdTime", "sensitivityLevel"]
+
+
+def test_a_pre_1_4_occupancy_sensor_is_vetoed_by_its_attribute_list():
+    """No HoldTime in the list — refused before the limits are even consulted."""
+    lists = {0x0406: [0, 1, 2, 65531], 0x0080: [0, 1, 2, 65531]}
+    offered = offered_settings(MOTION, _limits(), _attr_lists(lists))
+    assert [o.setting.key for o in offered] == ["sensitivityLevel"]
+
+
+def test_relay_settings_validate_against_their_declared_bounds():
+    lists = _attr_lists({0x0006: ONOFF_WITH_LIGHTING})
+    assert validate_settings(RELAY, {"startUpOnOff": "2", "onTime": "600"},
+                             lambda c, a: None, lists) == {}
+    errors = validate_settings(RELAY, {"startUpOnOff": "9"}, lambda c, a: None, lists)
+    assert "startUpOnOff" in errors

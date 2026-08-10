@@ -11,6 +11,7 @@ from typing import Any, Optional
 
 from .base import ENDPOINT_OWNER_CLUSTERS, ClusterHandler, IndigoDeviceSpec, MatterCommand
 from .electrical import CLUSTER_ELECTRICAL_ENERGY, CLUSTER_ELECTRICAL_POWER
+from .settings import ATTR_ON_TIME, ATTR_START_UP_ON_OFF
 
 CLUSTER_LEVEL_CONTROL = 0x0008
 CLUSTER_COLOR_CONTROL = 0x0300
@@ -64,13 +65,39 @@ class OnOffHandler(ClusterHandler):
             )
         ]
 
+    #: Attribute id → Indigo state, for the writable Lighting-feature settings
+    #: (issue #186). Subscribed so the Edit Device dialog can show the current
+    #: value without a live read, and so a change made from another ecosystem
+    #: still reaches Indigo. Conformance LT: a device implementing none of these
+    #: simply never reports them, and the AttributeList gate keeps the fields
+    #: hidden — subscribing to an attribute a device lacks is harmless.
+    SETTING_STATES = {
+        ATTR_START_UP_ON_OFF: "startUpOnOff",
+        ATTR_ON_TIME: "onTime",
+    }
+
     def attributes_to_subscribe(self) -> list[int]:
-        return [self.ATTR_ON_OFF]
+        return [self.ATTR_ON_OFF, *self.SETTING_STATES]
 
     def on_attribute_update(self, indigo_dev: Any, attribute_id: int, value: Any) -> dict:
         if attribute_id == self.ATTR_ON_OFF:
             return {"onOffState": bool(value)}
-        return {}
+        state_key = self.SETTING_STATES.get(attribute_id)
+        if state_key is None or value is None:
+            return {}
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            # StartUpOnOff is nullable ("restore previous state") and a null
+            # arrives as something unparseable. There is no integer that means
+            # it, so the state is left alone rather than given a value the
+            # device does not hold.
+            return {}
+        # Guard: relays fielded before #186 have no such state until Indigo
+        # rebuilds their state list (deviceStartComm) — same reason as holdTime.
+        if state_key not in getattr(indigo_dev, "states", {}):
+            return {}
+        return {state_key: number}
 
     def handle_indigo_action(self, indigo_dev: Any, action: Any) -> Optional[MatterCommand]:
         import indigo  # provided by the Indigo runtime (and the test mock)

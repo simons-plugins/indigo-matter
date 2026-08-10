@@ -1,0 +1,283 @@
+#!/usr/bin/env python3
+"""Enumerate every writable Matter attribute from matter.js's data model.
+
+Answers "what settings COULD this plugin offer, and what would each declaration
+cost?" — the input to batching the work behind issue #186, rather than guessing
+a roadmap from cluster names.
+
+**Why the model rather than the spec PDF.** `@matter/model` carries the Matter
+data model as generated JS, one file per cluster, and each attribute records
+everything a :class:`DeviceSetting` declaration needs:
+
+    Attribute({
+      name: "HoldTime", id: 3, type: "uint16",
+      access: "RW VM",
+      conformance: "O",
+      constraint: "holdTimeLimits.holdTimeMin to holdTimeLimits.holdTimeMax",
+      quality: "N"
+    })
+
+The `constraint` names its own bounds source, so a setting's cluster, attribute,
+type, writability AND where its limits come from are all derivable. The two
+constraint grammars this script classifies as ``limits-struct`` and ``count``
+are exactly the two bounds parsers `matter_handlers/settings.py` implements by
+hand for the FP300 — which is the evidence that generating the rest is viable.
+
+**Where the model lives.** It is a dependency of matter-server / the bridge
+node, not something this repo vendors. On jarvis:
+
+    ~/indigo-matter/node_modules/@matter/model/dist/esm/standard/elements
+
+Copy that directory locally (or point --elements at a mount) and run:
+
+    python3 tools/enumerate_settings.py --elements <dir> --out settings-coverage.md
+
+This reads only; it writes one report and touches nothing else.
+
+**What it deliberately does NOT do.** It does not decide what is a *setting*.
+Plenty of writable attributes are controls the plugin already drives (a level, a
+setpoint), and privilege does not separate them: `HoldTime` is `RW VM` while
+`CurrentSensitivityLevel` is `RW VO`, and both are settings. So the report ranks
+and annotates; a human still picks. It also cannot tell you whether a device
+implements an attribute — only the device can, which is what the limits-presence
+check at runtime is for.
+"""
+from __future__ import annotations
+
+import argparse
+import re
+import sys
+from collections import defaultdict
+from pathlib import Path
+
+# Clusters this plugin has an inbound handler for, parsed from the handler
+# sources rather than imported: importing them drags in `protocol` and the
+# handler registry, and this script must run without the plugin's environment.
+HANDLER_DIR = (Path(__file__).parent.parent / "indigo-matter.indigoPlugin"
+               / "Contents" / "Server Plugin" / "matter_handlers")
+
+#: Attribute props we care about, as they appear in the generated JS.
+_PROP = re.compile(
+    r'(name|id|type|access|conformance|constraint|quality|default)\s*:\s*'
+    r'("(?:[^"\\]|\\.)*"|0x[0-9a-fA-F]+|\d+|true|false)')
+
+
+def _unquote(raw: str):
+    if raw.startswith('"'):
+        return raw[1:-1].replace('\\"', '"').replace("\\xA7", "§")
+    if raw in ("true", "false"):
+        return raw == "true"
+    try:
+        return int(raw, 0)
+    except ValueError:
+        return raw
+
+
+def _balanced_object(text: str, start: int) -> tuple[str, int]:
+    """Return the ``{...}`` beginning at *start*, respecting strings."""
+    depth = 0
+    in_string = False
+    escape = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1], i + 1
+    return "", len(text)
+
+
+def _props(obj: str) -> dict:
+    return {k: _unquote(v) for k, v in _PROP.findall(obj)}
+
+
+def parse_cluster(path: Path) -> tuple[dict, list[dict]]:
+    """Return ``(cluster_props, [attribute_props, …])`` for one element file."""
+    text = path.read_text(encoding="utf-8")
+    cluster: dict = {}
+    marker = "Cluster(" if "Cluster(" in text else None
+    if marker:
+        idx = text.index(marker) + len(marker)
+        brace = text.find("{", idx)
+        if brace != -1:
+            obj, _ = _balanced_object(text, brace)
+            cluster = _props(obj)
+
+    attributes = []
+    for match in re.finditer(r"Attribute\(", text):
+        brace = text.find("{", match.end())
+        if brace == -1 or brace > match.end() + 4:
+            continue  # `Attribute(` not immediately followed by its object
+        obj, _ = _balanced_object(text, brace)
+        props = _props(obj)
+        if props.get("name"):
+            attributes.append(props)
+    return cluster, attributes
+
+
+# --- constraint grammars -----------------------------------------------------
+# Each maps to a bounds strategy a DeviceSetting would declare. The first two
+# are already implemented for the FP300 (settings.parse_limits_struct /
+# parse_level_count); the rest are what the next batch would need.
+
+_C_STRUCT = re.compile(r"^(\w+)\.(\w+) to (\w+)\.(\w+)$")
+_C_COUNT = re.compile(r"^max (\w+) - 1$")
+_C_ATTRS = re.compile(r"^(\w+) to (\w+)$")
+_C_STATIC = re.compile(r"^(?:(\d+) to (\d+)|max (\d+)|min (\d+))$")
+
+
+def classify_constraint(constraint) -> tuple[str, str]:
+    """(strategy, note) for a constraint expression."""
+    if not constraint or not isinstance(constraint, str):
+        return "none", "no declared bounds — needs a spec/type range or no validation"
+    c = constraint.strip()
+    m = _C_STRUCT.match(c)
+    if m:
+        return "limits-struct", f"bounds from {m.group(1)} (struct fields {m.group(2)}/{m.group(4)})"
+    m = _C_COUNT.match(c)
+    if m:
+        return "count", f"bounds from {m.group(1)} (a count: 0..n-1)"
+    m = _C_STATIC.match(c)
+    if m:
+        return "static", f"fixed range in the spec: {c}"
+    m = _C_ATTRS.match(c)
+    if m:
+        return "two-attrs", f"bounds from attributes {m.group(1)} and {m.group(2)}"
+    if c in ("desc", "all"):
+        return "none", "spec says 'desc' — the device defines it; no machine-readable bounds"
+    return "other", f"unparsed constraint: {c}"
+
+
+def handled_clusters() -> dict:
+    """``{cluster_id: handler_file}`` for clusters with an inbound handler."""
+    found = {}
+    if not HANDLER_DIR.is_dir():
+        return found
+    for path in sorted(HANDLER_DIR.glob("*.py")):
+        source = path.read_text(encoding="utf-8")
+        for match in re.finditer(r"^\s*cluster_id\s*=\s*(0x[0-9a-fA-F]+|\d+)",
+                                 source, re.M):
+            value = int(match.group(1), 0)
+            if value:
+                found.setdefault(value, path.name)
+        # Non-primary handlers and the settings registry name clusters as
+        # module constants rather than a cluster_id class attribute.
+        for match in re.finditer(r"^CLUSTER_\w+\s*=\s*(0x[0-9a-fA-F]+)", source, re.M):
+            found.setdefault(int(match.group(1), 0), path.name)
+    return found
+
+
+def declared_settings() -> set:
+    """``{(cluster, attribute)}`` already declared in settings.py."""
+    path = HANDLER_DIR / "settings.py"
+    if not path.is_file():
+        return set()
+    source = path.read_text(encoding="utf-8")
+    pairs = set()
+    for block in re.finditer(r"DeviceSetting\((.*?)\n    \)", source, re.S):
+        body = block.group(1)
+        cluster = re.search(r"cluster=(\w+)", body)
+        attribute = re.search(r"attribute=(\w+)", body)
+        if cluster and attribute:
+            pairs.add((cluster.group(1), attribute.group(1)))
+    return pairs
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--elements", required=True, type=Path,
+                    help="@matter/model .../standard/elements directory")
+    ap.add_argument("--out", type=Path, help="write the markdown report here")
+    ap.add_argument("--all-clusters", action="store_true",
+                    help="include clusters this plugin has no handler for")
+    args = ap.parse_args()
+
+    if not args.elements.is_dir():
+        print(f"not a directory: {args.elements}", file=sys.stderr)
+        return 2
+
+    handled = handled_clusters()
+    declared = declared_settings()
+    rows = defaultdict(list)
+    totals = defaultdict(int)
+    cluster_count = 0
+
+    for path in sorted(args.elements.glob("*.element.js")):
+        cluster, attributes = parse_cluster(path)
+        name, cluster_id = cluster.get("name"), cluster.get("id")
+        if not name or not isinstance(cluster_id, int):
+            continue
+        cluster_count += 1
+        is_handled = cluster_id in handled
+        if not is_handled and not args.all_clusters:
+            continue
+        for attr in attributes:
+            access = attr.get("access") or ""
+            if "RW" not in access:
+                continue
+            strategy, note = classify_constraint(attr.get("constraint"))
+            totals[strategy] += 1
+            totals["writable"] += 1
+            rows[(name, cluster_id, is_handled)].append({
+                "name": attr.get("name"), "id": attr.get("id"),
+                "type": attr.get("type"), "access": access,
+                "conformance": attr.get("conformance") or "",
+                "strategy": strategy, "note": note,
+            })
+
+    lines = ["# Writable Matter attributes — candidate device settings", "",
+             f"Generated by `tools/enumerate_settings.py` from {cluster_count} clusters "
+             f"in `@matter/model`.", "",
+             "`strategy` is how a `DeviceSetting` would get its bounds. "
+             "**limits-struct** and **count** are already implemented "
+             "(`parse_limits_struct` / `parse_level_count`), so those cost a "
+             "declaration and nothing else.", "",
+             "Writable ≠ setting: many of these are controls the plugin already "
+             "drives. Privilege does not separate them — `HoldTime` is `RW VM` and "
+             "`CurrentSensitivityLevel` is `RW VO`, and both are settings.", ""]
+
+    lines.append("## Summary\n")
+    lines.append(f"- **{totals['writable']} writable attributes** on the clusters shown")
+    for strategy in ("limits-struct", "count", "static", "two-attrs", "none", "other"):
+        if totals[strategy]:
+            ready = " ← parser already exists" if strategy in ("limits-struct", "count") else ""
+            lines.append(f"- `{strategy}`: {totals[strategy]}{ready}")
+    lines.append("")
+
+    for (name, cluster_id, is_handled), attrs in sorted(rows.items()):
+        flag = "" if is_handled else "  _(no inbound handler yet)_"
+        lines.append(f"## {name} (0x{cluster_id:04X}){flag}\n")
+        lines.append("| Attribute | Id | Type | Access | Conf | Bounds strategy | Notes |")
+        lines.append("|---|---|---|---|---|---|---|")
+        for a in sorted(attrs, key=lambda x: x["id"] if isinstance(x["id"], int) else 0):
+            done = " ✅ declared" if any(a["name"].lower() in d[1].lower()
+                                        for d in declared) else ""
+            lines.append(
+                f"| {a['name']}{done} | {a['id']} | {a['type']} | {a['access']} | "
+                f"{a['conformance']} | {a['strategy']} | {a['note']} |")
+        lines.append("")
+
+    report = "\n".join(lines)
+    if args.out:
+        args.out.write_text(report, encoding="utf-8")
+        print(f"wrote {args.out} ({totals['writable']} writable attributes)")
+    else:
+        print(report)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

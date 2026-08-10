@@ -29,15 +29,17 @@ Three rules are enforced here rather than left to call sites, because all three
 come from live evidence rather than caution-in-principle (see the issue #186
 research doc):
 
-* **Bounds come from the device, never from a constant.** Every setting names
-  the attribute its limits are read from (``HoldTimeLimits``,
-  ``SupportedSensitivityLevels``) and how to parse it. A setting whose limits
-  are unknown is not offered at all rather than offered and guessed at.
-* **A setting the device does not implement is not offered.** The presence of
-  the limits attribute IS the capability check: the Matter spec makes
-  ``HoldTimeLimits`` mandatory where ``HoldTime`` is supported, so a pre-1.4
-  unit with neither simply has no hold-time field. This is why the check is not
-  a firmware-version test.
+* **Bounds are never a guess.** Every setting declares WHERE its permitted
+  values come from — :class:`FromAttribute` (the device reports its own limits),
+  :class:`StaticRange` (the spec fixes them) or :class:`EnumValues`. Bounds that
+  cannot be resolved mean the setting is not offered at all.
+* **A setting the device does not implement is not offered.** The capability
+  check is the device's own **AttributeList** (0xFFFB), not a firmware-version
+  test and not the presence of a limits attribute — that stood in for it while
+  both shipped settings happened to have one, but most settings take their
+  bounds from the spec, so "are the limits readable?" cannot answer "does this
+  unit have the attribute?". Of four plugs on the dev fabric, two implement
+  OnOff's Lighting attributes and two do not; the list is what tells them apart.
 * **Every write is verified by reading back.** Aqara firmware can ACK a write
   and silently ignore it, so an unverified write is reported as a FAILURE. That
   logic lives in :func:`verify_write` and has exactly one implementation.
@@ -53,9 +55,12 @@ from typing import Any, Callable, Optional
 
 __all__ = [
     "Bounds", "DeviceSetting", "SETTINGS",
+    "FromAttribute", "StaticRange", "EnumValues",
     "parse_limits_struct", "parse_level_count",
-    "settings_for_type", "coerce_value", "verify_write",
+    "settings_for_type", "coerce_value", "verify_write", "implements",
     "CLUSTER_OCCUPANCY_SENSING", "ATTR_HOLD_TIME", "ATTR_HOLD_TIME_LIMITS",
+    "CLUSTER_ON_OFF", "ATTR_START_UP_ON_OFF", "ATTR_ON_TIME",
+    "ATTR_ATTRIBUTE_LIST",
 ]
 
 # OccupancySensing (0x0406) — HoldTime and its limits. Matter 1.4 (cluster
@@ -72,21 +77,115 @@ CLUSTER_BOOLEAN_STATE_CONFIG = 0x0080
 ATTR_CURRENT_SENSITIVITY = 0x0000
 ATTR_SUPPORTED_SENSITIVITY_LEVELS = 0x0001
 
+# OnOff (0x0006). These three are conformance LT — the Lighting feature — so a
+# plug may implement all, some or none of them; the AttributeList gate decides.
+CLUSTER_ON_OFF = 0x0006
+ATTR_ON_TIME = 0x4001
+ATTR_OFF_WAIT_TIME = 0x4002
+ATTR_START_UP_ON_OFF = 0x4003
+
+#: AttributeList (0xFFFB) — the device's own list of the attribute ids it
+#: implements on a cluster. THE capability check: it is what the device says it
+#: has, rather than what the spec says it might, and unlike a limits attribute
+#: it exists on every cluster so it works for settings whose bounds are fixed by
+#: the spec rather than reported per unit.
+ATTR_ATTRIBUTE_LIST = 0xFFFB
+
 
 @dataclass(frozen=True)
 class Bounds:
-    """The inclusive range a setting's value may take, per the device itself."""
+    """The values a setting may take.
+
+    A contiguous range by default. ``allowed`` additionally restricts it to a
+    specific set, for an enum whose values are not contiguous — validating such
+    an attribute on range alone would accept a gap the device will reject.
+    """
 
     minimum: int
     maximum: int
+    allowed: Optional[frozenset] = None
 
     def contains(self, value: int) -> bool:
-        """Whether *value* is within the device's own permitted range."""
+        """Whether *value* is one the device will accept."""
+        if self.allowed is not None:
+            return value in self.allowed
         return self.minimum <= value <= self.maximum
 
     def describe(self) -> str:
         """The range as UI text, e.g. ``1-300``."""
         return f"{self.minimum}-{self.maximum}"
+
+
+# ---------------------------------------------------------------------------
+# Where a setting's bounds come from
+#
+# Enumerating the Matter data model (tools/enumerate_settings.py) showed the
+# FP300's pattern is the RARE one: of 57 writable attributes on the clusters
+# this plugin handles, exactly 2 take their bounds from another attribute on the
+# device — and both are already shipped. Most are a range fixed by the spec, an
+# enum, or unbounded. So bounds are a declared STRATEGY rather than always a
+# device read, and the capability question ("does this unit implement the
+# attribute at all?") is answered separately, by the device's own AttributeList.
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class FromAttribute:
+    """Bounds read from another attribute on the device (HoldTimeLimits…).
+
+    The authoritative case: the device states its own limits, so nothing is
+    assumed. Unresolvable limits mean the setting is not offered.
+    """
+
+    attribute: int
+    parse: Callable[[Any], Optional[Bounds]]
+
+    def resolve(self, cluster: int, limits: Callable) -> Optional[Bounds]:
+        """Read and parse the device's limits attribute."""
+        raw = limits(cluster, self.attribute)
+        return None if raw is None else self.parse(raw)
+
+
+@dataclass(frozen=True)
+class StaticRange:
+    """A range fixed by the Matter spec (e.g. WindowCovering Mode, max 15).
+
+    No device read: the spec constrains every conformant implementation, so
+    there is no per-unit limits attribute to consult. Weaker evidence than
+    :class:`FromAttribute` — a non-conformant device could still reject a value
+    in range — which is why the write is verified by read-back regardless.
+    """
+
+    minimum: int
+    maximum: int
+
+    # pylint: disable=unused-argument
+    def resolve(self, cluster: int, limits: Callable) -> Optional[Bounds]:
+        """The spec's range — same for every conformant device, so no read."""
+        return Bounds(self.minimum, self.maximum)
+
+
+@dataclass(frozen=True)
+class EnumValues:
+    """A spec-defined enum — fixed values with fixed meanings.
+
+    Carries its own labels, unlike :attr:`DeviceSetting.options`, which builds
+    them from something the device reports (sensitivity's level count).
+    """
+
+    values: tuple
+
+    # pylint: disable=unused-argument
+    def resolve(self, cluster: int, limits: Callable) -> Optional[Bounds]:
+        """The enum's values — fixed by the spec, so no read."""
+        numbers = [int(value) for value, _label in self.values]
+        if not numbers:
+            return None
+        return Bounds(min(numbers), max(numbers), frozenset(numbers))
+
+    # pylint: disable=unused-argument
+    def options(self, bounds: Bounds) -> list:
+        """Picker rows. The labels are the enum's own, not derived."""
+        return [(str(value), label) for value, label in self.values]
 
 
 def parse_limits_struct(value: Any) -> Optional[Bounds]:
@@ -196,24 +295,37 @@ class DeviceSetting:
     label: str
     cluster: int
     attribute: int
-    #: The read-only attribute the bounds come from, and how to read it. Its
-    #: presence on the node is also the capability check — see the module
-    #: docstring.
-    limits_attribute: int
-    parse_limits: Callable[[Any], Optional[Bounds]]
+    #: Where the permitted values come from: FromAttribute (the device states
+    #: its own limits), StaticRange (the spec fixes them), or EnumValues.
+    #: NOT the capability check — that is the device's AttributeList, so a
+    #: setting with spec-fixed bounds is still only offered to a unit that
+    #: actually implements the attribute.
+    bounds: Any
     #: Indigo device types whose Devices.xml declares this setting's field. A
     #: setting is only ever offered on a type listed here, so the registry can
     #: never promise a field the XML does not have.
     device_types: frozenset
     unit: str = ""
-    #: Builds picker rows, for settings rendered as a menu. None means a plain
-    #: numeric text field validated against the bounds.
+    #: Builds picker rows from the resolved bounds, for a menu whose LABELS
+    #: depend on what the device reported (sensitivity's level count). An
+    #: EnumValues bounds carries its own labels and needs nothing here.
     options: Optional[Callable[[Bounds], list[tuple[str, str]]]] = None
+
+    def resolve_bounds(self, limits: Callable) -> Optional[Bounds]:
+        """The permitted values for this setting on one device, or None."""
+        return self.bounds.resolve(self.cluster, limits)
+
+    def option_rows(self, bounds: Bounds) -> Optional[list]:
+        """Picker rows, or None when this renders as a numeric field."""
+        if self.options is not None:
+            return self.options(bounds)
+        builder = getattr(self.bounds, "options", None)
+        return builder(bounds) if builder is not None else None
 
     @property
     def is_choice(self) -> bool:
         """True when this renders as a picker rather than a numeric field."""
-        return self.options is not None
+        return self.options is not None or hasattr(self.bounds, "options")
 
     def describe_range(self, bounds: Bounds) -> str:
         """Human range hint, e.g. ``1-300 seconds``."""
@@ -228,8 +340,7 @@ SETTINGS: tuple = (
         label="Presence Hold Time",
         cluster=CLUSTER_OCCUPANCY_SENSING,
         attribute=ATTR_HOLD_TIME,
-        limits_attribute=ATTR_HOLD_TIME_LIMITS,
-        parse_limits=parse_limits_struct,
+        bounds=FromAttribute(ATTR_HOLD_TIME_LIMITS, parse_limits_struct),
         # OccupancySensing only — there is no hold time on a contact sensor.
         device_types=frozenset({"matterMotionSensor"}),
         unit=" seconds",
@@ -239,12 +350,40 @@ SETTINGS: tuple = (
         label="Sensitivity",
         cluster=CLUSTER_BOOLEAN_STATE_CONFIG,
         attribute=ATTR_CURRENT_SENSITIVITY,
-        limits_attribute=ATTR_SUPPORTED_SENSITIVITY_LEVELS,
-        parse_limits=parse_level_count,
+        bounds=FromAttribute(ATTR_SUPPORTED_SENSITIVITY_LEVELS, parse_level_count),
         # The Matter spec pairs 0x0080 with BooleanState (contact); the FP300
         # co-locates it with OccupancySensing (motion) instead — issue #85. Both.
         device_types=frozenset({"matterMotionSensor", "matterContactSensor"}),
         options=sensitivity_options,
+    ),
+    # --- OnOff's Lighting-feature settings (conformance LT) ------------------
+    # Present only on devices implementing the Lighting feature — which is NOT
+    # the same as "is a light". Of four plugs on the dev fabric two implement
+    # these and two do not, so the AttributeList gate is doing real work here
+    # rather than guarding a theoretical case.
+    DeviceSetting(
+        key="startUpOnOff",
+        label="After a power cut",
+        cluster=CLUSTER_ON_OFF,
+        attribute=ATTR_START_UP_ON_OFF,
+        # StartUpOnOffEnum: spec-fixed values, spec-fixed meanings. The spec
+        # also allows null ("restore the previous state"), which is deliberately
+        # NOT offered: null is a distinct wire value this write path has no way
+        # to express, and silently mapping it to something else would misreport
+        # what the device is set to.
+        bounds=EnumValues(((0, "Off"), (1, "On"), (2, "Toggle (opposite of before)"))),
+        device_types=frozenset({"matterRelay"}),
+    ),
+    DeviceSetting(
+        key="onTime",
+        label="Auto-off after (0 = never)",
+        cluster=CLUSTER_ON_OFF,
+        attribute=ATTR_ON_TIME,
+        # uint16 with no spec constraint; the OnWithTimedOff command's own
+        # OnTime field caps at 65534, so that is the honest ceiling.
+        bounds=StaticRange(0, 65534),
+        device_types=frozenset({"matterRelay"}),
+        unit=" tenths of a second",
     ),
 )
 
@@ -253,11 +392,33 @@ def settings_for_type(device_type_id: str) -> list:
     """Every setting declared for an Indigo device TYPE.
 
     Type-level, so it says what the XML has fields for — not what a particular
-    unit implements. Deciding that needs the device's limits (see
-    :meth:`DeviceSetting.parse_limits`) and is done by the plugin's ConfigUI
-    layer, which is the only place that can look a node up.
+    unit implements. That question is answered by the device's own
+    AttributeList, in the plugin's ConfigUI layer, which is the only place that
+    can look a node up.
     """
     return [s for s in SETTINGS if device_type_id in s.device_types]
+
+
+def implements(attribute_list: Any, attribute: int) -> Optional[bool]:
+    """Does a device implement *attribute*, per its own AttributeList?
+
+    Returns True/False when the list is readable, and **None when it is
+    unknown** — an unreconciled node, or a cluster whose AttributeList was not
+    captured. None is not False: callers treat "unknown" as "fall back to the
+    older evidence" rather than as proof of absence, because hiding a setting a
+    device really has is just as wrong as offering one it lacks.
+    """
+    if not isinstance(attribute_list, (list, tuple, set, frozenset)):
+        return None
+    ids = set()
+    for entry in attribute_list:
+        try:
+            ids.add(int(entry))
+        except (TypeError, ValueError):
+            continue
+    if not ids:
+        return None
+    return int(attribute) in ids
 
 
 def coerce_value(setting: DeviceSetting, raw: Any, bounds: Bounds) -> tuple[Optional[int], str]:

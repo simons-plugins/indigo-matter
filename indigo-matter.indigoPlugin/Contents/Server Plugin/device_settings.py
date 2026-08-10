@@ -28,6 +28,7 @@ from matter_handlers.settings import (
     Bounds,
     DeviceSetting,
     coerce_value,
+    implements,
     settings_for_type,
     verify_write,
 )
@@ -67,21 +68,33 @@ class PlannedWrite:
     previous: Optional[int]
 
 
-def offered_settings(device_type_id: str, limits: LimitsLookup) -> list[OfferedSetting]:
-    """Which of the type's declared settings THIS unit implements.
+def offered_settings(device_type_id: str, limits: LimitsLookup,
+                     attribute_list: Optional[Callable] = None) -> list[OfferedSetting]:
+    """Which of the type's declared settings THIS unit actually offers.
 
-    The gate is the limits attribute: a setting whose limits cannot be read and
-    parsed is not offered at all. That is the honest-degradation rule — a pre-1.4
-    occupancy sensor has neither HoldTime nor HoldTimeLimits, so it is shown no
-    hold-time field rather than one that would silently fail — and it doubles as
-    the guarantee that nothing is ever validated against a guessed range.
+    Two independent gates, and they answer different questions:
+
+    * **Does the device implement the attribute?** Its own AttributeList says
+      so. This is the honest capability check and it works for every setting,
+      including ones whose bounds are fixed by the spec rather than reported by
+      the device. Of four plugs on the dev fabric, two implement OnOff's
+      Lighting attributes and two do not — this is what tells them apart.
+    * **What values are permitted?** The setting's declared bounds strategy.
+      Unresolvable bounds still mean "do not offer", because validating against
+      a guessed range is the thing the whole design refuses to do.
+
+    An AttributeList that is missing or unreadable yields *unknown*, not *no* —
+    the setting then stands or falls on its bounds alone, which is exactly the
+    behaviour that shipped before the list was consulted. Hiding a setting a
+    device really has would be as wrong as offering one it lacks.
     """
     offered: list[OfferedSetting] = []
     for setting in settings_for_type(device_type_id):
-        raw = limits(setting.cluster, setting.limits_attribute)
-        if raw is None:
-            continue
-        bounds = setting.parse_limits(raw)
+        if attribute_list is not None:
+            known = implements(attribute_list(setting.cluster), setting.attribute)
+            if known is False:
+                continue
+        bounds = setting.resolve_bounds(limits)
         if bounds is None:
             continue
         offered.append(OfferedSetting(setting, bounds))
@@ -89,7 +102,8 @@ def offered_settings(device_type_id: str, limits: LimitsLookup) -> list[OfferedS
 
 
 def config_ui_values(device_type_id: str, states: dict, limits: LimitsLookup,
-                     values: Optional[dict] = None) -> dict:
+                     values: Optional[dict] = None,
+                     attribute_list: Optional[Callable] = None) -> dict:
     """Seed values for the dialog: markers, current values, range hints.
 
     Returns only the keys this module owns, for the caller to merge over the
@@ -98,7 +112,7 @@ def config_ui_values(device_type_id: str, states: dict, limits: LimitsLookup,
     than showing back whatever was typed last time.
     """
     out = dict(values or {})
-    offered = offered_settings(device_type_id, limits)
+    offered = offered_settings(device_type_id, limits, attribute_list)
     by_key = {o.setting.key: o for o in offered}
 
     for setting in settings_for_type(device_type_id):
@@ -129,8 +143,8 @@ def _marker_field(setting: DeviceSetting) -> str:
     return "has" + setting.key[0].upper() + setting.key[1:]
 
 
-def validate_settings(device_type_id: str, values: dict,
-                      limits: LimitsLookup) -> dict:
+def validate_settings(device_type_id: str, values: dict, limits: LimitsLookup,
+                      attribute_list: Optional[Callable] = None) -> dict:
     """Bounds-check every offered setting. Returns ``{field_id: message}``.
 
     Synchronous and cheap by design: it runs when the user clicks Save, on the
@@ -139,7 +153,7 @@ def validate_settings(device_type_id: str, values: dict,
     done here; see :func:`apply_setting`.
     """
     errors: dict = {}
-    for offer in offered_settings(device_type_id, limits):
+    for offer in offered_settings(device_type_id, limits, attribute_list):
         setting = offer.setting
         if setting.key not in values:
             continue
@@ -150,7 +164,8 @@ def validate_settings(device_type_id: str, values: dict,
 
 
 def planned_writes(device_type_id: str, values: dict, states: dict,
-                   limits: LimitsLookup) -> list[PlannedWrite]:
+                   limits: LimitsLookup,
+                   attribute_list: Optional[Callable] = None) -> list[PlannedWrite]:
     """The settings whose value the user actually CHANGED.
 
     Only changed settings are written. Re-sending an unchanged value on every
@@ -159,7 +174,7 @@ def planned_writes(device_type_id: str, values: dict, states: dict,
     dialog opened to read a value into a write.
     """
     planned: list[PlannedWrite] = []
-    for offer in offered_settings(device_type_id, limits):
+    for offer in offered_settings(device_type_id, limits, attribute_list):
         setting = offer.setting
         if setting.key not in values:
             continue

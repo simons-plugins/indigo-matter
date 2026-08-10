@@ -41,7 +41,7 @@ from http_api_mixin import HttpApiMixin
 from http_handlers import HttpApi
 from matter_client import MatterClient
 from matter_handlers.registry import HandlerRegistry
-from matter_handlers.settings import sensitivity_options, settings_for_type
+from matter_handlers.settings import settings_for_type
 from pairing_menu_mixin import PairingMenuMixin
 import protocol
 from protocol import MatterWrite, Protocol
@@ -835,7 +835,8 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, ServerMenuMixin,
         if not settings_for_type(typeId):
             return (True, valuesDict)  # most types declare none — nothing to look up
         setting_errors = device_settings.validate_settings(
-            typeId, valuesDict, self._setting_limits_lookup(valuesDict))
+            typeId, valuesDict, self._setting_limits_lookup(valuesDict),
+            self._setting_attribute_list_lookup(valuesDict))
         if setting_errors:
             errors = indigo.Dict()
             for field, message in setting_errors.items():
@@ -873,6 +874,29 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, ServerMenuMixin,
 
         return lookup
 
+    def _setting_attribute_list_lookup(self, props):
+        """A ``cluster -> AttributeList`` lookup for one device.
+
+        The capability half of offering a setting: the device's own statement
+        of which attributes it implements. Separate from the limits lookup
+        because most settings take their bounds from the spec, so "are the
+        limits readable?" cannot answer "does this unit have the attribute?".
+        """
+        node_id = props.get("nodeId")
+        endpoint_id = props.get("endpointId")
+        if not node_id or endpoint_id in (None, ""):
+            return lambda cluster: None
+
+        def lookup(cluster):
+            try:
+                return self.device_sync.attribute_list(int(node_id), int(endpoint_id), cluster)
+            except Exception as exc:  # noqa: BLE001 - unknown, never "absent"
+                self.logger.debug("attribute-list lookup failed for node %s/%s: %s",
+                                  node_id, endpoint_id, exc)
+                return None
+
+        return lookup
+
     def getDeviceConfigUiValues(self, pluginProps, typeId, devId):  # noqa: N802
         """Seed the Edit Device dialog with this device's CURRENT settings.
 
@@ -892,7 +916,8 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, ServerMenuMixin,
         states = self._device_states(devId)
         try:
             values.update(device_settings.config_ui_values(
-                typeId, states, self._setting_limits_lookup(values)))
+                typeId, states, self._setting_limits_lookup(values),
+                attribute_list=self._setting_attribute_list_lookup(values)))
         except Exception as exc:  # noqa: BLE001 - never block the dialog over the settings section
             self.logger.exception("could not build device settings for %s: %s", devId, exc)
         # MUST be indigo.Dict, not a plain dict — the same shape
@@ -924,16 +949,20 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, ServerMenuMixin,
     def closed_device_config_ui(self, valuesDict, userCancelled, typeId, devId):
         return self.closedDeviceConfigUi(valuesDict, userCancelled, typeId, devId)
 
-    def getSettingSensitivityLevels(self, filter="", valuesDict=None, typeId="", targetId=0):  # noqa: N802, A002, ARG002
-        """Picker rows for the Edit Device dialog's Sensitivity menu.
+    def getSettingOptions(self, filter="", valuesDict=None, typeId="", targetId=0):  # noqa: N802, A002
+        """Picker rows for ANY menu-rendered setting in the Edit Device dialog.
+
+        One callback for every such field: Indigo tells a list method which
+        field asked via the ``<List filter="…">`` attribute, so the filter
+        carries the setting key and this does not need a method per setting.
 
         Distinct from :meth:`getSensitivityLevels` (the issue #85 ACTION's
         picker) because the two degrade differently, and deliberately so. The
         action's list must always offer something — it is building an automation
         that may run long before the device is ever reachable. This one is
-        backed by the same bounds that gate the field's visibility, so if the
-        device's own limits are unknown the field is not shown at all and there
-        is nothing to guess about.
+        backed by the same bounds that gate the field's visibility, so when the
+        device's values are unknown the field is not shown at all and there is
+        nothing to guess about.
         """
         props = dict(valuesDict or {})
         try:
@@ -941,10 +970,16 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, ServerMenuMixin,
             props.setdefault("nodeId", dev.pluginProps.get("nodeId"))
             props.setdefault("endpointId", dev.pluginProps.get("endpointId"))
         except Exception as exc:  # noqa: BLE001 - fall back to whatever the dialog carries
-            self.logger.debug("getSettingSensitivityLevels: no device %r: %s", targetId, exc)
-        for offer in device_settings.offered_settings(typeId, self._setting_limits_lookup(props)):
-            if offer.setting.key == "sensitivityLevel":
-                return sensitivity_options(offer.bounds)
+            self.logger.debug("getSettingOptions: no device %r: %s", targetId, exc)
+        wanted = str(filter or "").strip()
+        for offer in device_settings.offered_settings(
+                typeId, self._setting_limits_lookup(props),
+                self._setting_attribute_list_lookup(props)):
+            if wanted and offer.setting.key != wanted:
+                continue
+            rows = offer.setting.option_rows(offer.bounds)
+            if rows is not None:
+                return rows
         return []
 
     def closedDeviceConfigUi(self, valuesDict, userCancelled, typeId, devId):  # noqa: N802
@@ -967,7 +1002,8 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, ServerMenuMixin,
         try:
             plans = device_settings.planned_writes(
                 typeId, valuesDict, self._device_states(devId),
-                self._setting_limits_lookup(valuesDict))
+                self._setting_limits_lookup(valuesDict),
+                self._setting_attribute_list_lookup(valuesDict))
         except Exception as exc:  # noqa: BLE001
             self.logger.exception("could not work out device setting changes: %s", exc)
             return

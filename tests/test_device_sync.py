@@ -41,6 +41,7 @@ _STATIC_DEVICE_TYPE_STATES = {
     # "is this state on this device?" guards depend on that being true.
     "matterMotionSensor": {"sensitivityLevel", "holdTime"},
     "matterContactSensor": {"sensitivityLevel"},
+    "matterRelay": {"startUpOnOff", "onTime"},
 }
 
 
@@ -2635,3 +2636,62 @@ def test_hold_time_is_primed_onto_the_device_at_creation(ds, indigo_env):
     ds.create_from_raw(FP300_SETTINGS_NODE, "Landing Presence")
     dev = devices[ds.lookup(0x38, 1)]
     assert dev.states.get("holdTime") == 10
+
+
+#: A plug implementing OnOff's Lighting feature — the shape two of the four
+#: dev-fabric plugs report (AttributeList carries 16385/16386/16387).
+LIGHTING_PLUG_NODE = {
+    "node_id": 0x33,
+    "available": True,
+    "attributes": {
+        "0/40/1": "Shelly",
+        "0/40/3": "1PM Mini Gen3",
+        "1/29/0": [{"0": 266}],
+        "1/6/0": True,
+        "1/6/16385": 0,
+        "1/6/16387": 1,
+        "1/6/65531": [0, 16384, 16385, 16386, 16387, 65528, 65529, 65531, 65532, 65533],
+    },
+}
+
+#: …and one that does not: OnOff and nothing else.
+PLAIN_PLUG_NODE = {
+    "node_id": 0x34,
+    "available": True,
+    "attributes": {
+        "0/40/1": "IKEA",
+        "0/40/3": "GRILLPLATS Plug",
+        "1/29/0": [{"0": 266}],
+        "1/6/0": True,
+        "1/6/65531": [0, 65528, 65529, 65530, 65531, 65532, 65533],
+    },
+}
+
+
+def test_attribute_list_is_cached_per_cluster(ds, indigo_env):
+    ds.create_from_raw(LIGHTING_PLUG_NODE, "Desk Light Switch")
+    assert 16387 in ds.attribute_list(0x33, 1, 0x0006)
+
+
+def test_attribute_list_is_none_for_an_uncached_cluster(ds, indigo_env):
+    ds.create_from_raw(LIGHTING_PLUG_NODE, "Desk Light Switch")
+    assert ds.attribute_list(0x33, 1, 0x0406) is None
+
+
+def test_attribute_list_is_none_before_reconcile(ds, indigo_env):
+    assert ds.attribute_list(0x33, 1, 0x0006) is None
+
+
+def test_a_plain_plug_reports_a_list_without_the_lighting_attributes(ds, indigo_env):
+    ds.create_from_raw(PLAIN_PLUG_NODE, "Grillplats socket")
+    listed = ds.attribute_list(0x34, 1, 0x0006)
+    assert listed is not None, "the list itself is known"
+    assert 16387 not in listed, "…and it says the device lacks StartUpOnOff"
+
+
+def test_lighting_settings_are_primed_onto_the_relay(ds, indigo_env):
+    _indigo, devices = indigo_env
+    ds.create_from_raw(LIGHTING_PLUG_NODE, "Desk Light Switch")
+    dev = devices[ds.lookup(0x33, 1)]
+    assert dev.states.get("startUpOnOff") == 1
+    assert dev.states.get("onTime") == 0

@@ -39,7 +39,7 @@ from matter_handlers.boolean_state_config import (
     ATTR_SUPPORTED_SENSITIVITY_LEVELS,
     CLUSTER_BOOLEAN_STATE_CONFIG,
 )
-from matter_handlers.settings import SETTINGS
+from matter_handlers.settings import ATTR_ATTRIBUTE_LIST, SETTINGS
 from matter_handlers.electrical import (
     ATTR_ACTIVE_ENDPOINTS,
     ATTR_AVAILABLE_ENDPOINTS,
@@ -207,6 +207,13 @@ class DeviceSync:
         # for. It also keeps the Edit Device dialog from blocking the Indigo UI
         # thread on a multi-second read to a sleepy device just to draw itself.
         self._setting_limits: dict[tuple[int, int, int, int], Any] = {}
+        # Each settings-bearing cluster's AttributeList (0xFFFB) per
+        # (node_id, endpoint_id, cluster) — the device's own statement of which
+        # attributes it implements, and THE capability check for whether a
+        # setting may be offered (issue #186). Needed because most settings take
+        # their bounds from the spec rather than from a device attribute, so
+        # "are the limits readable?" cannot stand in for "does it have this?".
+        self._attribute_lists: dict[tuple[int, int, int], Any] = {}
         # Every node id matter-server has told us about this session, whether or
         # not it produced any Indigo device. `_index` cannot serve this purpose:
         # it is keyed by endpoints that HAVE an Indigo device (however the entry
@@ -1153,24 +1160,34 @@ class DeviceSync:
     # ------------------------------------------------------------------
 
     def _cache_setting_limits(self, node: NodeInfo) -> None:
-        """Cache the limits attribute behind every declared writable setting.
+        """Cache what the ConfigUI layer needs to offer settings on this node.
 
-        Scans the full node snapshot rather than going through a handler,
-        because these values are deliberately NOT Indigo states — a limit is a
-        capability, not a reading, so there is nothing to dispatch them to.
+        Two things, both scanned straight off the node snapshot rather than
+        through a handler, because neither is an Indigo state — a limit and a
+        capability are not readings, so there is nothing to dispatch them to:
 
-        Raw values are stored, not parsed ones: each setting declares its own
-        parser (a struct for HoldTimeLimits, a count for
-        SupportedSensitivityLevels), and doing the parse at read time keeps the
-        one place that knows a limit's SHAPE next to the one that declares it.
+        * the **limits attribute** behind any setting that declares one, stored
+          RAW because each setting declares its own parser (a struct for
+          HoldTimeLimits, a count for SupportedSensitivityLevels) and parsing
+          at read time keeps the code that knows a limit's SHAPE next to the
+          code that declares it;
+        * each settings-bearing cluster's **AttributeList**, which is the
+          device's own statement of what it implements.
         """
-        wanted = {(s.cluster, s.limits_attribute) for s in SETTINGS}
+        wanted = set()
+        for setting in SETTINGS:
+            attribute = getattr(setting.bounds, "attribute", None)
+            if attribute is not None:
+                wanted.add((setting.cluster, int(attribute)))
+        clusters = {s.cluster for s in SETTINGS}
         with self._lock:
             for (ep, cluster, attribute), value in node.attributes.items():
-                if (cluster, attribute) not in wanted:
-                    continue
-                self._setting_limits[
-                    (int(node.node_id), int(ep), int(cluster), int(attribute))] = value
+                if (cluster, attribute) in wanted:
+                    self._setting_limits[
+                        (int(node.node_id), int(ep), int(cluster), int(attribute))] = value
+                elif attribute == ATTR_ATTRIBUTE_LIST and cluster in clusters:
+                    self._attribute_lists[
+                        (int(node.node_id), int(ep), int(cluster))] = value
 
     def setting_limits(self, node_id: Any, endpoint_id: Any, cluster: Any,
                        attribute: Any) -> Any:
@@ -1184,6 +1201,16 @@ class DeviceSync:
         with self._lock:
             return self._setting_limits.get(
                 (int(node_id), int(endpoint_id), int(cluster), int(attribute)))
+
+    def attribute_list(self, node_id: Any, endpoint_id: Any, cluster: Any) -> Any:
+        """The cluster's AttributeList on (node, endpoint), or None if unknown.
+
+        None means "not captured", NOT "implements nothing" — callers must not
+        read it as proof a device lacks an attribute (see settings.implements).
+        """
+        with self._lock:
+            return self._attribute_lists.get(
+                (int(node_id), int(endpoint_id), int(cluster)))
 
     def sensitivity_levels_supported(self, node_id: Any, endpoint_id: Any) -> Optional[int]:
         """SupportedSensitivityLevels for (node, endpoint), or None if unknown.

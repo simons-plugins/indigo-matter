@@ -234,16 +234,19 @@ def test_validate_allows_unchanged_type(plugin_cls, mock_indigo_base):
     assert result[0] is True
 
 
-def test_validate_allows_unstamped_device(plugin_cls, mock_indigo_base):
-    # Pre-guard or manually created device — no stamp, no opinion.
+def test_validate_allows_unstamped_device(plugin_cls, mock_indigo_base, mock_logger):
+    # Pre-guard or manually created device — no stamp, no opinion. matterRelay
+    # carries settings since #186, so this now runs the settings path too.
     mock_indigo_base.devices = {5: _dev({})}
-    result = plugin_cls.validateDeviceConfigUi(None, {}, "matterRelay", 5)
+    stub = _settings_stub(plugin_cls, mock_logger, limits={}, attr_lists={})
+    result = plugin_cls.validateDeviceConfigUi(stub, {}, "matterRelay", 5)
     assert result[0] is True
 
 
-def test_validate_allows_unknown_device_id(plugin_cls, mock_indigo_base):
+def test_validate_allows_unknown_device_id(plugin_cls, mock_indigo_base, mock_logger):
     mock_indigo_base.devices = {}
-    result = plugin_cls.validateDeviceConfigUi(None, {}, "matterRelay", 999)
+    stub = _settings_stub(plugin_cls, mock_logger, limits={}, attr_lists={})
+    result = plugin_cls.validateDeviceConfigUi(stub, {}, "matterRelay", 999)
     assert result[0] is True
 
 
@@ -637,8 +640,17 @@ _FP300_LIMITS = {
     (0x0080, 0x0001): 3,
 }
 
+#: AttributeList (0xFFFB) per cluster, as the live FP300 reports it — the
+#: capability gate. Occupancy carries HoldTime (3); BooleanStateConfiguration
+#: carries CurrentSensitivityLevel (0).
+_FP300_ATTR_LISTS = {
+    0x0406: [0, 1, 2, 3, 4, 65528, 65529, 65531, 65532, 65533],
+    0x0080: [0, 1, 2, 65528, 65529, 65531, 65532, 65533],
+}
 
-def _settings_stub(plugin_cls, mock_logger, limits=None, runtime=None, matter=None):
+
+def _settings_stub(plugin_cls, mock_logger, limits=None, runtime=None, matter=None,
+                   attr_lists=None):
     """A Plugin stand-in wired to a limits table instead of a live node.
 
     ``_setting_limits_lookup`` is bound from the real class rather than mocked:
@@ -651,11 +663,16 @@ def _settings_stub(plugin_cls, mock_logger, limits=None, runtime=None, matter=No
     device_sync = MagicMock()
     device_sync.setting_limits.side_effect = (
         lambda node, ep, cluster, attr: table.get((cluster, attr)))
+    lists = _FP300_ATTR_LISTS if attr_lists is None else attr_lists
+    device_sync.attribute_list.side_effect = (
+        lambda node, ep, cluster: lists.get(cluster))
     stub = SimpleNamespace(device_sync=device_sync, logger=mock_logger,
                            runtime=runtime, matter=matter)
     stub._setting_limits_lookup = (
         lambda props: plugin_cls._setting_limits_lookup(stub, props))
     stub._device_states = lambda dev_id: plugin_cls._device_states(stub, dev_id)
+    stub._setting_attribute_list_lookup = (
+        lambda props: plugin_cls._setting_attribute_list_lookup(stub, props))
     return stub
 
 
@@ -728,8 +745,9 @@ def test_validate_accepts_an_in_range_hold_time(plugin_cls, mock_indigo_base, mo
 def test_settings_picker_offers_the_devices_own_level_count(plugin_cls, mock_indigo_base, mock_logger):
     mock_indigo_base.devices = {5: _fp300_dev()}
     stub = _settings_stub(plugin_cls, mock_logger)
-    rows = plugin_cls.getSettingSensitivityLevels(
-        stub, valuesDict={"nodeId": "56", "endpointId": "1"},
+    rows = plugin_cls.getSettingOptions(
+        stub, filter="sensitivityLevel",
+        valuesDict={"nodeId": "56", "endpointId": "1"},
         typeId="matterMotionSensor", targetId=5)
     assert [value for value, _label in rows] == ["0", "1", "2"]
 
@@ -740,8 +758,9 @@ def test_settings_picker_is_empty_when_the_device_does_not_support_it(plugin_cls
     to guess about."""
     mock_indigo_base.devices = {5: _fp300_dev()}
     stub = _settings_stub(plugin_cls, mock_logger, limits={})
-    rows = plugin_cls.getSettingSensitivityLevels(
-        stub, valuesDict={"nodeId": "56", "endpointId": "1"},
+    rows = plugin_cls.getSettingOptions(
+        stub, filter="sensitivityLevel",
+        valuesDict={"nodeId": "56", "endpointId": "1"},
         typeId="matterMotionSensor", targetId=5)
     assert rows == []
 
