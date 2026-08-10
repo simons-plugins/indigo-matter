@@ -417,7 +417,7 @@ def test_allowance_never_goes_negative_when_exports_exceed_the_cap(
     """Exported rows are uncapped by design; without the floor a shrunk limit
     would slice other_rows with a negative index and keep the wrong rows
     (a plain device that should have been dropped along with everything else)."""
-    monkeypatch.setattr(plugin_mod, "EXPORT_PICKER_LIMIT", 3)
+    monkeypatch.setattr(plugin_mod.export_dialog_mixin, "EXPORT_PICKER_LIMIT", 3)
     for device_id in range(500, 504):
         devices.add(RelayDevice(device_id, f"Export {device_id}"))
         plug.exports.upsert(ExportEntry(device_id, "onOffPlugInUnit"))

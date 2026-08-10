@@ -190,8 +190,8 @@ class LaunchAgent:
         # matter-server npm package exposes no bin executable (see server_process).
         self.node_path = os.path.join(os.path.dirname(self.npx_path), "node")
         self.project_dir = os.path.join(self.home, DEFAULT_PROJECT_DIRNAME)
-        # Mirrored from the spec so callers (plugin.py, fabric backup) keep reading it
-        # off the agent itself.
+        # Mirrored from the spec so callers (the pairing/backup menus, fabric backup)
+        # keep reading it off the agent itself.
         self.storage_path = spec.storage_path
 
     # ------------------------------------------------------------------

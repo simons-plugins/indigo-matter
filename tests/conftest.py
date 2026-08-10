@@ -75,6 +75,16 @@ class _IndigoPluginBaseStub:
         self._record_base_call("deviceDeleted", dev)
 
 
+#: Every module `plugin` composes. The mixins bind `indigo` at import time and MUST
+#: be evicted alongside `plugin` so `importlib.reload(plugin)` re-imports them against
+#: the mock installed for THIS test; `plugin_constants`/`pairing_page` bind no indigo
+#: but are listed so the rule stays simply "everything plugin composes" (issue #146).
+#: Eviction uses raising=False, so a typo'd entry would no-op silently —
+#: test_plugin_module.py pins each entry to a real Server Plugin file.
+_PLUGIN_MODULES = ("plugin", "plugin_constants", "pairing_page", "http_api_mixin",
+                   "export_dialog_mixin", "pairing_menu_mixin", "server_menu_mixin")
+
+
 @pytest.fixture
 def mock_indigo_base(monkeypatch):
     """Install a minimal ``indigo`` module into ``sys.modules``.
@@ -86,5 +96,6 @@ def mock_indigo_base(monkeypatch):
     indigo.PluginBase = _IndigoPluginBaseStub
     indigo.Dict = dict
     monkeypatch.setitem(sys.modules, "indigo", indigo)
-    monkeypatch.delitem(sys.modules, "plugin", raising=False)
+    for name in _PLUGIN_MODULES:
+        monkeypatch.delitem(sys.modules, name, raising=False)
     return indigo

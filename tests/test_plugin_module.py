@@ -6,6 +6,7 @@ the classic "renamed a handler but not the XML" breakage before it reaches Indig
 """
 from __future__ import annotations
 
+import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -577,3 +578,32 @@ def test_no_current_doc_names_a_retired_menu_item(doc):
     text = " ".join(doc.read_text(encoding="utf-8").split())
     hits = [name for name in RETIRED_MENU_NAMES if name in text]
     assert not hits, f"{doc.name} still references retired menu name(s): {hits}"
+
+
+#: Matches `import plugin` / `from plugin import ...` but not `plugin_constants`
+#: or any other `plugin_`-prefixed module — the trailing `\b` fails right after
+#: "plugin" when the next character is the word-character `_`.
+_BACK_IMPORT_RE = re.compile(r"^\s*(import plugin\b|from plugin\b\s+import)")
+
+
+def test_no_mixin_module_imports_plugin():
+    """The dependency arrows point away from plugin.py — a back-import would
+    make the extraction a cycle waiting to happen (issue #146)."""
+    for path in SERVER_PLUGIN.rglob("*.py"):
+        if path.name == "plugin.py":
+            continue
+        src = path.read_text(encoding="utf-8")
+        offenders = [line for line in src.splitlines() if _BACK_IMPORT_RE.match(line)]
+        assert not offenders, f"{path.name} back-imports plugin: {offenders}"
+
+
+def test_plugin_modules_eviction_tuple_matches_real_files():
+    """conftest's ``_PLUGIN_MODULES`` eviction uses ``raising=False``, so a
+    typo'd or renamed entry would silently no-op forever — pin each entry to a
+    real module file (issue #146)."""
+    from conftest import _PLUGIN_MODULES
+
+    for name in _PLUGIN_MODULES:
+        assert (SERVER_PLUGIN / f"{name}.py").is_file(), (
+            f"conftest._PLUGIN_MODULES entry {name!r} has no matching Server Plugin file"
+        )
