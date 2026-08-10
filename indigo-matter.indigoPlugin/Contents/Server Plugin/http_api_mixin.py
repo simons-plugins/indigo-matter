@@ -16,6 +16,7 @@ from commission_jobs import node_id_to_str
 from http_handlers import MatterUnavailable
 from pairing_page import _pairing_html
 from plugin_constants import DECOMMISSION_TIMEOUT, PAIRING_READ_TIMEOUT
+from protocol import is_node_not_exists
 
 
 class HttpApiMixin:
@@ -131,16 +132,40 @@ class HttpApiMixin:
         # decommission could not be retried (issue #111 review).
         known = self.device_sync.knows_node(node_id)
         fabric_removed = True
+        # Distinct from fabric_removed: "we sent a RemoveFabric and it worked" and
+        # "there was nothing there to remove" are both fine outcomes for the caller,
+        # but only the FORMER is evidence the node ever existed. Without this the 404
+        # below became unreachable and any nonsense node id answered 200 (API.md §3.3).
+        fabric_already_absent = False
         try:
             await self.matter.remove_node(node_id)
         except Exception as exc:  # noqa: BLE001
-            self.logger.warning("remove_node failed (device may be offline): %s", exc)
-            fabric_removed = False
+            if is_node_not_exists(exc):
+                fabric_already_absent = True
+                # matter-server has no such node, so there is no fabric entry left to
+                # remove and the decommission's goal is ALREADY MET. Treating this as a
+                # failure was a trap: the node stayed in the picker, every retry failed
+                # identically, and the user was told to "retry once the device is
+                # reachable" about a device that could never make the message come true.
+                # Reachable in normal use whenever matter-server's node list and the
+                # plugin's index disagree — a decommission from another admin, a fabric
+                # restored from an older backup, or the duplicate-server cutover in #182.
+                self.logger.info(
+                    "node %s is not in matter-server's fabric — nothing to remove there; "
+                    "completing the Indigo-side cleanup.", node_id_to_str(node_id),
+                )
+            else:
+                self.logger.warning("remove_node failed (device may be offline): %s", exc)
+                fabric_removed = False
         # Only forget the node if it actually left the fabric; otherwise it must
         # stay listed so the user can retry.
         removed_ids = self.device_sync.delete_node(node_id, forget=fabric_removed)
-        if not removed_ids and not fabric_removed and not known:
-            return None  # genuinely unknown and unreachable → 404
+        if not removed_ids and not known and (fabric_already_absent or not fabric_removed):
+            # Never heard of it, no devices to show for it, and nothing was actually
+            # removed from the fabric → 404. A node we DID remove for real still
+            # answers 200 even with no Indigo devices, which is why this cannot
+            # simply test `not fabric_removed`.
+            return None
         return {
             "nodeId": node_id_to_str(node_id),
             "removedIndigoDeviceIds": removed_ids,

@@ -1439,9 +1439,18 @@ class DeviceSync:
             # leaves none at all, so without this line a transient short/empty
             # get_nodes() would silently retract it from the decommission list and
             # read to the user as "it must already be gone".
+            #
+            # Wording is deliberate: dropping a node from _known_nodes does NOT
+            # remove it from the picker, because list_nodes() unions _known_nodes
+            # with _index and the orphan sweep leaves _index alone. So a node whose
+            # Indigo devices still exist stays listed — which is what you want (it is
+            # the only route to cleaning them up), and decommissioning it now
+            # succeeds rather than failing forever on "Node N does not exist".
             self.logger.warning(
-                "Matter node(s) %s are no longer reported by matter-server — they will "
-                "not be offered for decommission until they reappear.",
+                "Matter node(s) %s are no longer reported by matter-server, so they are "
+                "no longer commissioned on it. Any Indigo devices they left behind are "
+                "marked unreachable and stay listed for decommission so you can remove "
+                "them; nodes with no devices left drop off the list entirely.",
                 ", ".join(node_id_to_str(n) for n in sorted(dropped)),
             )
         for dev_id in orphans:

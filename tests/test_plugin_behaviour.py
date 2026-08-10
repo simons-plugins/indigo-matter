@@ -288,6 +288,65 @@ def test_decommission_inner_offline_reports_fabric_not_removed(plug):
     asyncio.run(scenario())
 
 
+def test_decommission_treats_node_not_exists_as_already_removed(plug):
+    """A node matter-server does not have needs no RemoveFabric — the goal is met.
+
+    Treating ServerErrorCode.NodeNotExists (5) as a failure was a trap: the node stayed
+    in the picker, every retry failed identically with "Node N does not exist", and the
+    dialog told the user to retry "once the device is reachable" about a device that
+    could never make that come true. Hit whenever matter-server's node list and the
+    plugin's index disagree — a decommission from another admin, a fabric restored from
+    an older backup, or the duplicate-server cutover in #182.
+    """
+    from protocol import ProtocolError
+
+    forgotten = {}
+
+    async def scenario():
+        async def gone(node_id):
+            raise ProtocolError(5, f"Node {node_id} does not exist")
+        plug.matter = SimpleNamespace(remove_node=gone)
+        plug.device_sync.knows_node = lambda nid: True
+
+        def delete_node(nid, forget=True):
+            forgotten["forget"] = forget
+            return []                      # devices already deleted by hand
+        plug.device_sync.delete_node = delete_node
+        result = await plug._decommission(38)
+        assert result["fabricRemoved"] is True      # reported as removed…
+        assert result["nodeId"] == "0x26"
+        assert result["removedIndigoDeviceIds"] == []
+        return result
+
+    asyncio.run(scenario())
+    # …and forgotten, so it leaves the picker instead of being offered for ever.
+    assert forgotten["forget"] is True
+
+
+def test_decommission_still_reports_failure_for_a_non_missing_node_error(plug):
+    """Only NodeNotExists is benign. Any other matter-server error must NOT forget the
+    node — doing so would drop a still-commissioned device out of the only UI that can
+    remove it."""
+    from protocol import ProtocolError
+
+    forgotten = {}
+
+    async def scenario():
+        async def busy(node_id):
+            raise ProtocolError(3, "NodeNotReady")   # a real, retryable failure
+        plug.matter = SimpleNamespace(remove_node=busy)
+        plug.device_sync.knows_node = lambda nid: True
+
+        def delete_node(nid, forget=True):
+            forgotten["forget"] = forget
+            return [111]
+        plug.device_sync.delete_node = delete_node
+        result = await plug._decommission(42)
+        assert result["fabricRemoved"] is False
+    asyncio.run(scenario())
+    assert forgotten["forget"] is False
+
+
 def test_decommission_inner_unknown_unreachable_returns_none(plug):
     async def scenario():
         async def boom(node_id):
@@ -1591,3 +1650,37 @@ def test_a_failing_port_check_never_kills_the_watchdog(plug):
     _plug_with_server(plug, boom)
     plug._port_conflict_tick()               # must not raise
     assert not plug.logger.error.called      # a diagnostic failure is not a conflict
+
+
+def test_unknown_node_that_matter_server_also_lacks_is_still_a_404(plug):
+    """The #184 fix must not turn a documented 404 into a 200 (API.md §3.3).
+
+    Review catch: making NodeNotExists set fabric_removed=True made the 404 branch
+    unreachable, so any nonsense node id — a typo, an id from a long-dropped node —
+    answered "decommissioned" with an empty device list.
+    """
+    from protocol import ProtocolError
+
+    async def scenario():
+        async def gone(node_id):
+            raise ProtocolError(5, f"Node {node_id} does not exist")
+        plug.matter = SimpleNamespace(remove_node=gone)
+        plug.device_sync.knows_node = lambda nid: False    # never heard of it
+        plug.device_sync.delete_node = lambda nid, forget=True: []
+        assert await plug._decommission(9999) is None      # → 404
+    asyncio.run(scenario())
+
+
+def test_a_real_removal_of_a_device_less_node_is_not_a_404(plug):
+    # The inverse guard: remove_node SUCCEEDED for a node the plugin had no devices
+    # for. Something really was removed, so this must stay a 200 — which is why the
+    # 404 test cannot simply be "not fabric_removed".
+    async def scenario():
+        async def ok(node_id):
+            return None
+        plug.matter = SimpleNamespace(remove_node=ok)
+        plug.device_sync.knows_node = lambda nid: False
+        plug.device_sync.delete_node = lambda nid, forget=True: []
+        result = await plug._decommission(77)
+        assert result is not None and result["fabricRemoved"] is True
+    asyncio.run(scenario())
