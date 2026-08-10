@@ -1650,3 +1650,37 @@ def test_a_failing_port_check_never_kills_the_watchdog(plug):
     _plug_with_server(plug, boom)
     plug._port_conflict_tick()               # must not raise
     assert not plug.logger.error.called      # a diagnostic failure is not a conflict
+
+
+def test_unknown_node_that_matter_server_also_lacks_is_still_a_404(plug):
+    """The #184 fix must not turn a documented 404 into a 200 (API.md §3.3).
+
+    Review catch: making NodeNotExists set fabric_removed=True made the 404 branch
+    unreachable, so any nonsense node id — a typo, an id from a long-dropped node —
+    answered "decommissioned" with an empty device list.
+    """
+    from protocol import ProtocolError
+
+    async def scenario():
+        async def gone(node_id):
+            raise ProtocolError(5, f"Node {node_id} does not exist")
+        plug.matter = SimpleNamespace(remove_node=gone)
+        plug.device_sync.knows_node = lambda nid: False    # never heard of it
+        plug.device_sync.delete_node = lambda nid, forget=True: []
+        assert await plug._decommission(9999) is None      # → 404
+    asyncio.run(scenario())
+
+
+def test_a_real_removal_of_a_device_less_node_is_not_a_404(plug):
+    # The inverse guard: remove_node SUCCEEDED for a node the plugin had no devices
+    # for. Something really was removed, so this must stay a 200 — which is why the
+    # 404 test cannot simply be "not fabric_removed".
+    async def scenario():
+        async def ok(node_id):
+            return None
+        plug.matter = SimpleNamespace(remove_node=ok)
+        plug.device_sync.knows_node = lambda nid: False
+        plug.device_sync.delete_node = lambda nid, forget=True: []
+        result = await plug._decommission(77)
+        assert result is not None and result["fabricRemoved"] is True
+    asyncio.run(scenario())

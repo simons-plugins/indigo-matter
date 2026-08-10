@@ -226,3 +226,8 @@ def test_unreadable_or_absent_codes_are_not_node_not_exists():
     assert not protocol.is_node_not_exists(protocol.ProtocolError(None, "no code"))
     assert not protocol.is_node_not_exists(protocol.ProtocolError("not-a-number", "junk"))
     assert not protocol.is_node_not_exists(ConnectionError("offline"))   # no .code at all
+
+
+def test_node_not_exists_recognised_from_a_hex_string_code():
+    # _to_int parses base-0, so "0x05" is as valid on the wire as 5 or "5".
+    assert protocol.is_node_not_exists(protocol.ProtocolError("0x05", "does not exist"))
