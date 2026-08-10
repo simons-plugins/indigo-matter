@@ -39,8 +39,11 @@ COMMISSION_TIMEOUT = 300.0
 # sibling IKEA sleepy device on the same mesh was measured polling at ~9.5s
 # intervals (issue #186 research). The 5s COMMAND_TIMEOUT the control path uses
 # is therefore too short to be evidence of anything — it would report a healthy
-# device as failed. Used by the settings read/verify path, which is the only
-# caller that must distinguish "the device said no" from "the device is asleep".
+# device as failed. Used by BOTH legs of the settings write/verify path
+# (device_settings.apply_setting) — the only caller that must distinguish "the
+# device said no" from "the device is asleep". The write leg used to fall
+# through to write()'s 5s default while only the read got this, reporting
+# healthy hardware as "could not be sent": the same false verdict, inverted.
 ATTRIBUTE_TIMEOUT = 30.0
 
 
@@ -183,8 +186,12 @@ class MatterClient(WsJsonClient):
 
         The unwrap is deliberately narrow rather than "if it's a dict of one,
         take the value", because plenty of attributes ARE dicts: OccupancySensing's
-        HoldTimeLimits reads as ``{"min": 1, "max": 300, "default": 10}``, and a
-        loose unwrap would hand back ``1`` for a one-key variant of that. So: the
+        HoldTimeLimits reads as ``{"0": 1, "1": 300, "2": 10}`` — a struct keyed
+        by FIELD INDEX, which is how matter-server serialises every struct — and
+        a loose unwrap would hand back ``1`` for a one-key variant of that. (Do
+        not restate that attribute as ``{"min":…,"max":…}``: that rendering is
+        prose from the issue #186 research doc about what the fields MEAN, and
+        coding against it shipped a hold-time field that never appeared.) So: the
         exact path wins; failing that, a lone key that looks like an attribute
         path (matter-server has formatted these differently across versions)
         wins; anything else is returned untouched, on the grounds that a server

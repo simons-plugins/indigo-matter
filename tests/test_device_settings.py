@@ -43,6 +43,7 @@ from matter_handlers.settings import (
     ATTR_SUPPORTED_SENSITIVITY_LEVELS,
     CLUSTER_BOOLEAN_STATE_CONFIG,
     CLUSTER_OCCUPANCY_SENSING,
+    NO_ANSWER,
     Bounds,
     coerce_value,
     parse_level_count,
@@ -242,9 +243,19 @@ def test_the_boundaries_themselves_are_allowed():
     assert validate_settings(MOTION, {"holdTime": "300"}, _limits()) == {}
 
 
-@pytest.mark.parametrize("entered", ["abc", "12.5", ""])
+@pytest.mark.parametrize("entered", ["abc", "12.5"])
 def test_non_integer_hold_time_is_refused(entered):
     assert "holdTime" in validate_settings(MOTION, {"holdTime": entered}, _limits())
+
+
+@pytest.mark.parametrize("entered", ["", "   "])
+def test_a_blank_field_is_left_alone_rather_than_rejected(entered):
+    """config_ui_values seeds blank when the device has not reported the value
+    yet. Rejecting that made the dialog unsavable on a freshly adopted device —
+    the user could not even rename it, and the error blamed them for a value the
+    plugin does not know either."""
+    assert validate_settings(MOTION, {"holdTime": entered}, _limits()) == {}
+    assert planned_writes(MOTION, {"holdTime": entered}, {}, _limits()) == []
 
 
 def test_sensitivity_above_the_supported_count_is_refused_before_sending():
@@ -311,10 +322,19 @@ def test_a_mismatched_read_back_is_a_failure_that_names_both_values():
     assert "NOT applied" in reason
 
 
-def test_an_absent_read_back_is_a_failure_not_a_success():
-    ok, reason = verify_write(_setting("holdTime"), 30, None)
+def test_no_answer_at_all_is_a_failure_and_says_the_outcome_is_unknown():
+    ok, reason = verify_write(_setting("holdTime"), 30, NO_ANSWER)
     assert ok is False
     assert "may or may not" in reason
+
+
+def test_a_null_answer_is_a_DEFINITE_failure_not_an_unknown_one():
+    """The device answered; it just holds no value. StartUpOnOff is nullable, so
+    this is a real reply and the write provably did not land."""
+    ok, reason = verify_write(_setting("holdTime"), 30, None)
+    assert ok is False
+    assert "NOT applied" in reason
+    assert "may or may not" not in reason
 
 
 def test_an_unreadable_read_back_is_a_failure():
@@ -335,17 +355,24 @@ class _Client:
         self._write_errors = list(write_errors or [])
         self._read_errors = list(read_errors or [])
         self.read_calls = 0
+        # Recorded, not ignored: the write leg silently fell through to
+        # MatterClient.write's 5s default while only the read got 30s, and this
+        # double could not see it because it took no timeout at all.
+        self.write_timeouts = []
+        self.read_timeouts = []
 
-    async def write(self, write):
+    async def write(self, write, timeout=None):
         self.writes.append(write)
+        self.write_timeouts.append(timeout)
         if self._write_errors:
             err = self._write_errors.pop(0)
             if err is not None:
                 raise err
         return {"status": 0}
 
-    async def read(self, node_id, endpoint, cluster, attribute):
+    async def read(self, node_id, endpoint, cluster, attribute, timeout=None):
         self.read_calls += 1
+        self.read_timeouts.append(timeout)
         if self._read_errors:
             err = self._read_errors.pop(0)
             if err is not None:
@@ -528,20 +555,67 @@ def test_a_plug_without_the_lighting_feature_is_offered_nothing():
                             _attr_lists({0x0006: ONOFF_WITHOUT_LIGHTING})) == []
 
 
-def test_an_unknown_attribute_list_does_not_hide_a_setting():
-    """Unknown is not absent: before the list is captured, a setting still
-    stands or falls on its bounds, which is the pre-existing behaviour."""
-    offered = offered_settings(RELAY, lambda c, a: None, _attr_lists({}))
-    assert sorted(o.setting.key for o in offered) == ["onTime", "startUpOnOff"]
+def test_an_unknown_attribute_list_does_not_hide_a_setting_with_device_bounds():
+    """Unknown is not absent — but only where something ELSE is evidence. A
+    FromAttribute setting still has its limits attribute, so it stands or falls
+    on that, as before."""
+    offered = offered_settings(MOTION, _limits(), _attr_lists({}))
+    assert sorted(o.setting.key for o in offered) == ["holdTime", "sensitivityLevel"]
 
 
-def test_the_attribute_list_can_veto_a_setting_whose_bounds_resolve():
-    """StaticRange always resolves, so without the AttributeList gate every
-    relay would be offered these — which is exactly the bug the gate prevents."""
-    with_gate = offered_settings(RELAY, lambda c, a: None,
-                                 _attr_lists({0x0006: ONOFF_WITHOUT_LIGHTING}))
-    without_gate = offered_settings(RELAY, lambda c, a: None)
-    assert with_gate == [] and len(without_gate) == 2
+def test_an_unknown_attribute_list_DOES_hide_a_spec_bounded_setting():
+    """StaticRange/EnumValues resolve unconditionally, so with no AttributeList
+    there is no evidence at all. Treating unknown as "offer" there silently
+    became "offer to everything", including the plugs that demonstrably do not
+    implement it."""
+    assert offered_settings(RELAY, lambda c, a: None, _attr_lists({})) == []
+    assert offered_settings(RELAY, lambda c, a: None) == []
+
+
+def test_the_attribute_list_is_what_admits_a_spec_bounded_setting():
+    admitted = offered_settings(RELAY, lambda c, a: None,
+                                _attr_lists({0x0006: ONOFF_WITH_LIGHTING}))
+    vetoed = offered_settings(RELAY, lambda c, a: None,
+                              _attr_lists({0x0006: ONOFF_WITHOUT_LIGHTING}))
+    assert sorted(o.setting.key for o in admitted) == ["onTime", "startUpOnOff"]
+    assert vetoed == []
+
+
+def test_a_device_with_no_node_is_offered_nothing_whatever_its_bounds():
+    """The relay case: EnumValues/StaticRange resolve with no device at all, so
+    a never-reconciled relay used to be shown a full settings section that could
+    not be saved and threw on the way out."""
+    assert offered_settings(RELAY, lambda c, a: None,
+                            _attr_lists({0x0006: ONOFF_WITH_LIGHTING}),
+                            device_known=False) == []
+    assert offered_settings(MOTION, _limits(), None, device_known=False) == []
+
+
+def test_every_rejection_is_reported_to_the_caller():
+    """The silent drop was the mechanism of both bugs that shipped on this
+    branch. offered_settings must be able to say what it withheld and why."""
+    skipped = []
+    offered_settings(RELAY, lambda c, a: None,
+                     _attr_lists({0x0006: ONOFF_WITHOUT_LIGHTING}),
+                     on_skip=lambda setting, reason: skipped.append((setting.key, reason)))
+    assert sorted(k for k, _ in skipped) == ["onTime", "startUpOnOff"]
+    assert all("AttributeList" in reason for _, reason in skipped)
+
+
+def test_unresolvable_bounds_are_reported_not_just_dropped():
+    skipped = []
+    table = {(CLUSTER_OCCUPANCY_SENSING, ATTR_HOLD_TIME_LIMITS): "1 to 300"}
+    offered_settings(MOTION, _limits(table), None,
+                     on_skip=lambda setting, reason: skipped.append((setting.key, reason)))
+    reasons = dict(skipped)
+    assert "permitted values could not be determined" in reasons["holdTime"]
+
+
+def test_a_missing_node_is_reported_as_such():
+    skipped = []
+    offered_settings(MOTION, _limits(), None, device_known=False,
+                     on_skip=lambda setting, reason: skipped.append((setting.key, reason)))
+    assert all("no Matter node" in reason for _, reason in skipped)
 
 
 def test_the_fp300_gate_still_passes_on_its_real_attribute_lists():
@@ -563,3 +637,58 @@ def test_relay_settings_validate_against_their_declared_bounds():
                              lambda c, a: None, lists) == {}
     errors = validate_settings(RELAY, {"startUpOnOff": "9"}, lambda c, a: None, lists)
     assert "startUpOnOff" in errors
+
+
+def test_both_legs_use_the_long_attribute_timeout():
+    """A sleepy Thread SED polls at ~9.5s. The write leg used to fall through to
+    MatterClient.write's 5s default while only the read-back got 30s, so a
+    healthy device was reported as "could not be sent" — and the code returned
+    before ever reading back to discover the write had landed."""
+    from matter_client import ATTRIBUTE_TIMEOUT
+    client = _Client(reads=30)
+    ok, _message = _run(apply_setting(client, 56, 1, _plan(), sleep=_no_sleep))
+    assert ok is True
+    assert client.write_timeouts == [ATTRIBUTE_TIMEOUT]
+    assert client.read_timeouts == [ATTRIBUTE_TIMEOUT]
+
+
+def test_the_timeout_is_injectable_for_both_legs():
+    client = _Client(reads=30)
+    _run(apply_setting(client, 56, 1, _plan(), sleep=_no_sleep, timeout=7.5))
+    assert client.write_timeouts == [7.5]
+    assert client.read_timeouts == [7.5]
+
+
+def test_an_integral_float_state_seeds_as_a_whole_number():
+    """Seeding "10.0" would be rejected by the field's own numeric validator on
+    an untouched dialog — the plugin blaming the user for its own formatting."""
+    values = config_ui_values(MOTION, {"holdTime": 10.0}, _limits())
+    assert values["holdTime"] == "10"
+    assert validate_settings(MOTION, values, _limits()) == {}
+
+
+def test_an_untouched_seeded_dialog_always_revalidates():
+    """Round-trip invariant: whatever config_ui_values seeds must pass
+    validate_settings untouched, for every state shape a handler might write."""
+    for state in (10, 10.0, "10", None):
+        values = config_ui_values(MOTION, {"holdTime": state, "sensitivityLevel": 1},
+                                  _limits())
+        assert validate_settings(MOTION, values, _limits()) == {}, f"state={state!r}"
+
+
+def test_a_null_read_back_is_not_reported_as_no_answer():
+    """StartUpOnOff is nullable. A device holding null after we asked for 1
+    definitely did not apply the write — reporting that as an unconfirmed
+    timeout hides the exact firmware behaviour this feature exists to expose."""
+    client = _Client(reads=None)
+    ok, message = _run(apply_setting(client, 56, 1, _plan(), sleep=_no_sleep))
+    assert ok is False
+    assert "did not answer" not in message
+
+
+def test_a_read_back_failure_names_the_underlying_error():
+    client = _Client(read_errors=[TimeoutError("poll window missed"),
+                                  TimeoutError("poll window missed")])
+    ok, message = _run(apply_setting(client, 56, 1, _plan(), sleep=_no_sleep))
+    assert ok is False
+    assert "poll window missed" in message

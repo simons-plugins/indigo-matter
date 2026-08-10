@@ -673,6 +673,8 @@ def _settings_stub(plugin_cls, mock_logger, limits=None, runtime=None, matter=No
     stub._device_states = lambda dev_id: plugin_cls._device_states(stub, dev_id)
     stub._setting_attribute_list_lookup = (
         lambda props: plugin_cls._setting_attribute_list_lookup(stub, props))
+    stub._has_matter_node = plugin_cls._has_matter_node
+    stub._log_setting_skips = lambda dev_id: plugin_cls._log_setting_skips(stub, dev_id)
     return stub
 
 
@@ -861,9 +863,14 @@ def test_a_lying_device_leaves_the_state_alone_and_flags_the_device(plugin_cls, 
     stub.matter.write = _async_none
     stub.matter.read = _async_value(10)     # ACKed the write, kept the old value
     _run_apply(plugin_cls, stub, _hold_time_plan())
-    stub.device_sync.apply_states.assert_not_called()
     assert mock_logger.error.called
     dev.setErrorStateOnServer.assert_called_once_with("setting failed")
+    # The requested value is NEVER written — that would be the optimistic echo
+    # this feature exists to kill. What IS written is what the read-back proved
+    # the device actually holds, so the dialog (which re-seeds from state)
+    # cannot show a value the device never adopted.
+    stub.device_sync.apply_states.assert_called_once_with(
+        5, [{"key": "holdTime", "value": 10}])
 
 
 def test_a_crash_in_the_write_path_never_kills_the_loop(plugin_cls, mock_indigo_base,
@@ -931,3 +938,96 @@ def test_the_snake_case_alias_seeds_the_same_values(plugin_cls, mock_indigo_base
         stub, {"nodeId": "56", "endpointId": "1"}, "matterMotionSensor", 5)
     assert values["hasHoldTime"] == "yes"
     assert values["holdTime"] == "10"
+
+
+# ---------------------------------------------------------------------------
+# Registry ↔ Devices.xml parity (issue #186)
+#
+# Indigo builds ConfigUI from static XML per device type with no runtime field
+# injection, so the registry and the XML are kept in step BY HAND. Nothing
+# checked that until now — which is how a renamed picker method shipped, and
+# what settings.py's "the registry can never promise a field the XML does not
+# have" was asserting without enforcing.
+# ---------------------------------------------------------------------------
+
+def _device_config_fields(device_type_id):
+    """{field id: <Field> element} for one <Device>'s ConfigUI."""
+    root = ET.parse(SERVER_PLUGIN / "Devices.xml").getroot()
+    for device in root.findall("Device"):
+        if device.get("id") != device_type_id:
+            continue
+        config = device.find("ConfigUI")
+        return {f.get("id"): f for f in (config.findall("Field") if config is not None else [])}
+    raise AssertionError(f"no <Device id={device_type_id!r}> in Devices.xml")
+
+
+def _device_state_ids(device_type_id):
+    root = ET.parse(SERVER_PLUGIN / "Devices.xml").getroot()
+    for device in root.findall("Device"):
+        if device.get("id") != device_type_id:
+            continue
+        states = device.find("States")
+        return {s.get("id") for s in (states.findall("State") if states is not None else [])}
+    raise AssertionError(f"no <Device id={device_type_id!r}> in Devices.xml")
+
+
+def _declared_settings():
+    from matter_handlers.settings import SETTINGS
+    return SETTINGS
+
+
+def test_every_declared_setting_has_its_configui_field(plugin_cls):
+    from device_settings import _marker_field
+    for setting in _declared_settings():
+        for type_id in sorted(setting.device_types):
+            fields = _device_config_fields(type_id)
+            assert setting.key in fields, \
+                f"{type_id} declares setting {setting.key!r} with no <Field id={setting.key!r}>"
+            marker = _marker_field(setting)
+            assert marker in fields, \
+                f"{type_id}: setting {setting.key!r} needs its hidden marker <Field id={marker!r}>"
+            assert fields[setting.key].get("visibleBindingId") == marker, \
+                f"{type_id}: {setting.key!r} must be gated on {marker!r}"
+
+
+def test_every_declared_setting_has_its_state(plugin_cls):
+    """The dialog seeds current values from device STATE, so a setting with no
+    state can never show what the device holds."""
+    for setting in _declared_settings():
+        for type_id in sorted(setting.device_types):
+            assert setting.key in _device_state_ids(type_id), \
+                f"{type_id} declares setting {setting.key!r} but no <State id={setting.key!r}>"
+
+
+def test_numeric_settings_have_a_range_field_and_choices_have_a_picker(plugin_cls):
+    for setting in _declared_settings():
+        for type_id in sorted(setting.device_types):
+            fields = _device_config_fields(type_id)
+            if setting.is_choice:
+                field = fields[setting.key]
+                assert field.get("type") == "menu", f"{setting.key} should be a menu"
+                lst = field.find("List")
+                assert lst is not None and lst.get("filter") == setting.key, \
+                    f"{setting.key}'s <List> must carry filter={setting.key!r}"
+            else:
+                assert f"{setting.key}Range" in fields, \
+                    f"{type_id}: numeric setting {setting.key!r} needs a {setting.key}Range field"
+
+
+def test_no_orphan_setting_fields_in_the_xml(plugin_cls):
+    """The other direction: an XML field with no declaration behind it renders
+    as a control that does nothing."""
+    from device_settings import _marker_field
+    declared = {}
+    for setting in _declared_settings():
+        for type_id in setting.device_types:
+            declared.setdefault(type_id, set()).update(
+                {setting.key, _marker_field(setting)})
+            if not setting.is_choice:
+                declared[type_id].add(f"{setting.key}Range")
+    for type_id, keys in declared.items():
+        fields = set(_device_config_fields(type_id))
+        settings_fields = {f for f in fields
+                           if f.startswith("has") or f in keys or f.endswith("Range")}
+        orphans = settings_fields - keys - {"hasAnySetting"}
+        assert not orphans, f"{type_id} has settings fields with no declaration: {orphans}"

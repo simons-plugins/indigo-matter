@@ -222,10 +222,12 @@
                  injection (unlike states, cf. getDeviceStateList), so the
                  registry cannot generate these — the two must be kept in step.
 
-                 The hasX markers are set per DEVICE by getDeviceConfigUiValues:
-                 "yes" only when this unit's own limits attribute was found on
-                 the node, so a pre-1.4 occupancy sensor with no HoldTime is
-                 never shown a hold-time field it would fail to honour.
+                 The hasX markers are set per DEVICE by getDeviceConfigUiValues,
+                 and are "yes" only when BOTH gates pass: the device's own
+                 AttributeList (0xFFFB) does not deny the attribute, and its
+                 permitted values can be resolved. So a pre-1.4 occupancy sensor
+                 with no HoldTime is never shown a hold-time field it would fail
+                 to honour.
                  NOTE: visibleBindingValue is a CONTAINS match, not equality —
                  marker values must never be substrings of one another. -->
             <Field id="hasHoldTime" type="textfield" hidden="true" defaultValue="no"/>

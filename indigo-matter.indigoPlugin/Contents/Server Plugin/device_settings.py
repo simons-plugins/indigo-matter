@@ -24,8 +24,11 @@ import asyncio
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
+from matter_client import ATTRIBUTE_TIMEOUT
 from matter_handlers.settings import (
+    NO_ANSWER,
     Bounds,
+    FromAttribute,
     DeviceSetting,
     coerce_value,
     implements,
@@ -45,6 +48,7 @@ __all__ = [
 #: equality, so these two must never be substrings of one another.
 MARKER_YES = "yes"
 MARKER_NO = "no"
+
 
 #: A limits lookup: ``(cluster, attribute) -> raw value or None``. Injected so
 #: this module never has to know about device_sync or a node id.
@@ -69,7 +73,9 @@ class PlannedWrite:
 
 
 def offered_settings(device_type_id: str, limits: LimitsLookup,
-                     attribute_list: Optional[Callable] = None) -> list[OfferedSetting]:
+                     attribute_list: Optional[Callable] = None,
+                     device_known: bool = True,
+                     on_skip: Optional[Callable] = None) -> list[OfferedSetting]:
     """Which of the type's declared settings THIS unit actually offers.
 
     Two independent gates, and they answer different questions:
@@ -87,15 +93,51 @@ def offered_settings(device_type_id: str, limits: LimitsLookup,
     the setting then stands or falls on its bounds alone, which is exactly the
     behaviour that shipped before the list was consulted. Hiding a setting a
     device really has would be as wrong as offering one it lacks.
+
+    ``device_known=False`` means there is no Matter node behind this Indigo
+    device yet, and nothing is offered. That has to be explicit: it used to fall
+    out of the bounds being unresolvable, which stopped being true the moment a
+    setting could take spec-fixed bounds. ``StaticRange``/``EnumValues`` resolve
+    with no device at all, so a never-reconciled relay was shown a fully
+    populated settings section, could not be saved past validation, and threw
+    on the way out.
+
+    ``on_skip(setting, reason)`` receives every setting that was NOT offered and
+    why. Without it the caller sees only survivors, so a setting that vanished
+    because of a shape change or a partial interview looks exactly like a
+    feature that was never built — the shape of both bugs that shipped on this
+    branch. This module stays logger-free; the caller decides how loud to be.
     """
     offered: list[OfferedSetting] = []
+
+    def skip(setting, reason):
+        if on_skip is not None:
+            on_skip(setting, reason)
+
     for setting in settings_for_type(device_type_id):
-        if attribute_list is not None:
-            known = implements(attribute_list(setting.cluster), setting.attribute)
-            if known is False:
-                continue
+        if not device_known:
+            skip(setting, "the device has no Matter node yet")
+            continue
+        listed = attribute_list(setting.cluster) if attribute_list is not None else None
+        known = implements(listed, setting.attribute)
+        if known is False:
+            skip(setting, "the device's AttributeList says it does not implement "
+                          f"attribute 0x{setting.attribute:04X}")
+            continue
+        if known is None and not isinstance(setting.bounds, FromAttribute):
+            # No positive evidence from EITHER source. FromAttribute settings
+            # still have the limits attribute as evidence, but spec-fixed bounds
+            # resolve unconditionally, so "unknown" would silently become
+            # "offer it to everything" — including the plugs that demonstrably
+            # do not implement it.
+            skip(setting, "the device has not reported an AttributeList for cluster "
+                          f"0x{setting.cluster:04X}, so there is no evidence it "
+                          "implements this")
+            continue
         bounds = setting.resolve_bounds(limits)
         if bounds is None:
+            skip(setting, "its permitted values could not be determined "
+                          "(limits attribute missing or unreadable)")
             continue
         offered.append(OfferedSetting(setting, bounds))
     return offered
@@ -103,7 +145,9 @@ def offered_settings(device_type_id: str, limits: LimitsLookup,
 
 def config_ui_values(device_type_id: str, states: dict, limits: LimitsLookup,
                      values: Optional[dict] = None,
-                     attribute_list: Optional[Callable] = None) -> dict:
+                     attribute_list: Optional[Callable] = None,
+                     device_known: bool = True,
+                     on_skip: Optional[Callable] = None) -> dict:
     """Seed values for the dialog: markers, current values, range hints.
 
     Returns only the keys this module owns, for the caller to merge over the
@@ -112,7 +156,8 @@ def config_ui_values(device_type_id: str, states: dict, limits: LimitsLookup,
     than showing back whatever was typed last time.
     """
     out = dict(values or {})
-    offered = offered_settings(device_type_id, limits, attribute_list)
+    offered = offered_settings(device_type_id, limits, attribute_list,
+                               device_known, on_skip)
     by_key = {o.setting.key: o for o in offered}
 
     for setting in settings_for_type(device_type_id):
@@ -125,10 +170,27 @@ def config_ui_values(device_type_id: str, states: dict, limits: LimitsLookup,
         # A menu's value must be a string to match its option ids; a text field
         # is a string either way. An unknown current value leaves the field
         # blank rather than inventing a plausible one.
-        out[setting.key] = "" if current is None else str(current)
+        out[setting.key] = _seed_value(current)
         if not setting.is_choice:
             out[f"{setting.key}Range"] = setting.describe_range(offer.bounds)
     return out
+
+
+def _seed_value(current: Any) -> str:
+    """Render a state for the dialog.
+
+    Integral values are rendered as ints so that merely opening and saving an
+    untouched dialog always revalidates: a float-valued state seeded as "10.0"
+    would be rejected by its own numeric validator as "must be a whole number",
+    blaming the user for the plugin's own formatting.
+    """
+    if current is None:
+        return ""
+    if isinstance(current, bool):
+        return str(int(current))
+    if isinstance(current, float) and current.is_integer():
+        return str(int(current))
+    return str(current)
 
 
 def _marker_field(setting: DeviceSetting) -> str:
@@ -144,7 +206,8 @@ def _marker_field(setting: DeviceSetting) -> str:
 
 
 def validate_settings(device_type_id: str, values: dict, limits: LimitsLookup,
-                      attribute_list: Optional[Callable] = None) -> dict:
+                      attribute_list: Optional[Callable] = None,
+                      device_known: bool = True) -> dict:
     """Bounds-check every offered setting. Returns ``{field_id: message}``.
 
     Synchronous and cheap by design: it runs when the user clicks Save, on the
@@ -153,9 +216,17 @@ def validate_settings(device_type_id: str, values: dict, limits: LimitsLookup,
     done here; see :func:`apply_setting`.
     """
     errors: dict = {}
-    for offer in offered_settings(device_type_id, limits, attribute_list):
+    for offer in offered_settings(device_type_id, limits, attribute_list, device_known):
         setting = offer.setting
         if setting.key not in values:
+            continue
+        # A BLANK field means "leave this alone", never "you must fill this in".
+        # config_ui_values deliberately seeds blank when the device has not
+        # reported the value yet, so rejecting blank made the Edit Device dialog
+        # unsavable on a freshly adopted device — the user could not even rename
+        # it, and the error blamed them for a value the plugin does not know
+        # either. planned_writes skips blanks for the same reason.
+        if not str(values.get(setting.key, "")).strip():
             continue
         value, reason = coerce_value(setting, values.get(setting.key), offer.bounds)
         if value is None:
@@ -165,7 +236,8 @@ def validate_settings(device_type_id: str, values: dict, limits: LimitsLookup,
 
 def planned_writes(device_type_id: str, values: dict, states: dict,
                    limits: LimitsLookup,
-                   attribute_list: Optional[Callable] = None) -> list[PlannedWrite]:
+                   attribute_list: Optional[Callable] = None,
+                   device_known: bool = True) -> list[PlannedWrite]:
     """The settings whose value the user actually CHANGED.
 
     Only changed settings are written. Re-sending an unchanged value on every
@@ -174,9 +246,17 @@ def planned_writes(device_type_id: str, values: dict, states: dict,
     dialog opened to read a value into a write.
     """
     planned: list[PlannedWrite] = []
-    for offer in offered_settings(device_type_id, limits, attribute_list):
+    for offer in offered_settings(device_type_id, limits, attribute_list, device_known):
         setting = offer.setting
         if setting.key not in values:
+            continue
+        # A BLANK field means "leave this alone", never "you must fill this in".
+        # config_ui_values deliberately seeds blank when the device has not
+        # reported the value yet, so rejecting blank made the Edit Device dialog
+        # unsavable on a freshly adopted device — the user could not even rename
+        # it, and the error blamed them for a value the plugin does not know
+        # either. planned_writes skips blanks for the same reason.
+        if not str(values.get(setting.key, "")).strip():
             continue
         value, _reason = coerce_value(setting, values.get(setting.key), offer.bounds)
         if value is None:
@@ -200,7 +280,9 @@ def _as_int(value: Any) -> Optional[int]:
 async def apply_setting(client: Any, node_id: int, endpoint: int,
                         plan: PlannedWrite, *,
                         sleep: Callable = asyncio.sleep,
-                        retry_delay: float = 2.0) -> tuple[bool, str]:
+                        retry_delay: float = 2.0,
+                        timeout: float = ATTRIBUTE_TIMEOUT,
+                        on_observed: Optional[Callable] = None) -> tuple[bool, str]:
     """Write a setting and PROVE it landed. Returns ``(ok, message)``.
 
     Success means one thing only: a subsequent read returns the value we asked
@@ -220,10 +302,16 @@ async def apply_setting(client: Any, node_id: int, endpoint: int,
     write = MatterWrite(int(node_id), int(endpoint), setting.cluster,
                         setting.attribute, plan.value)
 
+    # BOTH legs get the attribute timeout. The write used to fall through to
+    # MatterClient.write's 5s default while only the read-back got 30s — on the
+    # sleepy Thread device this feature targets (~9.5s poll interval) that
+    # reported healthy hardware as "could not be sent", the exact false verdict
+    # the whole design exists to prevent, and it returned before ever reading
+    # back to find out the write had landed.
     last_error: Optional[Exception] = None
     for attempt in (1, 2):
         try:
-            await client.write(write)
+            await client.write(write, timeout=timeout)
             last_error = None
             break
         except Exception as exc:  # noqa: BLE001 - retried below, reported if final
@@ -234,18 +322,37 @@ async def apply_setting(client: Any, node_id: int, endpoint: int,
         return False, (f"{setting.label} could not be sent to the device: {last_error}. "
                        f"The setting was not changed.")
 
-    read_back: Any = None
+    read_back: Any = NO_ANSWER
+    read_error: Optional[Exception] = None
     for attempt in (1, 2):
         try:
             read_back = await client.read(int(node_id), int(endpoint),
-                                          setting.cluster, setting.attribute)
+                                          setting.cluster, setting.attribute,
+                                          timeout=timeout)
+            read_error = None
             break
-        except Exception:  # noqa: BLE001 - an unreadable verify is a failure, below
-            read_back = None
+        except Exception as exc:  # noqa: BLE001 - an unreadable verify is a failure, below
+            read_back = NO_ANSWER
+            read_error = exc
             if attempt == 1:
                 await sleep(retry_delay)
 
+    # Hand the caller what the device ACTUALLY holds, when it said anything
+    # readable. On a mismatch this is the authoritative value, and recording it
+    # is what stops the dialog re-seeding a value the device never adopted.
+    if on_observed is not None and read_back is not NO_ANSWER:
+        try:
+            on_observed(None if read_back is None else int(read_back))
+        except (TypeError, ValueError):
+            pass  # unreadable: verify_write below reports it; nothing to record
+
     ok, reason = verify_write(setting, plan.value, read_back)
+    if not ok and read_error is not None:
+        # The write leg names its error; this one used to discard the exception
+        # entirely, so a timeout, a dead socket and a protocol error all read as
+        # one generic sentence. For a feature whose whole job is saying what
+        # really happened, that is self-defeating.
+        reason = f"{reason} (read-back failed: {read_error})"
     if ok:
         return True, f"{setting.label} is now {plan.value}{setting.unit}."
     return False, reason

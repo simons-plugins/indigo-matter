@@ -70,7 +70,10 @@ class OnOffHandler(ClusterHandler):
     #: value without a live read, and so a change made from another ecosystem
     #: still reaches Indigo. Conformance LT: a device implementing none of these
     #: simply never reports them, and the AttributeList gate keeps the fields
-    #: hidden — subscribing to an attribute a device lacks is harmless.
+    #: hidden. Subscribing to an attribute a device lacks costs nothing here
+    #: because the plugin takes matter-server's whole start_listening firehose
+    #: and these lists are only a future filtering aid (see matter_client) — no
+    #: per-attribute subscription is actually issued.
     SETTING_STATES = {
         ATTR_START_UP_ON_OFF: "startUpOnOff",
         ATTR_ON_TIME: "onTime",

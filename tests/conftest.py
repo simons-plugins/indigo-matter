@@ -45,6 +45,28 @@ def mock_logger():
     return logger
 
 
+class _IndigoDict(dict):
+    """Stand-in for ``indigo.Dict`` that is a DISTINCT type from ``dict``.
+
+    This was plain ``dict`` until issue #186, which made an entire bug class
+    invisible. Indigo's ConfigUI pre-population callbacks must return
+    ``indigo.Dict``; returning a plain dict fails inside Indigo's C++ bridge
+    ("No registered converter was able to extract a C++ reference to type
+    CXmlDict from this Python object of type dict") and silently seeds nothing.
+    That shipped, cost an hour on jarvis — and the regression test written
+    afterwards could not fail, because ``isinstance(x, indigo.Dict)`` was
+    ``isinstance(x, dict)``. Proven by reverting the fix: the whole suite
+    stayed green.
+
+    Subclassing dict keeps every existing test working (the mapping behaves
+    identically) while making the isinstance check mean something.
+    """
+
+
+class _IndigoList(list):
+    """Same reasoning as :class:`_IndigoDict`, for ``indigo.List``."""
+
+
 class _IndigoPluginBaseStub:
     """Stand-in for ``indigo.PluginBase`` at ``class Plugin`` definition time.
 
@@ -94,7 +116,8 @@ def mock_indigo_base(monkeypatch):
     """
     indigo = MagicMock()
     indigo.PluginBase = _IndigoPluginBaseStub
-    indigo.Dict = dict
+    indigo.Dict = _IndigoDict
+    indigo.List = _IndigoList
     monkeypatch.setitem(sys.modules, "indigo", indigo)
     for name in _PLUGIN_MODULES:
         monkeypatch.delitem(sys.modules, name, raising=False)

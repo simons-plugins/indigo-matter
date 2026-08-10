@@ -836,7 +836,8 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, ServerMenuMixin,
             return (True, valuesDict)  # most types declare none — nothing to look up
         setting_errors = device_settings.validate_settings(
             typeId, valuesDict, self._setting_limits_lookup(valuesDict),
-            self._setting_attribute_list_lookup(valuesDict))
+            self._setting_attribute_list_lookup(valuesDict),
+            self._has_matter_node(valuesDict))
         if setting_errors:
             errors = indigo.Dict()
             for field, message in setting_errors.items():
@@ -848,19 +849,54 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, ServerMenuMixin,
     # Writable device settings — the Edit Device dialog (issue #186)
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _has_matter_node(props) -> bool:
+        """Is there a Matter node behind this Indigo device yet?
+
+        Explicit because it used to be emergent: with every setting taking its
+        bounds from a device attribute, "no node" made the bounds unresolvable
+        and nothing was offered. Spec-fixed bounds resolve with no device at
+        all, so a never-reconciled relay was shown a full settings section it
+        could not save and which threw on the way out.
+        """
+        node_id = str(props.get("nodeId") or "").strip()
+        endpoint_id = props.get("endpointId")
+        if not node_id or endpoint_id in (None, ""):
+            return False
+        try:
+            int(node_id)
+            int(endpoint_id)
+        except (TypeError, ValueError):
+            return False
+        return True
+
+    def _log_setting_skips(self, dev_id):
+        """An ``on_skip`` sink that says out loud what was withheld and why.
+
+        Both bugs that shipped on this branch presented as "the feature is
+        missing" because a setting was dropped in silence. DEBUG is not enough —
+        it is off by default, so the one clue is at a level the affected user
+        does not have on.
+        """
+        def note(setting, reason):
+            self.logger.info('device %s: "%s" not offered — %s',
+                             dev_id, setting.label, reason)
+        return note
+
     def _setting_limits_lookup(self, props):
         """A ``(cluster, attribute) -> raw limits`` lookup for one device.
 
         Closes over the device's node/endpoint so the pure settings layer never
         has to know what a node id is. Reads props rather than the Indigo device
         so it works while a dialog is open on a device that has none of this
-        saved yet; a device with no node/endpoint yet (never reconciled) yields
-        a lookup that answers None to everything, which honestly degrades to
-        offering no settings at all.
+        saved yet. A device with no node yet yields a lookup answering None to
+        everything — but that is NOT what stops settings being offered: settings
+        with spec-fixed bounds resolve without any device read, so the gate is
+        the explicit :meth:`_has_matter_node` check, not this lookup's answers.
         """
         node_id = props.get("nodeId")
         endpoint_id = props.get("endpointId")
-        if not node_id or endpoint_id in (None, ""):
+        if not self._has_matter_node(props):
             return lambda cluster, attribute: None
 
         def lookup(cluster, attribute):
@@ -884,7 +920,7 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, ServerMenuMixin,
         """
         node_id = props.get("nodeId")
         endpoint_id = props.get("endpointId")
-        if not node_id or endpoint_id in (None, ""):
+        if not self._has_matter_node(props):
             return lambda cluster: None
 
         def lookup(cluster):
@@ -911,13 +947,17 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, ServerMenuMixin,
         read from a sleepy device is seconds. See the device_settings docstring.
         """
         values = dict(pluginProps)
-        # A brand-new device (devId 0) or one deleted mid-dialog simply has no
-        # settings to show — the seeding below degrades to hiding the section.
+        # A brand-new device (devId 0) or one deleted mid-dialog has no states
+        # and no node, so device_known below is False and the section is hidden.
+        # That is an explicit gate, not an emergent one — spec-bounded settings
+        # resolve with no device at all and used to be offered regardless.
         states = self._device_states(devId)
         try:
             values.update(device_settings.config_ui_values(
                 typeId, states, self._setting_limits_lookup(values),
-                attribute_list=self._setting_attribute_list_lookup(values)))
+                attribute_list=self._setting_attribute_list_lookup(values),
+                device_known=self._has_matter_node(values),
+                on_skip=self._log_setting_skips(devId)))
         except Exception as exc:  # noqa: BLE001 - never block the dialog over the settings section
             self.logger.exception("could not build device settings for %s: %s", devId, exc)
         # MUST be indigo.Dict, not a plain dict — the same shape
@@ -974,7 +1014,8 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, ServerMenuMixin,
         wanted = str(filter or "").strip()
         for offer in device_settings.offered_settings(
                 typeId, self._setting_limits_lookup(props),
-                self._setting_attribute_list_lookup(props)):
+                self._setting_attribute_list_lookup(props),
+                self._has_matter_node(props)):
             if wanted and offer.setting.key != wanted:
                 continue
             rows = offer.setting.option_rows(offer.bounds)
@@ -1003,7 +1044,8 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, ServerMenuMixin,
             plans = device_settings.planned_writes(
                 typeId, valuesDict, self._device_states(devId),
                 self._setting_limits_lookup(valuesDict),
-                self._setting_attribute_list_lookup(valuesDict))
+                self._setting_attribute_list_lookup(valuesDict),
+                self._has_matter_node(valuesDict))
         except Exception as exc:  # noqa: BLE001
             self.logger.exception("could not work out device setting changes: %s", exc)
             return
@@ -1014,29 +1056,57 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, ServerMenuMixin,
                 "cannot apply device settings — the Matter connection is not running; "
                 "no setting was changed")
             return
-        node_id = valuesDict.get("nodeId")
-        endpoint_id = valuesDict.get("endpointId")
+        if not self._has_matter_node(valuesDict):
+            # Belt-and-braces: planned_writes is already gated on the same
+            # check, so reaching here means the two disagree. int() on an
+            # absent node id would throw a raw traceback out of a dialog-close
+            # callback, with no user-facing message and the remaining plans
+            # abandoned.
+            self.logger.error(
+                "cannot apply device settings — device %s has no Matter node yet", devId)
+            return
+        node_id = int(valuesDict.get("nodeId"))
+        endpoint_id = int(valuesDict.get("endpointId"))
         for plan in plans:
-            self.runtime.submit(self._apply_setting(int(node_id), int(endpoint_id),
-                                                    int(devId), plan))
+            self.runtime.submit(self._apply_setting(node_id, endpoint_id, int(devId), plan))
 
     def _device_states(self, dev_id) -> dict:
+        """This device's states, or {} if it has none we can read.
+
+        {} is not harmless: planned_writes compares against it to decide what
+        CHANGED, so an empty mapping makes every offered setting look changed
+        and turns a dialog opened to read values into a burst of writes to a
+        possibly battery-powered device. Narrow catch and a log line, so that
+        outcome is never silent — KeyError is the one anticipated case (a
+        brand-new devId 0, or a device deleted mid-dialog).
+        """
         try:
             return dict(indigo.devices[dev_id].states)
-        except Exception:  # noqa: BLE001 - no states means "nothing known", so every value counts as changed
+        except KeyError:
+            self.logger.debug("device %s has no states (new or deleted mid-dialog)", dev_id)
+            return {}
+        except Exception as exc:  # noqa: BLE001 - unexpected, and it changes what we write
+            self.logger.warning(
+                "could not read states for device %s (%s) — every setting will look "
+                "changed, so only settings you actually edited should be saved", dev_id, exc)
             return {}
 
     async def _apply_setting(self, node_id, endpoint_id, dev_id, plan) -> None:
         """Loop-side half of a settings write: send, verify, report.
 
-        Runs on the asyncio loop, so every Indigo write goes through
+        Runs on the asyncio loop, so the STATE write goes through
         ``device_sync.apply_states`` — the same discipline the attribute
-        firehose and the export bridge's command dispatch already use.
+        firehose and the export bridge's command dispatch already use. The error
+        flag is set directly, as ``device_sync``'s own ``_safe_unreachable`` /
+        ``_clear_error`` do from the same thread; the seam rule covers
+        ``updateStatesOnServer``, not every Indigo call.
         """
         label = plan.setting.label
+        observed: list = []
         try:
             ok, message = await device_settings.apply_setting(
-                self.matter, node_id, endpoint_id, plan)
+                self.matter, node_id, endpoint_id, plan,
+                on_observed=observed.append)
         except Exception as exc:  # noqa: BLE001 - a crash here must not kill the loop
             self.logger.exception('"%s" could not be applied: %s', label, exc)
             return
@@ -1044,7 +1114,7 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, ServerMenuMixin,
             self.logger.info("%s", message)
             # The read-back already proved this value is on the device, so this
             # is a confirmed write-through, not the optimistic echo the #85
-            # action does.
+            # action does. apply_states also clears any stale error flag.
             self.device_sync.apply_states(dev_id, [{"key": plan.setting.key,
                                                     "value": plan.value}])
             return
@@ -1052,6 +1122,15 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, ServerMenuMixin,
         try:
             dev = indigo.devices[dev_id]
             dev.setErrorStateOnServer("setting failed")
+            # A mismatch means the read-back told us what the device ACTUALLY
+            # holds. Recording it keeps the dialog honest on next open — it
+            # re-seeds from state, so leaving the stale value would show the
+            # user a setting the device never adopted, which is the divergence
+            # this whole feature exists to prevent.
+            actual = observed[0] if observed else None
+            if actual is not None:
+                self.device_sync.apply_states(
+                    dev_id, [{"key": plan.setting.key, "value": actual}])
         except Exception as exc:  # noqa: BLE001
             self.logger.debug("could not flag failed setting on device %s: %s", dev_id, exc)
 

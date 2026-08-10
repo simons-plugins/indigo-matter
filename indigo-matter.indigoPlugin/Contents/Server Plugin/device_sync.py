@@ -193,12 +193,14 @@ class DeviceSync:
         # on ep1) or must stay confined to its own endpoint (a bridge with
         # more than one battery-bearing child).
         self._power_source_eps: dict[int, set[int]] = {}
-        # The raw LIMITS attribute behind every declared writable setting
-        # (matter_handlers.settings.SETTINGS), keyed
+        # The raw LIMITS attribute behind every setting that declares
+        # FromAttribute bounds (most take theirs from the spec and cache nothing
+        # here — matter_handlers.settings.SETTINGS), keyed
         # (node_id, endpoint_id, cluster, attribute) — issues #85 and #186.
         # NodeInfo snapshots are transient (this class holds no other
         # node-attribute cache), so the ConfigUI layer in plugin.py needs these
-        # captured somewhere durable; refreshed on every create/reconcile pass.
+        # captured somewhere durable; updated on every create/reconcile pass.
+        # Entries are never EVICTED — see issue #191.
         #
         # Cached rather than read live ON PURPOSE, and the distinction matters:
         # get_node is a CACHE and is the wrong source for a reading that drifts,
@@ -1194,9 +1196,11 @@ class DeviceSync:
         """Raw limits value for a setting on (node, endpoint), or None if
         unknown — not yet reconciled, or this node does not implement it.
 
-        None is load-bearing: the ConfigUI layer treats "no limits" as "do not
-        offer this setting", which is what stops a pre-1.4 occupancy sensor with
-        no HoldTime from being shown a hold-time field it would fail to honour.
+        None is load-bearing for a setting with FromAttribute bounds: the
+        ConfigUI layer treats "no limits" as "do not offer", which is what stops
+        a pre-1.4 occupancy sensor with no HoldTime being shown a field it would
+        fail to honour. A setting whose bounds come from the spec never consults
+        this at all — its capability check is :meth:`attribute_list`.
         """
         with self._lock:
             return self._setting_limits.get(

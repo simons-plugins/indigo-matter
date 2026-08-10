@@ -57,7 +57,7 @@ __all__ = [
     "Bounds", "DeviceSetting", "SETTINGS",
     "FromAttribute", "StaticRange", "EnumValues",
     "parse_limits_struct", "parse_level_count",
-    "settings_for_type", "coerce_value", "verify_write", "implements",
+    "settings_for_type", "coerce_value", "verify_write", "implements", "NO_ANSWER",
     "CLUSTER_OCCUPANCY_SENSING", "ATTR_HOLD_TIME", "ATTR_HOLD_TIME_LIMITS",
     "CLUSTER_ON_OFF", "ATTR_START_UP_ON_OFF", "ATTR_ON_TIME",
     "ATTR_ATTRIBUTE_LIST",
@@ -90,6 +90,13 @@ ATTR_START_UP_ON_OFF = 0x4003
 #: it exists on every cluster so it works for settings whose bounds are fixed by
 #: the spec rather than reported per unit.
 ATTR_ATTRIBUTE_LIST = 0xFFFB
+
+#: "The device did not answer the read-back at all", kept DISTINCT from ``None``
+#: because ``None`` is a legitimate attribute value — StartUpOnOff is nullable
+#: ("restore the previous state", quality X). Conflating them reported a write
+#: that provably did not land as merely unconfirmed, which is the one firmware
+#: behaviour this whole feature exists to expose.
+NO_ANSWER = object()
 
 
 @dataclass(frozen=True)
@@ -302,8 +309,9 @@ class DeviceSetting:
     #: actually implements the attribute.
     bounds: Any
     #: Indigo device types whose Devices.xml declares this setting's field. A
-    #: setting is only ever offered on a type listed here, so the registry can
-    #: never promise a field the XML does not have.
+    #: setting is only ever offered on a type listed here. The XML is kept in
+    #: step BY HAND, so that correspondence is enforced by a parity test
+    #: (tests/test_plugin_module.py) rather than by this declaration alone.
     device_types: frozenset
     unit: str = ""
     #: Builds picker rows from the resolved bounds, for a menu whose LABELS
@@ -415,7 +423,10 @@ def implements(attribute_list: Any, attribute: int) -> Optional[bool]:
         try:
             ids.add(int(entry))
         except (TypeError, ValueError):
-            continue
+            # A list we could only partly read cannot support a confident NO.
+            # Claiming absence from data we know we failed to parse is worse
+            # than admitting we do not know.
+            return None
     if not ids:
         return None
     return int(attribute) in ids
@@ -457,10 +468,17 @@ def verify_write(setting: DeviceSetting, intended: int, read_back: Any) -> tuple
     write whose verification timed out on a sleepy device — but reporting an
     unproven write as success is the one outcome that makes the check pointless,
     and the wording says which case the user is in.
+
+    A read-back of ``None`` is NOT that case: it is the device answering with a
+    null, which for a nullable attribute means it holds no value. That is a
+    definite failure, not an unproven one.
     """
-    if read_back is None:
+    if read_back is NO_ANSWER:
         return False, (f"{setting.label} could not be confirmed — the device did not answer "
                        f"the read-back. The setting may or may not have been applied.")
+    if read_back is None:
+        return False, (f"{setting.label} was NOT applied — the device answered the read-back "
+                       f"with no value (null) after being asked for {intended}{setting.unit}.")
     try:
         actual = int(read_back)
     except (TypeError, ValueError):
