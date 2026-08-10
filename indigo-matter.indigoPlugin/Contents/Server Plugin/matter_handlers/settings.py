@@ -92,15 +92,32 @@ class Bounds:
 def parse_limits_struct(value: Any) -> Optional[Bounds]:
     """Bounds from a Matter limits STRUCT — OccupancySensing's HoldTimeLimits.
 
-    Reads as ``{"min": 1, "max": 300, "default": 10}`` on the FP300. matter-server
-    has been seen using both the short spec names and the full attribute names
-    across versions, so both are accepted; anything else yields None, which the
-    caller turns into "do not offer this setting" rather than a guess.
+    **The wire shape is field-INDEX keys, not names.** The live FP300 reports:
+
+        "1/1030/4": {"0": 1, "1": 300, "2": 10}
+
+    which is ``HoldTimeLimitsStruct{HoldTimeMin=0, HoldTimeMax=1,
+    HoldTimeDefault=2}`` — the same index-keyed serialisation matter-server uses
+    for every struct (cf. the Descriptor's DeviceTypeList, ``[{"0": 263}]``).
+    Verified against the raw ``get_node`` dump, which is the only trustworthy
+    source for this: the issue #186 research doc renders the same attribute as
+    ``{min: 1, max: 300, default: 10}``, and that is prose about what the fields
+    MEAN, not what arrives. Coding against the prose shipped a hold-time field
+    that never appeared, because the parse returned None and a setting whose
+    bounds are unknown is deliberately not offered.
+
+    Named keys are still accepted as a fallback in case a future matter-server
+    resolves struct fields to names. Anything else yields None, which the caller
+    turns into "do not offer this setting" rather than a guess.
+
+    Indices 0/1 are min/max **for this struct**; a different limits struct would
+    need its own parser rather than reusing this one on the assumption that
+    every Matter struct orders its fields that way.
     """
     if not isinstance(value, dict):
         return None
-    low = value.get("min", value.get("holdTimeMin"))
-    high = value.get("max", value.get("holdTimeMax"))
+    low = _struct_field(value, 0, "min", "holdTimeMin")
+    high = _struct_field(value, 1, "max", "holdTimeMax")
     try:
         low_i, high_i = int(low), int(high)
     except (TypeError, ValueError):
@@ -108,6 +125,21 @@ def parse_limits_struct(value: Any) -> Optional[Bounds]:
     if low_i > high_i:
         return None  # a device contradicting itself is not a range to validate against
     return Bounds(low_i, high_i)
+
+
+def _struct_field(struct: dict, index: int, *names: str) -> Any:
+    """One field of a wire struct, by index first and then by any known name.
+
+    JSON object keys are strings, but nothing guarantees a parser has not handed
+    back real ints, so both are tried.
+    """
+    for key in (str(index), index):
+        if key in struct:
+            return struct[key]
+    for name in names:
+        if name in struct:
+            return struct[name]
+    return None
 
 
 def parse_level_count(value: Any) -> Optional[Bounds]:

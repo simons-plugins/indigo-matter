@@ -2571,7 +2571,7 @@ FP300_SETTINGS_NODE = {
         "1/29/0": [{"0": 263}],
         "1/1030/0": 0,
         "1/1030/3": 10,
-        "1/1030/4": {"min": 1, "max": 300, "default": 10},
+        "1/1030/4": {"0": 1, "1": 300, "2": 10},   # struct: index-keyed on the wire
         "1/128/0": 1,
         "1/128/1": 3,
     },
@@ -2580,7 +2580,7 @@ FP300_SETTINGS_NODE = {
 
 def test_setting_limits_caches_hold_time_limits(ds, indigo_env):
     ds.create_from_raw(FP300_SETTINGS_NODE, "Landing Presence")
-    assert ds.setting_limits(0x38, 1, 0x0406, 0x0004) == {"min": 1, "max": 300, "default": 10}
+    assert ds.setting_limits(0x38, 1, 0x0406, 0x0004) == {"0": 1, "1": 300, "2": 10}
 
 
 def test_setting_limits_caches_the_sensitivity_count_too(ds, indigo_env):
@@ -2610,9 +2610,9 @@ def test_setting_limits_refreshed_on_reconcile(ds, indigo_env):
     ds.create_from_raw(FP300_SETTINGS_NODE, "Landing Presence")
     import copy
     changed = copy.deepcopy(FP300_SETTINGS_NODE)
-    changed["attributes"]["1/1030/4"] = {"min": 1, "max": 600, "default": 10}
+    changed["attributes"]["1/1030/4"] = {"0": 1, "1": 600, "2": 10}
     ds.reconcile_all([changed])
-    assert ds.setting_limits(0x38, 1, 0x0406, 0x0004)["max"] == 600
+    assert ds.setting_limits(0x38, 1, 0x0406, 0x0004)["1"] == 600
 
 
 def test_sensitivity_levels_supported_still_works_off_the_general_cache(ds, indigo_env):

@@ -633,7 +633,7 @@ def _async_value(value):
 
 
 _FP300_LIMITS = {
-    (0x0406, 0x0004): {"min": 1, "max": 300, "default": 10},
+    (0x0406, 0x0004): {"0": 1, "1": 300, "2": 10},   # real wire shape
     (0x0080, 0x0001): 3,
 }
 

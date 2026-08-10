@@ -52,9 +52,13 @@ from matter_handlers.settings import (
 MOTION = "matterMotionSensor"
 CONTACT = "matterContactSensor"
 
-#: What the real FP300 reports (issue #186 research doc, node 56).
+#: EXACTLY what the real FP300 reports, copied from the raw get_node dump —
+#: HoldTimeLimits is a struct with field-INDEX keys (0=min, 1=max, 2=default),
+#: not {"min":…,"max":…}. Fixtures previously used the research doc's prose
+#: rendering, which is why a parser that could not read the real thing passed
+#: every test and then showed no hold-time field on jarvis.
 FP300_LIMITS = {
-    (CLUSTER_OCCUPANCY_SENSING, ATTR_HOLD_TIME_LIMITS): {"min": 1, "max": 300, "default": 10},
+    (CLUSTER_OCCUPANCY_SENSING, ATTR_HOLD_TIME_LIMITS): {"0": 1, "1": 300, "2": 10},
     (CLUSTER_BOOLEAN_STATE_CONFIG, ATTR_SUPPORTED_SENSITIVITY_LEVELS): 3,
 }
 
@@ -76,18 +80,28 @@ def _setting(key):
 # Bounds parsing
 # ---------------------------------------------------------------------------
 
-def test_parse_limits_struct_reads_the_fp300_holdtimelimits():
+def test_parse_limits_struct_reads_the_REAL_fp300_holdtimelimits():
+    """The exact bytes off the wire: struct fields keyed by INDEX."""
+    assert parse_limits_struct({"0": 1, "1": 300, "2": 10}) == Bounds(1, 300)
+
+
+def test_parse_limits_struct_accepts_integer_struct_keys():
+    # JSON keys are strings, but no parser guarantees it stays that way.
+    assert parse_limits_struct({0: 1, 1: 300, 2: 10}) == Bounds(1, 300)
+
+
+def test_parse_limits_struct_still_accepts_resolved_field_names():
+    # Fallback, in case matter-server ever resolves struct fields to names.
     assert parse_limits_struct({"min": 1, "max": 300, "default": 10}) == Bounds(1, 300)
-
-
-def test_parse_limits_struct_accepts_the_long_attribute_names():
-    # matter-server has used both spellings across versions.
     assert parse_limits_struct({"holdTimeMin": 2, "holdTimeMax": 60}) == Bounds(2, 60)
 
 
 @pytest.mark.parametrize("value", [
     None, 5, "1-300", [], {}, {"min": 1}, {"min": "x", "max": 300},
-    {"min": 300, "max": 1},  # a device contradicting itself is not a range
+    {"min": 300, "max": 1},   # a device contradicting itself is not a range
+    {"0": 1},                 # index-keyed but truncated
+    {"0": 300, "1": 1},       # index-keyed and self-contradictory
+    {"2": 10},                # only the default — no range to validate against
 ])
 def test_parse_limits_struct_refuses_junk(value):
     assert parse_limits_struct(value) is None
