@@ -887,7 +887,6 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, ServerMenuMixin,
         read from a sleepy device is seconds. See the device_settings docstring.
         """
         values = dict(pluginProps)
-        errors = indigo.Dict()
         # A brand-new device (devId 0) or one deleted mid-dialog simply has no
         # settings to show — the seeding below degrades to hiding the section.
         states = self._device_states(devId)
@@ -896,7 +895,34 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, ServerMenuMixin,
                 typeId, states, self._setting_limits_lookup(values)))
         except Exception as exc:  # noqa: BLE001 - never block the dialog over the settings section
             self.logger.exception("could not build device settings for %s: %s", devId, exc)
-        return values, errors
+        # MUST be indigo.Dict, not a plain dict — the same shape
+        # getPrefsConfigUiValues returns. Returning a plain dict fails INSIDE
+        # Indigo's C++ bridge, which logs
+        #   Error in plugin execution UiGetValues2: No registered converter was
+        #   able to extract a C++ reference to type CXmlDict from this Python
+        #   object of type dict
+        # and then seeds NOTHING. For a section gated on hidden marker fields
+        # that reads as "the feature is missing": the markers keep their
+        # Devices.xml defaultValue of "no" and every field stays invisible, with
+        # the only clue an error naming an internal symbol rather than this
+        # method. Cost an hour on jarvis (#186); the tuple type is load-bearing.
+        return (indigo.Dict(values), indigo.Dict())
+
+    # Indigo 2025.2's PluginBase carries snake_case aliases for these callbacks
+    # alongside the camelCase names and does not document which it dispatches
+    # on — the same hedge getPrefsConfigUiValues above already makes. On this
+    # build the camelCase names ARE the ones called (proven by the UiGetValues2
+    # error above arriving at all), so these are belt-and-braces against a
+    # future build preferring the other spelling, not a fix for anything
+    # observed.
+    def get_device_config_ui_values(self, pluginProps, typeId, devId):
+        return self.getDeviceConfigUiValues(pluginProps, typeId, devId)
+
+    def validate_device_config_ui(self, valuesDict, typeId, devId):
+        return self.validateDeviceConfigUi(valuesDict, typeId, devId)
+
+    def closed_device_config_ui(self, valuesDict, userCancelled, typeId, devId):
+        return self.closedDeviceConfigUi(valuesDict, userCancelled, typeId, devId)
 
     def getSettingSensitivityLevels(self, filter="", valuesDict=None, typeId="", targetId=0):  # noqa: N802, A002, ARG002
         """Picker rows for the Edit Device dialog's Sensitivity menu.

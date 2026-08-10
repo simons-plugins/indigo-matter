@@ -867,3 +867,48 @@ def test_a_crash_in_the_write_path_never_kills_the_loop(plugin_cls, mock_indigo_
     _run_apply(plugin_cls, stub, _hold_time_plan())
     assert mock_logger.exception.called or mock_logger.error.called
     stub.device_sync.apply_states.assert_not_called()
+
+
+def test_device_config_ui_callbacks_have_snake_case_aliases(plugin_cls):
+    """Indigo 2025.2's PluginBase carries both spellings and does not document
+    which it dispatches on. camelCase is what this build calls, so these aliases
+    guard against a future build preferring the other spelling."""
+    for camel, snake in (
+        ("getDeviceConfigUiValues", "get_device_config_ui_values"),
+        ("validateDeviceConfigUi", "validate_device_config_ui"),
+        ("closedDeviceConfigUi", "closed_device_config_ui"),
+    ):
+        assert hasattr(plugin_cls, camel), f"missing {camel}"
+        assert hasattr(plugin_cls, snake), f"missing snake_case alias {snake}"
+
+
+def test_config_ui_values_are_returned_as_an_indigo_dict(plugin_cls, mock_indigo_base, mock_logger):
+    """Regression, found live on jarvis (#186): returning a plain dict fails
+    inside Indigo's C++ bridge —
+
+        Error in plugin execution UiGetValues2: No registered converter was able
+        to extract a C++ reference to type CXmlDict from this Python object of
+        type dict
+
+    — and seeds NOTHING, so a section gated on hidden marker fields never
+    appears and the only clue names an internal symbol, not this method."""
+    import indigo
+    mock_indigo_base.devices = {5: _fp300_dev()}
+    stub = _settings_stub(plugin_cls, mock_logger)
+    result = plugin_cls.getDeviceConfigUiValues(
+        stub, {"nodeId": "56", "endpointId": "1"}, "matterMotionSensor", 5)
+    assert isinstance(result, tuple) and len(result) == 2
+    for part in result:
+        assert isinstance(part, indigo.Dict)
+
+
+def test_the_snake_case_alias_seeds_the_same_values(plugin_cls, mock_indigo_base, mock_logger):
+    mock_indigo_base.devices = {5: _fp300_dev()}
+    stub = _settings_stub(plugin_cls, mock_logger)
+    stub.getDeviceConfigUiValues = (
+        lambda props, type_id, dev_id: plugin_cls.getDeviceConfigUiValues(
+            stub, props, type_id, dev_id))
+    values, _errors = plugin_cls.get_device_config_ui_values(
+        stub, {"nodeId": "56", "endpointId": "1"}, "matterMotionSensor", 5)
+    assert values["hasHoldTime"] == "yes"
+    assert values["holdTime"] == "10"
