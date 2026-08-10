@@ -7,7 +7,7 @@ has actually caught, and how to reproduce or extend them.
 
 | Layer | What it is | What it catches |
 |---|---|---|
-| 1. Unit suite | ~750 pytest tests, everything mocked | Logic, protocol parsing, reconcile/state machinery |
+| 1. Unit suite | 2,417 pytest tests, everything mocked | Logic, protocol parsing, reconcile/state machinery |
 | 2. Device zoo | Contract invariants over cluster combinations | Whole *classes* of device-mapping bugs |
 | 3. Virtual fleet | 15+ real Matter devices (matter.js) on the LAN | Real commissioning, subscriptions, command round-trips |
 | 4. Real hardware | Shipping devices on the production path | Everything else — including what Indigo itself really does |

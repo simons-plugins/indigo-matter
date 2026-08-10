@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>What is Matter — indigo-matter Field Notes № 1</title>
+<meta name="description" content="A plain-English primer on the Matter protocol: transports and Thread, border routers, commissioning, fabrics and multi-admin, and what &ldquo;uncertified&rdquo; really means. Ecosystem-neutral — no plugin mechanics.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400..700;1,9..144,400..700&display=swap" rel="stylesheet">
+<link href="https://api.fontshare.com/v2/css?f[]=general-sans@400,500,600&display=swap" rel="stylesheet">
+<script>document.documentElement.classList.add("js")</script>
+<link rel="stylesheet" href="aizome.css">
+<style>
+  :root { --accent: var(--leaf); --accent-soft: rgba(59, 90, 62, .10); }
+</style>
+</head>
+<body>
+
+<header class="mast">
+  <div class="mast-rule">
+    <span>indigo-matter · Field Notes</span>
+    <span class="no">№ 1 — What is Matter</span>
+    <a href="https://github.com/simons-plugins/indigo-matter">github / simons-plugins / indigo-matter</a>
+  </div>
+  <h1>What is <em>Matter</em></h1>
+  <p class="standfirst">The protocol, on its own terms — transports, border routers,
+  commissioning, fabrics, and the word “uncertified”. Nothing here is about Indigo or this
+  plugin; it is the vocabulary the other two issues assume you have.</p>
+  <div class="mast-foot">
+    <span>Then read: <a href="controller.html">№ 2 — The controller</a> ·
+    <a href="bridge.html">№ 3 — The bridge</a></span>
+  </div>
+</header>
+
+<main>
+
+<section class="note reveal">
+  <div class="sec-no">§ 01</div>
+  <div class="sec-body">
+    <h2>A protocol, not a radio</h2>
+    <p class="dropcap">Matter is a smart-home standard backed by Apple, Google, Amazon, Samsung
+    and hundreds of device makers under the Connectivity Standards Alliance. Its promise: buy a
+    device with the Matter logo and it works with every major ecosystem, locally, without a
+    vendor cloud.</p>
+    <div class="pull">Matter is not a radio. It is a control protocol that runs on top of
+    ordinary IP networking.<small>The single most useful fact on this page</small></div>
+    <p>A Matter device reaches your network over one of:</p>
+    <ul class="chips">
+      <li><b>Wi-Fi</b> — joins your normal wireless network</li>
+      <li><b>Ethernet</b> — same, wired</li>
+      <li><b>Thread</b> — a low-power mesh radio (§ 02)</li>
+    </ul>
+    <p>Either way, control traffic is local IP — UDP over link-local IPv6, discovered via
+    mDNS/Bonjour, the same multicast machinery as AirPlay and HomeKit. No cloud round-trips,
+    no vendor app needed for control. It also means Matter assumes a flat residential network:
+    one subnet, multicast allowed. Routers and VLANs are where it stops working.</p>
+  </div>
+</section>
+
+<section class="note reveal">
+  <div class="sec-no">§ 02</div>
+  <div class="sec-body">
+    <h2>Thread, and what it has to do with anything</h2>
+    <p>Thread is one of the <em>transports</em> Matter can run over: a low-power, self-healing
+    mesh radio (802.15.4 — the same silicon family as Zigbee) built for battery devices that
+    can’t afford Wi-Fi’s power budget — sensors, buttons, locks.</p>
+    <p>Thread devices can’t talk IP to your LAN directly; they need a <strong>Thread Border
+    Router</strong> to bridge the mesh onto your network. You probably already own one — by
+    2026 almost every ecosystem hub is a TBR:</p>
+    <ul class="chips">
+      <li><b>Apple</b> — HomePod mini, HomePod 2, recent Apple TV 4K</li>
+      <li><b>Amazon</b> — Echo 4, Echo Hub, Echo Studio, recent Echo Shows, eero</li>
+      <li><b>Google</b> — Nest Hub 2, Nest Hub Max, Nest Wifi Pro</li>
+    </ul>
+    <p>Two distinctions that save a lot of confusion:</p>
+    <ul>
+      <li><strong>Thread ≠ Matter.</strong> Thread is plumbing; Matter is the language. Some
+      Thread devices speak HomeKit-over-Thread or proprietary protocols instead.</li>
+      <li><strong>A Matter Wi-Fi device needs no border router at all.</strong> It’s just
+      another client on your LAN.</li>
+    </ul>
+    <div class="aside">
+      <span class="tag">One rule for Thread</span>
+      A Thread device joins the mesh of whichever ecosystem first commissioned it, so
+      <strong>that ecosystem’s border router must stay online</strong> for the device to stay
+      reachable — an Apple-commissioned device rides the Apple TBR, an Alexa-commissioned one
+      rides the Echo. For Wi-Fi devices, none of this applies.
+    </div>
+  </div>
+</section>
+
+<section class="note reveal">
+  <div class="sec-no">§ 03</div>
+  <div class="sec-body">
+    <h2>Commissioning, and why Bluetooth is in it</h2>
+    <p>Pairing a brand-new Matter device is called <strong>commissioning</strong>, and the very
+    first step usually happens over <strong>Bluetooth LE</strong>: the commissioner sends the
+    device your Wi-Fi credentials (or the Thread network key) over BLE, the device joins the
+    network — and BLE is never used again. Everything after that is plain IP.</p>
+    <p>That’s why phones and ecosystem hubs make good <em>first</em> commissioners: they have
+    BLE radios and, for Thread, the network credentials to hand out. It is also why the
+    printed QR code on the box is a one-shot: a commissioning passcode is single-use. Adding a
+    <em>second</em> controller later needs a freshly generated code, from an <em>enhanced
+    commissioning window</em> the first controller opens on request.</p>
+    <div class="pull">Once a device is on the network, commissioning it again is pure IP — no
+    Bluetooth, no phone, no proximity. Everything downstream of the code is
+    ecosystem-free.<small>True for Thread exactly as for Wi-Fi</small></div>
+    <p>Which raises the obvious question: why would you add a second controller at all?</p>
+  </div>
+</section>
+
+<section class="note reveal">
+  <div class="sec-no">§ 04</div>
+  <div class="sec-body">
+    <h2>Fabrics &amp; multi-admin: one device, many controllers</h2>
+    <p>A Matter <strong>fabric</strong> is a controller’s trust domain — a set of cryptographic
+    credentials a controller installs on a device. The crucial design choice in Matter is that
+    <strong>a device can belong to several fabrics at once</strong>. The spec floor is
+    five — and since each fabric slot costs the device persistent storage, the floor is also
+    what most devices ship. Treat five as your planning number. Each controller talks to the
+    device directly and locally; none of them knows or cares about the others.</p>
+    <p>A single plug can happily serve four admins simultaneously — an ecosystem app, a home
+    automation controller, the vendor’s own app, and something like Home Assistant — with no
+    cross-interference. Removing one fabric leaves the others untouched; only a factory reset
+    on the device wipes them all.</p>
+    <div class="aside caution">
+      <span class="tag">Caution — reset buttons</span>
+      Vendors overload the reset button. On TP-Link Tapo plugs, a ~5&nbsp;s hold is a
+      Wi-Fi-only reset (Matter fabrics survive); a ~10&nbsp;s hold is a <strong>factory reset
+      that wipes every fabric</strong> and undoes all your commissioning. Check before holding.
+    </div>
+    <p>Multi-admin is the single feature everything in these notes is built on: it is what lets
+    an ecosystem you already own do the hard first step, and something else join afterwards
+    over plain IP. That story is <a href="controller.html">№ 2 — The controller</a>.</p>
+  </div>
+</section>
+
+<section class="note reveal">
+  <div class="sec-no">§ 05</div>
+  <div class="sec-body">
+    <h2>Attestation, and the word “uncertified”</h2>
+    <p>Matter devices carry a certificate issued against a <strong>Vendor ID</strong> the
+    manufacturer holds from the CSA. At commissioning the process runs one way: the
+    <em>commissioner</em> checks the <em>device’s</em> certificate. A device whose certificate
+    doesn’t chain to a production CSA vendor is flagged — Apple Home, Alexa and Google Home all
+    show some version of “this accessory is not certified”, with a proceed-anyway option.</p>
+    <p>The specification reserves test vendor IDs (<code>0xFFF1</code>–<code>0xFFF4</code>) for
+    exactly this: development, and software that isn’t a shipped product. Every open-source
+    bridge and controller you have heard of uses one, because a real vendor ID means paid CSA
+    membership plus per-product certification.</p>
+    <p>Two consequences show up later in these notes, and both are expected behaviour rather
+    than bugs:</p>
+    <ul>
+      <li>an uncertified <em>controller</em> is displayed under its test vendor’s registered
+      name rather than a name of its own (<a href="controller.html">№ 2</a>);</li>
+      <li>an uncertified <em>bridge</em> gets the “not certified” prompt every time it is
+      paired, permanently (<a href="bridge.html">№ 3</a>).</li>
+    </ul>
+  </div>
+</section>
+
+<section class="note reveal">
+  <div class="sec-no">§ 06</div>
+  <div class="sec-body">
+    <h2>Bridges</h2>
+    <p>A Matter <strong>bridge</strong> is a device that presents things which aren’t Matter —
+    Zigbee bulbs, proprietary RF sensors, whatever a hub already speaks — as Matter endpoints
+    behind one accessory. Aqara, SwitchBot and Hue hubs all do this, and so does software:
+    Homebridge’s Matter successors, Home Assistant, and this plugin’s own export half all
+    publish a bridge rather than a fleet of individual devices.</p>
+    <p>From the network’s point of view a bridge is just a Matter device with a lot of
+    endpoints. Everything above — fabrics, multi-admin, attestation — applies to it unchanged.
+    That symmetry is the whole reason this plugin can work in both directions.</p>
+  </div>
+</section>
+
+</main>
+
+<footer class="colophon">
+  <span>indigo-matter Field Notes · set in Fraunces &amp; General Sans on warm paper<span class="dot">.</span></span>
+  <span>
+    <a href="index.html">Index</a> ·
+    <a href="controller.html">№ 2 — The controller</a> ·
+    <a href="bridge.html">№ 3 — The bridge</a> ·
+    <a href="testing.html">№ 4 — The Proving Ground</a>
+  </span>
+</footer>
+
+<script>
+  const io = new IntersectionObserver((entries) => {
+    for (const e of entries) if (e.isIntersecting) { e.target.classList.add("in"); io.unobserve(e.target); }
+  }, { rootMargin: "0px 0px -8% 0px" });
+  document.querySelectorAll(".reveal").forEach(el => io.observe(el));
+</script>
+
+</body>
+</html>
