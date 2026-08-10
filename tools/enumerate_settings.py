@@ -39,8 +39,8 @@ Plenty of writable attributes are controls the plugin already drives (a level, a
 setpoint), and privilege does not separate them: `HoldTime` is `RW VM` while
 `CurrentSensitivityLevel` is `RW VO`, and both are settings. So the report ranks
 and annotates; a human still picks. It also cannot tell you whether a device
-implements an attribute — only the device can, which is what the limits-presence
-check at runtime is for.
+implements an attribute — only the device can, which is what the runtime
+AttributeList (0xFFFB) check is for.
 """
 from __future__ import annotations
 
@@ -180,18 +180,42 @@ def handled_clusters() -> dict:
 
 
 def declared_settings() -> set:
-    """``{(cluster, attribute)}`` already declared in settings.py."""
+    """``{(cluster_id, attribute_id)}`` already declared in settings.py.
+
+    Resolved to NUMBERS, not names. Matching a model attribute by name against
+    the declaration's expression text marks the wrong thing declared as soon as
+    two clusters share an attribute name (``CurrentSensitivityLevel`` and
+    ``Occupancy`` are both ``id 0``), and misses any declaration written with a
+    numeric literal. The constants are read from the same file, so this stays a
+    pure text parse with no plugin import.
+    """
     path = HANDLER_DIR / "settings.py"
     if not path.is_file():
         return set()
     source = path.read_text(encoding="utf-8")
+    consts = {name: int(value, 0) for name, value in
+              re.findall(r"^([A-Z][A-Z0-9_]*)\s*=\s*(0x[0-9a-fA-F]+|\d+)\s*$",
+                         source, re.M)}
+
+    def resolve(token):
+        token = token.strip()
+        if token in consts:
+            return consts[token]
+        try:
+            return int(token, 0)
+        except ValueError:
+            return None
+
     pairs = set()
     for block in re.finditer(r"DeviceSetting\((.*?)\n    \)", source, re.S):
         body = block.group(1)
-        cluster = re.search(r"cluster=(\w+)", body)
-        attribute = re.search(r"attribute=(\w+)", body)
-        if cluster and attribute:
-            pairs.add((cluster.group(1), attribute.group(1)))
+        cluster = re.search(r"cluster=([\w.]+)", body)
+        attribute = re.search(r"attribute=([\w.]+)", body)
+        if not (cluster and attribute):
+            continue
+        cluster_id, attribute_id = resolve(cluster.group(1)), resolve(attribute.group(1))
+        if cluster_id is not None and attribute_id is not None:
+            pairs.add((cluster_id, attribute_id))
     return pairs
 
 
@@ -263,8 +287,7 @@ def main() -> int:
         lines.append("| Attribute | Id | Type | Access | Conf | Bounds strategy | Notes |")
         lines.append("|---|---|---|---|---|---|---|")
         for a in sorted(attrs, key=lambda x: x["id"] if isinstance(x["id"], int) else 0):
-            done = " ✅ declared" if any(a["name"].lower() in d[1].lower()
-                                        for d in declared) else ""
+            done = " ✅ declared" if (cluster_id, a["id"]) in declared else ""
             lines.append(
                 f"| {a['name']}{done} | {a['id']} | {a['type']} | {a['access']} | "
                 f"{a['conformance']} | {a['strategy']} | {a['note']} |")

@@ -318,9 +318,13 @@ async def apply_setting(client: Any, node_id: int, endpoint: int,
             last_error = exc
             if attempt == 1:
                 await sleep(retry_delay)
-    if last_error is not None:
-        return False, (f"{setting.label} could not be sent to the device: {last_error}. "
-                       f"The setting was not changed.")
+    # A failed write is NOT evidence the setting is unchanged. A timeout can
+    # land after matter-server or the device accepted it — which is the same
+    # argument that justifies the long timeout above, so returning "the setting
+    # was not changed" here would contradict it and assert an outcome nothing
+    # verified. Fall through to the read-back and let the device answer; if the
+    # transport really is down the read fails too and it is reported as
+    # unconfirmed, which is the honest verdict.
 
     read_back: Any = NO_ANSWER
     read_error: Optional[Exception] = None
@@ -347,12 +351,20 @@ async def apply_setting(client: Any, node_id: int, endpoint: int,
             pass  # unreadable: verify_write below reports it; nothing to record
 
     ok, reason = verify_write(setting, plan.value, read_back)
-    if not ok and read_error is not None:
+    if ok:
+        if last_error is not None:
+            # The send errored and the value is on the device anyway — exactly
+            # the case that made "could not be sent" a lie.
+            return True, (f"{setting.label} is now {plan.value}{setting.unit} "
+                          f"(the send reported an error — {last_error} — but the "
+                          f"device holds the new value).")
+        return True, reason or f"{setting.label} is now {plan.value}{setting.unit}."
+    if last_error is not None:
+        reason = f"{reason} The send also failed: {last_error}."
+    if read_error is not None:
         # The write leg names its error; this one used to discard the exception
         # entirely, so a timeout, a dead socket and a protocol error all read as
         # one generic sentence. For a feature whose whole job is saying what
         # really happened, that is self-defeating.
         reason = f"{reason} (read-back failed: {read_error})"
-    if ok:
-        return True, f"{setting.label} is now {plan.value}{setting.unit}."
     return False, reason

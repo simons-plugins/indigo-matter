@@ -448,12 +448,35 @@ def test_the_write_is_retried_once_before_giving_up():
     assert len(client.writes) == 2
 
 
-def test_a_write_that_fails_twice_is_reported_and_never_verified():
-    client = _Client(write_errors=[TimeoutError(), TimeoutError()])
+def test_a_failed_write_is_still_verified_rather_than_assumed_unchanged():
+    """A timeout is not evidence of anything — the same argument that justifies
+    the 30s timeout. It can land after matter-server accepted it, so claiming
+    "the setting was not changed" would assert an outcome nothing verified."""
+    client = _Client(reads=10, write_errors=[TimeoutError(), TimeoutError()])
     ok, message = _run(apply_setting(client, 56, 1, _plan(), sleep=_no_sleep))
     assert ok is False
-    assert "was not changed" in message
-    assert client.read_calls == 0, "a write that never landed must not be read back"
+    assert client.read_calls > 0, "the device must be asked, not assumed"
+    assert "NOT applied" in message      # the read-back proved it
+    assert "send also failed" in message  # and the send error is still named
+
+
+def test_a_write_that_errored_but_landed_is_reported_as_SUCCESS():
+    """The case that made the old wording a lie: the send reports a timeout,
+    the device has the value anyway."""
+    client = _Client(reads=30, write_errors=[TimeoutError("no ack"), TimeoutError("no ack")])
+    ok, message = _run(apply_setting(client, 56, 1, _plan(), sleep=_no_sleep))
+    assert ok is True
+    assert "is now 30 seconds" in message
+    assert "no ack" in message, "the send error is still disclosed"
+
+
+def test_a_write_and_read_that_both_fail_is_reported_as_unconfirmed():
+    client = _Client(write_errors=[TimeoutError(), TimeoutError()],
+                     read_errors=[TimeoutError("asleep"), TimeoutError("asleep")])
+    ok, message = _run(apply_setting(client, 56, 1, _plan(), sleep=_no_sleep))
+    assert ok is False
+    assert "may or may not" in message
+    assert "asleep" in message
 
 
 def test_sensitivity_writes_go_to_the_boolean_state_config_cluster():
