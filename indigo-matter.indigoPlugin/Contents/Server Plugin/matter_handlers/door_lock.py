@@ -55,7 +55,7 @@ class DoorLockHandler(ClusterHandler):
                     # API-created devices; set it here so the device gets the lock
                     # UI (Lock/Unlock buttons, triggers, control-page) instead of
                     # the generic switch UI — same pattern as ColorControlHandler
-                    # sets SupportsColor/SupportsRGB in props (HANDOVER item 4).
+                    # sets SupportsColor/SupportsRGB in props (issue #56).
                     "IsLockSubType": True,
                 },
                 initial_states={},  # defer to first attribute_updated from matter-server

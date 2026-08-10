@@ -297,14 +297,6 @@ Commission device by setup code…** — and it will appear as a native Indigo d
 
 ## Exporting Indigo devices (Indigo as a Matter bridge)
 
-> **You cannot install this yet.** The export bridge needs a second npm package,
-> `indigo-matter-bridge`, and it **has not been published to the npm registry**.
-> Until it is, **Install/update the Matter bridge** cannot resolve the
-> version the plugin pins, and the install fails. Nothing else in the plugin is
-> affected — the inbound controller, your commissioned devices and every Indigo
-> device carry on as normal — but export cannot be brought up. Everything below
-> is what you are waiting for.
-
 Everything above is the plugin's **inbound** half: Matter devices becoming Indigo
 devices. The plugin also runs the opposite direction — a selected set of your
 *existing* Indigo devices (Z-Wave, Insteon, Zigbee, MQTT, anything a plugin owns)
@@ -747,7 +739,7 @@ dialog, most-likely-first — the top two are what a first export usually hits.
 | Log line | Cause | Fix |
 |---|---|---|
 | `Matter bridge: the bridge node is not responding after N attempts on port 5581` | The node is not running, is crash-looping, or was never installed. All three look identical at the socket, so the plugin appends what the LaunchAgent found. | Read the sentence that follows it in the log — it names the real cause. Then: install the package (below), free the port (below), or check `bridge-node.err.log`. |
-| The log names **Install/update the Matter bridge** | The `indigo-matter-bridge` package is not installed, so no LaunchAgent was written. This is the normal first-run state. | Run that menu item. Note it cannot succeed until the package is published to npm — see *Export prerequisites*. |
+| The log names **Install/update the Matter bridge** | The `indigo-matter-bridge` package is not installed, so no LaunchAgent was written. This is the normal first-run state. | Run that menu item. |
 | An `EADDRINUSE` / address-already-in-use failure in `bridge-node.err.log`. The node labels which startup step failed, so the line says whether it was the Matter port or the loopback protocol port | **Matter port (UDP 5540):** another Matter *device* stack on this Mac already holds it — Homebridge 2.x, matterbridge, or a Home Assistant container in host mode. **Protocol port (TCP 5581):** an orphaned bridge node from an earlier LaunchAgent is still running, or an unrelated service has the port. | **Matter port:** stop the other stack, or Configure… ▸ **Show export port settings** ▸ **Matter port**, pick another, and **reload the plugin**. Find the holder with `lsof -nP -iUDP:5540`. Moving off 5540 is a real trade — it is the port ecosystems expect. **Protocol port:** **Stop the Matter bridge…** then re-save an export (the plugin reaps its own orphans on start). If something else holds it, find it with `lsof -nP -iTCP:5581 -sTCP:LISTEN`, and either stop it or change **Bridge control port** and reload the plugin. |
 | `Matter bridge: the bridge node's LaunchAgent did not start` / `could not be loaded by launchd` | launchd accepted the job and the process died, or refused the plist. | Check `bridge-node.err.log` first. Then `launchctl print gui/$(id -u)/com.simons-plugins.indigo-matter.bridge`. **Stop the Matter bridge…** followed by re-saving an export rebuilds the plist from scratch. |
 | `Matter bridge: the bridge node is serving NOTHING because its endpoint-number map is unreadable` | The bridge's `endpoint-map.json` is present but corrupt. It refuses to serve rather than silently renumber every accessory. | **Rebuild Matter Endpoint Map…** — and read what it does first (above). The unusable file is kept as `endpoint-map.json.corrupt-<timestamp>` in the bridge storage folder; if you have a backup of the original, restoring it is better than rebuilding. |

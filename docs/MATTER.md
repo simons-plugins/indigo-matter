@@ -295,11 +295,10 @@ If you have run Homebridge, this is the same idea over Matter's protocol instead
 of HomeKit's — with the difference that Matter is one implementation reaching
 every ecosystem that speaks it, rather than one bridge per ecosystem.
 
-**It is not installable yet.** The bridge is a second npm package,
-`indigo-matter-bridge`, and it has not been published to the npm registry — so
-the plugin's install menu item cannot resolve it, and export cannot be brought
-up on any machine today. Everything below describes what is built and waiting on
-that. Setup steps, for when it lands, are in [INSTALL.md](./INSTALL.md); this
+The bridge is a second npm package, `indigo-matter-bridge`, published on the
+npm registry (0.5.0 onward) and exact-pinned by the plugin, so the
+**Install/update the Matter bridge** menu item resolves it.
+Setup steps are in [INSTALL.md](./INSTALL.md); this
 section is the shape of it.
 
 The two questions this page gets asked most are "can I export my lock?" and "why

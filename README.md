@@ -100,9 +100,9 @@ and all), an on/off light and a dimmer **have** been controlled in both directio
 accessory identity **has** survived an upgrade without duplicating (2026-08-04 / 05, on
 the reference server). Still outstanding: pairing through the plugin's own menu rather
 than the node's console, a second controller alongside Apple Home, the reboot leg of the
-identity check, and the managed LaunchAgent end to end — that last one needs the package
-installed, which until `indigo-matter-bridge` is published means the local-install
-workaround rather than the shipped install menu. Treat the export half as new. See
+identity check, and the managed LaunchAgent end to end — `indigo-matter-bridge` is on the npm
+registry now, so the shipped install menu is the route for that last one.
+Treat the export half as new. See
 [MATTER.md](docs/MATTER.md#indigo-as-a-matter-bridge--the-other-direction) for how it
 works.
 

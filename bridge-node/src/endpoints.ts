@@ -544,8 +544,8 @@ const COMMAND_SINKS = new Map<string, CommandSink>();
  * away, and the bolt never moved. There is no protocol frame for "your command
  * was dropped" (the plugin cannot be told about invocations that arrived while
  * it was away; that would be a §3.1 protocol addition, deliberately not made
- * here), so failing the invocation is the only way the
- * truth reaches the person standing at the door. A Matter status error makes
+ * here), so failing the invocation is the only way the truth reaches the
+ * person standing at the door. A Matter status error makes
  * Home say the accessory did not respond, which is exactly what happened.
  */
 function emitCommand(

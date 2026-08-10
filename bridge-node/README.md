@@ -109,10 +109,11 @@ npm test                  # publishing an untested build is the one unrecoverabl
 npm publish --access public
 ```
 
-**Every release bumps two versions in step**, and a mismatch is silent until an
-install fails: `package.json`'s `version` here, and
-`bridge_agent.DEFAULT_INSTALL_SPEC` in the plugin. `test_bridge_agent.py`
-asserts they agree, so a mismatch is a test failure rather than a field report.
+**Every release bumps two versions in step**: `package.json`'s `version` here,
+and `bridge_agent.DEFAULT_INSTALL_SPEC` in the plugin. `test_bridge_agent.py`
+only asserts the pin is never *ahead* of `package.json` (a trailing pin is
+legal — installs just keep pulling the older release), so the in-step bump is
+manual discipline, not something the suite enforces.
 
 **Testing an unreleased node** (dev workaround, *not* the shipped default): the
 on-disk layout the LaunchAgent expects is reproduced by a local install —
