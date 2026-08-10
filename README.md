@@ -105,14 +105,16 @@ worked end to end, a second controller **has** joined alongside Apple Home — A
 fabric #3 — an on/off light and a dimmer **have** been controlled in both directions, the
 one-click managed LaunchAgent chain **has** installed and run the bridge without hand
 intervention, and accessory identity **has** survived an upgrade without duplicating
-(2026-08-04 / 05, on the reference server). Still outstanding: the reboot leg of the
+(2026-08-04 → 06, on the reference server). Still outstanding: the reboot leg of the
 accessory-identity check. Treat the export half as new. See
 [MATTER.md](docs/MATTER.md#indigo-as-a-matter-bridge--the-other-direction) for how it
 works.
 
 ## Setup
 
-Install the plugin from the **Indigo Plugin Store**, then set it up. It doesn't speak
+Install the plugin from the **Indigo Plugin Store** (or download the
+`.indigoPlugin.zip` from [Releases](https://github.com/simons-plugins/indigo-matter/releases)
+and double-click it), then set it up. It doesn't speak
 Matter directly — it drives **matter-server**, a separate Node.js process holding the
 Indigo-owned fabric. In local mode the plugin installs and manages that for you, so setup
 from here is three steps and no Terminal beyond installing Node:
@@ -143,7 +145,7 @@ reconciled N Matter node(s)
 
 `N` is 0 on a fresh install; that's fine. If you instead see
 `Connect call failed ('127.0.0.1', 5580)`, matter-server isn't running — that, plus
-manual mode, fabric backups, upgrading and uninstalling, is covered in the
+the "On another computer" mode, fabric backups, upgrading and uninstalling, is covered in the
 [full install guide](https://simons-plugins.github.io/indigo-matter/INSTALL.html).
 
 To **export** Indigo devices as well, add a fourth step — **Plugins ▸ Matter ▸
@@ -179,11 +181,11 @@ typeset. **Start here.**
   Matter out: the separate bridge node, opt-in exports, pairing into an ecosystem, and
   what has and hasn't been validated.
 - **[№ 4 — The Proving Ground](https://simons-plugins.github.io/indigo-matter/testing.html)** —
-  how this plugin is tested: the unit suite, the device zoo, the virtual matter.js fleet,
-  and live validation on a production server.
+  how this plugin is tested: the unit suites (plugin + bridge node), the device zoo, the
+  virtual matter.js fleet, and live validation on a production server.
 
 Setup is covered above; the [full install guide](https://simons-plugins.github.io/indigo-matter/INSTALL.html)
-has manual mode, backups, upgrading and troubleshooting.
+has the "On another computer" mode, backups, upgrading and troubleshooting.
 
 ## Development
 
@@ -194,7 +196,7 @@ pytest          # full unit suite; matter-server (WebSocket) and Indigo are mock
 Developer reference, in the repo — not intended as user documentation:
 
 - [`docs/IMPLEMENTATION.md`](https://github.com/simons-plugins/indigo-matter/blob/main/docs/IMPLEMENTATION.md) — protocols, scaffold, cluster handlers.
-- [`docs/API.md`](https://github.com/simons-plugins/indigo-matter/blob/main/docs/API.md) — the Domio ↔ plugin HTTP contract (v1.3).
+- [`docs/API.md`](https://github.com/simons-plugins/indigo-matter/blob/main/docs/API.md) — the Domio ↔ plugin HTTP contract (v1.4).
 - [`docs/BRIDGE_PROTOCOL.md`](https://github.com/simons-plugins/indigo-matter/blob/main/docs/BRIDGE_PROTOCOL.md) — the plugin ⇄ bridge-node local protocol (export side).
 - [`docs/PRD-indigo-matter-plugin.md`](https://github.com/simons-plugins/indigo-matter/blob/main/docs/PRD-indigo-matter-plugin.md) — product requirements and milestones (inbound).
 - [`docs/PRD-indigo-matter-export.md`](https://github.com/simons-plugins/indigo-matter/blob/main/docs/PRD-indigo-matter-export.md) — the same for the Matter bridge.

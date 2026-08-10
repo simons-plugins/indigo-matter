@@ -115,7 +115,9 @@ did not mean to touch.
 
 ## Prerequisites
 
-Install Matter from the **Indigo Plugin Store**, then:
+Install Matter from the **Indigo Plugin Store** (or download the
+`.indigoPlugin.zip` from [Releases](https://github.com/simons-plugins/indigo-matter/releases)
+and double-click it), then:
 
 - **macOS** running your Indigo Server.
 - **Indigo 2025.2+** with the `indigo-matter` plugin installed (≥ **2026.0.6** — earlier

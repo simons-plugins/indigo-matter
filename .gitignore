@@ -9,3 +9,4 @@ bridge-node/node_modules/
 bridge-node/dist/
 bridge-node/.test-build/
 docs/HANDOVER.md
+.gstack/

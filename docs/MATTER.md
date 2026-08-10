@@ -503,7 +503,7 @@ Honestly stated, because the difference matters:
   and Indigo's own controller — the bridge does not care who commissions it.
 
 **What has and has not been proven on live hardware** is stated once, in the
-project [README](https://github.com/simons-plugins/indigo-matter#readme), rather
+project [README](https://github.com/simons-plugins/indigo-matter#status), rather
 than restated here where the two copies would drift apart. The short version: the
 bridge has been commissioned into Apple Home and Alexa and exported devices have
 been controlled both ways, but the reboot leg of the accessory-identity check is
