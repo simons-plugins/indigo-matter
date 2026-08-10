@@ -73,13 +73,60 @@
     <p>You build the list in Plugins ▸ Matter ▸ <em>Manage Matter Exports…</em>. The picker
     marks anything already exported with a <code>●</code>, and shows devices that <em>can’t</em>
     be exported too, with the reason, rather than leaving you to wonder where they went.</p>
-    <ul class="chips">
-      <li><b>Relay</b> → plug, light, or lock</li>
-      <li><b>Dimmer</b> → dimmable light or window covering</li>
-      <li><b>Colour dimmer</b> → colour-temperature or full-colour light</li>
-      <li><b>Sensor</b> → one of seven Matter sensor types</li>
-      <li><b>Thermostat</b> → thermostat</li>
-    </ul>
+    <table class="specimen">
+      <caption>What your device can become — the outbound mapping, v1</caption>
+      <thead><tr><th scope="col">Your Indigo device</th><th scope="col">Roles offered
+      <small>(default first)</small></th><th scope="col">Appears in ecosystems as</th></tr></thead>
+      <tbody>
+        <tr>
+          <th scope="row">Relay</th>
+          <td><b>Plug</b> · Light · Lock</td>
+          <td>On/Off Plug-in Unit · On/Off Light · Door Lock</td>
+        </tr>
+        <tr>
+          <th scope="row">Dimmer</th>
+          <td><b>Dimmable light</b> · Window covering</td>
+          <td>Dimmable Light · Window Covering</td>
+        </tr>
+        <tr>
+          <th scope="row">Dimmer, colour-temperature capable</th>
+          <td><b>Colour-temperature light</b> · Dimmable light · Window covering</td>
+          <td>Color Temperature Light · Dimmable Light · Window Covering</td>
+        </tr>
+        <tr>
+          <th scope="row">Dimmer, full colour</th>
+          <td><b>Full-colour light</b> · Dimmable light · Colour-temperature light ·
+          Window covering</td>
+          <td>Extended Color Light · Dimmable Light · Color Temperature Light ·
+          Window Covering</td>
+        </tr>
+        <tr>
+          <th scope="row">Sensor, on/off</th>
+          <td><b>Occupancy</b> · Contact</td>
+          <td>Occupancy Sensor · Contact Sensor</td>
+        </tr>
+        <tr>
+          <th scope="row">Sensor, numeric</th>
+          <td>Temperature · Humidity · Light (lux) · Pressure · Flow — the default is guessed
+          from the device’s units, and you can correct it</td>
+          <td>the matching Matter sensor type</td>
+        </tr>
+        <tr>
+          <th scope="row">Thermostat</th>
+          <td><b>Thermostat</b></td>
+          <td>Thermostat — setpoints and modes; no fan in v1</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>Window covering appears under every dimmer because Indigo represents blinds as dimmers.
+    An exported position always means 100&nbsp;% = fully open in your ecosystem app (the bridge
+    handles Matter’s own inverted attribute for you), and a per-export tick-box flips it if
+    your hardware runs the other way. Locks pass commands to Indigo and confirm <em>nothing</em>
+    optimistically — what the ecosystem shows moves only when the bolt actually moves. What
+    <em>can’t</em> be exported — valves and garage doors as <em>roles</em> (the relay itself
+    stays exportable as a plug), fans, sprinklers — is listed with the reason for each in
+    <a href="MATTER.html">MATTER.html</a>; the one thing filtered out of the picker entirely is
+    this plugin’s own Matter devices, so a Matter device is never re-exported over Matter.</p>
     <div class="flow" role="img" aria-label="Export flow from an Indigo device through the plugin's bridge role, the bridge node, and into Apple Home">
       <div class="flow-node"><b>An Indigo device</b><span>Z-Wave, Insteon, Zigbee behind a
       plugin, MQTT — anything with a device record — added to the allow-list</span></div>

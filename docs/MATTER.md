@@ -325,8 +325,10 @@ are offered.
 | Thermostat | Thermostat | Thermostat (setpoints and modes; no fan in v1) |
 
 Two notes on that table. **Window covering** is offered for any dimmer because
-Indigo represents blinds as dimmers; Matter's convention is 100 % = fully open,
-and there is a per-export tick-box if your device runs the other way. And the
+Indigo represents blinds as dimmers; an exported position always means 100 % =
+fully open in your ecosystem app (the bridge node handles Matter's own inverted
+WindowCovering attribute for you), and there is a per-export tick-box if your
+device runs the other way. And the
 **numeric sensor** guess reads whatever unit hints the device carries (its
 plugin's properties, its displayed value, then its name) — it is only a default,
 and all five roles stay selectable.
