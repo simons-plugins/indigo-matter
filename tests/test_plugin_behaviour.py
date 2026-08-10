@@ -288,6 +288,65 @@ def test_decommission_inner_offline_reports_fabric_not_removed(plug):
     asyncio.run(scenario())
 
 
+def test_decommission_treats_node_not_exists_as_already_removed(plug):
+    """A node matter-server does not have needs no RemoveFabric — the goal is met.
+
+    Treating ServerErrorCode.NodeNotExists (5) as a failure was a trap: the node stayed
+    in the picker, every retry failed identically with "Node N does not exist", and the
+    dialog told the user to retry "once the device is reachable" about a device that
+    could never make that come true. Hit whenever matter-server's node list and the
+    plugin's index disagree — a decommission from another admin, a fabric restored from
+    an older backup, or the duplicate-server cutover in #182.
+    """
+    from protocol import ProtocolError
+
+    forgotten = {}
+
+    async def scenario():
+        async def gone(node_id):
+            raise ProtocolError(5, f"Node {node_id} does not exist")
+        plug.matter = SimpleNamespace(remove_node=gone)
+        plug.device_sync.knows_node = lambda nid: True
+
+        def delete_node(nid, forget=True):
+            forgotten["forget"] = forget
+            return []                      # devices already deleted by hand
+        plug.device_sync.delete_node = delete_node
+        result = await plug._decommission(38)
+        assert result["fabricRemoved"] is True      # reported as removed…
+        assert result["nodeId"] == "0x26"
+        assert result["removedIndigoDeviceIds"] == []
+        return result
+
+    asyncio.run(scenario())
+    # …and forgotten, so it leaves the picker instead of being offered for ever.
+    assert forgotten["forget"] is True
+
+
+def test_decommission_still_reports_failure_for_a_non_missing_node_error(plug):
+    """Only NodeNotExists is benign. Any other matter-server error must NOT forget the
+    node — doing so would drop a still-commissioned device out of the only UI that can
+    remove it."""
+    from protocol import ProtocolError
+
+    forgotten = {}
+
+    async def scenario():
+        async def busy(node_id):
+            raise ProtocolError(3, "NodeNotReady")   # a real, retryable failure
+        plug.matter = SimpleNamespace(remove_node=busy)
+        plug.device_sync.knows_node = lambda nid: True
+
+        def delete_node(nid, forget=True):
+            forgotten["forget"] = forget
+            return [111]
+        plug.device_sync.delete_node = delete_node
+        result = await plug._decommission(42)
+        assert result["fabricRemoved"] is False
+    asyncio.run(scenario())
+    assert forgotten["forget"] is False
+
+
 def test_decommission_inner_unknown_unreachable_returns_none(plug):
     async def scenario():
         async def boom(node_id):

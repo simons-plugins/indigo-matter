@@ -72,6 +72,16 @@ CMD_DEVICE = "device_command"            # invoke a cluster command
 CMD_START_LISTENING = "start_listening"
 CMD_SET_FABRIC_LABEL = "set_default_fabric_label"  # persists + pushes UpdateFabricLabel to nodes
 
+# matter-server's ServerErrorCode.NodeNotExists. VERIFIED against ws-controller 1.2.2
+# (@matter-server/ws-controller/dist/esm/types/WebSocketMessageTypes.js: UnknownError 0,
+# NodeCommissionFailed 1, NodeInterviewFailed 2, NodeNotReady 3, NodeNotResolving 4,
+# NodeNotExists 5, VersionMismatch 6, SDKStackError 7, InvalidArguments 8,
+# InvalidCommand 9, UpdateCheckError 10, UpdateError 11, IcdMultiAdmin 100).
+# Only this one is named because only this one changes a decision: for remove_node,
+# "the node is not in the fabric" is the DESIRED END STATE of a decommission, not a
+# failure — see HttpApiMixin._decommission.
+ERR_NODE_NOT_EXISTS = 5
+
 # device_command argument keys (the most contested names — see module docstring)
 ARG_NODE_ID = "node_id"
 ARG_ENDPOINT = "endpoint_id"             # IMPLEMENTATION.md used "endpoint"
@@ -172,6 +182,25 @@ def _to_int(value: Any) -> int:
     if isinstance(value, int):
         return value
     return int(str(value), 0)
+
+
+def is_node_not_exists(exc: Exception) -> bool:
+    """True when matter-server refused a request because the node is not in the fabric.
+
+    Lives here rather than at the call site because the numeric code is wire
+    vocabulary, and because the coercion is not obvious: ``ProtocolError.code`` is
+    whatever the JSON carried, so it may be an int or a string. Anything we cannot
+    read as :data:`ERR_NODE_NOT_EXISTS` is deliberately False — misreading a real
+    failure as "already gone" would let a decommission forget a node that is still
+    commissioned, which is strictly worse than making the user retry.
+    """
+    code = getattr(exc, "code", None)
+    if code is None:
+        return False
+    try:
+        return _to_int(code) == ERR_NODE_NOT_EXISTS
+    except (TypeError, ValueError):
+        return False
 
 
 class Protocol:

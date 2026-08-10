@@ -321,8 +321,12 @@ class ServerMenuMixin:
             errors["node"] = "Unknown node — nothing was removed."
             return (False, valuesDict, errors)
         if result["fabricRemoved"]:
+            # "removed or already absent": a node matter-server does not have is
+            # reported as removed on purpose (HttpApiMixin._decommission), so this
+            # message must not claim we sent a RemoveFabric that never happened.
             self.logger.info(
-                "Decommissioned Matter node %s: fabric removed, Indigo device(s) deleted: %s",
+                "Decommissioned Matter node %s: fabric entry removed or already absent, "
+                "Indigo device(s) deleted: %s",
                 result["nodeId"], result["removedIndigoDeviceIds"] or "none",
             )
             return (True, valuesDict)

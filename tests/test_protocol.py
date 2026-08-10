@@ -200,3 +200,29 @@ def test_parse_node_event_hex_string_ids(proto):
     assert evt.cluster == 0x003B
     assert evt.event_id == 0x03
     assert evt.event_data == {"previousPosition": 0}
+
+
+# ---------------------------------------------------------------------------
+# is_node_not_exists — the one error code that changes a decision
+# ---------------------------------------------------------------------------
+
+def test_node_not_exists_recognised_from_the_numeric_code():
+    assert protocol.is_node_not_exists(protocol.ProtocolError(5, "Node 38 does not exist"))
+
+
+def test_node_not_exists_recognised_when_the_code_arrives_as_a_string():
+    # ProtocolError.code is whatever the JSON carried, so it may not be an int.
+    assert protocol.is_node_not_exists(protocol.ProtocolError("5", "Node 38 does not exist"))
+
+
+def test_other_error_codes_are_not_node_not_exists():
+    # Fails CLOSED: misreading a real failure as "already gone" would forget a node
+    # that is still commissioned, which is worse than making the user retry.
+    for code in (0, 1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 100):
+        assert not protocol.is_node_not_exists(protocol.ProtocolError(code, "boom"))
+
+
+def test_unreadable_or_absent_codes_are_not_node_not_exists():
+    assert not protocol.is_node_not_exists(protocol.ProtocolError(None, "no code"))
+    assert not protocol.is_node_not_exists(protocol.ProtocolError("not-a-number", "junk"))
+    assert not protocol.is_node_not_exists(ConnectionError("offline"))   # no .code at all
