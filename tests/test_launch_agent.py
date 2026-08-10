@@ -9,7 +9,7 @@ its own orphans.
 
 Every agent here is built against a ``tmp_path`` home. Never construct one against the
 real ``$HOME``: ``ensure_installed()``'s preflight-failure path calls ``uninstall()``,
-which would delete the developer's live LaunchAgent (docs/HANDOVER.md).
+which would delete the developer's live LaunchAgent.
 """
 from __future__ import annotations
 

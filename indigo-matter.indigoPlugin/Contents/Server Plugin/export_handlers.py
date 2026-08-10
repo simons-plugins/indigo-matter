@@ -386,8 +386,7 @@ class ExportHandler:
         here (handlers are stateless singletons with no device context and no
         latch), so ``export_bridge`` can say it once per device per streak.
         Spelling an explicit "unknown" on the wire would be a protocol
-        addition; it is noted in ``docs/HANDOVER.md`` and deliberately not made
-        here.
+        addition, deliberately not made here.
         """
         return self.diff_from(self.states_for(orig_dev, options), new_dev, options)
 

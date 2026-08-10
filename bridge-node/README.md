@@ -95,6 +95,37 @@ faults worth catching here (a role factory that builds but writes the wrong
 attribute; a bridged child publishing the wrong manufacturer) cannot fail against
 a stub.
 
+## Releasing
+
+The package is publish-ready by construction: `files` is limited to `dist`,
+`main` is `dist/main.js` (what the plugin's `bridge_agent.DEFAULT_BRIDGE_ENTRY`
+expects), `engines.node` is `>=22.13.0`, and a `prepublishOnly` script runs
+`clean` then `build` so a stale `dist` can never ship. (`npm pack --dry-run`
+also includes `README.md` — npm always ships it regardless of `files`.)
+
+```sh
+npm login                 # the package owner's npm account
+npm test                  # publishing an untested build is the one unrecoverable mistake
+npm publish --access public
+```
+
+**Every release bumps two versions in step**, and a mismatch is silent until an
+install fails: `package.json`'s `version` here, and
+`bridge_agent.DEFAULT_INSTALL_SPEC` in the plugin. `test_bridge_agent.py`
+asserts they agree, so a mismatch is a test failure rather than a field report.
+
+**Testing an unreleased node** (dev workaround, *not* the shipped default): the
+on-disk layout the LaunchAgent expects is reproduced by a local install —
+
+```sh
+npm install --prefix ~/indigo-matter /path/to/indigo-matter/bridge-node
+```
+
+which puts the package at `~/indigo-matter/node_modules/indigo-matter-bridge`
+exactly where `LaunchAgent._server_entry()` looks for it (`npm link` works
+too). The plugin's install menu still tries the registry spec — the local
+install covers everything else.
+
 ## Licence
 
 MIT. Not affiliated with Perceptive Automation, the Connectivity Standards

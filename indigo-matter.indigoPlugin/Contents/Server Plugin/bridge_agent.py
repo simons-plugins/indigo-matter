@@ -35,8 +35,8 @@ a top-level source directory in the repo and is published from there.
 **It is published**: 0.5.0 and 0.6.0 are both on the registry, so
 :meth:`BridgeProcess.install` resolves :data:`DEFAULT_INSTALL_SPEC` off npm like
 any other dependency. The pin is deliberate and moves by hand — see
-``docs/HANDOVER.md`` → "Publishing the bridge node" for the release steps, and
-for the local-install recipe that is still the fastest way to test an unreleased
+``bridge-node/README.md`` § Releasing for the release steps, and for the
+local-install recipe that is still the fastest way to test an unreleased
 node.
 """
 from __future__ import annotations
