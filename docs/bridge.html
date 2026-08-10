@@ -91,13 +91,14 @@
         <tr>
           <th scope="row">Dimmer, colour-temperature capable</th>
           <td><b>Colour-temperature light</b> · Dimmable light · Window covering</td>
-          <td>Color Temperature Light</td>
+          <td>Color Temperature Light · Dimmable Light · Window Covering</td>
         </tr>
         <tr>
           <th scope="row">Dimmer, full colour</th>
           <td><b>Full-colour light</b> · Dimmable light · Colour-temperature light ·
           Window covering</td>
-          <td>Extended Color Light</td>
+          <td>Extended Color Light · Dimmable Light · Color Temperature Light ·
+          Window Covering</td>
         </tr>
         <tr>
           <th scope="row">Sensor, on/off</th>
@@ -117,14 +118,15 @@
         </tr>
       </tbody>
     </table>
-    <p>Window covering appears under every dimmer because Indigo represents blinds as dimmers;
-    Matter’s convention is 100&nbsp;% = fully open, and a per-export tick-box inverts it if your
-    hardware runs the other way. Locks pass commands to Indigo and confirm <em>nothing</em>
+    <p>Window covering appears under every dimmer because Indigo represents blinds as dimmers.
+    An exported position always means 100&nbsp;% = fully open in your ecosystem app (the bridge
+    handles Matter’s own inverted attribute for you), and a per-export tick-box flips it if
+    your hardware runs the other way. Locks pass commands to Indigo and confirm <em>nothing</em>
     optimistically — what the ecosystem shows moves only when the bolt actually moves. What
-    <em>can’t</em> be exported — valves, fans, garage doors, sprinklers, and this plugin’s own
-    Matter devices among them — is listed with the reason for each in
-    <a href="https://simons-plugins.github.io/indigo-matter/MATTER.html">MATTER.html</a>, and
-    the picker shows excluded devices with their reason rather than hiding them.</p>
+    <em>can’t</em> be exported — valves and garage doors as <em>roles</em> (the relay itself
+    stays exportable as a plug), fans, sprinklers — is listed with the reason for each in
+    <a href="MATTER.html">MATTER.html</a>; the one thing filtered out of the picker entirely is
+    this plugin’s own Matter devices, so a Matter device is never re-exported over Matter.</p>
     <div class="flow" role="img" aria-label="Export flow from an Indigo device through the plugin's bridge role, the bridge node, and into Apple Home">
       <div class="flow-node"><b>An Indigo device</b><span>Z-Wave, Insteon, Zigbee behind a
       plugin, MQTT — anything with a device record — added to the allow-list</span></div>
