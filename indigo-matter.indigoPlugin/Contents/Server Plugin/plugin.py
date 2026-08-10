@@ -33,7 +33,7 @@ from commission_jobs import CommissionJobs
 from device_sync import DeviceSync
 import export_bridge
 from export_bridge import ExportBridge
-import export_dialog_mixin      # noqa: F401  (tests patch export_dialog_mixin.EXPORT_PICKER_LIMIT)
+import export_dialog_mixin      # noqa: F401 (tests patch EXPORT_PICKER_LIMIT)  # pylint: disable=unused-import
 from export_dialog_mixin import ExportDialogMixin
 from export_store import ExportStore
 from http_api_mixin import HttpApiMixin
@@ -47,7 +47,7 @@ from matter_handlers.registry import HandlerRegistry
 from pairing_menu_mixin import PairingMenuMixin
 import protocol
 from protocol import MatterWrite, Protocol
-import server_menu_mixin        # noqa: F401  (tests patch server_menu_mixin.ServerProcess)
+import server_menu_mixin        # noqa: F401 (tests patch ServerProcess)  # pylint: disable=unused-import
 from server_menu_mixin import ServerMenuMixin
 from server_process import ServerProcess
 

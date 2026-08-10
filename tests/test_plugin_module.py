@@ -589,9 +589,21 @@ _BACK_IMPORT_RE = re.compile(r"^\s*(import plugin\b|from plugin\b\s+import)")
 def test_no_mixin_module_imports_plugin():
     """The dependency arrows point away from plugin.py — a back-import would
     make the extraction a cycle waiting to happen (issue #146)."""
-    for path in SERVER_PLUGIN.glob("*.py"):
+    for path in SERVER_PLUGIN.rglob("*.py"):
         if path.name == "plugin.py":
             continue
         src = path.read_text(encoding="utf-8")
         offenders = [line for line in src.splitlines() if _BACK_IMPORT_RE.match(line)]
         assert not offenders, f"{path.name} back-imports plugin: {offenders}"
+
+
+def test_plugin_modules_eviction_tuple_matches_real_files():
+    """conftest's ``_PLUGIN_MODULES`` eviction uses ``raising=False``, so a
+    typo'd or renamed entry would silently no-op forever — pin each entry to a
+    real module file (issue #146)."""
+    from conftest import _PLUGIN_MODULES
+
+    for name in _PLUGIN_MODULES:
+        assert (SERVER_PLUGIN / f"{name}.py").is_file(), (
+            f"conftest._PLUGIN_MODULES entry {name!r} has no matching Server Plugin file"
+        )
