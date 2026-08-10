@@ -7,7 +7,7 @@ has actually caught, and how to reproduce or extend them.
 
 | Layer | What it is | What it catches |
 |---|---|---|
-| 1. Unit suite | ~750 pytest tests, everything mocked | Logic, protocol parsing, reconcile/state machinery |
+| 1. Unit suites | 2,417 pytest tests for the plugin, 405 for the bridge node | Logic, protocol parsing, reconcile/state machinery — on both sides of the loopback socket |
 | 2. Device zoo | Contract invariants over cluster combinations | Whole *classes* of device-mapping bugs |
 | 3. Virtual fleet | 15+ real Matter devices (matter.js) on the LAN | Real commissioning, subscriptions, command round-trips |
 | 4. Real hardware | Shipping devices on the production path | Everything else — including what Indigo itself really does |
@@ -26,6 +26,15 @@ No Indigo server and no matter-server needed: the `indigo` module is mocked
 against recorded protocol shapes. `tests/test_golden_real.py` pins parsing
 against captured frames from a live matter-server, so a wire-format drift
 fails loudly.
+
+The **bridge node has its own suite** (`cd bridge-node && npm run build && npm test`
+— 405 tests): protocol/reconcile/identity units plus an integration file that
+stands up a **real** `ServerNode` on a real Matter stack behind a real WebSocket
+server, because the faults worth catching there (a role factory writing the
+wrong attribute; a bridged child publishing the wrong manufacturer) cannot fail
+against a stub. The two suites share ONE golden fixture file for the bridge
+protocol (`tests/fixtures/bridge_protocol/frames.json`) — change a frame and
+both sides must be updated, by design.
 
 A deliberate piece of test design worth knowing: the fake Indigo device models
 the **pessimistic** behaviours we have observed or must guard against — e.g.
@@ -136,6 +145,16 @@ The method, reproducible by any plugin dev with a test server:
 |---|---|---|---|
 | TP-Link Tapo P110M | Wi-Fi | 2026-06-10 | Full Domio share-model flow; on/off + live energy after Tapo's Matter 1.3 firmware update |
 | Aqara FP300 | Thread (HomePod TBR) | 2026-06-12 | Share model first try, ~10 s join, 4 endpoints, battery fan-out, unprompted live reports (third-party tester, matter-server 0.6.8) |
+
+**Export (bridge) validation legs on the same production server:**
+
+| Leg | Date | Result |
+|---|---|---|
+| Bridge commissioned into Apple Home; on/off + dimmer controlled both directions | 2026-08-04/05 | Validated (uncertified prompt and all); accessory identity survived an upgrade without duplicating |
+| Pairing from the plugin's own menu (*Pair Matter Bridge…*) | 2026-08-06 | Validated — window opened, code to the event log, paired in Apple Home |
+| Second controller alongside Apple Home (Alexa as fabric #3) | 2026-08-06 | Validated — the ADR-0007 multi-admin proof; Alexa day-to-day control works, with the issue #143 convergence caveat on newly-added exports |
+| One-click managed install chain (npm install → plist → launchd → node online → attach → reconcile) | 2026-08-06 | Validated |
+| Accessory identity across a full reboot of the Indigo Mac | — | **Outstanding** — treat as untested until done |
 
 The FP300 test also delivered the bug report that became issue #56 — external
 testers running real devices are part of the methodology, not an afterthought.

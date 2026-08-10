@@ -3,463 +3,64 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Matter, Thread &amp; where Indigo fits — indigo-matter Field Notes № 1</title>
-<meta name="description" content="A plain-English field guide to the Matter landscape and how Indigo, the indigo-matter plugin, matter-server, Domio and Apple Home fit together.">
+<title>Moved — indigo-matter Field Notes</title>
+<meta name="description" content="This page has been split. The controller story is now Field Notes № 2, and Indigo as a Matter bridge is Field Notes № 3.">
+<meta name="robots" content="noindex">
+<link rel="canonical" href="https://simons-plugins.github.io/indigo-matter/controller.html">
+<meta http-equiv="refresh" content="4;url=controller.html">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400..700;1,9..144,400..700&display=swap" rel="stylesheet">
 <link href="https://api.fontshare.com/v2/css?f[]=general-sans@400,500,600&display=swap" rel="stylesheet">
-<script>document.documentElement.classList.add("js")</script>
 <link rel="stylesheet" href="aizome.css">
-<style>
-  :root { --accent: var(--leaf); --accent-soft: rgba(59, 90, 62, .10); }
-</style>
+<script>
+  /* Old links land on matter.html#matter-bridge. Send those to the bridge issue
+     rather than the controller one; everything else follows the meta refresh. */
+  if (location.hash === "#matter-bridge") { location.replace("bridge.html"); }
+</script>
 </head>
 <body>
 
 <header class="mast">
   <div class="mast-rule">
     <span>indigo-matter · Field Notes</span>
-    <span class="no">№ 1 — The Landscape</span>
+    <span class="no">This page has moved</span>
     <a href="https://github.com/simons-plugins/indigo-matter">github / simons-plugins / indigo-matter</a>
   </div>
-  <h1>Matter, Thread &amp; <em>where Indigo fits</em></h1>
-  <p class="standfirst">A plain-English guide to the Matter landscape — and how Indigo, the
-  indigo-matter plugin, matter-server, Domio and Apple Home divide the work between them, in
-  both directions: Matter devices becoming Indigo devices, and Indigo devices becoming a
-  Matter bridge of their own. This is the “why does it work this way” page.</p>
-  <div class="mast-foot">
-    <span class="stamp">Wi-Fi · validated</span>
-    <span class="stamp">Thread · validated</span>
-    <span>Companion read: <a href="testing.html">№ 2 — The Proving Ground</a></span>
-  </div>
+  <h1>№ 1 became <em>three issues</em></h1>
+  <p class="standfirst">“Matter, Thread &amp; where Indigo fits” outgrew one page once the
+  plugin gained a second direction. It is now a protocol primer, a controller issue and a bridge
+  issue. You’ll be sent to the controller issue in a moment.</p>
 </header>
 
 <main>
 
-<section class="note reveal">
-  <div class="sec-no">§ 01</div>
+<section class="note">
+  <div class="sec-no">→</div>
   <div class="sec-body">
-    <h2>What Matter is</h2>
-    <p class="dropcap">Matter is a smart-home standard backed by Apple, Google, Amazon, Samsung
-    and hundreds of device makers under the Connectivity Standards Alliance. Its promise: buy a
-    device with the Matter logo and it works with every major ecosystem, locally, without a
-    vendor cloud.</p>
-    <div class="pull">Matter is not a radio. It is a control protocol that runs on top of
-    ordinary IP networking.<small>The single most useful fact on this page</small></div>
-    <p>A Matter device talks over one of:</p>
-    <ul class="chips">
-      <li><b>Wi-Fi</b> — joins your normal wireless network</li>
-      <li><b>Ethernet</b> — same, wired</li>
-      <li><b>Thread</b> — a low-power mesh radio (§ 02)</li>
-    </ul>
-    <p>Either way, control traffic is local IP — UDP over link-local IPv6, discovered via
-    mDNS/Bonjour, the same multicast machinery as AirPlay and HomeKit. No cloud round-trips,
-    no vendor app needed for control.</p>
-  </div>
-</section>
-
-<section class="note reveal">
-  <div class="sec-no">§ 02</div>
-  <div class="sec-body">
-    <h2>Thread, and what it has to do with anything</h2>
-    <p>Thread is one of the <em>transports</em> Matter can run over: a low-power, self-healing
-    mesh radio (802.15.4 — the same silicon family as Zigbee) built for battery devices that
-    can’t afford Wi-Fi’s power budget — sensors, buttons, locks.</p>
-    <p>Thread devices can’t talk IP to your LAN directly; they need a <strong>Thread Border
-    Router</strong> to bridge the mesh onto your network. You probably already own one — by
-    2026 almost every ecosystem hub is a TBR:</p>
-    <ul class="chips">
-      <li><b>Apple</b> — HomePod mini, HomePod 2, recent Apple TV 4K</li>
-      <li><b>Amazon</b> — Echo 4, Echo Hub, Echo Studio, recent Echo Shows, eero</li>
-      <li><b>Google</b> — Nest Hub 2, Nest Hub Max, Nest Wifi Pro</li>
-    </ul>
-    <p>Two distinctions that save a lot of confusion:</p>
+    <h2>Where everything went</h2>
     <ul>
-      <li><strong>Thread ≠ Matter.</strong> Thread is plumbing; Matter is the language. Some
-      Thread devices speak HomeKit-over-Thread or proprietary protocols instead.</li>
-      <li><strong>A Matter Wi-Fi device needs no border router at all.</strong> It’s just
-      another client on your LAN.</li>
+      <li><a href="what-is-matter.html"><strong>№ 1 — What is Matter</strong></a> — the protocol
+      primer: transports and Thread, border routers, commissioning, fabrics and multi-admin,
+      attestation.</li>
+      <li><a href="controller.html"><strong>№ 2 — The controller</strong></a> — the share model,
+      adding and removing devices, what lands in Indigo, troubleshooting. <em>This is where
+      this link now goes.</em></li>
+      <li><a href="bridge.html"><strong>№ 3 — The bridge</strong></a> — Indigo devices published
+      back out as a Matter bridge.</li>
+      <li><a href="testing.html"><strong>№ 4 — The Proving Ground</strong></a> — how it is
+      tested.</li>
     </ul>
-
-    <h3>Thread status in this plugin</h3>
-    <p><span class="stamp">Works — real hardware</span></p>
-    <p>Thread devices ride the normal share-model flow — the same Apple&nbsp;Home → pairing
-    code path as Wi-Fi. Validated on both transports: a <strong>Tapo P110M</strong> (Wi-Fi,
-    with live energy metering) and an <strong>Aqara FP300</strong> presence multi-sensor
-    (Thread, via a HomePod border router — a ten-second join, all four sensors, unprompted
-    live reports).</p>
-    <p>Here’s why it works. The one Thread operation the plugin’s controller stack
-    (<a href="https://github.com/matter-js/matterjs-server">matter-server</a>, matter.js)
-    can’t do is <em>first-admin</em> commissioning — handing a factory-fresh device the Thread
-    network credentials over Bluetooth. In the share model that step is always the first
-    ecosystem’s job: Apple Home (or Alexa, or Google Home — § 07) provisions the device onto
-    <em>its own</em> mesh with its own radios. From then on the device is just an IP endpoint —
-    the ecosystem’s border router routes IPv6 between mesh and LAN, so when the plugin joins
-    as a second admin over IP it neither knows nor cares that the last hop is Thread.</p>
-    <p>Practical caveats: matter-server is Alpha, and battery Thread devices are “sleepy”
-    (they wake on long intervals) — which is where an alpha controller is most likely to be
-    flaky. That said, the first Thread device validated here was exactly such a sleepy battery
-    sensor, and it behaved. And should a true gap ever surface, the WebSocket protocol the
-    plugin speaks is deliberately compatible with Home Assistant’s python-matter-server — a
-    different backend is a swap, not a rewrite.</p>
   </div>
 </section>
 
-<section class="note reveal">
-  <div class="sec-no">§ 03</div>
+<section class="note" id="matter-bridge">
+  <div class="sec-no">→</div>
   <div class="sec-body">
-    <h2>Bluetooth, commissioning, and why this plugin needs neither</h2>
-    <p>When you pair a brand-new Matter device (“commissioning”), the very first step usually
-    happens over <strong>Bluetooth LE</strong>: the commissioner sends the device your Wi-Fi
-    credentials (or Thread network key) over BLE, the device joins the network — and BLE is
-    never used again.</p>
-    <p>That’s why phones and ecosystem hubs make good <em>first</em> commissioners: they have
-    BLE radios and, for Thread, the network credentials. A headless Mac running Indigo is a
-    poor first commissioner — matter-server runs without BLE on macOS, and macOS has no Thread
-    credential store.</p>
-    <p>This plugin sidesteps the problem entirely with the <strong>share model</strong> —
-    the plugin’s founding architecture decision:</p>
-    <div class="pull">An ecosystem you already own commissions the device first — it owns the
-    Bluetooth step. Then the device is <em>shared</em> to Indigo over plain IP. Indigo never
-    needs BLE, Thread credentials, or proximity to the device.<small>The share model</small></div>
-    <p>That’s only possible because of Matter’s best feature: multi-admin.</p>
-  </div>
-</section>
-
-<section class="note reveal">
-  <div class="sec-no">§ 04</div>
-  <div class="sec-body">
-    <h2>Fabrics &amp; multi-admin: one device, many controllers</h2>
-    <p>A Matter <strong>fabric</strong> is a controller’s trust domain — a set of cryptographic
-    credentials a controller installs on a device. The crucial design choice in Matter is that
-    <strong>a device can belong to several fabrics at once</strong>. The spec floor is
-    five — and since each fabric slot costs the device persistent storage, the floor is
-    also what most devices ship. Treat five as your planning number.
-    Each controller talks to the device directly and locally; none of them knows or cares
-    about the others.</p>
-    <p>A single plug in this house happily serves four admins simultaneously:</p>
-    <ul class="chips">
-      <li>Apple Home</li>
-      <li><b>Indigo</b> — this plugin’s fabric</li>
-      <li>The vendor’s app</li>
-      <li>Home Assistant</li>
-    </ul>
-    <p>— with no cross-interference. Removing one fabric (“Remove from Indigo”) leaves the
-    others untouched; only a factory reset wipes them all.</p>
-    <p>The plugin’s fabric lives inside matter-server’s storage directory. It is the single
-    point of total loss — destroyed, every device must be re-commissioned — which is why the
-    plugin ships fabric <strong>backup and restore</strong> (menu items: <em>Back up the
-    Matter fabric…</em> / <em>Restore a fabric backup…</em>).</p>
-    <div class="aside">
-      <span class="tag">Expected behaviour</span>
-      <strong>Why Apple Home calls our fabric “Matter Test”.</strong> When the plugin joins a
-      device, Apple Home’s “joined a new network” notification lists the Indigo fabric as
-      “Matter Test”. Nothing is wrong: the fabric <em>label</em> is correctly set to “Indigo”,
-      but that notification shows the fabric’s <strong>Vendor ID</strong>, and matter-server
-      commissions under the Matter test vendor ID <code>0xFFF1</code>, registered as “Matter
-      Test”. A custom name there needs a paid, certified CSA Vendor ID — the same limitation
-      every non-certified controller has (Home Assistant shows up the same way). Purely
-      cosmetic; control and security are unaffected.
-    </div>
-  </div>
-</section>
-
-<section class="note reveal">
-  <div class="sec-no">§ 05</div>
-  <div class="sec-body">
-    <h2>The pieces, end to end</h2>
-    <div class="flow" role="img" aria-label="Commissioning and control flow from Apple Home through Domio to the indigo-matter plugin, matter-server, and the device">
-      <div class="flow-node"><b>Apple Home — admin 1</b><span>commissions the factory-fresh
-      device: BLE onboarding, Wi-Fi or Thread credentials, border router for Thread</span></div>
-      <div class="flow-link"><i>“Turn On Pairing Mode” → one-time setup code</i></div>
-      <div class="flow-node"><b>Domio (iOS)</b><span>owns the add-device moment: captures the
-      code, names the device, picks the room — one-shot per device</span></div>
-      <div class="flow-link"><i>HTTPS → the plugin’s commission API</i></div>
-      <div class="flow-node hero"><b>indigo-matter — admin 2, the Indigo fabric</b><span>joins
-      the device over plain IP, maps its clusters to native Indigo devices, owns runtime
-      control for the device’s lifetime</span></div>
-      <div class="flow-link"><i>local WebSocket</i></div>
-      <div class="flow-node"><b>matter-server (Node.js / matter.js)</b><span>the actual Matter
-      controller stack — PASE/CASE, subscriptions, commands on the network</span></div>
-      <div class="flow-link"><i>UDP · link-local IPv6 · mDNS — Thread rides the TBR</i></div>
-      <div class="flow-node"><b>The device</b><span>serves all of its fabrics at once, locally
-      — and appears in Indigo as triggers, schedules, action groups, control pages, Domio</span></div>
-    </div>
-    <table class="specimen">
-      <caption>Cast of characters</caption>
-      <thead><tr><th scope="col">Piece</th><th scope="col">Role</th></tr></thead>
-      <tbody>
-        <tr><th scope="row">Apple Home</th><td>First commissioner. BLE onboarding and, for Thread, the border router. Alexa or Google Home can play this role instead (§ 07).</td></tr>
-        <tr><th scope="row">Domio</th><td>The <em>add device</em> UX. Relays the pairing code to the plugin. Not in the control path afterwards.</td></tr>
-        <tr><th scope="row">indigo-matter</th><td>Holds the Indigo fabric, translates Matter clusters ↔ Indigo device types, serves the Domio API, supervises matter-server.</td></tr>
-        <tr><th scope="row">matter-server</th><td>The Matter controller stack (matter.js). The plugin drives it over a local WebSocket.</td></tr>
-        <tr><th scope="row">Indigo</th><td>Where devices live. A Matter plug is a relay, a Matter bulb is a dimmer — first-class citizens in every Indigo feature.</td></tr>
-      </tbody>
-    </table>
-  </div>
-</section>
-
-<section class="note reveal">
-  <div class="sec-no">§ 06</div>
-  <div class="sec-body">
-    <h2>Adding a device</h2>
-    <ol class="steps">
-      <li><b>Commission in Apple Home first.</b> Scan the device’s QR code in the Home app. If
-      your main Wi-Fi runs “advanced” features (WPA3-only, 802.11r, band steering), a basic
-      2.4&nbsp;GHz IoT SSID is far more reliable — but it <strong>must be the same subnet</strong>
-      as the Indigo Mac (§ 11).</li>
-      <li><b>Open pairing mode.</b> Home app → device settings → <em>Turn On Pairing Mode</em>.
-      A fresh one-time setup code appears — the printed QR code will <em>not</em> work for this.</li>
-      <li><b>Enter the code</b>, in whichever is closer to hand — <b>Domio</b> (add Matter
-      device → code, name, room) or <b>Indigo</b> (Plugins ▸ Matter ▸ <em>Commission device by
-      setup code…</em>). Either way the plugin joins as a second admin over IP and creates the
-      Indigo device(s). Discovery can take a couple of minutes on a busy LAN — the plugin
-      waits up to five.</li>
-      <li><b>Done.</b> The device appears in Indigo (the room becomes a device folder),
-      controllable from everything Indigo offers, plus Domio.</li>
-    </ol>
-    <div class="pull">Once the pairing-mode code exists, the join is pure IP — no Bluetooth, no
-    phone, no proximity. Everything downstream of the code is ecosystem-free.<small>True for
-    Thread exactly as for Wi-Fi</small></div>
-    <p><strong>The two entry points are equals</strong>, and for the same reason: once the code
-    exists, the rest is plain IP. The plugin menu’s <em>Commission device by setup code…</em>
-    does exactly what Domio does — paste the pairing-mode code, Wi-Fi or Thread alike. Neither
-    is a fallback for the other, and Domio is not required.</p>
-    <p>Pick on convenience, not capability. Domio wins when you’re standing at the new device
-    with the Home app open and the code has just appeared — it’s the next tap on the same phone,
-    and you never go near the Mac. The plugin menu wins when you’re already in Indigo, or have
-    the code some other way. (And if a device is already on your network but was never
-    commissioned by anyone, its <em>printed</em> code works directly in either entry point.)</p>
-    <p><strong>Removing:</strong> plugin menu → <em>Decommission Matter device…</em> — removes
-    only the Indigo fabric; the device stays in Apple Home and everywhere else. Deleting the
-    Indigo device alone does <em>not</em> work — by design the plugin recreates it at the next
-    reconcile. Only a factory reset on the device itself removes everything.</p>
-  </div>
-</section>
-
-<section class="note reveal">
-  <div class="sec-no">§ 07</div>
-  <div class="sec-body">
-    <h2>Don’t have Apple Home? Alexa or Google work too</h2>
-    <p>The plugin and Domio never care <em>which</em> ecosystem is admin 1 — they just consume
-    a pairing code. Apple Home is the smoothest path for Domio users (you’re on an iPhone
-    already), but any Matter ecosystem can play the role:</p>
-    <ul>
-      <li><strong>Alexa:</strong> commission in the Alexa app, then device settings →
-      <em>Other assistants and apps</em> → it generates a pairing code. For Thread, a
-      TBR-capable Echo plays the HomePod’s part.</li>
-      <li><strong>Google Home:</strong> commission in the Google Home app, then device
-      settings → <em>Linked Matter apps &amp; services</em> → share. Nest Hub / Nest Wifi are
-      the TBRs.</li>
-    </ul>
-    <div class="aside">
-      <span class="tag">One rule for Thread</span>
-      A Thread device joins the mesh of whichever ecosystem commissions it, so <strong>that
-      ecosystem’s border router must stay online</strong> for the device to be reachable — an
-      Apple-commissioned device rides the Apple TBR, an Alexa-commissioned one rides the Echo.
-      For Wi-Fi devices none of this applies.
-    </div>
-  </div>
-</section>
-
-<section class="note reveal">
-  <div class="sec-no">§ 08</div>
-  <div class="sec-body">
-    <h2>Sharing with other platforms — and vendor apps</h2>
-    <p>Multi-admin works in every direction: the same pairing-mode trick adds the device to
-    Google Home, Alexa or Home Assistant alongside Indigo.</p>
-    <p>Adding a device to its <strong>vendor app</strong> is often worth doing once, because
-    firmware updates usually ship through it (§ 10).</p>
-    <div class="aside caution">
-      <span class="tag">Caution — reset buttons</span>
-      On TP-Link Tapo plugs, a ~5&nbsp;s hold is a Wi-Fi-only reset (Matter fabrics survive);
-      a ~10&nbsp;s hold is a <strong>factory reset that wipes every fabric</strong> and undoes
-      all your commissioning. Vendors differ — check before holding.
-    </div>
-    <h3>Bridges</h3>
-    <p>A Matter <strong>bridge</strong> exposes non-Matter devices (Zigbee, proprietary RF) as
-    Matter endpoints — Aqara, SwitchBot and Hue hubs all do this. The plugin supports bridges:
-    each bridged child appears as its own Indigo device. It’s also a practical route into
-    Indigo for the Zigbee sensors you already own behind such a hub.</p>
-  </div>
-</section>
-
-<section class="note reveal">
-  <div class="sec-no">§ 09</div>
-  <div class="sec-body">
-    <h2>What’s supported</h2>
-    <table class="specimen">
-      <caption>Matter capability → Indigo device</caption>
-      <thead><tr><th scope="col">Matter capability</th><th scope="col">Indigo device</th></tr></thead>
-      <tbody>
-        <tr><td>On/Off — plugs, switches, lights</td><td>Relay</td></tr>
-        <tr><td>Dimming (Level Control)</td><td>Dimmer</td></tr>
-        <tr><td>Colour &amp; colour temperature</td><td>Colour dimmer (RGB + white-temp UI)</td></tr>
-        <tr><td>Temperature · humidity · occupancy · contact · illuminance · pressure · flow</td><td>Sensor — one device per measurement</td></tr>
-        <tr><td>Thermostats (incl. attached fan)</td><td>Thermostat</td></tr>
-        <tr><td>Standalone fans</td><td>Speed-controlled dimmer</td></tr>
-        <tr><td>Window coverings</td><td>Dimmer (100% = open)</td></tr>
-        <tr><td>Door locks</td><td>Relay with lock UI</td></tr>
-        <tr><td>Valves (water / irrigation)</td><td>Relay with flood-safe toggle behaviour</td></tr>
-        <tr><td>Buttons / scene switches</td><td>Button device firing Indigo trigger events</td></tr>
-        <tr><td>Smoke / CO alarms</td><td>Sensor (alarm latch)</td></tr>
-        <tr><td>Air quality — AQI · CO₂ · PM2.5 · TVOC</td><td>Sensors, one per metric</td></tr>
-        <tr><td>Power &amp; energy metering</td><td><code>curEnergyLevel</code> (W) / <code>accumEnergyTotal</code> (kWh) on the primary device</td></tr>
-        <tr><td>Battery level</td><td><code>batteryLevel</code> on every device of the node</td></tr>
-        <tr><td>Bridges</td><td>One Indigo device per bridged child</td></tr>
-        <tr><td>Anything else</td><td>A visible placeholder listing the unsupported clusters — so you can report it, not lose it</td></tr>
-      </tbody>
-    </table>
-    <p>A node exposing several capabilities gets several Indigo devices (a multi-sensor becomes
-    one device per measurement); secondary capabilities like energy and battery merge into the
-    primary device’s states.</p>
-  </div>
-</section>
-
-<section class="note reveal">
-  <div class="sec-no">§ 10</div>
-  <div class="sec-body">
-    <h2>Firmware updates — they matter more than usual</h2>
-    <p>Matter firmware arrives by two routes: the device <strong>vendor’s app</strong>, and
-    the ecosystems themselves — those that act as Matter OTA providers push updates too
-    (<strong>Apple Home auto-updates Matter accessory firmware</strong>; observed on this
-    house’s Tapo plug). The vendor app typically gets releases first, so check there when
-    you’re waiting on a feature. And vendors are still actively <em>adding Matter
-    features</em> via firmware.</p>
-    <div class="pull">A Tapo P110M shipped exposing only on/off over Matter. The energy
-    clusters appeared after a firmware update — and the existing Indigo device gained its
-    energy states automatically. No restart, no re-pairing.<small>Field note, this house,
-    June 2026</small></div>
-    <p>Rule of thumb: if a device seems to be missing a capability you know it has, check
-    firmware first. The plugin’s diagnostics endpoint (API.md §3.5) lists exactly which
-    clusters a node advertises — settling the “device or plugin?” question in one request.</p>
-  </div>
-</section>
-
-<section class="note reveal">
-  <div class="sec-no">§ 11</div>
-  <div class="sec-body">
-    <h2>Troubleshooting</h2>
-    <p><strong>Network first.</strong> Matter assumes a flat residential network. The plugin,
-    the device and matter-server must share <strong>one subnet/VLAN</strong>: discovery is
-    mDNS multicast, transport is link-local IPv6, and neither crosses routers. You do
-    <em>not</em> need “IPv6 from your ISP” — link-local addresses are self-assigned and always
-    present.</p>
-    <p>Common failure modes, in rough order of likelihood:</p>
-    <ul>
-      <li><strong>Commissioning fails in Apple Home on the main SSID.</strong> Advanced Wi-Fi
-      features break many 2.4&nbsp;GHz-only IoT radios during onboarding. Use a
-      backward-compatible IoT SSID — on the same subnet.</li>
-      <li><strong>Apple Home controls it, Indigo can’t reach it.</strong> The IoT SSID is on a
-      separate VLAN, or AP client isolation is blocking station-to-LAN traffic. (Apple Home can
-      ride BLE and hubs; the plugin is pure IP, so it notices first.)</li>
-      <li><strong>“1 discovered, attempt failed” / discovery timeouts.</strong> Pairing-mode
-      windows are short (~15&nbsp;min) — regenerate the code and commission promptly. mDNS
-      snooping on managed switches also causes this.</li>
-      <li><strong>Commissioning times out, then the device appears anyway.</strong> LAN
-      discovery can exceed 60&nbsp;s; the plugin waits 300&nbsp;s and reconciles late joins.
-      Give it the full window.</li>
-      <li><strong>Unreachable after a vendor-app setup or firmware update.</strong> Normal for
-      a minute or two while it reboots; the plugin marks it unreachable and self-clears.
-      Persistently dead usually means a factory reset wiped the fabric — re-commission.</li>
-      <li><strong>Capability missing.</strong> Firmware first (§ 10), then diagnostics.</li>
-    </ul>
-    <p><strong>Backups.</strong> Back up the fabric after commissioning anything you’d hate
-    to re-pair. The plugin keeps rotating zips; restore is menu-driven and reversible.</p>
-  </div>
-</section>
-
-<section class="note reveal" id="matter-bridge">
-  <div class="sec-no">§ 12</div>
-  <div class="sec-body">
-    <h2>Indigo as a Matter bridge — the other direction</h2>
-    <p>Everything above is Indigo as a Matter <strong>controller</strong>: other people’s
-    devices becoming Indigo devices. The plugin runs the arrangement backwards too. The very
-    same plugin that joins your ecosystems as a second admin can just as easily be the one
-    that gets joined — publishing a set of Indigo devices you choose as a Matter bridge of its
-    own, so Apple Home sees and controls them like any other Matter accessory. Locally, with no
-    cloud relay and no separate bridge app per ecosystem.</p>
-    <div class="pull">If you’ve run Homebridge, this is the same idea over Matter’s protocol
-    instead of HomeKit’s — one implementation reaching every ecosystem that speaks it, rather
-    than one bridge per ecosystem.<small>The share model, inverted</small></div>
-    <p>Exporting is opt-in, per device, and starts from nothing: a fresh install exports zero
-    devices, pairs nothing, and runs no bridge process at all. You build the list yourself in
-    Plugins ▸ Matter ▸ <em>Manage Matter Exports…</em> — pick a device, and because Indigo
-    doesn’t record what a device <em>is</em> (a relay could be a lamp, a plug, or a lock), you
-    declare a role for it, and the dialog defaults to the safest reading. The picker marks
-    anything already on the list with a <code>●</code>, and shows devices that can’t be
-    exported too, with the reason, rather than leaving you to wonder where they went.</p>
-    <ul class="chips">
-      <li><b>Relay</b> → plug, light, or lock</li>
-      <li><b>Dimmer</b> → dimmable light or window covering</li>
-      <li><b>Colour dimmer</b> → colour-temperature or full-colour light</li>
-      <li><b>Sensor</b> → one of seven Matter sensor types</li>
-      <li><b>Thermostat</b> → thermostat</li>
-    </ul>
-    <div class="flow" role="img" aria-label="Export flow from an Indigo device through the plugin's bridge role, the bridge node, and into Apple Home">
-      <div class="flow-node"><b>An Indigo device</b><span>Z-Wave, Insteon, Zigbee behind a
-      plugin, MQTT — anything with a device record — added to the allow-list</span></div>
-      <div class="flow-link"><i>you declare a role</i></div>
-      <div class="flow-node hero"><b>indigo-matter — the bridge role</b><span>owns the
-      allow-list, translates Indigo device states ↔ Matter clusters, drives the bridge node
-      over a local WebSocket</span></div>
-      <div class="flow-link"><i>loopback WebSocket</i></div>
-      <div class="flow-node"><b>bridge node (Node.js / matter.js)</b><span>a Matter
-      <em>device</em>, not a controller — it holds no fabric of its own, and gets commissioned
-      into every ecosystem that pairs it</span></div>
-      <div class="flow-link"><i>UDP · link-local IPv6 · mDNS</i></div>
-      <div class="flow-node"><b>Apple Home (and any ecosystem you pair)</b><span>sees one
-      bridge accessory, with one child endpoint per exported device</span></div>
-    </div>
-
-    <h3>Pairing the bridge into an ecosystem</h3>
-    <p>Pairing happens once per ecosystem, not once per device — export something new later
-    and it appears in every ecosystem you’ve already paired, with no further action.</p>
-    <ol class="steps">
-      <li><b>Export at least one device first.</b> The bridge process only exists while the
-      export list is non-empty — there’s nothing to pair against an empty list.</li>
-      <li><b>Open a pairing window.</b> Plugins ▸ Matter ▸ <em>Pair Matter Bridge…</em>.
-      Indigo’s own dialogs can’t display a value their own button just computed, so the code
-      doesn’t appear in the dialog — it goes to the Event Log, alongside a link to a page,
-      served over Indigo’s own web server, that shows the same code large enough to read
-      across a room, plus a QR payload.</li>
-      <li><b>Add the accessory</b> in Apple Home (or Alexa, or Google Home), entering the code
-      by hand. It’s found as <em>Indigo Matter Bridge</em> — and immediately flagged as an
-      uncertified accessory.</li>
-      <li><b>Choose Add Anyway.</b> See below for why that’s the right call, every time.</li>
-    </ol>
-    <div class="aside">
-      <span class="tag">Expected behaviour</span>
-      <strong>Why every ecosystem calls the bridge “uncertified”.</strong> Matter attestation
-      runs one way — the <em>commissioner</em> checks the <em>device’s</em> certificate — and
-      out here the bridge is the device. It advertises with the specification’s test vendor ID,
-      the same posture Homebridge, matterbridge and Home Assistant’s own bridge all ship with.
-      A real CSA vendor ID needs paid membership and per-product certification, which isn’t
-      proportionate for a free plugin — so the warning is permanent, not a bug to chase.
-    </div>
-
-    <h3>Accessory identity, and why restarts don’t duplicate anything</h3>
-    <p>Every exported device gets a stable identity tied to its Indigo device ID, and a Matter
-    endpoint number allocated once against that identity — never from its position in a list.
-    Ecosystems remember both: the name you gave the accessory, the room you put it in, the
-    scenes and automations you built on it are all keyed to the identity, not the name.</p>
-    <div class="pull">The endpoint numbers are matter.js’s. The bridge’s own record is a
-    witness, not an allocator — it notices when something’s wrong; it never repairs it, and it
-    never hands out numbers of its own.<small>Why restarts are safe</small></div>
-    <p>That witness record is also what makes a restart harmless. Reboots, plugin upgrades and
-    crash recoveries used to leave the bridge briefly showing ecosystems an empty accessory
-    list, and Apple would treat whatever came back as brand new, stuck in the bridge’s own
-    room. The bridge now rebuilds its accessory list from disk before it ever goes back online,
-    so a restart shows ecosystems accessories that were briefly unavailable, not accessories
-    that vanished — and even a full pairing reset, which used to trip a false drift alarm on
-    the witness record, now just quietly adopts the fresh numbers matter.js hands out.</p>
-    <p>This page is the shape of it. For the walkthrough — installing the bridge package,
-    exporting your first device, opening a pairing window, the recovery actions — see
-    <a href="https://github.com/simons-plugins/indigo-matter/blob/main/docs/INSTALL.md">INSTALL.md</a>.
-    For the full prose — what can and can’t be exported and why, the fabric mechanics, which
-    ecosystems are proven — see
-    <a href="https://github.com/simons-plugins/indigo-matter/blob/main/docs/MATTER.md#indigo-as-a-matter-bridge--the-other-direction">MATTER.md</a>.</p>
+    <h2>Looking for “Indigo as a Matter bridge”?</h2>
+    <p>The old <code>#matter-bridge</code> section is now a page of its own, with an expanded
+    architecture summary, the pairing walkthrough and an explicit validation position:
+    <a href="bridge.html"><strong>№ 3 — The bridge</strong></a>.</p>
   </div>
 </section>
 
@@ -468,19 +69,13 @@
 <footer class="colophon">
   <span>indigo-matter Field Notes · set in Fraunces &amp; General Sans on warm paper<span class="dot">.</span></span>
   <span>
-    <a href="testing.html">№ 2 — The Proving Ground</a> ·
-    <a href="https://github.com/simons-plugins/indigo-matter/blob/main/docs/INSTALL.md">Install</a> ·
-    <a href="https://github.com/simons-plugins/indigo-matter/blob/main/docs/API.md">API</a> ·
-    <a href="https://domio-smart-home.app">Domio</a>
+    <a href="index.html">Index</a> ·
+    <a href="what-is-matter.html">№ 1</a> ·
+    <a href="controller.html">№ 2</a> ·
+    <a href="bridge.html">№ 3</a> ·
+    <a href="testing.html">№ 4</a>
   </span>
 </footer>
-
-<script>
-  const io = new IntersectionObserver((entries) => {
-    for (const e of entries) if (e.isIntersecting) { e.target.classList.add("in"); io.unobserve(e.target); }
-  }, { rootMargin: "0px 0px -8% 0px" });
-  document.querySelectorAll(".reveal").forEach(el => io.observe(el));
-</script>
 
 </body>
 </html>

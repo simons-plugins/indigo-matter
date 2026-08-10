@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>indigo-matter — Field Notes</title>
-<meta name="description" content="Matter support for Indigo. The field notes: the landscape, and the proving ground — plus the install guide.">
+<meta name="description" content="Matter support for Indigo, in both directions: Matter devices becoming Indigo devices, and Indigo devices published back out as a Matter bridge. Four field notes — the protocol primer, the controller, the bridge, and how it is all tested.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400..700;1,9..144,400..700&display=swap" rel="stylesheet">
@@ -26,10 +26,13 @@
   .issue h2 { margin: .5rem 0 .5rem; font-size: 1.7rem; }
   .issue p { color: var(--ink-soft); font-size: .95rem; margin: 0; }
   .issue.one   { --accent: var(--leaf); }
-  .issue.two   { --accent: var(--ochre); }
+  .issue.two   { --accent: #2E5E7E; }
   .issue.three { --accent: var(--purple); }
+  .issue.four  { --accent: var(--ochre); }
+  .issue.setup { --accent: var(--ink-faint); }
   .issue .kicker { color: var(--accent); }
   .issue:hover { border-color: var(--accent); }
+  .lede { max-width: var(--measure); margin: 2.4rem 0 0; }
 </style>
 </head>
 <body>
@@ -41,31 +44,51 @@
     <a href="https://github.com/simons-plugins/indigo-matter">github / simons-plugins / indigo-matter</a>
   </div>
   <h1>Matter support for <em>Indigo</em></h1>
-  <p class="standfirst">Commission with the ecosystem you already own; control everything from
-  Indigo — and publish it back out as a Matter bridge of your own. Two long reads explain the
-  whole thing — the landscape, and how it’s proven — plus the install guide for hands-on setup.</p>
+  <p class="standfirst">Both directions. Commission with the ecosystem you already own and
+  control everything from Indigo — and publish the Indigo devices you choose back out as a
+  Matter bridge of your own.</p>
 </header>
 
 <main>
+  <p class="lede">Four field notes, written to be read in order or dipped into. Start with the
+  protocol if Matter is new to you; jump straight to the direction you care about if it isn’t.
+  The plugin itself installs from the <strong>Indigo Plugin Store</strong> — the install guide
+  picks up from there.</p>
+
   <div class="issues">
-    <a class="issue one" href="matter.html">
-      <span class="kicker">№ 1 · for everyone</span>
-      <h2>The Landscape</h2>
-      <p>Matter, Thread, fabrics and the share model — a plain-English guide to where Indigo,
-      Domio, matter-server and Apple Home each fit, plus adding devices, troubleshooting, and
-      publishing Indigo devices back out as a Matter bridge of your own.</p>
+    <a class="issue one" href="what-is-matter.html">
+      <span class="kicker">№ 1 · the primer</span>
+      <h2>What is Matter</h2>
+      <p>The protocol on its own terms — transports and Thread, border routers, commissioning,
+      fabrics and multi-admin, and what “uncertified” actually means. No Indigo, no plugin
+      mechanics.</p>
     </a>
-    <a class="issue two" href="testing.html">
-      <span class="kicker">№ 2 · for the curious &amp; plugin devs</span>
+    <a class="issue two" href="controller.html">
+      <span class="kicker">№ 2 · Matter in</span>
+      <h2>The controller</h2>
+      <p>The share model: your ecosystem commissions the device, the plugin joins as a second
+      admin over plain IP. What lands in Indigo, what has been validated on real hardware over
+      Wi-Fi and Thread, and what to check when it doesn’t work.</p>
+    </a>
+    <a class="issue three" href="bridge.html">
+      <span class="kicker">№ 3 · Matter out</span>
+      <h2>The bridge</h2>
+      <p>Indigo devices published as one Matter bridge accessory — the opt-in allow-list, the
+      roles you declare, pairing into an ecosystem, and an honest account of exactly what has
+      and hasn’t been proven.</p>
+    </a>
+    <a class="issue four" href="testing.html">
+      <span class="kicker">№ 4 · for the curious &amp; plugin devs</span>
       <h2>The Proving Ground</h2>
-      <p>Four layers of testing — the unit suite, the device zoo, a fifteen-device virtual
-      Matter fleet, and live validation on real hardware over Wi-Fi and Thread.</p>
+      <p>How all of it is tested — the unit suites, the device zoo, a fifteen-device virtual
+      Matter fleet, the bridge node’s own suite, and live validation on a production server.</p>
     </a>
-    <a class="issue three" href="https://github.com/simons-plugins/indigo-matter/blob/main/docs/INSTALL.md">
+    <a class="issue setup" href="INSTALL.html">
       <span class="kicker">Setup guide</span>
       <h2>Install &amp; Configure</h2>
-      <p>Step by step: the Matter controller, the export bridge, backups, security, and every
-      troubleshooting table — the reference to keep open while you set things up.</p>
+      <p>Step by step after the Plugin Store: the Matter controller, the export bridge, backups,
+      security, and every troubleshooting table — the reference to keep open while you set
+      things up.</p>
     </a>
   </div>
 </main>
@@ -73,8 +96,9 @@
 <footer class="colophon">
   <span>indigo-matter Field Notes · set in Fraunces &amp; General Sans on warm paper<span class="dot">.</span></span>
   <span>
-    <a href="https://github.com/simons-plugins/indigo-matter/blob/main/docs/INSTALL.md">Install</a> ·
-    <a href="https://github.com/simons-plugins/indigo-matter/blob/main/docs/API.md">API</a> ·
+    <a href="INSTALL.html">Install</a> ·
+    <a href="MATTER.html">Matter</a> ·
+    <a href="API.html">API</a> ·
     <a href="https://domio-smart-home.app">Domio</a>
   </span>
 </footer>

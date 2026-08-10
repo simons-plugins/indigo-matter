@@ -115,6 +115,10 @@ did not mean to touch.
 
 ## Prerequisites
 
+Install Matter from the **Indigo Plugin Store** (or download the
+`.indigoPlugin.zip` from [Releases](https://github.com/simons-plugins/indigo-matter/releases)
+and double-click it), then:
+
 - **macOS** running your Indigo Server.
 - **Indigo 2025.2+** with the `indigo-matter` plugin installed (≥ **2026.0.6** — earlier
   builds launched matter-server via `npx` and no longer work; see Troubleshooting).
@@ -202,22 +206,25 @@ bump the version deliberately and re-validate.
 
 ## Step 3 — Configure the plugin
 
-Open **Plugins → Matter → Configure…** in Indigo. There are two ways to run
-matter-server.
+Open **Plugins → Matter → Configure…** in Indigo. The field that decides everything else
+is **Matter controller location:**, a menu with two options.
 
-### Mode A — Plugin-managed LaunchAgent (recommended)
+### Mode A — "On this Mac (recommended)"
 
-Let the plugin install and supervise matter-server for you.
+The default. The plugin installs and supervises matter-server for you, on loopback.
 
-1. Tick **Manage matter-server LaunchAgent automatically**.
-2. **Homebrew users: leave Node bin directory blank** (auto-detect). Only if you used nvm,
-   set it to *your* node bin dir — run `echo ~/.nvm/versions/node/$(nvm version)/bin` to get
-   the exact path; don't copy a version string from these docs.
-3. Leave **matter-server listen address** at `127.0.0.1` (loopback — see Security).
-4. Leave **port** `5580`, **WebSocket path** `/ws`, **host** `localhost`, **primary
-   interface** `en0` (change only if your active interface differs — check with
-   `ifconfig | grep "status: active"`).
-5. Save.
+1. Leave **Matter controller location:** on **On this Mac (recommended)**.
+2. **Homebrew users: nothing else to set.** Only if you used nvm, tick **Show advanced
+   server settings** and set **Node bin directory (optional):** to *your* node bin dir —
+   run `echo ~/.nvm/versions/node/$(nvm version)/bin` to get the exact path; don't copy a
+   version string from these docs.
+3. The rest of **Show advanced server settings** is rarely needed: **Primary network
+   interface:** (default `en0` — change only if your active interface differs; check with
+   `ifconfig | grep "status: active"`), **Matter controller storage path:** (the fabric —
+   see Backups), and **Allow test/development device certificates:** (see the config field
+   reference below). There is no listen-address field to set — the managed server always
+   binds loopback only, `127.0.0.1:5580` (see Security).
+4. Save.
 
 The plugin writes `~/Library/LaunchAgents/com.simons-plugins.indigo-matter.plist`
 (`RunAtLoad` + `KeepAlive`, running as the Indigo user) and bootstraps it via `launchctl`.
@@ -232,12 +239,14 @@ The plugin writes `~/Library/LaunchAgents/com.simons-plugins.indigo-matter.plist
 > **Don't hand-edit the plist.** The plugin regenerates it from your config on every
 > restart; manual edits are overwritten.
 
-### Mode B — Manual
+### Mode B — "On another computer"
 
-Run matter-server yourself and leave **Manage matter-server LaunchAgent automatically**
-**off**. The plugin just connects to whatever is listening on the configured host/port.
+Set **Matter controller location:** to **On another computer** and run matter-server
+yourself; the plugin just connects to whatever is listening at the host/port you give it.
 
-A minimal `run.sh`:
+1. Fill in **Matter controller host:**, **Matter controller port:** (default `5580`), and
+   **WebSocket path:** (default `/ws`).
+2. Start matter-server yourself. A minimal `run.sh`:
 
 ```bash
 #!/bin/sh
@@ -253,17 +262,20 @@ node ~/indigo-matter/node_modules/matter-server/dist/esm/MatterServer.js \
 
 | Field | Default | Purpose |
 |---|---|---|
-| **matter-server host** | `localhost` | Client connect target the plugin dials. |
-| **matter-server port** | `5580` | WebSocket port. |
-| **matter-server WebSocket path** | `/ws` | WebSocket path. |
-| **Node bin directory (optional)** | *(blank)* | Directory containing `node`. Blank = auto-detect (Homebrew, then nvm, then PATH). nvm users should pin their own path (see Step 1). Managed mode only. |
-| **matter-server storage path** | `~/Library/Application Support/com.simons-plugins.indigo-matter/matter-server` | The fabric. See Backups. |
-| **Manage matter-server LaunchAgent automatically** | off | On = plugin supervises matter-server (Mode A); off = you run it (Mode B). |
-| **Primary network interface** | `en0` | macOS interface matter-server binds to. Managed mode only. |
-| **matter-server listen address** | `127.0.0.1` | IP the managed server binds its (unauthenticated) control API to. Keep loopback. Managed mode only. See Security. |
-| **Allow test/development device certificates** | off | Passes `--enable-test-net-dcl` to the managed matter-server, trusting the Matter test-net DCL alongside the production one (production verification is unchanged). It **also** allows test-net OTA firmware to be offered to commissioned devices. Turn on only if commissioning fails on device attestation because the device uses a test certificate (Homebridge and other dev bridges do). This is a global setting that stays on until you turn it off — untick it once the device is paired. Managed mode only; takes effect on plugin reload or via Plugins ▸ Matter ▸ Restart the Matter controller. While it is on, the plugin logs a warning on every startup. |
-| **Verbose Matter logging** | off | Extra plugin logging. |
-| **Trace matter-server WebSocket messages** | off | Logs raw WS frames (debug). |
+| **Matter controller location:** | On this Mac (recommended) | The one choice that matters — `local` (Mode A): the plugin runs and supervises matter-server here; `remote` (Mode B): you run it, the plugin only connects. `manageLaunchAgent` and the connect host/port are derived from this, not set separately. |
+| **Matter controller host:** | `localhost` | Mode B only. Client connect target the plugin dials. |
+| **Matter controller port:** | `5580` | Mode B only. WebSocket port. |
+| **WebSocket path:** | `/ws` | Mode B only. WebSocket path. |
+| **Node bin directory (optional):** | *(blank)* | Behind **Show advanced server settings**. Directory containing `node`. Blank = auto-detect (Homebrew, then nvm, then PATH). nvm users should pin their own path (see Step 1). Mode A only. |
+| **Matter controller storage path:** | `~/Library/Application Support/com.simons-plugins.indigo-matter/matter-server` | Behind **Show advanced server settings**. The fabric. See Backups. |
+| **Primary network interface:** | `en0` | Behind **Show advanced server settings**. macOS interface matter-server binds to. Mode A only. |
+| **Allow test/development device certificates:** | off | Behind **Show advanced server settings**. Passes `--enable-test-net-dcl` to the managed matter-server, trusting the Matter test-net DCL alongside the production one (production verification is unchanged). It **also** allows test-net OTA firmware to be offered to commissioned devices. Turn on only if commissioning fails on device attestation because the device uses a test certificate (Homebridge and other dev bridges do). This is a global setting that stays on until you turn it off — untick it once the device is paired. Mode A only; takes effect on plugin reload or via Plugins ▸ Matter ▸ Restart the Matter controller. While it is on, the plugin logs a warning on every startup. |
+| **Fabric label:** | `Indigo` | How this Indigo controller is named on your Matter devices. Applied on every connect. |
+| **Verbose Matter logging:** | off | Extra plugin logging. |
+| **Trace matter-server WebSocket messages (debug):** | off | Logs raw WS frames (debug). |
+
+There is no field to set the matter-server listen address — Mode A always binds loopback
+only (`127.0.0.1`); see Security.
 
 ---
 
@@ -315,26 +327,31 @@ Export is opt-in per device: **nothing is exported and no bridge process runs
 until you add a device** to the list in *Manage Matter Exports…*. (The
 **Enable Matter export** tickbox in Configure… is on by default. It is a master
 *off*-switch, not the thing that starts anything — an empty export list is what
-keeps a fresh install inert.) See [MATTER.md](./MATTER.md) → *Indigo as a Matter
-bridge* for how it works and what it can and cannot represent; this section is
+keeps a fresh install inert.) See
+[MATTER.html](https://simons-plugins.github.io/indigo-matter/MATTER.html) → *Indigo as a
+Matter bridge* for how it works and what it can and cannot represent; this section is
 the setup.
 
 Three things to know before you start:
 
-- **Some of this has been proven on real hardware, and some has not.** What has:
-  the bridge **has** been commissioned into Apple Home and the uncertified prompt
-  accepted; an on/off light and a dimmer **have** been controlled from Apple Home
-  and from Indigo, each direction showing up on the other side; and three
-  exported accessories **kept their identities** across a plugin and bridge-node
-  upgrade, with no duplicates in Apple Home. What has not: pairing driven from
-  the plugin's own menu (the pairing above was driven from the bridge node's
-  console), a second ecosystem alongside Apple Home, a full Mac reboot, and the
-  managed LaunchAgent end to end. Treat the export half as new.
-- **Apple Home is the ecosystem this is built and documented for.** Alexa, Google
-  Home and SmartThings are **untested and unclaimed** — the bridge is a standard
-  multi-admin Matter bridge and there is no reason they should not work, but
-  nobody here has hardware to try them on, so nothing is promised. If you pair
-  one, please say so on the forum.
+- **Most of this has been proven on real hardware.** The bridge **has** been
+  commissioned into Apple Home and the uncertified prompt accepted; pairing
+  driven from the plugin's own menu **has** worked end to end; a second
+  controller **has** joined alongside Apple Home — Alexa, as fabric #3; an
+  on/off light and a dimmer **have** been controlled from Apple Home and from
+  Indigo, each direction showing up on the other side; the managed LaunchAgent
+  **has** installed and run the bridge end to end with no hand intervention;
+  and three exported accessories **kept their identities** across a plugin and
+  bridge-node upgrade, with no duplicates in Apple Home. What has not: the
+  reboot leg of the accessory-identity check. Treat the export half as new.
+- **Apple Home and Alexa are validated; Google Home and SmartThings are not.**
+  Apple Home works end-to-end. Alexa pairs and controls too, with a known
+  caveat: newly-exported accessories can show stale or unresponsive in Alexa
+  for some minutes before converging (issue #143). Google Home and SmartThings
+  are **untested and unclaimed** — the bridge is a standard multi-admin Matter
+  bridge and there is no reason they should not work, but nobody here has
+  hardware to try them on, so nothing is promised. If you pair either, please
+  say so on the forum.
 - **The bridge is not certified**, and every ecosystem will say so when you add
   it. That is expected, not a fault — see
   [Step E4](#step-e4--add-the-bridge-in-apple-home-and-expect-the-uncertified-prompt).
@@ -346,12 +363,12 @@ Three things to know before you start:
   (auto-detect, or the **Node bin directory** you pinned).
 - **A storage path** (Step 3). The bridge's own storage directory is *derived*
   from the controller's — it is the `bridge-node/` folder beside it — so the
-  **matter-server storage path** field decides where the bridge keeps its
+  **Matter controller storage path** field decides where the bridge keeps its
   ecosystem pairings and its endpoint map, whether or not you run matter-server.
 - **A second npm package**, `indigo-matter-bridge`. It is not part of the plugin
   bundle — the plugin ships no JavaScript — and it is not the same package as
-  `matter-server`. It is installed from its own menu item (Step E1), once it is
-  published.
+  `matter-server`. It is on the npm registry (0.5.0 onward), exact-pinned to
+  **0.8.0**, and installed from its own menu item (Step E1).
 
 What export does **not** need is a working matter-server. The two are separate
 processes with separate packages, ports, storage directories and launchd jobs,
@@ -369,7 +386,8 @@ same Node, and takes a minute; watch the Event Log. On success you will see:
 
 ```
 Matter bridge installed. It is NOT being started: nothing is exported yet,
-and the bridge only runs while the export list is non-empty.
+and the bridge only runs while the export list is non-empty. Add a device in
+'Manage Matter Exports…' and it will start itself.
 ```
 
 That is correct — the bridge process starts itself the moment you export
@@ -425,9 +443,11 @@ Matter bridge: bridge node attached — 1 endpoint(s) live, not yet paired
 
 > **Changing a device's role later re-creates the accessory.** Matter does not
 > allow an endpoint to change device type, so the plugin removes it and adds it
-> back — and every paired ecosystem treats that as a brand-new accessory, losing
-> the name, room, scenes and automations you gave it there. The dialog says so
-> when you do it.
+> back — and every paired ecosystem treats that as a brand-new accessory (any
+> scenes or automations you built on it there break too). The dialog says so
+> when you do it, in these words: *"Changing the role RE-CREATES the accessory,
+> so it loses the name and room you gave it in Apple Home and any other paired
+> ecosystem."*
 
 ### Step E3 — Open a pairing window
 
@@ -443,8 +463,10 @@ devices to *their* Apple Home account.
   maximum. A value outside that band is rejected in the dialog rather than
   silently changed.
 - You must have exported something first. The bridge only runs while the export
-  list is non-empty, so with nothing exported the dialog answers *"Export at
-  least one device in 'Manage Matter Exports…' first"*.
+  list is non-empty, so with nothing exported the dialog answers *"Not connected
+  to the bridge node — see the log"* and the log explains why: *"Export at least
+  one device in 'Manage Matter Exports…' first — the bridge only runs while
+  something is exported."*
 - **The code goes to the Event Log**, not into the dialog: Indigo dialogs cannot
   display a value their own button computes. The log line carries the manual
   pairing code, the raw `MT:` QR payload, the expiry, and the URL of a page that
@@ -502,11 +524,12 @@ the Matter export section names what you are paired with.
 
 | Field | Default | Purpose |
 |---|---|---|
-| **Enable Matter export** | on | The wholesale switch. Unticking it stops the bridge and its accessories go unavailable — it does **not** unpair anything or delete accessories, so ticking it again brings them straight back. Nothing runs until at least one device is exported. This is the one export setting that acts immediately on save. |
-| **Status** | *(read-only)* | How many devices are exported, whether the plugin is connected to the bridge node, which ecosystems it last reported being paired with, and whether a pairing window is open. Computed when the dialog opens, from what the plugin already knows — it never blocks on the bridge. |
-| **Bridge control port (loopback)** | `5581` | How the plugin talks to the bridge node. Loopback only; nothing outside this Mac can reach it. Change only if something else already uses 5581. |
-| **Matter port** | `5540` | The UDP port ecosystems reach the bridge on. 5540 is the Matter default. Move it only if another Matter stack on this Mac already holds it (see Troubleshooting). |
+| **Enable Matter export:** | on | The wholesale switch. Unticking it stops the bridge and its accessories go unavailable — it does **not** unpair anything or delete accessories, so ticking it again brings them straight back. Nothing runs until at least one device is exported. This is the one export setting that acts immediately on save. |
+| **Status:** | *(read-only)* | How many devices are exported, whether the plugin is connected to the bridge node, which ecosystems it last reported being paired with, and whether a pairing window is open. Computed when the dialog opens, from what the plugin already knows — it never blocks on the bridge. |
+| **Bridge control port (loopback):** | `5581` | Behind **Show export port settings**. How the plugin talks to the bridge node. Loopback only; nothing outside this Mac can reach it. Change it only if something else already uses 5581. |
+| **Matter port:** | `5540` | Behind **Show export port settings**. The UDP port ecosystems reach the bridge on. 5540 is the Matter default. Move it only if another Matter stack on this Mac already holds it (see Troubleshooting). |
 
+Both ports are hidden by default — tick **Show export port settings** to reveal them.
 **Changing either port needs a plugin reload** — they are read when the bridge
 node and its LaunchAgent are built. The **Matter port** field says so in its own
 description; the **Bridge control port** field does not, but the same is true
@@ -597,10 +620,11 @@ bad restore is reversible). Copy the zips somewhere off-machine as well — a ba
 the same disk is not a backup.
 
 > **Restore has a precondition, and its dialog states it: *"Requires 'Manage
-> LaunchAgent' to be on."*** Restoring stops matter-server, swaps the storage
-> directory and starts it again, so it needs the plugin to be the thing that
-> runs matter-server. In Mode B (manual) the restore is refused — stop
-> matter-server yourself and swap the directory by hand instead.
+> LaunchAgent' to be on."*** ("Manage LaunchAgent" is the dialog's own wording for
+> **Matter controller location:** being set to **On this Mac (recommended)** — Mode A.)
+> Restoring stops matter-server, swaps the storage directory and starts it again, so it
+> needs the plugin to be the thing that runs matter-server. In Mode B (remote) the restore
+> is refused — stop matter-server yourself and swap the directory by hand instead.
 
 If you would rather do it by hand, stop the plugin (or matter-server) and copy the
 directory:
@@ -650,9 +674,10 @@ matter-server's WebSocket control API is **unauthenticated**, and with no
 `--listen-address` it binds **all** interfaces — meaning anyone on your LAN could control
 your entire Matter fabric.
 
-The plugin defaults the managed server to `--listen-address 127.0.0.1` (loopback) via the
-**matter-server listen address** config field. **Keep it on loopback** unless
-matter-server runs on a different host and you have a trusted firewall in front of it.
+The plugin's managed server (Mode A) always launches with `--listen-address 127.0.0.1`
+(loopback) — this is hardcoded, not a config field. If you run matter-server yourself on a
+different host (Mode B), **keep it on loopback** there too unless you have a trusted
+firewall in front of it.
 
 ### Before you pair the export bridge
 
@@ -727,7 +752,9 @@ dialog, most-likely-first — the top two are what a first export usually hits.
 |---|---|---|
 | You exported a device and **nothing appeared** in Apple Home | The bridge has never been paired. Exporting publishes a device *on* the bridge; an ecosystem sees nothing at all until the bridge itself has been added to it. | Do Step E3 then Step E4. You do this **once per ecosystem** — after that, later exports appear by themselves with no further pairing. |
 | Apple Home's **Add Accessory** cannot find the bridge | One of three: nothing is exported (the bridge only runs while the export list is non-empty), or no pairing window is open, or **Primary network interface** in Configure… names an interface this Mac is not actually using. That field is shared with matter-server and the bridge pins its mDNS advertising to it, so a wrong value advertises where nobody is listening. Matter discovery is also mDNS + link-local IPv6, so the phone must be on the same subnet as the Mac. | Export at least one device; open a window with **Pair Matter Bridge…**; check the interface with `ifconfig \| grep "status: active"` and **reload the plugin** after changing it; put the phone on the same subnet/VLAN as the Indigo Mac. |
+| Installing/updating either agent (controller or bridge) can't reach the new install, or seems to keep running an old Node | `nodeBinDir` is pinned to whichever node resolved at the last successful install and is never re-validated (issue #101, open) — install a newer Node afterwards and the plugin silently keeps using the stale pinned one, for **both** agents (they share the pin). | Configure… ▸ **Show advanced server settings** ▸ clear **Node bin directory (optional):**, save, then reinstall/restart so auto-detect re-resolves to the new node. |
 | An accessory shows as **unavailable** in Apple Home | Either the Indigo device is disabled or unconfigured (the bridge deliberately marks it unreachable rather than letting the ecosystem time out), or export is switched off, or the bridge node is not running. | Re-enable the Indigo device; or Configure… ▸ **Enable Matter export**; or work the log rows below. |
+| A command sent from an ecosystem gets **no response, and nothing shows in the Indigo log** | The bridge suppresses ecosystem commands that already match the endpoint's believed state — normal dedup, not a fault. If Indigo's own state has drifted from what the bridge believes, a command matching that *stale* belief is silently dropped, and that direction stays dead until something else moves the attribute. This is the mechanism behind issue #143: newly-exported accessories can read stale or unresponsive in **Alexa** for some minutes after export, before the two sides converge. | Toggle the device from the **Indigo** side — that forces a real state write and re-syncs the bridge's belief — or reload the plugin. For Alexa, give a fresh export a few minutes before treating it as broken. |
 | Accessories **stay** in Apple Home after you stopped exporting them | The removal never reached the node — it was down, or the plugin was reloaded mid-request. | It is recorded and finished automatically the next time the plugin connects to the node: export a device again, or reload the plugin. There is no retry loop in between, so nothing happens before then. |
 | A thermostat or sensor exports numbers that look wrong | Indigo records no units anywhere in its device model, so the bridge takes each reading as already being in the unit Matter wants (°C, %RH, lux, m³/h). A °F thermostat therefore exports the Fahrenheit number labelled as Celsius. **Barometric pressure is the one exception**: Indigo's convention is hPa, and the bridge divides by 10 to reach Matter's kPa — so a barometer reading in hPa is already correct. Do **not** "fix" it to report kPa; that is what produces a reading ten times too high. | Not fixable from Indigo's device model today — it needs a declared unit per export. Export devices that already read in metric (and leave barometers in hPa), or leave that one un-exported. |
 | A **pressure or flow** sensor never appears in Apple Home | Apple Home has no UI for those Matter device types. | **Nothing is broken and there is nothing to fix.** The accessories exist on the bridge and other ecosystems can use them; Apple simply does not render them. If Apple Home is all you run, don't export those sensors. |
@@ -748,7 +775,7 @@ dialog, most-likely-first — the top two are what a first export usually hits.
 | `Matter bridge: endpoint-number DRIFT detected` | **On bridge-node 0.8.0 or newer this should not follow a reset at all** — the node voids its witness numbers at a factory reset (from *Reset Matter Bridge Pairings…* or a last-ecosystem unpair) and silently adopts the fresh ones (issue #140), so drift that persists on a current node means the bridge's storage changed *outside* any reset, and exported accessories may have swapped identities in paired ecosystems. **On a node from before 0.8.0**, post-reset drift is the expected renumbering being reported — update the bridge. | **On a current node: treat it as a real anomaly.** Drift is never repaired automatically, deliberately — an auto-repair would bless the loss and hide the next one. Check the named accessories in each ecosystem, and restore the bridge storage from a backup if you have one. **On a pre-0.8.0 node after a reset:** no action beyond updating the bridge (*Install/update the Matter bridge*). |
 | `Matter bridge: the bridge client is HALTED` | Either the node speaks a different protocol version than this plugin (an old node left running across a plugin upgrade), or it refused a request that would have removed every accessory at once. | Nothing retries on its own. For version skew: **Stop the Matter bridge…**, then **Install/update the Matter bridge**, then re-save an export. The reason is on the line itself. |
 | `Matter bridge: the pairing window has expired without an ecosystem completing commissioning` | Nobody paired within the window (up to 15 minutes). The code it showed is now dead. | Open a new one: **Pair Matter Bridge…**. Have the phone in your hand first. |
-| The pairing menu says the bridge is *already advertising with its original code* | The bridge has never been paired, so its first commissioning window is already open with its own code — deriving a new one would kill a code you may already be typing. | Use the code in the log. This is not an error. |
+| `…it is ALREADY advertising with its original code — no new window was opened.` | The bridge has never been paired, so its first commissioning window is already open with its own code — deriving a new one would kill a code you may already be typing. | Use the code in the log. This is not an error. |
 | `Matter bridge: device N is in the export list but will NOT be bridged` | That Indigo device was deleted, disabled beyond recognition, re-typed, or no longer offers the role you exported it as. The rest of the export list is unaffected. | Open **Manage Matter Exports…**, pick the device, and either re-choose a role or **Remove export**. |
 | `Matter bridge: … stopped reporting <state>` | The Indigo device has gone quiet — a flat battery, a plugin that lost it. Matter has no way to say "I no longer know", so the ecosystem keeps showing the last value it was given, indefinitely. | Fix the underlying device. Note this warning is said **once**, when it happens; it is not repeated after a plugin reload, so its absence is not evidence that everything is reporting. |
 | `Matter bridge: '<command>' for device N has not returned after 30s` | Something you pressed in Apple Home reached an Indigo device that is not answering. Commands run one at a time, so everything behind it is queued. | Fix that device or its plugin. The ecosystem already shows the command as done and nothing corrects that until the device next reports. |

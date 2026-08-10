@@ -298,7 +298,8 @@ every ecosystem that speaks it, rather than one bridge per ecosystem.
 The bridge is a second npm package, `indigo-matter-bridge`, published on the
 npm registry (0.5.0 onward) and exact-pinned by the plugin, so the
 **Install/update the Matter bridge** menu item resolves it.
-Setup steps are in [INSTALL.md](./INSTALL.md); this
+Setup steps are in
+[INSTALL.html](https://simons-plugins.github.io/indigo-matter/INSTALL.html); this
 section is the shape of it.
 
 The two questions this page gets asked most are "can I export my lock?" and "why
@@ -454,7 +455,8 @@ what turns out to be the only one.
 
 **Back up
 `~/Library/Application Support/com.simons-plugins.indigo-matter/bridge-node/`**,
-and read the recovery notes in [INSTALL.md](./INSTALL.md) before using either of
+and read the recovery notes in
+[INSTALL.html](https://simons-plugins.github.io/indigo-matter/INSTALL.html) before using either of
 the two destructive repair actions. That is the whole practical instruction; the
 rest of this subsection is why it matters more than it looks.
 
@@ -483,26 +485,29 @@ losing the name and room it had. The dialog warns you at the time.
 
 Honestly stated, because the difference matters:
 
-- **Apple Home** is the ecosystem this bridge is designed for, documented for,
-  and the only one anything is claimed about. It is also the strictest
-  attestation experience we can test — the uncertified prompt.
-- **Alexa, Google Home and SmartThings are untested and unclaimed.** Not
-  supported, not unsupported: nobody here has the hardware, no decision hangs on
-  the answer, and the only remedy for a refusal — a real CSA vendor ID — is out
-  of scope for a free plugin. The bridge is an ordinary multi-admin Matter
-  bridge and there is no reason in principle they should refuse it, but a reason
-  in principle is not a test. Google Home is the most likely to be awkward: it
-  has historically been strictest about test-range vendor IDs. If you pair any of
-  them, please report it.
+- **Apple Home is validated end-to-end**, and the strictest attestation
+  experience we can test — the uncertified prompt.
+- **Alexa pairs and controls too**, with a known caveat: newly-exported
+  accessories can show stale or unresponsive in Alexa for some minutes before
+  converging (issue #143). Give a fresh export a few minutes before treating it
+  as broken.
+- **Google Home and SmartThings are untested and unclaimed.** Not supported,
+  not unsupported: nobody here has the hardware, no decision hangs on the
+  answer, and the only remedy for a refusal — a real CSA vendor ID — is out of
+  scope for a free plugin. The bridge is an ordinary multi-admin Matter bridge
+  and there is no reason in principle they should refuse it, but a reason in
+  principle is not a test. Google Home is the most likely to be awkward: it has
+  historically been strictest about test-range vendor IDs. If you pair either,
+  please report it.
 - **Any Matter controller you already own** counts too, including Home Assistant
   and Indigo's own controller — the bridge does not care who commissions it.
 
 **What has and has not been proven on live hardware** is stated once, in the
-project [README](../README.md#status), rather than restated here where the two
-copies would drift apart. The short version: the bridge has been commissioned
-into a real Apple Home and exported devices have been controlled both ways, but
-several legs — pairing driven from the plugin's own menu, a second ecosystem, a
-full reboot — are still outstanding. Treat the export half as new.
+project [README](https://github.com/simons-plugins/indigo-matter#status), rather
+than restated here where the two copies would drift apart. The short version: the
+bridge has been commissioned into Apple Home and Alexa and exported devices have
+been controlled both ways, but the reboot leg of the accessory-identity check is
+still outstanding. Treat the export half as new.
 
 ### Why every ecosystem calls it "uncertified"
 
@@ -584,7 +589,7 @@ reversible.
 
 **Exporting devices** has its own failure modes, its own logs and its own
 recovery actions — see the *export bridge* table in
-[INSTALL.md → Troubleshooting](./INSTALL.md#the-export-bridge).
+[INSTALL.html → Troubleshooting](https://simons-plugins.github.io/indigo-matter/INSTALL.html#the-export-bridge).
 
 ---
 
