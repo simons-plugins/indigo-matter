@@ -5,8 +5,11 @@ nav_order: 100
 title: "ADR-NNNN: {short title, imperative}"
 
 # These are optional elements. Feel free to remove any of them.
+# NOTE: `date:` is deliberately absent from this template. GitHub Pages builds
+# docs/ with Jekyll, and a placeholder like `YYYY-MM-DD` is parsed as a date and
+# fails the build for the WHOLE SITE — quoting it does not help. Add a real
+# `date: YYYY-MM-DD` (e.g. date: 2026-08-11) to the ADR you create from this.
 status: "proposed"
-date: YYYY-MM-DD
 decision-makers: solo (Simon)
 consulted: none
 informed: none
