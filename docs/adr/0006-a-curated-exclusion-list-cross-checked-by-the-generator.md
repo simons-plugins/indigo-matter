@@ -214,6 +214,32 @@ filed as both a non-setting and a reviewed real setting.
 cover the case this ADR exists for; `test_the_explorer_still_labels_on_time_a_command_parameter`
 is the control case alongside it.
 
+**Confirmed live on jarvis, 2026-08-11 20:16 UTC, plugin 2026.12.0.** All seven
+commissioned nodes re-surveyed on restart — the banked fingerprints are
+`{"39":"1.0.26#[]", "46":"1.9.15#[]", "47":"1.0.21#[]", "49":"1.3.0#[]",
+"50":"1.2.0-s2#[]", "52":"1.4.6#[]", "56":"1.1.3.8#[]"}` — every settable set
+empty. So the report is silent because there is nothing to say, not because the
+survey failed to run, and **ADR-0005's Confirmation claim still holds** after the
+localization clusters were un-suppressed: no node on this fabric implements them.
+
+Two claims this fabric cannot test, stated rather than assumed: there is no lock
+commissioned, so `DoorLock.AutoRelockTime` appearing in the report is unverified
+on hardware; and no node exposes a writable root-node attribute, so the
+endpoint-0 wording is unverified on hardware. Both are covered by unit tests only.
+
+**The retirement notice's per-device count was verified against real hardware and
+is the reason the naive version was wrong.** The fabric has four `matterRelay`
+devices; the notice reported **two**. The two that lost `startUpOnOff` in the same
+restart (an IKEA ALPSTUGA and a Shelly 1PM Mini Gen3) are the pair without the
+Lighting feature, so the two that genuinely carried `onTime` were the GRILLPLATS
+and the Tapo plug. Counting relays would have told two users their triggers may
+have broken when those devices never had the state.
+
+That result also settles, empirically, the ordering assumption the notice depends
+on and which no Indigo document states outright: `startup()` runs before
+`deviceStartComm()`, so `dev.states` still described the pre-upgrade world when it
+was read. Had the states already migrated, the count would have been zero.
+
 ## Pros and Cons of the Options
 
 ### Keep the command-field rule as the decision authority
