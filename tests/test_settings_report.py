@@ -256,7 +256,6 @@ def test_the_explorer_shows_command_parameters_and_says_what_they_are():
     (0x003F, 0x0000, "GroupKeyManagement.GroupKeyMap"),
     (0x0041, 0x0000, "UserLabel.LabelList"),
     (0x002A, 0x0000, "OtaSoftwareUpdateRequestor.DefaultOtaProviders"),
-    (0x002D, 0x0000, "UnitLocalization.TemperatureUnit"),
 ])
 def test_the_list_typed_plumbing_recovered_by_the_parser_fix_stays_quiet(
         cluster, attribute, name):
@@ -283,6 +282,7 @@ def test_the_list_typed_plumbing_recovered_by_the_parser_fix_stays_quiet(
     (0x0201, 0x0050, "Thermostat.Presets"),
     (0x0201, 0x0051, "Thermostat.Schedules"),
     (0x0101, 0x002B, "DoorLock.EnablePrivacyModeButton"),
+    (0x002D, 0x0000, "UnitLocalization.TemperatureUnit"),
 ])
 def test_the_REAL_settings_recovered_by_the_parser_fix_ARE_reported(
         cluster, attribute, name):
@@ -291,10 +291,37 @@ def test_the_REAL_settings_recovered_by_the_parser_fix_ARE_reported(
     lock's privacy button — that the report was structurally unable to mention.
     RockSetting and WindSetting bear directly on the open fan work in #46.
     """
+    endpoint = 0 if cluster == 0x002D else 1   # UnitLocalization is a node cluster
     survey = survey_node(node({
-        (1, cluster, ATTR_ATTRIBUTE_LIST): [attribute, ATTR_ATTRIBUTE_LIST],
+        (endpoint, cluster, ATTR_ATTRIBUTE_LIST): [attribute, ATTR_ATTRIBUTE_LIST],
     }))
     assert reported(survey) == {(cluster, attribute)}, f"{name} is a genuine gap"
+
+
+@pytest.mark.parametrize("cluster,attribute,name", [
+    (0x002B, 0x0000, "LocalizationConfiguration.ActiveLocale"),
+    (0x002C, 0x0000, "TimeFormatLocalization.HourFormat"),
+    (0x002D, 0x0000, "UnitLocalization.TemperatureUnit"),
+])
+def test_the_localization_trio_is_reported_not_suppressed(cluster, attribute, name):
+    """These sat in INFRASTRUCTURE_CLUSTERS from the day the report shipped, on
+    the stated grounds that such things "belong to the fabric, not to the device's
+    behaviour". They do not. All three are ``RW VM`` with **quality N** —
+    persistent configuration by the model's own account, which is exactly what
+    OnTime lacks — and each carries a device-reported ``Supported*`` list, the
+    ``FromAttribute`` bounds strategy the registry already implements twice.
+
+    They are node-level DISPLAY preferences: show °F on the thermostat, use a
+    24-hour clock. A user would recognise every one of them as a setting, which is
+    the test this list is supposed to apply.
+
+    Feature-gated on the root node, so a node reports them only if it opted in —
+    which is why un-suppressing them is not a return to wallpaper.
+    """
+    survey = survey_node(node({
+        (0, cluster, ATTR_ATTRIBUTE_LIST): [attribute, ATTR_ATTRIBUTE_LIST],
+    }))
+    assert reported(survey) == {(cluster, attribute)}, f"{name} is a real setting"
 
 
 def test_a_cluster_with_no_writable_attributes_at_all_is_skipped():

@@ -100,16 +100,30 @@ GLOBAL_ATTRIBUTES: dict[int, str] = {
 #:
 #: The second block was added with #197's parser fix, which raised the model's
 #: writable count from 110 to 124 — the generator had been skipping every
-#: multi-line ``Attribute(``, i.e. every list- and struct-typed one. Eight of the
+#: multi-line ``Attribute(``, i.e. every list- and struct-typed one. Seven of the
 #: fourteen it recovered are list-typed fabric plumbing (an ACL, a binding table,
 #: a group-key map) and would have been recommended as settings on the next
 #: report of any node that implements them. They are exactly what this list is
-#: for; the other six are genuine candidates and are deliberately left to report.
+#: for; the rest are genuine candidates and are deliberately left to report.
+#:
+#: **The three localization clusters were REMOVED from this list in #197**, having
+#: been on it since the report shipped. They failed the test above on inspection:
+#: ``TemperatureUnit``, ``ActiveLocale`` and ``HourFormat`` are all ``RW VM`` with
+#: **quality N** — persistent configuration by the model's own account, unlike
+#: everything left here — and each carries a device-reported ``Supported*`` list,
+#: which is precisely the ``FromAttribute`` bounds strategy the registry already
+#: implements. They are node-level DISPLAY PREFERENCES ("show °F on the
+#: thermostat"), not fabric plumbing, and the sentence above about belonging to
+#: the fabric was simply wrong about them. All three are feature-gated on the root
+#: node, so a node reports them only if it opted in — no wallpaper risk.
+#:
+#: Implementing one is a real design problem, and that is the resulting issue's to
+#: solve rather than a reason to stay quiet: they sit on **endpoint 0**, which has
+#: no Indigo device, so there is no Edit Device dialog to host the field
+#: (ADR-0002). The report only ever claims the plugin does not offer something.
 INFRASTRUCTURE_CLUSTERS: frozenset = frozenset({
     0x0003,  # Identify — IdentifyTime is a momentary command, not a setting
     0x0028,  # BasicInformation — NodeLabel/Location/LocalConfigDisabled
-    0x002B,  # LocalizationConfiguration — ActiveLocale
-    0x002C,  # TimeFormatLocalization — HourFormat/ActiveCalendarType
     0x0030,  # GeneralCommissioning — Breadcrumb
     0x0031,  # NetworkCommissioning — InterfaceEnabled
     0x0453,  # ThreadNetworkDirectory — PreferredExtendedPanId
@@ -117,11 +131,6 @@ INFRASTRUCTURE_CLUSTERS: frozenset = frozenset({
     0x001E,  # Binding — the binding table; device-to-device wiring
     0x001F,  # AccessControl — Acl/Extension, who may talk to this node
     0x002A,  # OtaSoftwareUpdateRequestor — DefaultOtaProviders
-    0x002D,  # UnitLocalization — TemperatureUnit. The closest call on this list:
-             # a display preference is arguably the device's behaviour. Excluded
-             # for consistency with its two siblings above — ActiveLocale and
-             # HourFormat are no less "real", and splitting the localization trio
-             # on a hunch would be harder to defend than keeping it whole.
     0x003F,  # GroupKeyManagement — GroupKeyMap/GroupcastAdoption
     0x0041,  # UserLabel — LabelList. Naming, like BasicInformation's NodeLabel
              # which is already excluded here, and Indigo owns the name anyway.
