@@ -57,6 +57,10 @@ ATTR_NODE_LABEL = 0x0005
 CLUSTER_LEVEL = 0x0008
 ATTR_ON_LEVEL = 0x0011           # a plain writable gap — offered by nothing
 ATTR_LEVEL_TRANSITION = 0x0010   # OnOffTransitionTime — a second one, lower id
+CLUSTER_DOOR_LOCK = 0x0101
+ATTR_OPERATING_MODE = 0x0025     # a real setting the derived rule falsely flagged
+CLUSTER_LOCALIZATION = 0x002B    # LocalizationConfiguration — lives on endpoint 0
+ATTR_ACTIVE_LOCALE = 0x0000
 
 
 def node(attributes: dict, *, node_id: int = 0x38, vendor: str = "Aqara",
@@ -192,22 +196,51 @@ def test_matter_plumbing_is_never_reported(cluster):
 # Command parameters are not settings — issue #197
 # ---------------------------------------------------------------------------
 
-def test_the_command_parameter_table_is_EXACTLY_the_four_known_pairs():
-    """The generator builds this by scanning ``Command(...)`` blocks for their
-    sibling ``Field`` arguments — a parse that returns nothing on a wrong scan
-    and would silently disable every filter below. The generator refuses to
-    write an empty table; this is the same guard from the consuming side, so a
-    hand-edited or truncated artefact is caught too."""
-    pairs = {(cluster, attribute)
-             for cluster, ids in settings_report.COMMAND_FIELD_ATTRIBUTES.items()
-             for attribute in ids}
-    assert pairs == {
-        (0x0003, 0x0000),  # Identify.IdentifyTime           <- Identify()
-        (0x0006, 0x4001),  # OnOff.OnTime                    <- OnWithTimedOff()
-        (0x0006, 0x4002),  # OnOff.OffWaitTime               <- OnWithTimedOff()
-        (0x0030, 0x0000),  # GeneralCommissioning.Breadcrumb <- ArmFailSafe(),
-                           #                                    SetRegulatoryConfig()
-    }, "the four writable attributes in the pinned model that are command fields"
+def test_every_generated_command_field_collision_has_been_judged_by_a_human():
+    """The whole point of splitting the generator's DETECTOR from a human
+    DECIDER (#197 follow-up, after ADR-0005's mechanical rule proved unsound).
+
+    ``COMMAND_FIELD_ATTRIBUTES`` is machine-derived from the pinned model and
+    moves when matter.js moves. Every member it contains must have been looked
+    at by a human and filed into exactly one of ``NOT_SETTINGS`` (confirmed:
+    not a setting, with a citation) or ``REVIEWED_COMMAND_FIELD_COLLISIONS``
+    (confirmed: a real setting that merely collides by name, with a citation).
+
+    THIS IS THE SAFETY PROPERTY: if a matter.js bump introduces a new writable
+    attribute that happens to share a name with a command field on its own
+    cluster, this test fails — loudly, with instructions — instead of the
+    report silently swallowing what might be a real setting the way it
+    silently swallowed ``DoorLock.OperatingMode`` until this PR. Fix a failure
+    here by reading the spec for the new pair and adding it, with a citation,
+    to ``NOT_SETTINGS`` if writing it means nothing on its own, or to
+    ``REVIEWED_COMMAND_FIELD_COLLISIONS`` if it is a real setting. Never fix it
+    by deleting or weakening this assertion.
+    """
+    detected = {(cluster, attribute)
+                for cluster, ids in settings_report.COMMAND_FIELD_ATTRIBUTES.items()
+                for attribute in ids}
+    judged = set(settings_report.NOT_SETTINGS) | set(
+        settings_report.REVIEWED_COMMAND_FIELD_COLLISIONS)
+    unjudged = sorted(detected - judged)
+    assert not unjudged, (
+        "the generated COMMAND_FIELD_ATTRIBUTES has member(s) that are in neither "
+        "NOT_SETTINGS nor REVIEWED_COMMAND_FIELD_COLLISIONS — a matter.js bump "
+        "introduced a new writable attribute that collides by name with a command "
+        f"field, and nobody has judged it yet: {unjudged}. Read the spec for each "
+        "pair, decide whether writing the attribute on its own means anything, and "
+        "add it (with a citation) to NOT_SETTINGS if not, or to "
+        "REVIEWED_COMMAND_FIELD_COLLISIONS if it is a real setting like "
+        "DoorLock.OperatingMode was."
+    )
+
+
+def test_not_settings_and_reviewed_collisions_are_disjoint():
+    """The two lists are alternatives for one detected pair, never both — a pair
+    in both would mean the report both excludes it (NOT_SETTINGS) and the
+    explorer treats it as a reviewed-real setting at the same time, which is a
+    contradiction the two tables must not be able to express."""
+    assert not (set(settings_report.NOT_SETTINGS)
+                & set(settings_report.REVIEWED_COMMAND_FIELD_COLLISIONS))
 
 
 @pytest.mark.parametrize("attribute", [ATTR_ON_TIME, ATTR_OFF_WAIT_TIME])
@@ -248,6 +281,45 @@ def test_the_explorer_shows_command_parameters_and_says_what_they_are():
     })))
     assert "OnTime (0x4001) [writable, command parameter] = 0" in lines
     assert "StartUpOnOff (0x4003) [writable] = 1" in lines
+
+
+def test_door_lock_operating_mode_IS_reported_as_a_gap():
+    """The false positive that broke the old command-field rule (#197
+    follow-up). ``OperatingMode`` is a real DoorLock setting —
+    Normal/Vacation/Privacy/NoRemoteLockUnlock (§5.2.9.24) — that merely shares
+    its name with a field of the request command ``SetHolidaySchedule``
+    (§5.2.10.12.4). It must be reported as a gap, not filtered.
+
+    DoorLock is Indigo device type ``matterLock`` (see ``test_door_lock.py``),
+    but ``survey_node`` decides purely from the AttributeList and does not
+    consult Indigo device types at all, so a bare ``node()`` fixture is enough
+    — the same pattern the parser-fix tests above already use.
+    """
+    survey = survey_node(node({
+        (1, CLUSTER_DOOR_LOCK, ATTR_ATTRIBUTE_LIST):
+            [ATTR_OPERATING_MODE, ATTR_ATTRIBUTE_LIST],
+    }))
+    assert reported(survey) == {(CLUSTER_DOOR_LOCK, ATTR_OPERATING_MODE)}
+
+
+def test_the_explorer_does_not_label_door_lock_operating_mode_a_command_parameter():
+    """The generated ``COMMAND_FIELD_ATTRIBUTES`` flags this pair, but a human
+    has reviewed it (``REVIEWED_COMMAND_FIELD_COLLISIONS``) and found it to be
+    a real setting — so, unlike ``OnTime``, the explorer must show it as an
+    ordinary writable attribute, not a command parameter."""
+    body = "\n".join(explore_lines(node({
+        (1, CLUSTER_DOOR_LOCK, ATTR_OPERATING_MODE): 0,
+    })))
+    assert "OperatingMode (0x0025) [writable] = 0" in body
+    assert "command parameter" not in body
+
+
+def test_the_explorer_still_labels_on_time_a_command_parameter():
+    """The control case for the test above: a NOT_SETTINGS member must still
+    be labelled, so the split between the two tables actually drives the
+    explorer rather than the label having quietly gone unconditional."""
+    body = "\n".join(explore_lines(node({(1, CLUSTER_ON_OFF, ATTR_ON_TIME): 0})))
+    assert "OnTime (0x4001) [writable, command parameter] = 0" in body
 
 
 @pytest.mark.parametrize("cluster,attribute,name", [
@@ -406,9 +478,71 @@ def test_endpoints_are_titled_by_their_indigo_device_when_named():
 
 
 def test_an_endpoint_with_no_indigo_device_falls_back_to_its_number():
+    """Scoped to endpoint 1, not 0: an ordinary endpoint with no Indigo
+    device YET (this fixture just never named one) falls back to its bare
+    number, but endpoint 0 never gets a device AT ALL and has its own
+    "Matter root node" heading instead (issue #204, see the tests below) —
+    the two must not collapse into the same fallback."""
     survey = settings_report.name_endpoints(
         survey_node(level_node([ATTR_ON_LEVEL, ATTR_ATTRIBUTE_LIST])), lambda ep: [])
     assert "  endpoint 1:" in report_lines(survey)
+
+
+def test_an_ordinary_endpoints_heading_and_lines_are_unchanged():
+    """Guards the new endpoint-0 framing against leaking onto an endpoint
+    that DOES have an Indigo device — only endpoint 0 is special, and that
+    has to stay derived from the endpoint number, not become a default."""
+    survey = settings_report.name_endpoints(
+        survey_node(level_node([ATTR_ON_LEVEL, ATTR_ATTRIBUTE_LIST])),
+        lambda ep: ["Kitchen Plug"])
+    body = "\n".join(report_lines(survey))
+    assert "Kitchen Plug (endpoint 1)" in body
+    assert "root node" not in body.lower()
+    assert "node-level" not in body.lower()
+    assert "#204" not in body
+
+
+def test_an_endpoint_0_only_survey_renders_the_root_node_heading_and_204():
+    """Endpoint 0 is the Matter root node and never gets an Indigo device
+    (issue #204), so its heading must say what it is rather than rendering
+    a bare "endpoint 0:", and its lines must say support is already tracked
+    — otherwise the generic closing paragraph below would read as an
+    invitation to file a duplicate of #204."""
+    survey = survey_node(node({
+        (0, CLUSTER_LOCALIZATION, ATTR_ACTIVE_LOCALE): "en-US",
+        (0, CLUSTER_LOCALIZATION, ATTR_ATTRIBUTE_LIST):
+            [ATTR_ACTIVE_LOCALE, ATTR_ATTRIBUTE_LIST],
+    }))
+    body = "\n".join(report_lines(survey))
+    assert "the Matter root node (endpoint 0)" in body
+    assert "  endpoint 0:" not in body
+    assert "node-level" in body.lower()
+    assert "#204" in body
+
+
+def test_a_node_with_endpoint_0_and_an_application_endpoint_renders_each_correctly():
+    """The realistic case: one node reporting both a root-node display
+    preference and an ordinary per-device gap in the same block. Each
+    endpoint must get its own framing — the root-node text must not bleed
+    into endpoint 1's lines, and endpoint 1 must not gain a #204 reference
+    that belongs only to endpoint 0."""
+    survey = survey_node(node({
+        (0, CLUSTER_LOCALIZATION, ATTR_ACTIVE_LOCALE): "en-US",
+        (0, CLUSTER_LOCALIZATION, ATTR_ATTRIBUTE_LIST):
+            [ATTR_ACTIVE_LOCALE, ATTR_ATTRIBUTE_LIST],
+        (1, CLUSTER_LEVEL, ATTR_ATTRIBUTE_LIST): [ATTR_ON_LEVEL, ATTR_ATTRIBUTE_LIST],
+    }))
+    lines = report_lines(survey)
+    body = "\n".join(lines)
+    assert "the Matter root node (endpoint 0)" in body
+    assert "#204" in body
+    assert "  endpoint 1:" in body
+    assert "OnLevel (0x0011)" in body
+    # The #204 reference belongs to endpoint 0's block, not endpoint 1's.
+    root_index = next(i for i, ln in enumerate(lines) if "root node" in ln)
+    ep1_index = next(i for i, ln in enumerate(lines) if ln == "  endpoint 1:")
+    assert not any("#204" in ln for ln in lines[ep1_index:])
+    assert root_index < ep1_index
 
 
 # ---------------------------------------------------------------------------

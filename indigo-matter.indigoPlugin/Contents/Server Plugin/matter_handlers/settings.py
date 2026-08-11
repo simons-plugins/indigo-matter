@@ -144,12 +144,18 @@ class Bounds:
 # Where a setting's bounds come from
 #
 # Enumerating the Matter data model (tools/enumerate_settings.py) showed the
-# FP300's pattern is the RARE one: of 57 writable attributes on the clusters
+# FP300's pattern is the RARE one: of 76 writable attributes on the clusters
 # this plugin handles, exactly 2 take their bounds from another attribute on the
 # device — and both are already shipped. Most are a range fixed by the spec, an
 # enum, or unbounded. So bounds are a declared STRATEGY rather than always a
 # device read, and the capability question ("does this unit implement the
 # attribute at all?") is answered separately, by the device's own AttributeList.
+#
+# The count was 57 until #197's review fixed three generator defects (multi-line
+# `Attribute(`, the `R[W]` access form, and a last-match-wins property parse).
+# The ARGUMENT is unchanged and in fact strengthened — 2 of 76 rather than 2 of
+# 57. ADR-0002 and ADR-0003 quote the old figure and are immutable; ADR-0006
+# carries the correction.
 # ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)

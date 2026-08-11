@@ -497,8 +497,10 @@ def test_apply_setting_is_exported_for_the_plugin_layer():
 # Bounds strategies — issue #186 follow-up
 #
 # Enumerating the Matter model showed the FP300's "bounds from a device
-# attribute" pattern is the RARE one: 2 of 57 writable attributes on the
+# attribute" pattern is the RARE one: 2 of 76 writable attributes on the
 # clusters this plugin handles. Most take a spec-fixed range or an enum.
+# (Was "2 of 57" until #197's review fixed three generator defects; the
+# argument only got stronger. ADR-0006 carries the correction.)
 # ---------------------------------------------------------------------------
 
 RELAY = "matterRelay"

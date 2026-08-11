@@ -162,7 +162,53 @@ def _balanced_parens(text: str, start: int) -> str:
 
 
 def _props(obj: str) -> dict:
-    return {k: _unquote(v) for k, v in _PROP.findall(obj)}
+    """Properties of one element's object literal. FIRST match per key wins.
+
+    Not last. ``_PROP`` is a flat ``findall`` over the whole literal, and five
+    attributes in the pinned model nest another object inside their own::
+
+        Attribute({
+            name: "MinHeatSetpointLimit", id: 21, type: "temperature",
+            access: "RW VM",
+            default: { type: "reference", name: "AbsMinHeatSetpointLimit" },
+            quality: "N"
+        })
+
+    With last-match-wins the nested ``name``/``type`` overwrote the attribute's
+    own, so the generated table gave ONE NAME TO TWO IDS — 0x0015 and 0x0003 both
+    came out ``AbsMinHeatSetpointLimit``, one writable and one not. The report
+    then told users to open an issue quoting a name that, under that name, is a
+    different and read-only attribute. First-match-wins is correct because an
+    element's own properties always precede any nested literal (#197 review).
+    """
+    props: dict = {}
+    for key, value in _PROP.findall(obj):
+        props.setdefault(key, _unquote(value))
+    return props
+
+
+def is_writable(access) -> bool:
+    """True if a model ``access`` string marks the attribute writable.
+
+    The original test was ``"RW" in access``, which only recognises the
+    unconditional form. matter.js's own parser (``@matter/model``'s
+    ``Access.parse``, in ``aspects/Access.js``) treats ``R[W]`` — conditionally/
+    optionally writable — as writable too: the ``[`` case pushes
+    ``Rw.ReadWriteOption`` when followed by ``W]``, and the ``writable`` getter
+    returns true for anything other than ``Rw.Read``. A generator that only
+    matched ``RW`` therefore silently dropped every ``R[W]`` attribute from
+    ``WRITABLE_ATTRIBUTES`` — **13 spec-writable attributes** on the pinned
+    model, twelve of them DoorLock settings (including ``AutoRelockTime``, the
+    working door-lock analogue of the "auto-off after" feature #197 retired for
+    OnOff — a genuine setting, not a command parameter) and one Thermostat
+    (``MinSetpointDeadBand``). Same bug class as the two fixed-window defects
+    already fixed on this branch: a check that recognises one spelling of a
+    model construct and silently skips a form that spells the same thing
+    differently (#197 review).
+    """
+    if not access or not isinstance(access, str):
+        return False
+    return "RW" in access or "R[W]" in access
 
 
 def parse_cluster(path: Path) -> tuple[dict, list[dict]]:
@@ -430,7 +476,7 @@ def emit_table(elements: Path, path: Path) -> tuple[int, int, dict]:
             if not isinstance(attr_id, int) or not attr_name:
                 continue
             names.setdefault(cluster_id, {}).setdefault(attr_id, str(attr_name))
-            if "RW" in (attr.get("access") or ""):
+            if is_writable(attr.get("access")):
                 writable.setdefault(cluster_id, set()).add(attr_id)
 
     parameters = command_parameters(writable, names, command_fields)

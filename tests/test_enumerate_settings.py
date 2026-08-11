@@ -1,16 +1,22 @@
 """Tests for the table generator — `tools/enumerate_settings.py` (#191, #197).
 
-Nothing imported this module before #197, which is how TWO parser bugs of the
-same shape reached the checked-in artefact. Both located a call's object literal
-by a fixed character distance, so both silently skipped the multi-line form —
-which is exactly how the model prints anything carrying nested fields.
+Nothing imported this module before #197, which is how FOUR parser defects
+reached the checked-in artefact. The shipped table claimed 110 writable
+attributes; the model has **137**.
 
-* `parse_command_fields` dropped 53 `Field(` sites and 39 names. Harmless by
-  luck: none of the 39 collided with a writable attribute on its own cluster.
-* `parse_cluster` dropped 265 `Attribute(` sites, **14 of them writable**. The
-  shipped table said 110 writable attributes when the model has 124, so the
-  settable-attribute report was blind to `FanControl.RockSetting`,
+* `parse_command_fields` located a `Field(`'s object literal by a fixed
+  character distance, so it skipped the multi-line form — 53 sites, 39 names.
+  Harmless by luck: none collided with a writable attribute on its own cluster.
+* `parse_cluster` had the same window on `Attribute(` — 265 sites, **14 of them
+  writable**, so the report was blind to `FanControl.RockSetting`,
   `Thermostat.Presets` and ten others from the day #191 shipped.
+* Writability was tested as `"RW" in access`, which misses matter.js's `R[W]`
+  (conditionally writable) form — **13 more**, twelve of them DoorLock settings
+  including `AutoRelockTime`, the working analogue of the feature #197 retired.
+* `_props` was a flat `findall` into a dict comprehension, so a nested
+  `default: {type, name}` overwrote the attribute's own — five attributes came
+  out under the WRONG NAME, and the report printed those names to users. The
+  only one of the four that produced wrong output rather than missing output.
 
 **That is the failure mode these tests exist for, and why they are worth having
 even though the generator is a build script.** The repo already carries the same
@@ -261,3 +267,74 @@ def test_the_floor_matches_the_documented_four():
         (0x0006, 0x4002),  # OnOff.OffWaitTime
         (0x0030, 0x0000),  # GeneralCommissioning.Breadcrumb
     }
+
+
+# ---------------------------------------------------------------------------
+# _props — first-match-wins on a nested object literal (#197 review)
+# ---------------------------------------------------------------------------
+
+def test_props_first_match_wins_on_a_nested_default_reference():
+    """THE regression this branch's first edit fixed. `_PROP` is a flat
+    ``findall`` over the whole object literal, so an attribute whose ``default``
+    nests another object literal — the exact shape below, lifted from the real
+    model — yields TWO ``name``/``type`` pairs from one ``findall``: the
+    attribute's own, then the nested reference's. Last-match-wins gave every
+    such attribute the NESTED name, so 0x0015 (``MinHeatSetpointLimit``) and
+    0x0003 (``AbsMinHeatSetpointLimit``) both printed as ``AbsMinHeatSetpointLimit``
+    — one writable attribute wrongly reported under a different, read-only
+    attribute's name. First-match-wins is correct because an element's own
+    properties always precede any nested literal."""
+    obj = '''{
+        name: "MinHeatSetpointLimit", id: 21, type: "temperature",
+        access: "RW VM",
+        default: { type: "reference", name: "AbsMinHeatSetpointLimit" },
+        quality: "N"
+    }'''
+    props = es._props(obj)
+    assert props["name"] == "MinHeatSetpointLimit"
+    assert props["type"] == "temperature"
+
+
+# ---------------------------------------------------------------------------
+# is_writable — the R[W] gap
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("access, expected", [
+    ("RW VM", True),
+    ("RW VO", True),
+    ("RW VA", True),
+    ("R[W] VM", True),
+    ("R[W] VA", True),
+    ("R V", False),
+    ("R [V]", False),
+    ("", False),
+    (None, False),
+])
+def test_is_writable(access, expected):
+    """``"RW" in access`` alone misses ``R[W]`` — matter.js's conditionally/
+    optionally-writable form (``Access.js``'s ``ReadWriteOption``, parsed from
+    the ``[W]`` DSL token). That gap dropped 13 spec-writable attributes from
+    ``WRITABLE_ATTRIBUTES`` on the pinned model — twelve DoorLock settings
+    (including ``AutoRelockTime``, DoorLock's working analogue of the OnOff
+    "auto-off after" feature #197 retired) and Thermostat's
+    ``MinSetpointDeadBand``. ``"R [V]"`` (a bracketed privilege, not a
+    bracketed write flag) must stay non-writable — the bracket alone is not
+    the signal, ``[W]`` specifically is."""
+    assert es.is_writable(access) is expected
+
+
+def test_an_r_bracket_w_attribute_reaches_the_writable_set(tmp_path):
+    """The same classification `emit_table` applies at its per-attribute step
+    (``if is_writable(attr.get("access")): writable...add(attr_id)``), run here
+    as `parse_cluster` + `is_writable` directly rather than through
+    `emit_table()` itself: `emit_table` also runs `command_parameters`'s
+    `KNOWN_COMMAND_FIELD_ATTRIBUTES` floor, which demands the real model's four
+    command-parameter pairs be present and would abort on a synthetic
+    single-attribute fixture for a reason unrelated to what this test checks."""
+    path = _element(tmp_path, '''
+export const x = Cluster({ name: "DoorLock", id: 257 },
+  Attribute({ name: "AutoRelockTime", id: 0x23, type: "uint32", access: "R[W] VM", conformance: "O" })
+)''')
+    _, attributes = es.parse_cluster(path)
+    writable_ids = {a["id"] for a in attributes if es.is_writable(a.get("access"))}
+    assert writable_ids == {0x23}
