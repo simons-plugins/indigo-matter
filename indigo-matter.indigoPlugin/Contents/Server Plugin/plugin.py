@@ -281,20 +281,26 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, ServerMenuMixin,
             self.logger.exception(exc)
 
     def _announce_retired_on_time_state(self) -> None:
-        """Say once that the ``onTime`` state and its field are gone (#197).
+        """Say once that the ``onTime`` device SETTING is gone (#197).
 
-        Withdrawing a state is the one change this plugin can make that breaks a
-        user's automation *silently* — a trigger bound to a state that no longer
-        exists simply never fires again, with nothing in the log to connect it to
-        an upgrade. ADR-0003 records that asymmetry as the reason states are
-        withdrawn only on a positive NO; removing one outright is rarer still, so
-        it is announced.
+        Only the setting is retired. The ``onTime`` *state* is not withdrawn —
+        workspace ADR-0007 keeps it, flagged, precisely because a live
+        experiment (ADR-0006's Confirmation, 2026-08-11) found that withdrawing
+        a state leaves any trigger already bound to it silently orphaned:
+        still enabled, nothing in the log, its own dialog quietly repointed at
+        a different, real state. Kept instead, a trigger built on 'Auto-Off
+        Timer' stays bound to what its author actually built — it simply never
+        fires, because ``deviceStartComm``/``_prime_retired_on_time_state``
+        pin the state at 0 with ``uiValue="<unused>"`` on every start and
+        nothing else writes it. So this notice no longer has a broken binding
+        to warn about; it only has to say the setting is gone from the dialog
+        and where the state stands now.
 
         Counted per DEVICE THAT ACTUALLY HAD THE STATE, not per relay. Only relays
         implementing OnOff's Lighting feature ever carried it — ``getDeviceStateList``
         withdrew it from the rest (#190), and on the dev fabric that is two plugs in
-        four. Telling the other two that a trigger of theirs may have broken sends
-        them hunting for a breakage that cannot have happened.
+        four. Telling the other two that a setting of theirs was retired sends
+        them looking for something they never had.
 
         ``dev.states`` is the right evidence and this is the right MOMENT to read
         it: Indigo calls ``startup`` before ``deviceStartComm``, and it is
@@ -316,12 +322,13 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, ServerMenuMixin,
                         if dev.deviceTypeId == "matterRelay" and "onTime" in dev.states]
             if affected:
                 self.logger.info(
-                    "Matter: the 'Auto-off after' device setting and its 'Auto-Off Timer' "
-                    "state have been removed from %d relay device(s). They could never "
-                    "work: Matter's OnTime is a parameter of a command this plugin does "
-                    "not send, not a stored setting, so the value was always ignored and "
-                    "reset to 0. If you built a trigger on 'Auto-Off Timer' it will no "
-                    "longer fire — use Indigo's own 'Auto-off after X minutes' on the "
+                    "Matter: the 'Auto-off after' device setting has been removed from "
+                    "the Edit Device dialog on %d relay device(s) — Matter's OnTime is a "
+                    "parameter of a command this plugin does not send, not a stored "
+                    "setting, so it never did anything. The 'Auto-Off Timer' state stays "
+                    "on the device, so any trigger already built on it stays bound, but "
+                    "it will never update again — the device's properties now show it as "
+                    "'<unused>'. Use Indigo's own 'Auto-off after X minutes' on the "
                     "device's turn-on action instead. See issue #197.", len(affected))
             self.pluginPrefs[ON_TIME_RETIRED_PREF] = True
             # Through the shared seam rather than a bare savePluginPrefs(): that is
@@ -1311,6 +1318,34 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, ServerMenuMixin,
             )
         self.device_sync.note_device(dev)
         self.device_sync.set_active(dev.id, True)
+        if dev.deviceTypeId == "matterRelay":
+            self._prime_retired_on_time_state(dev)
+
+    def _prime_retired_on_time_state(self, dev) -> None:
+        """Flag the retired ``onTime`` state as dead, on every start (#197).
+
+        The setting is gone for good, but the state stays — ADR-0006's
+        Confirmation found that withdrawing a state leaves any trigger already
+        bound to it silently orphaned, which is worse than keeping one that
+        never moves (workspace ADR-0007). Nothing writes ``onTime`` any more
+        (``on_off.py``'s ``SETTING_STATES`` no longer maps it), so without this
+        it would just sit at whatever Indigo's own default is and look like a
+        stalled reading rather than a dead field. ``uiValue`` fixes that: it is
+        display-only (Indigo API v1.6+), invisible to triggers and conditional
+        logic, so it cannot repeat the #190 "phantom zero" mistake — a user
+        looking at the device's properties sees ``<unused>``, not ``0``.
+
+        Called by ``deviceStartComm`` — runs after ``stateListOrDisplayStateIdChanged``,
+        which is what puts ``onTime`` on the device's state list in the first
+        place for units created before this state existed.
+
+        Never raises: a cosmetic label must not be able to stop device start.
+        """
+        try:
+            self.device_sync.apply_states(
+                dev.id, [{"key": "onTime", "value": 0, "uiValue": "<unused>"}])
+        except Exception as exc:  # noqa: BLE001 - cosmetic, must not break device start
+            self.logger.debug("could not flag retired onTime state for %s: %s", dev.id, exc)
 
     def deviceStopComm(self, dev):  # noqa: N802
         self.device_sync.set_active(dev.id, False)

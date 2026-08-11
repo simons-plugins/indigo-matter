@@ -34,7 +34,8 @@
                  An "Auto-off after" field lived here and was withdrawn: OnTime
                  is a parameter of OnWithTimedOff, not a setting, so the field
                  could never do anything (#197, ADR-0005 (superseded by
-                 ADR-0006)). -->
+                 ADR-0006)). The field stays gone for good — ADR-0007 only
+                 changes what happens to the STATE below, not this. -->
             <Field id="hasStartUpOnOff" type="textfield" hidden="true" defaultValue="no"/>
             <Field id="hasAnySetting" type="textfield" hidden="true" defaultValue="no"/>
             <Field id="settingsSeparator" type="separator"
@@ -57,14 +58,32 @@
                  live read, and so a change made from another ecosystem lands.
                  Declared for the TYPE; getDeviceStateList removes it per unit
                  when the device's own AttributeList says it does not implement
-                 the attribute (#190).
-                 An onTime state was declared here and REMOVED in the release
-                 following v2026.10.1 — removing a state breaks any trigger bound
-                 to it, which is why the plugin logs the removal once (#197). -->
+                 the attribute (#190). -->
             <State id="startUpOnOff">
                 <ValueType>Integer</ValueType>
                 <TriggerLabel>Power-On Behaviour</TriggerLabel>
                 <ControlPageLabel>Power-On Behaviour</ControlPageLabel>
+            </State>
+            <!-- onTime — the SETTING is retired for good (#197: it is a
+                 parameter of OnWithTimedOff, not a stored setting, and a value
+                 here never did anything). This STATE, unlike the field, is kept
+                 and flagged rather than withdrawn (workspace ADR-0007): a live
+                 experiment (ADR-0006's Confirmation, 2026-08-11) found that
+                 removing a device state leaves any trigger already bound to it
+                 silently orphaned — still enabled, nothing in the log, and its
+                 own dialog quietly repoints at a different, real state. Kept, it
+                 stays bound to what the user actually built; it just never fires.
+                 plugin.py's deviceStartComm primes it to 0 with
+                 uiValue="<unused>" on every start so it reads as dead rather
+                 than as a stalled reading — uiValue is display-only (Indigo API
+                 v1.6+) and cannot be seen by a trigger or conditional, so it
+                 cannot repeat the #190 "phantom zero" mistake. Nothing else
+                 writes this state: on_off.py's SETTING_STATES no longer maps
+                 OnTime. -->
+            <State id="onTime">
+                <ValueType>Integer</ValueType>
+                <TriggerLabel>Auto-Off Timer (retired — do not use)</TriggerLabel>
+                <ControlPageLabel>Auto-Off Timer (retired — do not use)</ControlPageLabel>
             </State>
         </States>
         <UiDisplayStateId>onOffState</UiDisplayStateId>

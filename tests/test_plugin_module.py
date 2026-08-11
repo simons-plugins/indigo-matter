@@ -257,7 +257,8 @@ def test_validate_allows_unknown_device_id(plugin_cls, mock_indigo_base, mock_lo
 def test_device_start_comm_warns_on_type_mismatch(plugin_cls, mock_logger):
     from types import SimpleNamespace
     from unittest.mock import MagicMock
-    stub = SimpleNamespace(logger=mock_logger, device_sync=MagicMock())
+    stub = SimpleNamespace(logger=mock_logger, device_sync=MagicMock(),
+                           _prime_retired_on_time_state=MagicMock())
     dev = _dev({"createdTypeId": "matterTemperatureSensor"}, type_id="matterRelay")
     plugin_cls.deviceStartComm(stub, dev)
     assert mock_logger.warning.called
@@ -270,7 +271,8 @@ def test_device_start_comm_warns_on_type_mismatch(plugin_cls, mock_logger):
 def test_device_start_comm_quiet_when_types_match(plugin_cls, mock_logger):
     from types import SimpleNamespace
     from unittest.mock import MagicMock
-    stub = SimpleNamespace(logger=mock_logger, device_sync=MagicMock())
+    stub = SimpleNamespace(logger=mock_logger, device_sync=MagicMock(),
+                           _prime_retired_on_time_state=MagicMock())
     dev = _dev({"createdTypeId": "matterRelay"}, type_id="matterRelay")
     plugin_cls.deviceStartComm(stub, dev)
     assert not mock_logger.warning.called
@@ -281,11 +283,64 @@ def test_device_start_comm_refreshes_state_list(plugin_cls, mock_logger):
     # must request the refresh so states added by upgrades exist (issue #60).
     from types import SimpleNamespace
     from unittest.mock import MagicMock
-    stub = SimpleNamespace(logger=mock_logger, device_sync=MagicMock())
+    stub = SimpleNamespace(logger=mock_logger, device_sync=MagicMock(),
+                           _prime_retired_on_time_state=MagicMock())
     dev = _dev({"createdTypeId": "matterRelay"}, type_id="matterRelay")
     dev.stateListOrDisplayStateIdChanged = MagicMock()
     plugin_cls.deviceStartComm(stub, dev)
     dev.stateListOrDisplayStateIdChanged.assert_called_once_with()
+
+
+def test_device_start_comm_primes_the_retired_on_time_state_for_relays(
+        plugin_cls, mock_logger):
+    """Every matterRelay start must flag ``onTime`` as unused — this is the
+    seam that keeps the state from just sitting at Indigo's default 0 once
+    ADR-0007 stops it from being withdrawn."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    stub = SimpleNamespace(logger=mock_logger, device_sync=MagicMock(),
+                           _prime_retired_on_time_state=MagicMock())
+    dev = _dev({"createdTypeId": "matterRelay"}, type_id="matterRelay")
+    plugin_cls.deviceStartComm(stub, dev)
+    stub._prime_retired_on_time_state.assert_called_once_with(dev)
+
+
+def test_device_start_comm_does_not_prime_on_time_for_other_types(
+        plugin_cls, mock_logger):
+    """Only matterRelay ever declared this state — priming it on a dimmer or
+    sensor would write a state that does not exist on their state list."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    stub = SimpleNamespace(logger=mock_logger, device_sync=MagicMock(),
+                           _prime_retired_on_time_state=MagicMock())
+    dev = _dev({"createdTypeId": "matterDimmer"}, type_id="matterDimmer")
+    plugin_cls.deviceStartComm(stub, dev)
+    stub._prime_retired_on_time_state.assert_not_called()
+
+
+def test_prime_retired_on_time_state_writes_zero_and_unused_uivalue(plugin_cls):
+    """The actual write — the whole point of keeping the state (#197,
+    workspace ADR-0007) is that it must read '<unused>' in the UI, not a bare
+    0 indistinguishable from a real reading (the #190 mistake ADR-0003 exists
+    to avoid)."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    stub = SimpleNamespace(logger=MagicMock(), device_sync=MagicMock())
+    dev = SimpleNamespace(id=42)
+    plugin_cls._prime_retired_on_time_state(stub, dev)
+    stub.device_sync.apply_states.assert_called_once_with(
+        42, [{"key": "onTime", "value": 0, "uiValue": "<unused>"}])
+
+
+def test_prime_retired_on_time_state_never_raises(plugin_cls):
+    """Cosmetic — a device_sync failure here must not stop device start."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    stub = SimpleNamespace(logger=MagicMock(), device_sync=MagicMock())
+    stub.device_sync.apply_states.side_effect = RuntimeError("boom")
+    dev = SimpleNamespace(id=42)
+    plugin_cls._prime_retired_on_time_state(stub, dev)  # must not raise
+    assert stub.logger.debug.called
 
 
 def test_action_control_device_sends_each_command_of_a_list(plugin_cls):
@@ -1055,39 +1110,70 @@ def test_no_orphan_setting_fields_in_the_xml(plugin_cls):
         assert not orphans, f"{type_id} has settings fields with no declaration: {orphans}"
 
 
-#: Setting keys this plugin once declared and has since withdrawn. APPEND-ONLY —
-#: a key here must never reappear in Devices.xml.
+#: Setting keys this plugin once declared and has since withdrawn from the
+#: ConfigUI. APPEND-ONLY — a key here must never reappear as a <Field>.
 #:
 #: `onTime` is the whole of it so far: shipped in v2026.10.1 as "Auto-off after",
 #: retired by #197 once it turned out to be a parameter of a command the plugin
 #: does not send.
 RETIRED_SETTING_KEYS = frozenset({"onTime"})
 
+#: Retired setting keys whose <State> workspace ADR-0007 deliberately KEEPS,
+#: flagged, rather than withdraws — {device_type_id: state_key}. A capability
+#: a unit lacks (#190) is withdrawn per device, because a state never offered
+#: cannot have a doomed trigger built on it. A setting retired EVERYWHERE
+#: (#197) is the opposite case: there is nothing left to *prevent*, only
+#: bindings that already exist to protect, and a live experiment (ADR-0006's
+#: Confirmation) found withdrawal leaves a bound trigger enabled, silent, and
+#: quietly repointed at a different, real state in its own dialog — worse
+#: than a state that simply stops moving.
+FLAGGED_RETIRED_STATES = {"matterRelay": "onTime"}
 
-def test_no_retired_setting_leaves_a_state_or_field_behind(plugin_cls):
+
+def test_no_retired_setting_leaves_a_configui_field_behind(plugin_cls):
     """The direction the parity tests above do not run.
 
     Every check here goes registry→XML, and `test_no_orphan_setting_fields_in_the_xml`
-    covers ConfigUI <Field> only — never <States>. Re-adding the <State id="onTime">
-    block to matterRelay leaves the whole suite green.
-
-    A widowed STATE is worse than a widowed field. Nothing declares it, so
-    `unimplemented_states` never withdraws it, so it sits on every device of that
-    type forever reading Indigo's default 0 — indistinguishable from a real
-    reading, and bindable by a trigger that can never fire. That is exactly the
-    #190 failure the AttributeList gate exists to prevent, reintroduced by an
-    edit nobody would think to check.
+    covers ConfigUI <Field> only in the other direction (declared setting →
+    field must exist). This is the field half of the old combined test — the
+    <State> half now has its own test below, because the two now have
+    opposite expectations (see `FLAGGED_RETIRED_STATES`).
     """
     root = ET.parse(SERVER_PLUGIN / "Devices.xml").getroot()
     for device in root.findall("Device"):
         type_id = device.get("id")
-        leftover_states = _device_state_ids(type_id) & RETIRED_SETTING_KEYS
-        assert not leftover_states, (
-            f"{type_id} declares <State> for retired setting(s) {leftover_states} — "
-            "nothing will ever remove them")
         leftover_fields = set(_device_config_fields(type_id)) & RETIRED_SETTING_KEYS
         assert not leftover_fields, (
             f"{type_id} declares a ConfigUI field for retired setting(s) {leftover_fields}")
+
+
+def test_a_flagged_retired_state_is_present_not_withdrawn(plugin_cls):
+    """The opposite assertion the old combined test made for <State> —
+    corrected by workspace ADR-0007 after a live experiment (ADR-0006's
+    Confirmation, 2026-08-11) showed withdrawing a state a trigger is bound to
+    is worse than keeping one that never updates: the trigger stays enabled,
+    Indigo logs nothing, and its own dialog silently repoints at a different,
+    real state in place of the one that vanished.
+
+    So `onTime` must be PRESENT on `matterRelay` — not absent, and not
+    reduced to a bare marker; `plugin._prime_retired_on_time_state` is what
+    flags it dead (uiValue="<unused>") at runtime, not the XML. Every OTHER
+    device type must still have none of it: this state was only ever
+    declared for the relay, and nothing about ADR-0007 licenses it spreading.
+    """
+    root = ET.parse(SERVER_PLUGIN / "Devices.xml").getroot()
+    for device in root.findall("Device"):
+        type_id = device.get("id")
+        expected = FLAGGED_RETIRED_STATES.get(type_id)
+        states = _device_state_ids(type_id)
+        if expected:
+            assert expected in states, (
+                f"{type_id} must keep <State id={expected!r}> — workspace ADR-0007 "
+                "flags a retired-everywhere setting's state rather than withdrawing it")
+        else:
+            leftover = states & set(FLAGGED_RETIRED_STATES.values())
+            assert not leftover, (
+                f"{type_id} declares flagged-retired state(s) {leftover} it never had")
 
 
 # ===========================================================================

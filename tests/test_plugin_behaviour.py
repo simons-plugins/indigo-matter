@@ -1723,6 +1723,25 @@ def test_the_retired_onTime_state_is_announced_to_a_user_who_had_it(
     assert not plug.logger.exception.called
 
 
+def test_the_notice_says_the_state_stays_bound_and_flagged_unused(
+        plug, mock_indigo_base):
+    """Workspace ADR-0007 keeps the ``onTime`` state instead of withdrawing it,
+    so the old wording (an orphaned trigger that must be deleted or rebuilt) no
+    longer applies — a trigger built on 'Auto-Off Timer' stays bound, it just
+    never fires. The notice must say the setting is gone from the dialog, that
+    the state stays and is shown as '<unused>', and name the still-working
+    remedy — without claiming anything is broken."""
+    _relays(mock_indigo_base, True)
+    plug._announce_retired_on_time_state()
+    notice = str(plug.logger.info.call_args)
+    assert "stays on the device" in notice
+    assert "any trigger already built on it stays bound" in notice
+    assert "'<unused>'" in notice
+    assert "Auto-off after X minutes" in notice
+    for word in ("error", "fail", "warning", "problem"):
+        assert word not in notice.lower()
+
+
 def test_only_devices_that_ACTUALLY_HAD_the_state_are_counted(plug, mock_indigo_base):
     """The count is per device that had it, not per relay. Only Lighting-feature
     plugs ever carried it (#190 withdrew it from the rest — two in four on the dev

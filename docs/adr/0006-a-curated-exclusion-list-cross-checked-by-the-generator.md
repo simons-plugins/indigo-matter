@@ -261,6 +261,54 @@ on and which no Indigo document states outright: `startup()` runs before
 `deviceStartComm()`, so `dev.states` still described the pre-upgrade world when it
 was read. Had the states already migrated, the count would have been zero.
 
+**A second live experiment, 2026-08-11 (times UTC; the server log is BST, one
+hour ahead), settles a premise ADR-0003 asserted with no citation of its own —
+"Withdrawing a device **state** breaks any trigger or control page bound to it,
+silently" (ADR-0003, Decision Drivers) — and that ADR-0003's state-gate policy,
+this ADR, ADR-0005, and `_announce_retired_on_time_state()`'s notice all inherit
+unproven. ADR-0003 is immutable, so the confirming evidence is recorded here
+instead, exactly as this ADR already does for ADR-0005.**
+
+Method, compact enough to repeat: a throwaway `<State id="zzTriggerTest">` was
+added to `matterRelay`'s `Devices.xml`, deployed, plugin restarted — it appeared
+on the IKEA GRILLPLATS (device 1794293937) as `zzTriggerTest: 0`. A Device State
+Changed trigger (`** MATTER TEST`, id 807063350) was bound to that state in the
+Indigo UI and left enabled. The state was then deleted from `Devices.xml`,
+redeployed, plugin restarted.
+
+Observed after removal: the state vanished from the device's state dictionary
+(`{…, onOffState, startUpOnOff, zzTriggerTest}` → `{…, onOffState,
+startUpOnOff}`); the trigger still existed and still reported `enabled: true`;
+Indigo logged nothing — no notice that a trigger references a state that no
+longer exists; the trigger's own state dropdown, opened to inspect it, showed a
+**different, real** state (the device's On/Off state) in place of the one that
+had vanished; and toggling the plug off→on→off (`last_changed` confirms both
+transitions) did not fire it.
+
+**The control, without which the last observation is an assumption, not
+evidence.** The trigger's action was a Domio push notification that turned out
+to be independently misconfigured (`Domio Error: Notification body is
+required`), so its silence during that first toggle proved nothing on its own —
+a broken action and a trigger that never fired are indistinguishable from
+outside. The trigger was then rebound to the live On/Off state and the plug
+toggled again: it fired twice, and Indigo logged `Trigger ** MATTER TEST` on
+each firing. **That log line is the actual evidence** — its total absence
+during the state-deleted toggle is what shows the trigger did not fire, and its
+presence here shows the trigger machinery and the device were both working
+throughout, which is what makes the earlier silence mean something rather than
+nothing. The first attempt at evidence (the push notification's absence) was
+weak for exactly this reason and would have been worthless without the second.
+
+This **confirms and strengthens** ADR-0003's premise; it does not contradict it.
+It also sharpens the premise into something worse than "stops firing": a
+trigger left bound to a withdrawn state does not error, does not disable
+itself, and does not look unusual — it presents a plausible, real state in its
+own dialog. A user who opens it, even only to inspect it with no intent to
+change anything, and saves, rebinds it to whatever state the dialog now shows —
+silently turning "a trigger that no longer fires" into "a trigger that fires on
+something its author never wrote." `_announce_retired_on_time_state()`'s notice
+(`plugin.py`, issue #197) now says so, rather than only naming the remedy.
+
 ## Pros and Cons of the Options
 
 ### Keep the command-field rule as the decision authority
