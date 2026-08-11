@@ -39,7 +39,7 @@ from matter_handlers.boolean_state_config import (
     ATTR_SUPPORTED_SENSITIVITY_LEVELS,
     CLUSTER_BOOLEAN_STATE_CONFIG,
 )
-from matter_handlers.settings import ATTR_ATTRIBUTE_LIST, SETTINGS
+from matter_handlers.settings import ATTR_ATTRIBUTE_LIST, SETTINGS, settings_for_type
 from matter_handlers.electrical import (
     ATTR_ACTIVE_ENDPOINTS,
     ATTR_AVAILABLE_ENDPOINTS,
@@ -51,6 +51,7 @@ from matter_handlers.electrical import (
     FEATURE_SET_TOPOLOGY,
 )
 from matter_handlers.power_source import CLUSTER_POWER_SOURCE
+import settings_report
 from protocol import MatterCommand
 
 # Device type ids for which SupportsPowerMeter/SupportsEnergyMeter are meaningful.
@@ -258,6 +259,13 @@ class DeviceSync:
         # reconcile pass (WS connect/reconnect only, see plugin._resync), so a
         # node removed out of band stops being offered.
         self._known_nodes: set[int] = set()
+        # Which nodes have already had their settable-attribute report logged
+        # (issue #191). Injected by plugin.startup because the log is persisted
+        # in pluginPrefs and this class owns no prefs; left None in tests and in
+        # any path that has not wired it, which disables the automatic report
+        # rather than making it fire on every reconcile pass — an unbounded
+        # repeat is the one outcome that would make the INFO wallpaper.
+        self.survey_log: Optional[Any] = None
         # Nodes whose AttributeLists changed but whose Indigo devices have not
         # yet had their state lists rebuilt (issue #190). Needed because
         # _cache_setting_limits both records the new answer and reports the
@@ -778,6 +786,14 @@ class DeviceSync:
         # the cache already agrees with itself.
         if int(node.node_id) in self._pending_state_refresh or new_ids:
             self._refresh_state_lists(int(node.node_id))
+        # Outside the lock, and after the devices exist: the survey names them,
+        # and reporting is a log-and-persist that has no business holding a lock
+        # every state update also needs. `informative` for the same reason the
+        # capability caches need it — an empty snapshot would survey a device as
+        # implementing nothing, record that as the answer, and then never report
+        # the real one because the fingerprint had already been banked.
+        if informative:
+            self.report_settable_attributes(node)
         result = {
             "indigoDeviceIds": created,
             "primaryDeviceId": primary,
@@ -1299,6 +1315,96 @@ class DeviceSync:
         # again — the exact flap the no-flap rule exists to prevent.
         return _capability_fingerprint(attribute_lists) != _capability_fingerprint(previous)
 
+    # ------------------------------------------------------------------
+    # Settable-attribute report (issue #191)
+    # ------------------------------------------------------------------
+
+    def offered_setting_pairs(self, node_id: Any, endpoint_id: Any) -> set:
+        """``{(cluster, attribute)}`` the plugin already offers on an endpoint.
+
+        Derived from the Indigo device TYPES that exist there, because that is
+        what decides whether a setting has a ConfigUI field at all — a setting is
+        declared against types and the XML cannot be generated, so a type with no
+        field offers nothing however capable the hardware is.
+
+        Empty for an endpoint with no Indigo device, which is correct rather than
+        merely convenient: nothing is offered for a device that does not exist,
+        so everything it implements is a genuine gap.
+        """
+        with self._lock:
+            type_ids = set(self._index.get((int(node_id), int(endpoint_id)), {}))
+        return {(s.cluster, s.attribute)
+                for type_id in type_ids if type_id
+                for s in settings_for_type(type_id)}
+
+    def _device_names(self, node_id: Any, endpoint_id: Any) -> list:
+        """Indigo device names on an endpoint, for the report's headings."""
+        with self._lock:
+            dev_ids = sorted(set(self._index.get((int(node_id), int(endpoint_id)), {}).values()))
+        names = []
+        for dev_id in dev_ids:
+            try:
+                names.append(indigo.devices[dev_id].name)
+            except KeyError:
+                continue  # deleted between the index read and here; nothing to name
+            except Exception as exc:  # noqa: BLE001 - a label must never break the report
+                self.logger.debug("survey: name lookup for device %s failed: %s", dev_id, exc)
+        return names
+
+    def survey_node(self, node: NodeInfo) -> Any:
+        """The settable-attribute survey for one node, with device names attached.
+
+        Public because the on-demand menu path wants exactly this against a node
+        it fetched itself, and duplicating the two lookups it needs — what is
+        already offered, and what the endpoints are called — is how the menu and
+        the automatic report would drift into disagreeing about the same device.
+        """
+        survey = settings_report.survey_node(
+            node, lambda ep: self.offered_setting_pairs(node.node_id, ep))
+        return settings_report.name_endpoints(
+            survey, lambda ep: self._device_names(node.node_id, ep))
+
+    def report_settable_attributes(self, node: NodeInfo, force: bool = False) -> bool:
+        """Log what this node exposes that the plugin does not offer. Once.
+
+        Returns whether anything was logged. ``force`` skips the once-per-device
+        check for the on-demand menu item, which exists precisely because a
+        device commissioned before this feature shipped would otherwise never
+        report — and because a user asking a question deserves an answer even if
+        the plugin already answered it to an empty log months ago.
+
+        A node with nothing to report is recorded as reported anyway, so a
+        fully-supported device does not re-survey on every reconcile pass for
+        the rest of time. Nothing is logged for it either way.
+
+        Never raises. This is a diagnostic hanging off the creation path, and a
+        diagnostic that can break reconciliation is worse than no diagnostic.
+        """
+        try:
+            survey = self.survey_node(node)
+            fingerprint = survey.fingerprint()
+            log = self.survey_log
+            if not force:
+                if log is None or not log.should_report(node.node_id, fingerprint):
+                    return False
+            lines = settings_report.report_lines(survey)
+            if log is not None:
+                log.record(node.node_id, fingerprint)
+            if not lines:
+                if force:
+                    # Silence would read as a failure to a user who just asked.
+                    self.logger.info(
+                        "%s implements no settable Matter attributes beyond the ones "
+                        "this plugin already offers.", survey.identity())
+                return False
+            for line in lines:
+                self.logger.info("%s", line)
+            return True
+        except Exception as exc:  # noqa: BLE001 - a diagnostic must not sink reconcile
+            self.logger.warning("settable-attribute report for node %s failed: %s",
+                                node_id_to_str(getattr(node, "node_id", "?")), exc)
+            return False
+
     def _forget_node_capabilities(self, node_id: Any) -> None:
         """Drop every cached capability answer for a node that is gone.
 
@@ -1340,6 +1446,13 @@ class DeviceSync:
                                     if k[0] != target}
             self._attribute_lists = {k: v for k, v in self._attribute_lists.items()
                                      if k[0] != target}
+        # And the "already reported" mark (issue #191). Node ids are assigned at
+        # commissioning and re-used across a decommission/recommission cycle, so
+        # keeping it would let a genuinely different device inherit the old
+        # one's mark and never report. Outside the lock — SurveyLog has its own,
+        # and persisting reaches pluginPrefs.
+        if self.survey_log is not None:
+            self.survey_log.forget(target)
 
     def _refresh_state_lists(self, node_id: Any) -> None:
         """Ask Indigo to rebuild the state list of every device on a node.

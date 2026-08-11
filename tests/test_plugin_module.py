@@ -112,9 +112,13 @@ def test_dynamic_list_methods_exist_on_plugin(plugin_cls):
 # ---------------------------------------------------------------------------
 
 MENU_SECTIONS = [
-    # 1 · Matter devices Indigo controls
+    # 1 · Matter devices Indigo controls — the two read-only diagnostics
+    # (issue #191) live here, beside the devices they describe, rather than
+    # with the plumbing further down.
     ["Commission device by setup code (advanced)…",
-     "Decommission Matter device…"],
+     "Decommission Matter device…",
+     "Report settable Matter settings…",
+     "Explore Matter attributes (advanced)…"],
     # 2 · Matter devices Indigo publishes
     ["Manage Matter Exports…",
      "Pair Matter Bridge…",
@@ -616,6 +620,24 @@ def test_plugin_modules_eviction_tuple_matches_real_files():
         assert (SERVER_PLUGIN / f"{name}.py").is_file(), (
             f"conftest._PLUGIN_MODULES entry {name!r} has no matching Server Plugin file"
         )
+
+
+def test_every_mixin_module_is_evicted_between_tests():
+    """The OTHER direction, and the one that bites: a NEW mixin that nobody adds
+    to ``_PLUGIN_MODULES`` is not evicted, so it caches the first test's indigo
+    mock and every later test drives a stale module — green, and wrong (#146).
+
+    The forward check above cannot see that: it only pins the entries that are
+    already there. Adding ``diagnostics_menu_mixin`` (#191) hit exactly this.
+    """
+    from conftest import _PLUGIN_MODULES
+
+    on_disk = {p.stem for p in SERVER_PLUGIN.glob("*_mixin.py")}
+    missing = sorted(on_disk - set(_PLUGIN_MODULES))
+    assert not missing, (
+        f"mixin module(s) {missing} are not in conftest._PLUGIN_MODULES, so they keep "
+        f"the first test's mocked indigo module for the rest of the session"
+    )
 
 
 # ---------------------------------------------------------------------------

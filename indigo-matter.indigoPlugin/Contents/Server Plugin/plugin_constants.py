@@ -73,6 +73,21 @@ ROW_ERROR_LABEL = "(error reading device — see Event Log)"
 #: 2000-device database would otherwise build an unusable popup menu.
 EXPORT_PICKER_LIMIT = 300
 
+#: pluginPrefs key holding the settable-attribute report's "already told you
+#: about this one" log (issue #191) — one JSON string keyed by node id, the same
+#: shape ``matterExports`` uses. Named here because ``plugin.startup`` loads it
+#: and ``DiagnosticsMenuMixin`` saves it.
+SURVEY_LOG_PREF = "matterSettingsSurveyed"
+#: How long a diagnostic menu action may block the Indigo UI thread on
+#: ``get_node``. That call is answered from matter-server's own cache, so it is
+#: a socket round trip rather than a device round trip — generous, but nothing
+#: like the device timeouts, because no device is involved.
+SURVEY_READ_TIMEOUT = 20.0
+#: The "every device" row in the diagnostic node pickers, and the "no filter"
+#: rows in the explorer's endpoint/cluster pickers. Shares NO_SELECTION_ID's
+#: reasoning: never "", which Indigo rejects outright.
+ALL_OPTION_ID = "all"
+
 
 def server_location(prefs: dict) -> str:
     """Resolve the one user-facing choice: is matter-server on this Mac?

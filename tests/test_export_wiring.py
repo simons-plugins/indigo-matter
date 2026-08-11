@@ -17,6 +17,7 @@ pins the four things only ``plugin.py`` can get wrong:
 from __future__ import annotations
 
 import importlib
+import json
 from unittest.mock import Mock
 
 import pytest
@@ -665,3 +666,51 @@ class TestResubscribeWatchdog:
         for _ in range(20):
             plug._resubscribe_tick()
         subscribe.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# issue #191 — the settable-attribute report's startup wiring
+#
+# Here rather than in test_diagnostics_menu.py because this needs the real
+# ``Plugin.startup()`` harness above, and cloning forty lines of collaborator
+# fakes to avoid a slightly odd file name is the worse trade.
+# ---------------------------------------------------------------------------
+
+class TestSurveyLogWiring:
+    """Delete either line and everything still starts, still logs, still
+    reconciles — and no device ever reports what it exposes, for anyone. The
+    same shape of silent hole as the ``_exports_changed()`` case above, which is
+    why it gets the same kind of test.
+    """
+
+    def test_startup_hands_device_sync_a_survey_log(self, plugin_mod, monkeypatch,
+                                                    mock_indigo_base):
+        import settings_report
+
+        p = _started_plugin(plugin_mod, monkeypatch, {})
+        assert isinstance(p.device_sync.survey_log, settings_report.SurveyLog), (
+            "device_sync has no survey log, so the automatic report never fires"
+        )
+
+    def test_startup_restores_what_was_already_reported(self, plugin_mod, monkeypatch,
+                                                        mock_indigo_base):
+        """Without the load, every device re-reports on every plugin restart —
+        which is exactly the wallpaper the once-per-device rule exists to avoid.
+        """
+        from plugin_constants import SURVEY_LOG_PREF
+
+        p = _started_plugin(plugin_mod, monkeypatch, {SURVEY_LOG_PREF: '{"52": "fp-1"}'})
+        assert not p.survey_log.should_report(0x34, "fp-1")
+
+    def test_a_recorded_answer_reaches_prefs(self, plugin_mod, monkeypatch,
+                                             mock_indigo_base):
+        """The save hook has to be wired to THIS plugin's prefs, not to a
+        captured mapping — Indigo rebinds pluginPrefs when the config dialog is
+        saved."""
+        from plugin_constants import SURVEY_LOG_PREF
+
+        prefs: dict = {}
+        p = _started_plugin(plugin_mod, monkeypatch, prefs)
+        p.survey_log.record(0x34, "fp-9")
+        assert json.loads(prefs[SURVEY_LOG_PREF]) == {"52": "fp-9"}
+        assert mock_indigo_base.server.savePluginPrefs.called

@@ -32,7 +32,29 @@ Copy that directory locally (or point --elements at a mount) and run:
 
     python3 tools/enumerate_settings.py --elements <dir> --out settings-coverage.md
 
-This reads only; it writes one report and touches nothing else.
+The elements directory also ships with the bridge node's own dependencies, so
+in a checkout with `bridge-node/node_modules` populated the path is simply
+`bridge-node/node_modules/@matter/model/dist/esm/standard/elements`.
+
+**Two outputs, and only one of them is for a human.** ``--out`` writes the
+markdown report above — the roadmap input. ``--emit-table`` writes
+``matter_handlers/writable_attributes.py``, a generated Python module the
+PLUGIN imports at runtime (issue #191): the settable-attribute report has to
+turn a device's AttributeList into "…and 4 of these are settable", and
+writability is spec metadata that never appears on the wire. That table is a
+**build artefact, checked in**, not computed at runtime — the plugin must never
+import ``@matter/model`` (only the bridge node may; workspace ADR-0006), and
+the Python side has no Node available to it in the first place.
+
+    python3 tools/enumerate_settings.py --elements <dir> --emit-table
+
+**Regenerate it when the pinned matter.js version moves** — i.e. when
+``bridge-node/package.json``'s ``@matter/*`` pin changes. The generated header
+records the version it came from so the two can be compared; a test asserts the
+file parses and is non-empty, not that it is current, because "current" is only
+knowable with the model in hand.
+
+This reads only; it writes the files you ask for and touches nothing else.
 
 **What it deliberately does NOT do.** It does not decide what is a *setting*.
 Plenty of writable attributes are controls the plugin already drives (a level, a
@@ -219,6 +241,125 @@ def declared_settings() -> set:
     return pairs
 
 
+#: Where ``--emit-table`` writes its generated module by default.
+TABLE_PATH = HANDLER_DIR / "writable_attributes.py"
+
+
+def model_version(elements: Path) -> str:
+    """The ``@matter/model`` version the *elements* directory belongs to.
+
+    ``.../@matter/model/dist/esm/standard/elements`` → four levels up is the
+    package root. Returns ``"unknown"`` rather than failing: a table generated
+    from a directory copied out of its package is still a correct table, it just
+    cannot say what produced it, and refusing to emit would be the wrong trade.
+    """
+    try:
+        raw = (elements.parents[3] / "package.json").read_text(encoding="utf-8")
+        match = re.search(r'"version"\s*:\s*"([^"]+)"', raw)
+        if match:
+            return match.group(1)
+    except (OSError, IndexError):
+        pass
+    return "unknown"
+
+
+def emit_table(elements: Path, path: Path) -> tuple[int, int]:
+    """Write the generated attribute table. Returns ``(clusters, writable)``.
+
+    Deliberately covers EVERY cluster in the model, not only the ones this
+    plugin handles: the report this feeds exists to describe devices the plugin
+    does NOT support yet, so restricting it to handled clusters would blind it
+    to precisely the devices it is for.
+
+    Names as well as ids, and for every attribute rather than only the writable
+    ones, because the explorer (issue #191 deliverable A) dumps what a device
+    implements and a bare ``0x4003`` is no more use to a user than the raw
+    ``get_node`` JSON they already could not read.
+    """
+    clusters: dict[int, str] = {}
+    names: dict[int, dict[int, str]] = {}
+    writable: dict[int, set] = {}
+
+    for source in sorted(elements.glob("*.element.js")):
+        cluster, attributes = parse_cluster(source)
+        name, cluster_id = cluster.get("name"), cluster.get("id")
+        if not name or not isinstance(cluster_id, int):
+            continue
+        # A cluster id can appear twice across the model's element files (an
+        # alias or a revision split). First writer wins, deterministically,
+        # because the files are walked in sorted order.
+        clusters.setdefault(cluster_id, str(name))
+        for attr in attributes:
+            attr_id, attr_name = attr.get("id"), attr.get("name")
+            if not isinstance(attr_id, int) or not attr_name:
+                continue
+            names.setdefault(cluster_id, {}).setdefault(attr_id, str(attr_name))
+            if "RW" in (attr.get("access") or ""):
+                writable.setdefault(cluster_id, set()).add(attr_id)
+
+    version = model_version(elements)
+    lines = [
+        '"""Matter attribute names and writability, generated from `@matter/model`.',
+        "",
+        "DO NOT EDIT. Regenerate with:",
+        "",
+        "    python3 tools/enumerate_settings.py \\",
+        "        --elements bridge-node/node_modules/@matter/model/dist/esm/standard/elements \\",
+        "        --emit-table",
+        "",
+        "**Why this is a checked-in build artefact rather than a runtime lookup.**",
+        "Writability is spec metadata: a device's AttributeList (0xFFFB) says which",
+        "attributes it *implements* and never which are writable, so the settable-",
+        "attribute report (issue #191) can only answer that from the data model. The",
+        "data model lives in `@matter/model`, which is a Node package — and the Python",
+        "plugin must never import matter.js (workspace ADR-0006 confines it to the",
+        "bridge node). So it is generated, checked in, and regenerated when the pinned",
+        "matter.js version moves.",
+        "",
+        "The table is the SPEC's answer, not any device's. It says what an attribute",
+        "would be if implemented; whether a given unit implements it is a question only",
+        "that unit's AttributeList can answer.",
+        '"""',
+        "from __future__ import annotations",
+        "",
+        f'#: The ``@matter/model`` release this was generated from.',
+        f'MODEL_VERSION = "{version}"',
+        "",
+        "#: ``{cluster_id: cluster_name}`` for every cluster in the data model.",
+        "CLUSTER_NAMES: dict[int, str] = {",
+    ]
+    for cluster_id in sorted(clusters):
+        lines.append(f'    0x{cluster_id:04X}: "{clusters[cluster_id]}",')
+    lines += [
+        "}",
+        "",
+        "#: ``{cluster_id: {attribute_id: attribute_name}}`` — every attribute the",
+        "#: model defines, writable or not. Global attributes (0xFFF8-0xFFFD) are",
+        "#: implicit on every cluster and are named in ``settings_report`` instead.",
+        "ATTRIBUTE_NAMES: dict[int, dict[int, str]] = {",
+    ]
+    for cluster_id in sorted(names):
+        lines.append(f"    0x{cluster_id:04X}: {{")
+        for attr_id in sorted(names[cluster_id]):
+            lines.append(f'        0x{attr_id:04X}: "{names[cluster_id][attr_id]}",')
+        lines.append("    },")
+    lines += [
+        "}",
+        "",
+        "#: ``{cluster_id: frozenset(attribute_ids)}`` — the attributes the spec",
+        "#: declares WRITABLE (model access contains ``RW``). Ids only: the names",
+        "#: live in ATTRIBUTE_NAMES, so nothing is stored twice.",
+        "WRITABLE_ATTRIBUTES: dict[int, frozenset] = {",
+    ]
+    for cluster_id in sorted(writable):
+        ids = ", ".join(f"0x{a:04X}" for a in sorted(writable[cluster_id]))
+        lines.append(f"    0x{cluster_id:04X}: frozenset({{{ids}}}),")
+    lines += ["}", ""]
+
+    path.write_text("\n".join(lines), encoding="utf-8")
+    return len(clusters), sum(len(v) for v in writable.values())
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -227,11 +368,24 @@ def main() -> int:
     ap.add_argument("--out", type=Path, help="write the markdown report here")
     ap.add_argument("--all-clusters", action="store_true",
                     help="include clusters this plugin has no handler for")
+    ap.add_argument("--emit-table", nargs="?", const=TABLE_PATH, type=Path,
+                    metavar="PATH", default=None,
+                    help="write the generated writable_attributes.py the plugin "
+                         f"imports (default: {TABLE_PATH.name} beside the handlers)")
     args = ap.parse_args()
 
     if not args.elements.is_dir():
         print(f"not a directory: {args.elements}", file=sys.stderr)
         return 2
+
+    if args.emit_table is not None:
+        clusters, writable = emit_table(args.elements, args.emit_table)
+        print(f"wrote {args.emit_table} ({clusters} clusters, {writable} writable attributes, "
+              f"@matter/model {model_version(args.elements)})")
+        # Emitting the table is a build step, not a report request: only fall
+        # through to the markdown when one was actually asked for.
+        if args.out is None:
+            return 0
 
     handled = handled_clusters()
     declared = declared_settings()
