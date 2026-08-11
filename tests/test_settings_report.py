@@ -192,7 +192,7 @@ def test_matter_plumbing_is_never_reported(cluster):
 # Command parameters are not settings — issue #197
 # ---------------------------------------------------------------------------
 
-def test_the_command_parameter_table_is_not_empty():
+def test_the_command_parameter_table_is_EXACTLY_the_four_known_pairs():
     """The generator builds this by scanning ``Command(...)`` blocks for their
     sibling ``Field`` arguments — a parse that returns nothing on a wrong scan
     and would silently disable every filter below. The generator refuses to
@@ -205,7 +205,8 @@ def test_the_command_parameter_table_is_not_empty():
         (0x0003, 0x0000),  # Identify.IdentifyTime           <- Identify()
         (0x0006, 0x4001),  # OnOff.OnTime                    <- OnWithTimedOff()
         (0x0006, 0x4002),  # OnOff.OffWaitTime               <- OnWithTimedOff()
-        (0x0030, 0x0000),  # GeneralCommissioning.Breadcrumb <- ArmFailSafe()
+        (0x0030, 0x0000),  # GeneralCommissioning.Breadcrumb <- ArmFailSafe(),
+                           #                                    SetRegulatoryConfig()
     }, "the four writable attributes in the pinned model that are command fields"
 
 
@@ -567,6 +568,23 @@ def test_no_attribute_is_both_driven_and_declared_as_a_setting():
     a control goes through the action bridge. Both would mean two UI routes to
     one attribute with different validation."""
     assert not (DRIVEN_ATTRIBUTES & settings_report.declared_pairs())
+
+
+def test_no_declared_setting_is_a_command_parameter():
+    """#197 in one line, pointed forwards.
+
+    The PR that retired onTime derived a machine-readable answer to "which
+    writable attributes does a command own?" and then checked the registry
+    against it only at the single point (0x0006, 0x4001). Declaring a setting for
+    Identify.IdentifyTime — or for whatever a future matter.js adds — would ship
+    the same dead dialog field with CI green, and the explorer would label the
+    very same attribute "[writable, command parameter]", so the plugin would
+    contradict itself in two surfaces.
+    """
+    parameters = {(cluster, attribute)
+                  for cluster, ids in settings_report.COMMAND_FIELD_ATTRIBUTES.items()
+                  for attribute in ids}
+    assert not (parameters & settings_report.declared_pairs())
 
 
 def _handler_write_targets() -> set:

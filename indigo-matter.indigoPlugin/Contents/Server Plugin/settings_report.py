@@ -243,9 +243,9 @@ def survey_node(node: NodeInfo,
     nothing rather than being guessed at, so a partial interview under-reports
     instead of inventing.
 
-    Three exclusions, all of them things that ARE writable and still are not
-    gaps: infrastructure clusters, attributes the plugin already drives as
-    ordinary controls, and **command parameters** — writable attributes that are
+    Three further exclusions on top of ``offered`` above, all of them things
+    that ARE writable and still are not gaps: infrastructure clusters, attributes
+    the plugin already drives as ordinary controls, and **command parameters** — writable attributes that are
     a field of a command on their own cluster, which the command sets and which
     mean nothing pre-set (#197, ADR-0005). The explorer still shows all three.
     """

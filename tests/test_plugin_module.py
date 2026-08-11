@@ -1055,6 +1055,41 @@ def test_no_orphan_setting_fields_in_the_xml(plugin_cls):
         assert not orphans, f"{type_id} has settings fields with no declaration: {orphans}"
 
 
+#: Setting keys this plugin once declared and has since withdrawn. APPEND-ONLY —
+#: a key here must never reappear in Devices.xml.
+#:
+#: `onTime` is the whole of it so far: shipped in v2026.10.1 as "Auto-off after",
+#: retired by #197 once it turned out to be a parameter of a command the plugin
+#: does not send.
+RETIRED_SETTING_KEYS = frozenset({"onTime"})
+
+
+def test_no_retired_setting_leaves_a_state_or_field_behind(plugin_cls):
+    """The direction the parity tests above do not run.
+
+    Every check here goes registry→XML, and `test_no_orphan_setting_fields_in_the_xml`
+    covers ConfigUI <Field> only — never <States>. Re-adding the <State id="onTime">
+    block to matterRelay leaves the whole suite green.
+
+    A widowed STATE is worse than a widowed field. Nothing declares it, so
+    `unimplemented_states` never withdraws it, so it sits on every device of that
+    type forever reading Indigo's default 0 — indistinguishable from a real
+    reading, and bindable by a trigger that can never fire. That is exactly the
+    #190 failure the AttributeList gate exists to prevent, reintroduced by an
+    edit nobody would think to check.
+    """
+    root = ET.parse(SERVER_PLUGIN / "Devices.xml").getroot()
+    for device in root.findall("Device"):
+        type_id = device.get("id")
+        leftover_states = _device_state_ids(type_id) & RETIRED_SETTING_KEYS
+        assert not leftover_states, (
+            f"{type_id} declares <State> for retired setting(s) {leftover_states} — "
+            "nothing will ever remove them")
+        leftover_fields = set(_device_config_fields(type_id)) & RETIRED_SETTING_KEYS
+        assert not leftover_fields, (
+            f"{type_id} declares a ConfigUI field for retired setting(s) {leftover_fields}")
+
+
 # ===========================================================================
 # issue #190 — getDeviceStateList follows the device's own AttributeList
 # ===========================================================================

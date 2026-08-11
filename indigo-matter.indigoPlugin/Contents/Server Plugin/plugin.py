@@ -290,19 +290,31 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, ServerMenuMixin,
         withdrawn only on a positive NO; removing one outright is rarer still, so
         it is announced.
 
-        Only for users who actually have a relay: everyone else never saw the
-        field, and an INFO about a setting they never had is the report noise
-        #191 was careful to avoid. The flag is written either way, so this
-        question is asked once and never again.
+        Counted per DEVICE THAT ACTUALLY HAD THE STATE, not per relay. Only relays
+        implementing OnOff's Lighting feature ever carried it — ``getDeviceStateList``
+        withdrew it from the rest (#190), and on the dev fabric that is two plugs in
+        four. Telling the other two that a trigger of theirs may have broken sends
+        them hunting for a breakage that cannot have happened.
 
-        Never raises. A cosmetic notice must not be able to stop startup.
+        ``dev.states`` is the right evidence and this is the right MOMENT to read
+        it: Indigo calls ``startup`` before ``deviceStartComm``, and it is
+        ``deviceStartComm`` that forces ``stateListOrDisplayStateIdChanged`` and
+        so migrates the device to the new state list. So the states read here still
+        describe the pre-upgrade world, which is exactly the question being asked.
+
+        The flag is written even when nothing is logged, so a user with no affected
+        devices is not re-scanned on every startup for the rest of time.
+
+        Never raises. A cosmetic notice must not be able to stop startup. A failure
+        deliberately leaves the flag UNSET so the notice retries next launch —
+        losing it entirely is the worse direction.
         """
         try:
             if self.pluginPrefs.get(ON_TIME_RETIRED_PREF, False):
                 return
-            relays = [dev for dev in indigo.devices.iter("self")
-                      if dev.deviceTypeId == "matterRelay"]
-            if relays:
+            affected = [dev for dev in indigo.devices.iter("self")
+                        if dev.deviceTypeId == "matterRelay" and "onTime" in dev.states]
+            if affected:
                 self.logger.info(
                     "Matter: the 'Auto-off after' device setting and its 'Auto-Off Timer' "
                     "state have been removed from %d relay device(s). They could never "
@@ -310,9 +322,13 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, ServerMenuMixin,
                     "not send, not a stored setting, so the value was always ignored and "
                     "reset to 0. If you built a trigger on 'Auto-Off Timer' it will no "
                     "longer fire — use Indigo's own 'Auto-off after X minutes' on the "
-                    "device's turn-on action instead. See issue #197.", len(relays))
+                    "device's turn-on action instead. See issue #197.", len(affected))
             self.pluginPrefs[ON_TIME_RETIRED_PREF] = True
-            indigo.server.savePluginPrefs()
+            # Through the shared seam rather than a bare savePluginPrefs(): that is
+            # the commit, and without it the flag survives only until the plugin
+            # stops — so every reload would re-announce (diagnostics_menu_mixin.py
+            # records the same trap for the survey log).
+            self._save_plugin_prefs()
         except Exception as exc:  # noqa: BLE001 - a notice must never break startup
             self.logger.exception(exc)
 

@@ -1361,8 +1361,10 @@ WRITABLE_ATTRIBUTES: dict[int, frozenset] = {
 #: that command and are not configuration: the value has no meaning until
 #: the command runs, and the command's own implementation owns it. OnOff's
 #: OnTime is the case that proved it — writable, settable, verified by
-#: read-back, and completely inert, because only OnWithTimedOff starts the
-#: countdown and Off zeroes the attribute unconditionally (issue #197).
+#: read-back, and completely inert, because a WRITE never starts the
+#: countdown; only OnWithTimedOff does (matter.js says so in as many words
+#: at OnOffServer.js:38-40). Off then zeroes it, under the Lighting-feature
+#: guard that every device carrying the attribute satisfies (issue #197).
 COMMAND_FIELD_ATTRIBUTES: dict[int, frozenset] = {
     0x0003: frozenset({0x0000}),
     0x0006: frozenset({0x4001, 0x4002}),

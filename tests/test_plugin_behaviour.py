@@ -1690,34 +1690,58 @@ def test_a_real_removal_of_a_device_less_node_is_not_a_404(plug):
 # issue #197 — the retired onTime state announces itself, once
 # ===========================================================================
 
-def _with_relays(mock_indigo_base, *type_ids):
-    """Stub ``indigo.devices.iter("self")`` with devices of the given types."""
+def _relays(mock_indigo_base, *had_the_state):
+    """Stub ``indigo.devices.iter("self")`` with relays, each flagged for whether
+    its persisted states still carry ``onTime``.
+
+    That flag is the whole point: only relays implementing OnOff's Lighting
+    feature ever had the state, so a plain plug must not be counted. ``startup``
+    runs before ``deviceStartComm``, so at the moment this is called the states
+    still describe the pre-upgrade world.
+    """
     mock_indigo_base.devices.iter.return_value = [
-        SimpleNamespace(id=index, deviceTypeId=type_id)
-        for index, type_id in enumerate(type_ids, start=1)
+        SimpleNamespace(id=index, deviceTypeId="matterRelay",
+                        states={"onOffState": False,
+                                **({"onTime": 0} if had else {})})
+        for index, had in enumerate(had_the_state, start=1)
     ]
 
 
-def _notice(plug):
-    return " ".join(str(call) for call in plug.logger.info.call_args_list)
+def _count_logged(plug):
+    """The %d argument the notice was actually formatted with."""
+    return plug.logger.info.call_args.args[-1]
 
 
-def test_the_retired_onTime_state_is_announced_to_a_user_who_has_a_relay(
+def test_the_retired_onTime_state_is_announced_to_a_user_who_had_it(
         plug, mock_indigo_base):
     """Removing a state breaks any trigger bound to it with nothing in the log to
     connect the two — the asymmetry ADR-0003 records. So the removal says so."""
-    _with_relays(mock_indigo_base, "matterRelay", "matterMotionSensor")
+    _relays(mock_indigo_base, True, True)
     plug._announce_retired_on_time_state()
-    notice = _notice(plug)
+    notice = str(plug.logger.info.call_args)
     assert "Auto-Off Timer" in notice, "name the STATE — that is what a trigger binds to"
-    assert "1" in notice, "…and how many devices lost it"
     assert not plug.logger.exception.called
 
 
-def test_the_notice_is_not_shown_to_a_user_with_no_relays(plug, mock_indigo_base):
-    """They never saw the field. An INFO about a setting they never had is the
-    report noise #191 was careful to avoid."""
-    _with_relays(mock_indigo_base, "matterMotionSensor", "matterContactSensor")
+def test_only_devices_that_ACTUALLY_HAD_the_state_are_counted(plug, mock_indigo_base):
+    """The count is per device that had it, not per relay. Only Lighting-feature
+    plugs ever carried it (#190 withdrew it from the rest — two in four on the dev
+    fabric), and telling the others their triggers may have broken sends them
+    hunting for a breakage that could not have happened.
+
+    Asserts the formatted ARGUMENT, not a substring: '1' appears in the message
+    unconditionally, inside 'See issue #197.'
+    """
+    _relays(mock_indigo_base, True, False, True, False)
+    plug._announce_retired_on_time_state()
+    assert _count_logged(plug) == 2, "4 relays, 2 of which had the state"
+
+
+def test_the_notice_is_not_shown_to_a_user_who_never_had_the_state(
+        plug, mock_indigo_base):
+    """Relays without the Lighting feature never saw the field. An INFO about a
+    setting they never had is the report noise #191 was careful to avoid."""
+    _relays(mock_indigo_base, False, False)
     plug._announce_retired_on_time_state()
     assert plug.logger.info.call_args_list == []
 
@@ -1725,26 +1749,94 @@ def test_the_notice_is_not_shown_to_a_user_with_no_relays(plug, mock_indigo_base
 def test_the_notice_fires_once_and_never_again(plug, mock_indigo_base):
     """Every startup would otherwise repeat it — which is how a one-off notice
     becomes wallpaper and stops being read."""
-    _with_relays(mock_indigo_base, "matterRelay")
+    _relays(mock_indigo_base, True)
     plug._announce_retired_on_time_state()
-    first = len(plug.logger.info.call_args_list)
-    assert first == 1
+    assert len(plug.logger.info.call_args_list) == 1
     plug._announce_retired_on_time_state()
-    assert len(plug.logger.info.call_args_list) == first
+    assert len(plug.logger.info.call_args_list) == 1
+
+
+def test_the_flag_is_COMMITTED_not_just_set_in_memory(plug, mock_indigo_base):
+    """pluginPrefs without savePluginPrefs survives only until the plugin stops,
+    so the notice would return on every reload — the trap diagnostics_menu_mixin
+    documents for the survey log. Asserts the flush, which a two-call test against
+    one in-memory dict cannot see."""
+    from plugin_constants import ON_TIME_RETIRED_PREF
+    _relays(mock_indigo_base, True)
+    plug._announce_retired_on_time_state()
+    assert plug.pluginPrefs[ON_TIME_RETIRED_PREF] is True
+    assert mock_indigo_base.server.savePluginPrefs.called, "set in memory only"
 
 
 def test_the_question_is_banked_even_when_there_is_nothing_to_say(plug, mock_indigo_base):
-    """A user with no relays must not be re-asked on every startup either — the
-    flag records "asked", not "logged". Without this the device scan runs
-    forever, which is the same shape as the survey log's "banked silently"."""
-    _with_relays(mock_indigo_base, "matterMotionSensor")
+    """A user with no affected devices must not be re-scanned on every startup
+    either — the flag records "asked", not "logged"."""
+    from plugin_constants import ON_TIME_RETIRED_PREF
+    _relays(mock_indigo_base, False)
     plug._announce_retired_on_time_state()
-    assert plug.pluginPrefs, "the flag is written whether or not anything was logged"
+    assert plug.pluginPrefs[ON_TIME_RETIRED_PREF] is True
 
 
 def test_a_broken_device_scan_never_stops_startup(plug, mock_indigo_base):
     """A cosmetic notice that can stop the plugin starting is worse than no
     notice. Startup calls this before the runtime exists."""
+    from plugin_constants import ON_TIME_RETIRED_PREF
     mock_indigo_base.devices.iter.side_effect = RuntimeError("database busy")
     plug._announce_retired_on_time_state()
     assert plug.logger.exception.called
+    assert ON_TIME_RETIRED_PREF not in plug.pluginPrefs, (
+        "a transient failure must leave the notice to retry, not bank it unsaid")
+
+
+def test_startup_really_emits_the_notice(plugin_mod, mock_indigo_base, monkeypatch):
+    """The WIRING, driven through the real startup() rather than asserted on the
+    source. Every test above calls the method directly, so deleting the call from
+    startup() left the whole suite green — the feature could be disconnected
+    entirely without a single failure.
+
+    Same collaborator fakes as the other startup tests; ServerProcess in
+    particular MUST stay patched (#104 — an unpatched one deletes the developer's
+    live LaunchAgent).
+    """
+    class FakeMatter:
+        def __init__(self, proto, logger, prefs, **kw):
+            pass
+
+        def run(self):
+            return None
+
+    class FakeRuntimeObj:
+        is_running = True
+
+        def start(self):
+            pass
+
+        def submit(self, coro):
+            if hasattr(coro, "close"):
+                coro.close()
+            return Mock()
+
+    monkeypatch.setattr(plugin_mod, "MatterClient", FakeMatter)
+    monkeypatch.setattr(plugin_mod, "AsyncRuntime", lambda logger: FakeRuntimeObj())
+    monkeypatch.setattr(plugin_mod, "CommissionJobs", lambda *a, **k: Mock())
+    monkeypatch.setattr(plugin_mod, "HttpApi", lambda *a, **k: Mock())
+    monkeypatch.setattr(plugin_mod, "ServerProcess", lambda *a, **k: Mock())
+    mock_indigo_base.devices.iter.return_value = [
+        SimpleNamespace(id=1, deviceTypeId="matterRelay",
+                        states={"onOffState": False, "onTime": 0}),
+    ]
+
+    p = plugin_mod.Plugin.__new__(plugin_mod.Plugin)
+    p.logger = Mock()
+    p._version = "2026.0.1"
+    p._subscribed_to_devices = False
+    p.pluginPrefs = {}
+    p.proto = object()
+    p.registry = object()
+    p.device_sync = Mock()
+    p.runtime = None
+    p.server_process = None
+
+    p.startup()
+    assert any("Auto-Off Timer" in str(call) for call in p.logger.info.call_args_list), \
+        "startup() never announced the retired state"

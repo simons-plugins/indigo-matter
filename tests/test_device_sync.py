@@ -2655,6 +2655,20 @@ def test_hold_time_is_primed_onto_the_device_at_creation(ds, indigo_env):
 #: byte-for-byte node 0x32's (the Shelly's), 65530 and all. The issue's reasoning
 #: is unaffected — one plug has these attributes and one does not — but the two
 #: device names are swapped, and these fixtures used to inherit that.
+LIGHTING_PLUG_NODE = {
+    "node_id": 0x34,
+    "available": True,
+    "attributes": {
+        "0/40/1": "IKEA",
+        "0/40/3": "GRILLPLATS Plug",
+        "1/29/0": [{"0": 266}],
+        "1/6/0": True,
+        "1/6/16385": 0,
+        "1/6/16387": 1,
+        "1/6/65531": [0, 16384, 16385, 16386, 16387, 65528, 65529, 65531, 65532, 65533],
+    },
+}
+
 #: A pre-1.4 occupancy sensor. Its deprecated PirOccupiedToUnoccupiedDelay is
 #: writable, really implemented, and not offered by the plugin — which declares
 #: HoldTime (0x0003) instead, and this device does not implement it. So it is a
@@ -2674,19 +2688,6 @@ PIR_DELAY_NODE = {
     },
 }
 
-LIGHTING_PLUG_NODE = {
-    "node_id": 0x34,
-    "available": True,
-    "attributes": {
-        "0/40/1": "IKEA",
-        "0/40/3": "GRILLPLATS Plug",
-        "1/29/0": [{"0": 266}],
-        "1/6/0": True,
-        "1/6/16385": 0,
-        "1/6/16387": 1,
-        "1/6/65531": [0, 16384, 16385, 16386, 16387, 65528, 65529, 65531, 65532, 65533],
-    },
-}
 
 #: …and one that does not: the Shelly 1PM Mini Gen3 (live node 0x32). OnOff and
 #: nothing else — no 16385/16386/16387.
@@ -2729,7 +2730,23 @@ def test_lighting_settings_are_primed_onto_the_relay(ds, indigo_env):
     ds.create_from_raw(LIGHTING_PLUG_NODE, "Grillplats socket")
     dev = devices[ds.lookup(0x34, 1)]
     assert dev.states.get("startUpOnOff") == 1
-    assert "onTime" not in dev.states, "retired with its setting (#197)"
+
+
+def test_the_relay_handler_no_longer_maps_onTime_to_a_STATE():
+    """Pinned against the handler, not against a fixture.
+
+    The obvious version of this — asserting "onTime" not in a created device's
+    states — passes for the wrong reason: on_off.on_attribute_update returns {}
+    for any key the device does not already carry, and the fake's declared state
+    set was edited alongside the code. Restoring ATTR_ON_TIME to SETTING_STATES
+    left the whole suite green, so the handler could resurrect the state and
+    nothing would notice (#197).
+    """
+    from matter_handlers.on_off import OnOffHandler
+    from matter_handlers.settings import ATTR_ON_TIME
+    assert ATTR_ON_TIME not in OnOffHandler.SETTING_STATES
+    assert "onTime" not in OnOffHandler.SETTING_STATES.values()
+    assert ATTR_ON_TIME not in OnOffHandler().attributes_to_subscribe()
 
 
 # ===========================================================================

@@ -27,10 +27,14 @@ value written. It has never once turned a plug off.
 
 `OnTime` and `OffWaitTime` (0x4002) are the mandatory **fields of
 `OnWithTimedOff`** (command 0x42) — a command this plugin has never implemented.
-The command sets them; they are not pre-set. matter.js's reference
-`OnOffServer.off()` zeroes `OnTime` unconditionally, so a written value cannot
-even survive an off. Live on the GRILLPLATS: a write of 100 verified by read-back,
-no auto-off, back to 0 as soon as the plug was switched.
+matter.js states the consequence in its own words at `OnOffServer.js:38-40`:
+*"Writes never start a countdown — only `OnWithTimedOff` does."* So a pre-set
+value does nothing at all. `off()` then zeroes `OnTime`, inside an
+`if (this.features.lighting)` guard that every device carrying the attribute
+satisfies, the attribute being conformance LT.
+
+Live on the GRILLPLATS: a write of 100 verified by read-back, no auto-off, and
+back to 0 as soon as the plug was switched.
 
 The same mistake reached the diagnostics from the other end. Issue #191's
 settable-attribute report named `OffWaitTime` on two plugs as a setting that
@@ -65,9 +69,13 @@ rather than per case?**
 Chosen option: **the command-field rule**, derived by the generator and emitted
 into the checked-in table as `COMMAND_FIELD_ATTRIBUTES`.
 
-It is exact rather than heuristic. Across all 110 writable attributes in the
-pinned model it selects **four**, and all four are genuinely "writable but not
-configuration":
+The *rule* is positive evidence rather than a proxy: a command that takes the
+attribute as a parameter is the thing that owns it. The *match* is by attribute
+and field **name** within one cluster (see `parse_command_fields`), so a name
+collision — a response-command field, or a struct member — is the theoretical
+failure mode, and a false positive would silently demote a real setting. None
+exists in the pinned model, where the rule selects **four** of 110 writable
+attributes, all genuinely "writable but not configuration":
 
 | Cluster | Attribute | Set by |
 |---|---|---|
@@ -108,18 +116,32 @@ both directions natively, via `indigo.device.turnOn(id, duration=N)` and
   to it — the asymmetry ADR-0003 exists to respect. Accepted because the setting
   shipped only in `v2026.10.1`, could only ever have held 0, and the removal is
   announced once in the event log rather than happening quietly.
-* Bad, because the parse is fragile in a specific way: a `Command`'s `Field`
+* Bad, because the parse is fragile in two specific ways. A `Command`'s `Field`
   blocks are *sibling arguments* to its property object, so a brace scan finds
-  none and yields an empty table that silently disables the filter. Mitigated by
-  the generator refusing to write a table that does not contain all four known
-  pairs.
+  none and yields an empty table that silently disables the filter — mitigated by
+  the generator refusing to write a table missing any of the four known pairs. And
+  a fixed-width search for a field's own object literal skips the multi-line
+  list-typed form, which under-reports WITHOUT tripping that floor; caught in
+  review of this PR, and now covered by `tests/test_enumerate_settings.py`.
+* Bad, because the margin is thinner than "four of 110" suggests: 22 further
+  attributes share a name with a command field on their own cluster and are
+  excluded only by being read-only. The spec pattern — command-set attributes are
+  made read-only, and these four are the exceptions — is what makes the rule work,
+  and it is one `access` string away from not working.
 
 ### Confirmation
 
 `pytest`, specifically: the four pairs are excluded from `survey_node`; retiring
 the setting does **not** make `OnTime` appear as a gap (the two halves had to ship
 together, because `offered_setting_pairs` was what suppressed it); the explorer
-still shows them, marked; and the generated set contains exactly the four.
+still shows them, marked; the generated set contains exactly the four; and no
+declared `DeviceSetting` is one of them — the guard that would have stopped #186
+shipping, mirroring the existing one for driven attributes.
+
+The generator itself is tested against synthetic input in
+`tests/test_enumerate_settings.py`, which runs in CI where `@matter/model` is
+absent. `KNOWN_COMMAND_FIELD_ATTRIBUTES` only fires when a human regenerates the
+table, so it is a floor for the operator, not coverage.
 
 Live: with `matterSettingsSurveyed` cleared so every node re-surveys, both
 Lighting-feature plugs report nothing at all.
@@ -133,6 +155,9 @@ Lighting-feature plugs report nothing at all.
 * Good, because it is machine-readable from the model the plugin already parses.
 * Neutral, because it changes real behaviour for only two attributes today; its
   value is that it keeps working.
+* Bad, because matching by name means a collision is possible in principle. The
+  generator's floor catches under-reporting; nothing catches a false positive
+  except the report's exact-set test failing when the model moves.
 * Bad, because it needs a balanced-parenthesis scan the existing parser did not
   have.
 

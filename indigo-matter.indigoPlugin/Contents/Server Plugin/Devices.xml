@@ -57,9 +57,9 @@
                  Declared for the TYPE; getDeviceStateList removes it per unit
                  when the device's own AttributeList says it does not implement
                  the attribute (#190).
-                 An onTime state was declared here and REMOVED in 2026.12.0 —
-                 removing a state breaks any trigger bound to it, which is why
-                 the plugin logs the removal once (#197). -->
+                 An onTime state was declared here and REMOVED in the release
+                 following v2026.10.1 — removing a state breaks any trigger bound
+                 to it, which is why the plugin logs the removal once (#197). -->
             <State id="startUpOnOff">
                 <ValueType>Integer</ValueType>
                 <TriggerLabel>Power-On Behaviour</TriggerLabel>

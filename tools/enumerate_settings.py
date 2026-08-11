@@ -133,8 +133,9 @@ def _balanced_parens(text: str, start: int) -> str:
         )
 
     Scanning braces therefore finds no fields at all and yields an empty table,
-    which would silently disable the filter that depends on it (#197). Hence the
-    generator's assertion that the emitted set is non-empty.
+    which would silently disable the filter that depends on it (#197). Hence
+    KNOWN_COMMAND_FIELD_ATTRIBUTES: the generator refuses to write a table that
+    does not contain every pair it already knows about.
     """
     depth = 0
     in_string = False
@@ -203,8 +204,18 @@ def parse_command_fields(path: Path) -> set:
         block = _balanced_parens(text, paren)
         for field in re.finditer(r"Field\(", block):
             brace = block.find("{", field.end())
-            if brace == -1 or brace > field.end() + 4:
-                continue  # `Field(` not immediately followed by its object
+            # Reject on non-whitespace rather than on DISTANCE. A fixed window
+            # ("the brace is within N characters") silently skips every field
+            # the model pretty-prints across lines — which is exactly the
+            # list-typed form, `Field(\n  { name: "Arl", … },\n  Field({…})\n)`.
+            # On 0.17.8 that dropped 53 sites and 39 names. None of them
+            # collided with a writable attribute, so the emitted table was
+            # right by luck; a model bump that moves a real command field into
+            # that form would put a command parameter back into the report with
+            # KNOWN_COMMAND_FIELD_ATTRIBUTES still green, because that floor
+            # only asserts the pairs it already knows.
+            if brace == -1 or block[field.end():brace].strip():
+                continue  # `Field(` whose first argument is not its own object
             obj, _ = _balanced_object(block, brace)
             name = _props(obj).get("name")
             if name:
@@ -367,12 +378,15 @@ def command_parameters(writable: dict, names: dict, command_fields: dict) -> dic
         raise SystemExit(
             "refusing to write a table missing known command-parameter attributes: "
             + ", ".join(f"0x{c:04X}/0x{a:04X}" for c, a in sorted(missing))
-            + " — the Command/Field parse found nothing, see _balanced_parens")
+            + f" ({len(missing)} of {len(KNOWN_COMMAND_FIELD_ATTRIBUTES)} missing). "
+            + "ALL four missing means the Command/Field parse found nothing — start at "
+            + "_balanced_parens. SOME missing means the model's shape changed for that "
+            + "cluster; check it against the spec before touching this list.")
     return parameters
 
 
-def emit_table(elements: Path, path: Path) -> tuple[int, int]:
-    """Write the generated attribute table. Returns ``(clusters, writable)``.
+def emit_table(elements: Path, path: Path) -> tuple[int, int, dict]:
+    """Write the generated attribute table. Returns ``(clusters, writable, parameters)``.
 
     Deliberately covers EVERY cluster in the model, not only the ones this
     plugin handles: the report this feeds exists to describe devices the plugin
@@ -394,6 +408,10 @@ def emit_table(elements: Path, path: Path) -> tuple[int, int]:
         name, cluster_id = cluster.get("name"), cluster.get("id")
         if not name or not isinstance(cluster_id, int):
             continue
+        # Unioned across files, where `clusters` below is first-writer-wins. The
+        # asymmetry is deliberate: for an exclusion list the conservative answer is
+        # the larger set. Moot on 0.17.8 — no cluster id appears in two files — but
+        # the two rules sit three lines apart and the difference should be stated.
         command_fields.setdefault(cluster_id, set()).update(parse_command_fields(source))
         # A cluster id can appear twice across the model's element files (an
         # alias or a revision split). First writer wins, deterministically,
@@ -473,8 +491,10 @@ def emit_table(elements: Path, path: Path) -> tuple[int, int]:
         "#: that command and are not configuration: the value has no meaning until",
         "#: the command runs, and the command's own implementation owns it. OnOff's",
         "#: OnTime is the case that proved it — writable, settable, verified by",
-        "#: read-back, and completely inert, because only OnWithTimedOff starts the",
-        "#: countdown and Off zeroes the attribute unconditionally (issue #197).",
+        "#: read-back, and completely inert, because a WRITE never starts the",
+        "#: countdown; only OnWithTimedOff does (matter.js says so in as many words",
+        "#: at OnOffServer.js:38-40). Off then zeroes it, under the Lighting-feature",
+        "#: guard that every device carrying the attribute satisfies (issue #197).",
         "COMMAND_FIELD_ATTRIBUTES: dict[int, frozenset] = {",
     ]
     for cluster_id in sorted(parameters):
@@ -483,7 +503,7 @@ def emit_table(elements: Path, path: Path) -> tuple[int, int]:
     lines += ["}", ""]
 
     path.write_text("\n".join(lines), encoding="utf-8")
-    return len(clusters), sum(len(v) for v in writable.values())
+    return len(clusters), sum(len(v) for v in writable.values()), parameters
 
 
 def main() -> int:
@@ -505,9 +525,18 @@ def main() -> int:
         return 2
 
     if args.emit_table is not None:
-        clusters, writable = emit_table(args.elements, args.emit_table)
+        clusters, writable, parameters = emit_table(args.elements, args.emit_table)
         print(f"wrote {args.emit_table} ({clusters} clusters, {writable} writable attributes, "
               f"@matter/model {model_version(args.elements)})")
+        # Name the exclusions rather than counting them. This set decides what the
+        # settable-attribute report will never mention again, so a change to it is
+        # the single most consequential thing a regeneration can do — and the least
+        # visible, since the diff is three lines at the end of a 1300-line file.
+        print(f"  command parameters excluded from the settable report "
+              f"({sum(len(v) for v in parameters.values())}):")
+        for cluster_id in sorted(parameters):
+            for attr_id in sorted(parameters[cluster_id]):
+                print(f"    0x{cluster_id:04X}/0x{attr_id:04X}")
         # Emitting the table is a build step, not a report request: only fall
         # through to the markdown when one was actually asked for.
         if args.out is None:

@@ -63,7 +63,7 @@ __all__ = [
     "parse_limits_struct", "parse_level_count",
     "settings_for_type", "coerce_value", "verify_write", "implements", "NO_ANSWER",
     "CLUSTER_OCCUPANCY_SENSING", "ATTR_HOLD_TIME", "ATTR_HOLD_TIME_LIMITS",
-    "CLUSTER_ON_OFF", "ATTR_START_UP_ON_OFF", "ATTR_ON_TIME",
+    "CLUSTER_ON_OFF", "ATTR_START_UP_ON_OFF", "ATTR_ON_TIME", "ATTR_OFF_WAIT_TIME",
     "ATTR_ATTRIBUTE_LIST",
 ]
 
@@ -81,13 +81,18 @@ CLUSTER_BOOLEAN_STATE_CONFIG = 0x0080
 ATTR_CURRENT_SENSITIVITY = 0x0000
 ATTR_SUPPORTED_SENSITIVITY_LEVELS = 0x0001
 
-# OnOff (0x0006). All three are conformance LT — the Lighting feature — so a
-# plug may implement all, some or none of them; the AttributeList gate decides.
+# OnOff (0x0006). All three are conformance LT — mandatory if the Lighting
+# feature is supported — so a compliant plug implements all three or none. The
+# AttributeList gate decides per unit anyway, because compliance is a claim and
+# the device's own list is evidence.
 #
 # Only StartUpOnOff is a SETTING. OnTime and OffWaitTime are the mandatory
-# OnTime/OffWaitTime fields of OnWithTimedOff (command 0x42): the command sets
-# them, and matter.js's reference OnOffServer.off() zeroes OnTime
-# unconditionally, so a pre-set value cannot survive an off (#197, ADR-0005).
+# OnTime/OffWaitTime fields of OnWithTimedOff (command 0x42). The load-bearing
+# fact, in matter.js's own words at OnOffServer.js:38-40: "Writes never start a
+# countdown — only OnWithTimedOff does." So a pre-set value does nothing at all;
+# off() then zeroes OnTime, inside an `if (this.features.lighting)` guard that
+# every device carrying the attribute satisfies (#197, ADR-0005).
+#
 # Both ids are kept — deliberately unused for now — because implementing
 # OnWithTimedOff as an action would need them, and because a bare 0x4001 in a
 # future diff should resolve to a name that carries this warning with it.
