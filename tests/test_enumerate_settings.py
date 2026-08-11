@@ -1,11 +1,16 @@
 """Tests for the table generator — `tools/enumerate_settings.py` (#191, #197).
 
-Nothing imported this module before #197, which is how a parser bug reached the
-checked-in artefact: `parse_command_fields` used a fixed character window to find
-a `Field(`'s object literal, so it silently skipped every field the model
-pretty-prints across lines. On `@matter/model` 0.17.8 that dropped 53 sites and
-39 names. The emitted table was still correct, but only because none of those 39
-names collided with a writable attribute on its own cluster.
+Nothing imported this module before #197, which is how TWO parser bugs of the
+same shape reached the checked-in artefact. Both located a call's object literal
+by a fixed character distance, so both silently skipped the multi-line form —
+which is exactly how the model prints anything carrying nested fields.
+
+* `parse_command_fields` dropped 53 `Field(` sites and 39 names. Harmless by
+  luck: none of the 39 collided with a writable attribute on its own cluster.
+* `parse_cluster` dropped 265 `Attribute(` sites, **14 of them writable**. The
+  shipped table said 110 writable attributes when the model has 124, so the
+  settable-attribute report was blind to `FanControl.RockSetting`,
+  `Thermostat.Presets` and ten others from the day #191 shipped.
 
 **That is the failure mode these tests exist for, and why they are worth having
 even though the generator is a build script.** The repo already carries the same
@@ -135,6 +140,40 @@ def test_a_file_with_no_commands_yields_nothing(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# parse_cluster — the same window bug, on the attributes themselves
+# ---------------------------------------------------------------------------
+
+def test_a_multiline_attribute_is_found(tmp_path):
+    """THE bigger regression. A list-typed attribute carries its entry Field on
+    its own lines, and a fixed-width window skipped the whole thing — 14 writable
+    attributes missing from the shipped table, so the report could never name
+    them however plainly a device implemented them."""
+    path = _element(tmp_path, '''
+export const x = Cluster({ name: "FanControl", id: 514 },
+  Attribute(
+    { name: "RockSetting", id: 0x8, type: "map8", access: "RW VO", conformance: "O" },
+    Field({ name: "RockLeftRight", constraint: "0" })
+  ),
+  Attribute({ name: "FanMode", id: 0x0, access: "RW VO", conformance: "M" })
+)''')
+    _, attributes = es.parse_cluster(path)
+    assert {a["name"] for a in attributes} == {"RockSetting", "FanMode"}
+    rock = next(a for a in attributes if a["name"] == "RockSetting")
+    assert "RW" in rock["access"], "and its access must survive the parse, or it is not writable"
+
+
+def test_an_attribute_whose_first_argument_is_not_an_object_is_skipped(tmp_path):
+    """The check the window stood in for — kept, so the fix does not simply
+    widen the net."""
+    path = _element(tmp_path, '''
+export const x = Cluster({ name: "Thing", id: 1 },
+  Attribute(SHARED_ATTRIBUTE, { name: "NotMine", id: 0, access: "RW VO" })
+)''')
+    _, attributes = es.parse_cluster(path)
+    assert attributes == []
+
+
+# ---------------------------------------------------------------------------
 # command_parameters — the derivation and its floor
 # ---------------------------------------------------------------------------
 
@@ -171,7 +210,7 @@ def test_a_real_setting_is_not_swept_up():
 
 
 def test_a_command_field_matching_a_READ_ONLY_attribute_is_ignored():
-    """22 attributes in the pinned model share a name with a command field on
+    """30 attributes in the pinned model share a name with a command field on
     their own cluster and are saved only by being read-only — OpenDuration,
     CookTime, six TemperatureAlarm thresholds. They must not appear, because a
     non-writable attribute is never a candidate setting in the first place.

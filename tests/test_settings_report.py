@@ -250,6 +250,53 @@ def test_the_explorer_shows_command_parameters_and_says_what_they_are():
     assert "StartUpOnOff (0x4003) [writable] = 1" in lines
 
 
+@pytest.mark.parametrize("cluster,attribute,name", [
+    (0x001F, 0x0000, "AccessControl.Acl"),
+    (0x001E, 0x0000, "Binding.Binding"),
+    (0x003F, 0x0000, "GroupKeyManagement.GroupKeyMap"),
+    (0x0041, 0x0000, "UserLabel.LabelList"),
+    (0x002A, 0x0000, "OtaSoftwareUpdateRequestor.DefaultOtaProviders"),
+    (0x002D, 0x0000, "UnitLocalization.TemperatureUnit"),
+])
+def test_the_list_typed_plumbing_recovered_by_the_parser_fix_stays_quiet(
+        cluster, attribute, name):
+    """#197's parser fix took the model's writable count from 110 to 124 — the
+    generator had been skipping every multi-line ``Attribute(``, i.e. every list-
+    and struct-typed one.
+
+    Eight of the fourteen it recovered are fabric plumbing: an access-control
+    list, a binding table, a group-key map. Every node implements several, so
+    without an INFRASTRUCTURE_CLUSTERS entry each one would have started
+    recommending them as settings on the next survey of every device on the
+    fabric — the wallpaper this report is built to avoid, arriving as a
+    side-effect of a bug fix.
+    """
+    survey = survey_node(node({
+        (0, cluster, ATTR_ATTRIBUTE_LIST): [attribute, ATTR_ATTRIBUTE_LIST],
+    }))
+    assert survey.endpoints == (), f"{name} is plumbing, not a setting"
+
+
+@pytest.mark.parametrize("cluster,attribute,name", [
+    (0x0202, 0x0008, "FanControl.RockSetting"),
+    (0x0202, 0x000A, "FanControl.WindSetting"),
+    (0x0201, 0x0050, "Thermostat.Presets"),
+    (0x0201, 0x0051, "Thermostat.Schedules"),
+    (0x0101, 0x002B, "DoorLock.EnablePrivacyModeButton"),
+])
+def test_the_REAL_settings_recovered_by_the_parser_fix_ARE_reported(
+        cluster, attribute, name):
+    """The other six, and the point of fixing the parser at all. These are
+    ordinary device settings a user would recognise — a fan's oscillation, a
+    lock's privacy button — that the report was structurally unable to mention.
+    RockSetting and WindSetting bear directly on the open fan work in #46.
+    """
+    survey = survey_node(node({
+        (1, cluster, ATTR_ATTRIBUTE_LIST): [attribute, ATTR_ATTRIBUTE_LIST],
+    }))
+    assert reported(survey) == {(cluster, attribute)}, f"{name} is a genuine gap"
+
+
 def test_a_cluster_with_no_writable_attributes_at_all_is_skipped():
     survey = survey_node(node({
         (1, 0x0402, ATTR_ATTRIBUTE_LIST): [0x0000, ATTR_ATTRIBUTE_LIST],  # TemperatureMeasurement

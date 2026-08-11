@@ -74,7 +74,7 @@ attribute as a parameter is the thing that owns it. The *match* is by attribute
 and field **name** within one cluster (see `parse_command_fields`), so a name
 collision — a response-command field, or a struct member — is the theoretical
 failure mode, and a false positive would silently demote a real setting. None
-exists in the pinned model, where the rule selects **four** of 110 writable
+exists in the pinned model, where the rule selects **four** of 124 writable
 attributes, all genuinely "writable but not configuration":
 
 | Cluster | Attribute | Set by |
@@ -123,7 +123,7 @@ both directions natively, via `indigo.device.turnOn(id, duration=N)` and
   a fixed-width search for a field's own object literal skips the multi-line
   list-typed form, which under-reports WITHOUT tripping that floor; caught in
   review of this PR, and now covered by `tests/test_enumerate_settings.py`.
-* Bad, because the margin is thinner than "four of 110" suggests: 22 further
+* Bad, because the margin is thinner than "four of 124" suggests: **30** further
   attributes share a name with a command field on their own cluster and are
   excluded only by being read-only. The spec pattern — command-set attributes are
   made read-only, and these four are the exceptions — is what makes the rule work,

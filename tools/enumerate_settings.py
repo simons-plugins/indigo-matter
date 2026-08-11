@@ -180,8 +180,16 @@ def parse_cluster(path: Path) -> tuple[dict, list[dict]]:
     attributes = []
     for match in re.finditer(r"Attribute\(", text):
         brace = text.find("{", match.end())
-        if brace == -1 or brace > match.end() + 4:
-            continue  # `Attribute(` not immediately followed by its object
+        # Same rule as parse_command_fields, and for the same reason: a fixed
+        # window silently skips the multi-line form, which is how the model
+        # prints any attribute carrying nested Fields — i.e. every list- and
+        # struct-typed one. That dropped 265 sites on 0.17.8, 14 of them
+        # WRITABLE, so the generated table under-reported by 14 from the day it
+        # shipped (#191) until #197's review found it. Among the missing were
+        # FanControl's RockSetting/WindSetting and Thermostat's Presets/Schedules
+        # — real settings the report existed to surface.
+        if brace == -1 or text[match.end():brace].strip():
+            continue  # `Attribute(` whose first argument is not its own object
         obj, _ = _balanced_object(text, brace)
         props = _props(obj)
         if props.get("name"):

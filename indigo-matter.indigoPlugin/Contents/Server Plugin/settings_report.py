@@ -97,6 +97,14 @@ GLOBAL_ATTRIBUTES: dict[int, str] = {
 #: them too. Deliberately kept here anyway: this list answers "is the cluster
 #: infrastructure?", which stays the right exclusion if either ever gains a
 #: writable attribute that is not a command parameter.
+#:
+#: The second block was added with #197's parser fix, which raised the model's
+#: writable count from 110 to 124 — the generator had been skipping every
+#: multi-line ``Attribute(``, i.e. every list- and struct-typed one. Eight of the
+#: fourteen it recovered are list-typed fabric plumbing (an ACL, a binding table,
+#: a group-key map) and would have been recommended as settings on the next
+#: report of any node that implements them. They are exactly what this list is
+#: for; the other six are genuine candidates and are deliberately left to report.
 INFRASTRUCTURE_CLUSTERS: frozenset = frozenset({
     0x0003,  # Identify — IdentifyTime is a momentary command, not a setting
     0x0028,  # BasicInformation — NodeLabel/Location/LocalConfigDisabled
@@ -105,6 +113,18 @@ INFRASTRUCTURE_CLUSTERS: frozenset = frozenset({
     0x0030,  # GeneralCommissioning — Breadcrumb
     0x0031,  # NetworkCommissioning — InterfaceEnabled
     0x0453,  # ThreadNetworkDirectory — PreferredExtendedPanId
+    # --- recovered by #197's parser fix; all fabric-owned, none a user setting -
+    0x001E,  # Binding — the binding table; device-to-device wiring
+    0x001F,  # AccessControl — Acl/Extension, who may talk to this node
+    0x002A,  # OtaSoftwareUpdateRequestor — DefaultOtaProviders
+    0x002D,  # UnitLocalization — TemperatureUnit. The closest call on this list:
+             # a display preference is arguably the device's behaviour. Excluded
+             # for consistency with its two siblings above — ActiveLocale and
+             # HourFormat are no less "real", and splitting the localization trio
+             # on a hunch would be harder to defend than keeping it whole.
+    0x003F,  # GroupKeyManagement — GroupKeyMap/GroupcastAdoption
+    0x0041,  # UserLabel — LabelList. Naming, like BasicInformation's NodeLabel
+             # which is already excluded here, and Indigo owns the name anyway.
 })
 
 #: Writable attributes the plugin ALREADY drives, as ordinary Indigo controls
