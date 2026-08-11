@@ -715,3 +715,68 @@ def test_a_read_back_failure_names_the_underlying_error():
     ok, message = _run(apply_setting(client, 56, 1, _plan(), sleep=_no_sleep))
     assert ok is False
     assert "poll window missed" in message
+
+
+# ===========================================================================
+# issue #190 — which STATES a unit should own
+# ===========================================================================
+
+def test_a_plug_without_the_lighting_feature_should_not_own_its_states():
+    absent = device_settings.unimplemented_states(
+        RELAY, _attr_lists({0x0006: ONOFF_WITHOUT_LIGHTING}))
+    assert sorted(s.key for s in absent) == ["onTime", "startUpOnOff"]
+
+
+def test_a_plug_with_the_lighting_feature_keeps_them():
+    absent = device_settings.unimplemented_states(
+        RELAY, _attr_lists({0x0006: ONOFF_WITH_LIGHTING}))
+    assert absent == []
+
+
+def test_an_unknown_attribute_list_keeps_every_state():
+    """The rule that separates this from offered_settings. Withdrawing a state
+    breaks any trigger bound to it, so it needs a positive NO — and there is
+    always a window (device start, before the first reconcile) where nothing is
+    known. Treating that as absent would make states flap on every launch."""
+    assert device_settings.unimplemented_states(RELAY, _attr_lists({})) == []
+    assert device_settings.unimplemented_states(RELAY, None) == []
+
+
+def test_an_unparseable_attribute_list_keeps_every_state():
+    assert device_settings.unimplemented_states(
+        RELAY, _attr_lists({0x0006: "not a list"})) == []
+    assert device_settings.unimplemented_states(
+        RELAY, _attr_lists({0x0006: [0, "sixteen thousand", 16387]})) == []
+
+
+def test_the_state_gate_is_weaker_than_the_offer_gate_on_purpose():
+    """Same device, same unknown AttributeList, deliberately opposite answers:
+    a spec-bounded setting is NOT offered without positive evidence, but its
+    state is still kept. Offering an unusable field is recoverable; silently
+    removing a state that a trigger references is not."""
+    unknown = _attr_lists({})
+    assert offered_settings(RELAY, lambda c, a: None, unknown) == []
+    assert device_settings.unimplemented_states(RELAY, unknown) == []
+
+
+def test_a_pre_1_4_occupancy_sensor_should_not_own_a_hold_time_state():
+    lists = {0x0406: [0, 1, 2, 65531], 0x0080: [0, 1, 2, 65531]}
+    absent = device_settings.unimplemented_states(MOTION, _attr_lists(lists))
+    assert [s.key for s in absent] == ["holdTime"]
+
+
+def test_every_setting_key_is_a_real_state_id_on_its_device_types():
+    """The gate removes states BY SETTING KEY, so the two must not drift — a
+    typo would silently gate nothing. Checked against Devices.xml itself."""
+    import re
+    from pathlib import Path
+    from matter_handlers.settings import SETTINGS
+    xml = Path(__file__).resolve().parents[1].joinpath(
+        "indigo-matter.indigoPlugin/Contents/Server Plugin/Devices.xml").read_text()
+    for setting in SETTINGS:
+        for device_type in setting.device_types:
+            block = re.search(rf'<Device id="{device_type}".*?</Device>', xml, re.S)
+            assert block, f"no <Device id={device_type}> in Devices.xml"
+            assert f'<State id="{setting.key}">' in block.group(0), (
+                f'{device_type} declares no "{setting.key}" state for setting '
+                f'{setting.key!r} — the #190 gate would silently do nothing')

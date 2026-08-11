@@ -199,8 +199,8 @@ class DeviceSync:
         # (node_id, endpoint_id, cluster, attribute) — issues #85 and #186.
         # NodeInfo snapshots are transient (this class holds no other
         # node-attribute cache), so the ConfigUI layer in plugin.py needs these
-        # captured somewhere durable; updated on every create/reconcile pass.
-        # Entries are never EVICTED — see issue #191.
+        # captured somewhere durable; REBUILT per node on every create/reconcile
+        # pass and dropped when the node goes away (issue #192).
         #
         # Cached rather than read live ON PURPOSE, and the distinction matters:
         # get_node is a CACHE and is the wrong source for a reading that drifts,
@@ -487,12 +487,26 @@ class DeviceSync:
                 if endpoint.has(CLUSTER_POWER_SOURCE)
             }
             multi_power_source = len(power_source_eps) > 1
-            with self._lock:
-                if power_source_eps:
-                    self._power_source_eps[int(node.node_id)] = power_source_eps
-                else:
-                    self._power_source_eps.pop(int(node.node_id), None)
-            self._cache_setting_limits(node)
+            # An EMPTY snapshot is "no information", never "implements nothing"
+            # (issue #192). matter-server populates its attribute cache lazily:
+            # getNodeDetails returns `attributeCache.get(nodeId) ?? {}` and kicks
+            # off the fill in the background, so the first node_updated after a
+            # server restart legitimately carries `attributes: {}` and a second
+            # one follows once the cache is warm. Every capability answer below
+            # is derived from those attributes, so believing an empty one would
+            # retract the node's battery endpoints and AttributeLists on a
+            # routine restart — and, since #190, take its device states with them.
+            informative = bool(node.attributes)
+            if informative:
+                with self._lock:
+                    if power_source_eps:
+                        self._power_source_eps[int(node.node_id)] = power_source_eps
+                    else:
+                        self._power_source_eps.pop(int(node.node_id), None)
+            # Deferred deliberately: the refresh calls into Indigo per device and
+            # must not run under _lock, and it has to see the devices this pass
+            # is about to create.
+            capabilities_changed = informative and self._cache_setting_limits(node)
             # Pass 1: cache every endpoint's handler-produced specs BEFORE any
             # fallback/placeholder decision. Meter-link resolution (issue #79)
             # needs to know which endpoints will host a _METER_CAPABLE_TYPES
@@ -709,6 +723,8 @@ class DeviceSync:
                 "node %s: %d of %d expected device(s) failed to create",
                 node.node_id, failed, len(plan),
             )
+        if capabilities_changed:
+            self._refresh_state_lists(int(node.node_id))
         result = {
             "indigoDeviceIds": created,
             "primaryDeviceId": primary,
@@ -1161,7 +1177,7 @@ class DeviceSync:
     # Writable-setting limits cache (issues #85, #186)
     # ------------------------------------------------------------------
 
-    def _cache_setting_limits(self, node: NodeInfo) -> None:
+    def _cache_setting_limits(self, node: NodeInfo) -> bool:
         """Cache what the ConfigUI layer needs to offer settings on this node.
 
         Two things, both scanned straight off the node snapshot rather than
@@ -1175,6 +1191,23 @@ class DeviceSync:
           code that declares it;
         * each settings-bearing cluster's **AttributeList**, which is the
           device's own statement of what it implements.
+
+        This node's entries are REBUILT, not merged over (issue #192). The cache
+        used to be append-only, which quietly made three different things
+        permanent: a re-used node id inherited the previous device's capability
+        answers outright (ids are assigned at commissioning, so re-use across a
+        decommission/recommission cycle is ordinary), a firmware update that
+        dropped an attribute left the old answer standing, and nothing ever
+        shrank for the life of the plugin process. Rebuilding handles all three
+        with no separate eviction path to keep in step.
+
+        The caller guarantees the snapshot is informative — see ``create_devices``
+        for why an empty one must never reach here.
+
+        Returns whether this node's **AttributeLists** changed, which is the half
+        that decides what the user can see (settings offered, and since #190
+        device states). Limits moving does not change any of that, so it is not
+        worth rebuilding a state list over.
         """
         wanted = set()
         for setting in SETTINGS:
@@ -1182,14 +1215,70 @@ class DeviceSync:
             if attribute is not None:
                 wanted.add((setting.cluster, int(attribute)))
         clusters = {s.cluster for s in SETTINGS}
+        node_id = int(node.node_id)
+        limits: dict[tuple[int, int, int, int], Any] = {}
+        attribute_lists: dict[tuple[int, int, int], Any] = {}
+        for (ep, cluster, attribute), value in node.attributes.items():
+            if (cluster, attribute) in wanted:
+                limits[(node_id, int(ep), int(cluster), int(attribute))] = value
+            elif attribute == ATTR_ATTRIBUTE_LIST and cluster in clusters:
+                attribute_lists[(node_id, int(ep), int(cluster))] = value
         with self._lock:
-            for (ep, cluster, attribute), value in node.attributes.items():
-                if (cluster, attribute) in wanted:
-                    self._setting_limits[
-                        (int(node.node_id), int(ep), int(cluster), int(attribute))] = value
-                elif attribute == ATTR_ATTRIBUTE_LIST and cluster in clusters:
-                    self._attribute_lists[
-                        (int(node.node_id), int(ep), int(cluster))] = value
+            previous = {key: value for key, value in self._attribute_lists.items()
+                        if key[0] == node_id}
+            for key in [k for k in self._setting_limits if k[0] == node_id]:
+                del self._setting_limits[key]
+            for key in previous:
+                del self._attribute_lists[key]
+            self._setting_limits.update(limits)
+            self._attribute_lists.update(attribute_lists)
+        return attribute_lists != previous
+
+    def _forget_node_capabilities(self, node_id: Any) -> None:
+        """Drop every cached capability answer for a node that is gone.
+
+        The rebuild in :meth:`_cache_setting_limits` covers a node that is still
+        reporting; this covers one that has stopped — decommissioned, or absent
+        from matter-server's authoritative node list.
+
+        Forgetting is safe in the direction that matters: an absent entry reads
+        as *unknown*, and both consumers treat unknown as "fall back to the older
+        evidence" rather than as proof of absence. So this can never hide a
+        setting or withdraw a state — it only stops a stale answer being given
+        confidently, which is the whole complaint in issue #192.
+        """
+        target = int(node_id)
+        with self._lock:
+            for key in [k for k in self._setting_limits if k[0] == target]:
+                del self._setting_limits[key]
+            for key in [k for k in self._attribute_lists if k[0] == target]:
+                del self._attribute_lists[key]
+            self._power_source_eps.pop(target, None)
+
+    def _refresh_state_lists(self, node_id: Any) -> None:
+        """Ask Indigo to rebuild the state list of every device on a node.
+
+        Called when a node's AttributeLists changed, because ``getDeviceStateList``
+        runs at device start — long before the first reconcile has said what the
+        device implements (issue #190). Without this the answer could only ever
+        settle on the NEXT plugin start, which is worse than the stale state it
+        replaces: identical installations would disagree depending on how many
+        times they had been restarted.
+
+        Never fatal. A device that will not rebuild its state list keeps the one
+        it has, which is exactly the pre-#190 behaviour.
+        """
+        with self._lock:
+            dev_ids = [
+                dev_id
+                for (nid, _ep), type_map in self._index.items() if nid == int(node_id)
+                for dev_id in type_map.values()
+            ]
+        for dev_id in dev_ids:
+            try:
+                indigo.devices[dev_id].stateListOrDisplayStateIdChanged()
+            except Exception as exc:  # noqa: BLE001 - a device that will not rebuild keeps its states
+                self.logger.debug("could not rebuild state list for device %s: %s", dev_id, exc)
 
     def setting_limits(self, node_id: Any, endpoint_id: Any, cluster: Any,
                        attribute: Any) -> Any:
@@ -1517,6 +1606,12 @@ class DeviceSync:
                 "them; nodes with no devices left drop off the list entirely.",
                 ", ".join(node_id_to_str(n) for n in sorted(dropped)),
             )
+        for node_id in dropped:
+            # Not merely tidiness (issue #192): node ids are handed out by the
+            # controller at commissioning, so the next device to commission may
+            # well BE this id. Without this it would inherit this node's
+            # capability answers wholesale.
+            self._forget_node_capabilities(node_id)
         for dev_id in orphans:
             self._safe_unreachable(dev_id)
 
@@ -1623,6 +1718,11 @@ class DeviceSync:
             self._on_node_added(evt)
         elif evt.kind == protocol.EVT_NODE_REMOVED and evt.node_id is not None:
             self.mark_unreachable(evt.node_id)
+            # The node is decommissioned; its Indigo devices may well outlive it
+            # (the user has to delete them). Their cached capability answers must
+            # not (issue #192) — see _forget_node_capabilities for why dropping
+            # them cannot hide anything.
+            self._forget_node_capabilities(evt.node_id)
         elif evt.kind == protocol.EVT_ENDPOINT_ADDED:
             # matter-server ALWAYS fires node_updated (via structureChanged) after
             # endpoint_added — verified against PairedNode.ts #triggerNodeStructureChanges

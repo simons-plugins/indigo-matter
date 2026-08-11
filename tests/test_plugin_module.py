@@ -1031,3 +1031,120 @@ def test_no_orphan_setting_fields_in_the_xml(plugin_cls):
                            if f.startswith("has") or f in keys or f.endswith("Range")}
         orphans = settings_fields - keys - {"hasAnySetting"}
         assert not orphans, f"{type_id} has settings fields with no declaration: {orphans}"
+
+
+# ===========================================================================
+# issue #190 — getDeviceStateList follows the device's own AttributeList
+# ===========================================================================
+
+#: The two OnOff AttributeLists from the dev fabric, as the plugs really report.
+_LIGHTING_PLUG_LISTS = {0x0006: [0, 16384, 16385, 16386, 16387,
+                                 65528, 65529, 65531, 65532, 65533]}
+_PLAIN_PLUG_LISTS = {0x0006: [0, 65528, 65529, 65531, 65532, 65533]}
+
+
+def _relay_states():
+    """matterRelay's <States> as Devices.xml declares them."""
+    return [{"Key": key, "StateLabel": key, "TriggerLabel": key}
+            for key in ("onOffState", "startUpOnOff", "onTime")]
+
+
+def _state_list_plugin(plugin_cls, mock_indigo_base, mock_logger, attr_lists):
+    """A real Plugin INSTANCE (so ``super()`` resolves) without running __init__.
+
+    ``getDeviceStateList`` chains up to ``indigo.PluginBase``, which the stub
+    dispatch in _settings_stub cannot model — super() needs a genuine instance.
+    """
+    from unittest.mock import MagicMock
+    plugin = plugin_cls.__new__(plugin_cls)
+    plugin.logger = mock_logger
+    device_sync = MagicMock()
+    device_sync.attribute_list.side_effect = (
+        lambda node, ep, cluster: attr_lists.get(cluster))
+    plugin.device_sync = device_sync
+    plugin.base_state_lists = {"matterRelay": _relay_states()}
+    return plugin
+
+
+def _relay_dev():
+    from types import SimpleNamespace
+    return SimpleNamespace(id=7, name="Grillplats socket", deviceTypeId="matterRelay",
+                           pluginProps={"nodeId": "52", "endpointId": "1"})
+
+
+def test_a_plug_without_the_lighting_feature_loses_those_states(
+        plugin_cls, mock_indigo_base, mock_logger):
+    plugin = _state_list_plugin(plugin_cls, mock_indigo_base, mock_logger, _PLAIN_PLUG_LISTS)
+    keys = [state["Key"] for state in plugin.getDeviceStateList(_relay_dev())]
+    assert keys == ["onOffState"], "startUpOnOff/onTime are not this device's to own"
+
+
+def test_a_plug_with_the_lighting_feature_keeps_them(
+        plugin_cls, mock_indigo_base, mock_logger):
+    plugin = _state_list_plugin(plugin_cls, mock_indigo_base, mock_logger, _LIGHTING_PLUG_LISTS)
+    keys = [state["Key"] for state in plugin.getDeviceStateList(_relay_dev())]
+    assert keys == ["onOffState", "startUpOnOff", "onTime"]
+
+
+def test_an_unknown_attribute_list_keeps_every_state(
+        plugin_cls, mock_indigo_base, mock_logger):
+    """Device start runs before the first reconcile, so 'unknown' is the normal
+    state of the world at exactly the moment this is called."""
+    plugin = _state_list_plugin(plugin_cls, mock_indigo_base, mock_logger, {})
+    keys = [state["Key"] for state in plugin.getDeviceStateList(_relay_dev())]
+    assert keys == ["onOffState", "startUpOnOff", "onTime"]
+
+
+def test_the_parents_live_list_is_never_mutated(
+        plugin_cls, mock_indigo_base, mock_logger):
+    """Indigo returns its internal per-type cache, not a copy. Filtering it in
+    place would corrupt every later call and eventually the XML serialiser."""
+    plugin = _state_list_plugin(plugin_cls, mock_indigo_base, mock_logger, _PLAIN_PLUG_LISTS)
+    parent = plugin.base_state_lists["matterRelay"]
+    before = [dict(state) for state in parent]
+    plugin.getDeviceStateList(_relay_dev())
+    plugin.getDeviceStateList(_relay_dev())
+    assert parent == before
+
+
+def test_the_filtered_list_is_an_indigo_list(plugin_cls, mock_indigo_base, mock_logger):
+    """A plain list dies in Indigo's C++ bridge the same way a plain dict does
+    in the ConfigUI path."""
+    import indigo
+    plugin = _state_list_plugin(plugin_cls, mock_indigo_base, mock_logger, _PLAIN_PLUG_LISTS)
+    assert isinstance(plugin.getDeviceStateList(_relay_dev()), indigo.List)
+
+
+def test_removing_a_state_says_so_in_the_log(plugin_cls, mock_indigo_base, mock_logger):
+    """A state vanishing breaks any trigger bound to it with nothing in the log
+    to connect the two."""
+    plugin = _state_list_plugin(plugin_cls, mock_indigo_base, mock_logger, _PLAIN_PLUG_LISTS)
+    plugin.getDeviceStateList(_relay_dev())
+    logged = " ".join(str(call[0]) for call in mock_logger.info.call_args_list)
+    assert "startUpOnOff" in logged and "onTime" in logged
+
+
+def test_keeping_every_state_logs_nothing(plugin_cls, mock_indigo_base, mock_logger):
+    plugin = _state_list_plugin(plugin_cls, mock_indigo_base, mock_logger, _LIGHTING_PLUG_LISTS)
+    plugin.getDeviceStateList(_relay_dev())
+    assert not mock_logger.info.call_args_list
+
+
+def test_a_broken_capability_lookup_keeps_the_whole_state_list(
+        plugin_cls, mock_indigo_base, mock_logger):
+    """A device that fails to build its states is far worse than a spurious 0."""
+    plugin = _state_list_plugin(plugin_cls, mock_indigo_base, mock_logger, _PLAIN_PLUG_LISTS)
+    dev = _relay_dev()
+    del dev.pluginProps            # any shape the gate did not expect
+    keys = [state["Key"] for state in plugin.getDeviceStateList(dev)]
+    assert keys == ["onOffState", "startUpOnOff", "onTime"]
+
+
+def test_a_device_type_with_no_settings_is_passed_straight_through(
+        plugin_cls, mock_indigo_base, mock_logger):
+    from types import SimpleNamespace
+    plugin = _state_list_plugin(plugin_cls, mock_indigo_base, mock_logger, _PLAIN_PLUG_LISTS)
+    plugin.base_state_lists["matterTemperatureSensor"] = [{"Key": "sensorValue"}]
+    dev = SimpleNamespace(id=9, name="Hall Temp", deviceTypeId="matterTemperatureSensor",
+                          pluginProps={"nodeId": "52", "endpointId": "1"})
+    assert [s["Key"] for s in plugin.getDeviceStateList(dev)] == ["sensorValue"]

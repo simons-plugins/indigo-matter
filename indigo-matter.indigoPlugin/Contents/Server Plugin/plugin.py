@@ -933,6 +933,70 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, ServerMenuMixin,
 
         return lookup
 
+    def getDeviceStateList(self, dev):  # noqa: N802
+        """Build this device's states from what the DEVICE says it implements.
+
+        Devices.xml declares a setting's state for a whole device *type*, so
+        Indigo creates it on every unit of that type and initialises it to 0
+        (issue #190). For a unit that does not implement the attribute, that 0 is
+        Indigo's default and means nothing — but it is indistinguishable from a
+        real reading, and for StartUpOnOff it is even a *valid* value ("Off"), so
+        it reads as genuine configuration. A state is visible to triggers,
+        control pages and the API, so someone can build a trigger on a setting
+        the device has no concept of and watch it never fire.
+
+        The device's own AttributeList is the authority; a reading never is.
+        Unlike ConfigUI fields — static XML per type, no runtime injection —
+        states CAN be built per device, which is what this does.
+
+        Three rules, all load-bearing:
+
+        * The parent's list is Indigo's live internal cache for the type, not a
+          copy. Returning a filtered ``indigo.List`` leaves it untouched;
+          mutating it in place would corrupt every later call and eventually the
+          XML serialiser.
+        * Only a positive NO removes a state — see
+          ``device_settings.unimplemented_states``. Unknown keeps it.
+        * Anything unexpected keeps the whole list. A device that fails to build
+          its states is far worse than a spurious 0.
+        """
+        states = super().getDeviceStateList(dev)
+        try:
+            absent = device_settings.unimplemented_states(
+                dev.deviceTypeId,
+                self._setting_attribute_list_lookup(dict(dev.pluginProps)))
+        except Exception as exc:  # noqa: BLE001 - never break a device's state list
+            self.logger.debug("state-list capability gate failed for %s: %s", dev.id, exc)
+            return states
+        if not absent or states is None:
+            return states
+        drop = {setting.key: setting for setting in absent}
+        kept = indigo.List()
+        removed = []
+        for state in states:
+            try:
+                key = state["Key"]
+            except Exception:  # noqa: BLE001 - an entry we cannot read is an entry we keep
+                kept.append(state)
+                continue
+            if key in drop:
+                removed.append(key)
+            else:
+                kept.append(state)
+        for key in removed:
+            # INFO, and worth it: a state disappearing silently breaks any
+            # trigger or control page bound to it, with nothing in the log to
+            # connect the two. Indigo rebuilds a state list at every device
+            # start, so this is one line per affected device per plugin start —
+            # it is not per reconcile, because _refresh_state_lists only fires
+            # when a node's AttributeLists actually changed.
+            self.logger.info(
+                'device "%s": removed the "%s" state — this unit\'s AttributeList says it '
+                "does not implement attribute 0x%04X, so the value shown was Indigo's "
+                "default rather than anything the device reported",
+                dev.name, key, drop[key].attribute)
+        return kept
+
     def getDeviceConfigUiValues(self, pluginProps, typeId, devId):  # noqa: N802
         """Seed the Edit Device dialog with this device's CURRENT settings.
 

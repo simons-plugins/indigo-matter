@@ -96,6 +96,18 @@ class _IndigoPluginBaseStub:
     def deviceDeleted(self, dev):  # noqa: N802
         self._record_base_call("deviceDeleted", dev)
 
+    #: ``{deviceTypeId: [state dicts]}`` standing in for Devices.xml's <States>.
+    #: Tests populate it; the same list object is handed back on every call
+    #: BECAUSE that is what real Indigo does — the return value is the XML
+    #: parser's internal cache for the type, not a fresh copy, so an override
+    #: that mutates it in place corrupts every later call and eventually the XML
+    #: serialiser. Sharing the object here is what lets a test catch that.
+    base_state_lists: dict = {}
+
+    def getDeviceStateList(self, dev):  # noqa: N802
+        self._record_base_call("getDeviceStateList", dev)
+        return self.base_state_lists.get(dev.deviceTypeId)
+
 
 #: Every module `plugin` composes. The mixins bind `indigo` at import time and MUST
 #: be evicted alongside `plugin` so `importlib.reload(plugin)` re-imports them against
