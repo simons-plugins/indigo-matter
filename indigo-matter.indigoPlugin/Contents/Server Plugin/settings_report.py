@@ -99,24 +99,32 @@ GLOBAL_ATTRIBUTES: dict[int, str] = {
 #: cluster infrastructure?", which stays the right exclusion if either ever
 #: gains a writable attribute that ``NOT_SETTINGS`` does not name.
 #:
-#: The second block was added with #197's parser fix, which raised the model's
-#: writable count from 110 to 124 — the generator had been skipping every
-#: multi-line ``Attribute(``, i.e. every list- and struct-typed one. Seven of the
-#: fourteen it recovered are list-typed fabric plumbing (an ACL, a binding table,
-#: a group-key map) and would have been recommended as settings on the next
-#: report of any node that implements them. They are exactly what this list is
-#: for; the rest are genuine candidates and are deliberately left to report.
+#: The second block was added with #197's parser fix, one step in the chain
+#: that raised the model's writable count 110 → 124 → 137 → 141 — the
+#: generator had been skipping every multi-line ``Attribute(``, i.e. every
+#: list- and struct-typed one. Seven of the fourteen it recovered are
+#: list-typed fabric plumbing (an ACL, a binding table, a group-key map) and
+#: would have been recommended as settings on the next report of any node that
+#: implements them. They are exactly what this list is for; the rest are
+#: genuine candidates and are deliberately left to report.
 #:
-#: **The three localization clusters were REMOVED from this list in #197**, having
-#: been on it since the report shipped. They failed the test above on inspection:
-#: ``TemperatureUnit``, ``ActiveLocale`` and ``HourFormat`` are all ``RW VM`` with
-#: **quality N** — persistent configuration by the model's own account, unlike
-#: everything left here — and each carries a device-reported ``Supported*`` list,
-#: which is precisely the ``FromAttribute`` bounds strategy the registry already
-#: implements. They are node-level DISPLAY PREFERENCES ("show °F on the
-#: thermostat"), not fabric plumbing, and the sentence above about belonging to
-#: the fabric was simply wrong about them. All three are feature-gated on the root
-#: node, so a node reports them only if it opted in — no wallpaper risk.
+#: **``UnitLocalization`` (0x002D, ``TemperatureUnit``) was added to this list
+#: by this branch, then removed again** — it was never on ``main``'s list to
+#: begin with: ``TemperatureUnit`` was invisible to the pre-#197 parser, so it
+#: had nothing to be suppressed from. ``LocalizationConfiguration`` (0x002B,
+#: ``ActiveLocale``) and ``TimeFormatLocalization`` (0x002C, ``HourFormat``)
+#: are the two that were genuinely here and removed. All three failed the test
+#: above on inspection: they are node-level DISPLAY PREFERENCES ("show °F on
+#: the thermostat"), not fabric plumbing, and the sentence above about
+#: belonging to the fabric was simply wrong about them — that argument stands
+#: on its own. Only ``ActiveLocale`` carries a device-reported ``Supported*``
+#: list (``constraint: "in SupportedLocales"``) — one of the three, not all;
+#: ``HourFormat`` and ``TemperatureUnit`` have no constraint at all. Only
+#: ``UnitLocalization.TemperatureUnit`` is FeatureMap-gated
+#: (``conformance: "TEMP"``); ``ActiveLocale`` and ``HourFormat`` are
+#: ``conformance: "M"`` — what actually opts all three in is the Root Node
+#: device type's ``LanguageLocale``/``TimeLocale``/``UnitLocale`` conditions,
+#: so a node reports them only if it opted in — no wallpaper risk.
 #:
 #: Implementing one is a real design problem, and that is the resulting issue's to
 #: solve rather than a reason to stay quiet: they sit on **endpoint 0**, which has
@@ -135,6 +143,16 @@ INFRASTRUCTURE_CLUSTERS: frozenset = frozenset({
     0x003F,  # GroupKeyManagement — GroupKeyMap/GroupcastAdoption
     0x0041,  # UserLabel — LabelList. Naming, like BasicInformation's NodeLabel
              # which is already excluded here, and Indigo owns the name anyway.
+    # --- recovered by #197's inheritance-aware regen; the model now resolves an
+    # --- attribute's access through the cluster's base chain instead of only its
+    # --- own literal (raised the model from 1167 to 1319 attributes, 137 to 141
+    # --- writable) --------------------------------------------------------------
+    0x0039,  # BridgedDeviceBasicInformation — NodeLabel inherits RW VM from
+             # BasicInformation (0x0028, already excluded above for the same
+             # attribute, for the same reason), and every endpoint of every
+             # Matter bridge implements this cluster, so without suppression it
+             # would recommend NodeLabel on all of them. Indigo owns the device
+             # name anyway.
 })
 
 #: Writable attributes the plugin ALREADY drives, as ordinary Indigo controls
@@ -172,16 +190,18 @@ DRIVEN_ATTRIBUTES: frozenset = frozenset({
 #:
 #: The three reasons, spelled out because none reduces to another:
 #:
-#: 1. **Inert until a specific command runs.** OnOff's ``OnTime``/
-#:    ``OffWaitTime``: Application Clusters R1.2 §1.5.6.4 — "This attribute can
-#:    be written at any time, but writing a value only has effect when in the
-#:    Timed On state." Only ``OnWithTimedOff`` (0x42) enters that state
+#: 1. **Inert until a specific command runs.** OnOff's ``OnTime``
+#:    (Application Clusters R1.5 §1.5.6.4) and ``OffWaitTime`` (**§1.5.6.5** —
+#:    a different section with a materially wider window: it also has effect in
+#:    the Delayed Off state): "This attribute can be written at any time, but
+#:    writing a value only has effect when in the Timed On state." Only ``OnWithTimedOff`` (0x42) enters that state
 #:    (§1.5.7.6.4, §1.5.8 Figure 2), so a pre-set value with no
 #:    ``OnWithTimedOff`` call does nothing — proved live on the GRILLPLATS
 #:    (ADR-0005). This one DOES match the command-field pattern; it is simply
 #:    not the only reason a writable attribute can fail to be a setting.
 #: 2. **Writing IS the action, not a stored preference.** Identify's
-#:    ``IdentifyTime``: core §1.2.5.1 — "If this attribute is set to a value
+#:    ``IdentifyTime``: Application Clusters R1.5 §1.2.5.1 — "If this attribute
+#:    is set to a value
 #:    other than 0 then the device shall enter its identification state."
 #:    There is no persisted setting behind it to recover later; the write and
 #:    the effect are the same event, a momentary command in attribute clothing.
@@ -192,13 +212,15 @@ DRIVEN_ATTRIBUTES: frozenset = frozenset({
 NOT_SETTINGS: dict = {
     (0x0006, 0x4001): (
         "OnOff.OnTime is inert until OnWithTimedOff() runs (Application "
-        "Clusters R1.2 §1.5.6.4, §1.5.7.6.4; ADR-0005)"),
+        "Clusters R1.5 §1.5.6.4, §1.5.7.6.4; ADR-0005 (superseded by "
+        "ADR-0006))"),
     (0x0006, 0x4002): (
         "OnOff.OffWaitTime is inert until OnWithTimedOff() runs (Application "
-        "Clusters R1.2 §1.5.6.4, §1.5.7.6.4; ADR-0005)"),
+        "Clusters R1.5 §1.5.6.5, §1.5.7.6.4; ADR-0005 (superseded by "
+        "ADR-0006))"),
     (0x0003, 0x0000): (
         "Identify.IdentifyTime — writing IS the action, not a stored "
-        "preference (core §1.2.5.1)"),
+        "preference (Application Clusters §1.2.5.1)"),
     (0x0030, 0x0000): (
         "GeneralCommissioning.Breadcrumb — commissioner scratch space, reset "
         "to zero on restart (core §11.10.6.1)"),
@@ -486,7 +508,7 @@ def explore_lines(node: NodeInfo, endpoint: Optional[int] = None,
     ``NOT_SETTINGS`` entries the report filters out: this is the power-user
     surface, and hiding things from a diagnostic is how a diagnostic stops
     being trusted. A ``NOT_SETTINGS`` attribute is labelled a command parameter
-    instead of omitted — a real command parameter is what all three of its
+    instead of omitted — a real command parameter is what all four of its
     members are, whatever their individual reason for being one (#197). A
     ``DoorLock.OperatingMode``, reviewed and found to be a real setting despite
     the generator flagging it (``REVIEWED_COMMAND_FIELD_COLLISIONS``), is NOT

@@ -33,7 +33,8 @@
                  AttributeList, are doing real work here.
                  An "Auto-off after" field lived here and was withdrawn: OnTime
                  is a parameter of OnWithTimedOff, not a setting, so the field
-                 could never do anything (#197, ADR-0005). -->
+                 could never do anything (#197, ADR-0005 (superseded by
+                 ADR-0006)). -->
             <Field id="hasStartUpOnOff" type="textfield" hidden="true" defaultValue="no"/>
             <Field id="hasAnySetting" type="textfield" hidden="true" defaultValue="no"/>
             <Field id="settingsSeparator" type="separator"

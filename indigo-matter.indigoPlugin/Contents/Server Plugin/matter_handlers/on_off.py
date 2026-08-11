@@ -76,8 +76,9 @@ class OnOffHandler(ClusterHandler):
     #: per-attribute subscription is actually issued.
     #:
     #: OnTime was here and was withdrawn with its setting (#197): a state that
-    #: can only ever read 0 is worse than no state, because it looks like an
-    #: answer.
+    #: usually reads 0 — it only moves while another admin on the fabric has
+    #: put the device into Timed On — is worse than no state, because it looks
+    #: like an answer.
     SETTING_STATES = {
         ATTR_START_UP_ON_OFF: "startUpOnOff",
     }

@@ -192,6 +192,27 @@ def test_matter_plumbing_is_never_reported(cluster):
     assert survey.endpoints == ()
 
 
+@pytest.mark.parametrize("cluster,attribute,name", [
+    (0x0031, 0x0004, "NetworkCommissioning.InterfaceEnabled"),
+    (0x0453, 0x0000, "ThreadNetworkDirectory.PreferredExtendedPanId"),
+])
+def test_specific_infrastructure_clusters_stay_suppressed(cluster, attribute, name):
+    """Hard-coded, NOT derived from ``INFRASTRUCTURE_CLUSTERS`` the way
+    ``test_matter_plumbing_is_never_reported`` above is. That parametrize is
+    self-referential — ``sorted(INFRASTRUCTURE_CLUSTERS)`` — so deleting an
+    entry from the constant deletes its own test case along with it, and
+    these two currently have ZERO other coverage: both are writable, absent
+    from ``NOT_SETTINGS``, and would start recommending fabric plumbing (a
+    network interface toggle, the Thread network directory's preferred PAN
+    id) on every Thread node the moment their ``INFRASTRUCTURE_CLUSTERS``
+    entry went missing.
+    """
+    survey = survey_node(node({
+        (0, cluster, ATTR_ATTRIBUTE_LIST): [attribute, ATTR_ATTRIBUTE_LIST],
+    }))
+    assert survey.endpoints == (), f"{name} is plumbing, not a setting"
+
+
 # ---------------------------------------------------------------------------
 # Command parameters are not settings — issue #197
 # ---------------------------------------------------------------------------
@@ -226,12 +247,59 @@ def test_every_generated_command_field_collision_has_been_judged_by_a_human():
         "the generated COMMAND_FIELD_ATTRIBUTES has member(s) that are in neither "
         "NOT_SETTINGS nor REVIEWED_COMMAND_FIELD_COLLISIONS — a matter.js bump "
         "introduced a new writable attribute that collides by name with a command "
-        f"field, and nobody has judged it yet: {unjudged}. Read the spec for each "
-        "pair, decide whether writing the attribute on its own means anything, and "
-        "add it (with a citation) to NOT_SETTINGS if not, or to "
-        "REVIEWED_COMMAND_FIELD_COLLISIONS if it is a real setting like "
+        "field, and nobody has judged it yet: "
+        f"{[f'{cluster_label(c)} {attribute_label(c, a)}' for c, a in unjudged]}. "
+        "Read the spec for each pair, decide whether writing the attribute on its "
+        "own means anything, and add it (with a citation) to NOT_SETTINGS if not, "
+        "or to REVIEWED_COMMAND_FIELD_COLLISIONS if it is a real setting like "
         "DoorLock.OperatingMode was."
     )
+
+
+def test_every_reviewed_collision_is_still_detected():
+    """The direction the test above does NOT check, and the one a mutation audit
+    found missing: ``REVIEWED_COMMAND_FIELD_COLLISIONS`` exists only to excuse a
+    pair the generator's detector flags (ADR-0006's whole design — a detector
+    plus a human decider). An entry that stopped being detected means the
+    detector regressed, not that the collision went away.
+
+    This is what catches emptying ``COMMAND_FIELD_ATTRIBUTES`` in the checked-in
+    artefact: with ``detected`` empty, ``detected - judged`` above is vacuously
+    empty too, so
+    ``test_every_generated_command_field_collision_has_been_judged_by_a_human``
+    goes green for the wrong reason at the same moment
+    ``test_no_declared_setting_is_a_command_parameter`` does. Neither the
+    generator's own floor (``KNOWN_COMMAND_FIELD_ATTRIBUTES``) nor CI catches
+    that on its own — the generator's assertion only runs when a human
+    regenerates with ``@matter/model`` in hand, and CI has neither Node nor
+    that package.
+    """
+    detected = {(cluster, attribute)
+                for cluster, ids in settings_report.COMMAND_FIELD_ATTRIBUTES.items()
+                for attribute in ids}
+    assert set(settings_report.REVIEWED_COMMAND_FIELD_COLLISIONS) <= detected
+
+
+def test_the_checked_in_table_still_detects_the_four_documented_command_field_pairs():
+    """Mirrors ``tools/enumerate_settings.py``'s ``KNOWN_COMMAND_FIELD_ATTRIBUTES``
+    floor, but against the SHIPPED artefact rather than a live regeneration —
+    the only place in CI that can check the checked-in table, since CI has no
+    ``@matter/model`` to regenerate it from. If this fails, either the table was
+    hand-edited (never do this — regenerate instead) or the checked-in file is
+    stale against a matter.js version that legitimately removed one of these.
+    """
+    detected = {(cluster, attribute)
+                for cluster, ids in settings_report.COMMAND_FIELD_ATTRIBUTES.items()
+                for attribute in ids}
+    for cluster, attribute in (
+        (0x0003, 0x0000),  # Identify.IdentifyTime <- Identify()
+        (0x0006, 0x4001),  # OnOff.OnTime <- OnWithTimedOff()
+        (0x0006, 0x4002),  # OnOff.OffWaitTime <- OnWithTimedOff()
+        (0x0030, 0x0000),  # GeneralCommissioning.Breadcrumb <- ArmFailSafe()/SetRegulatoryConfig()
+    ):
+        assert (cluster, attribute) in detected, (
+            f"{cluster_label(cluster)} {attribute_label(cluster, attribute)} is "
+            "missing from the checked-in COMMAND_FIELD_ATTRIBUTES table")
 
 
 def test_not_settings_and_reviewed_collisions_are_disjoint():
@@ -331,11 +399,11 @@ def test_the_explorer_still_labels_on_time_a_command_parameter():
 ])
 def test_the_list_typed_plumbing_recovered_by_the_parser_fix_stays_quiet(
         cluster, attribute, name):
-    """#197's parser fix took the model's writable count from 110 to 124 — the
-    generator had been skipping every multi-line ``Attribute(``, i.e. every list-
-    and struct-typed one.
+    """#197's parser fixes took the model's writable count 110 → 124 → 137 →
+    141. This test is about the first step: the generator had been skipping
+    every multi-line ``Attribute(``, i.e. every list- and struct-typed one.
 
-    Eight of the fourteen it recovered are fabric plumbing: an access-control
+    Seven of the fourteen it recovered are fabric plumbing: an access-control
     list, a binding table, a group-key map. Every node implements several, so
     without an INFRASTRUCTURE_CLUSTERS entry each one would have started
     recommending them as settings on the next survey of every device on the
@@ -358,7 +426,7 @@ def test_the_list_typed_plumbing_recovered_by_the_parser_fix_stays_quiet(
 ])
 def test_the_REAL_settings_recovered_by_the_parser_fix_ARE_reported(
         cluster, attribute, name):
-    """The other six, and the point of fixing the parser at all. These are
+    """The other seven, and the point of fixing the parser at all. These are
     ordinary device settings a user would recognise — a fan's oscillation, a
     lock's privacy button — that the report was structurally unable to mention.
     RockSetting and WindSetting bear directly on the open fan work in #46.
@@ -376,24 +444,69 @@ def test_the_REAL_settings_recovered_by_the_parser_fix_ARE_reported(
     (0x002D, 0x0000, "UnitLocalization.TemperatureUnit"),
 ])
 def test_the_localization_trio_is_reported_not_suppressed(cluster, attribute, name):
-    """These sat in INFRASTRUCTURE_CLUSTERS from the day the report shipped, on
-    the stated grounds that such things "belong to the fabric, not to the device's
-    behaviour". They do not. All three are ``RW VM`` with **quality N** —
-    persistent configuration by the model's own account, which is exactly what
-    OnTime lacks — and each carries a device-reported ``Supported*`` list, the
-    ``FromAttribute`` bounds strategy the registry already implements twice.
+    """``ActiveLocale`` and ``HourFormat`` sat in INFRASTRUCTURE_CLUSTERS from
+    the day the report shipped; ``TemperatureUnit`` did not — it was invisible
+    to the pre-#197 parser, so it was added and then removed again within this
+    same branch. All three were suppressed on the stated grounds that such
+    things "belong to the fabric, not to the device's behaviour". They do not.
 
     They are node-level DISPLAY preferences: show °F on the thermostat, use a
-    24-hour clock. A user would recognise every one of them as a setting, which is
-    the test this list is supposed to apply.
+    24-hour clock. A user would recognise every one of them as a setting, which
+    is the test this list is supposed to apply — that argument stands on its
+    own; **quality N** is not evidence for it (ADR-0006 rejects that inference).
+    Only ``ActiveLocale`` carries a device-reported ``Supported*`` list, the
+    ``FromAttribute`` bounds strategy the registry already implements; the
+    other two have no constraint at all.
 
-    Feature-gated on the root node, so a node reports them only if it opted in —
-    which is why un-suppressing them is not a return to wallpaper.
+    What actually opts all three in is the Root Node device type's
+    ``LanguageLocale``/``TimeLocale``/``UnitLocale`` conditions — only
+    ``TemperatureUnit`` is separately FeatureMap-gated — so a node reports them
+    only if it opted in, which is why un-suppressing them is not a return to
+    wallpaper.
     """
     survey = survey_node(node({
         (0, cluster, ATTR_ATTRIBUTE_LIST): [attribute, ATTR_ATTRIBUTE_LIST],
     }))
     assert reported(survey) == {(cluster, attribute)}, f"{name} is a real setting"
+
+
+def test_bridged_device_basic_information_node_label_stays_suppressed():
+    """Hard-coded, not derived from ``INFRASTRUCTURE_CLUSTERS`` — same
+    self-reference reason as ``test_specific_infrastructure_clusters_stay_suppressed``
+    above: a test parametrized over ``sorted(INFRASTRUCTURE_CLUSTERS)`` loses its
+    own case the moment the entry it is meant to guard is deleted.
+
+    ``NodeLabel`` (0x0039/0x0005) inherits ``RW VM`` from ``BasicInformation`` via
+    the inheritance-aware regen (#197) and every endpoint of every Matter bridge
+    implements ``BridgedDeviceBasicInformation`` — without suppression the report
+    would recommend it on all of them. ``BasicInformation``'s own ``NodeLabel``
+    (0x0028) is already excluded for the identical reason; Indigo owns the
+    device name in both cases.
+    """
+    survey = survey_node(node({
+        (1, 0x0039, ATTR_ATTRIBUTE_LIST): [0x0005, ATTR_ATTRIBUTE_LIST],
+    }))
+    assert survey.endpoints == ()
+
+
+def test_a_resource_monitoring_cluster_last_changed_time_IS_reported():
+    """The inheritance-aware regen (#197) resolves an attribute's access through
+    the cluster's base chain, and it made ``LastChangedTime`` (0x0004, ``RW VO``)
+    writable on ``HepaFilterMonitoring``, ``ActivatedCarbonFilterMonitoring`` and
+    ``WaterTankLevelMonitoring`` — none of which declare it on their own literal;
+    all three inherit it from ``ResourceMonitoring``. The spec (cluster §2.8.6.5)
+    says it is "the time at which the resource has been changed", i.e. when the
+    filter was last replaced — a genuine user setting, not fabric plumbing like
+    ``BridgedDeviceBasicInformation.NodeLabel`` (the fourth attribute this same
+    regen turned up, and the one that IS suppressed — see
+    ``INFRASTRUCTURE_CLUSTERS``). Pinned here so a future reader who sees four
+    new writable attributes appear from one regen does not lump all four
+    together and suppress this one too.
+    """
+    survey = survey_node(node({
+        (1, 0x0071, ATTR_ATTRIBUTE_LIST): [0x0004, ATTR_ATTRIBUTE_LIST],  # HepaFilterMonitoring
+    }))
+    assert reported(survey) == {(0x0071, 0x0004)}
 
 
 def test_a_cluster_with_no_writable_attributes_at_all_is_skipped():
@@ -427,12 +540,26 @@ def test_the_deprecated_pir_delays_ARE_reported():
 # The log block
 # ---------------------------------------------------------------------------
 
-def test_report_reads_as_information_not_as_a_fault():
+@pytest.mark.parametrize("survey", [
+    survey_node(level_node([ATTR_ON_LEVEL, ATTR_LEVEL_TRANSITION, ATTR_ATTRIBUTE_LIST])),
+    survey_node(node({
+        (0, CLUSTER_LOCALIZATION, ATTR_ACTIVE_LOCALE): "en-US",
+        (0, CLUSTER_LOCALIZATION, ATTR_ATTRIBUTE_LIST):
+            [ATTR_ACTIVE_LOCALE, ATTR_ATTRIBUTE_LIST],
+    })),
+], ids=["ordinary-endpoint", "endpoint-0-root-node"])
+def test_report_reads_as_information_not_as_a_fault(survey):
     """This fires unprompted at commissioning on hardware that is working
     perfectly. A line that reads like an error generates support traffic for a
-    non-problem, which is the failure mode the issue calls out by name."""
-    lines = report_lines(survey_node(level_node(
-        [ATTR_ON_LEVEL, ATTR_LEVEL_TRANSITION, ATTR_ATTRIBUTE_LIST])))
+    non-problem, which is the failure mode the issue calls out by name.
+
+    Parametrized over an ordinary endpoint AND an endpoint-0-only survey: the
+    original single-fixture version only ever built from an endpoint-1 fixture,
+    so the endpoint-0 ``#204`` note (a whole separate block of prose, see
+    ``report_lines``) could say "error"/"problem"/"warning"/"failed" and this
+    loop would never see it.
+    """
+    lines = report_lines(survey)
     blob = "\n".join(lines).lower()
     assert "nothing is wrong" in blob
     assert "once per device" in blob
@@ -543,6 +670,31 @@ def test_a_node_with_endpoint_0_and_an_application_endpoint_renders_each_correct
     ep1_index = next(i for i, ln in enumerate(lines) if ln == "  endpoint 1:")
     assert not any("#204" in ln for ln in lines[ep1_index:])
     assert root_index < ep1_index
+
+
+def test_report_lines_endpoint_0_block_has_the_caption_before_the_attribute():
+    """A structural pin on one endpoint's block, not just substring checks.
+
+    Two mutations survive without this: moving the ``#204`` note to AFTER the
+    attribute line(s) it captions (readable as "here are the attributes, oh
+    and by the way #204" instead of the caption explaining what follows), and
+    emitting every attribute line twice (a duplicated ``for item in
+    endpoint.settable`` loop). The note-before-attribute ordering and the
+    exactly-once count are both asserted directly.
+    """
+    survey = survey_node(node({
+        (0, CLUSTER_LOCALIZATION, ATTR_ACTIVE_LOCALE): "en-US",
+        (0, CLUSTER_LOCALIZATION, ATTR_ATTRIBUTE_LIST):
+            [ATTR_ACTIVE_LOCALE, ATTR_ATTRIBUTE_LIST],
+    }))
+    lines = report_lines(survey)
+    note_index = next(i for i, ln in enumerate(lines) if "#204" in ln)
+    attr_index = next(i for i, ln in enumerate(lines) if "ActiveLocale" in ln)
+    assert note_index < attr_index, (
+        "the #204 note must caption the attribute lines that follow it, not "
+        "come after them")
+    assert sum(1 for ln in lines if "ActiveLocale" in ln) == 1, (
+        "each attribute must be listed exactly once")
 
 
 # ---------------------------------------------------------------------------

@@ -56,6 +56,44 @@ knowable with the model in hand.
 
 This reads only; it writes the files you ask for and touches nothing else.
 
+**Six defects, one shape, fixed on this branch (#191/#197 review).** Every one
+is a check that recognises ONE spelling of a model construct and silently
+skips a form that spells the same thing differently — never an exception,
+never a warning, just a smaller table. In the order they were found:
+
+1. ``parse_command_fields`` located a ``Field(``'s object literal by a fixed
+   character distance, missing the multi-line form the model pretty-prints for
+   list-typed fields — 53 sites, 39 names dropped (harmless by luck: none
+   collided with a writable attribute on its own cluster).
+2. ``parse_cluster`` had the same fixed-distance window on ``Attribute(`` —
+   265 sites, **14 of them writable** (``FanControl.RockSetting``,
+   ``Thermostat.Presets``, twelve others), missing from the day #191 shipped.
+3. ``is_writable`` tested ``"RW" in access``, missing matter.js's ``R[W]``
+   (conditionally/optionally writable) form — 13 more, twelve DoorLock
+   settings including ``AutoRelockTime``, one Thermostat.
+4. ``_props`` was a flat ``findall`` into a dict comprehension, so a nested
+   ``default: {type, name}`` object overwrote the attribute's own — five
+   attributes printed under the WRONG NAME, one writable one not.
+5. ``is_writable`` (defect 3) was defined and used by ``emit_table``, but
+   ``main()``'s ``--out`` report path still ran its own ``"RW" not in access``
+   test rather than calling it, so the markdown report and the checked-in
+   table disagreed on 13 attributes — including the two this branch's
+   ADR-0006 is about, ``DoorLock.AutoRelockTime`` and
+   ``DoorLock.OperatingMode``.
+6. ``parse_cluster`` reads only what is literally on one element, but
+   matter.js resolves an attribute's name and access through the cluster's
+   base chain (``type: "SomeBase"`` — ``ValueModel``/
+   ``ModelTraversal.findAccess``). ``HepaFilterMonitoring``
+   (``type: "ResourceMonitoring"``) has ZERO ``Attribute(`` children of its
+   own, so every one of its attribute names came out EMPTY — the exact
+   failure the explorer exists to prevent — repeated across ~180 attributes
+   on 31 derived clusters. ``resolve_cluster_attributes`` (below) fixes this.
+
+Each was found by review, not by a test that existed first — which is why the
+tests in ``tests/test_enumerate_settings.py`` exist now: a text parse that
+quietly matches nothing, or matches the wrong thing, reads identically to a
+correct one until someone counts.
+
 **What it deliberately does NOT do.** It does not decide what is a *setting*.
 Plenty of writable attributes are controls the plugin already drives (a level, a
 setpoint), and privilege does not separate them: `HoldTime` is `RW VM` while
@@ -439,6 +477,81 @@ def command_parameters(writable: dict, names: dict, command_fields: dict) -> dic
     return parameters
 
 
+def resolve_cluster_attributes(name: str, own_by_name: dict, base_by_name: dict) -> list:
+    """*name*'s attributes, merged with its base chain's (defect 6, family item 6).
+
+    matter.js composes a derived cluster's attribute set from its base's via
+    ``type: "BaseName"`` — ``ClusterElement``'s ``type`` names another cluster
+    element, not a datatype, and ``ValueModel``/``ModelTraversal.findAccess``
+    walk that chain at runtime to answer "what is this attribute's name/access".
+    ``parse_cluster`` only ever sees one element's own literal, so a cluster
+    declared with zero ``Attribute(`` children of its own — ``HepaFilterMonitoring
+    = Cluster({ name: "HepaFilterMonitoring", id: 113, type: "ResourceMonitoring" })``,
+    no attribute list at all — previously produced an EMPTY entry in every table
+    this generator writes.
+
+    The merge is per-attribute-id, not per-cluster: a derived declaration wins
+    key-by-key over the inherited one (``BridgedDeviceBasicInformation``
+    redeclares ``NodeLabel`` with only ``conformance: "O"``, narrowing
+    ``BasicInformation``'s ``conformance: "M"`` — its ``access: "RW VM"`` still
+    has to come from the base, or the override silently erases it). An override
+    resolving to ``conformance: "X"`` (not applicable) EXCLUDES the attribute
+    outright — this is how ``OvenMode`` and the other nine ``ModeBase``-derived
+    clusters retire ``StartUpMode``/``OnMode`` without becoming new writable
+    settings.
+
+    ``type`` is only followed when it names another parsed cluster element —
+    *own_by_name* is the full set of ``Cluster(...)`` literals found, by name,
+    whether or not they carry their own id (an abstract base like ``ModeBase``
+    has none). A ``type`` that resolves to nothing real, or to itself through a
+    cycle, is treated as no base at all rather than raising: a model that stops
+    composing cleanly should still degrade to "own attributes only", not abort
+    the whole table.
+
+    *name* itself, by contrast, is trusted to already be a key of
+    *own_by_name* — every caller (``emit_table``, and this function calling
+    itself for an already-checked ``base_name``) only ever passes a name it
+    just confirmed was parsed. That is what makes the ``type`` guard above
+    load-bearing rather than redundant: drop the ``in own_by_name`` half of it
+    and the very next line's lookup is a ``KeyError`` on any ``type`` that
+    doesn't resolve, not a quiet no-op.
+    """
+    return _merge_inherited(name, own_by_name, base_by_name, {}, frozenset())
+
+
+def _merge_inherited(name: str, own_by_name: dict, base_by_name: dict,
+                      cache: dict, stack: frozenset) -> list:
+    if name in cache:
+        return cache[name]
+    if name in stack:
+        return []  # cycle guard — a base chain that loops back on itself
+    base_by_id: dict[int, dict] = {}
+    base_name = base_by_name.get(name)
+    if base_name and base_name in own_by_name:
+        for attr in _merge_inherited(base_name, own_by_name, base_by_name,
+                                      cache, stack | {name}):
+            attr_id = attr.get("id")
+            if isinstance(attr_id, int):
+                base_by_id[attr_id] = attr
+
+    merged: dict[int, dict] = dict(base_by_id)
+    for attr in own_by_name[name]:
+        attr_id = attr.get("id")
+        if not isinstance(attr_id, int):
+            continue
+        # Key-by-key merge, not whole-record replacement: the derived literal
+        # only carries the fields it changes (see resolve_cluster_attributes).
+        combined = {**base_by_id[attr_id], **attr} if attr_id in base_by_id else attr
+        if combined.get("conformance") == "X":
+            merged.pop(attr_id, None)
+            continue
+        merged[attr_id] = combined
+
+    result = list(merged.values())
+    cache[name] = result
+    return result
+
+
 def emit_table(elements: Path, path: Path) -> tuple[int, int, dict]:
     """Write the generated attribute table. Returns ``(clusters, writable, parameters)``.
 
@@ -456,11 +569,23 @@ def emit_table(elements: Path, path: Path) -> tuple[int, int, dict]:
     names: dict[int, dict[int, str]] = {}
     writable: dict[int, set] = {}
     command_fields: dict[int, set] = {}
+    # Every parsed Cluster(...) literal, by name, whether or not it has its own
+    # id — an abstract base like ModeBase or ResourceMonitoring never appears in
+    # `clusters` (nothing to key it by) but still has to be here, or a derived
+    # cluster's resolve_cluster_attributes() call finds no base to inherit from.
+    own_by_name: dict[str, list] = {}
+    base_by_name: dict[str, str] = {}
 
     for source in sorted(elements.glob("*.element.js")):
         cluster, attributes = parse_cluster(source)
         name, cluster_id = cluster.get("name"), cluster.get("id")
-        if not name or not isinstance(cluster_id, int):
+        if not name:
+            continue
+        own_by_name.setdefault(name, attributes)
+        base_type = cluster.get("type")
+        if isinstance(base_type, str):
+            base_by_name.setdefault(name, base_type)
+        if not isinstance(cluster_id, int):
             continue
         # Unioned across files, where `clusters` below is first-writer-wins. The
         # asymmetry is deliberate: for an exclusion list the conservative answer is
@@ -471,7 +596,9 @@ def emit_table(elements: Path, path: Path) -> tuple[int, int, dict]:
         # alias or a revision split). First writer wins, deterministically,
         # because the files are walked in sorted order.
         clusters.setdefault(cluster_id, str(name))
-        for attr in attributes:
+
+    for cluster_id, name in clusters.items():
+        for attr in resolve_cluster_attributes(name, own_by_name, base_by_name):
             attr_id, attr_name = attr.get("id"), attr.get("name")
             if not isinstance(attr_id, int) or not attr_name:
                 continue
@@ -541,14 +668,15 @@ def emit_table(elements: Path, path: Path) -> tuple[int, int, dict]:
         "}",
         "",
         "#: ``{cluster_id: frozenset(attribute_ids)}`` — writable attributes that",
-        "#: are ALSO a field of a command on their OWN cluster. These are set BY",
-        "#: that command and are not configuration: the value has no meaning until",
-        "#: the command runs, and the command's own implementation owns it. OnOff's",
-        "#: OnTime is the case that proved it — writable, settable, verified by",
-        "#: read-back, and completely inert, because a WRITE never starts the",
-        "#: countdown; only OnWithTimedOff does (matter.js says so in as many words",
-        "#: at OnOffServer.js:38-40). Off then zeroes it, under the Lighting-feature",
-        "#: guard that every device carrying the attribute satisfies (issue #197).",
+        "#: are ALSO a field of a command on their OWN cluster. This is a DETECTOR,",
+        "#: not the decision: sharing a name with a command field is evidence worth",
+        "#: checking, not proof the attribute is not configuration — the table now",
+        "#: contains ``DoorLock.OperatingMode``, which IS a real setting despite the",
+        "#: collision. The decision for every member here is made by hand, each",
+        "#: with its own spec citation, in ``settings_report.NOT_SETTINGS``",
+        "#: (confirmed not a setting) or ``settings_report.REVIEWED_COMMAND_FIELD_",
+        "#: COLLISIONS`` (confirmed a real setting anyway) — see ADR-0006. A test",
+        "#: asserts every member here is filed into exactly one of those two.",
         "COMMAND_FIELD_ATTRIBUTES: dict[int, frozenset] = {",
     ]
     for cluster_id in sorted(parameters):
@@ -613,7 +741,11 @@ def main() -> int:
             continue
         for attr in attributes:
             access = attr.get("access") or ""
-            if "RW" not in access:
+            # Defect 5 (module docstring): this used to be its own
+            # `"RW" not in access` test, disagreeing with is_writable() over
+            # the same 13 R[W] attributes emit_table() already counts —
+            # DoorLock.AutoRelockTime and DoorLock.OperatingMode among them.
+            if not is_writable(access):
                 continue
             strategy, note = classify_constraint(attr.get("constraint"))
             totals[strategy] += 1

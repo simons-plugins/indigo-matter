@@ -1,15 +1,16 @@
 """Tests for the table generator — `tools/enumerate_settings.py` (#191, #197).
 
-Nothing imported this module before #197, which is how FOUR parser defects
-reached the checked-in artefact. The shipped table claimed 110 writable
-attributes; the model has **137**.
+Nothing imported this module before #197, which is how a family of SIX parser
+defects reached the checked-in artefact — the full list, with evidence, is in
+`enumerate_settings.py`'s own module docstring rather than repeated here. The
+first four:
 
 * `parse_command_fields` located a `Field(`'s object literal by a fixed
   character distance, so it skipped the multi-line form — 53 sites, 39 names.
   Harmless by luck: none collided with a writable attribute on its own cluster.
 * `parse_cluster` had the same window on `Attribute(` — 265 sites, **14 of them
   writable**, so the report was blind to `FanControl.RockSetting`,
-  `Thermostat.Presets` and ten others from the day #191 shipped.
+  `Thermostat.Presets` and twelve others from the day #191 shipped.
 * Writability was tested as `"RW" in access`, which misses matter.js's `R[W]`
   (conditionally writable) form — **13 more**, twelve of them DoorLock settings
   including `AutoRelockTime`, the working analogue of the feature #197 retired.
@@ -17,6 +18,16 @@ attributes; the model has **137**.
   `default: {type, name}` overwrote the attribute's own — five attributes came
   out under the WRONG NAME, and the report printed those names to users. The
   only one of the four that produced wrong output rather than missing output.
+
+Two more, found by the same review that produced this docstring's predecessor:
+
+* `main()`'s `--out` report path re-implemented writability as its own
+  `"RW" not in access` test instead of calling `is_writable()`, so it and
+  `--emit-table` disagreed on 13 attributes.
+* `parse_cluster` reads one element's own literal only, but matter.js resolves
+  a derived cluster's (`type: "SomeBase"`) attributes through its base chain —
+  so a cluster with no `Attribute(` children of its own, like
+  `HepaFilterMonitoring`, produced empty names for every attribute it has.
 
 **That is the failure mode these tests exist for, and why they are worth having
 even though the generator is a build script.** The repo already carries the same
@@ -338,3 +349,204 @@ export const x = Cluster({ name: "DoorLock", id: 257 },
     _, attributes = es.parse_cluster(path)
     writable_ids = {a["id"] for a in attributes if es.is_writable(a.get("access"))}
     assert writable_ids == {0x23}
+
+
+# ---------------------------------------------------------------------------
+# main()'s --out path — defect A / module docstring family item 5: it had its
+# own "RW" not in access test instead of calling is_writable().
+# ---------------------------------------------------------------------------
+
+def test_out_report_uses_is_writable_not_a_hand_rolled_RW_test(tmp_path, monkeypatch):
+    """Runs the script end to end (via `main()`, not a helper) against a
+    cluster whose ONLY attribute is R[W]-writable. `"RW" not in access` marks
+    ``"R[W] VM"`` as not writable (no literal ``"RW"`` substring — the `[`
+    lands between the R and the W), so before this fix the attribute was
+    silently absent from the markdown report while `--emit-table` already
+    counted it via `is_writable()`. `--all-clusters` so a missing inbound
+    handler can't also explain the absence."""
+    elements = tmp_path / "elements"
+    elements.mkdir()
+    (elements / "thing.element.js").write_text('''
+export const x = Cluster({ name: "Thing", id: 64206 },
+  Attribute({ name: "OnlyRBracketW", id: 1, type: "uint8", access: "R[W] VM", conformance: "O" })
+)''')
+    out = tmp_path / "report.md"
+    monkeypatch.setattr(sys, "argv", [
+        "enumerate_settings.py", "--elements", str(elements),
+        "--all-clusters", "--out", str(out),
+    ])
+    assert es.main() == 0
+    assert "OnlyRBracketW" in out.read_text()
+
+
+# ---------------------------------------------------------------------------
+# resolve_cluster_attributes — inheritance through Cluster's `type:` (defect B
+# / module docstring family item 6)
+# ---------------------------------------------------------------------------
+
+def test_a_derived_cluster_with_zero_own_attributes_inherits_the_bases_names_and_access():
+    """THE bigger regression. `HepaFilterMonitoring = Cluster({ name: ...,
+    id: 113, type: "ResourceMonitoring" })` has no `Attribute(` children at
+    all — before this fix its entry in ATTRIBUTE_NAMES was an empty dict, so
+    the explorer printed every one of its attributes as a bare `0x....` with
+    no name, the exact failure #191 exists to prevent."""
+    own_by_name = {
+        "Base": [{"name": "Foo", "id": 1, "type": "string",
+                  "access": "RW VM", "conformance": "M"}],
+        "Derived": [],  # emit_table records every parsed cluster, even empty
+    }
+    base_by_name = {"Derived": "Base"}
+    result = es.resolve_cluster_attributes("Derived", own_by_name, base_by_name)
+    assert result == own_by_name["Base"]
+
+
+def test_a_derived_cluster_overriding_an_inherited_attribute_wins():
+    """THE regression that made the naive fix wrong: replacing the base's
+    whole record with the derived one (rather than merging field-by-field)
+    silently erases every field the derived declaration doesn't repeat.
+    `BridgedDeviceBasicInformation` redeclares `NodeLabel` with only
+    `conformance: "O"`, narrowing `BasicInformation`'s `conformance: "M"` —
+    but its `access: "RW VM"` has to keep coming from the base, or
+    WRITABLE_ATTRIBUTES loses the one setting this defect is about."""
+    own_by_name = {
+        "BasicInformation": [{
+            "name": "NodeLabel", "id": 5, "type": "string",
+            "access": "RW VM", "conformance": "M", "constraint": "max 32",
+            "quality": "N",
+        }],
+        "BridgedDeviceBasicInformation": [
+            {"name": "NodeLabel", "id": 5, "conformance": "O"},
+        ],
+    }
+    base_by_name = {"BridgedDeviceBasicInformation": "BasicInformation"}
+    result = es.resolve_cluster_attributes(
+        "BridgedDeviceBasicInformation", own_by_name, base_by_name)
+    assert len(result) == 1
+    attr = result[0]
+    assert attr["conformance"] == "O", "the derived override wins"
+    assert attr["access"] == "RW VM", "but fields it didn't repeat still come from the base"
+    assert attr["constraint"] == "max 32"
+
+
+def test_an_inherited_attribute_redeclared_conformance_x_is_excluded():
+    """`OvenMode` and the other nine `ModeBase`-derived clusters redeclare
+    `StartUpMode`/`OnMode` as `conformance: "X"` (not applicable) — this is
+    the mechanism that keeps those ten clusters from gaining new writable
+    settings once inheritance is honoured; without it #197's review would
+    have found ten new writable attributes, not one."""
+    own_by_name = {
+        "ModeBase": [{"name": "StartUpMode", "id": 2, "type": "uint8",
+                      "access": "RW VO", "conformance": "O"}],
+        "OvenMode": [{"name": "StartUpMode", "id": 2, "conformance": "X"}],
+    }
+    base_by_name = {"OvenMode": "ModeBase"}
+    result = es.resolve_cluster_attributes("OvenMode", own_by_name, base_by_name)
+    assert result == []
+
+
+def test_a_type_naming_a_non_cluster_is_ignored_safely():
+    """`type:` is a free-text field; nothing in the model constrains it to
+    always name a cluster that was actually parsed. A base that resolves to
+    nothing real must fall back to "own attributes only", not raise."""
+    own_by_name = {"Derived": [{"name": "Bar", "id": 2, "access": "R V"}]}
+    base_by_name = {"Derived": "NotARealCluster"}
+    result = es.resolve_cluster_attributes("Derived", own_by_name, base_by_name)
+    assert result == own_by_name["Derived"]
+
+
+def test_a_base_chain_cycle_does_not_infinite_loop():
+    """Nothing in the pinned model cycles, but `type:` is parsed text, not a
+    verified DAG — a future model (or a bad `--elements` copy) that has A and
+    B name each other as `type:` must not recurse until Python's stack gives
+    up; it should just treat the cycle as no base and return what it can."""
+    own_by_name = {
+        "A": [{"name": "X", "id": 1, "access": "RW VM"}],
+        "B": [],
+    }
+    base_by_name = {"A": "B", "B": "A"}
+    result = es.resolve_cluster_attributes("A", own_by_name, base_by_name)
+    assert result == own_by_name["A"]
+
+
+# ---------------------------------------------------------------------------
+# emit_table — end to end
+# ---------------------------------------------------------------------------
+
+def test_emit_table_end_to_end_populates_command_field_attributes(tmp_path):
+    """A synthetic model carrying exactly the four `KNOWN_COMMAND_FIELD_ATTRIBUTES`
+    pairs, run through the real `emit_table()` and the module it writes. Kills
+    two mutations that unit tests on the pieces wouldn't: `emit_table` omitting
+    the `COMMAND_FIELD_ATTRIBUTES` block from the written file entirely (caught
+    by asserting the executed module's dict is non-empty and exactly right, not
+    just that the string appears), and its three return values being swapped
+    (caught by pinning `clusters == 3`, distinct from `writable == 4`)."""
+    elements = tmp_path / "elements"
+    elements.mkdir()
+    (elements / "identify.element.js").write_text('''
+export const x = Cluster({ name: "Identify", id: 3 },
+  Attribute({ name: "IdentifyTime", id: 0, type: "uint16", access: "RW VO", conformance: "M" }),
+  Command(
+    { name: "Identify", id: 0, access: "O", conformance: "M", direction: "request", response: "status" },
+    Field({ name: "IdentifyTime", id: 0, type: "uint16", conformance: "M" })
+  )
+)''')
+    (elements / "onoff.element.js").write_text('''
+export const x = Cluster({ name: "OnOff", id: 6 },
+  Attribute({ name: "OnTime", id: 0x4001, type: "uint16", access: "RW VO", conformance: "LT" }),
+  Attribute({ name: "OffWaitTime", id: 0x4002, type: "uint16", access: "RW VO", conformance: "LT" }),
+  Command(
+    { name: "OnWithTimedOff", id: 66, access: "O", conformance: "LT", direction: "request", response: "status" },
+    Field({ name: "OnOffControl", id: 0, type: "map8", conformance: "M" }),
+    Field({ name: "OnTime", id: 1, type: "uint16", conformance: "M" }),
+    Field({ name: "OffWaitTime", id: 2, type: "uint16", conformance: "M" })
+  )
+)''')
+    (elements / "generalcommissioning.element.js").write_text('''
+export const x = Cluster({ name: "GeneralCommissioning", id: 0x30 },
+  Attribute({ name: "Breadcrumb", id: 0, type: "uint64", access: "RW VA", conformance: "M" }),
+  Command(
+    { name: "ArmFailSafe", id: 0, access: "A", conformance: "M", direction: "request", response: "ArmFailSafeResponse" },
+    Field({ name: "ExpiryLengthSeconds", id: 0, type: "uint16", conformance: "M" }),
+    Field({ name: "Breadcrumb", id: 1, type: "uint64", conformance: "M" })
+  )
+)''')
+    out = tmp_path / "writable_attributes.py"
+    clusters, writable, parameters = es.emit_table(elements, out)
+
+    assert clusters == 3
+    assert writable == 4
+    assert parameters == {
+        0x0003: {0x0000}, 0x0006: {0x4001, 0x4002}, 0x0030: {0x0000},
+    }
+
+    module_text = out.read_text()
+    assert "COMMAND_FIELD_ATTRIBUTES" in module_text
+    namespace: dict = {}
+    exec(compile(module_text, str(out), "exec"), namespace)
+    generated = namespace["COMMAND_FIELD_ATTRIBUTES"]
+    assert generated, "must be non-empty — not the whole block silently omitted"
+    found = {(c, a) for c, ids in generated.items() for a in ids}
+    assert found == es.KNOWN_COMMAND_FIELD_ATTRIBUTES
+
+
+# ---------------------------------------------------------------------------
+# model_version
+# ---------------------------------------------------------------------------
+
+def test_model_version_reads_the_packages_version(tmp_path):
+    """The version is stamped into the generated table as `MODEL_VERSION`,
+    which the plugin re-exports and prints to users — so a silent "unknown"
+    here makes the table lie about its own provenance."""
+    elements = tmp_path / "pkg" / "dist" / "esm" / "standard" / "elements"
+    elements.mkdir(parents=True)
+    (tmp_path / "pkg" / "package.json").write_text(
+        '{"name": "@matter/model", "version": "0.17.8"}', encoding="utf-8")
+    assert es.model_version(elements) == "0.17.8"
+
+
+def test_model_version_is_unknown_without_a_package_json():
+    """A directory copied out of its package (the documented workflow: 'copy
+    that directory locally') still produces a correct table — it just can't
+    say what produced it. Refusing to emit would be the wrong trade, so this
+    is the one field allowed to say "unknown"."""
+    assert es.model_version(Path("/nonexistent/standard/elements")) == "unknown"

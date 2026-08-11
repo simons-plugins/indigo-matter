@@ -89,9 +89,11 @@ ATTR_SUPPORTED_SENSITIVITY_LEVELS = 0x0001
 # Only StartUpOnOff is a SETTING. OnTime and OffWaitTime are the mandatory
 # OnTime/OffWaitTime fields of OnWithTimedOff (command 0x42). The load-bearing
 # fact, in matter.js's own words at OnOffServer.js:38-40: "Writes never start a
-# countdown — only OnWithTimedOff does." So a pre-set value does nothing at all;
-# off() then zeroes OnTime, inside an `if (this.features.lighting)` guard that
-# every device carrying the attribute satisfies (#197, ADR-0005).
+# countdown — only OnWithTimedOff does." So a pre-set value has no effect
+# BEFORE OnWithTimedOff runs; a write DURING Timed On is normative and
+# effective (Application Clusters R1.5 §1.5.6.4) — off() then zeroes OnTime,
+# inside an `if (this.features.lighting)` guard that every device carrying the
+# attribute satisfies (#197, ADR-0005 (superseded by ADR-0006)).
 #
 # Both ids are kept — deliberately unused for now — because implementing
 # OnWithTimedOff as an action would need them, and because a bare 0x4001 in a
@@ -145,17 +147,21 @@ class Bounds:
 #
 # Enumerating the Matter data model (tools/enumerate_settings.py) showed the
 # FP300's pattern is the RARE one: of 76 writable attributes on the clusters
-# this plugin handles, exactly 2 take their bounds from another attribute on the
-# device — and both are already shipped. Most are a range fixed by the spec, an
-# enum, or unbounded. So bounds are a declared STRATEGY rather than always a
-# device read, and the capability question ("does this unit implement the
-# attribute at all?") is answered separately, by the device's own AttributeList.
+# this plugin handles, exactly 6 take their bounds from another attribute on the
+# device (OccupancySensing.HoldTime, BooleanStateConfiguration.
+# CurrentSensitivityLevel, FanControl.SpeedSetting, LevelControl.OnLevel,
+# Thermostat.Presets, Thermostat.Schedules) — and all are already shipped or
+# accounted for. Most are a range fixed by the spec, an enum, or unbounded. So
+# bounds are a declared STRATEGY rather than always a device read, and the
+# capability question ("does this unit implement the attribute at all?") is
+# answered separately, by the device's own AttributeList.
 #
 # The count was 57 until #197's review fixed three generator defects (multi-line
 # `Attribute(`, the `R[W]` access form, and a last-match-wins property parse).
-# The ARGUMENT is unchanged and in fact strengthened — 2 of 76 rather than 2 of
-# 57. ADR-0002 and ADR-0003 quote the old figure and are immutable; ADR-0006
-# carries the correction.
+# The ARGUMENT is unchanged and in fact strengthened — 6 of 76 rather than the
+# 2 of 57 ADR-0002/0003 quote (that figure was itself an undercount: four of
+# the six were already in the old 57). ADR-0002 and ADR-0003 quote the old
+# figure and are immutable; ADR-0006 carries the correction.
 # ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
@@ -396,7 +402,8 @@ SETTINGS: tuple = (
     # StartUpOnOff is the ONLY genuine setting on this cluster. OnTime (0x4001)
     # and OffWaitTime (0x4002) are writable and look like siblings, but they are
     # parameters of OnWithTimedOff — declaring one shipped a dialog field that
-    # could never work (#197, ADR-0005). Do not add them back.
+    # could never work (#197, ADR-0005 (superseded by ADR-0006)). Do not add
+    # them back.
     DeviceSetting(
         key="startUpOnOff",
         label="After a power cut",

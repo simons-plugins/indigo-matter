@@ -21,7 +21,7 @@ own cluster is that command's parameter, generated into
 and (as a label) the explorer.
 
 Issue #197's follow-up put that rule through a full spec review — Application
-Clusters R1.2 and core sections, cited attribute by attribute — not because the
+Clusters R1.5 and core sections, cited attribute by attribute — not because the
 outcome it produced (retiring `onTime`) was wrong, but to check whether the
 mechanism reached it for the right reason. It was not. The rule is right about
 its four founding members for **three unrelated reasons**, is provably false as
@@ -47,7 +47,8 @@ ADR restates why with the spec citations ADR-0005 didn't have.
   `quality` signature that could be tested instead.
 * ADR-0005 understated its own rejected alternative's damage: `quality: "N"`
   does not drop one real setting (`SmokeCoAlarm.SmokeSensitivityLevel`), it drops
-  roughly fifteen, including an entire cluster
+  **46** writable attributes that lack it — more than twenty of them plainly
+  user-facing — including an entire cluster
   (`ThermostatUserInterfaceConfiguration`) and attributes both Home Assistant and
   ZHA ship as user-facing config (`LevelControl.OnOffTransitionTime`/`OnLevel`/
   `OnTransitionTime`).
@@ -60,7 +61,7 @@ ADR restates why with the spec citations ADR-0005 didn't have.
 
 * Keep the command-field rule as the decision authority (status quo)
 * Narrow the command-field rule to exclude request/response asymmetries
-* Filter on write privilege (`Manage` vs `View`/`Operate`)
+* Filter on write privilege (`Manage` or above vs below)
 * A hand-curated `NOT_SETTINGS` exclusion list, each entry citing its spec
   section, with the generated `COMMAND_FIELD_ATTRIBUTES` demoted to a
   cross-checked **detector** rather than the filter itself
@@ -77,7 +78,7 @@ more certain, not less:
 
 * **Retiring the `onTime` setting was correct — and is now confirmed by the
   specification itself, not by matter.js's implementation.** Application
-  Clusters R1.2 §1.5.6.4: *"This attribute can be written at any time, but
+  Clusters R1.5 §1.5.6.4: *"This attribute can be written at any time, but
   writing a value only has effect when in the Timed On state."* §1.5.7.6.4
   defines the decrement loop only inside `OnWithTimedOff`'s Effect on Receipt,
   and the §1.5.8 state machine (Figure 2) shows `OnWithTimedOff` is the **only**
@@ -85,7 +86,8 @@ more certain, not less:
   expose no `OnTime` config entity; zigbee2mqtt implements `on_time` only as
   command 0x42, never as an attribute write.
 * **Rejecting `quality: "N"` as the filter remains right — and ADR-0005
-  understated it.** Roughly fifteen real settings lack `N`, not one:
+  understated it.** **46** writable attributes lack `N`, not one — more than
+  twenty of them plainly user-facing:
   `LevelControl.OnOffTransitionTime`/`OnLevel`/`OnTransitionTime` (which Home
   Assistant and ZHA both ship as user config), the whole
   `ThermostatUserInterfaceConfiguration` cluster, several `DoorLock` settings,
@@ -96,13 +98,14 @@ more certain, not less:
 * **Its stated principle is false for half its own members.** "A command that
   takes the attribute as a parameter owns it, so a pre-set does nothing" holds
   for `OnOff.OnTime`/`OffWaitTime` (§1.5.6.4 above) but not for the other two of
-  its four founding members. `Identify.IdentifyTime` — core §1.2.5.1: *"If this
-  attribute is set to a value other than 0 then the device shall enter its
-  identification state"* — writing IS the mechanism; there is no command that
-  must run first. `GeneralCommissioning.Breadcrumb` — core §11.10.6.1 — is
-  commissioner/administrator scratch space, written by design and zeroed on
-  restart; nothing about it being a command's field parameter is why it fails to
-  be a setting. Four right answers, reached through **three unrelated
+  its four founding members. `Identify.IdentifyTime` — Application Clusters
+  R1.5 §1.2.5.1: *"If this attribute is set to a value other than 0 then the
+  device shall enter its identification state"* — writing IS the mechanism;
+  there is no command that must run first. `GeneralCommissioning.Breadcrumb`
+  — core §11.10.6.1 — is commissioner/administrator scratch space, written by
+  design and zeroed on restart; nothing about it being a command's field
+  parameter is why it fails to be a setting. Four right answers, reached
+  through **three unrelated
   mechanisms** — a single mechanical test cannot be evidence for all three at
   once, however often it happened to land on the right side.
 * **ADR-0005 claimed no false positive existed in the pinned model. That was an
@@ -148,13 +151,22 @@ Findings from the same review that would otherwise be rediscovered the hard way:
   nothing about meaning" is baked into the mandatory certification test plan
   itself. `Test_TC_OO_2_3.yaml` exercises Timed On exclusively via
   `OnWithTimedOff`, never via a direct write.
-* **A fourth option was considered and rejected: filter on write privilege.**
-  Core §9.10.5.2.2 defines `Manage` as *"can modify persistent configuration"* —
-  the closest thing the spec has to a stated configuration marker. It fails both
-  ways: `Breadcrumb` is `VA` (would be wrongly promoted to a setting) and
+* **A fourth option was considered and rejected: filter on write privilege
+  (Manage or above).** Core R1.5 §9.10.5.2 "AccessControlEntryPrivilegeEnum
+  Type", table value 4 (Manage) — *"Operate privileges, and can modify
+  persistent configuration of this Node"* — is the closest thing the spec has
+  to a stated configuration marker (the per-value descriptions are unnumbered
+  headings; in R1.2/R1.3 the same table is §9.10.4.2). Privilege ranks View 1,
+  ProxyView 2, Operate 3, Manage 4, Administer 5, so the only reading under
+  which the rule demotes what it should is "privilege is Manage or above" — a
+  literal "privilege equals Manage" reading fails immediately, since it would
+  also demote `Breadcrumb`. Read that way it still fails both ways:
+  `Breadcrumb` is `RW VA` (Administer, one level above Manage) — it passes
+  "Manage or above" and would be wrongly promoted to a setting — and
   `LevelControl.OnLevel`, `ThermostatUserInterfaceConfiguration.TemperatureDisplayMode`,
-  and `BooleanStateConfiguration.CurrentSensitivityLevel` are all `VO` (would be
-  wrongly demoted from real settings).
+  and `BooleanStateConfiguration.CurrentSensitivityLevel` are all `VO`
+  (Operate, below Manage) — they fail the filter and would be wrongly demoted
+  from real settings.
 * **Corrections to ADR-0005's own wording, recorded here because that ADR is
   immutable and cannot be edited.** "A pre-set value does nothing at all" and "a
   state that can only ever read 0" are overstated: a write *during* Timed On is
@@ -166,11 +178,12 @@ Findings from the same review that would otherwise be rediscovered the hard way:
   auto-on" was verified for the OnOff cluster only (there is no `OffTime`
   attribute there) — it was never checked across all clusters and should not be
   read as a workspace-wide claim.
-* **A count correction.** ADR-0005 said "four of 110/124 writable" and "30
-  further attributes … excluded only by being read-only". After the parser fix
-  the model has **137** writable attributes (not 124), and one member of that
-  ~30 — `DoorLock.OperatingMode` — was never read-only at all; it was invisible
-  to the buggy parser, which is a different failure than the one ADR-0005
+* **A count correction.** ADR-0005 said "four of 124 writable" and "30
+  further attributes … excluded only by being read-only" — "110/" appears
+  nowhere in ADR-0005 itself. After the parser and inheritance fixes the model
+  has **141** writable attributes (not 124), and one member of that ~30 —
+  `DoorLock.OperatingMode` — was never read-only at all; it was invisible to
+  the buggy parser, which is a different failure than the one ADR-0005
   described.
 * **A note on stale language elsewhere.** Commit `50136e3`'s message asserts the
   very inference this ADR rejects: "quality N … which is exactly what OnTime
@@ -180,8 +193,14 @@ Findings from the same review that would otherwise be rediscovered the hard way:
   [ADR-0002](0002-writable-settings-are-a-declarative-registry.md) and
   [ADR-0003](0003-attributelist-is-the-capability-authority.md) also carry a
   stale "57 writable attributes on handled clusters / would have excluded 55"
-  figure. Those ADRs are immutable, so the correction is recorded here instead:
-  the true figures, as of this review, are **76** and **74**.
+  figure — itself already wrong when written: four of the six attributes that
+  take bounds from another device attribute were already present in that old
+  57, not the two ADR-0002/0003 counted. Those ADRs are immutable, so the
+  correction is recorded here instead: the true figures, as of this review,
+  are **76** writable attributes on the clusters this plugin handles, of which
+  **6** take bounds from another device attribute, so a registry requiring one
+  would have excluded **70**. The argument those ADRs made survives unchanged
+  — 6 of 76 is still a small minority — only the count was ever wrong.
 
 ### Consequences
 
@@ -214,8 +233,9 @@ filed as both a non-setting and a reviewed real setting.
 cover the case this ADR exists for; `test_the_explorer_still_labels_on_time_a_command_parameter`
 is the control case alongside it.
 
-**Confirmed live on jarvis, 2026-08-11 20:16 UTC, plugin 2026.12.0.** All seven
-commissioned nodes re-surveyed on restart — the banked fingerprints are
+**Confirmed live on jarvis, 2026-08-11 19:16 UTC (20:16 BST), plugin
+2026.12.0.** All seven commissioned nodes re-surveyed on restart — the banked
+fingerprints are
 `{"39":"1.0.26#[]", "46":"1.9.15#[]", "47":"1.0.21#[]", "49":"1.3.0#[]",
 "50":"1.2.0-s2#[]", "52":"1.4.6#[]", "56":"1.1.3.8#[]"}` — every settable set
 empty. So the report is silent because there is nothing to say, not because the
@@ -229,11 +249,12 @@ endpoint-0 wording is unverified on hardware. Both are covered by unit tests onl
 
 **The retirement notice's per-device count was verified against real hardware and
 is the reason the naive version was wrong.** The fabric has four `matterRelay`
-devices; the notice reported **two**. The two that lost `startUpOnOff` in the same
-restart (an IKEA ALPSTUGA and a Shelly 1PM Mini Gen3) are the pair without the
-Lighting feature, so the two that genuinely carried `onTime` were the GRILLPLATS
-and the Tapo plug. Counting relays would have told two users their triggers may
-have broken when those devices never had the state.
+devices; the notice reported **two**. What the hardware confirms is only this:
+the two the notice reported (an IKEA ALPSTUGA and a Shelly 1PM Mini Gen3) were
+the two whose persisted Indigo states still carried `onTime` when `startup()`
+read them; the other two (the GRILLPLATS and the Tapo plug) did not. Counting
+all four relays would have told two users their triggers may have broken when
+those devices never had the state.
 
 That result also settles, empirically, the ordering assumption the notice depends
 on and which no Indigo document states outright: `startup()` runs before
@@ -259,16 +280,19 @@ was read. Had the states already migrated, the count would have been zero.
   so excluding `*Response` commands does not help, and the four true members
   share no `access` or `quality` signature a narrower rule could test instead.
 
-### Filter on write privilege (`Manage`)
+### Filter on write privilege (`Manage` or above)
 
-* Good, because core §9.10.5.2.2 gives it an actual spec definition —
-  "can modify persistent configuration" — closer to a stated marker than
-  anything else in the model.
-* Bad, because it fails in both directions: `Breadcrumb` (`VA`) would be wrongly
-  promoted, and `LevelControl.OnLevel`,
+* Good, because Core R1.5 §9.10.5.2 gives `Manage` an actual spec definition —
+  "Operate privileges, and can modify persistent configuration of this Node" —
+  closer to a stated marker than anything else in the model.
+* Bad, because reading the filter as "Manage or above" (the only reading under
+  which it demotes what it should — a literal "equals Manage" reading would
+  also demote `Breadcrumb`) still fails in both directions: `Breadcrumb`
+  (`RW VA`, Administer — one level above Manage) would be wrongly promoted,
+  and `LevelControl.OnLevel`,
   `ThermostatUserInterfaceConfiguration.TemperatureDisplayMode`, and
-  `BooleanStateConfiguration.CurrentSensitivityLevel` (all `VO`) would be
-  wrongly demoted.
+  `BooleanStateConfiguration.CurrentSensitivityLevel` (all `VO`, Operate —
+  below Manage) would be wrongly demoted.
 
 ### A hand-curated `NOT_SETTINGS` list, cross-checked by the generator
 
@@ -315,7 +339,7 @@ superseded it).
   rule. It was tried, reviewed against the spec, and found to hold for only one
   of its four founding members for that reason.
 - DON'T: treat `quality: "N"` as a proxy for "is a setting" — it misclassifies
-  roughly fifteen real settings, not one.
+  46 writable attributes, not one.
 - DON'T: declare `DoorLock.OperatingMode` a command parameter. It is a real
   setting; the collision with `SetHolidaySchedule`'s field of the same name is
   reviewed and recorded in `REVIEWED_COMMAND_FIELD_COLLISIONS`.
