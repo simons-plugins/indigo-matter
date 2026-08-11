@@ -187,6 +187,31 @@ Module-level description: [`../ARCHITECTURE.md`](../ARCHITECTURE.md) rows for
 Issues: #190 (per-unit capability withdrawal), #186 (shipped the `onTime`
 setting), #197 (retired it; this ADR is its live-experiment follow-up).
 
+### Addendum (2026-08-11): a label names the attribute, not the behaviour
+
+`onTime`'s `TriggerLabel`/`ControlPageLabel` shipped in #186 as `Auto-Off
+Timer (retired — do not use)`. That label was wrong at the root, and not
+because it needed a "(retired)" suffix — it never named the thing it was
+labelling. `OnTime` (0x4001) is a parameter of a command this plugin never
+sends; there was never an auto-off timer, so "Auto-Off Timer" was not a stale
+name for the state, it was a claim about a behaviour the attribute never had.
+That claim outlived the feature it described by a full release, because a
+label is read far less often than the code around it is changed — the same
+failure mode this repo already knows from comments, on a surface (Indigo's
+trigger and control-page editors) a comment audit never reaches.
+
+The generalisable rule this leaves behind: a state's `TriggerLabel`/
+`ControlPageLabel` must name the Matter **attribute** it carries, never
+assert the **behaviour** the author hoped it would have. A label that makes
+a claim ages exactly as badly as a comment that makes one — worse, because a
+user reads it with no source history to check it against. `onTime`'s label
+is now `OnTime (retired)`: the honest attribute name, plus the one fact that
+is still true. "Auto-Off Timer" is gone from `Devices.xml`; the retirement
+notice in `plugin.py` (`_announce_retired_on_time_state`) now names the
+state on both surfaces a user might be looking at — the device inspector's
+KEY (`onTime`) and the trigger editor's LABEL (`OnTime (retired)`) — instead
+of repeating the retired label.
+
 ## For AI agents
 - DO: withdraw a state per unit only on positive evidence that specific unit
   lacks the capability (ADR-0003) — never for a setting the plugin is retiring

@@ -73,6 +73,15 @@
                  silently orphaned — still enabled, nothing in the log, and its
                  own dialog quietly repoints at a different, real state. Kept, it
                  stays bound to what the user actually built; it just never fires.
+                 The label below used to be "Auto-Off Timer (retired — do not
+                 use)" (#186) — wrong at the root: it described a behaviour this
+                 attribute never had instead of naming the attribute itself. A
+                 TriggerLabel/ControlPageLabel must NAME the state, not assert a
+                 behaviour — a label that claims ages exactly as badly as a
+                 comment that does. Now "OnTime (retired)": names the real
+                 Matter attribute, says it is dead. "do not use" is dropped —
+                 the state cannot do anything, so there is nothing left to
+                 not-use (see workspace ADR-0007's addendum).
                  plugin.py's deviceStartComm primes it to 0 with
                  uiValue="<unused>" on every start so it reads as dead rather
                  than as a stalled reading — uiValue is display-only (Indigo API
@@ -82,8 +91,8 @@
                  OnTime. -->
             <State id="onTime">
                 <ValueType>Integer</ValueType>
-                <TriggerLabel>Auto-Off Timer (retired — do not use)</TriggerLabel>
-                <ControlPageLabel>Auto-Off Timer (retired — do not use)</ControlPageLabel>
+                <TriggerLabel>OnTime (retired)</TriggerLabel>
+                <ControlPageLabel>OnTime (retired)</ControlPageLabel>
             </State>
         </States>
         <UiDisplayStateId>onOffState</UiDisplayStateId>

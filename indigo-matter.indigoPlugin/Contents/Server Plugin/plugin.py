@@ -288,9 +288,9 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, ServerMenuMixin,
         experiment (ADR-0006's Confirmation, 2026-08-11) found that withdrawing
         a state leaves any trigger already bound to it silently orphaned:
         still enabled, nothing in the log, its own dialog quietly repointed at
-        a different, real state. Kept instead, a trigger built on 'Auto-Off
-        Timer' stays bound to what its author actually built — it simply never
-        fires, because ``deviceStartComm``/``_prime_retired_on_time_state``
+        a different, real state. Kept instead, a trigger built on the
+        ``onTime`` state stays bound to what its author actually built — it
+        simply never fires, because ``deviceStartComm``/``_prime_retired_on_time_state``
         pin the state at 0 with ``uiValue="<unused>"`` on every start and
         nothing else writes it. So this notice no longer has a broken binding
         to warn about; it only has to say the setting is gone from the dialog
@@ -325,11 +325,12 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, ServerMenuMixin,
                     "Matter: the 'Auto-off after' device setting has been removed from "
                     "the Edit Device dialog on %d relay device(s) — Matter's OnTime is a "
                     "parameter of a command this plugin does not send, not a stored "
-                    "setting, so it never did anything. The 'Auto-Off Timer' state stays "
-                    "on the device, so any trigger already built on it stays bound, but "
-                    "it will never update again — the device's properties now show it as "
-                    "'<unused>'. Use Indigo's own 'Auto-off after X minutes' on the "
-                    "device's turn-on action instead. See issue #197.", len(affected))
+                    "setting, so it never did anything. The device's 'onTime' state — "
+                    "shown as 'OnTime (retired)' in the trigger and control page editors "
+                    "— stays on the device, so any trigger already built on it stays "
+                    "bound, but it will never update again — the device's properties now "
+                    "show it as '<unused>'. Use Indigo's own 'Auto-off after X minutes' "
+                    "on the device's turn-on action instead. See issue #197.", len(affected))
             self.pluginPrefs[ON_TIME_RETIRED_PREF] = True
             # Through the shared seam rather than a bare savePluginPrefs(): that is
             # the commit, and without it the flag survives only until the plugin
