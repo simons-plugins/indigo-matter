@@ -187,6 +187,11 @@ typeset. **Start here.**
 Setup is covered above; the [full install guide](https://simons-plugins.github.io/indigo-matter/INSTALL.html)
 has the "On another computer" mode, backups, upgrading and troubleshooting.
 
+- **[`docs/DEVICE-NOTES.md`](https://github.com/simons-plugins/indigo-matter/blob/main/docs/DEVICE-NOTES.md)** —
+  behaviours of specific hardware that are not obvious from the spec: the Tapo
+  reset holds (one keeps your fabrics, one wipes them), the BILRESA channel →
+  endpoint map, and why a sleepy Thread device takes seconds to answer.
+
 ## Development
 
 ```bash
@@ -195,13 +200,15 @@ pytest          # full unit suite; matter-server (WebSocket) and Indigo are mock
 
 Developer reference, in the repo — not intended as user documentation:
 
+- [`docs/ARCHITECTURE.md`](https://github.com/simons-plugins/indigo-matter/blob/main/docs/ARCHITECTURE.md) — what every module does and why. **Read before changing one.**
+- [`docs/adr/INDEX.md`](https://github.com/simons-plugins/indigo-matter/blob/main/docs/adr/INDEX.md) — architecture decisions: what was chosen, what was rejected, and what must not be revisited.
 - [`docs/IMPLEMENTATION.md`](https://github.com/simons-plugins/indigo-matter/blob/main/docs/IMPLEMENTATION.md) — protocols, scaffold, cluster handlers.
 - [`docs/API.md`](https://github.com/simons-plugins/indigo-matter/blob/main/docs/API.md) — the Domio ↔ plugin HTTP contract (v1.4).
 - [`docs/BRIDGE_PROTOCOL.md`](https://github.com/simons-plugins/indigo-matter/blob/main/docs/BRIDGE_PROTOCOL.md) — the plugin ⇄ bridge-node local protocol (export side).
 - [`docs/PRD-indigo-matter-plugin.md`](https://github.com/simons-plugins/indigo-matter/blob/main/docs/PRD-indigo-matter-plugin.md) — product requirements and milestones (inbound).
 - [`docs/PRD-indigo-matter-export.md`](https://github.com/simons-plugins/indigo-matter/blob/main/docs/PRD-indigo-matter-export.md) — the same for the Matter bridge.
 - [`bridge-node/`](https://github.com/simons-plugins/indigo-matter/tree/main/bridge-node) — the bridge node itself (TypeScript; the only place matter.js is imported). `npm run build && npm test`.
-- [`CLAUDE.md`](https://github.com/simons-plugins/indigo-matter/blob/main/CLAUDE.md) — architecture and workspace conventions.
+- [`CLAUDE.md`](https://github.com/simons-plugins/indigo-matter/blob/main/CLAUDE.md) — orientation and workspace conventions (the per-module detail moved to `docs/ARCHITECTURE.md`).
 
 ## Trademarks and certification
 
