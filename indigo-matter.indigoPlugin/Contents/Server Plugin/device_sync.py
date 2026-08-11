@@ -1405,15 +1405,25 @@ class DeviceSync:
         None means "not captured", NOT "implements nothing" — callers must not
         read it as proof a device lacks an attribute (see settings.implements).
 
-        **Lock-free on purpose, and it has to be.** Since #190 this is reached
-        from ``Plugin.getDeviceStateList``, which Indigo calls on ITS thread —
-        including while ``create_devices`` is inside ``indigo.device.create()``
-        on the asyncio thread holding ``_lock``. Taking the lock here would let
-        Indigo's thread block on a lock held by a thread that is itself waiting
-        on Indigo: a hang of the whole server UI, not merely of this plugin.
-        The lock is not needed anyway — writers REPLACE the dict rather than
-        mutate it, so a reader either sees the whole old map or the whole new
-        one, and attribute binding is atomic under the GIL.
+        **Lock-free, because the lock buys nothing here** — not because it would
+        be unsafe to take. Writers REPLACE the dict rather than mutate it, so a
+        reader sees either the whole old map or the whole new one, and the
+        rebinding is atomic under the GIL.
+
+        An earlier version of this comment claimed the lock-free read was
+        REQUIRED, on the grounds that ``getDeviceStateList`` runs on Indigo's
+        thread and could deadlock against ``create_devices`` holding ``_lock``
+        inside ``indigo.device.create()``. That argument does not survive
+        contact with the callback it names: ``deviceStartComm`` reaches this via
+        ``stateListOrDisplayStateIdChanged`` and then calls ``note_device``
+        thirteen lines later, which takes ``_lock`` anyway — so the hang would
+        merely move. Indigo evidently does not invoke ``deviceStartComm``
+        synchronously on a foreign thread from inside ``device.create()``, since
+        the plugin creates devices in the field without hanging there.
+
+        Do not read this docstring as "Indigo-thread paths must avoid ``_lock``".
+        Several already take it (``note_device``, ``set_active``, ``lookup`` from
+        the actionControl path).
         """
         return self._attribute_lists.get(
             (int(node_id), int(endpoint_id), int(cluster)))

@@ -979,6 +979,7 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, ServerMenuMixin,
         kept = indigo.List()
         removed = []
         unreadable = 0
+        total = len(states)
         for state in states:
             try:
                 key = state["Key"]
@@ -998,7 +999,7 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, ServerMenuMixin,
             # Indigo could rename it and this is the only warning anyone gets.
             self.logger.warning(
                 'device "%s": %d of %d state entries could not be read, so the Matter '
-                "capability filter was not applied to them", dev.name, unreadable, len(kept))
+                "capability filter was not applied to them", dev.name, unreadable, total)
         if removed:
             # INFO, and worth it: a state disappearing silently breaks any
             # trigger or control page bound to it, with nothing in the log to
@@ -1008,9 +1009,10 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, ServerMenuMixin,
             # before the first reconcile has run, so the cache is cold, every
             # answer is unknown and nothing is removed. The line comes from the
             # first _refresh_state_lists after that reconcile, and thereafter
-            # only when a node's AttributeLists actually change. Indigo also
-            # rebuilds when an Edit Device dialog is dismissed, so editing one of
-            # these devices reprints it.
+            # when a node's AttributeLists change OR the pass created a device
+            # (the refresh covers the whole node, so a new sibling reprints this
+            # for the devices already filtered). Indigo also rebuilds when an
+            # Edit Device dialog is dismissed, so editing one reprints it.
             self.logger.info(
                 'device "%s": removed the state(s) %s — this unit\'s AttributeList says it '
                 "does not implement %s, so the values shown were Indigo's defaults rather "
