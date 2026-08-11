@@ -63,7 +63,7 @@ __all__ = [
     "parse_limits_struct", "parse_level_count",
     "settings_for_type", "coerce_value", "verify_write", "implements", "NO_ANSWER",
     "CLUSTER_OCCUPANCY_SENSING", "ATTR_HOLD_TIME", "ATTR_HOLD_TIME_LIMITS",
-    "CLUSTER_ON_OFF", "ATTR_START_UP_ON_OFF", "ATTR_ON_TIME",
+    "CLUSTER_ON_OFF", "ATTR_START_UP_ON_OFF", "ATTR_ON_TIME", "ATTR_OFF_WAIT_TIME",
     "ATTR_ATTRIBUTE_LIST",
 ]
 
@@ -81,8 +81,23 @@ CLUSTER_BOOLEAN_STATE_CONFIG = 0x0080
 ATTR_CURRENT_SENSITIVITY = 0x0000
 ATTR_SUPPORTED_SENSITIVITY_LEVELS = 0x0001
 
-# OnOff (0x0006). These three are conformance LT — the Lighting feature — so a
-# plug may implement all, some or none of them; the AttributeList gate decides.
+# OnOff (0x0006). All three are conformance LT — mandatory if the Lighting
+# feature is supported — so a compliant plug implements all three or none. The
+# AttributeList gate decides per unit anyway, because compliance is a claim and
+# the device's own list is evidence.
+#
+# Only StartUpOnOff is a SETTING. OnTime and OffWaitTime are the mandatory
+# OnTime/OffWaitTime fields of OnWithTimedOff (command 0x42). The load-bearing
+# fact, in matter.js's own words at OnOffServer.js:38-40: "Writes never start a
+# countdown — only OnWithTimedOff does." So a pre-set value has no effect
+# BEFORE OnWithTimedOff runs; a write DURING Timed On is normative and
+# effective (Application Clusters R1.5 §1.5.6.4) — off() then zeroes OnTime,
+# inside an `if (this.features.lighting)` guard that every device carrying the
+# attribute satisfies (#197, ADR-0005 (superseded by ADR-0006)).
+#
+# Both ids are kept — deliberately unused for now — because implementing
+# OnWithTimedOff as an action would need them, and because a bare 0x4001 in a
+# future diff should resolve to a name that carries this warning with it.
 CLUSTER_ON_OFF = 0x0006
 ATTR_ON_TIME = 0x4001
 ATTR_OFF_WAIT_TIME = 0x4002
@@ -131,12 +146,22 @@ class Bounds:
 # Where a setting's bounds come from
 #
 # Enumerating the Matter data model (tools/enumerate_settings.py) showed the
-# FP300's pattern is the RARE one: of 57 writable attributes on the clusters
-# this plugin handles, exactly 2 take their bounds from another attribute on the
-# device — and both are already shipped. Most are a range fixed by the spec, an
-# enum, or unbounded. So bounds are a declared STRATEGY rather than always a
-# device read, and the capability question ("does this unit implement the
-# attribute at all?") is answered separately, by the device's own AttributeList.
+# FP300's pattern is the RARE one: of 76 writable attributes on the clusters
+# this plugin handles, exactly 6 take their bounds from another attribute on the
+# device (OccupancySensing.HoldTime, BooleanStateConfiguration.
+# CurrentSensitivityLevel, FanControl.SpeedSetting, LevelControl.OnLevel,
+# Thermostat.Presets, Thermostat.Schedules) — and all are already shipped or
+# accounted for. Most are a range fixed by the spec, an enum, or unbounded. So
+# bounds are a declared STRATEGY rather than always a device read, and the
+# capability question ("does this unit implement the attribute at all?") is
+# answered separately, by the device's own AttributeList.
+#
+# The count was 57 until #197's review fixed three generator defects (multi-line
+# `Attribute(`, the `R[W]` access form, and a last-match-wins property parse).
+# The ARGUMENT is unchanged and in fact strengthened — 6 of 76 rather than the
+# 2 of 57 ADR-0002/0003 quote (that figure was itself an undercount: four of
+# the six were already in the old 57). ADR-0002 and ADR-0003 quote the old
+# figure and are immutable; ADR-0006 carries the correction.
 # ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
@@ -368,11 +393,17 @@ SETTINGS: tuple = (
         device_types=frozenset({"matterMotionSensor", "matterContactSensor"}),
         options=sensitivity_options,
     ),
-    # --- OnOff's Lighting-feature settings (conformance LT) ------------------
+    # --- OnOff's Lighting-feature setting (conformance LT) -------------------
     # Present only on devices implementing the Lighting feature — which is NOT
-    # the same as "is a light". Of four plugs on the dev fabric two implement
-    # these and two do not, so the AttributeList gate is doing real work here
-    # rather than guarding a theoretical case.
+    # the same as "is a light". Of four plugs on the dev fabric two implement it
+    # and two do not, so the AttributeList gate is doing real work here rather
+    # than guarding a theoretical case.
+    #
+    # StartUpOnOff is the ONLY genuine setting on this cluster. OnTime (0x4001)
+    # and OffWaitTime (0x4002) are writable and look like siblings, but they are
+    # parameters of OnWithTimedOff — declaring one shipped a dialog field that
+    # could never work (#197, ADR-0005 (superseded by ADR-0006)). Do not add
+    # them back.
     DeviceSetting(
         key="startUpOnOff",
         label="After a power cut",
@@ -385,17 +416,6 @@ SETTINGS: tuple = (
         # what the device is set to.
         bounds=EnumValues(((0, "Off"), (1, "On"), (2, "Toggle (opposite of before)"))),
         device_types=frozenset({"matterRelay"}),
-    ),
-    DeviceSetting(
-        key="onTime",
-        label="Auto-off after (0 = never)",
-        cluster=CLUSTER_ON_OFF,
-        attribute=ATTR_ON_TIME,
-        # uint16 with no spec constraint; the OnWithTimedOff command's own
-        # OnTime field caps at 65534, so that is the honest ceiling.
-        bounds=StaticRange(0, 65534),
-        device_types=frozenset({"matterRelay"}),
-        unit=" tenths of a second",
     ),
 )
 

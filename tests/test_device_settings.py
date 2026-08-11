@@ -497,8 +497,10 @@ def test_apply_setting_is_exported_for_the_plugin_layer():
 # Bounds strategies — issue #186 follow-up
 #
 # Enumerating the Matter model showed the FP300's "bounds from a device
-# attribute" pattern is the RARE one: 2 of 57 writable attributes on the
+# attribute" pattern is the RARE one: 6 of 76 writable attributes on the
 # clusters this plugin handles. Most take a spec-fixed range or an enum.
+# (Was "2 of 57" until #197's review fixed three generator defects; the
+# argument only got stronger. ADR-0006 carries the correction.)
 # ---------------------------------------------------------------------------
 
 RELAY = "matterRelay"
@@ -565,10 +567,10 @@ def test_implements_reads_the_devices_own_attribute_list(attribute_list, attribu
     assert implements(attribute_list, attribute) is expected
 
 
-def test_a_plug_with_the_lighting_feature_is_offered_the_onoff_settings():
+def test_a_plug_with_the_lighting_feature_is_offered_the_onoff_setting():
     offered = offered_settings(RELAY, lambda c, a: None,
                                _attr_lists({0x0006: ONOFF_WITH_LIGHTING}))
-    assert sorted(o.setting.key for o in offered) == ["onTime", "startUpOnOff"]
+    assert [o.setting.key for o in offered] == ["startUpOnOff"]
 
 
 def test_a_plug_without_the_lighting_feature_is_offered_nothing():
@@ -600,7 +602,7 @@ def test_the_attribute_list_is_what_admits_a_spec_bounded_setting():
                                 _attr_lists({0x0006: ONOFF_WITH_LIGHTING}))
     vetoed = offered_settings(RELAY, lambda c, a: None,
                               _attr_lists({0x0006: ONOFF_WITHOUT_LIGHTING}))
-    assert sorted(o.setting.key for o in admitted) == ["onTime", "startUpOnOff"]
+    assert [o.setting.key for o in admitted] == ["startUpOnOff"]
     assert vetoed == []
 
 
@@ -621,7 +623,7 @@ def test_every_rejection_is_reported_to_the_caller():
     offered_settings(RELAY, lambda c, a: None,
                      _attr_lists({0x0006: ONOFF_WITHOUT_LIGHTING}),
                      on_skip=lambda setting, reason: skipped.append((setting.key, reason)))
-    assert sorted(k for k, _ in skipped) == ["onTime", "startUpOnOff"]
+    assert [k for k, _ in skipped] == ["startUpOnOff"]
     assert all("AttributeList" in reason for _, reason in skipped)
 
 
@@ -656,7 +658,7 @@ def test_a_pre_1_4_occupancy_sensor_is_vetoed_by_its_attribute_list():
 
 def test_relay_settings_validate_against_their_declared_bounds():
     lists = _attr_lists({0x0006: ONOFF_WITH_LIGHTING})
-    assert validate_settings(RELAY, {"startUpOnOff": "2", "onTime": "600"},
+    assert validate_settings(RELAY, {"startUpOnOff": "2"},
                              lambda c, a: None, lists) == {}
     errors = validate_settings(RELAY, {"startUpOnOff": "9"}, lambda c, a: None, lists)
     assert "startUpOnOff" in errors
@@ -724,7 +726,7 @@ def test_a_read_back_failure_names_the_underlying_error():
 def test_a_plug_without_the_lighting_feature_should_not_own_its_states():
     absent = device_settings.unimplemented_states(
         RELAY, _attr_lists({0x0006: ONOFF_WITHOUT_LIGHTING}))
-    assert sorted(s.key for s in absent) == ["onTime", "startUpOnOff"]
+    assert [s.key for s in absent] == ["startUpOnOff"]
 
 
 def test_a_plug_with_the_lighting_feature_keeps_them():

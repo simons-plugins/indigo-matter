@@ -1684,3 +1684,182 @@ def test_a_real_removal_of_a_device_less_node_is_not_a_404(plug):
         result = await plug._decommission(77)
         assert result is not None and result["fabricRemoved"] is True
     asyncio.run(scenario())
+
+
+# ===========================================================================
+# issue #197 — the retired onTime state announces itself, once
+# ===========================================================================
+
+def _relays(mock_indigo_base, *had_the_state):
+    """Stub ``indigo.devices.iter("self")`` with relays, each flagged for whether
+    its persisted states still carry ``onTime``.
+
+    That flag is the whole point: only relays implementing OnOff's Lighting
+    feature ever had the state, so a plain plug must not be counted. ``startup``
+    runs before ``deviceStartComm``, so at the moment this is called the states
+    still describe the pre-upgrade world.
+    """
+    mock_indigo_base.devices.iter.return_value = [
+        SimpleNamespace(id=index, deviceTypeId="matterRelay",
+                        states={"onOffState": False,
+                                **({"onTime": 0} if had else {})})
+        for index, had in enumerate(had_the_state, start=1)
+    ]
+
+
+def _count_logged(plug):
+    """The %d argument the notice was actually formatted with."""
+    return plug.logger.info.call_args.args[-1]
+
+
+def test_the_retired_onTime_state_is_announced_to_a_user_who_had_it(
+        plug, mock_indigo_base):
+    """Removing a state breaks any trigger bound to it with nothing in the log to
+    connect the two — the asymmetry ADR-0003 records. So the removal says so."""
+    _relays(mock_indigo_base, True, True)
+    plug._announce_retired_on_time_state()
+    notice = str(plug.logger.info.call_args)
+    assert "'onTime' state" in notice, "name the STATE — that is what a trigger binds to"
+    assert not plug.logger.exception.called
+
+
+def test_the_notice_says_the_state_stays_bound_and_flagged_unused(
+        plug, mock_indigo_base):
+    """Workspace ADR-0007 keeps the ``onTime`` state instead of withdrawing it,
+    so the old wording (an orphaned trigger that must be deleted or rebuilt) no
+    longer applies — a trigger built on the ``onTime`` state stays bound, it
+    just never fires. The notice must say the setting is gone from the dialog,
+    that the state stays and is shown as '<unused>', name the still-working
+    remedy, and name the state on both surfaces a user might be looking at:
+    the device inspector (the KEY, 'onTime') and the trigger editor (the
+    LABEL, 'OnTime (retired)') — without claiming anything is broken."""
+    _relays(mock_indigo_base, True)
+    plug._announce_retired_on_time_state()
+    notice = str(plug.logger.info.call_args)
+    assert "'onTime' state" in notice
+    assert "'OnTime (retired)'" in notice
+    assert "stays on the device" in notice
+    assert "any trigger already built on it stays bound" in notice
+    assert "'<unused>'" in notice
+    assert "Auto-off after X minutes" in notice
+    for word in ("error", "fail", "warning", "problem"):
+        assert word not in notice.lower()
+
+
+def test_only_devices_that_ACTUALLY_HAD_the_state_are_counted(plug, mock_indigo_base):
+    """The count is per device that had it, not per relay. Only Lighting-feature
+    plugs ever carried it (#190 withdrew it from the rest — two in four on the dev
+    fabric), and telling the others their triggers may have broken sends them
+    hunting for a breakage that could not have happened.
+
+    Asserts the formatted ARGUMENT, not a substring: '1' appears in the message
+    unconditionally, inside 'See issue #197.'
+    """
+    _relays(mock_indigo_base, True, False, True, False)
+    plug._announce_retired_on_time_state()
+    assert _count_logged(plug) == 2, "4 relays, 2 of which had the state"
+
+
+def test_the_notice_is_not_shown_to_a_user_who_never_had_the_state(
+        plug, mock_indigo_base):
+    """Relays without the Lighting feature never saw the field. An INFO about a
+    setting they never had is the report noise #191 was careful to avoid."""
+    _relays(mock_indigo_base, False, False)
+    plug._announce_retired_on_time_state()
+    assert plug.logger.info.call_args_list == []
+
+
+def test_the_notice_fires_once_and_never_again(plug, mock_indigo_base):
+    """Every startup would otherwise repeat it — which is how a one-off notice
+    becomes wallpaper and stops being read."""
+    _relays(mock_indigo_base, True)
+    plug._announce_retired_on_time_state()
+    assert len(plug.logger.info.call_args_list) == 1
+    plug._announce_retired_on_time_state()
+    assert len(plug.logger.info.call_args_list) == 1
+
+
+def test_the_flag_is_COMMITTED_not_just_set_in_memory(plug, mock_indigo_base):
+    """pluginPrefs without savePluginPrefs survives only until the plugin stops,
+    so the notice would return on every reload — the trap diagnostics_menu_mixin
+    documents for the survey log. Asserts the flush, which a two-call test against
+    one in-memory dict cannot see."""
+    from plugin_constants import ON_TIME_RETIRED_PREF
+    _relays(mock_indigo_base, True)
+    plug._announce_retired_on_time_state()
+    assert plug.pluginPrefs[ON_TIME_RETIRED_PREF] is True
+    assert mock_indigo_base.server.savePluginPrefs.called, "set in memory only"
+
+
+def test_the_question_is_banked_even_when_there_is_nothing_to_say(plug, mock_indigo_base):
+    """A user with no affected devices must not be re-scanned on every startup
+    either — the flag records "asked", not "logged"."""
+    from plugin_constants import ON_TIME_RETIRED_PREF
+    _relays(mock_indigo_base, False)
+    plug._announce_retired_on_time_state()
+    assert plug.pluginPrefs[ON_TIME_RETIRED_PREF] is True
+
+
+def test_a_broken_device_scan_never_stops_startup(plug, mock_indigo_base):
+    """A cosmetic notice that can stop the plugin starting is worse than no
+    notice. Startup calls this before the runtime exists."""
+    from plugin_constants import ON_TIME_RETIRED_PREF
+    mock_indigo_base.devices.iter.side_effect = RuntimeError("database busy")
+    plug._announce_retired_on_time_state()
+    assert plug.logger.exception.called
+    assert ON_TIME_RETIRED_PREF not in plug.pluginPrefs, (
+        "a transient failure must leave the notice to retry, not bank it unsaid")
+
+
+def test_startup_really_emits_the_notice(plugin_mod, mock_indigo_base, monkeypatch):
+    """The WIRING, driven through the real startup() rather than asserted on the
+    source. Every test above calls the method directly, so deleting the call from
+    startup() left the whole suite green — the feature could be disconnected
+    entirely without a single failure.
+
+    Same collaborator fakes as the other startup tests; ServerProcess in
+    particular MUST stay patched (#104 — an unpatched one deletes the developer's
+    live LaunchAgent).
+    """
+    class FakeMatter:
+        def __init__(self, proto, logger, prefs, **kw):
+            pass
+
+        def run(self):
+            return None
+
+    class FakeRuntimeObj:
+        is_running = True
+
+        def start(self):
+            pass
+
+        def submit(self, coro):
+            if hasattr(coro, "close"):
+                coro.close()
+            return Mock()
+
+    monkeypatch.setattr(plugin_mod, "MatterClient", FakeMatter)
+    monkeypatch.setattr(plugin_mod, "AsyncRuntime", lambda logger: FakeRuntimeObj())
+    monkeypatch.setattr(plugin_mod, "CommissionJobs", lambda *a, **k: Mock())
+    monkeypatch.setattr(plugin_mod, "HttpApi", lambda *a, **k: Mock())
+    monkeypatch.setattr(plugin_mod, "ServerProcess", lambda *a, **k: Mock())
+    mock_indigo_base.devices.iter.return_value = [
+        SimpleNamespace(id=1, deviceTypeId="matterRelay",
+                        states={"onOffState": False, "onTime": 0}),
+    ]
+
+    p = plugin_mod.Plugin.__new__(plugin_mod.Plugin)
+    p.logger = Mock()
+    p._version = "2026.0.1"
+    p._subscribed_to_devices = False
+    p.pluginPrefs = {}
+    p.proto = object()
+    p.registry = object()
+    p.device_sync = Mock()
+    p.runtime = None
+    p.server_process = None
+
+    p.startup()
+    assert any("'onTime' state" in str(call) for call in p.logger.info.call_args_list), \
+        "startup() never announced the retired state"

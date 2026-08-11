@@ -257,7 +257,8 @@ def test_validate_allows_unknown_device_id(plugin_cls, mock_indigo_base, mock_lo
 def test_device_start_comm_warns_on_type_mismatch(plugin_cls, mock_logger):
     from types import SimpleNamespace
     from unittest.mock import MagicMock
-    stub = SimpleNamespace(logger=mock_logger, device_sync=MagicMock())
+    stub = SimpleNamespace(logger=mock_logger, device_sync=MagicMock(),
+                           _prime_retired_on_time_state=MagicMock())
     dev = _dev({"createdTypeId": "matterTemperatureSensor"}, type_id="matterRelay")
     plugin_cls.deviceStartComm(stub, dev)
     assert mock_logger.warning.called
@@ -270,7 +271,8 @@ def test_device_start_comm_warns_on_type_mismatch(plugin_cls, mock_logger):
 def test_device_start_comm_quiet_when_types_match(plugin_cls, mock_logger):
     from types import SimpleNamespace
     from unittest.mock import MagicMock
-    stub = SimpleNamespace(logger=mock_logger, device_sync=MagicMock())
+    stub = SimpleNamespace(logger=mock_logger, device_sync=MagicMock(),
+                           _prime_retired_on_time_state=MagicMock())
     dev = _dev({"createdTypeId": "matterRelay"}, type_id="matterRelay")
     plugin_cls.deviceStartComm(stub, dev)
     assert not mock_logger.warning.called
@@ -281,11 +283,64 @@ def test_device_start_comm_refreshes_state_list(plugin_cls, mock_logger):
     # must request the refresh so states added by upgrades exist (issue #60).
     from types import SimpleNamespace
     from unittest.mock import MagicMock
-    stub = SimpleNamespace(logger=mock_logger, device_sync=MagicMock())
+    stub = SimpleNamespace(logger=mock_logger, device_sync=MagicMock(),
+                           _prime_retired_on_time_state=MagicMock())
     dev = _dev({"createdTypeId": "matterRelay"}, type_id="matterRelay")
     dev.stateListOrDisplayStateIdChanged = MagicMock()
     plugin_cls.deviceStartComm(stub, dev)
     dev.stateListOrDisplayStateIdChanged.assert_called_once_with()
+
+
+def test_device_start_comm_primes_the_retired_on_time_state_for_relays(
+        plugin_cls, mock_logger):
+    """Every matterRelay start must flag ``onTime`` as unused — this is the
+    seam that keeps the state from just sitting at Indigo's default 0 once
+    ADR-0007 stops it from being withdrawn."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    stub = SimpleNamespace(logger=mock_logger, device_sync=MagicMock(),
+                           _prime_retired_on_time_state=MagicMock())
+    dev = _dev({"createdTypeId": "matterRelay"}, type_id="matterRelay")
+    plugin_cls.deviceStartComm(stub, dev)
+    stub._prime_retired_on_time_state.assert_called_once_with(dev)
+
+
+def test_device_start_comm_does_not_prime_on_time_for_other_types(
+        plugin_cls, mock_logger):
+    """Only matterRelay ever declared this state — priming it on a dimmer or
+    sensor would write a state that does not exist on their state list."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    stub = SimpleNamespace(logger=mock_logger, device_sync=MagicMock(),
+                           _prime_retired_on_time_state=MagicMock())
+    dev = _dev({"createdTypeId": "matterDimmer"}, type_id="matterDimmer")
+    plugin_cls.deviceStartComm(stub, dev)
+    stub._prime_retired_on_time_state.assert_not_called()
+
+
+def test_prime_retired_on_time_state_writes_zero_and_unused_uivalue(plugin_cls):
+    """The actual write — the whole point of keeping the state (#197,
+    workspace ADR-0007) is that it must read '<unused>' in the UI, not a bare
+    0 indistinguishable from a real reading (the #190 mistake ADR-0003 exists
+    to avoid)."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    stub = SimpleNamespace(logger=MagicMock(), device_sync=MagicMock())
+    dev = SimpleNamespace(id=42)
+    plugin_cls._prime_retired_on_time_state(stub, dev)
+    stub.device_sync.apply_states.assert_called_once_with(
+        42, [{"key": "onTime", "value": 0, "uiValue": "<unused>"}])
+
+
+def test_prime_retired_on_time_state_never_raises(plugin_cls):
+    """Cosmetic — a device_sync failure here must not stop device start."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    stub = SimpleNamespace(logger=MagicMock(), device_sync=MagicMock())
+    stub.device_sync.apply_states.side_effect = RuntimeError("boom")
+    dev = SimpleNamespace(id=42)
+    plugin_cls._prime_retired_on_time_state(stub, dev)  # must not raise
+    assert stub.logger.debug.called
 
 
 def test_action_control_device_sends_each_command_of_a_list(plugin_cls):
@@ -1055,6 +1110,72 @@ def test_no_orphan_setting_fields_in_the_xml(plugin_cls):
         assert not orphans, f"{type_id} has settings fields with no declaration: {orphans}"
 
 
+#: Setting keys this plugin once declared and has since withdrawn from the
+#: ConfigUI. APPEND-ONLY — a key here must never reappear as a <Field>.
+#:
+#: `onTime` is the whole of it so far: shipped in v2026.10.1 as "Auto-off after",
+#: retired by #197 once it turned out to be a parameter of a command the plugin
+#: does not send.
+RETIRED_SETTING_KEYS = frozenset({"onTime"})
+
+#: Retired setting keys whose <State> workspace ADR-0007 deliberately KEEPS,
+#: flagged, rather than withdraws — {device_type_id: state_key}. A capability
+#: a unit lacks (#190) is withdrawn per device, because a state never offered
+#: cannot have a doomed trigger built on it. A setting retired EVERYWHERE
+#: (#197) is the opposite case: there is nothing left to *prevent*, only
+#: bindings that already exist to protect, and a live experiment (ADR-0006's
+#: Confirmation) found withdrawal leaves a bound trigger enabled, silent, and
+#: quietly repointed at a different, real state in its own dialog — worse
+#: than a state that simply stops moving.
+FLAGGED_RETIRED_STATES = {"matterRelay": "onTime"}
+
+
+def test_no_retired_setting_leaves_a_configui_field_behind(plugin_cls):
+    """The direction the parity tests above do not run.
+
+    Every check here goes registry→XML, and `test_no_orphan_setting_fields_in_the_xml`
+    covers ConfigUI <Field> only in the other direction (declared setting →
+    field must exist). This is the field half of the old combined test — the
+    <State> half now has its own test below, because the two now have
+    opposite expectations (see `FLAGGED_RETIRED_STATES`).
+    """
+    root = ET.parse(SERVER_PLUGIN / "Devices.xml").getroot()
+    for device in root.findall("Device"):
+        type_id = device.get("id")
+        leftover_fields = set(_device_config_fields(type_id)) & RETIRED_SETTING_KEYS
+        assert not leftover_fields, (
+            f"{type_id} declares a ConfigUI field for retired setting(s) {leftover_fields}")
+
+
+def test_a_flagged_retired_state_is_present_not_withdrawn(plugin_cls):
+    """The opposite assertion the old combined test made for <State> —
+    corrected by workspace ADR-0007 after a live experiment (ADR-0006's
+    Confirmation, 2026-08-11) showed withdrawing a state a trigger is bound to
+    is worse than keeping one that never updates: the trigger stays enabled,
+    Indigo logs nothing, and its own dialog silently repoints at a different,
+    real state in place of the one that vanished.
+
+    So `onTime` must be PRESENT on `matterRelay` — not absent, and not
+    reduced to a bare marker; `plugin._prime_retired_on_time_state` is what
+    flags it dead (uiValue="<unused>") at runtime, not the XML. Every OTHER
+    device type must still have none of it: this state was only ever
+    declared for the relay, and nothing about ADR-0007 licenses it spreading.
+    """
+    root = ET.parse(SERVER_PLUGIN / "Devices.xml").getroot()
+    for device in root.findall("Device"):
+        type_id = device.get("id")
+        expected = FLAGGED_RETIRED_STATES.get(type_id)
+        states = _device_state_ids(type_id)
+        if expected:
+            assert expected in states, (
+                f"{type_id} must keep <State id={expected!r}> — workspace ADR-0007 "
+                "flags a retired-everywhere setting's state rather than withdrawing it")
+        else:
+            leftover = states & set(FLAGGED_RETIRED_STATES.values())
+            assert not leftover, (
+                f"{type_id} declares flagged-retired state(s) {leftover} it never had")
+
+
 # ===========================================================================
 # issue #190 — getDeviceStateList follows the device's own AttributeList
 # ===========================================================================
@@ -1068,7 +1189,7 @@ _PLAIN_PLUG_LISTS = {0x0006: [0, 65528, 65529, 65531, 65532, 65533]}
 def _relay_states():
     """matterRelay's <States> as Devices.xml declares them."""
     return [{"Key": key, "StateLabel": key, "TriggerLabel": key}
-            for key in ("onOffState", "startUpOnOff", "onTime")]
+            for key in ("onOffState", "startUpOnOff")]
 
 
 def _state_list_plugin(plugin_cls, mock_indigo_base, mock_logger, attr_lists):
@@ -1095,7 +1216,8 @@ def _state_list_plugin(plugin_cls, mock_indigo_base, mock_logger, attr_lists):
 
     device_sync.attribute_list.side_effect = lookup
     plugin.device_sync = device_sync
-    plugin.base_state_lists = {"matterRelay": _relay_states()}
+    plugin.base_state_lists = {"matterRelay": _relay_states(),
+                               "matterMotionSensor": _motion_states()}
     return plugin
 
 
@@ -1105,18 +1227,35 @@ def _relay_dev(dev_id=7, name="Grillplats socket", node="52", endpoint="1"):
                            pluginProps={"nodeId": node, "endpointId": endpoint})
 
 
+def _motion_states():
+    """matterMotionSensor's <States> as Devices.xml declares them.
+
+    The only handled type left with TWO settings, which is what the
+    one-line-per-device test needs — matterRelay dropped to one when #197
+    retired onTime.
+    """
+    return [{"Key": key, "StateLabel": key, "TriggerLabel": key}
+            for key in ("onOffState", "batteryLevel", "holdTime", "sensitivityLevel")]
+
+
+def _motion_dev(dev_id=11, name="Kitchen motion", node="56", endpoint="1"):
+    from types import SimpleNamespace
+    return SimpleNamespace(id=dev_id, name=name, deviceTypeId="matterMotionSensor",
+                           pluginProps={"nodeId": node, "endpointId": endpoint})
+
+
 def test_a_plug_without_the_lighting_feature_loses_those_states(
         plugin_cls, mock_indigo_base, mock_logger):
     plugin = _state_list_plugin(plugin_cls, mock_indigo_base, mock_logger, _PLAIN_PLUG_LISTS)
     keys = [state["Key"] for state in plugin.getDeviceStateList(_relay_dev())]
-    assert keys == ["onOffState"], "startUpOnOff/onTime are not this device's to own"
+    assert keys == ["onOffState"], "startUpOnOff is not this device's to own"
 
 
 def test_a_plug_with_the_lighting_feature_keeps_them(
         plugin_cls, mock_indigo_base, mock_logger):
     plugin = _state_list_plugin(plugin_cls, mock_indigo_base, mock_logger, _LIGHTING_PLUG_LISTS)
     keys = [state["Key"] for state in plugin.getDeviceStateList(_relay_dev())]
-    assert keys == ["onOffState", "startUpOnOff", "onTime"]
+    assert keys == ["onOffState", "startUpOnOff"]
 
 
 def test_an_unknown_attribute_list_keeps_every_state(
@@ -1125,7 +1264,7 @@ def test_an_unknown_attribute_list_keeps_every_state(
     state of the world at exactly the moment this is called."""
     plugin = _state_list_plugin(plugin_cls, mock_indigo_base, mock_logger, {})
     keys = [state["Key"] for state in plugin.getDeviceStateList(_relay_dev())]
-    assert keys == ["onOffState", "startUpOnOff", "onTime"]
+    assert keys == ["onOffState", "startUpOnOff"]
 
 
 def test_the_parents_live_list_is_never_mutated(
@@ -1154,7 +1293,7 @@ def test_removing_a_state_says_so_in_the_log(plugin_cls, mock_indigo_base, mock_
     plugin = _state_list_plugin(plugin_cls, mock_indigo_base, mock_logger, _PLAIN_PLUG_LISTS)
     plugin.getDeviceStateList(_relay_dev())
     logged = " ".join(str(call[0]) for call in mock_logger.info.call_args_list)
-    assert "startUpOnOff" in logged and "onTime" in logged
+    assert "startUpOnOff" in logged
 
 
 def test_keeping_every_state_logs_nothing(plugin_cls, mock_indigo_base, mock_logger):
@@ -1170,7 +1309,7 @@ def test_a_broken_capability_lookup_keeps_the_whole_state_list(
     dev = _relay_dev()
     del dev.pluginProps            # any shape the gate did not expect
     keys = [state["Key"] for state in plugin.getDeviceStateList(dev)]
-    assert keys == ["onOffState", "startUpOnOff", "onTime"]
+    assert keys == ["onOffState", "startUpOnOff"]
     assert mock_logger.exception.called, (
         "nothing expected can reach that handler, so silence would hide a real defect")
 
@@ -1184,7 +1323,7 @@ def test_a_device_sync_that_raises_keeps_the_whole_state_list(
     plugin = _state_list_plugin(plugin_cls, mock_indigo_base, mock_logger, _PLAIN_PLUG_LISTS)
     plugin.device_sync.attribute_list.side_effect = RuntimeError("cache exploded")
     keys = [state["Key"] for state in plugin.getDeviceStateList(_relay_dev())]
-    assert keys == ["onOffState", "startUpOnOff", "onTime"]
+    assert keys == ["onOffState", "startUpOnOff"]
 
 
 def test_two_relays_share_one_parent_list_without_contaminating_each_other(
@@ -1200,7 +1339,7 @@ def test_two_relays_share_one_parent_list_without_contaminating_each_other(
     lighting = plugin.getDeviceStateList(
         _relay_dev(dev_id=8, name="Shelly 1PM", node="53"))
     assert [s["Key"] for s in plain] == ["onOffState"]
-    assert [s["Key"] for s in lighting] == ["onOffState", "startUpOnOff", "onTime"]
+    assert [s["Key"] for s in lighting] == ["onOffState", "startUpOnOff"]
 
 
 def test_a_device_is_gated_on_its_OWN_endpoint(plugin_cls, mock_indigo_base, mock_logger):
@@ -1212,19 +1351,29 @@ def test_a_device_is_gated_on_its_OWN_endpoint(plugin_cls, mock_indigo_base, moc
     })
     ep1 = plugin.getDeviceStateList(_relay_dev(dev_id=7, node="64", endpoint="1"))
     ep2 = plugin.getDeviceStateList(_relay_dev(dev_id=8, node="64", endpoint="2"))
-    assert [s["Key"] for s in ep1] == ["onOffState", "startUpOnOff", "onTime"]
+    assert [s["Key"] for s in ep1] == ["onOffState", "startUpOnOff"]
     assert [s["Key"] for s in ep2] == ["onOffState"]
 
 
 def test_one_log_line_per_device_not_per_removed_state(
         plugin_cls, mock_indigo_base, mock_logger):
-    """A plain plug drops two states; a bridge of ten would have printed twenty
-    lines. One line naming both is the same information without the wall."""
-    plugin = _state_list_plugin(plugin_cls, mock_indigo_base, mock_logger, _PLAIN_PLUG_LISTS)
-    plugin.getDeviceStateList(_relay_dev())
+    """A sensor implementing neither setting drops two states; a bridge of ten
+    would have printed twenty lines. One line naming both is the same
+    information without the wall.
+
+    A motion sensor rather than a plug because the property needs a device that
+    can drop MORE than one state, and matterRelay stopped being one when #197
+    retired onTime — with a single removable state, "one line per device" and
+    "one line per state" are indistinguishable and the test proves nothing.
+    """
+    plugin = _state_list_plugin(plugin_cls, mock_indigo_base, mock_logger, {
+        0x0406: [0, 65528, 65529, 65531, 65532, 65533],  # OccupancySensing, no HoldTime
+        0x0080: [65528, 65529, 65531, 65532, 65533],     # BooleanStateConfig, no sensitivity
+    })
+    plugin.getDeviceStateList(_motion_dev())
     assert len(mock_logger.info.call_args_list) == 1
     line = str(mock_logger.info.call_args_list[0])
-    assert "startUpOnOff" in line and "onTime" in line
+    assert "holdTime" in line and "sensitivityLevel" in line
 
 
 def test_a_device_type_with_no_settings_is_passed_straight_through(

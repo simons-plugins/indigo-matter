@@ -51,6 +51,7 @@ from matter_handlers.settings import ATTR_ATTRIBUTE_LIST, SETTINGS, implements
 from matter_handlers.writable_attributes import (
     ATTRIBUTE_NAMES,
     CLUSTER_NAMES,
+    COMMAND_FIELD_ATTRIBUTES,
     MODEL_VERSION,
     WRITABLE_ATTRIBUTES,
 )
@@ -60,7 +61,9 @@ __all__ = [
     "SettableAttribute", "EndpointSurvey", "NodeSurvey", "SurveyLog",
     "survey_node", "report_lines", "explore_lines",
     "cluster_label", "attribute_label", "GLOBAL_ATTRIBUTES",
-    "INFRASTRUCTURE_CLUSTERS", "DRIVEN_ATTRIBUTES", "MODEL_VERSION",
+    "INFRASTRUCTURE_CLUSTERS", "DRIVEN_ATTRIBUTES", "COMMAND_FIELD_ATTRIBUTES",
+    "NOT_SETTINGS", "REVIEWED_COMMAND_FIELD_COLLISIONS",
+    "MODEL_VERSION",
 ]
 
 #: The global attributes every cluster carries. Not in the generated table —
@@ -90,14 +93,66 @@ GLOBAL_ATTRIBUTES: dict[int, str] = {
 #: ``Identify`` is here for a different reason. IdentifyTime is writable, but it
 #: is a momentary command in attribute clothing ("blink for N seconds") with no
 #: persistent setting behind it.
+#: Identify and GeneralCommissioning are now covered TWICE — their only writable
+#: attribute is also individually excluded by ``NOT_SETTINGS`` below, for the
+#: reason stated there. Deliberately kept here anyway: this list answers "is the
+#: cluster infrastructure?", which stays the right exclusion if either ever
+#: gains a writable attribute that ``NOT_SETTINGS`` does not name.
+#:
+#: The second block was added with #197's parser fix, one step in the chain
+#: that raised the model's writable count 110 → 124 → 137 → 141 — the
+#: generator had been skipping every multi-line ``Attribute(``, i.e. every
+#: list- and struct-typed one. Seven of the fourteen it recovered are
+#: list-typed fabric plumbing (an ACL, a binding table, a group-key map) and
+#: would have been recommended as settings on the next report of any node that
+#: implements them. They are exactly what this list is for; the rest are
+#: genuine candidates and are deliberately left to report.
+#:
+#: **``UnitLocalization`` (0x002D, ``TemperatureUnit``) was added to this list
+#: by this branch, then removed again** — it was never on ``main``'s list to
+#: begin with: ``TemperatureUnit`` was invisible to the pre-#197 parser, so it
+#: had nothing to be suppressed from. ``LocalizationConfiguration`` (0x002B,
+#: ``ActiveLocale``) and ``TimeFormatLocalization`` (0x002C, ``HourFormat``)
+#: are the two that were genuinely here and removed. All three failed the test
+#: above on inspection: they are node-level DISPLAY PREFERENCES ("show °F on
+#: the thermostat"), not fabric plumbing, and the sentence above about
+#: belonging to the fabric was simply wrong about them — that argument stands
+#: on its own. Only ``ActiveLocale`` carries a device-reported ``Supported*``
+#: list (``constraint: "in SupportedLocales"``) — one of the three, not all;
+#: ``HourFormat`` and ``TemperatureUnit`` have no constraint at all. Only
+#: ``UnitLocalization.TemperatureUnit`` is FeatureMap-gated
+#: (``conformance: "TEMP"``); ``ActiveLocale`` and ``HourFormat`` are
+#: ``conformance: "M"`` — what actually opts all three in is the Root Node
+#: device type's ``LanguageLocale``/``TimeLocale``/``UnitLocale`` conditions,
+#: so a node reports them only if it opted in — no wallpaper risk.
+#:
+#: Implementing one is a real design problem, and that is the resulting issue's to
+#: solve rather than a reason to stay quiet: they sit on **endpoint 0**, which has
+#: no Indigo device, so there is no Edit Device dialog to host the field
+#: (ADR-0002). The report only ever claims the plugin does not offer something.
 INFRASTRUCTURE_CLUSTERS: frozenset = frozenset({
     0x0003,  # Identify — IdentifyTime is a momentary command, not a setting
     0x0028,  # BasicInformation — NodeLabel/Location/LocalConfigDisabled
-    0x002B,  # LocalizationConfiguration — ActiveLocale
-    0x002C,  # TimeFormatLocalization — HourFormat/ActiveCalendarType
     0x0030,  # GeneralCommissioning — Breadcrumb
     0x0031,  # NetworkCommissioning — InterfaceEnabled
     0x0453,  # ThreadNetworkDirectory — PreferredExtendedPanId
+    # --- recovered by #197's parser fix; all fabric-owned, none a user setting -
+    0x001E,  # Binding — the binding table; device-to-device wiring
+    0x001F,  # AccessControl — Acl/Extension, who may talk to this node
+    0x002A,  # OtaSoftwareUpdateRequestor — DefaultOtaProviders
+    0x003F,  # GroupKeyManagement — GroupKeyMap/GroupcastAdoption
+    0x0041,  # UserLabel — LabelList. Naming, like BasicInformation's NodeLabel
+             # which is already excluded here, and Indigo owns the name anyway.
+    # --- recovered by #197's inheritance-aware regen; the model now resolves an
+    # --- attribute's access through the cluster's base chain instead of only its
+    # --- own literal (raised the model from 1167 to 1319 attributes, 137 to 141
+    # --- writable) --------------------------------------------------------------
+    0x0039,  # BridgedDeviceBasicInformation — NodeLabel inherits RW VM from
+             # BasicInformation (0x0028, already excluded above for the same
+             # attribute, for the same reason), and every endpoint of every
+             # Matter bridge implements this cluster, so without suppression it
+             # would recommend NodeLabel on all of them. Indigo owns the device
+             # name anyway.
 })
 
 #: Writable attributes the plugin ALREADY drives, as ordinary Indigo controls
@@ -117,6 +172,80 @@ DRIVEN_ATTRIBUTES: frozenset = frozenset({
     (0x0202, 0x0000),  # FanControl FanMode — fan on/off/mode
     (0x0202, 0x0002),  # FanControl PercentSetting — fan speed (dimmer-style)
 })
+
+#: Writable attributes that are NOT settings, hand-curated, each with a spec
+#: citation — the DECIDER for what the report and the explorer's labelling
+#: exclude. ``COMMAND_FIELD_ATTRIBUTES`` (generated, imported above) stays only
+#: a DETECTOR: "writable, and also named as a field of a command on the same
+#: cluster" is positive evidence worth checking, but a spec review after
+#: ADR-0005 shipped found it unsound as a DECISION rule (issue #197 follow-up).
+#: It got its four founding members right through three UNRELATED mechanisms —
+#: a single mechanical test cannot express three different reasons — and a
+#: generator fix that let it recognise matter.js's ``R[W]`` writability form
+#: promptly gave it a fifth member, ``DoorLock.OperatingMode``, which is a real
+#: setting (see ``REVIEWED_COMMAND_FIELD_COLLISIONS`` below). The rule cannot be
+#: patched to exclude that case: it is a request command's field, so excluding
+#: response commands does not help, and the four true members share no access
+#: or quality signature to test instead.
+#:
+#: The three reasons, spelled out because none reduces to another:
+#:
+#: 1. **Inert until a specific command runs.** OnOff's ``OnTime``
+#:    (Application Clusters R1.5 §1.5.6.4) and ``OffWaitTime`` (**§1.5.6.5** —
+#:    a different section with a materially wider window: it also has effect in
+#:    the Delayed Off state): "This attribute can be written at any time, but
+#:    writing a value only has effect when in the Timed On state." Only ``OnWithTimedOff`` (0x42) enters that state
+#:    (§1.5.7.6.4, §1.5.8 Figure 2), so a pre-set value with no
+#:    ``OnWithTimedOff`` call does nothing — proved live on the GRILLPLATS
+#:    (ADR-0005). This one DOES match the command-field pattern; it is simply
+#:    not the only reason a writable attribute can fail to be a setting.
+#: 2. **Writing IS the action, not a stored preference.** Identify's
+#:    ``IdentifyTime``: Application Clusters R1.5 §1.2.5.1 — "If this attribute
+#:    is set to a value
+#:    other than 0 then the device shall enter its identification state."
+#:    There is no persisted setting behind it to recover later; the write and
+#:    the effect are the same event, a momentary command in attribute clothing.
+#: 3. **Commissioner scratch space, not device configuration.**
+#:    GeneralCommissioning's ``Breadcrumb``: core §11.10.6.1 — administrator
+#:    working storage, reset to zero on restart. Writing it is its entire
+#:    purpose; nothing here survives a reboot for a settings dialog to show.
+NOT_SETTINGS: dict = {
+    (0x0006, 0x4001): (
+        "OnOff.OnTime is inert until OnWithTimedOff() runs (Application "
+        "Clusters R1.5 §1.5.6.4, §1.5.7.6.4; ADR-0005 (superseded by "
+        "ADR-0006))"),
+    (0x0006, 0x4002): (
+        "OnOff.OffWaitTime is inert until OnWithTimedOff() runs (Application "
+        "Clusters R1.5 §1.5.6.5, §1.5.7.6.4; ADR-0005 (superseded by "
+        "ADR-0006))"),
+    (0x0003, 0x0000): (
+        "Identify.IdentifyTime — writing IS the action, not a stored "
+        "preference (Application Clusters §1.2.5.1)"),
+    (0x0030, 0x0000): (
+        "GeneralCommissioning.Breadcrumb — commissioner scratch space, reset "
+        "to zero on restart (core §11.10.6.1)"),
+}
+
+#: Attributes ``COMMAND_FIELD_ATTRIBUTES`` flags that a human has reviewed and
+#: judged to BE real settings — the detector's false positives, kept alongside
+#: its true ones so the cross-check in ``tests/test_settings_report.py`` can
+#: prove every generated member has been looked at by someone (see that test
+#: for the safety property this exists to guarantee).
+#:
+#: ``DoorLock.OperatingMode`` (0x0101/0x0025) is a genuine user setting —
+#: Normal/Vacation/Privacy/NoRemoteLockUnlock (§5.2.9.24) — that merely shares
+#: its NAME with a field of ``SetHolidaySchedule`` (§5.2.10.12.4). The two are
+#: not the same kind of thing: ``SetHolidaySchedule``'s ``OperatingMode`` is one
+#: argument of a request that also programs a schedule, while the
+#: ``OperatingMode`` ATTRIBUTE is read independently by the lock at any time to
+#: decide its current behaviour and is exactly what a settings dialog should
+#: expose.
+REVIEWED_COMMAND_FIELD_COLLISIONS: dict = {
+    (0x0101, 0x0025): (
+        "DoorLock.OperatingMode is a real setting (§5.2.9.24) that merely "
+        "shares a name with a field of the request command "
+        "SetHolidaySchedule (§5.2.10.12.4)"),
+}
 
 #: Longest rendered attribute value the explorer prints before truncating. A
 #: node's AttributeList or a camera's Viewport struct can be hundreds of
@@ -165,6 +294,15 @@ class EndpointSurvey:
     settable: tuple = ()
 
     def title(self) -> str:
+        if self.endpoint == 0:
+            # Endpoint 0 is the Matter root node. It never gets an Indigo
+            # device — device_names is always empty here, not because
+            # nobody happened to name one, but because nothing reconciles
+            # onto endpoint 0 by design (issue #204) — so it earns its own
+            # heading rather than falling through to the bare-number
+            # fallback below, which is for an ordinary endpoint that
+            # merely has no device YET.
+            return "the Matter root node (endpoint 0)"
         if self.device_names:
             return f"{', '.join(self.device_names)} (endpoint {self.endpoint})"
         return f"endpoint {self.endpoint}"
@@ -235,6 +373,15 @@ def survey_node(node: NodeInfo,
     a gap worth naming. Clusters with no AttributeList captured contribute
     nothing rather than being guessed at, so a partial interview under-reports
     instead of inventing.
+
+    Three further exclusions on top of ``offered`` above, all of them things
+    that ARE writable and still are not gaps: infrastructure clusters,
+    attributes the plugin already drives as ordinary controls, and
+    ``NOT_SETTINGS`` — a hand-curated table of writable attributes that are not
+    configuration, for three unrelated reasons (a command's inert pre-set
+    field, a momentary action wearing attribute clothing, or commissioner
+    scratch space) that a single mechanical rule cannot express (#197, spec
+    review after ADR-0005). The explorer still shows all three.
     """
     endpoints: list[EndpointSurvey] = []
     for endpoint in sorted({ep for (ep, _c, _a) in node.attributes}):
@@ -251,6 +398,8 @@ def survey_node(node: NodeInfo,
                 if implements(listed, attribute) is not True:
                     continue
                 if (cluster, attribute) in DRIVEN_ATTRIBUTES:
+                    continue
+                if (cluster, attribute) in NOT_SETTINGS:
                     continue
                 if (cluster, attribute) in already:
                     continue
@@ -303,6 +452,19 @@ def report_lines(survey: NodeSurvey) -> list[str]:
     ]
     for endpoint in survey.endpoints:
         lines.append(f"  {endpoint.title()}:")
+        if endpoint.endpoint == 0:
+            # Same "no Indigo device" fact as EndpointSurvey.title() above,
+            # said again here because it is the reason these lines need
+            # different framing: they are not gaps in an Edit Device
+            # dialog like every other line in this report, they are
+            # node-level settings with nowhere to live at all — already
+            # tracked as issue #204, so the closing "open an issue" below
+            # must not read as an invitation to file a second one for them.
+            lines.append(
+                "    Node-level settings — they belong to the device as a "
+                "whole, not to any one Indigo device, so there is no Edit "
+                "Device dialog to host them. Already tracked as issue "
+                "#204; no need to open a new one for these.")
         for item in endpoint.settable:
             lines.append(f"    - {item.describe()}")
     lines.append(
@@ -342,9 +504,15 @@ def explore_lines(node: NodeInfo, endpoint: Optional[int] = None,
     menu offers a separate live single-attribute read for that and this does
     not pretend to be one. Each block says so.
 
-    Every attribute is shown, including the infrastructure clusters the report
-    filters out: this is the power-user surface, and hiding things from a
-    diagnostic is how a diagnostic stops being trusted.
+    Every attribute is shown, including the infrastructure clusters and
+    ``NOT_SETTINGS`` entries the report filters out: this is the power-user
+    surface, and hiding things from a diagnostic is how a diagnostic stops
+    being trusted. A ``NOT_SETTINGS`` attribute is labelled a command parameter
+    instead of omitted — a real command parameter is what all four of its
+    members are, whatever their individual reason for being one (#197). A
+    ``DoorLock.OperatingMode``, reviewed and found to be a real setting despite
+    the generator flagging it (``REVIEWED_COMMAND_FIELD_COLLISIONS``), is NOT
+    labelled — it is a genuine gap and must read as one here too.
     """
     wanted = {
         (ep, cl, at): value for (ep, cl, at), value in node.attributes.items()
@@ -367,7 +535,18 @@ def explore_lines(node: NodeInfo, endpoint: Optional[int] = None,
             writable = WRITABLE_ATTRIBUTES.get(cl, frozenset())
             lines.append(f"    {cluster_label(cl)}:")
             for at in sorted(a for (e, c, a) in wanted if e == ep and c == cl):
-                flag = " [writable]" if at in writable else ""
+                if (cl, at) in NOT_SETTINGS:
+                    # Shown, and shown as what it is. The report filters these
+                    # out; hiding them HERE would leave a user who read the spec
+                    # and expected the attribute wondering if the dump was
+                    # broken — the report's job is to be quiet, the explorer's
+                    # is to be complete (ADR-0004). Driven by NOT_SETTINGS, not
+                    # the generated COMMAND_FIELD_ATTRIBUTES, so a reviewed
+                    # collision like DoorLock.OperatingMode reads as the real
+                    # setting it is (#197).
+                    flag = " [writable, command parameter]"
+                else:
+                    flag = " [writable]" if at in writable else ""
                 lines.append(f"      {attribute_label(cl, at)}{flag} = "
                              f"{render_value(wanted[(ep, cl, at)])}")
     return lines

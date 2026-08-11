@@ -29,6 +29,7 @@ import pytest
 import settings_report
 from matter_handlers.settings import (
     ATTR_ATTRIBUTE_LIST,
+    ATTR_OFF_WAIT_TIME,
     ATTR_ON_TIME,
     ATTR_START_UP_ON_OFF,
     CLUSTER_ON_OFF,
@@ -54,7 +55,12 @@ ATTR_LOCAL_CALIBRATION = 0x0010  # LocalTemperatureCalibration — a real gap
 CLUSTER_BASIC_INFO = 0x0028
 ATTR_NODE_LABEL = 0x0005
 CLUSTER_LEVEL = 0x0008
-ATTR_ON_LEVEL = 0x0011
+ATTR_ON_LEVEL = 0x0011           # a plain writable gap — offered by nothing
+ATTR_LEVEL_TRANSITION = 0x0010   # OnOffTransitionTime — a second one, lower id
+CLUSTER_DOOR_LOCK = 0x0101
+ATTR_OPERATING_MODE = 0x0025     # a real setting the derived rule falsely flagged
+CLUSTER_LOCALIZATION = 0x002B    # LocalizationConfiguration — lives on endpoint 0
+ATTR_ACTIVE_LOCALE = 0x0000
 
 
 def node(attributes: dict, *, node_id: int = 0x38, vendor: str = "Aqara",
@@ -72,6 +78,22 @@ def onoff_node(listed, **kwargs) -> NodeInfo:
     }, **kwargs)
 
 
+def level_node(listed, **kwargs) -> NodeInfo:
+    """A one-endpoint LevelControl device whose AttributeList is *listed*.
+
+    LevelControl, not OnOff, wherever a test needs a plain "writable attribute
+    the plugin does not offer". OnOff can no longer supply one: of its three
+    writable attributes StartUpOnOff is offered as a setting and the other two
+    are parameters of OnWithTimedOff, which the report now filters (#197). Tests
+    that used OnTime as a generic example were testing the report's machinery,
+    not OnOff, so they moved rather than changed meaning.
+    """
+    return node({
+        (1, CLUSTER_LEVEL, 0x0000): 0,
+        (1, CLUSTER_LEVEL, ATTR_ATTRIBUTE_LIST): list(listed),
+    }, **kwargs)
+
+
 def reported(survey) -> set:
     return {(item.cluster, item.attribute)
             for ep in survey.endpoints for item in ep.settable}
@@ -82,10 +104,10 @@ def reported(survey) -> set:
 # ---------------------------------------------------------------------------
 
 def test_a_listed_writable_attribute_is_reported():
-    survey = survey_node(onoff_node([0x0000, ATTR_ON_TIME, ATTR_START_UP_ON_OFF,
+    survey = survey_node(level_node([0x0000, ATTR_ON_LEVEL, ATTR_LEVEL_TRANSITION,
                                      ATTR_ATTRIBUTE_LIST]))
-    assert reported(survey) == {(CLUSTER_ON_OFF, ATTR_ON_TIME),
-                                (CLUSTER_ON_OFF, ATTR_START_UP_ON_OFF)}
+    assert reported(survey) == {(CLUSTER_LEVEL, ATTR_ON_LEVEL),
+                                (CLUSTER_LEVEL, ATTR_LEVEL_TRANSITION)}
 
 
 def test_an_unlisted_attribute_is_not_reported_however_capable_the_cluster_is():
@@ -107,7 +129,7 @@ def test_a_missing_attribute_list_reports_nothing_rather_than_guessing():
 def test_an_unparseable_attribute_list_reports_nothing():
     """``implements`` refuses a confident answer from a list it could only
     partly read, and that refusal has to survive up to here."""
-    survey = survey_node(onoff_node(["not-a-number", ATTR_ON_TIME]))
+    survey = survey_node(level_node(["not-a-number", ATTR_ON_LEVEL]))
     assert survey.endpoints == ()
 
 
@@ -127,23 +149,23 @@ def test_a_value_in_the_snapshot_is_not_evidence_of_implementation():
 # ---------------------------------------------------------------------------
 
 def test_a_setting_the_plugin_already_offers_here_is_not_reported():
-    listed = [0x0000, ATTR_ON_TIME, ATTR_START_UP_ON_OFF, ATTR_ATTRIBUTE_LIST]
-    survey = survey_node(onoff_node(listed),
-                         offered=lambda ep: {(CLUSTER_ON_OFF, ATTR_START_UP_ON_OFF)})
-    assert reported(survey) == {(CLUSTER_ON_OFF, ATTR_ON_TIME)}
+    listed = [0x0000, ATTR_ON_LEVEL, ATTR_LEVEL_TRANSITION, ATTR_ATTRIBUTE_LIST]
+    survey = survey_node(level_node(listed),
+                         offered=lambda ep: {(CLUSTER_LEVEL, ATTR_LEVEL_TRANSITION)})
+    assert reported(survey) == {(CLUSTER_LEVEL, ATTR_ON_LEVEL)}
 
 
 def test_offered_is_asked_per_endpoint():
     """A setting is declared against Indigo device TYPES, and what type an
     endpoint became is the only thing that decides whether its field exists — so
     two endpoints of one node can legitimately give different answers."""
-    listed = [0x0000, ATTR_ON_TIME, ATTR_ATTRIBUTE_LIST]
+    listed = [0x0000, ATTR_ON_LEVEL, ATTR_ATTRIBUTE_LIST]
     two = node({
-        (1, CLUSTER_ON_OFF, ATTR_ATTRIBUTE_LIST): listed,
-        (2, CLUSTER_ON_OFF, ATTR_ATTRIBUTE_LIST): listed,
+        (1, CLUSTER_LEVEL, ATTR_ATTRIBUTE_LIST): listed,
+        (2, CLUSTER_LEVEL, ATTR_ATTRIBUTE_LIST): listed,
     })
     survey = survey_node(
-        two, offered=lambda ep: {(CLUSTER_ON_OFF, ATTR_ON_TIME)} if ep == 1 else set())
+        two, offered=lambda ep: {(CLUSTER_LEVEL, ATTR_ON_LEVEL)} if ep == 1 else set())
     assert [ep.endpoint for ep in survey.endpoints] == [2]
 
 
@@ -168,6 +190,323 @@ def test_matter_plumbing_is_never_reported(cluster):
         (0, cluster, ATTR_ATTRIBUTE_LIST): sorted(writable) + [ATTR_ATTRIBUTE_LIST],
     }))
     assert survey.endpoints == ()
+
+
+@pytest.mark.parametrize("cluster,attribute,name", [
+    (0x0031, 0x0004, "NetworkCommissioning.InterfaceEnabled"),
+    (0x0453, 0x0000, "ThreadNetworkDirectory.PreferredExtendedPanId"),
+])
+def test_specific_infrastructure_clusters_stay_suppressed(cluster, attribute, name):
+    """Hard-coded, NOT derived from ``INFRASTRUCTURE_CLUSTERS`` the way
+    ``test_matter_plumbing_is_never_reported`` above is. That parametrize is
+    self-referential — ``sorted(INFRASTRUCTURE_CLUSTERS)`` — so deleting an
+    entry from the constant deletes its own test case along with it, and
+    these two currently have ZERO other coverage: both are writable, absent
+    from ``NOT_SETTINGS``, and would start recommending fabric plumbing (a
+    network interface toggle, the Thread network directory's preferred PAN
+    id) on every Thread node the moment their ``INFRASTRUCTURE_CLUSTERS``
+    entry went missing.
+    """
+    survey = survey_node(node({
+        (0, cluster, ATTR_ATTRIBUTE_LIST): [attribute, ATTR_ATTRIBUTE_LIST],
+    }))
+    assert survey.endpoints == (), f"{name} is plumbing, not a setting"
+
+
+# ---------------------------------------------------------------------------
+# Command parameters are not settings — issue #197
+# ---------------------------------------------------------------------------
+
+def test_every_generated_command_field_collision_has_been_judged_by_a_human():
+    """The whole point of splitting the generator's DETECTOR from a human
+    DECIDER (#197 follow-up, after ADR-0005's mechanical rule proved unsound).
+
+    ``COMMAND_FIELD_ATTRIBUTES`` is machine-derived from the pinned model and
+    moves when matter.js moves. Every member it contains must have been looked
+    at by a human and filed into exactly one of ``NOT_SETTINGS`` (confirmed:
+    not a setting, with a citation) or ``REVIEWED_COMMAND_FIELD_COLLISIONS``
+    (confirmed: a real setting that merely collides by name, with a citation).
+
+    THIS IS THE SAFETY PROPERTY: if a matter.js bump introduces a new writable
+    attribute that happens to share a name with a command field on its own
+    cluster, this test fails — loudly, with instructions — instead of the
+    report silently swallowing what might be a real setting the way it
+    silently swallowed ``DoorLock.OperatingMode`` until this PR. Fix a failure
+    here by reading the spec for the new pair and adding it, with a citation,
+    to ``NOT_SETTINGS`` if writing it means nothing on its own, or to
+    ``REVIEWED_COMMAND_FIELD_COLLISIONS`` if it is a real setting. Never fix it
+    by deleting or weakening this assertion.
+    """
+    detected = {(cluster, attribute)
+                for cluster, ids in settings_report.COMMAND_FIELD_ATTRIBUTES.items()
+                for attribute in ids}
+    judged = set(settings_report.NOT_SETTINGS) | set(
+        settings_report.REVIEWED_COMMAND_FIELD_COLLISIONS)
+    unjudged = sorted(detected - judged)
+    assert not unjudged, (
+        "the generated COMMAND_FIELD_ATTRIBUTES has member(s) that are in neither "
+        "NOT_SETTINGS nor REVIEWED_COMMAND_FIELD_COLLISIONS — a matter.js bump "
+        "introduced a new writable attribute that collides by name with a command "
+        "field, and nobody has judged it yet: "
+        f"{[f'{cluster_label(c)} {attribute_label(c, a)}' for c, a in unjudged]}. "
+        "Read the spec for each pair, decide whether writing the attribute on its "
+        "own means anything, and add it (with a citation) to NOT_SETTINGS if not, "
+        "or to REVIEWED_COMMAND_FIELD_COLLISIONS if it is a real setting like "
+        "DoorLock.OperatingMode was."
+    )
+
+
+def test_every_reviewed_collision_is_still_detected():
+    """The direction the test above does NOT check, and the one a mutation audit
+    found missing: ``REVIEWED_COMMAND_FIELD_COLLISIONS`` exists only to excuse a
+    pair the generator's detector flags (ADR-0006's whole design — a detector
+    plus a human decider). An entry that stopped being detected means the
+    detector regressed, not that the collision went away.
+
+    This is what catches emptying ``COMMAND_FIELD_ATTRIBUTES`` in the checked-in
+    artefact: with ``detected`` empty, ``detected - judged`` above is vacuously
+    empty too, so
+    ``test_every_generated_command_field_collision_has_been_judged_by_a_human``
+    goes green for the wrong reason at the same moment
+    ``test_no_declared_setting_is_a_command_parameter`` does. Neither the
+    generator's own floor (``KNOWN_COMMAND_FIELD_ATTRIBUTES``) nor CI catches
+    that on its own — the generator's assertion only runs when a human
+    regenerates with ``@matter/model`` in hand, and CI has neither Node nor
+    that package.
+    """
+    detected = {(cluster, attribute)
+                for cluster, ids in settings_report.COMMAND_FIELD_ATTRIBUTES.items()
+                for attribute in ids}
+    assert set(settings_report.REVIEWED_COMMAND_FIELD_COLLISIONS) <= detected
+
+
+def test_the_checked_in_table_still_detects_the_four_documented_command_field_pairs():
+    """Mirrors ``tools/enumerate_settings.py``'s ``KNOWN_COMMAND_FIELD_ATTRIBUTES``
+    floor, but against the SHIPPED artefact rather than a live regeneration —
+    the only place in CI that can check the checked-in table, since CI has no
+    ``@matter/model`` to regenerate it from. If this fails, either the table was
+    hand-edited (never do this — regenerate instead) or the checked-in file is
+    stale against a matter.js version that legitimately removed one of these.
+    """
+    detected = {(cluster, attribute)
+                for cluster, ids in settings_report.COMMAND_FIELD_ATTRIBUTES.items()
+                for attribute in ids}
+    for cluster, attribute in (
+        (0x0003, 0x0000),  # Identify.IdentifyTime <- Identify()
+        (0x0006, 0x4001),  # OnOff.OnTime <- OnWithTimedOff()
+        (0x0006, 0x4002),  # OnOff.OffWaitTime <- OnWithTimedOff()
+        (0x0030, 0x0000),  # GeneralCommissioning.Breadcrumb <- ArmFailSafe()/SetRegulatoryConfig()
+    ):
+        assert (cluster, attribute) in detected, (
+            f"{cluster_label(cluster)} {attribute_label(cluster, attribute)} is "
+            "missing from the checked-in COMMAND_FIELD_ATTRIBUTES table")
+
+
+def test_not_settings_and_reviewed_collisions_are_disjoint():
+    """The two lists are alternatives for one detected pair, never both — a pair
+    in both would mean the report both excludes it (NOT_SETTINGS) and the
+    explorer treats it as a reviewed-real setting at the same time, which is a
+    contradiction the two tables must not be able to express."""
+    assert not (set(settings_report.NOT_SETTINGS)
+                & set(settings_report.REVIEWED_COMMAND_FIELD_COLLISIONS))
+
+
+@pytest.mark.parametrize("attribute", [ATTR_ON_TIME, ATTR_OFF_WAIT_TIME])
+def test_a_command_parameter_is_never_reported_as_a_gap(attribute):
+    """OnTime and OffWaitTime are writable, implemented by real plugs, and not
+    offered by the plugin — every condition the report otherwise needs. They are
+    still not settings: they are the mandatory fields of OnWithTimedOff, set BY
+    that command. #191's first live run named OffWaitTime on two plugs as a
+    setting that "COULD be added", which is the false positive this removes."""
+    survey = survey_node(onoff_node([0x0000, attribute, ATTR_ATTRIBUTE_LIST]))
+    assert survey.endpoints == ()
+
+
+def test_retiring_the_onTime_SETTING_does_not_make_it_a_reported_GAP():
+    """The interaction that forced #197's two halves to ship together.
+
+    What suppressed OnTime from the report was ``offered_setting_pairs``, which
+    derives from the settings registry — so deleting the DeviceSetting would have
+    turned a broken dialog field into a recurring INFO recommending it be added
+    back. Stated against the registry itself rather than a hard-coded pair, so it
+    keeps meaning if the declaration ever returns.
+    """
+    assert (CLUSTER_ON_OFF, ATTR_ON_TIME) not in settings_report.declared_pairs(), \
+        "the setting is retired — see matter_handlers/settings.py"
+    survey = survey_node(onoff_node(
+        [0x0000, ATTR_ON_TIME, ATTR_ATTRIBUTE_LIST]), offered=lambda ep: set())
+    assert survey.endpoints == (), "nothing offers it, and it must still not be reported"
+
+
+def test_the_explorer_shows_command_parameters_and_says_what_they_are():
+    """ADR-0004: the report is allowed to be quiet, the explorer is not allowed
+    to be incomplete. Omitting the attribute would leave a user who read the spec
+    wondering whether the dump was broken; labelling it answers the question the
+    omission would have raised."""
+    lines = "\n".join(explore_lines(node({
+        (1, CLUSTER_ON_OFF, ATTR_ON_TIME): 0,
+        (1, CLUSTER_ON_OFF, ATTR_START_UP_ON_OFF): 1,
+    })))
+    assert "OnTime (0x4001) [writable, command parameter] = 0" in lines
+    assert "StartUpOnOff (0x4003) [writable] = 1" in lines
+
+
+def test_door_lock_operating_mode_IS_reported_as_a_gap():
+    """The false positive that broke the old command-field rule (#197
+    follow-up). ``OperatingMode`` is a real DoorLock setting —
+    Normal/Vacation/Privacy/NoRemoteLockUnlock (§5.2.9.24) — that merely shares
+    its name with a field of the request command ``SetHolidaySchedule``
+    (§5.2.10.12.4). It must be reported as a gap, not filtered.
+
+    DoorLock is Indigo device type ``matterLock`` (see ``test_door_lock.py``),
+    but ``survey_node`` decides purely from the AttributeList and does not
+    consult Indigo device types at all, so a bare ``node()`` fixture is enough
+    — the same pattern the parser-fix tests above already use.
+    """
+    survey = survey_node(node({
+        (1, CLUSTER_DOOR_LOCK, ATTR_ATTRIBUTE_LIST):
+            [ATTR_OPERATING_MODE, ATTR_ATTRIBUTE_LIST],
+    }))
+    assert reported(survey) == {(CLUSTER_DOOR_LOCK, ATTR_OPERATING_MODE)}
+
+
+def test_the_explorer_does_not_label_door_lock_operating_mode_a_command_parameter():
+    """The generated ``COMMAND_FIELD_ATTRIBUTES`` flags this pair, but a human
+    has reviewed it (``REVIEWED_COMMAND_FIELD_COLLISIONS``) and found it to be
+    a real setting — so, unlike ``OnTime``, the explorer must show it as an
+    ordinary writable attribute, not a command parameter."""
+    body = "\n".join(explore_lines(node({
+        (1, CLUSTER_DOOR_LOCK, ATTR_OPERATING_MODE): 0,
+    })))
+    assert "OperatingMode (0x0025) [writable] = 0" in body
+    assert "command parameter" not in body
+
+
+def test_the_explorer_still_labels_on_time_a_command_parameter():
+    """The control case for the test above: a NOT_SETTINGS member must still
+    be labelled, so the split between the two tables actually drives the
+    explorer rather than the label having quietly gone unconditional."""
+    body = "\n".join(explore_lines(node({(1, CLUSTER_ON_OFF, ATTR_ON_TIME): 0})))
+    assert "OnTime (0x4001) [writable, command parameter] = 0" in body
+
+
+@pytest.mark.parametrize("cluster,attribute,name", [
+    (0x001F, 0x0000, "AccessControl.Acl"),
+    (0x001E, 0x0000, "Binding.Binding"),
+    (0x003F, 0x0000, "GroupKeyManagement.GroupKeyMap"),
+    (0x0041, 0x0000, "UserLabel.LabelList"),
+    (0x002A, 0x0000, "OtaSoftwareUpdateRequestor.DefaultOtaProviders"),
+])
+def test_the_list_typed_plumbing_recovered_by_the_parser_fix_stays_quiet(
+        cluster, attribute, name):
+    """#197's parser fixes took the model's writable count 110 → 124 → 137 →
+    141. This test is about the first step: the generator had been skipping
+    every multi-line ``Attribute(``, i.e. every list- and struct-typed one.
+
+    Seven of the fourteen it recovered are fabric plumbing: an access-control
+    list, a binding table, a group-key map. Every node implements several, so
+    without an INFRASTRUCTURE_CLUSTERS entry each one would have started
+    recommending them as settings on the next survey of every device on the
+    fabric — the wallpaper this report is built to avoid, arriving as a
+    side-effect of a bug fix.
+    """
+    survey = survey_node(node({
+        (0, cluster, ATTR_ATTRIBUTE_LIST): [attribute, ATTR_ATTRIBUTE_LIST],
+    }))
+    assert survey.endpoints == (), f"{name} is plumbing, not a setting"
+
+
+@pytest.mark.parametrize("cluster,attribute,name", [
+    (0x0202, 0x0008, "FanControl.RockSetting"),
+    (0x0202, 0x000A, "FanControl.WindSetting"),
+    (0x0201, 0x0050, "Thermostat.Presets"),
+    (0x0201, 0x0051, "Thermostat.Schedules"),
+    (0x0101, 0x002B, "DoorLock.EnablePrivacyModeButton"),
+    (0x002D, 0x0000, "UnitLocalization.TemperatureUnit"),
+])
+def test_the_REAL_settings_recovered_by_the_parser_fix_ARE_reported(
+        cluster, attribute, name):
+    """The other seven, and the point of fixing the parser at all. These are
+    ordinary device settings a user would recognise — a fan's oscillation, a
+    lock's privacy button — that the report was structurally unable to mention.
+    RockSetting and WindSetting bear directly on the open fan work in #46.
+    """
+    endpoint = 0 if cluster == 0x002D else 1   # UnitLocalization is a node cluster
+    survey = survey_node(node({
+        (endpoint, cluster, ATTR_ATTRIBUTE_LIST): [attribute, ATTR_ATTRIBUTE_LIST],
+    }))
+    assert reported(survey) == {(cluster, attribute)}, f"{name} is a genuine gap"
+
+
+@pytest.mark.parametrize("cluster,attribute,name", [
+    (0x002B, 0x0000, "LocalizationConfiguration.ActiveLocale"),
+    (0x002C, 0x0000, "TimeFormatLocalization.HourFormat"),
+    (0x002D, 0x0000, "UnitLocalization.TemperatureUnit"),
+])
+def test_the_localization_trio_is_reported_not_suppressed(cluster, attribute, name):
+    """``ActiveLocale`` and ``HourFormat`` sat in INFRASTRUCTURE_CLUSTERS from
+    the day the report shipped; ``TemperatureUnit`` did not — it was invisible
+    to the pre-#197 parser, so it was added and then removed again within this
+    same branch. All three were suppressed on the stated grounds that such
+    things "belong to the fabric, not to the device's behaviour". They do not.
+
+    They are node-level DISPLAY preferences: show °F on the thermostat, use a
+    24-hour clock. A user would recognise every one of them as a setting, which
+    is the test this list is supposed to apply — that argument stands on its
+    own; **quality N** is not evidence for it (ADR-0006 rejects that inference).
+    Only ``ActiveLocale`` carries a device-reported ``Supported*`` list, the
+    ``FromAttribute`` bounds strategy the registry already implements; the
+    other two have no constraint at all.
+
+    What actually opts all three in is the Root Node device type's
+    ``LanguageLocale``/``TimeLocale``/``UnitLocale`` conditions — only
+    ``TemperatureUnit`` is separately FeatureMap-gated — so a node reports them
+    only if it opted in, which is why un-suppressing them is not a return to
+    wallpaper.
+    """
+    survey = survey_node(node({
+        (0, cluster, ATTR_ATTRIBUTE_LIST): [attribute, ATTR_ATTRIBUTE_LIST],
+    }))
+    assert reported(survey) == {(cluster, attribute)}, f"{name} is a real setting"
+
+
+def test_bridged_device_basic_information_node_label_stays_suppressed():
+    """Hard-coded, not derived from ``INFRASTRUCTURE_CLUSTERS`` — same
+    self-reference reason as ``test_specific_infrastructure_clusters_stay_suppressed``
+    above: a test parametrized over ``sorted(INFRASTRUCTURE_CLUSTERS)`` loses its
+    own case the moment the entry it is meant to guard is deleted.
+
+    ``NodeLabel`` (0x0039/0x0005) inherits ``RW VM`` from ``BasicInformation`` via
+    the inheritance-aware regen (#197) and every endpoint of every Matter bridge
+    implements ``BridgedDeviceBasicInformation`` — without suppression the report
+    would recommend it on all of them. ``BasicInformation``'s own ``NodeLabel``
+    (0x0028) is already excluded for the identical reason; Indigo owns the
+    device name in both cases.
+    """
+    survey = survey_node(node({
+        (1, 0x0039, ATTR_ATTRIBUTE_LIST): [0x0005, ATTR_ATTRIBUTE_LIST],
+    }))
+    assert survey.endpoints == ()
+
+
+def test_a_resource_monitoring_cluster_last_changed_time_IS_reported():
+    """The inheritance-aware regen (#197) resolves an attribute's access through
+    the cluster's base chain, and it made ``LastChangedTime`` (0x0004, ``RW VO``)
+    writable on ``HepaFilterMonitoring``, ``ActivatedCarbonFilterMonitoring`` and
+    ``WaterTankLevelMonitoring`` — none of which declare it on their own literal;
+    all three inherit it from ``ResourceMonitoring``. The spec (cluster §2.8.6.5)
+    says it is "the time at which the resource has been changed", i.e. when the
+    filter was last replaced — a genuine user setting, not fabric plumbing like
+    ``BridgedDeviceBasicInformation.NodeLabel`` (the fourth attribute this same
+    regen turned up, and the one that IS suppressed — see
+    ``INFRASTRUCTURE_CLUSTERS``). Pinned here so a future reader who sees four
+    new writable attributes appear from one regen does not lump all four
+    together and suppress this one too.
+    """
+    survey = survey_node(node({
+        (1, 0x0071, ATTR_ATTRIBUTE_LIST): [0x0004, ATTR_ATTRIBUTE_LIST],  # HepaFilterMonitoring
+    }))
+    assert reported(survey) == {(0x0071, 0x0004)}
 
 
 def test_a_cluster_with_no_writable_attributes_at_all_is_skipped():
@@ -201,12 +540,26 @@ def test_the_deprecated_pir_delays_ARE_reported():
 # The log block
 # ---------------------------------------------------------------------------
 
-def test_report_reads_as_information_not_as_a_fault():
+@pytest.mark.parametrize("survey", [
+    survey_node(level_node([ATTR_ON_LEVEL, ATTR_LEVEL_TRANSITION, ATTR_ATTRIBUTE_LIST])),
+    survey_node(node({
+        (0, CLUSTER_LOCALIZATION, ATTR_ACTIVE_LOCALE): "en-US",
+        (0, CLUSTER_LOCALIZATION, ATTR_ATTRIBUTE_LIST):
+            [ATTR_ACTIVE_LOCALE, ATTR_ATTRIBUTE_LIST],
+    })),
+], ids=["ordinary-endpoint", "endpoint-0-root-node"])
+def test_report_reads_as_information_not_as_a_fault(survey):
     """This fires unprompted at commissioning on hardware that is working
     perfectly. A line that reads like an error generates support traffic for a
-    non-problem, which is the failure mode the issue calls out by name."""
-    lines = report_lines(survey_node(onoff_node(
-        [ATTR_ON_TIME, ATTR_START_UP_ON_OFF, ATTR_ATTRIBUTE_LIST])))
+    non-problem, which is the failure mode the issue calls out by name.
+
+    Parametrized over an ordinary endpoint AND an endpoint-0-only survey: the
+    original single-fixture version only ever built from an endpoint-1 fixture,
+    so the endpoint-0 ``#204`` note (a whole separate block of prose, see
+    ``report_lines``) could say "error"/"problem"/"warning"/"failed" and this
+    loop would never see it.
+    """
+    lines = report_lines(survey)
     blob = "\n".join(lines).lower()
     assert "nothing is wrong" in blob
     assert "once per device" in blob
@@ -218,7 +571,7 @@ def test_report_reads_as_information_not_as_a_fault():
 def test_report_names_vendor_product_and_firmware():
     """#186 established behaviour here is firmware-specific, so the same product
     on two releases is, for this purpose, two devices."""
-    lines = report_lines(survey_node(onoff_node([ATTR_ON_TIME, ATTR_ATTRIBUTE_LIST])))
+    lines = report_lines(survey_node(level_node([ATTR_ON_LEVEL, ATTR_ATTRIBUTE_LIST])))
     assert "Aqara FP300 firmware 1.2.3 (node 0x38)" in lines[0]
 
 
@@ -230,12 +583,12 @@ def test_report_names_the_attribute_and_its_cluster_by_name():
 
 
 def test_report_counts_in_the_singular_when_there_is_one():
-    lines = report_lines(survey_node(onoff_node([ATTR_ON_TIME, ATTR_ATTRIBUTE_LIST])))
+    lines = report_lines(survey_node(level_node([ATTR_ON_LEVEL, ATTR_ATTRIBUTE_LIST])))
     assert "1 settable Matter attribute that" in lines[0]
 
 
 def test_an_unknown_device_still_gets_an_identity_line():
-    survey = survey_node(onoff_node([ATTR_ON_TIME, ATTR_ATTRIBUTE_LIST],
+    survey = survey_node(level_node([ATTR_ON_LEVEL, ATTR_ATTRIBUTE_LIST],
                                     vendor="", product="", firmware=""))
     assert report_lines(survey)[0].startswith("unknown device (node 0x38)")
 
@@ -246,15 +599,102 @@ def test_nothing_to_say_produces_no_lines_at_all():
 
 def test_endpoints_are_titled_by_their_indigo_device_when_named():
     survey = settings_report.name_endpoints(
-        survey_node(onoff_node([ATTR_ON_TIME, ATTR_ATTRIBUTE_LIST])),
+        survey_node(level_node([ATTR_ON_LEVEL, ATTR_ATTRIBUTE_LIST])),
         lambda ep: ["Kitchen Plug"])
     assert "Kitchen Plug (endpoint 1)" in "\n".join(report_lines(survey))
 
 
 def test_an_endpoint_with_no_indigo_device_falls_back_to_its_number():
+    """Scoped to endpoint 1, not 0: an ordinary endpoint with no Indigo
+    device YET (this fixture just never named one) falls back to its bare
+    number, but endpoint 0 never gets a device AT ALL and has its own
+    "Matter root node" heading instead (issue #204, see the tests below) —
+    the two must not collapse into the same fallback."""
     survey = settings_report.name_endpoints(
-        survey_node(onoff_node([ATTR_ON_TIME, ATTR_ATTRIBUTE_LIST])), lambda ep: [])
+        survey_node(level_node([ATTR_ON_LEVEL, ATTR_ATTRIBUTE_LIST])), lambda ep: [])
     assert "  endpoint 1:" in report_lines(survey)
+
+
+def test_an_ordinary_endpoints_heading_and_lines_are_unchanged():
+    """Guards the new endpoint-0 framing against leaking onto an endpoint
+    that DOES have an Indigo device — only endpoint 0 is special, and that
+    has to stay derived from the endpoint number, not become a default."""
+    survey = settings_report.name_endpoints(
+        survey_node(level_node([ATTR_ON_LEVEL, ATTR_ATTRIBUTE_LIST])),
+        lambda ep: ["Kitchen Plug"])
+    body = "\n".join(report_lines(survey))
+    assert "Kitchen Plug (endpoint 1)" in body
+    assert "root node" not in body.lower()
+    assert "node-level" not in body.lower()
+    assert "#204" not in body
+
+
+def test_an_endpoint_0_only_survey_renders_the_root_node_heading_and_204():
+    """Endpoint 0 is the Matter root node and never gets an Indigo device
+    (issue #204), so its heading must say what it is rather than rendering
+    a bare "endpoint 0:", and its lines must say support is already tracked
+    — otherwise the generic closing paragraph below would read as an
+    invitation to file a duplicate of #204."""
+    survey = survey_node(node({
+        (0, CLUSTER_LOCALIZATION, ATTR_ACTIVE_LOCALE): "en-US",
+        (0, CLUSTER_LOCALIZATION, ATTR_ATTRIBUTE_LIST):
+            [ATTR_ACTIVE_LOCALE, ATTR_ATTRIBUTE_LIST],
+    }))
+    body = "\n".join(report_lines(survey))
+    assert "the Matter root node (endpoint 0)" in body
+    assert "  endpoint 0:" not in body
+    assert "node-level" in body.lower()
+    assert "#204" in body
+
+
+def test_a_node_with_endpoint_0_and_an_application_endpoint_renders_each_correctly():
+    """The realistic case: one node reporting both a root-node display
+    preference and an ordinary per-device gap in the same block. Each
+    endpoint must get its own framing — the root-node text must not bleed
+    into endpoint 1's lines, and endpoint 1 must not gain a #204 reference
+    that belongs only to endpoint 0."""
+    survey = survey_node(node({
+        (0, CLUSTER_LOCALIZATION, ATTR_ACTIVE_LOCALE): "en-US",
+        (0, CLUSTER_LOCALIZATION, ATTR_ATTRIBUTE_LIST):
+            [ATTR_ACTIVE_LOCALE, ATTR_ATTRIBUTE_LIST],
+        (1, CLUSTER_LEVEL, ATTR_ATTRIBUTE_LIST): [ATTR_ON_LEVEL, ATTR_ATTRIBUTE_LIST],
+    }))
+    lines = report_lines(survey)
+    body = "\n".join(lines)
+    assert "the Matter root node (endpoint 0)" in body
+    assert "#204" in body
+    assert "  endpoint 1:" in body
+    assert "OnLevel (0x0011)" in body
+    # The #204 reference belongs to endpoint 0's block, not endpoint 1's.
+    root_index = next(i for i, ln in enumerate(lines) if "root node" in ln)
+    ep1_index = next(i for i, ln in enumerate(lines) if ln == "  endpoint 1:")
+    assert not any("#204" in ln for ln in lines[ep1_index:])
+    assert root_index < ep1_index
+
+
+def test_report_lines_endpoint_0_block_has_the_caption_before_the_attribute():
+    """A structural pin on one endpoint's block, not just substring checks.
+
+    Two mutations survive without this: moving the ``#204`` note to AFTER the
+    attribute line(s) it captions (readable as "here are the attributes, oh
+    and by the way #204" instead of the caption explaining what follows), and
+    emitting every attribute line twice (a duplicated ``for item in
+    endpoint.settable`` loop). The note-before-attribute ordering and the
+    exactly-once count are both asserted directly.
+    """
+    survey = survey_node(node({
+        (0, CLUSTER_LOCALIZATION, ATTR_ACTIVE_LOCALE): "en-US",
+        (0, CLUSTER_LOCALIZATION, ATTR_ATTRIBUTE_LIST):
+            [ATTR_ACTIVE_LOCALE, ATTR_ATTRIBUTE_LIST],
+    }))
+    lines = report_lines(survey)
+    note_index = next(i for i, ln in enumerate(lines) if "#204" in ln)
+    attr_index = next(i for i, ln in enumerate(lines) if "ActiveLocale" in ln)
+    assert note_index < attr_index, (
+        "the #204 note must caption the attribute lines that follow it, not "
+        "come after them")
+    assert sum(1 for ln in lines if "ActiveLocale" in ln) == 1, (
+        "each attribute must be listed exactly once")
 
 
 # ---------------------------------------------------------------------------
@@ -262,17 +702,17 @@ def test_an_endpoint_with_no_indigo_device_falls_back_to_its_number():
 # ---------------------------------------------------------------------------
 
 def test_fingerprint_changes_with_firmware():
-    listed = [ATTR_ON_TIME, ATTR_ATTRIBUTE_LIST]
-    before = survey_node(onoff_node(listed, firmware="1.0.0")).fingerprint()
-    after = survey_node(onoff_node(listed, firmware="1.1.0")).fingerprint()
+    listed = [ATTR_ON_LEVEL, ATTR_ATTRIBUTE_LIST]
+    before = survey_node(level_node(listed, firmware="1.0.0")).fingerprint()
+    after = survey_node(level_node(listed, firmware="1.1.0")).fingerprint()
     assert before != after
 
 
 def test_fingerprint_changes_with_the_settable_set():
     """A first informative snapshot that arrived mid-interview must not latch a
     short answer forever — this is what makes the log self-correcting."""
-    short = survey_node(onoff_node([ATTR_ON_TIME, ATTR_ATTRIBUTE_LIST])).fingerprint()
-    full = survey_node(onoff_node([ATTR_ON_TIME, ATTR_START_UP_ON_OFF,
+    short = survey_node(level_node([ATTR_ON_LEVEL, ATTR_ATTRIBUTE_LIST])).fingerprint()
+    full = survey_node(level_node([ATTR_ON_LEVEL, ATTR_LEVEL_TRANSITION,
                                    ATTR_ATTRIBUTE_LIST])).fingerprint()
     assert short != full
 
@@ -288,17 +728,17 @@ def test_the_reported_order_does_not_follow_the_wire():
     every sort removed, because a frozenset of small ints iterates stably within
     a process. It proved the property and pinned none of the code.)
     """
-    survey = survey_node(onoff_node([ATTR_START_UP_ON_OFF, ATTR_ATTRIBUTE_LIST, ATTR_ON_TIME]))
+    survey = survey_node(level_node([ATTR_ON_LEVEL, ATTR_ATTRIBUTE_LIST, ATTR_LEVEL_TRANSITION]))
     ids = [item.attribute for ep in survey.endpoints for item in ep.settable]
-    assert ids == sorted(ids) == [ATTR_ON_TIME, ATTR_START_UP_ON_OFF]
+    assert ids == sorted(ids) == [ATTR_LEVEL_TRANSITION, ATTR_ON_LEVEL]
 
 
 def test_fingerprint_is_stable_across_attribute_list_ORDER():
     """The property the test above protects the mechanism of: a device
     re-reporting the same ids in a different order is not a change, and treating
     it as one would re-report on every reconnect."""
-    one = survey_node(onoff_node([ATTR_ON_TIME, ATTR_START_UP_ON_OFF, ATTR_ATTRIBUTE_LIST]))
-    two = survey_node(onoff_node([ATTR_START_UP_ON_OFF, ATTR_ATTRIBUTE_LIST, ATTR_ON_TIME]))
+    one = survey_node(level_node([ATTR_ON_LEVEL, ATTR_LEVEL_TRANSITION, ATTR_ATTRIBUTE_LIST]))
+    two = survey_node(level_node([ATTR_LEVEL_TRANSITION, ATTR_ATTRIBUTE_LIST, ATTR_ON_LEVEL]))
     assert one.fingerprint() == two.fingerprint()
 
 
@@ -488,6 +928,23 @@ def test_no_attribute_is_both_driven_and_declared_as_a_setting():
     a control goes through the action bridge. Both would mean two UI routes to
     one attribute with different validation."""
     assert not (DRIVEN_ATTRIBUTES & settings_report.declared_pairs())
+
+
+def test_no_declared_setting_is_a_command_parameter():
+    """#197 in one line, pointed forwards.
+
+    The PR that retired onTime derived a machine-readable answer to "which
+    writable attributes does a command own?" and then checked the registry
+    against it only at the single point (0x0006, 0x4001). Declaring a setting for
+    Identify.IdentifyTime — or for whatever a future matter.js adds — would ship
+    the same dead dialog field with CI green, and the explorer would label the
+    very same attribute "[writable, command parameter]", so the plugin would
+    contradict itself in two surfaces.
+    """
+    parameters = {(cluster, attribute)
+                  for cluster, ids in settings_report.COMMAND_FIELD_ATTRIBUTES.items()
+                  for attribute in ids}
+    assert not (parameters & settings_report.declared_pairs())
 
 
 def _handler_write_targets() -> set:
