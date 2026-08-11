@@ -10,10 +10,11 @@ matter-server/bridge-node menus — has moved to mixins (issue #146), except
 the Set Sensitivity Level custom action (``actionSetSensitivityLevel`` and
 its ``getSensitivityLevels`` picker), which stays with the action bridge:
 :class:`HttpApiMixin`, :class:`ExportDialogMixin`, :class:`PairingMenuMixin`,
-:class:`ServerMenuMixin`. ``plugin_constants.py`` holds the shared constants
-and prefs helpers; ``pairing_page.py`` holds the pairing IWS page template.
-``Plugin`` composes all four mixins so every callback still resolves as a
-plain attribute on the ``Plugin`` class, which is how Indigo looks them up.
+:class:`ServerMenuMixin`, :class:`DiagnosticsMenuMixin`.
+``plugin_constants.py`` holds the shared constants and prefs helpers;
+``pairing_page.py`` holds the pairing IWS page template. ``Plugin`` composes all
+five mixins so every callback still resolves as a plain attribute on the
+``Plugin`` class, which is how Indigo looks them up.
 
 See ``docs/PRD-indigo-matter-plugin.md``, ``docs/IMPLEMENTATION.md`` (protocol +
 scaffold) and ``docs/API.md`` (the Domio contract). matter-server protocol field
@@ -32,6 +33,7 @@ from async_runtime import AsyncRuntime
 from commission_jobs import CommissionJobs
 import device_settings
 from device_sync import DeviceSync
+from diagnostics_menu_mixin import DiagnosticsMenuMixin
 import export_bridge
 from export_bridge import ExportBridge
 import export_dialog_mixin      # noqa: F401 (tests patch EXPORT_PICKER_LIMIT)  # pylint: disable=unused-import
@@ -51,8 +53,10 @@ from server_process import ServerProcess
 
 from plugin_constants import (
     COMMAND_TIMEOUT, MAX_RESUBSCRIBE_ATTEMPTS, PLUGIN_NAME,
-    PORT_CONFLICT_CHECK_INTERVAL, RESUBSCRIBE_TICKS, sanitize_host, server_location,
+    PORT_CONFLICT_CHECK_INTERVAL, RESUBSCRIBE_TICKS, SURVEY_LOG_PREF,
+    sanitize_host, server_location,
 )
+import settings_report
 
 # Re-exported for the test suite, which reaches into this module's namespace
 # (tests/test_*.py do `plugin_mod.<name>`) and for backwards compatibility with
@@ -63,10 +67,10 @@ import export_catalog          # noqa: F401
 import export_handlers         # noqa: F401
 from pairing_page import _escape, _pairing_html   # noqa: F401
 from plugin_constants import (  # noqa: F401
-    DECOMMISSION_TIMEOUT, EXCLUDED_OPTION_PREFIX, EXPORT_PICKER_LIMIT,
+    ALL_OPTION_ID, DECOMMISSION_TIMEOUT, EXCLUDED_OPTION_PREFIX, EXPORT_PICKER_LIMIT,
     FACTORY_RESET_TIMEOUT, LIST_ERROR_OPTION, MENU_MANAGE_EXPORTS,
     MENU_UNPAIR_ECOSYSTEM, NO_MATCH_OPTION, NO_SELECTION_ID, NO_SELECTION_LABEL,
-    PAIRING_READ_TIMEOUT, ROW_ERROR_LABEL, TRUNCATED_OPTION,
+    PAIRING_READ_TIMEOUT, ROW_ERROR_LABEL, SURVEY_READ_TIMEOUT, TRUNCATED_OPTION,
     UNPAIR_TIMEOUT, WINDOW_OPEN_TIMEOUT,
 )
 
@@ -78,7 +82,8 @@ _SENSITIVITY_SETTING = next(
     s for s in settings_for_type("matterMotionSensor") if s.key == "sensitivityLevel")
 
 
-class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, ServerMenuMixin, indigo.PluginBase):
+class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, ServerMenuMixin,
+             DiagnosticsMenuMixin, indigo.PluginBase):
     """Matter plugin entry point."""
 
     def __init__(self, plugin_id, plugin_display_name, plugin_version, plugin_prefs, **kwargs):
@@ -196,6 +201,15 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, ServerMenuMixin,
         if len(self.exports):
             self.logger.info("Matter export allow-list: %d device(s) exported", len(self.exports))
         self._reconcile_exports()
+
+        # Which devices have already had their settable-attribute report logged
+        # (issue #191). Same prefs discipline as the export store: read through a
+        # getter and commit via savePluginPrefs, because Indigo rebinds
+        # self.pluginPrefs when the PluginConfig dialog is saved and a captured
+        # mapping would be written to an orphan.
+        self.survey_log = settings_report.SurveyLog(save=self._save_survey_log)
+        self.survey_log.load(self.pluginPrefs.get(SURVEY_LOG_PREF, ""))
+        self.device_sync.survey_log = self.survey_log
 
         self.runtime = AsyncRuntime(self.logger)
         self.runtime.start()

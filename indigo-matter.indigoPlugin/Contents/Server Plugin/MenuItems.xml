@@ -64,6 +64,76 @@
         </ConfigUI>
     </MenuItem>
 
+    <!--
+        Read-only diagnostics (issue #191). Deliberately in section 1, beside
+        the devices they describe, rather than with the plumbing in sections
+        3-5: these answer questions about a DEVICE.
+
+        Both report into the EVENT LOG, and that is forced rather than chosen.
+        Indigo's ConfigUI has no per-field change callback — the only dynamic
+        mechanism is <List dynamicReload="true">, which regenerates a list's
+        OPTIONS — so a menu dialog physically cannot display an answer. Same
+        constraint and same resolution as the pairing codes in section 3.
+
+        NEITHER WRITES ANYTHING, and that is settled (2026-08-11), not an
+        omission awaiting a follow-up: a generic attribute writer is
+        unvalidated by construction, is device-global on devices joined to
+        several ecosystems, and adds nothing over declaring another
+        DeviceSetting — which is bounds-checked and verified by read-back.
+    -->
+    <MenuItem id="reportSettableSettings">
+        <Name>Report settable Matter settings…</Name>
+        <CallbackMethod>menuReportSettings</CallbackMethod>
+        <ConfigUI>
+            <Field id="reportIntro" type="label">
+                <Label>Lists, in the Event Log, the Matter settings a device supports that this plugin does not offer yet. Nothing is changed and nothing is wrong with a device that reports some — it is a list of settings that could be added. Paste the result into a GitHub issue to ask for them.</Label>
+            </Field>
+            <Field id="node" type="menu">
+                <Label>Device:</Label>
+                <List class="self" method="getSurveyNodes" dynamicReload="true"/>
+                <Description>Devices report this automatically the first time they are seen; use this to ask again, or for devices added before this feature existed.</Description>
+            </Field>
+        </ConfigUI>
+    </MenuItem>
+    <MenuItem id="exploreAttributes">
+        <Name>Explore Matter attributes (advanced)…</Name>
+        <CallbackMethod>menuExploreAttributes</CallbackMethod>
+        <ConfigUI>
+            <Field id="exploreIntro" type="label">
+                <Label>Dumps what a Matter device reports, to the Event Log. Read-only — nothing is ever written to the device. Leave the attribute box empty for a full dump of the chosen scope; fill it in to read one attribute live from the device instead.</Label>
+            </Field>
+            <!--
+                The node menu's CallbackMethod does nothing on purpose. It is
+                the ONLY way to make Indigo round-trip to the plugin, which is
+                what re-runs the two dynamicReload lists below — ConfigUI has
+                no per-field change event, so a menu callback is the whole
+                cascade mechanism.
+            -->
+            <Field id="node" type="menu">
+                <Label>Device:</Label>
+                <List class="self" method="getExploreNodes" dynamicReload="true"/>
+                <CallbackMethod>exploreNodeChanged</CallbackMethod>
+            </Field>
+            <Field id="endpoint" type="menu" defaultValue="all">
+                <Label>Endpoint:</Label>
+                <List class="self" method="getExploreEndpoints" dynamicReload="true"/>
+                <CallbackMethod>exploreNodeChanged</CallbackMethod>
+                <Description>A device with several functions (or a bridge) has one endpoint per function. Endpoint 0 is the device itself.</Description>
+            </Field>
+            <Field id="cluster" type="menu" defaultValue="all">
+                <Label>Cluster:</Label>
+                <List class="self" method="getExploreClusters" dynamicReload="true"/>
+                <Description>Only clusters this device actually reports are listed.</Description>
+            </Field>
+            <Field id="attribute" type="textfield">
+                <Label>Read one attribute live (optional):</Label>
+            </Field>
+            <Field id="attributeHelp" type="label" fontColor="darkgray">
+                <Label>Leave empty for a full dump from the cached snapshot — complete and instant, but an unsubscribed value can be stale. To confirm one value against the device itself, choose an exact endpoint and cluster and enter an attribute id here (e.g. 0x4003). A battery or Thread device can take several seconds to answer.</Label>
+            </Field>
+        </ConfigUI>
+    </MenuItem>
+
     <MenuItem id="sepDevicesFromExport"/>
 
     <!--
