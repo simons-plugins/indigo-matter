@@ -61,6 +61,8 @@ Inherits workspace standards from [root CLAUDE.md](../CLAUDE.md#common-standards
 - **Testing**: `pytest` (`pyproject.toml`, pylint + 120-char like netro). matter-server is mocked at the WS layer (`tests/fakes.py`); the `indigo` module is mocked. Run: `cd indigo-matter && pytest`. The bridge node has its own suite: `cd bridge-node && npm run build && npm test`.
 - **Bridge-protocol golden frames**: `tests/fixtures/bridge_protocol/frames.json` is the ONE shared fixture file (BRIDGE_PROTOCOL §7) — the Python suite reads it directly, `npm test` copies it into the TS build. Change a frame and both suites must be updated, by design.
 - **Merge**: GitHub PR only, never `--admin`, never squash, wait for CI green, wait for user go-ahead.
+- **Architecture decisions**: repo-local ones live in [`docs/adr/`](./docs/adr/INDEX.md) (MADR 4.0.0). **Read that index before changing writable settings, capability detection, or the diagnostics surface.** Cross-repo concerns go in the workspace `docs/adr/` instead. Numbering is independent and collides, so always qualify a reference as "workspace ADR-NNNN". ADRs are immutable once accepted — supersede, never edit.
+- **Device quirks**: hardware behaviours that surprised us are in [`docs/DEVICE-NOTES.md`](./docs/DEVICE-NOTES.md).
 
 ## Status
 
