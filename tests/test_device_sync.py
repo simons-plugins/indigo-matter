@@ -2645,14 +2645,22 @@ def test_hold_time_is_primed_onto_the_device_at_creation(ds, indigo_env):
     assert dev.states.get("holdTime") == 10
 
 
-#: A plug implementing OnOff's Lighting feature — the shape two of the four
-#: dev-fabric plugs report (AttributeList carries 16385/16386/16387).
+#: A plug implementing OnOff's Lighting feature — the IKEA GRILLPLATS, read off
+#: the live fabric on 2026-08-11 (node 0x34): AttributeList carries
+#: 16385/16386/16387 and StartUpOnOff really reads 1.
+#:
+#: NOTE: issue #190 attributes this the other way round — it names the Shelly as
+#: the one implementing Lighting and the GRILLPLATS as the one without. The live
+#: devices say the opposite, and the list the issue quotes for the GRILLPLATS is
+#: byte-for-byte node 0x32's (the Shelly's), 65530 and all. The issue's reasoning
+#: is unaffected — one plug has these attributes and one does not — but the two
+#: device names are swapped, and these fixtures used to inherit that.
 LIGHTING_PLUG_NODE = {
-    "node_id": 0x33,
+    "node_id": 0x34,
     "available": True,
     "attributes": {
-        "0/40/1": "Shelly",
-        "0/40/3": "1PM Mini Gen3",
+        "0/40/1": "IKEA",
+        "0/40/3": "GRILLPLATS Plug",
         "1/29/0": [{"0": 266}],
         "1/6/0": True,
         "1/6/16385": 0,
@@ -2661,13 +2669,14 @@ LIGHTING_PLUG_NODE = {
     },
 }
 
-#: …and one that does not: OnOff and nothing else.
+#: …and one that does not: the Shelly 1PM Mini Gen3 (live node 0x32). OnOff and
+#: nothing else — no 16385/16386/16387.
 PLAIN_PLUG_NODE = {
-    "node_id": 0x34,
+    "node_id": 0x32,
     "available": True,
     "attributes": {
-        "0/40/1": "IKEA",
-        "0/40/3": "GRILLPLATS Plug",
+        "0/40/1": "Shelly",
+        "0/40/3": "1PM Mini Gen3",
         "1/29/0": [{"0": 266}],
         "1/6/0": True,
         "1/6/65531": [0, 65528, 65529, 65530, 65531, 65532, 65533],
@@ -2676,30 +2685,30 @@ PLAIN_PLUG_NODE = {
 
 
 def test_attribute_list_is_cached_per_cluster(ds, indigo_env):
-    ds.create_from_raw(LIGHTING_PLUG_NODE, "Desk Light Switch")
-    assert 16387 in ds.attribute_list(0x33, 1, 0x0006)
+    ds.create_from_raw(LIGHTING_PLUG_NODE, "Grillplats socket")
+    assert 16387 in ds.attribute_list(0x34, 1, 0x0006)
 
 
 def test_attribute_list_is_none_for_an_uncached_cluster(ds, indigo_env):
-    ds.create_from_raw(LIGHTING_PLUG_NODE, "Desk Light Switch")
-    assert ds.attribute_list(0x33, 1, 0x0406) is None
+    ds.create_from_raw(LIGHTING_PLUG_NODE, "Grillplats socket")
+    assert ds.attribute_list(0x34, 1, 0x0406) is None
 
 
 def test_attribute_list_is_none_before_reconcile(ds, indigo_env):
-    assert ds.attribute_list(0x33, 1, 0x0006) is None
+    assert ds.attribute_list(0x34, 1, 0x0006) is None
 
 
 def test_a_plain_plug_reports_a_list_without_the_lighting_attributes(ds, indigo_env):
-    ds.create_from_raw(PLAIN_PLUG_NODE, "Grillplats socket")
-    listed = ds.attribute_list(0x34, 1, 0x0006)
+    ds.create_from_raw(PLAIN_PLUG_NODE, "Desk Light Switch")
+    listed = ds.attribute_list(0x32, 1, 0x0006)
     assert listed is not None, "the list itself is known"
     assert 16387 not in listed, "…and it says the device lacks StartUpOnOff"
 
 
 def test_lighting_settings_are_primed_onto_the_relay(ds, indigo_env):
     _indigo, devices = indigo_env
-    ds.create_from_raw(LIGHTING_PLUG_NODE, "Desk Light Switch")
-    dev = devices[ds.lookup(0x33, 1)]
+    ds.create_from_raw(LIGHTING_PLUG_NODE, "Grillplats socket")
+    dev = devices[ds.lookup(0x34, 1)]
     assert dev.states.get("startUpOnOff") == 1
     assert dev.states.get("onTime") == 0
 
@@ -2714,13 +2723,13 @@ def test_lighting_settings_are_primed_onto_the_relay(ds, indigo_env):
 #: node_updated after a server restart legitimately carries no attributes at all
 #: and a second follows once the cache is warm. Every capability answer is
 #: derived from these attributes, so an empty one must mean "no information".
-COLD_CACHE_NODE = {"node_id": 0x34, "available": True, "attributes": {}}
+COLD_CACHE_NODE = {"node_id": 0x32, "available": True, "attributes": {}}
 
 
 def test_an_empty_snapshot_does_not_retract_an_attribute_list(ds, indigo_env):
-    ds.create_from_raw(PLAIN_PLUG_NODE, "Grillplats socket")
+    ds.create_from_raw(PLAIN_PLUG_NODE, "Desk Light Switch")
     ds.reconcile_all([COLD_CACHE_NODE])
-    assert ds.attribute_list(0x34, 1, 0x0006) is not None, (
+    assert ds.attribute_list(0x32, 1, 0x0006) is not None, (
         "a cold-cache node_updated must not be read as 'implements nothing'")
 
 
@@ -2751,13 +2760,13 @@ def test_a_cluster_that_stops_reporting_its_list_drops_the_cached_answer(ds, ind
     never broken. What survived forever was a key the node stopped reporting at
     all — the answer then stayed YES with nothing behind it.
     """
-    ds.create_from_raw(LIGHTING_PLUG_NODE, "Desk Light Switch")
-    assert 16387 in ds.attribute_list(0x33, 1, 0x0006)
+    ds.create_from_raw(LIGHTING_PLUG_NODE, "Grillplats socket")
+    assert 16387 in ds.attribute_list(0x34, 1, 0x0006)
     import copy
     silent = copy.deepcopy(LIGHTING_PLUG_NODE)
     del silent["attributes"]["1/6/65531"]
     ds.reconcile_all([silent])
-    assert ds.attribute_list(0x33, 1, 0x0006) is None, (
+    assert ds.attribute_list(0x34, 1, 0x0006) is None, (
         "a list no longer reported is unknown, not the list from last time")
 
 
@@ -2769,22 +2778,22 @@ def test_a_reused_node_id_does_not_inherit_the_previous_devices_answers(ds, indi
     like swap overwrites the same keys and hides the bug, which is precisely why
     it went unnoticed.
     """
-    ds.create_from_raw(LIGHTING_PLUG_NODE, "Desk Light Switch")
-    assert ds.attribute_list(0x33, 1, 0x0006) is not None
+    ds.create_from_raw(LIGHTING_PLUG_NODE, "Grillplats socket")
+    assert ds.attribute_list(0x34, 1, 0x0006) is not None
     import copy
     recommissioned = copy.deepcopy(FP300_SETTINGS_NODE)
-    recommissioned["node_id"] = 0x33          # same id, different physical device
+    recommissioned["node_id"] = 0x34          # same id, different physical device
     ds.reconcile_all([recommissioned])
-    assert ds.attribute_list(0x33, 1, 0x0006) is None, (
+    assert ds.attribute_list(0x34, 1, 0x0006) is None, (
         "the OnOff answer belonged to the plug that used to hold this id")
 
 
 def test_node_removed_evicts_the_capability_caches(ds, indigo_env):
-    ds.create_from_raw(LIGHTING_PLUG_NODE, "Desk Light Switch")
+    ds.create_from_raw(LIGHTING_PLUG_NODE, "Grillplats socket")
     ds.handle_event(MatterEvent(
-        kind=protocol.EVT_NODE_REMOVED, node_id=0x33,
-        raw={"event": "node_removed", "data": 0x33}))
-    assert ds.attribute_list(0x33, 1, 0x0006) is None
+        kind=protocol.EVT_NODE_REMOVED, node_id=0x34,
+        raw={"event": "node_removed", "data": 0x34}))
+    assert ds.attribute_list(0x34, 1, 0x0006) is None
 
 
 def test_a_node_missing_from_get_nodes_KEEPS_its_capability_answers(ds, indigo_env):
@@ -2797,9 +2806,9 @@ def test_a_node_missing_from_get_nodes_KEEPS_its_capability_answers(ds, indigo_e
     node_removed, which is an explicit decommission. The re-used node id that
     motivated #192 is handled by the per-node rebuild instead.
     """
-    ds.create_from_raw(LIGHTING_PLUG_NODE, "Desk Light Switch")
+    ds.create_from_raw(LIGHTING_PLUG_NODE, "Grillplats socket")
     ds.reconcile_all([])          # authoritative list came back short/empty
-    assert ds.attribute_list(0x33, 1, 0x0006) is not None
+    assert ds.attribute_list(0x34, 1, 0x0006) is not None
 
 
 def test_a_blip_does_not_blank_the_device_settings_section(ds, indigo_env):
@@ -2903,8 +2912,8 @@ def test_a_reordered_attribute_list_is_not_a_capability_change(ds, indigo_env):
     """No ordering is promised for an AttributeList and `implements` reads it as
     a set, so a reshuffle must not rebuild state lists or reprint the log."""
     _indigo, devices = indigo_env
-    ds.create_from_raw(LIGHTING_PLUG_NODE, "Desk Light Switch")
-    dev = devices[ds.lookup(0x33, 1)]
+    ds.create_from_raw(LIGHTING_PLUG_NODE, "Grillplats socket")
+    dev = devices[ds.lookup(0x34, 1)]
     before = dev.state_list_rebuilds
     import copy
     shuffled = copy.deepcopy(LIGHTING_PLUG_NODE)
@@ -2917,14 +2926,14 @@ def test_a_reordered_attribute_list_is_not_a_capability_change(ds, indigo_env):
 def test_a_node_updated_event_rebuilds_the_cache_too(ds, indigo_env):
     """The live path a firmware change actually arrives on — reconcile is only
     the connect-time one."""
-    ds.create_from_raw(LIGHTING_PLUG_NODE, "Desk Light Switch")
+    ds.create_from_raw(LIGHTING_PLUG_NODE, "Grillplats socket")
     import copy
     downgraded = copy.deepcopy(LIGHTING_PLUG_NODE)
     downgraded["attributes"]["1/6/65531"] = [0, 65528, 65529, 65531, 65532, 65533]
     ds.handle_event(MatterEvent(
-        kind=protocol.EVT_NODE_UPDATED, node_id=0x33,
+        kind=protocol.EVT_NODE_UPDATED, node_id=0x34,
         raw={"event": "node_updated", "data": downgraded}))
-    assert 16387 not in ds.attribute_list(0x33, 1, 0x0006)
+    assert 16387 not in ds.attribute_list(0x34, 1, 0x0006)
 
 
 def test_a_device_created_on_an_unchanged_pass_still_gets_its_states_rebuilt(ds, indigo_env):
@@ -2932,12 +2941,12 @@ def test_a_device_created_on_an_unchanged_pass_still_gets_its_states_rebuilt(ds,
     match the cache, so the change flag is False — but the NEW device still
     carries the unfiltered type-level state list and must be revisited."""
     _indigo, devices = indigo_env
-    ds.create_from_raw(LIGHTING_PLUG_NODE, "Desk Light Switch")
-    dev_id = ds.lookup(0x33, 1)
+    ds.create_from_raw(LIGHTING_PLUG_NODE, "Grillplats socket")
+    dev_id = ds.lookup(0x34, 1)
     del devices._by_id[dev_id]          # the user deleted it in the Indigo UI
     ds.rebuild_index()
     ds.reconcile_all([LIGHTING_PLUG_NODE])
-    recreated = devices[ds.lookup(0x33, 1)]
+    recreated = devices[ds.lookup(0x34, 1)]
     assert recreated.state_list_rebuilds >= 1
 
 
@@ -2946,8 +2955,8 @@ def test_a_refresh_that_fails_is_retried_on_the_next_pass(ds, indigo_env):
     that throws can never be rediscovered — without the pending set the stale
     state list is latched until a plugin restart."""
     _indigo, devices = indigo_env
-    ds.create_from_raw(LIGHTING_PLUG_NODE, "Desk Light Switch")
-    dev = devices[ds.lookup(0x33, 1)]
+    ds.create_from_raw(LIGHTING_PLUG_NODE, "Grillplats socket")
+    dev = devices[ds.lookup(0x34, 1)]
     import copy
     downgraded = copy.deepcopy(LIGHTING_PLUG_NODE)
     downgraded["attributes"]["1/6/65531"] = [0, 65528, 65529, 65531, 65532, 65533]
@@ -2967,11 +2976,11 @@ def test_eviction_leaves_the_devices_alone(ds, indigo_env):
     """Forgetting a capability answer must never look like a state change —
     unknown is 'fall back to older evidence', not 'the device lacks this'."""
     _indigo, devices = indigo_env
-    ds.create_from_raw(LIGHTING_PLUG_NODE, "Desk Light Switch")
-    dev = devices[ds.lookup(0x33, 1)]
+    ds.create_from_raw(LIGHTING_PLUG_NODE, "Grillplats socket")
+    dev = devices[ds.lookup(0x34, 1)]
     ds.handle_event(MatterEvent(
-        kind=protocol.EVT_NODE_REMOVED, node_id=0x33,
-        raw={"event": "node_removed", "data": 0x33}))
+        kind=protocol.EVT_NODE_REMOVED, node_id=0x34,
+        raw={"event": "node_removed", "data": 0x34}))
     assert dev.states.get("startUpOnOff") == 1
 
 
@@ -2979,8 +2988,8 @@ def test_eviction_leaves_the_devices_alone(ds, indigo_env):
 
 def test_a_changed_attribute_list_rebuilds_the_devices_state_list(ds, indigo_env):
     _indigo, devices = indigo_env
-    ds.create_from_raw(LIGHTING_PLUG_NODE, "Desk Light Switch")
-    dev = devices[ds.lookup(0x33, 1)]
+    ds.create_from_raw(LIGHTING_PLUG_NODE, "Grillplats socket")
+    dev = devices[ds.lookup(0x34, 1)]
     before = dev.state_list_rebuilds
     import copy
     downgraded = copy.deepcopy(LIGHTING_PLUG_NODE)
@@ -2994,8 +3003,8 @@ def test_an_unchanged_reconcile_does_not_rebuild_the_state_list(ds, indigo_env):
     availability change, and a device dropping offline and returning reports the
     same AttributeList both times — so nothing may move."""
     _indigo, devices = indigo_env
-    ds.create_from_raw(LIGHTING_PLUG_NODE, "Desk Light Switch")
-    dev = devices[ds.lookup(0x33, 1)]
+    ds.create_from_raw(LIGHTING_PLUG_NODE, "Grillplats socket")
+    dev = devices[ds.lookup(0x34, 1)]
     before = dev.state_list_rebuilds
     ds.reconcile_all([LIGHTING_PLUG_NODE])
     ds.reconcile_all([LIGHTING_PLUG_NODE])
@@ -3008,10 +3017,10 @@ def test_an_empty_snapshot_does_not_rebuild_the_state_list(ds, indigo_env):
     RESURRECT the spurious 0s #190 removes, for the next warm frame to withdraw
     them again."""
     _indigo, devices = indigo_env
-    ds.create_from_raw(LIGHTING_PLUG_NODE, "Desk Light Switch")
-    dev = devices[ds.lookup(0x33, 1)]
+    ds.create_from_raw(LIGHTING_PLUG_NODE, "Grillplats socket")
+    dev = devices[ds.lookup(0x34, 1)]
     before = dev.state_list_rebuilds
-    ds.reconcile_all([{"node_id": 0x33, "available": True, "attributes": {}}])
+    ds.reconcile_all([{"node_id": 0x34, "available": True, "attributes": {}}])
     assert dev.state_list_rebuilds == before
 
 
