@@ -11,7 +11,7 @@ from typing import Any, Optional
 
 from .base import ENDPOINT_OWNER_CLUSTERS, ClusterHandler, IndigoDeviceSpec, MatterCommand
 from .electrical import CLUSTER_ELECTRICAL_ENERGY, CLUSTER_ELECTRICAL_POWER
-from .settings import ATTR_ON_TIME, ATTR_START_UP_ON_OFF
+from .settings import ATTR_START_UP_ON_OFF
 
 CLUSTER_LEVEL_CONTROL = 0x0008
 CLUSTER_COLOR_CONTROL = 0x0300
@@ -68,15 +68,18 @@ class OnOffHandler(ClusterHandler):
     #: Attribute id → Indigo state, for the writable Lighting-feature settings
     #: (issue #186). Subscribed so the Edit Device dialog can show the current
     #: value without a live read, and so a change made from another ecosystem
-    #: still reaches Indigo. Conformance LT: a device implementing none of these
-    #: simply never reports them, and the AttributeList gate keeps the fields
+    #: still reaches Indigo. Conformance LT: a device that does not implement it
+    #: simply never reports it, and the AttributeList gate keeps the field
     #: hidden. Subscribing to an attribute a device lacks costs nothing here
     #: because the plugin takes matter-server's whole start_listening firehose
     #: and these lists are only a future filtering aid (see matter_client) — no
     #: per-attribute subscription is actually issued.
+    #:
+    #: OnTime was here and was withdrawn with its setting (#197): a state that
+    #: can only ever read 0 is worse than no state, because it looks like an
+    #: answer.
     SETTING_STATES = {
         ATTR_START_UP_ON_OFF: "startUpOnOff",
-        ATTR_ON_TIME: "onTime",
     }
 
     def attributes_to_subscribe(self) -> list[int]:

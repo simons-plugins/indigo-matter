@@ -1068,7 +1068,7 @@ _PLAIN_PLUG_LISTS = {0x0006: [0, 65528, 65529, 65531, 65532, 65533]}
 def _relay_states():
     """matterRelay's <States> as Devices.xml declares them."""
     return [{"Key": key, "StateLabel": key, "TriggerLabel": key}
-            for key in ("onOffState", "startUpOnOff", "onTime")]
+            for key in ("onOffState", "startUpOnOff")]
 
 
 def _state_list_plugin(plugin_cls, mock_indigo_base, mock_logger, attr_lists):
@@ -1095,7 +1095,8 @@ def _state_list_plugin(plugin_cls, mock_indigo_base, mock_logger, attr_lists):
 
     device_sync.attribute_list.side_effect = lookup
     plugin.device_sync = device_sync
-    plugin.base_state_lists = {"matterRelay": _relay_states()}
+    plugin.base_state_lists = {"matterRelay": _relay_states(),
+                               "matterMotionSensor": _motion_states()}
     return plugin
 
 
@@ -1105,18 +1106,35 @@ def _relay_dev(dev_id=7, name="Grillplats socket", node="52", endpoint="1"):
                            pluginProps={"nodeId": node, "endpointId": endpoint})
 
 
+def _motion_states():
+    """matterMotionSensor's <States> as Devices.xml declares them.
+
+    The only handled type left with TWO settings, which is what the
+    one-line-per-device test needs — matterRelay dropped to one when #197
+    retired onTime.
+    """
+    return [{"Key": key, "StateLabel": key, "TriggerLabel": key}
+            for key in ("onOffState", "batteryLevel", "holdTime", "sensitivityLevel")]
+
+
+def _motion_dev(dev_id=11, name="Kitchen motion", node="56", endpoint="1"):
+    from types import SimpleNamespace
+    return SimpleNamespace(id=dev_id, name=name, deviceTypeId="matterMotionSensor",
+                           pluginProps={"nodeId": node, "endpointId": endpoint})
+
+
 def test_a_plug_without_the_lighting_feature_loses_those_states(
         plugin_cls, mock_indigo_base, mock_logger):
     plugin = _state_list_plugin(plugin_cls, mock_indigo_base, mock_logger, _PLAIN_PLUG_LISTS)
     keys = [state["Key"] for state in plugin.getDeviceStateList(_relay_dev())]
-    assert keys == ["onOffState"], "startUpOnOff/onTime are not this device's to own"
+    assert keys == ["onOffState"], "startUpOnOff is not this device's to own"
 
 
 def test_a_plug_with_the_lighting_feature_keeps_them(
         plugin_cls, mock_indigo_base, mock_logger):
     plugin = _state_list_plugin(plugin_cls, mock_indigo_base, mock_logger, _LIGHTING_PLUG_LISTS)
     keys = [state["Key"] for state in plugin.getDeviceStateList(_relay_dev())]
-    assert keys == ["onOffState", "startUpOnOff", "onTime"]
+    assert keys == ["onOffState", "startUpOnOff"]
 
 
 def test_an_unknown_attribute_list_keeps_every_state(
@@ -1125,7 +1143,7 @@ def test_an_unknown_attribute_list_keeps_every_state(
     state of the world at exactly the moment this is called."""
     plugin = _state_list_plugin(plugin_cls, mock_indigo_base, mock_logger, {})
     keys = [state["Key"] for state in plugin.getDeviceStateList(_relay_dev())]
-    assert keys == ["onOffState", "startUpOnOff", "onTime"]
+    assert keys == ["onOffState", "startUpOnOff"]
 
 
 def test_the_parents_live_list_is_never_mutated(
@@ -1154,7 +1172,7 @@ def test_removing_a_state_says_so_in_the_log(plugin_cls, mock_indigo_base, mock_
     plugin = _state_list_plugin(plugin_cls, mock_indigo_base, mock_logger, _PLAIN_PLUG_LISTS)
     plugin.getDeviceStateList(_relay_dev())
     logged = " ".join(str(call[0]) for call in mock_logger.info.call_args_list)
-    assert "startUpOnOff" in logged and "onTime" in logged
+    assert "startUpOnOff" in logged
 
 
 def test_keeping_every_state_logs_nothing(plugin_cls, mock_indigo_base, mock_logger):
@@ -1170,7 +1188,7 @@ def test_a_broken_capability_lookup_keeps_the_whole_state_list(
     dev = _relay_dev()
     del dev.pluginProps            # any shape the gate did not expect
     keys = [state["Key"] for state in plugin.getDeviceStateList(dev)]
-    assert keys == ["onOffState", "startUpOnOff", "onTime"]
+    assert keys == ["onOffState", "startUpOnOff"]
     assert mock_logger.exception.called, (
         "nothing expected can reach that handler, so silence would hide a real defect")
 
@@ -1184,7 +1202,7 @@ def test_a_device_sync_that_raises_keeps_the_whole_state_list(
     plugin = _state_list_plugin(plugin_cls, mock_indigo_base, mock_logger, _PLAIN_PLUG_LISTS)
     plugin.device_sync.attribute_list.side_effect = RuntimeError("cache exploded")
     keys = [state["Key"] for state in plugin.getDeviceStateList(_relay_dev())]
-    assert keys == ["onOffState", "startUpOnOff", "onTime"]
+    assert keys == ["onOffState", "startUpOnOff"]
 
 
 def test_two_relays_share_one_parent_list_without_contaminating_each_other(
@@ -1200,7 +1218,7 @@ def test_two_relays_share_one_parent_list_without_contaminating_each_other(
     lighting = plugin.getDeviceStateList(
         _relay_dev(dev_id=8, name="Shelly 1PM", node="53"))
     assert [s["Key"] for s in plain] == ["onOffState"]
-    assert [s["Key"] for s in lighting] == ["onOffState", "startUpOnOff", "onTime"]
+    assert [s["Key"] for s in lighting] == ["onOffState", "startUpOnOff"]
 
 
 def test_a_device_is_gated_on_its_OWN_endpoint(plugin_cls, mock_indigo_base, mock_logger):
@@ -1212,19 +1230,29 @@ def test_a_device_is_gated_on_its_OWN_endpoint(plugin_cls, mock_indigo_base, moc
     })
     ep1 = plugin.getDeviceStateList(_relay_dev(dev_id=7, node="64", endpoint="1"))
     ep2 = plugin.getDeviceStateList(_relay_dev(dev_id=8, node="64", endpoint="2"))
-    assert [s["Key"] for s in ep1] == ["onOffState", "startUpOnOff", "onTime"]
+    assert [s["Key"] for s in ep1] == ["onOffState", "startUpOnOff"]
     assert [s["Key"] for s in ep2] == ["onOffState"]
 
 
 def test_one_log_line_per_device_not_per_removed_state(
         plugin_cls, mock_indigo_base, mock_logger):
-    """A plain plug drops two states; a bridge of ten would have printed twenty
-    lines. One line naming both is the same information without the wall."""
-    plugin = _state_list_plugin(plugin_cls, mock_indigo_base, mock_logger, _PLAIN_PLUG_LISTS)
-    plugin.getDeviceStateList(_relay_dev())
+    """A sensor implementing neither setting drops two states; a bridge of ten
+    would have printed twenty lines. One line naming both is the same
+    information without the wall.
+
+    A motion sensor rather than a plug because the property needs a device that
+    can drop MORE than one state, and matterRelay stopped being one when #197
+    retired onTime — with a single removable state, "one line per device" and
+    "one line per state" are indistinguishable and the test proves nothing.
+    """
+    plugin = _state_list_plugin(plugin_cls, mock_indigo_base, mock_logger, {
+        0x0406: [0, 65528, 65529, 65531, 65532, 65533],  # OccupancySensing, no HoldTime
+        0x0080: [65528, 65529, 65531, 65532, 65533],     # BooleanStateConfig, no sensitivity
+    })
+    plugin.getDeviceStateList(_motion_dev())
     assert len(mock_logger.info.call_args_list) == 1
     line = str(mock_logger.info.call_args_list[0])
-    assert "startUpOnOff" in line and "onTime" in line
+    assert "holdTime" in line and "sensitivityLevel" in line
 
 
 def test_a_device_type_with_no_settings_is_passed_straight_through(

@@ -29,6 +29,7 @@ import pytest
 import settings_report
 from matter_handlers.settings import (
     ATTR_ATTRIBUTE_LIST,
+    ATTR_OFF_WAIT_TIME,
     ATTR_ON_TIME,
     ATTR_START_UP_ON_OFF,
     CLUSTER_ON_OFF,
@@ -54,7 +55,8 @@ ATTR_LOCAL_CALIBRATION = 0x0010  # LocalTemperatureCalibration — a real gap
 CLUSTER_BASIC_INFO = 0x0028
 ATTR_NODE_LABEL = 0x0005
 CLUSTER_LEVEL = 0x0008
-ATTR_ON_LEVEL = 0x0011
+ATTR_ON_LEVEL = 0x0011           # a plain writable gap — offered by nothing
+ATTR_LEVEL_TRANSITION = 0x0010   # OnOffTransitionTime — a second one, lower id
 
 
 def node(attributes: dict, *, node_id: int = 0x38, vendor: str = "Aqara",
@@ -72,6 +74,22 @@ def onoff_node(listed, **kwargs) -> NodeInfo:
     }, **kwargs)
 
 
+def level_node(listed, **kwargs) -> NodeInfo:
+    """A one-endpoint LevelControl device whose AttributeList is *listed*.
+
+    LevelControl, not OnOff, wherever a test needs a plain "writable attribute
+    the plugin does not offer". OnOff can no longer supply one: of its three
+    writable attributes StartUpOnOff is offered as a setting and the other two
+    are parameters of OnWithTimedOff, which the report now filters (#197). Tests
+    that used OnTime as a generic example were testing the report's machinery,
+    not OnOff, so they moved rather than changed meaning.
+    """
+    return node({
+        (1, CLUSTER_LEVEL, 0x0000): 0,
+        (1, CLUSTER_LEVEL, ATTR_ATTRIBUTE_LIST): list(listed),
+    }, **kwargs)
+
+
 def reported(survey) -> set:
     return {(item.cluster, item.attribute)
             for ep in survey.endpoints for item in ep.settable}
@@ -82,10 +100,10 @@ def reported(survey) -> set:
 # ---------------------------------------------------------------------------
 
 def test_a_listed_writable_attribute_is_reported():
-    survey = survey_node(onoff_node([0x0000, ATTR_ON_TIME, ATTR_START_UP_ON_OFF,
+    survey = survey_node(level_node([0x0000, ATTR_ON_LEVEL, ATTR_LEVEL_TRANSITION,
                                      ATTR_ATTRIBUTE_LIST]))
-    assert reported(survey) == {(CLUSTER_ON_OFF, ATTR_ON_TIME),
-                                (CLUSTER_ON_OFF, ATTR_START_UP_ON_OFF)}
+    assert reported(survey) == {(CLUSTER_LEVEL, ATTR_ON_LEVEL),
+                                (CLUSTER_LEVEL, ATTR_LEVEL_TRANSITION)}
 
 
 def test_an_unlisted_attribute_is_not_reported_however_capable_the_cluster_is():
@@ -107,7 +125,7 @@ def test_a_missing_attribute_list_reports_nothing_rather_than_guessing():
 def test_an_unparseable_attribute_list_reports_nothing():
     """``implements`` refuses a confident answer from a list it could only
     partly read, and that refusal has to survive up to here."""
-    survey = survey_node(onoff_node(["not-a-number", ATTR_ON_TIME]))
+    survey = survey_node(level_node(["not-a-number", ATTR_ON_LEVEL]))
     assert survey.endpoints == ()
 
 
@@ -127,23 +145,23 @@ def test_a_value_in_the_snapshot_is_not_evidence_of_implementation():
 # ---------------------------------------------------------------------------
 
 def test_a_setting_the_plugin_already_offers_here_is_not_reported():
-    listed = [0x0000, ATTR_ON_TIME, ATTR_START_UP_ON_OFF, ATTR_ATTRIBUTE_LIST]
-    survey = survey_node(onoff_node(listed),
-                         offered=lambda ep: {(CLUSTER_ON_OFF, ATTR_START_UP_ON_OFF)})
-    assert reported(survey) == {(CLUSTER_ON_OFF, ATTR_ON_TIME)}
+    listed = [0x0000, ATTR_ON_LEVEL, ATTR_LEVEL_TRANSITION, ATTR_ATTRIBUTE_LIST]
+    survey = survey_node(level_node(listed),
+                         offered=lambda ep: {(CLUSTER_LEVEL, ATTR_LEVEL_TRANSITION)})
+    assert reported(survey) == {(CLUSTER_LEVEL, ATTR_ON_LEVEL)}
 
 
 def test_offered_is_asked_per_endpoint():
     """A setting is declared against Indigo device TYPES, and what type an
     endpoint became is the only thing that decides whether its field exists — so
     two endpoints of one node can legitimately give different answers."""
-    listed = [0x0000, ATTR_ON_TIME, ATTR_ATTRIBUTE_LIST]
+    listed = [0x0000, ATTR_ON_LEVEL, ATTR_ATTRIBUTE_LIST]
     two = node({
-        (1, CLUSTER_ON_OFF, ATTR_ATTRIBUTE_LIST): listed,
-        (2, CLUSTER_ON_OFF, ATTR_ATTRIBUTE_LIST): listed,
+        (1, CLUSTER_LEVEL, ATTR_ATTRIBUTE_LIST): listed,
+        (2, CLUSTER_LEVEL, ATTR_ATTRIBUTE_LIST): listed,
     })
     survey = survey_node(
-        two, offered=lambda ep: {(CLUSTER_ON_OFF, ATTR_ON_TIME)} if ep == 1 else set())
+        two, offered=lambda ep: {(CLUSTER_LEVEL, ATTR_ON_LEVEL)} if ep == 1 else set())
     assert [ep.endpoint for ep in survey.endpoints] == [2]
 
 
@@ -168,6 +186,67 @@ def test_matter_plumbing_is_never_reported(cluster):
         (0, cluster, ATTR_ATTRIBUTE_LIST): sorted(writable) + [ATTR_ATTRIBUTE_LIST],
     }))
     assert survey.endpoints == ()
+
+
+# ---------------------------------------------------------------------------
+# Command parameters are not settings — issue #197
+# ---------------------------------------------------------------------------
+
+def test_the_command_parameter_table_is_not_empty():
+    """The generator builds this by scanning ``Command(...)`` blocks for their
+    sibling ``Field`` arguments — a parse that returns nothing on a wrong scan
+    and would silently disable every filter below. The generator refuses to
+    write an empty table; this is the same guard from the consuming side, so a
+    hand-edited or truncated artefact is caught too."""
+    pairs = {(cluster, attribute)
+             for cluster, ids in settings_report.COMMAND_FIELD_ATTRIBUTES.items()
+             for attribute in ids}
+    assert pairs == {
+        (0x0003, 0x0000),  # Identify.IdentifyTime           <- Identify()
+        (0x0006, 0x4001),  # OnOff.OnTime                    <- OnWithTimedOff()
+        (0x0006, 0x4002),  # OnOff.OffWaitTime               <- OnWithTimedOff()
+        (0x0030, 0x0000),  # GeneralCommissioning.Breadcrumb <- ArmFailSafe()
+    }, "the four writable attributes in the pinned model that are command fields"
+
+
+@pytest.mark.parametrize("attribute", [ATTR_ON_TIME, ATTR_OFF_WAIT_TIME])
+def test_a_command_parameter_is_never_reported_as_a_gap(attribute):
+    """OnTime and OffWaitTime are writable, implemented by real plugs, and not
+    offered by the plugin — every condition the report otherwise needs. They are
+    still not settings: they are the mandatory fields of OnWithTimedOff, set BY
+    that command. #191's first live run named OffWaitTime on two plugs as a
+    setting that "COULD be added", which is the false positive this removes."""
+    survey = survey_node(onoff_node([0x0000, attribute, ATTR_ATTRIBUTE_LIST]))
+    assert survey.endpoints == ()
+
+
+def test_retiring_the_onTime_SETTING_does_not_make_it_a_reported_GAP():
+    """The interaction that forced #197's two halves to ship together.
+
+    What suppressed OnTime from the report was ``offered_setting_pairs``, which
+    derives from the settings registry — so deleting the DeviceSetting would have
+    turned a broken dialog field into a recurring INFO recommending it be added
+    back. Stated against the registry itself rather than a hard-coded pair, so it
+    keeps meaning if the declaration ever returns.
+    """
+    assert (CLUSTER_ON_OFF, ATTR_ON_TIME) not in settings_report.declared_pairs(), \
+        "the setting is retired — see matter_handlers/settings.py"
+    survey = survey_node(onoff_node(
+        [0x0000, ATTR_ON_TIME, ATTR_ATTRIBUTE_LIST]), offered=lambda ep: set())
+    assert survey.endpoints == (), "nothing offers it, and it must still not be reported"
+
+
+def test_the_explorer_shows_command_parameters_and_says_what_they_are():
+    """ADR-0004: the report is allowed to be quiet, the explorer is not allowed
+    to be incomplete. Omitting the attribute would leave a user who read the spec
+    wondering whether the dump was broken; labelling it answers the question the
+    omission would have raised."""
+    lines = "\n".join(explore_lines(node({
+        (1, CLUSTER_ON_OFF, ATTR_ON_TIME): 0,
+        (1, CLUSTER_ON_OFF, ATTR_START_UP_ON_OFF): 1,
+    })))
+    assert "OnTime (0x4001) [writable, command parameter] = 0" in lines
+    assert "StartUpOnOff (0x4003) [writable] = 1" in lines
 
 
 def test_a_cluster_with_no_writable_attributes_at_all_is_skipped():
@@ -205,8 +284,8 @@ def test_report_reads_as_information_not_as_a_fault():
     """This fires unprompted at commissioning on hardware that is working
     perfectly. A line that reads like an error generates support traffic for a
     non-problem, which is the failure mode the issue calls out by name."""
-    lines = report_lines(survey_node(onoff_node(
-        [ATTR_ON_TIME, ATTR_START_UP_ON_OFF, ATTR_ATTRIBUTE_LIST])))
+    lines = report_lines(survey_node(level_node(
+        [ATTR_ON_LEVEL, ATTR_LEVEL_TRANSITION, ATTR_ATTRIBUTE_LIST])))
     blob = "\n".join(lines).lower()
     assert "nothing is wrong" in blob
     assert "once per device" in blob
@@ -218,7 +297,7 @@ def test_report_reads_as_information_not_as_a_fault():
 def test_report_names_vendor_product_and_firmware():
     """#186 established behaviour here is firmware-specific, so the same product
     on two releases is, for this purpose, two devices."""
-    lines = report_lines(survey_node(onoff_node([ATTR_ON_TIME, ATTR_ATTRIBUTE_LIST])))
+    lines = report_lines(survey_node(level_node([ATTR_ON_LEVEL, ATTR_ATTRIBUTE_LIST])))
     assert "Aqara FP300 firmware 1.2.3 (node 0x38)" in lines[0]
 
 
@@ -230,12 +309,12 @@ def test_report_names_the_attribute_and_its_cluster_by_name():
 
 
 def test_report_counts_in_the_singular_when_there_is_one():
-    lines = report_lines(survey_node(onoff_node([ATTR_ON_TIME, ATTR_ATTRIBUTE_LIST])))
+    lines = report_lines(survey_node(level_node([ATTR_ON_LEVEL, ATTR_ATTRIBUTE_LIST])))
     assert "1 settable Matter attribute that" in lines[0]
 
 
 def test_an_unknown_device_still_gets_an_identity_line():
-    survey = survey_node(onoff_node([ATTR_ON_TIME, ATTR_ATTRIBUTE_LIST],
+    survey = survey_node(level_node([ATTR_ON_LEVEL, ATTR_ATTRIBUTE_LIST],
                                     vendor="", product="", firmware=""))
     assert report_lines(survey)[0].startswith("unknown device (node 0x38)")
 
@@ -246,14 +325,14 @@ def test_nothing_to_say_produces_no_lines_at_all():
 
 def test_endpoints_are_titled_by_their_indigo_device_when_named():
     survey = settings_report.name_endpoints(
-        survey_node(onoff_node([ATTR_ON_TIME, ATTR_ATTRIBUTE_LIST])),
+        survey_node(level_node([ATTR_ON_LEVEL, ATTR_ATTRIBUTE_LIST])),
         lambda ep: ["Kitchen Plug"])
     assert "Kitchen Plug (endpoint 1)" in "\n".join(report_lines(survey))
 
 
 def test_an_endpoint_with_no_indigo_device_falls_back_to_its_number():
     survey = settings_report.name_endpoints(
-        survey_node(onoff_node([ATTR_ON_TIME, ATTR_ATTRIBUTE_LIST])), lambda ep: [])
+        survey_node(level_node([ATTR_ON_LEVEL, ATTR_ATTRIBUTE_LIST])), lambda ep: [])
     assert "  endpoint 1:" in report_lines(survey)
 
 
@@ -262,17 +341,17 @@ def test_an_endpoint_with_no_indigo_device_falls_back_to_its_number():
 # ---------------------------------------------------------------------------
 
 def test_fingerprint_changes_with_firmware():
-    listed = [ATTR_ON_TIME, ATTR_ATTRIBUTE_LIST]
-    before = survey_node(onoff_node(listed, firmware="1.0.0")).fingerprint()
-    after = survey_node(onoff_node(listed, firmware="1.1.0")).fingerprint()
+    listed = [ATTR_ON_LEVEL, ATTR_ATTRIBUTE_LIST]
+    before = survey_node(level_node(listed, firmware="1.0.0")).fingerprint()
+    after = survey_node(level_node(listed, firmware="1.1.0")).fingerprint()
     assert before != after
 
 
 def test_fingerprint_changes_with_the_settable_set():
     """A first informative snapshot that arrived mid-interview must not latch a
     short answer forever — this is what makes the log self-correcting."""
-    short = survey_node(onoff_node([ATTR_ON_TIME, ATTR_ATTRIBUTE_LIST])).fingerprint()
-    full = survey_node(onoff_node([ATTR_ON_TIME, ATTR_START_UP_ON_OFF,
+    short = survey_node(level_node([ATTR_ON_LEVEL, ATTR_ATTRIBUTE_LIST])).fingerprint()
+    full = survey_node(level_node([ATTR_ON_LEVEL, ATTR_LEVEL_TRANSITION,
                                    ATTR_ATTRIBUTE_LIST])).fingerprint()
     assert short != full
 
@@ -288,17 +367,17 @@ def test_the_reported_order_does_not_follow_the_wire():
     every sort removed, because a frozenset of small ints iterates stably within
     a process. It proved the property and pinned none of the code.)
     """
-    survey = survey_node(onoff_node([ATTR_START_UP_ON_OFF, ATTR_ATTRIBUTE_LIST, ATTR_ON_TIME]))
+    survey = survey_node(level_node([ATTR_ON_LEVEL, ATTR_ATTRIBUTE_LIST, ATTR_LEVEL_TRANSITION]))
     ids = [item.attribute for ep in survey.endpoints for item in ep.settable]
-    assert ids == sorted(ids) == [ATTR_ON_TIME, ATTR_START_UP_ON_OFF]
+    assert ids == sorted(ids) == [ATTR_LEVEL_TRANSITION, ATTR_ON_LEVEL]
 
 
 def test_fingerprint_is_stable_across_attribute_list_ORDER():
     """The property the test above protects the mechanism of: a device
     re-reporting the same ids in a different order is not a change, and treating
     it as one would re-report on every reconnect."""
-    one = survey_node(onoff_node([ATTR_ON_TIME, ATTR_START_UP_ON_OFF, ATTR_ATTRIBUTE_LIST]))
-    two = survey_node(onoff_node([ATTR_START_UP_ON_OFF, ATTR_ATTRIBUTE_LIST, ATTR_ON_TIME]))
+    one = survey_node(level_node([ATTR_ON_LEVEL, ATTR_LEVEL_TRANSITION, ATTR_ATTRIBUTE_LIST]))
+    two = survey_node(level_node([ATTR_LEVEL_TRANSITION, ATTR_ATTRIBUTE_LIST, ATTR_ON_LEVEL]))
     assert one.fingerprint() == two.fingerprint()
 
 

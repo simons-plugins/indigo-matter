@@ -1684,3 +1684,67 @@ def test_a_real_removal_of_a_device_less_node_is_not_a_404(plug):
         result = await plug._decommission(77)
         assert result is not None and result["fabricRemoved"] is True
     asyncio.run(scenario())
+
+
+# ===========================================================================
+# issue #197 — the retired onTime state announces itself, once
+# ===========================================================================
+
+def _with_relays(mock_indigo_base, *type_ids):
+    """Stub ``indigo.devices.iter("self")`` with devices of the given types."""
+    mock_indigo_base.devices.iter.return_value = [
+        SimpleNamespace(id=index, deviceTypeId=type_id)
+        for index, type_id in enumerate(type_ids, start=1)
+    ]
+
+
+def _notice(plug):
+    return " ".join(str(call) for call in plug.logger.info.call_args_list)
+
+
+def test_the_retired_onTime_state_is_announced_to_a_user_who_has_a_relay(
+        plug, mock_indigo_base):
+    """Removing a state breaks any trigger bound to it with nothing in the log to
+    connect the two — the asymmetry ADR-0003 records. So the removal says so."""
+    _with_relays(mock_indigo_base, "matterRelay", "matterMotionSensor")
+    plug._announce_retired_on_time_state()
+    notice = _notice(plug)
+    assert "Auto-Off Timer" in notice, "name the STATE — that is what a trigger binds to"
+    assert "1" in notice, "…and how many devices lost it"
+    assert not plug.logger.exception.called
+
+
+def test_the_notice_is_not_shown_to_a_user_with_no_relays(plug, mock_indigo_base):
+    """They never saw the field. An INFO about a setting they never had is the
+    report noise #191 was careful to avoid."""
+    _with_relays(mock_indigo_base, "matterMotionSensor", "matterContactSensor")
+    plug._announce_retired_on_time_state()
+    assert plug.logger.info.call_args_list == []
+
+
+def test_the_notice_fires_once_and_never_again(plug, mock_indigo_base):
+    """Every startup would otherwise repeat it — which is how a one-off notice
+    becomes wallpaper and stops being read."""
+    _with_relays(mock_indigo_base, "matterRelay")
+    plug._announce_retired_on_time_state()
+    first = len(plug.logger.info.call_args_list)
+    assert first == 1
+    plug._announce_retired_on_time_state()
+    assert len(plug.logger.info.call_args_list) == first
+
+
+def test_the_question_is_banked_even_when_there_is_nothing_to_say(plug, mock_indigo_base):
+    """A user with no relays must not be re-asked on every startup either — the
+    flag records "asked", not "logged". Without this the device scan runs
+    forever, which is the same shape as the survey log's "banked silently"."""
+    _with_relays(mock_indigo_base, "matterMotionSensor")
+    plug._announce_retired_on_time_state()
+    assert plug.pluginPrefs, "the flag is written whether or not anything was logged"
+
+
+def test_a_broken_device_scan_never_stops_startup(plug, mock_indigo_base):
+    """A cosmetic notice that can stop the plugin starting is worse than no
+    notice. Startup calls this before the runtime exists."""
+    mock_indigo_base.devices.iter.side_effect = RuntimeError("database busy")
+    plug._announce_retired_on_time_state()
+    assert plug.logger.exception.called

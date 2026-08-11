@@ -1355,3 +1355,16 @@ WRITABLE_ATTRIBUTES: dict[int, frozenset] = {
     0x0551: frozenset({0x000D, 0x0013, 0x0014, 0x0016, 0x0017, 0x0018, 0x0019, 0x001A, 0x001D, 0x001E, 0x0021, 0x0022, 0x0023, 0x0024, 0x0025, 0x0026, 0x0027, 0x0028, 0x0029}),
     0x0556: frozenset({0x0001, 0x0002}),
 }
+
+#: ``{cluster_id: frozenset(attribute_ids)}`` — writable attributes that
+#: are ALSO a field of a command on their OWN cluster. These are set BY
+#: that command and are not configuration: the value has no meaning until
+#: the command runs, and the command's own implementation owns it. OnOff's
+#: OnTime is the case that proved it — writable, settable, verified by
+#: read-back, and completely inert, because only OnWithTimedOff starts the
+#: countdown and Off zeroes the attribute unconditionally (issue #197).
+COMMAND_FIELD_ATTRIBUTES: dict[int, frozenset] = {
+    0x0003: frozenset({0x0000}),
+    0x0006: frozenset({0x4001, 0x4002}),
+    0x0030: frozenset({0x0000}),
+}

@@ -81,8 +81,16 @@ CLUSTER_BOOLEAN_STATE_CONFIG = 0x0080
 ATTR_CURRENT_SENSITIVITY = 0x0000
 ATTR_SUPPORTED_SENSITIVITY_LEVELS = 0x0001
 
-# OnOff (0x0006). These three are conformance LT — the Lighting feature — so a
+# OnOff (0x0006). All three are conformance LT — the Lighting feature — so a
 # plug may implement all, some or none of them; the AttributeList gate decides.
+#
+# Only StartUpOnOff is a SETTING. OnTime and OffWaitTime are the mandatory
+# OnTime/OffWaitTime fields of OnWithTimedOff (command 0x42): the command sets
+# them, and matter.js's reference OnOffServer.off() zeroes OnTime
+# unconditionally, so a pre-set value cannot survive an off (#197, ADR-0005).
+# Both ids are kept — deliberately unused for now — because implementing
+# OnWithTimedOff as an action would need them, and because a bare 0x4001 in a
+# future diff should resolve to a name that carries this warning with it.
 CLUSTER_ON_OFF = 0x0006
 ATTR_ON_TIME = 0x4001
 ATTR_OFF_WAIT_TIME = 0x4002
@@ -368,11 +376,16 @@ SETTINGS: tuple = (
         device_types=frozenset({"matterMotionSensor", "matterContactSensor"}),
         options=sensitivity_options,
     ),
-    # --- OnOff's Lighting-feature settings (conformance LT) ------------------
+    # --- OnOff's Lighting-feature setting (conformance LT) -------------------
     # Present only on devices implementing the Lighting feature — which is NOT
-    # the same as "is a light". Of four plugs on the dev fabric two implement
-    # these and two do not, so the AttributeList gate is doing real work here
-    # rather than guarding a theoretical case.
+    # the same as "is a light". Of four plugs on the dev fabric two implement it
+    # and two do not, so the AttributeList gate is doing real work here rather
+    # than guarding a theoretical case.
+    #
+    # StartUpOnOff is the ONLY genuine setting on this cluster. OnTime (0x4001)
+    # and OffWaitTime (0x4002) are writable and look like siblings, but they are
+    # parameters of OnWithTimedOff — declaring one shipped a dialog field that
+    # could never work (#197, ADR-0005). Do not add them back.
     DeviceSetting(
         key="startUpOnOff",
         label="After a power cut",
@@ -385,17 +398,6 @@ SETTINGS: tuple = (
         # what the device is set to.
         bounds=EnumValues(((0, "Off"), (1, "On"), (2, "Toggle (opposite of before)"))),
         device_types=frozenset({"matterRelay"}),
-    ),
-    DeviceSetting(
-        key="onTime",
-        label="Auto-off after (0 = never)",
-        cluster=CLUSTER_ON_OFF,
-        attribute=ATTR_ON_TIME,
-        # uint16 with no spec constraint; the OnWithTimedOff command's own
-        # OnTime field caps at 65534, so that is the honest ceiling.
-        bounds=StaticRange(0, 65534),
-        device_types=frozenset({"matterRelay"}),
-        unit=" tenths of a second",
     ),
 )
 

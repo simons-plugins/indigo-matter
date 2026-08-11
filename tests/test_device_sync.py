@@ -41,7 +41,7 @@ _STATIC_DEVICE_TYPE_STATES = {
     # "is this state on this device?" guards depend on that being true.
     "matterMotionSensor": {"sensitivityLevel", "holdTime"},
     "matterContactSensor": {"sensitivityLevel"},
-    "matterRelay": {"startUpOnOff", "onTime"},
+    "matterRelay": {"startUpOnOff"},
 }
 
 
@@ -2655,6 +2655,25 @@ def test_hold_time_is_primed_onto_the_device_at_creation(ds, indigo_env):
 #: byte-for-byte node 0x32's (the Shelly's), 65530 and all. The issue's reasoning
 #: is unaffected — one plug has these attributes and one does not — but the two
 #: device names are swapped, and these fixtures used to inherit that.
+#: A pre-1.4 occupancy sensor. Its deprecated PirOccupiedToUnoccupiedDelay is
+#: writable, really implemented, and not offered by the plugin — which declares
+#: HoldTime (0x0003) instead, and this device does not implement it. So it is a
+#: genuine gap, and it is the fixture the report-MACHINERY tests use: the
+#: GRILLPLATS below stopped being one when #197 established that OnTime and
+#: OffWaitTime are command parameters rather than settings.
+PIR_DELAY_NODE = {
+    "node_id": 0x35,
+    "available": True,
+    "attributes": {
+        "0/40/1": "Aqara",
+        "0/40/3": "FP300",
+        "1/29/0": [{"0": 263}],   # OccupancySensor
+        "1/1030/0": 1,            # occupied
+        "1/1030/16": 30,          # PirOccupiedToUnoccupiedDelay (0x0010)
+        "1/1030/65531": [0, 16, 65528, 65529, 65531, 65532, 65533],
+    },
+}
+
 LIGHTING_PLUG_NODE = {
     "node_id": 0x34,
     "available": True,
@@ -2710,7 +2729,7 @@ def test_lighting_settings_are_primed_onto_the_relay(ds, indigo_env):
     ds.create_from_raw(LIGHTING_PLUG_NODE, "Grillplats socket")
     dev = devices[ds.lookup(0x34, 1)]
     assert dev.states.get("startUpOnOff") == 1
-    assert dev.states.get("onTime") == 0
+    assert "onTime" not in dev.states, "retired with its setting (#197)"
 
 
 # ===========================================================================
@@ -3079,30 +3098,45 @@ def surveying_ds(ds):
 
 
 def test_a_new_device_reports_what_it_exposes(surveying_ds, indigo_env, mock_logger):
-    """GRILLPLATS implements OnOff's Lighting attributes; the plugin offers
-    StartUpOnOff and OnTime but not OffWaitTime, so exactly one line is owed."""
-    surveying_ds.create_from_raw(LIGHTING_PLUG_NODE, "Grillplats socket")
+    """A pre-1.4 occupancy sensor implements the deprecated PIR delay, the plugin
+    declares HoldTime instead, and this unit does not implement HoldTime — so
+    exactly one line is owed."""
+    surveying_ds.create_from_raw(PIR_DELAY_NODE, "Kitchen motion")
     body = _survey_report(mock_logger)
-    assert "OffWaitTime (0x4002)" in body
-    assert "StartUpOnOff" not in body, "the plugin already offers this one"
+    assert "PirOccupiedToUnoccupiedDelay (0x0010)" in body
     assert "Nothing is wrong" in body
+
+
+def test_the_lighting_plug_now_has_NOTHING_to_report(
+        surveying_ds, indigo_env, mock_logger):
+    """The behaviour change #197 shipped, asserted end to end from raw
+    matter-server JSON.
+
+    The GRILLPLATS implements all three of OnOff's writable attributes. The
+    plugin offers exactly one of them as a setting (StartUpOnOff); the other two
+    are parameters of OnWithTimedOff. Before #197 this device produced an INFO
+    naming OffWaitTime as a setting that "COULD be added" — a recommendation to
+    build something that cannot work. It must now be silent.
+    """
+    surveying_ds.create_from_raw(LIGHTING_PLUG_NODE, "Grillplats socket")
+    assert _survey_lines(mock_logger) == []
 
 
 def test_the_report_names_the_indigo_device(surveying_ds, indigo_env, mock_logger):
     """The user knows the device by its Indigo name, not by an endpoint number."""
-    surveying_ds.create_from_raw(LIGHTING_PLUG_NODE, "Grillplats socket")
-    assert "Grillplats socket (endpoint 1)" in _survey_report(mock_logger)
+    surveying_ds.create_from_raw(PIR_DELAY_NODE, "Kitchen motion")
+    assert "Kitchen motion (endpoint 1)" in _survey_report(mock_logger)
 
 
 def test_the_report_fires_once_and_not_on_every_reconcile(surveying_ds, indigo_env, mock_logger):
     """The failure this guards is the whole design constraint: an INFO block on
     every reconcile pass — i.e. every reconnect — is wallpaper, and wallpaper is
     not read."""
-    surveying_ds.create_from_raw(LIGHTING_PLUG_NODE, "Grillplats socket")
+    surveying_ds.create_from_raw(PIR_DELAY_NODE, "Kitchen motion")
     first = len(_survey_lines(mock_logger))
     assert first
-    surveying_ds.reconcile_all([LIGHTING_PLUG_NODE])
-    surveying_ds.reconcile_all([LIGHTING_PLUG_NODE])
+    surveying_ds.reconcile_all([PIR_DELAY_NODE])
+    surveying_ds.reconcile_all([PIR_DELAY_NODE])
     assert len(_survey_lines(mock_logger)) == first
 
 
@@ -3119,9 +3153,9 @@ def test_firmware_moving_reports_again(surveying_ds, indigo_env, mock_logger):
     """#186 established behaviour here is firmware-specific, so a device on new
     firmware is a device that has not been reported."""
     import copy
-    surveying_ds.create_from_raw(LIGHTING_PLUG_NODE, "Grillplats socket")
+    surveying_ds.create_from_raw(PIR_DELAY_NODE, "Kitchen motion")
     first = len(_survey_lines(mock_logger))
-    updated = copy.deepcopy(LIGHTING_PLUG_NODE)
+    updated = copy.deepcopy(PIR_DELAY_NODE)
     updated["attributes"]["0/40/10"] = "2.0.0"
     surveying_ds.reconcile_all([updated])
     assert len(_survey_lines(mock_logger)) > first
@@ -3144,11 +3178,11 @@ def test_an_empty_snapshot_is_not_surveyed_at_all(surveying_ds, indigo_env, mock
     saved = []
     import settings_report
     surveying_ds.survey_log = settings_report.SurveyLog(save=saved.append)
-    surveying_ds.reconcile_all([{"node_id": 0x34, "available": True, "attributes": {}}])
+    surveying_ds.reconcile_all([{"node_id": 0x35, "available": True, "attributes": {}}])
     assert _survey_lines(mock_logger) == []
     assert saved == [], "a cold-cache frame must not write an answer to prefs"
-    surveying_ds.reconcile_all([LIGHTING_PLUG_NODE])
-    assert "OffWaitTime (0x4002)" in _survey_report(mock_logger)
+    surveying_ds.reconcile_all([PIR_DELAY_NODE])
+    assert "PirOccupiedToUnoccupiedDelay (0x0010)" in _survey_report(mock_logger)
     assert saved, "…but the warm frame does"
 
 
@@ -3161,9 +3195,9 @@ def test_no_report_at_all_without_a_survey_log(ds, indigo_env, mock_logger):
 
 def test_forcing_reports_again_even_when_already_seen(surveying_ds, indigo_env, mock_logger):
     """The menu item's whole purpose: a user asking now deserves an answer."""
-    surveying_ds.create_from_raw(LIGHTING_PLUG_NODE, "Grillplats socket")
+    surveying_ds.create_from_raw(PIR_DELAY_NODE, "Kitchen motion")
     first = len(_survey_lines(mock_logger))
-    assert surveying_ds.report_settable_attributes(_parsed(LIGHTING_PLUG_NODE), force=True)
+    assert surveying_ds.report_settable_attributes(_parsed(PIR_DELAY_NODE), force=True)
     assert len(_survey_lines(mock_logger)) > first
 
 
@@ -3177,10 +3211,10 @@ def test_forcing_a_device_with_no_gap_says_so(surveying_ds, indigo_env, mock_log
 def test_decommissioning_forgets_the_report_mark(surveying_ds, indigo_env, mock_logger):
     """Node ids are re-used across a decommission/recommission cycle, so a
     different device must not inherit the old one's "already told you"."""
-    surveying_ds.create_from_raw(LIGHTING_PLUG_NODE, "Grillplats socket")
+    surveying_ds.create_from_raw(PIR_DELAY_NODE, "Kitchen motion")
     first = len(_survey_lines(mock_logger))
-    surveying_ds.handle_event(MatterEvent(kind=protocol.EVT_NODE_REMOVED, node_id=0x34, raw={}))
-    surveying_ds.create_from_raw(LIGHTING_PLUG_NODE, "Grillplats socket")
+    surveying_ds.handle_event(MatterEvent(kind=protocol.EVT_NODE_REMOVED, node_id=0x35, raw={}))
+    surveying_ds.create_from_raw(PIR_DELAY_NODE, "Kitchen motion")
     assert len(_survey_lines(mock_logger)) > first
 
 

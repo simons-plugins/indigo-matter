@@ -121,6 +121,45 @@ def _balanced_object(text: str, start: int) -> tuple[str, int]:
     return "", len(text)
 
 
+def _balanced_parens(text: str, start: int) -> str:
+    """Return the ``(...)`` beginning at *start*, respecting strings.
+
+    Distinct from :func:`_balanced_object` because a ``Command(...)``'s ``Field``
+    blocks are SIBLING ARGUMENTS to its property object, not nested inside it::
+
+        Command(
+            { name: "OnWithTimedOff", id: 66, … },   <- _balanced_object stops here
+            Field({ name: "OnTime", … }),            <- but the fields are out here
+        )
+
+    Scanning braces therefore finds no fields at all and yields an empty table,
+    which would silently disable the filter that depends on it (#197). Hence the
+    generator's assertion that the emitted set is non-empty.
+    """
+    depth = 0
+    in_string = False
+    escape = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1]
+    return ""
+
+
 def _props(obj: str) -> dict:
     return {k: _unquote(v) for k, v in _PROP.findall(obj)}
 
@@ -147,6 +186,30 @@ def parse_cluster(path: Path) -> tuple[dict, list[dict]]:
         if props.get("name"):
             attributes.append(props)
     return cluster, attributes
+
+
+def parse_command_fields(path: Path) -> set:
+    """Every ``Field`` NAME appearing inside a ``Command(...)`` in one element file.
+
+    Names rather than ids because a command field's id is its position in the
+    command's payload and has nothing to do with the attribute id it adjusts —
+    ``OnWithTimedOff``'s ``OnTime`` is field 1 and attribute 0x4001. The name is
+    the only thing the two share, and the model spells it identically.
+    """
+    text = path.read_text(encoding="utf-8")
+    fields: set = set()
+    for match in re.finditer(r"Command\(", text):
+        paren = text.find("(", match.start())
+        block = _balanced_parens(text, paren)
+        for field in re.finditer(r"Field\(", block):
+            brace = block.find("{", field.end())
+            if brace == -1 or brace > field.end() + 4:
+                continue  # `Field(` not immediately followed by its object
+            obj, _ = _balanced_object(block, brace)
+            name = _props(obj).get("name")
+            if name:
+                fields.add(str(name))
+    return fields
 
 
 # --- constraint grammars -----------------------------------------------------
@@ -263,6 +326,51 @@ def model_version(elements: Path) -> str:
     return "unknown"
 
 
+#: The command-parameter attributes known to exist in the pinned model, asserted
+#: before the table is written. A parser that finds none is the failure mode this
+#: guards: ``Field`` blocks sit outside the ``Command``'s property object, so the
+#: obvious brace scan returns nothing, the emitted table comes out empty, and the
+#: report silently goes back to naming command parameters as settings (#197).
+#:
+#: Not a hard-coded answer — the generator derives the whole set. This is the
+#: floor it must reach. If a matter.js bump legitimately removes one, this list
+#: is what forces the removal to be noticed rather than absorbed.
+KNOWN_COMMAND_FIELD_ATTRIBUTES = {
+    (0x0003, 0x0000),  # Identify.IdentifyTime      <- Identify()
+    (0x0006, 0x4001),  # OnOff.OnTime               <- OnWithTimedOff()
+    (0x0006, 0x4002),  # OnOff.OffWaitTime          <- OnWithTimedOff()
+    (0x0030, 0x0000),  # GeneralCommissioning.Breadcrumb <- ArmFailSafe(), SetRegulatoryConfig()
+}
+
+
+def command_parameters(writable: dict, names: dict, command_fields: dict) -> dict:
+    """``{cluster_id: {attribute_id}}`` for writable attributes a command owns.
+
+    Matched by NAME within one cluster: a command field's id is its position in
+    the payload and says nothing about the attribute it adjusts (OnWithTimedOff's
+    ``OnTime`` is field 1 and attribute 0x4001), but the model spells the two
+    identically.
+
+    Raises rather than returning a short answer. An empty or partial result means
+    the Command/Field parse failed, and a table written from it would silently
+    put command parameters back into the settable-attribute report.
+    """
+    parameters: dict[int, set] = {}
+    for cluster_id, field_names in command_fields.items():
+        for attr_id in writable.get(cluster_id, ()):
+            if names.get(cluster_id, {}).get(attr_id) in field_names:
+                parameters.setdefault(cluster_id, set()).add(attr_id)
+
+    found = {(c, a) for c, ids in parameters.items() for a in ids}
+    missing = KNOWN_COMMAND_FIELD_ATTRIBUTES - found
+    if missing:
+        raise SystemExit(
+            "refusing to write a table missing known command-parameter attributes: "
+            + ", ".join(f"0x{c:04X}/0x{a:04X}" for c, a in sorted(missing))
+            + " — the Command/Field parse found nothing, see _balanced_parens")
+    return parameters
+
+
 def emit_table(elements: Path, path: Path) -> tuple[int, int]:
     """Write the generated attribute table. Returns ``(clusters, writable)``.
 
@@ -279,12 +387,14 @@ def emit_table(elements: Path, path: Path) -> tuple[int, int]:
     clusters: dict[int, str] = {}
     names: dict[int, dict[int, str]] = {}
     writable: dict[int, set] = {}
+    command_fields: dict[int, set] = {}
 
     for source in sorted(elements.glob("*.element.js")):
         cluster, attributes = parse_cluster(source)
         name, cluster_id = cluster.get("name"), cluster.get("id")
         if not name or not isinstance(cluster_id, int):
             continue
+        command_fields.setdefault(cluster_id, set()).update(parse_command_fields(source))
         # A cluster id can appear twice across the model's element files (an
         # alias or a revision split). First writer wins, deterministically,
         # because the files are walked in sorted order.
@@ -297,6 +407,7 @@ def emit_table(elements: Path, path: Path) -> tuple[int, int]:
             if "RW" in (attr.get("access") or ""):
                 writable.setdefault(cluster_id, set()).add(attr_id)
 
+    parameters = command_parameters(writable, names, command_fields)
     version = model_version(elements)
     lines = [
         '"""Matter attribute names and writability, generated from `@matter/model`.',
@@ -353,6 +464,21 @@ def emit_table(elements: Path, path: Path) -> tuple[int, int]:
     ]
     for cluster_id in sorted(writable):
         ids = ", ".join(f"0x{a:04X}" for a in sorted(writable[cluster_id]))
+        lines.append(f"    0x{cluster_id:04X}: frozenset({{{ids}}}),")
+    lines += [
+        "}",
+        "",
+        "#: ``{cluster_id: frozenset(attribute_ids)}`` — writable attributes that",
+        "#: are ALSO a field of a command on their OWN cluster. These are set BY",
+        "#: that command and are not configuration: the value has no meaning until",
+        "#: the command runs, and the command's own implementation owns it. OnOff's",
+        "#: OnTime is the case that proved it — writable, settable, verified by",
+        "#: read-back, and completely inert, because only OnWithTimedOff starts the",
+        "#: countdown and Off zeroes the attribute unconditionally (issue #197).",
+        "COMMAND_FIELD_ATTRIBUTES: dict[int, frozenset] = {",
+    ]
+    for cluster_id in sorted(parameters):
+        ids = ", ".join(f"0x{a:04X}" for a in sorted(parameters[cluster_id]))
         lines.append(f"    0x{cluster_id:04X}: frozenset({{{ids}}}),")
     lines += ["}", ""]
 

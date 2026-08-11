@@ -51,6 +51,7 @@ from matter_handlers.settings import ATTR_ATTRIBUTE_LIST, SETTINGS, implements
 from matter_handlers.writable_attributes import (
     ATTRIBUTE_NAMES,
     CLUSTER_NAMES,
+    COMMAND_FIELD_ATTRIBUTES,
     MODEL_VERSION,
     WRITABLE_ATTRIBUTES,
 )
@@ -60,7 +61,8 @@ __all__ = [
     "SettableAttribute", "EndpointSurvey", "NodeSurvey", "SurveyLog",
     "survey_node", "report_lines", "explore_lines",
     "cluster_label", "attribute_label", "GLOBAL_ATTRIBUTES",
-    "INFRASTRUCTURE_CLUSTERS", "DRIVEN_ATTRIBUTES", "MODEL_VERSION",
+    "INFRASTRUCTURE_CLUSTERS", "DRIVEN_ATTRIBUTES", "COMMAND_FIELD_ATTRIBUTES",
+    "MODEL_VERSION",
 ]
 
 #: The global attributes every cluster carries. Not in the generated table —
@@ -90,6 +92,11 @@ GLOBAL_ATTRIBUTES: dict[int, str] = {
 #: ``Identify`` is here for a different reason. IdentifyTime is writable, but it
 #: is a momentary command in attribute clothing ("blink for N seconds") with no
 #: persistent setting behind it.
+#: Identify and GeneralCommissioning are now covered TWICE — their only writable
+#: attribute is also a command field, so ``COMMAND_FIELD_ATTRIBUTES`` excludes
+#: them too. Deliberately kept here anyway: this list answers "is the cluster
+#: infrastructure?", which stays the right exclusion if either ever gains a
+#: writable attribute that is not a command parameter.
 INFRASTRUCTURE_CLUSTERS: frozenset = frozenset({
     0x0003,  # Identify — IdentifyTime is a momentary command, not a setting
     0x0028,  # BasicInformation — NodeLabel/Location/LocalConfigDisabled
@@ -235,6 +242,12 @@ def survey_node(node: NodeInfo,
     a gap worth naming. Clusters with no AttributeList captured contribute
     nothing rather than being guessed at, so a partial interview under-reports
     instead of inventing.
+
+    Three exclusions, all of them things that ARE writable and still are not
+    gaps: infrastructure clusters, attributes the plugin already drives as
+    ordinary controls, and **command parameters** — writable attributes that are
+    a field of a command on their own cluster, which the command sets and which
+    mean nothing pre-set (#197, ADR-0005). The explorer still shows all three.
     """
     endpoints: list[EndpointSurvey] = []
     for endpoint in sorted({ep for (ep, _c, _a) in node.attributes}):
@@ -251,6 +264,8 @@ def survey_node(node: NodeInfo,
                 if implements(listed, attribute) is not True:
                     continue
                 if (cluster, attribute) in DRIVEN_ATTRIBUTES:
+                    continue
+                if attribute in COMMAND_FIELD_ATTRIBUTES.get(cluster, ()):
                     continue
                 if (cluster, attribute) in already:
                     continue
@@ -342,9 +357,11 @@ def explore_lines(node: NodeInfo, endpoint: Optional[int] = None,
     menu offers a separate live single-attribute read for that and this does
     not pretend to be one. Each block says so.
 
-    Every attribute is shown, including the infrastructure clusters the report
-    filters out: this is the power-user surface, and hiding things from a
-    diagnostic is how a diagnostic stops being trusted.
+    Every attribute is shown, including the infrastructure clusters and command
+    parameters the report filters out: this is the power-user surface, and hiding
+    things from a diagnostic is how a diagnostic stops being trusted. A command
+    parameter is labelled as one instead, which is more use than omitting it —
+    it answers the question the omission would have raised.
     """
     wanted = {
         (ep, cl, at): value for (ep, cl, at), value in node.attributes.items()
@@ -365,9 +382,18 @@ def explore_lines(node: NodeInfo, endpoint: Optional[int] = None,
         lines.append(f"  endpoint {ep}:")
         for cl in sorted({c for (e, c, _a) in wanted if e == ep}):
             writable = WRITABLE_ATTRIBUTES.get(cl, frozenset())
+            parameters = COMMAND_FIELD_ATTRIBUTES.get(cl, frozenset())
             lines.append(f"    {cluster_label(cl)}:")
             for at in sorted(a for (e, c, a) in wanted if e == ep and c == cl):
-                flag = " [writable]" if at in writable else ""
+                if at in parameters:
+                    # Shown, and shown as what it is. The report filters these
+                    # out; hiding them HERE would leave a user who read the spec
+                    # and expected the attribute wondering if the dump was
+                    # broken — the report's job is to be quiet, the explorer's
+                    # is to be complete (ADR-0004).
+                    flag = " [writable, command parameter]"
+                else:
+                    flag = " [writable]" if at in writable else ""
                 lines.append(f"      {attribute_label(cl, at)}{flag} = "
                              f"{render_value(wanted[(ep, cl, at)])}")
     return lines

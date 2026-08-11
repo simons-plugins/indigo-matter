@@ -52,7 +52,7 @@ from server_menu_mixin import ServerMenuMixin
 from server_process import ServerProcess
 
 from plugin_constants import (
-    COMMAND_TIMEOUT, MAX_RESUBSCRIBE_ATTEMPTS, PLUGIN_NAME,
+    COMMAND_TIMEOUT, MAX_RESUBSCRIBE_ATTEMPTS, ON_TIME_RETIRED_PREF, PLUGIN_NAME,
     PORT_CONFLICT_CHECK_INTERVAL, RESUBSCRIBE_TICKS, SURVEY_LOG_PREF,
     sanitize_host, server_location,
 )
@@ -211,6 +211,8 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, ServerMenuMixin,
         self.survey_log.load(self.pluginPrefs.get(SURVEY_LOG_PREF, ""))
         self.device_sync.survey_log = self.survey_log
 
+        self._announce_retired_on_time_state()
+
         self.runtime = AsyncRuntime(self.logger)
         self.runtime.start()
 
@@ -276,6 +278,42 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, ServerMenuMixin,
             return
         exc = fut.exception()
         if exc is not None:
+            self.logger.exception(exc)
+
+    def _announce_retired_on_time_state(self) -> None:
+        """Say once that the ``onTime`` state and its field are gone (#197).
+
+        Withdrawing a state is the one change this plugin can make that breaks a
+        user's automation *silently* — a trigger bound to a state that no longer
+        exists simply never fires again, with nothing in the log to connect it to
+        an upgrade. ADR-0003 records that asymmetry as the reason states are
+        withdrawn only on a positive NO; removing one outright is rarer still, so
+        it is announced.
+
+        Only for users who actually have a relay: everyone else never saw the
+        field, and an INFO about a setting they never had is the report noise
+        #191 was careful to avoid. The flag is written either way, so this
+        question is asked once and never again.
+
+        Never raises. A cosmetic notice must not be able to stop startup.
+        """
+        try:
+            if self.pluginPrefs.get(ON_TIME_RETIRED_PREF, False):
+                return
+            relays = [dev for dev in indigo.devices.iter("self")
+                      if dev.deviceTypeId == "matterRelay"]
+            if relays:
+                self.logger.info(
+                    "Matter: the 'Auto-off after' device setting and its 'Auto-Off Timer' "
+                    "state have been removed from %d relay device(s). They could never "
+                    "work: Matter's OnTime is a parameter of a command this plugin does "
+                    "not send, not a stored setting, so the value was always ignored and "
+                    "reset to 0. If you built a trigger on 'Auto-Off Timer' it will no "
+                    "longer fire — use Indigo's own 'Auto-off after X minutes' on the "
+                    "device's turn-on action instead. See issue #197.", len(relays))
+            self.pluginPrefs[ON_TIME_RETIRED_PREF] = True
+            indigo.server.savePluginPrefs()
+        except Exception as exc:  # noqa: BLE001 - a notice must never break startup
             self.logger.exception(exc)
 
     # ------------------------------------------------------------------

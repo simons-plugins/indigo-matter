@@ -78,6 +78,13 @@ EXPORT_PICKER_LIMIT = 300
 #: shape ``matterExports`` uses. Named here because ``plugin.startup`` loads it
 #: and ``DiagnosticsMenuMixin`` saves it.
 SURVEY_LOG_PREF = "matterSettingsSurveyed"
+#: pluginPrefs flag: the one-shot notice that the ``onTime`` state was withdrawn
+#: in 2026.12.0 has been logged (issue #197). Removing a state silently breaks
+#: any trigger bound to it — the asymmetry ADR-0003 records — so the removal
+#: announces itself once rather than leaving a user to find a dead trigger. A
+#: flag rather than a version comparison: the plugin has no record of the
+#: version it upgraded FROM, and "have I said this?" is the actual question.
+ON_TIME_RETIRED_PREF = "matterOnTimeStateRetired"
 #: How long a diagnostic menu action may block the Indigo UI thread on
 #: ``get_node``. That call is answered from matter-server's own cache, so it is
 #: a socket round trip rather than a device round trip — generous, but nothing

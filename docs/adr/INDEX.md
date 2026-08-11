@@ -20,5 +20,6 @@ chosen), see [`../ARCHITECTURE.md`](../ARCHITECTURE.md).
 * [ADR-0002](0002-writable-settings-are-a-declarative-registry.md) - ADR-0002: Writable device settings are a declarative registry, edited in the Edit Device dialog (accepted)
 * [ADR-0003](0003-attributelist-is-the-capability-authority.md) - ADR-0003: A device's own AttributeList is the only capability evidence (accepted)
 * [ADR-0004](0004-matter-diagnostics-are-read-only.md) - ADR-0004: The Matter attribute diagnostics are read-only, permanently (accepted)
+* [ADR-0005](0005-command-parameters-are-not-settings.md) - ADR-0005: A command parameter is not a setting (accepted; narrows what ADR-0002 may declare)
 
 <!-- adrlogstop -->
