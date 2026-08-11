@@ -780,3 +780,6 @@ def test_every_setting_key_is_a_real_state_id_on_its_device_types():
             assert f'<State id="{setting.key}">' in block.group(0), (
                 f'{device_type} declares no "{setting.key}" state for setting '
                 f'{setting.key!r} — the #190 gate would silently do nothing')
+            assert f"<UiDisplayStateId>{setting.key}</UiDisplayStateId>" not in block.group(0), (
+                f'{device_type} uses "{setting.key}" as its display state, but the #190 gate '
+                "can remove that state — the device list's State column would point at nothing")

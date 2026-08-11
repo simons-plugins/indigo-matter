@@ -1054,22 +1054,33 @@ def _state_list_plugin(plugin_cls, mock_indigo_base, mock_logger, attr_lists):
 
     ``getDeviceStateList`` chains up to ``indigo.PluginBase``, which the stub
     dispatch in _settings_stub cannot model — super() needs a genuine instance.
+
+    ``attr_lists`` is keyed ``(node, endpoint, cluster)`` when a test cares about
+    which device is asking, or by cluster alone for the single-device tests. The
+    node/endpoint form matters: the lookup reads them out of the device's OWN
+    pluginProps, and a stub that ignores them cannot catch a device being given
+    its neighbour's answer.
     """
     from unittest.mock import MagicMock
     plugin = plugin_cls.__new__(plugin_cls)
     plugin.logger = mock_logger
     device_sync = MagicMock()
-    device_sync.attribute_list.side_effect = (
-        lambda node, ep, cluster: attr_lists.get(cluster))
+
+    def lookup(node, ep, cluster):
+        if (node, ep, cluster) in attr_lists:
+            return attr_lists[(node, ep, cluster)]
+        return attr_lists.get(cluster)
+
+    device_sync.attribute_list.side_effect = lookup
     plugin.device_sync = device_sync
     plugin.base_state_lists = {"matterRelay": _relay_states()}
     return plugin
 
 
-def _relay_dev():
+def _relay_dev(dev_id=7, name="Grillplats socket", node="52", endpoint="1"):
     from types import SimpleNamespace
-    return SimpleNamespace(id=7, name="Grillplats socket", deviceTypeId="matterRelay",
-                           pluginProps={"nodeId": "52", "endpointId": "1"})
+    return SimpleNamespace(id=dev_id, name=name, deviceTypeId="matterRelay",
+                           pluginProps={"nodeId": node, "endpointId": endpoint})
 
 
 def test_a_plug_without_the_lighting_feature_loses_those_states(
@@ -1138,6 +1149,60 @@ def test_a_broken_capability_lookup_keeps_the_whole_state_list(
     del dev.pluginProps            # any shape the gate did not expect
     keys = [state["Key"] for state in plugin.getDeviceStateList(dev)]
     assert keys == ["onOffState", "startUpOnOff", "onTime"]
+    assert mock_logger.exception.called, (
+        "nothing expected can reach that handler, so silence would hide a real defect")
+
+
+def test_a_device_sync_that_raises_keeps_the_whole_state_list(
+        plugin_cls, mock_indigo_base, mock_logger):
+    """The realistic version of the above — the cache lookup itself failing,
+    which takes a DIFFERENT path: the inner handler in
+    _setting_attribute_list_lookup swallows it and answers 'unknown', so the
+    states are kept without the outer handler ever running."""
+    plugin = _state_list_plugin(plugin_cls, mock_indigo_base, mock_logger, _PLAIN_PLUG_LISTS)
+    plugin.device_sync.attribute_list.side_effect = RuntimeError("cache exploded")
+    keys = [state["Key"] for state in plugin.getDeviceStateList(_relay_dev())]
+    assert keys == ["onOffState", "startUpOnOff", "onTime"]
+
+
+def test_two_relays_share_one_parent_list_without_contaminating_each_other(
+        plugin_cls, mock_indigo_base, mock_logger):
+    """The real corruption case in #190: the GRILLPLATS and the Shelly 1PM on one
+    server share Indigo's single cached <States> list for matterRelay. An
+    in-place filter passes the single-device test and fails this one."""
+    plugin = _state_list_plugin(plugin_cls, mock_indigo_base, mock_logger, {
+        (52, 1, 0x0006): _PLAIN_PLUG_LISTS[0x0006],       # no Lighting feature
+        (53, 1, 0x0006): _LIGHTING_PLUG_LISTS[0x0006],    # has it
+    })
+    plain = plugin.getDeviceStateList(_relay_dev(dev_id=7, node="52"))
+    lighting = plugin.getDeviceStateList(
+        _relay_dev(dev_id=8, name="Shelly 1PM", node="53"))
+    assert [s["Key"] for s in plain] == ["onOffState"]
+    assert [s["Key"] for s in lighting] == ["onOffState", "startUpOnOff", "onTime"]
+
+
+def test_a_device_is_gated_on_its_OWN_endpoint(plugin_cls, mock_indigo_base, mock_logger):
+    """Two relays on one node, one endpoint each — issue #82 was this same
+    cross-endpoint mistake on another cache."""
+    plugin = _state_list_plugin(plugin_cls, mock_indigo_base, mock_logger, {
+        (64, 1, 0x0006): _LIGHTING_PLUG_LISTS[0x0006],
+        (64, 2, 0x0006): _PLAIN_PLUG_LISTS[0x0006],
+    })
+    ep1 = plugin.getDeviceStateList(_relay_dev(dev_id=7, node="64", endpoint="1"))
+    ep2 = plugin.getDeviceStateList(_relay_dev(dev_id=8, node="64", endpoint="2"))
+    assert [s["Key"] for s in ep1] == ["onOffState", "startUpOnOff", "onTime"]
+    assert [s["Key"] for s in ep2] == ["onOffState"]
+
+
+def test_one_log_line_per_device_not_per_removed_state(
+        plugin_cls, mock_indigo_base, mock_logger):
+    """A plain plug drops two states; a bridge of ten would have printed twenty
+    lines. One line naming both is the same information without the wall."""
+    plugin = _state_list_plugin(plugin_cls, mock_indigo_base, mock_logger, _PLAIN_PLUG_LISTS)
+    plugin.getDeviceStateList(_relay_dev())
+    assert len(mock_logger.info.call_args_list) == 1
+    line = str(mock_logger.info.call_args_list[0])
+    assert "startUpOnOff" in line and "onTime" in line
 
 
 def test_a_device_type_with_no_settings_is_passed_straight_through(

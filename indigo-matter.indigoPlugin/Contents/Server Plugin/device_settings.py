@@ -2,7 +2,11 @@
 
 The machinery behind the Device Settings section of a Matter device's Edit
 Device dialog: deciding which settings this particular unit can be offered,
-seeding the dialog, validating what the user typed, and applying it.
+seeding the dialog, validating what the user typed, and applying it — plus,
+since #190, which of the type's declared device STATES this unit should be
+given (:func:`unimplemented_states`, called from ``plugin.getDeviceStateList``).
+That last one is not dialog machinery at all; it lives here because it answers
+the same question from the same evidence, and the two answers must not drift.
 
 Deliberately Indigo-free and matter-server-free. Everything here takes plain
 dicts and injected lookups, so the whole flow — including the case that matters

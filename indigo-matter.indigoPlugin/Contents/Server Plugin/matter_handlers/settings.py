@@ -14,10 +14,14 @@ that shape scales badly: each one would re-implement the same validation and,
 worse, the same read-back verification. Here each setting is a DECLARATION and
 the machinery is written once.
 
-Adding a setting is therefore two steps, not two hundred lines:
+Adding a setting is therefore three steps, not two hundred lines:
 
 1. Declare a :class:`DeviceSetting` in :data:`SETTINGS` below.
 2. Add its field(s) to the owning device type's ConfigUI in ``Devices.xml``.
+3. Declare a ``<State id="…">`` in the same type's ``<States>`` whose id is the
+   setting's ``key``. Since #190 that correspondence is load-bearing rather than
+   conventional: ``getDeviceStateList`` withdraws states BY SETTING KEY, so a
+   key with no matching state silently gates nothing. A parity test enforces it.
 
 Step 2 is unavoidable and worth being honest about: Indigo builds ConfigUI
 fields from static XML per device *type*, and unlike device states (which have
@@ -401,8 +405,9 @@ def settings_for_type(device_type_id: str) -> list:
 
     Type-level, so it says what the XML has fields for — not what a particular
     unit implements. That question is answered by the device's own
-    AttributeList, in the plugin's ConfigUI layer, which is the only place that
-    can look a node up.
+    AttributeList, in the plugin's Indigo-facing layer — the ConfigUI callbacks
+    for whether a setting is offered, and ``getDeviceStateList`` for whether its
+    state exists — those being the only places that can look a node up.
     """
     return [s for s in SETTINGS if device_type_id in s.device_types]
 
@@ -412,9 +417,19 @@ def implements(attribute_list: Any, attribute: int) -> Optional[bool]:
 
     Returns True/False when the list is readable, and **None when it is
     unknown** — an unreconciled node, or a cluster whose AttributeList was not
-    captured. None is not False: callers treat "unknown" as "fall back to the
-    older evidence" rather than as proof of absence, because hiding a setting a
-    device really has is just as wrong as offering one it lacks.
+    captured.
+
+    None is not False. But there is deliberately **no single policy for what
+    None means** — read the consumer, do not assume:
+
+    * ``device_settings.unimplemented_states`` keeps the state (withdrawing one
+      breaks triggers bound to it, so it needs a positive NO).
+    * ``device_settings.offered_settings`` still WITHHOLDS a spec-bounded
+      setting on None, because those bounds resolve unconditionally and
+      "unknown" would otherwise mean "offer it to everything".
+
+    Assuming the first policy held everywhere is exactly how the #192 eviction
+    path came to claim it could never hide a setting.
     """
     if not isinstance(attribute_list, (list, tuple, set, frozenset)):
         return None

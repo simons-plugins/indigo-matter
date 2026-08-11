@@ -101,12 +101,23 @@ class _IndigoPluginBaseStub:
     #: BECAUSE that is what real Indigo does — the return value is the XML
     #: parser's internal cache for the type, not a fresh copy, so an override
     #: that mutates it in place corrupts every later call and eventually the XML
-    #: serialiser. Sharing the object here is what lets a test catch that.
-    base_state_lists: dict = {}
+    #: serialiser. Sharing the object here is what lets a test catch that, and
+    #: it must be shared across DEVICES of a type, not merely across calls for
+    #: one device — two relays on one server is the real corruption case.
+    #:
+    #: Built per instance in ``__init__`` rather than left as a class attribute:
+    #: a mutable class-level dict would leak a test's entries into every later
+    #: test in the session, which is an order-dependent failure and miserable to
+    #: diagnose.
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.base_state_lists: dict = {}
 
     def getDeviceStateList(self, dev):  # noqa: N802
         self._record_base_call("getDeviceStateList", dev)
-        return self.base_state_lists.get(dev.deviceTypeId)
+        # Real Indigo always has a <States> block for a type it knows about, so
+        # an empty list — never None — is the honest stand-in for "no states".
+        return self.base_state_lists.get(dev.deviceTypeId, [])
 
 
 #: Every module `plugin` composes. The mixins bind `indigo` at import time and MUST
