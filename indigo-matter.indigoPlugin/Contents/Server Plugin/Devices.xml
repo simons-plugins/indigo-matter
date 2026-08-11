@@ -59,7 +59,11 @@
         <States>
             <!-- OnOff Lighting-feature settings (issue #186). States rather than
                  props alone so the dialog can show the current value without a
-                 live read, and so a change made from another ecosystem lands. -->
+                 live read, and so a change made from another ecosystem lands.
+                 Declared for the TYPE; getDeviceStateList removes them per unit
+                 when the device's own AttributeList says it does not implement
+                 the attribute (#190) — a plug without the Lighting feature gets
+                 neither. -->
             <State id="startUpOnOff">
                 <ValueType>Integer</ValueType>
                 <TriggerLabel>Power-On Behaviour</TriggerLabel>

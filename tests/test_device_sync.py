@@ -60,6 +60,10 @@ class FakeDev:
         self.error = None
         self.errorState = ""
         self.folderId = 0
+        # Issue #190: how many times Indigo was asked to rebuild this device's
+        # state list. The question the tests care about is WHEN that is asked
+        # for, not what Indigo does next, so the fake only counts.
+        self.state_list_rebuilds = 0
         # Real Indigo derives the list display from Supports* props at CREATION
         # and caches it (issue #56) — approximate the precedence rule verified
         # live on jarvis: a True Supports* wins; with BOTH explicitly False the
@@ -76,6 +80,9 @@ class FakeDev:
     def updateStatesOnServer(self, kvlist):
         for kv in kvlist:
             self.states[kv["key"]] = kv["value"]
+
+    def stateListOrDisplayStateIdChanged(self):
+        self.state_list_rebuilds += 1
 
     def setErrorStateOnServer(self, value):
         self.error = value
@@ -2695,3 +2702,336 @@ def test_lighting_settings_are_primed_onto_the_relay(ds, indigo_env):
     dev = devices[ds.lookup(0x33, 1)]
     assert dev.states.get("startUpOnOff") == 1
     assert dev.states.get("onTime") == 0
+
+
+# ===========================================================================
+# issues #190 / #192 — the capability caches are rebuilt, evicted, and never
+# believe an empty snapshot
+# ===========================================================================
+
+#: matter-server's attribute cache is populated LAZILY: getNodeDetails returns
+#: `attributeCache.get(nodeId) ?? {}` and fills in the background, so the first
+#: node_updated after a server restart legitimately carries no attributes at all
+#: and a second follows once the cache is warm. Every capability answer is
+#: derived from these attributes, so an empty one must mean "no information".
+COLD_CACHE_NODE = {"node_id": 0x34, "available": True, "attributes": {}}
+
+
+def test_an_empty_snapshot_does_not_retract_an_attribute_list(ds, indigo_env):
+    ds.create_from_raw(PLAIN_PLUG_NODE, "Grillplats socket")
+    ds.reconcile_all([COLD_CACHE_NODE])
+    assert ds.attribute_list(0x34, 1, 0x0006) is not None, (
+        "a cold-cache node_updated must not be read as 'implements nothing'")
+
+
+def test_an_empty_snapshot_does_not_retract_setting_limits(ds, indigo_env):
+    ds.create_from_raw(FP300_SETTINGS_NODE, "Landing Presence")
+    ds.reconcile_all([{"node_id": 0x38, "available": True, "attributes": {}}])
+    assert ds.setting_limits(0x38, 1, 0x0406, 0x0004) is not None
+
+
+def test_an_empty_snapshot_does_not_retract_the_power_source_endpoints(ds, indigo_env):
+    """The same bug, already live on a different cache before #192.
+
+    `_power_source_eps` popped whenever a snapshot carried no PowerSource
+    endpoint — which an empty snapshot never does — so a routine matter-server
+    restart dropped a node's battery endpoints.
+    """
+    ds.create_from_raw(TEMP_BATTERY_NODE, "Hall Temperature")
+    before = dict(ds._power_source_eps)
+    assert before, "fixture must actually bear a PowerSource for this to test anything"
+    ds.reconcile_all([{"node_id": 0x42, "available": True, "attributes": {}}])
+    assert ds._power_source_eps == before
+
+
+def test_a_cluster_that_stops_reporting_its_list_drops_the_cached_answer(ds, indigo_env):
+    """The stale case an overwriting cache could never fix.
+
+    Re-reporting a CHANGED list always overwrote the same key, so that half was
+    never broken. What survived forever was a key the node stopped reporting at
+    all — the answer then stayed YES with nothing behind it.
+    """
+    ds.create_from_raw(LIGHTING_PLUG_NODE, "Desk Light Switch")
+    assert 16387 in ds.attribute_list(0x33, 1, 0x0006)
+    import copy
+    silent = copy.deepcopy(LIGHTING_PLUG_NODE)
+    del silent["attributes"]["1/6/65531"]
+    ds.reconcile_all([silent])
+    assert ds.attribute_list(0x33, 1, 0x0006) is None, (
+        "a list no longer reported is unknown, not the list from last time")
+
+
+def test_a_reused_node_id_does_not_inherit_the_previous_devices_answers(ds, indigo_env):
+    """Node ids are assigned by the controller at commissioning, so re-use
+    across a decommission/recommission cycle is ordinary, not exotic.
+
+    The recommissioned unit is a DIFFERENT device type on purpose: a like-for-
+    like swap overwrites the same keys and hides the bug, which is precisely why
+    it went unnoticed.
+    """
+    ds.create_from_raw(LIGHTING_PLUG_NODE, "Desk Light Switch")
+    assert ds.attribute_list(0x33, 1, 0x0006) is not None
+    import copy
+    recommissioned = copy.deepcopy(FP300_SETTINGS_NODE)
+    recommissioned["node_id"] = 0x33          # same id, different physical device
+    ds.reconcile_all([recommissioned])
+    assert ds.attribute_list(0x33, 1, 0x0006) is None, (
+        "the OnOff answer belonged to the plug that used to hold this id")
+
+
+def test_node_removed_evicts_the_capability_caches(ds, indigo_env):
+    ds.create_from_raw(LIGHTING_PLUG_NODE, "Desk Light Switch")
+    ds.handle_event(MatterEvent(
+        kind=protocol.EVT_NODE_REMOVED, node_id=0x33,
+        raw={"event": "node_removed", "data": 0x33}))
+    assert ds.attribute_list(0x33, 1, 0x0006) is None
+
+
+def test_a_node_missing_from_get_nodes_KEEPS_its_capability_answers(ds, indigo_env):
+    """The deliberate non-eviction, and it is not an oversight.
+
+    reconcile_all's own comment says a transient short or empty get_nodes() puts
+    a LIVE node in `dropped`. Forgetting its answers is not harmless: unknown
+    makes offered_settings withhold every spec-bounded setting, so the whole
+    Device Settings section of a working device goes blank. Eviction is left to
+    node_removed, which is an explicit decommission. The re-used node id that
+    motivated #192 is handled by the per-node rebuild instead.
+    """
+    ds.create_from_raw(LIGHTING_PLUG_NODE, "Desk Light Switch")
+    ds.reconcile_all([])          # authoritative list came back short/empty
+    assert ds.attribute_list(0x33, 1, 0x0006) is not None
+
+
+def test_a_blip_does_not_blank_the_device_settings_section(ds, indigo_env):
+    """The user-visible consequence of the above, asserted through the gate the
+    Edit Device dialog actually uses rather than through the cache."""
+    import device_settings
+    ds.create_from_raw(FP300_SETTINGS_NODE, "Landing Presence")
+    ds.reconcile_all([])
+    offered = device_settings.offered_settings(
+        "matterMotionSensor",
+        lambda cluster, attr: ds.setting_limits(0x38, 1, cluster, attr),
+        lambda cluster: ds.attribute_list(0x38, 1, cluster))
+    assert sorted(o.setting.key for o in offered) == ["holdTime", "sensitivityLevel"]
+
+
+def test_decommissioning_DOES_drop_the_limits_cache_too(ds, indigo_env):
+    """The limits half of #192 — a separate dict from the AttributeLists, and
+    the one the issue names first."""
+    ds.create_from_raw(FP300_SETTINGS_NODE, "Landing Presence")
+    assert ds.setting_limits(0x38, 1, 0x0406, 0x0004) is not None
+    ds.handle_event(MatterEvent(
+        kind=protocol.EVT_NODE_REMOVED, node_id=0x38,
+        raw={"event": "node_removed", "data": 0x38}))
+    assert ds.setting_limits(0x38, 1, 0x0406, 0x0004) is None
+
+
+def test_a_limits_attribute_that_stops_being_reported_drops_out(ds, indigo_env):
+    """"Validate against bounds from a previous firmware" — the failure #192
+    names. Rebuilding the limits dict is what prevents it."""
+    ds.create_from_raw(FP300_SETTINGS_NODE, "Landing Presence")
+    import copy
+    silent = copy.deepcopy(FP300_SETTINGS_NODE)
+    del silent["attributes"]["1/1030/4"]        # HoldTimeLimits gone
+    ds.reconcile_all([silent])
+    assert ds.setting_limits(0x38, 1, 0x0406, 0x0004) is None
+
+
+def test_a_reused_node_id_does_not_inherit_the_previous_devices_LIMITS(ds, indigo_env):
+    """The mirror of the AttributeList case, on the other cache."""
+    ds.create_from_raw(FP300_SETTINGS_NODE, "Landing Presence")
+    import copy
+    recommissioned = copy.deepcopy(LIGHTING_PLUG_NODE)
+    recommissioned["node_id"] = 0x38
+    ds.reconcile_all([recommissioned])
+    assert ds.setting_limits(0x38, 1, 0x0406, 0x0004) is None
+
+
+def test_node_removed_does_NOT_forget_the_power_source_endpoints(ds, indigo_env):
+    """`_power_source_eps` is read as ``len(...) > 1``, so an absent entry is not
+    'unknown' — it is a positive 'one power source', which selects the node-wide
+    battery fan-out and re-opens issue #82 on a multi-battery bridge. Cache
+    eviction is not a uniform policy; it depends on what empty is read to mean.
+    """
+    ds.create_from_raw(TEMP_BATTERY_NODE, "Hall Temperature")
+    before = dict(ds._power_source_eps)
+    assert before
+    ds.handle_event(MatterEvent(
+        kind=protocol.EVT_NODE_REMOVED, node_id=0x42,
+        raw={"event": "node_removed", "data": 0x42}))
+    assert ds._power_source_eps == before
+
+
+#: Two OnOff endpoints on one node, and only ONE of them implements the Lighting
+#: feature — the case that catches a cache keyed on the node while ignoring the
+#: endpoint. Issue #82 was this same cross-endpoint mistake on another cache.
+SPLIT_LIGHTING_BRIDGE_NODE = {
+    "node_id": 0x40,
+    "available": True,
+    "attributes": {
+        "0/40/1": "Acme",
+        "0/40/3": "Two Gang",
+        "1/29/0": [{"0": 266}],
+        "1/6/0": True,
+        "1/6/16387": 1,
+        "1/6/65531": [0, 16384, 16385, 16386, 16387, 65528, 65529, 65531, 65532, 65533],
+        "2/29/0": [{"0": 266}],
+        "2/6/0": False,
+        "2/6/65531": [0, 65528, 65529, 65531, 65532, 65533],
+    },
+}
+
+
+def test_each_endpoint_keeps_its_own_capability_answer(ds, indigo_env):
+    ds.create_from_raw(SPLIT_LIGHTING_BRIDGE_NODE, "Two Gang")
+    assert 16387 in ds.attribute_list(0x40, 1, 0x0006)
+    assert 16387 not in ds.attribute_list(0x40, 2, 0x0006), (
+        "endpoint 2 must not inherit endpoint 1's answer")
+
+
+def test_the_endpoint_is_part_of_the_limits_key_too(ds, indigo_env):
+    """Guards the same hardcoded-endpoint mistake on the limits cache."""
+    import copy
+    node = copy.deepcopy(FP300_SETTINGS_NODE)
+    node["attributes"]["2/1030/4"] = {"0": 5, "1": 900, "2": 30}
+    ds.create_from_raw(node, "Landing Presence")
+    assert ds.setting_limits(0x38, 1, 0x0406, 0x0004)["1"] == 300
+    assert ds.setting_limits(0x38, 2, 0x0406, 0x0004)["1"] == 900
+
+
+def test_a_reordered_attribute_list_is_not_a_capability_change(ds, indigo_env):
+    """No ordering is promised for an AttributeList and `implements` reads it as
+    a set, so a reshuffle must not rebuild state lists or reprint the log."""
+    _indigo, devices = indigo_env
+    ds.create_from_raw(LIGHTING_PLUG_NODE, "Desk Light Switch")
+    dev = devices[ds.lookup(0x33, 1)]
+    before = dev.state_list_rebuilds
+    import copy
+    shuffled = copy.deepcopy(LIGHTING_PLUG_NODE)
+    shuffled["attributes"]["1/6/65531"] = list(
+        reversed(shuffled["attributes"]["1/6/65531"]))
+    ds.reconcile_all([shuffled])
+    assert dev.state_list_rebuilds == before
+
+
+def test_a_node_updated_event_rebuilds_the_cache_too(ds, indigo_env):
+    """The live path a firmware change actually arrives on — reconcile is only
+    the connect-time one."""
+    ds.create_from_raw(LIGHTING_PLUG_NODE, "Desk Light Switch")
+    import copy
+    downgraded = copy.deepcopy(LIGHTING_PLUG_NODE)
+    downgraded["attributes"]["1/6/65531"] = [0, 65528, 65529, 65531, 65532, 65533]
+    ds.handle_event(MatterEvent(
+        kind=protocol.EVT_NODE_UPDATED, node_id=0x33,
+        raw={"event": "node_updated", "data": downgraded}))
+    assert 16387 not in ds.attribute_list(0x33, 1, 0x0006)
+
+
+def test_a_device_created_on_an_unchanged_pass_still_gets_its_states_rebuilt(ds, indigo_env):
+    """A device the user deleted and a node_updated recreated. The AttributeLists
+    match the cache, so the change flag is False — but the NEW device still
+    carries the unfiltered type-level state list and must be revisited."""
+    _indigo, devices = indigo_env
+    ds.create_from_raw(LIGHTING_PLUG_NODE, "Desk Light Switch")
+    dev_id = ds.lookup(0x33, 1)
+    del devices._by_id[dev_id]          # the user deleted it in the Indigo UI
+    ds.rebuild_index()
+    ds.reconcile_all([LIGHTING_PLUG_NODE])
+    recreated = devices[ds.lookup(0x33, 1)]
+    assert recreated.state_list_rebuilds >= 1
+
+
+def test_a_refresh_that_fails_is_retried_on_the_next_pass(ds, indigo_env):
+    """The cache has already moved by the time the refresh runs, so a refresh
+    that throws can never be rediscovered — without the pending set the stale
+    state list is latched until a plugin restart."""
+    _indigo, devices = indigo_env
+    ds.create_from_raw(LIGHTING_PLUG_NODE, "Desk Light Switch")
+    dev = devices[ds.lookup(0x33, 1)]
+    import copy
+    downgraded = copy.deepcopy(LIGHTING_PLUG_NODE)
+    downgraded["attributes"]["1/6/65531"] = [0, 65528, 65529, 65531, 65532, 65533]
+
+    def explode():
+        raise RuntimeError("Indigo refused the rebuild")
+
+    dev.stateListOrDisplayStateIdChanged = explode
+    ds.reconcile_all([downgraded])          # change detected, refresh fails
+    del dev.stateListOrDisplayStateIdChanged
+    before = dev.state_list_rebuilds
+    ds.reconcile_all([downgraded])          # cache now AGREES — only the pending set can save us
+    assert dev.state_list_rebuilds > before
+
+
+def test_eviction_leaves_the_devices_alone(ds, indigo_env):
+    """Forgetting a capability answer must never look like a state change —
+    unknown is 'fall back to older evidence', not 'the device lacks this'."""
+    _indigo, devices = indigo_env
+    ds.create_from_raw(LIGHTING_PLUG_NODE, "Desk Light Switch")
+    dev = devices[ds.lookup(0x33, 1)]
+    ds.handle_event(MatterEvent(
+        kind=protocol.EVT_NODE_REMOVED, node_id=0x33,
+        raw={"event": "node_removed", "data": 0x33}))
+    assert dev.states.get("startUpOnOff") == 1
+
+
+# --- when the state list is rebuilt (issue #190) ---------------------------
+
+def test_a_changed_attribute_list_rebuilds_the_devices_state_list(ds, indigo_env):
+    _indigo, devices = indigo_env
+    ds.create_from_raw(LIGHTING_PLUG_NODE, "Desk Light Switch")
+    dev = devices[ds.lookup(0x33, 1)]
+    before = dev.state_list_rebuilds
+    import copy
+    downgraded = copy.deepcopy(LIGHTING_PLUG_NODE)
+    downgraded["attributes"]["1/6/65531"] = [0, 65528, 65529, 65531, 65532, 65533]
+    ds.reconcile_all([downgraded])
+    assert dev.state_list_rebuilds > before
+
+
+def test_an_unchanged_reconcile_does_not_rebuild_the_state_list(ds, indigo_env):
+    """The no-flap guarantee. matter-server emits node_updated on every
+    availability change, and a device dropping offline and returning reports the
+    same AttributeList both times — so nothing may move."""
+    _indigo, devices = indigo_env
+    ds.create_from_raw(LIGHTING_PLUG_NODE, "Desk Light Switch")
+    dev = devices[ds.lookup(0x33, 1)]
+    before = dev.state_list_rebuilds
+    ds.reconcile_all([LIGHTING_PLUG_NODE])
+    ds.reconcile_all([LIGHTING_PLUG_NODE])
+    assert dev.state_list_rebuilds == before
+
+
+def test_an_empty_snapshot_does_not_rebuild_the_state_list(ds, indigo_env):
+    """The flap this whole rule exists to prevent — and note which way round it
+    goes: unknown KEEPS a state, so believing the cold-cache frame would
+    RESURRECT the spurious 0s #190 removes, for the next warm frame to withdraw
+    them again."""
+    _indigo, devices = indigo_env
+    ds.create_from_raw(LIGHTING_PLUG_NODE, "Desk Light Switch")
+    dev = devices[ds.lookup(0x33, 1)]
+    before = dev.state_list_rebuilds
+    ds.reconcile_all([{"node_id": 0x33, "available": True, "attributes": {}}])
+    assert dev.state_list_rebuilds == before
+
+
+def test_a_limits_only_change_does_not_rebuild_the_state_list(ds, indigo_env):
+    """Limits decide permitted VALUES, not which states exist — rebuilding a
+    state list over one would be churn for nothing.
+
+    The fixture carries a real AttributeList on purpose: without one, "the
+    AttributeLists did not change" would be trivially true because there were
+    none on either side, and the test would pass for the wrong reason.
+    """
+    _indigo, devices = indigo_env
+    import copy
+    listed = copy.deepcopy(FP300_SETTINGS_NODE)
+    listed["attributes"]["1/1030/65531"] = [0, 1, 2, 3, 4, 65531]
+    ds.create_from_raw(listed, "Landing Presence")
+    dev = devices[ds.lookup(0x38, 1)]
+    before = dev.state_list_rebuilds
+    changed = copy.deepcopy(listed)
+    changed["attributes"]["1/1030/4"] = {"0": 1, "1": 600, "2": 10}
+    ds.reconcile_all([changed])
+    assert dev.state_list_rebuilds == before
+    assert ds.setting_limits(0x38, 1, 0x0406, 0x0004)["1"] == 600, "…but the limit did move"

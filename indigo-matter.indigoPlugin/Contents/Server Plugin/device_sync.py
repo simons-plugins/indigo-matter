@@ -134,6 +134,30 @@ def _kvlist(states: dict) -> list:
     return [{"key": key, "value": value} for key, value in states.items()]
 
 
+def _capability_fingerprint(lists: dict) -> dict:
+    """An AttributeList map reduced to what a capability answer actually depends on.
+
+    An AttributeList is a SET of attribute ids; the wire carries it as a sequence
+    and nothing promises a stable order. ``settings.implements`` reads it as a
+    set, so two orderings of the same ids are the same answer — comparing the raw
+    values would report a capability change where none happened (issue #190: a
+    needless state-list rebuild plus a repeat of the removal log).
+
+    A value that is not a sequence, or one carrying something unhashable, is
+    passed through untouched: it is unusable either way, and ``implements``
+    already answers *unknown* for it.
+    """
+    def fingerprint(value):
+        if not isinstance(value, (list, tuple, set, frozenset)):
+            return value
+        try:
+            return frozenset(value)
+        except TypeError:
+            return value        # a list of dicts, say — order-sensitive, but never a capability
+
+    return {key: fingerprint(value) for key, value in lists.items()}
+
+
 def _salvage_node_id(raw: Any) -> Optional[int]:
     """Best-effort node id from a raw node dict that ``parse_node`` rejected.
 
@@ -199,8 +223,9 @@ class DeviceSync:
         # (node_id, endpoint_id, cluster, attribute) — issues #85 and #186.
         # NodeInfo snapshots are transient (this class holds no other
         # node-attribute cache), so the ConfigUI layer in plugin.py needs these
-        # captured somewhere durable; updated on every create/reconcile pass.
-        # Entries are never EVICTED — see issue #191.
+        # captured somewhere durable; REBUILT per node on every create/reconcile
+        # pass THAT CARRIES ATTRIBUTES (an empty snapshot is no information, not
+        # a retraction — see create_devices) and dropped on decommission (#192).
         #
         # Cached rather than read live ON PURPOSE, and the distinction matters:
         # get_node is a CACHE and is the wrong source for a reading that drifts,
@@ -212,7 +237,9 @@ class DeviceSync:
         # Each settings-bearing cluster's AttributeList (0xFFFB) per
         # (node_id, endpoint_id, cluster) — the device's own statement of which
         # attributes it implements, and THE capability check for whether a
-        # setting may be offered (issue #186). Needed because most settings take
+        # setting may be offered (issue #186) — and, since #190, for which of the
+        # type's declared STATES this unit is given (plugin.getDeviceStateList).
+        # Needed because most settings take
         # their bounds from the spec rather than from a device attribute, so
         # "are the limits readable?" cannot stand in for "does it have this?".
         self._attribute_lists: dict[tuple[int, int, int], Any] = {}
@@ -231,6 +258,15 @@ class DeviceSync:
         # reconcile pass (WS connect/reconnect only, see plugin._resync), so a
         # node removed out of band stops being offered.
         self._known_nodes: set[int] = set()
+        # Nodes whose AttributeLists changed but whose Indigo devices have not
+        # yet had their state lists rebuilt (issue #190). Needed because
+        # _cache_setting_limits both records the new answer and reports the
+        # change: once it has run, no later pass can rediscover that something
+        # moved, so a refresh that is skipped (an exception later in the create
+        # pass) or that fails (Indigo rejecting the rebuild) would latch the
+        # stale state list until a plugin restart. Cleared only by a refresh that
+        # actually completed.
+        self._pending_state_refresh: set[int] = set()
 
     # ------------------------------------------------------------------
     # Active-device tracking (deviceStartComm/deviceStopComm)
@@ -487,12 +523,38 @@ class DeviceSync:
                 if endpoint.has(CLUSTER_POWER_SOURCE)
             }
             multi_power_source = len(power_source_eps) > 1
-            with self._lock:
-                if power_source_eps:
-                    self._power_source_eps[int(node.node_id)] = power_source_eps
-                else:
-                    self._power_source_eps.pop(int(node.node_id), None)
-            self._cache_setting_limits(node)
+            # An EMPTY snapshot is "no information", never "implements nothing"
+            # (issue #192). matter-server populates its attribute cache lazily:
+            # getNodeDetails returns `attributeCache.get(nodeId) ?? {}` and kicks
+            # off the fill in the background, so the first node_updated after a
+            # server restart legitimately carries `attributes: {}` and a second
+            # one follows once the cache is warm. Every capability answer below
+            # is derived from those attributes, so believing an empty one would
+            # retract the node's battery endpoints and AttributeLists on a
+            # routine restart — and, since #190, RESURRECT exactly the spurious-0
+            # states #190 removes (unknown keeps a state), for the next warm
+            # snapshot to withdraw them again. Verified in matter-server 1.2.2:
+            # @matter-server/ws-controller ControllerCommandHandler.js
+            # getNodeDetails + AttributeDataCache.js #runPopulate, which collects
+            # into a local object and does ONE #cache.set once complete — so the
+            # snapshot is all-or-nothing, never partially filled.
+            informative = bool(node.attributes)
+            if informative:
+                with self._lock:
+                    if power_source_eps:
+                        self._power_source_eps[int(node.node_id)] = power_source_eps
+                    else:
+                        self._power_source_eps.pop(int(node.node_id), None)
+            # Deferred deliberately: the refresh calls into Indigo per device and
+            # must not run under _lock, and it has to see the devices this pass
+            # is about to create.
+            if informative and self._cache_setting_limits(node):
+                # Recorded rather than acted on, because the cache is now the NEW
+                # value: if the refresh below is skipped or throws, no later pass
+                # can ever detect the change again and the stale state list is
+                # latched until a plugin restart. The node stays pending until a
+                # refresh actually completes.
+                self._pending_state_refresh.add(int(node.node_id))
             # Pass 1: cache every endpoint's handler-produced specs BEFORE any
             # fallback/placeholder decision. Meter-link resolution (issue #79)
             # needs to know which endpoints will host a _METER_CAPABLE_TYPES
@@ -709,6 +771,13 @@ class DeviceSync:
                 "node %s: %d of %d expected device(s) failed to create",
                 node.node_id, failed, len(plan),
             )
+        # `new_ids` too, not just a changed cache: a device created on a pass
+        # where the AttributeLists happened to match (a node_updated that
+        # recreates a device the user deleted, say) would otherwise be born with
+        # the unfiltered type-level state list and never be revisited, because
+        # the cache already agrees with itself.
+        if int(node.node_id) in self._pending_state_refresh or new_ids:
+            self._refresh_state_lists(int(node.node_id))
         result = {
             "indigoDeviceIds": created,
             "primaryDeviceId": primary,
@@ -1161,7 +1230,7 @@ class DeviceSync:
     # Writable-setting limits cache (issues #85, #186)
     # ------------------------------------------------------------------
 
-    def _cache_setting_limits(self, node: NodeInfo) -> None:
+    def _cache_setting_limits(self, node: NodeInfo) -> bool:
         """Cache what the ConfigUI layer needs to offer settings on this node.
 
         Two things, both scanned straight off the node snapshot rather than
@@ -1175,6 +1244,27 @@ class DeviceSync:
           code that declares it;
         * each settings-bearing cluster's **AttributeList**, which is the
           device's own statement of what it implements.
+
+        This node's entries are REBUILT, not merged over (issue #192). The cache
+        used to be append-only — and it is worth being precise about what that
+        did and did not break, because the obvious reading is wrong. A key that
+        was RE-reported simply overwrote, so a changed AttributeList or a widened
+        limit was never stale. What survived forever was a key that stopped
+        appearing at all: a cluster or endpoint the node no longer reports, a
+        limits attribute that vanished while its cluster stayed, or the leftovers
+        of a different device on a RE-USED node id whose topology does not
+        happen to overwrite the same keys (ids are assigned at commissioning, so
+        re-use across a decommission/recommission cycle is ordinary). Plus the
+        unbounded growth. Rebuilding handles all of it with no separate eviction
+        path to keep in step.
+
+        The caller guarantees the snapshot is informative — see ``create_devices``
+        for why an empty one must never reach here.
+
+        Returns whether this node's **AttributeLists** changed, which is the half
+        that decides what the user can see (settings offered, and since #190
+        device states). Limits moving does not change any of that, so it is not
+        worth rebuilding a state list over.
         """
         wanted = set()
         for setting in SETTINGS:
@@ -1182,14 +1272,116 @@ class DeviceSync:
             if attribute is not None:
                 wanted.add((setting.cluster, int(attribute)))
         clusters = {s.cluster for s in SETTINGS}
+        node_id = int(node.node_id)
+        limits: dict[tuple[int, int, int, int], Any] = {}
+        attribute_lists: dict[tuple[int, int, int], Any] = {}
+        for (ep, cluster, attribute), value in node.attributes.items():
+            if (cluster, attribute) in wanted:
+                limits[(node_id, int(ep), int(cluster), int(attribute))] = value
+            elif attribute == ATTR_ATTRIBUTE_LIST and cluster in clusters:
+                attribute_lists[(node_id, int(ep), int(cluster))] = value
         with self._lock:
-            for (ep, cluster, attribute), value in node.attributes.items():
-                if (cluster, attribute) in wanted:
-                    self._setting_limits[
-                        (int(node.node_id), int(ep), int(cluster), int(attribute))] = value
-                elif attribute == ATTR_ATTRIBUTE_LIST and cluster in clusters:
-                    self._attribute_lists[
-                        (int(node.node_id), int(ep), int(cluster))] = value
+            previous = {key: value for key, value in self._attribute_lists.items()
+                        if key[0] == node_id}
+            # Replaced wholesale rather than mutated in place, so a reader never
+            # observes a half-rebuilt cache and never has to take the lock — see
+            # setting_limits/attribute_list for why a lock-free read matters.
+            self._setting_limits = {
+                **{k: v for k, v in self._setting_limits.items() if k[0] != node_id},
+                **limits}
+            self._attribute_lists = {
+                **{k: v for k, v in self._attribute_lists.items() if k[0] != node_id},
+                **attribute_lists}
+        # Compared by CONTENT, not by wire order: matter-server gives no ordering
+        # guarantee for an AttributeList, and a device re-reporting the same ids
+        # in a different order is not a capability change. Treating it as one
+        # would rebuild every state list on the node and print the removal log
+        # again — the exact flap the no-flap rule exists to prevent.
+        return _capability_fingerprint(attribute_lists) != _capability_fingerprint(previous)
+
+    def _forget_node_capabilities(self, node_id: Any) -> None:
+        """Drop every cached capability answer for a node that is gone.
+
+        The rebuild in :meth:`_cache_setting_limits` covers a node that is still
+        reporting; this covers one that has stopped — decommissioned, or absent
+        from matter-server's authoritative node list.
+
+        Be precise about what forgetting costs, because "unknown is harmless" is
+        only half true and the wrong half is the intuitive one:
+
+        * It can never **withdraw a state**. ``unimplemented_states`` needs a
+          positive NO, so unknown keeps every state.
+        * It absolutely can **hide a setting**. ``offered_settings`` withholds a
+          spec-bounded setting for want of positive evidence, and a
+          ``FromAttribute`` one for want of resolvable limits — so a forgotten
+          node shows an EMPTY Device Settings section until the next informative
+          reconcile refills the cache.
+
+        That is the right trade for a node that is genuinely gone, which is why
+        this is called from ``node_removed`` (an explicit decommission) and
+        deliberately NOT from ``reconcile_all``'s ``dropped`` set, where a
+        transient short ``get_nodes()`` would blank a device that is sitting
+        there working.
+
+        **`_power_source_eps` is deliberately NOT evicted here**, and the reason
+        is that the same argument fails for it. It is read as
+        ``len(...) > 1`` (see _refresh_live_node and the battery fan-out), so an
+        absent entry is not "unknown" — it is a positive "one power source",
+        which selects the node-wide fan-out and re-opens issue #82's
+        cross-contamination on a bridge with several battery children. Its
+        lifetime is already correct without help: every informative pass rebuilds
+        it, so a re-used node id is corrected the first time the new device
+        reports. Cache eviction is not a policy to apply uniformly — it depends
+        entirely on what the empty case is read to MEAN.
+        """
+        target = int(node_id)
+        with self._lock:
+            self._setting_limits = {k: v for k, v in self._setting_limits.items()
+                                    if k[0] != target}
+            self._attribute_lists = {k: v for k, v in self._attribute_lists.items()
+                                     if k[0] != target}
+
+    def _refresh_state_lists(self, node_id: Any) -> None:
+        """Ask Indigo to rebuild the state list of every device on a node.
+
+        Called when a node's AttributeLists changed, because ``getDeviceStateList``
+        runs at device start — long before the first reconcile has said what the
+        device implements (issue #190). Without this the answer could only ever
+        settle on the NEXT plugin start, which is worse than the stale state it
+        replaces: identical installations would disagree depending on how many
+        times they had been restarted.
+
+        Never fatal. A device that will not rebuild its state list keeps the one
+        it has, which is exactly the pre-#190 behaviour — but the node stays on
+        ``_pending_state_refresh`` so the next pass tries again, because the
+        cache has already moved and nothing else would ever notice.
+        """
+        target = int(node_id)
+        with self._lock:
+            dev_ids = [
+                dev_id
+                for (nid, _ep), type_map in self._index.items() if nid == target
+                for dev_id in type_map.values()
+            ]
+        complete = True
+        for dev_id in dev_ids:
+            try:
+                indigo.devices[dev_id].stateListOrDisplayStateIdChanged()
+            except KeyError:
+                # Deleted between the index read and here — the same deletion
+                # race the rest of this class tolerates. Nothing to retry for.
+                self.logger.debug("device %s vanished before its state list could rebuild", dev_id)
+            except Exception as exc:  # noqa: BLE001 - a device that will not rebuild keeps its states
+                # NOT debug: this workspace's field notes record that this call
+                # rejects a bad state id with an error naming no key, and it is
+                # a plugin defect rather than anything the user did. Silence here
+                # leaves the device on the state list #190 exists to correct.
+                complete = False
+                self.logger.warning(
+                    "could not rebuild the state list for device %s: %s — its Matter settings "
+                    "states may show values the device never reported", dev_id, exc)
+        if complete:
+            self._pending_state_refresh.discard(target)
 
     def setting_limits(self, node_id: Any, endpoint_id: Any, cluster: Any,
                        attribute: Any) -> Any:
@@ -1201,20 +1393,30 @@ class DeviceSync:
         a pre-1.4 occupancy sensor with no HoldTime being shown a field it would
         fail to honour. A setting whose bounds come from the spec never consults
         this at all — its capability check is :meth:`attribute_list`.
+
+        Reads WITHOUT the lock, deliberately — see :meth:`attribute_list`.
         """
-        with self._lock:
-            return self._setting_limits.get(
-                (int(node_id), int(endpoint_id), int(cluster), int(attribute)))
+        return self._setting_limits.get(
+            (int(node_id), int(endpoint_id), int(cluster), int(attribute)))
 
     def attribute_list(self, node_id: Any, endpoint_id: Any, cluster: Any) -> Any:
         """The cluster's AttributeList on (node, endpoint), or None if unknown.
 
         None means "not captured", NOT "implements nothing" — callers must not
         read it as proof a device lacks an attribute (see settings.implements).
+
+        **Lock-free on purpose, and it has to be.** Since #190 this is reached
+        from ``Plugin.getDeviceStateList``, which Indigo calls on ITS thread —
+        including while ``create_devices`` is inside ``indigo.device.create()``
+        on the asyncio thread holding ``_lock``. Taking the lock here would let
+        Indigo's thread block on a lock held by a thread that is itself waiting
+        on Indigo: a hang of the whole server UI, not merely of this plugin.
+        The lock is not needed anyway — writers REPLACE the dict rather than
+        mutate it, so a reader either sees the whole old map or the whole new
+        one, and attribute binding is atomic under the GIL.
         """
-        with self._lock:
-            return self._attribute_lists.get(
-                (int(node_id), int(endpoint_id), int(cluster)))
+        return self._attribute_lists.get(
+            (int(node_id), int(endpoint_id), int(cluster)))
 
     def sensitivity_levels_supported(self, node_id: Any, endpoint_id: Any) -> Optional[int]:
         """SupportedSensitivityLevels for (node, endpoint), or None if unknown.
@@ -1517,6 +1719,18 @@ class DeviceSync:
                 "them; nodes with no devices left drop off the list entirely.",
                 ", ".join(node_id_to_str(n) for n in sorted(dropped)),
             )
+        # NOTE: `dropped` deliberately does NOT evict the capability caches.
+        # The comment above says why it cannot be trusted for that — a transient
+        # short or empty get_nodes() puts a live node in here — and forgetting a
+        # live node's answers is not the harmless act it first looks like:
+        # offered_settings withholds a spec-bounded setting for want of positive
+        # evidence, so blanking the cache blanks the whole Device Settings
+        # section of a device that is sitting right there working. The re-used
+        # node id that motivated eviction (#192) is already handled without this,
+        # because _cache_setting_limits REBUILDS a node's entries rather than
+        # merging into them. Eviction is left to node_removed, which is an
+        # explicit decommission rather than an inference from a list that may
+        # just be short.
         for dev_id in orphans:
             self._safe_unreachable(dev_id)
 
@@ -1623,6 +1837,11 @@ class DeviceSync:
             self._on_node_added(evt)
         elif evt.kind == protocol.EVT_NODE_REMOVED and evt.node_id is not None:
             self.mark_unreachable(evt.node_id)
+            # The node is decommissioned; its Indigo devices may well outlive it
+            # (the user has to delete them). Their cached capability answers must
+            # not (issue #192) — see _forget_node_capabilities for why dropping
+            # them cannot hide anything.
+            self._forget_node_capabilities(evt.node_id)
         elif evt.kind == protocol.EVT_ENDPOINT_ADDED:
             # matter-server ALWAYS fires node_updated (via structureChanged) after
             # endpoint_added — verified against PairedNode.ts #triggerNodeStructureChanges

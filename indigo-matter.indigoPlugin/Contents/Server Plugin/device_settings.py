@@ -2,7 +2,11 @@
 
 The machinery behind the Device Settings section of a Matter device's Edit
 Device dialog: deciding which settings this particular unit can be offered,
-seeding the dialog, validating what the user typed, and applying it.
+seeding the dialog, validating what the user typed, and applying it — plus,
+since #190, which of the type's declared device STATES this unit should be
+given (:func:`unimplemented_states`, called from ``plugin.getDeviceStateList``).
+That last one is not dialog machinery at all; it lives here because it answers
+the same question from the same evidence, and the two answers must not drift.
 
 Deliberately Indigo-free and matter-server-free. Everything here takes plain
 dicts and injected lookups, so the whole flow — including the case that matters
@@ -39,8 +43,8 @@ from protocol import MatterWrite
 
 __all__ = [
     "OfferedSetting", "PlannedWrite", "MARKER_YES", "MARKER_NO",
-    "offered_settings", "config_ui_values", "validate_settings",
-    "planned_writes", "apply_setting",
+    "offered_settings", "unimplemented_states", "config_ui_values",
+    "validate_settings", "planned_writes", "apply_setting",
 ]
 
 #: Marker values for the ``hasX`` hidden ConfigUI fields that drive
@@ -141,6 +145,36 @@ def offered_settings(device_type_id: str, limits: LimitsLookup,
             continue
         offered.append(OfferedSetting(setting, bounds))
     return offered
+
+
+def unimplemented_states(device_type_id: str,
+                         attribute_list: Optional[Callable] = None) -> list[DeviceSetting]:
+    """Settings whose device state this unit should NOT be given (issue #190).
+
+    Every setting's key doubles as the id of the Indigo state carrying its
+    current value, so this answers "which of the type's declared states does
+    THIS unit have no business owning?" — the input to ``getDeviceStateList``.
+
+    **Deliberately a weaker test than :func:`offered_settings`, and the
+    asymmetry is the point.** Offering a *field* on no evidence is recoverable —
+    the user sees something they cannot save, and nothing else breaks. Removing
+    a *state* is not: any trigger or control page bound to it breaks silently,
+    and unlike a field a state is visible to the whole server. So a state is
+    withdrawn only on a positive NO — the device's own AttributeList was read
+    and the attribute is absent from it. ``implements`` returning None (never
+    reconciled, cluster not captured, list unparseable) keeps the state.
+
+    That also makes the answer stable across a restart in the way that matters:
+    state lists are built at device start, while AttributeLists are cached at
+    reconcile, so there is always a window where nothing is known. Treating that
+    window as "absent" would make states vanish and reappear on every launch.
+    """
+    absent: list[DeviceSetting] = []
+    for setting in settings_for_type(device_type_id):
+        listed = attribute_list(setting.cluster) if attribute_list is not None else None
+        if implements(listed, setting.attribute) is False:
+            absent.append(setting)
+    return absent
 
 
 def config_ui_values(device_type_id: str, states: dict, limits: LimitsLookup,
