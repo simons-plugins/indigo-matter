@@ -3044,3 +3044,161 @@ def test_a_limits_only_change_does_not_rebuild_the_state_list(ds, indigo_env):
     ds.reconcile_all([changed])
     assert dev.state_list_rebuilds == before
     assert ds.setting_limits(0x38, 1, 0x0406, 0x0004)["1"] == 600, "…but the limit did move"
+
+
+# ---------------------------------------------------------------------------
+# issue #191 — the automatic settable-attribute report
+#
+# The decision logic lives in settings_report and is tested there; these pin the
+# WIRING, which is the half a pure test cannot see: when it fires, when it must
+# not, and that it can never take reconcile down with it.
+# ---------------------------------------------------------------------------
+
+def _parsed(raw):
+    """A NodeInfo from a raw fixture — the shape report_settable_attributes takes."""
+    from matter_model import parse_node
+    return parse_node(raw)
+
+
+def _survey_lines(mock_logger) -> list[str]:
+    """Every INFO line the settable-attribute report emitted."""
+    return [call.args[1] for call in mock_logger.info.call_args_list
+            if call.args and call.args[0] == "%s"]
+
+
+def _survey_report(mock_logger) -> str:
+    return "\n".join(_survey_lines(mock_logger))
+
+
+@pytest.fixture
+def surveying_ds(ds):
+    """A DeviceSync with the once-per-device log wired, as plugin.startup does."""
+    import settings_report
+    ds.survey_log = settings_report.SurveyLog()
+    return ds
+
+
+def test_a_new_device_reports_what_it_exposes(surveying_ds, indigo_env, mock_logger):
+    """GRILLPLATS implements OnOff's Lighting attributes; the plugin offers
+    StartUpOnOff and OnTime but not OffWaitTime, so exactly one line is owed."""
+    surveying_ds.create_from_raw(LIGHTING_PLUG_NODE, "Grillplats socket")
+    body = _survey_report(mock_logger)
+    assert "OffWaitTime (0x4002)" in body
+    assert "StartUpOnOff" not in body, "the plugin already offers this one"
+    assert "Nothing is wrong" in body
+
+
+def test_the_report_names_the_indigo_device(surveying_ds, indigo_env, mock_logger):
+    """The user knows the device by its Indigo name, not by an endpoint number."""
+    surveying_ds.create_from_raw(LIGHTING_PLUG_NODE, "Grillplats socket")
+    assert "Grillplats socket (endpoint 1)" in _survey_report(mock_logger)
+
+
+def test_the_report_fires_once_and_not_on_every_reconcile(surveying_ds, indigo_env, mock_logger):
+    """The failure this guards is the whole design constraint: an INFO block on
+    every reconcile pass — i.e. every reconnect — is wallpaper, and wallpaper is
+    not read."""
+    surveying_ds.create_from_raw(LIGHTING_PLUG_NODE, "Grillplats socket")
+    first = len(_survey_lines(mock_logger))
+    assert first
+    surveying_ds.reconcile_all([LIGHTING_PLUG_NODE])
+    surveying_ds.reconcile_all([LIGHTING_PLUG_NODE])
+    assert len(_survey_lines(mock_logger)) == first
+
+
+def test_a_device_with_no_gap_is_banked_silently(surveying_ds, indigo_env, mock_logger):
+    """A fully-supported device says nothing — and must not re-survey forever
+    because "nothing to report" was never recorded as an answer."""
+    surveying_ds.create_from_raw(PLAIN_PLUG_NODE, "Shelly")
+    assert _survey_lines(mock_logger) == []
+    assert not surveying_ds.survey_log.should_report(
+        0x32, surveying_ds.survey_node(_parsed(PLAIN_PLUG_NODE)).fingerprint())
+
+
+def test_firmware_moving_reports_again(surveying_ds, indigo_env, mock_logger):
+    """#186 established behaviour here is firmware-specific, so a device on new
+    firmware is a device that has not been reported."""
+    import copy
+    surveying_ds.create_from_raw(LIGHTING_PLUG_NODE, "Grillplats socket")
+    first = len(_survey_lines(mock_logger))
+    updated = copy.deepcopy(LIGHTING_PLUG_NODE)
+    updated["attributes"]["0/40/10"] = "2.0.0"
+    surveying_ds.reconcile_all([updated])
+    assert len(_survey_lines(mock_logger)) > first
+
+
+def test_an_empty_snapshot_is_not_surveyed_at_all(surveying_ds, indigo_env, mock_logger):
+    """matter-server's attribute cache populates lazily, so the first
+    node_updated after a server restart legitimately carries no attributes at
+    all — an empty snapshot is "no information", never "implements nothing"
+    (issue #192).
+
+    What that costs is a PREFS WRITE, and that is what this asserts. The report
+    itself survives an unguarded cold frame by luck rather than design: the
+    fingerprint includes the settable set, so the cold answer and the warm one
+    differ and the warm one still reports. But banking it means an Indigo
+    database write per node per matter-server restart, recording nothing. Stated
+    the long way round because a mutation check proved the obvious assertion —
+    that the real report still arrives — passes with the guard removed.
+    """
+    saved = []
+    import settings_report
+    surveying_ds.survey_log = settings_report.SurveyLog(save=saved.append)
+    surveying_ds.reconcile_all([{"node_id": 0x34, "available": True, "attributes": {}}])
+    assert _survey_lines(mock_logger) == []
+    assert saved == [], "a cold-cache frame must not write an answer to prefs"
+    surveying_ds.reconcile_all([LIGHTING_PLUG_NODE])
+    assert "OffWaitTime (0x4002)" in _survey_report(mock_logger)
+    assert saved, "…but the warm frame does"
+
+
+def test_no_report_at_all_without_a_survey_log(ds, indigo_env, mock_logger):
+    """No log means no way to be quiet the second time, so the automatic report
+    stays off rather than repeating on every pass."""
+    ds.create_from_raw(LIGHTING_PLUG_NODE, "Grillplats socket")
+    assert _survey_lines(mock_logger) == []
+
+
+def test_forcing_reports_again_even_when_already_seen(surveying_ds, indigo_env, mock_logger):
+    """The menu item's whole purpose: a user asking now deserves an answer."""
+    surveying_ds.create_from_raw(LIGHTING_PLUG_NODE, "Grillplats socket")
+    first = len(_survey_lines(mock_logger))
+    assert surveying_ds.report_settable_attributes(_parsed(LIGHTING_PLUG_NODE), force=True)
+    assert len(_survey_lines(mock_logger)) > first
+
+
+def test_forcing_a_device_with_no_gap_says_so(surveying_ds, indigo_env, mock_logger):
+    """Silence would read as a failure to someone who just clicked the menu."""
+    assert not surveying_ds.report_settable_attributes(_parsed(PLAIN_PLUG_NODE), force=True)
+    assert any("implements no settable Matter attributes" in str(call)
+               for call in mock_logger.info.call_args_list)
+
+
+def test_decommissioning_forgets_the_report_mark(surveying_ds, indigo_env, mock_logger):
+    """Node ids are re-used across a decommission/recommission cycle, so a
+    different device must not inherit the old one's "already told you"."""
+    surveying_ds.create_from_raw(LIGHTING_PLUG_NODE, "Grillplats socket")
+    first = len(_survey_lines(mock_logger))
+    surveying_ds.handle_event(MatterEvent(kind=protocol.EVT_NODE_REMOVED, node_id=0x34, raw={}))
+    surveying_ds.create_from_raw(LIGHTING_PLUG_NODE, "Grillplats socket")
+    assert len(_survey_lines(mock_logger)) > first
+
+
+def test_a_broken_report_never_sinks_the_create_pass(surveying_ds, indigo_env, mock_logger):
+    """A diagnostic hanging off the creation path that can break creation is
+    strictly worse than no diagnostic."""
+    surveying_ds.survey_log = Mock()
+    surveying_ds.survey_log.should_report.side_effect = RuntimeError("boom")
+    result = surveying_ds.create_from_raw(LIGHTING_PLUG_NODE, "Grillplats socket")
+    assert result["indigoDeviceIds"], "the device must still be created"
+    assert mock_logger.warning.called
+
+
+def test_offered_pairs_follow_the_endpoint_device_type(surveying_ds, indigo_env):
+    """What the plugin offers is decided by the Indigo TYPE an endpoint became —
+    a setting with no ConfigUI field on that type is not offered however capable
+    the hardware is."""
+    from matter_handlers.settings import ATTR_START_UP_ON_OFF, CLUSTER_ON_OFF
+    surveying_ds.create_from_raw(LIGHTING_PLUG_NODE, "Grillplats socket")
+    assert (CLUSTER_ON_OFF, ATTR_START_UP_ON_OFF) in surveying_ds.offered_setting_pairs(0x34, 1)
+    assert surveying_ds.offered_setting_pairs(0x34, 99) == set(), "no device, nothing offered"
