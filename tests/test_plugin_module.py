@@ -270,8 +270,14 @@ def test_matter_node_configui_has_the_identity_fields():
 
 def test_matter_node_states_are_the_deliberately_short_list():
     """ADR-0007: a shipped State is permanent, so only values that CAN change
-    are declared — vendorName/productName are NOT here (props only)."""
-    assert _device_state_ids("matterNode") == {"nodeLabel", "softwareVersion", "batteryLevel", "reachable"}
+    are declared — vendorName/productName are NOT here (props only).
+    curEnergyLevel/accumEnergyTotal joined once ep-0 energy attribution
+    shipped (issue #204's final stage) — same ids matterEnergyMeter already
+    declares, deliberately permanent for the same reason."""
+    assert _device_state_ids("matterNode") == {
+        "nodeLabel", "softwareVersion", "batteryLevel", "reachable",
+        "curEnergyLevel", "accumEnergyTotal",
+    }
 
 
 def test_matter_node_battery_level_state_is_an_integer():
@@ -293,6 +299,24 @@ def test_matter_node_has_no_declared_settings():
     aside) — this PR does not add any."""
     from matter_handlers.settings import settings_for_type
     assert settings_for_type("matterNode") == []
+
+
+def test_matter_node_is_not_meter_capable():
+    """curEnergyLevel/accumEnergyTotal are declared unconditionally (custom
+    types get no auto states from Supports* props), so matterNode must NOT
+    join _METER_CAPABLE_TYPES: that frozenset only gates whether
+    _reassert_capability_props re-stamps SupportsPowerMeter/SupportsEnergyMeter
+    props, and matterNode's declared state list is static — stamping those
+    props on it would rebuild state lists pointlessly (issue #204's final
+    stage)."""
+    import device_sync
+    assert "matterNode" not in device_sync._METER_CAPABLE_TYPES
+
+
+def test_matter_node_configui_has_the_survey_summary_field():
+    fields = _device_config_fields("matterNode")
+    assert "lastSurveySummary" in fields
+    assert fields["lastSurveySummary"].get("readonly") == "yes"
 
 
 # ---------------------------------------------------------------------------
@@ -332,6 +356,30 @@ def test_validate_allows_unknown_device_id(plugin_cls, mock_indigo_base, mock_lo
     stub = _settings_stub(plugin_cls, mock_logger, limits={}, attr_lists={})
     result = plugin_cls.validateDeviceConfigUi(stub, {}, "matterRelay", 999)
     assert result[0] is True
+
+
+def test_validate_matter_node_strips_last_survey_summary_before_save(
+        plugin_cls, mock_indigo_base):
+    """Indigo persists every ConfigUI field into pluginProps on Save, readonly
+    included — left alone the display-only survey summary would become a
+    stored (and stale, comm-restart-triggering) prop. validateDeviceConfigUi
+    must strip it out of valuesDict before Save can persist it."""
+    mock_indigo_base.devices = {9: _dev({}, type_id="matterNode")}
+    values = {"lastSurveySummary": "3 settings confirmed.", "nodeId": "9"}
+    result = plugin_cls.validateDeviceConfigUi(None, values, "matterNode", 9)
+    assert result[0] is True
+    assert "lastSurveySummary" not in result[1]
+    assert result[1]["nodeId"] == "9"  # only the survey field is stripped
+
+
+def test_validate_other_types_keep_their_fields_untouched(plugin_cls, mock_indigo_base):
+    """The strip is matterNode-specific — it must not touch any other device
+    type's valuesDict, even one that happens to have a field of that name."""
+    mock_indigo_base.devices = {5: _dev({"createdTypeId": "matterTemperatureSensor"})}
+    values = {"lastSurveySummary": "should survive", "someField": "value"}
+    result = plugin_cls.validateDeviceConfigUi(None, values, "matterTemperatureSensor", 5)
+    assert result[0] is True
+    assert result[1]["lastSurveySummary"] == "should survive"
 
 
 def test_device_start_comm_warns_on_type_mismatch(plugin_cls, mock_logger):
@@ -421,6 +469,154 @@ def test_prime_retired_on_time_state_never_raises(plugin_cls):
     dev = SimpleNamespace(id=42)
     plugin_cls._prime_retired_on_time_state(stub, dev)  # must not raise
     assert stub.logger.debug.called
+
+
+# ---------------------------------------------------------------------------
+# issue #204 review, fix E — phantom energy states on matterNode (ADR-0007)
+# ---------------------------------------------------------------------------
+
+def test_device_start_comm_primes_absent_node_energy_state_for_node_devices(
+        plugin_cls, mock_logger):
+    """Every matterNode start must flag curEnergyLevel/accumEnergyTotal as
+    meterless — the seam that keeps them from just sitting at Indigo's
+    plausible-looking default 0 (the #190 failure mode) when the node has no
+    ep-0 energy measurement at all."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    stub = SimpleNamespace(logger=mock_logger, device_sync=MagicMock(),
+                           _prime_absent_node_energy_state=MagicMock())
+    dev = _dev({"createdTypeId": "matterNode"}, type_id="matterNode")
+    plugin_cls.deviceStartComm(stub, dev)
+    stub._prime_absent_node_energy_state.assert_called_once_with(dev)
+
+
+def test_device_start_comm_does_not_prime_node_energy_for_other_types(
+        plugin_cls, mock_logger):
+    """Only matterNode ever declared these states — priming them on a relay
+    or sensor would write states that do not exist on their state list."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    stub = SimpleNamespace(logger=mock_logger, device_sync=MagicMock(),
+                           _prime_retired_on_time_state=MagicMock(),
+                           _prime_absent_node_energy_state=MagicMock())
+    dev = _dev({"createdTypeId": "matterRelay"}, type_id="matterRelay")
+    plugin_cls.deviceStartComm(stub, dev)
+    stub._prime_absent_node_energy_state.assert_not_called()
+
+
+def test_prime_absent_node_energy_state_writes_zero_and_no_meter_uivalue(
+        plugin_cls, mock_indigo_base):
+    """The actual write — a FRESH node device (no ui reading yet) with no
+    ep-0 meter must read '<no meter>' in the UI, not a bare 0
+    indistinguishable from a real 0 W reading (the #190 mistake ADR-0003
+    exists to avoid)."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    mock_indigo_base.devices = {42: SimpleNamespace(states={})}
+    stub = SimpleNamespace(logger=MagicMock(), device_sync=MagicMock())
+    dev = SimpleNamespace(id=42)
+    plugin_cls._prime_absent_node_energy_state(stub, dev)
+    stub.device_sync.apply_states.assert_called_once_with(
+        42, [{"key": "curEnergyLevel", "value": 0, "uiValue": "<no meter>"},
+             {"key": "accumEnergyTotal", "value": 0, "uiValue": "<no meter>"}])
+
+
+def test_prime_absent_node_energy_state_reprimes_an_already_flagged_device(
+        plugin_cls, mock_indigo_base):
+    """A device already carrying the '<no meter>' placeholder is exactly the
+    'no real reading yet' case the evidence check must still pass through —
+    re-priming it is harmless/idempotent (same value, same uiValue) and must
+    not itself be mistaken for a real reading."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    mock_indigo_base.devices = {
+        42: SimpleNamespace(states={"curEnergyLevel.ui": "<no meter>", "curEnergyLevel": 0}),
+    }
+    stub = SimpleNamespace(logger=MagicMock(), device_sync=MagicMock())
+    dev = SimpleNamespace(id=42)
+    plugin_cls._prime_absent_node_energy_state(stub, dev)
+    stub.device_sync.apply_states.assert_called_once_with(
+        42, [{"key": "curEnergyLevel", "value": 0, "uiValue": "<no meter>"},
+             {"key": "accumEnergyTotal", "value": 0, "uiValue": "<no meter>"}])
+
+
+def test_prime_absent_node_energy_state_skips_a_device_with_a_real_reading(
+        plugin_cls, mock_indigo_base):
+    """The evidence check itself (issue #204 review, verifier confidence 88):
+    ``deviceStartComm`` re-fires on EVERY prop change (nodeBaseName restamp,
+    ``_reassert_capability_props``, any Edit-dialog Save — there is no
+    ``didDeviceCommPropertyChange`` override to narrow it), not just first
+    start. A node whose ``curEnergyLevel`` already carries a real uiValue
+    (reverse ordering: the real reading landed BEFORE this start-comm re-fire)
+    must be left completely untouched — priming here would clobber it with 0,
+    exactly the #190 'phantom zero' mistake this whole feature exists to
+    avoid."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    mock_indigo_base.devices = {
+        42: SimpleNamespace(states={"curEnergyLevel.ui": "45 W", "curEnergyLevel": 45.0}),
+    }
+    stub = SimpleNamespace(logger=MagicMock(), device_sync=MagicMock())
+    dev = SimpleNamespace(id=42)
+    plugin_cls._prime_absent_node_energy_state(stub, dev)
+    stub.device_sync.apply_states.assert_not_called()
+
+
+def test_prime_absent_node_energy_state_never_raises(plugin_cls, mock_indigo_base):
+    """Cosmetic — a device_sync failure here must not stop device start."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    mock_indigo_base.devices = {42: SimpleNamespace(states={})}
+    stub = SimpleNamespace(logger=MagicMock(), device_sync=MagicMock())
+    stub.device_sync.apply_states.side_effect = RuntimeError("boom")
+    dev = SimpleNamespace(id=42)
+    plugin_cls._prime_absent_node_energy_state(stub, dev)  # must not raise
+    assert stub.logger.debug.called
+
+
+def test_prime_absent_node_energy_state_primes_when_the_evidence_read_fails(
+        plugin_cls, mock_indigo_base):
+    """A failed evidence read (device vanished, states unreadable, ...) must
+    not silently swallow priming — it degrades to the old unconditional
+    behaviour rather than leaving the state at Indigo's plausible-looking 0
+    default forever."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    mock_indigo_base.devices = {}  # dev.id not present → KeyError on lookup
+    stub = SimpleNamespace(logger=MagicMock(), device_sync=MagicMock())
+    dev = SimpleNamespace(id=42)
+    plugin_cls._prime_absent_node_energy_state(stub, dev)
+    stub.device_sync.apply_states.assert_called_once_with(
+        42, [{"key": "curEnergyLevel", "value": 0, "uiValue": "<no meter>"},
+             {"key": "accumEnergyTotal", "value": 0, "uiValue": "<no meter>"}])
+
+
+def test_prime_absent_node_energy_state_is_overwritten_by_a_real_reading(
+        plugin_cls, mock_indigo_base):
+    """The 'let real readings overwrite' half of fix E's design: the
+    placeholder write is not special — whichever apply_states call for a key
+    happens LAST wins, same as any other state write. A node WITH ep-0
+    energy gets the real value from device_sync's own priming pass (proven at
+    that layer by test_ep0_energy_ambiguous_two_relay_lands_on_node_device in
+    test_device_sync.py); this pins that the placeholder never re-asserts
+    itself over a value written after it."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    mock_indigo_base.devices = {7: SimpleNamespace(states={})}
+    states: dict = {}
+
+    class _RecordingDeviceSync:
+        def apply_states(self, dev_id, kv):
+            for item in kv:
+                states[item["key"]] = item["value"]
+
+    stub = SimpleNamespace(logger=MagicMock(), device_sync=_RecordingDeviceSync())
+    dev = SimpleNamespace(id=7)
+    plugin_cls._prime_absent_node_energy_state(stub, dev)
+    assert states["curEnergyLevel"] == 0
+    # A real reading landing afterwards (device_sync's own priming pass) must win.
+    stub.device_sync.apply_states(dev.id, [{"key": "curEnergyLevel", "value": 42.0}])
+    assert states["curEnergyLevel"] == 42.0
 
 
 def test_action_control_device_sends_each_command_of_a_list(plugin_cls):
@@ -609,6 +805,83 @@ def test_action_set_sensitivity_level_allows_any_level_when_support_unknown(plug
     action = SimpleNamespace(props={"level": "9"})
     plugin_cls.actionSetSensitivityLevel(stub, action, dev)
     stub.runtime.submit.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# issue #204 final stage — "Report this node's settable attributes" action
+# ---------------------------------------------------------------------------
+
+def _node_settings_dev(node_id="45"):
+    from types import SimpleNamespace
+    return SimpleNamespace(id=9, name="Landing Node", pluginProps={"nodeId": node_id})
+
+
+def test_action_report_node_settings_reports_the_resolved_node(plugin_cls, mock_logger):
+    """The device-targeted twin of DiagnosticsMenuMixin.menuReportSettings —
+    same force=True path, scoped to the one node the matterNode device
+    names."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    dev = _node_settings_dev()
+    fake_node = SimpleNamespace(node_id=45)
+    stub = SimpleNamespace(
+        device_sync=MagicMock(), logger=mock_logger,
+        _fetch_node=MagicMock(return_value=fake_node),
+    )
+    plugin_cls.actionReportNodeSettings(stub, SimpleNamespace(), dev)
+    stub._fetch_node.assert_called_once_with(45)
+    stub.device_sync.report_settable_attributes.assert_called_once_with(fake_node, force=True)
+
+
+def test_action_report_node_settings_no_node_id_logs_error(plugin_cls, mock_logger):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    dev = _node_settings_dev(node_id="")
+    stub = SimpleNamespace(device_sync=MagicMock(), logger=mock_logger,
+                           _fetch_node=MagicMock())
+    plugin_cls.actionReportNodeSettings(stub, SimpleNamespace(), dev)
+    stub._fetch_node.assert_not_called()
+    stub.device_sync.report_settable_attributes.assert_not_called()
+    assert mock_logger.error.called
+
+
+def test_action_report_node_settings_invalid_node_id_logs_error(plugin_cls, mock_logger):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    dev = _node_settings_dev(node_id="not-a-number")
+    stub = SimpleNamespace(device_sync=MagicMock(), logger=mock_logger,
+                           _fetch_node=MagicMock())
+    plugin_cls.actionReportNodeSettings(stub, SimpleNamespace(), dev)
+    stub.device_sync.report_settable_attributes.assert_not_called()
+    assert mock_logger.error.called
+
+
+def test_action_report_node_settings_matter_unavailable_logs_warning(plugin_cls, mock_logger):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    import plugin as plugin_module
+    dev = _node_settings_dev()
+    stub = SimpleNamespace(
+        device_sync=MagicMock(), logger=mock_logger,
+        _fetch_node=MagicMock(side_effect=plugin_module.MatterUnavailable("not connected")),
+    )
+    plugin_cls.actionReportNodeSettings(stub, SimpleNamespace(), dev)
+    stub.device_sync.report_settable_attributes.assert_not_called()
+    assert mock_logger.warning.called
+
+
+def test_action_report_node_settings_unknown_node_logs_warning(plugin_cls, mock_logger):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    dev = _node_settings_dev()
+    stub = SimpleNamespace(
+        device_sync=MagicMock(), logger=mock_logger,
+        _fetch_node=MagicMock(return_value=None),
+    )
+    plugin_cls.actionReportNodeSettings(stub, SimpleNamespace(), dev)
+    stub.device_sync.report_settable_attributes.assert_not_called()
+    assert mock_logger.warning.called
 
 
 @pytest.fixture
@@ -880,6 +1153,95 @@ def test_config_ui_values_keep_the_dialog_alive_if_the_lookup_explodes(plugin_cl
         stub, {"nodeId": "56", "endpointId": "1"}, "matterMotionSensor", 5)
     assert values["nodeId"] == "56"          # the rest of the dialog is intact
     assert values["hasHoldTime"] == "no"     # and the settings simply hide
+
+
+# ---------------------------------------------------------------------------
+# issue #204 final stage — SurveyLog surfaced on the matterNode Edit Device
+# dialog's read-only survey summary field
+# ---------------------------------------------------------------------------
+
+def _node_dev_stub(plugin_cls, mock_logger, device_sync=None):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    dev_sync = device_sync if device_sync is not None else MagicMock()
+    stub = SimpleNamespace(device_sync=dev_sync, logger=mock_logger)
+    stub._setting_limits_lookup = lambda props: plugin_cls._setting_limits_lookup(stub, props)
+    stub._device_states = lambda dev_id: plugin_cls._device_states(stub, dev_id)
+    stub._setting_attribute_list_lookup = (
+        lambda props: plugin_cls._setting_attribute_list_lookup(stub, props))
+    stub._has_matter_node = plugin_cls._has_matter_node
+    stub._log_setting_skips = lambda dev_id: plugin_cls._log_setting_skips(stub, dev_id)
+    stub._survey_summary_for = lambda props: plugin_cls._survey_summary_for(stub, props)
+    return stub
+
+
+def test_config_ui_values_matterNode_shows_the_survey_summary(plugin_cls, mock_indigo_base, mock_logger):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    node_dev = SimpleNamespace(id=9, name="Landing Node", deviceTypeId="matterNode",
+                               pluginProps={"nodeId": "45"}, states={})
+    mock_indigo_base.devices = {9: node_dev}
+    device_sync = MagicMock()
+    device_sync.survey_log.fingerprint_for.return_value = "1.2.3#[[1,40,5]]"
+    stub = _node_dev_stub(plugin_cls, mock_logger, device_sync)
+    values, _errors = plugin_cls.getDeviceConfigUiValues(stub, {"nodeId": "45"}, "matterNode", 9)
+    device_sync.survey_log.fingerprint_for.assert_called_once_with(45)
+    assert values["lastSurveySummary"] == "Last survey: 1 settable attribute not yet offered."
+
+
+def test_config_ui_values_matterNode_defaults_to_not_yet_surveyed(plugin_cls, mock_indigo_base, mock_logger):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    node_dev = SimpleNamespace(id=9, name="Landing Node", deviceTypeId="matterNode",
+                               pluginProps={"nodeId": "45"}, states={})
+    mock_indigo_base.devices = {9: node_dev}
+    device_sync = MagicMock()
+    device_sync.survey_log.fingerprint_for.return_value = None
+    stub = _node_dev_stub(plugin_cls, mock_logger, device_sync)
+    values, _errors = plugin_cls.getDeviceConfigUiValues(stub, {"nodeId": "45"}, "matterNode", 9)
+    assert values["lastSurveySummary"] == "Not yet surveyed."
+
+
+def test_config_ui_values_matterNode_survives_no_survey_log(plugin_cls, mock_indigo_base, mock_logger):
+    """device_sync.survey_log is only injected in plugin.startup — a dialog
+    opened before that (or in a test) must not raise."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    node_dev = SimpleNamespace(id=9, name="Landing Node", deviceTypeId="matterNode",
+                               pluginProps={"nodeId": "45"}, states={})
+    mock_indigo_base.devices = {9: node_dev}
+    device_sync = MagicMock()
+    device_sync.survey_log = None
+    stub = _node_dev_stub(plugin_cls, mock_logger, device_sync)
+    values, _errors = plugin_cls.getDeviceConfigUiValues(stub, {"nodeId": "45"}, "matterNode", 9)
+    assert values["lastSurveySummary"] == "Not yet surveyed."
+
+
+def test_config_ui_values_matterNode_survey_summary_explosion_keeps_dialog_alive(
+        plugin_cls, mock_indigo_base, mock_logger):
+    """Fix C.1 (issue #204 review): ``_survey_summary_for`` must run INSIDE the
+    settings section's 'never block the dialog' try/except. Before this fix an
+    exception here escaped ``getDeviceConfigUiValues`` entirely, skipping the
+    ``indigo.Dict(...)`` return and hitting the C++ bridge with nothing at all
+    — the #186 failure mode."""
+    from types import SimpleNamespace
+    node_dev = SimpleNamespace(id=9, name="Landing Node", deviceTypeId="matterNode",
+                               pluginProps={"nodeId": "45"}, states={})
+    mock_indigo_base.devices = {9: node_dev}
+    stub = _node_dev_stub(plugin_cls, mock_logger)
+    stub._survey_summary_for = lambda props: (_ for _ in ()).throw(RuntimeError("boom"))
+    values, _errors = plugin_cls.getDeviceConfigUiValues(stub, {"nodeId": "45"}, "matterNode", 9)
+    assert values["nodeId"] == "45"          # the rest of the dialog is intact
+    assert "lastSurveySummary" not in values  # the field itself just doesn't seed
+    assert mock_logger.exception.called
+
+
+def test_config_ui_values_non_node_types_get_no_survey_summary_field(plugin_cls, mock_indigo_base, mock_logger):
+    mock_indigo_base.devices = {5: _fp300_dev()}
+    stub = _settings_stub(plugin_cls, mock_logger)
+    values, _errors = plugin_cls.getDeviceConfigUiValues(
+        stub, {"nodeId": "56", "endpointId": "1"}, "matterMotionSensor", 5)
+    assert "lastSurveySummary" not in values
 
 
 def test_validate_rejects_an_out_of_range_hold_time(plugin_cls, mock_indigo_base, mock_logger):

@@ -45,8 +45,12 @@ _STATIC_DEVICE_TYPE_STATES = {
     "matterRelay": {"startUpOnOff"},
     # issue #204 / ADR-0008 — declared unconditionally in Devices.xml (no
     # Supports* prop gates any of them), same custom-type discipline as
-    # matterEnergyMeter/matterUnknown's `reachable`.
-    "matterNode": {"nodeLabel", "softwareVersion", "batteryLevel", "reachable"},
+    # matterEnergyMeter/matterUnknown's `reachable`. curEnergyLevel/
+    # accumEnergyTotal joined the list once ep-0 energy attribution shipped
+    # (issue #204's final stage) — same ids matterEnergyMeter already
+    # declares, also unconditionally.
+    "matterNode": {"nodeLabel", "softwareVersion", "batteryLevel", "reachable",
+                   "curEnergyLevel", "accumEnergyTotal"},
 }
 
 
@@ -89,6 +93,11 @@ class FakeDev:
     def updateStatesOnServer(self, kvlist):
         for kv in kvlist:
             self.states[kv["key"]] = kv["value"]
+            # Real Indigo's states dict answers a "key.ui" lookup with the
+            # display value from a uiValue-bearing write (used by both fix A's
+            # evidence check and fix D's reachable/unreachable column text).
+            if "uiValue" in kv:
+                self.states[f"{kv['key']}.ui"] = kv["uiValue"]
 
     def stateListOrDisplayStateIdChanged(self):
         self.state_list_rebuilds += 1
@@ -4047,6 +4056,303 @@ def test_node_device_has_no_battery_when_sources_cover_only_children(ds, indigo_
     assert dev.states.get("batteryLevel") == 0    # FakeDev's declared-state default, never primed
 
 
+# ===========================================================================
+# issue #204 final stage — energy on endpoint 0 (Simon's original ask)
+#
+# _is_meter_source_candidate no longer excludes endpoint 0. Same two outcomes
+# as any other meter-link source: a resolvable target (the reading lands on
+# the actuator, no device at all on ep0) or an ambiguous/absent one (issue #79
+# ordinarily falls back to a standalone matterEnergyMeter, but ep0 instead
+# falls back to the matterNode device's own curEnergyLevel/accumEnergyTotal
+# states — it already has a home, so no third/standalone device is created).
+# ===========================================================================
+
+EP0_ENERGY_SOLE_ACTUATOR_NODE = {
+    "node_id": 0x38,
+    "available": True,
+    "attributes": {
+        "0/144/8": 1200,                    # ElectricalPowerMeasurement.ActivePower, on ep0
+        "0/145/1": {"energy": 3_600_000},   # ElectricalEnergyMeasurement, on ep0
+        "1/29/0": [{"0": 266}],             # OnOffPlugInUnit
+        "1/6/0": False,                     # OnOff
+    },
+}
+
+
+def test_ep0_energy_links_to_sole_relay_no_third_device(ds, indigo_env):
+    """The structural gap Simon reported: 0x0090/0x0091 on endpoint 0 used to
+    be silently dropped (_is_meter_source_candidate excluded ep0 explicitly).
+    Now it resolves through the SAME sole-actuator heuristic the GRILLPLATS
+    ep2 fixtures already exercise — just sourced from ep0 instead of an
+    ordinary application endpoint. No node device exists here (this fixture
+    carries no BasicInformation AttributeList evidence, so the ADR-0003 gate
+    withholds it) — the point of this test is the link, not the node
+    device."""
+    _indigo, devices = indigo_env
+    result = ds.create_from_raw(EP0_ENERGY_SOLE_ACTUATOR_NODE, "Grill Plug")
+    assert len(result["indigoDeviceIds"]) == 1
+    dev = devices[result["primaryDeviceId"]]
+    assert dev.deviceTypeId == "matterRelay"
+    assert dev.pluginProps.get("SupportsPowerMeter") is True
+    assert dev.pluginProps.get("SupportsEnergyMeter") is True
+    assert dev.states.get("curEnergyLevel") == 1.2        # 1200 mW → 1.2 W, primed
+    assert dev.states.get("accumEnergyTotal") == 3.6       # 3,600,000 mWh → 3.6 kWh, primed
+    assert ds.lookup(0x38, 0) is None, "ep0 must get no device at all when the link succeeds"
+
+
+EP0_ENERGY_AMBIGUOUS_TWO_RELAY_NODE = {
+    "node_id": 0x39,
+    "available": True,
+    "attributes": {
+        "0/144/8": 800,                     # ElectricalPowerMeasurement.ActivePower, on ep0
+        "0/145/1": {"energy": 200_000},     # ElectricalEnergyMeasurement, on ep0
+        "1/29/0": [{"0": 266}],
+        "1/6/0": False,
+        "2/29/0": [{"0": 266}],
+        "2/6/0": False,
+    },
+}
+
+
+def test_ep0_energy_ambiguous_two_relay_lands_on_node_device(ds, indigo_env):
+    """No PowerTopology to disambiguate two actuator endpoints, so
+    attribution is ambiguous (mirrors AMBIGUOUS_MULTI_RELAY_NODE) — but
+    unlike an ambiguous source at endpoint >0 (which falls back to a
+    standalone matterEnergyMeter, issue #79), ep0 has its own home: the
+    matterNode device, evidenced here via _with_node_evidence. Neither relay
+    gets meter props, and ep0 itself gets no SEPARATE device — the node
+    device, already indexed at (node, 0), is what _lookup_for_cluster's bare
+    lookup(node, 0) fallback resolves to."""
+    _indigo, devices = indigo_env
+    evidenced = _with_node_evidence(EP0_ENERGY_AMBIGUOUS_TWO_RELAY_NODE)
+    result = ds.create_from_raw(evidenced, "Power Strip")
+    ep1_id = ds.lookup(0x39, 1)
+    ep2_id = ds.lookup(0x39, 2)
+    assert ep1_id is not None and ep2_id is not None
+    assert not devices[ep1_id].pluginProps.get("SupportsPowerMeter")
+    assert not devices[ep2_id].pluginProps.get("SupportsPowerMeter")
+    node_id = result["nodeDeviceId"]
+    assert node_id is not None
+    assert ds.lookup(0x39, 0) == node_id, "ep0 resolves to the node device, not a standalone one"
+    assert ds.lookup(0x39, 0, "matterEnergyMeter") is None, "no standalone fallback for ep0"
+    node_dev = devices[node_id]
+    assert node_dev.states.get("curEnergyLevel") == 0.8     # 800 mW → 0.8 W, primed
+    assert node_dev.states.get("accumEnergyTotal") == 0.2   # 200,000 mWh → 0.2 kWh, primed
+
+
+def test_ep0_energy_linked_case_does_not_also_prime_the_node_device(ds, indigo_env):
+    """The scenario EP0_ENERGY_SOLE_ACTUATOR_NODE sidesteps by carrying no
+    node evidence: a node with BOTH a linkable ep0 energy source AND enough
+    BasicInformation evidence for a node device. Without the source-endpoint
+    guard in _prime_states, the node device's own-endpoint priming would
+    ALSO pick up ep0's 0x0090/0x0091 values — showing the same wattage twice,
+    once on the relay (correctly) and once on the node device (a mirror of a
+    reading that was just attributed elsewhere). The reading must land on the
+    relay only."""
+    _indigo, devices = indigo_env
+    evidenced = _with_node_evidence(EP0_ENERGY_SOLE_ACTUATOR_NODE)
+    result = ds.create_from_raw(evidenced, "Grill Plug")
+    relay_id = ds.lookup(0x38, 1)
+    node_id = result["nodeDeviceId"]
+    assert relay_id is not None and node_id is not None
+    assert devices[relay_id].states.get("curEnergyLevel") == 1.2
+    assert devices[relay_id].states.get("accumEnergyTotal") == 3.6
+    node_dev = devices[node_id]
+    assert node_dev.states.get("curEnergyLevel") == 0     # FakeDev's declared-state default
+    assert node_dev.states.get("accumEnergyTotal") == 0   # — never primed, the link claimed it
+    assert ds.lookup(0x38, 0) == node_id, "ep0 still resolves to the node device by lookup()"
+
+
+def test_ep0_energy_live_event_reaches_the_node_device_when_unlinkable(ds, indigo_env):
+    """Live-routing twin of test_ep0_energy_ambiguous_two_relay_lands_on_node_device:
+    an attribute_updated event for (node, 0, 0x0090/0x0091) must reach the
+    node device via handle_event, the same production path the GRILLPLATS
+    live-routing test exercises for a linked ep2 source."""
+    _indigo, devices = indigo_env
+    evidenced = _with_node_evidence(EP0_ENERGY_AMBIGUOUS_TWO_RELAY_NODE)
+    result = ds.create_from_raw(evidenced, "Power Strip")
+    node_id = result["nodeDeviceId"]
+
+    ds.handle_event(MatterEvent(
+        kind=protocol.EVT_ATTRIBUTE_UPDATED,
+        node_id=0x39, endpoint=0, cluster=0x0090, attribute=0x0008, value=2500,
+    ))
+    assert devices[node_id].states.get("curEnergyLevel") == 2.5   # 2500 mW → 2.5 W
+
+    ds.handle_event(MatterEvent(
+        kind=protocol.EVT_ATTRIBUTE_UPDATED,
+        node_id=0x39, endpoint=0, cluster=0x0091, attribute=0x0001,
+        value={"energy": 5_000_000},
+    ))
+    assert devices[node_id].states.get("accumEnergyTotal") == 5.0  # 5,000,000 mWh → 5.0 kWh
+
+
+# ===========================================================================
+# issue #204 review — fix A (CRITICAL): meter links must survive a
+# non-informative snapshot, and a live ep-0 event must keep routing to the
+# linked relay even once a node device also exists at (node, 0).
+# ===========================================================================
+
+def test_ep0_energy_live_event_with_node_device_still_routes_to_relay(ds, indigo_env):
+    """Live-routing companion to test_grillplats_live_attribute_event_routes_to_linked_relay,
+    but sourced from ep0 WITH a node device also present (via _with_node_evidence)
+    — the shape fix A's test 1 asks for. A live (node, 0, 0x0090/0x0091) event
+    must still resolve through _lookup_for_cluster's linked-target rewrite to
+    the relay, not fall through to the bare lookup(node, 0) fallback just
+    because ep0 now also has a device. This is what would catch an `if eid !=
+    0` mutation of that rewrite: without it firing for ep0, the bare fallback
+    would resolve the event to the node device instead of the relay."""
+    _indigo, devices = indigo_env
+    evidenced = _with_node_evidence(EP0_ENERGY_SOLE_ACTUATOR_NODE)
+    result = ds.create_from_raw(evidenced, "Grill Plug")
+    relay_id = ds.lookup(0x38, 1)
+    node_id = result["nodeDeviceId"]
+    assert relay_id is not None and node_id is not None
+
+    ds.handle_event(MatterEvent(
+        kind=protocol.EVT_ATTRIBUTE_UPDATED,
+        node_id=0x38, endpoint=0, cluster=0x0090, attribute=0x0008, value=2500,
+    ))
+    assert devices[relay_id].states.get("curEnergyLevel") == 2.5   # 2500 mW → 2.5 W, routed
+    assert devices[node_id].states.get("curEnergyLevel") == 0      # unchanged — link claims it
+
+
+def test_meter_links_survive_a_non_informative_reconcile_pass(ds, indigo_env):
+    """CRITICAL (issue #204 review, fix A): an empty ``attributes: {}``
+    snapshot (routine after a matter-server restart — see create_devices'
+    ``informative`` docstring) must never retract meter links a prior
+    informative pass established. Before the fix, ``_resolve_meter_links`` ran
+    unconditionally and CLEARS-then-rebuilds this node's links from
+    ``node.endpoints``, which a non-informative pass reports as empty — wiping
+    the link. A live ep-0 reading arriving after that wipe would then resolve
+    to nothing (or, with a node device present, to the wrong device), and the
+    #204 review's own priming guard ensures nothing ever corrects it again."""
+    _indigo, devices = indigo_env
+    result = ds.create_from_raw(EP0_ENERGY_SOLE_ACTUATOR_NODE, "Grill Plug")
+    relay_id = ds.lookup(0x38, 1)
+    assert relay_id is not None
+    assert devices[relay_id].states.get("curEnergyLevel") == 1.2   # primed at creation
+
+    # A non-informative pass — matter-server's cold-cache restart shape.
+    ds.reconcile_all([{"node_id": 0x38, "attributes": {}, "available": True}])
+
+    ds.handle_event(MatterEvent(
+        kind=protocol.EVT_ATTRIBUTE_UPDATED,
+        node_id=0x38, endpoint=0, cluster=0x0090, attribute=0x0008, value=2500,
+    ))
+    assert devices[relay_id].states.get("curEnergyLevel") == 2.5   # link survived the empty pass
+    assert ds.lookup(0x38, 0) is None, "still no device created on ep0"
+
+
+# ===========================================================================
+# issue #204 review — fix B (IMPORTANT): the _prime_states link-source guard
+# is scoped to endpoint 0 only — a standalone matterEnergyMeter whose link
+# only resolves on a LATER pass must keep receiving fresh readings.
+# ===========================================================================
+
+# Pass 1: ep1/ep3 both actuators, no SetTopology — attribution is ambiguous,
+# so ep2 falls back to a standalone matterEnergyMeter (mirrors
+# AMBIGUOUS_MULTI_RELAY_NODE). Pass 2: ep3 is gone, so ep1 is now the sole
+# actuator — the link resolves without recreating ep2's device.
+LATER_RESOLVED_LINK_NODE_PASS1 = {
+    "node_id": 0x3D,
+    "available": True,
+    "attributes": {
+        "1/29/0": [{"0": 266}],
+        "1/6/0": False,
+        "2/144/8": 800,
+        "2/145/1": {"energy": 200_000},
+        "3/29/0": [{"0": 266}],
+        "3/6/0": False,
+    },
+}
+
+LATER_RESOLVED_LINK_NODE_PASS2 = {
+    "node_id": 0x3D,
+    "available": True,
+    "attributes": {
+        "1/29/0": [{"0": 266}],
+        "1/6/0": False,
+        "2/144/8": 1500,
+        "2/145/1": {"energy": 400_000},
+    },
+}
+
+
+def test_standalone_meter_re_primes_after_its_link_later_resolves(ds, indigo_env):
+    """IMPORTANT (issue #204 review, fix B): a standalone matterEnergyMeter on
+    an endpoint whose link only resolves on a LATER pass must keep receiving
+    fresh readings via ordinary ``_prime_states`` re-priming. The guard that
+    stops a link SOURCE endpoint's own device double-counting a reading
+    ``_resolve_meter_links`` already routed elsewhere (issue #204/ADR-0008) is
+    scoped to endpoint 0 only, because endpoint 0 is the one endpoint whose
+    device (the node device) has a real identity independent of the actuator
+    it might link to; every other source endpoint's device exists ONLY
+    because no actuator claimed it, so there is no separate identity for its
+    own reading to duplicate. Before the fix the guard fired for ANY
+    link-source endpoint hosting a device — this repro shape (ep2's link is
+    ambiguous on pass 1, resolves on pass 2) is exactly what would freeze such
+    a device at its pre-link reading with no diagnostic."""
+    _indigo, devices = indigo_env
+    ds.create_from_raw(LATER_RESOLVED_LINK_NODE_PASS1, "Power Strip")
+    meter_id = ds.lookup(0x3D, 2)
+    assert meter_id is not None
+    assert devices[meter_id].deviceTypeId == "matterEnergyMeter"
+    assert devices[meter_id].states.get("curEnergyLevel") == 0.8   # 800 mW, pass 1
+
+    ds.reconcile_all([LATER_RESOLVED_LINK_NODE_PASS2])
+
+    assert ds.lookup(0x3D, 2) == meter_id, "same device, not recreated"
+    assert devices[meter_id].states.get("curEnergyLevel") == 1.5   # 1500 mW, pass 2 — re-primed
+    assert devices[meter_id].states.get("accumEnergyTotal") == 0.4  # 400,000 mWh, pass 2
+
+
+# ===========================================================================
+# issue #204 review — fix F.1: the endpoint-0 purity exemption
+# (_is_meter_source_candidate) needs a fixture that actually carries a
+# root-utility cluster NOT in _NON_DEVICE_CLUSTERS, or removing the exemption
+# is a no-op against every existing fixture (they all carry only 0x0028,
+# which is already in that set).
+# ===========================================================================
+
+EP0_ENERGY_SOLE_ACTUATOR_ROOT_UTILITY_NODE = {
+    "node_id": 0x3E,
+    "available": True,
+    "attributes": {
+        "0/144/8": 1200,                    # ElectricalPowerMeasurement.ActivePower, on ep0
+        "0/145/1": {"energy": 3_600_000},   # ElectricalEnergyMeasurement, on ep0
+        "0/48/0": 0,                        # GeneralCommissioning.Breadcrumb — root utility
+        "0/62/0": [],                       # OperationalCredentials.NOCs — root utility
+        "1/29/0": [{"0": 266}],             # OnOffPlugInUnit
+        "1/6/0": False,                     # OnOff
+    },
+}
+
+
+def test_ep0_energy_with_root_utility_clusters_still_links_to_relay(ds, indigo_env):
+    """Endpoint 0 always carries root utility clusters like GeneralCommissioning
+    (0x0030) and OperationalCredentials (0x003E) that are NOT in
+    _NON_DEVICE_CLUSTERS — unlike every other _is_meter_source_candidate
+    fixture in this file, which happens to carry only 0x0028 (BasicInformation,
+    itself IN _NON_DEVICE_CLUSTERS) and so never actually exercises the
+    endpoint-0 purity exemption (issue #204 review, fix F.1/9-10): removing
+    the ``if int(endpoint.endpoint_id) == 0: return True`` line would still
+    pass every other ep0-energy fixture, because none of them carries a
+    cluster the purity bar would object to. This one does — without the
+    exemption, ep0 stops being a meter-source candidate at all, and the
+    relay never gets its meter props or its primed reading."""
+    _indigo, devices = indigo_env
+    result = ds.create_from_raw(EP0_ENERGY_SOLE_ACTUATOR_ROOT_UTILITY_NODE, "Grill Plug")
+    assert len(result["indigoDeviceIds"]) == 1
+    dev = devices[result["primaryDeviceId"]]
+    assert dev.deviceTypeId == "matterRelay"
+    assert dev.pluginProps.get("SupportsPowerMeter") is True
+    assert dev.pluginProps.get("SupportsEnergyMeter") is True
+    assert dev.states.get("curEnergyLevel") == 1.2        # 1200 mW → 1.2 W, primed
+    assert dev.states.get("accumEnergyTotal") == 3.6       # 3,600,000 mWh → 3.6 kWh, primed
+    assert ds.lookup(0x3E, 0) is None, "ep0 must get no device at all even with root utility clusters"
+
+
 def test_delete_node_deletes_children_before_the_node_device(ds, indigo_env):
     """The node device is still deleted LAST — not because the ordering
     protects anything any more (ADR-0009: the group is dissolved first, and on
@@ -4145,6 +4451,38 @@ def test_forget_node_capabilities_clears_the_tombstone(ds, indigo_env):
     assert not ds.node_tombstones.is_tombstoned(42)
 
 
+def test_forget_node_capabilities_prunes_this_nodes_meter_links(ds, indigo_env):
+    """Verifier note, issue #204 review: unlike `_power_coverage`, a removed
+    node's meter links have no devices behind them to protect, and
+    `_resolve_meter_links` does not rebuild on the next informative pass the
+    way the setting-limits/attribute-list caches do — it only runs from
+    `create_devices`. Without pruning here a stale link would sit in the
+    dicts (keyed on a node id matter-server may reuse) until the node is
+    recommissioned."""
+    ds.create_from_raw(GRILLPLATS_NODE, "Grill Plug")
+    assert any(k[0] == 0x34 for k in ds._forward_links)
+    assert any(k[0] == 0x34 for k in ds._reverse_links)
+
+    ds.handle_event(MatterEvent(kind=protocol.EVT_NODE_REMOVED, node_id=0x34))
+
+    assert not any(k[0] == 0x34 for k in ds._forward_links)
+    assert not any(k[0] == 0x34 for k in ds._reverse_links)
+
+
+def test_forget_node_capabilities_leaves_other_nodes_links_alone(ds, indigo_env):
+    """The prune is per-node — a decommission on one node must not touch a
+    different node's live meter links."""
+    ds.create_from_raw(GRILLPLATS_NODE, "Grill Plug")
+    before_forward = dict(ds._forward_links)
+    before_reverse = dict(ds._reverse_links)
+    assert before_forward and before_reverse
+
+    ds.handle_event(MatterEvent(kind=protocol.EVT_NODE_REMOVED, node_id=0x999999))
+
+    assert ds._forward_links == before_forward
+    assert ds._reverse_links == before_reverse
+
+
 def test_note_node_device_deleted_with_no_tombstones_object_never_raises(ds, indigo_env):
     """self.node_tombstones is None until plugin.startup wires it — inert,
     same discipline as survey_log."""
@@ -4222,6 +4560,20 @@ def test_a_failed_self_delete_does_not_swallow_a_later_user_delete(ds, indigo_en
     assert ds.node_tombstones.is_tombstoned(42)
 
 
+def test_node_device_reachable_state_gets_a_display_uivalue_at_creation(ds, indigo_env):
+    """Fix D (issue #204 review, Simon's UX finding): matterNode's
+    UiDisplayStateId is `reachable` — a bare Boolean YesNo renders as a bare
+    "yes" in the device list, read next to an on/off actuator like another
+    on/off answer rather than a connectivity flag. Creation must seed the
+    uiValue alongside the boolean, not just the boolean."""
+    _indigo, devices = indigo_env
+    evidenced = _with_node_evidence(RELAY_NODE)
+    result = ds.create_from_raw(evidenced, "Office Plug")
+    node_dev_id = result["nodeDeviceId"]
+    assert devices[node_dev_id].states.get("reachable") is True
+    assert devices[node_dev_id].states.get("reachable.ui") == "reachable"
+
+
 def test_mark_unreachable_flags_the_node_device(ds, indigo_env):
     """Issue #204 review, fix E: mark_unreachable is the EVT_NODE_REMOVED
     path (and others) — it never went through _apply_reachability, so the
@@ -4233,6 +4585,7 @@ def test_mark_unreachable_flags_the_node_device(ds, indigo_env):
     ds.mark_unreachable(42)
     assert devices[node_dev_id].errorState == "unreachable"
     assert devices[node_dev_id].states.get("reachable") is False
+    assert devices[node_dev_id].states.get("reachable.ui") == "unreachable"  # fix D
 
 
 def test_mark_all_unreachable_flags_every_node_device(ds, indigo_env):
@@ -4246,6 +4599,7 @@ def test_mark_all_unreachable_flags_every_node_device(ds, indigo_env):
     ds.mark_all_unreachable()
     assert devices[node_dev_id].errorState == "unreachable"
     assert devices[node_dev_id].states.get("reachable") is False
+    assert devices[node_dev_id].states.get("reachable.ui") == "unreachable"  # fix D
 
 
 def test_reconcile_orphan_sweep_marks_a_non_informative_node_device_unreachable(ds, indigo_env):
@@ -4280,11 +4634,13 @@ def test_apply_reachability_writes_the_node_reachable_state_both_directions(ds, 
     ds._apply_reachability(unavailable)
     assert devices[node_dev_id].states.get("reachable") is False
     assert devices[node_dev_id].errorState == "unreachable"
+    assert devices[node_dev_id].states.get("reachable.ui") == "unreachable"  # fix D
 
     available = parse_node({**evidenced, "available": True}, "Office Plug")
     ds._apply_reachability(available)
     assert devices[node_dev_id].states.get("reachable") is True
     assert devices[node_dev_id].errorState == ""
+    assert devices[node_dev_id].states.get("reachable.ui") == "reachable"  # fix D — recovery
 
 
 def test_reconcile_all_never_sweeps_the_node_device_as_an_orphan(ds, indigo_env):

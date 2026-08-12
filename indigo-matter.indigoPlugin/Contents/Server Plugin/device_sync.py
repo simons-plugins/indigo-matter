@@ -207,6 +207,21 @@ def _kvlist(states: dict) -> list:
     return [{"key": key, "value": value} for key, value in states.items()]
 
 
+def _reachable_kv(value: bool) -> dict:
+    """kv-dict for the ``reachable`` boolean WITH its display ``uiValue``.
+
+    ``reachable`` is a bare Boolean YesNo on several device types — several of
+    them (``matterNode`` in particular) use it as their ``UiDisplayStateId``,
+    so the device list's own status column shows it. Without a uiValue that
+    renders as a bare "yes"/"no", which next to an on/off actuator reads like
+    another on/off answer rather than a connectivity flag. The STATE stays a
+    plain boolean either way (ADR-0007 — triggers/conditionals may bind it);
+    this only changes what a human reads in the column.
+    """
+    return {"key": "reachable", "value": bool(value),
+            "uiValue": "reachable" if value else "unreachable"}
+
+
 def _capability_fingerprint(lists: dict) -> dict:
     """An AttributeList map reduced to what a capability answer actually depends on.
 
@@ -746,14 +761,23 @@ class DeviceSync:
         the product name). Only the node device is synthetic enough that its
         deletion has to be honoured rather than healed.
 
-        Since stage 2 the node device is in a group with its siblings, and
-        ``indigo.device.delete`` refuses to delete the ROOT of a non-empty
-        group. Whether that root is the node device depends on age (ADR-0009):
-        on a node commissioned since the node device existed it is, so the
-        route to here is the user ungrouping it first and then deleting it; on
-        a fielded install the root is an older endpoint device and the node
-        device deletes straight out of the group. Both land in
-        ``deviceDeleted`` and both tombstone.
+        Since stage 2 the node device is in a group with its siblings, and the
+        two deletion routes behave DIFFERENTLY — verified live 2026-08-12,
+        because assuming otherwise would have put a false claim in the user
+        docs. ``indigo.device.delete`` (the scripting API, what ``delete_node``
+        calls) refuses the ROOT of a non-empty group, which is why that method
+        dissolves the group first. **Indigo's UI does not refuse**: deleting a
+        grouped device flags the dependent devices and offers to delete the
+        whole family, so a user who confirms takes every device on the node
+        with it — node device included, whichever one leads the group
+        (ADR-0009: that is the oldest member, so the node device on a node
+        commissioned since node devices existed, an older endpoint device on a
+        fielded install). Either way the node device's own deletion lands in
+        ``deviceDeleted`` and tombstones, which is right: the user confirmed a
+        dialog naming it. The endpoint devices heal on the next reconcile with
+        NEW ids, so their bindings do not — ``docs/MATTER.md`` warns about that
+        and points at decommissioning as the operation that actually means
+        "remove this hardware", and at a quiet folder for "just hide it".
 
         ``dev_id`` (issue #204 review, fix A) is what tells a genuine user
         deletion apart from ``delete_node`` deleting its own node device as
@@ -917,7 +941,17 @@ class DeviceSync:
                 int(endpoint.endpoint_id): self.registry.handlers_for_endpoint(node, endpoint)
                 for endpoint in node.endpoints
             }
-            self._resolve_meter_links(node, specs_by_ep)
+            # Same `informative` gate as _power_coverage above, for the same
+            # reason (ADR-0003: an empty snapshot is no information, never a
+            # retraction) — _resolve_meter_links CLEARS-then-rebuilds this
+            # node's links from node.endpoints, so a non-informative pass (zero
+            # endpoints) would wipe every link a prior pass established. A live
+            # ep-0 reading arriving after that wipe would resolve to the node
+            # device instead of the actuator it belongs to, writing a duplicate
+            # reading the priming guard below then never corrects (issue #204
+            # review, fix A).
+            if informative:
+                self._resolve_meter_links(node, specs_by_ep)
 
             for endpoint in node.endpoints:
                 eid = int(endpoint.endpoint_id)
@@ -942,8 +976,14 @@ class DeviceSync:
                         # all — readings route to the linked target via
                         # _lookup_for_cluster. Otherwise fall back to a
                         # standalone matterEnergyMeter device rather than the
-                        # matterUnknown placeholder (issue #79).
-                        if ep_key not in self._forward_links:
+                        # matterUnknown placeholder (issue #79) — EXCEPT for
+                        # endpoint 0 (issue #204/ADR-0008), which never gets a
+                        # standalone matterEnergyMeter: it already has a home,
+                        # the matterNode device's own curEnergyLevel/
+                        # accumEnergyTotal states, and _lookup_for_cluster's
+                        # bare lookup(node, 0) fallback resolves an unlinked
+                        # (node, 0, 0x0090/0x0091) reading straight to it.
+                        if eid != 0 and ep_key not in self._forward_links:
                             specs = [self._energy_meter_spec(node, endpoint)]
                     else:
                         # No handler claimed this endpoint. If it carries clusters
@@ -1975,11 +2015,29 @@ class DeviceSync:
         cluster is silently dropped with no placeholder and no log line,
         reintroducing the exact "commission succeeds with nothing visible"
         failure mode issue #58 fixed.
+
+        Endpoint 0 is exempted from the purity check (issue #204/ADR-0008):
+        it always carries root utility clusters (General Commissioning,
+        Network Commissioning, Operational Credentials, …) that are not in
+        _NON_DEVICE_CLUSTERS, so a literal purity bar would keep excluding it
+        even now that it may host 0x0090/0x0091. Nothing is lost by skipping
+        the bar here: ``_unknown_spec`` already returns ``None`` for endpoint
+        0 unconditionally (by design, since before this change existed), so
+        endpoint 0 never got a matterUnknown placeholder either way — the
+        purity bar's #58 concern was never covered BY a placeholder here, it
+        was covered by other surfaces. The writable half of what a
+        root-utility cluster exposes surfaces via settings_report's survey
+        (WRITABLE attributes only); anything read-only is visible on demand
+        via the explorer (settings_report.explore_lines), not in this report.
+        This is preferred over maintaining a parallel root-utility-clusters
+        frozenset that would rot as the model grows.
         """
-        if int(endpoint.endpoint_id) == 0 or specs:
+        if specs:
             return False
         if not (endpoint.has(CLUSTER_ELECTRICAL_POWER) or endpoint.has(CLUSTER_ELECTRICAL_ENERGY)):
             return False
+        if int(endpoint.endpoint_id) == 0:
+            return True
         return not set(endpoint.cluster_ids) - _NON_DEVICE_CLUSTERS
 
     def _resolve_meter_target(self, node: NodeInfo, source_endpoint: Any,
@@ -2271,6 +2329,16 @@ class DeviceSync:
                 dev.updateStatesOnServer(_kvlist(spec.initial_states))
             except Exception as exc:  # noqa: BLE001
                 self.logger.debug("initial state set failed: %s", exc)
+            if "reachable" in spec.initial_states:
+                # Second write, uiValue-bearing (display column UX, see
+                # _reachable_kv): initial_states is a plain {key: value} dict
+                # (_kvlist above has no uiValue slot), so the write just above
+                # left the column reading a bare "yes"/"no". apply_states
+                # carries the kv-dict uiValue form; on a device this fresh
+                # (just created, no errorState yet) its errorState-clearing
+                # side effect is a no-op.
+                self.apply_states(
+                    dev.id, [_reachable_kv(spec.initial_states["reachable"])])
         return dev.id
 
     # ------------------------------------------------------------------
@@ -2385,7 +2453,11 @@ class DeviceSync:
         Within the own endpoint, skip attributes whose cluster's handler targets
         a *different* existing device on the same endpoint (fix/#44: prevents the
         Pressure device being primed with Flow values or an AQ device being primed
-        with CO2 values it doesn't own).
+        with CO2 values it doesn't own) — and, since #204/ADR-0008, also skip
+        0x0090/0x0091 on the own endpoint when that endpoint is itself a
+        resolved meter-link SOURCE: its device (only ever the node device
+        today, endpoint 0) must not mirror a reading _resolve_meter_links
+        already sent to another endpoint's device.
 
         The sibling-type skip is narrowed to fire only when the handler's type
         actually exists as a SEPARATE device on the endpoint.  Merge-into handlers
@@ -2407,10 +2479,34 @@ class DeviceSync:
         dev = indigo.devices[dev_id]
         with self._lock:
             linked_sources = self._reverse_links.get((int(node.node_id), int(endpoint_id)), set())
+            # Endpoint 0 is the ONE link-source endpoint whose own device must
+            # not ALSO be primed with the reading _resolve_meter_links just
+            # attributed to another endpoint's device — that would show the
+            # same wattage twice. It is special because its device is the
+            # NODE device (issue #204/ADR-0008): a plug may carry 0x0090/0x0091
+            # on ep0 while its relay sits on ep1, and the node device has its
+            # own real identity independent of that relay, so it must not
+            # mirror a reading that was just attributed elsewhere. This guard
+            # is symmetric with _lookup_for_cluster's live-routing rewrite,
+            # which already sends a live update to the linked TARGET only.
+            #
+            # Every OTHER link-source endpoint (>0) is different: its device,
+            # when it has one, only exists BECAUSE no actuator claimed it
+            # (_is_meter_source_candidate/_energy_meter_spec's standalone
+            # matterEnergyMeter fallback) — there is no separate "real"
+            # identity for a reading to duplicate, so it must keep receiving
+            # its own readings normally, including on a LATER pass where its
+            # link only now resolves (issue #204 review, fix B — narrowed from
+            # "any link-source endpoint hosting a device", which froze such a
+            # standalone meter at its pre-link reading with no diagnostic).
+            own_forward_target = self._forward_links.get((int(node.node_id), int(endpoint_id)))
         kv: list = []
         for (ep, cluster, attribute), value in node.attributes.items():
             handler = self.registry.handler_for_cluster(cluster)
             if handler is None:
+                continue
+            if (ep == endpoint_id and int(ep) == 0 and own_forward_target is not None
+                    and cluster in (CLUSTER_ELECTRICAL_POWER, CLUSTER_ELECTRICAL_ENERGY)):
                 continue
             # Include attributes from: this device's own endpoint, any
             # node-scoped cluster living on a different endpoint, or a linked
@@ -2658,6 +2754,18 @@ class DeviceSync:
         Cache eviction is still not a policy to apply uniformly — it depends
         entirely on what the empty case is read to MEAN, which for the two
         dicts above is the opposite of harmless.
+
+        **`_forward_links`/`_reverse_links` ARE evicted here** (verifier note,
+        issue #204 review) — a THIRD answer, neither of the two above: unlike
+        `_power_coverage`, a removed node's links have no devices behind them
+        to protect (the node is gone, full stop), so there is nothing an empty
+        entry could wrongly mean. And unlike `_setting_limits`/
+        `_attribute_lists`, `_resolve_meter_links` does not do a bare rebuild
+        on the next informative pass the way `_cache_setting_limits` does —
+        it only runs from `create_devices`, so a stale link surviving a
+        decommission would sit there until the node (or whatever reuses its
+        id) is recommissioned and passes through `create_devices` again. This
+        closes that gap rather than relying on the eventual rebuild to.
         """
         target = int(node_id)
         with self._lock:
@@ -2665,6 +2773,10 @@ class DeviceSync:
                                     if k[0] != target}
             self._attribute_lists = {k: v for k, v in self._attribute_lists.items()
                                      if k[0] != target}
+            self._forward_links = {k: v for k, v in self._forward_links.items()
+                                   if k[0] != target}
+            self._reverse_links = {k: v for k, v in self._reverse_links.items()
+                                   if k[0] != target}
         # And the "already reported" mark (issue #191). Node ids are assigned at
         # commissioning and re-used across a decommission/recommission cycle, so
         # keeping it would let a genuinely different device inherit the old
@@ -3240,13 +3352,18 @@ class DeviceSync:
 
         A silent no-op when the node has no ``matterNode`` device yet (most
         nodes, most of the time) — this is not a diagnostic path.
+
+        ``uiValue``-bearing (see ``_reachable_kv``): this is the ONLY path
+        that ever writes ``reachable`` again after creation (``_apply_
+        reachability``'s docstring), so it is also the only place the
+        display column's "yes"/"no" would otherwise never get corrected.
         """
         with self._lock:
             dev_id = self._index.get((int(node_id), 0), {}).get("matterNode")
         if dev_id is None:
             return
         try:
-            indigo.devices[dev_id].updateStatesOnServer([{"key": "reachable", "value": reachable}])
+            indigo.devices[dev_id].updateStatesOnServer([_reachable_kv(reachable)])
         except Exception as exc:  # noqa: BLE001
             self.logger.debug(
                 "could not write matterNode reachable state for node %s: %s", node_id, exc)
