@@ -262,6 +262,19 @@ class FakeDeviceFactory:
         returned byte-identical member lists on the live rig, and adding a
         third device to an existing pair left the root untouched — so this
         models a symmetric union with an age sort and no notion of a joiner.
+
+        What is and isn't experiment-backed, honestly: SINGLETON+SINGLETON
+        (both argument orders) and SINGLETON-JOINS-EXISTING-GROUP (the
+        experiment's third line) are what the live rig actually exercised.
+        A general GROUP+GROUP union — two already-multi-member groups
+        merged in one call — is EXTRAPOLATED from those, never run on
+        jarvis. Production's own guard (`_ensure_grouped`'s family check
+        only ever passes a SINGLETON node device as one side) means only
+        the backed directions are exercised today; this fake unions
+        unconditionally because nothing here currently calls it any other
+        way. Anyone relaxing that guard to call this with two genuine
+        multi-member groups must extend the live experiment first, not
+        just trust this model to still be right.
         """
         first, second = self._id_of(dev_1), self._id_of(dev_2)
         self.group_calls.append((first, second))
@@ -4820,7 +4833,12 @@ def test_a_user_built_group_is_left_alone_and_warned_once(ds, indigo_env, mock_l
     The test that the plugin has left it alone is MEMBERSHIP, not the root:
     under age ordering the root of a user-built group is often the plugin's
     own device (it is the older one here), which is exactly why the warning
-    must not name a root at all."""
+    must not name a root at all.
+
+    Also the family-aware branch's negative case: ``foreign`` is NOT one of
+    this node's own device ids, so ``{relay_id, foreign.id}`` is not a
+    subset of ``family`` and this must still hit the foreign warn-and-leave,
+    not the new join-the-family path added alongside it."""
     _indigo, devices = indigo_env
     ds.create_from_raw(RELAY_NODE, "")
     relay_id = ds.lookup(42, 1, "matterRelay")
@@ -4835,6 +4853,7 @@ def test_a_user_built_group_is_left_alone_and_warned_once(ds, indigo_env, mock_l
     assert result["nodeDeviceId"] not in _grouped(_indigo, relay_id)
     # No grouping call was even attempted for it.
     assert _indigo.device.group_calls == []
+    assert _indigo.device.ungroup_calls == []
     messages = [str(call.args) for call in mock_logger.warning.call_args_list]
     assert sum("already in a device group" in message for message in messages) == 1
     # ...and it never says "rooted at 1001" about device 1001 (ADR-0009).
@@ -4935,6 +4954,87 @@ def test_grouping_n_children_sequentially_leaves_one_group_with_every_member(
         group = _indigo.device.getGroupList(dev_id)
         assert set(group) == expected
         assert group[0] == node_dev_id
+
+
+def test_recreated_node_device_rejoins_its_surviving_family_group(ds, indigo_env, mock_logger):
+    """The reviewer's reproduction: a node device deleted by hand and
+    recreated via the "Recreate Matter node devices…" menu could never
+    rejoin its own family before this fix. Real Indigo drops the deleted
+    device OUT of its shared group rather than dissolving the whole group,
+    so the node's own endpoint devices stay grouped with each other after
+    the delete. The old, non-family-aware `_ensure_grouped` read that
+    surviving group — every id its own — as a stranger's arrangement and
+    warned-and-left it forever, because nothing in it was the (new) node
+    device.
+
+    Fielded-install shape deliberately (children created before the node
+    device exists at all, same as `_with_node_evidence` arriving on a later
+    pass elsewhere in this file): that makes an endpoint device the group's
+    root under ADR-0009's age ordering, not the node device, so the
+    hand-delete below is a plain non-root removal — exactly what a user
+    clicking "Delete" on the node device in the Indigo UI does, and not the
+    root-of-a-non-empty-group refusal `delete_node` has to dissolve around."""
+    _indigo, devices = indigo_env
+    import device_sync as device_sync_mod
+    ds.node_tombstones = device_sync_mod.NodeDeviceTombstones()
+    result = ds.create_from_raw(AQ_NODE, "Air Sensor")   # children only: no node device yet
+    children = set(result["indigoDeviceIds"])
+    result_with_node = ds.create_from_raw(_with_node_evidence(AQ_NODE), "")
+    node_dev_id = result_with_node["nodeDeviceId"]
+    assert node_dev_id is not None
+    expected = children | {node_dev_id}
+    assert _grouped(_indigo, node_dev_id) == expected
+    assert node_dev_id != min(expected), \
+        "sanity: the node device is younger than its siblings, so it does not root the group"
+
+    # The hand-delete: tombstone it (as plugin.deviceDeleted would), then
+    # delete it through the fake's real delete() — NOT a raw dict pop — so
+    # the group model behaves the way live Indigo does and drops the node
+    # device out of the shared group rather than dissolving it.
+    ds.note_node_device_deleted(30, node_dev_id)
+    _indigo.device.delete(devices[node_dev_id])
+    sample_child = next(iter(children))
+    assert _grouped(_indigo, sample_child) == children, \
+        "sanity: the family's own group survives the node device's delete"
+
+    # The menu route back, then the reconcile it triggers.
+    ds.node_tombstones.clear_all()
+    result2 = ds.create_from_raw(_with_node_evidence(AQ_NODE), "")
+    new_node_dev_id = result2["nodeDeviceId"]
+    assert new_node_dev_id is not None
+    assert new_node_dev_id != node_dev_id, "a fresh device, new id"
+
+    expected = children | {new_node_dev_id}
+    for dev_id in expected:
+        assert _grouped(_indigo, dev_id) == expected
+    assert mock_logger.warning.call_args_list == []
+
+
+def test_two_siblings_pregrouped_without_a_node_device_are_joined_not_warned(
+        ds, indigo_env, mock_logger):
+    """A leftover arrangement: two of this node's OWN endpoint devices are
+    already grouped with each other, but the node device was never part of
+    it (predates ADR-0008, or the user's own tidying). Every id in that
+    group still belongs to this node, so one reconcile pass must join the
+    node device into it by ACCUMULATION — not read it as a foreign
+    arrangement and warn-and-leave, and not tear anything down to do it."""
+    _indigo, devices = indigo_env
+    result = ds.create_from_raw(AQ_NODE, "Air Sensor")   # no evidence: no node device yet
+    children = result["indigoDeviceIds"]
+    sib_a, sib_b = children[0], children[1]
+    _indigo.device.groupWithDevice(sib_a, sib_b)   # the leftover: two siblings, no node device
+    _indigo.device.group_calls.clear()
+    _indigo.device.ungroup_calls.clear()
+
+    result2 = ds.create_from_raw(_with_node_evidence(AQ_NODE), "")
+    node_dev_id = result2["nodeDeviceId"]
+    assert node_dev_id is not None
+
+    expected = set(children) | {node_dev_id}
+    for dev_id in expected:
+        assert _grouped(_indigo, dev_id) == expected
+    assert _indigo.device.ungroup_calls == [], "healing must not tear anything down"
+    assert mock_logger.warning.call_args_list == []
 
 
 def test_an_endpoint_device_deleted_by_hand_is_not_a_warning(ds, indigo_env, mock_logger):
@@ -5041,6 +5141,13 @@ def test_delete_node_dissolves_the_group_before_deleting_anything(ds, indigo_env
     assert deleted[-1] == node_dev_id
     assert _indigo.device.groups == {}
     assert not devices._by_id
+    # The docstring's actual claim, pinned: EVERY candidate was ungrouped —
+    # not just enough of them that the fake's delete happened to drop the
+    # rest via _drop_from_group's side effect of a passing delete loop.
+    # Without this, the test passes on incidental ordering (delete drops
+    # membership per device; node deleted last) rather than on the
+    # dissolve-first shape it claims to verify.
+    assert set(_indigo.device.ungroup_calls) == set(deleted)
 
 
 def test_delete_node_survives_a_group_rooted_at_an_endpoint_device(ds, indigo_env):

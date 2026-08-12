@@ -1184,14 +1184,22 @@ class DeviceSync:
             # the node has no node device (the ADR-0003 gate not passed, or
             # tombstoned): there is nothing for the family to be a group WITH.
             to_group: list[tuple[int, int]] = []
+            # This node's own device ids, node device included — passed to
+            # _ensure_grouped so it can tell "every id in this fielded group is
+            # ours" (heal it) from "this group has a device that isn't" (leave
+            # it, ADR-0008/#204 review). Built alongside to_group from the same
+            # _index sweep, so both see the identical membership.
+            family: frozenset[int] = frozenset()
             if node_dev_id is not None:
-                to_group = [
-                    (dev_id, node_dev_id)
-                    for (nid, _eid), type_map in self._index.items()
-                    if nid == int(node.node_id)
-                    for dev_id in type_map.values()
-                    if dev_id != node_dev_id
-                ]
+                family = frozenset(
+                    {int(node_dev_id)} | {
+                        dev_id
+                        for (nid, _eid), type_map in self._index.items()
+                        if nid == int(node.node_id)
+                        for dev_id in type_map.values()
+                    }
+                )
+                to_group = [(dev_id, node_dev_id) for dev_id in family if dev_id != node_dev_id]
         # Outside the lock, deliberately, and for the same reason
         # report_settable_attributes below is: every call reaches into Indigo
         # (getGroupList/groupWithDevice), and grouping is Indigo-side metadata
@@ -1215,7 +1223,7 @@ class DeviceSync:
                 self.logger.debug("not grouping device %s: %s", dev_id, exc)
                 continue
             try:
-                self._ensure_grouped(dev_id, group_with)
+                self._ensure_grouped(dev_id, group_with, family)
             except Exception as exc:  # noqa: BLE001 - per-device independence (fix F)
                 self.logger.debug(
                     "grouping device %s with %s failed: %s", dev_id, group_with, exc)
@@ -1793,7 +1801,38 @@ class DeviceSync:
         self._group_warned.add(key)
         self.logger.warning(fmt, *args)
 
-    def _ensure_grouped(self, dev_id: int, node_dev_id: int) -> None:
+    def _group_and_verify(self, dev_id: int, node_dev_id: int, first: int, second: int) -> None:
+        """Call ``groupWithDevice(first, second)`` and confirm ``dev_id`` and
+        ``node_dev_id`` land in one group afterwards. Shared by both callers
+        in ``_ensure_grouped`` below — the ordinary join and the family
+        rejoin differ only in which id leads the call; the failure handling
+        and the membership read-back are identical either way."""
+        try:
+            indigo.device.groupWithDevice(first, second)
+        except Exception as exc:  # noqa: BLE001
+            self._group_warn(
+                dev_id, "group",
+                "could not group device %s with Matter node device %s: %s — if a device "
+                "or device-factory dialog was open, close it and reload the plugin",
+                dev_id, node_dev_id, exc)
+            return
+        try:
+            after = [int(member) for member in indigo.device.getGroupList(dev_id)]
+        except Exception as exc:  # noqa: BLE001 - the group was made; only the check failed
+            self.logger.debug("could not verify the group of device %s: %s", dev_id, exc)
+            return
+        if int(node_dev_id) not in after:
+            # MEMBERSHIP is what is verified, not position: the call reported
+            # success but the two devices are not in one group, which is the
+            # only outcome left that the user can act on.
+            self._group_warn(
+                dev_id, "group",
+                "device %s was grouped with Matter node device %s but Indigo did not put "
+                "them in one group — the node's devices will not show together in the "
+                "device list", dev_id, node_dev_id)
+
+    def _ensure_grouped(self, dev_id: int, node_dev_id: int,
+                         family: "frozenset[int]" = frozenset()) -> None:
         """Put ``dev_id`` in one Indigo device group with ``node_dev_id``
         (ADR-0008 option B, as narrowed by ADR-0009).
 
@@ -1820,7 +1859,10 @@ class DeviceSync:
         of two or more that does NOT contain its node device is a deliberate
         arrangement of theirs — warn once and leave it, rather than quietly
         rearranging the device list of someone who grouped their Matter relay
-        with a Z-Wave sensor.
+        with a Z-Wave sensor. The one exception is ``family``: a group whose
+        members are ENTIRELY this node's own device ids (incl. the node
+        device) is not a foreign arrangement at all, just this node's own
+        membership caught mid-repair — see the ``family`` branch below.
 
         Everything is guarded: the docs warn twice that this call should not
         be made while a device dialog or the device factory UI is open, and a
@@ -1851,6 +1893,50 @@ class DeviceSync:
         # at all — undocumented either way); both fall through to the group
         # call below, and neither is mistaken for a user-built group.
         if len(group) > 1:
+            if set(group) <= family:
+                # Every id in this group is one of THIS NODE'S OWN devices
+                # (incl. the node device itself, which is why it is not in
+                # `group` already) — not a user's foreign arrangement, just
+                # this node's own membership caught mid-repair. Two fielded
+                # ways this happens: a node device deleted by hand and
+                # recreated via the "Recreate Matter node devices…" menu
+                # (the group of its own endpoint devices survives the
+                # delete — nothing ever ungroups them), or two siblings
+                # grouped together without ever picking up the node device
+                # (a leftover from before this migration, or the user's own
+                # tidying). Either way the fix is the same: join the node
+                # device into the surviving group.
+                #
+                # This is SINGLETON-JOINS-GROUP — the live experiment's
+                # third line (jarvis, 2026-08-12): a singleton (temp) joined
+                # an existing pair ([motion, node]) via
+                # ``groupWithDevice(temp, node)``, one of its members named
+                # as the second argument. The reverse direction — pulling
+                # ONE member OUT of an established group to join it to a
+                # singleton elsewhere — is deliberately never used here: the
+                # experiment never ran that case, so anyone relaxing this
+                # guard to cover it must extend the live experiment first.
+                try:
+                    node_group = [
+                        int(member) for member in indigo.device.getGroupList(node_dev_id)]
+                except Exception as exc:  # noqa: BLE001
+                    self.logger.debug(
+                        "could not read the device group of node device %s: %s",
+                        node_dev_id, exc)
+                    return
+                if len(node_group) > 1:
+                    # Guard: the node device is unexpectedly already a member
+                    # of some OTHER group of its own — should not happen (it
+                    # was just created, or is a singleton). Merging two
+                    # already-established groups is not something the third
+                    # line of the experiment covers, so this leaves both
+                    # alone rather than guess.
+                    self.logger.debug(
+                        "node device %s is already in its own device group — not joining "
+                        "it into device %s's family group", node_dev_id, dev_id)
+                    return
+                self._group_and_verify(dev_id, node_dev_id, node_dev_id, dev_id)
+                return
             # Deliberately says nothing about which member roots it: under
             # age ordering that is frequently `dev_id` itself, and "device
             # 5678 is in a group rooted at 5678" is not a sentence to put in
@@ -1861,33 +1947,11 @@ class DeviceSync:
                 "not part of, so it has not been added to the node's group — ungroup it if "
                 "you want it grouped with the rest of the node", dev_id, node_dev_id)
             return
-        try:
-            # Arg order is irrelevant (the experiment: the two orders returned
-            # byte-identical member lists), so this reads the way the docs'
-            # own example does and means nothing more than "these two belong
-            # in one group".
-            indigo.device.groupWithDevice(dev_id, node_dev_id)
-        except Exception as exc:  # noqa: BLE001
-            self._group_warn(
-                dev_id, "group",
-                "could not group device %s with Matter node device %s: %s — if a device "
-                "or device-factory dialog was open, close it and reload the plugin",
-                dev_id, node_dev_id, exc)
-            return
-        try:
-            after = [int(member) for member in indigo.device.getGroupList(dev_id)]
-        except Exception as exc:  # noqa: BLE001 - the group was made; only the check failed
-            self.logger.debug("could not verify the group of device %s: %s", dev_id, exc)
-            return
-        if int(node_dev_id) not in after:
-            # MEMBERSHIP is what is verified, not position: the call reported
-            # success but the two devices are not in one group, which is the
-            # only outcome left that the user can act on.
-            self._group_warn(
-                dev_id, "group",
-                "device %s was grouped with Matter node device %s but Indigo did not put "
-                "them in one group — the node's devices will not show together in the "
-                "device list", dev_id, node_dev_id)
+        # Arg order is irrelevant (the experiment: the two orders returned
+        # byte-identical member lists), so this reads the way the docs' own
+        # example does and means nothing more than "these two belong in one
+        # group".
+        self._group_and_verify(dev_id, node_dev_id, dev_id, node_dev_id)
 
     @staticmethod
     def _endpoint_by_id(node: NodeInfo, endpoint_id: int) -> Optional[Any]:
