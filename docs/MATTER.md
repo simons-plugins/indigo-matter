@@ -275,7 +275,7 @@ The plugin maps Matter clusters to native Indigo device types:
 | Smoke / CO alarms | Sensor (alarm latch) |
 | Air quality (AQI, CO₂, PM2.5, TVOC) | Sensors (one per metric) |
 | Power & energy metering | `curEnergyLevel` (W) / `accumEnergyTotal` (kWh) states on the primary device |
-| Battery level | `batteryLevel` on every device of the node |
+| Battery level | `batteryLevel` on every device the power source says it powers (usually the whole node) |
 | Bridges | One Indigo device per bridged child endpoint |
 
 A node exposing several capabilities gets several Indigo devices (e.g. a
