@@ -910,7 +910,24 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, ServerMenuMixin,
         the node does not implement. ``createdTypeId`` is stamped into props at
         creation (and healed onto older devices at reconcile); absence of the
         stamp (e.g. a manually created device) allows the save.
+
+        Also strips ``matterNode``'s ``lastSurveySummary`` field from
+        ``valuesDict`` (issue #204 review) — Indigo persists EVERY ConfigUI
+        field into pluginProps on Save, readonly included, so left alone the
+        display-only survey summary would become a stored prop that churns on
+        every Save (Devices.xml's claim that it is "never a stored prop" was
+        aspirational, not true, until this strip). Two costs, not one: the
+        persisted copy goes stale the moment the real answer changes
+        elsewhere, AND — the one that matters for fix E above — a prop churn
+        is a comm restart, so a Save on this dialog alone would re-fire
+        ``deviceStartComm`` for a reason with nothing to do with the device's
+        actual settings. ``settings_report.SurveyLog`` already made this exact
+        call for its own store (kept in pluginPrefs rather than per-device
+        props, see its docstring); this is the same call applied to this
+        field's per-device echo of that store.
         """
+        if typeId == "matterNode":
+            valuesDict.pop("lastSurveySummary", None)
         created = ""
         try:
             created = indigo.devices[devId].pluginProps.get("createdTypeId", "")
@@ -1159,14 +1176,19 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, ServerMenuMixin,
                 attribute_list=self._setting_attribute_list_lookup(values),
                 device_known=self._has_matter_node(values),
                 on_skip=self._log_setting_skips(devId)))
+            if typeId == "matterNode":
+                # Display-only summary of settings_report's SurveyLog for THIS
+                # node (issue #204): the store stays in pluginPrefs (see
+                # settings_report.SurveyLog's docstring for why), but its answer
+                # now has somewhere to be read back besides the event log.
+                # INSIDE this try, not after it: an uncaught exception here
+                # would escape getDeviceConfigUiValues entirely, skip the
+                # indigo.Dict(...) return below, and hit the C++ bridge with
+                # nothing at all — the #186 failure mode the comment on that
+                # return already documents.
+                values["lastSurveySummary"] = self._survey_summary_for(values)
         except Exception as exc:  # noqa: BLE001 - never block the dialog over the settings section
             self.logger.exception("could not build device settings for %s: %s", devId, exc)
-        if typeId == "matterNode":
-            # Display-only summary of settings_report's SurveyLog for THIS
-            # node (issue #204): the store stays in pluginPrefs (see
-            # settings_report.SurveyLog's docstring for why), but its answer
-            # now has somewhere to be read back besides the event log.
-            values["lastSurveySummary"] = self._survey_summary_for(values)
         # MUST be indigo.Dict, not a plain dict — the same shape
         # getPrefsConfigUiValues returns. Returning a plain dict fails INSIDE
         # Indigo's C++ bridge, which logs
@@ -1368,8 +1390,10 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, ServerMenuMixin,
             self._prime_absent_node_energy_state(dev)
 
     def _prime_absent_node_energy_state(self, dev) -> None:
-        """Flag a node device's energy states as meterless until real evidence
-        arrives (issue #204 review, fix E; ADR-0007's flagged-state rule).
+        """Flag a node device's energy states as meterless — unless real
+        evidence has already landed (issue #204 review, fix E; ADR-0007's
+        flagged-state rule; hardened by the #204 verifier's evidence-checked-
+        prime finding).
 
         Every ``matterNode`` device declares ``curEnergyLevel``/
         ``accumEnergyTotal`` unconditionally (Devices.xml — ep 0 may host an
@@ -1378,26 +1402,42 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, ServerMenuMixin,
         0 at all. Left at Indigo's bare integer default, that reads as
         "0 W, plug off" — a PLAUSIBLE reading, exactly the #190 failure mode
         this plugin already knows to avoid, not "there is no meter here".
-        ``uiValue`` fixes that the same way ``_prime_retired_on_time_state``
-        does: display-only (API v1.6+), invisible to triggers and conditional
-        logic, so flagging it can never be mistaken for a live reading by
-        anything that matters.
+        ``uiValue`` fixes the DISPLAY the same way ``_prime_retired_on_time_state``
+        does — but unlike that state, the ``value`` half here is NOT cosmetic:
+        it is a real state write, visible to triggers and conditional logic
+        exactly like any other. ``onTime``'s "invisible" claim does not
+        transfer to this state: nothing ever writes ``onTime`` again once
+        primed, so its flagged value can never diverge from reality. This
+        state DOES get written again — by device_sync's own ``_prime_states``
+        on every connect/reconnect — so a prime here is a live write that can
+        race a genuine reading, not an inert label.
 
-        Called on EVERY start, for EVERY ``matterNode`` device, with no
-        evidence check: unlike ``_prime_retired_on_time_state`` (whose state
-        nothing else ever writes again), this one CAN be overwritten by a real
-        reading — but ``deviceStartComm`` has no synchronous access to the
-        node's live attribute snapshot (that lives behind matter-server, on
-        the async loop), and blocking device start on a round-trip there is
-        not a trade this seam makes. A node that DOES have ep-0 energy
-        self-corrects moments later: reconcile's ``_prime_states`` (on
-        connect, and every reconnect) writes the real reading over this
-        placeholder, same as a freshly-primed value landing after this write
-        during commissioning would. A node that has none simply keeps reading
-        "<no meter>" forever, which is the point.
+        ``deviceStartComm`` re-fires on EVERY prop change (nodeBaseName
+        restamp, ``_reassert_capability_props``, any Edit-dialog Save — there
+        is no ``didDeviceCommPropertyChange`` override to narrow it), not just
+        first start. Priming unconditionally there clobbers a real ep-0
+        reading mid-session with 0 — ``accumEnergyTotal`` especially, since it
+        moves slowly enough that SQL Logger would log a huge negative delta
+        immediately followed by an equally huge positive one once the real
+        value returned. The guard below is what prevents that: before
+        writing, read the device's CURRENT ``curEnergyLevel`` uiValue directly
+        off ``indigo.devices`` (the one place this method can see live state
+        without a matter-server round trip). If it is already something other
+        than blank or the ``<no meter>`` placeholder, a real reading is on the
+        device and this method does nothing — device_sync's own priming pass
+        owns that value from here.
 
-        Never raises: a cosmetic label must not be able to stop device start.
+        Never raises: a cosmetic label must not be able to stop device start,
+        and neither must a failed evidence check — on a read failure this
+        primes as if the device had no reading at all, same as before this
+        guard existed.
         """
+        try:
+            existing_ui = str(indigo.devices[dev.id].states.get("curEnergyLevel.ui", ""))
+            if existing_ui not in ("", "<no meter>"):
+                return  # a real reading is already on the device — leave it alone
+        except Exception:  # noqa: BLE001 - a failed read must not block priming
+            pass
         try:
             self.device_sync.apply_states(
                 dev.id,

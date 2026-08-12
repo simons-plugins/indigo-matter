@@ -949,9 +949,14 @@
                 <Label>Firmware:</Label>
             </Field>
             <!-- Display-only, seeded by getDeviceConfigUiValues from the
-                 injected SurveyLog (issue #204/#212) — never a stored prop,
-                 re-derived on every dialog open like the settings section
-                 every other type already gets. -->
+                 injected SurveyLog (issue #204/#212) — re-derived on every
+                 dialog open like the settings section every other type
+                 already gets. Indigo persists every ConfigUI field on Save
+                 regardless of readonly, so this one would otherwise become a
+                 stored (and stale, and comm-restart-triggering) prop;
+                 validateDeviceConfigUi strips it back out before Save
+                 completes, which is what actually keeps it out of
+                 pluginProps — the readonly attribute alone does not. -->
             <Field id="lastSurveySummary" type="textfield" readonly="yes">
                 <Label>Settings Survey:</Label>
             </Field>

@@ -327,12 +327,32 @@ as evidence. When it disagrees with its siblings there is no single answer, and
 the plugin then leaves **every** name on that node alone, including the node
 device's. Nothing of yours is overwritten either way; the automatic renaming
 just stops (grouping and folder tidying still run). Renaming to anything else
-("Hall thermometer") avoids it entirely. If
-you would rather not have the node device at
-all, delete it: it stays deleted, and **Plugins → Matter → Recreate Matter node
-devices…** is the way back. Indigo will not let you delete the device leading a
-group while the group still has members — if that is the node device, ungroup
-it first.
+("Hall thermometer") avoids it entirely.
+
+### Deleting: what to do instead, and the one exception
+
+The endpoint devices are not the plugin's to keep or yours to remove: each one
+exists because the node reports the cluster behind it, so **deleting one brings
+it straight back** on the next reconcile. That is not the plugin overruling
+you, it is the same self-healing that repairs a device you lost to a mishap.
+
+So if a device is simply in your way — an endpoint you will never automate —
+**move it to a folder you do not look at**. It keeps working, it stops
+cluttering the list, and nothing fights you over it. And if you want the
+hardware genuinely gone from Indigo, **decommission the node** (*Remove from
+Indigo*): that drops Indigo from the device's Matter fabric and takes its
+Indigo devices with it, which is the operation that actually means "gone".
+
+What you should not do is delete a grouped device and confirm. Indigo will
+tell you the rest of the family goes too, and it means it — and because the
+plugin then recreates them, they come back as **new devices with new ids**, so
+any trigger, schedule or control page pointing at the old ones quietly stops
+working. Indigo does not warn about that part, and there is no undo. If you
+confirm it anyway, expect to rebind whatever referred to them.
+
+The node device is the exception, because it is the one device here the plugin
+invented rather than derived: delete it and it **stays** deleted, with
+**Plugins → Matter → Recreate Matter node devices…** as the way back.
 
 ## Indigo as a Matter bridge — the other direction
 

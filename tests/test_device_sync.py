@@ -93,6 +93,11 @@ class FakeDev:
     def updateStatesOnServer(self, kvlist):
         for kv in kvlist:
             self.states[kv["key"]] = kv["value"]
+            # Real Indigo's states dict answers a "key.ui" lookup with the
+            # display value from a uiValue-bearing write (used by both fix A's
+            # evidence check and fix D's reachable/unreachable column text).
+            if "uiValue" in kv:
+                self.states[f"{kv['key']}.ui"] = kv["uiValue"]
 
     def stateListOrDisplayStateIdChanged(self):
         self.state_list_rebuilds += 1
@@ -4446,6 +4451,38 @@ def test_forget_node_capabilities_clears_the_tombstone(ds, indigo_env):
     assert not ds.node_tombstones.is_tombstoned(42)
 
 
+def test_forget_node_capabilities_prunes_this_nodes_meter_links(ds, indigo_env):
+    """Verifier note, issue #204 review: unlike `_power_coverage`, a removed
+    node's meter links have no devices behind them to protect, and
+    `_resolve_meter_links` does not rebuild on the next informative pass the
+    way the setting-limits/attribute-list caches do — it only runs from
+    `create_devices`. Without pruning here a stale link would sit in the
+    dicts (keyed on a node id matter-server may reuse) until the node is
+    recommissioned."""
+    ds.create_from_raw(GRILLPLATS_NODE, "Grill Plug")
+    assert any(k[0] == 0x34 for k in ds._forward_links)
+    assert any(k[0] == 0x34 for k in ds._reverse_links)
+
+    ds.handle_event(MatterEvent(kind=protocol.EVT_NODE_REMOVED, node_id=0x34))
+
+    assert not any(k[0] == 0x34 for k in ds._forward_links)
+    assert not any(k[0] == 0x34 for k in ds._reverse_links)
+
+
+def test_forget_node_capabilities_leaves_other_nodes_links_alone(ds, indigo_env):
+    """The prune is per-node — a decommission on one node must not touch a
+    different node's live meter links."""
+    ds.create_from_raw(GRILLPLATS_NODE, "Grill Plug")
+    before_forward = dict(ds._forward_links)
+    before_reverse = dict(ds._reverse_links)
+    assert before_forward and before_reverse
+
+    ds.handle_event(MatterEvent(kind=protocol.EVT_NODE_REMOVED, node_id=0x999999))
+
+    assert ds._forward_links == before_forward
+    assert ds._reverse_links == before_reverse
+
+
 def test_note_node_device_deleted_with_no_tombstones_object_never_raises(ds, indigo_env):
     """self.node_tombstones is None until plugin.startup wires it — inert,
     same discipline as survey_log."""
@@ -4523,6 +4560,20 @@ def test_a_failed_self_delete_does_not_swallow_a_later_user_delete(ds, indigo_en
     assert ds.node_tombstones.is_tombstoned(42)
 
 
+def test_node_device_reachable_state_gets_a_display_uivalue_at_creation(ds, indigo_env):
+    """Fix D (issue #204 review, Simon's UX finding): matterNode's
+    UiDisplayStateId is `reachable` — a bare Boolean YesNo renders as a bare
+    "yes" in the device list, read next to an on/off actuator like another
+    on/off answer rather than a connectivity flag. Creation must seed the
+    uiValue alongside the boolean, not just the boolean."""
+    _indigo, devices = indigo_env
+    evidenced = _with_node_evidence(RELAY_NODE)
+    result = ds.create_from_raw(evidenced, "Office Plug")
+    node_dev_id = result["nodeDeviceId"]
+    assert devices[node_dev_id].states.get("reachable") is True
+    assert devices[node_dev_id].states.get("reachable.ui") == "reachable"
+
+
 def test_mark_unreachable_flags_the_node_device(ds, indigo_env):
     """Issue #204 review, fix E: mark_unreachable is the EVT_NODE_REMOVED
     path (and others) — it never went through _apply_reachability, so the
@@ -4534,6 +4585,7 @@ def test_mark_unreachable_flags_the_node_device(ds, indigo_env):
     ds.mark_unreachable(42)
     assert devices[node_dev_id].errorState == "unreachable"
     assert devices[node_dev_id].states.get("reachable") is False
+    assert devices[node_dev_id].states.get("reachable.ui") == "unreachable"  # fix D
 
 
 def test_mark_all_unreachable_flags_every_node_device(ds, indigo_env):
@@ -4547,6 +4599,7 @@ def test_mark_all_unreachable_flags_every_node_device(ds, indigo_env):
     ds.mark_all_unreachable()
     assert devices[node_dev_id].errorState == "unreachable"
     assert devices[node_dev_id].states.get("reachable") is False
+    assert devices[node_dev_id].states.get("reachable.ui") == "unreachable"  # fix D
 
 
 def test_reconcile_orphan_sweep_marks_a_non_informative_node_device_unreachable(ds, indigo_env):
@@ -4581,11 +4634,13 @@ def test_apply_reachability_writes_the_node_reachable_state_both_directions(ds, 
     ds._apply_reachability(unavailable)
     assert devices[node_dev_id].states.get("reachable") is False
     assert devices[node_dev_id].errorState == "unreachable"
+    assert devices[node_dev_id].states.get("reachable.ui") == "unreachable"  # fix D
 
     available = parse_node({**evidenced, "available": True}, "Office Plug")
     ds._apply_reachability(available)
     assert devices[node_dev_id].states.get("reachable") is True
     assert devices[node_dev_id].errorState == ""
+    assert devices[node_dev_id].states.get("reachable.ui") == "reachable"  # fix D — recovery
 
 
 def test_reconcile_all_never_sweeps_the_node_device_as_an_orphan(ds, indigo_env):

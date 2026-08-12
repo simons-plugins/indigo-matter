@@ -207,6 +207,21 @@ def _kvlist(states: dict) -> list:
     return [{"key": key, "value": value} for key, value in states.items()]
 
 
+def _reachable_kv(value: bool) -> dict:
+    """kv-dict for the ``reachable`` boolean WITH its display ``uiValue``.
+
+    ``reachable`` is a bare Boolean YesNo on several device types — several of
+    them (``matterNode`` in particular) use it as their ``UiDisplayStateId``,
+    so the device list's own status column shows it. Without a uiValue that
+    renders as a bare "yes"/"no", which next to an on/off actuator reads like
+    another on/off answer rather than a connectivity flag. The STATE stays a
+    plain boolean either way (ADR-0007 — triggers/conditionals may bind it);
+    this only changes what a human reads in the column.
+    """
+    return {"key": "reachable", "value": bool(value),
+            "uiValue": "reachable" if value else "unreachable"}
+
+
 def _capability_fingerprint(lists: dict) -> dict:
     """An AttributeList map reduced to what a capability answer actually depends on.
 
@@ -746,14 +761,23 @@ class DeviceSync:
         the product name). Only the node device is synthetic enough that its
         deletion has to be honoured rather than healed.
 
-        Since stage 2 the node device is in a group with its siblings, and
-        ``indigo.device.delete`` refuses to delete the ROOT of a non-empty
-        group. Whether that root is the node device depends on age (ADR-0009):
-        on a node commissioned since the node device existed it is, so the
-        route to here is the user ungrouping it first and then deleting it; on
-        a fielded install the root is an older endpoint device and the node
-        device deletes straight out of the group. Both land in
-        ``deviceDeleted`` and both tombstone.
+        Since stage 2 the node device is in a group with its siblings, and the
+        two deletion routes behave DIFFERENTLY — verified live 2026-08-12,
+        because assuming otherwise would have put a false claim in the user
+        docs. ``indigo.device.delete`` (the scripting API, what ``delete_node``
+        calls) refuses the ROOT of a non-empty group, which is why that method
+        dissolves the group first. **Indigo's UI does not refuse**: deleting a
+        grouped device flags the dependent devices and offers to delete the
+        whole family, so a user who confirms takes every device on the node
+        with it — node device included, whichever one leads the group
+        (ADR-0009: that is the oldest member, so the node device on a node
+        commissioned since node devices existed, an older endpoint device on a
+        fielded install). Either way the node device's own deletion lands in
+        ``deviceDeleted`` and tombstones, which is right: the user confirmed a
+        dialog naming it. The endpoint devices heal on the next reconcile with
+        NEW ids, so their bindings do not — ``docs/MATTER.md`` warns about that
+        and points at decommissioning as the operation that actually means
+        "remove this hardware", and at a quiet folder for "just hide it".
 
         ``dev_id`` (issue #204 review, fix A) is what tells a genuine user
         deletion apart from ``delete_node`` deleting its own node device as
@@ -2305,6 +2329,16 @@ class DeviceSync:
                 dev.updateStatesOnServer(_kvlist(spec.initial_states))
             except Exception as exc:  # noqa: BLE001
                 self.logger.debug("initial state set failed: %s", exc)
+            if "reachable" in spec.initial_states:
+                # Second write, uiValue-bearing (display column UX, see
+                # _reachable_kv): initial_states is a plain {key: value} dict
+                # (_kvlist above has no uiValue slot), so the write just above
+                # left the column reading a bare "yes"/"no". apply_states
+                # carries the kv-dict uiValue form; on a device this fresh
+                # (just created, no errorState yet) its errorState-clearing
+                # side effect is a no-op.
+                self.apply_states(
+                    dev.id, [_reachable_kv(spec.initial_states["reachable"])])
         return dev.id
 
     # ------------------------------------------------------------------
@@ -2720,6 +2754,18 @@ class DeviceSync:
         Cache eviction is still not a policy to apply uniformly — it depends
         entirely on what the empty case is read to MEAN, which for the two
         dicts above is the opposite of harmless.
+
+        **`_forward_links`/`_reverse_links` ARE evicted here** (verifier note,
+        issue #204 review) — a THIRD answer, neither of the two above: unlike
+        `_power_coverage`, a removed node's links have no devices behind them
+        to protect (the node is gone, full stop), so there is nothing an empty
+        entry could wrongly mean. And unlike `_setting_limits`/
+        `_attribute_lists`, `_resolve_meter_links` does not do a bare rebuild
+        on the next informative pass the way `_cache_setting_limits` does —
+        it only runs from `create_devices`, so a stale link surviving a
+        decommission would sit there until the node (or whatever reuses its
+        id) is recommissioned and passes through `create_devices` again. This
+        closes that gap rather than relying on the eventual rebuild to.
         """
         target = int(node_id)
         with self._lock:
@@ -2727,6 +2773,10 @@ class DeviceSync:
                                     if k[0] != target}
             self._attribute_lists = {k: v for k, v in self._attribute_lists.items()
                                      if k[0] != target}
+            self._forward_links = {k: v for k, v in self._forward_links.items()
+                                   if k[0] != target}
+            self._reverse_links = {k: v for k, v in self._reverse_links.items()
+                                   if k[0] != target}
         # And the "already reported" mark (issue #191). Node ids are assigned at
         # commissioning and re-used across a decommission/recommission cycle, so
         # keeping it would let a genuinely different device inherit the old
@@ -3302,13 +3352,18 @@ class DeviceSync:
 
         A silent no-op when the node has no ``matterNode`` device yet (most
         nodes, most of the time) — this is not a diagnostic path.
+
+        ``uiValue``-bearing (see ``_reachable_kv``): this is the ONLY path
+        that ever writes ``reachable`` again after creation (``_apply_
+        reachability``'s docstring), so it is also the only place the
+        display column's "yes"/"no" would otherwise never get corrected.
         """
         with self._lock:
             dev_id = self._index.get((int(node_id), 0), {}).get("matterNode")
         if dev_id is None:
             return
         try:
-            indigo.devices[dev_id].updateStatesOnServer([{"key": "reachable", "value": reachable}])
+            indigo.devices[dev_id].updateStatesOnServer([_reachable_kv(reachable)])
         except Exception as exc:  # noqa: BLE001
             self.logger.debug(
                 "could not write matterNode reachable state for node %s: %s", node_id, exc)
