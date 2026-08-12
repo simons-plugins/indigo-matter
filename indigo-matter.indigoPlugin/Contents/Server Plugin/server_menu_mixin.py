@@ -18,7 +18,7 @@ import bridge_agent
 import bridge_client            # bridge_client.rebuild_timeout_for
 from commission_jobs import node_id_to_str
 from http_handlers import MatterUnavailable
-from plugin_constants import FACTORY_RESET_TIMEOUT, server_location
+from plugin_constants import FACTORY_RESET_TIMEOUT, NODE_TOMBSTONES_PREF, RECONCILE_TIMEOUT, server_location
 from server_process import ServerProcess
 
 
@@ -439,6 +439,60 @@ class ServerMenuMixin:
                 "not. The rebuild does NOT need repeating — exports resume when the connection "
                 "does, and the reason is logged above.")
         return (True, valuesDict)
+
+    def menuRecreateNodeDevices(self):  # noqa: N802
+        """The only way back after a matterNode device was deleted by hand
+        (issue #204, ADR-0008): device_sync deliberately does NOT recreate a
+        node device it has been told to leave deleted, so undoing that has to
+        be a deliberate action too. No ConfigUI/valuesDict — same "outcome
+        via the log only" shape as menuExportFabricBackup — because there is
+        nothing to pick: every tombstoned node is cleared in one go.
+
+        Clearing first and reconciling second means a reconcile failure still
+        leaves the tombstones cleared — the next successful reconnect (the
+        normal, unattended reconcile path) picks up where this left off,
+        rather than silently discarding the user's request.
+
+        ``_resync`` (``Plugin._resync``) swallows every exception itself and
+        logs "resync incomplete" rather than raising (issue #204 review, fix
+        B), so the ``except`` below only ever catches ``runtime.submit``/
+        ``.result`` failing outright (timeout, submission failure) — never a
+        real reconcile error. That means this handler must not claim success
+        unconditionally past that point: it can honestly say a reconcile was
+        *requested*, not that devices *were* recreated.
+        """
+        tombstones = getattr(self.device_sync, "node_tombstones", None)
+        if tombstones is None:
+            self.logger.info("Matter: no node-device tombstones to clear.")
+            return
+        count = tombstones.clear_all()
+        if count == 0:
+            self.logger.info(
+                "Matter: no node-device tombstones to clear — nothing to recreate.")
+            return
+        try:
+            # pylint: disable=no-member  # Plugin._resync (issue #146)
+            self.runtime.submit(self._resync()).result(timeout=RECONCILE_TIMEOUT)
+        except Exception as exc:  # noqa: BLE001
+            self.logger.error(
+                "Matter: cleared %d node-device tombstone(s), but the reconcile that "
+                "recreates them FAILED — %s. They will be recreated on the next successful "
+                "reconnect instead.", count, exc)
+            self.logger.exception(exc)
+            return
+        self.logger.info(
+            "Matter: cleared %d node-device tombstone(s) and requested a reconcile. If the "
+            "device(s) do not reappear, look for a 'resync incomplete' warning above — "
+            "they will be recreated on the next successful reconnect either way.", count)
+
+    def _save_node_tombstones(self, blob: str) -> None:
+        """Persist the node-device tombstone set (issue #204). Same discipline
+        as DiagnosticsMenuMixin._save_survey_log: written through
+        self.pluginPrefs at call time (Indigo rebinds it on PluginConfig save)
+        and committed via savePluginPrefs, without which it survives only
+        until the plugin stops."""
+        self.pluginPrefs[NODE_TOMBSTONES_PREF] = blob
+        indigo.server.savePluginPrefs()
 
     def menuResetBridgePairings(self, valuesDict, menuId=""):  # noqa: N802, ARG002
         """§3.10 — wipe the Matter bridge's commissioning and re-advertise."""

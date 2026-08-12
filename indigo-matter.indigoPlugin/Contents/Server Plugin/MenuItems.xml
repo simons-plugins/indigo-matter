@@ -428,6 +428,17 @@ If the bridge node is NOT refusing, this does nothing useful and is refused: the
             </Field>
         </ConfigUI>
     </MenuItem>
+    <!-- issue #204 / ADR-0008: the ONLY way to bring back a matterNode device
+         a user deleted by hand — device_sync deliberately does not recreate
+         one it has been told to leave deleted (unlike every endpoint device,
+         which self-heals on the next reconcile). No ConfigUI: this clears
+         every tombstoned node in one go and reconciles, reporting outcome
+         only through the event log — same shape as "Back up the Matter
+         fabric…" above. -->
+    <MenuItem id="recreateNodeDevices">
+        <Name>Recreate Matter node devices…</Name>
+        <CallbackMethod>menuRecreateNodeDevices</CallbackMethod>
+    </MenuItem>
     <MenuItem id="resetBridgePairings">
         <Name>Reset Matter Bridge Pairings…</Name>
         <CallbackMethod>menuResetBridgePairings</CallbackMethod>

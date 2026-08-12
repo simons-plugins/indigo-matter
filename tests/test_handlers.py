@@ -4,6 +4,12 @@ from __future__ import annotations
 import protocol
 from matter_model import parse_node
 from matter_handlers.base import IndigoDeviceSpec
+from matter_handlers.basic_information import (
+    ATTR_NODE_LABEL,
+    ATTR_SW_VERSION_STRING,
+    BasicInformationHandler,
+    CLUSTER_BASIC_INFORMATION,
+)
 from matter_handlers.registry import HandlerRegistry
 from matter_handlers.on_off import OnOffHandler
 
@@ -128,3 +134,107 @@ def test_onoff_handle_action_builds_matter_command(mock_indigo_base):
     # an unmapped action yields no command
     Action.deviceAction = indigo.kDeviceAction.SetBrightness
     assert handler.handle_indigo_action(Dev(), Action()) is None
+
+
+# ---------------------------------------------------------------------------
+# BasicInformationHandler (0x0028) — issue #204, ADR-0008
+# ---------------------------------------------------------------------------
+
+class _NodeDev:
+    """Minimal Indigo device stub for BasicInformationHandler tests."""
+    def __init__(self, states=None):
+        self.states = states if states is not None else {"nodeLabel": "", "softwareVersion": ""}
+
+
+def test_basic_information_cluster_id():
+    assert BasicInformationHandler.cluster_id == CLUSTER_BASIC_INFORMATION == 0x0028
+
+
+def test_basic_information_is_non_primary():
+    h = BasicInformationHandler()
+    assert h.is_primary_for(None, None) is False
+
+
+def test_basic_information_creates_no_devices():
+    h = BasicInformationHandler()
+    assert h.create_indigo_devices(None, None) == []
+
+
+def test_basic_information_device_type_id_is_matterNode():
+    assert BasicInformationHandler.device_type_id == "matterNode"
+
+
+def test_basic_information_not_node_scoped():
+    # Unlike PowerSource: this cluster lives on the SAME endpoint (0) as the
+    # device it describes, so ordinary same-endpoint dispatch is correct.
+    assert BasicInformationHandler.node_scoped is False
+
+
+def test_basic_information_subscribes_to_both_attrs():
+    h = BasicInformationHandler()
+    subs = h.attributes_to_subscribe()
+    assert ATTR_NODE_LABEL in subs
+    assert ATTR_SW_VERSION_STRING in subs
+
+
+def test_node_label_maps_to_state():
+    h = BasicInformationHandler()
+    assert h.on_attribute_update(_NodeDev(), ATTR_NODE_LABEL, "Landing Presence") == {
+        "nodeLabel": "Landing Presence"}
+
+
+def test_sw_version_maps_to_state():
+    h = BasicInformationHandler()
+    assert h.on_attribute_update(_NodeDev(), ATTR_SW_VERSION_STRING, "1.2.3") == {
+        "softwareVersion": "1.2.3"}
+
+
+def test_sw_version_value_is_coerced_to_str():
+    # matter-server could in principle hand back a non-string; the state is
+    # declared String in Devices.xml, so the handler must not pass a raw type through.
+    h = BasicInformationHandler()
+    assert h.on_attribute_update(_NodeDev(), ATTR_SW_VERSION_STRING, 123) == {
+        "softwareVersion": "123"}
+
+
+def test_basic_information_unmapped_attribute_returns_empty():
+    h = BasicInformationHandler()
+    assert h.on_attribute_update(_NodeDev(), 0x0001, "Aqara") == {}  # VendorName — not subscribed
+
+
+def test_basic_information_none_value_returns_empty():
+    h = BasicInformationHandler()
+    assert h.on_attribute_update(_NodeDev(), ATTR_NODE_LABEL, None) == {}
+    assert h.on_attribute_update(_NodeDev(), ATTR_SW_VERSION_STRING, None) == {}
+
+
+def test_basic_information_missing_state_guard():
+    # A matterNode device that (hypothetically) lacks one of these states must
+    # not be handed a key Indigo will reject — same idiom as every other
+    # merge-in/state-guarded handler in this package.
+    h = BasicInformationHandler()
+    bare = _NodeDev(states={})
+    assert h.on_attribute_update(bare, ATTR_NODE_LABEL, "x") == {}
+    assert h.on_attribute_update(bare, ATTR_SW_VERSION_STRING, "1.0") == {}
+
+
+def test_basic_information_handle_action_returns_none():
+    h = BasicInformationHandler()
+    assert h.handle_indigo_action(None, object()) is None
+
+
+def test_basic_information_registered_in_default_handlers():
+    reg = HandlerRegistry()
+    handler = reg.handler_for_cluster(CLUSTER_BASIC_INFORMATION)
+    assert isinstance(handler, BasicInformationHandler)
+
+
+def test_basic_information_never_produces_specs_via_the_registry():
+    """handlers_for_endpoint must never create a device through this handler
+    (device_sync._ensure_node_device owns matterNode creation) — regression
+    guard for the is_primary_for=False contract."""
+    reg = HandlerRegistry()
+    node = parse_node(RELAY_NODE, suggested_name="Office Plug")
+    ep0 = _endpoint(node, 0)
+    specs = reg.handlers_for_endpoint(node, ep0)
+    assert not any(s.device_type_id == "matterNode" for s in specs)

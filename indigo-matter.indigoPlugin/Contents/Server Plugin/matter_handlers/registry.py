@@ -13,6 +13,7 @@ from __future__ import annotations
 from typing import Any, Optional
 
 from .base import ClusterHandler, IndigoDeviceSpec
+from .basic_information import BasicInformationHandler
 from .boolean_state_config import BooleanStateConfigHandler
 from .color_control import ColorControlHandler
 from .door_lock import DoorLockHandler
@@ -47,7 +48,11 @@ def default_handlers() -> list[ClusterHandler]:
     ElectricalPower/Energy are non-primary and merge into existing relay/dimmer
     devices. BooleanStateConfiguration (0x0080) is non-primary and merges into
     existing occupancy/contact sensor devices (issue #85). PowerSource is
-    non-primary and node-scoped (order-independent; placed last)."""
+    non-primary and node-scoped (order-independent; placed last).
+    BasicInformation is non-primary too — device_sync owns matterNode
+    creation, like the device_sync-owned _unknown_spec/_energy_meter_spec
+    fallback specs (issue #204, ADR-0008) — and order-independent for the
+    same reason PowerSource is, so it sits alongside it at the end."""
     return [
         ColorControlHandler(),
         LevelControlHandler(),
@@ -74,6 +79,7 @@ def default_handlers() -> list[ClusterHandler]:
         ElectricalEnergyHandler(),
         BooleanStateConfigHandler(),
         PowerSourceHandler(),
+        BasicInformationHandler(),
     ]
 
 

@@ -608,6 +608,54 @@ def test_startup_wires_knows_node_into_commission_jobs(plugin_mod, monkeypatch):
     p.startup()
     assert captured["knows_node"] == p.device_sync.knows_node
 
+
+def test_startup_wires_node_tombstones(plugin_mod, monkeypatch):
+    """Issue #204 review, fix I.2: the WIRING, driven through the real
+    startup() rather than asserted on the source — every device_sync test
+    above sets ds.node_tombstones directly, so deleting the two wiring lines
+    in startup() would leave the whole suite green while the plugin's own
+    device_sync never saw a tombstone at all."""
+    class FakeMatter:
+        def __init__(self, proto, logger, prefs, **kw):
+            pass
+
+        def run(self):
+            return None
+
+    class FakeRuntimeObj:
+        is_running = True
+
+        def start(self):
+            pass
+
+        def submit(self, coro):
+            if hasattr(coro, "close"):
+                coro.close()
+            return Mock()
+
+    monkeypatch.setattr(plugin_mod, "MatterClient", FakeMatter)
+    monkeypatch.setattr(plugin_mod, "AsyncRuntime", lambda logger: FakeRuntimeObj())
+    monkeypatch.setattr(plugin_mod, "CommissionJobs", lambda *a, **k: Mock())
+    monkeypatch.setattr(plugin_mod, "HttpApi", lambda *a, **k: Mock())
+    monkeypatch.setattr(plugin_mod, "ServerProcess", lambda *a, **k: Mock())
+
+    p = plugin_mod.Plugin.__new__(plugin_mod.Plugin)
+    p.logger = Mock()
+    p._version = "2026.0.1"
+    p._subscribed_to_devices = False
+    p.pluginPrefs = {plugin_mod.NODE_TOMBSTONES_PREF: '["42"]'}
+    p.proto = object()
+    p.registry = object()
+    p.device_sync = Mock()
+    p.runtime = None
+    p.server_process = None
+
+    p.startup()
+    assert p.node_tombstones.is_tombstoned(42), \
+        "startup() never loaded pluginPrefs into node_tombstones"
+    assert p.device_sync.node_tombstones is p.node_tombstones, \
+        "startup() never wired node_tombstones into device_sync"
+
 # ---------------------------------------------------------------------------
 # node_added → commission-job reconcile wiring (#16)
 # ---------------------------------------------------------------------------
@@ -1156,6 +1204,98 @@ def test_menu_decommission_unexpected_error_is_dialog_error(plug):
     assert ok is False
     assert "node" in errors
     plug.logger.exception.assert_called()
+
+
+# ---------------------------------------------------------------------------
+# issue #204 / ADR-0008 — "Recreate Matter node devices…" and deviceDeleted
+# ---------------------------------------------------------------------------
+
+def test_menu_recreate_node_devices_clears_tombstones_and_reconciles(plug):
+    plug.device_sync = Mock()
+    plug.device_sync.node_tombstones.clear_all.return_value = 2
+    plug.runtime = FakeRuntime(FakeFuture(value=None))
+    plug.menuRecreateNodeDevices()
+    plug.device_sync.node_tombstones.clear_all.assert_called_once()
+    msg = " ".join(str(a) for a in plug.logger.info.call_args.args)
+    assert "2" in msg
+    # Fix B: _resync swallows its own exceptions, so this handler can never
+    # know a reconcile actually recreated anything — it must not claim it did.
+    assert "has been recreated" not in msg
+
+
+def test_menu_recreate_node_devices_submission_failure_still_leaves_tombstones_cleared(plug):
+    """Issue #204 review, fix B: Plugin._resync catches every exception itself
+    and logs "resync incomplete" rather than raising, so the only way this
+    handler's except branch fires is runtime.submit/.result failing outright
+    (timeout, submission failure) — never a real reconcile error. Clearing
+    first and reconciling second means that failure must not look like the
+    request itself failed — the next successful reconnect picks up where
+    this left off."""
+    plug.device_sync = Mock()
+    plug.device_sync.node_tombstones.clear_all.return_value = 1
+    plug.runtime = FakeRuntime(FakeFuture(exc=RuntimeError("submit timed out")))
+    plug.menuRecreateNodeDevices()
+    plug.device_sync.node_tombstones.clear_all.assert_called_once()
+    assert plug.logger.error.called
+
+
+def test_menu_recreate_node_devices_no_tombstones_object_is_a_quiet_noop(plug):
+    plug.device_sync = Mock()
+    plug.device_sync.node_tombstones = None
+    plug.runtime = Mock()
+    plug.menuRecreateNodeDevices()
+    plug.runtime.submit.assert_not_called()
+
+
+def test_menu_recreate_node_devices_zero_tombstones_skips_the_reconcile(plug):
+    """Fix B: no tombstones to clear means nothing to recreate — the handler
+    must not block the UI thread for up to RECONCILE_TIMEOUT on a no-op."""
+    plug.device_sync = Mock()
+    plug.device_sync.node_tombstones.clear_all.return_value = 0
+    plug.runtime = Mock()
+    plug.menuRecreateNodeDevices()
+    plug.runtime.submit.assert_not_called()
+    msg = " ".join(str(a) for a in plug.logger.info.call_args.args)
+    assert "nothing to recreate" in msg
+
+
+def test_save_node_tombstones_commits_through_indigo(plug, plugin_mod):
+    import sys
+    plug._save_node_tombstones('["42"]')
+    assert plug.pluginPrefs[plugin_mod.NODE_TOMBSTONES_PREF] == '["42"]'
+    assert sys.modules["indigo"].server.savePluginPrefs.called
+
+
+def test_device_deleted_routes_matterNode_to_note_node_device_deleted(plug):
+    plug.exports = None
+    dev = SimpleNamespace(id=555, name="Node 77", deviceTypeId="matterNode",
+                          pluginProps={"nodeId": "77"})
+    plug.deviceDeleted(dev)
+    plug.device_sync.note_node_device_deleted.assert_called_once_with(77, 555)
+
+
+def test_device_deleted_ignores_non_matterNode_types(plug):
+    plug.exports = None
+    dev = SimpleNamespace(id=556, name="Relay", deviceTypeId="matterRelay",
+                          pluginProps={"nodeId": "77"})
+    plug.deviceDeleted(dev)
+    plug.device_sync.note_node_device_deleted.assert_not_called()
+
+
+def test_device_deleted_matterNode_without_node_id_prop_is_a_noop(plug):
+    plug.exports = None
+    dev = SimpleNamespace(id=557, name="Node ?", deviceTypeId="matterNode", pluginProps={})
+    plug.deviceDeleted(dev)
+    plug.device_sync.note_node_device_deleted.assert_not_called()
+
+
+def test_device_deleted_matterNode_survives_a_device_sync_exception(plug):
+    plug.exports = None
+    plug.device_sync.note_node_device_deleted.side_effect = RuntimeError("boom")
+    dev = SimpleNamespace(id=558, name="Node X", deviceTypeId="matterNode",
+                          pluginProps={"nodeId": "9"})
+    plug.deviceDeleted(dev)  # must not raise
+    assert plug.logger.exception.called
 
 
 def test_menu_decommission_offline_is_dialog_error_and_warns_resurrection(plug):
