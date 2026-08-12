@@ -2608,6 +2608,11 @@ def test_an_unusable_endpoint_list_falls_back_and_says_so(ds, indigo_env, mock_l
     assert any("EndpointList" in m for m in debug_msgs)
 
 
+#: Shared substring for the exclusion INFO — kept in one place so the wording
+#: in device_sync.py and the assertions below cannot silently drift apart.
+_EXCLUSION_PHRASE = "no power source on this node covers this endpoint"
+
+
 def test_newly_excluded_battery_device_gets_one_time_info(ds, indigo_env, mock_logger):
     """Issue #205 upgrade gap: an endpoint covered under the pre-#205 fallback
     (single source, no EndpointList ⇒ node-wide) that a LATER, more specific
@@ -2643,14 +2648,90 @@ def test_newly_excluded_battery_device_gets_one_time_info(ds, indigo_env, mock_l
     assert devices[hum_id].pluginProps.get("SupportsBatteryLevel") is True   # add-only: still set
     assert devices[hum_id].states.get("batteryLevel") == 33                  # frozen, not withdrawn
     info_msgs = [c[0][0] % tuple(c[0][1:]) for c in mock_logger.info.call_args_list]
-    exclusion_msgs = [m for m in info_msgs if "no longer fed" in m]
+    exclusion_msgs = [m for m in info_msgs if _EXCLUSION_PHRASE in m]
     assert len(exclusion_msgs) == 1
+    # Names the RIGHT device, not just any excluded one — a bare count==1
+    # would pass even if the message pointed at the wrong id.
+    assert f"device {hum_id} " in exclusion_msgs[0]
 
     # A second pass over the SAME excluding snapshot must not repeat the log.
     mock_logger.info.reset_mock()
     ds.create_from_raw(named_node, "Fallback Bridge")
     info_msgs2 = [c[0][0] % tuple(c[0][1:]) for c in mock_logger.info.call_args_list]
-    assert not [m for m in info_msgs2 if "no longer fed" in m]
+    assert not [m for m in info_msgs2 if _EXCLUSION_PHRASE in m]
+
+
+def test_non_informative_pass_never_warns_of_exclusion(ds, indigo_env, mock_logger):
+    """Issue #192 failure class: an empty ``attributes: {}`` snapshot (the
+    lazily-filled matter-server cache on a WS reconnect) is "no information",
+    never "implements nothing". Feeding it through here must not read a
+    previously-covered device as newly excluded — `informative` gates the
+    exclusion check the same way it gates every other capability answer."""
+    _indigo, devices = indigo_env
+    fallback_node = {
+        "node_id": 0x71, "available": True,
+        "attributes": {
+            "0/47/12": 160,
+            "1/29/0": [{"0": 770}],
+            "1/1026/0": 2100,
+            "2/29/0": [{"0": 775}],
+            "2/1029/0": 5500,
+        },
+    }
+    ds.create_from_raw(fallback_node, "Fallback Bridge")
+    hum_id = ds.lookup(0x71, 2, "matterHumiditySensor")
+    assert hum_id is not None
+    assert devices[hum_id].pluginProps.get("SupportsBatteryLevel") is True
+
+    empty_node = {"node_id": 0x71, "available": True, "attributes": {}}
+    mock_logger.info.reset_mock()
+    ds.create_from_raw(empty_node, "Fallback Bridge")
+    info_msgs = [c[0][0] % tuple(c[0][1:]) for c in mock_logger.info.call_args_list]
+    assert not [m for m in info_msgs if _EXCLUSION_PHRASE in m]
+
+
+def test_device_without_battery_prop_at_excluded_endpoint_stays_silent(ds, indigo_env, mock_logger):
+    """With the ``has_reading`` gate gone, ``SupportsBatteryLevel`` is the only
+    gate left. A device that never had the prop (e.g. a mains-powered sibling
+    that was never in coverage to begin with) must stay silent forever, not
+    just on the pass that happens to freeze a reading."""
+    _indigo, devices = indigo_env
+    ds.create_from_raw(POWER_SOURCE_CONFINED_NODE, "Half Battery Hub")
+    hum_id = ds.lookup(0x64, 2, "matterHumiditySensor")
+    assert hum_id is not None
+    assert not devices[hum_id].pluginProps.get("SupportsBatteryLevel")
+
+    # A reconcile-shaped re-pass over the identical, still-excluding snapshot.
+    mock_logger.info.reset_mock()
+    ds.create_from_raw(POWER_SOURCE_CONFINED_NODE, "Half Battery Hub")
+    info_msgs = [c[0][0] % tuple(c[0][1:]) for c in mock_logger.info.call_args_list]
+    assert not [m for m in info_msgs if _EXCLUSION_PHRASE in m]
+
+
+def test_bridge_child_departure_does_not_warn_of_exclusion(ds, indigo_env, mock_logger):
+    """A departed bridge child (its endpoint gone from the snapshot entirely,
+    not merely re-routed away) is the orphan sweep's story — reconcile_all
+    marks its device unreachable. This diagnostic is only about an endpoint
+    that is still present whose routing narrowed, so the presence filter must
+    keep it out of the exclusion warning."""
+    _indigo, devices = indigo_env
+    import copy
+    ds.create_from_raw(BRIDGE_ENDPOINT_LIST_NODE, "Multi Sensor Bridge")
+    hum_id = ds.lookup(0x65, 2, "matterHumiditySensor")
+    assert hum_id is not None
+    assert devices[hum_id].pluginProps.get("SupportsBatteryLevel") is True
+
+    # ep2 leaves the node entirely — a bridge child departure, not a routing
+    # change. Its device stays in the index; the endpoint itself is gone.
+    departed_node = copy.deepcopy(BRIDGE_ENDPOINT_LIST_NODE)
+    for key in list(departed_node["attributes"]):
+        if key.startswith("2/"):
+            del departed_node["attributes"][key]
+
+    mock_logger.info.reset_mock()
+    ds.create_from_raw(departed_node, "Multi Sensor Bridge")
+    info_msgs = [c[0][0] % tuple(c[0][1:]) for c in mock_logger.info.call_args_list]
+    assert not [m for m in info_msgs if _EXCLUSION_PHRASE in m]
 
 
 # ===========================================================================

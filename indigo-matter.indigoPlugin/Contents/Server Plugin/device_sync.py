@@ -570,13 +570,6 @@ class DeviceSync:
                         self._power_coverage[int(node.node_id)] = dict(coverage.by_source)
                     else:
                         self._power_coverage.pop(int(node.node_id), None)
-                # A device whose endpoint WAS covered under the old heuristic
-                # (or an earlier, less specific EndpointList) but is now
-                # EXCLUDED by this pass's evidence keeps its last batteryLevel
-                # forever with no further diagnostic (props/states are
-                # add-only by policy, and reconcile only runs on a WS
-                # reconnect) — name it once so that staleness is discoverable.
-                self._warn_of_newly_excluded_battery_devices(node, coverage)
             # Deferred deliberately: the refresh calls into Indigo per device and
             # must not run under _lock, and it has to see the devices this pass
             # is about to create.
@@ -818,6 +811,17 @@ class DeviceSync:
         # implementing nothing, record that as the answer, and then never report
         # the real one because the fingerprint had already been banked.
         if informative:
+            # A device whose endpoint WAS covered under the old heuristic (or an
+            # earlier, less specific EndpointList) but is now EXCLUDED by this
+            # pass's evidence keeps its last batteryLevel forever with no
+            # further diagnostic (props/states are add-only by policy, and
+            # reconcile only runs on a WS reconnect) — name it once so that
+            # staleness is discoverable. Same reasoning as report_settable_
+            # attributes just below: a diagnostic must not run under the lock
+            # every state update needs, and it has nothing to do with the
+            # endpoint loop above that the lock actually protects (issue #205
+            # review — the old in-lock, pre-loop placement contradicted this).
+            self._warn_of_newly_excluded_battery_devices(node, coverage)
             self.report_settable_attributes(node)
         result = {
             "indigoDeviceIds": created,
@@ -1129,53 +1133,75 @@ class DeviceSync:
         ``SupportsBatteryLevel``/``batteryLevel`` are add-only (see
         ``_battery_endpoints``): exclusion never withdraws them, so a device
         fed a reading under looser (or absent) EndpointList evidence keeps
-        showing its LAST value forever once fresher evidence excludes its
-        endpoint — silently, because reconcile only runs on a WS reconnect.
-        This cannot fix that (add-only is deliberate policy elsewhere), but it
-        can name the device once so the staleness is discoverable rather than
-        invisible.
+        showing its last-written value forever once fresher evidence excludes
+        its endpoint — silently, because reconcile only runs on a WS
+        reconnect. This cannot fix that (add-only is deliberate policy
+        elsewhere), but it can name the device once so the staleness is
+        discoverable rather than invisible.
 
-        Both conditions below are required: a non-empty ``batteryLevel``
-        state (a reading actually arrived — not just an unfed placeholder)
-        AND the ``SupportsBatteryLevel`` prop. The prop check also catches
-        the upgrade case: a device created before #205 already carries both,
-        and it is precisely THIS pass's fresh EndpointList evidence that
-        newly excludes it.
+        Only the ``SupportsBatteryLevel`` prop gates this — not whether
+        ``batteryLevel`` looks like a real reading. There used to be a second
+        gate here ("a reading actually arrived"), but issue #190 established
+        that Indigo initialises a declared Integer state to 0 on device
+        creation, so a bare ``0`` is indistinguishable from "no reading ever
+        arrived"; treating it as a live value would silently exclude exactly
+        the devices most likely to need the warning (freshly created, never
+        updated). The prop alone still catches the upgrade case: a device
+        created before #205 already carries it, and it is precisely THIS
+        pass's fresh routing evidence that newly excludes the endpoint.
+
+        Only endpoints still present on the node are considered — see the
+        ``present`` filter below. ``eid not in coverage.covered`` also fires
+        when a bridge child DEPARTS the node entirely (``coverage.covered`` is
+        derived from ``node.endpoints`` under the rev-1 fallback), and that
+        case already has its own, more accurate diagnosis: the orphan sweep in
+        ``reconcile_all`` marks a departed endpoint's device unreachable. This
+        warning is only about an endpoint that is still there, whose routing
+        just narrowed.
 
         Guarded to once per (node, device) per plugin run via
         ``_battery_exclusion_warned`` — this runs on every informative
         create/reconcile pass, and a WS reconnect can recur many times in a
         session, so without the guard the same device would nag every time.
+
+        Never raises. This is a diagnostic hanging off the creation path, and
+        a diagnostic that can break reconciliation is worse than no
+        diagnostic.
         """
-        node_id = int(node.node_id)
-        with self._lock:
-            excluded = [
-                (eid, dev_id)
-                for (nid, eid), type_map in self._index.items()
-                if nid == node_id and eid not in coverage.covered
-                for dev_id in type_map.values()
-            ]
-        for eid, dev_id in excluded:
-            key = (node_id, dev_id)
-            if key in self._battery_exclusion_warned:
-                continue
-            try:
-                dev = indigo.devices[dev_id]
-            except KeyError:
-                continue  # deleted out-of-band — nothing to warn about
-            battery = dev.states.get("batteryLevel")
-            has_reading = battery is not None and battery != ""
-            has_prop = bool(dev.pluginProps.get("SupportsBatteryLevel"))
-            if not (has_reading and has_prop):
-                continue
-            self._battery_exclusion_warned.add(key)
-            self.logger.info(
-                "node %s endpoint %s (device %s \"%s\"): its battery reading is "
-                "no longer fed by any power source on this node — the node's "
-                "EndpointList evidence now excludes this endpoint. The "
-                "batteryLevel shown (%s) is the last value received and will "
-                "not update further.",
-                node_id_to_str(node.node_id), eid, dev_id, getattr(dev, "name", "?"), battery,
+        try:
+            node_id = int(node.node_id)
+            present = {int(ep.endpoint_id) for ep in node.endpoints}
+            with self._lock:
+                excluded = [
+                    (eid, dev_id)
+                    for (nid, eid), type_map in self._index.items()
+                    if nid == node_id and eid in present and eid not in coverage.covered
+                    for dev_id in type_map.values()
+                ]
+            for eid, dev_id in excluded:
+                key = (node_id, dev_id)
+                if key in self._battery_exclusion_warned:
+                    continue
+                try:
+                    dev = indigo.devices[dev_id]
+                except KeyError:
+                    continue  # deleted out-of-band — nothing to warn about
+                if not dev.pluginProps.get("SupportsBatteryLevel"):
+                    continue
+                battery = dev.states.get("batteryLevel")
+                self._battery_exclusion_warned.add(key)
+                self.logger.info(
+                    "node %s endpoint %s (device %s \"%s\"): no power source on "
+                    "this node covers this endpoint any more under the current "
+                    "routing (device's own EndpointList evidence where reported, "
+                    "the rev-1 fallback otherwise) — its batteryLevel state "
+                    "(currently %s) will not update further.",
+                    node_id_to_str(node.node_id), eid, dev_id, getattr(dev, "name", "?"), battery,
+                )
+        except Exception as exc:  # noqa: BLE001 - a diagnostic must not sink reconcile
+            self.logger.debug(
+                "battery-exclusion warning for node %s failed: %s",
+                node_id_to_str(getattr(node, "node_id", "?")), exc,
             )
 
     def _create_one(self, spec: Any, name: str, folder_id: int = 0,

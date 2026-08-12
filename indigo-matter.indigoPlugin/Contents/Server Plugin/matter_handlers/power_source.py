@@ -172,11 +172,13 @@ class PowerSourceHandler(ClusterHandler):
         # oversight: it is topology, not a reading, and it has no Indigo state
         # to write. The realistic cause of an EndpointList change is a bridge
         # gaining/losing a child, which IS a structure change — and that DOES
-        # fire node_updated (device_sync.py:2027, citing matter.js
-        # PairedNode.ts #triggerNodeStructureChanges line 954), which triggers
-        # a fresh create_devices pass that rebuilds the coverage map from the
-        # whole snapshot. A pure value rewrite without a structure change would
-        # instead wait for the next reconcile — acceptable for topology data.
+        # fire node_updated (see handle_event's EVT_ENDPOINT_ADDED branch in
+        # device_sync.py, and the protocol.py note above EVT_ENDPOINT_ADDED
+        # citing matter.js PairedNode.ts #triggerNodeStructureChanges), which
+        # triggers a fresh create_devices pass that rebuilds the coverage map
+        # from the whole snapshot. A pure value rewrite without a structure
+        # change would instead wait for the next reconcile — acceptable for
+        # topology data.
         if attribute_id != ATTR_BAT_PERCENT_REMAINING or value is None:
             return {}
         # Guard: devices created before this feature lack the batteryLevel state.
