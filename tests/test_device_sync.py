@@ -3771,6 +3771,33 @@ def test_single_endpoint_node_creates_node_device_without_touching_the_relay(ds,
     assert devices[node_id].name == "Office Plug 2"
 
 
+def test_node_device_adopts_the_folder_of_its_endpoint_siblings(ds, indigo_env):
+    """Reconcile passes no commission-time folder (folder_id 0), so a node
+    device created for an EXISTING install would land in the root folder while
+    its endpoint siblings sit in a real one — observed on the live rig during
+    the #204 validation pass. It must adopt a sibling's folder instead."""
+    _indigo, devices = indigo_env
+    # Commission WITHOUT node evidence: the relay lands in the "Office" folder
+    # and the ADR-0003 gate withholds the node device.
+    ds.create_from_raw(RELAY_NODE, "Office Plug", "Office")
+    relay_id = ds.lookup(42, 1, "matterRelay")
+    assert ds.lookup(42, 0, "matterNode") is None
+    assert devices[relay_id].folderId != 0
+    # A later reconcile-style pass (non-authoritative: no name, no room)
+    # carries the evidence and creates the node device.
+    result = ds.create_from_raw(_with_node_evidence(RELAY_NODE), "")
+    node_dev = devices[result["nodeDeviceId"]]
+    assert node_dev.folderId == devices[relay_id].folderId
+
+
+def test_node_device_folder_falls_back_to_root_with_no_homed_siblings(ds, indigo_env):
+    """No sibling has a real folder (fresh commission with no room): the node
+    device stays in root alongside them, and the adoption walk must not raise."""
+    _indigo, devices = indigo_env
+    result = ds.create_from_raw(_with_node_evidence(RELAY_NODE), "Office Plug")
+    assert devices[result["nodeDeviceId"]].folderId == 0
+
+
 def test_multi_device_node_creates_node_device_without_touching_endpoint_names(ds, indigo_env):
     """A genuinely multi-device node (4 additive AQ sensors on one endpoint):
     role-suffixed endpoint names, and role_counts/`multi`, must be exactly

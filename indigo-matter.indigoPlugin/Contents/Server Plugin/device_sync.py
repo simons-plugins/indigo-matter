@@ -1287,6 +1287,14 @@ class DeviceSync:
                 )
             return None
         spec = self._node_spec(node, coverage)
+        if not folder_id:
+            # Reconcile has no commission-time folder (it passes 0), so a node
+            # device created for an EXISTING install would land in the root
+            # folder while its endpoint siblings sit in a real one — observed
+            # on the live rig during #204 validation. A node device belongs
+            # beside its siblings: adopt the first indexed endpoint device's
+            # folder. Fresh commissions pass a real folder_id and skip this.
+            folder_id = self._sibling_folder_id(nid) or folder_id
         dev_id = self._create_one(spec, spec.name, folder_id, model)
         if dev_id is None:
             return None
@@ -1299,6 +1307,30 @@ class DeviceSync:
             node.product_name or "unknown product", dev_id,
         )
         return dev_id
+
+    def _sibling_folder_id(self, node_id: int) -> int:
+        """The folder of one of this node's existing endpoint devices, or 0.
+
+        Used only when the caller has no commission-time folder (reconcile);
+        which sibling wins is arbitrary and fine — a node's devices are
+        created into one folder together, and a user who has since spread
+        them across folders gets one of their own choices, not ours.
+        """
+        with self._lock:
+            dev_ids = [
+                dev_id
+                for (nid, eid), type_map in self._index.items()
+                if nid == node_id and eid != 0
+                for dev_id in type_map.values()
+            ]
+        for dev_id in dev_ids:
+            try:
+                folder = int(indigo.devices[dev_id].folderId)
+            except (KeyError, AttributeError, TypeError, ValueError):
+                continue  # deleted out-of-band or a fake without folders
+            if folder:
+                return folder  # first sibling with a real folder wins
+        return 0
 
     @staticmethod
     def _endpoint_by_id(node: NodeInfo, endpoint_id: int) -> Optional[Any]:
