@@ -193,6 +193,8 @@ def test_a_mixed_bridge_believes_the_child_that_answered():
     ["x"],              # a list of something that is not an endpoint number
     {"0": 1},           # not a list at all (a tag-based struct)
     [1, None],          # a None element mid-list
+    [True],             # bool is an int subclass — would silently alias ep1
+    [True, False],      # same, with more than one bool member
 ])
 def test_a_malformed_endpoint_list_degrades_to_the_fallback(raw):
     """Degrade, don't raise — the same idiom as _resolve_meter_target: one

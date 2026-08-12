@@ -79,11 +79,15 @@ def resolve_power_coverage(
     a good answer from the child that DID report one because a sibling did not.
 
     ``endpoint_lists`` maps a source endpoint to its raw ``EndpointList`` value
-    (``None`` when the node never reported one). A value that is not a list, or
-    a list holding something that is not an endpoint number, is treated as
-    ABSENT and reported through ``note`` at debug — the same degrade-don't-raise
-    idiom as ``device_sync._resolve_meter_target``: one non-conformant device
-    must not abort a whole node's battery routing.
+    (``None`` when the node never reported one). Both a plain ``None`` and a
+    value that is not a list (or a list holding something that is not an
+    endpoint number) are treated as ABSENT for routing purposes — the fallback
+    heuristic applies to both. Only the malformed case (``raw is not None``) is
+    reported through ``note`` at debug, the same degrade-don't-raise idiom as
+    ``device_sync._resolve_meter_target``: one non-conformant device must not
+    abort a whole node's battery routing. A plain ``None`` is NOT noted — it is
+    the expected rev-1 shape (legacy firmware that predates the attribute
+    entirely), and noting it would be log noise on every such device.
     """
     sources = sorted(int(ep) for ep in power_source_eps)
     all_endpoints = frozenset(int(ep) for ep in node_endpoint_ids)
@@ -126,6 +130,11 @@ def _parse_endpoint_list(raw: Any) -> Optional[frozenset[int]]:
     if not isinstance(raw, list):
         return None
     try:
+        # bool is an int subclass — [True] would silently alias endpoint 1 and
+        # be trusted as evidence; reject so it degrades like any other
+        # malformed value.
+        if any(isinstance(entry, bool) for entry in raw):
+            return None
         return frozenset(int(entry) for entry in raw)
     except (TypeError, ValueError):
         return None
@@ -161,10 +170,13 @@ class PowerSourceHandler(ClusterHandler):
     def on_attribute_update(self, indigo_dev: Any, attribute_id: int, value: Any) -> dict:
         # A live EndpointList event is deliberately a NO-OP here, not an
         # oversight: it is topology, not a reading, and it has no Indigo state
-        # to write. matter-server pairs any such change with a node_updated,
-        # which triggers a fresh create_devices pass — and THAT rebuilds the
-        # coverage map from the whole snapshot. Acting on the event alone would
-        # mean rebuilding routing from one endpoint's answer in isolation.
+        # to write. The realistic cause of an EndpointList change is a bridge
+        # gaining/losing a child, which IS a structure change — and that DOES
+        # fire node_updated (device_sync.py:2027, citing matter.js
+        # PairedNode.ts #triggerNodeStructureChanges line 954), which triggers
+        # a fresh create_devices pass that rebuilds the coverage map from the
+        # whole snapshot. A pure value rewrite without a structure change would
+        # instead wait for the next reconcile — acceptable for topology data.
         if attribute_id != ATTR_BAT_PERCENT_REMAINING or value is None:
             return {}
         # Guard: devices created before this feature lack the batteryLevel state.

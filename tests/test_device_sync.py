@@ -2502,6 +2502,79 @@ def test_bridge_with_per_child_endpoint_lists_is_isolated_from_evidence(ds, indi
     assert devices[hum_id].states.get("batteryLevel") == 40   # untouched, no leak
 
 
+def test_an_unknown_source_in_a_known_multi_source_map_does_not_fan_out(ds, indigo_env):
+    """The #82 posture for a source ``_battery_targets`` has never heard of.
+
+    BRIDGE_ENDPOINT_LIST_NODE has TWO PowerSource endpoints (ep1, ep2), each
+    naming only its own endpoint via EndpointList — so the cached
+    ``by_source`` map (device_sync.py) has more than one entry. A live event
+    from a source NOT in that map (endpoint 0 — no PowerSource lives there on
+    this fixture) exercises ``_battery_targets``' per-source #82 fallback,
+    `return frozenset({int(source_ep)}) if len(by_source) > 1 else None` —
+    confining an unattributed reading to its OWN (deviceless) endpoint rather
+    than fanning it across the bridge's children. The observable outcome is
+    that no existing device changes.
+    """
+    _indigo, devices = indigo_env
+    ds.create_from_raw(BRIDGE_ENDPOINT_LIST_NODE, "Multi Sensor Bridge")
+    temp_id = ds.lookup(0x65, 1, "matterTemperatureSensor")
+    hum_id = ds.lookup(0x65, 2, "matterHumiditySensor")
+    relay_id = ds.lookup(0x65, 3, "matterRelay")
+    assert temp_id and hum_id and relay_id
+
+    # Seed a batteryLevel state on the relay too, so the assertion below
+    # proves routing confinement rather than the handler's missing-state
+    # guard (a device with no such state looks "unchanged" either way).
+    devices[relay_id].states["batteryLevel"] = 0
+    temp_before = devices[temp_id].states.get("batteryLevel")
+    hum_before = devices[hum_id].states.get("batteryLevel")
+    relay_before = devices[relay_id].states.get("batteryLevel")
+
+    # A PowerSource event from endpoint 0 — not a key in the cached map.
+    ds.handle_event(MatterEvent(
+        kind=protocol.EVT_ATTRIBUTE_UPDATED,
+        node_id=0x65, endpoint=0, cluster=0x002F, attribute=0x000C, value=200,
+    ))
+
+    assert devices[temp_id].states.get("batteryLevel") == temp_before
+    assert devices[hum_id].states.get("batteryLevel") == hum_before
+    assert devices[relay_id].states.get("batteryLevel") == relay_before
+
+
+def test_reconcile_self_heal_confines_battery_prop_to_each_fallback_source(ds, indigo_env):
+    """The reconcile self-heal (issue #45) must use the SAME per-source #82
+    confinement the create pass does when there is no EndpointList evidence —
+    not re-fan SupportsBatteryLevel across the whole node.
+
+    BRIDGE_MULTI_BATTERY_NODE deliberately carries no EndpointList (0x001F):
+    its two PowerSource-bearing children (ep1, ep2) fall back to the pre-#205
+    heuristic, which confines each source to its own endpoint. A relay on ep3
+    has no PowerSource at all. Mirrors
+    test_reconcile_reasserts_battery_prop_from_power_source_on_other_endpoint's
+    shape, but for the multi-source fallback rather than the single-source
+    node-wide case.
+    """
+    _indigo, devices = indigo_env
+    ds.create_from_raw(BRIDGE_MULTI_BATTERY_NODE, "Multi Sensor Bridge")
+    temp_id = ds.lookup(0x61, 1, "matterTemperatureSensor")
+    hum_id = ds.lookup(0x61, 2, "matterHumiditySensor")
+    relay_id = ds.lookup(0x61, 3, "matterRelay")
+    assert temp_id and hum_id and relay_id
+
+    # Simulate a mid-interview creation: both battery children lost the prop.
+    for dev_id in (temp_id, hum_id):
+        props = dict(devices[dev_id].pluginProps)
+        props.pop("SupportsBatteryLevel", None)
+        devices[dev_id].pluginProps = props
+
+    ds.reconcile_all([BRIDGE_MULTI_BATTERY_NODE])
+
+    assert devices[temp_id].pluginProps.get("SupportsBatteryLevel") is True
+    assert devices[hum_id].pluginProps.get("SupportsBatteryLevel") is True
+    # The relay must NOT gain the prop — a node-wide re-fan would give it one.
+    assert not devices[relay_id].pluginProps.get("SupportsBatteryLevel")
+
+
 def test_a_battery_event_with_no_cached_coverage_still_fans_out_node_wide(ds, indigo_env):
     """No cached coverage is "no authority", NOT "powers nothing" — the reading
     keeps the pre-#205 node-wide default rather than being dropped. Asserted
@@ -2533,6 +2606,51 @@ def test_an_unusable_endpoint_list_falls_back_and_says_so(ds, indigo_env, mock_l
     assert devices[ds.lookup(0x64, 2, "matterHumiditySensor")].states.get("batteryLevel") == 60
     debug_msgs = [c[0][0] % tuple(c[0][1:]) for c in mock_logger.debug.call_args_list]
     assert any("EndpointList" in m for m in debug_msgs)
+
+
+def test_newly_excluded_battery_device_gets_one_time_info(ds, indigo_env, mock_logger):
+    """Issue #205 upgrade gap: an endpoint covered under the pre-#205 fallback
+    (single source, no EndpointList ⇒ node-wide) that a LATER, more specific
+    EndpointList excludes must not silently freeze forever — SupportsBatteryLevel
+    and batteryLevel are add-only, so nothing withdraws them, but the device
+    gets exactly ONE INFO naming it so the staleness is discoverable."""
+    _indigo, devices = indigo_env
+    import copy
+    fallback_node = {
+        "node_id": 0x70, "available": True,
+        "attributes": {
+            "0/47/12": 160,             # BatPercentRemaining = 80%
+            "1/29/0": [{"0": 770}],
+            "1/1026/0": 2100,
+            "2/29/0": [{"0": 775}],
+            "2/1029/0": 5500,
+        },
+    }
+    ds.create_from_raw(fallback_node, "Fallback Bridge")
+    hum_id = ds.lookup(0x70, 2, "matterHumiditySensor")
+    assert hum_id is not None
+    assert devices[hum_id].pluginProps.get("SupportsBatteryLevel") is True
+    # Hand-set a distinctive reading so it is unambiguous below that this
+    # exact value is what got frozen, independent of whatever priming wrote.
+    devices[hum_id].states["batteryLevel"] = 33
+
+    # A later snapshot ADDS a naming EndpointList that excludes ep2.
+    named_node = copy.deepcopy(fallback_node)
+    named_node["attributes"]["0/47/31"] = [1]   # names ep1 only; ep2 drops out
+
+    mock_logger.info.reset_mock()
+    ds.create_from_raw(named_node, "Fallback Bridge")
+    assert devices[hum_id].pluginProps.get("SupportsBatteryLevel") is True   # add-only: still set
+    assert devices[hum_id].states.get("batteryLevel") == 33                  # frozen, not withdrawn
+    info_msgs = [c[0][0] % tuple(c[0][1:]) for c in mock_logger.info.call_args_list]
+    exclusion_msgs = [m for m in info_msgs if "no longer fed" in m]
+    assert len(exclusion_msgs) == 1
+
+    # A second pass over the SAME excluding snapshot must not repeat the log.
+    mock_logger.info.reset_mock()
+    ds.create_from_raw(named_node, "Fallback Bridge")
+    info_msgs2 = [c[0][0] % tuple(c[0][1:]) for c in mock_logger.info.call_args_list]
+    assert not [m for m in info_msgs2 if "no longer fed" in m]
 
 
 # ===========================================================================

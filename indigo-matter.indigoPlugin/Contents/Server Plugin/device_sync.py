@@ -284,6 +284,14 @@ class DeviceSync:
         # stale state list until a plugin restart. Cleared only by a refresh that
         # actually completed.
         self._pending_state_refresh: set[int] = set()
+        # (node_id, dev_id) pairs already told their battery reading is
+        # frozen because new EndpointList evidence excluded their endpoint
+        # (issue #205 upgrade gap — see _warn_of_newly_excluded_battery_devices).
+        # A plain per-run set, not persisted: the point is one INFO line per
+        # device per plugin run, not a permanent suppression — a restart (or a
+        # later coverage change that excludes a DIFFERENT device) should be
+        # free to log again.
+        self._battery_exclusion_warned: set[tuple[int, int]] = set()
 
     # ------------------------------------------------------------------
     # Active-device tracking (deviceStartComm/deviceStopComm)
@@ -562,6 +570,13 @@ class DeviceSync:
                         self._power_coverage[int(node.node_id)] = dict(coverage.by_source)
                     else:
                         self._power_coverage.pop(int(node.node_id), None)
+                # A device whose endpoint WAS covered under the old heuristic
+                # (or an earlier, less specific EndpointList) but is now
+                # EXCLUDED by this pass's evidence keeps its last batteryLevel
+                # forever with no further diagnostic (props/states are
+                # add-only by policy, and reconcile only runs on a WS
+                # reconnect) — name it once so that staleness is discoverable.
+                self._warn_of_newly_excluded_battery_devices(node, coverage)
             # Deferred deliberately: the refresh calls into Indigo per device and
             # must not run under _lock, and it has to see the devices this pass
             # is about to create.
@@ -1067,6 +1082,10 @@ class DeviceSync:
         reconcile self-heal both ask. An empty answer means "no power source
         told us about this node" — which is also what an unknown node returns,
         and correctly so: the prop is add-only, so nothing is withdrawn by it.
+
+        add-only: exclusion never withdraws a state — see the one-time INFO
+        in create_devices (``_warn_of_newly_excluded_battery_devices``) for
+        the diagnostic that covers the resulting staleness instead.
         """
         with self._lock:
             by_source = self._power_coverage.get(int(node_id))
@@ -1102,6 +1121,62 @@ class DeviceSync:
         if targets is not None:
             return targets
         return frozenset({int(source_ep)}) if len(by_source) > 1 else None
+
+    def _warn_of_newly_excluded_battery_devices(self, node: NodeInfo, coverage: Any) -> None:
+        """One-time INFO: an existing device's endpoint just dropped OUT of
+        this node's power coverage (issue #205 upgrade gap).
+
+        ``SupportsBatteryLevel``/``batteryLevel`` are add-only (see
+        ``_battery_endpoints``): exclusion never withdraws them, so a device
+        fed a reading under looser (or absent) EndpointList evidence keeps
+        showing its LAST value forever once fresher evidence excludes its
+        endpoint — silently, because reconcile only runs on a WS reconnect.
+        This cannot fix that (add-only is deliberate policy elsewhere), but it
+        can name the device once so the staleness is discoverable rather than
+        invisible.
+
+        Both conditions below are required: a non-empty ``batteryLevel``
+        state (a reading actually arrived — not just an unfed placeholder)
+        AND the ``SupportsBatteryLevel`` prop. The prop check also catches
+        the upgrade case: a device created before #205 already carries both,
+        and it is precisely THIS pass's fresh EndpointList evidence that
+        newly excludes it.
+
+        Guarded to once per (node, device) per plugin run via
+        ``_battery_exclusion_warned`` — this runs on every informative
+        create/reconcile pass, and a WS reconnect can recur many times in a
+        session, so without the guard the same device would nag every time.
+        """
+        node_id = int(node.node_id)
+        with self._lock:
+            excluded = [
+                (eid, dev_id)
+                for (nid, eid), type_map in self._index.items()
+                if nid == node_id and eid not in coverage.covered
+                for dev_id in type_map.values()
+            ]
+        for eid, dev_id in excluded:
+            key = (node_id, dev_id)
+            if key in self._battery_exclusion_warned:
+                continue
+            try:
+                dev = indigo.devices[dev_id]
+            except KeyError:
+                continue  # deleted out-of-band — nothing to warn about
+            battery = dev.states.get("batteryLevel")
+            has_reading = battery is not None and battery != ""
+            has_prop = bool(dev.pluginProps.get("SupportsBatteryLevel"))
+            if not (has_reading and has_prop):
+                continue
+            self._battery_exclusion_warned.add(key)
+            self.logger.info(
+                "node %s endpoint %s (device %s \"%s\"): its battery reading is "
+                "no longer fed by any power source on this node — the node's "
+                "EndpointList evidence now excludes this endpoint. The "
+                "batteryLevel shown (%s) is the last value received and will "
+                "not update further.",
+                node_id_to_str(node.node_id), eid, dev_id, getattr(dev, "name", "?"), battery,
+            )
 
     def _create_one(self, spec: Any, name: str, folder_id: int = 0,
                     model: str = "") -> Optional[int]:
