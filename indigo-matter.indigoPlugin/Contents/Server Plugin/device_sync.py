@@ -50,7 +50,11 @@ from matter_handlers.electrical import (
     FEATURE_DYNAMIC_POWER_FLOW,
     FEATURE_SET_TOPOLOGY,
 )
-from matter_handlers.power_source import CLUSTER_POWER_SOURCE
+from matter_handlers.power_source import (
+    ATTR_ENDPOINT_LIST,
+    CLUSTER_POWER_SOURCE,
+    resolve_power_coverage,
+)
 import settings_report
 from protocol import MatterCommand
 
@@ -210,14 +214,19 @@ class DeviceSync:
         self._recognized_clusters = frozenset(
             h.cluster_id for h in registry.handlers
         ) | _NON_DEVICE_CLUSTERS
-        # PowerSource-bearing endpoints per node (issue #82 — bridge battery
-        # cross-contamination). Populated by create_devices/_resolve_meter_links-
-        # adjacent bookkeeping on every create pass; consulted by creation,
-        # priming, and live fan-out to decide whether PowerSource is node-wide
-        # (the common single-endpoint case, e.g. FP300: battery on ep0, sensor
-        # on ep1) or must stay confined to its own endpoint (a bridge with
-        # more than one battery-bearing child).
-        self._power_source_eps: dict[int, set[int]] = {}
+        # What each of a node's power sources POWERS, per node:
+        # node_id -> {source endpoint -> endpoints it powers} (issue #205).
+        # Decided by matter_handlers.power_source.resolve_power_coverage from
+        # the device's own EndpointList (0x001F, core §11.7.7.32), falling back
+        # per source to the pre-#205 heuristic for rev-1 firmware that predates
+        # the attribute. Rebuilt from the node snapshot on every informative
+        # create pass (never merged, never persisted), exactly like the meter
+        # links above; read only through _battery_endpoints/_battery_targets,
+        # which are the single decision seam the four old open-coded copies of
+        # the heuristic — creation, priming, capability self-heal and live
+        # fan-out — collapsed into. Issue #82's cross-contamination bug was a
+        # bug in one of those copies.
+        self._power_coverage: dict[int, dict[int, frozenset[int]]] = {}
         # The raw LIMITS attribute behind every setting that declares
         # FromAttribute bounds (most take theirs from the spec and cache nothing
         # here — matter_handlers.settings.SETTINGS), keyed
@@ -516,21 +525,21 @@ class DeviceSync:
             # not by how many happen to be missing on this pass. A plug's root
             # endpoint 0 produces no handler, so this is not len(node.endpoints).
             plan: list[tuple] = []  # (endpoint, spec)
-            # Detect which endpoint(s) carry PowerSource. Indigo applies
-            # Supports* via device props at creation, not Devices.xml statics
-            # (the colour-support lesson; issue #56).
-            # Single PowerSource-bearing endpoint (the common case — e.g. FP300:
-            # battery on ep0, sensor on ep1) keeps the original node-wide
-            # behaviour: SupportsBatteryLevel on every device regardless of its
-            # own endpoint. More than one PowerSource-bearing endpoint (a
-            # bridge with multiple battery-powered children) must NOT fan out
-            # node-wide — issue #82's cross-contamination bug — so each
-            # device only gets the prop when ITS OWN endpoint bears PowerSource.
+            # Ask each PowerSource endpoint what it powers (issue #205). Indigo
+            # applies Supports* via device props at creation, not Devices.xml
+            # statics (the colour-support lesson; issue #56), so this has to be
+            # settled before the plan loop stamps them.
             power_source_eps = {
                 int(endpoint.endpoint_id) for endpoint in node.endpoints
                 if endpoint.has(CLUSTER_POWER_SOURCE)
             }
-            multi_power_source = len(power_source_eps) > 1
+            coverage = resolve_power_coverage(
+                power_source_eps,
+                {ep: node.attributes.get((ep, CLUSTER_POWER_SOURCE, ATTR_ENDPOINT_LIST))
+                 for ep in power_source_eps},
+                (int(endpoint.endpoint_id) for endpoint in node.endpoints),
+                note=self.logger.debug,
+            )
             # An EMPTY snapshot is "no information", never "implements nothing"
             # (issue #192). matter-server populates its attribute cache lazily:
             # getNodeDetails returns `attributeCache.get(nodeId) ?? {}` and kicks
@@ -549,10 +558,10 @@ class DeviceSync:
             informative = bool(node.attributes)
             if informative:
                 with self._lock:
-                    if power_source_eps:
-                        self._power_source_eps[int(node.node_id)] = power_source_eps
+                    if coverage.by_source:
+                        self._power_coverage[int(node.node_id)] = dict(coverage.by_source)
                     else:
-                        self._power_source_eps.pop(int(node.node_id), None)
+                        self._power_coverage.pop(int(node.node_id), None)
             # Deferred deliberately: the refresh calls into Indigo per device and
             # must not run under _lock, and it has to see the devices this pass
             # is about to create.
@@ -642,11 +651,12 @@ class DeviceSync:
                         node_id_to_str(node.node_id), endpoint.endpoint_id,
                     )
                 for spec in specs:
-                    # Single-PowerSource-endpoint node: fan out to every
-                    # device as before. Multi-PowerSource-endpoint node
-                    # (issue #82): only the device(s) on the SAME endpoint as
-                    # a PowerSource cluster get the prop.
-                    if power_source_eps and (not multi_power_source or eid in power_source_eps):
+                    # A device gets the battery prop when some power source on
+                    # this node says it powers this endpoint (issue #205). Read
+                    # from the pass-local coverage, not the cache: this is the
+                    # pass that WRITES the cache, and a non-informative one
+                    # deliberately writes nothing.
+                    if eid in coverage.covered:
                         spec.props.setdefault("SupportsBatteryLevel", True)
                     if spec.device_type_id in _METER_CAPABLE_TYPES:
                         # Central injection (issue #79): a linked source
@@ -1045,6 +1055,54 @@ class DeviceSync:
             self._forward_links.update(forward)
             self._reverse_links.update(reverse)
 
+    # ------------------------------------------------------------------
+    # Power coverage readers (issue #205)
+    # ------------------------------------------------------------------
+
+    def _battery_endpoints(self, node_id: Any) -> frozenset[int]:
+        """Endpoints on this node that some power source says it powers.
+
+        The devices on these endpoints are the ones that should carry a
+        ``batteryLevel`` state, so this is what the creation prop and the
+        reconcile self-heal both ask. An empty answer means "no power source
+        told us about this node" — which is also what an unknown node returns,
+        and correctly so: the prop is add-only, so nothing is withdrawn by it.
+        """
+        with self._lock:
+            by_source = self._power_coverage.get(int(node_id))
+        if not by_source:
+            return frozenset()
+        return frozenset().union(*by_source.values())
+
+    def _battery_targets(self, node_id: Any, source_ep: Any) -> Optional[frozenset[int]]:
+        """Endpoints a reading from ``(node_id, source_ep)`` applies to.
+
+        ``None`` is not "nothing" — it is **no authority cached**, and callers
+        must read it as "keep the node-wide default this code had before issue
+        #205". That is the pre-change behaviour for a node no create pass has
+        described yet (a live attribute arriving before the first reconcile),
+        and it deliberately errs towards delivering a reading to too many
+        devices rather than dropping it: a battery level on a sibling is
+        cosmetic and self-corrects on the next pass, a battery level that never
+        arrives looks like broken hardware.
+
+        A source that is UNKNOWN inside a node we do have a map for is a
+        different case, and gets a different answer: the map is the whole node's
+        answer, so an absent source is one the snapshot did not carry. With
+        several sources on the node, confine it to its own endpoint (the #82
+        posture — never fan an unattributed reading across a bridge's children);
+        with one or none, there is nothing to cross-contaminate, so fall back to
+        the node-wide default.
+        """
+        with self._lock:
+            by_source = self._power_coverage.get(int(node_id))
+        if not by_source:
+            return None
+        targets = by_source.get(int(source_ep))
+        if targets is not None:
+            return targets
+        return frozenset({int(source_ep)}) if len(by_source) > 1 else None
+
     def _create_one(self, spec: Any, name: str, folder_id: int = 0,
                     model: str = "") -> Optional[int]:
         # Stamp the type the cluster pipeline chose, so the type-edit guard
@@ -1164,13 +1222,11 @@ class DeviceSync:
         a linked meter-source endpoint for this device (issue #79 — split-endpoint
         energy, e.g. IKEA GRILLPLATS ep2's ActivePower priming the ep1 relay).
 
-        The node-scoped cross-endpoint fan-in is itself confined to the
-        device's own endpoint when the node has MORE THAN ONE PowerSource-
-        bearing endpoint (issue #82 — a bridge with several battery-powered
-        children): otherwise endpoint 2's battery reading would prime
-        endpoint 1's device too. A node with zero or one PowerSource endpoint
-        keeps the original any-endpoint behaviour (the common single-battery
-        case, e.g. FP300).
+        The node-scoped cross-endpoint fan-in is itself limited to the
+        endpoints the source says it powers (issue #205 — ``_battery_targets``,
+        from the device's own EndpointList): otherwise a bridge child's battery
+        reading would prime its siblings too, which is issue #82. A source with
+        no cached authority keeps the original any-endpoint behaviour.
 
         Within the own endpoint, skip attributes whose cluster's handler targets
         a *different* existing device on the same endpoint (fix/#44: prevents the
@@ -1197,7 +1253,6 @@ class DeviceSync:
         dev = indigo.devices[dev_id]
         with self._lock:
             linked_sources = self._reverse_links.get((int(node.node_id), int(endpoint_id)), set())
-            multi_power_source = len(self._power_source_eps.get(int(node.node_id), ())) > 1
         kv: list = []
         for (ep, cluster, attribute), value in node.attributes.items():
             handler = self.registry.handler_for_cluster(cluster)
@@ -1208,12 +1263,15 @@ class DeviceSync:
             # meter-source endpoint (issue #79 — split-endpoint energy).
             if ep != endpoint_id and not handler.node_scoped and ep not in linked_sources:
                 continue
-            # Issue #82: a node-scoped cluster (PowerSource) on a DIFFERENT
-            # endpoint only fans in when the node has at most one
-            # PowerSource-bearing endpoint — a bridge with several
-            # battery-powered children must not cross-contaminate.
-            if ep != endpoint_id and handler.node_scoped and multi_power_source:
-                continue
+            # Issue #205: a node-scoped cluster (PowerSource) on a DIFFERENT
+            # endpoint only fans in when that source says it powers THIS
+            # endpoint — a bridge with several battery-powered children must
+            # not cross-contaminate (issue #82). No cached authority (None)
+            # keeps the pre-#205 node-wide fan-in.
+            if ep != endpoint_id and handler.node_scoped:
+                targets = self._battery_targets(node.node_id, ep)
+                if targets is not None and int(endpoint_id) not in targets:
+                    continue
             # For this device's own endpoint, skip attributes that belong to a
             # sibling device (handler has a non-empty device_type_id that differs
             # from this device's type).  This prevents e.g. the Pressure device
@@ -1429,16 +1487,23 @@ class DeviceSync:
         transient short ``get_nodes()`` would blank a device that is sitting
         there working.
 
-        **`_power_source_eps` is deliberately NOT evicted here**, and the reason
-        is that the same argument fails for it. It is read as
-        ``len(...) > 1`` (see _refresh_live_node and the battery fan-out), so an
-        absent entry is not "unknown" — it is a positive "one power source",
-        which selects the node-wide fan-out and re-opens issue #82's
-        cross-contamination on a bridge with several battery children. Its
-        lifetime is already correct without help: every informative pass rebuilds
-        it, so a re-used node id is corrected the first time the new device
-        reports. Cache eviction is not a policy to apply uniformly — it depends
-        entirely on what the empty case is read to MEAN.
+        **`_power_coverage` is deliberately NOT evicted here** — the same
+        conclusion the pre-#205 `_power_source_eps` reached, but no longer for
+        the same reason, and the old reason was the dangerous one. That cache
+        was read as ``len(...) > 1``, so an absent entry was a positive "one
+        power source" and evicting it re-opened issue #82's cross-contamination
+        on a bridge with several battery children. Coverage does not have that
+        failure mode: absent means "no coverage", which is the SAFE answer
+        everywhere it is read — ``_battery_endpoints`` returns nothing (and the
+        prop is add-only, so nothing is withdrawn), ``_battery_targets`` returns
+        None and the caller keeps the node-wide default it had before #205.
+
+        It stays because eviction would buy nothing, not because it would cost
+        something: every informative pass rebuilds this node's entry outright,
+        so a re-used node id is corrected the first time the new device reports.
+        Cache eviction is still not a policy to apply uniformly — it depends
+        entirely on what the empty case is read to MEAN, which for the two
+        dicts above is the opposite of harmless.
         """
         target = int(node_id)
         with self._lock:
@@ -1568,17 +1633,14 @@ class DeviceSync:
                                                      or on a LINKED source endpoint)
         - SupportsEnergyMeter  → accumEnergyTotal  (cluster 0x0091 on the endpoint,
                                                      or on a LINKED source endpoint)
-        - SupportsBatteryLevel → batteryLevel      (cluster 0x002F anywhere on the node,
-                                                     confined to its own endpoint when
-                                                     the node has more than one
-                                                     PowerSource-bearing endpoint)
+        - SupportsBatteryLevel → batteryLevel      (a cluster 0x002F instance on the
+                                                     node that says it powers THIS
+                                                     endpoint — its EndpointList)
 
         The cluster constants are imported from their handler modules — no magic
         numbers here.  The battery check mirrors create_devices' central setdefault
-        (issue #82): a single PowerSource-bearing endpoint still fans out to every
-        device on the node, but more than one (a bridge with several
-        battery-powered children) confines the prop to each device's own endpoint
-        so siblings don't cross-contaminate.
+        (issue #205): both ask the same coverage question, one from the pass-local
+        answer and one from the cache that pass wrote.
 
         No longer a ``@staticmethod``: split-endpoint energy (issue #79 — e.g.
         IKEA GRILLPLATS) needs the instance's meter-link map to fold a linked
@@ -1603,11 +1665,7 @@ class DeviceSync:
                 props["SupportsPowerMeter"] = True
             if src_endpoint.has(CLUSTER_ELECTRICAL_ENERGY):
                 props["SupportsEnergyMeter"] = True
-        with self._lock:
-            power_source_eps = self._power_source_eps.get(int(node.node_id), set())
-        if power_source_eps and (
-            len(power_source_eps) == 1 or int(endpoint.endpoint_id) in power_source_eps
-        ):
+        if int(endpoint.endpoint_id) in self._battery_endpoints(node.node_id):
             props["SupportsBatteryLevel"] = True
         return props
 
@@ -2087,26 +2145,27 @@ class DeviceSync:
             return
         if handler.node_scoped:
             # Node-scoped clusters (e.g. PowerSource) live on a different endpoint
-            # than the devices they augment. Fan the update out to ALL Indigo devices
-            # for this node so every sensor on the node receives the battery update —
-            # UNLESS the node has more than one PowerSource-bearing endpoint (issue
-            # #82 — a bridge with several battery-powered children), in which case
-            # fanning out node-wide would cross-contaminate siblings; confine the
-            # update to devices on the event's own endpoint instead.
+            # than the devices they augment, so the update goes to the endpoints
+            # this source says it powers (issue #205 — its own EndpointList,
+            # cached as coverage). Fanning out node-wide unconditionally is what
+            # cross-contaminated a bridge's battery children in issue #82. No
+            # cached authority (targets is None — e.g. an event arriving before
+            # the first create pass has described the node) keeps the pre-#205
+            # node-wide fan-out.
+            targets = self._battery_targets(evt.node_id, int(evt.endpoint))
             with self._lock:
-                multi_power_source = len(self._power_source_eps.get(int(evt.node_id), ())) > 1
-                if multi_power_source:
+                if targets is None:
                     dev_ids = [
                         dev_id
-                        for (nid, eid), type_map in self._index.items()
-                        if nid == int(evt.node_id) and eid == int(evt.endpoint)
+                        for (nid, _eid), type_map in self._index.items()
+                        if nid == int(evt.node_id)
                         for dev_id in type_map.values()
                     ]
                 else:
                     dev_ids = [
                         dev_id
-                        for (nid, _eid), type_map in self._index.items()
-                        if nid == int(evt.node_id)
+                        for (nid, eid), type_map in self._index.items()
+                        if nid == int(evt.node_id) and eid in targets
                         for dev_id in type_map.values()
                     ]
             for dev_id in dev_ids:
@@ -2117,8 +2176,8 @@ class DeviceSync:
                 except KeyError:
                     # Deletion race (see the non-node-scoped path below) — debug,
                     # not the "bad update" warning, and keep fanning out to the
-                    # rest of this node's devices (endpoint-narrowed only in the
-                    # multi_power_source branch).
+                    # rest of this source's devices (already narrowed to its
+                    # coverage above).
                     self.logger.debug(
                         "device %s vanished mid-update (deleted?); dropped ep%s cl%s attr%s",
                         dev_id, evt.endpoint, evt.cluster, evt.attribute,

@@ -2346,6 +2346,196 @@ def test_bridge_multi_power_source_battery_isolated_per_endpoint(ds, indigo_env)
 
 
 # ===========================================================================
+# issue #205 — PowerSource.EndpointList (0x001F, core §11.7.7.32) is the
+# authority for what a battery powers; the #82 heuristic is now only the
+# fallback for rev-1 firmware that predates the attribute.
+#
+# "0/47/31" = endpoint 0, cluster 0x002F (PowerSource), attr 0x001F (EndpointList).
+# ===========================================================================
+
+#: The FP300 shape stated explicitly: one source on ep0 whose EMPTY list means
+#: "the entire node". The heuristic already reached this answer — here it is
+#: reached from evidence.
+POWER_SOURCE_NODE_WIDE_NODE = {
+    "node_id": 0x63,
+    "available": True,
+    "attributes": {
+        "0/40/1": "Aqara",
+        "0/40/3": "FP300",
+        "0/47/12": 160,             # BatPercentRemaining = 160/2 = 80%
+        "0/47/31": [],              # EndpointList: empty = the whole node
+        "1/29/0": [{"0": 770}],     # TemperatureSensor
+        "1/1026/0": 2100,
+        "2/29/0": [{"0": 775}],     # HumiditySensor
+        "2/1029/0": 5500,
+    },
+}
+
+#: THE new-behaviour proof, and the case the old heuristic gets WRONG: a single
+#: PowerSource endpoint (so the heuristic says "node-wide") that names exactly
+#: one application endpoint. ep1 is battery-powered, ep2 is not — a
+#: mains-powered child sharing a node with a battery one.
+POWER_SOURCE_CONFINED_NODE = {
+    "node_id": 0x64,
+    "available": True,
+    "attributes": {
+        "0/40/1": "ACME",
+        "0/40/3": "Half Battery Hub",
+        "0/47/12": 120,             # BatPercentRemaining = 120/2 = 60%
+        "0/47/31": [1],             # EndpointList: ep1 only (ep0 added defensively)
+        "1/29/0": [{"0": 770}],     # TemperatureSensor — powered by the source
+        "1/1026/0": 2100,
+        "2/29/0": [{"0": 775}],     # HumiditySensor — NOT powered by it
+        "2/1029/0": 5500,
+    },
+}
+
+#: The issue #82 bridge, rev-2: each child's own source states its own endpoint.
+#: Same outcome as BRIDGE_MULTI_BATTERY_NODE's heuristic — from evidence now.
+BRIDGE_ENDPOINT_LIST_NODE = {
+    "node_id": 0x65,
+    "available": True,
+    "attributes": {
+        "0/40/1": "ACME",
+        "0/40/3": "Multi Sensor Bridge",
+        "1/29/0": [{"0": 770}],
+        "1/1026/0": 2100,
+        "1/47/12": 160,             # 80%
+        "1/47/31": [1],
+        "2/29/0": [{"0": 775}],
+        "2/1029/0": 5500,
+        "2/47/12": 80,              # 40%
+        "2/47/31": [2],
+        "3/29/0": [{"0": 266}],     # mains relay — no PowerSource at all
+        "3/6/0": False,
+    },
+}
+
+
+def test_empty_endpoint_list_gives_every_device_on_the_node_battery(ds, indigo_env):
+    _indigo, devices = indigo_env
+    ds.create_from_raw(POWER_SOURCE_NODE_WIDE_NODE, "Landing Presence")
+    temp_id = ds.lookup(0x63, 1, "matterTemperatureSensor")
+    hum_id = ds.lookup(0x63, 2, "matterHumiditySensor")
+    assert temp_id and hum_id
+
+    assert devices[temp_id].pluginProps.get("SupportsBatteryLevel") is True
+    assert devices[hum_id].pluginProps.get("SupportsBatteryLevel") is True
+    assert devices[temp_id].states.get("batteryLevel") == 80
+    assert devices[hum_id].states.get("batteryLevel") == 80
+
+
+def test_a_named_endpoint_list_confines_battery_to_the_endpoints_it_names(ds, indigo_env):
+    """The behaviour change #205 buys: ONE PowerSource endpoint, so the old
+    heuristic fanned out node-wide and gave the mains-powered child a battery
+    level it does not have. Its own EndpointList says otherwise."""
+    _indigo, devices = indigo_env
+    ds.create_from_raw(POWER_SOURCE_CONFINED_NODE, "Half Battery Hub")
+    temp_id = ds.lookup(0x64, 1, "matterTemperatureSensor")
+    hum_id = ds.lookup(0x64, 2, "matterHumiditySensor")
+    assert temp_id and hum_id
+
+    assert devices[temp_id].pluginProps.get("SupportsBatteryLevel") is True
+    assert devices[temp_id].states.get("batteryLevel") == 60
+    assert not devices[hum_id].pluginProps.get("SupportsBatteryLevel")
+    assert "batteryLevel" not in devices[hum_id].states
+
+
+def test_a_named_endpoint_list_confines_the_LIVE_battery_update_too(ds, indigo_env):
+    """Routing, not just the handler's missing-state guard: the uncovered
+    device is given a batteryLevel state by hand, so if the event reached it at
+    all the value would land."""
+    _indigo, devices = indigo_env
+    ds.create_from_raw(POWER_SOURCE_CONFINED_NODE, "Half Battery Hub")
+    temp_id = ds.lookup(0x64, 1, "matterTemperatureSensor")
+    hum_id = ds.lookup(0x64, 2, "matterHumiditySensor")
+    devices[hum_id].states["batteryLevel"] = 0
+
+    ds.handle_event(MatterEvent(
+        kind=protocol.EVT_ATTRIBUTE_UPDATED,
+        node_id=0x64, endpoint=0, cluster=0x002F, attribute=0x000C, value=200,
+    ))
+    assert devices[temp_id].states.get("batteryLevel") == 100
+    assert devices[hum_id].states.get("batteryLevel") == 0, "ep2 is not powered by this source"
+
+
+def test_capability_self_heal_only_adds_battery_where_the_source_says(ds, indigo_env):
+    """_capability_props reads the same coverage the creation prop did, so the
+    issue #45 reconcile self-heal cannot re-introduce the prop on an endpoint
+    the EndpointList excludes."""
+    _indigo, devices = indigo_env
+    ds.create_from_raw(POWER_SOURCE_CONFINED_NODE, "Half Battery Hub")
+    temp_id = ds.lookup(0x64, 1, "matterTemperatureSensor")
+    hum_id = ds.lookup(0x64, 2, "matterHumiditySensor")
+    # Simulate the mid-interview creation #45 exists for: the covered device
+    # lost the prop it should have.
+    props = dict(devices[temp_id].pluginProps)
+    props.pop("SupportsBatteryLevel", None)
+    devices[temp_id].pluginProps = props
+
+    ds.reconcile_all([POWER_SOURCE_CONFINED_NODE])
+
+    assert devices[temp_id].pluginProps.get("SupportsBatteryLevel") is True
+    assert not devices[hum_id].pluginProps.get("SupportsBatteryLevel")
+
+
+def test_bridge_with_per_child_endpoint_lists_is_isolated_from_evidence(ds, indigo_env):
+    """The issue #82 outcome, now reached because each child SAID so rather
+    than because the plugin counted PowerSource endpoints."""
+    _indigo, devices = indigo_env
+    ds.create_from_raw(BRIDGE_ENDPOINT_LIST_NODE, "Multi Sensor Bridge")
+    temp_id = ds.lookup(0x65, 1, "matterTemperatureSensor")
+    hum_id = ds.lookup(0x65, 2, "matterHumiditySensor")
+    relay_id = ds.lookup(0x65, 3, "matterRelay")
+    assert temp_id and hum_id and relay_id
+
+    assert devices[temp_id].states.get("batteryLevel") == 80
+    assert devices[hum_id].states.get("batteryLevel") == 40
+    assert not devices[relay_id].pluginProps.get("SupportsBatteryLevel")
+
+    # Live routing: ep1's source powers ep1 and nothing else.
+    ds.handle_event(MatterEvent(
+        kind=protocol.EVT_ATTRIBUTE_UPDATED,
+        node_id=0x65, endpoint=1, cluster=0x002F, attribute=0x000C, value=200,
+    ))
+    assert devices[temp_id].states.get("batteryLevel") == 100
+    assert devices[hum_id].states.get("batteryLevel") == 40   # untouched, no leak
+
+
+def test_a_battery_event_with_no_cached_coverage_still_fans_out_node_wide(ds, indigo_env):
+    """No cached coverage is "no authority", NOT "powers nothing" — the reading
+    keeps the pre-#205 node-wide default rather than being dropped. Asserted
+    against a node whose devices exist but whose coverage never got cached (a
+    non-informative snapshot), because a dropped battery reading looks like
+    broken hardware and a stray one self-corrects on the next pass."""
+    _indigo, devices = indigo_env
+    ds.create_from_raw(POWER_SOURCE_NODE_WIDE_NODE, "Landing Presence")
+    hum_id = ds.lookup(0x63, 2, "matterHumiditySensor")
+    ds._power_coverage.clear()
+
+    ds.handle_event(MatterEvent(
+        kind=protocol.EVT_ATTRIBUTE_UPDATED,
+        node_id=0x63, endpoint=0, cluster=0x002F, attribute=0x000C, value=100,
+    ))
+    assert devices[hum_id].states.get("batteryLevel") == 50
+
+
+def test_an_unusable_endpoint_list_falls_back_and_says_so(ds, indigo_env, mock_logger):
+    """Degrade, don't raise: a non-conformant list must not abort the node's
+    device creation, and the fallback it took is diagnosable from the log."""
+    _indigo, devices = indigo_env
+    import copy
+    broken = copy.deepcopy(POWER_SOURCE_CONFINED_NODE)
+    broken["attributes"]["0/47/31"] = ["ep1"]
+    ds.create_from_raw(broken, "Half Battery Hub")
+    # Single source + unusable list ⇒ the heuristic's node-wide answer.
+    assert devices[ds.lookup(0x64, 1, "matterTemperatureSensor")].states.get("batteryLevel") == 60
+    assert devices[ds.lookup(0x64, 2, "matterHumiditySensor")].states.get("batteryLevel") == 60
+    debug_msgs = [c[0][0] % tuple(c[0][1:]) for c in mock_logger.debug.call_args_list]
+    assert any("EndpointList" in m for m in debug_msgs)
+
+
+# ===========================================================================
 # issue #85 — BooleanStateConfiguration (0x0080) sensitivity level
 # ===========================================================================
 
@@ -2775,18 +2965,19 @@ def test_an_empty_snapshot_does_not_retract_setting_limits(ds, indigo_env):
     assert ds.setting_limits(0x38, 1, 0x0406, 0x0004) is not None
 
 
-def test_an_empty_snapshot_does_not_retract_the_power_source_endpoints(ds, indigo_env):
+def test_an_empty_snapshot_does_not_retract_the_power_coverage(ds, indigo_env):
     """The same bug, already live on a different cache before #192.
 
-    `_power_source_eps` popped whenever a snapshot carried no PowerSource
-    endpoint — which an empty snapshot never does — so a routine matter-server
-    restart dropped a node's battery endpoints.
+    The coverage map (`_power_source_eps` before #205) popped whenever a
+    snapshot carried no PowerSource endpoint — which an empty snapshot never
+    does — so a routine matter-server restart dropped a node's battery
+    endpoints.
     """
     ds.create_from_raw(TEMP_BATTERY_NODE, "Hall Temperature")
-    before = dict(ds._power_source_eps)
+    before = dict(ds._power_coverage)
     assert before, "fixture must actually bear a PowerSource for this to test anything"
     ds.reconcile_all([{"node_id": 0x42, "available": True, "attributes": {}}])
-    assert ds._power_source_eps == before
+    assert ds._power_coverage == before
 
 
 def test_a_cluster_that_stops_reporting_its_list_drops_the_cached_answer(ds, indigo_env):
@@ -2892,19 +3083,23 @@ def test_a_reused_node_id_does_not_inherit_the_previous_devices_LIMITS(ds, indig
     assert ds.setting_limits(0x38, 1, 0x0406, 0x0004) is None
 
 
-def test_node_removed_does_NOT_forget_the_power_source_endpoints(ds, indigo_env):
-    """`_power_source_eps` is read as ``len(...) > 1``, so an absent entry is not
-    'unknown' — it is a positive 'one power source', which selects the node-wide
-    battery fan-out and re-opens issue #82 on a multi-battery bridge. Cache
-    eviction is not a uniform policy; it depends on what empty is read to mean.
+def test_node_removed_does_NOT_forget_the_power_coverage(ds, indigo_env):
+    """The non-eviction survives #205; its justification does not.
+
+    Before #205 the cache was read as ``len(...) > 1``, so an absent entry was a
+    positive "one power source" — evicting it selected the node-wide fan-out and
+    re-opened issue #82 on a multi-battery bridge. Coverage has no such failure
+    mode (absent = no coverage = the safe answer), so this is now kept because
+    eviction buys nothing rather than because it would break something. Either
+    way `_forget_node_capabilities` must leave it alone.
     """
     ds.create_from_raw(TEMP_BATTERY_NODE, "Hall Temperature")
-    before = dict(ds._power_source_eps)
+    before = dict(ds._power_coverage)
     assert before
     ds.handle_event(MatterEvent(
         kind=protocol.EVT_NODE_REMOVED, node_id=0x42,
         raw={"event": "node_removed", "data": 0x42}))
-    assert ds._power_source_eps == before
+    assert ds._power_coverage == before
 
 
 #: Two OnOff endpoints on one node, and only ONE of them implements the Lighting
