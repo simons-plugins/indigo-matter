@@ -74,7 +74,9 @@ def test_full_commission_flow_creates_indigo_device(env):
         assert final["result"]["nodeId"] == "0x2A"
         dev_id = final["result"]["primaryDeviceId"]
         assert env.devices[dev_id].deviceTypeId == "matterRelay"
-        assert env.devices[dev_id].name == "Office Plug"
+        # The endpoint device carries its role suffix since issue #204 stage 2;
+        # the bare "Office Plug" is the node device's name (ADR-0008 option B).
+        assert env.devices[dev_id].name == "Office Plug - Switch"
 
         # /status now reports the node
         scode, sbody = http.status()

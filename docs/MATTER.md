@@ -282,6 +282,52 @@ A node exposing several capabilities gets several Indigo devices (e.g. a
 multi-sensor becomes one device per measurement); secondary capabilities like
 energy metering and battery merge into the primary device's states.
 
+### One extra device per node — and the node's devices group together
+
+Every Matter device also has a **node device** in Indigo: one per physical
+product, carrying the things that belong to the whole thing rather than to any
+one of its functions — vendor and product, firmware version, whether it is
+reachable, and its battery level where the device says the battery powers the
+whole node.
+
+A node's devices are put in **one Indigo device group** together, node device
+included. So an Aqara FP300 called "Landing sensor" reads as "Landing sensor"
+(the node device) together with "Landing sensor - Motion", "Landing sensor -
+Temperature" and the rest, and a plug called "Office Plug" reads as "Office
+Plug" together with "Office Plug - Switch". Indigo shows the family as one
+group in the device list.
+
+Which device *leads* the group is Indigo's decision, not this plugin's: Indigo
+lists a group's members oldest first, and the oldest one leads. For anything
+you commission from now on that is the node device — it is created before the
+others deliberately, so that it comes out in front. For devices you already had
+before node devices existed, the group is led by whichever of that node's
+devices you have had longest, because nothing can make an existing device
+younger. Either way every device is in the group, which is what makes the
+family show together; and battery level, which Indigo reads from the device
+leading the group, still lands on a device that has one — the node device when
+it leads, and otherwise the sensor or plug whose own battery reading the
+hardware reports.
+
+Devices commissioned before this existed are brought into that shape
+automatically, the first time the plugin reconciles with them — grouped,
+and renamed to match their family. **A device you renamed yourself is never
+renamed**, which sometimes means a name is left slightly out of step with its
+siblings; that is deliberate. The plugin works out what a node's family is
+called by reading the names its existing devices already wear, so one thing is
+worth knowing: if you rename a device to something shaped exactly like the
+names the plugin generates — "Landing sensor - Temperature" — that name counts
+as evidence. When it disagrees with its siblings there is no single answer, and
+the plugin then leaves **every** name on that node alone, including the node
+device's. Nothing of yours is overwritten either way; the automatic renaming
+just stops (grouping and folder tidying still run). Renaming to anything else
+("Hall thermometer") avoids it entirely. If
+you would rather not have the node device at
+all, delete it: it stays deleted, and **Plugins → Matter → Recreate Matter node
+devices…** is the way back. Indigo will not let you delete the device leading a
+group while the group still has members — if that is the node device, ungroup
+it first.
+
 ## Indigo as a Matter bridge — the other direction
 
 Everything up to here is Indigo as a Matter **controller**: other people's Matter
