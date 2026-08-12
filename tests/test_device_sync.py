@@ -65,6 +65,10 @@ class FakeDev:
         self.error = None
         self.errorState = ""
         self.folderId = 0
+        # See replaceOnServer: fail_replace models real Indigo's discard-on-
+        # failure semantics; _name_on_server is the last name Indigo accepted.
+        self.fail_replace = False
+        self._name_on_server = name
         # Issue #190: how many times Indigo was asked to rebuild this device's
         # state list. The question the tests care about is WHEN that is asked
         # for, not what Indigo does next, so the fake only counts.
@@ -94,9 +98,17 @@ class FakeDev:
         self.errorState = value
 
     def replaceOnServer(self):
-        # Real Indigo persists the in-memory edits (name etc.); the fake already
-        # mutated the object in place, so this is a no-op marker.
+        # Real Indigo persists the in-memory edits (name etc.). Production
+        # writes dev.name BEFORE calling this, and real Indigo discards the
+        # in-memory edit on failure — so a failing fake must roll the name
+        # back, or later passes vote on a name Indigo never had (issue #204
+        # verification round). Set fail_replace=True to model failure; do NOT
+        # override this method with a bare raiser.
+        if self.fail_replace:
+            self.name = self._name_on_server
+            raise ValueError("replaceOnServer refused (fail_replace)")
         self.replaced = True
+        self._name_on_server = self.name
 
     def replacePluginPropsOnServer(self, new_props):
         # Real Indigo updates pluginProps and rebuilds device states from Supports*
@@ -161,9 +173,36 @@ class FakeDevices:
 
 
 class FakeDeviceFactory:
+    """Stands in for the ``indigo.device`` command namespace.
+
+    Since issue #204 stage 2 this carries a REAL device-group model rather than
+    recording calls, because two behaviours the plugin now depends on are
+    behaviours, not call counts: ``getGroupList``'s first element is the
+    group's root (documented), and ``indigo.device.delete`` REFUSES to delete
+    the root of a non-empty group (ADR-0008's stated reason for delete_node's
+    children-before-root ordering). A fake that merely recorded
+    ``groupWithDevice`` calls would let both regress silently.
+    """
+
     def __init__(self, devices):
         self.devices = devices
         self.created = []
+        #: dev_id → the group's member list, SHARED by every member; [0] is the
+        #: root. Absent means ungrouped.
+        self.groups = {}
+        #: (dev_1, dev_2) per groupWithDevice call — the idempotence assertion
+        #: is "a second reconcile pass adds none of these".
+        self.group_calls = []
+        self.ungroup_calls = []
+        #: Make the group's root come out as the JOINER rather than the device
+        #: named first. Which end Indigo actually roots is undocumented, so the
+        #: plugin reads the result back and warns; this is how that warning is
+        #: reachable in a test.
+        self.misroot = False
+
+    @staticmethod
+    def _id_of(dev_or_id):
+        return dev_or_id.id if hasattr(dev_or_id, "id") else int(dev_or_id)
 
     def create(self, protocol=None, deviceTypeId="", name="", props=None, folder=0, **kwargs):
         dev = FakeDev(self.devices.next_id(), name, deviceTypeId, dict(props or {}))
@@ -174,12 +213,68 @@ class FakeDeviceFactory:
         return dev
 
     def delete(self, dev):
-        dev_id = dev.id if hasattr(dev, "id") else dev
+        dev_id = self._id_of(dev)
+        members = self.groups.get(dev_id)
+        if members and len(members) > 1 and members[0] == dev_id:
+            raise ValueError(
+                "cannot delete device %s: it is the root of a non-empty device group" % dev_id)
+        self._drop_from_group(dev_id)
         self.devices._by_id.pop(dev_id, None)
 
     def moveToFolder(self, dev_or_id, value=None):
         dev = dev_or_id if hasattr(dev_or_id, "folderId") else self.devices[dev_or_id]
         dev.folderId = value
+
+    # -- the device-group model -----------------------------------------
+    def getGroupList(self, dev_or_id):
+        dev_id = self._id_of(dev_or_id)
+        if dev_id not in self.devices._by_id:
+            # Real Indigo cannot answer for an id that is not a device, and the
+            # plugin's index CAN carry one: plugin.deviceDeleted only prunes
+            # matterNode ids, so a hand-deleted endpoint device leaves a dead
+            # id behind (issue #204 review, fix D). Without this tooth the
+            # grouping sweep looks harmless against a fake that answers anyway.
+            raise ValueError("device %s does not exist" % dev_id)
+        members = self.groups.get(dev_id)
+        # An ungrouped device answers with just itself — the plugin tolerates an
+        # empty list too (both shapes are undocumented; see _ensure_grouped).
+        return list(members) if members else [dev_id]
+
+    def groupWithDevice(self, dev_1, dev_2):
+        first, second = self._id_of(dev_1), self._id_of(dev_2)
+        self.group_calls.append((first, second))
+        existing = self.groups.get(first)
+        members = list(existing or [first])
+        for member in (self.groups.get(second) or [second]):
+            if member not in members:
+                members.append(member)
+        # Misroot only the FIRST join of a fresh group. A rotate-on-every-join
+        # model accidentally rotated the node device back to the root on the
+        # second join, silently self-healing the misroot and hiding the
+        # multi-endpoint N-1-warnings case from the tests (issue #204
+        # verification round). Real Indigo, whichever end it roots, is at
+        # least consistent: adding a member does not change an existing root.
+        if self.misroot and existing is None and len(members) > 1:
+            members = members[1:] + members[:1]
+        for member in members:
+            self.groups[member] = members
+
+    def ungroupDevice(self, dev_or_id):
+        dev_id = self._id_of(dev_or_id)
+        self.ungroup_calls.append(dev_id)
+        self._drop_from_group(dev_id)
+
+    def _drop_from_group(self, dev_id):
+        members = self.groups.pop(dev_id, None)
+        if not members:
+            return
+        remaining = [member for member in members if member != dev_id]
+        for member in remaining:
+            # A group of one is no group at all.
+            if len(remaining) > 1:
+                self.groups[member] = remaining
+            else:
+                self.groups.pop(member, None)
 
 
 @pytest.fixture
@@ -210,7 +305,9 @@ def test_create_from_raw_creates_relay(ds, indigo_env):
     assert result["vendorName"] == "TP-Link"
     dev = devices[dev_id]
     assert dev.deviceTypeId == "matterRelay"
-    assert dev.name == "Office Plug"
+    # Since #204 stage 2 every endpoint device carries its role suffix — the
+    # bare base is the node device's name now (ADR-0008 option B).
+    assert dev.name == "Office Plug - Switch"
     assert dev.pluginProps["nodeId"] == "42"
     assert dev.states["onOffState"] is False
     # index populated
@@ -389,7 +486,7 @@ def test_commission_creates_device_in_room_folder(ds, indigo_env):
     _indigo, devices = indigo_env
     result = ds.create_from_raw(RELAY_NODE, "Office Plug", "Office")
     dev = devices[result["primaryDeviceId"]]
-    assert dev.name == "Office Plug"
+    assert dev.name == "Office Plug - Switch"
     folder = next(f for f in _indigo.devices.folders if f.id == dev.folderId)
     assert folder.name == "Office"
 
@@ -422,7 +519,7 @@ def test_commission_overrides_name_and_room_after_node_added_race(ds, indigo_env
     assert result["primaryDeviceId"] == dev_id
     assert result["indigoDeviceIds"] == [dev_id]
     dev = devices[dev_id]
-    assert dev.name == "Hallway Lamp"
+    assert dev.name == "Hallway Lamp - Switch"
     folder = next(f for f in _indigo.devices.folders if f.id == dev.folderId)
     assert folder.name == "Hallway"
 
@@ -562,7 +659,7 @@ def test_folder_resolution_failure_falls_back_to_folder_0(ds, indigo_env):
 
     result = ds.create_from_raw(RELAY_NODE, "Office Plug", "Office")
     dev = devices[result["primaryDeviceId"]]
-    assert dev.name == "Office Plug"   # still created
+    assert dev.name == "Office Plug - Switch"   # still created
     assert dev.folderId == 0           # degraded gracefully
 
 
@@ -1176,7 +1273,7 @@ def test_list_nodes_groups_devices_per_node(ds, indigo_env):
     assert len(nodes) == 1
     node_id, names = nodes[0]
     assert node_id == 42
-    assert names == ["Office Plug"]
+    assert names == ["Office Plug - Switch"]
 
 
 def test_list_nodes_survives_out_of_band_delete(ds, indigo_env):
@@ -1199,8 +1296,8 @@ def test_list_nodes_orders_multiple_nodes_and_groups_by_node(ds, indigo_env):
     ds.create_from_raw(node7, "Lamp Plug")
     nodes = ds.list_nodes()
     assert [nid for nid, _names in nodes] == [7, 42]
-    assert nodes[0][1] == ["Lamp Plug"]
-    assert nodes[1][1] == ["Office Plug"]
+    assert nodes[0][1] == ["Lamp Plug - Switch"]
+    assert nodes[1][1] == ["Office Plug - Switch"]
 
 
 # ---------------------------------------------------------------------------
@@ -1232,7 +1329,7 @@ def test_list_nodes_includes_empty_bridge_alongside_real_nodes(ds, indigo_env):
     ds.create_from_raw(RELAY_NODE, "Office Plug")
     ds.create_from_raw(EMPTY_BRIDGE_NODE, "")
     nodes = dict(ds.list_nodes())
-    assert nodes[42] == ["Office Plug"]
+    assert nodes[42] == ["Office Plug - Switch"]
     assert nodes[53] == []              # the empty bridge is selectable too
 
 
@@ -3541,7 +3638,7 @@ def test_the_lighting_plug_now_has_NOTHING_to_report(
 def test_the_report_names_the_indigo_device(surveying_ds, indigo_env, mock_logger):
     """The user knows the device by its Indigo name, not by an endpoint number."""
     surveying_ds.create_from_raw(PIR_DELAY_NODE, "Kitchen motion")
-    assert "Kitchen motion (endpoint 1)" in _survey_report(mock_logger)
+    assert "Kitchen motion - Motion (endpoint 1)" in _survey_report(mock_logger)
 
 
 def test_the_report_fires_once_and_not_on_every_reconcile(surveying_ds, indigo_env, mock_logger):
@@ -3752,23 +3849,25 @@ def test_node_device_created_once_evidence_arrives_on_a_later_pass(ds, indigo_en
 
 
 def test_single_endpoint_node_creates_node_device_without_touching_the_relay(ds, indigo_env):
-    """The anti-mass-rename guarantee: adding node-device creation must not
-    rename, re-suffix, or otherwise touch the relay's own identity — and must
-    not flip `multi = len(plan) > 1` for a genuinely single-endpoint node
-    (the most dangerous regression this PR could introduce)."""
+    """The node device must not flip `multi = len(plan) > 1` for a genuinely
+    single-endpoint node (the most dangerous regression stage 1 could have
+    introduced): the relay is named by its ROLE, never by an endpoint number,
+    and never as one of two identical siblings.
+
+    Stage 2 (ADR-0008 option B) is what changed the names here: the relay takes
+    its role suffix and the node device takes the bare base, so the numeric
+    collision suffix stage 1 documented as temporary is gone."""
     _indigo, devices = indigo_env
     evidenced = _with_node_evidence(RELAY_NODE)
     result = ds.create_from_raw(evidenced, "Office Plug")
     relay_id = ds.lookup(42, 1, "matterRelay")
     node_id = result["nodeDeviceId"]
     assert relay_id is not None and node_id is not None and relay_id != node_id
-    # The relay is untouched: bare name, no role suffix, no "(endpoint N)".
-    assert devices[relay_id].name == "Office Plug"
+    assert devices[relay_id].name == "Office Plug - Switch"
+    assert "endpoint" not in devices[relay_id].name
     assert result["indigoDeviceIds"] == [relay_id]        # node device NOT in this list
     assert result["primaryDeviceId"] == relay_id           # untouched — the plug stays primary
-    # The node device claims the same bare base and eats the naming collision
-    # (documented, temporary — the follow-up naming PR trues this up).
-    assert devices[node_id].name == "Office Plug 2"
+    assert devices[node_id].name == "Office Plug"          # bare base, no collision to resolve
 
 
 def test_node_device_adopts_the_folder_of_its_endpoint_siblings(ds, indigo_env):
@@ -4280,3 +4379,562 @@ def test_tombstones_persist_failure_without_logger_still_never_raises():
     t = device_sync_mod.NodeDeviceTombstones(save=boom)
     t.add(42)  # must not raise even with no logger wired
     assert t.is_tombstoned(42)
+
+
+# ===========================================================================
+# issue #204 stage 2 / ADR-0008 option B — grouping + naming/folder true-up
+#
+# The node device becomes the ROOT of its endpoint devices' Indigo device
+# group, every endpoint device takes a role suffix (including a single-endpoint
+# node's one device), and a fielded install is migrated to that shape by the
+# ordinary reconcile path — idempotently, and without ever renaming a device a
+# human named.
+# ===========================================================================
+
+def _group_root(indigo_module, dev_id):
+    """The root of ``dev_id``'s group, or None if it is ungrouped."""
+    group = indigo_module.device.getGroupList(dev_id)
+    return group[0] if group and group[0] != dev_id else None
+
+
+# --- the pure name grammar --------------------------------------------------
+
+def test_generated_base_parses_only_this_plugins_own_suffix_forms():
+    import device_sync as device_sync_mod
+    parse = device_sync_mod._generated_base
+    assert parse("Office Plug - Switch", "Switch") == "Office Plug"
+    assert parse("Patio - Switch 2", "Switch") == "Patio"          # identical siblings
+    assert parse("Weird Thing (endpoint 3)", "") == "Weird Thing"  # unmapped type fallback
+    # A role that is not THIS device's own role is a hand-rename that merely
+    # looks generated — it must not vote (a matterRelay named "- Motion").
+    assert parse("Lamp - Motion", "Switch") is None
+    assert parse("Desk lamp", "Switch") is None                    # bare: no evidence either way
+    assert parse(None, "Switch") is None
+
+
+def test_is_generated_name_covers_every_form_including_the_unique_suffix():
+    import device_sync as device_sync_mod
+    generated = device_sync_mod._is_generated_name
+    assert generated("Office Plug", "Office Plug", "Switch")
+    assert generated("Office Plug 2", "Office Plug", "Switch")     # _unique_name collision
+    assert generated("Office Plug - Switch", "Office Plug", "Switch")
+    assert generated("Office Plug - Switch 3", "Office Plug", "Switch")
+    assert generated("Office Plug (endpoint 1)", "Office Plug", "Switch")
+    assert not generated("Desk lamp", "Office Plug", "Switch")
+    assert not generated("Office Plug - Motion", "Office Plug", "Switch")
+    assert not generated("Office Plug", "", "Switch")              # no base, no verdict
+
+
+# --- fresh commissions ------------------------------------------------------
+
+def test_fresh_single_endpoint_commission_suffixes_and_groups(ds, indigo_env):
+    """The headline shape: the node device holds the bare name and is the
+    group's root; the one endpoint device is named by its role."""
+    _indigo, devices = indigo_env
+    result = ds.create_from_raw(_with_node_evidence(RELAY_NODE), "Office Plug")
+    relay_id = ds.lookup(42, 1, "matterRelay")
+    node_dev_id = result["nodeDeviceId"]
+    assert devices[relay_id].name == "Office Plug - Switch"
+    assert devices[node_dev_id].name == "Office Plug"
+    assert _indigo.device.getGroupList(relay_id)[0] == node_dev_id
+
+
+def test_fresh_multi_endpoint_commission_groups_every_endpoint_device(ds, indigo_env):
+    """Multi-endpoint role suffixes are unchanged by stage 2 — all four AQ
+    devices keep their names AND all four join the node device's group."""
+    _indigo, devices = indigo_env
+    result = ds.create_from_raw(_with_node_evidence(AQ_NODE), "Air Sensor")
+    node_dev_id = result["nodeDeviceId"]
+    assert {devices[d].name for d in result["indigoDeviceIds"]} == {
+        "Air Sensor - Air Quality", "Air Sensor - CO₂",
+        "Air Sensor - PM2.5", "Air Sensor - TVOC",
+    }
+    assert devices[node_dev_id].name == "Air Sensor"
+    for dev_id in result["indigoDeviceIds"]:
+        assert _indigo.device.getGroupList(dev_id)[0] == node_dev_id
+
+
+def test_placeholder_devices_group_under_the_node_device_like_any_sibling(ds, indigo_env):
+    """matterUnknown carries a role label ("Unsupported") and is grouped like
+    every other device on the node — nothing about it is special here."""
+    _indigo, devices = indigo_env
+    result = ds.create_from_raw(_with_node_evidence(UNKNOWN_NODE), "Robot")
+    placeholder_id = ds.lookup(0x50, 1, "matterUnknown")
+    assert devices[placeholder_id].name == "Robot - Unsupported"
+    assert _indigo.device.getGroupList(placeholder_id)[0] == result["nodeDeviceId"]
+
+
+def test_energy_meter_fallback_device_groups_under_the_node_device(ds, indigo_env):
+    _indigo, devices = indigo_env
+    result = ds.create_from_raw(_with_node_evidence(ELECTRICAL_ONLY_NODE), "Mains")
+    meter_id = ds.lookup(0x52, 1, "matterEnergyMeter")
+    assert _indigo.device.getGroupList(meter_id)[0] == result["nodeDeviceId"]
+
+
+# --- the fielded-install migration -----------------------------------------
+
+def _fielded_install(ds, indigo_env, base="Kitchen sensor"):
+    """Reconstruct what a 2026.13.0 install of the FP300-shaped node looks like
+    on disk, then hand back to the caller for ONE migrating reconcile pass.
+
+    Assembled by driving the real code and then mangling the result into the
+    older shape, rather than by hand-building devices: the endpoint devices
+    really were created by a commission pass (role suffixes, a real folder),
+    and the three defects stage 2 heals are then applied exactly as 2026.13.0
+    left them —
+
+    * the node device named from the PRODUCT name, because a reconcile
+      snapshot has no ``suggested_name`` (live finding), with ``nodeBaseName``
+      stamped to match, so the prop is wrong on every fielded install;
+    * the node device in folder 0, because folder adoption landed with the
+      creation path and the devices created before it never got it;
+    * nothing grouped at all — stage 1 grouped nothing, by design.
+    """
+    _indigo, devices = indigo_env
+    ds.create_from_raw(POWER_SOURCE_NODE_WIDE_NODE, base, "Kitchen")
+    temp_id = ds.lookup(0x63, 1, "matterTemperatureSensor")
+    hum_id = ds.lookup(0x63, 2, "matterHumiditySensor")
+    result = ds.create_from_raw(_with_node_evidence(POWER_SOURCE_NODE_WIDE_NODE), "")
+    node_dev_id = result["nodeDeviceId"]
+    node_dev = devices[node_dev_id]
+    node_dev.name = "FP300"                                        # the product name
+    node_dev._name_on_server = "FP300"   # the mangled name IS the on-disk state
+    node_dev.pluginProps = dict(node_dev.pluginProps, nodeBaseName="FP300")
+    node_dev.folderId = 0
+    _indigo.device.groups.clear()
+    _indigo.device.group_calls.clear()
+    return node_dev_id, temp_id, hum_id
+
+
+def test_migration_pass_groups_renames_adopts_folder_and_restamps(ds, indigo_env):
+    """One ordinary reconcile pass over a 2026.13.0 install fixes all four
+    defects at once: grouping, the node device's name, its nodeBaseName prop,
+    and its folder."""
+    _indigo, devices = indigo_env
+    node_dev_id, temp_id, hum_id = _fielded_install(ds, indigo_env)
+
+    ds.create_from_raw(_with_node_evidence(POWER_SOURCE_NODE_WIDE_NODE), "")
+
+    assert devices[node_dev_id].name == "Kitchen sensor"
+    assert devices[node_dev_id].pluginProps["nodeBaseName"] == "Kitchen sensor"
+    assert devices[node_dev_id].folderId == devices[temp_id].folderId != 0
+    assert devices[temp_id].name == "Kitchen sensor - Temperature"   # already canonical
+    assert devices[hum_id].name == "Kitchen sensor - Humidity"
+    for dev_id in (temp_id, hum_id):
+        assert _indigo.device.getGroupList(dev_id)[0] == node_dev_id
+
+
+def test_second_migration_pass_does_nothing_at_all(ds, indigo_env, mock_logger):
+    """Idempotence, counted rather than inferred: the pass after the migrating
+    one must make ZERO grouping calls, change no name, and say NOTHING. The
+    silence is load-bearing — a settled install reconciles on every reconnect,
+    so anything said here is said forever."""
+    _indigo, devices = indigo_env
+    node_dev_id, temp_id, hum_id = _fielded_install(ds, indigo_env)
+    ds.create_from_raw(_with_node_evidence(POWER_SOURCE_NODE_WIDE_NODE), "")
+    before = {d.id: d.name for d in devices}
+    _indigo.device.group_calls.clear()
+    for dev in devices:
+        dev.replaced_props = False
+    mock_logger.warning.reset_mock()
+
+    ds.create_from_raw(_with_node_evidence(POWER_SOURCE_NODE_WIDE_NODE), "")
+
+    assert _indigo.device.group_calls == []
+    assert {d.id: d.name for d in devices} == before
+    assert not any(dev.replaced_props for dev in devices), \
+        "a settled node device must not be restamped (a props write costs a comm restart)"
+    # Kills the mutation that drops _ensure_grouped's already-grouped
+    # short-circuit: re-grouping an already-grouped device warns rather than
+    # crashing, so the name/props assertions above would all still pass.
+    assert mock_logger.warning.call_args_list == []
+
+
+def test_migration_renames_a_bare_product_named_endpoint_device(ds, indigo_env):
+    """The pre-stage-2 single-endpoint form: one device wearing the bare
+    PRODUCT name, which is provably a name this plugin wrote."""
+    _indigo, devices = indigo_env
+    ds.create_from_raw(RELAY_NODE, "")                 # non-authoritative: product name
+    relay_id = ds.lookup(42, 1, "matterRelay")
+    devices[relay_id].name = "Tapo P125M"              # the pre-stage-2 bare form
+
+    result = ds.create_from_raw(_with_node_evidence(RELAY_NODE), "")
+
+    assert devices[relay_id].name == "Tapo P125M - Switch"
+    assert devices[result["nodeDeviceId"]].name == "Tapo P125M"
+    assert _indigo.device.getGroupList(relay_id)[0] == result["nodeDeviceId"]
+
+
+def test_a_bare_user_named_single_endpoint_device_is_left_alone(ds, indigo_env):
+    """The deliberate limitation, stated as a test: on a node whose ONLY
+    device wears a bare name that is neither the product name nor a suffixed
+    form, "the user renamed it" and "this plugin named it at commission time"
+    are indistinguishable — so nothing is renamed, and the node device takes
+    the collision suffix instead. Never renaming a hand-renamed device wins."""
+    _indigo, devices = indigo_env
+    ds.create_from_raw(RELAY_NODE, "")
+    relay_id = ds.lookup(42, 1, "matterRelay")
+    devices[relay_id].name = "Desk lamp"
+
+    result = ds.create_from_raw(_with_node_evidence(RELAY_NODE), "")
+
+    assert devices[relay_id].name == "Desk lamp"
+    # ...and it is still grouped: grouping is not conditional on naming.
+    assert _indigo.device.getGroupList(relay_id)[0] == result["nodeDeviceId"]
+
+
+def test_hand_renamed_endpoint_device_is_never_renamed(ds, indigo_env):
+    """One child of a family renamed by hand: its siblings still derive the
+    family base and are trued up, and it is not touched."""
+    _indigo, devices = indigo_env
+    node_dev_id, temp_id, hum_id = _fielded_install(ds, indigo_env)
+    devices[hum_id].name = "Desk lamp"
+    devices[temp_id].name = "Kitchen sensor - Temperature 9"   # a generated form
+
+    ds.create_from_raw(_with_node_evidence(POWER_SOURCE_NODE_WIDE_NODE), "")
+
+    assert devices[hum_id].name == "Desk lamp"
+    assert devices[temp_id].name == "Kitchen sensor - Temperature"
+    assert devices[node_dev_id].name == "Kitchen sensor"
+
+
+def test_a_node_with_no_derivable_base_renames_nothing_and_logs_debug(ds, indigo_env, mock_logger):
+    """Two siblings whose generated-looking names disagree: there is no single
+    family base, so every name — including the node device's — is left alone.
+
+    There is deliberately no separate "majority wins" test: the votes are
+    collected into a SET, so N devices agreeing on "Alpha" and one saying
+    "Beta" is the same two-element set as one-vs-one. Any N-vs-1 case IS this
+    case by construction."""
+    _indigo, devices = indigo_env
+    node_dev_id, temp_id, hum_id = _fielded_install(ds, indigo_env)
+    devices[temp_id].name = "Alpha - Temperature"
+    devices[hum_id].name = "Beta - Humidity"
+    mock_logger.debug.reset_mock()
+
+    ds.create_from_raw(_with_node_evidence(POWER_SOURCE_NODE_WIDE_NODE), "")
+
+    assert devices[temp_id].name == "Alpha - Temperature"
+    assert devices[hum_id].name == "Beta - Humidity"
+    assert devices[node_dev_id].name == "FP300"
+    assert devices[node_dev_id].pluginProps["nodeBaseName"] == "FP300"
+    assert any("no single family base" in str(call.args)
+               for call in mock_logger.debug.call_args_list)
+    # The folder heal is independent of any name evidence and still happens.
+    assert devices[node_dev_id].folderId == devices[temp_id].folderId != 0
+
+
+def test_recreated_endpoint_device_takes_the_derived_family_base(ds, indigo_env):
+    """The live ALPSTUGA regression: a device deleted by hand comes back on the
+    next reconcile named from the PRODUCT name ("FP300 - Humidity") beside
+    siblings called "Kitchen sensor - …", because a reconcile snapshot carries
+    no suggested_name. It must come back into the family instead."""
+    _indigo, devices = indigo_env
+    node_dev_id, temp_id, hum_id = _fielded_install(ds, indigo_env)
+    ds.create_from_raw(_with_node_evidence(POWER_SOURCE_NODE_WIDE_NODE), "")
+    # The user deletes a GROUPED endpoint device in the UI. Indigo is assumed to
+    # ungroup-and-delete (undocumented — see the fake's delete): a non-root
+    # member simply goes, and the group survives without it.
+    _indigo.device.delete(devices[hum_id])
+    assert _indigo.device.getGroupList(temp_id)[0] == node_dev_id
+
+    ds.reconcile_all([_with_node_evidence(POWER_SOURCE_NODE_WIDE_NODE)])
+
+    recreated = ds.lookup(0x63, 2, "matterHumiditySensor")
+    assert recreated is not None and recreated != hum_id
+    assert devices[recreated].name == "Kitchen sensor - Humidity"
+    assert _indigo.device.getGroupList(recreated)[0] == node_dev_id
+
+
+def test_a_taken_canonical_name_never_starts_a_rename_ping_pong(ds, indigo_env):
+    """issue #204 review, fix A. When the canonical name belongs to something
+    else — a foreign device, a second node of the same product — _apply_identity
+    substitutes "<target> 2", and _is_generated_name's "{base} \\d+" arm re-admits
+    THAT on the next pass, whose substitute is "<target> 3"… one real rename per
+    reconcile, for as long as the plugin runs. Counted, not inferred: neither
+    pass may rename anything at all."""
+    _indigo, devices = indigo_env
+    node_dev_id, temp_id, hum_id = _fielded_install(ds, indigo_env)
+    # A generated form, so the hand-rename gate lets the true-up through...
+    devices[hum_id].name = "Kitchen sensor - Humidity 2"
+    # ...but the name it wants is a non-Matter device's.
+    _indigo.device.create(deviceTypeId="other", name="Kitchen sensor - Humidity")
+
+    snapshots = []
+    for _pass in range(2):
+        for dev in devices:
+            dev.replaced = False
+        ds.create_from_raw(_with_node_evidence(POWER_SOURCE_NODE_WIDE_NODE), "")
+        snapshots.append({d.id: d.name for d in devices})
+        assert not devices[hum_id].replaced, "no rename may even be attempted"
+
+    assert snapshots[0][hum_id] == "Kitchen sensor - Humidity 2"
+    assert snapshots[0] == snapshots[1]
+
+
+def test_a_refused_rename_never_advances_nodeBaseName(ds, indigo_env, mock_logger):
+    """issue #204 review, fix B. _apply_identity catches and warns its own
+    failures, so a refused replaceOnServer used to leave the node device wearing
+    the old name with nodeBaseName already stamped to the new base — after which
+    _is_generated_name never matches again and the device is stuck under the
+    wrong name permanently, silently. The prop must follow the rename, not
+    precede it, so that a later pass can retry."""
+    _indigo, devices = indigo_env
+    node_dev_id, temp_id, hum_id = _fielded_install(ds, indigo_env)
+    node_dev = devices[node_dev_id]
+
+    # fail_replace gives real-Indigo semantics (discard-on-failure) from the
+    # fake itself — no per-test compensation stub to forget.
+    node_dev.fail_replace = True
+
+    ds.create_from_raw(_with_node_evidence(POWER_SOURCE_NODE_WIDE_NODE), "")
+    ds.create_from_raw(_with_node_evidence(POWER_SOURCE_NODE_WIDE_NODE), "")
+
+    assert node_dev.name == "FP300"
+    assert node_dev.pluginProps["nodeBaseName"] == "FP300"
+    # ...and the failure is said ONCE across both passes (fix E): a true-up
+    # repeats on every reconnect, and the grouping side's dedup exists for
+    # exactly this.
+    assert sum("could not rename device" in str(call.args)
+               for call in mock_logger.warning.call_args_list) == 1
+
+    node_dev.fail_replace = False           # the server heals
+
+    ds.create_from_raw(_with_node_evidence(POWER_SOURCE_NODE_WIDE_NODE), "")
+
+    assert node_dev.name == "Kitchen sensor"
+    assert node_dev.pluginProps["nodeBaseName"] == "Kitchen sensor"
+
+
+def test_a_hand_renamed_node_device_is_left_alone_and_not_restamped(ds, indigo_env):
+    """A node device the user renamed is like any other hand-renamed device —
+    and its nodeBaseName is not quietly restamped behind it either: a props
+    write costs the device a comm restart, and the rename that prop exists to
+    unlock is the very thing being declined. Folder adoption is independent
+    evidence and still runs."""
+    _indigo, devices = indigo_env
+    node_dev_id, temp_id, hum_id = _fielded_install(ds, indigo_env)
+    devices[node_dev_id].name = "My Renamed Hub"
+    devices[node_dev_id].replaced_props = False
+
+    ds.create_from_raw(_with_node_evidence(POWER_SOURCE_NODE_WIDE_NODE), "")
+
+    assert devices[node_dev_id].name == "My Renamed Hub"
+    assert devices[node_dev_id].pluginProps["nodeBaseName"] == "FP300"
+    assert not devices[node_dev_id].replaced_props
+    assert devices[node_dev_id].folderId == devices[temp_id].folderId != 0
+    # The siblings' own true-up is unaffected — the family base is theirs.
+    assert devices[temp_id].name == "Kitchen sensor - Temperature"
+
+
+# --- grouping mechanics -----------------------------------------------------
+
+def test_a_user_built_group_is_left_alone_and_warned_once(ds, indigo_env, mock_logger):
+    """A group the user built (its root is something else entirely) is never
+    re-parented — and the warning about it does not nag once per reconnect."""
+    _indigo, devices = indigo_env
+    ds.create_from_raw(RELAY_NODE, "")
+    relay_id = ds.lookup(42, 1, "matterRelay")
+    foreign = _indigo.device.create(deviceTypeId="other", name="Someone else's device")
+    _indigo.device.groupWithDevice(foreign.id, relay_id)   # user groups them, foreign is root
+    _indigo.device.group_calls.clear()
+
+    ds.create_from_raw(_with_node_evidence(RELAY_NODE), "")
+    ds.create_from_raw(_with_node_evidence(RELAY_NODE), "")
+
+    assert _indigo.device.getGroupList(relay_id)[0] == foreign.id
+    # No grouping call was even attempted for it (the call is (root, joiner)).
+    assert _indigo.device.group_calls == []
+    assert sum("already in a device group" in str(call.args)
+               for call in mock_logger.warning.call_args_list) == 1
+
+
+def test_an_empty_group_list_is_treated_as_ungrouped(ds, indigo_env):
+    """Indigo's answer for an UNGROUPED device is undocumented — [dev_id] is
+    what the fake models, but an empty list must not be mistaken for a group
+    the plugin has to leave alone."""
+    _indigo, devices = indigo_env
+    real_get = _indigo.device.getGroupList
+    calls = {"n": 0}
+
+    def empty_then_real(dev_or_id):
+        calls["n"] += 1
+        return [] if calls["n"] == 1 else real_get(dev_or_id)
+
+    _indigo.device.getGroupList = empty_then_real
+    try:
+        result = ds.create_from_raw(_with_node_evidence(RELAY_NODE), "Office Plug")
+    finally:
+        _indigo.device.getGroupList = real_get
+    relay_id = ds.lookup(42, 1, "matterRelay")
+    assert _indigo.device.getGroupList(relay_id)[0] == result["nodeDeviceId"]
+
+
+def test_group_root_verification_warns_when_indigo_roots_the_wrong_end(ds, indigo_env, mock_logger):
+    """WHICH device becomes the root of a freshly-made group is not documented
+    anywhere, so the result is read back rather than assumed. If Indigo roots
+    the joiner, the batteryLevel-on-the-root behaviour the node device exists
+    for is silently wrong — so it must be said out loud."""
+    _indigo, devices = indigo_env
+    _indigo.device.misroot = True
+    ds.create_from_raw(_with_node_evidence(RELAY_NODE), "Office Plug")
+    assert any("group's root" in str(call.args)
+               for call in mock_logger.warning.call_args_list)
+
+
+def test_the_pass_after_a_misroot_says_what_actually_happened(ds, indigo_env, mock_logger):
+    """issue #204 review, fix C. Once Indigo has rooted the wrong end, every
+    LATER pass finds a group of two that is not rooted at the node device — and
+    the foreign-group branch would blame the user for it, in a message where
+    group[0] can be the device itself ("device 5678 … rooted at 5678"). The
+    plugin built this group; it has to own it."""
+    _indigo, devices = indigo_env
+    _indigo.device.misroot = True
+    ds.create_from_raw(_with_node_evidence(RELAY_NODE), "Office Plug")
+    mock_logger.warning.reset_mock()
+
+    ds.create_from_raw(_with_node_evidence(RELAY_NODE), "")
+    ds.create_from_raw(_with_node_evidence(RELAY_NODE), "")
+
+    messages = [str(call.args) for call in mock_logger.warning.call_args_list]
+    assert not any("already in a device group" in message for message in messages)
+    assert sum("read from the wrong end" in message for message in messages) == 1
+
+
+def test_a_misrooted_multi_endpoint_group_never_gets_the_foreign_warning(ds, indigo_env, mock_logger):
+    """issue #204 verification round: on a multi-endpoint node a misrooted
+    group has 3+ members, and a len()==2 guard let every later pass fall
+    into the foreign branch — N-1 self-referential warnings ("rooted at
+    5678" about device 5678) on exactly the FP300-shaped nodes the docs
+    lead with. The misroot message must claim the whole family."""
+    _indigo, devices = indigo_env
+    _indigo.device.misroot = True
+    ds.create_from_raw(_with_node_evidence(POWER_SOURCE_NODE_WIDE_NODE), "Kitchen sensor")
+    mock_logger.warning.reset_mock()
+
+    ds.create_from_raw(_with_node_evidence(POWER_SOURCE_NODE_WIDE_NODE), "")
+    ds.create_from_raw(_with_node_evidence(POWER_SOURCE_NODE_WIDE_NODE), "")
+
+    messages = [str(call.args) for call in mock_logger.warning.call_args_list]
+    assert not any("already in a device group" in message for message in messages)
+    # One accurate warning per grouped device, once — never the foreign nag.
+    assert 1 <= sum("read from the wrong end" in m for m in messages) <= 2
+
+
+def test_an_endpoint_device_deleted_by_hand_is_not_a_warning(ds, indigo_env, mock_logger):
+    """issue #204 review, fix D. plugin.deviceDeleted only prunes matterNode
+    ids, so a hand-deleted ENDPOINT device leaves a dead id in the index.
+    This test pins the EXISTENCE PRE-CHECK in the to_group collection: the
+    dead id is skipped before _ensure_grouped ever runs, so no getGroupList
+    read is attempted for it and nothing warns. (The getGroupList-failure
+    demotion itself is pinned separately by the next test — a refactor
+    removing either half fails one of the pair.)"""
+    _indigo, devices = indigo_env
+    result = ds.create_from_raw(_with_node_evidence(AQ_NODE), "Air Sensor")
+    victim = result["indigoDeviceIds"][0]
+    _indigo.device.delete(devices[victim])
+    mock_logger.warning.reset_mock()
+
+    ds.create_from_raw(_with_node_evidence(AQ_NODE), "")
+
+    assert mock_logger.warning.call_args_list == []
+
+
+def test_an_unreadable_device_group_is_debug_not_a_warning(ds, indigo_env, mock_logger):
+    """The read failure itself is demoted as well (fix D). The identical
+    condition in _derive_family_base has always been debug, and "Indigo would
+    not tell me this device's group" is not something a user can act on."""
+    _indigo, devices = indigo_env
+
+    def boom(_dev_or_id):
+        raise RuntimeError("no such device")
+    _indigo.device.getGroupList = boom
+    mock_logger.warning.reset_mock()
+
+    ds.create_from_raw(_with_node_evidence(RELAY_NODE), "Office Plug")
+
+    assert mock_logger.warning.call_args_list == []
+    assert any("could not read the device group" in str(call.args)
+               for call in mock_logger.debug.call_args_list)
+
+
+def test_a_grouping_failure_never_sinks_the_pass(ds, indigo_env, mock_logger):
+    """The docs warn twice against grouping while a device or device-factory
+    dialog is open, and a plugin cannot detect either — so a refusal has to be
+    a log line, not an exception out of create_devices."""
+    _indigo, devices = indigo_env
+
+    def boom(_a, _b):
+        raise RuntimeError("a device dialog is open")
+    _indigo.device.groupWithDevice = boom
+
+    result = ds.create_from_raw(_with_node_evidence(RELAY_NODE), "Office Plug")
+    assert result["nodeDeviceId"] is not None
+    assert ds.lookup(42, 1, "matterRelay") is not None
+    assert any("could not group device" in str(call.args)
+               for call in mock_logger.warning.call_args_list)
+
+
+def test_grouping_leaves_the_index_and_the_orphan_sweep_alone(ds, indigo_env):
+    """Grouping is Indigo-side metadata, not index state: a rebuild from
+    pluginProps must find exactly the same devices, and a healthy reconcile
+    must still clear rather than orphan them."""
+    _indigo, devices = indigo_env
+    evidenced = _with_node_evidence(POWER_SOURCE_NODE_WIDE_NODE)
+    result = ds.create_from_raw(evidenced, "Kitchen sensor")
+    before = dict(ds._index)
+
+    ds.rebuild_index()
+    assert dict(ds._index) == before
+
+    ds.reconcile_all([evidenced])
+    assert dict(ds._index) == before
+    for dev_id in result["indigoDeviceIds"] + [result["nodeDeviceId"]]:
+        assert devices[dev_id].errorState == ""
+
+
+# --- deletion, with the group real -----------------------------------------
+
+def test_delete_node_empties_the_group_before_deleting_its_root(ds, indigo_env):
+    """End to end against a fake that REFUSES to delete the root of a
+    non-empty group, exactly as Indigo does (ADR-0008): delete_node's
+    children-before-root ordering is now load-bearing, not defensive."""
+    _indigo, devices = indigo_env
+    result = ds.create_from_raw(_with_node_evidence(AQ_NODE), "Air Sensor")
+    node_dev_id = result["nodeDeviceId"]
+    assert _indigo.device.groups, "the group must actually exist for this to prove anything"
+
+    deleted = ds.delete_node(0x1E)
+
+    assert set(deleted) == set(result["indigoDeviceIds"]) | {node_dev_id}
+    assert deleted[-1] == node_dev_id
+    assert _indigo.device.groups == {}
+    assert not devices._by_id
+
+
+def test_deleting_the_root_first_is_what_the_fake_refuses(ds, indigo_env):
+    """The fake's teeth, asserted directly — otherwise the test above could
+    pass against a fake that refuses nothing."""
+    _indigo, devices = indigo_env
+    result = ds.create_from_raw(_with_node_evidence(RELAY_NODE), "Office Plug")
+    with pytest.raises(ValueError):
+        _indigo.device.delete(devices[result["nodeDeviceId"]])
+
+
+def test_ungroup_then_user_delete_still_tombstones_the_node(ds, indigo_env):
+    """With grouping live, the realistic route to a hand-deleted node device is
+    ungroup-then-delete (Indigo refuses to delete a non-empty group's root).
+    That still has to reach deviceDeleted and still has to tombstone."""
+    _indigo, devices = indigo_env
+    import device_sync as device_sync_mod
+    ds.node_tombstones = device_sync_mod.NodeDeviceTombstones()
+    evidenced = _with_node_evidence(RELAY_NODE)
+    result = ds.create_from_raw(evidenced, "Office Plug")
+    node_dev_id = result["nodeDeviceId"]
+
+    _indigo.device.ungroupDevice(node_dev_id)      # the user ungroups it first
+    _indigo.device.delete(devices[node_dev_id])    # ...then deletes it
+    ds.note_node_device_deleted(42, node_dev_id)   # plugin.deviceDeleted's route
+
+    assert ds.node_tombstones.is_tombstoned(42)
+    assert ds.create_from_raw(evidenced, "Office Plug")["nodeDeviceId"] is None

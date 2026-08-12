@@ -282,6 +282,40 @@ A node exposing several capabilities gets several Indigo devices (e.g. a
 multi-sensor becomes one device per measurement); secondary capabilities like
 energy metering and battery merge into the primary device's states.
 
+### One extra device per node — and it's the group's root
+
+Every Matter device also has a **node device** in Indigo: one per physical
+product, carrying the things that belong to the whole thing rather than to any
+one of its functions — vendor and product, firmware version, whether it is
+reachable, and its battery level where the device says the battery powers the
+whole node.
+
+That node device is the **root of an Indigo device group**, and the node's other
+devices are its members. So an Aqara FP300 called "Landing sensor" reads as
+"Landing sensor" (the node device) with "Landing sensor - Motion", "Landing
+sensor - Temperature" and the rest grouped under it, and a plug called "Office
+Plug" reads as "Office Plug" with "Office Plug - Switch" under it. Indigo shows
+the group together, and root-only properties like battery level land where
+Indigo expects to find them.
+
+Devices commissioned before this existed are brought into that shape
+automatically, the first time the plugin reconciles with them — grouped,
+and renamed to match their family. **A device you renamed yourself is never
+renamed**, which sometimes means a name is left slightly out of step with its
+siblings; that is deliberate. The plugin works out what a node's family is
+called by reading the names its existing devices already wear, so one thing is
+worth knowing: if you rename a device to something shaped exactly like the
+names the plugin generates — "Landing sensor - Temperature" — that name counts
+as evidence. When it disagrees with its siblings there is no single answer, and
+the plugin then leaves **every** name on that node alone, including the node
+device's. Nothing of yours is overwritten either way; the automatic renaming
+just stops (grouping and folder tidying still run). Renaming to anything else
+("Hall thermometer") avoids it entirely. If
+you would rather not have the node device at
+all, delete it: it stays deleted, and **Plugins → Matter → Recreate Matter node
+devices…** is the way back. Indigo will not let you delete a group's root while
+the group still has members, so ungroup it first.
+
 ## Indigo as a Matter bridge — the other direction
 
 Everything up to here is Indigo as a Matter **controller**: other people's Matter

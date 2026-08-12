@@ -245,6 +245,19 @@ def test_matter_node_is_the_only_type_with_allowUserCreation_false():
         f"expected only matterNode to carry allowUserCreation=\"false\", got {no_creation}")
 
 
+def test_every_endpoint_device_type_has_a_role_label():
+    """Issue #204 stage 2: an endpoint device's name is "<base> - <Role>", and
+    the bare base is the NODE device's name. A type missing from
+    ``_ROLE_LABELS`` silently falls back to the bare base on a single-endpoint
+    node and then collides with its own node device — so a new device class
+    shipping without a label must fail here, not in the field."""
+    import device_sync
+    root = ET.parse(SERVER_PLUGIN / "Devices.xml").getroot()
+    declared = {dev.get("id") for dev in root.findall("Device")} - {"matterNode"}
+    missing = sorted(declared - set(device_sync._ROLE_LABELS))
+    assert not missing, f"device types with no role suffix in _ROLE_LABELS: {missing}"
+
+
 def test_matter_node_configui_has_the_identity_fields():
     fields = _device_config_fields("matterNode")
     for field_id in ("nodeId", "endpointId", "vendorName", "productName", "softwareVersion"):

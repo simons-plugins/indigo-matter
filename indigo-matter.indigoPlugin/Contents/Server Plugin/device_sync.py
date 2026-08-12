@@ -22,6 +22,7 @@ runs on the commissioning/Indigo thread, not the loop.)
 from __future__ import annotations
 
 import json
+import re
 import threading
 from typing import Any, Callable, Optional
 
@@ -108,12 +109,18 @@ _ELECTRICAL_MERGE_CLUSTERS = frozenset({
 DEVICE_TYPE_AGGREGATOR = 0x000E
 
 
-#: Friendly role suffix per Indigo device type, used to name the individual
-#: devices of a multi-function node.  A HomePod exposing temperature + humidity
-#: becomes "<name> - Temperature" / "<name> - Humidity" rather than the opaque
+#: Friendly role suffix per Indigo device type, used to name a node's endpoint
+#: devices.  A HomePod exposing temperature + humidity becomes
+#: "<name> - Temperature" / "<name> - Humidity" rather than the opaque
 #: "<name> (endpoint 1)".  Endpoint-number naming is kept only as the fallback
 #: for a type absent from this map, and to disambiguate genuinely identical
 #: siblings (e.g. four outlets on one strip — see create_devices).
+#:
+#: Since issue #204 stage 2 (ADR-0008 option B) EVERY endpoint device takes its
+#: role suffix, including the sole device of a single-endpoint node: the node
+#: device is what now carries the bare base name, so "Office Plug" (the node)
+#: and "Office Plug - Switch" (the relay) read as a family instead of
+#: colliding over one name and being told apart by a numeric suffix.
 _ROLE_LABELS = {
     "matterRelay": "Switch",
     "matterDimmer": "Dimmer",
@@ -139,6 +146,61 @@ _ROLE_LABELS = {
     "matterEnergyMeter": "Energy",
     "matterUnknown": "Unsupported",
 }
+
+
+#: A trailing "(endpoint N)" — the pre-role naming fallback, still generated for
+#: a type absent from _ROLE_LABELS on a multi-endpoint node.
+_ENDPOINT_SUFFIX_RE = re.compile(r" \(endpoint \d+\)$")
+
+
+def _generated_base(name: Any, role: str) -> Optional[str]:
+    """The base a plugin-generated endpoint-device name was built FROM, or None.
+
+    The inverse of ``create_devices``' naming rules, and deliberately only of
+    the *suffixed* ones — a bare name carries no evidence of who wrote it, so
+    it is not parsed here (see ``_derive_family_base``, which admits a bare
+    name only when it matches a base it already knows).
+
+    Recognised: ``"<base> - <Role>"``, ``"<base> - <Role> <n>"`` (the identical-
+    siblings form, and equally the numeric suffix ``_unique_name`` adds on a
+    collision — indistinguishable, and both mean the same thing here) and
+    ``"<base> (endpoint <n>)"``.
+
+    ``role`` is the label of the device's OWN Indigo type, not any role: a
+    matterRelay named "Lamp - Motion" is a hand-rename that happens to look
+    generated, and admitting it would let one such name steer the whole
+    family's true-up (issue #204 stage 2).
+    """
+    if not isinstance(name, str) or not name:
+        return None
+    stripped = _ENDPOINT_SUFFIX_RE.sub("", name)
+    if stripped != name:
+        return stripped or None
+    if role:
+        match = re.fullmatch(rf"(?P<base>.+) - {re.escape(role)}(?: \d+)?", name)
+        if match:
+            return match.group("base")
+    return None
+
+
+def _is_generated_name(name: Any, base: str, role: str) -> bool:
+    """Whether ``name`` is a name THIS plugin would have generated from ``base``.
+
+    The gate on every rename in the stage-2 true-up: a device whose name is not
+    one of these forms was named by a human and is never touched (issue #204 —
+    "NEVER rename a hand-renamed device"). Covers the bare base (the pre-stage-2
+    single-endpoint form, and the node device's own form), any of the suffixed
+    forms ``_generated_base`` parses, and ``_unique_name``'s numeric suffix on
+    top of either.
+    """
+    if not isinstance(name, str) or not base:
+        return False
+    if name == base or re.fullmatch(rf"{re.escape(base)} \d+", name):
+        return True
+    if role and (name == f"{base} - {role}"
+                 or re.fullmatch(rf"{re.escape(base)} - {re.escape(role)} \d+", name)):
+        return True
+    return bool(re.fullmatch(rf"{re.escape(base)} \(endpoint \d+\)", name))
 
 
 def _kvlist(states: dict) -> list:
@@ -438,6 +500,14 @@ class DeviceSync:
         # immediately when its own delete raises, so a marked-but-never-
         # deleted id can never swallow a LATER genuine user deletion.
         self._self_deleted_ids: set[int] = set()
+        # (dev_id, kind) pairs already warned about by _ensure_grouped (issue
+        # #204 stage 2). Grouping is attempted on EVERY create/reconcile pass —
+        # that repetition IS the migration, and it is what makes the operation
+        # idempotent without a version stamp — so an unguarded warning would
+        # nag once per WS reconnect for the lifetime of the plugin run. Same
+        # per-run-only discipline as _battery_exclusion_warned: a restart is
+        # free to say it again, because a restart is when a user is looking.
+        self._group_warned: set[tuple[int, str]] = set()
 
     # ------------------------------------------------------------------
     # Active-device tracking (deviceStartComm/deviceStopComm)
@@ -572,11 +642,11 @@ class DeviceSync:
 
         Deletion is ORDERED: every non-``matterNode`` device for this node
         first, its ``matterNode`` device (if any) last. ``indigo.device.delete``
-        refuses to delete the root of a non-empty Indigo device group, and the
-        node device is that root's intended occupant (ADR-0008) — harmless
-        today (no grouping exists yet), but load-bearing the moment the
-        grouping follow-up PR lands, so the ordering is established here
-        rather than left for that PR to discover the hard way.
+        refuses to delete the root of a non-empty Indigo device group, and
+        since issue #204 stage 2 the node device genuinely IS that root
+        (ADR-0008 option B) — so this ordering, established defensively in
+        stage 1, is now load-bearing: reverse it and a decommission leaves the
+        node device behind on every grouped node.
         """
         target = int(node_id)
         with self._lock:
@@ -650,8 +720,17 @@ class DeviceSync:
         Endpoint devices deliberately do NOT get this treatment: they are
         cluster-derived, so deleting one is corrected by the next reconcile
         (issue #45's self-heal) — that is existing, expected behaviour this
-        method does not change. Only the node device is synthetic enough that
-        its deletion has to be honoured rather than healed.
+        method does not change (and since stage 2 the recreated device rejoins
+        the node device's group, and is named from the family base rather than
+        the product name). Only the node device is synthetic enough that its
+        deletion has to be honoured rather than healed.
+
+        Since stage 2 the node device is the ROOT of a non-empty group for
+        most nodes, and ``indigo.device.delete`` refuses to delete such a root
+        — so the realistic route to here is the user ungrouping it first and
+        then deleting it, which still lands in ``deviceDeleted`` and still
+        tombstones. (A node whose only device is the node device — every
+        endpoint device already deleted — deletes directly.)
 
         ``dev_id`` (issue #204 review, fix A) is what tells a genuine user
         deletion apart from ``delete_node`` deleting its own node device as
@@ -926,6 +1005,14 @@ class DeviceSync:
             # column (the grouping Indigo offers short of a Device Factory).
             model = node.product_name or node.vendor_name or ""
             folder_id = self._resolve_folder_id(suggested_room) if authoritative else 0
+            # The base name this node's EXISTING Indigo devices already agree
+            # on (issue #204 stage 2) — what the user called this thing, which
+            # a NON-authoritative pass has no other way of knowing: reconcile
+            # parses the node with an empty suggested_name, so every spec below
+            # falls back to the product name. Only consulted on a
+            # non-authoritative pass; a commission/room pass carries the user's
+            # choice in spec.name already and _apply_identity stamps it.
+            derived_base = None if authoritative else self._derive_family_base(node)
             # Pre-compute the FULL set of planned device_type_ids per endpoint so
             # _prime_states can identify merge-into handlers correctly regardless
             # of creation order.  (The index is built incrementally, so checking
@@ -942,9 +1029,16 @@ class DeviceSync:
                 #   - Authoritative pass (user-chosen name in suggested_name):
                 #     use spec.name (already encodes suggested_name); still skip
                 #     the suffix — bridged children have unique identities.
-                # For non-bridged endpoints the suffix is applied for multi-endpoint
-                # nodes exactly as before.
+                # Every OTHER endpoint device is named "<base> - <Role>" since
+                # issue #204 stage 2, single-endpoint nodes included.
                 bridge_label = endpoint.node_label or endpoint.product_name
+                # A bridged child names itself; everything else is named from
+                # the family base — the derived one when this pass found one
+                # (issue #204 stage 2: it is what recreating a deleted device
+                # under the family's own name depends on), the spec's own
+                # otherwise.
+                base = spec.name if bridge_label or not derived_base else derived_base
+                role = _ROLE_LABELS.get(spec.device_type_id, "")
                 if bridge_label:
                     # TODO(#43): on an authoritative pass, spec.name (the user's
                     # chosen bridge name) overwrites each child's own NodeLabel,
@@ -952,20 +1046,24 @@ class DeviceSync:
                     # per-bulb names the user set in the bridge app.  Issue #43
                     # tracks the fix (prefix or bridge-only authoritative stamp).
                     name = spec.name if authoritative else bridge_label
-                elif multi:
+                elif role and role_counts.get(role, 0) > 1:
+                    # Genuinely identical siblings (four outlets on one strip):
+                    # the role alone cannot tell them apart, so the endpoint
+                    # number does.
+                    name = f"{base} - {role} {endpoint.endpoint_id}"
+                elif role:
                     # Name by the device's function ("- Temperature"), not its
                     # Matter endpoint number, which is meaningless to the user.
-                    # Fall back to the endpoint suffix only for identical
-                    # siblings or an unmapped type.
-                    role = _ROLE_LABELS.get(spec.device_type_id, "")
-                    if role and role_counts.get(role, 0) > 1:
-                        name = f"{spec.name} - {role} {endpoint.endpoint_id}"
-                    elif role:
-                        name = f"{spec.name} - {role}"
-                    else:
-                        name = f"{spec.name} (endpoint {endpoint.endpoint_id})"
+                    # Since #204 stage 2 this is NOT conditional on `multi`: a
+                    # single-endpoint node's one device is suffixed too, because
+                    # the node device is what holds the bare base now.
+                    name = f"{base} - {role}"
+                elif multi:
+                    # Unmapped type on a multi-device node — nothing to name it
+                    # by but its endpoint.
+                    name = f"{base} (endpoint {endpoint.endpoint_id})"
                 else:
-                    name = spec.name
+                    name = base
                 ep_key = (int(node.node_id), int(endpoint.endpoint_id))
                 type_id = spec.device_type_id
                 # Existing-device check is now per (node, ep, device_type_id)
@@ -977,6 +1075,18 @@ class DeviceSync:
                     # authoritative commission pass, stamp the chosen name/room.
                     if authoritative:
                         self._apply_identity(existing, name, folder_id)
+                    elif derived_base and not bridge_label:
+                        # Non-authoritative pass on a node whose family base is
+                        # known: true the name up to the canonical form, but
+                        # ONLY if the current one is a name this plugin wrote
+                        # (issue #204 stage 2). A BRIDGED child is excluded
+                        # outright: its name comes from its own NodeLabel, set
+                        # in the bridge's app, and this pass has no business
+                        # deciding that a family base beats it (issue #43 is
+                        # the open question about bridge naming; stage 2
+                        # deliberately does not touch it).
+                        self._true_up_endpoint_name(
+                            existing, name, derived_base, self._fallback_base(node), role)
                     created.append(existing)
                     primary = primary if primary is not None else existing
                     continue
@@ -1012,16 +1122,57 @@ class DeviceSync:
             # endpoint specs, or every single-endpoint node would flip to
             # "multi" and rename its one real device with a role suffix it
             # doesn't need — the most dangerous regression in this change).
-            # LAST is also a naming decision, not just a plan-list one: a
-            # single-endpoint node's relay and its node device both want the
-            # bare product name, and whichever is created first keeps it
-            # unsuffixed. Creating endpoint devices first means the RELAY
-            # claims it — "a user who commissioned a plug wants the relay" is
-            # the same priority `primary`/`nodeDeviceId` already encode below
-            # — so the node device is the one `_create_one`'s `_unique_name`
-            # suffixes on a collision, never an already-fielded endpoint
-            # device.
-            node_dev_id = self._ensure_node_device(node, coverage, folder_id, model, plan)
+            # LAST still matters for naming, though less than it did in stage
+            # 1: endpoint devices now carry role suffixes, so the bare base is
+            # the node device's alone and there is normally no collision at
+            # all. On a fielded install MID-migration there still is one — an
+            # endpoint device may be holding the bare name until this same
+            # pass renames it — and going last means the rename has already
+            # happened by the time `_create_one`'s `_unique_name` looks.
+            node_dev_id = self._ensure_node_device(
+                node, coverage, folder_id, model, plan, derived_base=derived_base)
+            # Every one of this node's OTHER devices belongs in the node
+            # device's Indigo device group (ADR-0008 option B). Collected here,
+            # under the lock that owns `_index`, and PERFORMED BELOW, outside
+            # it. Read from the index rather than from `plan`/`new_ids` so the
+            # sweep also reaches devices this pass did not touch — an
+            # already-created sibling, a matterUnknown placeholder, a
+            # matterEnergyMeter fallback — which is what makes this the
+            # migration for a fielded install as well as the wiring for a fresh
+            # commission. Empty when the node has no node device (the ADR-0003
+            # gate not passed, or tombstoned): there is no root to group under.
+            to_group: list[tuple[int, int]] = []
+            if node_dev_id is not None:
+                to_group = [
+                    (dev_id, node_dev_id)
+                    for (nid, _eid), type_map in self._index.items()
+                    if nid == int(node.node_id)
+                    for dev_id in type_map.values()
+                    if dev_id != node_dev_id
+                ]
+        # Outside the lock, deliberately, and for the same reason
+        # report_settable_attributes below is: every call reaches into Indigo
+        # (getGroupList/groupWithDevice), and grouping is Indigo-side metadata
+        # that no reader of `_index` is waiting on. Idempotent by construction
+        # — a device already rooted at its node device is a no-op — so this IS
+        # the migration; there is no version stamp to keep in step.
+        for dev_id, root_id in to_group:
+            try:
+                # Existence check first (issue #204 review, fix D): the index
+                # can still carry an endpoint device the user deleted by hand
+                # (plugin.deviceDeleted only prunes matterNode ids), and
+                # grouping a dead id is a guaranteed failure that is not the
+                # user's problem. int() lives in here too, so a non-coercible
+                # id costs one device rather than the rest of the node's sweep
+                # (fix F).
+                indigo.devices[int(dev_id)]
+            except Exception as exc:  # noqa: BLE001
+                self.logger.debug("not grouping device %s: %s", dev_id, exc)
+                continue
+            try:
+                self._ensure_grouped(dev_id, root_id)
+            except Exception as exc:  # noqa: BLE001 - per-device independence (fix F)
+                self.logger.debug("grouping device %s under %s failed: %s", dev_id, root_id, exc)
         if new_ids:
             # The only event-log evidence of an out-of-band join (node_added)
             # is this line — keep it INFO, not debug (issue #19). Idempotent
@@ -1183,7 +1334,8 @@ class DeviceSync:
         )
 
     @staticmethod
-    def _node_spec(node: NodeInfo, coverage: Any) -> IndigoDeviceSpec:
+    def _node_spec(node: NodeInfo, coverage: Any,
+                   base_name: Optional[str] = None) -> IndigoDeviceSpec:
         """Spec for the synthetic per-node device anchored at endpoint 0
         (issue #204, ADR-0008).
 
@@ -1193,18 +1345,17 @@ class DeviceSync:
         device_sync stays the one place that decides WHETHER a node device
         exists (the plan/ADR-0003 evidence a per-cluster handler cannot see).
 
-        ``name`` is the BARE base — ``node.suggested_name``/``product_name``/
-        fallback — with NO role suffix and NO "(endpoint N)" disambiguation.
-        That is deliberately the same name an application endpoint on this
-        node may already carry; ``_create_one``'s ``_unique_name`` resolves
-        the collision with a numeric suffix, same as any other same-named
-        device. This is temporary — ADR-0008's grouping/naming follow-up PR
-        is what trues the two apart properly — and until then a name
-        collision here is cosmetic, not a correctness problem: the two
-        devices are still distinguished by their own nodeId/endpointId props
-        and every other Indigo device-list column.
+        ``name`` is the BARE base — ``base_name`` when the caller derived one
+        from the node's existing devices, else ``node.suggested_name``/
+        ``product_name``/fallback — with NO role suffix and NO "(endpoint N)"
+        disambiguation. Since stage 2 (ADR-0008 option B) that no longer
+        collides with an application endpoint's name: every endpoint device
+        now carries a role suffix, so the bare base is the node device's
+        alone. ``_create_one``'s ``_unique_name`` still stands behind it for
+        the fielded install mid-migration, where an endpoint device may still
+        be holding the bare name until this same pass renames it.
         """
-        name = node.suggested_name or node.product_name or f"Matter {node.node_id}"
+        name = base_name or node.suggested_name or node.product_name or f"Matter {node.node_id}"
         props = {
             "nodeId": str(node.node_id),
             "endpointId": "0",
@@ -1235,14 +1386,19 @@ class DeviceSync:
         )
 
     def _ensure_node_device(self, node: NodeInfo, coverage: Any, folder_id: int,
-                            model: str, plan: list) -> Optional[int]:
+                            model: str, plan: list, *,
+                            derived_base: Optional[str] = None) -> Optional[int]:
         """Resolve or create this node's synthetic ``matterNode`` device
         (issue #204, ADR-0008).
 
         Order of checks, each a distinct reason to do nothing:
 
         1. Already indexed — idempotent, same precedent as every endpoint
-           device's existing-device check.
+           device's existing-device check. Since stage 2 this branch is not
+           quite "do nothing": it is where an already-created node device has
+           its name, its ``nodeBaseName`` prop and its folder trued up
+           (``_true_up_node_device``), which is what the fielded installs
+           created by 2026.13.0 need.
         2. Tombstoned — the user deliberately deleted this node's device
            (``note_node_device_deleted``); recreating it out from under them
            on the next reconnect would be exactly the silent override the
@@ -1274,6 +1430,7 @@ class DeviceSync:
         with self._lock:
             existing = self._index.get((nid, 0), {}).get("matterNode")
         if existing is not None:
+            self._true_up_node_device(existing, node, derived_base, folder_id)
             return existing
         if self.node_tombstones is not None and self.node_tombstones.is_tombstoned(nid):
             return None
@@ -1293,7 +1450,7 @@ class DeviceSync:
                     node_id_to_str(nid),
                 )
             return None
-        spec = self._node_spec(node, coverage)
+        spec = self._node_spec(node, coverage, derived_base)
         if not folder_id:
             # Reconcile has no commission-time folder (it passes 0), so a node
             # device created for an EXISTING install would land in the root
@@ -1338,6 +1495,353 @@ class DeviceSync:
             if folder:
                 return folder  # first sibling with a real folder wins
         return 0
+
+    # ------------------------------------------------------------------
+    # Naming/folder true-up + grouping (issue #204 stage 2, ADR-0008 option B)
+    #
+    # Lock discipline, stated out loud because this module's own prose insists
+    # on it: every true-up below is called from ``create_devices`` WHILE it
+    # holds ``_lock``, and each one reads a device (and may rename it) once per
+    # pass. That is an increment on an existing pattern, and deliberate —
+    # ``_create_one``, ``_apply_identity`` and ``_prime_states`` already run
+    # in-lock from the same loop, and the true-ups decide from, and act on,
+    # the very ``_index`` entries the lock protects. The GROUPING calls are the
+    # ones that stay outside it (see ``create_devices``): they are Indigo-side
+    # metadata no reader of ``_index`` is waiting on. A slow or blocking call
+    # added here is what would have to move out, not this comment.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _fallback_base(node: NodeInfo) -> str:
+        """The base name a NON-authoritative pass builds every spec from.
+
+        Exactly what each handler's ``create_indigo_devices`` computes
+        (``suggested_name or product_name or "Matter <id>"``) with the empty
+        ``suggested_name`` reconcile always parses with — i.e. the name a
+        device this plugin created OUTSIDE a commission is wearing. Knowing it
+        is what lets the true-up tell a plugin-written bare name from a
+        hand-written one.
+        """
+        return node.product_name or f"Matter {node.node_id}"
+
+    def _derive_family_base(self, node: NodeInfo) -> Optional[str]:
+        """What this node's EXISTING Indigo devices already agree they are
+        called, or None (issue #204 stage 2).
+
+        A reconcile pass parses the node with no ``suggested_name``, so every
+        spec falls back to the product name — which is how a device recreated
+        after a hand-delete came back as "ALPSTUGA air quality monitor -
+        Switch" beside three siblings called "Bedroom air quality monitor - …"
+        (observed on the live rig). The user's own name is not in the snapshot;
+        the only place it survives is the devices themselves.
+
+        Each existing endpoint device casts at most one vote:
+
+        * a name that PARSES as one of this plugin's suffixed forms for that
+          device's own role (``_generated_base``) votes for its prefix;
+        * a bare name equal to the product-name fallback votes for that;
+        * anything else does not vote at all.
+
+        The first rule is not limited to names this plugin actually wrote, and
+        saying otherwise would be a lie (issue #204 review, fix G): a name the
+        USER typed that happens to be shaped "<X> - <that device's own role>"
+        is indistinguishable from a generated one and casts a full STRONG vote
+        for "<X>". Two honest consequences. Beside siblings that say something
+        else it produces a disagreement, so the node gets no family base and
+        NOTHING is renamed this pass — the safe outcome, and the common one. As
+        a node's SOLE endpoint device its vote IS the family base, so "<X>"
+        propagates to the node device's name. What is guaranteed is narrower
+        than "a hand-rename is ignored": a hand-renamed device is never itself
+        renamed, because every rename is gated on the name already being a
+        generated form of the base it is being trued up to.
+
+        Votes equal to the product-name fallback are WEAK: they are what a
+        device that never learned the user's name looks like, so they lose to
+        any other agreed answer rather than turning that answer into a
+        disagreement (this is exactly the ALPSTUGA case — three strong votes
+        and one weak one). With no strong votes, a single weak one still wins:
+        a fielded install commissioned without a name genuinely is called the
+        product name, and its devices still need their role suffixes.
+
+        Disagreement among strong votes returns None, and NOTHING is renamed
+        for this node on this pass. That is the conservative outcome by
+        design: with no single answer, any rename would be a guess.
+        """
+        nid = int(node.node_id)
+        fallback = self._fallback_base(node)
+        with self._lock:
+            # Endpoint devices only: the node device (endpoint 0) is named FROM
+            # this answer, so letting it vote would make the derivation
+            # self-confirming and freeze a wrong nodeBaseName forever.
+            entries = [
+                (dev_id, type_id)
+                for (n_id, eid), type_map in self._index.items()
+                if n_id == nid and eid != 0
+                for type_id, dev_id in type_map.items()
+            ]
+        strong: set[str] = set()
+        weak: set[str] = set()
+        for dev_id, type_id in entries:
+            try:
+                name = indigo.devices[dev_id].name
+            except Exception as exc:  # noqa: BLE001 - deleted out of band; it just doesn't vote
+                self.logger.debug("family base: device %s unreadable: %s", dev_id, exc)
+                continue
+            base = _generated_base(name, _ROLE_LABELS.get(type_id, ""))
+            if base is None:
+                if fallback and name == fallback:
+                    weak.add(fallback)
+                continue
+            (weak if base == fallback else strong).add(base)
+        if len(strong) == 1:
+            return next(iter(strong))
+        if not strong and len(weak) == 1:
+            return next(iter(weak))
+        if entries:
+            self.logger.debug(
+                "node %s: no single family base derives from its existing devices "
+                "(candidates %s) — leaving every name alone this pass",
+                node_id_to_str(nid), sorted(strong | weak),
+            )
+        return None
+
+    def _true_up_endpoint_name(self, dev_id: int, target: str, derived_base: str,
+                               fallback_base: str, role: str) -> None:
+        """Rename an existing endpoint device to its canonical name — but only
+        if this plugin is the one that named it (issue #204 stage 2).
+
+        The whole migration turns on the second half. A device whose name is
+        one this plugin would have generated, from either the derived family
+        base or the product-name fallback, is ours to true up; anything else
+        is the user's and is left exactly as it is, however tempting the
+        resemblance. Renames are id-bound-safe for triggers and schedules
+        (Indigo binds by id), which is why this is allowed to happen at all.
+
+        A canonical name that is already TAKEN aborts the rename outright
+        rather than accepting ``_apply_identity``'s deduplicated substitute —
+        see the guard below; that substitute is what makes this pass
+        non-idempotent (issue #204 review, fix A).
+        """
+        try:
+            dev = indigo.devices[dev_id]
+        except Exception as exc:  # noqa: BLE001
+            self.logger.debug("name true-up: device %s unavailable: %s", dev_id, exc)
+            return
+        current = getattr(dev, "name", "")
+        if current == target:
+            return
+        if not (_is_generated_name(current, derived_base, role)
+                or _is_generated_name(current, fallback_base, role)):
+            self.logger.debug(
+                "leaving device %s (%r) alone — not a name this plugin generated", dev_id, current)
+            return
+        if self._unique_name(target) != target:
+            # The canonical name belongs to something else — a foreign device,
+            # a second node of the same product, a sibling mid-migration.
+            # _apply_identity would silently rename to "<target> 2" instead,
+            # and _is_generated_name's "{base} \d+" arm re-admits THAT next
+            # pass, so the device oscillates "… 2" ↔ "… 3" forever, one real
+            # rename per reconcile (issue #204 review, fix A). Leaving it alone
+            # is the same posture the hand-rename gate above already takes.
+            self.logger.debug(
+                "target name %r is taken — leaving device %s alone", target, dev_id)
+            return
+        # folder 0 = leave the folder alone; dedup because a true-up repeats
+        # every pass and its failures must not nag (fix E).
+        self._apply_identity(dev_id, target, 0, dedup=True)
+
+    def _true_up_node_device(self, dev_id: int, node: NodeInfo,
+                             derived_base: Optional[str], folder_id: int) -> None:
+        """Heal an already-created ``matterNode`` device's name, its
+        ``nodeBaseName`` prop and its folder (issue #204 stage 2).
+
+        Both defects are real and fielded, not hypothetical:
+
+        * **Name/prop.** A node device created by a RECONCILE pass took the
+          product-name fallback, because ``suggested_name`` is not in the
+          snapshot — so a live FP300 ended up called "Presence Multi-Sensor
+          FP300" beside children called "Kitchen matter motion 2 - …", with
+          ``nodeBaseName`` stamped to match. That prop is therefore not
+          trustworthy on a fielded install and must be RECOMPUTED from the
+          family, never merely read.
+        * **Folder.** Folder adoption at creation landed with the node device
+          itself; the seven devices created before it (and any install
+          upgrading through 2026.13.0) are still sitting in the root folder
+          while their siblings are in a real one.
+
+        The name is only changed when the current one is a name this plugin
+        generated — ``nodeBaseName`` (whatever it says) or the product-name
+        fallback, plus ``_unique_name``'s numeric suffix on either. A node
+        device the user has renamed is left alone like any other device, and
+        so is its ``nodeBaseName``: restamping the prop under a name the user
+        owns costs the device a comm restart and buys nothing, because the
+        rename it would unlock is the very thing being declined (issue #204
+        review, fix H2).
+
+        The prop is stamped only once the rename has actually LANDED (issue
+        #204 review, fix B). Stamping it unconditionally is worse than doing
+        nothing: ``_apply_identity`` catches and warns its own failures, so a
+        refused ``replaceOnServer`` used to leave the device wearing the old
+        name with ``nodeBaseName`` already advanced to the new base — after
+        which ``_is_generated_name`` never matches again and the device is
+        stuck under the wrong name permanently, silently, with no later pass
+        able to retry.
+        """
+        try:
+            dev = indigo.devices[dev_id]
+        except Exception as exc:  # noqa: BLE001
+            self.logger.debug("node-device true-up: device %s unavailable: %s", dev_id, exc)
+            return
+        # Folder first, and independently of any name evidence: an orphaned
+        # node device in the root folder is worth healing even for a node whose
+        # base cannot be derived.
+        try:
+            if not getattr(dev, "folderId", 0):
+                target_folder = folder_id or self._sibling_folder_id(int(node.node_id))
+                if target_folder:
+                    # dedup: this runs every pass until it succeeds (fix E).
+                    self._move_to_folder(dev_id, target_folder, dedup=True)
+        except Exception as exc:  # noqa: BLE001 - a folder must never sink a pass
+            self.logger.debug("node-device folder adoption for %s failed: %s", dev_id, exc)
+        if not derived_base:
+            return
+        props = dict(getattr(dev, "pluginProps", {}) or {})
+        stamped = props.get("nodeBaseName") or self._fallback_base(node)
+        current = getattr(dev, "name", "")
+        if current != derived_base:
+            if not _is_generated_name(current, stamped, ""):
+                self.logger.debug(
+                    "leaving node device %s (%r) alone — not a name this plugin generated",
+                    dev_id, current)
+                return
+            if self._unique_name(derived_base) != derived_base:
+                # Taken: same ping-pong as the endpoint side (fix A).
+                self.logger.debug(
+                    "target name %r is taken — leaving device %s alone", derived_base, dev_id)
+                return
+            if not self._apply_identity(dev_id, derived_base, 0, dedup=True):
+                # The rename was refused; the prop must NOT run ahead of it
+                # (fix B). A later pass, once Indigo accepts writes again,
+                # finds the same evidence and retries.
+                return
+        if props.get("nodeBaseName") != derived_base:
+            # Only when it actually moved: stamping props costs the device a
+            # comm restart (the same reason SurveyLog lives in pluginPrefs
+            # rather than in props), so this must be a once-per-install write,
+            # not a once-per-reconcile one.
+            props["nodeBaseName"] = derived_base
+            try:
+                dev.replacePluginPropsOnServer(props)
+            except Exception as exc:  # noqa: BLE001 - deduped for the same reason
+                # the rename and folder failures above are (fix E): a props
+                # write Indigo keeps refusing is retried on every pass.
+                self._group_warn(
+                    dev_id, "restamp",
+                    "could not restamp nodeBaseName on node device %s: %s", dev_id, exc)
+
+    def _group_warn(self, dev_id: int, kind: str, fmt: str, *args: Any) -> None:
+        """One warning per device per KIND of grouping failure, per plugin run."""
+        key = (int(dev_id), kind)
+        if key in self._group_warned:
+            return
+        self._group_warned.add(key)
+        self.logger.warning(fmt, *args)
+
+    def _ensure_grouped(self, dev_id: int, node_dev_id: int) -> None:
+        """Make ``dev_id`` a member of the group rooted at ``node_dev_id``
+        (ADR-0008 option B).
+
+        Idempotent, which is what lets it double as the migration for every
+        fielded install: a device already rooted at its node device costs one
+        ``getGroupList`` read and returns.
+
+        Never re-parents a group the USER built. If the device is already in a
+        group of two or more whose root is something else, that is a
+        deliberate arrangement of theirs — warn once and leave it, rather than
+        quietly rearranging the device list of someone who grouped their
+        Matter relay with a Z-Wave sensor.
+
+        ``groupWithDevice(node_dev_id, dev_id)`` puts the EXISTING member
+        first and the joiner second, which is the documented way to add a
+        device to a group ("if you want to add device 789 to the group, you
+        would use groupWithDevice(456, 789)"). Which of the two ends up the
+        group's ROOT is not documented anywhere, so the result is READ BACK
+        and a mismatch warned about rather than assumed — the root is where
+        Indigo puts ``batteryLevel`` and the whole point of the node device
+        being it.
+
+        Everything is guarded: the docs warn twice that neither this call nor
+        ``ungroupDevice`` should be made while a device dialog or the device
+        factory UI is open, and a plugin cannot detect either. A grouping
+        failure must therefore be a log line, never something that sinks a
+        reconcile pass that has real work in it.
+        """
+        if int(dev_id) == int(node_dev_id):
+            return
+        try:
+            group = [int(member) for member in indigo.device.getGroupList(dev_id)]
+        except Exception as exc:  # noqa: BLE001
+            # Debug, not a warning (issue #204 review, fix D): by far the most
+            # likely cause is an endpoint device the user deleted by hand —
+            # plugin.deviceDeleted only prunes matterNode ids, so a dead
+            # `_index` id can reach here — and that is not something to put a
+            # WARNING in the user's event log about. _derive_family_base treats
+            # the identical condition the same way.
+            self.logger.debug("could not read the device group of %s: %s", dev_id, exc)
+            return
+        # An ungrouped device answers [dev_id] (or, on some versions, nothing
+        # at all — undocumented either way); both fall through to the group
+        # call below, and neither is mistaken for a user-built group.
+        if group and group[0] == int(node_dev_id):
+            return
+        if int(node_dev_id) in group:
+            # The node device is IN this group but not its root. On any pass
+            # after a misrooted join this is almost always the plugin's own
+            # doing (the "root" warning below fired when it happened), and on
+            # a multi-endpoint node the group has 3+ members — a len()==2
+            # check here let the foreign branch fire N-1 self-referential
+            # warnings ("rooted at 5678" about device 5678) on exactly the
+            # FP300-shaped nodes the docs lead with (issue #204 review,
+            # fix C + verification round). From getGroupList alone a
+            # user-built {dev, node_dev} group is indistinguishable, so the
+            # message describes the STATE, claims no cause, and keeps the
+            # remedy the foreign branch offers.
+            self._group_warn(
+                dev_id, "misroot",
+                "device %s and its Matter node device %s are in one group, but %s is the "
+                "group's root rather than the node device — battery level and other "
+                "root-only properties read from the wrong end. Ungroup and reload the "
+                "plugin if you want the node device to be the root",
+                dev_id, node_dev_id, group[0])
+            return
+        if len(group) > 1:
+            self._group_warn(
+                dev_id, "foreign",
+                "device %s is already in a device group rooted at %s, so it has not been "
+                "added to its Matter node device's group — ungroup it if you want the "
+                "node device to be its root", dev_id, group[0])
+            return
+        try:
+            indigo.device.groupWithDevice(node_dev_id, dev_id)
+        except Exception as exc:  # noqa: BLE001
+            self._group_warn(
+                dev_id, "group",
+                "could not group device %s under Matter node device %s: %s — if a device "
+                "or device-factory dialog was open, close it and reload the plugin",
+                dev_id, node_dev_id, exc)
+            return
+        try:
+            after = [int(member) for member in indigo.device.getGroupList(dev_id)]
+        except Exception as exc:  # noqa: BLE001 - the group was made; only the check failed
+            self.logger.debug("could not verify the group of device %s: %s", dev_id, exc)
+            return
+        if not after or after[0] != int(node_dev_id):
+            self._group_warn(
+                dev_id, "root",
+                "device %s was grouped with Matter node device %s but Indigo made %s the "
+                "group's root instead — battery level and other root-only properties will "
+                "read from the wrong device", dev_id, node_dev_id,
+                after[0] if after else "nothing")
 
     @staticmethod
     def _endpoint_by_id(node: NodeInfo, endpoint_id: int) -> Optional[Any]:
@@ -1682,36 +2186,70 @@ class DeviceSync:
             self.logger.warning("could not resolve/create device folder %r: %s", name, exc)
             return 0
 
-    def _move_to_folder(self, dev_id: int, folder_id: int) -> None:
+    def _move_to_folder(self, dev_id: int, folder_id: int, *, dedup: bool = False) -> None:
         try:
             try:
                 indigo.device.moveToFolder(dev_id, value=folder_id)
             except TypeError:  # older positional signature
                 indigo.device.moveToFolder(dev_id, folder_id)
         except Exception as exc:  # noqa: BLE001
-            self.logger.warning("could not move device %s to folder %s: %s", dev_id, folder_id, exc)
+            # `dedup` is for the true-up callers only — see _apply_identity.
+            self._warn_once_if(dedup, dev_id, "folder",
+                               "could not move device %s to folder %s: %s",
+                               dev_id, folder_id, exc)
 
-    def _apply_identity(self, dev_id: int, name: str, folder_id: int) -> None:
+    def _warn_once_if(self, dedup: bool, dev_id: int, kind: str, fmt: str, *args: Any) -> None:
+        """Warn — once per device per kind when ``dedup``, every time otherwise.
+
+        The true-up paths (issue #204 stage 2) run on EVERY reconcile pass, so a
+        rename or folder move Indigo keeps refusing would nag once per pass
+        forever; the grouping side already built ``_group_warned`` for exactly
+        that shape and this shares it (issue #204 review, fix E). The
+        authoritative commission caller keeps the undeduped warning: it is a
+        one-shot, user-initiated action whose failure must be visible each time
+        the user asks for it.
+        """
+        if dedup:
+            self._group_warn(dev_id, kind, fmt, *args)
+        else:
+            self.logger.warning(fmt, *args)
+
+    def _apply_identity(self, dev_id: int, name: str, folder_id: int,
+                        *, dedup: bool = False) -> bool:
         """Stamp a commission-chosen name/folder onto an already-created device.
 
         Used when node_added raced ahead and created the device with the bare
         product name before the commission job (which carries the user's choices)
         ran. Idempotent: a device that already matches is left untouched.
+
+        Returns whether the device is now called exactly ``name`` — False when
+        the rename failed, when the device was unreadable, or when a collision
+        forced ``_unique_name``'s numeric substitute. The true-up callers
+        depend on the answer (issue #204 review, fix B: ``nodeBaseName`` must
+        never advance past a rename that did not land); the authoritative
+        commission caller ignores it, and its substitute-name behaviour is
+        unchanged.
         """
         try:
             dev = indigo.devices[dev_id]
         except Exception as exc:  # noqa: BLE001
             self.logger.debug("apply_identity: device %s unavailable: %s", dev_id, exc)
-            return
+            return False
+        renamed = False
         try:
             target = name if dev.name == name else self._unique_name(name)
             if dev.name != target:
                 dev.name = target
                 dev.replaceOnServer()
+            # Only AFTER replaceOnServer returns: `dev.name` was already
+            # mutated in memory above, so it is not evidence on its own.
+            renamed = target == name
         except Exception as exc:  # noqa: BLE001
-            self.logger.warning("could not rename device %s to %r: %s", dev_id, name, exc)
+            self._warn_once_if(dedup, dev_id, "rename",
+                               "could not rename device %s to %r: %s", dev_id, name, exc)
         if folder_id and getattr(dev, "folderId", 0) != folder_id:
-            self._move_to_folder(dev_id, folder_id)
+            self._move_to_folder(dev_id, folder_id, dedup=dedup)
+        return renamed
 
     def _prime_states(self, node: NodeInfo, dev_id: int, endpoint_id: int,
                       own_type_id: str,
