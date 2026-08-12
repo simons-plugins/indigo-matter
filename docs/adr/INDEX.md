@@ -23,5 +23,6 @@ chosen), see [`../ARCHITECTURE.md`](../ARCHITECTURE.md).
 * [ADR-0005](0005-command-parameters-are-not-settings.md) - ADR-0005: A command parameter is not a setting (accepted; narrows what ADR-0002 may declare; **superseded by ADR-0006**)
 * [ADR-0006](0006-a-curated-exclusion-list-cross-checked-by-the-generator.md) - ADR-0006: A curated exclusion list, cross-checked by the generator, decides what is not a setting (accepted; supersedes ADR-0005)
 * [ADR-0007](0007-a-retired-everywhere-setting-keeps-its-state-flagged.md) - ADR-0007: A setting retired everywhere keeps its state, flagged — only a missing capability withdraws it (accepted; narrows ADR-0003)
+* [ADR-0008](0008-a-matter-node-is-an-indigo-device.md) - ADR-0008: A Matter node is an Indigo device, and the root of its endpoint devices' group (accepted)
 
 <!-- adrlogstop -->

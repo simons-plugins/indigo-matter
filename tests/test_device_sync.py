@@ -5,6 +5,7 @@ state-update and device-creation paths run without a live Indigo server.
 """
 from __future__ import annotations
 
+import copy
 import importlib
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -42,6 +43,10 @@ _STATIC_DEVICE_TYPE_STATES = {
     "matterMotionSensor": {"sensitivityLevel", "holdTime"},
     "matterContactSensor": {"sensitivityLevel"},
     "matterRelay": {"startUpOnOff"},
+    # issue #204 / ADR-0008 — declared unconditionally in Devices.xml (no
+    # Supports* prop gates any of them), same custom-type discipline as
+    # matterEnergyMeter/matterUnknown's `reachable`.
+    "matterNode": {"nodeLabel", "softwareVersion", "batteryLevel", "reachable"},
 }
 
 
@@ -3647,3 +3652,565 @@ def test_offered_pairs_follow_the_endpoint_device_type(surveying_ds, indigo_env)
     surveying_ds.create_from_raw(LIGHTING_PLUG_NODE, "Grillplats socket")
     assert (CLUSTER_ON_OFF, ATTR_START_UP_ON_OFF) in surveying_ds.offered_setting_pairs(0x34, 1)
     assert surveying_ds.offered_setting_pairs(0x34, 99) == set(), "no device, nothing offered"
+
+
+# ===========================================================================
+# issue #204 / ADR-0008 — the synthetic per-node device
+#
+# Gated on ep 0's own BasicInformation AttributeList (0xFFFB, decimal 65531)
+# evidencing NodeLabel (0x0005) OR SoftwareVersionString (0x000A) — neither of
+# which any existing fixture in this file reports, so every pre-#204 test
+# above is unaffected by this section existing at all. `_with_node_evidence`
+# is the one place that adds it, so every test below is explicit about opting
+# a fixture INTO node-device creation.
+# ===========================================================================
+
+def _with_node_evidence(raw: dict, node_label: str = None) -> dict:
+    """A deepcopy of *raw* with ep 0's BasicInformation AttributeList made to
+    evidence NodeLabel (0x0005) and SoftwareVersionString (0x000A) — the
+    ADR-0003 gate `_ensure_node_device` checks. Optionally also stamps
+    NodeLabel's own value (0/40/5) so a test can assert priming."""
+    node = copy.deepcopy(raw)
+    node["attributes"]["0/40/65531"] = [1, 2, 3, 4, 5, 10]
+    if node_label is not None:
+        node["attributes"]["0/40/5"] = node_label
+    return node
+
+
+def _with_attribute_list(raw: dict, attrs: list) -> dict:
+    """A deepcopy of *raw* with ep 0's BasicInformation AttributeList set to
+    exactly *attrs* — for exercising the ADR-0003 OR gate's three outcomes
+    directly, rather than always granting both (issue #204 review, fix I.1:
+    `_with_node_evidence` above always grants both attributes, so an
+    and→or mutation of the gate would survive the suite)."""
+    node = copy.deepcopy(raw)
+    node["attributes"]["0/40/65531"] = attrs
+    return node
+
+
+def test_no_evidence_no_node_device(ds, indigo_env):
+    """ADR-0003: unknown is not yes. RELAY_NODE itself carries no AttributeList
+    for BasicInformation at all, so this pass is a node "mid-interview"."""
+    result = ds.create_from_raw(RELAY_NODE, "Office Plug")
+    assert result["nodeDeviceId"] is None
+    assert ds.lookup(42, 0, "matterNode") is None
+
+
+def test_no_evidence_no_node_device_stays_silent(ds, indigo_env, mock_logger):
+    """Fix D (issue #204 review): a mid-interview node (no AttributeList at
+    all — both implements() calls return None, not False) must not log the
+    non-conformant INFO. None is not a verdict."""
+    ds.create_from_raw(RELAY_NODE, "Office Plug")
+    assert not any(
+        "non-conformant" in str(call.args) for call in mock_logger.info.call_args_list
+    )
+
+
+def test_attribute_list_missing_both_ids_no_node_device_and_logs_once(ds, indigo_env, mock_logger):
+    """ADR-0003 gate OR, NEITHER case (issue #204 review, fix I.1): the
+    AttributeList is positively read (not absent) but contains neither
+    NodeLabel (5) nor SoftwareVersionString (10) — a stable non-conformant
+    verdict, not "unknown". Fix D: logged once, not once per reconcile pass."""
+    evidenced = _with_attribute_list(RELAY_NODE, [1, 2, 3, 4])
+    result = ds.create_from_raw(evidenced, "Office Plug")
+    assert result["nodeDeviceId"] is None
+    assert sum(
+        "non-conformant" in str(call.args) for call in mock_logger.info.call_args_list
+    ) == 1
+
+    # A second pass over the same non-conformant node must not repeat the INFO.
+    ds.create_from_raw(evidenced, "Office Plug")
+    assert sum(
+        "non-conformant" in str(call.args) for call in mock_logger.info.call_args_list
+    ) == 1
+
+
+def test_attribute_list_with_only_node_label_creates_device(ds, indigo_env):
+    """ADR-0003 gate OR, ONLY-5 case (issue #204 review, fix I.1)."""
+    evidenced = _with_attribute_list(RELAY_NODE, [1, 2, 3, 5])
+    result = ds.create_from_raw(evidenced, "Office Plug")
+    assert result["nodeDeviceId"] is not None
+
+
+def test_attribute_list_with_only_sw_version_creates_device(ds, indigo_env):
+    """ADR-0003 gate OR, ONLY-10 case (issue #204 review, fix I.1)."""
+    evidenced = _with_attribute_list(RELAY_NODE, [1, 2, 3, 10])
+    result = ds.create_from_raw(evidenced, "Office Plug")
+    assert result["nodeDeviceId"] is not None
+
+
+def test_node_device_created_once_evidence_arrives_on_a_later_pass(ds, indigo_env):
+    """The node "finishes its interview" between two reconcile passes — the
+    same shape #190's capability gates already handle for settings/states."""
+    _indigo, devices = indigo_env
+    result1 = ds.create_from_raw(RELAY_NODE, "Office Plug")
+    assert result1["nodeDeviceId"] is None
+    evidenced = _with_node_evidence(RELAY_NODE)
+    result2 = ds.create_from_raw(evidenced, "Office Plug")
+    assert result2["nodeDeviceId"] is not None
+    assert devices[result2["nodeDeviceId"]].deviceTypeId == "matterNode"
+
+
+def test_single_endpoint_node_creates_node_device_without_touching_the_relay(ds, indigo_env):
+    """The anti-mass-rename guarantee: adding node-device creation must not
+    rename, re-suffix, or otherwise touch the relay's own identity — and must
+    not flip `multi = len(plan) > 1` for a genuinely single-endpoint node
+    (the most dangerous regression this PR could introduce)."""
+    _indigo, devices = indigo_env
+    evidenced = _with_node_evidence(RELAY_NODE)
+    result = ds.create_from_raw(evidenced, "Office Plug")
+    relay_id = ds.lookup(42, 1, "matterRelay")
+    node_id = result["nodeDeviceId"]
+    assert relay_id is not None and node_id is not None and relay_id != node_id
+    # The relay is untouched: bare name, no role suffix, no "(endpoint N)".
+    assert devices[relay_id].name == "Office Plug"
+    assert result["indigoDeviceIds"] == [relay_id]        # node device NOT in this list
+    assert result["primaryDeviceId"] == relay_id           # untouched — the plug stays primary
+    # The node device claims the same bare base and eats the naming collision
+    # (documented, temporary — the follow-up naming PR trues this up).
+    assert devices[node_id].name == "Office Plug 2"
+
+
+def test_multi_device_node_creates_node_device_without_touching_endpoint_names(ds, indigo_env):
+    """A genuinely multi-device node (4 additive AQ sensors on one endpoint):
+    role-suffixed endpoint names, and role_counts/`multi`, must be exactly
+    what they were before the node device existed."""
+    _indigo, devices = indigo_env
+    evidenced = _with_node_evidence(AQ_NODE)
+    result = ds.create_from_raw(evidenced, "Air Sensor")
+    assert len(result["indigoDeviceIds"]) == 4
+    names = {devices[dev_id].name for dev_id in result["indigoDeviceIds"]}
+    assert names == {
+        "Air Sensor - Air Quality", "Air Sensor - CO₂",
+        "Air Sensor - PM2.5", "Air Sensor - TVOC",
+    }
+    node_id = result["nodeDeviceId"]
+    assert node_id is not None
+    assert node_id not in result["indigoDeviceIds"]
+    assert devices[node_id].name == "Air Sensor"           # bare base, no collision here
+
+
+def test_node_device_index_entry_at_endpoint_zero(ds, indigo_env):
+    evidenced = _with_node_evidence(RELAY_NODE)
+    result = ds.create_from_raw(evidenced, "Office Plug")
+    assert ds.lookup(42, 0, "matterNode") == result["nodeDeviceId"]
+
+
+def test_second_create_devices_pass_is_idempotent_for_the_node_device(ds, indigo_env):
+    evidenced = _with_node_evidence(RELAY_NODE)
+    first = ds.create_from_raw(evidenced, "Office Plug")
+    second = ds.create_from_raw(evidenced, "Office Plug")
+    assert first["nodeDeviceId"] == second["nodeDeviceId"]
+
+
+def test_empty_plan_creates_no_node_device(ds, indigo_env):
+    """Issue #105's empty-bridge case: a node with no endpoint devices at all
+    has nothing for a node device to be the root of."""
+    evidenced = _with_node_evidence(ROOT_ONLY_NODE)
+    result = ds.create_from_raw(evidenced, "Root Only")
+    assert result["nodeDeviceId"] is None
+    assert result["indigoDeviceIds"] == []
+
+
+def test_sw_version_lands_in_props_and_state(ds, indigo_env):
+    """First surfacing anywhere of matter_model.parse_node's sw_version field."""
+    _indigo, devices = indigo_env
+    evidenced = _with_node_evidence(RELAY_NODE)
+    result = ds.create_from_raw(evidenced, "Office Plug")
+    dev = devices[result["nodeDeviceId"]]
+    assert dev.pluginProps["softwareVersion"] == "1.2.3"
+    assert dev.states.get("softwareVersion") == "1.2.3"
+
+
+def test_node_label_primes_from_snapshot_when_present(ds, indigo_env):
+    _indigo, devices = indigo_env
+    evidenced = _with_node_evidence(RELAY_NODE, node_label="Landing Node")
+    result = ds.create_from_raw(evidenced, "Office Plug")
+    dev = devices[result["nodeDeviceId"]]
+    assert dev.states.get("nodeLabel") == "Landing Node"
+
+
+def test_node_label_absent_leaves_the_default(ds, indigo_env):
+    _indigo, devices = indigo_env
+    evidenced = _with_node_evidence(RELAY_NODE)  # no 0/40/5 this time
+    result = ds.create_from_raw(evidenced, "Office Plug")
+    dev = devices[result["nodeDeviceId"]]
+    assert dev.states.get("nodeLabel") == 0  # FakeDev's declared-state default
+
+
+def test_live_node_label_attribute_event_updates_the_node_device(ds, indigo_env):
+    """Issue #204 review, fix I.3: a LIVE BasicInformation (0x0028) NodeLabel
+    (0x0005) attribute_updated event, through the real ds.handle_event →
+    _on_attribute dispatch (not BasicInformationHandler unit-tested in
+    isolation — test_handlers.py already covers that) must land on the
+    matterNode device."""
+    _indigo, devices = indigo_env
+    evidenced = _with_node_evidence(RELAY_NODE)
+    result = ds.create_from_raw(evidenced, "Office Plug")
+    node_dev_id = result["nodeDeviceId"]
+
+    ds.handle_event(MatterEvent(
+        kind=protocol.EVT_ATTRIBUTE_UPDATED,
+        node_id=42, endpoint=0, cluster=0x0028, attribute=0x0005, value="Landing Node",
+    ))
+    assert devices[node_dev_id].states.get("nodeLabel") == "Landing Node"
+
+
+def test_live_software_version_attribute_event_updates_the_node_device(ds, indigo_env):
+    """Same as above for SoftwareVersionString (0x000A) (issue #204 review, fix I.3)."""
+    _indigo, devices = indigo_env
+    evidenced = _with_node_evidence(RELAY_NODE)
+    result = ds.create_from_raw(evidenced, "Office Plug")
+    node_dev_id = result["nodeDeviceId"]
+
+    ds.handle_event(MatterEvent(
+        kind=protocol.EVT_ATTRIBUTE_UPDATED,
+        node_id=42, endpoint=0, cluster=0x0028, attribute=0x000A, value="9.9.9",
+    ))
+    assert devices[node_dev_id].states.get("softwareVersion") == "9.9.9"
+
+
+def test_node_device_gets_battery_when_node_wide_coverage_includes_endpoint_zero(ds, indigo_env):
+    """POWER_SOURCE_NODE_WIDE_NODE (the FP300 shape): PowerSource lives ON
+    endpoint 0 with an EMPTY EndpointList — "the whole node" per spec, which
+    includes endpoint 0 itself. The #205→#204 join: the node device is just
+    another endpoint as far as power coverage is concerned."""
+    _indigo, devices = indigo_env
+    evidenced = _with_node_evidence(POWER_SOURCE_NODE_WIDE_NODE)
+    result = ds.create_from_raw(evidenced, "Landing Presence")
+    dev = devices[result["nodeDeviceId"]]
+    assert dev.pluginProps.get("SupportsBatteryLevel") is True
+    assert dev.states.get("batteryLevel") == 80   # BatPercentRemaining 160 // 2
+
+
+def test_node_device_has_no_battery_when_sources_cover_only_children(ds, indigo_env):
+    """BRIDGE_ENDPOINT_LIST_NODE: each PowerSource names only its own child
+    endpoint (1, 2) — endpoint 0 is not covered by anything, so the node
+    device correctly gets no battery at all. The #205→#204 join's negative
+    case."""
+    _indigo, devices = indigo_env
+    evidenced = _with_node_evidence(BRIDGE_ENDPOINT_LIST_NODE)
+    result = ds.create_from_raw(evidenced, "Multi Sensor Bridge")
+    dev = devices[result["nodeDeviceId"]]
+    assert "SupportsBatteryLevel" not in dev.pluginProps
+    assert dev.states.get("batteryLevel") == 0    # FakeDev's declared-state default, never primed
+
+
+def test_delete_node_deletes_children_before_the_node_device(ds, indigo_env):
+    """indigo.device.delete refuses to delete the root of a non-empty group
+    (ADR-0008) — this fake enforces the ordering for real by RAISING if the
+    matterNode device is deleted while a sibling still exists, rather than
+    merely recording call order and hoping the assertion below would catch a
+    regression."""
+    _indigo, devices = indigo_env
+    evidenced = _with_node_evidence(RELAY_NODE)
+    result = ds.create_from_raw(evidenced, "Office Plug")
+    node_dev_id = result["nodeDeviceId"]
+    relay_id = result["indigoDeviceIds"][0]
+    assert node_dev_id is not None
+
+    def guarded_delete(dev):
+        dev_id = dev.id if hasattr(dev, "id") else dev
+        if dev_id == node_dev_id and (devices._by_id.keys() - {node_dev_id}):
+            raise AssertionError("matterNode deleted while a sibling device still exists")
+        devices._by_id.pop(dev_id, None)
+
+    _indigo.device.delete = guarded_delete
+    deleted = ds.delete_node(42)
+    assert set(deleted) == {relay_id, node_dev_id}
+    assert deleted.index(node_dev_id) > deleted.index(relay_id)
+
+
+def test_note_node_device_deleted_prevents_recreation(ds, indigo_env):
+    _indigo, devices = indigo_env
+    import device_sync as device_sync_mod
+    ds.node_tombstones = device_sync_mod.NodeDeviceTombstones()
+    evidenced = _with_node_evidence(RELAY_NODE)
+    result = ds.create_from_raw(evidenced, "Office Plug")
+    node_dev_id = result["nodeDeviceId"]
+    assert node_dev_id is not None
+
+    ds.note_node_device_deleted(42, node_dev_id)
+    del devices._by_id[node_dev_id]   # simulate the Indigo-side deletion
+    assert ds.lookup(42, 0, "matterNode") is None
+
+    second = ds.create_from_raw(evidenced, "Office Plug")
+    assert second["nodeDeviceId"] is None, "a tombstoned node must not be recreated"
+
+
+def test_tombstone_honoured_through_reconcile_all(ds, indigo_env):
+    """Issue #204 review, fix I.5: the literal WS-reconnect path
+    (plugin._resync → device_sync.reconcile_all) must honour a tombstone too
+    — every prior tombstone test above drives ds.create_from_raw directly,
+    which is the commission/node_added path, not the reconnect path."""
+    _indigo, devices = indigo_env
+    import device_sync as device_sync_mod
+    ds.node_tombstones = device_sync_mod.NodeDeviceTombstones()
+    evidenced = _with_node_evidence(RELAY_NODE)
+    result = ds.create_from_raw(evidenced, "Office Plug")
+    node_dev_id = result["nodeDeviceId"]
+    assert node_dev_id is not None
+
+    ds.note_node_device_deleted(42, node_dev_id)
+    del devices._by_id[node_dev_id]   # simulate the Indigo-side deletion
+
+    ds.reconcile_all([evidenced])
+    assert ds.lookup(42, 0, "matterNode") is None, \
+        "a WS reconnect must not silently recreate a tombstoned node device"
+
+
+def test_menu_route_back_clears_the_tombstone_and_recreates(ds, indigo_env):
+    """The menu item's whole job: clear_all() undoes note_node_device_deleted
+    on the next create_devices pass."""
+    _indigo, devices = indigo_env
+    import device_sync as device_sync_mod
+    tombstones = device_sync_mod.NodeDeviceTombstones()
+    ds.node_tombstones = tombstones
+    evidenced = _with_node_evidence(RELAY_NODE)
+    result = ds.create_from_raw(evidenced, "Office Plug")
+    node_dev_id = result["nodeDeviceId"]
+    ds.note_node_device_deleted(42, node_dev_id)
+    del devices._by_id[node_dev_id]
+
+    tombstones.clear_all()
+    third = ds.create_from_raw(evidenced, "Office Plug")
+    assert third["nodeDeviceId"] is not None
+    assert third["nodeDeviceId"] != node_dev_id  # a fresh device, new id
+
+
+def test_forget_node_capabilities_clears_the_tombstone(ds, indigo_env):
+    """Node ids are reused across decommission/recommission — a genuinely
+    different device commissioned onto a reused id must not be born deleted."""
+    import device_sync as device_sync_mod
+    ds.node_tombstones = device_sync_mod.NodeDeviceTombstones()
+    evidenced = _with_node_evidence(RELAY_NODE)
+    result = ds.create_from_raw(evidenced, "Office Plug")
+    ds.note_node_device_deleted(42, result["nodeDeviceId"])
+    assert ds.node_tombstones.is_tombstoned(42)
+
+    ds._forget_node_capabilities(42)
+    assert not ds.node_tombstones.is_tombstoned(42)
+
+
+def test_note_node_device_deleted_with_no_tombstones_object_never_raises(ds, indigo_env):
+    """self.node_tombstones is None until plugin.startup wires it — inert,
+    same discipline as survey_log."""
+    evidenced = _with_node_evidence(RELAY_NODE)
+    result = ds.create_from_raw(evidenced, "Office Plug")
+    ds.note_node_device_deleted(42, result["nodeDeviceId"])  # must not raise
+
+
+def test_delete_node_does_not_tombstone_its_own_matterNode_delete(ds, indigo_env, mock_logger):
+    """Issue #204 review, fix A: decommission calls delete_node, which deletes
+    the matterNode device itself — Indigo's deviceDeleted callback fires for
+    THAT delete exactly as it would for a user's manual delete
+    (Plugin Guide: "gets called for every kind of device deletion"). Feeding
+    every id delete_node reports back through note_node_device_deleted (as
+    plugin.deviceDeleted would) must NOT tombstone the node or log the
+    misleading "will not be recreated" INFO — the decommission already
+    forgot the node, and a recommission onto the reused id needs a fresh
+    node device."""
+    _indigo, devices = indigo_env
+    import device_sync as device_sync_mod
+    ds.node_tombstones = device_sync_mod.NodeDeviceTombstones()
+    evidenced = _with_node_evidence(RELAY_NODE)
+    result = ds.create_from_raw(evidenced, "Office Plug")
+    node_dev_id = result["nodeDeviceId"]
+    assert node_dev_id is not None
+
+    deleted = ds.delete_node(42)
+    assert node_dev_id in deleted
+    for dev_id in deleted:
+        ds.note_node_device_deleted(42, dev_id)
+
+    assert not ds.node_tombstones.is_tombstoned(42)
+    assert not any(
+        "will not be recreated" in str(call.args)
+        for call in mock_logger.info.call_args_list
+    )
+
+
+def test_mark_unreachable_flags_the_node_device(ds, indigo_env):
+    """Issue #204 review, fix E: mark_unreachable is the EVT_NODE_REMOVED
+    path (and others) — it never went through _apply_reachability, so the
+    node device's own `reachable` state used to latch stale True."""
+    _indigo, devices = indigo_env
+    evidenced = _with_node_evidence(RELAY_NODE)
+    result = ds.create_from_raw(evidenced, "Office Plug")
+    node_dev_id = result["nodeDeviceId"]
+    ds.mark_unreachable(42)
+    assert devices[node_dev_id].errorState == "unreachable"
+    assert devices[node_dev_id].states.get("reachable") is False
+
+
+def test_mark_all_unreachable_flags_every_node_device(ds, indigo_env):
+    """Issue #204 review, fix E: a WS drop (mark_all_unreachable) is the most
+    common outage this plugin sees — it must not leave matterNode devices'
+    `reachable` state stale True."""
+    _indigo, devices = indigo_env
+    evidenced = _with_node_evidence(RELAY_NODE)
+    result = ds.create_from_raw(evidenced, "Office Plug")
+    node_dev_id = result["nodeDeviceId"]
+    ds.mark_all_unreachable()
+    assert devices[node_dev_id].errorState == "unreachable"
+    assert devices[node_dev_id].states.get("reachable") is False
+
+
+def test_reconcile_orphan_sweep_marks_a_non_informative_node_device_unreachable(ds, indigo_env):
+    """ADR-0008 correction (issue #204 review, fixes E and G.4): a
+    non-informative snapshot (empty attributes → node.endpoints == []) puts
+    EVERYTHING for that node in the orphan sweep, including the node device
+    at (node_id, 0) — the "orphan sweep never touches the node device" claim
+    only holds when the pass is informative. It must be marked unreachable,
+    not deleted."""
+    _indigo, devices = indigo_env
+    evidenced = _with_node_evidence(RELAY_NODE)
+    result = ds.create_from_raw(evidenced, "Office Plug")
+    node_dev_id = result["nodeDeviceId"]
+    relay_id = ds.lookup(42, 1, "matterRelay")
+
+    ds.reconcile_all([{"node_id": 42, "attributes": {}, "available": True}])
+
+    assert node_dev_id in devices._by_id, "orphan sweep marks unreachable, never deletes"
+    assert devices[node_dev_id].errorState == "unreachable"
+    assert devices[node_dev_id].states.get("reachable") is False
+    assert devices[relay_id].errorState == "unreachable"
+
+
+def test_apply_reachability_writes_the_node_reachable_state_both_directions(ds, indigo_env):
+    _indigo, devices = indigo_env
+    evidenced = _with_node_evidence(RELAY_NODE)
+    result = ds.create_from_raw(evidenced, "Office Plug")
+    node_dev_id = result["nodeDeviceId"]
+    from matter_model import parse_node
+
+    unavailable = parse_node({**evidenced, "available": False}, "Office Plug")
+    ds._apply_reachability(unavailable)
+    assert devices[node_dev_id].states.get("reachable") is False
+    assert devices[node_dev_id].errorState == "unreachable"
+
+    available = parse_node({**evidenced, "available": True}, "Office Plug")
+    ds._apply_reachability(available)
+    assert devices[node_dev_id].states.get("reachable") is True
+    assert devices[node_dev_id].errorState == ""
+
+
+def test_reconcile_all_never_sweeps_the_node_device_as_an_orphan(ds, indigo_env):
+    _indigo, devices = indigo_env
+    evidenced = _with_node_evidence(RELAY_NODE)
+    result = ds.create_from_raw(evidenced, "Office Plug")
+    node_dev_id = result["nodeDeviceId"]
+    ds.reconcile_all([evidenced])
+    assert devices[node_dev_id].errorState == ""
+    assert ds.lookup(42, 0, "matterNode") == node_dev_id
+
+
+# ---------------------------------------------------------------------------
+# NodeDeviceTombstones — the class itself (issue #204)
+# ---------------------------------------------------------------------------
+
+def test_tombstones_load_from_json_array():
+    import device_sync as device_sync_mod
+    t = device_sync_mod.NodeDeviceTombstones()
+    t.load('["42", "7"]')
+    assert t.is_tombstoned(42)
+    assert t.is_tombstoned(7)
+    assert not t.is_tombstoned(9)
+
+
+def test_tombstones_load_to_json_round_trip():
+    """Issue #204 review, fix I.4: load(other.to_json()) — the actual shape a
+    restart uses (pluginPrefs blob → load), rather than only testing load()
+    against a hand-written JSON literal."""
+    import device_sync as device_sync_mod
+    a = device_sync_mod.NodeDeviceTombstones()
+    a.add(1)
+    a.add(42)
+    b = device_sync_mod.NodeDeviceTombstones()
+    b.load(a.to_json())
+    assert b.is_tombstoned(1)
+    assert b.is_tombstoned(42)
+    assert not b.is_tombstoned(2)
+
+
+def test_tombstones_load_tolerates_garbage():
+    import device_sync as device_sync_mod
+    t = device_sync_mod.NodeDeviceTombstones()
+    t.load("not json at all")
+    assert not t.is_tombstoned(42)
+    t.load(None)
+    assert not t.is_tombstoned(42)
+    t.load("")
+    assert not t.is_tombstoned(42)
+
+
+def test_tombstones_add_persists():
+    import device_sync as device_sync_mod
+    saved = []
+    t = device_sync_mod.NodeDeviceTombstones(save=saved.append)
+    t.add(42)
+    assert saved == ['["42"]']
+    assert t.is_tombstoned(42)
+
+
+def test_tombstones_forget_persists_only_when_present():
+    import device_sync as device_sync_mod
+    saved = []
+    t = device_sync_mod.NodeDeviceTombstones(save=saved.append)
+    t.forget(42)
+    assert saved == [], "nothing to forget — must not persist a no-op write"
+    t.add(42)
+    saved.clear()
+    t.forget(42)
+    assert saved == ["[]"]
+    assert not t.is_tombstoned(42)
+
+
+def test_tombstones_clear_all_persists_only_when_something_was_cleared():
+    import device_sync as device_sync_mod
+    saved = []
+    t = device_sync_mod.NodeDeviceTombstones(save=saved.append)
+    assert t.clear_all() == 0
+    assert saved == [], "nothing tombstoned — must not persist a no-op write"
+    t.add(1)
+    t.add(2)
+    saved.clear()
+    # Fix B (issue #204 review): the count is what lets the menu handler skip
+    # a pointless reconcile and report an honest number.
+    assert t.clear_all() == 2
+    assert saved == ["[]"]
+    assert not t.is_tombstoned(1) and not t.is_tombstoned(2)
+
+
+def test_tombstones_persist_failure_never_raises():
+    import device_sync as device_sync_mod
+    def boom(_blob):
+        raise RuntimeError("prefs are read-only")
+    t = device_sync_mod.NodeDeviceTombstones(save=boom)
+    t.add(42)  # must not raise
+    assert t.is_tombstoned(42)
+
+
+def test_tombstones_persist_failure_logs_a_loud_warning(mock_logger):
+    """Issue #204 review, fix C: unlike SurveyLog's cosmetic repeat, a failed
+    tombstone save means a deliberately-deleted node device can be
+    resurrected after a restart — the failure must be loud, not silent."""
+    import device_sync as device_sync_mod
+    def boom(_blob):
+        raise RuntimeError("prefs are read-only")
+    t = device_sync_mod.NodeDeviceTombstones(save=boom, logger=mock_logger)
+    t.add(42)  # must not raise
+    assert mock_logger.warning.called
+    msg = " ".join(str(a) for a in mock_logger.warning.call_args.args)
+    assert "may be recreated" in msg
+
+
+def test_tombstones_persist_failure_without_logger_still_never_raises():
+    """logger is optional (constructor default None) — same discipline as
+    save=None; a test/path that hasn't wired one gets silence, not a crash."""
+    import device_sync as device_sync_mod
+    def boom(_blob):
+        raise RuntimeError("prefs are read-only")
+    t = device_sync_mod.NodeDeviceTombstones(save=boom)
+    t.add(42)  # must not raise even with no logger wired
+    assert t.is_tombstoned(42)

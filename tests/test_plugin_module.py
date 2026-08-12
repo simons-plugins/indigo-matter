@@ -136,6 +136,7 @@ MENU_SECTIONS = [
     ["Back up the Matter fabric…",
      "Restore a fabric backup…",
      "Rebuild Matter Endpoint Map…",
+     "Recreate Matter node devices…",
      "Reset Matter Bridge Pairings…"],
 ]
 
@@ -213,6 +214,72 @@ def test_relay_devices_do_not_redefine_native_onoffstate():
         and any(s.get("id") == "onOffState" for s in dev.iter("State"))
     ]
     assert not offenders, f"relay-type devices must not redefine native onOffState: {offenders}"
+
+
+# ---------------------------------------------------------------------------
+# issue #204 / ADR-0008 — the synthetic matterNode device type
+# ---------------------------------------------------------------------------
+
+def _device_element(device_type_id):
+    root = ET.parse(SERVER_PLUGIN / "Devices.xml").getroot()
+    for device in root.findall("Device"):
+        if device.get("id") == device_type_id:
+            return device
+    raise AssertionError(f"no <Device id={device_type_id!r}> in Devices.xml")
+
+
+def test_matter_node_device_exists_as_custom_type():
+    dev = _device_element("matterNode")
+    assert dev.get("type") == "custom"
+
+
+def test_matter_node_is_the_only_type_with_allowUserCreation_false():
+    """This type is only ever created by device_sync — a user-created one
+    would have no Matter node behind it at all (ADR-0008)."""
+    root = ET.parse(SERVER_PLUGIN / "Devices.xml").getroot()
+    no_creation = [
+        dev.get("id") for dev in root.findall("Device")
+        if dev.get("allowUserCreation") == "false"
+    ]
+    assert no_creation == ["matterNode"], (
+        f"expected only matterNode to carry allowUserCreation=\"false\", got {no_creation}")
+
+
+def test_matter_node_configui_has_the_identity_fields():
+    fields = _device_config_fields("matterNode")
+    for field_id in ("nodeId", "endpointId", "vendorName", "productName", "softwareVersion"):
+        assert field_id in fields, f"matterNode ConfigUI missing <Field id={field_id!r}>"
+        assert fields[field_id].get("readonly") == "yes", f"{field_id} must be readonly"
+    # vendorName/productName are creation-time props only, never states —
+    # unlike softwareVersion, which is both.
+    assert "nodeLabel" not in fields, "nodeLabel is state-only, not a ConfigUI field"
+
+
+def test_matter_node_states_are_the_deliberately_short_list():
+    """ADR-0007: a shipped State is permanent, so only values that CAN change
+    are declared — vendorName/productName are NOT here (props only)."""
+    assert _device_state_ids("matterNode") == {"nodeLabel", "softwareVersion", "batteryLevel", "reachable"}
+
+
+def test_matter_node_battery_level_state_is_an_integer():
+    """The reserved Indigo state name, used deliberately (ADR-0008) so a
+    future group-root device inherits Indigo's native battery-property
+    behaviour for free."""
+    dev = _device_element("matterNode")
+    states = {s.get("id"): s for s in dev.find("States").findall("State")}
+    assert states["batteryLevel"].findtext("ValueType") == "Integer"
+
+
+def test_matter_node_reachable_is_the_display_state():
+    dev = _device_element("matterNode")
+    assert dev.findtext("UiDisplayStateId") == "reachable"
+
+
+def test_matter_node_has_no_declared_settings():
+    """Node-level settings are future work (ADR-0008 correction to ADR-0002's
+    aside) — this PR does not add any."""
+    from matter_handlers.settings import settings_for_type
+    assert settings_for_type("matterNode") == []
 
 
 # ---------------------------------------------------------------------------

@@ -21,8 +21,9 @@ runs on the commissioning/Indigo thread, not the loop.)
 """
 from __future__ import annotations
 
+import json
 import threading
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import indigo
 
@@ -35,11 +36,16 @@ from matter_model import (
     parse_node,
 )
 from matter_handlers.base import IndigoDeviceSpec
+from matter_handlers.basic_information import (
+    ATTR_NODE_LABEL,
+    ATTR_SW_VERSION_STRING,
+    CLUSTER_BASIC_INFORMATION,
+)
 from matter_handlers.boolean_state_config import (
     ATTR_SUPPORTED_SENSITIVITY_LEVELS,
     CLUSTER_BOOLEAN_STATE_CONFIG,
 )
-from matter_handlers.settings import ATTR_ATTRIBUTE_LIST, SETTINGS, settings_for_type
+from matter_handlers.settings import ATTR_ATTRIBUTE_LIST, SETTINGS, implements, settings_for_type
 from matter_handlers.electrical import (
     ATTR_ACTIVE_ENDPOINTS,
     ATTR_AVAILABLE_ENDPOINTS,
@@ -185,6 +191,118 @@ def _salvage_node_id(raw: Any) -> Optional[int]:
     return None
 
 
+class NodeDeviceTombstones:
+    """Which nodes' synthetic ``matterNode`` device the user has deliberately
+    deleted (issue #204, ADR-0008), so a later reconcile does not silently
+    bring it back.
+
+    Every OTHER device this plugin creates is cluster-derived: delete one and
+    the next reconcile recreates it, because the Matter node still reports the
+    cluster that justified it — that is the correct, expected self-heal
+    (issue #45). The node device is different. It exists because
+    ``device_sync`` decided to represent the node (ADR-0008), not because a
+    cluster demanded it, so deleting it is a real, standing choice that a
+    reconcile must not quietly overturn. Without this, every WS reconnect
+    (``reconcile_all`` → ``create_devices``) would recreate a device the user
+    just removed.
+
+    Same shape as :class:`settings_report.SurveyLog` — one JSON string in
+    ``pluginPrefs`` — but a plain set of node ids rather than a fingerprint
+    map, because there is nothing to compare against, only membership: a node
+    is either tombstoned or it isn't. A blob that will not parse starts empty
+    rather than raising, the same discipline as ``SurveyLog.load``.
+
+    Cleared by ``_forget_node_capabilities`` on decommission, for the same
+    reason ``SurveyLog.forget`` is: node ids are reused across a
+    decommission/recommission cycle, and a genuinely different device must
+    not inherit an old one's tombstone. The asymmetry with everything else
+    that method drops is deliberate — every other cache it clears is
+    cluster-derived and self-heals on the next informative pass; a tombstoned
+    node device does not exist to self-heal, because deleting it WAS the
+    point, so it is cleared only when the node itself is gone, never merely
+    re-reported.
+    """
+
+    def __init__(self, save: Optional[Callable[[str], None]] = None, logger: Optional[Any] = None) -> None:
+        self._tombstoned: set[str] = set()
+        self._save = save
+        self._logger = logger
+        self._lock = threading.RLock()
+
+    def load(self, blob: Any) -> None:
+        """Replace the tombstone set from a stored JSON string (or anything unusable)."""
+        parsed: set[str] = set()
+        if isinstance(blob, str) and blob.strip():
+            try:
+                raw = json.loads(blob)
+                if isinstance(raw, list):
+                    parsed = {str(v) for v in raw}
+            except (TypeError, ValueError):
+                parsed = set()
+        with self._lock:
+            self._tombstoned = parsed
+
+    def to_json(self) -> str:
+        with self._lock:
+            return json.dumps(sorted(self._tombstoned), separators=(",", ":"))
+
+    def is_tombstoned(self, node_id: Any) -> bool:
+        with self._lock:
+            return str(int(node_id)) in self._tombstoned
+
+    def add(self, node_id: Any) -> None:
+        """Record a deliberate deletion (plugin.deviceDeleted → note_node_device_deleted)."""
+        with self._lock:
+            self._tombstoned.add(str(int(node_id)))
+        self._persist()
+
+    def forget(self, node_id: Any) -> None:
+        """Drop a decommissioned node's tombstone, so a re-commission is not born deleted."""
+        with self._lock:
+            existed = str(int(node_id)) in self._tombstoned
+            self._tombstoned.discard(str(int(node_id)))
+        if existed:
+            self._persist()
+
+    def clear_all(self) -> int:
+        """The menu route back (issue #204's "Recreate Matter node devices…"):
+        every tombstoned node is forgotten in one go, so the next reconcile
+        recreates every node device the user has deleted.
+
+        Returns the count of ids cleared (issue #204 review, fix B) — the
+        menu handler uses it to skip a pointless 30s reconcile when there was
+        nothing to clear, and to make its success log honest about how many
+        nodes are actually in play."""
+        with self._lock:
+            count = len(self._tombstoned)
+            self._tombstoned = set()
+        if count:
+            self._persist()
+        return count
+
+    def _persist(self) -> None:
+        if self._save is None:
+            return
+        try:
+            self._save(self.to_json())
+        except Exception as exc:  # noqa: BLE001 - bookkeeping must never sink a reconcile
+            # Unlike SurveyLog's failed save (cosmetic — the digest is just
+            # stale until the next successful write), a failed tombstone save
+            # is not cosmetic (issue #204 review, fix C): if the plugin
+            # restarts before a LATER successful save, this deliberately-
+            # deleted node device is resurrected on the next reconcile,
+            # because load() at startup reads whatever pluginPrefs still has.
+            # Loud, not silent — but still swallowed here, same reasoning as
+            # SurveyLog._persist: an exception escaping into
+            # create_devices/deviceDeleted would be worse than one repeated
+            # write attempt later.
+            if self._logger is not None:
+                self._logger.warning(
+                    "Matter: could not save node-device tombstones (%s) — if the plugin "
+                    "restarts before a later successful save, a node device you deleted "
+                    "may be recreated.", exc)
+
+
 class DeviceSync:
     def __init__(self, registry: Any, logger: Any) -> None:
         self.registry = registry
@@ -275,6 +393,11 @@ class DeviceSync:
         # rather than making it fire on every reconcile pass — an unbounded
         # repeat is the one outcome that would make the INFO wallpaper.
         self.survey_log: Optional[Any] = None
+        # Deliberate matterNode deletions (issue #204, ADR-0008). Injected by
+        # plugin.startup, same discipline as survey_log: None in tests and any
+        # path that hasn't wired it, which means "nothing is tombstoned" —
+        # NOT "recreate nothing" — see _ensure_node_device.
+        self.node_tombstones: Optional[Any] = None
         # Nodes whose AttributeLists changed but whose Indigo devices have not
         # yet had their state lists rebuilt (issue #190). Needed because
         # _cache_setting_limits both records the new answer and reports the
@@ -292,6 +415,27 @@ class DeviceSync:
         # later coverage change that excludes a DIFFERENT device) should be
         # free to log again.
         self._battery_exclusion_warned: set[tuple[int, int]] = set()
+        # Nodes already told their AttributeList stably fails ADR-0003's
+        # node-device gate (issue #204 review, fix D) — both NodeLabel and
+        # SoftwareVersionString read back False, not None. Same per-run-only
+        # discipline as _battery_exclusion_warned: a restart should be free
+        # to log again, and this is not meant to be a permanent suppression.
+        self._non_conformant_node_warned: set[int] = set()
+        # dev_ids delete_node is about to delete itself (issue #204 review,
+        # fix A). Indigo's deviceDeleted callback "gets called for every kind
+        # of device deletion — the user deleting it, a plugin deleting it,
+        # Indigo deleting it as part of a group" (Plugin Guide, deviceDeleted),
+        # so delete_node's own indigo.device.delete calls fire the SAME
+        # callback a user's manual delete does. Without this set,
+        # note_node_device_deleted cannot tell "user deleted the node device"
+        # from "delete_node deleted it as part of a decommission" and
+        # tombstones both — but the decommission already forgets the node
+        # (or the id gets reused on recommission), so the tombstone then
+        # blocks the node device from ever being recreated. Populated right
+        # before the delete loop, discarded on the deviceDeleted callback that
+        # follows (or defensively after the loop) so membership is short-lived
+        # rather than an ever-growing set.
+        self._self_deleted_ids: set[int] = set()
 
     # ------------------------------------------------------------------
     # Active-device tracking (deviceStartComm/deviceStopComm)
@@ -423,6 +567,14 @@ class DeviceSync:
         devices — ``_index`` cannot restore it, so it would vanish from the
         picker while still commissioned, with no way to retry until the next
         reconcile (issue #111 review).
+
+        Deletion is ORDERED: every non-``matterNode`` device for this node
+        first, its ``matterNode`` device (if any) last. ``indigo.device.delete``
+        refuses to delete the root of a non-empty Indigo device group, and the
+        node device is that root's intended occupant (ADR-0008) — harmless
+        today (no grouping exists yet), but load-bearing the moment the
+        grouping follow-up PR lands, so the ordering is established here
+        rather than left for that PR to discover the hard way.
         """
         target = int(node_id)
         with self._lock:
@@ -433,11 +585,30 @@ class DeviceSync:
             # next reconcile_all and could be picked a second time.
             if forget:
                 self._known_nodes.discard(target)
-            # Collect all dev_ids across all endpoints for this node
+            # Collect all dev_ids across all endpoints for this node, with the
+            # matterNode device (if present) held back to the end.
+            node_dev_id: Optional[int] = None
             candidates: list[int] = []
-            for (nid, _eid), type_map in self._index.items():
-                if nid == target:
-                    candidates.extend(type_map.values())
+            for (nid, eid), type_map in self._index.items():
+                if nid != target:
+                    continue
+                for type_id, dev_id in type_map.items():
+                    if eid == 0 and type_id == "matterNode":
+                        node_dev_id = dev_id
+                    else:
+                        candidates.append(dev_id)
+            if node_dev_id is not None:
+                candidates.append(node_dev_id)
+            # Mark every candidate as self-deleted BEFORE calling
+            # indigo.device.delete (issue #204 review, fix A — see
+            # _self_deleted_ids above). Whether Indigo's deviceDeleted
+            # callback for this delete lands synchronously inside the call
+            # below or arrives afterwards, note_node_device_deleted must find
+            # the id already marked. Membership is cleared there (discard on
+            # hit) rather than unconditionally here: a candidate whose
+            # callback hasn't landed yet by the time this loop finishes must
+            # still be recognised when it eventually does.
+            self._self_deleted_ids.update(candidates)
             deleted = []
             for dev_id in candidates:
                 try:
@@ -457,6 +628,53 @@ class DeviceSync:
                     new_index[key] = type_map
             self._index = new_index
             return deleted
+
+    def note_node_device_deleted(self, node_id: Any, dev_id: Any) -> None:
+        """A user deleted a node's ``matterNode`` device by hand (issue #204,
+        ADR-0008) — called from ``plugin.deviceDeleted``.
+
+        Drops the index entry immediately, so a stale dev_id can never be
+        handed back by :meth:`lookup`/:meth:`_ensure_node_device` before the
+        next reconcile runs, and tombstones the node so ``create_devices``
+        does not recreate it out from under the user on the next reconnect.
+        The "Recreate Matter node devices…" menu item
+        (``ServerMenuMixin.menuRecreateNodeDevices``) is the only way back.
+
+        Endpoint devices deliberately do NOT get this treatment: they are
+        cluster-derived, so deleting one is corrected by the next reconcile
+        (issue #45's self-heal) — that is existing, expected behaviour this
+        method does not change. Only the node device is synthetic enough that
+        its deletion has to be honoured rather than healed.
+
+        ``dev_id`` (issue #204 review, fix A) is what tells a genuine user
+        deletion apart from ``delete_node`` deleting its own node device as
+        part of a decommission: Indigo's ``deviceDeleted`` fires for BOTH —
+        "it gets called for every kind of device deletion, whether the user
+        deletes it manually, a script or action group deletes it, or a
+        plugin deletes it" (Plugin Guide, deviceDeleted) — so without this
+        check every decommission would tombstone the node it just forgot,
+        and a later recommission onto the reused node id would get no node
+        device and a misleading "will not be recreated" INFO forever.
+        """
+        nid = int(node_id)
+        did = int(dev_id)
+        with self._lock:
+            if did in self._self_deleted_ids:
+                self._self_deleted_ids.discard(did)
+                return
+            type_map = self._index.get((nid, 0))
+            if type_map is not None:
+                type_map.pop("matterNode", None)
+                if not type_map:
+                    self._index.pop((nid, 0), None)
+        if self.node_tombstones is not None:
+            self.node_tombstones.add(nid)
+        self.logger.info(
+            "node %s: its Matter node device was deleted and will not be recreated "
+            "automatically. Use the 'Recreate Matter node devices…' menu item if you "
+            "want it back.",
+            node_id_to_str(nid),
+        )
 
     def knows_node(self, node_id: Any) -> bool:
         """Whether this node is one we currently track — same set list_nodes offers.
@@ -780,6 +998,23 @@ class DeviceSync:
                     node, dev_id, endpoint.endpoint_id, type_id,
                     ep_sibling_types=ep_planned_types.get(ep_key, set()),
                 )
+            # Resolve-or-create the node's own synthetic device (issue #204,
+            # ADR-0008) — AFTER every endpoint device in `plan` has been
+            # created, deliberately NEVER appended to `plan` itself
+            # (`multi = len(plan) > 1` and `role_counts` above must see only
+            # endpoint specs, or every single-endpoint node would flip to
+            # "multi" and rename its one real device with a role suffix it
+            # doesn't need — the most dangerous regression in this change).
+            # LAST is also a naming decision, not just a plan-list one: a
+            # single-endpoint node's relay and its node device both want the
+            # bare product name, and whichever is created first keeps it
+            # unsuffixed. Creating endpoint devices first means the RELAY
+            # claims it — "a user who commissioned a plug wants the relay" is
+            # the same priority `primary`/`nodeDeviceId` already encode below
+            # — so the node device is the one `_create_one`'s `_unique_name`
+            # suffixes on a collision, never an already-fielded endpoint
+            # device.
+            node_dev_id = self._ensure_node_device(node, coverage, folder_id, model, plan)
         if new_ids:
             # The only event-log evidence of an out-of-band join (node_added)
             # is this line — keep it INFO, not debug (issue #19). Idempotent
@@ -825,6 +1060,12 @@ class DeviceSync:
             self.report_settable_attributes(node)
         result = {
             "indigoDeviceIds": created,
+            # Deliberately separate from indigoDeviceIds/primaryDeviceId
+            # (issue #204): the node device is not one of the node's endpoint
+            # devices and must never become — or displace — the primary a
+            # user who commissioned, say, a plug expects to get back (the
+            # relay), so it is surfaced as its own key instead of folded in.
+            "nodeDeviceId": node_dev_id,
             "primaryDeviceId": primary,
             "endpointCount": len(node.endpoints),
             "vendorId": node.vendor_id,
@@ -933,6 +1174,131 @@ class DeviceSync:
             },
             initial_states={"curEnergyLevel": 0.0, "accumEnergyTotal": 0.0, "reachable": True},
         )
+
+    @staticmethod
+    def _node_spec(node: NodeInfo, coverage: Any) -> IndigoDeviceSpec:
+        """Spec for the synthetic per-node device anchored at endpoint 0
+        (issue #204, ADR-0008).
+
+        Third device_sync-owned spec builder, beside ``_unknown_spec``/
+        ``_energy_meter_spec`` — no ``ClusterHandler`` owns this device either:
+        ``BasicInformationHandler.is_primary_for`` is False precisely so
+        device_sync stays the one place that decides WHETHER a node device
+        exists (the plan/ADR-0003 evidence a per-cluster handler cannot see).
+
+        ``name`` is the BARE base — ``node.suggested_name``/``product_name``/
+        fallback — with NO role suffix and NO "(endpoint N)" disambiguation.
+        That is deliberately the same name an application endpoint on this
+        node may already carry; ``_create_one``'s ``_unique_name`` resolves
+        the collision with a numeric suffix, same as any other same-named
+        device. This is temporary — ADR-0008's grouping/naming follow-up PR
+        is what trues the two apart properly — and until then a name
+        collision here is cosmetic, not a correctness problem: the two
+        devices are still distinguished by their own nodeId/endpointId props
+        and every other Indigo device-list column.
+        """
+        name = node.suggested_name or node.product_name or f"Matter {node.node_id}"
+        props = {
+            "nodeId": str(node.node_id),
+            "endpointId": "0",
+            # One node, one address — same convention every sibling endpoint
+            # device already uses (node_id_to_str stamped at creation).
+            "address": node_id_to_str(node.node_id),
+            "vendorName": node.vendor_name,
+            "productName": node.product_name,
+            # First use of the parsed sw_version field anywhere in this
+            # plugin — matter_model.parse_node has captured it since the
+            # first version, but nothing has ever surfaced it until now.
+            "softwareVersion": node.sw_version,
+            # Stamped (not just implied by `name`) so the follow-up naming PR
+            # can true up the node's device group deterministically without
+            # re-deriving the bare base from scratch.
+            "nodeBaseName": name,
+        }
+        if 0 in coverage.covered:
+            props["SupportsBatteryLevel"] = True
+        return IndigoDeviceSpec(
+            device_type_id="matterNode",
+            name=name,
+            props=props,
+            # nodeLabel/batteryLevel are NOT seeded here — they arrive
+            # through the normal _prime_states pass immediately after
+            # creation, exactly like every other device's first-value fill.
+            initial_states={"reachable": True, "softwareVersion": node.sw_version},
+        )
+
+    def _ensure_node_device(self, node: NodeInfo, coverage: Any, folder_id: int,
+                            model: str, plan: list) -> Optional[int]:
+        """Resolve or create this node's synthetic ``matterNode`` device
+        (issue #204, ADR-0008).
+
+        Order of checks, each a distinct reason to do nothing:
+
+        1. Already indexed — idempotent, same precedent as every endpoint
+           device's existing-device check.
+        2. Tombstoned — the user deliberately deleted this node's device
+           (``note_node_device_deleted``); recreating it out from under them
+           on the next reconnect would be exactly the silent override the
+           tombstone exists to prevent.
+        3. Empty plan — the issue #105 empty-bridge case. A node with no
+           endpoint devices at all has nothing for a node device to be the
+           root OF; creating one here would just be a device with nothing
+           behind it. (A node that is merely mid-interview and hasn't
+           produced any specs YET is covered by check 4 anyway: it has no
+           AttributeList yet either.)
+        4. ADR-0003 gate — ep 0's own BasicInformation AttributeList (0xFFFB)
+           must positively evidence NodeLabel (0x0005) OR
+           SoftwareVersionString (0x000A). Both are spec-mandatory, so a
+           healthy, fully-interviewed node always passes; a node still
+           mid-interview correctly gets nothing THIS pass — unknown is not
+           yes (ADR-0003's asymmetric policy), and the next informative
+           reconcile tries again.
+
+           ``implements()`` is trinary (True/False/None) and ``None`` must
+           stay silent — a mid-interview node is not a verdict. But False on
+           BOTH attributes (not None on either) IS a stable verdict: the
+           device positively read back an AttributeList lacking two
+           spec-MANDATORY attributes, i.e. a non-conformant node that will
+           never earn a node device. That is worth one INFO per node per
+           plugin run, not silence identical to "ask again later" (issue
+           #204 review, fix D).
+        """
+        nid = int(node.node_id)
+        with self._lock:
+            existing = self._index.get((nid, 0), {}).get("matterNode")
+        if existing is not None:
+            return existing
+        if self.node_tombstones is not None and self.node_tombstones.is_tombstoned(nid):
+            return None
+        if not plan:
+            return None
+        attribute_list = node.attributes.get((0, CLUSTER_BASIC_INFORMATION, ATTR_ATTRIBUTE_LIST))
+        has_node_label = implements(attribute_list, ATTR_NODE_LABEL)
+        has_sw_version = implements(attribute_list, ATTR_SW_VERSION_STRING)
+        if has_node_label is not True and has_sw_version is not True:
+            if has_node_label is False and has_sw_version is False \
+                    and nid not in self._non_conformant_node_warned:
+                self._non_conformant_node_warned.add(nid)
+                self.logger.info(
+                    "Matter node %s: its BasicInformation AttributeList reports neither "
+                    "NodeLabel nor SoftwareVersionString, so no node device will be created "
+                    "(non-conformant).",
+                    node_id_to_str(nid),
+                )
+            return None
+        spec = self._node_spec(node, coverage)
+        dev_id = self._create_one(spec, spec.name, folder_id, model)
+        if dev_id is None:
+            return None
+        with self._lock:
+            self._index.setdefault((nid, 0), {})["matterNode"] = dev_id
+        self._prime_states(node, dev_id, 0, "matterNode", ep_sibling_types={"matterNode"})
+        self.logger.info(
+            "Matter node %s (%s %s): created node device %s",
+            node_id_to_str(nid), node.vendor_name or "unknown vendor",
+            node.product_name or "unknown product", dev_id,
+        )
+        return dev_id
 
     @staticmethod
     def _endpoint_by_id(node: NodeInfo, endpoint_id: int) -> Optional[Any]:
@@ -1619,6 +1985,16 @@ class DeviceSync:
         # and persisting reaches pluginPrefs.
         if self.survey_log is not None:
             self.survey_log.forget(target)
+        # And the node-device tombstone (issue #204). Same reused-node-id
+        # reasoning as survey_log.forget above: a genuinely different device
+        # commissioned onto a reused id must not be born deleted because a
+        # PREVIOUS occupant's node device was removed by hand. Unlike every
+        # other cache this method drops, a tombstone has no self-heal to fall
+        # back to if this were skipped — it exists specifically to survive a
+        # reconcile, so decommission (an explicit "this node is gone") is the
+        # one event allowed to clear it, not a routine WS reconnect.
+        if self.node_tombstones is not None:
+            self.node_tombstones.forget(target)
 
     def _refresh_state_lists(self, node_id: Any) -> None:
         """Ask Indigo to rebuild the state list of every device on a node.
@@ -1959,6 +2335,19 @@ class DeviceSync:
             seen_nodes.add(int(node.node_id))
             for endpoint in node.endpoints:
                 live.add((node.node_id, endpoint.endpoint_id))
+                # (node_id, 0) — where a matterNode device is indexed
+                # (issue #204) — is covered here with no special-casing:
+                # endpoint 0 always parses out of a node's own attributes
+                # (matter_model.parse_node derives endpoints from attribute
+                # paths, and BasicInformation always reports on ep 0), so
+                # whenever this pass is informative enough to reach here at
+                # all, (node_id, 0) is already `live` and the orphan sweep
+                # below leaves the node device alone. A non-informative
+                # snapshot (empty attributes → no endpoints at all, so this
+                # loop body never runs for that node) IS still possible and
+                # DOES orphan (node_id, 0) along with everything else on that
+                # node (issue #204 review, fix G.4/E) — harmless, because the
+                # sweep only marks unreachable, never deletes.
             try:
                 self.create_devices(node)
                 # Reconcile reachability from matter-server's availability flag:
@@ -1981,6 +2370,17 @@ class DeviceSync:
                 if (node_id, _ep) not in live
                 for dev_id in type_map.values()
             ]
+            # Which of those orphaned endpoints is (node_id, 0) with a
+            # matterNode entry — the type_map tells us without a second index
+            # walk (issue #204 review, fix E: the orphan sweep below already
+            # marks these dev_ids unreachable via errorState, but the node
+            # device's own `reachable` state needs the same explicit write
+            # _apply_reachability makes elsewhere).
+            orphan_node_ids = {
+                node_id
+                for (node_id, ep), type_map in self._index.items()
+                if ep == 0 and (node_id, ep) not in live and "matterNode" in type_map
+            }
         if dropped:
             # A node with Indigo devices leaves evidence when it disappears (the
             # orphan sweep above marks them unreachable). One with NO devices
@@ -2015,6 +2415,8 @@ class DeviceSync:
         # just be short.
         for dev_id in orphans:
             self._safe_unreachable(dev_id)
+        for nid in orphan_node_ids:
+            self._write_node_reachable(nid, False)
 
     def _apply_reachability(self, node: NodeInfo) -> None:
         """Sync a node's Indigo devices to matter-server's reachability for it."""
@@ -2022,6 +2424,22 @@ class DeviceSync:
             self._refresh_live_node(node)
         else:
             self.mark_unreachable(node.node_id)
+        # The node device's own `reachable` STATE (issue #204) — on top of the
+        # errorState marking above, which `mark_unreachable`/`_refresh_live_node`
+        # already apply to it like any other device on the node via `_index`.
+        # `reachable` is matterNode's UiDisplayStateId, so its live value must
+        # track this same evidence directly, both directions, rather than sit
+        # at its creation-time True forever the way matterUnknown/
+        # matterEnergyMeter's write-once `reachable` currently does.
+        #
+        # This call is idempotent with `mark_unreachable`'s own write on the
+        # False branch above (issue #204 review, fix E) — both land the same
+        # value, so the repeat costs nothing. It is also THE ONLY path that
+        # ever writes True again: every other caller of `mark_unreachable`/
+        # `mark_all_unreachable`/the orphan sweep only has bad news to report
+        # and correctly only ever writes False. A reconcile that finds the
+        # node available is what un-latches it.
+        self._write_node_reachable(node.node_id, bool(node.available))
 
     def _refresh_live_node(self, node: NodeInfo) -> None:
         # Re-assert any capability props that were missed at creation time (issue #45).
@@ -2054,6 +2472,13 @@ class DeviceSync:
             ]
         for dev_id in targets:
             self._safe_unreachable(dev_id)
+        # errorState above covers every device generically; the node device's
+        # OWN `reachable` state (its UiDisplayStateId) needs the same explicit
+        # write _apply_reachability makes — otherwise it latches stale True
+        # through this path (issue #204 review, fix E: EVT_NODE_REMOVED and
+        # other event-driven callers of this method never went through
+        # _apply_reachability at all).
+        self._write_node_reachable(node_id, False)
 
     def mark_endpoint_unreachable(self, node_id: Any, endpoint_id: Any) -> None:
         """Mark ALL Indigo devices for a specific (node, endpoint) unreachable.
@@ -2073,13 +2498,22 @@ class DeviceSync:
             # but be defensive)
             seen: set[int] = set()
             targets: list[int] = []
-            for type_map in self._index.values():
+            node_ids: set[int] = set()
+            for (nid, eid), type_map in self._index.items():
+                if eid == 0 and "matterNode" in type_map:
+                    node_ids.add(nid)
                 for dev_id in type_map.values():
                     if dev_id not in seen:
                         seen.add(dev_id)
                         targets.append(dev_id)
         for dev_id in targets:
             self._safe_unreachable(dev_id)
+        # A WS drop is the most common outage this plugin sees (issue #204
+        # review, fix E) — without this, every matterNode device's own
+        # `reachable` state would latch stale True through a disconnect that
+        # errorState above already reports on every OTHER device.
+        for nid in node_ids:
+            self._write_node_reachable(nid, False)
 
     def _on_endpoint_removed(self, evt: protocol.MatterEvent) -> None:
         """A bridged child endpoint was removed from the bridge.
@@ -2106,6 +2540,29 @@ class DeviceSync:
                 dev.setErrorStateOnServer("")
         except Exception as exc:  # noqa: BLE001
             self.logger.debug("could not clear error on %s: %s", dev_id, exc)
+
+    def _write_node_reachable(self, node_id: Any, reachable: bool) -> None:
+        """Write matterNode's own ``reachable`` state directly (issue #204).
+
+        Deliberately NOT routed through :meth:`apply_states`: that helper
+        clears any existing ``errorState`` on every call, which for the
+        ``reachable=False`` branch would immediately undo the "unreachable"
+        marking :meth:`mark_unreachable`/:meth:`_safe_unreachable` just made a
+        moment earlier in :meth:`_apply_reachability`. Same direct-call idiom
+        as ``_safe_unreachable``/``_clear_error`` for exactly that reason.
+
+        A silent no-op when the node has no ``matterNode`` device yet (most
+        nodes, most of the time) — this is not a diagnostic path.
+        """
+        with self._lock:
+            dev_id = self._index.get((int(node_id), 0), {}).get("matterNode")
+        if dev_id is None:
+            return
+        try:
+            indigo.devices[dev_id].updateStatesOnServer([{"key": "reachable", "value": reachable}])
+        except Exception as exc:  # noqa: BLE001
+            self.logger.debug(
+                "could not write matterNode reachable state for node %s: %s", node_id, exc)
 
     # ------------------------------------------------------------------
     # Inbound events (asyncio thread) → Indigo state

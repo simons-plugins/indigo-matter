@@ -200,6 +200,7 @@ Poll commissioning job status. `jobId` is the trailing path component. Domio pol
     "productName": "Tapo P125M",
     "indigoDeviceIds": [1234567890],
     "primaryDeviceId": 1234567890,
+    "nodeDeviceId": 1234567891,
     "endpointCount": 1
   }
 }
@@ -210,6 +211,18 @@ Poll commissioning job status. `jobId` is the trailing path component. Domio pol
 cluster the plugin maps yet — the device is on the fabric and will gain Indigo devices
 when support is added. The job still reports `success`. Domio MUST handle a `null`
 `primaryDeviceId` (e.g. skip navigating to a device detail view).
+
+`result.nodeDeviceId` is also **nullable** (v1.4, additive) — it is the id of the node's own
+synthetic `matterNode` Indigo device (ADR-0008), distinct from `primaryDeviceId`/
+`indigoDeviceIds` (the per-endpoint devices). It is `null` when: the node hasn't
+cleared the ADR-0003 creation gate yet on this pass (its BasicInformation
+AttributeList doesn't positively evidence NodeLabel or SoftwareVersionString —
+unknown is not yes, and the next reconcile tries again); the node's device was
+previously deleted by hand and is tombstoned (issue #204) and not yet restored via
+the "Recreate Matter node devices…" menu item; or the node's endpoint plan is empty
+(issue #105's empty-bridge case — nothing for a node device to be the root of). The
+job still reports `success` in every one of these cases. Domio MUST handle a `null`
+`nodeDeviceId` the same way it already handles a `null` `primaryDeviceId`.
 
 **Response 200 (failed):**
 
@@ -396,6 +409,10 @@ case where a job's fields change after going terminal *while it stays* `failed`
   `error.code` becomes `commissioning_failed` (see the error table note and the "Late
   failure" paragraph). `status` never changes (`failed` stays `failed`); a late
   *success* answer does not update `error` and is not otherwise surfaced to Domio.
+- §3.3: new field `result.nodeDeviceId` — the id of the node's synthetic `matterNode`
+  device (ADR-0008), nullable for the same reasons `primaryDeviceId` is (see the
+  nullability paragraph below the sample). Additive, no version bump per §7's own
+  rule for new optional fields.
 
 Changes from v1.2 (v1.3, all clarifications/additive, no transport change):
 

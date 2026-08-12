@@ -912,4 +912,86 @@
         <UiDisplayStateId>reachable</UiDisplayStateId>
     </Device>
 
+    <!-- ============================================================ -->
+    <!-- Node identity: the synthetic per-node device (issue #204,     -->
+    <!-- ADR-0008)                                                     -->
+    <!-- ============================================================ -->
+
+    <!-- One matterNode device per Matter node, anchored at endpoint 0 — the
+         node's own "read me first" root (core spec). Everything endpoint 0
+         carries (identity, firmware, reachability, battery when the node's
+         own PowerSource covers it) had no Indigo device to live on before
+         this. ADR-0008 explains why a synthetic device is the answer and why
+         grouping/renaming the existing per-endpoint devices under it is a
+         SEPARATE, later PR — this type is created additively; no other
+         device is touched.
+         allowUserCreation="false" (Indigo 2022.1.2+, API 3.1) — first use of
+         this attribute in this file. This type is only ever created by
+         device_sync (_ensure_node_device); it must never appear in the New
+         Device dialog, because a user-created one would have no Matter node
+         behind it at all. -->
+    <Device id="matterNode" type="custom" allowUserCreation="false">
+        <Name>Matter Node</Name>
+        <ConfigUI>
+            <Field id="nodeId" type="textfield" readonly="yes">
+                <Label>Matter Node ID:</Label>
+            </Field>
+            <Field id="endpointId" type="textfield" readonly="yes">
+                <Label>Endpoint:</Label>
+            </Field>
+            <Field id="vendorName" type="textfield" readonly="yes">
+                <Label>Vendor:</Label>
+            </Field>
+            <Field id="productName" type="textfield" readonly="yes">
+                <Label>Product:</Label>
+            </Field>
+            <Field id="softwareVersion" type="textfield" readonly="yes">
+                <Label>Firmware:</Label>
+            </Field>
+        </ConfigUI>
+        <!-- vendorName/productName are creation-time PROPS (from the node's
+             own BasicInformation, like every other Matter device type in
+             this file) — not States, because they never change once
+             commissioned. States below are ONLY the values that CAN change
+             (ADR-0007: a shipped State is permanent, so this list is
+             deliberately short) — softwareVersion is both a prop (the
+             value at creation, shown above) AND a State (so a firmware
+             update is visible without reopening the Edit Device dialog).
+             custom types get no auto states from Supports* props (same note
+             as matterEnergyMeter above), so batteryLevel below is declared
+             unconditionally; it is only ever PRIMED (via BasicInformation's
+             sibling PowerSource cluster) when the node's own PowerSource
+             coverage includes endpoint 0 (issues #205/#204). -->
+        <States>
+            <State id="nodeLabel">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Node Label</TriggerLabel>
+                <ControlPageLabel>Node Label</ControlPageLabel>
+            </State>
+            <State id="softwareVersion">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Firmware Version</TriggerLabel>
+                <ControlPageLabel>Firmware Version</ControlPageLabel>
+            </State>
+            <!-- "batteryLevel" is Indigo's RESERVED state name for this
+                 purpose, used deliberately rather than avoided: Indigo
+                 routes a device's batteryLevel state to its native battery
+                 property, which is exactly what device grouping's
+                 "the main/root device carries batteryLevel" behaviour
+                 (Indigo SDK, getGroupList()) needs once ADR-0008's grouping
+                 follow-up PR makes this device a group root. -->
+            <State id="batteryLevel">
+                <ValueType>Integer</ValueType>
+                <TriggerLabel>Battery Level</TriggerLabel>
+                <ControlPageLabel>Battery Level</ControlPageLabel>
+            </State>
+            <State id="reachable">
+                <ValueType boolType="YesNo">Boolean</ValueType>
+                <TriggerLabel>Reachable</TriggerLabel>
+                <ControlPageLabel>Reachable</ControlPageLabel>
+            </State>
+        </States>
+        <UiDisplayStateId>reachable</UiDisplayStateId>
+    </Device>
+
 </Devices>

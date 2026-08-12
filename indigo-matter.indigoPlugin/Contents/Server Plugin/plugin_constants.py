@@ -85,6 +85,18 @@ SURVEY_LOG_PREF = "matterSettingsSurveyed"
 #: flag rather than a version comparison: the plugin has no record of the
 #: version it upgraded FROM, and "have I said this?" is the actual question.
 ON_TIME_RETIRED_PREF = "matterOnTimeStateRetired"
+#: pluginPrefs key holding the node-device tombstone set (issue #204, ADR-0008)
+#: — one JSON array of node ids whose synthetic matterNode device the user
+#: deliberately deleted, so create_devices does not recreate it on the next
+#: reconcile. Same prefs discipline as SURVEY_LOG_PREF/matterExports: plugin.
+#: startup loads it, ServerMenuMixin saves it (the "Recreate Matter node
+#: devices…" menu item is where a tombstone is cleared).
+NODE_TOMBSTONES_PREF = "matterNodeDeviceTombstones"
+#: How long the "Recreate Matter node devices…" menu action may block the
+#: Indigo UI thread on a full reconcile (get_nodes + get_node per node, not
+#: just one round trip like SURVEY_READ_TIMEOUT) — generous for the same
+#: reason WINDOW_OPEN_TIMEOUT/UNPAIR_TIMEOUT are: real work happens behind it.
+RECONCILE_TIMEOUT = 30.0
 #: How long a diagnostic menu action may block the Indigo UI thread on
 #: ``get_node``. That call is answered from matter-server's own cache, so it is
 #: a socket round trip rather than a device round trip — generous, but nothing

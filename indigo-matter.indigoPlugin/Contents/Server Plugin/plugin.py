@@ -32,7 +32,7 @@ import indigo  # provided by the Indigo runtime
 from async_runtime import AsyncRuntime
 from commission_jobs import CommissionJobs
 import device_settings
-from device_sync import DeviceSync
+from device_sync import DeviceSync, NodeDeviceTombstones
 from diagnostics_menu_mixin import DiagnosticsMenuMixin
 import export_bridge
 from export_bridge import ExportBridge
@@ -52,8 +52,8 @@ from server_menu_mixin import ServerMenuMixin
 from server_process import ServerProcess
 
 from plugin_constants import (
-    COMMAND_TIMEOUT, MAX_RESUBSCRIBE_ATTEMPTS, ON_TIME_RETIRED_PREF, PLUGIN_NAME,
-    PORT_CONFLICT_CHECK_INTERVAL, RESUBSCRIBE_TICKS, SURVEY_LOG_PREF,
+    COMMAND_TIMEOUT, MAX_RESUBSCRIBE_ATTEMPTS, NODE_TOMBSTONES_PREF, ON_TIME_RETIRED_PREF,
+    PLUGIN_NAME, PORT_CONFLICT_CHECK_INTERVAL, RESUBSCRIBE_TICKS, SURVEY_LOG_PREF,
     sanitize_host, server_location,
 )
 import settings_report
@@ -210,6 +210,14 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, ServerMenuMixin,
         self.survey_log = settings_report.SurveyLog(save=self._save_survey_log)
         self.survey_log.load(self.pluginPrefs.get(SURVEY_LOG_PREF, ""))
         self.device_sync.survey_log = self.survey_log
+
+        # Node-device tombstones (issue #204, ADR-0008). Same prefs discipline
+        # as survey_log above — read through a getter, committed via
+        # savePluginPrefs, because self.pluginPrefs is rebound when the
+        # PluginConfig dialog is saved.
+        self.node_tombstones = NodeDeviceTombstones(save=self._save_node_tombstones, logger=self.logger)
+        self.node_tombstones.load(self.pluginPrefs.get(NODE_TOMBSTONES_PREF, ""))
+        self.device_sync.node_tombstones = self.node_tombstones
 
         self._announce_retired_on_time_state()
 
@@ -500,8 +508,21 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, ServerMenuMixin,
             self._export_callback_failed.discard(newDev.id)
 
     def deviceDeleted(self, dev):  # noqa: N802
-        """A deleted device leaves the allow-list and the bridge (PRD §5.4)."""
+        """A deleted device leaves the allow-list and the bridge (PRD §5.4),
+        and — since issue #204/ADR-0008 — a deleted matterNode device is
+        tombstoned so the next reconcile does not silently recreate it."""
         super().deviceDeleted(dev)
+        if dev.deviceTypeId == "matterNode":
+            # Widened to cover pluginProps.get too (issue #204 review, fix F):
+            # the noqa below claims "a deletion must always complete", which
+            # only held for note_node_device_deleted itself — a broken
+            # pluginProps read used to escape this try entirely.
+            try:
+                node_id = dev.pluginProps.get("nodeId")
+                if node_id not in (None, ""):
+                    self.device_sync.note_node_device_deleted(int(node_id), dev.id)
+            except Exception as exc:  # noqa: BLE001 - a deletion must always complete
+                self.logger.exception(exc)
         if dev.id not in self._exported_ids or self.exports is None:
             return
         try:
