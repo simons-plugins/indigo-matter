@@ -1156,6 +1156,18 @@ class DeviceSync:
         # that no reader of `_index` is waiting on. Idempotent by construction
         # — a device already rooted at its node device is a no-op — so this IS
         # the migration; there is no version stamp to keep in step.
+        if to_group:
+            # BEFORE any child joins: undo a stale {child, node-device} pair
+            # the pre-fix arg order left behind (live finding, jarvis
+            # 2026-08-12). Per-child healing alone has an ordering hazard on
+            # a multi-child node: the stale pair holds the LAST-processed
+            # child, so every earlier child would join the still-misrooted
+            # pair first, growing it past two members — at which point the
+            # pair heal rightly refuses to touch it and the family is stuck
+            # rooted at the wrong end. Healing once per node, before the
+            # sweep, removes the order dependence; the per-child branch in
+            # _ensure_grouped stays as the belt.
+            self._pre_heal_stale_pair(to_group[0][1])
         for dev_id, root_id in to_group:
             try:
                 # Existence check first (issue #204 review, fix D): the index
@@ -1747,6 +1759,28 @@ class DeviceSync:
         self._group_warned.add(key)
         self.logger.warning(fmt, *args)
 
+    def _pre_heal_stale_pair(self, node_dev_id: Any) -> None:
+        """Ungroup the node device from a stale two-member pair it does not
+        root — once per node, before the grouping sweep runs.
+
+        The pre-fix arg order (``groupWithDevice(node_dev, child)``) left the
+        node device paired with its last-joined child, rooted at the child
+        (live finding, jarvis 2026-08-12). ``_ensure_grouped``'s own pair
+        heal covers the single-child case, but on a multi-child node the
+        sweep reaches the OTHER children first and each would join the
+        misrooted pair, growing it past the pair heal's reach — see the
+        call-site comment. Never raises; a failed read or ungroup degrades
+        to debug and the per-child paths report whatever they then find.
+        """
+        try:
+            nid = int(node_dev_id)
+            group = [int(member) for member in indigo.device.getGroupList(nid)]
+            if len(group) == 2 and nid in group and group[0] != nid:
+                indigo.device.ungroupDevice(nid)
+        except Exception as exc:  # noqa: BLE001 - a heal must not sink the sweep
+            self.logger.debug(
+                "pre-heal of node device %s's stale pair failed: %s", node_dev_id, exc)
+
     def _ensure_grouped(self, dev_id: int, node_dev_id: int) -> None:
         """Make ``dev_id`` a member of the group rooted at ``node_dev_id``
         (ADR-0008 option B).
@@ -1761,14 +1795,19 @@ class DeviceSync:
         quietly rearranging the device list of someone who grouped their
         Matter relay with a Z-Wave sensor.
 
-        ``groupWithDevice(node_dev_id, dev_id)`` puts the EXISTING member
-        first and the joiner second, which is the documented way to add a
-        device to a group ("if you want to add device 789 to the group, you
-        would use groupWithDevice(456, 789)"). Which of the two ends up the
-        group's ROOT is not documented anywhere, so the result is READ BACK
-        and a mismatch warned about rather than assumed — the root is where
-        Indigo puts ``batteryLevel`` and the whole point of the node device
-        being it.
+        ``groupWithDevice(a, b)`` moves **a into b's group, and b's end
+        roots** — established LIVE (jarvis 2026-08-12, 24 joins across 7
+        nodes), not from the docs, whose only example ("to add device 789 to
+        the group … groupWithDevice(456, 789)") reads member-first and does
+        not match observed behaviour. The pre-fix member-first call moved the
+        NODE DEVICE into each successive child's group, rooted at the child,
+        silently un-grouping the previous pairing — every join warned, which
+        is exactly what the read-back below is for. Hence the call is
+        ``groupWithDevice(dev_id, node_dev_id)``: the child joins the node
+        device's group and the node device's root survives. The result is
+        still READ BACK and a mismatch warned about rather than assumed —
+        the root is where Indigo puts ``batteryLevel`` and the whole point
+        of the node device being it.
 
         Everything is guarded: the docs warn twice that neither this call nor
         ``ungroupDevice`` should be made while a device dialog or the device
@@ -1795,25 +1834,46 @@ class DeviceSync:
         if group and group[0] == int(node_dev_id):
             return
         if int(node_dev_id) in group:
-            # The node device is IN this group but not its root. On any pass
-            # after a misrooted join this is almost always the plugin's own
-            # doing (the "root" warning below fired when it happened), and on
-            # a multi-endpoint node the group has 3+ members — a len()==2
-            # check here let the foreign branch fire N-1 self-referential
-            # warnings ("rooted at 5678" about device 5678) on exactly the
-            # FP300-shaped nodes the docs lead with (issue #204 review,
-            # fix C + verification round). From getGroupList alone a
-            # user-built {dev, node_dev} group is indistinguishable, so the
-            # message describes the STATE, claims no cause, and keeps the
-            # remedy the foreign branch offers.
-            self._group_warn(
-                dev_id, "misroot",
-                "device %s and its Matter node device %s are in one group, but %s is the "
-                "group's root rather than the node device — battery level and other "
-                "root-only properties read from the wrong end. Ungroup and reload the "
-                "plugin if you want the node device to be the root",
-                dev_id, node_dev_id, group[0])
-            return
+            # The node device is IN this group but not its root. When the
+            # group is EXACTLY the pair {dev_id, node_dev_id}, this is the
+            # state the pre-fix member-first arg order left behind (live
+            # finding, jarvis 2026-08-12) — not a user's arrangement to
+            # preserve. Unwind our own two-member pair and fall through to
+            # the corrected grouping call and read-back. A LARGER group
+            # containing the node device still gets the honest warn-and-
+            # leave: we cannot know what else is in it, and on a
+            # multi-endpoint node the group legitimately has 3+ members
+            # (issue #204 review, fix C + verification round: a len()==2
+            # gate on the WARNING is also what kept the foreign branch from
+            # firing N-1 self-referential nags on FP300-shaped nodes). From
+            # getGroupList alone a user-built pair is indistinguishable from
+            # our leftover — making the node device the root matches the
+            # documented convention either way, and the read-back still
+            # verifies the outcome.
+            if len(group) == 2:
+                try:
+                    indigo.device.ungroupDevice(node_dev_id)
+                except Exception as exc:  # noqa: BLE001
+                    self._group_warn(
+                        dev_id, "misroot",
+                        "device %s and its Matter node device %s are in one group, but %s "
+                        "is the group's root rather than the node device, and the automatic "
+                        "fix failed: %s — ungroup and reload the plugin if you want the "
+                        "node device to be the root",
+                        dev_id, node_dev_id, group[0], exc)
+                    return
+                # The pair is undone; fall through to the normal grouping
+                # call below, which re-joins dev_id under the node device.
+                group = [int(dev_id)]
+            else:
+                self._group_warn(
+                    dev_id, "misroot",
+                    "device %s and its Matter node device %s are in one group, but %s is the "
+                    "group's root rather than the node device — battery level and other "
+                    "root-only properties read from the wrong end. Ungroup and reload the "
+                    "plugin if you want the node device to be the root",
+                    dev_id, node_dev_id, group[0])
+                return
         if len(group) > 1:
             self._group_warn(
                 dev_id, "foreign",
@@ -1822,7 +1882,7 @@ class DeviceSync:
                 "node device to be its root", dev_id, group[0])
             return
         try:
-            indigo.device.groupWithDevice(node_dev_id, dev_id)
+            indigo.device.groupWithDevice(dev_id, node_dev_id)
         except Exception as exc:  # noqa: BLE001
             self._group_warn(
                 dev_id, "group",
