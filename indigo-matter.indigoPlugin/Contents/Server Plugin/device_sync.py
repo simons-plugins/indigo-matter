@@ -917,7 +917,17 @@ class DeviceSync:
                 int(endpoint.endpoint_id): self.registry.handlers_for_endpoint(node, endpoint)
                 for endpoint in node.endpoints
             }
-            self._resolve_meter_links(node, specs_by_ep)
+            # Same `informative` gate as _power_coverage above, for the same
+            # reason (ADR-0003: an empty snapshot is no information, never a
+            # retraction) — _resolve_meter_links CLEARS-then-rebuilds this
+            # node's links from node.endpoints, so a non-informative pass (zero
+            # endpoints) would wipe every link a prior pass established. A live
+            # ep-0 reading arriving after that wipe would resolve to the node
+            # device instead of the actuator it belongs to, writing a duplicate
+            # reading the priming guard below then never corrects (issue #204
+            # review, fix A).
+            if informative:
+                self._resolve_meter_links(node, specs_by_ep)
 
             for endpoint in node.endpoints:
                 eid = int(endpoint.endpoint_id)
@@ -942,8 +952,14 @@ class DeviceSync:
                         # all — readings route to the linked target via
                         # _lookup_for_cluster. Otherwise fall back to a
                         # standalone matterEnergyMeter device rather than the
-                        # matterUnknown placeholder (issue #79).
-                        if ep_key not in self._forward_links:
+                        # matterUnknown placeholder (issue #79) — EXCEPT for
+                        # endpoint 0 (issue #204/ADR-0008), which never gets a
+                        # standalone matterEnergyMeter: it already has a home,
+                        # the matterNode device's own curEnergyLevel/
+                        # accumEnergyTotal states, and _lookup_for_cluster's
+                        # bare lookup(node, 0) fallback resolves an unlinked
+                        # (node, 0, 0x0090/0x0091) reading straight to it.
+                        if eid != 0 and ep_key not in self._forward_links:
                             specs = [self._energy_meter_spec(node, endpoint)]
                     else:
                         # No handler claimed this endpoint. If it carries clusters
@@ -1975,11 +1991,29 @@ class DeviceSync:
         cluster is silently dropped with no placeholder and no log line,
         reintroducing the exact "commission succeeds with nothing visible"
         failure mode issue #58 fixed.
+
+        Endpoint 0 is exempted from the purity check (issue #204/ADR-0008):
+        it always carries root utility clusters (General Commissioning,
+        Network Commissioning, Operational Credentials, …) that are not in
+        _NON_DEVICE_CLUSTERS, so a literal purity bar would keep excluding it
+        even now that it may host 0x0090/0x0091. Nothing is lost by skipping
+        the bar here: ``_unknown_spec`` already returns ``None`` for endpoint
+        0 unconditionally (by design, since before this change existed), so
+        endpoint 0 never got a matterUnknown placeholder either way — the
+        purity bar's #58 concern was never covered BY a placeholder here, it
+        was covered by other surfaces. The writable half of what a
+        root-utility cluster exposes surfaces via settings_report's survey
+        (WRITABLE attributes only); anything read-only is visible on demand
+        via the explorer (settings_report.explore_lines), not in this report.
+        This is preferred over maintaining a parallel root-utility-clusters
+        frozenset that would rot as the model grows.
         """
-        if int(endpoint.endpoint_id) == 0 or specs:
+        if specs:
             return False
         if not (endpoint.has(CLUSTER_ELECTRICAL_POWER) or endpoint.has(CLUSTER_ELECTRICAL_ENERGY)):
             return False
+        if int(endpoint.endpoint_id) == 0:
+            return True
         return not set(endpoint.cluster_ids) - _NON_DEVICE_CLUSTERS
 
     def _resolve_meter_target(self, node: NodeInfo, source_endpoint: Any,
@@ -2385,7 +2419,11 @@ class DeviceSync:
         Within the own endpoint, skip attributes whose cluster's handler targets
         a *different* existing device on the same endpoint (fix/#44: prevents the
         Pressure device being primed with Flow values or an AQ device being primed
-        with CO2 values it doesn't own).
+        with CO2 values it doesn't own) — and, since #204/ADR-0008, also skip
+        0x0090/0x0091 on the own endpoint when that endpoint is itself a
+        resolved meter-link SOURCE: its device (only ever the node device
+        today, endpoint 0) must not mirror a reading _resolve_meter_links
+        already sent to another endpoint's device.
 
         The sibling-type skip is narrowed to fire only when the handler's type
         actually exists as a SEPARATE device on the endpoint.  Merge-into handlers
@@ -2407,10 +2445,34 @@ class DeviceSync:
         dev = indigo.devices[dev_id]
         with self._lock:
             linked_sources = self._reverse_links.get((int(node.node_id), int(endpoint_id)), set())
+            # Endpoint 0 is the ONE link-source endpoint whose own device must
+            # not ALSO be primed with the reading _resolve_meter_links just
+            # attributed to another endpoint's device — that would show the
+            # same wattage twice. It is special because its device is the
+            # NODE device (issue #204/ADR-0008): a plug may carry 0x0090/0x0091
+            # on ep0 while its relay sits on ep1, and the node device has its
+            # own real identity independent of that relay, so it must not
+            # mirror a reading that was just attributed elsewhere. This guard
+            # is symmetric with _lookup_for_cluster's live-routing rewrite,
+            # which already sends a live update to the linked TARGET only.
+            #
+            # Every OTHER link-source endpoint (>0) is different: its device,
+            # when it has one, only exists BECAUSE no actuator claimed it
+            # (_is_meter_source_candidate/_energy_meter_spec's standalone
+            # matterEnergyMeter fallback) — there is no separate "real"
+            # identity for a reading to duplicate, so it must keep receiving
+            # its own readings normally, including on a LATER pass where its
+            # link only now resolves (issue #204 review, fix B — narrowed from
+            # "any link-source endpoint hosting a device", which froze such a
+            # standalone meter at its pre-link reading with no diagnostic).
+            own_forward_target = self._forward_links.get((int(node.node_id), int(endpoint_id)))
         kv: list = []
         for (ep, cluster, attribute), value in node.attributes.items():
             handler = self.registry.handler_for_cluster(cluster)
             if handler is None:
+                continue
+            if (ep == endpoint_id and int(ep) == 0 and own_forward_target is not None
+                    and cluster in (CLUSTER_ELECTRICAL_POWER, CLUSTER_ELECTRICAL_ENERGY)):
                 continue
             # Include attributes from: this device's own endpoint, any
             # node-scoped cluster living on a different endpoint, or a linked

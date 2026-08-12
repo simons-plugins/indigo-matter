@@ -280,15 +280,21 @@ The plugin maps Matter clusters to native Indigo device types:
 
 A node exposing several capabilities gets several Indigo devices (e.g. a
 multi-sensor becomes one device per measurement); secondary capabilities like
-energy metering and battery merge into the primary device's states.
+energy metering and battery merge into the primary device's states. When a
+device reports its power/energy measurement on the node's own root endpoint
+rather than alongside a specific function, the reading is attributed to that
+function's device when there is exactly one candidate (e.g. a single relay),
+or otherwise lands on the node device described below.
 
 ### One extra device per node — and the node's devices group together
 
 Every Matter device also has a **node device** in Indigo: one per physical
 product, carrying the things that belong to the whole thing rather than to any
 one of its functions — vendor and product, firmware version, whether it is
-reachable, and its battery level where the device says the battery powers the
-whole node.
+reachable, its battery level where the device says the battery powers the
+whole node, and a power/energy reading when the device measures it on the
+node's own root endpoint and there is no single function to attribute it to
+(see above).
 
 A node's devices are put in **one Indigo device group** together, node device
 included. So an Aqara FP300 called "Landing sensor" reads as "Landing sensor"

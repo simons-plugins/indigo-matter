@@ -607,9 +607,9 @@ def test_endpoints_are_titled_by_their_indigo_device_when_named():
 def test_an_endpoint_with_no_indigo_device_falls_back_to_its_number():
     """Scoped to endpoint 1, not 0: an ordinary endpoint with no Indigo
     device YET (this fixture just never named one) falls back to its bare
-    number, but endpoint 0 never gets a device AT ALL and has its own
-    "Matter root node" heading instead (issue #204, see the tests below) —
-    the two must not collapse into the same fallback."""
+    number, but endpoint 0's heading is fixed regardless of whether it has a
+    device ("Matter root node", see the tests below — since ADR-0008 it
+    usually does) — the two must not collapse into the same fallback."""
     survey = settings_report.name_endpoints(
         survey_node(level_node([ATTR_ON_LEVEL, ATTR_ATTRIBUTE_LIST])), lambda ep: [])
     assert "  endpoint 1:" in report_lines(survey)
@@ -626,15 +626,18 @@ def test_an_ordinary_endpoints_heading_and_lines_are_unchanged():
     assert "Kitchen Plug (endpoint 1)" in body
     assert "root node" not in body.lower()
     assert "node-level" not in body.lower()
-    assert "#204" not in body
+    assert "#212" not in body
 
 
-def test_an_endpoint_0_only_survey_renders_the_root_node_heading_and_204():
-    """Endpoint 0 is the Matter root node and never gets an Indigo device
-    (issue #204), so its heading must say what it is rather than rendering
-    a bare "endpoint 0:", and its lines must say support is already tracked
-    — otherwise the generic closing paragraph below would read as an
-    invitation to file a duplicate of #204."""
+def test_an_endpoint_0_only_survey_renders_the_root_node_heading_and_212():
+    """Endpoint 0 is the Matter root node. Since ADR-0008 it DOES get an
+    Indigo device (the matterNode), but no node-level SETTINGS machinery
+    targets it yet (issue #212 — no node on the live fabric implements the
+    localization clusters this branch is about), so its heading must say
+    what it is rather than rendering a bare "endpoint 0:", and its lines
+    must say support is already tracked — otherwise the generic closing
+    paragraph below would read as an invitation to file a duplicate of
+    #212."""
     survey = survey_node(node({
         (0, CLUSTER_LOCALIZATION, ATTR_ACTIVE_LOCALE): "en-US",
         (0, CLUSTER_LOCALIZATION, ATTR_ATTRIBUTE_LIST):
@@ -644,14 +647,30 @@ def test_an_endpoint_0_only_survey_renders_the_root_node_heading_and_204():
     assert "the Matter root node (endpoint 0)" in body
     assert "  endpoint 0:" not in body
     assert "node-level" in body.lower()
-    assert "#204" in body
+    assert "#212" in body
+
+
+def test_node_level_settings_line_hedges_the_node_device_claim():
+    """issue #204 review, fix D: this report runs for every node, including
+    the three _ensure_node_device decline paths that leave no matterNode
+    device at all (tombstoned, empty plan #105, failed ADR-0003 gate) — the
+    line must not assert a node device exists, only that it is where one
+    would be. Hedged the same way EndpointSurvey.title() already hedges."""
+    survey = survey_node(node({
+        (0, CLUSTER_LOCALIZATION, ATTR_ACTIVE_LOCALE): "en-US",
+        (0, CLUSTER_LOCALIZATION, ATTR_ATTRIBUTE_LIST):
+            [ATTR_ACTIVE_LOCALE, ATTR_ATTRIBUTE_LIST],
+    }))
+    body = "\n".join(report_lines(survey))
+    assert "where one exists" in body
+    assert "the node has a home now" not in body
 
 
 def test_a_node_with_endpoint_0_and_an_application_endpoint_renders_each_correctly():
     """The realistic case: one node reporting both a root-node display
     preference and an ordinary per-device gap in the same block. Each
     endpoint must get its own framing — the root-node text must not bleed
-    into endpoint 1's lines, and endpoint 1 must not gain a #204 reference
+    into endpoint 1's lines, and endpoint 1 must not gain a #212 reference
     that belongs only to endpoint 0."""
     survey = survey_node(node({
         (0, CLUSTER_LOCALIZATION, ATTR_ACTIVE_LOCALE): "en-US",
@@ -662,22 +681,22 @@ def test_a_node_with_endpoint_0_and_an_application_endpoint_renders_each_correct
     lines = report_lines(survey)
     body = "\n".join(lines)
     assert "the Matter root node (endpoint 0)" in body
-    assert "#204" in body
+    assert "#212" in body
     assert "  endpoint 1:" in body
     assert "OnLevel (0x0011)" in body
-    # The #204 reference belongs to endpoint 0's block, not endpoint 1's.
+    # The #212 reference belongs to endpoint 0's block, not endpoint 1's.
     root_index = next(i for i, ln in enumerate(lines) if "root node" in ln)
     ep1_index = next(i for i, ln in enumerate(lines) if ln == "  endpoint 1:")
-    assert not any("#204" in ln for ln in lines[ep1_index:])
+    assert not any("#212" in ln for ln in lines[ep1_index:])
     assert root_index < ep1_index
 
 
 def test_report_lines_endpoint_0_block_has_the_caption_before_the_attribute():
     """A structural pin on one endpoint's block, not just substring checks.
 
-    Two mutations survive without this: moving the ``#204`` note to AFTER the
+    Two mutations survive without this: moving the ``#212`` note to AFTER the
     attribute line(s) it captions (readable as "here are the attributes, oh
-    and by the way #204" instead of the caption explaining what follows), and
+    and by the way #212" instead of the caption explaining what follows), and
     emitting every attribute line twice (a duplicated ``for item in
     endpoint.settable`` loop). The note-before-attribute ordering and the
     exactly-once count are both asserted directly.
@@ -688,10 +707,10 @@ def test_report_lines_endpoint_0_block_has_the_caption_before_the_attribute():
             [ATTR_ACTIVE_LOCALE, ATTR_ATTRIBUTE_LIST],
     }))
     lines = report_lines(survey)
-    note_index = next(i for i, ln in enumerate(lines) if "#204" in ln)
+    note_index = next(i for i, ln in enumerate(lines) if "#212" in ln)
     attr_index = next(i for i, ln in enumerate(lines) if "ActiveLocale" in ln)
     assert note_index < attr_index, (
-        "the #204 note must caption the attribute lines that follow it, not "
+        "the #212 note must caption the attribute lines that follow it, not "
         "come after them")
     assert sum(1 for ln in lines if "ActiveLocale" in ln) == 1, (
         "each attribute must be listed exactly once")
@@ -791,6 +810,73 @@ def test_a_failing_save_never_escapes():
     log = SurveyLog(save=boom)
     log.record(0x38, "fp-1")          # must not raise
     assert not log.should_report(0x38, "fp-1")
+
+
+# ---------------------------------------------------------------------------
+# issue #204 final stage — SurveyLog surfaced on the matterNode device
+# ---------------------------------------------------------------------------
+
+def test_fingerprint_for_is_none_when_never_surveyed():
+    log = SurveyLog()
+    assert log.fingerprint_for(0x38) is None
+
+
+def test_fingerprint_for_reads_back_what_record_wrote():
+    log = SurveyLog()
+    fp = survey_node(level_node([ATTR_ON_LEVEL, ATTR_ATTRIBUTE_LIST])).fingerprint()
+    log.record(0x38, fp)
+    assert log.fingerprint_for(0x38) == fp
+
+
+def test_describe_fingerprint_of_none_says_not_yet_surveyed():
+    assert settings_report.describe_fingerprint(None) == "Not yet surveyed."
+
+
+def test_describe_fingerprint_of_empty_string_says_not_yet_surveyed():
+    assert settings_report.describe_fingerprint("") == "Not yet surveyed."
+
+
+def test_describe_fingerprint_reports_the_pending_count():
+    fp = survey_node(level_node([ATTR_ON_LEVEL, ATTR_LEVEL_TRANSITION,
+                                 ATTR_ATTRIBUTE_LIST])).fingerprint()
+    assert settings_report.describe_fingerprint(fp) == \
+        "Last survey: 2 settable attributes not yet offered."
+
+
+def test_describe_fingerprint_singular_wording():
+    fp = survey_node(level_node([ATTR_ON_LEVEL, ATTR_ATTRIBUTE_LIST])).fingerprint()
+    assert settings_report.describe_fingerprint(fp) == \
+        "Last survey: 1 settable attribute not yet offered."
+
+
+def test_describe_fingerprint_of_a_fully_supported_node():
+    """A node that implements nothing beyond what the plugin already offers
+    still gets recorded (report_settable_attributes' "record anyway" rule) —
+    the summary must say so plainly, not read as "not yet surveyed"."""
+    fp = survey_node(onoff_node([0x0000, ATTR_ATTRIBUTE_LIST])).fingerprint()
+    assert settings_report.describe_fingerprint(fp) == \
+        "Last survey: fully supported — no settable attributes pending."
+
+
+def test_describe_fingerprint_tolerates_a_malformed_fingerprint():
+    """Display-only — a corrupt or hand-edited pref value must never raise
+    out of the Edit Device dialog."""
+    assert settings_report.describe_fingerprint("garbage#not-json") == \
+        "Last survey: could not be read."
+
+
+def test_describe_fingerprint_survives_a_hash_in_the_firmware_string():
+    """issue #204 review, fix G.1: firmware is a vendor string and CAN contain
+    "#" (e.g. "1.2.3#beta"); the JSON tail never can (NodeSurvey.fingerprint
+    builds it from a list of int triples, never a string value). A bare
+    ``partition("#")`` would split at the firmware's OWN "#" and hand a
+    non-JSON fragment to ``json.loads``, mis-reporting "could not be read" for
+    a perfectly good fingerprint — ``rpartition`` splits at the LAST "#",
+    which is always the real boundary."""
+    pairs = [[1, 6, 0x4003]]
+    fp = f"1.2.3#beta#{json.dumps(pairs, separators=(',', ':'))}"
+    assert settings_report.describe_fingerprint(fp) == \
+        "Last survey: 1 settable attribute not yet offered."
 
 
 def test_forget_of_an_unknown_node_does_not_write():

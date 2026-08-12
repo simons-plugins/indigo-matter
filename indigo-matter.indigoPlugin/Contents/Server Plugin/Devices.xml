@@ -948,6 +948,13 @@
             <Field id="softwareVersion" type="textfield" readonly="yes">
                 <Label>Firmware:</Label>
             </Field>
+            <!-- Display-only, seeded by getDeviceConfigUiValues from the
+                 injected SurveyLog (issue #204/#212) — never a stored prop,
+                 re-derived on every dialog open like the settings section
+                 every other type already gets. -->
+            <Field id="lastSurveySummary" type="textfield" readonly="yes">
+                <Label>Settings Survey:</Label>
+            </Field>
         </ConfigUI>
         <!-- vendorName/productName are creation-time PROPS (from the node's
              own BasicInformation, like every other Matter device type in
@@ -972,6 +979,42 @@
                 <ValueType>String</ValueType>
                 <TriggerLabel>Firmware Version</TriggerLabel>
                 <ControlPageLabel>Firmware Version</ControlPageLabel>
+            </State>
+            <!-- curEnergyLevel/accumEnergyTotal: endpoint 0's own
+                 0x0090/0x0091 readings, when they exist and could not be
+                 attributed to an actuator endpoint (issue #204, the
+                 structural gap — device_sync's _is_meter_source_candidate
+                 no longer excludes endpoint 0, and an unlinkable ep-0 source
+                 has nowhere else to land). Ids/types copied EXACTLY from
+                 matterEnergyMeter above, because ElectricalPowerHandler/
+                 ElectricalEnergyHandler guard only on "key in
+                 indigo_dev.states" and don't care which device type they're
+                 writing to. Declared unconditionally, same as batteryLevel
+                 above — ADR-0007 says a shipped State is permanent, and
+                 these two are deliberately permanent: they are the same
+                 ids every meter-capable type already carries.
+                 The accepted cost of that permanence, named deliberately:
+                 MOST nodes have no ep-0 energy at all, so most matterNode
+                 devices carry two states they will never legitimately fill.
+                 Left at Indigo's bare default that would read as a plausible
+                 "0 W, plug off" — the #190 failure mode — so
+                 plugin.deviceStartComm's _prime_absent_node_energy_state
+                 flags both with uiValue "<no meter>" on every start (ADR-0007's
+                 flagged-state rule, same mechanism as matterRelay's retired
+                 onTime), and a node that DOES have ep-0 energy simply
+                 overwrites the flag with a real reading on the next
+                 informative pass. -->
+            <State id="curEnergyLevel">
+                <ValueType>Number</ValueType>
+                <TriggerLabel>Power</TriggerLabel>
+                <TriggerLabelPrefix>Power is</TriggerLabelPrefix>
+                <ControlPageLabel>Power (W)</ControlPageLabel>
+            </State>
+            <State id="accumEnergyTotal">
+                <ValueType>Number</ValueType>
+                <TriggerLabel>Total Energy</TriggerLabel>
+                <TriggerLabelPrefix>Total Energy is</TriggerLabelPrefix>
+                <ControlPageLabel>Total Energy (kWh)</ControlPageLabel>
             </State>
             <!-- "batteryLevel" is Indigo's RESERVED state name for this
                  purpose, used deliberately rather than avoided: Indigo

@@ -33,7 +33,7 @@ from async_runtime import AsyncRuntime
 from commission_jobs import CommissionJobs
 import device_settings
 from device_sync import DeviceSync, NodeDeviceTombstones
-from diagnostics_menu_mixin import DiagnosticsMenuMixin
+from diagnostics_menu_mixin import DiagnosticsMenuMixin, MatterUnavailable
 import export_bridge
 from export_bridge import ExportBridge
 import export_dialog_mixin      # noqa: F401 (tests patch EXPORT_PICKER_LIMIT)  # pylint: disable=unused-import
@@ -967,6 +967,22 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, ServerMenuMixin,
             return False
         return True
 
+    def _survey_summary_for(self, props) -> str:
+        """The matterNode Edit Device dialog's read-only survey field (issue
+        #204): what settings_report's on-demand/automatic survey last found
+        for THIS node, or "Not yet surveyed." The SurveyLog itself stays in
+        pluginPrefs (settings_report.SurveyLog's docstring); this only reads
+        its answer back.
+        """
+        node_id = str(props.get("nodeId") or "").strip()
+        if not node_id or self.device_sync is None or self.device_sync.survey_log is None:
+            return settings_report.describe_fingerprint(None)
+        try:
+            fingerprint = self.device_sync.survey_log.fingerprint_for(int(node_id))
+        except (TypeError, ValueError):
+            return settings_report.describe_fingerprint(None)
+        return settings_report.describe_fingerprint(fingerprint)
+
     def _log_setting_skips(self, dev_id):
         """An ``on_skip`` sink that says out loud what was withheld and why.
 
@@ -1145,6 +1161,12 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, ServerMenuMixin,
                 on_skip=self._log_setting_skips(devId)))
         except Exception as exc:  # noqa: BLE001 - never block the dialog over the settings section
             self.logger.exception("could not build device settings for %s: %s", devId, exc)
+        if typeId == "matterNode":
+            # Display-only summary of settings_report's SurveyLog for THIS
+            # node (issue #204): the store stays in pluginPrefs (see
+            # settings_report.SurveyLog's docstring for why), but its answer
+            # now has somewhere to be read back besides the event log.
+            values["lastSurveySummary"] = self._survey_summary_for(values)
         # MUST be indigo.Dict, not a plain dict — the same shape
         # getPrefsConfigUiValues returns. Returning a plain dict fails INSIDE
         # Indigo's C++ bridge, which logs
@@ -1342,6 +1364,47 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, ServerMenuMixin,
         self.device_sync.set_active(dev.id, True)
         if dev.deviceTypeId == "matterRelay":
             self._prime_retired_on_time_state(dev)
+        if dev.deviceTypeId == "matterNode":
+            self._prime_absent_node_energy_state(dev)
+
+    def _prime_absent_node_energy_state(self, dev) -> None:
+        """Flag a node device's energy states as meterless until real evidence
+        arrives (issue #204 review, fix E; ADR-0007's flagged-state rule).
+
+        Every ``matterNode`` device declares ``curEnergyLevel``/
+        ``accumEnergyTotal`` unconditionally (Devices.xml — ep 0 may host an
+        unlinkable 0x0090/0x0091 source with nowhere else to land, issue
+        #204/ADR-0008), but MOST nodes have no energy measurement on endpoint
+        0 at all. Left at Indigo's bare integer default, that reads as
+        "0 W, plug off" — a PLAUSIBLE reading, exactly the #190 failure mode
+        this plugin already knows to avoid, not "there is no meter here".
+        ``uiValue`` fixes that the same way ``_prime_retired_on_time_state``
+        does: display-only (API v1.6+), invisible to triggers and conditional
+        logic, so flagging it can never be mistaken for a live reading by
+        anything that matters.
+
+        Called on EVERY start, for EVERY ``matterNode`` device, with no
+        evidence check: unlike ``_prime_retired_on_time_state`` (whose state
+        nothing else ever writes again), this one CAN be overwritten by a real
+        reading — but ``deviceStartComm`` has no synchronous access to the
+        node's live attribute snapshot (that lives behind matter-server, on
+        the async loop), and blocking device start on a round-trip there is
+        not a trade this seam makes. A node that DOES have ep-0 energy
+        self-corrects moments later: reconcile's ``_prime_states`` (on
+        connect, and every reconnect) writes the real reading over this
+        placeholder, same as a freshly-primed value landing after this write
+        during commissioning would. A node that has none simply keeps reading
+        "<no meter>" forever, which is the point.
+
+        Never raises: a cosmetic label must not be able to stop device start.
+        """
+        try:
+            self.device_sync.apply_states(
+                dev.id,
+                [{"key": "curEnergyLevel", "value": 0, "uiValue": "<no meter>"},
+                 {"key": "accumEnergyTotal", "value": 0, "uiValue": "<no meter>"}])
+        except Exception as exc:  # noqa: BLE001 - cosmetic, must not break device start
+            self.logger.debug("could not flag absent node energy state for %s: %s", dev.id, exc)
 
     def _prime_retired_on_time_state(self, dev) -> None:
         """Flag the retired ``onTime`` state as dead, on every start (#197).
@@ -1495,6 +1558,31 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, ServerMenuMixin,
             pass
         plan = device_settings.PlannedWrite(_SENSITIVITY_SETTING, level, previous)
         self.runtime.submit(self._apply_setting(int(node_id), int(endpoint_id), dev.id, plan))
+
+    def actionReportNodeSettings(self, action, dev):  # noqa: N802, ARG002
+        """Device-targeted twin of the "Report settable Matter settings…" menu
+        item (issue #204): the same ``report_settable_attributes(force=True)``
+        path ``DiagnosticsMenuMixin.menuReportSettings`` already uses, scoped
+        to the one node ``dev`` (a matterNode) names — so an automation, not
+        just a person at the menu, can ask what this node exposes that the
+        plugin does not offer yet."""
+        node_id = dev.pluginProps.get("nodeId")
+        if not node_id:
+            self.logger.error('"%s": cannot report settings — device has no Matter node id', dev.name)
+            return
+        try:
+            node = self._fetch_node(int(node_id))
+        except (TypeError, ValueError):
+            self.logger.error('"%s": invalid Matter node id %r', dev.name, node_id)
+            return
+        except MatterUnavailable as exc:
+            self.logger.warning('"%s": could not survey — %s', dev.name, exc)
+            return
+        if node is None:
+            self.logger.warning(
+                '"%s": could not survey — matter-server does not know this node', dev.name)
+            return
+        self.device_sync.report_settable_attributes(node, force=True)
 
     def _refresh_node(self, dev) -> None:
         """Re-interview the device's Matter node so matter-server re-reads its

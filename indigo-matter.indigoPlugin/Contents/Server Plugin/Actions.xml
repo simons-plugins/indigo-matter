@@ -40,6 +40,15 @@
             </Field>
         </ConfigUI>
     </Action>
+    <!-- Device-targeted twin of the "Report settable Matter settings…" menu
+         item (issue #204): reaches the same on-demand
+         report_settable_attributes(force=True) path from a control page,
+         trigger, or action group, scoped to the one node this matterNode
+         device already names. -->
+    <Action id="reportNodeSettings" deviceFilter="self.matterNode" uiPath="DeviceActions">
+        <Name>Report this node's settable attributes</Name>
+        <CallbackMethod>actionReportNodeSettings</CallbackMethod>
+    </Action>
     <Action id="status" uiPath="hidden">
         <Name>matter status</Name>
         <CallbackMethod>http_status</CallbackMethod>

@@ -59,7 +59,7 @@ from matter_model import NodeInfo, node_id_to_str
 
 __all__ = [
     "SettableAttribute", "EndpointSurvey", "NodeSurvey", "SurveyLog",
-    "survey_node", "report_lines", "explore_lines",
+    "survey_node", "report_lines", "explore_lines", "describe_fingerprint",
     "cluster_label", "attribute_label", "GLOBAL_ATTRIBUTES",
     "INFRASTRUCTURE_CLUSTERS", "DRIVEN_ATTRIBUTES", "COMMAND_FIELD_ATTRIBUTES",
     "NOT_SETTINGS", "REVIEWED_COMMAND_FIELD_COLLISIONS",
@@ -127,9 +127,13 @@ GLOBAL_ATTRIBUTES: dict[int, str] = {
 #: so a node reports them only if it opted in — no wallpaper risk.
 #:
 #: Implementing one is a real design problem, and that is the resulting issue's to
-#: solve rather than a reason to stay quiet: they sit on **endpoint 0**, which has
-#: no Indigo device, so there is no Edit Device dialog to host the field
-#: (ADR-0002). The report only ever claims the plugin does not offer something.
+#: solve rather than a reason to stay quiet: they sit on **endpoint 0**, which since
+#: ADR-0008 DOES have an Indigo device (the synthetic ``matterNode``) — the blocker
+#: is no longer "nowhere to host a field" (ADR-0002's node-level-settings correction
+#: makes that implementable through the ordinary registry), it is that the live
+#: gating probe (2026-08-12) found no node on the fabric implementing any of these
+#: three clusters to build and verify the machinery against (issue #212). The report
+#: only ever claims the plugin does not offer something.
 INFRASTRUCTURE_CLUSTERS: frozenset = frozenset({
     0x0003,  # Identify — IdentifyTime is a momentary command, not a setting
     0x0028,  # BasicInformation — NodeLabel/Location/LocalConfigDisabled
@@ -295,13 +299,15 @@ class EndpointSurvey:
 
     def title(self) -> str:
         if self.endpoint == 0:
-            # Endpoint 0 is the Matter root node. It never gets an Indigo
-            # device — device_names is always empty here, not because
-            # nobody happened to name one, but because nothing reconciles
-            # onto endpoint 0 by design (issue #204) — so it earns its own
-            # heading rather than falling through to the bare-number
-            # fallback below, which is for an ordinary endpoint that
-            # merely has no device YET.
+            # Endpoint 0 is the Matter root node. Since ADR-0008 it DOES get
+            # an Indigo device (the synthetic matterNode) — device_names may
+            # well be non-empty here now — but the heading stays fixed rather
+            # than folding that name in: this block is about what the ROOT
+            # ENDPOINT exposes that no Indigo control offers, which is a
+            # different question from "what is this endpoint's device
+            # called", and keeping the heading fixed keeps that framing
+            # distinct from the ordinary "<device name> (endpoint N)" case
+            # below.
             return "the Matter root node (endpoint 0)"
         if self.device_names:
             return f"{', '.join(self.device_names)} (endpoint {self.endpoint})"
@@ -453,18 +459,28 @@ def report_lines(survey: NodeSurvey) -> list[str]:
     for endpoint in survey.endpoints:
         lines.append(f"  {endpoint.title()}:")
         if endpoint.endpoint == 0:
-            # Same "no Indigo device" fact as EndpointSurvey.title() above,
-            # said again here because it is the reason these lines need
-            # different framing: they are not gaps in an Edit Device
-            # dialog like every other line in this report, they are
-            # node-level settings with nowhere to live at all — already
-            # tracked as issue #204, so the closing "open an issue" below
-            # must not read as an invitation to file a second one for them.
+            # Node-level settings need different framing from every other
+            # line in this report: the node now USUALLY has an Indigo device
+            # (the matterNode, ADR-0008/#204) — but not always: a node the
+            # user tombstoned, one whose plan was empty (#105), or one that
+            # failed the ADR-0003 gate (BasicInformation reports neither
+            # NodeLabel nor SoftwareVersionString) still runs this report with
+            # no matterNode device at all (_ensure_node_device's three decline
+            # paths), so the wording below must not assert one exists — hedged
+            # the same way EndpointSurvey.title() already hedges endpoint 0's
+            # heading. Also: no writable-settings machinery targets a node
+            # device yet regardless, because the live gating probe
+            # (2026-08-12) found no node on the fabric implementing the
+            # localization clusters (0x002B/0x002C/0x002D) this branch was
+            # written for — there is nothing to build the machinery against.
+            # Tracked as issue #212, so the closing "open an issue" below must
+            # not read as an invitation to file a second one for these.
             lines.append(
-                "    Node-level settings — they belong to the device as a "
-                "whole, not to any one Indigo device, so there is no Edit "
-                "Device dialog to host them. Already tracked as issue "
-                "#204; no need to open a new one for these.")
+                "    Node-level settings — this endpoint's home is the "
+                "Matter node device, where one exists, but no "
+                "writable-settings machinery targets it yet: that awaits "
+                "hardware that actually implements these clusters. Tracked "
+                "as issue #212; no need to open a new one for these.")
         for item in endpoint.settable:
             lines.append(f"    - {item.describe()}")
     lines.append(
@@ -565,24 +581,60 @@ def _node_identity(node: NodeInfo) -> str:
     return f"{who}{version} (node {node_id_to_str(node.node_id)})"
 
 
+def describe_fingerprint(fingerprint: Optional[str]) -> str:
+    """One line summarising a :class:`SurveyLog` fingerprint, for the
+    matterNode Edit Device dialog's read-only survey field (issue #204).
+
+    No new persisted schema — the count is already encoded in
+    :meth:`NodeSurvey.fingerprint`'s own JSON tail (``firmware#pairs``), so
+    this only needs to read it back, not add a field SurveyLog has to carry.
+    """
+    if not fingerprint:
+        return "Not yet surveyed."
+    try:
+        # rpartition, not partition: firmware (the part BEFORE "#") is a
+        # vendor string and can itself contain "#"; the JSON tail (built by
+        # NodeSurvey.fingerprint from a list of int triples, never a string
+        # value) never can, so splitting at the LAST "#" is the only split
+        # that can't cut into firmware and leave the tail unparseable.
+        _, _, tail = fingerprint.rpartition("#")
+        pairs = json.loads(tail) if tail else []
+        count = len(pairs) if isinstance(pairs, list) else 0
+    except (TypeError, ValueError):
+        return "Last survey: could not be read."
+    if count == 0:
+        return "Last survey: fully supported — no settable attributes pending."
+    plural = "attribute" if count == 1 else "attributes"
+    return f"Last survey: {count} settable {plural} not yet offered."
+
+
 class SurveyLog:
     """Which nodes have already been reported, and with what answer.
 
     **Why this is a plugin PREF and not a device prop.** The obvious home is the
-    Indigo device — props are pruned for free when the device is deleted. But
-    the report is about a NODE, and a node is not an Indigo device: a plug is one
-    node and one device, an FP300 is one node and four. Keying by device would
-    either report the same physical unit up to four times or pick one device
-    arbitrarily and lose the record when a user deletes that one. Stamping a prop
-    also costs a ``replacePluginPropsOnServer`` per device, which restarts device
-    communication (``didDeviceCommPropertyChange`` defaults to "any prop
-    changed") — a real cost for bookkeeping that changes nothing about the
-    device.
+    Indigo device — props are pruned for free when the device is deleted. ADR-0008
+    gave a node an Indigo device (the synthetic ``matterNode``), which retires the
+    old premise here ("a node is not an Indigo device") but not the conclusion: an
+    FP300 is now one node and FIVE Indigo devices (four endpoints plus the node
+    device), any of which a user can delete independently of the others —
+    including the node device itself, which ADR-0009's tombstone / "Recreate
+    Matter node devices…" pair lets a user delete and later recreate. Keying the
+    once-per-device record to any single device would still either report the
+    same physical unit multiple times or lose the record when the keyed-to device
+    goes. Stamping a prop also still costs a ``replacePluginPropsOnServer`` per
+    device, which restarts device communication (``didDeviceCommPropertyChange``
+    defaults to "any prop changed") — a real cost for bookkeeping that changes
+    nothing about the device, and unaffected by which devices exist.
 
     So: one JSON string in ``pluginPrefs``, keyed by node id, the same shape
-    ``export_store`` uses for the allow-list. It is bounded by the number of
+    ``export_store`` uses for the allow-list — outliving any one device's
+    deletion, at no comm-restart cost. It is bounded by the number of
     commissioned nodes and pruned on decommission (``node_removed``), which is
-    the answer to the growth objection.
+    the answer to the growth objection. What changed since ADR-0008 is that its
+    answer is no longer stuck in the event log alone: the matterNode device's
+    Edit Device dialog now reads the same record back
+    (``getDeviceConfigUiValues``, a display-only summary — the store itself does
+    not move).
 
     A blob that will not parse starts empty rather than raising. The cost of
     being wrong is one duplicate INFO block; the cost of raising is a reconcile
@@ -621,6 +673,17 @@ class SurveyLog:
         with self._lock:
             self._seen[str(int(node_id))] = fingerprint
         self._persist()
+
+    def fingerprint_for(self, node_id: Any) -> Optional[str]:
+        """This node's last recorded fingerprint, or None if never surveyed.
+
+        The read side of :meth:`record` — added for the matterNode Edit
+        Device dialog's read-only survey summary (issue #204): the store
+        itself does not move, this only lets something other than the
+        event log read its answer back.
+        """
+        with self._lock:
+            return self._seen.get(str(int(node_id)))
 
     def forget(self, node_id: Any) -> None:
         """Drop a decommissioned node, so a re-commission reports afresh.
