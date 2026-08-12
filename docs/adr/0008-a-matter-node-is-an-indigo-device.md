@@ -176,20 +176,27 @@ Endpoint 0 sidesteps the question entirely by being the one endpoint that was
 never a candidate for "which application function is the real one" in the
 first place.
 
-## Correcting ADR-0002's aside
+## ADR-0002's aside, noted and left moot
 
 [ADR-0002](0002-writable-settings-are-a-declarative-registry.md)'s "Pros and
 Cons" section rejected a plugin-menu dialog for settings with the reasoning
 *"a menu dialog cannot display a current value at all — no per-field ConfigUI
-callback exists."* That rejection stands as written — this ADR does not
-correct it. The vendored canonical SDK docs
-(`plugin-dev/reference/xml/menuitems.md`) are explicit that a menu-item
-dialog "runs as if it's the first time the menu item is run (default values
-will always be used if present)… any values the user enters will be
-discarded after the menu item action is run," and there is no
-`getMenuActionConfigUiValues` callback anywhere in that surface (zero hits in
-the vendored canonical docs) to seed one from current state. ADR-0002 was
-right.
+callback exists."* Its **conclusion** stands; that one stated reason is
+inaccurate on existence and unverified on behaviour, and this ADR records the
+facts without adjudicating it:
+
+* The callback exists. Indigo 2025.2's own `plugin_base.py` line 1199 defines
+  `getMenuActionConfigUiValues` (verified on the live server, 2026-08-12),
+  and the workspace's field notes (`plugin-dev/concepts/plugin-lifecycle.md`)
+  document it on every supported version.
+* Whether values it seeds actually *display* on every open is unverified:
+  the canonical menu-items reference
+  (`reference/canonical/plugin-dev/reference/xml/menuitems.md`) describes a
+  menu dialog that "runs as if it's the first time the menu item is run
+  (default values will always be used if present)" and never mentions the
+  callback, and no plugin in the surveyed corpus was seen using it. A docs
+  omission is not evidence of absence (this repo has been burned by exactly
+  that before), but nobody has run the live experiment either.
 
 What this ADR does is make the question **moot** for node-level settings,
 not answer it a different way: the node device (`matterNode`) gives them the

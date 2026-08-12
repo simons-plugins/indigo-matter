@@ -4032,11 +4032,11 @@ def test_delete_node_does_not_tombstone_its_own_matterNode_delete(ds, indigo_env
     the matterNode device itself — Indigo's deviceDeleted callback fires for
     THAT delete exactly as it would for a user's manual delete
     (Plugin Guide: "gets called for every kind of device deletion"). Feeding
-    every id delete_node reports back through note_node_device_deleted (as
-    plugin.deviceDeleted would) must NOT tombstone the node or log the
-    misleading "will not be recreated" INFO — the decommission already
-    forgot the node, and a recommission onto the reused id needs a fresh
-    node device."""
+    the node device's id back through note_node_device_deleted (the only id
+    plugin.deviceDeleted ever routes there — its matterNode type check) must
+    NOT tombstone the node or log the misleading "will not be recreated"
+    INFO — the decommission already forgot the node, and a recommission onto
+    the reused id needs a fresh node device."""
     _indigo, devices = indigo_env
     import device_sync as device_sync_mod
     ds.node_tombstones = device_sync_mod.NodeDeviceTombstones()
@@ -4047,14 +4047,53 @@ def test_delete_node_does_not_tombstone_its_own_matterNode_delete(ds, indigo_env
 
     deleted = ds.delete_node(42)
     assert node_dev_id in deleted
-    for dev_id in deleted:
-        ds.note_node_device_deleted(42, dev_id)
+    # Only the matterNode id ever reaches note_node_device_deleted — mirror
+    # plugin.deviceDeleted's type check rather than looping every id, which
+    # would hide a mark that leaked onto endpoint-device ids.
+    ds.note_node_device_deleted(42, node_dev_id)
 
     assert not ds.node_tombstones.is_tombstoned(42)
     assert not any(
         "will not be recreated" in str(call.args)
         for call in mock_logger.info.call_args_list
     )
+    # And the mark is consumed: nothing lingers to swallow a LATER genuine
+    # user deletion.
+    assert not ds._self_deleted_ids
+
+
+def test_a_failed_self_delete_does_not_swallow_a_later_user_delete(ds, indigo_env, mock_logger):
+    """Issue #204 verification review: if delete_node's own delete of the
+    matterNode device RAISES (the non-empty-group-root refusal, live once
+    grouping lands), the self-deleted mark must be withdrawn — otherwise a
+    later genuine user deletion of that surviving device is silently
+    swallowed: no tombstone, no INFO, and the next reconcile resurrects a
+    device the user deliberately deleted."""
+    _indigo, devices = indigo_env
+    import device_sync as device_sync_mod
+    ds.node_tombstones = device_sync_mod.NodeDeviceTombstones()
+    result = ds.create_from_raw(_with_node_evidence(RELAY_NODE), "Office Plug")
+    node_dev_id = result["nodeDeviceId"]
+
+    real_delete = _indigo.device.delete
+
+    def refuse_node_device(dev_or_id):
+        dev_id = getattr(dev_or_id, "id", dev_or_id)
+        if dev_id == node_dev_id:
+            raise ValueError("cannot delete the root of a non-empty group")
+        return real_delete(dev_or_id)
+
+    _indigo.device.delete = refuse_node_device
+    try:
+        deleted = ds.delete_node(42)
+    finally:
+        _indigo.device.delete = real_delete
+    assert node_dev_id not in deleted
+    assert node_dev_id not in ds._self_deleted_ids
+
+    # The survivor is later deleted by the USER: the tombstone must land.
+    ds.note_node_device_deleted(42, node_dev_id)
+    assert ds.node_tombstones.is_tombstoned(42)
 
 
 def test_mark_unreachable_flags_the_node_device(ds, indigo_env):

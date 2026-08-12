@@ -431,10 +431,12 @@ class DeviceSync:
         # from "delete_node deleted it as part of a decommission" and
         # tombstones both — but the decommission already forgets the node
         # (or the id gets reused on recommission), so the tombstone then
-        # blocks the node device from ever being recreated. Populated right
-        # before the delete loop, discarded on the deviceDeleted callback that
-        # follows (or defensively after the loop) so membership is short-lived
-        # rather than an ever-growing set.
+        # blocks the node device from ever being recreated. Only the node
+        # device's id is ever marked — note_node_device_deleted is the sole
+        # reader and only matterNode deletions reach it — and it is unmarked
+        # again either on the deviceDeleted callback (discard on hit) or
+        # immediately when its own delete raises, so a marked-but-never-
+        # deleted id can never swallow a LATER genuine user deletion.
         self._self_deleted_ids: set[int] = set()
 
     # ------------------------------------------------------------------
@@ -599,22 +601,27 @@ class DeviceSync:
                         candidates.append(dev_id)
             if node_dev_id is not None:
                 candidates.append(node_dev_id)
-            # Mark every candidate as self-deleted BEFORE calling
-            # indigo.device.delete (issue #204 review, fix A — see
+            # Mark the node device (and only it) as self-deleted BEFORE
+            # calling indigo.device.delete (issue #204 review, fix A — see
             # _self_deleted_ids above). Whether Indigo's deviceDeleted
             # callback for this delete lands synchronously inside the call
             # below or arrives afterwards, note_node_device_deleted must find
             # the id already marked. Membership is cleared there (discard on
-            # hit) rather than unconditionally here: a candidate whose
-            # callback hasn't landed yet by the time this loop finishes must
-            # still be recognised when it eventually does.
-            self._self_deleted_ids.update(candidates)
+            # hit) — or right here if the delete itself raises, because a
+            # marked id whose device SURVIVED (e.g. the non-empty-group-root
+            # refusal once grouping lands) would otherwise swallow a later
+            # genuine user deletion of that same device: no tombstone, no
+            # INFO, and the next reconcile resurrects it.
+            if node_dev_id is not None:
+                self._self_deleted_ids.add(node_dev_id)
             deleted = []
             for dev_id in candidates:
                 try:
                     indigo.device.delete(indigo.devices[dev_id])
                     deleted.append(dev_id)
                 except Exception as exc:  # noqa: BLE001
+                    if dev_id == node_dev_id:
+                        self._self_deleted_ids.discard(dev_id)
                     self.logger.warning("could not delete Indigo device %s: %s", dev_id, exc)
             deleted_set = set(deleted)
             # Drop successfully-deleted devices from the nested index
