@@ -640,13 +640,19 @@ class DeviceSync:
         picker while still commissioned, with no way to retry until the next
         reconcile (issue #111 review).
 
-        Deletion is ORDERED: every non-``matterNode`` device for this node
-        first, its ``matterNode`` device (if any) last. ``indigo.device.delete``
-        refuses to delete the root of a non-empty Indigo device group, and
-        since issue #204 stage 2 the node device genuinely IS that root
-        (ADR-0008 option B) — so this ordering, established defensively in
-        stage 1, is now load-bearing: reverse it and a decommission leaves the
-        node device behind on every grouped node.
+        Deletion DISSOLVES THE GROUP FIRST: every candidate is ungrouped, and
+        only then is anything deleted. ``indigo.device.delete`` refuses to
+        delete the root of a non-empty Indigo device group, and per ADR-0009
+        that root is whichever member is OLDEST — the node device only on a
+        node commissioned since the node device existed, and an ENDPOINT
+        device on every fielded install. Ordering alone therefore cannot
+        avoid the refusal (children-before-node-device, the stage-1 rule,
+        throws on the very first child of an age-rooted group); emptying the
+        group does, for every shape, with no need to know which end Indigo
+        picked. Each ungroup is guarded on its own: a device that cannot be
+        ungrouped still gets its delete attempted, and a delete that Indigo
+        refuses is reported and excluded from the returned list exactly as
+        before.
         """
         target = int(node_id)
         with self._lock:
@@ -657,8 +663,12 @@ class DeviceSync:
             # next reconcile_all and could be picked a second time.
             if forget:
                 self._known_nodes.discard(target)
-            # Collect all dev_ids across all endpoints for this node, with the
-            # matterNode device (if present) held back to the end.
+            # Collect all dev_ids across all endpoints for this node. The
+            # matterNode device (if present) is still held back to the end —
+            # not because deletion order matters any more (the group is
+            # dissolved below), but because the decommission response reads
+            # better with the node device last and `_self_deleted_ids` is
+            # easiest to reason about when it is.
             node_dev_id: Optional[int] = None
             candidates: list[int] = []
             for (nid, eid), type_map in self._index.items():
@@ -684,6 +694,17 @@ class DeviceSync:
             # INFO, and the next reconcile resurrects it.
             if node_dev_id is not None:
                 self._self_deleted_ids.add(node_dev_id)
+            # Dissolve the node's device group before deleting any of it
+            # (ADR-0009). Per-device and guarded: an ungroup Indigo refuses —
+            # the docs' open-dialog hazard, or a device that vanished between
+            # the index read and here — must not stop the other members being
+            # ungrouped, and the delete below is still attempted for it (a
+            # non-root member deletes perfectly well from inside a group).
+            for dev_id in candidates:
+                try:
+                    indigo.device.ungroupDevice(indigo.devices[dev_id])
+                except Exception as exc:  # noqa: BLE001
+                    self.logger.debug("could not ungroup Indigo device %s: %s", dev_id, exc)
             deleted = []
             for dev_id in candidates:
                 try:
@@ -725,12 +746,14 @@ class DeviceSync:
         the product name). Only the node device is synthetic enough that its
         deletion has to be honoured rather than healed.
 
-        Since stage 2 the node device is the ROOT of a non-empty group for
-        most nodes, and ``indigo.device.delete`` refuses to delete such a root
-        — so the realistic route to here is the user ungrouping it first and
-        then deleting it, which still lands in ``deviceDeleted`` and still
-        tombstones. (A node whose only device is the node device — every
-        endpoint device already deleted — deletes directly.)
+        Since stage 2 the node device is in a group with its siblings, and
+        ``indigo.device.delete`` refuses to delete the ROOT of a non-empty
+        group. Whether that root is the node device depends on age (ADR-0009):
+        on a node commissioned since the node device existed it is, so the
+        route to here is the user ungrouping it first and then deleting it; on
+        a fielded install the root is an older endpoint device and the node
+        device deletes straight out of the group. Both land in
+        ``deviceDeleted`` and both tombstone.
 
         ``dev_id`` (issue #204 review, fix A) is what tells a genuine user
         deletion apart from ``delete_node`` deleting its own node device as
@@ -1021,6 +1044,26 @@ class DeviceSync:
             for ep_, spec_ in plan:
                 key_ = (int(node.node_id), int(ep_.endpoint_id))
                 ep_planned_types.setdefault(key_, set()).add(spec_.device_type_id)
+            # Resolve-or-create the node's own synthetic device (issue #204,
+            # ADR-0008) BEFORE any endpoint device — deliberately, and
+            # deliberately NEVER appended to `plan` itself (`multi = len(plan)
+            # > 1` and `role_counts` above must see only endpoint specs, or
+            # every single-endpoint node would flip to "multi" and rename its
+            # one real device with a role suffix it doesn't need — the most
+            # dangerous regression in this change; that guard is unchanged).
+            #
+            # FIRST is the whole point (ADR-0009): Indigo orders a device
+            # group's members by device AGE and roots the group at the OLDEST
+            # member — the argument order of `groupWithDevice` decides nothing
+            # (controlled experiment, jarvis 2026-08-12). Creation order is
+            # therefore the ONLY lever on which device roots the group, and it
+            # only exists on a FRESH commission, where the node device can be
+            # made the oldest by making it first. A fielded install's node
+            # device is younger than every endpoint device it will ever be
+            # grouped with and can never root them; that is accepted, and
+            # membership — not the root — is what this plugin delivers.
+            node_dev_id = self._ensure_node_device(
+                node, coverage, folder_id, model, plan, derived_base=derived_base)
             for endpoint, spec in plan:
                 # Bridged endpoints carry their own identity in cluster 0x0039.
                 # When a bridge label (node_label or product_name) is present:
@@ -1115,32 +1158,31 @@ class DeviceSync:
                     node, dev_id, endpoint.endpoint_id, type_id,
                     ep_sibling_types=ep_planned_types.get(ep_key, set()),
                 )
-            # Resolve-or-create the node's own synthetic device (issue #204,
-            # ADR-0008) — AFTER every endpoint device in `plan` has been
-            # created, deliberately NEVER appended to `plan` itself
-            # (`multi = len(plan) > 1` and `role_counts` above must see only
-            # endpoint specs, or every single-endpoint node would flip to
-            # "multi" and rename its one real device with a role suffix it
-            # doesn't need — the most dangerous regression in this change).
-            # LAST still matters for naming, though less than it did in stage
-            # 1: endpoint devices now carry role suffixes, so the bare base is
-            # the node device's alone and there is normally no collision at
-            # all. On a fielded install MID-migration there still is one — an
-            # endpoint device may be holding the bare name until this same
-            # pass renames it — and going last means the rename has already
-            # happened by the time `_create_one`'s `_unique_name` looks.
-            node_dev_id = self._ensure_node_device(
-                node, coverage, folder_id, model, plan, derived_base=derived_base)
-            # Every one of this node's OTHER devices belongs in the node
-            # device's Indigo device group (ADR-0008 option B). Collected here,
-            # under the lock that owns `_index`, and PERFORMED BELOW, outside
-            # it. Read from the index rather than from `plan`/`new_ids` so the
-            # sweep also reaches devices this pass did not touch — an
-            # already-created sibling, a matterUnknown placeholder, a
-            # matterEnergyMeter fallback — which is what makes this the
-            # migration for a fielded install as well as the wiring for a fresh
-            # commission. Empty when the node has no node device (the ADR-0003
-            # gate not passed, or tombstoned): there is no root to group under.
+            # The name true-up, RE-RUN now that the endpoint loop above has
+            # renamed everything it is going to. Going first costs the node
+            # device the one thing going last used to buy it: on a fielded
+            # install mid-migration an endpoint device may still have been
+            # holding the bare base when `_create_one`'s `_unique_name`
+            # looked, so a node device created THIS pass can be born as
+            # "<base> 2". By here the sibling has taken its role suffix and
+            # the bare base is free, so the same idempotent true-up that heals
+            # a 2026.13.0 install heals that too — in ONE pass, as before.
+            # A settled node (name already canonical, folder set, prop
+            # stamped) reads the device and writes nothing.
+            if node_dev_id is not None:
+                self._true_up_node_device(node_dev_id, node, derived_base, folder_id)
+            # Every one of this node's OTHER devices belongs in ONE Indigo
+            # device group with the node device (ADR-0008 option B, as
+            # narrowed by ADR-0009: membership is the deliverable, the root is
+            # Indigo's own age-ordered choice). Collected here, under the lock
+            # that owns `_index`, and PERFORMED BELOW, outside it. Read from
+            # the index rather than from `plan`/`new_ids` so the sweep also
+            # reaches devices this pass did not touch — an already-created
+            # sibling, a matterUnknown placeholder, a matterEnergyMeter
+            # fallback — which is what makes this the migration for a fielded
+            # install as well as the wiring for a fresh commission. Empty when
+            # the node has no node device (the ADR-0003 gate not passed, or
+            # tombstoned): there is nothing for the family to be a group WITH.
             to_group: list[tuple[int, int]] = []
             if node_dev_id is not None:
                 to_group = [
@@ -1154,21 +1196,12 @@ class DeviceSync:
         # report_settable_attributes below is: every call reaches into Indigo
         # (getGroupList/groupWithDevice), and grouping is Indigo-side metadata
         # that no reader of `_index` is waiting on. Idempotent by construction
-        # — a device already rooted at its node device is a no-op — so this IS
-        # the migration; there is no version stamp to keep in step.
-        if to_group:
-            # BEFORE any child joins: undo a stale {child, node-device} pair
-            # the pre-fix arg order left behind (live finding, jarvis
-            # 2026-08-12). Per-child healing alone has an ordering hazard on
-            # a multi-child node: the stale pair holds the LAST-processed
-            # child, so every earlier child would join the still-misrooted
-            # pair first, growing it past two members — at which point the
-            # pair heal rightly refuses to touch it and the family is stuck
-            # rooted at the wrong end. Healing once per node, before the
-            # sweep, removes the order dependence; the per-child branch in
-            # _ensure_grouped stays as the belt.
-            self._pre_heal_stale_pair(to_group[0][1])
-        for dev_id, root_id in to_group:
+        # — a device already in a group with its node device is a no-op — so
+        # this IS the migration; there is no version stamp to keep in step.
+        # Order-independent too (ADR-0009): a partially-grouped node heals by
+        # ACCUMULATION, each remaining member joining the group the others are
+        # already in, whatever order the sweep happens to reach them in.
+        for dev_id, group_with in to_group:
             try:
                 # Existence check first (issue #204 review, fix D): the index
                 # can still carry an endpoint device the user deleted by hand
@@ -1182,9 +1215,10 @@ class DeviceSync:
                 self.logger.debug("not grouping device %s: %s", dev_id, exc)
                 continue
             try:
-                self._ensure_grouped(dev_id, root_id)
+                self._ensure_grouped(dev_id, group_with)
             except Exception as exc:  # noqa: BLE001 - per-device independence (fix F)
-                self.logger.debug("grouping device %s under %s failed: %s", dev_id, root_id, exc)
+                self.logger.debug(
+                    "grouping device %s with %s failed: %s", dev_id, group_with, exc)
         if new_ids:
             # The only event-log evidence of an out-of-band join (node_added)
             # is this line — keep it INFO, not debug (issue #19). Idempotent
@@ -1759,61 +1793,40 @@ class DeviceSync:
         self._group_warned.add(key)
         self.logger.warning(fmt, *args)
 
-    def _pre_heal_stale_pair(self, node_dev_id: Any) -> None:
-        """Ungroup the node device from a stale two-member pair it does not
-        root — once per node, before the grouping sweep runs.
-
-        The pre-fix arg order (``groupWithDevice(node_dev, child)``) left the
-        node device paired with its last-joined child, rooted at the child
-        (live finding, jarvis 2026-08-12). ``_ensure_grouped``'s own pair
-        heal covers the single-child case, but on a multi-child node the
-        sweep reaches the OTHER children first and each would join the
-        misrooted pair, growing it past the pair heal's reach — see the
-        call-site comment. Never raises; a failed read or ungroup degrades
-        to debug and the per-child paths report whatever they then find.
-        """
-        try:
-            nid = int(node_dev_id)
-            group = [int(member) for member in indigo.device.getGroupList(nid)]
-            if len(group) == 2 and nid in group and group[0] != nid:
-                indigo.device.ungroupDevice(nid)
-        except Exception as exc:  # noqa: BLE001 - a heal must not sink the sweep
-            self.logger.debug(
-                "pre-heal of node device %s's stale pair failed: %s", node_dev_id, exc)
-
     def _ensure_grouped(self, dev_id: int, node_dev_id: int) -> None:
-        """Make ``dev_id`` a member of the group rooted at ``node_dev_id``
-        (ADR-0008 option B).
+        """Put ``dev_id`` in one Indigo device group with ``node_dev_id``
+        (ADR-0008 option B, as narrowed by ADR-0009).
+
+        **Membership is the deliverable; the root is Indigo's to choose.** A
+        controlled experiment on the live rig (jarvis, 2026-08-12) settled
+        what the docs never say: Indigo orders a group's members by device
+        AGE and the OLDEST member is the root — stable, and identical read
+        from either end. ``groupWithDevice(a, b)`` and ``groupWithDevice(b,
+        a)`` produce the same group; **the argument order does nothing**. So
+        there is no arg order to get right, no root to steer, and nothing the
+        plugin could do about a fielded install whose node device was created
+        after every device it is joining. What this method guarantees is that
+        the node's devices end up in ONE group together, which is the part
+        that is actually visible and useful in the Indigo UI.
 
         Idempotent, which is what lets it double as the migration for every
-        fielded install: a device already rooted at its node device costs one
-        ``getGroupList`` read and returns.
+        fielded install: a device already grouped with its node device costs
+        one ``getGroupList`` read and returns — whatever roots that group.
+        Order-independent for the same reason: a PARTIAL group (the node
+        device plus some of its siblings) is completed by each remaining
+        sibling simply joining it, the third line of the experiment.
 
-        Never re-parents a group the USER built. If the device is already in a
-        group of two or more whose root is something else, that is a
-        deliberate arrangement of theirs — warn once and leave it, rather than
-        quietly rearranging the device list of someone who grouped their
-        Matter relay with a Z-Wave sensor.
+        Never re-parents a group the USER built. A device already in a group
+        of two or more that does NOT contain its node device is a deliberate
+        arrangement of theirs — warn once and leave it, rather than quietly
+        rearranging the device list of someone who grouped their Matter relay
+        with a Z-Wave sensor.
 
-        ``groupWithDevice(a, b)`` moves **a into b's group, and b's end
-        roots** — established LIVE (jarvis 2026-08-12, 24 joins across 7
-        nodes), not from the docs, whose only example ("to add device 789 to
-        the group … groupWithDevice(456, 789)") reads member-first and does
-        not match observed behaviour. The pre-fix member-first call moved the
-        NODE DEVICE into each successive child's group, rooted at the child,
-        silently un-grouping the previous pairing — every join warned, which
-        is exactly what the read-back below is for. Hence the call is
-        ``groupWithDevice(dev_id, node_dev_id)``: the child joins the node
-        device's group and the node device's root survives. The result is
-        still READ BACK and a mismatch warned about rather than assumed —
-        the root is where Indigo puts ``batteryLevel`` and the whole point
-        of the node device being it.
-
-        Everything is guarded: the docs warn twice that neither this call nor
-        ``ungroupDevice`` should be made while a device dialog or the device
-        factory UI is open, and a plugin cannot detect either. A grouping
-        failure must therefore be a log line, never something that sinks a
-        reconcile pass that has real work in it.
+        Everything is guarded: the docs warn twice that this call should not
+        be made while a device dialog or the device factory UI is open, and a
+        plugin cannot detect either. A grouping failure must therefore be a
+        log line, never something that sinks a reconcile pass that has real
+        work in it.
         """
         if int(dev_id) == int(node_dev_id):
             return
@@ -1828,65 +1841,36 @@ class DeviceSync:
             # the identical condition the same way.
             self.logger.debug("could not read the device group of %s: %s", dev_id, exc)
             return
+        if int(node_dev_id) in group:
+            # Already done — from ANY end. Whether the node device is the
+            # group's root (a fresh commission, where it was created first and
+            # is therefore the oldest) or merely a member (every fielded
+            # install) is not this method's business: ADR-0009.
+            return
         # An ungrouped device answers [dev_id] (or, on some versions, nothing
         # at all — undocumented either way); both fall through to the group
         # call below, and neither is mistaken for a user-built group.
-        if group and group[0] == int(node_dev_id):
-            return
-        if int(node_dev_id) in group:
-            # The node device is IN this group but not its root. When the
-            # group is EXACTLY the pair {dev_id, node_dev_id}, this is the
-            # state the pre-fix member-first arg order left behind (live
-            # finding, jarvis 2026-08-12) — not a user's arrangement to
-            # preserve. Unwind our own two-member pair and fall through to
-            # the corrected grouping call and read-back. A LARGER group
-            # containing the node device still gets the honest warn-and-
-            # leave: we cannot know what else is in it, and on a
-            # multi-endpoint node the group legitimately has 3+ members
-            # (issue #204 review, fix C + verification round: a len()==2
-            # gate on the WARNING is also what kept the foreign branch from
-            # firing N-1 self-referential nags on FP300-shaped nodes). From
-            # getGroupList alone a user-built pair is indistinguishable from
-            # our leftover — making the node device the root matches the
-            # documented convention either way, and the read-back still
-            # verifies the outcome.
-            if len(group) == 2:
-                try:
-                    indigo.device.ungroupDevice(node_dev_id)
-                except Exception as exc:  # noqa: BLE001
-                    self._group_warn(
-                        dev_id, "misroot",
-                        "device %s and its Matter node device %s are in one group, but %s "
-                        "is the group's root rather than the node device, and the automatic "
-                        "fix failed: %s — ungroup and reload the plugin if you want the "
-                        "node device to be the root",
-                        dev_id, node_dev_id, group[0], exc)
-                    return
-                # The pair is undone; fall through to the normal grouping
-                # call below, which re-joins dev_id under the node device.
-                group = [int(dev_id)]
-            else:
-                self._group_warn(
-                    dev_id, "misroot",
-                    "device %s and its Matter node device %s are in one group, but %s is the "
-                    "group's root rather than the node device — battery level and other "
-                    "root-only properties read from the wrong end. Ungroup and reload the "
-                    "plugin if you want the node device to be the root",
-                    dev_id, node_dev_id, group[0])
-                return
         if len(group) > 1:
+            # Deliberately says nothing about which member roots it: under
+            # age ordering that is frequently `dev_id` itself, and "device
+            # 5678 is in a group rooted at 5678" is not a sentence to put in
+            # a user's event log.
             self._group_warn(
                 dev_id, "foreign",
-                "device %s is already in a device group rooted at %s, so it has not been "
-                "added to its Matter node device's group — ungroup it if you want the "
-                "node device to be its root", dev_id, group[0])
+                "device %s is already in a device group that its Matter node device %s is "
+                "not part of, so it has not been added to the node's group — ungroup it if "
+                "you want it grouped with the rest of the node", dev_id, node_dev_id)
             return
         try:
+            # Arg order is irrelevant (the experiment: the two orders returned
+            # byte-identical member lists), so this reads the way the docs'
+            # own example does and means nothing more than "these two belong
+            # in one group".
             indigo.device.groupWithDevice(dev_id, node_dev_id)
         except Exception as exc:  # noqa: BLE001
             self._group_warn(
                 dev_id, "group",
-                "could not group device %s under Matter node device %s: %s — if a device "
+                "could not group device %s with Matter node device %s: %s — if a device "
                 "or device-factory dialog was open, close it and reload the plugin",
                 dev_id, node_dev_id, exc)
             return
@@ -1895,13 +1879,15 @@ class DeviceSync:
         except Exception as exc:  # noqa: BLE001 - the group was made; only the check failed
             self.logger.debug("could not verify the group of device %s: %s", dev_id, exc)
             return
-        if not after or after[0] != int(node_dev_id):
+        if int(node_dev_id) not in after:
+            # MEMBERSHIP is what is verified, not position: the call reported
+            # success but the two devices are not in one group, which is the
+            # only outcome left that the user can act on.
             self._group_warn(
-                dev_id, "root",
-                "device %s was grouped with Matter node device %s but Indigo made %s the "
-                "group's root instead — battery level and other root-only properties will "
-                "read from the wrong device", dev_id, node_dev_id,
-                after[0] if after else "nothing")
+                dev_id, "group",
+                "device %s was grouped with Matter node device %s but Indigo did not put "
+                "them in one group — the node's devices will not show together in the "
+                "device list", dev_id, node_dev_id)
 
     @staticmethod
     def _endpoint_by_id(node: NodeInfo, endpoint_id: int) -> Optional[Any]:

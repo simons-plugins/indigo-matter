@@ -176,36 +176,47 @@ class FakeDeviceFactory:
     """Stands in for the ``indigo.device`` command namespace.
 
     Since issue #204 stage 2 this carries a REAL device-group model rather than
-    recording calls, because two behaviours the plugin now depends on are
-    behaviours, not call counts: ``getGroupList``'s first element is the
-    group's root (documented), and ``indigo.device.delete`` REFUSES to delete
-    the root of a non-empty group (ADR-0008's stated reason for delete_node's
-    children-before-root ordering). A fake that merely recorded
-    ``groupWithDevice`` calls would let both regress silently.
+    recording calls, and since ADR-0009 that model is the one the CONTROLLED
+    EXPERIMENT on jarvis (2026-08-12) established rather than the one the docs
+    imply:
+
+    * Indigo orders a group's members by device AGE (creation order), and the
+      OLDEST member is the root — ``getGroupList``'s first element, identical
+      whichever member is asked.
+    * ``groupWithDevice(a, b)`` and ``groupWithDevice(b, a)`` produce the
+      SAME group. **The argument order does nothing.** A fake that honoured
+      arg order would let a plugin that (wrongly) depends on it pass.
+    * ``indigo.device.delete`` REFUSES to delete the root of a non-empty
+      group — whichever device that turns out to be, which is what makes
+      ``delete_node``'s dissolve-first shape load-bearing rather than
+      decorative.
     """
 
     def __init__(self, devices):
         self.devices = devices
         self.created = []
-        #: dev_id → the group's member list, SHARED by every member; [0] is the
-        #: root. Absent means ungrouped.
+        #: dev_id → the group's member list, SHARED by every member, ordered
+        #: OLDEST FIRST; [0] is therefore the root. Absent means ungrouped.
         self.groups = {}
         #: (dev_1, dev_2) per groupWithDevice call — the idempotence assertion
-        #: is "a second reconcile pass adds none of these". Call order is
-        #: (joiner, root) — see groupWithDevice below.
+        #: is "a second reconcile pass adds none of these". The order inside
+        #: the tuple is what the plugin passed and means nothing to Indigo.
         self.group_calls = []
         self.ungroup_calls = []
-        #: Make the group's root come out as arg1 (the JOINER) rather than
-        #: arg2's existing root. Which end Indigo actually roots is
-        #: undocumented (and, live-established 2026-08-12, is NOT arg2 for a
-        #: plain groupWithDevice(existing, joiner) reading — see
-        #: device_sync._ensure_grouped); the plugin reads the result back and
-        #: warns, and this is how that warning is reachable in a test.
-        self.misroot = False
 
     @staticmethod
     def _id_of(dev_or_id):
         return dev_or_id.id if hasattr(dev_or_id, "id") else int(dev_or_id)
+
+    def _age_of(self, dev_id):
+        """Creation sequence of a device — lower is older.
+
+        ``FakeDevices.next_id`` is a monotonic counter, so an id IS its
+        creation rank for every device these tests make; devices built by hand
+        with an explicit id (the orphan/ghost fixtures) sort by that id, which
+        is all the ordering they need.
+        """
+        return dev_id
 
     def create(self, protocol=None, deviceTypeId="", name="", props=None, folder=0, **kwargs):
         dev = FakeDev(self.devices.next_id(), name, deviceTypeId, dict(props or {}))
@@ -244,32 +255,21 @@ class FakeDeviceFactory:
         return list(members) if members else [dev_id]
 
     def groupWithDevice(self, dev_1, dev_2):
-        """Live-established semantics (jarvis 2026-08-12, 7 nodes / 24 joins):
-        arg1 (and its own group's members) merge INTO arg2's group, and
-        arg2's group's existing root survives — for a fresh singleton arg2,
-        that root is arg2 itself. This is the opposite of the reading the
-        docs' example suggests (existing member first), which is exactly why
-        _ensure_grouped's call is (dev_id, node_dev_id) — dev_id is the
-        joiner, node_dev_id is where the root must land."""
+        """The experiment's semantics: the two devices' groups are UNIONED and
+        the result is ordered by device age, oldest first.
+
+        ``groupWithDevice(motion, node)`` and ``groupWithDevice(node, motion)``
+        returned byte-identical member lists on the live rig, and adding a
+        third device to an existing pair left the root untouched — so this
+        models a symmetric union with an age sort and no notion of a joiner.
+        """
         first, second = self._id_of(dev_1), self._id_of(dev_2)
         self.group_calls.append((first, second))
-        existing = self.groups.get(second)
-        members = list(existing or [second])
-        for member in (self.groups.get(first) or [first]):
-            if member not in members:
-                members.append(member)
-        # Misroot only the FIRST join of a fresh group, and models the
-        # DEFENSIVE case this fake exists for: Indigo roots the JOINER'S end
-        # (arg1) instead of arg2's existing root. A rotate-on-every-join
-        # model would accidentally rotate the node device back to the root on
-        # a second join, silently self-healing the misroot and hiding the
-        # multi-endpoint N-1-warnings case from the tests (issue #204
-        # verification round). Real Indigo, whichever end it roots, is at
-        # least consistent: adding a member does not change an existing root.
-        if self.misroot and existing is None and len(members) > 1:
-            members = [first] + [member for member in members if member != first]
-        for member in members:
-            self.groups[member] = members
+        members = set(self.groups.get(first) or [first])
+        members |= set(self.groups.get(second) or [second])
+        ordered = sorted(members, key=self._age_of)
+        for member in ordered:
+            self.groups[member] = ordered
 
     def ungroupDevice(self, dev_or_id):
         dev_id = self._id_of(dev_or_id)
@@ -4035,11 +4035,13 @@ def test_node_device_has_no_battery_when_sources_cover_only_children(ds, indigo_
 
 
 def test_delete_node_deletes_children_before_the_node_device(ds, indigo_env):
-    """indigo.device.delete refuses to delete the root of a non-empty group
-    (ADR-0008) — this fake enforces the ordering for real by RAISING if the
-    matterNode device is deleted while a sibling still exists, rather than
-    merely recording call order and hoping the assertion below would catch a
-    regression."""
+    """The node device is still deleted LAST — not because the ordering
+    protects anything any more (ADR-0009: the group is dissolved first, and on
+    a fielded install the root is an endpoint device anyway), but because the
+    decommission response reads node-device-last and `_self_deleted_ids` is
+    easiest to reason about that way. Enforced for real by a delete that
+    RAISES if the matterNode device goes while a sibling still exists, rather
+    than by recording call order and hoping."""
     _indigo, devices = indigo_env
     evidenced = _with_node_evidence(RELAY_NODE)
     result = ds.create_from_raw(evidenced, "Office Plug")
@@ -4394,19 +4396,59 @@ def test_tombstones_persist_failure_without_logger_still_never_raises():
 
 
 # ===========================================================================
-# issue #204 stage 2 / ADR-0008 option B — grouping + naming/folder true-up
+# issue #204 stage 2 / ADR-0008 option B, as narrowed by ADR-0009 — grouping
+# + naming/folder true-up
 #
-# The node device becomes the ROOT of its endpoint devices' Indigo device
-# group, every endpoint device takes a role suffix (including a single-endpoint
-# node's one device), and a fielded install is migrated to that shape by the
-# ordinary reconcile path — idempotently, and without ever renaming a device a
-# human named.
+# A node's devices end up in ONE Indigo device group with the node device;
+# every endpoint device takes a role suffix (including a single-endpoint node's
+# one device); and a fielded install is migrated to that shape by the ordinary
+# reconcile path — idempotently, and without ever renaming a device a human
+# named.
+#
+# MEMBERSHIP is what the plugin delivers. Indigo roots a group at its OLDEST
+# member and ignores groupWithDevice's argument order (controlled experiment,
+# jarvis 2026-08-12 — ADR-0009), so the node device roots the group only where
+# it is the oldest: a FRESH commission, where create_devices creates it first.
+# Fielded installs lead with their oldest endpoint device, and that is fine.
 # ===========================================================================
 
-def _group_root(indigo_module, dev_id):
-    """The root of ``dev_id``'s group, or None if it is ungrouped."""
-    group = indigo_module.device.getGroupList(dev_id)
-    return group[0] if group and group[0] != dev_id else None
+def _grouped(indigo_module, dev_id):
+    """``dev_id``'s group as a SET — what the plugin actually guarantees."""
+    return set(indigo_module.device.getGroupList(dev_id))
+
+
+# --- the group model itself, pinned to the experiment -----------------------
+
+def test_group_membership_is_age_ordered_and_ignores_argument_order(indigo_env):
+    """The controlled experiment (jarvis 2026-08-12), reproduced against the
+    fake so that every grouping test below rests on the real semantics:
+
+        groupWithDevice(motion, node) -> [motion, node]
+        groupWithDevice(node, motion) -> [motion, node]   (IDENTICAL)
+        then groupWithDevice(temp, node) -> [motion, temp, node]
+
+    Members come back oldest-first, the oldest is the root, and swapping the
+    arguments changes nothing. A plugin that steers the root by argument order
+    is fighting something that does not exist."""
+    _indigo, _devices = indigo_env
+    motion = _indigo.device.create(deviceTypeId="other", name="motion")
+    temp = _indigo.device.create(deviceTypeId="other", name="temp")
+    node = _indigo.device.create(deviceTypeId="other", name="node")   # youngest
+
+    _indigo.device.groupWithDevice(motion.id, node.id)
+    one_way = _indigo.device.getGroupList(node.id)
+    _indigo.device.ungroupDevice(motion.id)
+    _indigo.device.groupWithDevice(node.id, motion.id)
+    other_way = _indigo.device.getGroupList(node.id)
+
+    assert one_way == other_way == [motion.id, node.id]
+    # ...and the answer is the same asked from either end.
+    assert _indigo.device.getGroupList(motion.id) == one_way
+
+    _indigo.device.groupWithDevice(temp.id, node.id)
+
+    # Accumulates, and the root does not move.
+    assert _indigo.device.getGroupList(temp.id) == [motion.id, temp.id, node.id]
 
 
 # --- the pure name grammar --------------------------------------------------
@@ -4440,14 +4482,22 @@ def test_is_generated_name_covers_every_form_including_the_unique_suffix():
 # --- fresh commissions ------------------------------------------------------
 
 def test_fresh_single_endpoint_commission_suffixes_and_groups(ds, indigo_env):
-    """The headline shape: the node device holds the bare name and is the
-    group's root; the one endpoint device is named by its role."""
+    """The headline shape: the node device holds the bare name and roots the
+    group; the one endpoint device is named by its role.
+
+    It roots the group for exactly one reason (ADR-0009): create_devices
+    creates it BEFORE the endpoint loop, so it is the oldest member and
+    Indigo's age ordering puts it first. Asserted here as an id comparison
+    against creation order, so that moving the call back after the loop fails
+    this test rather than silently demoting the node device."""
     _indigo, devices = indigo_env
     result = ds.create_from_raw(_with_node_evidence(RELAY_NODE), "Office Plug")
     relay_id = ds.lookup(42, 1, "matterRelay")
     node_dev_id = result["nodeDeviceId"]
     assert devices[relay_id].name == "Office Plug - Switch"
     assert devices[node_dev_id].name == "Office Plug"
+    assert node_dev_id < relay_id, "the node device must be created first"
+    assert _grouped(_indigo, relay_id) == {node_dev_id, relay_id}
     assert _indigo.device.getGroupList(relay_id)[0] == node_dev_id
 
 
@@ -4463,6 +4513,10 @@ def test_fresh_multi_endpoint_commission_groups_every_endpoint_device(ds, indigo
     }
     assert devices[node_dev_id].name == "Air Sensor"
     for dev_id in result["indigoDeviceIds"]:
+        # One group, everyone in it, rooted at the node device because it is
+        # the oldest member (ADR-0009 — a fresh commission is the only case
+        # where the plugin gets to decide that).
+        assert _grouped(_indigo, dev_id) == {node_dev_id, *result["indigoDeviceIds"]}
         assert _indigo.device.getGroupList(dev_id)[0] == node_dev_id
 
 
@@ -4521,7 +4575,13 @@ def _fielded_install(ds, indigo_env, base="Kitchen sensor"):
 def test_migration_pass_groups_renames_adopts_folder_and_restamps(ds, indigo_env):
     """One ordinary reconcile pass over a 2026.13.0 install fixes all four
     defects at once: grouping, the node device's name, its nodeBaseName prop,
-    and its folder."""
+    and its folder.
+
+    Grouping means MEMBERSHIP here, not rooting (ADR-0009): this node's
+    endpoint devices predate its node device, so Indigo's age ordering makes
+    the OLDEST endpoint device the root and no argument order or ungroup
+    dance can change that. The family shows together in the device list, which
+    is what the user gets out of it."""
     _indigo, devices = indigo_env
     node_dev_id, temp_id, hum_id = _fielded_install(ds, indigo_env)
 
@@ -4532,8 +4592,11 @@ def test_migration_pass_groups_renames_adopts_folder_and_restamps(ds, indigo_env
     assert devices[node_dev_id].folderId == devices[temp_id].folderId != 0
     assert devices[temp_id].name == "Kitchen sensor - Temperature"   # already canonical
     assert devices[hum_id].name == "Kitchen sensor - Humidity"
-    for dev_id in (temp_id, hum_id):
-        assert _indigo.device.getGroupList(dev_id)[0] == node_dev_id
+    family = {node_dev_id, temp_id, hum_id}
+    for dev_id in family:
+        assert _grouped(_indigo, dev_id) == family
+        # The oldest device leads, and here that is an endpoint device.
+        assert _indigo.device.getGroupList(dev_id)[0] == min(family) == temp_id
 
 
 def test_second_migration_pass_does_nothing_at_all(ds, indigo_env, mock_logger):
@@ -4573,16 +4636,22 @@ def test_migration_renames_a_bare_product_named_endpoint_device(ds, indigo_env):
     result = ds.create_from_raw(_with_node_evidence(RELAY_NODE), "")
 
     assert devices[relay_id].name == "Tapo P125M - Switch"
+    # In ONE pass, even though the node device is now created before the
+    # endpoint loop and was therefore born "Tapo P125M 2" while the relay
+    # still held the bare name: the post-loop true-up re-runs once the bare
+    # name is free (ADR-0009's cost, paid at the call site).
     assert devices[result["nodeDeviceId"]].name == "Tapo P125M"
-    assert _indigo.device.getGroupList(relay_id)[0] == result["nodeDeviceId"]
+    # Membership, not rooting — the relay predates the node device.
+    assert _grouped(_indigo, relay_id) == {relay_id, result["nodeDeviceId"]}
+    assert _indigo.device.getGroupList(relay_id)[0] == relay_id
 
 
 def test_a_bare_user_named_single_endpoint_device_is_left_alone(ds, indigo_env):
     """The deliberate limitation, stated as a test: on a node whose ONLY
     device wears a bare name that is neither the product name nor a suffixed
     form, "the user renamed it" and "this plugin named it at commission time"
-    are indistinguishable — so nothing is renamed, and the node device takes
-    the collision suffix instead. Never renaming a hand-renamed device wins."""
+    are indistinguishable — so nothing is renamed, and the node device falls
+    back to the product name. Never renaming a hand-renamed device wins."""
     _indigo, devices = indigo_env
     ds.create_from_raw(RELAY_NODE, "")
     relay_id = ds.lookup(42, 1, "matterRelay")
@@ -4592,7 +4661,7 @@ def test_a_bare_user_named_single_endpoint_device_is_left_alone(ds, indigo_env):
 
     assert devices[relay_id].name == "Desk lamp"
     # ...and it is still grouped: grouping is not conditional on naming.
-    assert _indigo.device.getGroupList(relay_id)[0] == result["nodeDeviceId"]
+    assert _grouped(_indigo, relay_id) == {relay_id, result["nodeDeviceId"]}
 
 
 def test_hand_renamed_endpoint_device_is_never_renamed(ds, indigo_env):
@@ -4648,14 +4717,16 @@ def test_recreated_endpoint_device_takes_the_derived_family_base(ds, indigo_env)
     # ungroup-and-delete (undocumented — see the fake's delete): a non-root
     # member simply goes, and the group survives without it.
     _indigo.device.delete(devices[hum_id])
-    assert _indigo.device.getGroupList(temp_id)[0] == node_dev_id
+    assert _grouped(_indigo, temp_id) == {temp_id, node_dev_id}
 
     ds.reconcile_all([_with_node_evidence(POWER_SOURCE_NODE_WIDE_NODE)])
 
     recreated = ds.lookup(0x63, 2, "matterHumiditySensor")
     assert recreated is not None and recreated != hum_id
     assert devices[recreated].name == "Kitchen sensor - Humidity"
-    assert _indigo.device.getGroupList(recreated)[0] == node_dev_id
+    # It rejoins the family's existing group by accumulation — the third line
+    # of the ADR-0009 experiment, and the reason no ordering rule is needed.
+    assert _grouped(_indigo, recreated) == {temp_id, node_dev_id, recreated}
 
 
 def test_a_taken_canonical_name_never_starts_a_rename_ping_pong(ds, indigo_env):
@@ -4742,23 +4813,32 @@ def test_a_hand_renamed_node_device_is_left_alone_and_not_restamped(ds, indigo_e
 # --- grouping mechanics -----------------------------------------------------
 
 def test_a_user_built_group_is_left_alone_and_warned_once(ds, indigo_env, mock_logger):
-    """A group the user built (its root is something else entirely) is never
-    re-parented — and the warning about it does not nag once per reconnect."""
+    """A group the user built — one this node's node device is not part of —
+    is never re-parented, and the warning about it does not nag once per
+    reconnect.
+
+    The test that the plugin has left it alone is MEMBERSHIP, not the root:
+    under age ordering the root of a user-built group is often the plugin's
+    own device (it is the older one here), which is exactly why the warning
+    must not name a root at all."""
     _indigo, devices = indigo_env
     ds.create_from_raw(RELAY_NODE, "")
     relay_id = ds.lookup(42, 1, "matterRelay")
     foreign = _indigo.device.create(deviceTypeId="other", name="Someone else's device")
-    _indigo.device.groupWithDevice(relay_id, foreign.id)   # user groups them, foreign is root
+    _indigo.device.groupWithDevice(relay_id, foreign.id)   # the user groups them
     _indigo.device.group_calls.clear()
 
-    ds.create_from_raw(_with_node_evidence(RELAY_NODE), "")
+    result = ds.create_from_raw(_with_node_evidence(RELAY_NODE), "")
     ds.create_from_raw(_with_node_evidence(RELAY_NODE), "")
 
-    assert _indigo.device.getGroupList(relay_id)[0] == foreign.id
-    # No grouping call was even attempted for it (the call is (joiner, root)).
+    assert _grouped(_indigo, relay_id) == {relay_id, foreign.id}
+    assert result["nodeDeviceId"] not in _grouped(_indigo, relay_id)
+    # No grouping call was even attempted for it.
     assert _indigo.device.group_calls == []
-    assert sum("already in a device group" in str(call.args)
-               for call in mock_logger.warning.call_args_list) == 1
+    messages = [str(call.args) for call in mock_logger.warning.call_args_list]
+    assert sum("already in a device group" in message for message in messages) == 1
+    # ...and it never says "rooted at 1001" about device 1001 (ADR-0009).
+    assert not any("rooted at" in message for message in messages)
 
 
 def test_an_empty_group_list_is_treated_as_ungrouped(ds, indigo_env):
@@ -4782,110 +4862,70 @@ def test_an_empty_group_list_is_treated_as_ungrouped(ds, indigo_env):
     assert _indigo.device.getGroupList(relay_id)[0] == result["nodeDeviceId"]
 
 
-def test_group_root_verification_warns_when_indigo_roots_the_wrong_end(ds, indigo_env, mock_logger):
-    """WHICH device becomes the root of a freshly-made group is not documented
-    anywhere, so the result is read back rather than assumed. If Indigo roots
-    the joiner, the batteryLevel-on-the-root behaviour the node device exists
-    for is silently wrong — so it must be said out loud."""
-    _indigo, devices = indigo_env
-    _indigo.device.misroot = True
-    ds.create_from_raw(_with_node_evidence(RELAY_NODE), "Office Plug")
-    assert any("group's root" in str(call.args)
-               for call in mock_logger.warning.call_args_list)
+def test_a_partial_group_heals_by_accumulation_whatever_roots_it(ds, indigo_env, mock_logger):
+    """The state every 2026.13.1 install was actually left in, and the reason
+    ADR-0009 needs no ordering rule and no ungroup dance: the node device is
+    in a two-member group with ONE of its children, rooted at whichever of
+    them is older, and the rest of the family is ungrouped.
 
-
-def test_the_pass_after_a_two_member_misroot_self_heals_instead_of_nagging(
-        ds, indigo_env, mock_logger):
-    """issue #204 review, fix C, revisited for the live arg-order finding
-    (jarvis 2026-08-12): a misrooted two-member {dev, node_dev} pair is
-    exactly the state the pre-fix arg order left behind on every fielded
-    2026.13.1 install, so instead of warning about it forever (the OLD misroot
-    branch) or blaming the user for it (the foreign-group branch), later
-    passes now ungroup and rejoin with the corrected arg order — evidenced
-    here by ungroup_calls, not inferred from silence. This fake's misroot
-    toggle deliberately re-misroots every fresh join, so the shape recurs
-    each pass, but the read-back guard's "root" warning (already said once,
-    in the pass that first built the pair) stays said only once."""
-    _indigo, devices = indigo_env
-    _indigo.device.misroot = True
-    result = ds.create_from_raw(_with_node_evidence(RELAY_NODE), "Office Plug")
-    node_dev_id = result["nodeDeviceId"]
-    mock_logger.warning.reset_mock()
-    _indigo.device.ungroup_calls.clear()
-
-    ds.create_from_raw(_with_node_evidence(RELAY_NODE), "")
-    ds.create_from_raw(_with_node_evidence(RELAY_NODE), "")
-
-    messages = [str(call.args) for call in mock_logger.warning.call_args_list]
-    assert not any("already in a device group" in message for message in messages)
-    assert not messages, "the root warning was already said in the first pass; no nagging"
-    # The self-heal (ungroup node_dev_id, fall through, rejoin) ran on BOTH
-    # later passes — proof this is an active fix, not a no-op.
-    assert _indigo.device.ungroup_calls == [node_dev_id, node_dev_id]
-
-
-def test_pre_heal_beats_the_sweep_order_on_a_multi_child_node(ds, indigo_env, mock_logger):
-    """Ordering hazard of per-child healing alone (issue #204 live finding,
-    second round): the stale pre-fix pair holds the LAST-processed child, so
-    every EARLIER child would join the still-misrooted pair first, growing
-    it past two members — where the pair heal rightly refuses. The per-node
-    pre-heal must run before the sweep so the whole family converges rooted
-    at the node device, warning-free."""
+    One reconcile pass must simply add the missing members to that group —
+    the third line of the experiment — leaving one group of N+1, silently,
+    without ungrouping anything."""
     _indigo, devices = indigo_env
     result = ds.create_from_raw(_with_node_evidence(POWER_SOURCE_NODE_WIDE_NODE), "Kitchen sensor")
     node_dev_id = result["nodeDeviceId"]
     temp_id = ds.lookup(0x63, 1, "matterTemperatureSensor")
     hum_id = ds.lookup(0x63, 2, "matterHumiditySensor")
-    # Pre-fix leftover: node device paired with the LAST-swept child, rooted
-    # at the child; the other child ungrouped.
+    # The leftover: node device + the LAST child only.
     _indigo.device.groups.clear()
     _indigo.device.groupWithDevice(node_dev_id, hum_id)
-    assert _indigo.device.getGroupList(hum_id)[0] == hum_id
+    _indigo.device.ungroup_calls.clear()
+    mock_logger.warning.reset_mock()
 
     ds.create_from_raw(_with_node_evidence(POWER_SOURCE_NODE_WIDE_NODE), "")
 
-    assert _indigo.device.getGroupList(temp_id)[0] == node_dev_id
-    assert set(_indigo.device.getGroupList(temp_id)) == {node_dev_id, temp_id, hum_id}
-    messages = [str(call.args) for call in mock_logger.warning.call_args_list]
-    assert not any("wrong end" in m or "already in a device group" in m for m in messages)
+    family = {node_dev_id, temp_id, hum_id}
+    for dev_id in family:
+        assert _grouped(_indigo, dev_id) == family
+    assert _indigo.device.ungroup_calls == [], "healing must not tear anything down"
+    assert mock_logger.warning.call_args_list == []
 
 
-def test_self_heal_fixes_the_pre_fix_arg_order_leftover_state(ds, indigo_env, mock_logger):
-    """The self-heal's actual target, built directly rather than via the
-    misroot toggle: a {child, node_dev} pair rooted at the CHILD — precisely
-    what groupWithDevice(node_dev_id, dev_id) (the pre-fix arg order) left
-    behind on jarvis, 2026-08-12. One reconcile pass must ungroup and rejoin
-    it rooted at the node device, with no misroot warning at all — this is
-    the plugin's own leftover state, not a user's arrangement to preserve."""
+def test_a_child_rooted_group_is_recognised_as_done_not_as_a_defect(
+        ds, indigo_env, mock_logger):
+    """The membership short-circuit, pinned against the shape the old code
+    called a "misroot": a {child, node_dev} pair whose ROOT is the child.
+    That is not a defect to fix — it is simply what Indigo does when the child
+    is the older device, which on a fielded install it always is (ADR-0009) —
+    so later passes must read it, find the node device already a member, and
+    do nothing at all."""
     _indigo, devices = indigo_env
-    result = ds.create_from_raw(_with_node_evidence(RELAY_NODE), "Office Plug")
+    ds.create_from_raw(RELAY_NODE, "")               # the relay exists first...
     relay_id = ds.lookup(42, 1, "matterRelay")
+    result = ds.create_from_raw(_with_node_evidence(RELAY_NODE), "")   # ...node device joins it
     node_dev_id = result["nodeDeviceId"]
-    # Tear down the (correct) group create_from_raw just built and hand-build
-    # the pre-fix leftover shape: rooted at the child instead of the node —
-    # what groupWithDevice(node_dev_id, dev_id) leaves behind under live
-    # semantics (arg1 joins arg2's, fresh arg2 becomes root; here arg2 is
-    # relay_id, the child).
-    _indigo.device.groups.clear()
-    _indigo.device.groupWithDevice(node_dev_id, relay_id)
-    assert _indigo.device.getGroupList(relay_id)[0] == relay_id, "sanity: pair is rooted at the child"
+    assert _indigo.device.getGroupList(relay_id) == [relay_id, node_dev_id], \
+        "sanity: the older endpoint device roots this group"
+    _indigo.device.group_calls.clear()
+    mock_logger.warning.reset_mock()
 
     ds.create_from_raw(_with_node_evidence(RELAY_NODE), "")
+    ds.create_from_raw(_with_node_evidence(RELAY_NODE), "")
 
-    assert _indigo.device.getGroupList(relay_id)[0] == node_dev_id
-    assert set(_indigo.device.getGroupList(relay_id)) == {relay_id, node_dev_id}
-    messages = [str(call.args) for call in mock_logger.warning.call_args_list]
-    assert not any("group's root" in message for message in messages)
+    assert _indigo.device.getGroupList(relay_id) == [relay_id, node_dev_id]
+    assert _indigo.device.group_calls == []
+    assert _indigo.device.ungroup_calls == []
+    assert mock_logger.warning.call_args_list == []
 
 
-def test_grouping_n_children_sequentially_leaves_one_group_rooted_at_the_node_device(
+def test_grouping_n_children_sequentially_leaves_one_group_with_every_member(
         ds, indigo_env):
-    """The regression the OLD fake's wrong merge direction made impossible to
-    fail: with groupWithDevice(node_dev_id, dev_id) (pre-fix), each successive
-    join accumulated into the LAST-JOINED CHILD's group and silently dropped
-    the previous child, so live jarvis ended up with one pair per node rather
-    than one group of N+1 (live finding, 2026-08-12). Every member must share
-    ONE group, rooted at the node device, with every child present."""
+    """The regression the OLD fake's asymmetric merge made impossible to fail:
+    on live jarvis each successive join accumulated into the last-joined
+    child's group and silently dropped the previous child, so a 5-device node
+    ended up as one pair rather than one group of N+1 (2026-08-12). Every
+    member must share ONE group — and on a fresh commission the node device
+    leads it, being the oldest."""
     _indigo, devices = indigo_env
     result = ds.create_from_raw(_with_node_evidence(AQ_NODE), "Air Sensor")
     node_dev_id = result["nodeDeviceId"]
@@ -4893,28 +4933,8 @@ def test_grouping_n_children_sequentially_leaves_one_group_rooted_at_the_node_de
     expected = {node_dev_id, *children}
     for dev_id in children:
         group = _indigo.device.getGroupList(dev_id)
-        assert group[0] == node_dev_id
         assert set(group) == expected
-
-
-def test_a_misrooted_multi_endpoint_group_never_gets_the_foreign_warning(ds, indigo_env, mock_logger):
-    """issue #204 verification round: on a multi-endpoint node a misrooted
-    group has 3+ members, and a len()==2 guard let every later pass fall
-    into the foreign branch — N-1 self-referential warnings ("rooted at
-    5678" about device 5678) on exactly the FP300-shaped nodes the docs
-    lead with. The misroot message must claim the whole family."""
-    _indigo, devices = indigo_env
-    _indigo.device.misroot = True
-    ds.create_from_raw(_with_node_evidence(POWER_SOURCE_NODE_WIDE_NODE), "Kitchen sensor")
-    mock_logger.warning.reset_mock()
-
-    ds.create_from_raw(_with_node_evidence(POWER_SOURCE_NODE_WIDE_NODE), "")
-    ds.create_from_raw(_with_node_evidence(POWER_SOURCE_NODE_WIDE_NODE), "")
-
-    messages = [str(call.args) for call in mock_logger.warning.call_args_list]
-    assert not any("already in a device group" in message for message in messages)
-    # One accurate warning per grouped device, once — never the foreign nag.
-    assert 1 <= sum("read from the wrong end" in m for m in messages) <= 2
+        assert group[0] == node_dev_id
 
 
 def test_an_endpoint_device_deleted_by_hand_is_not_a_warning(ds, indigo_env, mock_logger):
@@ -4971,6 +4991,21 @@ def test_a_grouping_failure_never_sinks_the_pass(ds, indigo_env, mock_logger):
                for call in mock_logger.warning.call_args_list)
 
 
+def test_the_read_back_verifies_membership_and_says_so_when_it_is_missing(
+        ds, indigo_env, mock_logger):
+    """The result is read back rather than assumed — but what is checked is
+    MEMBERSHIP, not position (ADR-0009). A groupWithDevice that reports
+    success and groups nothing is the one outcome left that a user can act
+    on, so it is said out loud."""
+    _indigo, devices = indigo_env
+    _indigo.device.groupWithDevice = lambda _a, _b: None    # succeeds, does nothing
+
+    ds.create_from_raw(_with_node_evidence(RELAY_NODE), "Office Plug")
+
+    assert any("did not put them in one group" in str(call.args)
+               for call in mock_logger.warning.call_args_list)
+
+
 def test_grouping_leaves_the_index_and_the_orphan_sweep_alone(ds, indigo_env):
     """Grouping is Indigo-side metadata, not index state: a rebuild from
     pluginProps must find exactly the same devices, and a healthy reconcile
@@ -4991,10 +5026,10 @@ def test_grouping_leaves_the_index_and_the_orphan_sweep_alone(ds, indigo_env):
 
 # --- deletion, with the group real -----------------------------------------
 
-def test_delete_node_empties_the_group_before_deleting_its_root(ds, indigo_env):
+def test_delete_node_dissolves_the_group_before_deleting_anything(ds, indigo_env):
     """End to end against a fake that REFUSES to delete the root of a
-    non-empty group, exactly as Indigo does (ADR-0008): delete_node's
-    children-before-root ordering is now load-bearing, not defensive."""
+    non-empty group, exactly as Indigo does: delete_node ungroups every
+    candidate first, so no delete ever meets a non-empty group."""
     _indigo, devices = indigo_env
     result = ds.create_from_raw(_with_node_evidence(AQ_NODE), "Air Sensor")
     node_dev_id = result["nodeDeviceId"]
@@ -5008,9 +5043,60 @@ def test_delete_node_empties_the_group_before_deleting_its_root(ds, indigo_env):
     assert not devices._by_id
 
 
-def test_deleting_the_root_first_is_what_the_fake_refuses(ds, indigo_env):
-    """The fake's teeth, asserted directly — otherwise the test above could
-    pass against a fake that refuses nothing."""
+def test_delete_node_survives_a_group_rooted_at_an_endpoint_device(ds, indigo_env):
+    """The fielded-install shape, and the reason ordering alone cannot work
+    (ADR-0009): here the group's root is the OLDEST ENDPOINT DEVICE, so the
+    old children-before-node-device rule would have thrown on the very first
+    child it tried to delete. Dissolving first is indifferent to which end
+    Indigo picked."""
+    _indigo, devices = indigo_env
+    ds.create_from_raw(POWER_SOURCE_NODE_WIDE_NODE, "Kitchen sensor", "Kitchen")
+    temp_id = ds.lookup(0x63, 1, "matterTemperatureSensor")
+    result = ds.create_from_raw(_with_node_evidence(POWER_SOURCE_NODE_WIDE_NODE), "")
+    node_dev_id = result["nodeDeviceId"]
+    assert _indigo.device.getGroupList(node_dev_id)[0] == temp_id, \
+        "sanity: an endpoint device roots this group"
+
+    deleted = ds.delete_node(0x63)
+
+    assert temp_id in deleted and node_dev_id in deleted
+    assert _indigo.device.groups == {}
+    assert not devices._by_id
+
+
+def test_a_refused_ungroup_still_lets_delete_node_delete_what_it_can(ds, indigo_env, mock_logger):
+    """The dissolve is guarded per device, for the same open-dialog reason the
+    grouping calls are: a refused ungroup must be a debug line, not an
+    exception out of a decommission — and every device Indigo will still let
+    go of is still deleted and still reported."""
+    _indigo, devices = indigo_env
+    ds.create_from_raw(POWER_SOURCE_NODE_WIDE_NODE, "Kitchen sensor", "Kitchen")
+    temp_id = ds.lookup(0x63, 1, "matterTemperatureSensor")
+    hum_id = ds.lookup(0x63, 2, "matterHumiditySensor")
+    result = ds.create_from_raw(_with_node_evidence(POWER_SOURCE_NODE_WIDE_NODE), "")
+    node_dev_id = result["nodeDeviceId"]
+
+    def boom(_dev):
+        raise RuntimeError("a device dialog is open")
+    _indigo.device.ungroupDevice = boom
+
+    deleted = ds.delete_node(0x63)
+
+    # With the group intact its ROOT — the oldest endpoint device — is the one
+    # delete Indigo refuses. Everything else still goes, and the refusal is
+    # reported rather than raised.
+    assert set(deleted) == {hum_id, node_dev_id}
+    assert temp_id not in deleted
+    assert any("could not delete Indigo device" in str(call.args)
+               for call in mock_logger.warning.call_args_list)
+    assert any("could not ungroup Indigo device" in str(call.args)
+               for call in mock_logger.debug.call_args_list)
+
+
+def test_deleting_a_non_empty_groups_root_is_what_the_fake_refuses(ds, indigo_env):
+    """The fake's teeth, asserted directly — otherwise the tests above could
+    pass against a fake that refuses nothing. On a FRESH commission that root
+    is the node device, because create_devices creates it first."""
     _indigo, devices = indigo_env
     result = ds.create_from_raw(_with_node_evidence(RELAY_NODE), "Office Plug")
     with pytest.raises(ValueError):

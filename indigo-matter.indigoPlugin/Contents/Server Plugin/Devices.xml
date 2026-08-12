@@ -976,10 +976,18 @@
             <!-- "batteryLevel" is Indigo's RESERVED state name for this
                  purpose, used deliberately rather than avoided: Indigo
                  routes a device's batteryLevel state to its native battery
-                 property, which is exactly what device grouping's
-                 "the main/root device carries batteryLevel" behaviour
-                 (Indigo SDK, getGroupList()) needs once ADR-0008's grouping
-                 follow-up PR makes this device a group root. -->
+                 property, which is what device grouping's "the main/root
+                 device carries batteryLevel" behaviour (Indigo SDK,
+                 getGroupList()) reads from.
+                 Honest caveat since ADR-0009: this device is the group's
+                 root only where it is the OLDEST member — a fresh
+                 commission, where it is created first. On a fielded install
+                 the root is an older ENDPOINT device, which carries
+                 batteryLevel itself whenever issue #205's PowerSource
+                 coverage reaches it, so the convention still lands on a
+                 battery-bearing device. Either way THIS device carries the
+                 node-wide reading whenever ep 0 is covered — that does not
+                 depend on rooting anything. -->
             <State id="batteryLevel">
                 <ValueType>Integer</ValueType>
                 <TriggerLabel>Battery Level</TriggerLabel>
