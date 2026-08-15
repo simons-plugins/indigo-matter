@@ -826,6 +826,16 @@ class CommissionJobs:
         if matter_error_code is not None:
             error["matterErrorCode"] = matter_error_code
         job.error = error
+        # #227: this is the ONLY place a ProtocolError/CommissionError failure
+        # was ever reported — job.error was stored for a poller that does not
+        # exist on the menu path, so a manual commission that failed this way
+        # logged nothing at all. Named by suggested_name (not jobId) so it
+        # reads next to the accept/success narrative lines (#226).
+        matter_error_suffix = f" (matter error {matter_error_code})" if matter_error_code is not None else ""
+        self.logger.error(
+            'commission of "%s" failed: %s%s (job %s)',
+            job.suggested_name, message, matter_error_suffix, job.job_id,
+        )
         self._advance(job, FAILED, job.progress, "")
 
     # ------------------------------------------------------------------

@@ -342,6 +342,50 @@ def test_missing_node_id_maps_to_commissioning_failed(mock_logger):
     asyncio.run(scenario())
 
 
+# ----------------------------------------------------------------------
+# #227: _fail() must log the failure — a manual commission that dies via
+# ProtocolError or CommissionError used to reach FAILED with zero log output
+# (job.error was stored for a poller that does not exist on the menu path).
+# ----------------------------------------------------------------------
+def test_protocol_error_failure_is_logged_named_by_suggested_name(mock_logger):
+    from protocol import ProtocolError
+
+    async def scenario():
+        class PEMatter(FakeMatter):
+            async def commission_with_code(self, code, **_kwargs):
+                raise ProtocolError(50, "PASE failed")
+
+        jobs = _jobs(PEMatter(), mock_logger, schedule=asyncio.ensure_future)
+        _, body = jobs.create_job({"setupCode": "12345678901", "suggestedName": "Kitchen Plug"})
+        final = await _await_terminal(jobs, body["jobId"])()
+        assert final["status"] == "failed"
+        mock_logger.error.assert_called()
+        logged = str(mock_logger.error.call_args)
+        assert "Kitchen Plug" in logged
+        assert "PASE failed" in logged
+        assert "50" in logged  # matter error code
+        assert body["jobId"] in logged
+    asyncio.run(scenario())
+
+
+def test_commission_error_failure_is_logged_named_by_suggested_name(mock_logger):
+    async def scenario():
+        async def failing_create(node, name, room):
+            raise CommissionError("interview_failed", "could not read descriptors")
+
+        matter = FakeMatter(node_id=99)
+        jobs = _jobs(matter, mock_logger, create=failing_create, schedule=asyncio.ensure_future)
+        _, body = jobs.create_job({"setupCode": "12345678901", "suggestedName": "Office Fan"})
+        final = await _await_terminal(jobs, body["jobId"])()
+        assert final["status"] == "failed"
+        mock_logger.error.assert_called()
+        logged = str(mock_logger.error.call_args)
+        assert "Office Fan" in logged
+        assert "could not read descriptors" in logged
+        assert body["jobId"] in logged
+    asyncio.run(scenario())
+
+
 def test_generic_exception_maps_to_internal_error(mock_logger):
     async def scenario():
         class BoomMatter(FakeMatter):
