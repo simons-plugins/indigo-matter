@@ -3,6 +3,41 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
+## 2026.16.1 — manual commission now logs what happened
+
+### Fixed
+
+- **A manual commission that failed via a matter-server protocol error or a
+  commissioning error logged nothing at all** (issue #227) — the reason was
+  stored on the job for a poller that doesn't exist on the menu path, so a
+  failed commission was indistinguishable from a silently successful one.
+  `_fail()` now logs an ERROR line naming the device and the reason the
+  moment it happens.
+
+### Changed
+
+- **Manual commission now narrates what it's doing, in the Event Log**
+  (issue #226) — the raw `manual commission → 202 {'jobId': …}`
+  acknowledgment read like an error to anyone unfamiliar with the wire
+  format, and success logged nothing tied to the commission at all. It now
+  reads:
+  - Accepted: `Commissioning "<name>" — this takes up to a minute; the
+    result will be logged here.`
+  - Already running: `A commission for this setup code is already
+    running — its result will be logged here.`
+  - Succeeded: `Commissioned "<name>" → node <id>, created N Indigo
+    device(s).`
+  - Failed: the #227 ERROR line above.
+  - Timed out: the existing warning, now led by the device's name (job id
+    kept in parens), and — for the "matter-server gave up but the device
+    may still join" case — extended with the most common real-world
+    causes (a pasted original QR code instead of a fresh share code,
+    an expired share window, or the device not being IP-reachable from
+    this Mac).
+
+  The raw wire acknowledgment (202/409) is unchanged in substance but now
+  logs at DEBUG instead of INFO.
+
 ## 2026.16.0 — share an Indigo-commissioned device with another ecosystem
 
 ### Added

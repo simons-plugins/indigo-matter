@@ -64,7 +64,10 @@ RECONCILE_WINDOW = timedelta(minutes=5)
 
 TIMEOUT_MESSAGE = (
     f"matter-server did not finish commissioning within {COMMISSION_TIMEOUT:.0f}s; "
-    "the device may still join — check Indigo before retrying"
+    "the device may still join — check Indigo before retrying. Common causes: the "
+    "device's ORIGINAL QR code was pasted instead of a fresh share code from its "
+    "current ecosystem; the share window expired; or the device is not IP-reachable "
+    "from this Mac."
 )
 
 # Operational Credentials cluster (0x003E), endpoint 0 — SupportedFabrics
@@ -126,6 +129,13 @@ def _exc_message(exc: BaseException) -> str:
     back to the type name so error payloads are never blank (#17)."""
     text = str(exc).strip()
     return text or type(exc).__name__
+
+
+def _device_count(created: dict) -> int:
+    """How many Indigo devices a ``_create_devices`` result created (#226's
+    SUCCESS narrative line) — ``indigoDeviceIds`` is the shared shape both
+    ``_run_job`` and ``_reconcile_job`` receive."""
+    return len(created.get("indigoDeviceIds") or [])
 
 
 def _node_key(value: Any) -> Any:
@@ -357,6 +367,13 @@ class CommissionJobs:
                 if self._by_code.get(setup_code) == job.job_id:
                     self._by_code.pop(setup_code, None)
             return 503, {"error": "matter_server_unreachable", "message": str(exc)}
+        # #226: the one seam both the menu path and Domio's HTTP path share —
+        # a raw 202/jobId acknowledgment reads like an error to a user with no
+        # other feedback for up to a minute.
+        self.logger.info(
+            'Commissioning "%s" — this takes up to a minute; the result will '
+            "be logged here.", job.suggested_name,
+        )
         return 202, {"jobId": job.job_id, "estimatedDurationSeconds": 30}
 
     def get_job(self, job_id: str) -> tuple[int, dict]:
@@ -589,9 +606,12 @@ class CommissionJobs:
                 created = await created
             job.result = {"nodeId": node_id_to_str(node_id), **created}
             self._advance(job, SUCCESS, 1.0, "Done (completed after timeout)")
+            # #226: one INFO line for this outcome — folds in the "reconciled
+            # after timeout" context the old separate log line carried.
             self.logger.info(
-                "commission job %s reconciled: node %s joined after the commission "
-                "request timed out", job.job_id, node_id_to_str(node_id),
+                'Commissioned "%s" → node %s, created %d Indigo device(s) '
+                "(completed after the commission request timed out).",
+                job.suggested_name, node_id_to_str(node_id), _device_count(created),
             )
         except Exception as exc:  # noqa: BLE001 - the job must reach a terminal state
             self.logger.exception(exc)
@@ -748,6 +768,10 @@ class CommissionJobs:
 
             job.result = {"nodeId": node_id_to_str(node_id), **created}
             self._advance(job, SUCCESS, 1.0, "Done")
+            self.logger.info(
+                'Commissioned "%s" → node %s, created %d Indigo device(s).',
+                job.suggested_name, node_id_to_str(node_id), _device_count(created),
+            )
         except asyncio.CancelledError:
             # Plugin shutdown cancelled the worker task. Land the terminal state
             # synchronously — _fail awaits remove_node, and any await inside a
@@ -774,7 +798,8 @@ class CommissionJobs:
                     f"timed out reading node descriptors for "
                     f"{node_id_to_str(node_id)} after commissioning succeeded"
                 )
-                self.logger.error("commission job %s: %s", job.job_id, message)
+                self.logger.error(
+                    'Commissioning "%s" (job %s): %s', job.suggested_name, job.job_id, message)
                 job.error = {"code": "internal_error", "message": message}
                 self._advance(job, FAILED, job.progress, "")
             else:
@@ -785,8 +810,11 @@ class CommissionJobs:
                 # branch would report internal_error with an empty message (#17).
                 # If the node arrives within RECONCILE_WINDOW, reconcile_node_added
                 # flips this job back to success. Logged so the event log holds
-                # evidence even after Domio has stopped polling the job.
-                self.logger.warning("commission job %s: %s", job.job_id, TIMEOUT_MESSAGE)
+                # evidence even after Domio has stopped polling the job. #226: led
+                # by suggested_name (not jobId alone) with the job id kept in
+                # parens, same shape as the other narrative lines.
+                self.logger.warning(
+                    'Commissioning "%s" (job %s): %s', job.suggested_name, job.job_id, TIMEOUT_MESSAGE)
                 job.error = {"code": "commissioning_timeout", "message": TIMEOUT_MESSAGE}
                 self._advance(job, FAILED, job.progress, "")
                 self._watch_reconcile_window(job)
@@ -826,6 +854,16 @@ class CommissionJobs:
         if matter_error_code is not None:
             error["matterErrorCode"] = matter_error_code
         job.error = error
+        # #227: this is the ONLY place a ProtocolError/CommissionError failure
+        # was ever reported — job.error was stored for a poller that does not
+        # exist on the menu path, so a manual commission that failed this way
+        # logged nothing at all. Named by suggested_name (not jobId) so it
+        # reads next to the accept/success narrative lines (#226).
+        matter_error_suffix = f" (matter error {matter_error_code})" if matter_error_code is not None else ""
+        self.logger.error(
+            'commission of "%s" failed: %s%s (job %s)',
+            job.suggested_name, message, matter_error_suffix, job.job_id,
+        )
         self._advance(job, FAILED, job.progress, "")
 
     # ------------------------------------------------------------------

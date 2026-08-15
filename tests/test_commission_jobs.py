@@ -98,6 +98,32 @@ def test_create_job_dedups_in_flight_by_setup_code(mock_logger):
 
 
 # ----------------------------------------------------------------------
+# #226: accept narrative — the ONE seam both the menu path and Domio's HTTP
+# path go through (they both call create_job directly).
+# ----------------------------------------------------------------------
+def test_create_job_logs_the_accept_narrative_keyed_by_name(mock_logger):
+    jobs = _jobs(FakeMatter(), mock_logger)
+    code, _body = jobs.create_job({"setupCode": "12345678901", "suggestedName": "Office Fan"})
+    assert code == 202
+    mock_logger.info.assert_called_once()
+    logged = str(mock_logger.info.call_args)
+    assert "Office Fan" in logged
+    assert "takes up to a minute" in logged
+
+
+def test_create_job_409_does_not_log_a_second_accept_narrative(mock_logger):
+    # The 409 path (already in progress) never reaches the 202 branch — no
+    # accept narrative for a job that was never created. (The menu path's own
+    # human breadcrumb for 409 is menu-level, tested in test_plugin_behaviour.)
+    jobs = _jobs(FakeMatter(), mock_logger)
+    jobs.create_job({"setupCode": "12345678901", "suggestedName": "Office Fan"})
+    mock_logger.info.reset_mock()
+    code, _body = jobs.create_job({"setupCode": "12345678901", "suggestedName": "Office Fan"})
+    assert code == 409
+    mock_logger.info.assert_not_called()
+
+
+# ----------------------------------------------------------------------
 # Worker (async, driven on a real loop)
 # ----------------------------------------------------------------------
 def _await_terminal(jobs, job_id):
@@ -123,6 +149,13 @@ def test_commission_success_path(mock_logger):
         assert final["progress"] == 1.0
         assert final["result"]["nodeId"] == "0xABCDEF"
         assert final["result"]["primaryDeviceId"] == 111
+        # #226: the success narrative — named, node id, and the device count
+        # _good_create's single indigoDeviceIds entry makes true.
+        success_calls = [c for c in mock_logger.info.call_args_list
+                         if c.args[0].startswith("Commissioned ")]
+        assert len(success_calls) == 1
+        assert success_calls[0].args == ('Commissioned "%s" → node %s, created %d Indigo device(s).',
+                                         "Office Fan", "0xABCDEF", 1)
     asyncio.run(scenario())
 
 
@@ -264,6 +297,10 @@ def test_create_job_rejected_503_when_matter_server_disconnected(mock_logger):
     assert code == 503
     assert body["error"] == "matter_server_unreachable"
     assert body["message"]  # actionable, non-empty
+    # #226: the accept narrative lives after the 202 return — it must never
+    # fire on a path that doesn't reach it (pins the ordering against a
+    # refactor that hoists it above the early returns).
+    mock_logger.info.assert_not_called()
 
 
 def test_cancelled_worker_fails_job_and_frees_setup_code(mock_logger):
@@ -342,6 +379,53 @@ def test_missing_node_id_maps_to_commissioning_failed(mock_logger):
     asyncio.run(scenario())
 
 
+# ----------------------------------------------------------------------
+# #227: _fail() must log the failure — a manual commission that dies via
+# ProtocolError or CommissionError used to reach FAILED with zero log output
+# (job.error was stored for a poller that does not exist on the menu path).
+# ----------------------------------------------------------------------
+def test_protocol_error_failure_is_logged_named_by_suggested_name(mock_logger):
+    from protocol import ProtocolError
+
+    async def scenario():
+        class PEMatter(FakeMatter):
+            async def commission_with_code(self, code, **_kwargs):
+                raise ProtocolError(50, "PASE failed")
+
+        jobs = _jobs(PEMatter(), mock_logger, schedule=asyncio.ensure_future)
+        _, body = jobs.create_job({"setupCode": "12345678901", "suggestedName": "Kitchen Plug"})
+        final = await _await_terminal(jobs, body["jobId"])()
+        assert final["status"] == "failed"
+        mock_logger.error.assert_called()
+        logged = str(mock_logger.error.call_args)
+        assert "Kitchen Plug" in logged
+        assert "PASE failed" in logged
+        assert "50" in logged  # matter error code
+        assert body["jobId"] in logged
+    asyncio.run(scenario())
+
+
+def test_commission_error_failure_is_logged_named_by_suggested_name(mock_logger):
+    async def scenario():
+        async def failing_create(node, name, room):
+            raise CommissionError("interview_failed", "could not read descriptors")
+
+        matter = FakeMatter(node_id=99)
+        jobs = _jobs(matter, mock_logger, create=failing_create, schedule=asyncio.ensure_future)
+        _, body = jobs.create_job({"setupCode": "12345678901", "suggestedName": "Office Fan"})
+        final = await _await_terminal(jobs, body["jobId"])()
+        assert final["status"] == "failed"
+        mock_logger.error.assert_called()
+        logged = str(mock_logger.error.call_args)
+        assert "Office Fan" in logged
+        assert "could not read descriptors" in logged
+        assert body["jobId"] in logged
+        # no matter_error_code was raised — the suffix must stay absent, not
+        # render as "(matter error None)"
+        assert "matter error" not in logged
+    asyncio.run(scenario())
+
+
 def test_generic_exception_maps_to_internal_error(mock_logger):
     async def scenario():
         class BoomMatter(FakeMatter):
@@ -401,18 +485,25 @@ def test_commission_timeout_maps_to_commissioning_timeout(mock_logger):
     async def scenario():
         matter = TimeoutMatter()
         jobs = _jobs(matter, mock_logger, schedule=asyncio.ensure_future)
-        _, body = jobs.create_job({"setupCode": "12345678901", "suggestedName": "X"})
+        _, body = jobs.create_job({"setupCode": "12345678901", "suggestedName": "Hall Lamp"})
         final = await _await_terminal(jobs, body["jobId"])()
         assert final["status"] == "failed"
         assert final["error"]["code"] == "commissioning_timeout"
         assert "may still join" in final["error"]["message"]
         assert "300" in final["error"]["message"]  # names the actual deadline
         assert matter.removed == []  # never tear down an in-flight join
+        # #226: the causes hint is in TIMEOUT_MESSAGE itself, so it reaches
+        # both the API error payload and the log line.
+        assert "share code" in final["error"]["message"]
+        assert "IP-reachable" in final["error"]["message"]
         # the timeout is logged so the event log holds evidence even after
-        # Domio stops polling the job
+        # Domio stops polling the job — #226: led by the suggested name, not
+        # jobId alone.
         mock_logger.warning.assert_called()
         logged = str(mock_logger.warning.call_args)
+        assert "Hall Lamp" in logged
         assert body["jobId"] in logged and "may still join" in logged
+        assert "share code" in logged and "IP-reachable" in logged
     asyncio.run(scenario())
 
 
@@ -428,7 +519,7 @@ def test_get_node_timeout_after_commission_is_internal_error(mock_logger):
 
         matter = SlowDescriptorMatter(node_id=0xAB)
         jobs = _jobs(matter, mock_logger, schedule=asyncio.ensure_future)
-        _, body = jobs.create_job({"setupCode": "12345678901", "suggestedName": "X"})
+        _, body = jobs.create_job({"setupCode": "12345678901", "suggestedName": "Hall Lamp"})
         final = await _await_terminal(jobs, body["jobId"])()
         assert final["status"] == "failed"
         assert final["error"]["code"] == "internal_error"
@@ -436,6 +527,10 @@ def test_get_node_timeout_after_commission_is_internal_error(mock_logger):
         assert "0xAB" in final["error"]["message"]
         assert "commissioning succeeded" in final["error"]["message"]
         assert matter.removed == []  # the node joined; don't tear it down
+        # #226: this timeout branch is also led by the suggested name.
+        mock_logger.error.assert_called()
+        logged = str(mock_logger.error.call_args)
+        assert "Hall Lamp" in logged and body["jobId"] in logged
     asyncio.run(scenario())
 
 
@@ -471,6 +566,13 @@ def test_late_node_added_reconciles_timed_out_job(mock_logger):
         assert calls == [(raw_node, "Hall Lamp", "Hallway")]
         # reconciled job is terminal again → reapable, and won't double-claim
         assert jobs.reconcile_node_added(raw_node) is None
+        # #226: the reconcile-site SUCCESS narrative — one INFO line, not two
+        # (the old separate "reconciled" line was folded into it).
+        success_calls = [c for c in mock_logger.info.call_args_list
+                         if c.args[0].startswith("Commissioned ")]
+        assert len(success_calls) == 1
+        name, node, count = success_calls[0].args[1:]
+        assert (name, node, count) == ("Hall Lamp", "0xAB", 1)
     asyncio.run(scenario())
 
 

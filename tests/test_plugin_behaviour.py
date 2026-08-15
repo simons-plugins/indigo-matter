@@ -1141,6 +1141,65 @@ def test_manual_commission_unknown_folder_id_falls_back_to_none(plug, mock_indig
     assert captured["suggestedRoom"] is None
 
 
+# ---------------------------------------------------------------------------
+# #226: the raw wire acknowledgment drops to DEBUG; a 202 gets its narrative
+# from create_job (tested in test_commission_jobs.py), a 409 gets its own
+# human breadcrumb here.
+# ---------------------------------------------------------------------------
+def test_manual_commission_202_logs_the_wire_line_at_debug_not_info(plug, mock_indigo_base):
+    mock_indigo_base.devices.folders = []
+    plug.jobs = SimpleNamespace(create_job=lambda params: (202, {"jobId": "abc"}))  # noqa: ARG005
+    plug.menuCommissionDeviceManually(
+        {"setupCode": "MT:ABC", "suggestedName": "Plug", "folder": "0"}, "commissionDeviceManually")
+    plug.logger.debug.assert_called_once()
+    assert "manual commission" in str(plug.logger.debug.call_args)
+    plug.logger.info.assert_not_called()  # create_job (a fake here) owns the 202 narrative
+
+
+def test_manual_commission_409_logs_a_human_breadcrumb_and_the_wire_line_at_debug(plug, mock_indigo_base):
+    mock_indigo_base.devices.folders = []
+    plug.jobs = SimpleNamespace(
+        create_job=lambda params: (409, {"error": "duplicate", "existingJobId": "abc"}))  # noqa: ARG005
+    ok, _vd = plug.menuCommissionDeviceManually(
+        {"setupCode": "MT:ABC", "suggestedName": "Plug", "folder": "0"}, "commissionDeviceManually")
+    assert ok is True  # 409 still closes the dialog without an error
+    plug.logger.info.assert_called_once()
+    said = str(plug.logger.info.call_args)
+    assert "already running" in said
+    plug.logger.debug.assert_called_once()
+    assert "manual commission" in str(plug.logger.debug.call_args)
+
+
+def test_manual_commission_400_is_logged_and_explained_in_the_dialog(plug, mock_indigo_base):
+    # #227 regression: demoting the wire line to DEBUG had removed the ONLY log
+    # output for invalid_setup_code (the single most likely menu failure), and
+    # the dialog closed over it with no error field — the exact invisible-failure
+    # shape #227 exists to eliminate.
+    mock_indigo_base.devices.folders = []
+    plug.jobs = SimpleNamespace(create_job=lambda params: (  # noqa: ARG005
+        400, {"error": "invalid_setup_code", "message": "Setup code must be an MT:... QR payload"}))
+    ok, _vd, errors = plug.menuCommissionDeviceManually(
+        {"setupCode": "bad", "suggestedName": "Plug", "folder": "0"}, "commissionDeviceManually")
+    assert ok is False
+    assert "MT:" in errors["setupCode"]
+    plug.logger.error.assert_called_once()
+    assert "MT:" in str(plug.logger.error.call_args)
+    plug.logger.info.assert_not_called()  # no accept narrative for a rejected request
+
+
+def test_manual_commission_503_is_logged_and_explained_in_the_dialog(plug, mock_indigo_base):
+    mock_indigo_base.devices.folders = []
+    plug.jobs = SimpleNamespace(create_job=lambda params: (  # noqa: ARG005
+        503, {"error": "matter_server_unreachable", "message": "Not connected to matter-server"}))
+    ok, _vd, errors = plug.menuCommissionDeviceManually(
+        {"setupCode": "MT:ABC", "suggestedName": "Plug", "folder": "0"}, "commissionDeviceManually")
+    assert ok is False
+    assert "matter-server" in errors["setupCode"]
+    plug.logger.error.assert_called_once()
+    assert "matter-server" in str(plug.logger.error.call_args)
+    plug.logger.info.assert_not_called()  # no accept narrative for a rejected request
+
+
 def test_menu_decommission_requires_selection(plug):
     ok, _vd, errors = plug.menuDecommissionDevice({"node": "", "confirm": True}, "decommissionDevice")
     assert ok is False

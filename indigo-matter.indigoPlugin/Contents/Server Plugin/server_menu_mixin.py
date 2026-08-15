@@ -271,7 +271,29 @@ class ServerMenuMixin:
             # (the same path Domio's room uses). "0"/unknown → no folder (root).
             "suggestedRoom": self._folder_name_for(valuesDict.get("folder")),
         })
-        self.logger.info("manual commission → %s %s", status, body)
+        if status == 409:
+            # #226: the raw 409 body is jargon on its own; create_job already
+            # logs the INFO narrative for a fresh 202, so this is the 409
+            # counterpart, not a duplicate of it.
+            self.logger.info(
+                "A commission for this setup code is already running — its "
+                "result will be logged here.")
+        # The wire-level acknowledgment stays available for debugging, but at
+        # DEBUG — create_job's narrative line (202) and the breadcrumb above
+        # (409) are what a user should see (#226).
+        self.logger.debug("manual commission → %s %s", status, body)
+        if status not in (202, 409):
+            # #227: create_job rejected the request outright (400 invalid_setup_code
+            # — the single most likely menu failure — or 503 matter_server_unreachable).
+            # Demoting the wire line to DEBUG above removed the only log output for
+            # this, and a bare (False, valuesDict) leaves the dialog open with no
+            # on-screen explanation either — the exact invisible-failure shape #227
+            # exists to eliminate. Mirrors the `self.jobs is None` branch above.
+            message = body.get("message") or body
+            self.logger.error("manual commission failed: %s", message)
+            errors = indigo.Dict()
+            errors["setupCode"] = str(message)
+            return (False, valuesDict, errors)
         return (status in (202, 409), valuesDict)
 
     def getDeviceFolders(self, filter="", valuesDict=None, typeId="", targetId=0):  # noqa: N802, A002, ARG002
