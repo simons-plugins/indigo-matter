@@ -13,7 +13,13 @@ import protocol
 from protocol import MatterCommand, Protocol
 from matter_client import MatterClient
 
-from fakes import COMMISSIONING_WINDOW_RESULT, FakeWebSocket, returns, scripted_responder
+from fakes import (
+    COMMISSIONING_WINDOW_RESULT,
+    FakeWebSocket,
+    error_responder,
+    returns,
+    scripted_responder,
+)
 
 
 def run(coro):
@@ -778,6 +784,29 @@ def test_open_commissioning_window_on_late_response_hook_receives_the_context(mo
         assert late.context == "share window for node 0x38"
         assert late.result == COMMISSIONING_WINDOW_RESULT
         assert late.error is None
+
+        await client.close()
+        task.cancel()
+    run(scenario())
+
+
+@pytest.mark.parametrize("code", [3, "3", "03"])
+def test_open_commissioning_window_surfaces_a_protocol_error_with_code_intact(mock_logger, code):
+    # error_responder (fakes.py) — proving a wire error frame reaches the
+    # caller as a ProtocolError with .code exactly as the wire sent it, in
+    # every shape that code can arrive in: a plain int, a plain string, and
+    # a zero-padded string (issue #210 review #2c/#3 — the wire-code
+    # coercion bug that made "03" unreadable as NodeNotReady).
+    async def scenario():
+        fake = FakeWebSocket(responder=error_responder(protocol.CMD_OPEN_WINDOW, code, "not ready"))
+        client = _client(mock_logger, fake)
+        task = asyncio.create_task(client.run())
+        await client.wait_connected(timeout=2)
+
+        with pytest.raises(protocol.ProtocolError) as exc_info:
+            await client.open_commissioning_window(56, duration=300)
+        assert exc_info.value.code == code
+        assert protocol.is_node_unreachable(exc_info.value)
 
         await client.close()
         task.cancel()
