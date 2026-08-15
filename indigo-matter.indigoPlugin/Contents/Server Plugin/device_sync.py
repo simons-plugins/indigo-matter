@@ -523,6 +523,18 @@ class DeviceSync:
         # per-run-only discipline as _battery_exclusion_warned: a restart is
         # free to say it again, because a restart is when a user is looking.
         self._group_warned: set[tuple[int, str]] = set()
+        # (node_id, endpoint_id) pairs already told their standalone issue-#79
+        # matterEnergyMeter fallback is now redundant (issue #215): a link
+        # that resolves AFTER the fallback was created leaves both devices
+        # showing the same reading (PR #213 kept the standalone one updating
+        # rather than orphaning it), so the user is told once — unlike the
+        # matterUnknown obsolescence log above, which is content to repeat
+        # every pass, this one is a standing fact for the endpoint's whole
+        # life once linked, so repeating it would just be noise on every
+        # reconnect. Evicted in _forget_node_capabilities alongside
+        # _forward_links, so a decommissioned-then-recommissioned node can
+        # earn the log again rather than being silenced by a stale entry.
+        self._redundant_meter_logged: set[tuple[int, int]] = set()
 
     # ------------------------------------------------------------------
     # Active-device tracking (deviceStartComm/deviceStopComm)
@@ -985,6 +997,30 @@ class DeviceSync:
                         # (node, 0, 0x0090/0x0091) reading straight to it.
                         if eid != 0 and ep_key not in self._forward_links:
                             specs = [self._energy_meter_spec(node, endpoint)]
+                        elif eid != 0 and ep_key not in self._redundant_meter_logged:
+                            # The link resolved THIS pass (or a prior one), but
+                            # a standalone matterEnergyMeter from before it
+                            # resolved may still be sitting there (PR #213 —
+                            # it keeps updating rather than going stale). Same
+                            # voice as the matterUnknown obsolescence log
+                            # below; fired once, not every pass (issue #215).
+                            meter_dev_id = self._index.get(ep_key, {}).get("matterEnergyMeter")
+                            if meter_dev_id is not None:
+                                self._redundant_meter_logged.add(ep_key)
+                                try:
+                                    meter_name = indigo.devices[meter_dev_id].name
+                                except Exception as exc:  # noqa: BLE001 - name lookup only; log fires either way
+                                    self.logger.debug(
+                                        "redundant meter: device %s name lookup failed: %s",
+                                        meter_dev_id, exc,
+                                    )
+                                    meter_name = f"device {meter_dev_id}"
+                                self.logger.info(
+                                    "node %s endpoint %s energy readings now route to the "
+                                    "linked actuator device — the standalone '%s' energy-meter "
+                                    "device is redundant and can be deleted",
+                                    node_id_to_str(node.node_id), eid, meter_name,
+                                )
                     else:
                         # No handler claimed this endpoint. If it carries clusters
                         # that DO make it a device (just ones we don't support yet),
@@ -2777,6 +2813,16 @@ class DeviceSync:
                                    if k[0] != target}
             self._reverse_links = {k: v for k, v in self._reverse_links.items()
                                    if k[0] != target}
+            # `_redundant_meter_logged` (issue #215) rides along with the links
+            # above for the same reason: it is a fact ABOUT a link ("this one
+            # made a device redundant"), so once the link is gone there is
+            # nothing left for a stale entry to correctly describe. A
+            # recommissioned node starts the resolution over from scratch, and
+            # should be free to earn the one-time log again if it lands in the
+            # same shape.
+            self._redundant_meter_logged = {
+                k for k in self._redundant_meter_logged if k[0] != target
+            }
         # And the "already reported" mark (issue #191). Node ids are assigned at
         # commissioning and re-used across a decommission/recommission cycle, so
         # keeping it would let a genuinely different device inherit the old

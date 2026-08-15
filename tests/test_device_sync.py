@@ -4308,6 +4308,57 @@ def test_standalone_meter_re_primes_after_its_link_later_resolves(ds, indigo_env
 
 
 # ===========================================================================
+# issue #215 — once a standalone issue-#79 matterEnergyMeter's link resolves,
+# PR #213 keeps it updating rather than going stale, but nothing told the
+# user the two devices now duplicate each other. Same fixtures as the
+# re-priming test above: pass 1 is ambiguous (standalone meter created),
+# pass 2 resolves the link without recreating it.
+# ===========================================================================
+
+def test_standalone_meter_redundancy_logged_once_when_its_link_resolves(ds, indigo_env, mock_logger):
+    """The redundancy INFO fires the pass the link resolves, names the
+    standalone device by its actual Indigo name, and — unlike the
+    matterUnknown obsolescence log — does NOT repeat on a later pass that
+    finds the same already-linked shape. The device itself is never touched;
+    deleting it stays the user's call."""
+    _indigo, devices = indigo_env
+    ds.create_from_raw(LATER_RESOLVED_LINK_NODE_PASS1, "Power Strip")
+    meter_id = ds.lookup(0x3D, 2)
+    assert meter_id is not None
+    meter_name = devices[meter_id].name
+
+    ds.reconcile_all([LATER_RESOLVED_LINK_NODE_PASS2])
+    info_msgs = [c[0][0] % tuple(c[0][1:]) for c in mock_logger.info.call_args_list]
+    redundant_msgs = [m for m in info_msgs if "redundant" in m]
+    assert len(redundant_msgs) == 1
+    assert meter_name in redundant_msgs[0]
+    assert devices[meter_id].deviceTypeId == "matterEnergyMeter", "never deleted"
+    assert ds.lookup(0x3D, 2) == meter_id, "never deleted"
+
+    # Same already-resolved shape again — must not repeat.
+    ds.reconcile_all([LATER_RESOLVED_LINK_NODE_PASS2])
+    info_msgs = [c[0][0] % tuple(c[0][1:]) for c in mock_logger.info.call_args_list]
+    redundant_msgs = [m for m in info_msgs if "redundant" in m]
+    assert len(redundant_msgs) == 1, "one-time log, not once-per-pass"
+
+
+def test_standalone_meter_redundancy_never_logged_while_link_stays_ambiguous(ds, indigo_env, mock_logger):
+    """No link ever resolves (pass 1's ambiguous shape repeats) — the
+    standalone matterEnergyMeter is the endpoint's only home for the reading,
+    so there is nothing redundant to report."""
+    _indigo, devices = indigo_env
+    ds.create_from_raw(LATER_RESOLVED_LINK_NODE_PASS1, "Power Strip")
+    meter_id = ds.lookup(0x3D, 2)
+    assert meter_id is not None
+
+    ds.reconcile_all([LATER_RESOLVED_LINK_NODE_PASS1])
+
+    info_msgs = [c[0][0] % tuple(c[0][1:]) for c in mock_logger.info.call_args_list]
+    assert not any("redundant" in m for m in info_msgs)
+    assert ds.lookup(0x3D, 2) == meter_id, "standalone device still there, still the only home"
+
+
+# ===========================================================================
 # issue #204 review — fix F.1: the endpoint-0 purity exemption
 # (_is_meter_source_candidate) needs a fixture that actually carries a
 # root-utility cluster NOT in _NON_DEVICE_CLUSTERS, or removing the exemption
