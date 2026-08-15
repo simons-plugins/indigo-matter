@@ -971,6 +971,37 @@ def test_action_share_matter_node_failure_logs_the_refusal_message(plugin_cls, m
     assert "Not connected to matter-server" in logged
 
 
+# ---------------------------------------------------------------------------
+# issue #210 — _on_late_matter_response fans out to BOTH late-response
+# consumers (commission RPC via CommissionJobs, share RPC via ServerMenuMixin)
+# ---------------------------------------------------------------------------
+
+def test_on_late_matter_response_routes_to_both_consumers(plugin_cls, mock_logger):
+    """A single MatterClient's on_late_response hook serves two different
+    senders (commission_with_code, open_commissioning_window) — each claims
+    only its own context via isinstance, so both run unconditionally rather
+    than this method dispatching on type itself."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    stub = SimpleNamespace(
+        jobs=MagicMock(), logger=mock_logger,
+        _note_late_share_response=MagicMock(),
+    )
+    late = SimpleNamespace(context="whatever")
+    plugin_cls._on_late_matter_response(stub, late)
+    stub.jobs.note_late_response.assert_called_once_with(late)
+    stub._note_late_share_response.assert_called_once_with(late)
+
+
+def test_on_late_matter_response_still_notes_share_when_jobs_is_none(plugin_cls, mock_logger):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    stub = SimpleNamespace(jobs=None, logger=mock_logger, _note_late_share_response=MagicMock())
+    late = SimpleNamespace(context="whatever")
+    plugin_cls._on_late_matter_response(stub, late)
+    stub._note_late_share_response.assert_called_once_with(late)
+
+
 @pytest.fixture
 def plugin_module(mock_indigo_base):
     import importlib

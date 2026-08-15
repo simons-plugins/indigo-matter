@@ -11,6 +11,7 @@ import os
 import threading
 from concurrent.futures import CancelledError as FuturesCancelledError
 from concurrent.futures import TimeoutError as FuturesTimeoutError
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
@@ -46,6 +47,22 @@ _UNREACHABLE_MESSAGE = (
     "on and try again in a moment (the report can lag a device that just woke). "
     "Nothing was changed."
 )
+
+
+@dataclass(frozen=True)
+class ShareWindowRequest:
+    """The context :meth:`ServerMenuMixin._share_node` hands the transport for
+    its ``open_commissioning_window`` RPC (issue #210) — both the correlation
+    key a LATE response (``ws_json_client.LateResponse.context``) is matched
+    back to this share attempt with, and the human-readable note an
+    un-awaited request's log line shows. Mirrors ``commission_jobs.
+    CommissionRequest``'s #23 role for the commission RPC.
+    """
+    node_id: int
+    duration: int
+
+    def __str__(self) -> str:
+        return f"share window for node {node_id_to_str(self.node_id)}"
 
 
 class ServerMenuMixin:
@@ -518,7 +535,8 @@ class ServerMenuMixin:
 
         try:
             window = self.runtime.submit(
-                self.matter.open_commissioning_window(node_id, duration=duration)
+                self.matter.open_commissioning_window(
+                    node_id, duration=duration, context=ShareWindowRequest(node_id, duration))
             ).result(timeout=SHARE_WINDOW_TIMEOUT)
         except FuturesTimeoutError:
             self.logger.warning(
@@ -593,7 +611,8 @@ class ServerMenuMixin:
                 node_id_to_str(node_id), free, supported)
         return line
 
-    def _log_node_share_codes(self, node_id, window, duration: int, fabric_line: str) -> None:
+    def _log_node_share_codes(self, node_id, window, duration: int, fabric_line: str,
+                              *, prefix: str = "") -> None:
         """Write the share codes to the event log — the node-flavoured sibling
         of :meth:`PairingMenuMixin._log_pairing_codes` (pairing_menu_mixin.py:
         153-173), same reasoning (no dynamic dialog labels), adapted rather
@@ -601,10 +620,17 @@ class ServerMenuMixin:
         not the whole exported bridge, and matter-server reports no expiry
         timestamp the way the export bridge's own node does — the expiry
         below is computed from ``duration``, not read, hence "approximately".
+
+        ``prefix`` (issue #210's late-answer path,
+        :meth:`_note_late_share_response`) escalates this to a WARNING and
+        prepends the given text — a late answer means the caller has ALREADY
+        told the user the code was lost, which deserves more visibility than
+        the ordinary info-level confirmation.
         """
         expires = (datetime.now(timezone.utc) + timedelta(seconds=duration)).strftime("%Y-%m-%d %H:%M UTC")
-        self.logger.info(
-            "Matter share — a %ds commissioning window is now open on node %s.\n"
+        log = self.logger.warning if prefix else self.logger.info
+        log(
+            "%sMatter share — a %ds commissioning window is now open on node %s.\n"
             "    Manual pairing code: %s\n"
             "    QR payload: %s\n"
             "    Expires approximately %s (matter-server does not report an exact expiry).\n"
@@ -618,9 +644,51 @@ class ServerMenuMixin:
             "to a device you own — anyone who can read this code can add it to THEIR Apple "
             "Home, Alexa or Google account. Do not share it beyond the ecosystem you intend "
             "to add.",
-            duration, node_id_to_str(node_id), window.manual_code, window.qr_code or "(none)",
+            prefix, duration, node_id_to_str(node_id), window.manual_code, window.qr_code or "(none)",
             expires, fabric_line,
         )
+
+    def _note_late_share_response(self, late) -> None:
+        """Fold a late matter-server answer to an ``open_commissioning_window``
+        RPC this plugin already gave up waiting on (issue #210) — the share
+        counterpart of ``commission_jobs.CommissionJobs.note_late_response``'s
+        #23 handling of the commission RPC. ``late`` is a
+        ``ws_json_client.LateResponse``, delivered to every ``on_late_response``
+        consumer (``Plugin._on_late_matter_response``); ``late.context`` names
+        this as ours only when it is our own :class:`ShareWindowRequest`.
+
+        Without this, matter-server answering after
+        ``matter_client.SHARE_WINDOW_RPC_TIMEOUT`` (a sleepy Thread device)
+        meant the code carrying the ONLY chance to share that device was
+        silently dropped into ``WsJsonClient._log_unmatched``'s payload-free
+        DEBUG line — the dialog had already told the user the code was lost,
+        so there was nowhere else for it to land.
+
+        A late ERROR is logged at INFO, not WARNING: it confirms no window
+        opened, which is a relief, not a fresh problem — the WARNING already
+        fired (or is about to, on the RPC-timeout path) is enough.
+        """
+        if not isinstance(late.context, ShareWindowRequest):
+            return
+        node_id = late.context.node_id
+        if late.error is not None:
+            code, details = late.error
+            self.logger.info(
+                "share: matter-server's late answer for node %s is a refusal — no window "
+                "opened; code %r (%s)", node_id_to_str(node_id), code, details)
+            return
+        try:
+            codes = protocol.parse_commissioning_window(late.result)
+        except ValueError as exc:
+            self.logger.error(
+                "share: node %s's late open_commissioning_window answer had an unexpected "
+                "shape (%s) — raw payload: %r", node_id_to_str(node_id), exc, late.result)
+            return
+        self._log_node_share_codes(
+            node_id, codes, late.context.duration,
+            "(fabric slot count not re-checked for a late answer)",
+            prefix="matter-server answered late — the window DID open after all; codes "
+                  "follow. ")
 
     # ------------------------------------------------------------------
     # Export-bridge recovery menus (BRIDGE_PROTOCOL §3.10/§3.11)

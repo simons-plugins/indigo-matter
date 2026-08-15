@@ -239,7 +239,8 @@ class MatterClient(WsJsonClient):
         return await self.request(protocol.CMD_REMOVE_NODE, {"node_id": node_id})
 
     async def open_commissioning_window(self, node_id: int, duration: Optional[int] = None,
-                                        timeout: float = SHARE_WINDOW_RPC_TIMEOUT) -> Any:
+                                        timeout: float = SHARE_WINDOW_RPC_TIMEOUT,
+                                        context: Any = None) -> Any:
         """Open an Enhanced commissioning window on an already-commissioned node
         (issue #210) — the "share this device with another ecosystem" primitive.
 
@@ -251,11 +252,21 @@ class MatterClient(WsJsonClient):
         them identically on the wire while they mean opposite things is exactly
         the trap ``protocol.py``'s module header calls out; do not let a future
         edit wire one into the other.
+
+        Built explicitly (not via :meth:`request`) for the same reason
+        :meth:`commission_with_code` is: this is a caller that wants to
+        correlate a LATE answer (``context``) against the request that sent
+        it — ``request()`` has no context param. A device that misses its
+        own RPC deadline (a sleepy Thread node) can still answer after this
+        plugin gives up waiting; without a context, that answer's code dies
+        in :meth:`WsJsonClient._log_unmatched` as a payload-free debug line.
+        ``ServerMenuMixin._note_late_share_response`` is the consumer.
         """
         args = {protocol.ARG_NODE_ID: node_id}
         if duration is not None:
             args[protocol.ARG_WINDOW_DURATION] = int(duration)
-        return await self.request(protocol.CMD_OPEN_WINDOW, args, timeout=timeout)
+        frame = self.proto.build_request(protocol.CMD_OPEN_WINDOW, args)
+        return await self._request_frame(frame, timeout, context=context)
 
     async def interview_node(self, node_id: int) -> Any:
         return await self.request(protocol.CMD_INTERVIEW, {"node_id": node_id})

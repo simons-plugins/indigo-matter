@@ -679,3 +679,106 @@ def test_open_commissioning_window_rpc_timeout_reaches_the_wait(mock_logger, mon
         await client.close()
         task.cancel()
     run(scenario())
+
+
+def test_open_commissioning_window_default_rpc_timeout_reaches_the_wait(mock_logger, monkeypatch):
+    # Pins the DEFAULT (no timeout= passed at all) — the test above only
+    # proves an EXPLICIT deadline reaches wait_for, not that the parameter's
+    # own default value is SHARE_WINDOW_RPC_TIMEOUT.
+    from matter_client import SHARE_WINDOW_RPC_TIMEOUT
+
+    captured: list[float] = []
+    real_wait_for = asyncio.wait_for
+
+    async def spying_wait_for(awaitable, timeout):
+        captured.append(timeout)
+        return await real_wait_for(awaitable, timeout)
+
+    monkeypatch.setattr("matter_client.asyncio.wait_for", spying_wait_for)
+
+    async def scenario():
+        fake = FakeWebSocket(responder=scripted_responder(
+            {protocol.CMD_OPEN_WINDOW: COMMISSIONING_WINDOW_RESULT}))
+        client = _client(mock_logger, fake)
+        task = asyncio.create_task(client.run())
+        await client.wait_connected(timeout=2)
+
+        captured.clear()
+        await client.open_commissioning_window(56, duration=300)  # no timeout= at all
+        assert captured == [SHARE_WINDOW_RPC_TIMEOUT]
+
+        await client.close()
+        task.cancel()
+    run(scenario())
+
+
+def test_open_commissioning_window_called_positionally_sends_the_same_wire_frame(mock_logger):
+    # Positional (node_id, duration) must reach the wire identically to the
+    # keyword form the codebase's own call sites use — the wire contract does
+    # not care which calling convention a caller picks.
+    async def scenario():
+        seen = {}
+
+        def window_result(frame):
+            seen["args"] = frame["args"]
+            return COMMISSIONING_WINDOW_RESULT
+
+        fake = FakeWebSocket(responder=scripted_responder(
+            {protocol.CMD_OPEN_WINDOW: window_result}))
+        client = _client(mock_logger, fake)
+        task = asyncio.create_task(client.run())
+        await client.wait_connected(timeout=2)
+
+        result = await client.open_commissioning_window(56, 300)
+        assert seen["args"] == {"node_id": 56, "timeout": 300}
+        assert result == COMMISSIONING_WINDOW_RESULT
+
+        await client.close()
+        task.cancel()
+    run(scenario())
+
+
+def _withheld_share_window(mock_logger, **kw):
+    """A connected matter-server client whose open_commissioning_window
+    request never gets an answer (or the fire-and-forget handshake's) —
+    everything else is answered immediately. Mirrors _withheld_commission."""
+    def responder(frame):
+        if frame.get(protocol.KEY_COMMAND) in (protocol.CMD_OPEN_WINDOW, protocol.CMD_START_LISTENING):
+            return []
+        return [{protocol.KEY_MESSAGE_ID: frame[protocol.KEY_MESSAGE_ID], protocol.KEY_RESULT: None}]
+
+    fake = FakeWebSocket(responder=responder)
+    return fake, _client(mock_logger, fake, **kw)
+
+
+def test_open_commissioning_window_on_late_response_hook_receives_the_context(mock_logger):
+    # Issue #210's late-answer fix depends entirely on this: a share request
+    # that misses its own RPC deadline must still hand its context to
+    # on_late_response when matter-server eventually answers — the same
+    # mechanism issue #23 proved for commission_with_code, mirrored here.
+    async def scenario():
+        seen = []
+        fake, client = _withheld_share_window(mock_logger, on_late_response=seen.append)
+        task = asyncio.create_task(client.run())
+        await client.wait_connected(timeout=2)
+
+        with pytest.raises(asyncio.TimeoutError):
+            await client.open_commissioning_window(
+                56, duration=300, timeout=0.02, context="share window for node 0x38")
+
+        mid = fake.sent[-1][protocol.KEY_MESSAGE_ID]
+        await fake.push_frame({"message_id": mid, "result": COMMISSIONING_WINDOW_RESULT})
+        for _ in range(50):
+            if seen:
+                break
+            await asyncio.sleep(0.01)
+
+        assert len(seen) == 1
+        late = seen[0]
+        assert late.context == "share window for node 0x38"
+        assert late.result == COMMISSIONING_WINDOW_RESULT
+        assert late.error is None
+
+        await client.close()
+        task.cancel()
+    run(scenario())

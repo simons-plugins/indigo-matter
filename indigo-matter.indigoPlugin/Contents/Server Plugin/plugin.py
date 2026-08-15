@@ -1732,4 +1732,11 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, ServerMenuMixin,
         # invariant honest rather than assumed, same as _on_matter_event above.
         if self.jobs is not None:
             self.jobs.note_late_response(late)
+        # A single MatterClient fans every late response out to whichever of
+        # its several possible senders' contexts matches (issue #210):
+        # note_late_response above only claims a CommissionRequest and drops
+        # anything else; this claims a ShareWindowRequest the same way. Both
+        # run unconditionally — a late answer names at most one of them via
+        # isinstance, never both, so there is no double-handling to guard.
+        self._note_late_share_response(late)  # pylint: disable=no-member  # ServerMenuMixin (issue #146)
 

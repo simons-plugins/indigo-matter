@@ -25,6 +25,7 @@ import pytest
 
 import protocol
 from fakes import COMMISSIONING_WINDOW_RESULT
+from ws_json_client import LateResponse
 
 SERVER_PLUGIN = (Path(__file__).parent.parent / "indigo-matter.indigoPlugin"
                  / "Contents" / "Server Plugin")
@@ -79,21 +80,33 @@ class _Future:
 
     def __init__(self, value=None, raises=None):
         self._value, self._raises = value, raises
+        #: The ``timeout`` argument of the last ``.result()`` call — lets a
+        #: test pin WHICH of the two nested deadlines (SURVEY_READ_TIMEOUT for
+        #: the fetch, SHARE_WINDOW_TIMEOUT for the window open) a given call
+        #: actually used, not just that *some* call happened.
+        self.result_timeout = None
 
-    def result(self, timeout=None):  # noqa: ARG002
+    def result(self, timeout=None):
+        self.result_timeout = timeout
         if self._raises is not None:
             raise self._raises
         return self._value
 
 
 def _submitter(get_node_result=None, get_node_raises=None,
-              open_window_result=None, open_window_raises=None):
+              open_window_result=None, open_window_raises=None, futures=None):
+    """``futures``, if given, records every ``_Future`` created, in call
+    order, so a test can inspect ``.result_timeout`` after the fact."""
     def _submit(coro):
         if coro is _GET_NODE_CORO:
-            return _Future(get_node_result, get_node_raises)
-        if coro is _OPEN_WINDOW_CORO:
-            return _Future(open_window_result, open_window_raises)
-        return _Future(None)
+            fut = _Future(get_node_result, get_node_raises)
+        elif coro is _OPEN_WINDOW_CORO:
+            fut = _Future(open_window_result, open_window_raises)
+        else:
+            fut = _Future(None)
+        if futures is not None:
+            futures.append(fut)
+        return fut
     return _submit
 
 
@@ -405,13 +418,27 @@ def test_fabric_slots_unknown_proceeds_silently(mixin):
 # ---------------------------------------------------------------------------
 
 def test_happy_path_opens_the_window_with_the_chosen_duration_and_logs_the_codes(mixin):
-    _module, obj = mixin
+    module, obj = mixin
+    futures: list = []
+    obj.runtime.submit.side_effect = _submitter(
+        get_node_result=RAW_NODE, open_window_result=COMMISSIONING_WINDOW_RESULT, futures=futures)
     ok, values = obj.menuShareMatterNode({"node": str(NODE_ID), "duration": "300"})
     assert ok is True
+    # The window-open call used the OUTER deadline (SHARE_WINDOW_TIMEOUT) —
+    # a mutation swapping which of the two nested timeouts reaches .result()
+    # would pass every other assertion here.
+    from plugin_constants import SHARE_WINDOW_TIMEOUT
+    assert futures[-1].result_timeout == SHARE_WINDOW_TIMEOUT
     # duration is passed by KEYWORD — a mutation that reorders
     # open_commissioning_window's parameters (duration before context, say)
     # would pass just as happily with a positional call; this pins the seam.
-    obj.matter.open_commissioning_window.assert_called_once_with(NODE_ID, duration=300)
+    # context is our own ShareWindowRequest — the correlation key a LATE
+    # answer (issue #210) is matched back against. Built from the fixture's
+    # OWN freshly-imported module, not a top-level import of this test file
+    # — the fixture reloads server_menu_mixin per test, and a dataclass's
+    # generated __eq__ compares __class__ identity, not just field values.
+    assert obj.matter.open_commissioning_window.call_args == (
+        (NODE_ID,), {"duration": 300, "context": module.ShareWindowRequest(NODE_ID, 300)})
     logged = str(obj.logger.info.call_args)
     assert COMMISSIONING_WINDOW_RESULT["setup_manual_code"] in logged
     assert COMMISSIONING_WINDOW_RESULT["setup_qr_code"] in logged
@@ -422,7 +449,63 @@ def test_happy_path_opens_the_window_with_the_chosen_duration_and_logs_the_codes
 def test_happy_path_defaults_duration_to_900_when_left_blank(mixin):
     _module, obj = mixin
     obj.menuShareMatterNode({"node": str(NODE_ID), "duration": ""})
-    obj.matter.open_commissioning_window.assert_called_once_with(NODE_ID, duration=900)
+    call = obj.matter.open_commissioning_window.call_args
+    assert call.args == (NODE_ID,)
+    assert call.kwargs["duration"] == 900
+
+
+# ---------------------------------------------------------------------------
+# _note_late_share_response — matter-server answers after this plugin gave
+# up waiting (issue #210, mirroring commission_jobs' #23 late-response path)
+# ---------------------------------------------------------------------------
+
+def test_late_success_logs_the_codes_at_warning_with_the_late_prefix(mixin):
+    module, obj = mixin
+    late = LateResponse(
+        message_id="42", context=module.ShareWindowRequest(NODE_ID, 300),
+        error=None, result=COMMISSIONING_WINDOW_RESULT)
+    obj._note_late_share_response(late)
+    logged = str(obj.logger.warning.call_args)
+    assert "answered late" in logged
+    assert "DID open after all" in logged
+    assert COMMISSIONING_WINDOW_RESULT["setup_manual_code"] in logged
+    obj.logger.info.assert_not_called()
+
+
+def test_late_error_logs_at_info_naming_no_window_opened(mixin):
+    module, obj = mixin
+    late = LateResponse(
+        message_id="42", context=module.ShareWindowRequest(NODE_ID, 300),
+        error=(7, "SDK error"), result=None)
+    obj._note_late_share_response(late)
+    logged = str(obj.logger.info.call_args)
+    assert "no window opened" in logged
+    assert "7" in logged and "SDK error" in logged
+    obj.logger.warning.assert_not_called()
+
+
+def test_late_unparseable_result_logs_the_raw_payload(mixin):
+    module, obj = mixin
+    late = LateResponse(
+        message_id="42", context=module.ShareWindowRequest(NODE_ID, 300),
+        error=None, result={"setup_qr_code": "MT:XYZ"})  # no manual code
+    obj._note_late_share_response(late)
+    logged = str(obj.logger.error.call_args)
+    assert "setup_qr_code" in logged
+    obj.logger.warning.assert_not_called()
+
+
+def test_late_response_with_a_foreign_context_is_ignored(mixin):
+    """The mechanism commission_jobs.CommissionJobs.note_late_response
+    already relies on: several senders share one on_late_response hook, and
+    isinstance is how each claims only its own."""
+    _module, obj = mixin
+    late = LateResponse(message_id="1", context="some other request's context",
+                        error=None, result={"node_id": 1})
+    obj._note_late_share_response(late)
+    obj.logger.warning.assert_not_called()
+    obj.logger.info.assert_not_called()
+    obj.logger.error.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
