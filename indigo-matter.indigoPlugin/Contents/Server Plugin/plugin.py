@@ -1624,6 +1624,36 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, ServerMenuMixin,
             return
         self.device_sync.report_settable_attributes(node, force=True)
 
+    def actionShareMatterNode(self, action, dev):  # noqa: N802
+        """Device-targeted twin of "Share a Matter device with another
+        ecosystem…" (issue #210): the same ``_share_node`` core
+        ``ServerMenuMixin.menuShareMatterNode`` uses, scoped to the one node
+        ``dev`` (a matterNode) names — reachable from a control page,
+        trigger, or action group, and the seam a future Domio "share this
+        device" endpoint would call instead of the menu. There is no dialog
+        here to report a refusal into, so the outcome only ever goes to the
+        log — same shape as ``actionReportNodeSettings`` above."""
+        node_id = dev.pluginProps.get("nodeId")
+        if not node_id:
+            self.logger.error('"%s": cannot share — device has no Matter node id', dev.name)
+            return
+        try:
+            node_id = int(node_id)
+        except (TypeError, ValueError):
+            self.logger.error('"%s": invalid Matter node id %r', dev.name, node_id)
+            return
+        errors = indigo.Dict()
+        # pylint: disable=no-member  # PairingMenuMixin._window_duration via MRO (issue #146)
+        duration = self._window_duration(action.props, errors)
+        # pylint: enable=no-member
+        if duration is None:
+            self.logger.error('"%s": cannot share — %s', dev.name,
+                              errors.get("duration", "invalid duration"))
+            return
+        ok, message = self._share_node(node_id, duration)  # pylint: disable=no-member  # ServerMenuMixin (issue #146)
+        if not ok:
+            self.logger.error('"%s": share failed — %s', dev.name, message)
+
     def _refresh_node(self, dev) -> None:
         """Re-interview the device's Matter node so matter-server re-reads its
         attributes; matter-server then emits a node_updated event which

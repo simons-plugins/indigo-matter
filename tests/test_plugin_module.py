@@ -885,6 +885,92 @@ def test_action_report_node_settings_unknown_node_logs_warning(plugin_cls, mock_
     assert mock_logger.warning.called
 
 
+# ---------------------------------------------------------------------------
+# issue #210 — "Share this device with another ecosystem" device action
+# ---------------------------------------------------------------------------
+
+def _share_dev(node_id="45"):
+    from types import SimpleNamespace
+    return SimpleNamespace(id=9, name="Landing Node", pluginProps={"nodeId": node_id})
+
+
+def test_action_share_matter_node_delegates_to_share_node(plugin_cls, mock_logger):
+    """The device-targeted twin of ServerMenuMixin.menuShareMatterNode — same
+    _window_duration/_share_node core, scoped to the node this device names."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    dev = _share_dev()
+    stub = SimpleNamespace(
+        logger=mock_logger,
+        _window_duration=MagicMock(return_value=300),
+        _share_node=MagicMock(return_value=(True, "")),
+    )
+    action = SimpleNamespace(props={"duration": "300"})
+    plugin_cls.actionShareMatterNode(stub, action, dev)
+    assert stub._window_duration.call_args[0][0] == action.props
+    stub._share_node.assert_called_once_with(45, 300)
+    assert not mock_logger.error.called
+
+
+def test_action_share_matter_node_no_node_id_logs_error(plugin_cls, mock_logger):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    dev = _share_dev(node_id="")
+    stub = SimpleNamespace(logger=mock_logger, _window_duration=MagicMock(), _share_node=MagicMock())
+    plugin_cls.actionShareMatterNode(stub, SimpleNamespace(props={}), dev)
+    stub._window_duration.assert_not_called()
+    stub._share_node.assert_not_called()
+    assert mock_logger.error.called
+
+
+def test_action_share_matter_node_invalid_node_id_logs_error(plugin_cls, mock_logger):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    dev = _share_dev(node_id="not-a-number")
+    stub = SimpleNamespace(logger=mock_logger, _window_duration=MagicMock(), _share_node=MagicMock())
+    plugin_cls.actionShareMatterNode(stub, SimpleNamespace(props={}), dev)
+    stub._share_node.assert_not_called()
+    assert mock_logger.error.called
+
+
+def test_action_share_matter_node_duration_out_of_band_logs_the_reused_validators_message(
+        plugin_cls, mock_logger):
+    """Pins the same cross-mixin _window_duration reuse the menu item uses —
+    the validator writes errors["duration"], which this action reads back
+    into the log since it has no dialog to show it in."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    def _invalid_duration(values_dict, errors):  # noqa: ARG001
+        errors["duration"] = "Enter a whole number of seconds between 180 and 900."
+        return None
+
+    dev = _share_dev()
+    stub = SimpleNamespace(
+        logger=mock_logger,
+        _window_duration=MagicMock(side_effect=_invalid_duration),
+        _share_node=MagicMock(),
+    )
+    plugin_cls.actionShareMatterNode(stub, SimpleNamespace(props={"duration": "60"}), dev)
+    stub._share_node.assert_not_called()
+    logged = str(mock_logger.error.call_args)
+    assert "180" in logged and "900" in logged
+
+
+def test_action_share_matter_node_failure_logs_the_refusal_message(plugin_cls, mock_logger):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    dev = _share_dev()
+    stub = SimpleNamespace(
+        logger=mock_logger,
+        _window_duration=MagicMock(return_value=900),
+        _share_node=MagicMock(return_value=(False, "Not connected to matter-server — see the log.")),
+    )
+    plugin_cls.actionShareMatterNode(stub, SimpleNamespace(props={"duration": "900"}), dev)
+    logged = str(mock_logger.error.call_args)
+    assert "Not connected to matter-server" in logged
+
+
 @pytest.fixture
 def plugin_module(mock_indigo_base):
     import importlib
