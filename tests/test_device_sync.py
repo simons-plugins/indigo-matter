@@ -4358,6 +4358,61 @@ def test_standalone_meter_redundancy_never_logged_while_link_stays_ambiguous(ds,
     assert ds.lookup(0x3D, 2) == meter_id, "standalone device still there, still the only home"
 
 
+def test_standalone_meter_redundancy_never_logged_when_link_resolves_on_first_contact(ds, indigo_env, mock_logger):
+    """Mutation guard: the common case is NOT the pass-1-ambiguous-then-later-
+    resolved shape above — it's a link that resolves the very first time the
+    plugin ever sees the node (LATER_RESOLVED_LINK_NODE_PASS2's own shape,
+    ep1 sole actuator, no ambiguity), so no standalone matterEnergyMeter is
+    EVER created for the endpoint. Without the `meter_dev_id is not None`
+    guard, `self._index.get(ep_key, {}).get("matterEnergyMeter")` returns
+    None and the redundancy branch would still fire — logging "the standalone
+    'device None' energy-meter device is redundant and can be deleted" for a
+    device that never existed, false delete-advice pointing at nothing.
+    Reconciled twice to also confirm a second pass over the same
+    already-resolved shape doesn't somehow manufacture the message."""
+    _indigo, devices = indigo_env
+    result = ds.create_from_raw(LATER_RESOLVED_LINK_NODE_PASS2, "Power Strip")
+    assert result["indigoDeviceIds"], "sanity: the node produced devices at all"
+    assert ds.lookup(0x3D, 2) is None, "sanity: no standalone meter was ever created"
+
+    ds.reconcile_all([LATER_RESOLVED_LINK_NODE_PASS2])
+
+    info_msgs = [c[0][0] % tuple(c[0][1:]) for c in mock_logger.info.call_args_list]
+    assert not any("redundant" in m for m in info_msgs)
+    assert not any("device None" in m for m in info_msgs)
+
+
+def test_forget_node_capabilities_clears_the_redundant_meter_mark(ds, indigo_env, mock_logger):
+    """Same verifier-note reasoning as the meter-links prune above, extended
+    to the issue #215 one-time mark: it is a fact ABOUT a link ("this link
+    made a device redundant"), so once the node's links are forgotten there
+    is nothing left for a stale mark to correctly describe. Node ids are
+    reused across a decommission/recommission cycle — without clearing this,
+    a genuinely different device that lands in the same shape a second time
+    would be silently denied its one-time log."""
+    ds.create_from_raw(LATER_RESOLVED_LINK_NODE_PASS1, "Power Strip")
+    ds.reconcile_all([LATER_RESOLVED_LINK_NODE_PASS2])
+    assert (0x3D, 2) in ds._redundant_meter_logged
+
+    ds.handle_event(MatterEvent(kind=protocol.EVT_NODE_REMOVED, node_id=0x3D))
+
+    assert not any(k[0] == 0x3D for k in ds._redundant_meter_logged)
+
+
+def test_forget_node_capabilities_leaves_other_nodes_redundant_meter_marks_alone(ds, indigo_env, mock_logger):
+    """The prune is per-node — a decommission on one node must not silence a
+    different node's already-earned one-time log."""
+    ds.create_from_raw(LATER_RESOLVED_LINK_NODE_PASS1, "Power Strip")
+    ds.reconcile_all([LATER_RESOLVED_LINK_NODE_PASS2])
+    assert (0x3D, 2) in ds._redundant_meter_logged
+    ds._redundant_meter_logged.add((0x999999, 2))  # another node's mark
+
+    ds.handle_event(MatterEvent(kind=protocol.EVT_NODE_REMOVED, node_id=0x999999))
+
+    assert (0x3D, 2) in ds._redundant_meter_logged, "other node's mark untouched"
+    assert (0x999999, 2) not in ds._redundant_meter_logged
+
+
 # ===========================================================================
 # issue #204 review — fix F.1: the endpoint-0 purity exemption
 # (_is_meter_source_candidate) needs a fixture that actually carries a
