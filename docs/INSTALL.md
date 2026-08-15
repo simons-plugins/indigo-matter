@@ -323,8 +323,11 @@ pairing mode:
    generated. Open the log and copy the manual code (or scan the QR line with
    the Home app if you'd rather).
 4. In the Home app: **Add Accessory** → **More options…** → enter the code
-   (or scan it). Expect an "uncertified accessory" warning — normal for a
-   device shared this way — choose **Add Anyway**.
+   (or scan it). A certified retail device (the normal case) adds with no
+   warning — this isn't the export bridge's own "uncertified accessory"
+   prompt, which comes from *its* development attestation. If you do see an
+   uncertified-accessory prompt here, it's about the shared device's own
+   attestation being non-production, not about Indigo or this share.
 
 The code is single-use and the window closes on its own after the duration
 you set (up to 15 minutes) — there is no way to read a lost code again, so if
