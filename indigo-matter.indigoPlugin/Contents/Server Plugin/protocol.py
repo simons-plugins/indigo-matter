@@ -89,6 +89,31 @@ ARG_CLUSTER = "cluster_id"               # IMPLEMENTATION.md used "cluster"
 ARG_COMMAND = "command_name"             # IMPLEMENTATION.md used "command"
 ARG_PAYLOAD = "payload"                  # IMPLEMENTATION.md used "args"
 
+# open_commissioning_window's one argument (issue #210). VERIFIED against the
+# pinned matter-server v1.2.2 (@matter-server/ws-controller/src/server/
+# WebSocketControllerHandler.ts): its name on the wire is "timeout", but it is
+# the length of the commissioning window in SECONDS, not an RPC deadline —
+# do not wire this to matter_client.request()'s same-named "timeout" kwarg,
+# which means the opposite thing on the same call. Omitted entirely, the
+# window defaults to 900s (matter.js PairedNode.openEnhancedCommissioningWindow's
+# own default). 1.2.2's handler also accepts iteration/option/discriminator in
+# its arg type, but has them commented out of the destructure, so every window
+# this plugin opens is an Enhanced window — there is no basic-window toggle to
+# build against this version.
+ARG_WINDOW_DURATION = "timeout"
+
+# open_commissioning_window's result keys (issue #210). VERIFIED against the
+# same WebSocketControllerHandler.ts: the reply is snake_case
+# {setup_pin_code, setup_manual_code, setup_qr_code} — NOT the camelCase
+# manualPairingCode/qrPairingCode our own bridge_protocol emits for the
+# OUTBOUND bridge node (a different wire contract we own both ends of; this
+# one we don't). parse_commissioning_window below still falls back to the
+# camelCase names defensively — source-verified is not the same as
+# wire-verified against whatever is actually running.
+KEY_SETUP_PIN = "setup_pin_code"
+KEY_SETUP_MANUAL = "setup_manual_code"
+KEY_SETUP_QR = "setup_qr_code"
+
 # Event names the plugin handles
 EVT_NODE_ADDED = "node_added"
 EVT_NODE_UPDATED = "node_updated"
@@ -142,6 +167,64 @@ class MatterWrite:
     cluster: int
     attribute: int
     value: Any
+
+
+@dataclass
+class CommissioningWindow:
+    """A normalised ``open_commissioning_window`` result (issue #210).
+
+    ``manual_code`` is the only field a caller can rely on — see
+    :func:`parse_commissioning_window`. ``qr_code``/``pin_code`` are whatever
+    the server sent alongside it, or ``None`` if it didn't.
+    """
+    manual_code: str
+    qr_code: Optional[str] = None
+    pin_code: Optional[int] = None
+
+
+def parse_commissioning_window(result: Any) -> CommissioningWindow:
+    """Normalise an ``open_commissioning_window`` result to a
+    :class:`CommissioningWindow`.
+
+    Shaped on :func:`bridge_protocol.parse_commissioning_window` — same idea,
+    different wire contract: that one is OUR OWN bridge node's, camelCase,
+    and requires all three fields; this one is matter-server's, snake_case,
+    and only ``setup_manual_code`` is required. A missing manual code is
+    fatal (there is nothing to hand the user); a missing QR or pin code just
+    means one fewer way to enter it, so those degrade to ``None`` instead of
+    failing the whole share.
+
+    Order: snake_case (verified — see the module header) first, camelCase
+    fallback (defensive — source-verified is not wire-verified), then a
+    :class:`ValueError` naming the raw payload so a shape drift is diagnosable
+    from the log rather than a bare KeyError.
+    """
+    data = result if isinstance(result, dict) else {}
+    manual = data.get(KEY_SETUP_MANUAL)
+    if manual is None:
+        manual = data.get("manualPairingCode")
+    if manual is None:
+        raise ValueError(f"open_commissioning_window result has no manual pairing code: {result!r}")
+    qr = data.get(KEY_SETUP_QR)
+    if qr is None:
+        qr = data.get("qrPairingCode")
+    pin = data.get(KEY_SETUP_PIN)
+    if pin is None:
+        pin = data.get("pinCode")
+    return CommissioningWindow(
+        manual_code=str(manual),
+        qr_code=str(qr) if qr is not None else None,
+        pin_code=_opt_pin(pin),
+    )
+
+
+def _opt_pin(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 # node_event MatterNodeEvent object field names (wire-level; rename-firewall)

@@ -9,11 +9,13 @@ import pytest
 
 import protocol
 from protocol import (
+    CommissioningWindow,
     MatterCommand,
     MatterEvent,
     MatterWrite,
     Protocol,
     ProtocolError,
+    parse_commissioning_window,
 )
 
 
@@ -231,3 +233,59 @@ def test_unreadable_or_absent_codes_are_not_node_not_exists():
 def test_node_not_exists_recognised_from_a_hex_string_code():
     # _to_int parses base-0, so "0x05" is as valid on the wire as 5 or "5".
     assert protocol.is_node_not_exists(protocol.ProtocolError("0x05", "does not exist"))
+
+
+# ---------------------------------------------------------------------------
+# parse_commissioning_window (issue #210) — open_commissioning_window's result,
+# VERIFIED snake_case against matter-server v1.2.2 (module header), camelCase
+# fallback kept only because source-verified is not wire-verified.
+# ---------------------------------------------------------------------------
+
+def test_parse_commissioning_window_snake_case():
+    window = parse_commissioning_window({
+        "setup_pin_code": 12345678,
+        "setup_manual_code": "34970112332",
+        "setup_qr_code": "MT:-24J0AFN00KA0648G00",
+    })
+    assert isinstance(window, CommissioningWindow)
+    assert window.manual_code == "34970112332"
+    assert window.qr_code == "MT:-24J0AFN00KA0648G00"
+    assert window.pin_code == 12345678
+
+
+def test_parse_commissioning_window_camel_case_fallback():
+    # Defensive only — 1.2.2 does not send this shape, but source-verified is
+    # not the same as wire-verified against whatever is actually running.
+    window = parse_commissioning_window({
+        "manualPairingCode": "34970112332",
+        "qrPairingCode": "MT:-24J0AFN00KA0648G00",
+    })
+    assert window.manual_code == "34970112332"
+    assert window.qr_code == "MT:-24J0AFN00KA0648G00"
+
+
+def test_parse_commissioning_window_missing_manual_code_raises_naming_payload():
+    payload = {"setup_qr_code": "MT:-24J0AFN00KA0648G00"}
+    with pytest.raises(ValueError) as exc:
+        parse_commissioning_window(payload)
+    assert "manual" in str(exc.value).lower()
+    assert repr(payload) in str(exc.value)
+
+
+def test_parse_commissioning_window_missing_qr_alone_succeeds():
+    # Only the manual code is required — there is a manual-entry path in every
+    # ecosystem's app, but no QR-only one, so a missing QR degrades rather than
+    # failing the whole share.
+    window = parse_commissioning_window({"setup_manual_code": "34970112332"})
+    assert window.manual_code == "34970112332"
+    assert window.qr_code is None
+    assert window.pin_code is None
+
+
+def test_parse_commissioning_window_ignores_unknown_extra_keys():
+    window = parse_commissioning_window({
+        "setup_manual_code": "34970112332",
+        "discriminator": 3840,
+        "some_future_field": "whatever",
+    })
+    assert window.manual_code == "34970112332"

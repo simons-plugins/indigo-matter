@@ -46,6 +46,14 @@ COMMISSION_TIMEOUT = 300.0
 # healthy hardware as "could not be sent": the same false verdict, inverted.
 ATTRIBUTE_TIMEOUT = 30.0
 
+# open_commissioning_window's RPC deadline (issue #210) — deliberately its own
+# constant, not COMMAND_TIMEOUT's 5s default: matter-server derives a fresh
+# passcode and re-advertises, real work against a device that may be a sleepy
+# Thread node, and the plugin's own SHARE_WINDOW_TIMEOUT (plugin_constants.py)
+# wraps this one and must stay strictly above it — see that constant's
+# docstring for why the ordering matters.
+SHARE_WINDOW_RPC_TIMEOUT = 45.0
+
 
 class MatterClient(WsJsonClient):
     """A reconnecting matter-server WebSocket client."""
@@ -230,8 +238,24 @@ class MatterClient(WsJsonClient):
     async def remove_node(self, node_id: int) -> Any:
         return await self.request(protocol.CMD_REMOVE_NODE, {"node_id": node_id})
 
-    async def open_commissioning_window(self, node_id: int) -> Any:
-        return await self.request(protocol.CMD_OPEN_WINDOW, {"node_id": node_id})
+    async def open_commissioning_window(self, node_id: int, duration: Optional[int] = None,
+                                        timeout: float = SHARE_WINDOW_RPC_TIMEOUT) -> Any:
+        """Open an Enhanced commissioning window on an already-commissioned node
+        (issue #210) — the "share this device with another ecosystem" primitive.
+
+        ``duration`` is the window's lifetime in SECONDS; omit it and
+        matter-server defaults to 900s (matter.js's own default). It is sent
+        under the wire name ``protocol.ARG_WINDOW_DURATION`` ("timeout"), which
+        is NOT the same thing as this method's own ``timeout`` parameter — that
+        one is the ordinary RPC deadline every other wrapper here takes. Naming
+        them identically on the wire while they mean opposite things is exactly
+        the trap ``protocol.py``'s module header calls out; do not let a future
+        edit wire one into the other.
+        """
+        args = {protocol.ARG_NODE_ID: node_id}
+        if duration is not None:
+            args[protocol.ARG_WINDOW_DURATION] = int(duration)
+        return await self.request(protocol.CMD_OPEN_WINDOW, args, timeout=timeout)
 
     async def interview_node(self, node_id: int) -> Any:
         return await self.request(protocol.CMD_INTERVIEW, {"node_id": node_id})
