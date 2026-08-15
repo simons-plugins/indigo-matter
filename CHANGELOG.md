@@ -3,6 +3,23 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
+## 2026.16.0 — share an Indigo-commissioned device with another ecosystem
+
+### Added
+
+- **"Share a Matter device with another ecosystem…"** menu item (issue
+  #210) — opens a fresh commissioning window on a device Indigo already
+  controls, so a second ecosystem (Apple Home, Alexa, Google, Home
+  Assistant) can add it too without you finding the device's own pairing
+  mode. The reverse of the share model this plugin already uses to join
+  devices commissioned elsewhere. Codes go to the Event Log, same reason
+  the export bridge's pairing codes do — Indigo dialogs have no dynamic
+  labels. Warns (never blocks) when a device's fabric capacity is getting
+  tight; an Apple Home pairing alone uses two slots.
+- **"Share this device with another ecosystem"** device action on the
+  Matter Node device type — the same feature, reachable from a control
+  page, trigger, or action group.
+
 ## 2026.15.0 — every Matter node gets an Indigo device
 
 **Read the upgrade notes below before installing: this release renames some
