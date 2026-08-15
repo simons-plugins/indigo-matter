@@ -896,19 +896,26 @@ def _share_dev(node_id="45"):
 
 def test_action_share_matter_node_delegates_to_share_node(plugin_cls, mock_logger):
     """The device-targeted twin of ServerMenuMixin.menuShareMatterNode — same
-    _window_duration/_share_node core, scoped to the node this device names."""
+    _window_duration/_share_node core, scoped to the node this device names.
+
+    Validation only, deliberately: the actual _share_node work now runs on a
+    detached thread (issue #210 — see test_action_share_matter_node_
+    schedules_run_share_node_on_a_daemon_thread below), so this checks only
+    that duration validation ran and nothing was logged as an error yet —
+    the delegation itself is pinned directly against _run_share_node in
+    test_run_share_node_delegates_to_share_node.
+    """
     from types import SimpleNamespace
     from unittest.mock import MagicMock
     dev = _share_dev()
     stub = SimpleNamespace(
         logger=mock_logger,
         _window_duration=MagicMock(return_value=300),
-        _share_node=MagicMock(return_value=(True, "")),
+        _run_share_node=MagicMock(),
     )
     action = SimpleNamespace(props={"duration": "300"})
     plugin_cls.actionShareMatterNode(stub, action, dev)
     assert stub._window_duration.call_args[0][0] == action.props
-    stub._share_node.assert_called_once_with(45, 300)
     assert not mock_logger.error.called
 
 
@@ -957,18 +964,139 @@ def test_action_share_matter_node_duration_out_of_band_logs_the_reused_validator
     assert "180" in logged and "900" in logged
 
 
-def test_action_share_matter_node_failure_logs_the_refusal_message(plugin_cls, mock_logger):
+def test_action_share_matter_node_failure_logs_the_refusal_message(plugin_cls, mock_logger, monkeypatch):
+    """End-to-end through the thread-scheduling seam (issue #210) — a
+    _SyncThread stand-in (defined below) runs the target inline so the
+    assertion is deterministic, with no sleeping/polling on a real
+    background thread."""
     from types import SimpleNamespace
     from unittest.mock import MagicMock
+
+    import plugin as plugin_module
+
+    monkeypatch.setattr(plugin_module.threading, "Thread", _SyncThread)
+
     dev = _share_dev()
     stub = SimpleNamespace(
         logger=mock_logger,
         _window_duration=MagicMock(return_value=900),
         _share_node=MagicMock(return_value=(False, "Not connected to matter-server — see the log.")),
     )
+    stub._run_share_node = lambda *a: plugin_cls._run_share_node(stub, *a)
     plugin_cls.actionShareMatterNode(stub, SimpleNamespace(props={"duration": "900"}), dev)
     logged = str(mock_logger.error.call_args)
     assert "Not connected to matter-server" in logged
+
+
+# ---------------------------------------------------------------------------
+# issue #210 — _run_share_node (the detached-thread body) and the scheduling
+# contract actionShareMatterNode hands it (queue-stall fix)
+# ---------------------------------------------------------------------------
+
+class _SyncThread:
+    """threading.Thread stand-in that runs its target SYNCHRONOUSLY on
+    .start() — keeps action-thread tests deterministic (no sleep/poll on a
+    real background thread) while still exercising the real scheduling call."""
+
+    def __init__(self, target=None, args=(), kwargs=None, name=None, daemon=None):  # noqa: ARG002
+        self._target, self._args, self._kwargs = target, args, kwargs or {}
+
+    def start(self):
+        self._target(*self._args, **self._kwargs)
+
+
+def test_run_share_node_delegates_to_share_node(plugin_cls, mock_logger):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    stub = SimpleNamespace(logger=mock_logger, _share_node=MagicMock(return_value=(True, "")))
+    plugin_cls._run_share_node(stub, "Landing Node", 45, 300)
+    stub._share_node.assert_called_once_with(45, 300)
+    assert not mock_logger.error.called
+
+
+def test_run_share_node_logs_the_refusal_message(plugin_cls, mock_logger):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    stub = SimpleNamespace(
+        logger=mock_logger,
+        _share_node=MagicMock(return_value=(False, "Not connected to matter-server — see the log.")),
+    )
+    plugin_cls._run_share_node(stub, "Landing Node", 45, 300)
+    logged = str(mock_logger.error.call_args)
+    assert "Landing Node" in logged and "Not connected to matter-server" in logged
+
+
+def test_action_share_matter_node_schedules_run_share_node_on_a_daemon_thread(
+        plugin_cls, mock_logger, monkeypatch):
+    """The queue-stall fix itself (issue #210): _share_node's real work must
+    be handed to a background thread, not run inline on the shared action
+    queue that actionControlDevice/actionControlThermostat also use.
+
+    threading.Thread is replaced with a spy that records its constructor
+    arguments and does NOT run the target — this test is about what gets
+    SCHEDULED, not what the target does once it runs (that is
+    test_run_share_node_delegates_to_share_node's job).
+    """
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    import plugin as plugin_module
+
+    captured = {}
+
+    class _CapturingThread:
+        def __init__(self, target=None, args=(), kwargs=None, name=None, daemon=None):
+            captured["target"] = target
+            captured["args"] = args
+            captured["name"] = name
+            captured["daemon"] = daemon
+
+        def start(self):
+            captured["started"] = True
+
+    monkeypatch.setattr(plugin_module.threading, "Thread", _CapturingThread)
+
+    dev = _share_dev()
+    stub = SimpleNamespace(
+        logger=mock_logger,
+        _window_duration=MagicMock(return_value=300),
+        _run_share_node=MagicMock(),
+    )
+    plugin_cls.actionShareMatterNode(stub, SimpleNamespace(props={"duration": "300"}), dev)
+
+    assert captured["target"] is stub._run_share_node
+    assert captured["args"] == (dev.name, 45, 300)
+    assert captured["daemon"] is True
+    assert captured.get("started") is True
+    stub._run_share_node.assert_not_called()  # the CAPTURING thread never actually ran it
+
+
+def test_action_share_matter_node_defaults_duration_via_the_real_validator_when_props_is_empty(
+        plugin_cls, mock_logger, monkeypatch):
+    """Pins the trigger-without-ConfigUI path end-to-end (mutation-analysis
+    finding #14): a trigger/schedule action carries an EMPTY props dict (no
+    ConfigUI ran to seed a default), and the REAL, unmocked
+    PairingMenuMixin._window_duration must still default to 900 — every
+    other test here mocks _window_duration, which could not catch a
+    regression in the validator's own default. Deterministic via
+    _SyncThread, not a real background thread."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    import plugin as plugin_module
+    from pairing_menu_mixin import PairingMenuMixin
+
+    monkeypatch.setattr(plugin_module.threading, "Thread", _SyncThread)
+
+    dev = _share_dev()
+    stub = SimpleNamespace(
+        logger=mock_logger,
+        _window_duration=PairingMenuMixin._window_duration,
+        _share_node=MagicMock(return_value=(True, "")),
+    )
+    stub._run_share_node = lambda *a: plugin_cls._run_share_node(stub, *a)
+    plugin_cls.actionShareMatterNode(stub, SimpleNamespace(props={}), dev)
+    stub._share_node.assert_called_once_with(45, 900)
 
 
 # ---------------------------------------------------------------------------
