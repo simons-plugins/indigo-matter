@@ -5462,6 +5462,34 @@ def test_the_read_back_verifies_membership_and_says_so_when_it_is_missing(
                for call in mock_logger.warning.call_args_list)
 
 
+def test_the_two_grouping_warnings_dedup_independently(ds, indigo_env, mock_logger):
+    """issue #218: the groupWithDevice-raised failure and the read-back
+    membership failure used to share the "group" dedup key, so whichever
+    fired first for a device silenced the other for the rest of the run —
+    a device dialog left open early in a pass could hide a genuine
+    read-back mismatch discovered later for the same device. They now
+    dedup as "group" and "verify" respectively, so both can speak for the
+    same device in one run."""
+    _indigo, devices = indigo_env
+    evidenced = _with_node_evidence(RELAY_NODE)
+
+    def boom(_a, _b):
+        raise RuntimeError("a device dialog is open")
+    _indigo.device.groupWithDevice = boom
+
+    ds.create_from_raw(evidenced, "Office Plug")
+    assert any("could not group device" in str(call.args)
+               for call in mock_logger.warning.call_args_list)
+
+    _indigo.device.groupWithDevice = lambda _a, _b: None    # succeeds, groups nothing
+    ds.reconcile_all([evidenced])   # _ensure_grouped re-runs on every reconcile
+
+    assert any("could not group device" in str(call.args)
+               for call in mock_logger.warning.call_args_list)
+    assert any("did not put them in one group" in str(call.args)
+               for call in mock_logger.warning.call_args_list)
+
+
 def test_grouping_leaves_the_index_and_the_orphan_sweep_alone(ds, indigo_env):
     """Grouping is Indigo-side metadata, not index state: a rebuild from
     pluginProps must find exactly the same devices, and a healthy reconcile

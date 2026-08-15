@@ -1866,7 +1866,7 @@ class DeviceSync:
             # success but the two devices are not in one group, which is the
             # only outcome left that the user can act on.
             self._group_warn(
-                dev_id, "group",
+                dev_id, "verify",
                 "device %s was grouped with Matter node device %s but Indigo did not put "
                 "them in one group — the node's devices will not show together in the "
                 "device list", dev_id, node_dev_id)
