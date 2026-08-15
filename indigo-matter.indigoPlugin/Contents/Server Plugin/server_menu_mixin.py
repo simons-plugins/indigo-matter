@@ -282,6 +282,18 @@ class ServerMenuMixin:
         # DEBUG — create_job's narrative line (202) and the breadcrumb above
         # (409) are what a user should see (#226).
         self.logger.debug("manual commission → %s %s", status, body)
+        if status not in (202, 409):
+            # #227: create_job rejected the request outright (400 invalid_setup_code
+            # — the single most likely menu failure — or 503 matter_server_unreachable).
+            # Demoting the wire line to DEBUG above removed the only log output for
+            # this, and a bare (False, valuesDict) leaves the dialog open with no
+            # on-screen explanation either — the exact invisible-failure shape #227
+            # exists to eliminate. Mirrors the `self.jobs is None` branch above.
+            message = body.get("message") or body
+            self.logger.error("manual commission failed: %s", message)
+            errors = indigo.Dict()
+            errors["setupCode"] = str(message)
+            return (False, valuesDict, errors)
         return (status in (202, 409), valuesDict)
 
     def getDeviceFolders(self, filter="", valuesDict=None, typeId="", targetId=0):  # noqa: N802, A002, ARG002

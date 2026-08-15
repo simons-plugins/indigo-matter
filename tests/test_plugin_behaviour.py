@@ -1170,6 +1170,36 @@ def test_manual_commission_409_logs_a_human_breadcrumb_and_the_wire_line_at_debu
     assert "manual commission" in str(plug.logger.debug.call_args)
 
 
+def test_manual_commission_400_is_logged_and_explained_in_the_dialog(plug, mock_indigo_base):
+    # #227 regression: demoting the wire line to DEBUG had removed the ONLY log
+    # output for invalid_setup_code (the single most likely menu failure), and
+    # the dialog closed over it with no error field — the exact invisible-failure
+    # shape #227 exists to eliminate.
+    mock_indigo_base.devices.folders = []
+    plug.jobs = SimpleNamespace(create_job=lambda params: (  # noqa: ARG005
+        400, {"error": "invalid_setup_code", "message": "Setup code must be an MT:... QR payload"}))
+    ok, _vd, errors = plug.menuCommissionDeviceManually(
+        {"setupCode": "bad", "suggestedName": "Plug", "folder": "0"}, "commissionDeviceManually")
+    assert ok is False
+    assert "MT:" in errors["setupCode"]
+    plug.logger.error.assert_called_once()
+    assert "MT:" in str(plug.logger.error.call_args)
+    plug.logger.info.assert_not_called()  # no accept narrative for a rejected request
+
+
+def test_manual_commission_503_is_logged_and_explained_in_the_dialog(plug, mock_indigo_base):
+    mock_indigo_base.devices.folders = []
+    plug.jobs = SimpleNamespace(create_job=lambda params: (  # noqa: ARG005
+        503, {"error": "matter_server_unreachable", "message": "Not connected to matter-server"}))
+    ok, _vd, errors = plug.menuCommissionDeviceManually(
+        {"setupCode": "MT:ABC", "suggestedName": "Plug", "folder": "0"}, "commissionDeviceManually")
+    assert ok is False
+    assert "matter-server" in errors["setupCode"]
+    plug.logger.error.assert_called_once()
+    assert "matter-server" in str(plug.logger.error.call_args)
+    plug.logger.info.assert_not_called()  # no accept narrative for a rejected request
+
+
 def test_menu_decommission_requires_selection(plug):
     ok, _vd, errors = plug.menuDecommissionDevice({"node": "", "confirm": True}, "decommissionDevice")
     assert ok is False

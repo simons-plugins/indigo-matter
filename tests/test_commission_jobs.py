@@ -297,6 +297,10 @@ def test_create_job_rejected_503_when_matter_server_disconnected(mock_logger):
     assert code == 503
     assert body["error"] == "matter_server_unreachable"
     assert body["message"]  # actionable, non-empty
+    # #226: the accept narrative lives after the 202 return — it must never
+    # fire on a path that doesn't reach it (pins the ordering against a
+    # refactor that hoists it above the early returns).
+    mock_logger.info.assert_not_called()
 
 
 def test_cancelled_worker_fails_job_and_frees_setup_code(mock_logger):
@@ -416,6 +420,9 @@ def test_commission_error_failure_is_logged_named_by_suggested_name(mock_logger)
         assert "Office Fan" in logged
         assert "could not read descriptors" in logged
         assert body["jobId"] in logged
+        # no matter_error_code was raised — the suffix must stay absent, not
+        # render as "(matter error None)"
+        assert "matter error" not in logged
     asyncio.run(scenario())
 
 
