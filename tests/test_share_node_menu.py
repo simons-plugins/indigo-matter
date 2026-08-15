@@ -33,7 +33,9 @@ NODE_ID = 0x34  # 52 decimal
 
 #: A real node-details payload (IMPLEMENTATION.md §1.3 shape), carrying the
 #: Operational Credentials fabric-count attributes (0/62/2, 0/62/3) the fabric
-#: warning line reads.
+#: warning line reads. Plentiful on purpose (4 of 5 free) — a fixture whose
+#: default reading itself warns would have every OTHER test in this file
+#: silently trip that warning as a side effect (mutation-analysis finding).
 RAW_NODE = {
     "node_id": NODE_ID,
     "available": True,
@@ -41,15 +43,28 @@ RAW_NODE = {
         "0/40/1": "IKEA",
         "0/40/3": "GRILLPLATS Plug",
         "0/62/2": 5,   # SupportedFabrics
-        "0/62/3": 4,   # CommissionedFabrics — 1 free, plenty
+        "0/62/3": 1,   # CommissionedFabrics — 4 free, plenty
         "1/6/0": True,
     },
 }
 
 RAW_NODE_OFFLINE = {**RAW_NODE, "available": False}
+#: 1 of 5 free — under the Apple-two-slots threshold, so this one MUST warn.
 RAW_NODE_TIGHT_FABRICS = {
     **RAW_NODE,
     "attributes": {**RAW_NODE["attributes"], "0/62/2": 5, "0/62/3": 4},
+}
+#: Exactly 2 free — the boundary the "< 2" check must NOT warn on.
+RAW_NODE_BOUNDARY_FABRICS = {
+    **RAW_NODE,
+    "attributes": {**RAW_NODE["attributes"], "0/62/2": 5, "0/62/3": 3},
+}
+#: No Operational Credentials attributes at all — older firmware, or a
+#: partial interview snapshot. Unknown must never be treated as zero.
+RAW_NODE_NO_FABRIC_INFO = {
+    "node_id": NODE_ID,
+    "available": True,
+    "attributes": {"0/40/1": "IKEA", "0/40/3": "GRILLPLATS Plug"},
 }
 
 #: Sentinels standing in for "the coroutine self.matter.<method>() returned" —
@@ -140,9 +155,28 @@ def test_picker_says_so_when_nothing_is_commissioned(mixin):
     assert options == [("0", "(no Matter devices — none commissioned yet)")]
 
 
+def test_picker_says_plugin_still_starting_when_device_sync_is_none(mixin):
+    """Distinct from the empty-list case above: before startup finishes there
+    is no way to know whether anything is commissioned, so claiming "none
+    commissioned yet" would be the wrong cause."""
+    _module, obj = mixin
+    obj.device_sync = None
+    assert obj.getShareableNodes() == [("0", "(plugin still starting)")]
+
+
 def test_picker_degrades_instead_of_killing_the_dialog(mixin):
     _module, obj = mixin
     obj.device_sync.list_nodes.side_effect = RuntimeError("boom")
+    options = obj.getShareableNodes()
+    assert options[0][1].startswith("(error building list")
+
+
+def test_picker_degrades_when_a_row_is_malformed_not_just_when_list_nodes_raises(mixin):
+    """The row-building loop used to run OUTSIDE the try — a single bad
+    node id (node_id_to_str choking on it) took the whole dialog down with
+    it instead of degrading like every other picker in this file."""
+    _module, obj = mixin
+    obj.device_sync.list_nodes.return_value = [(object(), ["bad id"])]
     options = obj.getShareableNodes()
     assert options[0][1].startswith("(error building list")
 
@@ -203,6 +237,22 @@ def test_node_unknown_when_the_fetch_itself_fails(mixin):
     assert ok is False
     assert "did not answer" in errors["node"]
     obj.matter.open_commissioning_window.assert_not_called()
+    # _fetch_node wraps this in its OWN MatterUnavailable — ordinary
+    # connectivity, not a code bug, so only a trail at debug, never error.
+    assert obj.logger.debug.called
+    assert not obj.logger.error.called
+
+
+def test_fetch_node_unexpected_exception_type_logs_error_with_traceback(mixin):
+    """Anything escaping _fetch_node that is NOT its own MatterUnavailable
+    would be a code bug there, mislabeled as connectivity if it only got a
+    debug line — this proves the differentiated branch actually fires."""
+    _module, obj = mixin
+    obj._fetch_node = Mock(side_effect=RuntimeError("boom"))
+    ok, values, errors = obj.menuShareMatterNode({"node": str(NODE_ID), "duration": "900"})
+    assert ok is False
+    assert obj.logger.error.called
+    assert obj.logger.exception.called
 
 
 def test_offline_node_refuses_fast_before_opening_a_window(mixin):
@@ -210,21 +260,26 @@ def test_offline_node_refuses_fast_before_opening_a_window(mixin):
     obj.runtime.submit.side_effect = _submitter(get_node_result=RAW_NODE_OFFLINE)
     ok, values, errors = obj.menuShareMatterNode({"node": str(NODE_ID), "duration": "900"})
     assert ok is False
-    assert "unreachable" in errors["node"]
+    assert "currently reports this device as unreachable" in errors["node"]
+    assert "in a moment" in errors["node"]  # acknowledges the flag can be stale
     assert "Nothing was changed" in errors["node"]
     obj.matter.open_commissioning_window.assert_not_called()
 
 
-@pytest.mark.parametrize("code", [3, 4])
+@pytest.mark.parametrize("code", [3, 4, "3", "4", "03", "04"])
 def test_offline_reported_at_window_open_time_too(mixin, code):
     """codes 3 (NodeNotReady) / 4 (NodeNotResolving) from the open call itself
-    read the same as the available=False fast-path."""
+    read the same as the available=False fast-path — including when the wire
+    sends them as a zero-padded string (int(x, 0) rejects "03" outright)."""
     _module, obj = mixin
     obj.runtime.submit.side_effect = _submitter(
         get_node_result=RAW_NODE, open_window_raises=protocol.ProtocolError(code, "not ready"))
     ok, values, errors = obj.menuShareMatterNode({"node": str(NODE_ID), "duration": "900"})
     assert ok is False
-    assert "unreachable" in errors["node"]
+    assert "currently reports this device as unreachable" in errors["node"]
+    # Every refusal branch leaves a record — "see the log" must point at something.
+    warned = str(obj.logger.warning.call_args)
+    assert "0x34" in warned and str(code) in warned and "not ready" in warned
 
 
 def test_node_not_exists_at_window_open_time(mixin):
@@ -235,6 +290,7 @@ def test_node_not_exists_at_window_open_time(mixin):
     ok, values, errors = obj.menuShareMatterNode({"node": str(NODE_ID), "duration": "900"})
     assert ok is False
     assert "does not know this node" in errors["node"]
+    assert obj.logger.warning.called
 
 
 def test_window_already_open_is_reported_honestly(mixin):
@@ -248,6 +304,22 @@ def test_window_already_open_is_reported_honestly(mixin):
     assert ok is False
     assert "already be open" in errors["node"]
     assert "cannot be recovered" in errors["node"]
+    warned = str(obj.logger.warning.call_args)
+    assert "0x34" in warned and "7" in warned and "SDK error" in warned
+
+
+def test_unnamed_protocol_error_codes_get_the_same_hedge(mixin):
+    """protocol.py's own error table lists ~10 codes (InvalidArguments 8,
+    InvalidCommand 9, IcdMultiAdmin 100, …) that all land in the fallthrough
+    — the message must not assert a single cause for that many possibilities."""
+    _module, obj = mixin
+    obj.runtime.submit.side_effect = _submitter(
+        get_node_result=RAW_NODE, open_window_raises=protocol.ProtocolError(8, "bad args"))
+    ok, values, errors = obj.menuShareMatterNode({"node": str(NODE_ID), "duration": "900"})
+    assert ok is False
+    assert "error 8" in errors["node"]
+    assert "may already be open" in errors["node"]
+    assert "cannot be recovered" in errors["node"]
 
 
 def test_rpc_timeout_says_the_window_may_still_have_opened(mixin):
@@ -259,6 +331,8 @@ def test_rpc_timeout_says_the_window_may_still_have_opened(mixin):
     assert ok is False
     assert "may still have opened" in errors["node"]
     assert "code is lost" in errors["node"]
+    warned = str(obj.logger.warning.call_args)
+    assert "0x34" in warned
 
 
 def test_disconnected_from_matter_server(mixin):
@@ -268,6 +342,8 @@ def test_disconnected_from_matter_server(mixin):
     ok, values, errors = obj.menuShareMatterNode({"node": str(NODE_ID), "duration": "900"})
     assert ok is False
     assert "Not connected to matter-server" in errors["node"]
+    warned = str(obj.logger.warning.call_args)
+    assert "0x34" in warned and "socket gone" in warned
 
 
 def test_unparseable_result_logs_the_raw_payload_and_warns_the_code_is_lost(mixin):
@@ -285,9 +361,8 @@ def test_unparseable_result_logs_the_raw_payload_and_warns_the_code_is_lost(mixi
 
 def test_fabric_slots_short_warns_but_still_proceeds(mixin):
     _module, obj = mixin
-    tight = {**RAW_NODE, "attributes": {**RAW_NODE["attributes"], "0/62/2": 5, "0/62/3": 4}}
     obj.runtime.submit.side_effect = _submitter(
-        get_node_result=tight, open_window_result=COMMISSIONING_WINDOW_RESULT)
+        get_node_result=RAW_NODE_TIGHT_FABRICS, open_window_result=COMMISSIONING_WINDOW_RESULT)
     ok, values = obj.menuShareMatterNode({"node": str(NODE_ID), "duration": "900"})
     assert ok is True  # diagnostic only, never blocking
     warned = str(obj.logger.warning.call_args)
@@ -296,11 +371,33 @@ def test_fabric_slots_short_warns_but_still_proceeds(mixin):
 
 def test_fabric_slots_plentiful_does_not_warn(mixin):
     _module, obj = mixin
-    plentiful = {**RAW_NODE, "attributes": {**RAW_NODE["attributes"], "0/62/2": 5, "0/62/3": 1}}
+    obj.menuShareMatterNode({"node": str(NODE_ID), "duration": "900"})  # RAW_NODE is plentiful
+    obj.logger.warning.assert_not_called()
+
+
+def test_fabric_slots_boundary_of_two_does_not_warn(mixin):
+    """Exactly 2 free is the "still fits Apple's two slots" boundary — the
+    warning only fires BELOW it."""
+    _module, obj = mixin
     obj.runtime.submit.side_effect = _submitter(
-        get_node_result=plentiful, open_window_result=COMMISSIONING_WINDOW_RESULT)
+        get_node_result=RAW_NODE_BOUNDARY_FABRICS, open_window_result=COMMISSIONING_WINDOW_RESULT)
     obj.menuShareMatterNode({"node": str(NODE_ID), "duration": "900"})
     obj.logger.warning.assert_not_called()
+
+
+def test_fabric_slots_unknown_proceeds_silently(mixin):
+    """No Operational Credentials attributes at all (older firmware, partial
+    interview) — unknown must never be treated as zero, and the share still
+    goes through: the fabric line becomes informational text in the success
+    log, not a refusal."""
+    _module, obj = mixin
+    obj.runtime.submit.side_effect = _submitter(
+        get_node_result=RAW_NODE_NO_FABRIC_INFO, open_window_result=COMMISSIONING_WINDOW_RESULT)
+    ok, values = obj.menuShareMatterNode({"node": str(NODE_ID), "duration": "900"})
+    assert ok is True
+    obj.logger.warning.assert_not_called()
+    logged = str(obj.logger.info.call_args)
+    assert "fabric slot count unavailable" in logged
 
 
 # ---------------------------------------------------------------------------
@@ -311,7 +408,10 @@ def test_happy_path_opens_the_window_with_the_chosen_duration_and_logs_the_codes
     _module, obj = mixin
     ok, values = obj.menuShareMatterNode({"node": str(NODE_ID), "duration": "300"})
     assert ok is True
-    obj.matter.open_commissioning_window.assert_called_once_with(NODE_ID, 300)
+    # duration is passed by KEYWORD — a mutation that reorders
+    # open_commissioning_window's parameters (duration before context, say)
+    # would pass just as happily with a positional call; this pins the seam.
+    obj.matter.open_commissioning_window.assert_called_once_with(NODE_ID, duration=300)
     logged = str(obj.logger.info.call_args)
     assert COMMISSIONING_WINDOW_RESULT["setup_manual_code"] in logged
     assert COMMISSIONING_WINDOW_RESULT["setup_qr_code"] in logged
@@ -322,7 +422,7 @@ def test_happy_path_opens_the_window_with_the_chosen_duration_and_logs_the_codes
 def test_happy_path_defaults_duration_to_900_when_left_blank(mixin):
     _module, obj = mixin
     obj.menuShareMatterNode({"node": str(NODE_ID), "duration": ""})
-    obj.matter.open_commissioning_window.assert_called_once_with(NODE_ID, 900)
+    obj.matter.open_commissioning_window.assert_called_once_with(NODE_ID, duration=900)
 
 
 # ---------------------------------------------------------------------------

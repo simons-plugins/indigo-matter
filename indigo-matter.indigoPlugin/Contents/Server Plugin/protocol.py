@@ -72,15 +72,22 @@ CMD_DEVICE = "device_command"            # invoke a cluster command
 CMD_START_LISTENING = "start_listening"
 CMD_SET_FABRIC_LABEL = "set_default_fabric_label"  # persists + pushes UpdateFabricLabel to nodes
 
-# matter-server's ServerErrorCode.NodeNotExists. VERIFIED against ws-controller 1.2.2
+# matter-server's ServerErrorCode. VERIFIED against ws-controller 1.2.2
 # (@matter-server/ws-controller/dist/esm/types/WebSocketMessageTypes.js: UnknownError 0,
 # NodeCommissionFailed 1, NodeInterviewFailed 2, NodeNotReady 3, NodeNotResolving 4,
 # NodeNotExists 5, VersionMismatch 6, SDKStackError 7, InvalidArguments 8,
 # InvalidCommand 9, UpdateCheckError 10, UpdateError 11, IcdMultiAdmin 100).
-# Only this one is named because only this one changes a decision: for remove_node,
-# "the node is not in the fabric" is the DESIRED END STATE of a decommission, not a
-# failure — see HttpApiMixin._decommission.
+# Named codes are the ones that change a decision — everything else is handled
+# generically. ERR_NODE_NOT_EXISTS: for remove_node, "the node is not in the
+# fabric" is the DESIRED END STATE of a decommission, not a failure — see
+# HttpApiMixin._decommission. ERR_NODE_NOT_READY/ERR_NODE_NOT_RESOLVING (issue
+# #210): opening a commissioning window on a node matter-server cannot reach
+# gets the same "device unreachable" wording the share menu's own pre-flight
+# ``available`` check gives, rather than the generic "a window may already be
+# open" guess every other refusal code gets.
 ERR_NODE_NOT_EXISTS = 5
+ERR_NODE_NOT_READY = 3
+ERR_NODE_NOT_RESOLVING = 4
 
 # device_command argument keys (the most contested names — see module docstring)
 ARG_NODE_ID = "node_id"
@@ -261,10 +268,23 @@ class ProtocolError(Exception):
 
 
 def _to_int(value: Any) -> int:
-    """Parse an int that may be decimal or a hex string like '0x0006'."""
+    """Parse an int that may be decimal (optionally zero-padded) or a hex
+    string like '0x0006'.
+
+    Plain ``int(str(value))`` is tried first. Going straight to base-0
+    (``int(x, 0)``) — the obvious one-liner — silently mis-parses a
+    zero-padded decimal string: base-0 requires a leading zero to be followed
+    by an "0x"/"0o"/"0b" prefix, so ``int("03", 0)`` RAISES rather than
+    returning 3. Plain ``int("03")`` has no such restriction. Only when the
+    plain parse fails (a hex-formatted string) does this fall back to base-0,
+    which is what actually understands the "0x" prefix.
+    """
     if isinstance(value, int):
         return value
-    return int(str(value), 0)
+    try:
+        return int(str(value))
+    except ValueError:
+        return int(str(value), 0)
 
 
 def is_node_not_exists(exc: Exception) -> bool:
@@ -282,6 +302,26 @@ def is_node_not_exists(exc: Exception) -> bool:
         return False
     try:
         return _to_int(code) == ERR_NODE_NOT_EXISTS
+    except (TypeError, ValueError):
+        return False
+
+
+def is_node_unreachable(exc: Exception) -> bool:
+    """True when matter-server refused a request because the node could not be
+    reached (NodeNotReady / NodeNotResolving) — issue #210's share menu uses
+    this to give the same "device unreachable" wording its own pre-flight
+    ``available`` check gives, rather than the generic guess every other
+    refusal code gets.
+
+    Same coercion discipline as :func:`is_node_not_exists`, for the same
+    reason: anything we cannot read as one of the two named codes is
+    deliberately False rather than a guess either way.
+    """
+    code = getattr(exc, "code", None)
+    if code is None:
+        return False
+    try:
+        return _to_int(code) in (ERR_NODE_NOT_READY, ERR_NODE_NOT_RESOLVING)
     except (TypeError, ValueError):
         return False
 

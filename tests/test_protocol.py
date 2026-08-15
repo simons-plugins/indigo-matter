@@ -236,6 +236,48 @@ def test_node_not_exists_recognised_from_a_hex_string_code():
 
 
 # ---------------------------------------------------------------------------
+# _to_int — plain int first, base-0 fallback (issue #210 review)
+# ---------------------------------------------------------------------------
+
+def test_to_int_accepts_a_zero_padded_decimal_string():
+    # int(x, 0) — the obvious one-liner — RAISES on "03": base-0 parsing
+    # requires a leading zero to carry an "0x"/"0o"/"0b" prefix. Plain
+    # int("03") has no such restriction, so it is tried first.
+    assert protocol._to_int("03") == 3
+    assert protocol._to_int("04") == 4
+
+
+def test_to_int_still_understands_hex_strings():
+    assert protocol._to_int("0x05") == 5
+    assert protocol._to_int(5) == 5
+
+
+# ---------------------------------------------------------------------------
+# is_node_unreachable — NodeNotReady(3)/NodeNotResolving(4) (issue #210)
+# ---------------------------------------------------------------------------
+
+def test_node_unreachable_recognised_from_the_numeric_codes():
+    assert protocol.is_node_unreachable(protocol.ProtocolError(3, "not ready"))
+    assert protocol.is_node_unreachable(protocol.ProtocolError(4, "not resolving"))
+
+
+def test_node_unreachable_recognised_from_zero_padded_string_codes():
+    # The wire-code coercion bug this fixes, applied to the codes it actually
+    # gates a decision on: "03"/"04" must not be misread as "unrecognised".
+    assert protocol.is_node_unreachable(protocol.ProtocolError("03", "not ready"))
+    assert protocol.is_node_unreachable(protocol.ProtocolError("04", "not resolving"))
+
+
+def test_node_unreachable_false_for_other_codes():
+    # Fails CLOSED, like is_node_not_exists — a code we cannot read as 3/4 is
+    # never guessed to be one.
+    for code in (0, 1, 2, 5, 6, 7, 8, 9, 10, 11, 100):
+        assert not protocol.is_node_unreachable(protocol.ProtocolError(code, "boom"))
+    assert not protocol.is_node_unreachable(protocol.ProtocolError(None, "no code"))
+    assert not protocol.is_node_unreachable(ConnectionError("offline"))
+
+
+# ---------------------------------------------------------------------------
 # parse_commissioning_window (issue #210) — open_commissioning_window's result,
 # VERIFIED snake_case against matter-server v1.2.2 (module header), camelCase
 # fallback kept only because source-verified is not wire-verified.

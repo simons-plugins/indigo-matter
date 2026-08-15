@@ -34,6 +34,19 @@ from plugin_constants import (
 from protocol import Protocol
 from server_process import ServerProcess
 
+#: Shared "device unreachable" refusal (issue #210), used both by
+#: ``_share_node``'s fast pre-flight (matter-server's cached ``available``
+#: flag) and its ``protocol.is_node_unreachable`` branch (a live refusal from
+#: the open_commissioning_window call itself) — same cause, same wording.
+#: "currently" and the parenthetical acknowledge what the picker's own
+#: docstring says: this flag can lag a device that just woke up, so the fast
+#: refusal is a good bet, not a certainty.
+_UNREACHABLE_MESSAGE = (
+    "matter-server currently reports this device as unreachable — wake it or power it "
+    "on and try again in a moment (the report can lag a device that just woke). "
+    "Nothing was changed."
+)
+
 
 class ServerMenuMixin:
     """matter-server install/restart, manual commission/decommission-device,
@@ -383,23 +396,31 @@ class ServerMenuMixin:
         picker — this runs on the Indigo UI thread while the dialog is being
         drawn (pairing_menu_mixin.py:196-202); ``device_sync.list_nodes()``
         is a local reconciliation-state read, not a round trip.
+
+        The row-building loop is INSIDE the same try as the ``list_nodes()``
+        call: a malformed entry (e.g. ``node_id_to_str`` choking on a bad id)
+        used to raise past the try/except and take the whole dialog down with
+        it — degrading to :data:`~plugin_constants.LIST_ERROR_OPTION` is the
+        same contract every other picker in this file already gives a bad row.
         """
         if self.device_sync is None:
-            return [(NO_SELECTION_ID, "(no Matter devices — none commissioned yet)")]
+            # Distinct from "zero nodes": a picker rendered before startup
+            # finished has no way to know whether anything is commissioned.
+            return [(NO_SELECTION_ID, "(plugin still starting)")]
         try:
             nodes = list(self.device_sync.list_nodes())
+            if not nodes:
+                return [(NO_SELECTION_ID, "(no Matter devices — none commissioned yet)")]
+            options = [(NO_SELECTION_ID, NO_SELECTION_LABEL)]
+            options.extend(
+                (str(node_id), f"{', '.join(names) if names else '(no Indigo devices)'} "
+                              f"— node {node_id_to_str(node_id)}")
+                for node_id, names in nodes
+            )
+            return options
         except Exception as exc:  # noqa: BLE001 - never break the dialog; degrade to an error row
             self.logger.exception(exc)
             return [LIST_ERROR_OPTION]
-        if not nodes:
-            return [(NO_SELECTION_ID, "(no Matter devices — none commissioned yet)")]
-        options = [(NO_SELECTION_ID, NO_SELECTION_LABEL)]
-        options.extend(
-            (str(node_id), f"{', '.join(names) if names else '(no Indigo devices)'} "
-                          f"— node {node_id_to_str(node_id)}")
-            for node_id, names in nodes
-        )
-        return options
 
     def menuShareMatterNode(self, valuesDict, menuId=""):  # noqa: N802, ARG002
         """Open a commissioning window on an ALREADY-commissioned node so a
@@ -471,6 +492,15 @@ class ServerMenuMixin:
             # rather than importing that mixin's exception type — a mixin importing a
             # sibling mixin's name is exactly the back-import issue #146 removed
             # (see diagnostics_menu_mixin.MatterUnavailable's own docstring).
+            if type(exc).__name__ == "MatterUnavailable":
+                self.logger.debug("share: node %s fetch unavailable — %s",
+                                  node_id_to_str(node_id), exc)
+            else:
+                # Anything else escaping _fetch_node is a code bug there, not a
+                # connectivity problem — a traceback is what a bug report needs.
+                self.logger.error("share: node %s fetch raised an unexpected %s — %s",
+                                  node_id_to_str(node_id), type(exc).__name__, exc)
+                self.logger.exception(exc)
             return False, f"matter-server did not answer — {exc}. Nothing was changed."
         if node is None:
             return False, ("matter-server does not know this node — it may have been "
@@ -479,31 +509,46 @@ class ServerMenuMixin:
             # Refuse FAST, before the expensive open_commissioning_window call:
             # matter-server's own ``available`` flag already answered the
             # question a timeout would otherwise spend up to a minute finding out.
-            return False, ("matter-server reports this device as unreachable — wake it or "
-                          "power it on and try again. Nothing was changed.")
+            # Acknowledged rather than treated as certain — the picker's own
+            # docstring argues this same flag can be stale, and Execute must
+            # not contradict that while still taking the fast, cheap exit.
+            return False, _UNREACHABLE_MESSAGE
 
         fabric_line = self._fabric_warning_line(node, node_id)
 
         try:
             window = self.runtime.submit(
-                self.matter.open_commissioning_window(node_id, duration)
+                self.matter.open_commissioning_window(node_id, duration=duration)
             ).result(timeout=SHARE_WINDOW_TIMEOUT)
         except FuturesTimeoutError:
+            self.logger.warning(
+                "share: node %s — matter-server did not answer opening a commissioning "
+                "window within %.0fs", node_id_to_str(node_id), SHARE_WINDOW_TIMEOUT)
             return False, ("matter-server did not answer in time. A window may still have "
                           "opened; if it did, its code is lost — wait for it to expire "
                           "before retrying.")
-        except (ConnectionError, RuntimeError):
+        except (ConnectionError, RuntimeError) as exc:
+            self.logger.warning("share: node %s — not connected to matter-server (%s)",
+                               node_id_to_str(node_id), exc)
             return False, "Not connected to matter-server — see the log."
         except protocol.ProtocolError as exc:
+            self.logger.warning(
+                "share: node %s — matter-server refused opening a commissioning window "
+                "(code %s: %s)", node_id_to_str(node_id), exc.code, exc.details)
             if protocol.is_node_not_exists(exc):
                 return False, ("matter-server does not know this node — it may have been "
                               "decommissioned. Reopen this dialog.")
-            if _opt_error_code(exc) in (3, 4):
-                return False, ("matter-server reports this device as unreachable — wake it "
-                              "or power it on and try again. Nothing was changed.")
-            return False, ("a window may already be open on this device — wait up to 15 "
-                          "minutes for it to expire and try again. The previous window's "
-                          "code cannot be recovered.")
+            if protocol.is_node_unreachable(exc):
+                return False, _UNREACHABLE_MESSAGE
+            # Codes 8/9/100 (InvalidArguments/InvalidCommand/IcdMultiAdmin) and every
+            # other unnamed one land here too — the same code protocol.py's own error
+            # table says is not reliably distinguishable from "a window is already
+            # open" (0 UnknownError, 7 SDKStackError), so the message hedges rather
+            # than asserting a single cause for what could be up to ~10 different ones.
+            return False, (
+                f"matter-server refused this (error {exc.code}) — a window may already be "
+                "open on this device; wait up to 15 minutes and try again. The previous "
+                "window's code cannot be recovered. See the log.")
         except Exception as exc:  # noqa: BLE001
             self.logger.error("share: opening a commissioning window on node %s FAILED — %s",
                               node_id_to_str(node_id), exc)
@@ -1075,14 +1120,3 @@ class ServerMenuMixin:
                 "Install of the Matter bridge did not complete after the npm step — the "
                 "package may be installed but the agent was not restarted. See the trace above, "
                 "then retry Plugins ▸ Matter ▸ Install/update the Matter bridge.")
-
-
-def _opt_error_code(exc: protocol.ProtocolError) -> Optional[int]:
-    """``exc.code`` as an int, or None — matter-server error codes are wire
-    vocabulary and may arrive as a string; used only to distinguish "device
-    offline" (3/4) from "window may already be open" (everything else) in
-    :meth:`ServerMenuMixin._share_node`."""
-    try:
-        return int(str(exc.code), 0)
-    except (TypeError, ValueError, AttributeError):
-        return None
