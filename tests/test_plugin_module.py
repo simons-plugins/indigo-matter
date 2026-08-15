@@ -116,6 +116,7 @@ MENU_SECTIONS = [
     # (issue #191) live here, beside the devices they describe, rather than
     # with the plumbing further down.
     ["Commission device by setup code (advanced)…",
+     "Share a Matter device with another ecosystem…",
      "Decommission Matter device…",
      "Report settable Matter settings…",
      "Explore Matter attributes (advanced)…"],

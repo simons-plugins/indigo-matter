@@ -102,6 +102,20 @@ RECONCILE_TIMEOUT = 30.0
 #: a socket round trip rather than a device round trip — generous, but nothing
 #: like the device timeouts, because no device is involved.
 SURVEY_READ_TIMEOUT = 20.0
+#: How long "Share a Matter device with another ecosystem…" (issue #210) may
+#: block the Indigo UI thread on ``open_commissioning_window`` — the OUTER of
+#: two nested deadlines, the inner being ``matter_client.SHARE_WINDOW_RPC_TIMEOUT``
+#: (45.0). PairingMenuMixin's WINDOW_OPEN_TIMEOUT (45.0) covers the SAME
+#: operation against the export bridge's own, LOCAL matter.js node; this one
+#: crosses the socket to matter-server AND a Thread radio round trip on top,
+#: so it gets its own, longer number rather than reusing that one.
+#: INVARIANT: this must stay strictly ABOVE SHARE_WINDOW_RPC_TIMEOUT — if the
+#: outer deadline fired first (or tied), ``.result(timeout=...)`` would abandon
+#: the future while the coroutine was still the one waiting on the inner
+#: timeout, turning a clean "matter-server did not answer" into a bare
+#: "future not done" the caller cannot explain. Tested in
+#: tests/test_share_node_menu.py.
+SHARE_WINDOW_TIMEOUT = 60.0
 #: The "every device" row in the diagnostic node pickers, and the "no filter"
 #: rows in the explorer's endpoint/cluster pickers. Shares NO_SELECTION_ID's
 #: reasoning: never "", which Indigo rejects outright.
