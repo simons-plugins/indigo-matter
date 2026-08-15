@@ -75,11 +75,15 @@ _ATTR_SUPPORTED_FABRICS = 0x0002
 _ATTR_COMMISSIONED_FABRICS = 0x0003
 
 
-def _fabric_slots_available(node: dict) -> Optional[int]:
-    """Best-effort read of remaining fabric capacity from the interview payload.
+def fabric_counts(node: dict) -> tuple[Optional[int], Optional[int]]:
+    """Read (SupportedFabrics, CommissionedFabrics) from a node's interview
+    payload — a named helper (issue #210) so a second caller (the "share with
+    another ecosystem" menu/action) can read the same two numbers without
+    reaching into commission_jobs' private fabric-slot arithmetic.
 
-    Returns None (unknown, never treated as zero) if the node's attribute
-    snapshot doesn't include both Operational Credentials attributes.
+    Either or both come back None (unknown, never treated as zero) if the
+    node's attribute snapshot doesn't include that Operational Credentials
+    attribute — older firmware, or a partial read.
     """
     supported = commissioned = None
     for key, value in (node.get("attributes") or {}).items():
@@ -93,12 +97,24 @@ def _fabric_slots_available(node: dict) -> Optional[int]:
             supported = value
         elif attribute == _ATTR_COMMISSIONED_FABRICS:
             commissioned = value
+    try:
+        supported = int(supported) if supported is not None else None
+        commissioned = int(commissioned) if commissioned is not None else None
+    except (TypeError, ValueError):
+        return None, None
+    return supported, commissioned
+
+
+def _fabric_slots_available(node: dict) -> Optional[int]:
+    """Best-effort read of remaining fabric capacity from the interview payload.
+
+    Returns None (unknown, never treated as zero) if the node's attribute
+    snapshot doesn't include both Operational Credentials attributes.
+    """
+    supported, commissioned = fabric_counts(node)
     if supported is None or commissioned is None:
         return None
-    try:
-        return int(supported) - int(commissioned)
-    except (TypeError, ValueError):
-        return None
+    return supported - commissioned
 
 
 def _now_utc() -> datetime:
