@@ -47,6 +47,38 @@
             </Field>
         </ConfigUI>
     </MenuItem>
+    <!--
+        Share a Matter device with another ecosystem… (issue #210). Placed
+        right after the other additive action (commission) and before the
+        destructive one (decommission stays last in this section per #134).
+
+        Same "codes go to the event log" reasoning as Pair Matter Bridge…
+        below (Indigo dialogs have no dynamic labels) — this is the reverse
+        direction: the device is already commissioned to Indigo, and this
+        opens a window so a SECOND ecosystem can add it too.
+    -->
+    <MenuItem id="shareMatterNode">
+        <Name>Share a Matter device with another ecosystem…</Name>
+        <CallbackMethod>menuShareMatterNode</CallbackMethod>
+        <ButtonTitle>Open sharing window</ButtonTitle>
+        <ConfigUI>
+            <Field id="shareIntro" type="label">
+                <Label>Opens a commissioning window on a Matter device Indigo already controls, so another ecosystem (Apple Home, Alexa, Google, Home Assistant) can add it too — without removing it from Indigo.
+
+The pairing code is written to the Indigo EVENT LOG when you click below — Indigo dialogs cannot display a code that is generated as you press the button. Add the device in the other ecosystem's app as you would any Matter accessory.
+
+A Matter pairing code is not durable: once used, or once the window expires (up to 15 minutes), that code stops working and there is no way to read it again — you would need to run this again for a fresh one.</Label>
+            </Field>
+            <Field id="node" type="menu">
+                <Label>Device (Matter node):</Label>
+                <List class="self" method="getShareableNodes" dynamicReload="true"/>
+            </Field>
+            <Field id="duration" type="textfield" defaultValue="900">
+                <Label>Window stays open for (seconds):</Label>
+                <Description>Matter allows 180 to 900 (3 to 15 minutes). 900 is the maximum and the default.</Description>
+            </Field>
+        </ConfigUI>
+    </MenuItem>
     <MenuItem id="decommissionDevice">
         <Name>Decommission Matter device…</Name>
         <CallbackMethod>menuDecommissionDevice</CallbackMethod>

@@ -242,6 +242,24 @@ devices none of this applies — no TBR is involved at all.
 Multi-admin works in every direction. The same pairing-mode trick adds the
 device to Google Home, Alexa, or Home Assistant alongside Indigo.
 
+**The Indigo-first direction.** For a device Indigo itself commissioned, you
+don't need to put it back into its own pairing mode by hand: Plugins ▸ Matter
+▸ **Share a Matter device with another ecosystem…** opens a fresh
+commissioning window on it directly, and writes the code to the Indigo Event
+Log (the same "codes can't go in a dialog" constraint as pairing the export
+bridge — see below). Add the device in the other ecosystem's app as you would
+any Matter accessory. There is no way to ask matter-server whether a window
+is already open, and no way to re-read a code once it's issued, so a code you
+lose or a window you let expire (up to 15 minutes) means running the menu
+item again for a fresh one.
+
+One thing to expect here too: **an Apple Home pairing uses two fabric
+slots**, not one — *Apple Home* and *Apple Keychain* (iCloud Keychain sync).
+Most Matter devices support only a handful of fabrics in total, so sharing a
+device that already has several admins can leave no room for Apple, or for
+anything after it. The share menu warns (never blocks) when a device is
+getting close.
+
 Adding the device to its **vendor app** is often worth doing once, because
 firmware updates usually ship through it (see below). Caution with reset
 buttons during vendor onboarding — e.g. on TP-Link Tapo plugs a ~5 s hold is

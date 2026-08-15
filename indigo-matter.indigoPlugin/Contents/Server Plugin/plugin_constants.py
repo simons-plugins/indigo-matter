@@ -102,6 +102,29 @@ RECONCILE_TIMEOUT = 30.0
 #: a socket round trip rather than a device round trip — generous, but nothing
 #: like the device timeouts, because no device is involved.
 SURVEY_READ_TIMEOUT = 20.0
+#: How long "Share a Matter device with another ecosystem…" (issue #210) may
+#: block the Indigo UI thread on ``open_commissioning_window`` — the OUTER of
+#: two nested deadlines, the inner being ``matter_client.SHARE_WINDOW_RPC_TIMEOUT``
+#: (45.0). PairingMenuMixin's WINDOW_OPEN_TIMEOUT (45.0) covers the SAME
+#: operation against the export bridge's own, LOCAL matter.js node; this one
+#: crosses the socket to matter-server AND a Thread radio round trip on top,
+#: so it gets its own, longer number rather than reusing that one.
+#: INVARIANT: this must stay strictly ABOVE SHARE_WINDOW_RPC_TIMEOUT. On
+#: Python 3.11+ ``concurrent.futures.TimeoutError`` IS ``asyncio.TimeoutError``
+#: IS the builtin ``TimeoutError`` (requires-python >= 3.11), so both
+#: deadlines raise the identical exception type either way — the ordering
+#: does not change WHAT is raised. It changes what happens FIRST: with the
+#: inner deadline strictly below, the RPC layer's own ``asyncio.wait_for``
+#: fires first and gets to complete its own cleanup of the pending frame
+#: normally — including, since issue #210's late-response wiring, handing
+#: any answer that arrives after this to the request's ``ShareWindowRequest``
+#: context — before this outer ``.result(timeout=...)`` would ever have
+#: given up on its own. Tied or reversed, the outer timeout could fire while
+#: the inner wait is still the one genuinely pending, which is not a
+#: different symptom (a mismatched deadline is not visible on the exception
+#: it raises) but does lose the ordering guarantee this book-keeping relies
+#: on. Tested in tests/test_share_node_menu.py.
+SHARE_WINDOW_TIMEOUT = 60.0
 #: The "every device" row in the diagnostic node pickers, and the "no filter"
 #: rows in the explorer's endpoint/cluster pickers. Shares NO_SELECTION_ID's
 #: reasoning: never "", which Indigo rejects outright.

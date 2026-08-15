@@ -9,7 +9,7 @@ import asyncio
 import json
 import threading
 from concurrent.futures import Future
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 import protocol
 
@@ -111,6 +111,33 @@ def scripted_responder(results: dict) -> Callable[[dict], list]:
             if callable(value):
                 value = value(frame)
             return [{protocol.KEY_MESSAGE_ID: mid, protocol.KEY_RESULT: value}]
+        return [{protocol.KEY_MESSAGE_ID: mid, protocol.KEY_RESULT: None}]
+    return _respond
+
+
+#: A real ``open_commissioning_window`` result (issue #210), snake_case —
+#: VERIFIED against matter-server v1.2.2's WebSocketControllerHandler.ts (see
+#: protocol.py's module header). Plays the role
+#: tests/fixtures/bridge_protocol/frames.json's shapes play for the OUTBOUND
+#: bridge contract: a golden fixture any test wanting a realistic result reaches
+#: for, rather than hand-rolling one.
+COMMISSIONING_WINDOW_RESULT = {
+    "setup_pin_code": 12345678,
+    "setup_manual_code": "34970112332",
+    "setup_qr_code": "MT:-24J0AFN00KA0648G00",
+}
+
+
+def error_responder(command: str, code: Any, details: str = "") -> Callable[[dict], list]:
+    """Build a responder that answers ONE command with a matter-server error
+    frame (``{message_id, error_code, details}``) and everything else with
+    ``result: None`` — ``scripted_responder``'s error-shaped counterpart, for
+    tests that need to prove a ``ProtocolError`` reaches the caller."""
+    def _respond(frame: dict) -> list:
+        mid = frame.get(protocol.KEY_MESSAGE_ID)
+        if frame.get(protocol.KEY_COMMAND) == command:
+            return [{protocol.KEY_MESSAGE_ID: mid, protocol.KEY_ERROR_CODE: code,
+                    protocol.KEY_ERROR_DETAILS: details}]
         return [{protocol.KEY_MESSAGE_ID: mid, protocol.KEY_RESULT: None}]
     return _respond
 

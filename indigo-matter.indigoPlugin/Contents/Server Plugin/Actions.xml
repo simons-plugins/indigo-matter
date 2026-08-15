@@ -49,6 +49,21 @@
         <Name>Report this node's settable attributes</Name>
         <CallbackMethod>actionReportNodeSettings</CallbackMethod>
     </Action>
+    <!-- Device-targeted twin of "Share a Matter device with another
+         ecosystem…" (Plugins ▸ Matter, issue #210): opens a commissioning
+         window on this node so a second ecosystem can add it too, reachable
+         from a control page, trigger, or action group. Outcome only ever
+         goes to the log — an action has no dialog to report into. -->
+    <Action id="shareMatterNode" deviceFilter="self.matterNode" uiPath="DeviceActions">
+        <Name>Share this device with another ecosystem</Name>
+        <CallbackMethod>actionShareMatterNode</CallbackMethod>
+        <ConfigUI>
+            <Field id="duration" type="textfield" defaultValue="900">
+                <Label>Window stays open for (seconds):</Label>
+                <Description>Matter allows 180 to 900 (3 to 15 minutes). 900 is the maximum and the default.</Description>
+            </Field>
+        </ConfigUI>
+    </Action>
     <Action id="status" uiPath="hidden">
         <Name>matter status</Name>
         <CallbackMethod>http_status</CallbackMethod>

@@ -706,6 +706,18 @@ def _node_with_fabrics(supported, commissioned, node_id=0x1):
     }
 
 
+def test_fabric_counts_reads_supported_and_commissioned():
+    # commission_jobs.fabric_counts (issue #210): a named helper reused by the
+    # "share with another ecosystem" menu/action, reusing this module's own
+    # 0/62/2-0/62/3 fixture so it and _fabric_slots_available agree on what
+    # the wire actually sends.
+    assert commission_jobs.fabric_counts(_node_with_fabrics(5, 4)) == (5, 4)
+
+
+def test_fabric_counts_unknown_when_attributes_absent():
+    assert commission_jobs.fabric_counts({"node_id": 0x1, "attributes": {}}) == (None, None)
+
+
 def test_expected_fabric_slots_warns_when_fewer_available(mock_logger):
     async def scenario():
         matter = FakeMatter(node_id=0x1, node=_node_with_fabrics(5, 4))

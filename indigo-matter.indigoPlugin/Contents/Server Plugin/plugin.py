@@ -1624,6 +1624,67 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, ServerMenuMixin,
             return
         self.device_sync.report_settable_attributes(node, force=True)
 
+    def actionShareMatterNode(self, action, dev):  # noqa: N802
+        """Device-targeted twin of "Share a Matter device with another
+        ecosystem…" (issue #210): the same ``_share_node`` core
+        ``ServerMenuMixin.menuShareMatterNode`` uses, scoped to the one node
+        ``dev`` (a matterNode) names — reachable from a control page,
+        trigger, or action group, and the seam a future Domio "share this
+        device" endpoint would call instead of the menu. There is no dialog
+        here to report a refusal into, so the outcome only ever goes to the
+        log — same shape as ``actionReportNodeSettings`` above.
+
+        **``_share_node`` itself runs on a detached thread — unlike every
+        other action in this file.** Indigo action callbacks share ONE queue
+        with ``actionControlDevice``/``actionControlThermostat``/etc — the
+        same queue a light switch's Toggle goes through. ``_share_node`` can
+        block for up to ``SHARE_WINDOW_TIMEOUT`` (60s) waiting on
+        matter-server, and unlike the modal menu item (which only blocks the
+        Indigo UI thread the user pressing it is already staring at), this
+        action is reachable from a trigger or schedule with nobody watching
+        — a wedged matter-server would otherwise stall every OTHER action
+        queued behind it, including turning off a light. Only ``_share_node``
+        detaches: the node-id/duration validation above is synchronous,
+        local, and fast (no I/O), so there is nothing to gain by threading it
+        too, and doing so would only add a race to a plain validation error.
+        """
+        node_id = dev.pluginProps.get("nodeId")
+        if not node_id:
+            self.logger.error('"%s": cannot share — device has no Matter node id', dev.name)
+            return
+        try:
+            node_id = int(node_id)
+        except (TypeError, ValueError):
+            self.logger.error('"%s": invalid Matter node id %r', dev.name, node_id)
+            return
+        errors = indigo.Dict()
+        # pylint: disable=no-member  # PairingMenuMixin._window_duration via MRO (issue #146)
+        duration = self._window_duration(action.props, errors)
+        # pylint: enable=no-member
+        if duration is None:
+            self.logger.error('"%s": cannot share — %s', dev.name,
+                              errors.get("duration", "invalid duration"))
+            return
+        self.logger.debug('"%s": share starting on a detached thread (node %s, %ds window)',
+                          dev.name, node_id, duration)
+        threading.Thread(
+            target=self._run_share_node, args=(dev.name, node_id, duration),
+            name="matter-share", daemon=True,
+        ).start()
+
+    def _run_share_node(self, dev_name: str, node_id: int, duration: int) -> None:
+        """The detached-thread body :meth:`actionShareMatterNode` starts.
+
+        Extracted to its own method so a test can call it directly and
+        deterministically instead of joining a real ``threading.Thread`` —
+        everything it does (``runtime.submit``, ``self.logger``) is already
+        safe to call from any thread, so there is nothing about running it
+        inline in a test that changes its behaviour.
+        """
+        ok, message = self._share_node(node_id, duration)  # pylint: disable=no-member  # ServerMenuMixin (issue #146)
+        if not ok:
+            self.logger.error('"%s": share failed — %s', dev_name, message)
+
     def _refresh_node(self, dev) -> None:
         """Re-interview the device's Matter node so matter-server re-reads its
         attributes; matter-server then emits a node_updated event which
@@ -1702,4 +1763,11 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, ServerMenuMixin,
         # invariant honest rather than assumed, same as _on_matter_event above.
         if self.jobs is not None:
             self.jobs.note_late_response(late)
+        # A single MatterClient fans every late response out to whichever of
+        # its several possible senders' contexts matches (issue #210):
+        # note_late_response above only claims a CommissionRequest and drops
+        # anything else; this claims a ShareWindowRequest the same way. Both
+        # run unconditionally — a late answer names at most one of them via
+        # isinstance, never both, so there is no double-handling to guard.
+        self._note_late_share_response(late)  # pylint: disable=no-member  # ServerMenuMixin (issue #146)
 

@@ -25,6 +25,7 @@ running but matter-server is not.
 - [Step 2 — Install matter-server](#step-2--install-matter-server)
 - [Step 3 — Configure the plugin](#step-3--configure-the-plugin)
 - [Step 4 — Verify](#step-4--verify)
+- [Sharing an Indigo-commissioned device with Apple Home](#sharing-an-indigo-commissioned-device-with-apple-home)
 - [**Exporting Indigo devices (Indigo as a Matter bridge)**](#exporting-indigo-devices-indigo-as-a-matter-bridge)
   - [Export prerequisites](#export-prerequisites)
   - [Step E1 — Install the export bridge](#step-e1--install-the-export-bridge)
@@ -105,7 +106,7 @@ did not mean to touch.
 
 | Section | Items | What it covers |
 |---|---|---|
-| 1 | *Commission device by setup code (advanced)…*, *Decommission Matter device…* | Matter devices Indigo **controls** — the everyday actions |
+| 1 | *Commission device by setup code (advanced)…*, *Share a Matter device with another ecosystem…*, *Decommission Matter device…* | Matter devices Indigo **controls** — the everyday actions |
 | 2 | *Manage Matter Exports…*, *Pair Matter Bridge…*, *Unpair an Ecosystem…* | Indigo devices Indigo **publishes** — the everyday actions |
 | 3 | *Install/update the Matter controller (matter-server)*, *Restart…*, *Reinstall (clean)…*, *Open the Matter controller log…* | The inbound controller's own plumbing |
 | 4 | *Install/update the Matter bridge*, *Reinstall… (clean)…*, *Stop…* | The outbound bridge node's own plumbing |
@@ -304,6 +305,36 @@ If matter-server crashed on launch, the reason is in
 
 Once both are healthy, add a device — from the **Domio app**, or via **Plugins ▸ Matter ▸
 Commission device by setup code…** — and it will appear as a native Indigo device.
+
+---
+
+## Sharing an Indigo-commissioned device with Apple Home
+
+A device Indigo commissioned isn't locked to Indigo — Matter's multi-admin
+model lets several ecosystems control the same device at once, and Indigo can
+open the door for one without you putting the device back into its own
+pairing mode:
+
+1. **Plugins ▸ Matter ▸ Share a Matter device with another ecosystem…**
+2. Pick the device, leave the window duration at the 900 s default (or shrink
+   it if you'll be quick), and click **Open sharing window**.
+3. The manual pairing code and QR payload are written to the **Indigo event
+   log** — Indigo dialogs can't display a value the button click just
+   generated. Open the log and copy the manual code (or scan the QR line with
+   the Home app if you'd rather).
+4. In the Home app: **Add Accessory** → **More options…** → enter the code
+   (or scan it). A certified retail device (the normal case) adds with no
+   warning — this isn't the export bridge's own "uncertified accessory"
+   prompt, which comes from *its* development attestation. If you do see an
+   uncertified-accessory prompt here, it's about the shared device's own
+   attestation being non-production, not about Indigo or this share.
+
+The code is single-use and the window closes on its own after the duration
+you set (up to 15 minutes) — there is no way to read a lost code again, so if
+you miss the window, run the menu item once more for a fresh one. If the
+device already has several admins, watch the event log for a fabric-capacity
+warning: an Apple Home pairing alone uses **two** fabric slots (Apple Home +
+Apple Keychain), so a device close to its limit may not have room.
 
 ---
 

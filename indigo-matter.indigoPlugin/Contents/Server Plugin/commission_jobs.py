@@ -25,7 +25,7 @@ from typing import Any, Awaitable, Callable, Optional
 
 from matter_client import COMMISSION_TIMEOUT
 from matter_model import node_id_to_str  # noqa: F401 - canonical home; re-exported for callers
-from protocol import Protocol, ProtocolError
+from protocol import Protocol, ProtocolError, opt_int
 
 
 class JobStatus(str, Enum):
@@ -75,11 +75,15 @@ _ATTR_SUPPORTED_FABRICS = 0x0002
 _ATTR_COMMISSIONED_FABRICS = 0x0003
 
 
-def _fabric_slots_available(node: dict) -> Optional[int]:
-    """Best-effort read of remaining fabric capacity from the interview payload.
+def fabric_counts(node: dict) -> tuple[Optional[int], Optional[int]]:
+    """Read (SupportedFabrics, CommissionedFabrics) from a node's interview
+    payload — a named helper (issue #210) so a second caller (the "share with
+    another ecosystem" menu/action) can read the same two numbers without
+    reaching into commission_jobs' private fabric-slot arithmetic.
 
-    Returns None (unknown, never treated as zero) if the node's attribute
-    snapshot doesn't include both Operational Credentials attributes.
+    Either or both come back None (unknown, never treated as zero) if the
+    node's attribute snapshot doesn't include that Operational Credentials
+    attribute — older firmware, or a partial read.
     """
     supported = commissioned = None
     for key, value in (node.get("attributes") or {}).items():
@@ -93,12 +97,24 @@ def _fabric_slots_available(node: dict) -> Optional[int]:
             supported = value
         elif attribute == _ATTR_COMMISSIONED_FABRICS:
             commissioned = value
+    try:
+        supported = int(supported) if supported is not None else None
+        commissioned = int(commissioned) if commissioned is not None else None
+    except (TypeError, ValueError):
+        return None, None
+    return supported, commissioned
+
+
+def _fabric_slots_available(node: dict) -> Optional[int]:
+    """Best-effort read of remaining fabric capacity from the interview payload.
+
+    Returns None (unknown, never treated as zero) if the node's attribute
+    snapshot doesn't include both Operational Credentials attributes.
+    """
+    supported, commissioned = fabric_counts(node)
     if supported is None or commissioned is None:
         return None
-    try:
-        return int(supported) - int(commissioned)
-    except (TypeError, ValueError):
-        return None
+    return supported - commissioned
 
 
 def _now_utc() -> datetime:
@@ -320,9 +336,9 @@ class CommissionJobs:
                 setup_code=setup_code,
                 suggested_name=name,
                 suggested_room=(params.get("suggestedRoom") or None),
-                discriminator=_opt_int(params.get("discriminator")),
+                discriminator=opt_int(params.get("discriminator")),
                 domio_node_id=(params.get("domioNodeId") or None),
-                expected_fabric_slots=_opt_int(params.get("expectedFabricSlots")),
+                expected_fabric_slots=opt_int(params.get("expectedFabricSlots")),
                 started_at=self._clock(),
             )
             self._jobs[job.job_id] = job
@@ -653,7 +669,7 @@ class CommissionJobs:
                     f"plugin stopped waiting: {details}"
                 ),
             }
-            matter_error_code = _opt_int(code)
+            matter_error_code = opt_int(code)
             if matter_error_code is not None:
                 new_error["matterErrorCode"] = matter_error_code
             job.error = new_error
@@ -779,7 +795,7 @@ class CommissionJobs:
             # PASE/CASE failure, …) — a device/commissioning failure, not a plugin
             # bug, so report it as such rather than internal_error.
             await self._fail(job, "commissioning_failed", str(exc), node_id,
-                             _opt_int(getattr(exc, "code", None)))
+                             opt_int(getattr(exc, "code", None)))
         except Exception as exc:  # noqa: BLE001 - last-resort, mapped to internal_error
             self.logger.exception(exc)
             await self._fail(job, "internal_error", _exc_message(exc), node_id)
@@ -1097,12 +1113,3 @@ class CommissionJobs:
             job = self._jobs.pop(jid)
             if self._by_code.get(job.setup_code) == jid:
                 self._by_code.pop(job.setup_code, None)
-
-
-def _opt_int(value: Any) -> Optional[int]:
-    if value is None or value == "":
-        return None
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None

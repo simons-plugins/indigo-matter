@@ -13,7 +13,13 @@ import protocol
 from protocol import MatterCommand, Protocol
 from matter_client import MatterClient
 
-from fakes import FakeWebSocket, returns, scripted_responder
+from fakes import (
+    COMMISSIONING_WINDOW_RESULT,
+    FakeWebSocket,
+    error_responder,
+    returns,
+    scripted_responder,
+)
 
 
 def run(coro):
@@ -594,3 +600,214 @@ def test_read_does_not_unwrap_an_attribute_whose_VALUE_is_a_struct():
 def test_read_passes_a_bare_value_straight_through():
     # Insurance: a server that starts answering with the value keeps working.
     assert MatterClient._unwrap_attribute(10, "1/1030/3") == 10
+
+
+# ---------------------------------------------------------------------------
+# open_commissioning_window — sharing a commissioned node (issue #210).
+#
+# The "timeout" trap is the whole point of these: matter-server's wire arg
+# named "timeout" is the commissioning-window DURATION, not this method's own
+# RPC deadline, and both are named "timeout" — see protocol.py's module
+# header. These pin that the two never get wired to each other.
+# ---------------------------------------------------------------------------
+
+def test_open_commissioning_window_sends_node_id_and_duration_as_the_wire_timeout(mock_logger):
+    async def scenario():
+        seen = {}
+
+        def window_result(frame):
+            seen["args"] = frame["args"]
+            return COMMISSIONING_WINDOW_RESULT
+
+        fake = FakeWebSocket(responder=scripted_responder(
+            {protocol.CMD_OPEN_WINDOW: window_result}))
+        client = _client(mock_logger, fake)
+        task = asyncio.create_task(client.run())
+        await client.wait_connected(timeout=2)
+
+        result = await client.open_commissioning_window(56, duration=300)
+        assert seen["args"] == {"node_id": 56, "timeout": 300}
+        assert result == COMMISSIONING_WINDOW_RESULT
+
+        await client.close()
+        task.cancel()
+    run(scenario())
+
+
+def test_open_commissioning_window_omits_duration_entirely_when_none(mock_logger):
+    async def scenario():
+        seen = {}
+
+        def window_result(frame):
+            seen["args"] = frame["args"]
+            return COMMISSIONING_WINDOW_RESULT
+
+        fake = FakeWebSocket(responder=scripted_responder(
+            {protocol.CMD_OPEN_WINDOW: window_result}))
+        client = _client(mock_logger, fake)
+        task = asyncio.create_task(client.run())
+        await client.wait_connected(timeout=2)
+
+        await client.open_commissioning_window(56)
+        # No "timeout" key at all — not None, not 900 — so a server that only
+        # applies its own default when the key is truly ABSENT still gets it.
+        assert seen["args"] == {"node_id": 56}
+
+        await client.close()
+        task.cancel()
+    run(scenario())
+
+
+def test_open_commissioning_window_rpc_timeout_reaches_the_wait(mock_logger, monkeypatch):
+    # Behavioural counterpart of the two tests above: the RPC deadline this
+    # method takes as its OWN "timeout" kwarg (never the wire duration) is what
+    # actually reaches asyncio.wait_for.
+    captured: list[float] = []
+    real_wait_for = asyncio.wait_for
+
+    async def spying_wait_for(awaitable, timeout):
+        captured.append(timeout)
+        return await real_wait_for(awaitable, timeout)
+
+    monkeypatch.setattr("matter_client.asyncio.wait_for", spying_wait_for)
+
+    async def scenario():
+        fake = FakeWebSocket(responder=scripted_responder(
+            {protocol.CMD_OPEN_WINDOW: COMMISSIONING_WINDOW_RESULT}))
+        client = _client(mock_logger, fake)
+        task = asyncio.create_task(client.run())
+        await client.wait_connected(timeout=2)
+
+        captured.clear()  # drop wait_connected's own wait_for
+        await client.open_commissioning_window(56, duration=300, timeout=45.0)
+        assert captured == [45.0]  # the RPC deadline, not the 300s window duration
+
+        await client.close()
+        task.cancel()
+    run(scenario())
+
+
+def test_open_commissioning_window_default_rpc_timeout_reaches_the_wait(mock_logger, monkeypatch):
+    # Pins the DEFAULT (no timeout= passed at all) — the test above only
+    # proves an EXPLICIT deadline reaches wait_for, not that the parameter's
+    # own default value is SHARE_WINDOW_RPC_TIMEOUT.
+    from matter_client import SHARE_WINDOW_RPC_TIMEOUT
+
+    captured: list[float] = []
+    real_wait_for = asyncio.wait_for
+
+    async def spying_wait_for(awaitable, timeout):
+        captured.append(timeout)
+        return await real_wait_for(awaitable, timeout)
+
+    monkeypatch.setattr("matter_client.asyncio.wait_for", spying_wait_for)
+
+    async def scenario():
+        fake = FakeWebSocket(responder=scripted_responder(
+            {protocol.CMD_OPEN_WINDOW: COMMISSIONING_WINDOW_RESULT}))
+        client = _client(mock_logger, fake)
+        task = asyncio.create_task(client.run())
+        await client.wait_connected(timeout=2)
+
+        captured.clear()
+        await client.open_commissioning_window(56, duration=300)  # no timeout= at all
+        assert captured == [SHARE_WINDOW_RPC_TIMEOUT]
+
+        await client.close()
+        task.cancel()
+    run(scenario())
+
+
+def test_open_commissioning_window_called_positionally_sends_the_same_wire_frame(mock_logger):
+    # Positional (node_id, duration) must reach the wire identically to the
+    # keyword form the codebase's own call sites use — the wire contract does
+    # not care which calling convention a caller picks.
+    async def scenario():
+        seen = {}
+
+        def window_result(frame):
+            seen["args"] = frame["args"]
+            return COMMISSIONING_WINDOW_RESULT
+
+        fake = FakeWebSocket(responder=scripted_responder(
+            {protocol.CMD_OPEN_WINDOW: window_result}))
+        client = _client(mock_logger, fake)
+        task = asyncio.create_task(client.run())
+        await client.wait_connected(timeout=2)
+
+        result = await client.open_commissioning_window(56, 300)
+        assert seen["args"] == {"node_id": 56, "timeout": 300}
+        assert result == COMMISSIONING_WINDOW_RESULT
+
+        await client.close()
+        task.cancel()
+    run(scenario())
+
+
+def _withheld_share_window(mock_logger, **kw):
+    """A connected matter-server client whose open_commissioning_window
+    request never gets an answer (or the fire-and-forget handshake's) —
+    everything else is answered immediately. Mirrors _withheld_commission."""
+    def responder(frame):
+        if frame.get(protocol.KEY_COMMAND) in (protocol.CMD_OPEN_WINDOW, protocol.CMD_START_LISTENING):
+            return []
+        return [{protocol.KEY_MESSAGE_ID: frame[protocol.KEY_MESSAGE_ID], protocol.KEY_RESULT: None}]
+
+    fake = FakeWebSocket(responder=responder)
+    return fake, _client(mock_logger, fake, **kw)
+
+
+def test_open_commissioning_window_on_late_response_hook_receives_the_context(mock_logger):
+    # Issue #210's late-answer fix depends entirely on this: a share request
+    # that misses its own RPC deadline must still hand its context to
+    # on_late_response when matter-server eventually answers — the same
+    # mechanism issue #23 proved for commission_with_code, mirrored here.
+    async def scenario():
+        seen = []
+        fake, client = _withheld_share_window(mock_logger, on_late_response=seen.append)
+        task = asyncio.create_task(client.run())
+        await client.wait_connected(timeout=2)
+
+        with pytest.raises(asyncio.TimeoutError):
+            await client.open_commissioning_window(
+                56, duration=300, timeout=0.02, context="share window for node 0x38")
+
+        mid = fake.sent[-1][protocol.KEY_MESSAGE_ID]
+        await fake.push_frame({"message_id": mid, "result": COMMISSIONING_WINDOW_RESULT})
+        for _ in range(50):
+            if seen:
+                break
+            await asyncio.sleep(0.01)
+
+        assert len(seen) == 1
+        late = seen[0]
+        assert late.context == "share window for node 0x38"
+        assert late.result == COMMISSIONING_WINDOW_RESULT
+        assert late.error is None
+
+        await client.close()
+        task.cancel()
+    run(scenario())
+
+
+@pytest.mark.parametrize("code", [3, "3", "03"])
+def test_open_commissioning_window_surfaces_a_protocol_error_with_code_intact(mock_logger, code):
+    # error_responder (fakes.py) — proving a wire error frame reaches the
+    # caller as a ProtocolError with .code exactly as the wire sent it, in
+    # every shape that code can arrive in: a plain int, a plain string, and
+    # a zero-padded string (issue #210 review #2c/#3 — the wire-code
+    # coercion bug that made "03" unreadable as NodeNotReady).
+    async def scenario():
+        fake = FakeWebSocket(responder=error_responder(protocol.CMD_OPEN_WINDOW, code, "not ready"))
+        client = _client(mock_logger, fake)
+        task = asyncio.create_task(client.run())
+        await client.wait_connected(timeout=2)
+
+        with pytest.raises(protocol.ProtocolError) as exc_info:
+            await client.open_commissioning_window(56, duration=300)
+        assert exc_info.value.code == code
+        assert protocol.is_node_unreachable(exc_info.value)
+
+        await client.close()
+        task.cancel()
+    run(scenario())

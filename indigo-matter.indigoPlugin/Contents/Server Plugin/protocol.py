@@ -72,15 +72,22 @@ CMD_DEVICE = "device_command"            # invoke a cluster command
 CMD_START_LISTENING = "start_listening"
 CMD_SET_FABRIC_LABEL = "set_default_fabric_label"  # persists + pushes UpdateFabricLabel to nodes
 
-# matter-server's ServerErrorCode.NodeNotExists. VERIFIED against ws-controller 1.2.2
+# matter-server's ServerErrorCode. VERIFIED against ws-controller 1.2.2
 # (@matter-server/ws-controller/dist/esm/types/WebSocketMessageTypes.js: UnknownError 0,
 # NodeCommissionFailed 1, NodeInterviewFailed 2, NodeNotReady 3, NodeNotResolving 4,
 # NodeNotExists 5, VersionMismatch 6, SDKStackError 7, InvalidArguments 8,
 # InvalidCommand 9, UpdateCheckError 10, UpdateError 11, IcdMultiAdmin 100).
-# Only this one is named because only this one changes a decision: for remove_node,
-# "the node is not in the fabric" is the DESIRED END STATE of a decommission, not a
-# failure — see HttpApiMixin._decommission.
+# Named codes are the ones that change a decision — everything else is handled
+# generically. ERR_NODE_NOT_EXISTS: for remove_node, "the node is not in the
+# fabric" is the DESIRED END STATE of a decommission, not a failure — see
+# HttpApiMixin._decommission. ERR_NODE_NOT_READY/ERR_NODE_NOT_RESOLVING (issue
+# #210): opening a commissioning window on a node matter-server cannot reach
+# gets the same "device unreachable" wording the share menu's own pre-flight
+# ``available`` check gives, rather than the generic "a window may already be
+# open" guess every other refusal code gets.
 ERR_NODE_NOT_EXISTS = 5
+ERR_NODE_NOT_READY = 3
+ERR_NODE_NOT_RESOLVING = 4
 
 # device_command argument keys (the most contested names — see module docstring)
 ARG_NODE_ID = "node_id"
@@ -88,6 +95,31 @@ ARG_ENDPOINT = "endpoint_id"             # IMPLEMENTATION.md used "endpoint"
 ARG_CLUSTER = "cluster_id"               # IMPLEMENTATION.md used "cluster"
 ARG_COMMAND = "command_name"             # IMPLEMENTATION.md used "command"
 ARG_PAYLOAD = "payload"                  # IMPLEMENTATION.md used "args"
+
+# open_commissioning_window's one argument (issue #210). VERIFIED against the
+# pinned matter-server v1.2.2 (@matter-server/ws-controller/src/server/
+# WebSocketControllerHandler.ts): its name on the wire is "timeout", but it is
+# the length of the commissioning window in SECONDS, not an RPC deadline —
+# do not wire this to matter_client.request()'s same-named "timeout" kwarg,
+# which means the opposite thing on the same call. Omitted entirely, the
+# window defaults to 900s (matter.js PairedNode.openEnhancedCommissioningWindow's
+# own default). 1.2.2's handler also accepts iteration/option/discriminator in
+# its arg type, but has them commented out of the destructure, so every window
+# this plugin opens is an Enhanced window — there is no basic-window toggle to
+# build against this version.
+ARG_WINDOW_DURATION = "timeout"
+
+# open_commissioning_window's result keys (issue #210). VERIFIED against the
+# same WebSocketControllerHandler.ts: the reply is snake_case
+# {setup_pin_code, setup_manual_code, setup_qr_code} — NOT the camelCase
+# manualPairingCode/qrPairingCode our own bridge_protocol emits for the
+# OUTBOUND bridge node (a different wire contract we own both ends of; this
+# one we don't). parse_commissioning_window below still falls back to the
+# camelCase names defensively — source-verified is not the same as
+# wire-verified against whatever is actually running.
+KEY_SETUP_PIN = "setup_pin_code"
+KEY_SETUP_MANUAL = "setup_manual_code"
+KEY_SETUP_QR = "setup_qr_code"
 
 # Event names the plugin handles
 EVT_NODE_ADDED = "node_added"
@@ -144,6 +176,74 @@ class MatterWrite:
     value: Any
 
 
+@dataclass
+class CommissioningWindow:
+    """A normalised ``open_commissioning_window`` result (issue #210).
+
+    ``manual_code`` is the only field a caller can rely on — see
+    :func:`parse_commissioning_window`. ``qr_code``/``pin_code`` are whatever
+    the server sent alongside it, or ``None`` if it didn't.
+    """
+    manual_code: str
+    qr_code: Optional[str] = None
+    pin_code: Optional[int] = None
+
+
+def parse_commissioning_window(result: Any) -> CommissioningWindow:
+    """Normalise an ``open_commissioning_window`` result to a
+    :class:`CommissioningWindow`.
+
+    Shaped on :func:`bridge_protocol.parse_commissioning_window` — same idea,
+    different wire contract: that one is OUR OWN bridge node's, camelCase,
+    and requires all three fields; this one is matter-server's, snake_case,
+    and only ``setup_manual_code`` is required. A missing manual code is
+    fatal (there is nothing to hand the user); a missing QR or pin code just
+    means one fewer way to enter it, so those degrade to ``None`` instead of
+    failing the whole share.
+
+    Order: snake_case (verified — see the module header) first, camelCase
+    fallback (defensive — source-verified is not wire-verified), then a
+    :class:`ValueError` naming the raw payload so a shape drift is diagnosable
+    from the log rather than a bare KeyError.
+    """
+    data = result if isinstance(result, dict) else {}
+    manual = data.get(KEY_SETUP_MANUAL)
+    if manual is None:
+        manual = data.get("manualPairingCode")
+    if manual is None:
+        raise ValueError(f"open_commissioning_window result has no manual pairing code: {result!r}")
+    qr = data.get(KEY_SETUP_QR)
+    if qr is None:
+        qr = data.get("qrPairingCode")
+    pin = data.get(KEY_SETUP_PIN)
+    if pin is None:
+        pin = data.get("pinCode")
+    return CommissioningWindow(
+        manual_code=str(manual),
+        qr_code=str(qr) if qr is not None else None,
+        pin_code=opt_int(pin),
+    )
+
+
+def opt_int(value: Any) -> Optional[int]:
+    """``int(value)``, or ``None`` for ``None``/unparseable — the one
+    "optional int" coercion shared across this codebase (this module's own
+    ``pin_code``, ``commission_jobs``' HTTP-request ints, ``matter_model``'s
+    vendor/product ids). Lives here, not any of those, because they already
+    import :mod:`protocol` and this module imports none of them — the
+    dependency-free end of that chain. Not :func:`_to_int`: that one raises
+    on anything it cannot parse (by design — a caller checking a specific
+    error code needs to know parsing failed, not silently get 0 or None) and
+    additionally understands hex strings, which no caller of this one needs.
+    """
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 # node_event MatterNodeEvent object field names (wire-level; rename-firewall)
 EVT_NODE_EVENT_NODE_ID     = "node_id"
 EVT_NODE_EVENT_ENDPOINT_ID = "endpoint_id"
@@ -178,10 +278,23 @@ class ProtocolError(Exception):
 
 
 def _to_int(value: Any) -> int:
-    """Parse an int that may be decimal or a hex string like '0x0006'."""
+    """Parse an int that may be decimal (optionally zero-padded) or a hex
+    string like '0x0006'.
+
+    Plain ``int(str(value))`` is tried first. Going straight to base-0
+    (``int(x, 0)``) — the obvious one-liner — silently mis-parses a
+    zero-padded decimal string: base-0 requires a leading zero to be followed
+    by an "0x"/"0o"/"0b" prefix, so ``int("03", 0)`` RAISES rather than
+    returning 3. Plain ``int("03")`` has no such restriction. Only when the
+    plain parse fails (a hex-formatted string) does this fall back to base-0,
+    which is what actually understands the "0x" prefix.
+    """
     if isinstance(value, int):
         return value
-    return int(str(value), 0)
+    try:
+        return int(str(value))
+    except ValueError:
+        return int(str(value), 0)
 
 
 def is_node_not_exists(exc: Exception) -> bool:
@@ -199,6 +312,26 @@ def is_node_not_exists(exc: Exception) -> bool:
         return False
     try:
         return _to_int(code) == ERR_NODE_NOT_EXISTS
+    except (TypeError, ValueError):
+        return False
+
+
+def is_node_unreachable(exc: Exception) -> bool:
+    """True when matter-server refused a request because the node could not be
+    reached (NodeNotReady / NodeNotResolving) — issue #210's share menu uses
+    this to give the same "device unreachable" wording its own pre-flight
+    ``available`` check gives, rather than the generic guess every other
+    refusal code gets.
+
+    Same coercion discipline as :func:`is_node_not_exists`, for the same
+    reason: anything we cannot read as one of the two named codes is
+    deliberately False rather than a guess either way.
+    """
+    code = getattr(exc, "code", None)
+    if code is None:
+        return False
+    try:
+        return _to_int(code) in (ERR_NODE_NOT_READY, ERR_NODE_NOT_RESOLVING)
     except (TypeError, ValueError):
         return False
 

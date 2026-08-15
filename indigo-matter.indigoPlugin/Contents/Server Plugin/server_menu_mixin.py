@@ -10,16 +10,59 @@ from __future__ import annotations
 import os
 import threading
 from concurrent.futures import CancelledError as FuturesCancelledError
+from concurrent.futures import TimeoutError as FuturesTimeoutError
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 import indigo  # provided by the Indigo runtime
 
 import bridge_agent
 import bridge_client            # bridge_client.rebuild_timeout_for
-from commission_jobs import node_id_to_str
+import protocol
+from commission_jobs import fabric_counts, node_id_to_str
 from http_handlers import MatterUnavailable
-from plugin_constants import FACTORY_RESET_TIMEOUT, NODE_TOMBSTONES_PREF, RECONCILE_TIMEOUT, server_location
+from plugin_constants import (
+    FACTORY_RESET_TIMEOUT,
+    LIST_ERROR_OPTION,
+    NODE_TOMBSTONES_PREF,
+    NO_SELECTION_ID,
+    NO_SELECTION_LABEL,
+    RECONCILE_TIMEOUT,
+    SHARE_WINDOW_TIMEOUT,
+    server_location,
+)
+from protocol import Protocol
 from server_process import ServerProcess
+
+#: Shared "device unreachable" refusal (issue #210), used both by
+#: ``_share_node``'s fast pre-flight (matter-server's cached ``available``
+#: flag) and its ``protocol.is_node_unreachable`` branch (a live refusal from
+#: the open_commissioning_window call itself) — same cause, same wording.
+#: "currently" and the parenthetical acknowledge what the picker's own
+#: docstring says: this flag can lag a device that just woke up, so the fast
+#: refusal is a good bet, not a certainty.
+_UNREACHABLE_MESSAGE = (
+    "matter-server currently reports this device as unreachable — wake it or power it "
+    "on and try again in a moment (the report can lag a device that just woke). "
+    "Nothing was changed."
+)
+
+
+@dataclass(frozen=True)
+class ShareWindowRequest:
+    """The context :meth:`ServerMenuMixin._share_node` hands the transport for
+    its ``open_commissioning_window`` RPC (issue #210) — both the correlation
+    key a LATE response (``ws_json_client.LateResponse.context``) is matched
+    back to this share attempt with, and the human-readable note an
+    un-awaited request's log line shows. Mirrors ``commission_jobs.
+    CommissionRequest``'s #23 role for the commission RPC.
+    """
+    node_id: int
+    duration: int
+
+    def __str__(self) -> str:
+        return f"share window for node {node_id_to_str(self.node_id)}"
 
 
 class ServerMenuMixin:
@@ -49,6 +92,7 @@ class ServerMenuMixin:
     jobs: Any
     device_sync: Any
     runtime: Any
+    matter: Any     # read here too — menuShareMatterNode/_share_node (issue #210)
     pluginPrefs: Any
     logger: Any
 
@@ -346,6 +390,305 @@ class ServerMenuMixin:
                           "in matter-server and will reappear at the next reconcile (plugin restart "
                           "or reconnect). Retry once the device is powered and reachable.")
         return (False, valuesDict, errors)
+
+    # ------------------------------------------------------------------
+    # Share a Matter device with another ecosystem (issue #210)
+    # ------------------------------------------------------------------
+    def getShareableNodes(self, filter="", valuesDict=None, typeId="", targetId=0):  # noqa: N802, A002, ARG002
+        """Node picker for "Share a Matter device with another ecosystem…".
+
+        Every commissioned node is eligible — the Indigo fabric holds
+        Administer on all of them, unlike an export role picker there is no
+        capability gate to apply here. An offline device is NOT filtered out:
+        matter-server's ``available`` flag can be stale by the time the
+        dialog opens, and Execute is where that gets caught for real (fast,
+        before the expensive call).
+
+        Leads with a real, unpickable "select a device" row
+        (:data:`~plugin_constants.NO_SELECTION_LABEL`) when there is
+        something to pick — Indigo pre-selects row one, and Execute here
+        opens a live commissioning window on whatever ends up selected, the
+        same reasoning ``PairingMenuMixin.getBridgeFabrics`` gives its own
+        leading row (pairing_menu_mixin.py:203-208). NEVER a WS call in a
+        picker — this runs on the Indigo UI thread while the dialog is being
+        drawn (pairing_menu_mixin.py:196-202); ``device_sync.list_nodes()``
+        is a local reconciliation-state read, not a round trip.
+
+        The row-building loop is INSIDE the same try as the ``list_nodes()``
+        call: a malformed entry (e.g. ``node_id_to_str`` choking on a bad id)
+        used to raise past the try/except and take the whole dialog down with
+        it — degrading to :data:`~plugin_constants.LIST_ERROR_OPTION` is the
+        same contract every other picker in this file already gives a bad row.
+        """
+        if self.device_sync is None:
+            # Distinct from "zero nodes": a picker rendered before startup
+            # finished has no way to know whether anything is commissioned.
+            return [(NO_SELECTION_ID, "(plugin still starting)")]
+        try:
+            nodes = list(self.device_sync.list_nodes())
+            if not nodes:
+                return [(NO_SELECTION_ID, "(no Matter devices — none commissioned yet)")]
+            options = [(NO_SELECTION_ID, NO_SELECTION_LABEL)]
+            options.extend(
+                (str(node_id), f"{', '.join(names) if names else '(no Indigo devices)'} "
+                              f"— node {node_id_to_str(node_id)}")
+                for node_id, names in nodes
+            )
+            return options
+        except Exception as exc:  # noqa: BLE001 - never break the dialog; degrade to an error row
+            self.logger.exception(exc)
+            return [LIST_ERROR_OPTION]
+
+    def menuShareMatterNode(self, valuesDict, menuId=""):  # noqa: N802, ARG002
+        """Open a commissioning window on an ALREADY-commissioned node so a
+        second ecosystem (Apple Home, Alexa, Google, Home Assistant, …) can
+        add it too (issue #210) — the reverse of the share model
+        ``matter_client.commission_with_code``'s docstring describes: there,
+        another ecosystem holds admin 1 and Indigo joins as admin 2 over IP;
+        here, Indigo already holds admin 1 (it commissioned this node itself)
+        and this menu opens the window that lets a second controller join
+        without displacing it. Same multi-admin machinery Matter itself
+        provides either way.
+
+        **Why the event log, again.** Indigo dialogs have no dynamic labels,
+        so the code this call derives cannot be shown in the dialog that
+        produced it — the same constraint ``menuPairMatterBridge`` documents
+        for the export bridge's own pairing codes.
+
+        **Why there is no "is a window already open" pre-check.**
+        matter-server 1.2.2 has no command to ask, and no way to re-read a
+        code once issued — a lost code is unrecoverable, which is why every
+        refusal path below says so rather than implying a retry is free.
+        """
+        errors = indigo.Dict()
+        if self.runtime is None or self.matter is None:
+            self.logger.warning("share requested before the plugin finished starting")
+            errors["node"] = "Plugin still starting — try again in a moment."
+            return (False, valuesDict, errors)
+        selected = str(valuesDict.get("node", "") or "")
+        if not selected or selected == NO_SELECTION_ID:
+            errors["node"] = "Select a device to share."
+            return (False, valuesDict, errors)
+        try:
+            node_id = int(selected)
+        except (TypeError, ValueError):
+            errors["node"] = "Invalid selection."
+            return (False, valuesDict, errors)
+        # pylint: disable=no-member  # PairingMenuMixin._window_duration via MRO (issue #146)
+        duration = self._window_duration(valuesDict, errors)
+        # pylint: enable=no-member
+        if duration is None:
+            return (False, valuesDict, errors)
+        ok, message = self._share_node(node_id, duration)
+        if not ok:
+            errors["node"] = message
+            return (False, valuesDict, errors)
+        return (True, valuesDict)
+
+    def _share_node(self, node_id: int, duration: int) -> tuple[bool, str]:  # pylint: disable=too-many-return-statements
+        """Do the actual share: fetch, refuse fast if unreachable, warn (never
+        block) on tight fabric capacity, open the window, log the codes.
+
+        Each early return below is a distinct, named refusal from the §5
+        error-path table (issue #210 plan) — collapsing them into fewer exits
+        would blur exactly the distinctions that table exists to keep separate.
+
+        Shared core for :meth:`menuShareMatterNode` and ``Plugin.
+        actionShareMatterNode`` (the device-action twin, issue #210) — the
+        seam a future Domio "share this device" endpoint would also call.
+
+        Returns ``(True, "")`` on success — the codes are already in the
+        event log by the time this returns — or ``(False, message)`` where
+        ``message`` is short enough for a dialog error field; the log carries
+        the rest.
+        """
+        try:
+            node = self._fetch_node(node_id)  # pylint: disable=no-member  # DiagnosticsMenuMixin (issue #146)
+        except Exception as exc:  # noqa: BLE001 - _fetch_node only ever raises its own
+            # MatterUnavailable (diagnostics_menu_mixin.py), caught by base class here
+            # rather than importing that mixin's exception type — a mixin importing a
+            # sibling mixin's name is exactly the back-import issue #146 removed
+            # (see diagnostics_menu_mixin.MatterUnavailable's own docstring).
+            if type(exc).__name__ == "MatterUnavailable":
+                self.logger.debug("share: node %s fetch unavailable — %s",
+                                  node_id_to_str(node_id), exc)
+            else:
+                # Anything else escaping _fetch_node is a code bug there, not a
+                # connectivity problem — a traceback is what a bug report needs.
+                self.logger.error("share: node %s fetch raised an unexpected %s — %s",
+                                  node_id_to_str(node_id), type(exc).__name__, exc)
+                self.logger.exception(exc)
+            return False, f"matter-server did not answer — {exc}. Nothing was changed."
+        if node is None:
+            return False, ("matter-server does not know this node — it may have been "
+                          "decommissioned. Reopen this dialog.")
+        if not node.available:
+            # Refuse FAST, before the expensive open_commissioning_window call:
+            # matter-server's own ``available`` flag already answered the
+            # question a timeout would otherwise spend up to a minute finding out.
+            # Acknowledged rather than treated as certain — the picker's own
+            # docstring argues this same flag can be stale, and Execute must
+            # not contradict that while still taking the fast, cheap exit.
+            return False, _UNREACHABLE_MESSAGE
+
+        fabric_line = self._fabric_warning_line(node, node_id)
+
+        try:
+            window = self.runtime.submit(
+                self.matter.open_commissioning_window(
+                    node_id, duration=duration, context=ShareWindowRequest(node_id, duration))
+            ).result(timeout=SHARE_WINDOW_TIMEOUT)
+        except FuturesTimeoutError:
+            self.logger.warning(
+                "share: node %s — matter-server did not answer opening a commissioning "
+                "window within %.0fs", node_id_to_str(node_id), SHARE_WINDOW_TIMEOUT)
+            return False, ("matter-server did not answer in time. A window may still have "
+                          "opened; if it did, its code is lost — wait for it to expire "
+                          "before retrying.")
+        except (ConnectionError, RuntimeError) as exc:
+            self.logger.warning("share: node %s — not connected to matter-server (%s)",
+                               node_id_to_str(node_id), exc)
+            return False, "Not connected to matter-server — see the log."
+        except protocol.ProtocolError as exc:
+            self.logger.warning(
+                "share: node %s — matter-server refused opening a commissioning window "
+                "(code %s: %s)", node_id_to_str(node_id), exc.code, exc.details)
+            if protocol.is_node_not_exists(exc):
+                return False, ("matter-server does not know this node — it may have been "
+                              "decommissioned. Reopen this dialog.")
+            if protocol.is_node_unreachable(exc):
+                return False, _UNREACHABLE_MESSAGE
+            # Codes 8/9/100 (InvalidArguments/InvalidCommand/IcdMultiAdmin) and every
+            # other unnamed one land here too — the same code protocol.py's own error
+            # table says is not reliably distinguishable from "a window is already
+            # open" (0 UnknownError, 7 SDKStackError), so the message hedges rather
+            # than asserting a single cause for what could be up to ~10 different ones.
+            return False, (
+                f"matter-server refused this (error {exc.code}) — a window may already be "
+                "open on this device; wait up to 15 minutes and try again. The previous "
+                "window's code cannot be recovered. See the log.")
+        except Exception as exc:  # noqa: BLE001
+            self.logger.error("share: opening a commissioning window on node %s FAILED — %s",
+                              node_id_to_str(node_id), exc)
+            self.logger.exception(exc)
+            return False, f"Opening a sharing window failed — {exc}. See the log."
+
+        try:
+            codes = protocol.parse_commissioning_window(window)
+        except ValueError as exc:
+            self.logger.error(
+                "share: node %s's open_commissioning_window result had an unexpected shape "
+                "(%s) — raw payload: %r", node_id_to_str(node_id), exc, window)
+            return False, ("matter-server's answer had an unexpected shape — see the log. A "
+                          "window may have opened anyway, but its code is lost.")
+
+        self._log_node_share_codes(node_id, codes, duration, fabric_line)
+        return True, ""
+
+    def _fabric_warning_line(self, node, node_id) -> str:
+        """§3.2-style fabric-capacity line for the share log (issue #210).
+
+        Never blocking — only a warning when free slots would drop below 2,
+        because an Apple Home pairing alone uses two (Apple Home + Apple
+        Keychain, docs/MATTER.md). Reconstructed from the already-fetched
+        :class:`~matter_model.NodeInfo` rather than a second ``get_node`` round
+        trip — ``commission_jobs.fabric_counts`` reads the raw wire attribute
+        shape, so its keys are rebuilt from ``node.attributes`` (already
+        parsed) via :meth:`Protocol.attr_key`.
+        """
+        raw_attrs = {Protocol.attr_key(ep, cl, attr): value
+                    for (ep, cl, attr), value in node.attributes.items()}
+        supported, commissioned = fabric_counts({"attributes": raw_attrs})
+        if supported is None or commissioned is None:
+            return "fabric slot count unavailable (older firmware, or a partial read)"
+        free = supported - commissioned
+        line = f"{free} of {supported} fabric slot(s) free before this share"
+        if free < 2:
+            self.logger.warning(
+                "share: node %s has only %d of %d fabric slot(s) free — an Apple Home "
+                "pairing alone uses TWO (Apple Home + Apple Keychain, docs/MATTER.md), so "
+                "this may be the last ecosystem that fits. Proceeding anyway.",
+                node_id_to_str(node_id), free, supported)
+        return line
+
+    def _log_node_share_codes(self, node_id, window, duration: int, fabric_line: str,
+                              *, prefix: str = "") -> None:
+        """Write the share codes to the event log — the node-flavoured sibling
+        of :meth:`PairingMenuMixin._log_pairing_codes` (pairing_menu_mixin.py:
+        153-173), same reasoning (no dynamic dialog labels), adapted rather
+        than copied: this is one node the Indigo fabric already administers,
+        not the whole exported bridge, and matter-server reports no expiry
+        timestamp the way the export bridge's own node does — the expiry
+        below is computed from ``duration``, not read, hence "approximately".
+
+        ``prefix`` (issue #210's late-answer path,
+        :meth:`_note_late_share_response`) escalates this to a WARNING and
+        prepends the given text — a late answer means the caller has ALREADY
+        told the user the code was lost, which deserves more visibility than
+        the ordinary info-level confirmation.
+        """
+        expires = (datetime.now(timezone.utc) + timedelta(seconds=duration)).strftime("%Y-%m-%d %H:%M UTC")
+        log = self.logger.warning if prefix else self.logger.info
+        log(
+            "%sMatter share — a %ds commissioning window is now open on node %s.\n"
+            "    Manual pairing code: %s\n"
+            "    QR payload: %s\n"
+            "    Expires approximately %s (matter-server does not report an exact expiry).\n"
+            "    %s.\n"
+            "Add it in your ecosystem's app as you would any Matter accessory. A certified "
+            "retail device should be accepted without warnings; if the ecosystem shows an "
+            "'uncertified accessory' prompt, the device's own attestation is non-production "
+            "(development hardware) — that prompt is about the device, not about Indigo or "
+            "this share.\n"
+            "SECURITY: while this window is open, this passcode grants administrator access "
+            "to a device you own — anyone who can read this code can add it to THEIR Apple "
+            "Home, Alexa or Google account. Do not share it beyond the ecosystem you intend "
+            "to add.",
+            prefix, duration, node_id_to_str(node_id), window.manual_code, window.qr_code or "(none)",
+            expires, fabric_line,
+        )
+
+    def _note_late_share_response(self, late) -> None:
+        """Fold a late matter-server answer to an ``open_commissioning_window``
+        RPC this plugin already gave up waiting on (issue #210) — the share
+        counterpart of ``commission_jobs.CommissionJobs.note_late_response``'s
+        #23 handling of the commission RPC. ``late`` is a
+        ``ws_json_client.LateResponse``, delivered to every ``on_late_response``
+        consumer (``Plugin._on_late_matter_response``); ``late.context`` names
+        this as ours only when it is our own :class:`ShareWindowRequest`.
+
+        Without this, matter-server answering after
+        ``matter_client.SHARE_WINDOW_RPC_TIMEOUT`` (a sleepy Thread device)
+        meant the code carrying the ONLY chance to share that device was
+        silently dropped into ``WsJsonClient._log_unmatched``'s payload-free
+        DEBUG line — the dialog had already told the user the code was lost,
+        so there was nowhere else for it to land.
+
+        A late ERROR is logged at INFO, not WARNING: it confirms no window
+        opened, which is a relief, not a fresh problem — the WARNING already
+        fired (or is about to, on the RPC-timeout path) is enough.
+        """
+        if not isinstance(late.context, ShareWindowRequest):
+            return
+        node_id = late.context.node_id
+        if late.error is not None:
+            code, details = late.error
+            self.logger.info(
+                "share: matter-server's late answer for node %s is a refusal — no window "
+                "opened; code %r (%s)", node_id_to_str(node_id), code, details)
+            return
+        try:
+            codes = protocol.parse_commissioning_window(late.result)
+        except ValueError as exc:
+            self.logger.error(
+                "share: node %s's late open_commissioning_window answer had an unexpected "
+                "shape (%s) — raw payload: %r", node_id_to_str(node_id), exc, late.result)
+            return
+        self._log_node_share_codes(
+            node_id, codes, late.context.duration,
+            "(fabric slot count not re-checked for a late answer)",
+            prefix="matter-server answered late — the window DID open after all; codes "
+                  "follow. ")
 
     # ------------------------------------------------------------------
     # Export-bridge recovery menus (BRIDGE_PROTOCOL §3.10/§3.11)
