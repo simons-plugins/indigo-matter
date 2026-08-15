@@ -221,11 +221,21 @@ def parse_commissioning_window(result: Any) -> CommissioningWindow:
     return CommissioningWindow(
         manual_code=str(manual),
         qr_code=str(qr) if qr is not None else None,
-        pin_code=_opt_pin(pin),
+        pin_code=opt_int(pin),
     )
 
 
-def _opt_pin(value: Any) -> Optional[int]:
+def opt_int(value: Any) -> Optional[int]:
+    """``int(value)``, or ``None`` for ``None``/unparseable — the one
+    "optional int" coercion shared across this codebase (this module's own
+    ``pin_code``, ``commission_jobs``' HTTP-request ints, ``matter_model``'s
+    vendor/product ids). Lives here, not any of those, because they already
+    import :mod:`protocol` and this module imports none of them — the
+    dependency-free end of that chain. Not :func:`_to_int`: that one raises
+    on anything it cannot parse (by design — a caller checking a specific
+    error code needs to know parsing failed, not silently get 0 or None) and
+    additionally understands hex strings, which no caller of this one needs.
+    """
     if value is None:
         return None
     try:

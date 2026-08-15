@@ -25,7 +25,7 @@ from typing import Any, Awaitable, Callable, Optional
 
 from matter_client import COMMISSION_TIMEOUT
 from matter_model import node_id_to_str  # noqa: F401 - canonical home; re-exported for callers
-from protocol import Protocol, ProtocolError
+from protocol import Protocol, ProtocolError, opt_int
 
 
 class JobStatus(str, Enum):
@@ -336,9 +336,9 @@ class CommissionJobs:
                 setup_code=setup_code,
                 suggested_name=name,
                 suggested_room=(params.get("suggestedRoom") or None),
-                discriminator=_opt_int(params.get("discriminator")),
+                discriminator=opt_int(params.get("discriminator")),
                 domio_node_id=(params.get("domioNodeId") or None),
-                expected_fabric_slots=_opt_int(params.get("expectedFabricSlots")),
+                expected_fabric_slots=opt_int(params.get("expectedFabricSlots")),
                 started_at=self._clock(),
             )
             self._jobs[job.job_id] = job
@@ -669,7 +669,7 @@ class CommissionJobs:
                     f"plugin stopped waiting: {details}"
                 ),
             }
-            matter_error_code = _opt_int(code)
+            matter_error_code = opt_int(code)
             if matter_error_code is not None:
                 new_error["matterErrorCode"] = matter_error_code
             job.error = new_error
@@ -795,7 +795,7 @@ class CommissionJobs:
             # PASE/CASE failure, …) — a device/commissioning failure, not a plugin
             # bug, so report it as such rather than internal_error.
             await self._fail(job, "commissioning_failed", str(exc), node_id,
-                             _opt_int(getattr(exc, "code", None)))
+                             opt_int(getattr(exc, "code", None)))
         except Exception as exc:  # noqa: BLE001 - last-resort, mapped to internal_error
             self.logger.exception(exc)
             await self._fail(job, "internal_error", _exc_message(exc), node_id)
@@ -1113,12 +1113,3 @@ class CommissionJobs:
             job = self._jobs.pop(jid)
             if self._by_code.get(job.setup_code) == jid:
                 self._by_code.pop(job.setup_code, None)
-
-
-def _opt_int(value: Any) -> Optional[int]:
-    if value is None or value == "":
-        return None
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None

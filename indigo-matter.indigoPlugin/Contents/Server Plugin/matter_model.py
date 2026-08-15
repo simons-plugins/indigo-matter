@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-from protocol import Protocol
+from protocol import Protocol, opt_int
 
 def node_id_to_str(node_id: Any) -> str:
     """Represent a Matter node id as the hex string the API uses.
@@ -125,8 +125,8 @@ def parse_node(raw: dict, suggested_name: str = "") -> NodeInfo:
     return NodeInfo(
         node_id=int(raw.get("node_id")),
         suggested_name=suggested_name,
-        vendor_id=_opt_int(basic(_ATTR_VENDOR_ID)),
-        product_id=_opt_int(basic(_ATTR_PRODUCT_ID)),
+        vendor_id=opt_int(basic(_ATTR_VENDOR_ID)),
+        product_id=opt_int(basic(_ATTR_PRODUCT_ID)),
         vendor_name=str(basic(_ATTR_VENDOR_NAME, "") or ""),
         product_name=str(basic(_ATTR_PRODUCT_NAME, "") or ""),
         sw_version=str(basic(_ATTR_SW_VERSION_STRING, "") or ""),
@@ -165,12 +165,3 @@ def _device_types(attrs: dict, endpoint_id: int) -> tuple[int, ...]:
         if isinstance(entry, dict) and entry.get("0") is not None:
             out.append(int(entry["0"]))
     return tuple(out)
-
-
-def _opt_int(value: Any) -> Optional[int]:
-    if value is None:
-        return None
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None

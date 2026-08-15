@@ -253,6 +253,24 @@ def test_to_int_still_understands_hex_strings():
 
 
 # ---------------------------------------------------------------------------
+# opt_int — the one "optional int" coercion shared across the codebase
+# (protocol.py's own pin_code, commission_jobs' HTTP-request ints,
+# matter_model's vendor/product ids) — issue #210 review item 8.
+# ---------------------------------------------------------------------------
+
+def test_opt_int_parses_a_valid_value():
+    assert protocol.opt_int("42") == 42
+    assert protocol.opt_int(42) == 42
+
+
+def test_opt_int_is_none_for_none_or_unparseable():
+    assert protocol.opt_int(None) is None
+    assert protocol.opt_int("") is None
+    assert protocol.opt_int("not a number") is None
+    assert protocol.opt_int([1, 2]) is None
+
+
+# ---------------------------------------------------------------------------
 # is_node_unreachable — NodeNotReady(3)/NodeNotResolving(4) (issue #210)
 # ---------------------------------------------------------------------------
 
