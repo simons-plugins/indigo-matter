@@ -497,6 +497,10 @@ version 2** since bridge-node 0.6.0:
   — an old build reads a file that has it exactly as it would without it,
   because every reader here reaches a field by name rather than validating the
   object as a whole, so the extra key is inert rather than a parse failure.
+- `orphaned` — issue #219, since bridge-node 0.8.1, present (`true`) and absent
+  otherwise, never `false`. Set by an un-export (see "Un-exporting" below);
+  cleared the moment the same `UniqueID` is live again. Same inert-extra-key
+  compatibility as `numberVoid`, so this stays schema version 2 too.
 
 **Version 1 files are read, migrated in place, and never treated as corrupt.**
 A v1 entry is a bare number; it keeps that number, is simply not restorable
@@ -535,18 +539,26 @@ subscribed to see any of it, and the alternative (deferring the restore until
 after the refusal decision) reopens the online-and-empty window for every
 healthy start, which is the bug itself.
 
-**Un-exporting clears an entry's restoration half.** When a reconcile or a
-`remove_endpoint` actually takes an endpoint away, its `role` and `label` are
-dropped from the map while its `number` is kept. Without that, `check`'s
-add-and-refresh-only behaviour left an un-exported device restorable for ever:
-it was rebuilt before every `server.start()` and removed again by the next
-attach — the same appear-then-vanish churn, aimed at devices the user had
-already removed — and each ghost also cost a removal-pacing slot on every
-attach. Keeping the number is §3.3's retained allocation, so a re-export returns
-the *same* accessory rather than a new one. Only a measured removal clears an
-entry: absence from the live set proves nothing (a node that never attached has
-an empty one), so a factory reset, a seed and an entry this build cannot rebuild
-all leave the map alone.
+**Un-exporting marks an entry orphaned, and (since issue #219) keeps its
+restoration half.** When a reconcile or a `remove_endpoint` actually takes an
+endpoint away, its entry is marked `orphaned` (see above) while `role`,
+`label` **and** `number` are all kept. Before #219, `role`/`label` were
+dropped instead — which also excluded the entry from restore-on-start, but
+threw away the only evidence a future re-adopt UI could match a *recreated*
+device (a factory-reset accessory that comes back with a new `UniqueID`)
+against the endpoint it used to occupy. Without either mechanism, `check`'s
+add-and-refresh-only behaviour would leave an un-exported device restorable
+for ever: it would be rebuilt before every `server.start()` and removed again
+by the next attach — the same appear-then-vanish churn, aimed at devices the
+user had already removed — and each ghost would also cost a removal-pacing
+slot on every attach. Keeping the number is §3.3's retained allocation, so a
+re-export returns the *same* accessory rather than a new one; keeping
+`role`/`label` costs nothing extra, since `orphaned` alone already keeps the
+entry out of restore-on-start. `orphaned` is cleared the moment the same
+`UniqueID` is live again, so a plain re-export is unaffected. Only a measured
+removal marks an entry: absence from the live set proves nothing (a node that
+never attached has an empty one), so a factory reset, a seed and an entry this
+build cannot rebuild all leave the map alone.
 
 `drift` is populated by every operation that can change the live endpoint set —
 `attach`/`reconcile`, `upsert_endpoint` and `remove_endpoint` — and **on the

@@ -459,7 +459,7 @@ describe("issue #141 meets the §3.1 mass-removal guard", () => {
 });
 
 describe("issue #141: an un-exported device stops being restored", () => {
-    it("clears its role/label on removal, keeps its number, and never comes back", async () => {
+    it("marks its entry orphaned on removal, keeps its number AND role/label, and never comes back", async () => {
         // ⊗ THE ghost. `check` only ever adds and refreshes, so once v2 recorded
         // a role and label an entry stayed restorable FOR EVER — including for a
         // device the user deliberately un-exported. Every boot rebuilt it as a
@@ -469,6 +469,10 @@ describe("issue #141: an un-exported device stops being restored", () => {
         // regression of XAC7's "un-exported accessories are gone". Delete the
         // `forgetRemoved` call in `node.reconcile` and the third boot below
         // restores 2 and the attach removes one of them again.
+        //
+        // Since issue #219, `forget` keeps role/label (re-adopt evidence for a
+        // future recreated-device UI) rather than deleting them — `orphaned` is
+        // what now keeps the entry out of `restorable`.
         const storagePath = storage();
         const numbers = await seedTwoAccessories(storagePath);
 
@@ -483,9 +487,10 @@ describe("issue #141: an un-exported device stops being restored", () => {
         const afterRemoval = readMap(storagePath);
         assert.deepEqual(
             afterRemoval.endpoints[uniqueIdFor(LOUNGE)],
-            { number: numbers[LOUNGE] },
-            "the number survives (§3.3) so a re-export returns the SAME accessory, " +
-                "but nothing is left to rebuild it from",
+            { number: numbers[LOUNGE], role: "dimmableLight", label: "Lounge Lamp", orphaned: true },
+            "the number AND role/label survive (§3.3, #219) so a re-export returns the SAME " +
+                "accessory and the entry remains re-adopt evidence, but `orphaned` keeps it " +
+                "out of the pre-attach rebuild",
         );
         assert.deepEqual(
             afterRemoval.endpoints[uniqueIdFor(KITCHEN)],
@@ -555,7 +560,12 @@ describe("issue #141: an un-exported device stops being restored", () => {
             await session.close();
         }
 
-        assert.deepEqual(readMap(storagePath).endpoints[uniqueIdFor(LOUNGE)], { number: numbers[LOUNGE] });
+        assert.deepEqual(readMap(storagePath).endpoints[uniqueIdFor(LOUNGE)], {
+            number: numbers[LOUNGE],
+            role: "dimmableLight",
+            label: "Lounge Lamp",
+            orphaned: true,
+        });
     });
 
     it("forgets only what it watched go, never merely what is absent", async () => {

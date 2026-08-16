@@ -185,6 +185,19 @@ export interface EndpointRecord {
      * version note below, which is why this stays version 2.
      */
     numberVoid?: true;
+    /**
+     * Set by {@link EndpointMapStore.forget} (issue #219, this half only —
+     * the re-adopt UI itself lands separately): the device was un-exported,
+     * so the entry must not be rebuilt by {@link restorable} — but unlike the
+     * pre-#219 behaviour, `role`/`label` are KEPT rather than deleted, because
+     * they are the only evidence a future re-adopt UI could match a recreated
+     * device against. Cleared the moment {@link check} sees the same
+     * `UniqueID` live again (`noteRestorable`) — a live device is by
+     * definition not orphaned, and re-exporting the same accessory must not
+     * leave it permanently excluded from the next boot's pre-seeding. Absent
+     * on every ordinary entry, same convention as `numberVoid`.
+     */
+    orphaned?: true;
 }
 
 /** The on-disk shape (v2). */
@@ -269,6 +282,10 @@ function readRecord(value: unknown): EndpointRecord | undefined {
     // simply not a void marker, rather than a reason to reject the entry.
     if (candidate.numberVoid === true) {
         record.numberVoid = true;
+    }
+    // Same tolerance, same reason: an old-format record simply lacks it.
+    if (candidate.orphaned === true) {
+        record.orphaned = true;
     }
     return record;
 }
@@ -371,6 +388,13 @@ function recordFor(entry: LiveEndpointNumber): EndpointRecord {
  * would strip a perfectly good entry of the very fields that make it
  * restorable. Returns whether anything changed, so a steady state still costs
  * no disk write.
+ *
+ * **Also un-orphans (issue #219).** `entry` being here at all means the
+ * `UniqueID` is live right now, which a {@link EndpointMapStore.forget}en
+ * entry — by definition, no longer live at the moment it was forgotten — is
+ * not. A re-export must not stay permanently excluded from the next boot's
+ * {@link EndpointMapStore.restorable} pre-seeding just because it was once
+ * un-exported.
  */
 function noteRestorable(record: EndpointRecord, entry: LiveEndpointNumber): boolean {
     let changed = false;
@@ -380,6 +404,10 @@ function noteRestorable(record: EndpointRecord, entry: LiveEndpointNumber): bool
     }
     if (entry.label !== undefined && record.label !== entry.label) {
         record.label = entry.label;
+        changed = true;
+    }
+    if (record.orphaned) {
+        delete record.orphaned;
         changed = true;
     }
     return changed;
@@ -528,11 +556,17 @@ export class EndpointMapStore {
      * check} that follows `server.start()` is what reconciles the map to
      * whatever number came back. Excluding void entries here would only widen
      * the online-and-empty window issue #141 already closed, for no benefit.
+     *
+     * **`orphaned` IS part of this filter (issue #219).** A {@link forget}en
+     * entry now keeps its `role`/`label` as re-adopt evidence rather than
+     * losing them, so the orphan marker is what still keeps it out of the
+     * pre-attach rebuild — exactly the churn {@link forget}'s own doc comment
+     * exists to prevent, unaffected by role/label now surviving alongside it.
      */
     restorable(): RestorableEndpoint[] {
         const restorable: RestorableEndpoint[] = [];
         for (const [uniqueId, record] of this.#endpoints) {
-            if (record.role === undefined || record.label === undefined) {
+            if (record.role === undefined || record.label === undefined || record.orphaned) {
                 continue;
             }
             restorable.push({
@@ -546,7 +580,7 @@ export class EndpointMapStore {
     }
 
     /**
-     * A device was **un-exported**: keep its number, drop what would rebuild it.
+     * A device was **un-exported**: keep its number AND its role/label, mark it orphaned.
      *
      * The other half of {@link restorable}, and without it the restore is a bug
      * rather than a fix. `check` only ever *adds* and *refreshes*, so once an
@@ -558,13 +592,18 @@ export class EndpointMapStore {
      * devices the user had already told us to stop exporting, and it regresses
      * XAC7's "un-exported accessories are gone".
      *
-     * **The number stays.** §3.3 retains the allocation on purpose, so re-adding
-     * the same device gets the same endpoint number back and paired ecosystems
-     * see the accessory they already know rather than a new one. Deleting the
-     * entry outright would throw that away to save three fields. Clearing only
-     * the restoration half makes the entry non-restorable — {@link restorable}
-     * filters on `role` **and** `label` — while leaving the identity intact, and
-     * one re-export refills it through the ordinary {@link check}.
+     * **The number AND the role/label stay (issue #219).** §3.3 already retained
+     * the number on purpose, so re-adding the same device gets the same endpoint
+     * number back and paired ecosystems see the accessory they already know
+     * rather than a new one. Deleting `role`/`label` too — the pre-#219
+     * behaviour — threw away the only evidence a future re-adopt UI could match
+     * a *recreated* device (a factory-reset accessory that comes back with a new
+     * `UniqueID`) against the endpoint it used to occupy. Instead the entry is
+     * marked {@link EndpointRecord.orphaned}, which is what keeps it out of
+     * {@link restorable}'s pre-attach rebuild — the actual thing #141 needed —
+     * without destroying anything. `check`'s `noteRestorable` clears the marker
+     * the moment the same `UniqueID` is live again, so a plain re-export is
+     * unaffected.
      *
      * **Only a caller that watched a specific endpoint go may call this.** An
      * empty live set is not evidence of anything: a node that has never attached
@@ -575,24 +614,28 @@ export class EndpointMapStore {
      * caller: `erase()` wipes matter.js's endpoints, but the user un-exported
      * nothing and the plugin's re-attach re-creates the same set.
      *
-     * Returns how many entries actually lost something, so a no-op costs no
-     * disk write.
+     * Returns how many entries were newly marked orphaned, so a no-op — no
+     * record at all, already orphaned, or nothing worth protecting because the
+     * entry never carried a `role`/`label` to begin with — costs no disk write.
      */
     forget(uniqueIds: readonly string[]): number {
         let forgotten = 0;
         for (const uniqueId of uniqueIds) {
             const record = this.#endpoints.get(uniqueId);
-            if (record === undefined || (record.role === undefined && record.label === undefined)) {
+            if (
+                record === undefined ||
+                record.orphaned ||
+                (record.role === undefined && record.label === undefined)
+            ) {
                 continue;
             }
-            delete record.role;
-            delete record.label;
+            record.orphaned = true;
             forgotten += 1;
         }
         if (forgotten > 0) {
             this.persist(
-                `cleared the role/label of ${forgotten} un-exported endpoint(s), keeping their ` +
-                    "numbers so a re-export returns the same accessory",
+                `marked ${forgotten} un-exported endpoint(s) orphaned, keeping their role/label ` +
+                    "as re-adopt evidence and their numbers so a re-export returns the same accessory",
             );
         }
         return forgotten;
