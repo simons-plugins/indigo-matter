@@ -22,6 +22,7 @@ names are isolated in ``protocol.py``.
 """
 from __future__ import annotations
 
+import os
 import threading
 import time
 from concurrent.futures import TimeoutError as FuturesTimeoutError
@@ -41,6 +42,7 @@ from export_dialog_mixin import ExportDialogMixin
 from export_store import ExportStore
 from http_api_mixin import HttpApiMixin
 from http_handlers import HttpApi
+from launch_agent import STARTUP_GRACE_SECONDS, VERDICT_CONFLICT_FREE, VERDICT_DEAD
 from matter_client import MatterClient
 from matter_handlers.registry import HandlerRegistry
 from matter_handlers.settings import settings_for_type
@@ -751,6 +753,22 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, ServerMenuMixin,
         except a pending post-bootstrap verification, which runs regardless of that
         cadence gate, because #187 exists precisely to catch a lost bind race sooner
         than the next scheduled pass.
+
+        **Review finding: "clear on any non-raising call" was wrong.** A due
+        verification's ``port_conflict_report()`` answers ``None`` for THREE
+        different situations — healthy, the process is too young to judge, and the
+        managed job has NO pid at all — and the old code cleared the flag on all
+        three alike. That last one IS the #187 fault: bootstrap succeeded, the
+        process then lost the port bind race and exited, and nothing was ever
+        logged. A due verification is now resolved via
+        :meth:`~launch_agent.LaunchAgent.post_bootstrap_verdict`, which tells the
+        three apart, and cleared (compare-and-clear, via the exact deadline token
+        this call observed) only once a real verdict — conflict, dead, or
+        healthy — has been rendered; "too young to tell" leaves it armed for the
+        next tick to retry. A verification that keeps failing to reach a verdict
+        (a raising report, or a process that never resolves) is bounded: past
+        ``2 * STARTUP_GRACE_SECONDS`` since it was armed it is disarmed with a
+        single warning instead — at most ~16 probes on the 15s watchdog cadence.
         """
         # getattr for the same reason _disconnect_ticks above uses it: this runs on the
         # watchdog thread, and a diagnostic must never be the thing that kills the
@@ -758,23 +776,55 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, ServerMenuMixin,
         if agent is None:                    # not managed this session: not ours to police
             return
         now = time.monotonic()
-        due_bootstrap = agent.due_for_bootstrap_verification()
-        if not due_bootstrap and now < getattr(self, next_attr, 0.0):
+        due_token = agent.due_for_bootstrap_verification()
+        if due_token is not None and now > due_token + 2 * STARTUP_GRACE_SECONDS:
+            agent.clear_bootstrap_verification(due_token)
+            self.logger.warning(
+                "post-bootstrap port verification for %s could not conclude within %.0fs of "
+                "its bootstrap, so it has been abandoned rather than retried forever. This does "
+                "NOT mean %s is unhealthy — only that the check itself never reached a verdict "
+                "(e.g. every port-conflict probe raised). The regular %.0fs interval check "
+                "below still polices this agent.",
+                agent.spec.package, 2 * STARTUP_GRACE_SECONDS, agent.spec.package,
+                PORT_CONFLICT_CHECK_INTERVAL,
+            )
+            setattr(self, next_attr, now + PORT_CONFLICT_CHECK_INTERVAL)
+            return
+        if due_token is None and now < getattr(self, next_attr, 0.0):
             return
         setattr(self, next_attr, now + PORT_CONFLICT_CHECK_INTERVAL)
         try:
             conflict = agent.port_conflict_report()
         except Exception as exc:  # noqa: BLE001 - a diagnostic must never kill the watchdog
             self.logger.debug("port conflict check failed: %s", exc)
-            return
-        if due_bootstrap:
-            agent.clear_bootstrap_verification()
+            return  # leave any pending #187 verification armed; the next tick retries
+        if due_token is not None:
+            if conflict:
+                agent.clear_bootstrap_verification(due_token)  # a verdict; the error path below logs it
+            else:
+                verdict = agent.post_bootstrap_verdict()
+                if verdict == VERDICT_DEAD:
+                    self.logger.error(
+                        "%s did not survive its own bootstrap: bootstrap succeeded, but the "
+                        "managed job now has no pid at all — most likely it lost the port %s "
+                        "bind race and exited on EADDRINUSE. See %s.",
+                        agent.spec.package, agent.spec.port,
+                        os.path.join(agent.log_dir, agent.spec.err_log),
+                    )
+                    agent.clear_bootstrap_verification(due_token)
+                elif verdict == VERDICT_CONFLICT_FREE:
+                    agent.clear_bootstrap_verification(due_token)
+                # else VERDICT_PENDING: too young (or unknowable) to render a verdict yet —
+                # leave the flag armed so the next tick retries.
         previous = getattr(self, last_attr, None)
         if conflict == previous:
             return
         if conflict:
             self.logger.error(conflict)
-        elif previous:
+        elif previous and agent.managed_job_has_pid():
+            # Gated on a pid (#187 review): port_conflict_report() also goes quiet when the
+            # managed job has NO pid at all — the dead-process branch above already reported
+            # that, and it is the opposite of resolved.
             self.logger.info("%s now owns port %s again; the port conflict reported "
                              "earlier is resolved.", agent.spec.package, agent.spec.port)
         setattr(self, last_attr, conflict)

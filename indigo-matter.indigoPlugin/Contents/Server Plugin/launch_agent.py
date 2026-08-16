@@ -75,6 +75,14 @@ MIN_NODE_VERSION = (22, 13)
 # already prints: run both Install/update menu actions.
 INSTALL_NODE_STAMP = ".indigo-node"
 
+# LaunchAgent.post_bootstrap_verdict() outcomes (issue #187 review). A due
+# verification whose port_conflict_report() answered None must be rendered into
+# exactly one of these three — see that method's docstring for why the three
+# cannot be conflated.
+VERDICT_DEAD = "dead"
+VERDICT_CONFLICT_FREE = "conflict_free"
+VERDICT_PENDING = "pending"
+
 
 def expand_home(path: str, home: str) -> str:
     """Expand a leading ``~`` against the given home dir (no os.environ lookup)."""
@@ -1367,9 +1375,23 @@ class LaunchAgent:
             )
         return message
 
-    def due_for_bootstrap_verification(self) -> bool:
-        """True once :data:`STARTUP_GRACE_SECONDS` has passed since this instance's
-        most recent bootstrap and that bootstrap has not yet been port-checked (#187).
+    def due_for_bootstrap_verification(self) -> Optional[float]:
+        """The armed deadline once :data:`STARTUP_GRACE_SECONDS` has passed since
+        this instance's most recent bootstrap and that bootstrap has not yet been
+        port-checked (#187); ``None`` while nothing is pending or the grace window
+        has not yet elapsed.
+
+        Returns the DEADLINE ITSELF, not a bool (review finding, #187), so the
+        caller can hand it straight back to :meth:`clear_bootstrap_verification` as
+        a compare-and-clear token: a caller's own tick observes "due" here, then
+        spends real wall-clock time inside a slow ``port_conflict_report()`` call
+        (shells out to lsof/ps) before it gets around to clearing. If a FRESH
+        bootstrap re-arms ``_bootstrap_verify_after`` on another thread during that
+        gap — a menu restart, a config apply — an unconditional clear would wipe
+        the new arming instead of the one the caller actually checked, silently
+        cancelling ITS verification. Handing back the exact value observed, and
+        having the clear compare against it, turns that race into a no-op instead
+        of a lost verification.
 
         ``port_conflict_report`` already knows how to tell "still starting up" from
         "genuinely headless" (its own age-gated branch), but nothing was calling it
@@ -1379,12 +1401,90 @@ class LaunchAgent:
         grace window would hold up plugin startup, so this is a flag for a caller's
         own periodic tick to poll instead — see :meth:`clear_bootstrap_verification`.
         """
-        return (self._bootstrap_verify_after is not None
-                and time.monotonic() >= self._bootstrap_verify_after)
+        if self._bootstrap_verify_after is None:
+            return None
+        if time.monotonic() < self._bootstrap_verify_after:
+            return None
+        return self._bootstrap_verify_after
 
-    def clear_bootstrap_verification(self) -> None:
-        """Mark the pending post-bootstrap port check (#187) as done."""
-        self._bootstrap_verify_after = None
+    def clear_bootstrap_verification(self, observed: float) -> None:
+        """Disarm the pending post-bootstrap port check (#187) — compare-and-clear.
+
+        ``observed`` must be the exact value :meth:`due_for_bootstrap_verification`
+        handed the caller. Clears only when the CURRENTLY armed deadline still
+        equals it, so a re-arm that landed after the caller observed "due" but
+        before it got here (see that method's docstring) is left untouched — the
+        stale clear becomes a no-op and the newer verification stays pending.
+        """
+        if self._bootstrap_verify_after == observed:
+            self._bootstrap_verify_after = None
+
+    def post_bootstrap_verdict(self) -> str:
+        """Render #187's verdict once ``port_conflict_report()`` has answered
+        ``None`` for a due verification — which happens for THREE different
+        reasons a caller must not conflate (see that method's docstring): healthy,
+        still inside (or unknowably within) the startup grace window, or the
+        managed job has no pid at all. That last one is the #187 fault itself:
+        bootstrap succeeded, but the process then lost the port bind race, logged
+        EADDRINUSE, and exited — and ``KeepAlive {SuccessfulExit: False}`` never
+        respawns it (see :meth:`_apply_plist`'s "loaded but not running" branch).
+        It is exactly the case ``port_conflict_report`` deliberately declines to
+        call a conflict, because calling it one would send a caller hunting for a
+        rival process that does not exist.
+
+        Returns one of:
+
+          * :data:`VERDICT_DEAD` — the managed job currently has no pid. A
+            verdict: the caller should report this and clear the verification.
+          * :data:`VERDICT_CONFLICT_FREE` — a pid is present and its age has
+            passed :data:`STARTUP_GRACE_SECONDS`. A verdict: healthy, clear.
+          * :data:`VERDICT_PENDING` — a pid is present but its age is still
+            inside the grace window, or unknowable. NOT a verdict — the caller
+            must leave the verification armed and let the next tick retry.
+
+        Reuses :meth:`_managed_job` rather than re-parsing ``launchctl print`` a
+        second time in the same tick.
+        """
+        pid = self._managed_job()["pid"]
+        if pid is None:
+            return VERDICT_DEAD
+        age = self._process_age_seconds(pid)
+        if age is not None and age >= STARTUP_GRACE_SECONDS:
+            return VERDICT_CONFLICT_FREE
+        return VERDICT_PENDING
+
+    def managed_job_has_pid(self) -> bool:
+        """True if the managed launchd job currently reports a pid.
+
+        Used to gate the "port conflict resolved" message (#187 review): a
+        standing conflict must not be announced as resolved just because
+        ``port_conflict_report()`` went quiet — it also goes quiet when the
+        managed job has NO pid at all (see :meth:`post_bootstrap_verdict`), which
+        is the opposite of resolved. Reuses :meth:`_managed_job`.
+        """
+        return self._managed_job()["pid"] is not None
+
+    def adopt_pending_bootstrap_verification(self, previous: Optional["LaunchAgent"]) -> None:
+        """Carry a pending #187 verification over from the instance THIS one replaces.
+
+        The armed deadline lives on the instance, not anywhere prefs-durable, and
+        ``server_menu_mixin.py`` rebuilds a fresh agent on every call (ports and
+        the mDNS interface are prefs, which may have changed since the last one).
+        A rebuild whose own ``ensure_installed()`` takes the digest-match "leave
+        alone" path — no fresh bootstrap on THIS instance — would otherwise
+        silently drop whatever verification the replaced instance still had
+        pending: a rapid re-export inside the grace window (every allow-list
+        change rebuilds ``BridgeProcess``) is the case that actually hits this
+        (review finding).
+
+        Safe to call unconditionally after ``ensure_installed()`` (``previous``
+        may be ``None`` — nothing to adopt on the very first call): if THIS
+        instance's own call already bootstrapped, ``_bootstrap_verify_after`` is
+        already set and the guard below is a no-op — a fresh arming always wins
+        over an older one, never the reverse.
+        """
+        if previous is not None and self._bootstrap_verify_after is None:
+            self._bootstrap_verify_after = previous._bootstrap_verify_after  # pylint: disable=protected-access
 
     def _managed_job(self) -> dict:
         """Parse ``launchctl print`` once into the three facts callers need.

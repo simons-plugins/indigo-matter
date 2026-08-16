@@ -19,6 +19,8 @@ from unittest.mock import Mock
 
 import pytest
 
+from launch_agent import STARTUP_GRACE_SECONDS, VERDICT_CONFLICT_FREE, VERDICT_DEAD, VERDICT_PENDING
+
 
 @pytest.fixture
 def plugin_mod(mock_indigo_base):
@@ -1787,22 +1789,33 @@ def test_menu_restart_clears_window_when_ensure_installed_raises(plug, plugin_mo
 # the WS client reports "connected" while talking to the wrong server)
 # ---------------------------------------------------------------------------
 
-def _fake_agent(port, package, report, *, due_bootstrap=False):
-    """A LaunchAgent-shaped fake for one agent's contribution to a tick (#182/#187)."""
+def _fake_agent(port, package, report, *, due_bootstrap=None, has_pid=True, verdict=VERDICT_CONFLICT_FREE):
+    """A LaunchAgent-shaped fake for one agent's contribution to a tick (#182/#187).
+
+    ``due_bootstrap`` is the deadline TOKEN ``due_for_bootstrap_verification()``
+    would hand back — ``None`` means nothing pending (the post-review
+    ``Optional[float]`` contract; it used to be a bare bool, and a caller wanting
+    "due" now passes a real ``time.monotonic()`` value, not ``True``). ``report``,
+    ``verdict`` and ``has_pid`` may be a plain value or a zero-arg callable,
+    mirroring the existing mutable-state-dict pattern used below.
+    """
     return SimpleNamespace(
         port_conflict_report=lambda: report() if callable(report) else report,
-        spec=SimpleNamespace(port=port, package=package),
-        due_for_bootstrap_verification=lambda: due_bootstrap,
-        clear_bootstrap_verification=lambda: None,
+        spec=SimpleNamespace(port=port, package=package, err_log=f"{package}.err.log"),
+        log_dir="/tmp/fake-log-dir",
+        due_for_bootstrap_verification=lambda: due_bootstrap() if callable(due_bootstrap) else due_bootstrap,
+        clear_bootstrap_verification=lambda observed: None,
+        post_bootstrap_verdict=lambda: verdict() if callable(verdict) else verdict,
+        managed_job_has_pid=lambda: has_pid() if callable(has_pid) else has_pid,
     )
 
 
-def _plug_with_server(plug, report, *, due_bootstrap=False):
+def _plug_with_server(plug, report, *, due_bootstrap=None):
     plug.server_process = _fake_agent(5580, "matter-server", report, due_bootstrap=due_bootstrap)
     return plug
 
 
-def _plug_with_bridge(plug, report, *, due_bootstrap=False):
+def _plug_with_bridge(plug, report, *, due_bootstrap=None):
     plug.bridge_process = _fake_agent(5581, "indigo-matter-bridge", report,
                                       due_bootstrap=due_bootstrap)
     return plug
@@ -1917,24 +1930,186 @@ def test_bridge_port_conflict_uses_its_own_last_seen_state(plug):
 def test_a_bootstrap_pending_verification_runs_inside_the_slow_interval(plug):
     """The whole point of #187: a fresh bootstrap's port must be re-checked once
     its bind window has passed, not whenever the 300s cadence next happens to
-    land — so due_for_bootstrap_verification()=True must bypass the interval gate."""
+    land — so a due verification must bypass the interval gate."""
     calls = {"n": 0}
 
     def report():
         calls["n"] += 1
         return None
-    _plug_with_server(plug, report, due_bootstrap=True)
+    _plug_with_server(plug, report, due_bootstrap=time.monotonic())
     plug._next_port_check = time.monotonic() + 10_000  # deep inside the interval
     plug._port_conflict_tick()
     assert calls["n"] == 1
 
 
 def test_a_bootstrap_pending_verification_is_consumed_once_checked(plug):
-    agent = _fake_agent(5580, "matter-server", None, due_bootstrap=True)
+    agent = _fake_agent(5580, "matter-server", None, due_bootstrap=time.monotonic())
     agent.clear_bootstrap_verification = Mock()
     plug.server_process = agent
     plug._port_conflict_tick()
     agent.clear_bootstrap_verification.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# #187 review — the redesign: clear only on a rendered verdict, retry while
+# too young to tell, and disarm loudly (not silently) on a hard timeout.
+# ---------------------------------------------------------------------------
+
+def test_a_raising_report_leaves_the_flag_armed_for_a_retry(plug):
+    """The retry itself: a report that keeps raising must not be treated as a
+    verdict, and a LATER tick must still be able to probe again — proving a
+    natural `finally:` refactor (clear unconditionally) is NOT what runs."""
+    now = time.monotonic()
+    calls = {"n": 0}
+
+    def boom():
+        calls["n"] += 1
+        raise OSError("ps exploded")
+
+    agent = _fake_agent(5580, "matter-server", boom, due_bootstrap=now)
+    agent.clear_bootstrap_verification = Mock()
+    plug.server_process = agent
+    plug._next_port_check = time.monotonic() + 10_000  # only the due-bypass lets this run at all
+    plug._port_conflict_tick()
+    agent.clear_bootstrap_verification.assert_not_called()
+    assert calls["n"] == 1
+    plug._port_conflict_tick()                          # a later tick retries
+    assert calls["n"] == 2
+
+
+def test_due_bootstrap_with_a_real_conflict_uses_the_existing_error_path_and_clears(plug):
+    """The actual jarvis incident, composed end to end: a due verification whose
+    report is a real conflict string is logged through the ordinary error path
+    (not a second, duplicate log) and the verification is cleared."""
+    now = time.monotonic()
+    agent = _fake_agent(5580, "matter-server", "port 5580 is held by pid 659", due_bootstrap=now)
+    agent.clear_bootstrap_verification = Mock()
+    plug.server_process = agent
+    plug._port_conflict_tick()
+    assert plug.logger.error.call_count == 1
+    assert "659" in str(plug.logger.error.call_args_list[0])
+    agent.clear_bootstrap_verification.assert_called_once_with(now)
+
+
+def test_due_bootstrap_with_no_pid_is_reported_as_the_187_fault_and_cleared(plug):
+    """None + no pid is the #187 fault itself (bootstrap OK, process then lost
+    the bind race and exited) — distinct from every other None case, and the
+    one the old "clear on any non-raising call" code swallowed silently."""
+    now = time.monotonic()
+    agent = _fake_agent(5580, "matter-server", None, due_bootstrap=now,
+                        verdict=VERDICT_DEAD, has_pid=False)
+    agent.clear_bootstrap_verification = Mock()
+    plug.server_process = agent
+    plug._port_conflict_tick()
+    assert plug.logger.error.call_count == 1
+    said = str(plug.logger.error.call_args_list[0])
+    assert "matter-server" in said and "5580" in said
+    agent.clear_bootstrap_verification.assert_called_once_with(now)
+
+
+def test_due_bootstrap_pending_leaves_the_flag_armed_then_clears_once_settled(plug):
+    """None + a young pid is NOT a verdict — retried, not cleared — until the
+    process ages past the grace window, at which point the next tick clears it."""
+    now = time.monotonic()
+    state = {"verdict": VERDICT_PENDING}
+    agent = _fake_agent(5580, "matter-server", None, due_bootstrap=now,
+                        verdict=lambda: state["verdict"])
+    agent.clear_bootstrap_verification = Mock()
+    plug.server_process = agent
+    plug._port_conflict_tick()
+    agent.clear_bootstrap_verification.assert_not_called()
+    state["verdict"] = VERDICT_CONFLICT_FREE
+    plug._port_conflict_tick()
+    agent.clear_bootstrap_verification.assert_called_once_with(now)
+
+
+def test_a_verification_stuck_past_the_hard_timeout_is_disarmed_loudly(plug):
+    """Bounds the retry churn from a persistently-raising report: past
+    2*STARTUP_GRACE_SECONDS since arming, disarm with ONE warning and stop
+    probing — rather than retrying every 15s forever."""
+    stale_deadline = time.monotonic() - (2 * STARTUP_GRACE_SECONDS + 1)
+
+    class _Agent:
+        def __init__(self):
+            self.spec = SimpleNamespace(port=5580, package="matter-server")
+            self.log_dir = "/tmp/fake-log-dir"
+            self._deadline = stale_deadline
+            self.report_calls = 0
+
+        def port_conflict_report(self):
+            self.report_calls += 1
+            return None
+
+        def due_for_bootstrap_verification(self):
+            return self._deadline
+
+        def clear_bootstrap_verification(self, observed):
+            if self._deadline == observed:
+                self._deadline = None
+
+    agent = _Agent()
+    plug.server_process = agent
+    plug._port_conflict_tick()
+    assert agent.report_calls == 0, "abandoned before ever probing"
+    assert plug.logger.warning.call_count == 1
+    assert agent.due_for_bootstrap_verification() is None
+    plug.logger.warning.reset_mock()
+    plug._port_conflict_tick()                          # the regular interval now applies
+    assert agent.report_calls == 0, "no further probes on the next tick"
+    assert not plug.logger.warning.called
+
+
+def test_a_concurrent_rearm_during_the_probe_survives_a_stale_clear(plug):
+    """Compare-and-clear (#187 review): a re-arm that lands on another thread
+    (a menu restart) DURING this tick's slow port_conflict_report() call must
+    not be wiped by a clear that only ever observed the OLD deadline."""
+    now = time.monotonic()
+    old_deadline = now - 1
+    new_deadline = now + STARTUP_GRACE_SECONDS
+
+    class _RaceAgent:
+        def __init__(self):
+            self.spec = SimpleNamespace(port=5580, package="matter-server")
+            self.log_dir = "/tmp/fake-log-dir"
+            self._deadline = old_deadline
+            self._rearm_to = new_deadline
+
+        def port_conflict_report(self):
+            if self._rearm_to is not None:            # simulates the concurrent re-arm
+                self._deadline = self._rearm_to
+                self._rearm_to = None
+            return None
+
+        def due_for_bootstrap_verification(self):
+            return self._deadline
+
+        def clear_bootstrap_verification(self, observed):
+            if self._deadline == observed:
+                self._deadline = None
+
+        def post_bootstrap_verdict(self):
+            return VERDICT_CONFLICT_FREE
+
+        def managed_job_has_pid(self):
+            return True
+
+    agent = _RaceAgent()
+    plug.server_process = agent
+    plug._port_conflict_tick()
+    assert agent.due_for_bootstrap_verification() == new_deadline, "the new arming must survive"
+
+
+def test_both_agents_due_simultaneously_are_each_handled_independently(plug):
+    now = time.monotonic()
+    server = _fake_agent(5580, "matter-server", None, due_bootstrap=now)
+    server.clear_bootstrap_verification = Mock()
+    bridge = _fake_agent(5581, "indigo-matter-bridge", None, due_bootstrap=now)
+    bridge.clear_bootstrap_verification = Mock()
+    plug.server_process = server
+    plug.bridge_process = bridge
+    plug._port_conflict_tick()
+    server.clear_bootstrap_verification.assert_called_once_with(now)
+    bridge.clear_bootstrap_verification.assert_called_once_with(now)
 
 
 def test_unknown_node_that_matter_server_also_lacks_is_still_a_404(plug):
