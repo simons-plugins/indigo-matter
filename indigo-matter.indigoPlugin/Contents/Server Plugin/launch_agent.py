@@ -197,6 +197,10 @@ class LaunchAgent:
         # is cleared by the next successful probe so a later failure is reported again.
         self._port_probe_warned = False
         self._process_age_warned = False
+        # Set by _bootstrap_and_record() on a successful fresh bootstrap; cleared once
+        # due_for_bootstrap_verification() has been acted on (issue #187). See that
+        # method's docstring for why this exists alongside port_conflict_report().
+        self._bootstrap_verify_after: Optional[float] = None
         self.home = home or os.path.expanduser("~")
         # Optional explicit override: directory containing node/npx. nvm users can
         # pin a specific version here (e.g. ~/.nvm/versions/node/v22.18.0/bin);
@@ -718,6 +722,12 @@ class LaunchAgent:
         always reflects the file launchd was told to load — never a recomputed
         :meth:`build_plist` that could have drifted from disk. Returns the bootstrap
         outcome; a best-effort marker write never changes it.
+
+        A successful bootstrap also arms :meth:`due_for_bootstrap_verification` (issue
+        #187): none of ``_apply_plist``'s fresh-bootstrap path, ``start()``, or
+        ``restart()`` themselves re-check that the process they just started actually
+        holds the port — a rival can win the bind race in the gap between bootstrap and
+        the server's own bind (matter-server was observed taking ~9s on jarvis).
         """
         if not self._bootstrap():
             return False
@@ -725,6 +735,7 @@ class LaunchAgent:
             plist_bytes = self._plist_on_disk()
         if plist_bytes is not None:
             self._record_applied_digest(self._digest_of(plist_bytes))
+        self._bootstrap_verify_after = time.monotonic() + STARTUP_GRACE_SECONDS
         return True
 
     @staticmethod
@@ -1355,6 +1366,25 @@ class LaunchAgent:
                 f"{os.path.join(self.log_dir, self.spec.err_log)}."
             )
         return message
+
+    def due_for_bootstrap_verification(self) -> bool:
+        """True once :data:`STARTUP_GRACE_SECONDS` has passed since this instance's
+        most recent bootstrap and that bootstrap has not yet been port-checked (#187).
+
+        ``port_conflict_report`` already knows how to tell "still starting up" from
+        "genuinely headless" (its own age-gated branch), but nothing was calling it
+        specifically at the moment that matters most: right after a fresh bootstrap,
+        when a rival is most likely to have won the port race in the bind-window gap.
+        Blocking ``_apply_plist``/``start``/``restart`` with a sleep for the whole
+        grace window would hold up plugin startup, so this is a flag for a caller's
+        own periodic tick to poll instead — see :meth:`clear_bootstrap_verification`.
+        """
+        return (self._bootstrap_verify_after is not None
+                and time.monotonic() >= self._bootstrap_verify_after)
+
+    def clear_bootstrap_verification(self) -> None:
+        """Mark the pending post-bootstrap port check (#187) as done."""
+        self._bootstrap_verify_after = None
 
     def _managed_job(self) -> dict:
         """Parse ``launchctl print`` once into the three facts callers need.

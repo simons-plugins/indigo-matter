@@ -608,6 +608,74 @@ def test_portless_agent_never_reports_a_port_conflict(tmp_path, mock_logger):
 
 
 # ---------------------------------------------------------------------------
+# #187 — a fresh bootstrap arms a deferred post-bind-window port verification,
+# consumed by the caller (the plugin's periodic tick) once STARTUP_GRACE_SECONDS
+# has passed. Neither _apply_plist's fresh-bootstrap path nor start()/restart()
+# used to check this themselves, leaving a rival free to win the bind race
+# unnoticed until whatever tick happened to run next.
+# ---------------------------------------------------------------------------
+
+def test_nothing_pending_before_any_bootstrap(tmp_path, mock_logger):
+    agent = _agent(tmp_path / "home", _spec("com.example.a", "pkg-a", str(tmp_path / "s"), port=5580),
+                   mock_logger, runner=FakeRunner())
+    assert agent.due_for_bootstrap_verification() is False
+
+
+def test_a_fresh_bootstrap_arms_verification_but_not_before_the_grace_window(tmp_path,
+                                                                             mock_logger):
+    agent = _agent(tmp_path / "home", _spec("com.example.a", "pkg-a", str(tmp_path / "s"), port=5580),
+                   mock_logger, runner=FakeRunner())
+    assert agent.ensure_installed() is True          # fresh bootstrap (no plist existed)
+    assert agent.due_for_bootstrap_verification() is False   # armed, but grace not elapsed
+    agent._bootstrap_verify_after = 0.0              # simulate STARTUP_GRACE_SECONDS elapsed
+    assert agent.due_for_bootstrap_verification() is True
+
+
+def test_clear_bootstrap_verification_disarms_it(tmp_path, mock_logger):
+    agent = _agent(tmp_path / "home", _spec("com.example.a", "pkg-a", str(tmp_path / "s"), port=5580),
+                   mock_logger, runner=FakeRunner())
+    agent.ensure_installed()
+    agent._bootstrap_verify_after = 0.0
+    assert agent.due_for_bootstrap_verification() is True
+    agent.clear_bootstrap_verification()
+    assert agent.due_for_bootstrap_verification() is False
+
+
+def test_restart_also_arms_verification(tmp_path, mock_logger):
+    agent = _agent(tmp_path / "home", _spec("com.example.a", "pkg-a", str(tmp_path / "s"), port=5580),
+                   mock_logger, runner=FakeRunner())
+    agent.ensure_installed()
+    agent.clear_bootstrap_verification()
+    assert agent.restart() is True
+    assert agent.due_for_bootstrap_verification() is False   # armed, not yet due
+    agent._bootstrap_verify_after = 0.0
+    assert agent.due_for_bootstrap_verification() is True
+
+
+def test_start_also_arms_verification(tmp_path, mock_logger):
+    agent = _agent(tmp_path / "home", _spec("com.example.a", "pkg-a", str(tmp_path / "s"), port=5580),
+                   mock_logger, runner=FakeRunner())
+    agent.ensure_installed()                          # writes the plist start() reloads
+    agent.clear_bootstrap_verification()
+    assert agent.start() is True
+    agent._bootstrap_verify_after = 0.0
+    assert agent.due_for_bootstrap_verification() is True
+
+
+def test_leaving_a_healthy_job_untouched_does_not_arm_verification(tmp_path, mock_logger):
+    """The digest-matches 'leave alone' branch already checks the port itself
+    (#182, unchanged) — it must not ALSO arm a #187 verification, since no
+    bootstrap happened on that pass."""
+    runner = ProcRunner(print_pid=4242, listen_pids=[4242])
+    agent = _agent(tmp_path / "home", _spec("com.example.a", "pkg-a", str(tmp_path / "s"), port=5580),
+                   mock_logger, runner=runner)
+    assert agent.ensure_installed() is True            # first pass: marker mismatch → bootstraps
+    agent.clear_bootstrap_verification()
+    assert agent.ensure_installed() is False            # second pass: digest matches → leave alone
+    assert agent.due_for_bootstrap_verification() is False
+
+
+# ---------------------------------------------------------------------------
 # Golden: the controller's plist must be byte-identical to the pre-extraction one
 # ---------------------------------------------------------------------------
 

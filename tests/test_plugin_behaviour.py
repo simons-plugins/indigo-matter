@@ -11,6 +11,7 @@ import asyncio
 import importlib
 import json
 import os
+import time
 from pathlib import Path
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from types import SimpleNamespace
@@ -43,9 +44,12 @@ def plug(plugin_mod):
     p._exported_ids = frozenset()
     p._subscribed_to_devices = False
     # Mirrors Plugin.__init__ (this fixture bypasses it via __new__): the periodic
-    # port-conflict check's interval gate and last-logged verdict (#182).
+    # port-conflict check's interval gate and last-logged verdict (#182), and the
+    # bridge agent's own pair of the same (#187).
     p._next_port_check = 0.0
     p._last_port_conflict = None
+    p._next_bridge_port_check = 0.0
+    p._last_bridge_port_conflict = None
     return p
 
 
@@ -1783,11 +1787,24 @@ def test_menu_restart_clears_window_when_ensure_installed_raises(plug, plugin_mo
 # the WS client reports "connected" while talking to the wrong server)
 # ---------------------------------------------------------------------------
 
-def _plug_with_server(plug, report):
-    plug.server_process = SimpleNamespace(
+def _fake_agent(port, package, report, *, due_bootstrap=False):
+    """A LaunchAgent-shaped fake for one agent's contribution to a tick (#182/#187)."""
+    return SimpleNamespace(
         port_conflict_report=lambda: report() if callable(report) else report,
-        spec=SimpleNamespace(port=5580),
+        spec=SimpleNamespace(port=port, package=package),
+        due_for_bootstrap_verification=lambda: due_bootstrap,
+        clear_bootstrap_verification=lambda: None,
     )
+
+
+def _plug_with_server(plug, report, *, due_bootstrap=False):
+    plug.server_process = _fake_agent(5580, "matter-server", report, due_bootstrap=due_bootstrap)
+    return plug
+
+
+def _plug_with_bridge(plug, report, *, due_bootstrap=False):
+    plug.bridge_process = _fake_agent(5581, "indigo-matter-bridge", report,
+                                      due_bootstrap=due_bootstrap)
     return plug
 
 
@@ -1849,6 +1866,75 @@ def test_a_failing_port_check_never_kills_the_watchdog(plug):
     _plug_with_server(plug, boom)
     plug._port_conflict_tick()               # must not raise
     assert not plug.logger.error.called      # a diagnostic failure is not a conflict
+
+
+# ---------------------------------------------------------------------------
+# #187 — the bridge agent is polled too, and a pending post-bootstrap
+# verification runs even inside the slow interval
+# ---------------------------------------------------------------------------
+
+def test_port_conflict_tick_also_polices_the_bridge_agent(plug):
+    """Before #187 only server_process was ever checked; bridge_process was
+    read via getattr and, being absent/None, silently skipped forever."""
+    _plug_with_bridge(plug, "port 5581 is held by pid 777")
+    plug._port_conflict_tick()
+    assert "777" in " ".join(str(c) for c in plug.logger.error.call_args_list)
+
+
+def test_port_conflict_tick_polices_both_agents_independently(plug):
+    _plug_with_server(plug, "port 5580 is held by pid 659")
+    _plug_with_bridge(plug, None)
+    plug._port_conflict_tick()
+    messages = " ".join(str(c) for c in plug.logger.error.call_args_list)
+    assert "659" in messages and "5581" not in messages
+
+
+def test_port_conflict_tick_is_skipped_when_bridge_agent_never_started(plug):
+    plug.bridge_process = None               # XG5: nothing exported this session
+    plug._port_conflict_tick()
+    assert not plug.logger.error.called
+
+
+def test_bridge_port_conflict_uses_its_own_last_seen_state(plug):
+    """A newly-resolved bridge conflict must be announced even though the
+    controller's conflict is still standing (or vice versa) — proving the two
+    keep independent last-logged verdicts rather than sharing one."""
+    _plug_with_server(plug, "port 5580 is held by pid 659")           # standing controller conflict
+    bridge_state = {"report": "port 5581 is held by pid 777"}
+    plug.bridge_process = _fake_agent(5581, "indigo-matter-bridge",
+                                      lambda: bridge_state["report"])
+    plug._port_conflict_tick()
+    assert plug.logger.error.call_count == 2   # both conflicts are new
+    plug.logger.error.reset_mock()
+    bridge_state["report"] = None              # only the bridge conflict resolves
+    plug._next_port_check = 0.0
+    plug._next_bridge_port_check = 0.0
+    plug._port_conflict_tick()
+    assert not plug.logger.error.called        # controller conflict unchanged → not re-logged
+    assert "resolved" in " ".join(str(c) for c in plug.logger.info.call_args_list)
+
+
+def test_a_bootstrap_pending_verification_runs_inside_the_slow_interval(plug):
+    """The whole point of #187: a fresh bootstrap's port must be re-checked once
+    its bind window has passed, not whenever the 300s cadence next happens to
+    land — so due_for_bootstrap_verification()=True must bypass the interval gate."""
+    calls = {"n": 0}
+
+    def report():
+        calls["n"] += 1
+        return None
+    _plug_with_server(plug, report, due_bootstrap=True)
+    plug._next_port_check = time.monotonic() + 10_000  # deep inside the interval
+    plug._port_conflict_tick()
+    assert calls["n"] == 1
+
+
+def test_a_bootstrap_pending_verification_is_consumed_once_checked(plug):
+    agent = _fake_agent(5580, "matter-server", None, due_bootstrap=True)
+    agent.clear_bootstrap_verification = Mock()
+    plug.server_process = agent
+    plug._port_conflict_tick()
+    agent.clear_bootstrap_verification.assert_called_once()
 
 
 def test_unknown_node_that_matter_server_also_lacks_is_still_a_404(plug):
