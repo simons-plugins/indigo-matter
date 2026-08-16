@@ -601,6 +601,43 @@ bridge has been commissioned into Apple Home and Alexa and exported devices have
 been controlled both ways, but the reboot leg of the accessory-identity check is
 still outstanding. Treat the export half as new.
 
+### Alexa conformance: what a code sweep found (issue #222)
+
+Alexa's Matter support is stricter and less documented than Apple's, so a
+completed sweep of the export side against Alexa's known requirements is
+recorded here rather than left implicit in the code:
+
+- **The Matter port is fixed at 5540 by default.** It is user-overridable
+  (`bridgeMatterPort`, for the Mac where something else already holds 5540),
+  but a non-default value is known to break Alexa discovery, and Amazon
+  documents support for only **one Matter node per host** — the bridge now
+  warns (never refuses) when the pref departs from the default.
+- **The aggregator is pinned at endpoint 1.** `node.ts` adds it to the
+  `ServerNode` before any bridged child on purpose — Alexa requires the
+  bridge's aggregator there — and that ordering is now a regression test
+  rather than an unstated assumption.
+- **Every exported accessory is a single endpoint whose clusters are exactly
+  the device type's own** — no foreign clusters bolted on, no composed
+  devices. This is a **constraint on future work, not just a description**:
+  adding a cluster outside a device type's allowed server list risks Alexa
+  dropping the endpoint entirely rather than ignoring the extra cluster, so a
+  future feature that wants to attach a cluster a role's Matter device type
+  does not declare needs a new role (or a new device type), not an addition
+  to an existing one.
+- **The widely-quoted "~50 device Alexa ceiling" is community folklore**, not
+  a documented matter.js or Alexa limit — repeated often enough in Alexa and
+  home-automation forums about large HomeKit/Matter bridges to be worth an
+  advisory, not certain enough to be worth a hard limit. The bridge now
+  advises past 50 exported endpoints and keeps its existing, harder warning
+  past 100 (PRD §5.3); the two do not double-log each other.
+- **Cover/shade polarity does not vary per ecosystem.** Window-covering
+  inversion (the per-export tick-box described above) is applied plugin-side,
+  once, and this bridge serves every paired ecosystem from that one setting —
+  there is no mechanism to tell Alexa "inverted" while telling Apple Home
+  "normal" for the same accessory. If your ecosystems disagree on which way is
+  open, set the polarity for whichever one you use as primary and expect the
+  others to show it backwards.
+
 ### Why every ecosystem calls it "uncertified"
 
 Because it is, deliberately, and there is nothing the plugin can do about it.
@@ -623,6 +660,34 @@ Anyway", and know that it says nothing about whether the bridge works.
 is our controller's fabric identity, the other is the bridge's attestation
 identity — and neither is a claim about the other.)
 
+### An on/off accessory forgets it was on across a bridge restart (issue #202)
+
+Matter's `StartUpOnOff` attribute lets an on/off device declare what it should
+do when it powers back up — stay off, come on, or restore its last state. On an
+**exported** endpoint, matter.js's `OnOffServer.initialize()` explicitly skips
+that power-on-behaviour restoration for any endpoint that lives under an
+`AggregatorEndpoint` — which every exported accessory does, by construction.
+The attribute is still there and still writable; it is just inert.
+
+**Not worked around, on purpose.** Two ways around it were considered and both
+make things worse:
+
+- Removing the Lighting feature to hide the attribute would be a **Matter
+  conformance regression** — `StartUpOnOff` is part of the feature a
+  Matter-certified on/off light is expected to expose — and it would also
+  delete `OnWithTimedOff`, a real command some ecosystems use for timed-on
+  behaviour, to solve a cosmetic problem.
+- A restart is exactly the moment this plugin already has the right answer
+  from elsewhere: on reconnect, it re-pushes every exported device's **real
+  Indigo state**, which is the correct source of truth for a bridge in the
+  first place — Indigo is the device of record, not the accessory's own
+  memory of where it was. `StartUpOnOff` answering the same question a second
+  time, possibly differently, would be the redundant (and potentially wrong)
+  mechanism.
+
+So the attribute is left as matter.js ships it: present, spec-conformant, and
+not the thing that actually decides what an exported device does when the
+bridge restarts.
 
 ## Firmware updates (and why they matter more than usual)
 
