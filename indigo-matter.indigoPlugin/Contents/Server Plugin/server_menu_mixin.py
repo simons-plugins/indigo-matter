@@ -87,6 +87,10 @@ class ServerMenuMixin:
     # in the split. Still one plain attribute on one object; nobody should
     # "tidy" it into a local (issue #146).
     _restart_expected_until: Any
+    # #187 review: reset here too (_stop_bridge_agent, menuStopBridgeNode) so an
+    # uninstall with a standing conflict cannot leave plugin.py's next tick
+    # reporting it "resolved" over a rival that still holds the port.
+    _last_bridge_port_conflict: Any
     exports: Any
     export_bridge: Any
     jobs: Any
@@ -155,6 +159,11 @@ class ServerMenuMixin:
             indigo.server.savePluginPrefs()
             self.server_process = ServerProcess(self._server_prefs(), self.logger)  # pylint: disable=no-member
             self.server_process.ensure_installed()
+            # #187 review: no adopt_pending_bootstrap_verification() needed here —
+            # unlike _start_bridge_agent's automatic, high-frequency rebuilds, the
+            # UNCONDITIONAL restart() a few lines below always re-arms this fresh
+            # instance's own #187 deadline regardless of what ensure_installed()
+            # above did, so there is never an old verification left to lose.
             # Restart matter-server onto the just-installed version — otherwise the
             # newly-installed package sits on disk while the OLD process keeps running
             # (a running LaunchAgent doesn't pick up new files). This is what makes the
@@ -224,6 +233,11 @@ class ServerMenuMixin:
         self.server_process = ServerProcess(self._server_prefs(), self.logger)  # pylint: disable=no-member
         self._expect_restart()  # expected outage, not a crash  # pylint: disable=no-member
         try:
+            # #187 review: no adopt_pending_bootstrap_verification() needed here —
+            # every branch below either bootstraps this fresh instance itself
+            # (ensure_installed() returning True, or the False branch's explicit
+            # restart()) or leaves nothing running at all (None), so there is
+            # never an old verification on the replaced instance left to lose.
             # None = preflight failed (plist torn down, nothing to restart);
             # True = it already reloaded launchd, so a restart() here would stop and
             # start the server a SECOND time for nothing — two outages, every device's
@@ -910,13 +924,27 @@ class ServerMenuMixin:
         and the mDNS interface are prefs, ``ensure_installed`` only reloads
         launchd when the resulting plist actually differs, and a stale
         ``BridgeProcess`` would write yesterday's ports while reporting success.
+
+        **#187 review: a rebuild can silently drop a still-pending post-bootstrap
+        verification.** This runs on every allow-list transition, so a second
+        export inside the previous one's grace window rebuilds a fresh instance
+        whose OWN ``ensure_installed()`` may take the digest-match "leave alone"
+        path (nothing actually changed) — no fresh bootstrap on THIS instance, and
+        the replaced instance's armed deadline would otherwise simply vanish with
+        it. :meth:`~launch_agent.LaunchAgent.adopt_pending_bootstrap_verification`
+        carries it over; it is a no-op when this call's own ``ensure_installed()``
+        DID bootstrap fresh (that arming must win).
         """
+        previous = self.bridge_process
         self.bridge_process = bridge_agent.BridgeProcess(dict(self.pluginPrefs), self.logger)
         agent = self.bridge_process
-        if agent.ensure_installed() is None:
+        applied = agent.ensure_installed()
+        if applied is None:
             # Preflight failed; the plist has been torn down and the reason
             # logged. Nothing to start, and starting would only crash-loop.
             return
+        if applied is False:
+            agent.adopt_pending_bootstrap_verification(previous)
         # ``ensure_installed() is not None`` is NOT the process being up. It is
         # False for "the current definition was already loaded and healthy" AND
         # for "bootout succeeded but neither bootstrap nor load did" AND for "the
@@ -960,10 +988,20 @@ class ServerMenuMixin:
 
         The storage dir — every ecosystem pairing plus the endpoint-number
         witness — is never touched by either (PRD §5.4).
+
+        **#187 review: also resets ``_last_bridge_port_conflict``.** Also called
+        from :meth:`menuStopBridgeNode`, which routes through here rather than
+        uninstalling separately. With a conflict standing, the very next tick
+        would otherwise see ``port_conflict_report()`` go quiet — because the
+        managed job now has no pid, not because the rival let go of the port —
+        and (pre-#187-review) announce it "resolved". Commit 1's pid-gate on
+        that log line is the belt; resetting the memory of the conflict here,
+        so there is nothing left to compare against, is the braces.
         """
         agent = self.bridge_process
         if agent is None:
             return
+        self._last_bridge_port_conflict = None
         was_loaded = agent.is_running()      # "is there a job on the books"
         agent.uninstall()                    # bootout + remove the plist
         if agent.is_running() or os.path.exists(agent.plist_path):
