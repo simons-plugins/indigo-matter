@@ -497,8 +497,11 @@ version 2** since bridge-node 0.6.0:
   — an old build reads a file that has it exactly as it would without it,
   because every reader here reaches a field by name rather than validating the
   object as a whole, so the extra key is inert rather than a parse failure.
-- `orphaned` — issue #219, since bridge-node 0.8.1, present (`true`) and absent
-  otherwise, never `false`. Set by an un-export (see "Un-exporting" below);
+- `orphaned` — issue #219, present (`true`) and absent otherwise, never
+  `false`. Ships in the first bridge-node release after 0.8.0 — the version
+  bump is a separate, deliberate release commit (`package.json` and
+  `DEFAULT_INSTALL_SPEC` move together, coordinated with an npm publish),
+  not this one. Set by an un-export (see "Un-exporting" below);
   cleared the moment the same `UniqueID` is live again. Same inert-extra-key
   compatibility as `numberVoid`, so this stays schema version 2 too.
 
