@@ -37,7 +37,7 @@ import {
     type EndpointMapFileV1,
 } from "../src/endpoint-map.js";
 import { uniqueIdFor } from "../src/endpoints.js";
-import { BridgeNode, matterJsVersion } from "../src/node.js";
+import { BridgeNode, ENDPOINT_COUNT_ADVISORY, ENDPOINT_COUNT_WARNING, matterJsVersion } from "../src/node.js";
 import { ErrorCode, PROTOCOL_VERSION, RefuseReason } from "../src/protocol.js";
 import { BridgeWsServer } from "../src/ws-server.js";
 import { TestClient } from "./client.js";
@@ -967,6 +967,95 @@ describe("issue #141: a refusing node restores nothing", () => {
             assert.ok(
                 session.logged.some(line => line.startsWith("Withdrawing the 2 endpoint(s) restored")),
                 "and it says so rather than leaving the user to wonder",
+            );
+        } finally {
+            await session.close();
+        }
+    });
+});
+
+describe("issue #222: the aggregator is pinned at endpoint 1", () => {
+    it("takes endpoint number 1, because it is added to the ServerNode before any child", async () => {
+        // ⊗ Alexa requires the bridge's aggregator at endpoint 1 (node.ts's
+        // `start()` doc comment). Nothing pinned that ordering decision until
+        // now — a future edit that adds another endpoint to the ServerNode
+        // before the aggregator would silently break Alexa discovery with no
+        // test catching it.
+        const storagePath = storage();
+        const session = await boot(storagePath);
+        try {
+            const aggregator = session.bridge.server.parts.find(part => part.id === "aggregator");
+            assert.ok(aggregator !== undefined, "the aggregator must be a direct child of the root node");
+            assert.equal(aggregator.number, 1);
+        } finally {
+            await session.close();
+        }
+    });
+});
+
+describe("issue #222: the endpoint-count advisory, softer than the 100 warning", () => {
+    /** `count` freshly-specced onOffLight accessories, distinct from every other suite's ids. */
+    function manySpecs(count: number): unknown[] {
+        return Array.from({ length: count }, (_, i) => ({
+            indigoDeviceId: 250000000 + i,
+            role: "onOffLight",
+            label: `Advisory ${i}`,
+            reachable: true,
+            states: { onOff: false },
+            options: {},
+        }));
+    }
+
+    it("stays quiet at exactly the advisory threshold — only PAST it counts", async () => {
+        const storagePath = storage();
+        const session = await boot(storagePath);
+        try {
+            await attach(session.client, "adv0", manySpecs(ENDPOINT_COUNT_ADVISORY));
+            assert.ok(
+                !session.logged.some(line => line.includes(`exceeds ${ENDPOINT_COUNT_ADVISORY}`)),
+                "50 itself must not trip the advisory",
+            );
+        } finally {
+            await session.close();
+        }
+    });
+
+    it("logs an advisory once past 50, without also tripping the 100 warning", async () => {
+        const storagePath = storage();
+        const session = await boot(storagePath);
+        try {
+            await attach(session.client, "adv1", manySpecs(ENDPOINT_COUNT_ADVISORY + 1));
+            assert.ok(
+                session.logged.some(
+                    line => line.startsWith(`${ENDPOINT_COUNT_ADVISORY + 1} exported endpoints exceeds`) &&
+                        line.includes("community-reported"),
+                ),
+                "the advisory must fire once past 50, phrased as community-reported not a verdict",
+            );
+            assert.ok(
+                !session.logged.some(line => line.includes("advisory limit")),
+                "the harder 100 warning's own wording must not ALSO fire",
+            );
+        } finally {
+            await session.close();
+        }
+    });
+
+    it("keeps the existing 100 warning, and does not also log the 50 advisory", async () => {
+        const storagePath = storage();
+        const session = await boot(storagePath);
+        try {
+            await attach(session.client, "adv2", manySpecs(ENDPOINT_COUNT_WARNING + 1));
+            assert.ok(
+                session.logged.some(
+                    line => line.startsWith(`${ENDPOINT_COUNT_WARNING + 1} exported endpoints exceeds the ` +
+                        `${ENDPOINT_COUNT_WARNING} advisory limit`),
+                ),
+                "the pre-existing 100 warning must be unchanged",
+            );
+            assert.ok(
+                !session.logged.some(line => line.includes("community-reported")),
+                "the softer 50 advisory must not ALSO fire once past 100",
             );
         } finally {
             await session.close();

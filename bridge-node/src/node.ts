@@ -92,6 +92,16 @@ export const HARDWARE_VERSION_STRING = "1";
 /** PRD §5.3: no hard cap, but past this many exports the log says so. */
 export const ENDPOINT_COUNT_WARNING = 100;
 
+/**
+ * Issue #222: an earlier, softer heads-up than {@link ENDPOINT_COUNT_WARNING}.
+ * "~50 bridged endpoints" is community-reported (Alexa forums, home-automation
+ * threads about large HomeKit/Matter bridges) as roughly where some ecosystems
+ * start dropping endpoints — Alexa is the one most often named — but it is NOT
+ * documented in matter.js's own docs, so this is phrased as an advisory, not a
+ * verdict. `ENDPOINT_COUNT_WARNING` stays the harder, unconditional line.
+ */
+export const ENDPOINT_COUNT_ADVISORY = 50;
+
 /** §4.3 `warnings` key for identity-file writes. Stable, so it replaces itself. */
 const WARN_IDENTITY_WRITE = "identity-write";
 
@@ -925,6 +935,13 @@ export class BridgeNode implements BridgeFacade {
             this.log(
                 `${this.registry.size} exported endpoints exceeds the ${ENDPOINT_COUNT_WARNING} advisory limit; ` +
                     "ecosystem per-home accessory caps will bite before memory does",
+            );
+        } else if (this.registry.size > ENDPOINT_COUNT_ADVISORY) {
+            this.log(
+                `${this.registry.size} exported endpoints exceeds ${ENDPOINT_COUNT_ADVISORY} — some Matter ` +
+                    "ecosystems (Alexa is the one most often named) have been community-reported to start " +
+                    "dropping bridged endpoints somewhere around that many, though this is not documented " +
+                    "in matter.js's own docs",
             );
         }
         return this.getStatus();
