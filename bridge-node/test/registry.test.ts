@@ -912,6 +912,22 @@ describe("command events and the echo guard (§4.2, §6.4)", () => {
         }
     });
 
+    it("emits no command event for a plain onOff role's set_state (#143 twin)", async () => {
+        // The extendedColorLight test above already pins this for a role whose
+        // onOff cluster is a side effect of the colour/level clusters; this pins
+        // it for the roles whose *only* cluster is OnOff, since #143 changes
+        // exactly how those roles' pushes reach the attribute.
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(1, Role.onOffLight)], false);
+            await h.registry.setState(1, { onOff: true });
+            await h.registry.setState(1, { onOff: false });
+            assert.deepEqual(h.commands, [], "a local onOff write echoed back as a command event");
+        } finally {
+            await h.close();
+        }
+    });
+
     it("emits the §4.2 payload for each attribute an ecosystem changes", async () => {
         const h = await harness();
         try {
@@ -939,6 +955,38 @@ describe("command events and the echo guard (§4.2, §6.4)", () => {
         }
     });
 
+    it("still lets the dimmer's LevelControl coupling move onOff directly (PR4 boundary fence)", async () => {
+        // LevelControlServer.couple() (LevelControlServer.js:363-390) writes
+        // `agent.get(OnOffServer).state.onOff` DIRECTLY when a *WithOnOff
+        // command turns the light on or off — it never calls on()/off(), so
+        // it is untouched by #143's conversion and reaches Indigo purely
+        // through WATCH_ON_OFF, exactly as before. A real invocation cannot
+        // stand in for the ecosystem here: `endpoint.act()` always opens an
+        // offline LocalActorContext (LocalActorContext.js:93), so this uses
+        // the same ecosystemWrite() lever the test above does — what PR2
+        // must not break is that the two attributes couple() moves, moved
+        // by a real MoveToLevelWithOnOff, still both reach Indigo. (What
+        // couple() still does that PR2 deliberately leaves alone — moving
+        // onOff optimistically before Indigo confirms — is a later PR's,
+        // not this one's; see the IndigoOnOffServer class doc.)
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(1, Role.dimmableLight, { states: { onOff: false } })], false);
+            const endpoint = [...h.aggregator.parts][0];
+            assert.ok(endpoint !== undefined);
+
+            ecosystemWrite(endpoint, "onOff", "onOff", true, false);
+            ecosystemWrite(endpoint, "levelControl", "currentLevel", 128, 1);
+
+            assert.deepEqual(h.commands, [
+                { indigoDeviceId: 1, command: "onOff", args: { value: true } },
+                { indigoDeviceId: 1, command: "setLevel", args: { level: 50 } },
+            ]);
+        } finally {
+            await h.close();
+        }
+    });
+
     it("stops listening once the endpoint is removed", async () => {
         const h = await harness();
         try {
@@ -956,6 +1004,14 @@ describe("command events and the echo guard (§4.2, §6.4)", () => {
             // not, or a removed export would keep talking to the plugin.
             ecosystemWrite(endpoint, "onOff", "onOff", false, true);
             assert.equal(h.commands.length, 1, "a removed endpoint still emitted");
+
+            // #143: `remove()` closes the underlying matter.js endpoint (unlike
+            // `registry.close()`, which only unwatches), so an invocation on it
+            // is refused by matter.js's own construction lifecycle before it
+            // ever reaches COMMAND_SINKS — the same guarantee the door lock's
+            // "refuses an invocation on a removed endpoint outright" test pins.
+            await assert.rejects(async () => endpoint.act(agent => agent.get(OnOffServer).on()));
+            assert.equal(h.commands.length, 1, "a removed endpoint still reported an invocation");
         } finally {
             await h.close();
         }
