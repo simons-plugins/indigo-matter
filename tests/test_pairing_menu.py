@@ -842,6 +842,23 @@ class TestBridgeAgentWiring:
         assert not plist.exists(), "the plist must be gone, not merely booted out"
         assert "cannot bring it back" in _logged(plug.logger)
 
+    def test_stop_resets_a_standing_conflict_so_nothing_later_calls_it_resolved(self, plug,
+                                                                                tmp_path):
+        """#187 review: with a conflict standing, uninstalling the agent must not
+        leave `_last_bridge_port_conflict` around for the next port-conflict tick
+        to see `port_conflict_report()` go quiet (no pid — we just uninstalled)
+        and announce "resolved" — the rival, if any, still holds the port. This is
+        the braces; Commit 1's pid-gate on that log line is the belt."""
+        plist = tmp_path / "com.simons-plugins.indigo-matter.bridge.plist"
+        plist.write_text("<plist/>")
+        agent = Mock(plist_path=str(plist))
+        agent.is_running.side_effect = [True, False]
+        agent.uninstall.side_effect = lambda: plist.unlink()
+        plug.bridge_process = agent
+        plug._last_bridge_port_conflict = "port 5581 is held by pid 777"
+        plug._stop_bridge_agent()
+        assert plug._last_bridge_port_conflict is None
+
     def test_a_stop_that_did_not_work_is_LOUD(self, plug, tmp_path):
         """⊗ The silent branch. `stop()` returning False said nothing at all and
         `_agent_started` had already been cleared, so nothing retried: the node
@@ -970,6 +987,82 @@ class TestBridgeAgentWiring:
         monkeypatch.setattr(plugin_mod.bridge_agent, "BridgeProcess", lambda *_a, **_k: agent)
         plug._start_bridge_agent()
         assert "LaunchAgent is running" in _logged(plug.logger)
+
+    def test_start_carries_a_pending_verification_over_a_leave_alone_rebuild(
+            self, plug, plugin_mod, monkeypatch, tmp_path):
+        """#187 review: `_start_bridge_agent` rebuilds a fresh `BridgeProcess` on
+        every call. If the rebuild's own `ensure_installed()` takes the
+        digest-match 'leave alone' path (nothing actually changed), the replaced
+        instance's still-pending #187 verification must survive onto the new one
+        — or a second export inside the grace window silently drops it."""
+        import bridge_agent as bridge_agent_mod
+        from bridge_agent import BridgeProcess as RealBridgeProcess
+        from test_server_process import FakeRunner
+
+        home = tmp_path / "home"
+        bindir = home / "bin"
+        bindir.mkdir(parents=True, exist_ok=True)
+        (bindir / "npx").write_text("#!/bin/sh\n")
+        (bindir / "node").write_text("#!/bin/sh\n")
+        entry = (home / "indigo-matter" / "node_modules" / bridge_agent_mod.BRIDGE_PACKAGE
+                 / "dist" / "main.js")
+        entry.parent.mkdir(parents=True, exist_ok=True)
+        entry.write_text("// fake entry\n")
+
+        def _factory(prefs, logger):
+            # RealBridgeProcess, NOT bridge_agent_mod.BridgeProcess: the latter IS what
+            # monkeypatch.setattr below replaces, and calling it here would recurse
+            # into this very factory.
+            return RealBridgeProcess(prefs, logger, home=str(home),
+                                     npx_path=str(bindir / "npx"),
+                                     runner=FakeRunner(), sleep=lambda *_a: None)
+
+        monkeypatch.setattr(plugin_mod.bridge_agent, "BridgeProcess", _factory)
+        plug._start_bridge_agent()                  # first export: fresh bootstrap, armed
+        first = plug.bridge_process
+        assert first._bootstrap_verify_after is not None
+        plug._start_bridge_agent()                  # second export, same prefs: leave-alone path
+        second = plug.bridge_process
+        assert second is not first
+        assert second._bootstrap_verify_after == first._bootstrap_verify_after
+
+    def test_start_lets_a_fresh_bootstrap_win_over_an_older_pending_verification(
+            self, plug, plugin_mod, monkeypatch, tmp_path):
+        """A rebuild whose OWN `ensure_installed()` bootstraps fresh must arm its
+        OWN deadline — never be overwritten by whatever the replaced instance
+        still had pending."""
+        import bridge_agent as bridge_agent_mod
+        from bridge_agent import BridgeProcess as RealBridgeProcess
+        from test_server_process import FakeRunner
+
+        home = tmp_path / "home"
+        bindir = home / "bin"
+        bindir.mkdir(parents=True, exist_ok=True)
+        (bindir / "npx").write_text("#!/bin/sh\n")
+        (bindir / "node").write_text("#!/bin/sh\n")
+        entry = (home / "indigo-matter" / "node_modules" / bridge_agent_mod.BRIDGE_PACKAGE
+                 / "dist" / "main.js")
+        entry.parent.mkdir(parents=True, exist_ok=True)
+        entry.write_text("// fake entry\n")
+
+        def _factory(prefs, logger):
+            # RealBridgeProcess, NOT bridge_agent_mod.BridgeProcess: the latter IS what
+            # monkeypatch.setattr below replaces, and calling it here would recurse
+            # into this very factory.
+            return RealBridgeProcess(prefs, logger, home=str(home),
+                                     npx_path=str(bindir / "npx"),
+                                     runner=FakeRunner(), sleep=lambda *_a: None)
+
+        monkeypatch.setattr(plugin_mod.bridge_agent, "BridgeProcess", _factory)
+        plug._start_bridge_agent()
+        first = plug.bridge_process
+        first_deadline = first._bootstrap_verify_after
+        assert first_deadline is not None
+        plug.pluginPrefs["bridgeMatterPort"] = "5541"     # a real settings change
+        plug._start_bridge_agent()                         # must bootstrap fresh, not leave-alone
+        second = plug.bridge_process
+        assert second._bootstrap_verify_after is not None
+        assert second._bootstrap_verify_after != first_deadline
 
     def test_the_install_action_refuses_a_concurrent_npm_run(self, plug):
         """One npm root; two concurrent installs into it corrupt each other."""

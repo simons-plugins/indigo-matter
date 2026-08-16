@@ -240,3 +240,27 @@ class BridgeProcess(LaunchAgent):
     def install(self, install_spec: str = DEFAULT_INSTALL_SPEC) -> bool:
         """npm-install the bridge node. Signature pins the default for callers/docs."""
         return super().install(install_spec)
+
+    def _warn_on_settings(self) -> None:
+        """Warn, on every ensure_installed() (that passes preflight), while the Matter
+        port is non-default (#222).
+
+        5540 is Matter's own default AND — per matter.js's ECOSYSTEMS.md — the port
+        Alexa hard-requires; the ``bridgeMatterPort`` pref exists as an escape hatch
+        for a Mac where something else already holds it (PRD §4.4), not as a tuning
+        knob. Advisory only: a non-default port is sometimes the only way to get the
+        bridge running at all, so this warns rather than refuses.
+        """
+        # int(), not a string compare: _port_str() returns digits as-is (a pref of
+        # "05540" survives with its leading zero), so a plain == would warn about a
+        # port that is numerically the default. Both sides are already digit-only
+        # per _port_str()'s own contract, so int() here never raises.
+        if int(self._matter_port) == int(DEFAULT_MATTER_PORT):
+            return
+        self.logger.warning(
+            "the Matter bridge is starting on port %s, not the default %s: non-standard "
+            "Matter ports are known to break Alexa discovery, and Amazon documents "
+            "support for only ONE Matter node per host. Use the default unless another "
+            "Matter stack on this Mac already holds it.",
+            self._matter_port, DEFAULT_MATTER_PORT,
+        )

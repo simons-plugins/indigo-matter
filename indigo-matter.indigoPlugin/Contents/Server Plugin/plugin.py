@@ -22,6 +22,7 @@ names are isolated in ``protocol.py``.
 """
 from __future__ import annotations
 
+import os
 import threading
 import time
 from concurrent.futures import TimeoutError as FuturesTimeoutError
@@ -41,6 +42,7 @@ from export_dialog_mixin import ExportDialogMixin
 from export_store import ExportStore
 from http_api_mixin import HttpApiMixin
 from http_handlers import HttpApi
+from launch_agent import STARTUP_GRACE_SECONDS, VERDICT_CONFLICT_FREE, VERDICT_DEAD
 from matter_client import MatterClient
 from matter_handlers.registry import HandlerRegistry
 from matter_handlers.settings import settings_for_type
@@ -104,6 +106,11 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, ServerMenuMixin,
         # verdict logged so a standing conflict is reported once, not every pass.
         self._next_port_check: float = 0.0
         self._last_port_conflict: str | None = None
+        # Same, for the bridge agent (#187) — a SEPARATE pair of state variables
+        # because the two agents start/stop on unrelated triggers (serverLocation
+        # vs the export allow-list) and must not silence each other's verdicts.
+        self._next_bridge_port_check: float = 0.0
+        self._last_bridge_port_conflict: str | None = None
         # The EXPORT bridge node's LaunchAgent (E7). Built lazily and only ever
         # by a path that means to run it: a fresh install must be inert (XAC1),
         # and constructing this in startup would be one `ensure_installed` away
@@ -713,7 +720,10 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, ServerMenuMixin,
         self._port_conflict_tick()
 
     def _port_conflict_tick(self) -> None:
-        """Periodically re-check that our matter-server still owns its port (#182).
+        """Periodically re-check that our launchd-managed processes still own their
+        ports (#182), and — for whichever of them just (re)bootstrapped — once their
+        bind window has passed rather than waiting for the next slow-interval pass
+        (#187, ``LaunchAgent.due_for_bootstrap_verification``).
 
         ``_apply`` already checks this, but only when something calls
         ``ensure_installed()`` — plugin startup or a menu action. The jarvis incident
@@ -724,33 +734,100 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, ServerMenuMixin,
         Without this tick the diagnosis only ever fires when someone was already about
         to intervene.
 
+        Checks BOTH agents this plugin can manage: the controller (``server_process``)
+        and the export bridge node (``bridge_process`` — before #187 only the
+        controller was polled, so a bridge that lost its port race went undetected for
+        as long as nothing else happened to reload it).
+        """
+        self._check_agent_port_conflict(
+            getattr(self, "server_process", None), "_next_port_check", "_last_port_conflict")
+        self._check_agent_port_conflict(
+            getattr(self, "bridge_process", None),
+            "_next_bridge_port_check", "_last_bridge_port_conflict")
+
+    def _check_agent_port_conflict(self, agent, next_attr: str, last_attr: str) -> None:
+        """One LaunchAgent's contribution to :meth:`_port_conflict_tick` (#182/#187).
+
         Runs on its own slow cadence (it shells out to lsof/ps) and logs only when the
-        verdict CHANGES, so a standing conflict is one line rather than 240 an hour.
+        verdict CHANGES, so a standing conflict is one line rather than 240 an hour —
+        except a pending post-bootstrap verification, which runs regardless of that
+        cadence gate, because #187 exists precisely to catch a lost bind race sooner
+        than the next scheduled pass.
+
+        **Review finding: "clear on any non-raising call" was wrong.** A due
+        verification's ``port_conflict_report()`` answers ``None`` for THREE
+        different situations — healthy, the process is too young to judge, and the
+        managed job has NO pid at all — and the old code cleared the flag on all
+        three alike. That last one IS the #187 fault: bootstrap succeeded, the
+        process then lost the port bind race and exited, and nothing was ever
+        logged. A due verification is now resolved via
+        :meth:`~launch_agent.LaunchAgent.post_bootstrap_verdict`, which tells the
+        three apart, and cleared (compare-and-clear, via the exact deadline token
+        this call observed) only once a real verdict — conflict, dead, or
+        healthy — has been rendered; "too young to tell" leaves it armed for the
+        next tick to retry. A verification that keeps failing to reach a verdict
+        (a raising report, or a process that never resolves) is bounded: past
+        ``2 * STARTUP_GRACE_SECONDS`` since it was armed it is disarmed with a
+        single warning instead — at most ~16 probes on the 15s watchdog cadence.
         """
         # getattr for the same reason _disconnect_ticks above uses it: this runs on the
         # watchdog thread, and a diagnostic must never be the thing that kills the
         # health loop if it is reached before/without full construction.
-        sp = getattr(self, "server_process", None)
-        if sp is None:                       # remote matter-server: not ours to police
+        if agent is None:                    # not managed this session: not ours to police
             return
         now = time.monotonic()
-        if now < getattr(self, "_next_port_check", 0.0):
+        due_token = agent.due_for_bootstrap_verification()
+        if due_token is not None and now > due_token + 2 * STARTUP_GRACE_SECONDS:
+            agent.clear_bootstrap_verification(due_token)
+            self.logger.warning(
+                "post-bootstrap port verification for %s could not conclude within %.0fs of "
+                "its bootstrap, so it has been abandoned rather than retried forever. This does "
+                "NOT mean %s is unhealthy — only that the check itself never reached a verdict "
+                "(e.g. every port-conflict probe raised). The regular %.0fs interval check "
+                "below still polices this agent.",
+                agent.spec.package, 2 * STARTUP_GRACE_SECONDS, agent.spec.package,
+                PORT_CONFLICT_CHECK_INTERVAL,
+            )
+            setattr(self, next_attr, now + PORT_CONFLICT_CHECK_INTERVAL)
             return
-        self._next_port_check = now + PORT_CONFLICT_CHECK_INTERVAL
+        if due_token is None and now < getattr(self, next_attr, 0.0):
+            return
+        setattr(self, next_attr, now + PORT_CONFLICT_CHECK_INTERVAL)
         try:
-            conflict = sp.port_conflict_report()
+            conflict = agent.port_conflict_report()
         except Exception as exc:  # noqa: BLE001 - a diagnostic must never kill the watchdog
             self.logger.debug("port conflict check failed: %s", exc)
-            return
-        previous = getattr(self, "_last_port_conflict", None)
+            return  # leave any pending #187 verification armed; the next tick retries
+        if due_token is not None:
+            if conflict:
+                agent.clear_bootstrap_verification(due_token)  # a verdict; the error path below logs it
+            else:
+                verdict = agent.post_bootstrap_verdict()
+                if verdict == VERDICT_DEAD:
+                    self.logger.error(
+                        "%s did not survive its own bootstrap: bootstrap succeeded, but the "
+                        "managed job now has no pid at all — most likely it lost the port %s "
+                        "bind race and exited on EADDRINUSE. See %s.",
+                        agent.spec.package, agent.spec.port,
+                        os.path.join(agent.log_dir, agent.spec.err_log),
+                    )
+                    agent.clear_bootstrap_verification(due_token)
+                elif verdict == VERDICT_CONFLICT_FREE:
+                    agent.clear_bootstrap_verification(due_token)
+                # else VERDICT_PENDING: too young (or unknowable) to render a verdict yet —
+                # leave the flag armed so the next tick retries.
+        previous = getattr(self, last_attr, None)
         if conflict == previous:
             return
         if conflict:
             self.logger.error(conflict)
-        elif previous:
-            self.logger.info("matter-server now owns port %s again; the port conflict "
-                             "reported earlier is resolved.", sp.spec.port)
-        self._last_port_conflict = conflict
+        elif previous and agent.managed_job_has_pid():
+            # Gated on a pid (#187 review): port_conflict_report() also goes quiet when the
+            # managed job has NO pid at all — the dead-process branch above already reported
+            # that, and it is the opposite of resolved.
+            self.logger.info("%s now owns port %s again; the port conflict reported "
+                             "earlier is resolved.", agent.spec.package, agent.spec.port)
+        setattr(self, last_attr, conflict)
 
     # ------------------------------------------------------------------
     # Config

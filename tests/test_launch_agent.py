@@ -20,7 +20,9 @@ import plistlib
 
 import pytest
 
-from launch_agent import INSTALL_NODE_STAMP, AgentSpec, LaunchAgent
+from launch_agent import (
+    INSTALL_NODE_STAMP, VERDICT_CONFLICT_FREE, VERDICT_DEAD, VERDICT_PENDING, AgentSpec, LaunchAgent,
+)
 from server_process import APPLIED_PLIST_MARKER, LABEL, ServerProcess
 
 from test_server_process import FakeRunner, ProcRunner
@@ -605,6 +607,157 @@ def test_portless_agent_never_reports_a_port_conflict(tmp_path, mock_logger):
                    _spec("com.example.a", "pkg-a", str(tmp_path / "a-store")),
                    mock_logger, runner=ProcRunner(listen_pids=[659]))
     assert agent.port_conflict_report(managed_pid=111) is None
+
+
+# ---------------------------------------------------------------------------
+# #187 — a fresh bootstrap arms a deferred post-bind-window port verification,
+# consumed by the caller (the plugin's periodic tick) once STARTUP_GRACE_SECONDS
+# has passed. Neither _apply_plist's fresh-bootstrap path nor start()/restart()
+# used to check this themselves, leaving a rival free to win the bind race
+# unnoticed until whatever tick happened to run next.
+# ---------------------------------------------------------------------------
+
+def test_nothing_pending_before_any_bootstrap(tmp_path, mock_logger):
+    agent = _agent(tmp_path / "home", _spec("com.example.a", "pkg-a", str(tmp_path / "s"), port=5580),
+                   mock_logger, runner=FakeRunner())
+    assert agent.due_for_bootstrap_verification() is None
+
+
+def test_a_fresh_bootstrap_arms_verification_but_not_before_the_grace_window(tmp_path,
+                                                                             mock_logger):
+    agent = _agent(tmp_path / "home", _spec("com.example.a", "pkg-a", str(tmp_path / "s"), port=5580),
+                   mock_logger, runner=FakeRunner())
+    assert agent.ensure_installed() is True          # fresh bootstrap (no plist existed)
+    assert agent.due_for_bootstrap_verification() is None   # armed, but grace not elapsed
+    agent._bootstrap_verify_after = 0.0              # simulate STARTUP_GRACE_SECONDS elapsed
+    assert agent.due_for_bootstrap_verification() == 0.0
+
+
+def test_clear_bootstrap_verification_disarms_it(tmp_path, mock_logger):
+    agent = _agent(tmp_path / "home", _spec("com.example.a", "pkg-a", str(tmp_path / "s"), port=5580),
+                   mock_logger, runner=FakeRunner())
+    agent.ensure_installed()
+    agent._bootstrap_verify_after = 0.0
+    token = agent.due_for_bootstrap_verification()
+    assert token == 0.0
+    agent.clear_bootstrap_verification(token)
+    assert agent.due_for_bootstrap_verification() is None
+
+
+def test_clear_bootstrap_verification_ignores_a_stale_token(tmp_path, mock_logger):
+    """Compare-and-clear (#187 review): a clear against a deadline that is no
+    longer the armed one — because something re-armed in between the caller's
+    due-observation and its clear call — must be a no-op, never wipe the NEW
+    arming. This is what makes a concurrent re-arm (a menu restart landing on
+    another thread mid-tick) safe."""
+    agent = _agent(tmp_path / "home", _spec("com.example.a", "pkg-a", str(tmp_path / "s"), port=5580),
+                   mock_logger, runner=FakeRunner())
+    agent._bootstrap_verify_after = 100.0
+    stale_token = agent._bootstrap_verify_after
+    agent._bootstrap_verify_after = 200.0        # a concurrent re-arm
+    agent.clear_bootstrap_verification(stale_token)
+    assert agent._bootstrap_verify_after == 200.0   # untouched by the stale clear
+    agent.clear_bootstrap_verification(200.0)
+    assert agent._bootstrap_verify_after is None
+
+
+def test_restart_also_arms_verification(tmp_path, mock_logger):
+    agent = _agent(tmp_path / "home", _spec("com.example.a", "pkg-a", str(tmp_path / "s"), port=5580),
+                   mock_logger, runner=FakeRunner())
+    agent.ensure_installed()
+    agent.clear_bootstrap_verification(agent._bootstrap_verify_after)
+    assert agent.restart() is True
+    assert agent.due_for_bootstrap_verification() is None   # armed, not yet due
+    agent._bootstrap_verify_after = 0.0
+    assert agent.due_for_bootstrap_verification() == 0.0
+
+
+def test_start_also_arms_verification(tmp_path, mock_logger):
+    agent = _agent(tmp_path / "home", _spec("com.example.a", "pkg-a", str(tmp_path / "s"), port=5580),
+                   mock_logger, runner=FakeRunner())
+    agent.ensure_installed()                          # writes the plist start() reloads
+    agent.clear_bootstrap_verification(agent._bootstrap_verify_after)
+    assert agent.start() is True
+    agent._bootstrap_verify_after = 0.0
+    assert agent.due_for_bootstrap_verification() == 0.0
+
+
+def test_leaving_a_healthy_job_untouched_does_not_arm_verification(tmp_path, mock_logger):
+    """The digest-matches 'leave alone' branch already checks the port itself
+    (#182, unchanged) — it must not ALSO arm a #187 verification, since no
+    bootstrap happened on that pass."""
+    runner = ProcRunner(print_pid=4242, listen_pids=[4242])
+    agent = _agent(tmp_path / "home", _spec("com.example.a", "pkg-a", str(tmp_path / "s"), port=5580),
+                   mock_logger, runner=runner)
+    assert agent.ensure_installed() is True            # first pass: marker mismatch → bootstraps
+    agent.clear_bootstrap_verification(agent._bootstrap_verify_after)
+    assert agent.ensure_installed() is False            # second pass: digest matches → leave alone
+    assert agent.due_for_bootstrap_verification() is None
+
+
+# ---------------------------------------------------------------------------
+# post_bootstrap_verdict() / managed_job_has_pid() — the tri-state #187 review
+# adds so a caller can tell "healthy", the #187 fault itself (no pid at all),
+# and "too soon to tell" apart once port_conflict_report() has answered None.
+# ---------------------------------------------------------------------------
+
+def test_verdict_is_dead_when_the_managed_job_has_no_pid(tmp_path, mock_logger):
+    agent = _portful(tmp_path, mock_logger, ProcRunner(print_pid=None))
+    assert agent.post_bootstrap_verdict() == VERDICT_DEAD
+    assert agent.managed_job_has_pid() is False
+
+
+def test_verdict_is_conflict_free_once_the_pid_is_past_the_grace_window(tmp_path, mock_logger):
+    agent = _portful(tmp_path, mock_logger, ProcRunner(print_pid=5423, proc_etime="10:00"))
+    assert agent.post_bootstrap_verdict() == VERDICT_CONFLICT_FREE
+    assert agent.managed_job_has_pid() is True
+
+
+def test_verdict_is_pending_while_the_pid_is_still_young(tmp_path, mock_logger):
+    agent = _portful(tmp_path, mock_logger, ProcRunner(print_pid=5423, proc_etime="00:05"))
+    assert agent.post_bootstrap_verdict() == VERDICT_PENDING
+
+
+def test_verdict_is_pending_when_the_pids_age_is_unknowable(tmp_path, mock_logger):
+    # Fail closed, same discipline as port_conflict_report's own age gate: "cannot
+    # tell" must never read as "old enough" and render a verdict it hasn't earned.
+    agent = _portful(tmp_path, mock_logger, ProcRunner(print_pid=5423, proc_etime=None))
+    assert agent.post_bootstrap_verdict() == VERDICT_PENDING
+
+
+# ---------------------------------------------------------------------------
+# adopt_pending_bootstrap_verification() — a rebuild whose own ensure_installed()
+# left a healthy job alone must not silently drop the replaced instance's
+# still-pending #187 verification (server_menu_mixin.py's _start_bridge_agent).
+# ---------------------------------------------------------------------------
+
+def test_adopt_carries_over_a_pending_verification(tmp_path, mock_logger):
+    spec = _spec("com.example.a", "pkg-a", str(tmp_path / "s"), port=5580)
+    old = _agent(tmp_path / "home", spec, mock_logger, runner=FakeRunner())
+    old._bootstrap_verify_after = 123.0
+    new = _agent(tmp_path / "home", spec, mock_logger, runner=FakeRunner())
+    assert new._bootstrap_verify_after is None
+    new.adopt_pending_bootstrap_verification(old)
+    assert new._bootstrap_verify_after == 123.0
+
+
+def test_adopt_never_overwrites_a_fresh_arming(tmp_path, mock_logger):
+    """A bootstrap THIS instance just did must win — never be clobbered by an
+    older instance's stale deadline."""
+    spec = _spec("com.example.a", "pkg-a", str(tmp_path / "s"), port=5580)
+    old = _agent(tmp_path / "home", spec, mock_logger, runner=FakeRunner())
+    old._bootstrap_verify_after = 1.0
+    new = _agent(tmp_path / "home", spec, mock_logger, runner=FakeRunner())
+    new._bootstrap_verify_after = 999.0          # this instance's OWN fresh bootstrap
+    new.adopt_pending_bootstrap_verification(old)
+    assert new._bootstrap_verify_after == 999.0
+
+
+def test_adopt_with_no_previous_instance_is_a_noop(tmp_path, mock_logger):
+    agent = _agent(tmp_path / "home", _spec("com.example.a", "pkg-a", str(tmp_path / "s"), port=5580),
+                   mock_logger, runner=FakeRunner())
+    agent.adopt_pending_bootstrap_verification(None)   # first-ever call: nothing to adopt
+    assert agent._bootstrap_verify_after is None
 
 
 # ---------------------------------------------------------------------------

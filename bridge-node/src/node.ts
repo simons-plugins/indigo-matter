@@ -92,6 +92,17 @@ export const HARDWARE_VERSION_STRING = "1";
 /** PRD §5.3: no hard cap, but past this many exports the log says so. */
 export const ENDPOINT_COUNT_WARNING = 100;
 
+/**
+ * Issue #222: an earlier, softer heads-up than {@link ENDPOINT_COUNT_WARNING}.
+ * "~50 bridged endpoints" is community-reported (Alexa forums, home-automation
+ * threads about large HomeKit/Matter bridges) as roughly where some ecosystems
+ * start dropping endpoints — Alexa is the one most often named — but it is NOT
+ * documented in matter.js's own docs, so this is phrased as an advisory, not a
+ * verdict. `ENDPOINT_COUNT_WARNING` stays the harder line, its wording not
+ * hedged as folklore the way this one's is.
+ */
+export const ENDPOINT_COUNT_ADVISORY = 50;
+
 /** §4.3 `warnings` key for identity-file writes. Stable, so it replaces itself. */
 const WARN_IDENTITY_WRITE = "identity-write";
 
@@ -202,6 +213,13 @@ export class BridgeNode implements BridgeFacade {
     /** The drift the last {@link checkDrift} found; what §4.3 reports. */
     #drift: DriftEntry[] = [];
     /**
+     * The highest {@link warnOnEndpointCount} tier already logged this session
+     * (0 = neither threshold crossed, 1 = the 50 advisory, 2 = the 100
+     * warning) — issue #222 review. So a standing endpoint count does not
+     * re-log on every `upsertEndpoint`; only a NEW crossing does.
+     */
+    #loggedEndpointCountTier = 0;
+    /**
      * §4.3 `warnings` this object owns — the identity-file ones. The endpoint
      * map keeps its own and {@link getStatus} merges them, so each warning is
      * cleared by whatever succeeded rather than by a central bookkeeper that
@@ -264,6 +282,14 @@ export class BridgeNode implements BridgeFacade {
      * takes endpoint 1; bridged children land at 2 and up, in the order the
      * first `attach` creates them (and thereafter at whatever number matter.js
      * has persisted against their id).
+     *
+     * **This ordering is load-bearing, not cosmetic (issue #222).** Alexa
+     * requires a bridge's aggregator to sit at endpoint 1 (matter.js's
+     * ECOSYSTEMS.md) — a future change that adds another endpoint to the
+     * `ServerNode` before the aggregator would silently break Alexa
+     * discovery with nothing catching it except the regression test this
+     * pins it against ("the aggregator is pinned at endpoint 1",
+     * `restore.test.ts`).
      */
     async start(): Promise<void> {
         const environment = Environment.default;
@@ -404,7 +430,19 @@ export class BridgeNode implements BridgeFacade {
         }
         const restorable = this.#endpointMap.restorable();
         if (restorable.length === 0) {
-            if (this.#endpointMap.size > 0) {
+            if (this.#endpointMap.allOrphaned()) {
+                // #222 review: the "no role/label yet" message below claimed the
+                // NEXT restart would restore these — false here, and the opposite
+                // of what actually happens. Every entry has a role/label; it is the
+                // `orphaned` marker (issue #219, every device deliberately
+                // un-exported) that keeps them out of `restorable()`, and that is
+                // the CORRECT outcome, not a fault to explain away.
+                this.log(
+                    `The endpoint map holds ${this.#endpointMap.size} number(s), all of them orphaned ` +
+                        "(un-exported) — nothing to rebuild before the plugin attaches, which is the " +
+                        "correct outcome: the next restart will NOT restore them unless they are re-exported.",
+                );
+            } else if (this.#endpointMap.size > 0) {
                 // A v1 map, or one written before an endpoint was ever created.
                 // Not a fault, but it IS the reason the bridge is about to come
                 // up empty, and that is worth saying once rather than leaving
@@ -904,6 +942,44 @@ export class BridgeNode implements BridgeFacade {
         this.#driftListener?.(drift);
     }
 
+    /**
+     * Issue #222 review: the >50 advisory and >100 warning used to live only
+     * in {@link reconcile}, so a user growing their export list one device at
+     * a time via {@link upsertEndpoint} could cross either threshold with no
+     * message until the next full `reconcile` happened to run — often days
+     * away from the export that actually caused it. Called from both.
+     *
+     * De-duplicated by the highest tier already logged (`#loggedEndpointCountTier`):
+     * a standing count above a threshold does not re-log on every subsequent
+     * upsert, but crossing the HARDER tier after the softer one already fired
+     * (50, then later 100) still logs — each tier is reported once, not the
+     * pair as a single unit.
+     */
+    private warnOnEndpointCount(): void {
+        const size = this.registry.size;
+        if (size > ENDPOINT_COUNT_WARNING) {
+            if (this.#loggedEndpointCountTier >= 2) {
+                return;
+            }
+            this.#loggedEndpointCountTier = 2;
+            this.log(
+                `${size} exported endpoints exceeds ${ENDPOINT_COUNT_WARNING} — ecosystem per-home accessory ` +
+                    "caps will bite before memory does",
+            );
+        } else if (size > ENDPOINT_COUNT_ADVISORY) {
+            if (this.#loggedEndpointCountTier >= 1) {
+                return;
+            }
+            this.#loggedEndpointCountTier = 1;
+            this.log(
+                `${size} exported endpoints exceeds ${ENDPOINT_COUNT_ADVISORY} — some Matter ` +
+                    "ecosystems (Alexa is the one most often named) have been community-reported to start " +
+                    "dropping bridged endpoints somewhere around that many, though this is not documented " +
+                    "in matter.js's own docs",
+            );
+        }
+    }
+
     /** §3.1 — reconcile the live endpoint set, then answer with the new status. */
     async reconcile(endpoints: readonly EndpointSpec[], replaceAll: boolean): Promise<StatusReport> {
         const before = this.liveUniqueIds();
@@ -921,12 +997,7 @@ export class BridgeNode implements BridgeFacade {
             // one case where drift is most likely un-looked-at.
             this.checkDrift();
         }
-        if (this.registry.size > ENDPOINT_COUNT_WARNING) {
-            this.log(
-                `${this.registry.size} exported endpoints exceeds the ${ENDPOINT_COUNT_WARNING} advisory limit; ` +
-                    "ecosystem per-home accessory caps will bite before memory does",
-            );
-        }
+        this.warnOnEndpointCount();
         return this.getStatus();
     }
 
@@ -936,6 +1007,7 @@ export class BridgeNode implements BridgeFacade {
             return await this.registry.upsert(spec);
         } finally {
             this.checkDrift();
+            this.warnOnEndpointCount();
         }
     }
 

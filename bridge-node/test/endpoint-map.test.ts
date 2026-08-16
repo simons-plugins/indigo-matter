@@ -648,13 +648,16 @@ describe("EndpointMapStore.voidNumbers — reset renumbering adoption (issue #14
     });
 });
 
-describe("EndpointMapStore.forget — un-export without losing the number", () => {
-    it("drops the restoration half and keeps the identity half", () => {
+describe("EndpointMapStore.forget — un-export without losing the number (issue #219)", () => {
+    it("marks the entry orphaned, keeping BOTH the restoration half and the identity half", () => {
         // ⊗ The other half of `restorable`. Without it a device the user
         // un-exported stayed restorable for ever and was rebuilt-then-removed on
-        // every boot. Deleting the ENTRY instead would work too and would be
-        // wrong: §3.3 retains the allocation so a re-export comes back as the
-        // same accessory rather than a new one in every paired ecosystem.
+        // every boot. Deleting role/label (the pre-#219 behaviour) worked too but
+        // threw away the only evidence a future re-adopt UI could match a
+        // recreated device against — so #219 marks `orphaned` instead of erasing
+        // anything. Deleting the ENTRY instead would also be wrong: §3.3 retains
+        // the allocation so a re-export comes back as the same accessory rather
+        // than a new one in every paired ecosystem.
         const dir = storage();
         const store = new EndpointMapStore(dir);
         store.load();
@@ -670,12 +673,12 @@ describe("EndpointMapStore.forget — un-export without losing the number", () =
             { uniqueId: "indigo-2", endpointNumber: 3, role: "dimmableLight", label: "Other" },
         ]);
         assert.deepEqual(mapFileIn(dir).endpoints, {
-            "indigo-1": { number: 2 },
+            "indigo-1": { number: 2, role: "onOffLight", label: "Lamp", orphaned: true },
             "indigo-2": { number: 3, role: "dimmableLight", label: "Other" },
         });
     });
 
-    it("re-exporting refills it, at the number it kept", () => {
+    it("re-exporting refills it, at the number it kept, and clears the orphan marker", () => {
         const dir = storage();
         const store = new EndpointMapStore(dir);
         store.load();
@@ -687,12 +690,16 @@ describe("EndpointMapStore.forget — un-export without losing the number", () =
         assert.deepEqual(store.restorable(), [
             { uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Lamp" },
         ]);
+        assert.deepEqual(mapFileIn(dir).endpoints, {
+            "indigo-1": { number: 2, role: "onOffLight", label: "Lamp" },
+        });
     });
 
     it("costs no disk write when there was nothing to forget", () => {
-        // Unknown ids and already-bare entries are both no-ops: `forget` is
-        // driven by a diff, and a diff that found nothing must not rewrite the
-        // file (nor make a failed write look like a fresh one).
+        // Unknown ids and already-bare entries (no role/label to protect) are
+        // both no-ops: `forget` is driven by a diff, and a diff that found
+        // nothing worth orphaning must not rewrite the file (nor make a failed
+        // write look like a fresh one).
         const dir = storage();
         const store = new EndpointMapStore(dir);
         store.load();
@@ -702,6 +709,37 @@ describe("EndpointMapStore.forget — un-export without losing the number", () =
         assert.equal(store.forget(["indigo-1", "indigo-nope"]), 0);
 
         assert.equal(readFileSync(join(dir, ENDPOINT_MAP_FILE), "utf8"), before);
+    });
+
+    it("is idempotent — forgetting an already-orphaned entry is a no-op", () => {
+        const dir = storage();
+        const store = new EndpointMapStore(dir);
+        store.load();
+        store.check([{ uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Lamp" }]);
+        assert.equal(store.forget(["indigo-1"]), 1);
+        const before = readFileSync(join(dir, ENDPOINT_MAP_FILE), "utf8");
+
+        assert.equal(store.forget(["indigo-1"]), 0);
+
+        assert.equal(readFileSync(join(dir, ENDPOINT_MAP_FILE), "utf8"), before);
+    });
+
+    it("old-format (bare {number}) records still load, and forgetting one is a no-op", () => {
+        // A v1-migrated or never-refreshed entry has no role/label to protect,
+        // and is already excluded from `restorable` on that basis alone — #219's
+        // `orphaned` marker adds nothing for it, so `forget` must not write one.
+        const dir = storage();
+        writeFileSync(
+            join(dir, ENDPOINT_MAP_FILE),
+            JSON.stringify({ version: 1, endpoints: { "indigo-1": 2 } }),
+        );
+        const store = new EndpointMapStore(dir);
+        const loaded = store.load();
+
+        assert.equal(loaded.problem, undefined);
+        assert.equal(store.numberFor("indigo-1"), 2);
+        assert.equal(store.forget(["indigo-1"]), 0);
+        assert.deepEqual(store.restorable(), []);
     });
 });
 

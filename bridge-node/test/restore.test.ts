@@ -37,7 +37,7 @@ import {
     type EndpointMapFileV1,
 } from "../src/endpoint-map.js";
 import { uniqueIdFor } from "../src/endpoints.js";
-import { BridgeNode, matterJsVersion } from "../src/node.js";
+import { BridgeNode, ENDPOINT_COUNT_ADVISORY, ENDPOINT_COUNT_WARNING, matterJsVersion } from "../src/node.js";
 import { ErrorCode, PROTOCOL_VERSION, RefuseReason } from "../src/protocol.js";
 import { BridgeWsServer } from "../src/ws-server.js";
 import { TestClient } from "./client.js";
@@ -166,6 +166,31 @@ async function attach(
 
 function readMap(storagePath: string): EndpointMapFile {
     return JSON.parse(readFileSync(join(storagePath, ENDPOINT_MAP_FILE), "utf8")) as EndpointMapFile;
+}
+
+/** `upsert_endpoint` for one freshly-specced onOffLight accessory, awaited. */
+async function upsertOne(client: TestClient, messageId: string, indigoDeviceId: number): Promise<void> {
+    client.send({
+        message_id: messageId,
+        command: "upsert_endpoint",
+        args: {
+            endpoint: {
+                indigoDeviceId,
+                role: "onOffLight",
+                label: `Advisory ${indigoDeviceId}`,
+                reachable: true,
+                states: { onOff: false },
+                options: {},
+            },
+        },
+    });
+    for (;;) {
+        const frame = await client.next(10_000);
+        if (frame.message_id === messageId) {
+            assert.equal(frame.error, undefined, JSON.stringify(frame.error));
+            return;
+        }
+    }
 }
 
 function numbersOf(bridge: BridgeNode): Record<number, number> {
@@ -459,7 +484,7 @@ describe("issue #141 meets the §3.1 mass-removal guard", () => {
 });
 
 describe("issue #141: an un-exported device stops being restored", () => {
-    it("clears its role/label on removal, keeps its number, and never comes back", async () => {
+    it("marks its entry orphaned on removal, keeps its number AND role/label, and never comes back", async () => {
         // ⊗ THE ghost. `check` only ever adds and refreshes, so once v2 recorded
         // a role and label an entry stayed restorable FOR EVER — including for a
         // device the user deliberately un-exported. Every boot rebuilt it as a
@@ -469,6 +494,10 @@ describe("issue #141: an un-exported device stops being restored", () => {
         // regression of XAC7's "un-exported accessories are gone". Delete the
         // `forgetRemoved` call in `node.reconcile` and the third boot below
         // restores 2 and the attach removes one of them again.
+        //
+        // Since issue #219, `forget` keeps role/label (re-adopt evidence for a
+        // future recreated-device UI) rather than deleting them — `orphaned` is
+        // what now keeps the entry out of `restorable`.
         const storagePath = storage();
         const numbers = await seedTwoAccessories(storagePath);
 
@@ -483,9 +512,10 @@ describe("issue #141: an un-exported device stops being restored", () => {
         const afterRemoval = readMap(storagePath);
         assert.deepEqual(
             afterRemoval.endpoints[uniqueIdFor(LOUNGE)],
-            { number: numbers[LOUNGE] },
-            "the number survives (§3.3) so a re-export returns the SAME accessory, " +
-                "but nothing is left to rebuild it from",
+            { number: numbers[LOUNGE], role: "dimmableLight", label: "Lounge Lamp", orphaned: true },
+            "the number AND role/label survive (§3.3, #219) so a re-export returns the SAME " +
+                "accessory and the entry remains re-adopt evidence, but `orphaned` keeps it " +
+                "out of the pre-attach rebuild",
         );
         assert.deepEqual(
             afterRemoval.endpoints[uniqueIdFor(KITCHEN)],
@@ -530,6 +560,44 @@ describe("issue #141: an un-exported device stops being restored", () => {
         });
     });
 
+    it("says the map is all-orphaned, not 'no role/label yet', when everything in it is un-exported", async () => {
+        // #222 review: restoreEndpoints()'s empty-restorable log said "no role/label
+        // yet ... the next restart will restore" UNCONDITIONALLY — false once every
+        // entry actually has a role/label but is `orphaned` (#219): those entries
+        // will NOT restore on the next boot, correctly, and the old message claimed
+        // the opposite.
+        const storagePath = storage();
+        await seedTwoAccessories(storagePath);
+
+        const first = await boot(storagePath);
+        try {
+            // XAC7's mass-removal guard refuses emptying the live set without
+            // explicit intent, so un-exporting BOTH needs it here.
+            const discharged = await attach(first.client, "o1", [], "replace_all");
+            assert.equal(discharged.status.error_code, undefined, JSON.stringify(discharged.status));
+        } finally {
+            await first.close();
+        }
+
+        const second = await boot(storagePath);
+        try {
+            assert.ok(
+                second.logged.some(line => line.includes("all of them orphaned")),
+                "must name the map as all-orphaned",
+            );
+            assert.ok(
+                second.logged.some(line => line.includes("correct outcome")),
+                "must say this is the correct outcome, not a fault",
+            );
+            assert.ok(
+                !second.logged.some(line => line.includes("no role/label yet")),
+                "must NOT claim the entries lack role/label — they have it; they are orphaned",
+            );
+        } finally {
+            await second.close();
+        }
+    });
+
     it("forgets one removed through remove_endpoint too, not just through attach", async () => {
         // ⊗ §3.3's own removal path is the other way a device leaves the live
         // set, and a fix wired only into `attach` would leave it making ghosts.
@@ -555,7 +623,12 @@ describe("issue #141: an un-exported device stops being restored", () => {
             await session.close();
         }
 
-        assert.deepEqual(readMap(storagePath).endpoints[uniqueIdFor(LOUNGE)], { number: numbers[LOUNGE] });
+        assert.deepEqual(readMap(storagePath).endpoints[uniqueIdFor(LOUNGE)], {
+            number: numbers[LOUNGE],
+            role: "dimmableLight",
+            label: "Lounge Lamp",
+            orphaned: true,
+        });
     });
 
     it("forgets only what it watched go, never merely what is absent", async () => {
@@ -957,6 +1030,195 @@ describe("issue #141: a refusing node restores nothing", () => {
             assert.ok(
                 session.logged.some(line => line.startsWith("Withdrawing the 2 endpoint(s) restored")),
                 "and it says so rather than leaving the user to wonder",
+            );
+        } finally {
+            await session.close();
+        }
+    });
+});
+
+describe("issue #222: the aggregator is pinned at endpoint 1", () => {
+    it("takes endpoint number 1, because it is added to the ServerNode before any child", async () => {
+        // ⊗ Alexa requires the bridge's aggregator at endpoint 1 (node.ts's
+        // `start()` doc comment). Nothing pinned that ordering decision until
+        // now — a future edit that adds another endpoint to the ServerNode
+        // before the aggregator would silently break Alexa discovery with no
+        // test catching it.
+        const storagePath = storage();
+        const session = await boot(storagePath);
+        try {
+            const aggregator = session.bridge.server.parts.find(part => part.id === "aggregator");
+            assert.ok(aggregator !== undefined, "the aggregator must be a direct child of the root node");
+            assert.equal(aggregator.number, 1);
+        } finally {
+            await session.close();
+        }
+    });
+});
+
+describe("issue #222: the endpoint-count advisory, softer than the 100 warning", () => {
+    /** `count` freshly-specced onOffLight accessories, distinct from every other suite's ids. */
+    function manySpecs(count: number): unknown[] {
+        return Array.from({ length: count }, (_, i) => ({
+            indigoDeviceId: 250000000 + i,
+            role: "onOffLight",
+            label: `Advisory ${i}`,
+            reachable: true,
+            states: { onOff: false },
+            options: {},
+        }));
+    }
+
+    it("stays quiet at exactly the advisory threshold — only PAST it counts", async () => {
+        const storagePath = storage();
+        const session = await boot(storagePath);
+        try {
+            await attach(session.client, "adv0", manySpecs(ENDPOINT_COUNT_ADVISORY));
+            assert.ok(
+                !session.logged.some(line => line.includes(`exceeds ${ENDPOINT_COUNT_ADVISORY}`)),
+                "50 itself must not trip the advisory",
+            );
+        } finally {
+            await session.close();
+        }
+    });
+
+    it("logs an advisory once past 50, without also tripping the 100 warning", async () => {
+        const storagePath = storage();
+        const session = await boot(storagePath);
+        try {
+            await attach(session.client, "adv1", manySpecs(ENDPOINT_COUNT_ADVISORY + 1));
+            assert.ok(
+                session.logged.some(
+                    line => line.startsWith(`${ENDPOINT_COUNT_ADVISORY + 1} exported endpoints exceeds`) &&
+                        line.includes("community-reported"),
+                ),
+                "the advisory must fire once past 50, phrased as community-reported not a verdict",
+            );
+            assert.ok(
+                !session.logged.some(line => line.includes("bite before memory does")),
+                "the harder 100 warning's own wording must not ALSO fire",
+            );
+        } finally {
+            await session.close();
+        }
+    });
+
+    it("keeps the existing 100 warning, reworded to no longer call itself an advisory", async () => {
+        const storagePath = storage();
+        const session = await boot(storagePath);
+        try {
+            await attach(session.client, "adv2", manySpecs(ENDPOINT_COUNT_WARNING + 1));
+            assert.ok(
+                session.logged.some(
+                    line => line.startsWith(`${ENDPOINT_COUNT_WARNING + 1} exported endpoints exceeds ` +
+                        `${ENDPOINT_COUNT_WARNING}`) && line.includes("bite before memory does"),
+                ),
+                "the 100 warning must still fire",
+            );
+            assert.ok(
+                !session.logged.some(line => line.includes("advisory")),
+                "review fix: the harder warning's OWN wording must not call itself an advisory " +
+                    "now that 50 has a real advisory of its own",
+            );
+            assert.ok(
+                !session.logged.some(line => line.includes("community-reported")),
+                "the softer 50 advisory must not ALSO fire once past 100",
+            );
+        } finally {
+            await session.close();
+        }
+    });
+
+    it("stays at the advisory tier at exactly 100 — only PAST it trips the harder warning", async () => {
+        // Pins the `>` (not `>=`) comparison on ENDPOINT_COUNT_WARNING.
+        const storagePath = storage();
+        const session = await boot(storagePath);
+        try {
+            await attach(session.client, "adv3", manySpecs(ENDPOINT_COUNT_WARNING));
+            assert.ok(
+                session.logged.some(line => line.includes("community-reported")),
+                "100 itself is still only the advisory tier",
+            );
+            assert.ok(
+                !session.logged.some(line => line.includes("bite before memory does")),
+                "100 itself must not trip the harder warning",
+            );
+        } finally {
+            await session.close();
+        }
+    });
+
+    it("crosses the advisory via one-at-a-time upsertEndpoint, not only a full reconcile", async () => {
+        // #222 review: warnOnEndpointCount() used to live only in `reconcile`, so
+        // growing the export list one device at a time via `upsert_endpoint` crossed
+        // the threshold with no message until the next full reconcile happened.
+        const storagePath = storage();
+        const session = await boot(storagePath);
+        try {
+            await attach(session.client, "up0", manySpecs(ENDPOINT_COUNT_ADVISORY));
+            session.logged.length = 0;
+            await upsertOne(session.client, "up1", 260000000);
+            assert.ok(
+                session.logged.some(
+                    line => line.startsWith(`${ENDPOINT_COUNT_ADVISORY + 1} exported endpoints exceeds`),
+                ),
+                "the advisory must fire from upsertEndpoint, not wait for the next reconcile",
+            );
+        } finally {
+            await session.close();
+        }
+    });
+
+    it("crosses the 100 warning via upsertEndpoint too", async () => {
+        const storagePath = storage();
+        const session = await boot(storagePath);
+        try {
+            await attach(session.client, "up2", manySpecs(ENDPOINT_COUNT_WARNING));
+            session.logged.length = 0;
+            await upsertOne(session.client, "up3", 270000000);
+            assert.ok(
+                session.logged.some(
+                    line => line.startsWith(`${ENDPOINT_COUNT_WARNING + 1} exported endpoints exceeds`) &&
+                        line.includes("bite before memory does"),
+                ),
+                "the harder warning must fire from upsertEndpoint too",
+            );
+        } finally {
+            await session.close();
+        }
+    });
+
+    it("does not re-log a standing count on every subsequent upsert", async () => {
+        const storagePath = storage();
+        const session = await boot(storagePath);
+        try {
+            await attach(session.client, "up4", manySpecs(ENDPOINT_COUNT_ADVISORY + 1)); // fires once
+            session.logged.length = 0;
+            await upsertOne(session.client, "up5", 280000000);
+            await upsertOne(session.client, "up6", 280000001);
+            assert.ok(
+                !session.logged.some(line => line.includes("exported endpoints exceeds")),
+                "a standing count above an already-logged tier must not re-log on every upsert",
+            );
+        } finally {
+            await session.close();
+        }
+    });
+
+    it("logs the harder tier after the softer one already fired, on the SAME session", async () => {
+        const storagePath = storage();
+        const session = await boot(storagePath);
+        try {
+            await attach(session.client, "up7", manySpecs(ENDPOINT_COUNT_ADVISORY + 1)); // tier 1 fires
+            assert.ok(session.logged.some(line => line.includes("community-reported")));
+            await attach(session.client, "up8", manySpecs(ENDPOINT_COUNT_WARNING + 1)); // now tier 2
+            assert.ok(
+                session.logged.some(
+                    line => line.startsWith(`${ENDPOINT_COUNT_WARNING + 1} exported endpoints exceeds`) &&
+                        line.includes("bite before memory does"),
+                ),
+                "each tier is reported once, not the pair as a single unit",
             );
         } finally {
             await session.close();
