@@ -580,6 +580,20 @@ export class EndpointMapStore {
     }
 
     /**
+     * True when the map is non-empty and EVERY entry in it is
+     * {@link EndpointRecord.orphaned} — issue #222's distinction for
+     * `node.ts`'s `restoreEndpoints()`: a map in this state is the *correct*
+     * "nothing to rebuild" outcome (every device was deliberately un-exported
+     * and the next restart will NOT restore them), which is a different fact
+     * from a map that simply has no `role`/`label` recorded yet (a v1 file,
+     * or one written before the first attach) — and the two must not share
+     * one log message.
+     */
+    allOrphaned(): boolean {
+        return this.#endpoints.size > 0 && [...this.#endpoints.values()].every(record => record.orphaned === true);
+    }
+
+    /**
      * A device was **un-exported**: keep its number AND its role/label, mark it orphaned.
      *
      * The other half of {@link restorable}, and without it the restore is a bug
