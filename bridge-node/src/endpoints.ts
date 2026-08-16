@@ -13,17 +13,24 @@
  * table rather than hand-kept, so the {@link UNSUPPORTED_ROLE_DETAILS} refusal
  * survives only as the gate a *future* enum addition would trip.
  *
- * Two kinds of role live here, and they use different machinery:
+ * Two kinds of role live here, and they use different machinery — and as of
+ * #143, `onOff` is the one attribute that genuinely belongs to both:
  *
- * * **Attribute-driven** roles (everything E3 built, plus every sensor and the
- *   thermostat) report ecosystem intent through {@link WatchSpec}s on the
- *   cluster attributes an ecosystem writes.
- * * **Invocation-driven** roles (`doorLock`, `windowCovering`) cannot: their
- *   ecosystem-facing surface is *commands*, and matter.js's stock servers
- *   answer those by writing the state themselves. Both are overridden here so
- *   the write never happens — see {@link IndigoDoorLockServer} and
- *   {@link IndigoWindowCoveringServer} — and they reach their `command` sink
- *   through {@link COMMAND_SINKS}.
+ * * **Attribute-driven** roles (every sensor, the thermostat, and — for
+ *   `onOff` alone — every light and plug) report ecosystem intent through
+ *   {@link WatchSpec}s on the cluster attributes an ecosystem writes. `onOff`
+ *   stays on this list because `LevelControlServer`'s `couple()` writes
+ *   `state.onOff` directly when a dimmer's `*WithOnOff` command turns the
+ *   light on or off — bypassing any command override entirely — so
+ *   `WATCH_ON_OFF` is still the only path that reaches Indigo for that case.
+ * * **Invocation-driven** roles (`doorLock`, `windowCovering`, and — for
+ *   `onOff` alone — every light and plug again) cannot rely on attributes:
+ *   their ecosystem-facing surface is *commands*, and matter.js's stock
+ *   servers answer those by writing the state themselves. All three are
+ *   overridden here so the write never happens — see
+ *   {@link IndigoDoorLockServer}, {@link IndigoWindowCoveringServer} and
+ *   {@link IndigoOnOffServer} — and they reach their `command` sink through
+ *   {@link COMMAND_SINKS}.
  */
 
 import { Endpoint, type EndpointType, Logger, type MaybePromise, VendorId } from "@matter/main";
@@ -31,6 +38,7 @@ import { BridgedDeviceBasicInformationServer } from "@matter/main/behaviors/brid
 import { ColorControlServer } from "@matter/main/behaviors/color-control";
 import { DoorLockServer } from "@matter/main/behaviors/door-lock";
 import { OccupancySensingServer } from "@matter/main/behaviors/occupancy-sensing";
+import { OnOffServer } from "@matter/main/behaviors/on-off";
 import { ThermostatServer } from "@matter/main/behaviors/thermostat";
 import { MovementDirection, MovementType, WindowCoveringServer } from "@matter/main/behaviors/window-covering";
 import { ColorControl } from "@matter/main/clusters/color-control";
@@ -573,6 +581,97 @@ function emitCommand(
         } catch {
             // The logger itself failed; there is nowhere left to report.
         }
+    }
+}
+
+/**
+ * OnOff, with the plugin's own push routed around the emitting overrides
+ * (#143, #201).
+ *
+ * `.with("Lighting")` is **mandatory**, not a default left in place for
+ * tidiness. Every onOff-bearing device type in matter.js 0.17.8 declares the
+ * identical `OnOffServer.with("Lighting")` (verified against
+ * `on-off-light.js`, `on-off-plug-in-unit.js`, `dimmable-light.js`,
+ * `color-temperature-light.js` and `extended-color-light.js`), and the
+ * Lighting feature is what makes `onTime`/`offWaitTime`/`globalSceneControl`/
+ * `startUpOnOff` exist at all. A bare `extends OnOffServer` would strip the
+ * feature from all five roles and make `OnWithTimedOff` unimplementable — do
+ * not "simplify" this away.
+ *
+ * **There is no context guard in `on()`/`off()`, and there must not be one.**
+ * The obvious echo guard — `isEcosystemChange(this.context)`, mirroring the
+ * attribute watcher — is broken by a *third* caller of `off()` that is also
+ * offline: the countdown timer's own expiry. `OnOffServer.js:163` builds the
+ * timer as `this.callback(this.#timedOnTick, { lock: true })`;
+ * `Behavior.callback` hands back a bare emitter with no context argument, so
+ * inside matter.js's `Reactors` the trailing-context lookup finds nothing and
+ * the reaction falls through to `LocalActorContext.act(...)`, which freezes
+ * `offline: true`. So `#timedOnTick`'s `await this.off()`
+ * (`OnOffServer.js:178`) runs with `this.context.offline === true` —
+ * indistinguishable from a plugin push under {@link isEcosystemChange}.
+ * Guarding `off()` on the context would silently swallow the
+ * countdown-expiry emission. (`hasRemoteActor`, the guard stock
+ * `offWithEffect` uses at `OnOffServer.js:112`, fails the same way — and
+ * would also swallow the scene-apply offs at `OnOffServer.js:204,229`, which
+ * run in a reactor context and SHOULD reach Indigo.)
+ *
+ * The guard that actually works is structural, not contextual:
+ * {@link applyIndigoOnOff} — the plugin's only entry point — calls
+ * `super.on()`/`super.off()`, which is static dispatch straight to
+ * `OnOffBaseServer.prototype.on`/`off`. The overrides below are simply never
+ * entered by our own push, in any context, so there is nothing to guard
+ * against and no interleaving to get wrong.
+ *
+ * Nothing here writes `this.state.onOff` or calls `super`: the attribute
+ * moves only from {@link applyIndigoOnOff}'s `super` calls, once Indigo has
+ * confirmed it — mirroring {@link IndigoDoorLockServer} and
+ * {@link IndigoWindowCoveringServer}. `toggle()`, `onWithTimedOff()`,
+ * `offWithEffect()` and `onWithRecallGlobalScene()` are deliberately left
+ * stock: matter.js's own class doc says "it is enough to override on() and
+ * off() with custom control logic" (`OnOffServer.js:94-98`), and all four
+ * funnel into `this.on()`/`this.off()` — virtual dispatch to the overrides
+ * below — so overriding them too would duplicate the logic and risk a
+ * double emission.
+ *
+ * What this does NOT fix: `LevelControlServer`'s `couple()` still
+ * writes `onOff` optimistically ahead of Indigo's confirmation when a dimmer
+ * command carries `WithOnOff` — a real PRD §7 gap, but LevelControl's to
+ * close, not this class's (a later PR's scope).
+ */
+class IndigoOnOffServer extends OnOffServer.with("Lighting") {
+    /**
+     * The plugin's own push, and the only writer of the `onOff` attribute.
+     *
+     * Deliberately not named `on`/`off` and not an override: routing through
+     * `super.on()`/`super.off()` is what keeps this method from ever reaching
+     * the emitting overrides below, in any context — see the class doc.
+     *
+     * A no-op when the pushed value already matches the attribute — **not**
+     * a tidiness filter. `super.off()` unconditionally stops `timedOnTimer`
+     * (`OnOffServer.js:85-88`), and `registry.update()` pushes the full state
+     * set on every attach/upsert (`registry.ts:413`). Without this guard, a
+     * plugin restart landing between an ecosystem `OnWithTimedOff` and
+     * Indigo's own confirmation — attribute still `false`, timer already
+     * running — would have the restart's replayed push read as "turn it
+     * off" and silently kill a countdown nothing asked to cancel. Every
+     * genuine #201 transition still has `value !== this.state.onOff`, so the
+     * guard can never mask one of those. (#203 asks the related "should a
+     * push ever be allowed to no-op" question for other roles; out of scope
+     * here.)
+     */
+    applyIndigoOnOff(value: boolean): MaybePromise {
+        if (value === this.state.onOff) {
+            return;
+        }
+        return value ? super.on() : super.off();
+    }
+
+    override on(): MaybePromise {
+        emitCommand(this.endpoint.id, "onOff", { value: true });
+    }
+
+    override off(): MaybePromise {
+        emitCommand(this.endpoint.id, "onOff", { value: false });
     }
 }
 
@@ -1161,26 +1260,31 @@ function doorLockDefaults(): Record<string, unknown> {
 }
 
 const ROLE_DEFINITIONS: Record<RoleValue, RoleDefinition> = {
+    // #143: every OnOff-bearing role below adds IndigoOnOffServer so the
+    // ecosystem's on/off/toggle/timed commands report through the sink
+    // instead of writing the attribute themselves. WATCH_ON_OFF stays too —
+    // it is still the only path LevelControl's onOff coupling reaches (§5 of
+    // the IndigoOnOffServer doc).
     [Role.onOffPlugInUnit]: {
-        deviceType: () => OnOffPlugInUnitDevice.with(BridgedDeviceBasicInformationServer),
+        deviceType: () => OnOffPlugInUnitDevice.with(BridgedDeviceBasicInformationServer, IndigoOnOffServer),
         initialState: () => ({}),
         statePatch: onOffPatch,
         watch: [WATCH_ON_OFF],
     },
     [Role.onOffLight]: {
-        deviceType: () => OnOffLightDevice.with(BridgedDeviceBasicInformationServer),
+        deviceType: () => OnOffLightDevice.with(BridgedDeviceBasicInformationServer, IndigoOnOffServer),
         initialState: () => ({}),
         statePatch: onOffPatch,
         watch: [WATCH_ON_OFF],
     },
     [Role.dimmableLight]: {
-        deviceType: () => DimmableLightDevice.with(BridgedDeviceBasicInformationServer),
+        deviceType: () => DimmableLightDevice.with(BridgedDeviceBasicInformationServer, IndigoOnOffServer),
         initialState: () => ({ [LEVEL_CONTROL]: { ...LEVEL_CONTROL_INITIAL } }),
         statePatch: states => ({ ...onOffPatch(states), ...levelPatch(states) }),
         watch: [WATCH_ON_OFF, WATCH_LEVEL],
     },
     [Role.colorTemperatureLight]: {
-        deviceType: () => ColorTemperatureLightDevice.with(BridgedDeviceBasicInformationServer),
+        deviceType: () => ColorTemperatureLightDevice.with(BridgedDeviceBasicInformationServer, IndigoOnOffServer),
         initialState: () => ({
             [LEVEL_CONTROL]: { ...LEVEL_CONTROL_INITIAL },
             [COLOR_CONTROL]: { ...colorControlDefaults(false), colorTemperatureMireds: MIREDS_MIN },
@@ -1198,6 +1302,7 @@ const ROLE_DEFINITIONS: Record<RoleValue, RoleDefinition> = {
         deviceType: () =>
             ExtendedColorLightDevice.with(
                 BridgedDeviceBasicInformationServer,
+                IndigoOnOffServer,
                 ColorControlServer.with("HueSaturation", "Xy", "ColorTemperature"),
             ),
         initialState: () => ({

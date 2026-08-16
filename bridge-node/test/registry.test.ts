@@ -1214,6 +1214,14 @@ const E4_BEHAVIORS: [RoleValue, string][] = [
  */
 const PositionAwareCovering = WindowCoveringServer.with("Lift", "PositionAwareLift");
 
+/**
+ * The OnOff behaviour as every onOff-bearing role builds it. `onTime`/
+ * `offWaitTime`/`onWithTimedOff` only exist with the Lighting feature, so
+ * `agent.get()` needs the same `.with()` the role factory used — mirrors
+ * {@link PositionAwareCovering}.
+ */
+const OnOffLighting = OnOffServer.with("Lighting");
+
 /** The one endpoint a single-spec reconcile produced. */
 function only(h: Harness): Endpoint {
     const endpoint = [...h.aggregator.parts][0];
@@ -1618,6 +1626,87 @@ describe("door lock commands (§4.2, §7, E4)", () => {
             await h.registry.remove(9);
             await assert.rejects(async () => endpoint.act(agent => agent.get(DoorLockServer).lockDoor({})));
             assert.deepEqual(h.commands, []);
+        } finally {
+            await h.close();
+        }
+    });
+});
+
+describe("onOff commands (§4.2, §7, #143, #201)", () => {
+    it("an invocation matching current state still emits, exactly once", async () => {
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(1, Role.onOffLight)], false);
+            const endpoint = only(h);
+            await h.registry.setState(1, { onOff: true });
+            h.commands.length = 0;
+
+            await endpoint.act(agent => agent.get(OnOffLighting).on());
+            assert.deepEqual(h.commands, [{ indigoDeviceId: 1, command: "onOff", args: { value: true } }]);
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("an invocation differing from current state emits exactly once, not twice", async () => {
+        // The fence against a watcher+sink double-emit: onOff is watched
+        // (WATCH_ON_OFF, for LevelControl's coupling) AND invocation-driven
+        // now, and applyIndigoOnOff/the overrides must not trip both.
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(1, Role.onOffLight, { states: { onOff: false } })], false);
+            const endpoint = only(h);
+            await endpoint.act(agent => agent.get(OnOffLighting).on());
+            assert.equal(h.commands.length, 1, "the invocation must not also echo through the attribute watcher");
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("NEVER auto-confirms: onOff does not move on the ecosystem's say-so (PRD §7)", async () => {
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(1, Role.onOffLight, { states: { onOff: false } })], false);
+            const endpoint = only(h);
+            await endpoint.act(agent => agent.get(OnOffLighting).on());
+            assert.equal(
+                (endpoint.stateOf("onOff") as Record<string, unknown>).onOff,
+                false,
+                "the ecosystem's on() moved onOff by itself",
+            );
+
+            // It moves when — and only when — Indigo says the device actually did.
+            await h.registry.setState(1, { onOff: true });
+            assert.equal((endpoint.stateOf("onOff") as Record<string, unknown>).onOff, true);
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("toggle and offWithEffect funnel through the same override, unmoved and single-emit", async () => {
+        // matter.js's own class doc: "it is enough to override on() and off()
+        // with custom control logic" — toggle/offWithEffect are deliberately
+        // left stock, and both dispatch to our off() virtually.
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(1, Role.onOffLight)], false);
+            const endpoint = only(h);
+            await h.registry.setState(1, { onOff: true });
+            h.commands.length = 0;
+
+            await endpoint.act(agent => agent.get(OnOffLighting).toggle());
+            assert.deepEqual(h.commands, [{ indigoDeviceId: 1, command: "onOff", args: { value: false } }]);
+
+            h.commands.length = 0;
+            await endpoint.act(agent =>
+                agent.get(OnOffLighting).offWithEffect({ effectIdentifier: 0, effectVariant: 0 }),
+            );
+            assert.deepEqual(h.commands, [{ indigoDeviceId: 1, command: "onOff", args: { value: false } }]);
+            assert.equal(
+                (endpoint.stateOf("onOff") as Record<string, unknown>).onOff,
+                true,
+                "offWithEffect must not move the attribute either",
+            );
         } finally {
             await h.close();
         }
