@@ -28,7 +28,14 @@ import { WindowCoveringServer } from "@matter/main/behaviors/window-covering";
 import { DoorLock } from "@matter/main/clusters/door-lock";
 import { AggregatorEndpoint } from "@matter/main/endpoints/aggregator";
 
-import { endpointIdFor, SUPPORTED_ROLES, uniqueIdFor, watchCommands } from "../src/endpoints.js";
+import {
+    applyStates,
+    endpointIdFor,
+    percentToCurrentLevel,
+    SUPPORTED_ROLES,
+    uniqueIdFor,
+    watchCommands,
+} from "../src/endpoints.js";
 import {
     type CommandEventData,
     type EndpointSpec,
@@ -1222,6 +1229,19 @@ const PositionAwareCovering = WindowCoveringServer.with("Lift", "PositionAwareLi
  */
 const OnOffLighting = OnOffServer.with("Lighting");
 
+/**
+ * Poll until `check` passes (or the cap expires — the following assertion then
+ * reports the real shortfall). The countdown tests used to sleep a fixed 400ms
+ * against ~200ms timer deadlines, which a loaded CI runner can blow through;
+ * polling keeps them fast when healthy and honest when not.
+ */
+async function waitFor(check: () => boolean, capMs = 1500): Promise<void> {
+    const deadline = Date.now() + capMs;
+    while (!check() && Date.now() < deadline) {
+        await new Promise(resolve => setTimeout(resolve, 25));
+    }
+}
+
 /** The one endpoint a single-spec reconcile produced. */
 function only(h: Harness): Endpoint {
     const endpoint = [...h.aggregator.parts][0];
@@ -1731,7 +1751,7 @@ describe("onOff commands (§4.2, §7, #143, #201)", () => {
             );
             assert.deepEqual(h.commands, [{ indigoDeviceId: 1, command: "onOff", args: { value: true } }]);
 
-            await new Promise(resolve => setTimeout(resolve, 400));
+            await waitFor(() => h.commands.length >= 2);
             assert.deepEqual(h.commands, [
                 { indigoDeviceId: 1, command: "onOff", args: { value: true } },
                 { indigoDeviceId: 1, command: "onOff", args: { value: false } },
@@ -1803,11 +1823,206 @@ describe("onOff commands (§4.2, §7, #143, #201)", () => {
             await h.registry.setState(1, { onOff: false });
             assert.deepEqual(h.commands, [], "the redundant push itself must not emit");
 
-            await new Promise(resolve => setTimeout(resolve, 400));
+            await waitFor(() => h.commands.length >= 1);
             assert.deepEqual(
                 h.commands,
                 [{ indigoDeviceId: 1, command: "onOff", args: { value: false } }],
                 "the countdown must still have expired and reported off",
+            );
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("every OnOff-bearing role reports invocations through the sink (five-role fence)", async () => {
+        // Dropping IndigoOnOffServer from any role's deviceType().with() is a
+        // SILENT regression everywhere else: agent.get resolves by behaviour
+        // id, so the stock server answers, auto-confirms the attribute, and
+        // emits nothing — and no other test in this file exercises an
+        // invocation on the plug or the two colour roles.
+        const roles = [
+            Role.onOffPlugInUnit,
+            Role.onOffLight,
+            Role.dimmableLight,
+            Role.colorTemperatureLight,
+            Role.extendedColorLight,
+        ];
+        for (const role of roles) {
+            const h = await harness();
+            try {
+                await h.registry.reconcile([spec(1, role)], false);
+                const endpoint = only(h);
+                await endpoint.act(agent => agent.get(OnOffLighting).on());
+                assert.deepEqual(
+                    h.commands,
+                    [{ indigoDeviceId: 1, command: "onOff", args: { value: true } }],
+                    `role ${role}: the invocation must emit through the sink, exactly once`,
+                );
+                assert.equal(
+                    (endpoint.stateOf("onOff") as Record<string, unknown>).onOff,
+                    false,
+                    `role ${role}: the invocation must not move the attribute`,
+                );
+            } finally {
+                await h.close();
+            }
+        }
+    });
+
+    it("acceptOnlyWhenOn discards the command while the attribute is unconfirmed (accepted stock quirk)", async () => {
+        // Stock onWithTimedOff answers acceptOnlyWhenOn from the ATTRIBUTE
+        // (OnOffServer.js:138-140), which under no-auto-confirm stays false
+        // for the whole tap-to-Indigo-confirmation window — so an "on, then
+        // timed-off-if-on" pair sent quickly loses its countdown, silently,
+        // with success reported to the controller. Accepted (see the
+        // IndigoOnOffServer class doc's stock-quirks block); this test exists
+        // so any change to that behaviour is noticed, not to endorse it.
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(1, Role.onOffLight)], false);
+            const endpoint = only(h);
+            await endpoint.act(agent =>
+                agent
+                    .get(OnOffLighting)
+                    .onWithTimedOff({ onOffControl: { acceptOnlyWhenOn: true }, onTime: 100, offWaitTime: 0 }),
+            );
+            assert.deepEqual(h.commands, [], "the discarded command must not emit");
+            assert.equal(
+                (endpoint.stateOf("onOff") as Record<string, unknown>).onTime,
+                0,
+                "the countdown must never have started",
+            );
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("a second onWithTimedOff during a live countdown extends it and still emits", async () => {
+        // Stock extension path: onTime = Math.max(requested, remaining)
+        // (OnOffServer.js:148), then this.on() — which must still reach our
+        // override and the sink.
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(1, Role.onOffLight)], false);
+            const endpoint = only(h);
+            await endpoint.act(agent =>
+                agent
+                    .get(OnOffLighting)
+                    .onWithTimedOff({ onOffControl: { acceptOnlyWhenOn: false }, onTime: 50, offWaitTime: 0 }),
+            );
+            await h.registry.setState(1, { onOff: true });
+            h.commands.length = 0;
+
+            await endpoint.act(agent =>
+                agent
+                    .get(OnOffLighting)
+                    .onWithTimedOff({ onOffControl: { acceptOnlyWhenOn: false }, onTime: 100, offWaitTime: 0 }),
+            );
+            assert.deepEqual(
+                h.commands,
+                [{ indigoDeviceId: 1, command: "onOff", args: { value: true } }],
+                "the extending command must still be forwarded",
+            );
+            assert.equal(
+                (endpoint.stateOf("onOff") as Record<string, unknown>).onTime,
+                100,
+                "the countdown must have extended to the larger onTime",
+            );
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("onWithRecallGlobalScene funnels through on() once, then no-ops once the flag is set", async () => {
+        // Stock (OnOffServer.js:119-131): early-return only when
+        // globalSceneControl is already true. In this composition it starts
+        // false, so the first recall skips the fabric-scene lookup (offline
+        // context, no fabric), flips the flag true, and funnels into
+        // this.on() — one emission through our override, attribute unmoved.
+        // The second recall then hits the early return: nothing at all.
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(1, Role.onOffLight)], false);
+            const endpoint = only(h);
+            await endpoint.act(agent => agent.get(OnOffLighting).onWithRecallGlobalScene());
+            assert.deepEqual(
+                h.commands,
+                [{ indigoDeviceId: 1, command: "onOff", args: { value: true } }],
+                "the first recall must forward exactly one on",
+            );
+            assert.equal(
+                (endpoint.stateOf("onOff") as Record<string, unknown>).onOff,
+                false,
+                "the recall must not move the attribute",
+            );
+
+            h.commands.length = 0;
+            await endpoint.act(agent => agent.get(OnOffLighting).onWithRecallGlobalScene());
+            assert.deepEqual(h.commands, [], "with globalSceneControl now true, the recall must no-op");
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("a combined push still applies the level half when the onOff half is a no-op", async () => {
+        // The §7.3 same-value guard lives INSIDE applyIndigoOnOff, per
+        // endpoint — fencing the refactor that hoists it into applyStates and
+        // early-returns the whole push, which would eat the level half of the
+        // full-state replay Indigo sends on every attach.
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(1, Role.dimmableLight)], false);
+            const endpoint = only(h);
+            await h.registry.setState(1, { onOff: true, level: 60 });
+            await h.registry.setState(1, { onOff: true, level: 80 });
+            const level = (endpoint.stateOf("levelControl") as Record<string, unknown>).currentLevel;
+            assert.equal(level, percentToCurrentLevel(80), "the level half of a no-op-onOff push must still apply");
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("a failed onOff half does not stop the residual set, and the error names the half (half-apply)", async () => {
+        // applyStates runs the onOff act and the residual set as two
+        // transactions; a failure in the first must not silently strand the
+        // second (stale brightness until the next push, indefinitely for an
+        // untouched lamp). Stub the endpoint's act to fail — the cleanest
+        // seam the harness offers, since a real act failure needs a closing
+        // endpoint mid-push.
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(1, Role.dimmableLight)], false);
+            const endpoint = only(h);
+            // Shadow act with an instance property that fails the FIRST call
+            // only: applyStates' onOff act must fail, but Endpoint.set()
+            // itself routes through act too (Endpoint.js:229-230), so a
+            // blanket stub would take the residual half down with it and turn
+            // this into the both-halves AggregateError case. Restore before
+            // close, which needs the real thing.
+            const endpointWithAct = endpoint as unknown as { act: (...args: unknown[]) => Promise<unknown> };
+            const originalAct = endpointWithAct.act;
+            let firstCall = true;
+            endpointWithAct.act = function (...args: unknown[]) {
+                if (firstCall) {
+                    firstCall = false;
+                    return Promise.reject(new Error("boom"));
+                }
+                return originalAct.apply(endpoint, args);
+            };
+            try {
+                await assert.rejects(
+                    async () => applyStates(endpoint, Role.dimmableLight, { onOff: true, level: 80 }),
+                    (error: Error) => /onOff half failed/.test(error.message),
+                    "the error must name the failed half",
+                );
+            } finally {
+                endpointWithAct.act = originalAct;
+            }
+            const level = (endpoint.stateOf("levelControl") as Record<string, unknown>).currentLevel;
+            assert.equal(
+                level,
+                percentToCurrentLevel(80),
+                "the residual set must still have applied despite the onOff failure",
             );
         } finally {
             await h.close();
