@@ -1588,7 +1588,32 @@ export async function applyStates(
     if (Object.keys(patch).length === 0) {
         return;
     }
+
+    // #201: the onOff attribute cannot be written directly any more. A raw
+    // `endpoint.set()` write leaves `timedOnTimer` running against a device
+    // Indigo has already turned off, and `#stopHeldTimer` cannot help — its
+    // first branch is guarded on `state.onOff` already being true
+    // (OnOffServer.js:43). Routing through the behaviour instead reaches
+    // `off()`'s own `timedOnTimer.stop()` (OnOffServer.js:85-88) and `on()`'s
+    // delayedOffTimer/offWaitTime cleanup (OnOffServer.js:67-72).
+    // `applyIndigoOnOff` calls `super.on()`/`super.off()`, so it can never
+    // re-enter the emitting overrides in {@link IndigoOnOffServer} — see that
+    // class's doc for why no context check is needed either. This is a
+    // second, separate transaction from the `endpoint.set()` below (§7.2 of
+    // the PR2 design accepts the split): a combined `{onOff, level}` push
+    // becomes two reports instead of one, which no reactor here minds.
+    const onOff = patch[ON_OFF] as { onOff?: boolean } | undefined;
+    if (onOff !== undefined) {
+        delete patch[ON_OFF];
+        await endpoint.act(agent => agent.get(IndigoOnOffServer).applyIndigoOnOff(onOff.onOff === true));
+    }
+
     const { afterApply } = definitionFor(role);
+    if (Object.keys(patch).length === 0) {
+        // An onOff-only set_state is now fully handled above; `endpoint.set({})`
+        // would be a pointless second write.
+        return;
+    }
     if (afterApply === undefined) {
         await endpoint.set(patch as never);
         return;

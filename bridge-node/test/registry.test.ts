@@ -1711,6 +1711,108 @@ describe("onOff commands (§4.2, §7, #143, #201)", () => {
             await h.close();
         }
     });
+
+    it("a running countdown's own expiry emits off exactly once (#201)", async () => {
+        // #timedOnTick's own `await this.off()` runs with the timer's bare
+        // callback context (OnOffServer.js:163, no trailing context argument),
+        // which is why on()/off() cannot be guarded on isEcosystemChange —
+        // see the IndigoOnOffServer class doc.
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(1, Role.onOffLight)], false);
+            const endpoint = only(h);
+            await h.registry.setState(1, { onOff: true });
+            h.commands.length = 0;
+
+            await endpoint.act(agent =>
+                agent
+                    .get(OnOffLighting)
+                    .onWithTimedOff({ onOffControl: { acceptOnlyWhenOn: false }, onTime: 2, offWaitTime: 0 }),
+            );
+            assert.deepEqual(h.commands, [{ indigoDeviceId: 1, command: "onOff", args: { value: true } }]);
+
+            await new Promise(resolve => setTimeout(resolve, 400));
+            assert.deepEqual(h.commands, [
+                { indigoDeviceId: 1, command: "onOff", args: { value: true } },
+                { indigoDeviceId: 1, command: "onOff", args: { value: false } },
+            ]);
+            // No auto-confirm: the attribute only ever moves from Indigo's own
+            // push, never from the countdown's own expiry.
+            assert.equal((endpoint.stateOf("onOff") as Record<string, unknown>).onOff, true);
+            assert.equal((endpoint.stateOf("onOff") as Record<string, unknown>).onTime, 0);
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("Indigo turning the device off during a countdown cancels it (#201)", async () => {
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(1, Role.onOffLight)], false);
+            const endpoint = only(h);
+            await h.registry.setState(1, { onOff: true });
+
+            await endpoint.act(agent =>
+                agent
+                    .get(OnOffLighting)
+                    .onWithTimedOff({ onOffControl: { acceptOnlyWhenOn: false }, onTime: 5, offWaitTime: 0 }),
+            );
+            h.commands.length = 0;
+
+            // Indigo reports the device off mid-countdown. super.off() stops
+            // timedOnTimer unconditionally (OnOffServer.js:85-87) — from
+            // matter.js's own code, not a special case here.
+            await h.registry.setState(1, { onOff: false });
+            assert.equal(
+                (endpoint.stateOf("onOff") as Record<string, unknown>).onTime,
+                0,
+                "the countdown must be cancelled",
+            );
+
+            // Push it back on: super.on()'s own cleanup (OnOffServer.js:67-72)
+            // leaves no stray delayedOffTimer/offWaitTime behind either.
+            await h.registry.setState(1, { onOff: true });
+
+            // If the cancellation had not taken (a #201 regression), the
+            // original countdown would still fire an off around its ~500ms mark.
+            await new Promise(resolve => setTimeout(resolve, 700));
+            assert.deepEqual(h.commands, [], "a cancelled countdown fired anyway, past its original deadline");
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("a redundant push does not kill a live countdown (§7.3)", async () => {
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(1, Role.onOffLight)], false);
+            const endpoint = only(h);
+            await endpoint.act(agent =>
+                agent
+                    .get(OnOffLighting)
+                    .onWithTimedOff({ onOffControl: { acceptOnlyWhenOn: false }, onTime: 2, offWaitTime: 0 }),
+            );
+            h.commands.length = 0;
+
+            // The attribute never moved — our on() only emits, it never writes
+            // state.onOff — so this "off" push targets an already-false
+            // attribute. Without the §7.3 guard, applyIndigoOnOff would call
+            // super.off(), which stops timedOnTimer unconditionally and would
+            // kill a countdown a genuine race (a plugin restart landing before
+            // its own confirming push) must not be able to cancel.
+            await h.registry.setState(1, { onOff: false });
+            assert.deepEqual(h.commands, [], "the redundant push itself must not emit");
+
+            await new Promise(resolve => setTimeout(resolve, 400));
+            assert.deepEqual(
+                h.commands,
+                [{ indigoDeviceId: 1, command: "onOff", args: { value: false } }],
+                "the countdown must still have expired and reported off",
+            );
+        } finally {
+            await h.close();
+        }
+    });
 });
 
 describe("window covering commands (§4.2, E4)", () => {
