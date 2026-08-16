@@ -403,6 +403,9 @@ ecosystem acts. Both are enumerated here in full; there is no other source.
   the node owns all Matter wire conversions (0.01°C, mireds bounds-clamping,
   the illuminance log scale). Exactly one converter per role, in the node,
   next to the cluster it feeds.
+- `onOff` is emitted per ecosystem *invocation* (on/off/toggle/timed-on), not
+  per attribute change — so a command that matches the accessory's current
+  state is still forwarded, the same way `lock`/`unlock` already were.
 
 ### 4.3 `StatusReport` and `FabricInfo`
 

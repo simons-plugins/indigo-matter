@@ -428,6 +428,21 @@ ecosystem is passed to Indigo and nothing else: no optimistic state, no
 synthesised confirmation. What the ecosystem shows moves only when Indigo's own
 state moves, because the bolt is the authority.
 
+**Switches, plugs and lights work the same way now.** Tapping a tile in Apple
+Home, Google Home or Alexa sends the request to Indigo and waits for Indigo to
+report back before the tile itself moves — the same no-optimistic-state rule
+the lock has always followed. For a fast relay this is imperceptible; for a
+slower Z-Wave device, a cloud-backed plugin, or a device that is simply
+offline, the tile may sit still for a moment (or not move at all, which is the
+honest answer for a device that never responded). One side effect you may
+notice: a command that matches what the accessory already believes — tapping
+"on" on a light your ecosystem already shows as on — is now forwarded to
+Indigo instead of being silently dropped, so a stuck or drifted tile gets a
+free resync tap rather than a no-op. And if an ecosystem starts a timed
+"turn off in N minutes" countdown and you turn the device off in Indigo before
+it fires, the countdown is cancelled rather than firing late on a device that
+is already off.
+
 ### What cannot be exported, and why
 
 Excluded devices still **appear in the picker with their reason** — they are
