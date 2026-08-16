@@ -3,6 +3,45 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
+## 2026.17.0 — exported switches, plugs and lights wait for Indigo
+
+> Takes effect on a live install only once the paired bridge-node release
+> ships; the plugin pins the bridge node by exact version.
+
+### Changed
+
+- **Exported on/off accessories no longer move optimistically** (issue #143,
+  onOff half). Tapping a tile in Apple Home/Google/Alexa sends the command to
+  Indigo and the tile confirms only when Indigo reports the device's real
+  state — the same rule locks and covers already followed. A command that
+  matches the accessory's current state is now forwarded instead of silently
+  dropped.
+
+### Fixed
+
+- **Turning a device off in Indigo now cancels a running ecosystem
+  "on for N minutes" countdown** (issue #201) — previously the countdown
+  fired late and switched off a device that was already off (or had been
+  turned back on since).
+
+## 2026.16.2 — export conformance guards and port-bind verification
+
+### Fixed
+
+- **A managed matter-server or bridge node that lost its port-bind race right
+  after bootstrap is now detected and reported** (issue #187) — previously
+  the bridge node was never checked for port conflicts at all.
+- **Un-exporting a device no longer destroys the evidence a future re-adopt
+  needs** (issue #219 groundwork) — the endpoint map keeps the role/label and
+  marks the record orphaned instead.
+
+### Changed
+
+- Warnings added for the two Alexa-relevant configurations: a non-default
+  Matter port, and export counts past the community-reported ~50-endpoint
+  ceiling. The full Alexa conformance sweep (issue #222) is documented in
+  `docs/MATTER.md`.
+
 ## 2026.16.1 — manual commission now logs what happened
 
 ### Fixed
