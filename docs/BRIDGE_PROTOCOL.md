@@ -498,12 +498,18 @@ version 2** since bridge-node 0.6.0:
   because every reader here reaches a field by name rather than validating the
   object as a whole, so the extra key is inert rather than a parse failure.
 - `orphaned` — issue #219, present (`true`) and absent otherwise, never
-  `false`. Ships in the first bridge-node release after 0.8.0 — the version
-  bump is a separate, deliberate release commit (`package.json` and
-  `DEFAULT_INSTALL_SPEC` move together, coordinated with an npm publish),
-  not this one. Set by an un-export (see "Un-exporting" below);
-  cleared the moment the same `UniqueID` is live again. Same inert-extra-key
-  compatibility as `numberVoid`, so this stays schema version 2 too.
+  `false`. Not yet in a published bridge-node release as of 0.8.0 — the
+  release commit that ships it should update this clause. Set by an
+  un-export (see "Un-exporting" below); cleared the moment the same
+  `UniqueID` is live again. Parses with the same inert-extra-key tolerance as
+  `numberVoid` — an old build reaches fields by name, so the unknown key is
+  simply never looked at — but that is true of PARSING only, not behaviour:
+  an older bridge (a plugin rollback reinstalling the pinned, published
+  bridge over the same `endpoint-map.json`) drops the unknown key on its next
+  write, and its `restorable()` filters only on `role`/`label`, so it
+  rebuilds every un-exported device before `server.start()`. That is the
+  #141 appear-then-vanish ghost churn, once, self-healing after one attach —
+  not the equivalence the schema-version note above claims for `numberVoid`.
 
 **Version 1 files are read, migrated in place, and never treated as corrupt.**
 A v1 entry is a bare number; it keeps that number, is simply not restorable

@@ -664,10 +664,11 @@ identity — and neither is a claim about the other.)
 
 Matter's `StartUpOnOff` attribute lets an on/off device declare what it should
 do when it powers back up — stay off, come on, or restore its last state. On an
-**exported** endpoint, matter.js's `OnOffServer.initialize()` explicitly skips
-that power-on-behaviour restoration for any endpoint that lives under an
-`AggregatorEndpoint` — which every exported accessory does, by construction.
-The attribute is still there and still writable; it is just inert.
+**exported** endpoint, as of matter.js 0.17.8 (the version this bridge pins),
+`OnOffServer.initialize()` explicitly skips that power-on-behaviour restoration
+for any endpoint that lives under an `AggregatorEndpoint` — which every
+exported accessory does, by construction. The attribute is still there and
+still writable; it is just inert.
 
 **Not worked around, on purpose.** Two ways around it were considered and both
 make things worse:

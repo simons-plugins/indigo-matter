@@ -197,6 +197,15 @@ def test_ensure_installed_is_quiet_on_the_default_matter_port(tmp_path, mock_log
     assert not any("Matter node per host" in str(c) for c in mock_logger.warning.call_args_list)
 
 
+def test_a_zero_padded_default_port_pref_does_not_spuriously_warn(tmp_path, mock_logger):
+    # Review finding: `_port_str` returns a pref's digits as-is (no int() round
+    # trip), so "05540" survived intact and a plain `==` against the plain-string
+    # default ("5540") warned about a port that IS the default, numerically.
+    bridge = _bridge(tmp_path, mock_logger, {bridge_agent.PREF_MATTER_PORT: "05540"})
+    bridge.ensure_installed()
+    assert not any("Matter node per host" in str(c) for c in mock_logger.warning.call_args_list)
+
+
 def test_the_port_warning_fires_on_every_startup_not_only_on_change(tmp_path, mock_logger):
     # Same discipline as the controller's attestation warning: the hazard is
     # forgetting a non-default port was ever set, so every ensure_installed()

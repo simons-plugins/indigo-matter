@@ -188,11 +188,12 @@ export interface EndpointRecord {
     /**
      * Set by {@link EndpointMapStore.forget} (issue #219, this half only —
      * the re-adopt UI itself lands separately): the device was un-exported,
-     * so the entry must not be rebuilt by {@link restorable} — but unlike the
-     * pre-#219 behaviour, `role`/`label` are KEPT rather than deleted, because
-     * they are the only evidence a future re-adopt UI could match a recreated
-     * device against. Cleared the moment {@link check} sees the same
-     * `UniqueID` live again (`noteRestorable`) — a live device is by
+     * so the entry must not be rebuilt by {@link EndpointMapStore.restorable}
+     * — but unlike the pre-#219 behaviour, `role`/`label` are KEPT rather
+     * than deleted, because they are the only evidence a future re-adopt UI
+     * could match a recreated device against. Cleared the moment
+     * {@link EndpointMapStore.check} sees the same `UniqueID` live again
+     * (`noteRestorable`) — a live device is by
      * definition not orphaned, and re-exporting the same accessory must not
      * leave it permanently excluded from the next boot's pre-seeding. Absent
      * on every ordinary entry, same convention as `numberVoid`.
