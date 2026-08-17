@@ -2625,17 +2625,16 @@ describe("ColorControl command conversion (§4.2, #143)", () => {
         }
     });
 
-    it("a plain moveToHue emits NOTHING while off — the colour twin of LevelControl's executeIfOff", async () => {
-        // Unlike LEVEL_CONTROL_INITIAL, colorControlDefaults() seeds no
-        // executeIfOff — deliberately (see that function's own doc): Indigo
-        // has no "set colour while off" semantic the way it does for
-        // brightness, and Matter's #optionsAllowExecution gate
-        // (ColorControlServer.js:1444-1446) is left at its stock default, so
-        // a colour command reaching an unconfirmed-off accessory is dropped
-        // before it ever reaches moveToHueLogic — the same stock behaviour
-        // this bridge had before #143. This is the opposite outcome from
-        // the level test of the same shape: there, the seed exists and lets
-        // the command through; here, there is no seed, and the gate holds.
+    it("a plain moveToHue emits while off — colour forwards exactly like level (#235)", async () => {
+        // Simon's #235 ruling (see colorControlDefaults' doc): the bridge
+        // sends, Indigo decides — withholding the command loses the colour
+        // for nothing, and whatever an RGB driver does with a colour write on
+        // an off lamp is Indigo/driver semantics, not the bridge's to
+        // second-guess. colorControlDefaults() seeds executeIfOff: true, so
+        // Matter's #optionsAllowExecution gate (ColorControlServer.js:
+        // 1444-1446) — whose premise broke under no-auto-confirm, where the
+        // attribute means "Indigo's last confirmation" — lets the command
+        // through to moveToHueLogic, same as the level test of this shape.
         const h = await harness();
         try {
             await h.registry.reconcile([spec(1, Role.extendedColorLight, { states: { onOff: false } })], false);
@@ -2649,7 +2648,9 @@ describe("ColorControl command conversion (§4.2, #143)", () => {
                     optionsOverride: {},
                 }),
             );
-            assert.deepEqual(h.commands, []);
+            assert.deepEqual(h.commands, [
+                { indigoDeviceId: 1, command: "setColor", args: { hue: 210, saturation: 0 } },
+            ]);
         } finally {
             await h.close();
         }

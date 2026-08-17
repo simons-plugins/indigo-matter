@@ -3,6 +3,21 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
+## 2026.20.0 — colour-while-off forwards, like brightness
+
+> Takes effect on a live install only once the paired bridge-node release
+> ships; the plugin pins the bridge node by exact version.
+
+### Changed
+
+- **Picking a colour or colour temperature on a lamp that is showing off now
+  reaches Indigo** (issue #235) — the same rule brightness follows: the
+  bridge sends, Indigo decides. On many RGB lamps a colour write lights the
+  lamp at the new colour (the device driver's own behaviour); a
+  colour-temperature change is stored without turning the lamp on. Previously
+  direct colour commands were dropped while the accessory was off (scene
+  recalls always went through).
+
 ## 2026.19.0 — exported brightness and colour wait for Indigo too
 
 > Takes effect on a live install only once the paired bridge-node release

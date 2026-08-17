@@ -480,14 +480,17 @@ ecosystem acts. Both are enumerated here in full; there is no other source.
   is deliberately absent from it. Commands that yield **no** `command`
   frame: continuous `moveHue`/`moveSaturation`/`moveColor` (no target value
   — nothing happens at the cluster level, so nothing is reported, matching
-  stock); `stepColor` (writes silently in stock, so it is a debug-logged
+  stock); and `stepColor` (writes silently in stock, so it is a debug-logged
   drop rather than a reported command — CIE xy step commands are not yet
-  converted); and, as of the level/colour invocation conversion, a direct
-  colour command reaching an accessory the node believes is off (gated
-  behind matter.js's own `executeIfOff`, stock behaviour, unchanged from
-  before #143). A plain `moveToLevel`/`move`/`step` on an off accessory is
-  the opposite case — it *is* forwarded, because Indigo's own semantics
-  treat "set brightness while off" as turn-on-to-that-level.
+  converted). Commands against an accessory the node believes is off are
+  **forwarded, not gated** — level AND colour alike (issue #235: the bridge
+  sends, Indigo decides; both clusters seed `executeIfOff: true` because the
+  stock gate reads the `onOff` attribute, which under no-auto-confirm means
+  "Indigo's last confirmation" rather than the device's state). Indigo's own
+  semantics then apply: brightness-while-off is turn-on-to-that-level, a
+  colour write does whatever the device's driver does with one, and a
+  colour-temperature change is stored without turning the lamp on
+  (`_set_color_temp`'s own documented choice).
 - `batteryLevel: 1-100` (issue #220) is the first **role-independent**
   `set_state` key — valid for `set_state` against ANY role whose endpoint was
   built with `battery: true` (§4.1), not listed against any single role above.

@@ -1348,26 +1348,26 @@ function movementPosition(direction: MovementDirection, targetPercent100ths?: nu
  * optional, which is why they are pinned here with a reason rather than
  * discovered again.
  *
- * **No `executeIfOff` seed here, unlike {@link LEVEL_CONTROL_INITIAL} — and
- * that is deliberate, not an oversight.** Simon's turn-on-to-level ruling
- * (read that constant's doc) is a LEVEL semantic: Indigo natively defines
- * "set brightness while off" as turn-on-to-that-level, so forwarding the
- * command is the ordinary meaning of a brightness write. Colour has no such
- * native Indigo semantic to honour, and the repo's own `_set_color_temp`
- * docstring (`export_handlers.py`) argues the opposite for colour: sending a
- * colour command to an off device is "a bridge turning a light on that
- * nobody asked it to". `_set_color` makes the case concrete rather than
- * hypothetical — it computes a full-vibrance RGB write, which on an
- * RGB-channel driver (Hue-class) physically turns an off lamp ON as a side
- * effect of a colour command alone. So direct colour commands
- * (`moveToHue`/`moveToColor`/`moveToColorTemperature` and siblings) stay
- * gated behind the cluster's own `#optionsAllowExecution`
- * (`ColorControlServer.js:1444-1446`) while the accessory is
- * unconfirmed-off — stock behaviour, unchanged from before #143. Scene
- * recalls bypass the gate entirely (pre-existing matter.js behaviour, also
- * unchanged). What colour-while-off *should* do — apply and wait for an on,
- * require the two together, something else — is tracked as a follow-up
- * issue on `_set_color`'s off-lamp handling rather than decided here.
+ * **`options: { executeIfOff: true }` — Simon's #235 ruling: colour-while-off
+ * forwards, exactly like level-while-off.** The rule is one sentence: the
+ * bridge sends, Indigo decides. Withholding the command loses the colour for
+ * nothing; and when the write's driver-level consequence on an RGB-channel
+ * lamp (Hue-class) is turning the light on — `_set_color` computes a
+ * full-vibrance RGB write — that is Indigo/driver semantics doing what it
+ * does for ANY colour write, not something the bridge should second-guess
+ * ("if we send and Indigo turns on then no point handling it ourselves").
+ * Two deliberate asymmetries survive plugin-side, both Indigo's own choices
+ * rather than this gate's: `_set_color_temp` preserves an off lamp's
+ * `whiteLevel` (a CT change stores without turning on — its docstring says
+ * why), while `_set_color` on RGB hardware lights the lamp. Stock's
+ * `#optionsAllowExecution` gate (`ColorControlServer.js:1444-1446`) would
+ * otherwise silently drop direct colour commands while the accessory is
+ * unconfirmed-off — under no-auto-confirm the `onOff` attribute means
+ * "Indigo's last confirmation", so the gate's premise is broken here for the
+ * same reason as on LevelControl. Scene recalls always bypassed the gate;
+ * this seed makes direct commands consistent with them. `options` is a
+ * writable attribute — an ecosystem writing it back to `false` restores the
+ * stock drop, same known limit as the level seed.
  */
 function colorControlDefaults(hueSaturation: boolean): Record<string, unknown> {
     return {
@@ -1378,6 +1378,7 @@ function colorControlDefaults(hueSaturation: boolean): Record<string, unknown> {
         colorTempPhysicalMaxMireds: MIREDS_MAX,
         coupleColorTempToLevelMinMireds: MIREDS_MIN,
         startUpColorTemperatureMireds: null,
+        options: { executeIfOff: true },
         ...(hueSaturation ? { currentHue: 0, currentSaturation: 0 } : {}),
     };
 }
