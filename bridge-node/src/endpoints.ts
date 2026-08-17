@@ -942,8 +942,22 @@ function addWithOverflow(value: number, add: number, min: number, max: number): 
  * only caller is `LevelControlServer.couple()` (`LevelControlServer.js:
  * 400-412`), which {@link IndigoLevelControlServer}'s `transition()` override
  * never calls.
+ *
+ * **`.alter({ attributes: { remainingTime: { optional: false } } })` is a
+ * genuine stock mandate this class was missing, not a new requirement this
+ * PR invents.** Every `extendedColorLight`-shaped ColorControl server the
+ * Matter spec defines carries `RemainingTime` as non-optional
+ * (`extended-color-light.js:32`, HR-1); the bare `.with(…)` above it had no
+ * such alter, so `remainingTime` was silently absent from `attributeList` —
+ * a pre-existing HR-1 deviation the self-referential fence test used to mask
+ * (see the cluster-composition test's own doc) rather than a regression this
+ * PR introduces. Attribute addition only: no accessory recreation, no
+ * migration, matching {@link IndigoColorTemperatureControlServer}'s own copy
+ * of the same alter.
  */
-class IndigoColorControlServer extends ColorControlServer.with("HueSaturation", "Xy", "ColorTemperature") {
+class IndigoColorControlServer extends ColorControlServer.with("HueSaturation", "Xy", "ColorTemperature").alter({
+    attributes: { remainingTime: { optional: false } },
+}) {
     override moveToHueLogic(
         targetHue: number,
         _direction: ColorControl.Direction,
@@ -1099,17 +1113,21 @@ class IndigoColorControlServer extends ColorControlServer.with("HueSaturation", 
 
 /**
  * The `colorTemperatureLight` twin of {@link IndigoColorControlServer},
- * carrying only the `ColorTemperature` feature AND the same `remainingTime`
+ * carrying only the `ColorTemperature` feature and the same `remainingTime`
  * mandatory-alter — matching the stock device type's own composition
  * byte-for-byte: `ColorControlServer.with("ColorTemperature").alter({
  * attributes: { remainingTime: { optional: false } } })`
- * (`color-temperature-light.js:24,32`, HR-1). Unlike
- * {@link IndigoColorControlServer} — which was already, before #143, a BARE
- * `ColorControlServer.with(…)` with no `remainingTime` alter, to restore
- * HueSaturation conformance the Matter spec requires and the stock
- * `extended-color-light.js` device type omits — `colorTemperatureLight`
- * never had a ColorControl override before this PR, so it is this class,
- * not a pre-existing one, whose composition must be pinned exactly or HR-1
+ * (`color-temperature-light.js:32`, HR-1 — line 24 of the same requirements
+ * table is the *LevelControl* alter that seeds `currentLevel: {min: 1, max:
+ * 254}`; {@link IndigoLevelControlServer} deliberately does not mirror it,
+ * relying instead on `LevelControlServer`'s own Lighting-feature `minLevel`
+ * default and construction-time validation for the same 1-254 constraint —
+ * see {@link percentToCurrentLevel}). Before this PR, {@link
+ * IndigoColorControlServer} carried a BARE `ColorControlServer.with(…)` with
+ * no `remainingTime` alter — a pre-existing HR-1 deviation this same commit
+ * closes (see that class's own doc) — so `colorTemperatureLight` never had a
+ * ColorControl override before #143 at all, and it is this class, not a
+ * pre-existing one, whose composition must be pinned exactly or HR-1
  * regresses silently (caught by the cluster-composition test: without the
  * `.alter()`, `remainingTime` drops out of `attributeList` entirely).
  * `HueSaturation`/`Xy` do not exist on this role at all, so there is no
@@ -1277,13 +1295,26 @@ function movementPosition(direction: MovementDirection, targetPercent100ths?: nu
  * optional, which is why they are pinned here with a reason rather than
  * discovered again.
  *
- * `options: { executeIfOff: true }` is #143's ColorControl half of the same
- * seed {@link LEVEL_CONTROL_INITIAL} carries — read that constant's doc for
- * the reasoning (Indigo's own semantics, the no-auto-confirm confirmation
- * loop, the known limits); it applies to `moveToHue`/`moveToColor`/
- * `moveToColorTemperature` and siblings exactly as it does to LevelControl's
- * commands, via the identical `#optionsAllowExecution` gate
- * (`ColorControlServer.js:1444-1446`).
+ * **No `executeIfOff` seed here, unlike {@link LEVEL_CONTROL_INITIAL} — and
+ * that is deliberate, not an oversight.** Simon's turn-on-to-level ruling
+ * (read that constant's doc) is a LEVEL semantic: Indigo natively defines
+ * "set brightness while off" as turn-on-to-that-level, so forwarding the
+ * command is the ordinary meaning of a brightness write. Colour has no such
+ * native Indigo semantic to honour, and the repo's own `_set_color_temp`
+ * docstring (`export_handlers.py`) argues the opposite for colour: sending a
+ * colour command to an off device is "a bridge turning a light on that
+ * nobody asked it to". `_set_color` makes the case concrete rather than
+ * hypothetical — it computes a full-vibrance RGB write, which on an
+ * RGB-channel driver (Hue-class) physically turns an off lamp ON as a side
+ * effect of a colour command alone. So direct colour commands
+ * (`moveToHue`/`moveToColor`/`moveToColorTemperature` and siblings) stay
+ * gated behind the cluster's own `#optionsAllowExecution`
+ * (`ColorControlServer.js:1444-1446`) while the accessory is
+ * unconfirmed-off — stock behaviour, unchanged from before #143. Scene
+ * recalls bypass the gate entirely (pre-existing matter.js behaviour, also
+ * unchanged). What colour-while-off *should* do — apply and wait for an on,
+ * require the two together, something else — is tracked as a follow-up
+ * issue on `_set_color`'s off-lamp handling rather than decided here.
  */
 function colorControlDefaults(hueSaturation: boolean): Record<string, unknown> {
     return {
@@ -1294,7 +1325,6 @@ function colorControlDefaults(hueSaturation: boolean): Record<string, unknown> {
         colorTempPhysicalMaxMireds: MIREDS_MAX,
         coupleColorTempToLevelMinMireds: MIREDS_MIN,
         startUpColorTemperatureMireds: null,
-        options: { executeIfOff: true },
         ...(hueSaturation ? { currentHue: 0, currentSaturation: 0 } : {}),
     };
 }

@@ -2468,6 +2468,11 @@ describe("ColorControl command conversion (§4.2, #143)", () => {
             const h = await harness();
             try {
                 await h.registry.reconcile([spec(1, Role.extendedColorLight)], false);
+                // Colour commands are gated behind onOff while unconfirmed-off
+                // (commit 1) — the same #optionsAllowExecution gate LevelControl
+                // uses, restored to its stock behaviour. Confirm the lamp on
+                // first so these rows exercise the override, not the gate.
+                await h.registry.setState(1, { onOff: true });
                 const endpoint = only(h);
                 await seed(endpoint);
                 h.commands.length = 0;
@@ -2514,12 +2519,45 @@ describe("ColorControl command conversion (§4.2, #143)", () => {
             const h = await harness();
             try {
                 await h.registry.reconcile([spec(1, Role.colorTemperatureLight)], false);
+                // See the matrix above: colour commands are gated while
+                // unconfirmed-off (commit 1).
+                await h.registry.setState(1, { onOff: true });
                 const endpoint = only(h);
                 await endpoint.act(agent => run(agent.get(ColorCt)));
                 assert.deepEqual(h.commands, [expected], label);
             } finally {
                 await h.close();
             }
+        }
+    });
+
+    it("a plain moveToHue emits NOTHING while off — the colour twin of LevelControl's executeIfOff", async () => {
+        // Unlike LEVEL_CONTROL_INITIAL, colorControlDefaults() seeds no
+        // executeIfOff — deliberately (see that function's own doc): Indigo
+        // has no "set colour while off" semantic the way it does for
+        // brightness, and Matter's #optionsAllowExecution gate
+        // (ColorControlServer.js:1444-1446) is left at its stock default, so
+        // a colour command reaching an unconfirmed-off accessory is dropped
+        // before it ever reaches moveToHueLogic — the same stock behaviour
+        // this bridge had before #143. This is the opposite outcome from
+        // the level test of the same shape: there, the seed exists and lets
+        // the command through; here, there is no seed, and the gate holds.
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(1, Role.extendedColorLight, { states: { onOff: false } })], false);
+            const endpoint = only(h);
+            await endpoint.act(agent =>
+                agent.get(ColorFull).moveToHue({
+                    hue: 148,
+                    direction: ColorControl.Direction.Shortest,
+                    transitionTime: 10,
+                    optionsMask: {},
+                    optionsOverride: {},
+                }),
+            );
+            assert.deepEqual(h.commands, []);
+        } finally {
+            await h.close();
         }
     });
 
@@ -2532,6 +2570,8 @@ describe("ColorControl command conversion (§4.2, #143)", () => {
         const h = await harness();
         try {
             await h.registry.reconcile([spec(1, Role.extendedColorLight)], false);
+            // Colour commands are gated while unconfirmed-off (commit 1).
+            await h.registry.setState(1, { onOff: true });
             const endpoint = only(h);
             // A stale saturation the composed-stock bug would have leaked.
             await endpoint.set({ colorControl: { currentSaturation: 10 } } as never);
@@ -2556,7 +2596,8 @@ describe("ColorControl command conversion (§4.2, #143)", () => {
         try {
             await h.registry.reconcile([spec(1, Role.extendedColorLight)], false);
             const endpoint = only(h);
-            await h.registry.setState(1, { hue: 210, saturation: 80 });
+            // Colour commands are gated while unconfirmed-off (commit 1).
+            await h.registry.setState(1, { onOff: true, hue: 210, saturation: 80 });
             const before = (endpoint.stateOf("colorControl") as Record<string, unknown>).currentSaturation;
             h.commands.length = 0;
 
@@ -2610,6 +2651,10 @@ describe("ColorControl command conversion (§4.2, #143)", () => {
         const h = await harness();
         try {
             await h.registry.reconcile([spec(1, Role.extendedColorLight)], false);
+            // Colour commands are gated while unconfirmed-off (commit 1) — the
+            // lamp must be on for this to reach the override under test rather
+            // than being dropped at the gate first.
+            await h.registry.setState(1, { onOff: true });
             const endpoint = only(h);
             const before = endpoint.stateOf("colorControl") as { currentX: number; currentY: number };
 
@@ -2636,6 +2681,8 @@ describe("ColorControl command conversion (§4.2, #143)", () => {
         const h = await harness();
         try {
             await h.registry.reconcile([spec(1, Role.extendedColorLight)], false);
+            // Colour commands are gated while unconfirmed-off (commit 1).
+            await h.registry.setState(1, { onOff: true });
             const endpoint = only(h);
             await endpoint.act(agent =>
                 agent.get(ColorFull).moveToColor({
@@ -2659,6 +2706,10 @@ describe("ColorControl command conversion (§4.2, #143)", () => {
         const h = await harness();
         try {
             await h.registry.reconcile([spec(1, Role.extendedColorLight)], false);
+            // Colour commands are gated while unconfirmed-off (commit 1) — the
+            // lamp must be on for this to reach stock's own transition logic
+            // rather than being dropped at the gate first.
+            await h.registry.setState(1, { onOff: true });
             const endpoint = only(h);
             const before = endpoint.stateOf("colorControl") as { currentX: number; currentY: number };
             await endpoint.act(agent =>
@@ -2680,6 +2731,8 @@ describe("ColorControl command conversion (§4.2, #143)", () => {
         const h1 = await harness();
         try {
             await h1.registry.reconcile([spec(1, Role.extendedColorLight)], false);
+            // Colour commands are gated while unconfirmed-off (commit 1).
+            await h1.registry.setState(1, { onOff: true });
             const endpoint = only(h1);
             await endpoint.act(agent =>
                 agent.get(ColorFull).moveToColorTemperature({
@@ -2699,6 +2752,7 @@ describe("ColorControl command conversion (§4.2, #143)", () => {
         const h2 = await harness();
         try {
             await h2.registry.reconcile([spec(1, Role.colorTemperatureLight)], false);
+            await h2.registry.setState(1, { onOff: true });
             const endpoint = only(h2);
             await endpoint.act(agent =>
                 agent.get(ColorCt).moveToColorTemperature({
@@ -2720,6 +2774,8 @@ describe("ColorControl command conversion (§4.2, #143)", () => {
         const h = await harness();
         try {
             await h.registry.reconcile([spec(1, Role.extendedColorLight)], false);
+            // Colour commands are gated while unconfirmed-off (commit 1).
+            await h.registry.setState(1, { onOff: true });
             const endpoint = only(h);
             await endpoint.act(agent =>
                 agent.get(ColorFull).moveToColorTemperature({
@@ -2766,10 +2822,22 @@ describe("cluster composition is unchanged from stock (HR-1)", () => {
         [
             "extendedColorLight",
             Role.extendedColorLight,
+            // The baseline used to be the SAME expression as production
+            // (self-referential — it could never catch production drifting
+            // from stock). It is rebuilt from a genuinely bare stock
+            // ColorControlServer, `.alter()`-ed identically to
+            // IndigoColorControlServer's own composition, so the fence's
+            // real claim holds: the Indigo* override class is
+            // composition-neutral against an EQUIVALENTLY-CONFIGURED stock
+            // server, not against a copy of itself. The `HueSaturation`
+            // deviation from bare stock is deliberate and already documented
+            // at IndigoColorControlServer's own class doc.
             () =>
                 ExtendedColorLightDevice.with(
                     BridgedDeviceBasicInformationServer,
-                    ColorControlServer.with("HueSaturation", "Xy", "ColorTemperature"),
+                    ColorControlServer.with("HueSaturation", "Xy", "ColorTemperature").alter({
+                        attributes: { remainingTime: { optional: false } },
+                    }),
                 ),
             ["onOff", "levelControl", "colorControl"],
         ],
