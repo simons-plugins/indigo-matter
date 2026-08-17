@@ -922,3 +922,90 @@ class TestKeysThatStopBeingReported:
                                                   DimmerDevice(1, "L", onState=True, brightness=75))
         assert changed == {"level": 75}
         assert stopped == frozenset()
+
+
+# ---------------------------------------------------------------------------
+# Battery (issue #220) — role-independent, added only by `published_states`
+# ---------------------------------------------------------------------------
+class TestBattery:
+    @pytest.mark.parametrize("value,expected", [
+        (None, None),
+        (0, None),      # issue #190: indistinguishable from "never polled"
+        (0.0, None),
+        (0.4, None),    # rounds to 0 — the old raw `== 0` check let this through
+        (0.49, None),
+        (0.5, None),    # Python's banker's rounding also lands on 0
+        (-1, None),     # a driver's "unknown" sentinel, not a real reading
+        (-0.2, None),
+        (True, None),   # bool is an int in Python; not a battery reading
+        ("77", None),
+        (1, 1),
+        (0.51, 1),      # rounds to 1
+        (77, 77),
+        (100.4, 100),
+        (150, 100),     # clamped
+    ])
+    def test_battery_percent(self, handlers, value, expected):
+        assert handlers.battery_percent(RelayDevice(1, "D", batteryLevel=value)) == expected
+
+    def test_battery_percent_is_none_when_the_attribute_is_absent(self, handlers):
+        assert handlers.battery_percent(RelayDevice(1, "D")) is None
+
+    def test_an_overrange_reading_warns_once_per_device_not_once_per_call(self, handlers, caplog):
+        dev = RelayDevice(42, "Leaky Sensor", batteryLevel=150)
+        with caplog.at_level("WARNING"):
+            assert handlers.battery_percent(dev) == 100
+            assert handlers.battery_percent(dev) == 100
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert len(warnings) == 1
+        assert "42" in warnings[0].message and "150" in warnings[0].message
+
+    def test_the_overrange_latch_is_keyed_per_device(self, handlers, caplog):
+        with caplog.at_level("WARNING"):
+            handlers.battery_percent(RelayDevice(43, "A", batteryLevel=150))
+            handlers.battery_percent(RelayDevice(44, "B", batteryLevel=150))
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert len(warnings) == 2
+
+    def test_an_in_range_reading_never_warns(self, handlers, caplog):
+        with caplog.at_level("WARNING"):
+            handlers.battery_percent(RelayDevice(45, "Normal", batteryLevel=80))
+        assert [r for r in caplog.records if r.levelname == "WARNING"] == []
+
+    @pytest.mark.parametrize("role", ALL_ROLES)
+    def test_published_states_adds_battery_level_for_every_role_but_states_for_never_does(
+            self, handlers, role):
+        dev = _capable_device(role)
+        dev.batteryLevel = 61
+        handler = handlers.HANDLERS[role]
+        assert handler.published_states(dev)["batteryLevel"] == 61
+        assert "batteryLevel" not in handler.states_for(dev)
+
+    def test_published_states_omits_the_key_when_there_is_no_reading(self, handlers):
+        handler = handlers.HANDLERS["onOffLight"]
+        dev = RelayDevice(1, "L", onState=True)
+        assert "batteryLevel" not in handler.published_states(dev)
+
+    def test_diff_from_reports_a_battery_change(self, handlers):
+        handler = handlers.HANDLERS["onOffLight"]
+        dev = RelayDevice(1, "L", onState=True, batteryLevel=80)
+        pushed = handler.published_states(dev)
+        after = RelayDevice(1, "L", onState=True, batteryLevel=79)
+        changed, stopped = handler.diff_from(pushed, after)
+        assert changed == {"batteryLevel": 79}
+        assert stopped == frozenset()
+
+    def test_diff_from_is_silent_when_battery_is_unchanged(self, handlers):
+        handler = handlers.HANDLERS["onOffLight"]
+        dev = RelayDevice(1, "L", onState=True, batteryLevel=80)
+        pushed = handler.published_states(dev)
+        changed, _stopped = handler.diff_from(pushed, RelayDevice(1, "L", onState=True, batteryLevel=80))
+        assert changed == {}
+
+    def test_a_device_that_stops_reporting_battery_is_a_stopped_key_streak(self, handlers):
+        handler = handlers.HANDLERS["onOffLight"]
+        pushed = handler.published_states(RelayDevice(1, "L", onState=True, batteryLevel=80))
+        after = RelayDevice(1, "L", onState=True, batteryLevel=None)
+        changed, stopped = handler.diff_from(pushed, after)
+        assert changed == {}
+        assert stopped == frozenset({"batteryLevel"})

@@ -1225,3 +1225,56 @@ describe("issue #222: the endpoint-count advisory, softer than the 100 warning",
         }
     });
 });
+
+describe("issue #220: a battery survives a restart", () => {
+    it("rebuilds the endpoint with PowerSource BEFORE the plugin attaches", async () => {
+        // ⊗ node.ts's `restoreEndpoints` reads `entry.battery` off the map —
+        // the one line that stops a battery accessory losing PowerSource on
+        // every restart. This restore path never goes through
+        // `attach`/`upsert_endpoint`, so `battery` is never asked for
+        // elsewhere; without that line the endpoint would rebuild bare, and
+        // PowerSource — a cluster that can only be declared at construction —
+        // would never come back without a remove/re-add the user has no way
+        // to trigger. `boot()` here does NOT attach, so this pins the state
+        // strictly before the plugin has said anything.
+        const storagePath = storage();
+        const numbers = await seedTwoAccessories(storagePath);
+        const handWritten: EndpointMapFile = {
+            version: ENDPOINT_MAP_VERSION,
+            endpoints: {
+                [uniqueIdFor(KITCHEN)]: {
+                    number: numbers[KITCHEN]!,
+                    role: "onOffLight",
+                    label: "Kitchen Lamp",
+                    battery: true,
+                },
+                [uniqueIdFor(LOUNGE)]: {
+                    number: numbers[LOUNGE]!,
+                    role: "dimmableLight",
+                    label: "Lounge Lamp",
+                },
+            },
+        };
+        writeFileSync(join(storagePath, ENDPOINT_MAP_FILE), JSON.stringify(handWritten));
+
+        const session = await boot(storagePath);
+        try {
+            const kitchen = childOf(session.bridge.server, KITCHEN);
+            assert.ok(kitchen !== undefined, "the battery entry must restore at all");
+            const kitchenServers = (kitchen!.stateOf("descriptor") as { serverList: unknown[] }).serverList;
+            assert.ok(
+                kitchenServers.map(Number).includes(47),
+                `serverList ${JSON.stringify(kitchenServers)} missing PowerSource (47) on restore`,
+            );
+
+            const lounge = childOf(session.bridge.server, LOUNGE);
+            const loungeServers = (lounge!.stateOf("descriptor") as { serverList: unknown[] }).serverList;
+            assert.ok(
+                !loungeServers.map(Number).includes(47),
+                "a non-battery entry must not gain PowerSource",
+            );
+        } finally {
+            await session.close();
+        }
+    });
+});

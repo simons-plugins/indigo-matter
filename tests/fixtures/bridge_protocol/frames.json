@@ -811,9 +811,11 @@
             "label": "Garage Contact",
             "reachable": true,
             "states": {
-              "contact": true
+              "contact": true,
+              "batteryLevel": 77
             },
-            "options": {}
+            "options": {},
+            "battery": true
           },
           {
             "indigoDeviceId": 900010,
@@ -1102,7 +1104,8 @@
       "args": {
         "indigoDeviceId": 900009,
         "states": {
-          "contact": true
+          "contact": true,
+          "batteryLevel": 77
         }
       }
     },
@@ -1208,6 +1211,23 @@
     "response": {
       "message_id": "m43",
       "result": {}
+    }
+  },
+  "set_state_battery_on_a_mains_endpoint": {
+    "request": {
+      "message_id": "m70",
+      "command": "set_state",
+      "args": {
+        "indigoDeviceId": 123456789,
+        "states": {
+          "batteryLevel": 77
+        }
+      }
+    },
+    "response": {
+      "message_id": "m70",
+      "error_code": "malformed_args",
+      "details": "endpoint 123456789 was not created with a battery, so batteryLevel cannot be published; re-export the device (§4.1)"
     }
   },
   "remove_fabric": {

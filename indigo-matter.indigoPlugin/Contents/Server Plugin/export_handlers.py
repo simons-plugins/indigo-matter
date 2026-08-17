@@ -114,6 +114,10 @@ STATE_LOCAL_TEMPERATURE_C = "localTemperatureC"
 STATE_HEATING_SETPOINT_C = "heatingSetpointC"
 STATE_COOLING_SETPOINT_C = "coolingSetpointC"
 STATE_SYSTEM_MODE = "systemMode"
+#: Role-independent (§4.2 ``bridge_protocol.SHARED_STATE_KEYS``, issue #220) —
+#: added by :meth:`ExportHandler.published_states`, never by a role's own
+#: ``states_for``.
+STATE_BATTERY_LEVEL = "batteryLevel"
 
 COMMAND_ON_OFF = "onOff"
 COMMAND_SET_LEVEL = "setLevel"
@@ -323,6 +327,66 @@ def _number(dev: Any, name: str) -> Optional[float]:
     return float(value)
 
 
+#: Devices whose ``battery_percent`` has already warned about a >100 raw
+#: reading. Once per device rather than once per call: a stuck driver reports
+#: the same bad value on every poll, and a per-poll warning would be the
+#: loudest line in the log for a condition that never changes. Module-level
+#: rather than a handler field because :func:`battery_percent` is a free
+#: function several handlers' ``published_states`` call directly, with no
+#: shared instance to hold it on.
+_overrange_warned: set[int] = set()
+
+
+def battery_percent(dev: Any) -> Optional[int]:
+    """``dev.batteryLevel`` as the §4.2 ``batteryLevel`` percentage, or ``None``.
+
+    Rounded FIRST, suppressed second: a value that rounds to 0 or below is
+    ``None``, whatever it was before rounding. ``None`` for a non-numeric
+    value too. The suppression is the deliberate opposite of
+    :func:`_first_number`'s temperature ruling elsewhere in this module, and
+    not an accident. Indigo initialises every declared Integer state to 0 at
+    device creation (issue #190 — see ``device_sync.py``'s
+    ``_warn_of_newly_excluded_battery_devices`` docstring for where that was
+    established), so a bare 0 on a freshly commissioned device is
+    indistinguishable from "never polled". Unlike 0 °C — a real reading a
+    working outdoor thermostat gives every winter — 0% is not a reading a
+    working device CAN give: a cell that
+    flat has stopped talking, not reported one last data point. Reporting a
+    fresh device's placeholder 0 as a battery level is exactly the false "your
+    device's battery is critically low" alarm issue #220 exists to avoid, and
+    that reasoning covers a negative reading at least as strongly — a driver's
+    "unknown" sentinel (e.g. -1) is even less a real percentage than 0 is.
+
+    Rounding before suppressing (rather than after) closes a real gap: the
+    old order compared the RAW value to 0, so only an exact ``0`` was
+    suppressed — 0.4, 0.49 and 0.5 all failed that comparison, rounded down
+    (or to even) to 0 anyway, and still reached the wire as a literal ``0``,
+    which is exactly the false-alarm value this function exists to keep off
+    it. Rounding first makes "is this reading a real >0 percentage once
+    rounded" the actual question asked, which is what the suppression was
+    always meant to answer.
+
+    Clamped to 100 at the top, and now warned about once per device: a
+    ``batteryLevel`` above 100 is a device/driver bug, not a value a working
+    battery can report, so letting it through silently would just move the
+    failure to the node's own ``percentToBatteryRemaining`` clamp (a debug
+    line there, naming no device) for no better an answer. This is the one
+    line in the module that logs above debug — see :data:`_overrange_warned`.
+    """
+    value = getattr(dev, "batteryLevel", None)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if value > 100 and dev.id not in _overrange_warned:
+        _overrange_warned.add(dev.id)
+        _LOG.warning(
+            "Matter bridge: device %s (id %s) reported batteryLevel %r, above the 0-100 domain — "
+            "clamped to 100.", getattr(dev, "name", ""), dev.id, value)
+    percent = min(100, int(round(value)))
+    if percent <= 0:
+        return None
+    return percent
+
+
 # --------------------------------------------------------------------------
 # Handlers
 # --------------------------------------------------------------------------
@@ -346,6 +410,30 @@ class ExportHandler:
         none and ignore it; ``windowCovering`` reads its polarity from it.
         """
         raise NotImplementedError
+
+    def published_states(self, dev: Any, options: Optional[dict] = None) -> dict:
+        """:meth:`states_for`, plus ``batteryLevel`` when the device has one.
+
+        The ONE place battery is added, deliberately outside every role's own
+        override chain (issue #220). Six of the fifteen handlers below skip
+        ``super().states_for()`` entirely (``OnOffExport``,
+        ``WindowCoveringExport``, ``DoorLockExport``, ``ThermostatExport``,
+        ``BinarySensorExport``, ``NumericSensorExport``), so a battery key
+        added inside ``states_for`` itself would silently vanish for exactly
+        those roles — the Wrong Abstraction fifteen near-identical additions
+        would be, and the reason this is a wrapper rather than a mixin method
+        any subclass could accidentally shadow.
+
+        :meth:`diff_with_gaps` and :meth:`diff_from` both read through THIS,
+        never through ``states_for`` directly — otherwise ``batteryLevel``
+        would show as permanently "stopped" on every single diff, since
+        ``states_for`` never had it to begin with.
+        """
+        states = self.states_for(dev, options)
+        percent = battery_percent(dev)
+        if percent is not None:
+            states = {**states, STATE_BATTERY_LEVEL: percent}
+        return states
 
     def diff(self, orig_dev: Any, new_dev: Any, options: Optional[dict] = None) -> dict:
         """The changed §4.2 keys only. Empty dict = nothing to push.
@@ -388,7 +476,7 @@ class ExportHandler:
         Spelling an explicit "unknown" on the wire would be a protocol
         addition, deliberately not made here.
         """
-        return self.diff_from(self.states_for(orig_dev, options), new_dev, options)
+        return self.diff_from(self.published_states(orig_dev, options), new_dev, options)
 
     def diff_from(self, pushed: Optional[dict], new_dev: Any,
                   options: Optional[dict] = None) -> StateDiff:
@@ -410,7 +498,7 @@ class ExportHandler:
         somebody's Home app.
         """
         before = dict(pushed or {})
-        after = self.states_for(new_dev, options)
+        after = self.published_states(new_dev, options)
         changed = {
             key: value for key, value in after.items()
             if self._changed(key, before.get(key, _MISSING), value)

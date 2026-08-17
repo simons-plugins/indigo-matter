@@ -481,6 +481,13 @@ export class BridgeNode implements BridgeFacade {
                 // ecosystem show a value nobody has read.
                 states: {},
                 options: {},
+                // Issue #220 — the one line that stops a battery accessory
+                // losing PowerSource on every restart: without it, this restore
+                // path (which does not go through `attach`/`upsert_endpoint`,
+                // so `battery` is never asked for elsewhere) would rebuild the
+                // endpoint with `battery: false` even though the persisted
+                // entry has seen one.
+                battery: entry.battery === true,
             });
         }
         if (specs.length === 0) {
@@ -872,6 +879,7 @@ export class BridgeNode implements BridgeFacade {
             endpointNumber: identity.endpointNumber,
             role: identity.role,
             label: identity.label,
+            battery: identity.battery,
         }));
     }
 

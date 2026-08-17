@@ -3,6 +3,24 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
+## 2026.18.0 — battery level on exported accessories
+
+> Takes effect on a live install only once the paired bridge-node release
+> ships; the plugin pins the bridge node by exact version.
+
+### Added
+
+- **Battery level now appears on exported accessories that report one**
+  (issue #220) — automatic, no export setting to change. A device's own
+  `batteryLevel` state is the whole trigger: the plugin declares a
+  `PowerSource` cluster the first time it sees one, and every ecosystem then
+  shows the reading on its normal update cadence. A device that has never
+  polled (Indigo's own `0` at device creation) does not trigger a false
+  "battery critical" alarm. **Migration note:** on the first reconnect after
+  this update, every already-exported battery-bearing device is re-created
+  once — endpoint identity is preserved, but names/rooms assigned in paired
+  ecosystems may need re-assigning.
+
 ## 2026.17.0 — exported switches, plugs and lights wait for Indigo
 
 > Takes effect on a live install only once the paired bridge-node release

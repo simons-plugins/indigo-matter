@@ -33,12 +33,13 @@
  *   {@link COMMAND_SINKS}.
  */
 
-import { Endpoint, type EndpointType, Logger, type MaybePromise, VendorId } from "@matter/main";
+import { Endpoint, type EndpointType, Logger, type MaybePromise, type MutableEndpoint, VendorId } from "@matter/main";
 import { BridgedDeviceBasicInformationServer } from "@matter/main/behaviors/bridged-device-basic-information";
 import { ColorControlServer } from "@matter/main/behaviors/color-control";
 import { DoorLockServer } from "@matter/main/behaviors/door-lock";
 import { OccupancySensingServer } from "@matter/main/behaviors/occupancy-sensing";
 import { OnOffServer } from "@matter/main/behaviors/on-off";
+import { PowerSourceServer } from "@matter/main/behaviors/power-source";
 import { ThermostatServer } from "@matter/main/behaviors/thermostat";
 import { MovementDirection, MovementType, WindowCoveringServer } from "@matter/main/behaviors/window-covering";
 import { ColorControl } from "@matter/main/clusters/color-control";
@@ -188,6 +189,23 @@ export function percentToMatter(percent: number): number {
 /** Matter 0-254 → Indigo 0-100. Inverse of {@link percentToMatter} for all 101 inputs. */
 export function matterToPercent(level: number): number {
     return clamp(roundHalfUp((clamp(level, 0, MATTER_LEVEL_MAX) * 100) / MATTER_LEVEL_MAX), 0, 100);
+}
+
+/**
+ * PowerSource's `batPercentRemaining`, in half-percent units (0-200), so 100%
+ * is 200 and the attribute can express a half-percent Indigo itself cannot.
+ */
+export const BATTERY_REMAINING_MAX = 200;
+
+/**
+ * §4.2 `batteryLevel` (1-100) → `batPercentRemaining` (0-200, half-percent
+ * units — 24% is 48). The clamp is load-bearing, not defensive: `endpoint.set`
+ * with a raw 201 throws a Matter `Constraint` error at 0.17.8 (measured, §0),
+ * and that would fail the whole `set_state`/`createEndpoint` write over one
+ * out-of-range battery reading rather than the residual state alongside it.
+ */
+export function percentToBatteryRemaining(percent: number): number {
+    return clampLogged(roundHalfUp(percent * 2), 0, BATTERY_REMAINING_MAX, "battery percent");
 }
 
 /**
@@ -504,6 +522,8 @@ const FLOW_MEASUREMENT = "flowMeasurement";
 const THERMOSTAT = "thermostat";
 const DOOR_LOCK = "doorLock";
 const WINDOW_COVERING = "windowCovering";
+/** Issue #220 — PowerSource, added optionally per §4.1's `battery` flag. */
+const POWER_SOURCE = "powerSource";
 
 // ---------------------------------------------------------------------------
 // Command sinks — the invocation-driven roles' route to `emit`
@@ -876,6 +896,44 @@ function colorControlDefaults(hueSaturation: boolean): Record<string, unknown> {
  * cannot silently sever the whole `setLevel` command family.
  */
 const LEVEL_CONTROL_INITIAL = { currentLevel: 1, managedTransitionTimeHandling: false };
+
+/**
+ * The PowerSource state every battery-bearing endpoint starts from (issue
+ * #220).
+ *
+ * **`batPercentRemaining: null` is REQUIRED, not a style choice — this is the
+ * measured trap (§0).** An endpoint built WITHOUT this key never gets
+ * attribute 12 (`batPercentRemaining`) added to its `attributeList` at all: a
+ * LATER `endpoint.set({powerSource: {batPercentRemaining: 48}})` SUCCEEDS
+ * SILENTLY and reads back 48 on this process, but the attribute was never
+ * declared, so no controller — Apple, Alexa, anyone — can ever read it. `null`
+ * (meaning "has a battery, reading unknown") seeds the attribute's existence;
+ * a real percentage arrives with the first `set_state`/`createEndpoint`
+ * `states` that carries one.
+ *
+ * `batReplacementNeeded: false` is pinned for the same reason
+ * {@link LEVEL_CONTROL_INITIAL} pins `managedTransitionTimeHandling`: 0.17.8
+ * already defaults it to `false` (`PowerSourceBaseServer` seeds nothing for
+ * it, so the cluster's own default applies), so this changes no behaviour
+ * today — it is here so a future matter.js default flip cannot silently start
+ * every exported battery device out claiming it needs a new cell.
+ *
+ * **`batChargeLevel` is deliberately ABSENT here, and never derived from the
+ * percentage.** The enum (`Ok`/`Warning`/`Critical`) is the device's OWN
+ * judgement against ITS OWN thresholds — Indigo has none, so inventing a
+ * mapping (e.g. "below 20% is Warning") would be this bridge's opinion
+ * standing in for a reading no Indigo device provides, and a wrong guess
+ * triggers an ecosystem's "replace battery" alarm on a device that never
+ * asked for one. Apple derives its own low-battery warning from the
+ * percentage already, so leaving the enum unset costs nothing and keeps one
+ * source of truth (the percentage) instead of two that can disagree.
+ * `status`/`order`/`description`/`batReplaceability` are left to matter.js
+ * entirely: all four were measured present with sane defaults on
+ * `PowerSourceServer.with("Battery")` (§0 — `status: 0`, `order: 0`,
+ * `description: "Battery power"`, `batReplaceability: 0`) and none of them
+ * are Indigo's to set.
+ */
+const BATTERY_INITIAL = { batPercentRemaining: null, batReplacementNeeded: false };
 
 /**
  * Why a lawful §4.2 role can still be refused.
@@ -1483,6 +1541,95 @@ function definitionFor(role: RoleValue): RoleDefinition {
 }
 
 /**
+ * A role's device type, optionally carrying PowerSource (§4.1 `battery`,
+ * issue #220).
+ *
+ * Always `.with("Battery")`, never the bare `PowerSourceServer` — the pattern
+ * every other role in this table already follows for a feature-narrowed
+ * server (`OnOffServer.with("Lighting")`, `ColorControlServer.with(
+ * "HueSaturation", …)`), and 0.18 readiness besides.
+ *
+ * `RoleDefinition.deviceType` is typed as the base {@link EndpointType} "on
+ * purpose" (see that field's own doc) because each role's `.with()` produces a
+ * different concrete type — but every one of them is, at runtime, the
+ * {@link MutableEndpoint} every `@matter/main/devices/*` export actually is,
+ * which is what lets a SECOND `.with()` be chained on here exactly the way
+ * {@link createEndpoint} already assumes when it hands the result to
+ * `new Endpoint(... as never, …)` two lines below. Measured (§0): chaining
+ * onto an already-`.with()`-ed device type retains the endpoint number across
+ * a close+re-add at the same `Endpoint.id`, adds 47 to `serverList` and
+ * `{deviceType: 17}` (0x0011) to `deviceTypeList` (via
+ * `PowerSourceServer#initialize`'s own `addDeviceTypes("PowerSource")`) — and
+ * `bridged-node.js`'s optional server set carries PowerSource, which is the
+ * sanctioned placement this composition relies on.
+ */
+function deviceTypeFor(definition: RoleDefinition, battery: boolean): EndpointType {
+    const deviceType = definition.deviceType();
+    if (!battery) {
+        return deviceType;
+    }
+    return (deviceType as unknown as MutableEndpoint).with(PowerSourceServer.with("Battery"));
+}
+
+/**
+ * {@link splitBattery}'s result: `battery` is the `powerSource` patch to merge
+ * in, present only when `states` carried a consumable `batteryLevel`; `rest`
+ * is everything else, unconsumed, for the role's own converter.
+ */
+interface BatterySplit {
+    battery?: Record<string, unknown>;
+    rest: Record<string, unknown>;
+}
+
+/**
+ * Peel `batteryLevel` off a `states`/spec-`states` object and convert it to a
+ * `powerSource` patch.
+ *
+ * **Role-independent by construction** (issue #220; `bridge_protocol.
+ * SHARED_STATE_KEYS` is the Python mirror of this same rule): `batteryLevel`
+ * is consumed HERE, before any role's own `statePatch` ever sees it, which is
+ * what keeps it out of {@link ROLE_DEFINITIONS} entirely — fifteen identical
+ * per-role additions would be exactly the copy-pasted-logic failure mode this
+ * codebase's own conventions warn against.
+ *
+ * Only a `typeof === "number" && Number.isFinite` value is consumed —
+ * deliberately NOT `typeof === "boolean"`, so `{"batteryLevel": true}` is left
+ * alone. A non-numeric value (a string, a boolean) stays in `rest`, where no
+ * role's converter can make sense of it either: it surfaces as an ordinary
+ * rejected key through {@link rejectedStateKeys}/`statePatchOrRefuse`, the same
+ * treatment a misspelt or mistyped key already gets — nothing here has to
+ * duplicate that machinery.
+ *
+ * This function does NOT know or care whether the endpoint it is destined for
+ * actually has a battery — it has no endpoint to ask. The composition check
+ * (does *this* endpoint carry PowerSource) is the caller's job, because only
+ * {@link createEndpoint} and {@link applyStates} have an endpoint/spec to
+ * check it against; see {@link refuseBatteryLevelWithoutBattery}.
+ */
+function splitBattery(states: Record<string, unknown>): BatterySplit {
+    const { batteryLevel, ...rest } = states;
+    if (typeof batteryLevel !== "number" || !Number.isFinite(batteryLevel)) {
+        return { rest: states };
+    }
+    return { battery: { batPercentRemaining: percentToBatteryRemaining(batteryLevel) }, rest };
+}
+
+/**
+ * §4.1's refusal for a consumable `batteryLevel` against an endpoint that was
+ * not created with a battery. Thrown BEFORE any write reaches matter.js — a
+ * silent accept would write an attribute no controller can ever read, the same
+ * lesson §0's measured trap teaches from the opposite direction (a write that
+ * succeeds into an attribute that does not exist at all).
+ */
+function refuseBatteryLevelWithoutBattery(indigoDeviceId: number): never {
+    throw new ProtocolError(
+        ErrorCode.malformedArgs,
+        `endpoint ${indigoDeviceId} was not created with a battery, so batteryLevel cannot be ` +
+            "published; re-export the device (§4.1)",
+    );
+}
+
+/**
  * Merge two behaviour-keyed patches one level deep.
  *
  * A plain spread is wrong here and fails loudly: `{...defaults, ...patch}`
@@ -1584,12 +1731,30 @@ function bridgedInfoFor(spec: EndpointSpec, identity: BridgedIdentity): Record<s
  */
 export function createEndpoint(spec: EndpointSpec, identity: BridgedIdentity): Endpoint {
     const definition = definitionFor(spec.role);
-    return new Endpoint(definition.deviceType() as never, {
+    const { battery, rest } = splitBattery(spec.states);
+    if (battery !== undefined && !spec.battery) {
+        refuseBatteryLevelWithoutBattery(spec.indigoDeviceId);
+    }
+    // A consumed `batteryLevel` counts as consumption for refusal purposes
+    // too, matching `applyStates`' version-skew tolerance below (the
+    // "*partly* consumed `states` still succeeds" paragraph on that
+    // function's own doc): without this, an initial `states` of
+    // `{batteryLevel: 48, futureKey: 1}` left `rest = {futureKey: 1}`, which
+    // `statePatchOrRefuse` refused WHOLESALE — a valid battery reading thrown
+    // away alongside the stranger it arrived with, at construction time.
+    const patch = battery !== undefined ? definition.statePatch(rest) : statePatchOrRefuse(spec.role, rest);
+    return new Endpoint(deviceTypeFor(definition, spec.battery) as never, {
         id: endpointIdFor(spec.indigoDeviceId),
         ...mergeBehaviors(
             { [BRIDGED_INFO]: bridgedInfoFor(spec, identity) },
             definition.initialState(),
-            statePatchOrRefuse(spec.role, spec.states),
+            // `BATTERY_INITIAL` seeds `batPercentRemaining: null` even when
+            // `battery` is undefined (no `batteryLevel` in the initial
+            // `states`) — the measured trap (§0): an endpoint built without
+            // this key never gets the attribute into `attributeList` at all,
+            // so seeding it is not optional on a battery-flagged endpoint.
+            spec.battery ? { [POWER_SOURCE]: { ...BATTERY_INITIAL, ...battery } } : {},
+            patch,
         ),
     } as never);
 }
@@ -1609,8 +1774,15 @@ export function createEndpoint(spec: EndpointSpec, identity: BridgedIdentity): E
  * cases the patch builders skip.
  */
 export function rejectedStateKeys(role: RoleValue, states: Record<string, unknown>): string[] {
+    // `batteryLevel` is treated as always consumable here, regardless of
+    // whether the (unknown, to this function) endpoint actually has a
+    // battery: this is a pure function of role+states with no endpoint to
+    // check composition against, and the golden fixtures carry a battery key
+    // on ordinary roles' `attach`/`set_state` frames. The composition check
+    // lives only in `createEndpoint`/`applyStates`, which do have one.
+    const { rest } = splitBattery(states);
     const { statePatch } = definitionFor(role);
-    return Object.keys(states).filter(key => Object.keys(statePatch({ [key]: states[key] })).length === 0);
+    return Object.keys(rest).filter(key => Object.keys(statePatch({ [key]: rest[key] })).length === 0);
 }
 
 /**
@@ -1633,8 +1805,37 @@ export async function applyStates(
     endpoint: Endpoint,
     role: RoleValue,
     states: Record<string, unknown>,
+    hasBattery: boolean,
 ): Promise<void> {
-    const patch = statePatchOrRefuse(role, states);
+    // Split FIRST, before `statePatchOrRefuse` sees `states` — the composition
+    // check (does *this* endpoint have a battery) has to run before anything
+    // is written, and `rest` (not `states`) is what the role's own converter
+    // gets.
+    const { battery, rest } = splitBattery(states);
+    if (battery !== undefined && !hasBattery) {
+        // `endpoint.id` is always `indigo-<indigoDeviceId>` for a bridge-owned
+        // endpoint (`endpointIdFor`), so this always parses.
+        refuseBatteryLevelWithoutBattery(indigoDeviceIdFrom(endpoint.id) ?? -1);
+    }
+    // A consumed `batteryLevel` counts as consumption for refusal purposes
+    // too — the version-skew tolerance this function's own doc describes
+    // ("a *partly* consumed `states` still succeeds") is about ANY key this
+    // bridge understood, not only the role's own vocabulary. Without this,
+    // `{batteryLevel: 48, futureKey: 1}` on a battery endpoint left
+    // `rest = {futureKey: 1}`, which `statePatchOrRefuse` refused wholesale —
+    // a valid battery reading thrown away alongside the stranger it arrived
+    // with. A push with no consumable battery key keeps the ordinary refusal.
+    const patch = battery !== undefined ? definitionFor(role).statePatch(rest) : statePatchOrRefuse(role, rest);
+    if (battery !== undefined) {
+        // Rides the existing residual `endpoint.set()` below — a plain
+        // attribute write, no command semantics, no `WatchSpec`, no third
+        // transaction. A battery-only push has `rest = {}` (so `patch` is `{}`
+        // here, lawfully — `statePatchOrRefuse`'s empty-states guard never saw
+        // the peeled-off `batteryLevel` key); adding this key is what stops the
+        // early-empty return just below from firing over a push that DOES have
+        // something to say.
+        patch[POWER_SOURCE] = battery;
+    }
     if (Object.keys(patch).length === 0) {
         return;
     }

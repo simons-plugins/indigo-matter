@@ -72,6 +72,15 @@ export function parseEndpointSpec(value: unknown): EndpointSpec {
     if (typeof reachable !== "boolean") {
         throw new ProtocolError(ErrorCode.malformedArgs, "endpoint.reachable must be a boolean");
     }
+    // `battery` defaults to FALSE, the opposite of `reachable` — absent means
+    // "no evidence this device has a battery", not "nothing said". Defaulting
+    // it true would publish an unevidenced PowerSource cluster on every
+    // accessory a client forgot to declare, which no paired ecosystem could
+    // ever un-see (§4.1: the cluster set is monotonic).
+    const battery = value.battery === undefined ? false : value.battery;
+    if (typeof battery !== "boolean") {
+        throw new ProtocolError(ErrorCode.malformedArgs, "endpoint.battery must be a boolean");
+    }
     return {
         indigoDeviceId,
         role: value.role,
@@ -79,6 +88,7 @@ export function parseEndpointSpec(value: unknown): EndpointSpec {
         reachable,
         states: requireStruct(value.states, "endpoint.states"),
         options: requireStruct(value.options, "endpoint.options"),
+        battery,
     };
 }
 
@@ -161,6 +171,18 @@ export interface ReconcilePlan {
     remove: number[];
 }
 
+/** What the planner needs to know about one live endpoint (§4.1/§4.2). */
+export interface LiveComposition {
+    role: RoleValue;
+    /**
+     * Whether the LIVE endpoint currently carries PowerSource. Compared against
+     * the desired spec's own {@link EndpointSpec.battery} below — a GAIN
+     * recreates (the cluster set can only be added to at construction, never
+     * patched on), a LOSS is left as an ordinary update (§4.1: monotonic).
+     */
+    battery: boolean;
+}
+
 /**
  * Diff the desired set against the live one, enforcing the §3.1 mass-removal
  * guard.
@@ -171,7 +193,7 @@ export interface ReconcilePlan {
  * every paired ecosystem" as `endpoints: []` is.
  */
 export function planReconcile(
-    live: ReadonlyMap<number, RoleValue>,
+    live: ReadonlyMap<number, LiveComposition>,
     desired: readonly EndpointSpec[],
     replaceAll: boolean,
 ): ReconcilePlan {
@@ -180,10 +202,10 @@ export function planReconcile(
 
     for (const spec of desired) {
         desiredIds.add(spec.indigoDeviceId);
-        const liveRole = live.get(spec.indigoDeviceId);
-        if (liveRole === undefined) {
+        const liveEndpoint = live.get(spec.indigoDeviceId);
+        if (liveEndpoint === undefined) {
             plan.create.push(spec);
-        } else if (liveRole === spec.role) {
+        } else if (liveEndpoint.role === spec.role && !(spec.battery && !liveEndpoint.battery)) {
             plan.update.push(spec);
         } else {
             plan.recreate.push(spec);

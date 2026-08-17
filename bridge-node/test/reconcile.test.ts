@@ -8,6 +8,7 @@ import { describe, it } from "node:test";
 
 import { type EndpointSpec, ErrorCode, ProtocolError, Role, type RoleValue } from "../src/protocol.js";
 import {
+    type LiveComposition,
     parseDeviceId,
     parseEndpointSpec,
     parseEndpointSpecs,
@@ -15,12 +16,14 @@ import {
     planReconcile,
 } from "../src/reconcile.js";
 
-function spec(indigoDeviceId: number, role: RoleValue = Role.onOffLight, label = "L"): EndpointSpec {
-    return { indigoDeviceId, role, label, reachable: true, states: {}, options: {} };
+function spec(
+    indigoDeviceId: number, role: RoleValue = Role.onOffLight, label = "L", battery = false,
+): EndpointSpec {
+    return { indigoDeviceId, role, label, reachable: true, states: {}, options: {}, battery };
 }
 
-function live(...entries: [number, RoleValue][]): Map<number, RoleValue> {
-    return new Map(entries);
+function live(...entries: [number, RoleValue, boolean?][]): Map<number, LiveComposition> {
+    return new Map(entries.map(([id, role, battery = false]) => [id, { role, battery }]));
 }
 
 function refusal(run: () => unknown): ProtocolError {
@@ -45,7 +48,18 @@ describe("parseEndpointSpec (§4.1)", () => {
             reachable: true,
             states: {},
             options: {},
+            // The opposite default direction from `reachable` (issue #220):
+            // absent means "no evidence this device has a battery", not
+            // "nothing said" — inventing one would publish an unevidenced
+            // PowerSource cluster on every accessory that omits the field.
+            battery: false,
         });
+    });
+
+    it("rejects a non-boolean battery as malformed_args", () => {
+        const error = refusal(() =>
+            parseEndpointSpec({ indigoDeviceId: 1, role: "onOffLight", label: "x", battery: "yes" }));
+        assert.equal(error.code, ErrorCode.malformedArgs);
     });
 
     it("rejects a role outside §4.2 with unknown_role, not malformed_args", () => {
@@ -164,5 +178,45 @@ describe("planReconcile (§3.1)", () => {
     it("does not fire when one endpoint survives", () => {
         const plan = planReconcile(live([1, Role.onOffLight], [2, Role.onOffLight]), [spec(1)], false);
         assert.deepEqual(plan.remove, [2]);
+    });
+
+    describe("battery composition (issue #220)", () => {
+        it("recreates on a battery GAIN, same role", () => {
+            const plan = planReconcile(
+                live([1, Role.onOffLight, false]), [spec(1, Role.onOffLight, "L", true)], false,
+            );
+            assert.deepEqual(plan.recreate.map(s => s.indigoDeviceId), [1]);
+            assert.deepEqual(plan.update, []);
+        });
+
+        it("updates (not recreate) on a battery LOSS — the cluster set is monotonic", () => {
+            const plan = planReconcile(
+                live([1, Role.onOffLight, true]), [spec(1, Role.onOffLight, "L", false)], false,
+            );
+            assert.deepEqual(plan.update.map(s => s.indigoDeviceId), [1]);
+            assert.deepEqual(plan.recreate, []);
+        });
+
+        it("updates when battery is unchanged in either direction", () => {
+            assert.deepEqual(
+                planReconcile(live([1, Role.onOffLight, true]), [spec(1, Role.onOffLight, "L", true)], false)
+                    .update.map(s => s.indigoDeviceId),
+                [1],
+            );
+            assert.deepEqual(
+                planReconcile(live([1, Role.onOffLight, false]), [spec(1, Role.onOffLight, "L", false)], false)
+                    .update.map(s => s.indigoDeviceId),
+                [1],
+            );
+        });
+
+        it("a battery-gain recreate does not trip the mass-removal guard", () => {
+            // Exactly like a role-change recreate: the device stays exported,
+            // it just changes what it publishes.
+            const plan = planReconcile(
+                live([1, Role.onOffLight, false]), [spec(1, Role.onOffLight, "L", true)], false,
+            );
+            assert.deepEqual(plan.remove, []);
+        });
     });
 });

@@ -31,7 +31,7 @@ import {
     type RoleValue,
     type UpsertResult,
 } from "./protocol.js";
-import { planReconcile } from "./reconcile.js";
+import { type LiveComposition, planReconcile } from "./reconcile.js";
 
 /**
  * PRD §5.3: bulk removals are paced so controllers see one subscription update
@@ -49,6 +49,13 @@ interface LiveEndpoint {
      * read per endpoint per reconcile.
      */
     label: string;
+    /**
+     * Whether this LIVE endpoint was built with PowerSource (issue #220). Set
+     * once at {@link EndpointRegistry.create} from `spec.battery` and never
+     * flipped false afterwards — the cluster set is monotonic (§4.1) — so this
+     * mirrors what the Matter tree actually holds, not the most recent spec.
+     */
+    battery: boolean;
     /** Reassigned when a failed close forces the listeners to be restored. */
     unwatch: () => void;
 }
@@ -59,6 +66,8 @@ export interface EndpointIdentity {
     endpointNumber: number;
     role: RoleValue;
     label: string;
+    /** Issue #220 — surfaced so `endpoint-map.json` can record it add-only. */
+    battery: boolean;
 }
 
 export interface EndpointRegistryOptions {
@@ -173,6 +182,7 @@ export class EndpointRegistry {
                 endpointNumber: Number(live.endpoint.number),
                 role: live.role,
                 label: live.label,
+                battery: live.battery,
             }))
             .sort((a, b) => a.indigoDeviceId - b.indigoDeviceId);
     }
@@ -218,9 +228,9 @@ export class EndpointRegistry {
         });
     }
 
-    /** The live role of a device, or undefined — what the reconcile planner diffs. */
-    liveRoles(): Map<number, RoleValue> {
-        return new Map([...this.#live.entries()].map(([id, live]) => [id, live.role]));
+    /** The live role+battery of a device — what the reconcile planner diffs. */
+    liveComposition(): Map<number, LiveComposition> {
+        return new Map([...this.#live.entries()].map(([id, live]) => [id, { role: live.role, battery: live.battery }]));
     }
 
     /**
@@ -246,13 +256,24 @@ export class EndpointRegistry {
         for (const spec of desired) {
             this.assertSupported(spec.role);
         }
-        const plan = planReconcile(this.liveRoles(), desired, replaceAll);
+        const live = this.liveComposition();
+        const plan = planReconcile(live, desired, replaceAll);
 
-        for (const indigoDeviceId of plan.recreate.map(spec => spec.indigoDeviceId)) {
+        for (const spec of plan.recreate) {
             // §4.1 rejects a role change through `upsert_endpoint`; attach is the
             // reconcile path and does it the only way Matter allows, which is a
-            // new accessory. Loud, because ecosystems lose the old one's name.
-            this.#log(`Recreating endpoint ${indigoDeviceId}: role changed`);
+            // new accessory. Loud, because ecosystems lose the old one's name —
+            // and issue #220 gave this a second reason, worth telling apart from
+            // the first: a role change is a full accessory swap in every paired
+            // ecosystem, while a battery gain keeps the same device type and
+            // only ADDS a cluster, which (per the live probe, §0) a paired
+            // ecosystem may or may not preserve the accessory's name/room across.
+            const existing = live.get(spec.indigoDeviceId);
+            const reason = existing !== undefined && existing.role === spec.role
+                ? "gained a battery (PowerSource can only be declared at construction; " +
+                  "the accessory's name/room MAY not survive in every ecosystem)"
+                : "role changed";
+            this.#log(`Recreating endpoint ${spec.indigoDeviceId}: ${reason}`);
         }
 
         const removals = [...plan.remove, ...plan.recreate.map(spec => spec.indigoDeviceId)];
@@ -314,6 +335,36 @@ export class EndpointRegistry {
                     `endpoint ${spec.indigoDeviceId} is ${existing.role}; remove and re-add to change role`,
                 );
             }
+            if (spec.battery && !existing.battery) {
+                // Issue #220: PowerSource can only be declared at construction
+                // (measured, §0), so a battery GAIN has to go through the same
+                // remove-then-add `reconcileNow` uses for a role change — an
+                // ordinary `update()` (a plain `endpoint.set()`) cannot add a
+                // cluster to a live endpoint. A LOSS is deliberately not
+                // symmetric: see `update`'s call into `applyStates`. Loud for
+                // the same reason `reconcileNow` is loud about its own
+                // recreate: the accessory's name/room MAY not survive in
+                // every paired ecosystem.
+                this.#log(
+                    `Recreating endpoint ${spec.indigoDeviceId}: gained a battery (PowerSource can only be ` +
+                        "declared at construction; the accessory's name/room MAY not survive in every ecosystem)",
+                );
+                await this.closeOne(spec.indigoDeviceId, existing);
+                try {
+                    const created = await this.create(spec);
+                    await this.noteConfigurationChange();
+                    return { endpointNumber: Number(created.number) };
+                } catch (error) {
+                    // `closeOne` already succeeded, so the bridged-node set
+                    // changed even though `create` never finished — the exact
+                    // case `reconcileNow`'s own catch handles above ("a
+                    // half-applied set becomes an invisible one"). Skipping
+                    // the bump here would leave every paired controller
+                    // believing the old accessory still exists.
+                    await this.noteConfigurationChange();
+                    throw error;
+                }
+            }
             await this.update(spec);
             return { endpointNumber: Number(existing.endpoint.number) };
         });
@@ -336,7 +387,7 @@ export class EndpointRegistry {
     async setState(indigoDeviceId: number, states: Record<string, unknown>): Promise<void> {
         return this.serialize("set_state", async () => {
             const live = this.require(indigoDeviceId);
-            await applyStates(live.endpoint, live.role, states);
+            await applyStates(live.endpoint, live.role, states, live.battery);
         });
     }
 
@@ -387,7 +438,8 @@ export class EndpointRegistry {
             await endpoint.close().catch(() => undefined);
             throw error;
         }
-        this.#live.set(spec.indigoDeviceId, { endpoint, role: spec.role, label: spec.label, unwatch });
+        this.#live.set(spec.indigoDeviceId,
+            { endpoint, role: spec.role, label: spec.label, battery: spec.battery, unwatch });
         this.#log(`Endpoint ${spec.indigoDeviceId} (${spec.role}) added as number ${Number(endpoint.number)}`);
         return endpoint;
     }
@@ -410,7 +462,10 @@ export class EndpointRegistry {
         // the cluster would restore yesterday's name after a restart.
         live.label = spec.label;
         await applyReachable(live.endpoint, spec.reachable);
-        await applyStates(live.endpoint, live.role, spec.states);
+        // `live.battery`, not `spec.battery`: a battery LOSS on `spec` is left
+        // alone here (§4.1, monotonic) — the gain case never reaches `update`
+        // at all, `upsert`/`reconcileNow` route it to a recreate instead.
+        await applyStates(live.endpoint, live.role, spec.states, live.battery);
     }
 
     /**

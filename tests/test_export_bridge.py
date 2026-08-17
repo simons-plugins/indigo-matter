@@ -368,6 +368,49 @@ class TestEndpointProvider:
         assert per_device_warnings(mock_logger) == 2
 
 
+class TestEndpointProviderBattery:
+    """Issue #220 — `_spec_for`'s `battery`/`batteryLevel` composition."""
+
+    def test_a_battery_device_carries_battery_true_and_the_state_key(
+            self, bridge_mod, mock_logger, devices):
+        devices.add(RelayDevice(200, "Battery Plug", onState=True, batteryLevel=80))
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(200, "onOffLight")])
+        (spec,) = h.bridge.endpoint_specs()
+        assert spec.battery is True
+        assert spec.states["batteryLevel"] == 80
+
+    def test_a_mains_device_carries_neither(self, bridge_mod, mock_logger, devices):
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(101, "onOffLight")])
+        (spec,) = h.bridge.endpoint_specs()
+        assert spec.battery is False
+        assert "batteryLevel" not in spec.states
+
+    def test_battery_level_zero_still_declares_a_battery_but_publishes_no_reading(
+            self, bridge_mod, mock_logger, devices):
+        """The asymmetry, pinned: `battery` is `is not None` (0 counts as HAS a
+        battery attribute); the *value* 0 is suppressed as untrustworthy
+        (issue #190) — the same attribute, two different tests, on purpose.
+        """
+        devices.add(RelayDevice(201, "Fresh Plug", onState=True, batteryLevel=0))
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(201, "onOffLight")])
+        (spec,) = h.bridge.endpoint_specs()
+        assert spec.battery is True
+        assert "batteryLevel" not in spec.states
+
+    def test_battery_level_negative_one_still_declares_a_battery_but_publishes_no_reading(
+            self, bridge_mod, mock_logger, devices):
+        """Same evidence rule, a different untrustworthy value: `-1` is a real
+        "unknown" sentinel some drivers use, so `is not None` still declares a
+        battery (the device factually has the property) while `battery_percent`
+        suppresses the reading itself. §4.2's 1-100 domain must never see it.
+        """
+        devices.add(RelayDevice(202, "Sentinel Plug", onState=True, batteryLevel=-1))
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(202, "onOffLight")])
+        (spec,) = h.bridge.endpoint_specs()
+        assert spec.battery is True
+        assert "batteryLevel" not in spec.states
+
+
 # ---------------------------------------------------------------------------
 # Client lifecycle (XG5)
 # ---------------------------------------------------------------------------
@@ -733,6 +776,99 @@ class TestDeviceUpdated:
         assert h.client.names() == []
 
 
+class TestBatteryDeviceUpdated:
+    """Issue #220 — a battery GAIN recreates via `upsert`; a loss does nothing special."""
+
+    def test_a_battery_gain_upserts_instead_of_pushing_state(self, bridge_mod, mock_logger, devices):
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(101, "onOffLight")])
+        h.start()
+        before = RelayDevice(101, "Study Plug", onState=False)
+        devices[101].batteryLevel = 80
+        h.bridge.device_updated(before, devices[101])
+        assert h.client.names() == ["upsert_endpoint"]
+        _name, spec = h.client.only("upsert_endpoint")
+        assert spec.battery is True
+        assert spec.states["batteryLevel"] == 80
+
+    def test_a_battery_gain_warns_before_the_identity_destroying_recreate(
+            self, bridge_mod, mock_logger, devices):
+        """The gain branch used to log NOTHING before recreating the
+        accessory — the same accessory-identity churn a role change costs,
+        with no trace of why in the log.
+        """
+        devices.add(RelayDevice(103, "Study Plug", onState=False))
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(103, "onOffLight")])
+        h.start()
+        before = RelayDevice(103, "Study Plug", onState=False)
+        devices[103].batteryLevel = 80
+        h.bridge.device_updated(before, devices[103])
+        warnings = warnings_of(mock_logger)
+        assert "103" in warnings and "started reporting a battery" in warnings
+        assert "may need re-assigning" in warnings
+
+    def test_a_battery_loss_triggers_no_upsert__the_cluster_is_monotonic(
+            self, bridge_mod, mock_logger, devices):
+        devices.add(RelayDevice(300, "Batt Plug", onState=True, batteryLevel=50))
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(300, "onOffLight")])
+        h.start()
+        before = RelayDevice(300, "Batt Plug", onState=True, batteryLevel=50)
+        devices[300].batteryLevel = None
+        h.bridge.device_updated(before, devices[300])
+        # No cluster removal exists to ask for, and the vanished reading alone
+        # is reported (if at all) through the ordinary stopped-key path, not a
+        # wire frame.
+        assert h.client.names() == []
+
+    def test_a_device_that_had_a_battery_all_along_is_unaffected(self, bridge_mod, mock_logger, devices):
+        devices.add(RelayDevice(301, "Batt Plug", onState=True, batteryLevel=50))
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(301, "onOffLight")])
+        h.start()
+        before = RelayDevice(301, "Batt Plug", onState=True, batteryLevel=50)
+        devices[301].batteryLevel = 49
+        h.bridge.device_updated(before, devices[301])
+        assert h.client.only("set_state") == ("set_state", 301, {"batteryLevel": 49})
+
+    def test_a_battery_gain_and_a_rename_in_the_same_update_is_one_upsert_carrying_the_new_label(
+            self, bridge_mod, mock_logger, devices):
+        """The gain branch returns early, before the ordinary rename check ever
+        runs — so a rename landing in the SAME update must not be dropped.
+        `upsert`'s own spec build (`_spec_for`) re-reads the device's current
+        name, so one upsert already carries it; no separate push is needed.
+        """
+        devices.add(RelayDevice(302, "Study Plug", onState=False))
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(302, "onOffLight")])
+        h.start()
+        before = RelayDevice(302, "Study Plug", onState=False)
+        devices[302].batteryLevel = 80
+        devices[302].name = "Desk Plug"
+        h.bridge.device_updated(before, devices[302])
+        assert h.client.names() == ["upsert_endpoint"]
+        _name, spec = h.client.only("upsert_endpoint")
+        assert spec.battery is True
+        assert spec.states["batteryLevel"] == 80
+        assert spec.label == "Desk Plug"
+
+    def test_a_drain_to_zero_stops_reporting_it_rather_than_upserting_or_pushing_a_zero(
+            self, bridge_mod, mock_logger, devices):
+        """The intended UX (issue #190's reasoning applied to battery): a live
+        77 -> 0 transition is NOT a battery loss (`batteryLevel` is still
+        `is not None`, so neither the gain nor any loss branch fires) and NOT
+        a value to push (0 is suppressed as untrustworthy) — it is exactly the
+        "device stopped answering a key" case. The ecosystem keeps showing
+        77% rather than a false "flat" alarm from a just-commissioned-style 0,
+        and the only trace is the stopped-key streak warning.
+        """
+        devices.add(RelayDevice(303, "Batt Plug", onState=True, batteryLevel=77))
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(303, "onOffLight")])
+        h.start()
+        before = RelayDevice(303, "Batt Plug", onState=True, batteryLevel=77)
+        devices[303].batteryLevel = 0
+        h.bridge.device_updated(before, devices[303])
+        assert h.client.names() == [], "no upsert, and no set_state carrying batteryLevel: 0"
+        warnings = warnings_of(mock_logger)
+        assert "303" in warnings and "batteryLevel" in warnings
+
+
 class TestIncrementalCrud:
     def test_upsert_sends_the_current_spec(self, bridge_mod, mock_logger, devices):
         h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(102, "dimmableLight")])
@@ -740,6 +876,18 @@ class TestIncrementalCrud:
         h.bridge.upsert(102)
         _name, spec = h.client.only("upsert_endpoint")
         assert spec.indigo_device_id == 102 and spec.role == "dimmableLight"
+
+    def test_a_failed_upsert_names_the_consequence_not_just_the_failure(
+            self, bridge_mod, mock_logger, devices):
+        """`_log_future`'s generic "X failed" line does not say whether that
+        heals itself — for `upsert_endpoint` it does not, until the next
+        reconnect/attach, and that has to be in the log line itself.
+        """
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(102, "dimmableLight")])
+        h.start()
+        h.client.fail["upsert_endpoint"] = ConnectionError("socket died mid-write")
+        h.bridge.upsert(102)
+        assert "not exported until the next reconnect/attach" in warnings_of(mock_logger)
 
     def test_upsert_of_an_unbridgeable_export_sends_nothing(self, bridge_mod, mock_logger,
                                                             devices, unbridgeable_role):

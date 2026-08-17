@@ -10,6 +10,8 @@ References to ``§N`` are BRIDGE_PROTOCOL.md sections.
 """
 from __future__ import annotations
 
+import json
+
 import pytest
 
 import bridge_protocol
@@ -322,7 +324,13 @@ class TestCoverage:
         assert bridge_protocol.ROLES - _covered_roles() == set()
 
     def test_every_state_key_appears_in_a_set_state_frame(self):
-        expected = {key for keys in bridge_protocol.ROLE_STATE_KEYS.values() for key in keys}
+        # SHARED_STATE_KEYS (issue #220's `batteryLevel`) is unioned in
+        # deliberately: it is role-independent by design, so it is not in any
+        # ROLE_STATE_KEYS tuple, but the fixture file is still required to
+        # carry it in a real `set_state` frame — `set_state_contact_sensor`
+        # does, one of the frames added for issue #220.
+        expected = ({key for keys in bridge_protocol.ROLE_STATE_KEYS.values() for key in keys}
+                    | set(bridge_protocol.SHARED_STATE_KEYS))
         assert expected - _covered_state_keys() == set()
 
     def test_every_role_command_appears_in_a_command_event(self):
@@ -367,3 +375,32 @@ class TestCoverage:
     def test_every_role_spec_round_trips(self):
         for spec in BY_NAME["attach_all_roles"]["request"]["args"]["endpoints"]:
             assert EndpointSpec.from_wire(spec).to_wire() == spec
+
+    def test_endpoint_spec_round_trips_with_battery(self):
+        # The contactSensor entry in `attach_all_roles` (added for issue #220)
+        # is the one spec in the whole file that carries `"battery": true` —
+        # pinned here by name so a future edit that moves the battery flag to
+        # a different spec still exercises this round trip.
+        specs = {s["indigoDeviceId"]: s for s in BY_NAME["attach_all_roles"]["request"]["args"]["endpoints"]}
+        contact_sensor = specs[900009]
+        assert contact_sensor["battery"] is True
+        assert EndpointSpec.from_wire(contact_sensor).to_wire() == contact_sensor
+
+    def test_endpoint_spec_round_trips_without_battery(self):
+        # §4.1: absent on the wire, not `false` — `to_wire()` must reproduce
+        # that (its own guard is exercised by every OTHER spec round trip too,
+        # but this one names the rule).
+        wire = BY_NAME["upsert_endpoint"]["request"]["args"]["endpoint"]
+        assert "battery" not in wire
+        spec = EndpointSpec.from_wire(wire)
+        assert spec.battery is False
+        assert "battery" not in spec.to_wire()
+
+    def test_no_golden_frame_spells_battery_false(self):
+        """§4.1/rail: `to_wire()` omits `battery` unless it is `True` — a
+        literal `"battery": false` anywhere in this file would mean a fixture
+        was hand-written rather than produced by the code it is meant to pin.
+        """
+        raw = json.dumps(FRAMES)
+        assert '"battery": false' not in raw
+        assert '"battery":false' not in raw

@@ -49,6 +49,8 @@ describe("golden fixtures match their typed mirror", () => {
         ["set_state result", golden.set_state.response.result, shapes.emptyResult],
         ["set_state unknown_device", golden.set_state_unknown_device.response, shapes.setStateUnknownDevice],
         ["set_state malformed_args (bad keys)", golden.set_state_bad_keys.response, shapes.setStateBadKeys],
+        ["set_state malformed_args (battery on a mains endpoint)",
+            golden.set_state_battery_on_a_mains_endpoint.response, shapes.setStateBatteryOnMainsEndpoint],
         ["set_reachable result", golden.set_reachable.response.result, shapes.emptyResult],
         ["get_pairing (uncommissioned)", golden.get_pairing_uncommissioned.response.result, shapes.pairingUncommissioned],
         ["get_pairing (commissioned)", golden.get_pairing_commissioned.response.result, shapes.pairingCommissioned],
@@ -100,6 +102,16 @@ describe("golden fixtures match their typed mirror", () => {
             return Object.entries(golden as Record<string, unknown>)
                 .filter((entry): entry is [string, GoldenExchange] => entry[0].startsWith("set_state_"))
                 .flatMap(([name, exchange]) => {
+                    if (name === "set_state_battery_on_a_mains_endpoint") {
+                        // Its device (123456789) IS attached — by
+                        // `attach_with_endpoints`, not `attach_all_roles` — so
+                        // excluding it by name here is deliberate, not an
+                        // accident of which fixture happens to attach this id.
+                        // Its own shape assertion (above) covers it: the whole
+                        // point of the frame is that battery composition is
+                        // refused for THIS endpoint specifically.
+                        return [];
+                    }
                     const args = exchange.request.args as { indigoDeviceId?: number; states?: unknown };
                     const spec = byDeviceId.get(args.indigoDeviceId ?? -1);
                     // set_state_unknown_device / _bad_keys are deliberately about
