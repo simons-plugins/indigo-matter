@@ -22,6 +22,7 @@ import { join } from "node:path";
 import { after, describe, it } from "node:test";
 
 import { type Endpoint, Logger } from "@matter/main";
+import { OnOffServer } from "@matter/main/behaviors/on-off";
 
 import { endpointIdFor } from "../src/endpoints.js";
 import {
@@ -207,6 +208,16 @@ describe("plugin ⇄ node, end to end", () => {
             assert.deepEqual(await client.next(), {
                 event: "command",
                 data: { indigoDeviceId: LOUNGE, command: "onOff", args: { value: false } },
+            });
+
+            // #143 — an ecosystem *invocation*, not just an attribute write,
+            // reaches the wire the same way: same command sink, a different
+            // matter.js entry point (IndigoOnOffServer.on() rather than the
+            // onOff$Changed observable).
+            await kitchen.act(agent => agent.get(OnOffServer).on());
+            assert.deepEqual(await client.next(), {
+                event: "command",
+                data: { indigoDeviceId: KITCHEN, command: "onOff", args: { value: true } },
             });
 
             // §3.9 over an index that holds nothing — the ONE removal outcome a

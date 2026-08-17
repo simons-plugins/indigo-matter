@@ -13,17 +13,24 @@
  * table rather than hand-kept, so the {@link UNSUPPORTED_ROLE_DETAILS} refusal
  * survives only as the gate a *future* enum addition would trip.
  *
- * Two kinds of role live here, and they use different machinery:
+ * Two kinds of role live here, and they use different machinery — and as of
+ * #143, `onOff` is the one attribute that genuinely belongs to both:
  *
- * * **Attribute-driven** roles (everything E3 built, plus every sensor and the
- *   thermostat) report ecosystem intent through {@link WatchSpec}s on the
- *   cluster attributes an ecosystem writes.
- * * **Invocation-driven** roles (`doorLock`, `windowCovering`) cannot: their
- *   ecosystem-facing surface is *commands*, and matter.js's stock servers
- *   answer those by writing the state themselves. Both are overridden here so
- *   the write never happens — see {@link IndigoDoorLockServer} and
- *   {@link IndigoWindowCoveringServer} — and they reach their `command` sink
- *   through {@link COMMAND_SINKS}.
+ * * **Attribute-driven** roles (every sensor, the thermostat, and — for
+ *   `onOff` alone — every light and plug) report ecosystem intent through
+ *   {@link WatchSpec}s on the cluster attributes an ecosystem writes. `onOff`
+ *   stays on this list because `LevelControlServer`'s `couple()` writes
+ *   `state.onOff` directly when a dimmer's `*WithOnOff` command turns the
+ *   light on or off — bypassing any command override entirely — so
+ *   `WATCH_ON_OFF` is still the only path that reaches Indigo for that case.
+ * * **Invocation-driven** roles (`doorLock`, `windowCovering`, and — for
+ *   `onOff` alone — every light and plug again) cannot rely on attributes:
+ *   their ecosystem-facing surface is *commands*, and matter.js's stock
+ *   servers answer those by writing the state themselves. All three are
+ *   overridden here so the write never happens — see
+ *   {@link IndigoDoorLockServer}, {@link IndigoWindowCoveringServer} and
+ *   {@link IndigoOnOffServer} — and they reach their `command` sink through
+ *   {@link COMMAND_SINKS}.
  */
 
 import { Endpoint, type EndpointType, Logger, type MaybePromise, VendorId } from "@matter/main";
@@ -31,6 +38,7 @@ import { BridgedDeviceBasicInformationServer } from "@matter/main/behaviors/brid
 import { ColorControlServer } from "@matter/main/behaviors/color-control";
 import { DoorLockServer } from "@matter/main/behaviors/door-lock";
 import { OccupancySensingServer } from "@matter/main/behaviors/occupancy-sensing";
+import { OnOffServer } from "@matter/main/behaviors/on-off";
 import { ThermostatServer } from "@matter/main/behaviors/thermostat";
 import { MovementDirection, MovementType, WindowCoveringServer } from "@matter/main/behaviors/window-covering";
 import { ColorControl } from "@matter/main/clusters/color-control";
@@ -573,6 +581,147 @@ function emitCommand(
         } catch {
             // The logger itself failed; there is nowhere left to report.
         }
+    }
+}
+
+/**
+ * OnOff, with the plugin's own push routed around the emitting overrides
+ * (#143, #201).
+ *
+ * `.with("Lighting")` is **mandatory**, not a default left in place for
+ * tidiness. Every onOff-bearing device type in matter.js 0.17.8 declares the
+ * identical `OnOffServer.with("Lighting")` (verified against
+ * `on-off-light.js`, `on-off-plug-in-unit.js`, `dimmable-light.js`,
+ * `color-temperature-light.js` and `extended-color-light.js`), and the
+ * Lighting feature is what makes `onTime`/`offWaitTime`/`globalSceneControl`/
+ * `startUpOnOff` exist at all. A bare `extends OnOffServer` would strip the
+ * feature from all five roles and make `OnWithTimedOff` unimplementable — do
+ * not "simplify" this away.
+ *
+ * **There is no context guard in `on()`/`off()`, and there must not be one.**
+ * The obvious echo guard — `isEcosystemChange(this.context)`, mirroring the
+ * attribute watcher — is broken by a *third* caller of `off()` that is also
+ * offline: the countdown timer's own expiry. `OnOffServer.js:163` builds the
+ * timer as `this.callback(this.#timedOnTick, { lock: true })`;
+ * `Behavior.callback` hands back a bare emitter with no context argument, so
+ * inside matter.js's `Reactors` the trailing-context lookup finds nothing and
+ * the reaction falls through to `LocalActorContext.act(...)`, which freezes
+ * `offline: true`. So `#timedOnTick`'s `await this.off()`
+ * (`OnOffServer.js:178`) runs with `this.context.offline === true` —
+ * indistinguishable from a plugin push under {@link isEcosystemChange}.
+ * Guarding `off()` on the context would silently swallow the
+ * countdown-expiry emission. (`hasRemoteActor`, the guard stock
+ * `offWithEffect` uses at `OnOffServer.js:112`, fails the same way on the
+ * expiry tick, and on the *delayed* scene-apply off at `OnOffServer.js:229`,
+ * which runs via `this.callback` in the same offline reactor shape. The
+ * *immediate* scene-apply at `OnOffServer.js:204` would survive such a guard —
+ * `ScenesManagementServer` invokes it through `agentFor(this.context)`, i.e.
+ * the recalling command's own remote context — but one surviving caller does
+ * not rescue the guard from the other two.)
+ *
+ * The guard that actually works is structural, not contextual:
+ * {@link applyIndigoOnOff} — the plugin's only entry point — calls
+ * `super.on()`/`super.off()`, which is static dispatch straight to
+ * `OnOffBaseServer.prototype.on`/`off`. The overrides below are simply never
+ * entered by our own push, in any context, so there is nothing to guard
+ * against and no interleaving to get wrong.
+ *
+ * Nothing here writes `this.state.onOff` or calls `super`: the attribute
+ * moves only from {@link applyIndigoOnOff}'s `super` calls, once Indigo has
+ * confirmed it — mirroring {@link IndigoDoorLockServer} and
+ * {@link IndigoWindowCoveringServer}. `toggle()`, `onWithTimedOff()`,
+ * `offWithEffect()` and `onWithRecallGlobalScene()` are deliberately left
+ * stock: matter.js's own method doc on `toggle()` says "it is enough to
+ * override on() and off() with custom control logic" (`OnOffServer.js:94-98`,
+ * repeated on `onWithTimedOff` at `:132-136`), and when they act, all four
+ * funnel into `this.on()`/`this.off()` — virtual dispatch to the overrides
+ * below — so overriding them too would duplicate the logic and risk a
+ * double emission.
+ *
+ * **Two stock `onWithTimedOff` branches silently discard the command** —
+ * accepted, matter.js 0.17.8 (`OnOffServer.js:137-147`), revisit on a field
+ * report of a lost countdown:
+ *
+ * * `acceptOnlyWhenOn` (`:138-140`): a controller asking "timed-off, but only
+ *   if the light is on" is answered from the *attribute*, which under
+ *   no-auto-confirm stays `false` for the whole tap-to-Indigo-confirmation
+ *   window — so an "on, then timed-off-if-on" pair sent quickly loses its
+ *   countdown, with success reported to the controller and nothing emitted.
+ * * the `offWaitTime > 0` hold-window branch (`:141-147`): attribute-`false`
+ *   is read as "in the delayed-off hold", which the confirmation window now
+ *   also looks like; the command adjusts hold timers and returns without
+ *   reaching `this.on()`, so nothing is emitted.
+ *
+ * Both are spec-shaped behaviour for a real device; the bridge merely widens
+ * the attribute-`false` window. No known controller sends either shape at a
+ * tile (Apple Home does not use `OnWithTimedOff` there), and overriding
+ * `onWithTimedOff` to special-case "unconfirmed" would duplicate stock logic
+ * this class otherwise leaves alone.
+ *
+ * What this does NOT fix: `LevelControlServer`'s `couple()` still
+ * writes `onOff` optimistically ahead of Indigo's confirmation when a dimmer
+ * command carries `WithOnOff` — a real PRD §7 gap, but LevelControl's to
+ * close, not this class's (a later PR's scope).
+ */
+class IndigoOnOffServer extends OnOffServer.with("Lighting") {
+    /**
+     * The plugin's own push, and the only writer of the `onOff` attribute.
+     *
+     * Deliberately not named `on`/`off` and not an override: routing through
+     * `super.on()`/`super.off()` is what keeps this method from ever reaching
+     * the emitting overrides below, in any context — see the class doc.
+     *
+     * A no-op when the pushed value already matches the attribute — **not**
+     * a tidiness filter. `super.off()` unconditionally stops `timedOnTimer`
+     * (`OnOffServer.js:85-88`), and `registry.update()` pushes the full state
+     * set on every attach/upsert (`registry.ts:413`). Without this guard, a
+     * plugin restart landing between an ecosystem `OnWithTimedOff` and
+     * Indigo's own confirmation — attribute still `false`, timer already
+     * running — would have the restart's replayed push read as "turn it
+     * off" and silently kill a countdown nothing asked to cancel.
+     *
+     * **The guard is right for that replay case and blind to one other**: when
+     * `LevelControlServer.couple()` has already moved the attribute (a dimmer
+     * `*WithOnOff` command writes `state.onOff` directly, never through
+     * `off()`), an Indigo off-confirmation arrives with `value === state.onOff`
+     * while `timedOnTimer` is still live — the no-op skips `super.off()`'s
+     * timer stop, and the ghost countdown later emits an off nothing asked
+     * for. The two cases are byte-identical here; the ambiguity exists only
+     * because `couple()` writes optimistically ahead of Indigo, so the real
+     * fix is the LevelControl conversion (the "What this does NOT fix"
+     * paragraph above). Until then the branch below makes the ambiguous state
+     * visible instead of silent. (#203 — a bridge-node *restart* dropping a
+     * running countdown, since the timer is in-memory only — is the other,
+     * separate half of countdown correctness; this guard merely governs the
+     * replayed push that follows such a restart.)
+     */
+    applyIndigoOnOff(value: boolean): MaybePromise {
+        if (value === this.state.onOff) {
+            // The `.with("Lighting")` composed type loses the base's `protected
+            // internal` declaration (matter.js 0.17.8 .d.ts quirk); the runtime
+            // shape is the stock one #stopHeldTimer itself reads, pinned by the
+            // countdown tests.
+            const internal = (this as unknown as { internal?: { timedOnTimer?: { isRunning?: boolean } } }).internal;
+            if (!value && internal?.timedOnTimer?.isRunning) {
+                logger.warn(
+                    `Endpoint ${this.endpoint.id}: an off push matched an already-off onOff attribute while a ` +
+                        "timed-on countdown is still running. Either this is a replayed push racing its own " +
+                        "confirmation (harmless; the countdown must survive) or LevelControl's onOff coupling " +
+                        "wrote the attribute ahead of Indigo — in which case this countdown is a ghost and will " +
+                        "emit an off later. Resolution is tracked with the LevelControl conversion (#143).",
+                );
+            }
+            return;
+        }
+        return value ? super.on() : super.off();
+    }
+
+    override on(): MaybePromise {
+        emitCommand(this.endpoint.id, "onOff", { value: true });
+    }
+
+    override off(): MaybePromise {
+        emitCommand(this.endpoint.id, "onOff", { value: false });
     }
 }
 
@@ -1161,26 +1310,31 @@ function doorLockDefaults(): Record<string, unknown> {
 }
 
 const ROLE_DEFINITIONS: Record<RoleValue, RoleDefinition> = {
+    // #143: every OnOff-bearing role below adds IndigoOnOffServer so the
+    // ecosystem's on/off/toggle/timed commands report through the sink
+    // instead of writing the attribute themselves. WATCH_ON_OFF stays too —
+    // it is still the only path LevelControl's onOff coupling reaches (the
+    // "What this does NOT fix" paragraph of the IndigoOnOffServer doc).
     [Role.onOffPlugInUnit]: {
-        deviceType: () => OnOffPlugInUnitDevice.with(BridgedDeviceBasicInformationServer),
+        deviceType: () => OnOffPlugInUnitDevice.with(BridgedDeviceBasicInformationServer, IndigoOnOffServer),
         initialState: () => ({}),
         statePatch: onOffPatch,
         watch: [WATCH_ON_OFF],
     },
     [Role.onOffLight]: {
-        deviceType: () => OnOffLightDevice.with(BridgedDeviceBasicInformationServer),
+        deviceType: () => OnOffLightDevice.with(BridgedDeviceBasicInformationServer, IndigoOnOffServer),
         initialState: () => ({}),
         statePatch: onOffPatch,
         watch: [WATCH_ON_OFF],
     },
     [Role.dimmableLight]: {
-        deviceType: () => DimmableLightDevice.with(BridgedDeviceBasicInformationServer),
+        deviceType: () => DimmableLightDevice.with(BridgedDeviceBasicInformationServer, IndigoOnOffServer),
         initialState: () => ({ [LEVEL_CONTROL]: { ...LEVEL_CONTROL_INITIAL } }),
         statePatch: states => ({ ...onOffPatch(states), ...levelPatch(states) }),
         watch: [WATCH_ON_OFF, WATCH_LEVEL],
     },
     [Role.colorTemperatureLight]: {
-        deviceType: () => ColorTemperatureLightDevice.with(BridgedDeviceBasicInformationServer),
+        deviceType: () => ColorTemperatureLightDevice.with(BridgedDeviceBasicInformationServer, IndigoOnOffServer),
         initialState: () => ({
             [LEVEL_CONTROL]: { ...LEVEL_CONTROL_INITIAL },
             [COLOR_CONTROL]: { ...colorControlDefaults(false), colorTemperatureMireds: MIREDS_MIN },
@@ -1198,6 +1352,7 @@ const ROLE_DEFINITIONS: Record<RoleValue, RoleDefinition> = {
         deviceType: () =>
             ExtendedColorLightDevice.with(
                 BridgedDeviceBasicInformationServer,
+                IndigoOnOffServer,
                 ColorControlServer.with("HueSaturation", "Xy", "ColorTemperature"),
             ),
         initialState: () => ({
@@ -1483,27 +1638,86 @@ export async function applyStates(
     if (Object.keys(patch).length === 0) {
         return;
     }
+
+    // #201: the onOff attribute cannot be written directly any more (matter.js
+    // 0.17.8 anchors throughout). A raw `endpoint.set()` write leaves
+    // `timedOnTimer` running against a device Indigo has already turned off,
+    // and `#stopHeldTimer` cannot help: it is wired only to
+    // `onTime$Changed`/`offWaitTime$Changed` (OnOffServer.js:29-30), so a bare
+    // onOff write never triggers it at all — and even a combined patch that
+    // also zeroed `onTime` would miss, because its first branch requires
+    // `state.onOff` to already be true (OnOffServer.js:43). Routing through
+    // the behaviour instead reaches `off()`'s own `timedOnTimer.stop()`
+    // (OnOffServer.js:85-88) and `on()`'s delayedOffTimer/offWaitTime cleanup
+    // (OnOffServer.js:67-72). `applyIndigoOnOff` calls
+    // `super.on()`/`super.off()`, so it can never re-enter the emitting
+    // overrides in {@link IndigoOnOffServer} — see that class's doc for why no
+    // context check is needed either. This is a second, separate transaction
+    // from the `endpoint.set()` below: a combined `{onOff, level}` push
+    // becomes two reports instead of one, which no reactor here minds.
+    //
+    // The two transactions can also fail independently — an act that landed
+    // followed by a set that threw would leave on/off applied and level/colour
+    // silently stale until the next push, which the single-set path could
+    // never do. So a failed half never stops the other half from being
+    // attempted, and the error names which half (or both) failed.
+    const onOff = patch[ON_OFF] as { onOff?: boolean } | undefined;
+    let onOffFailure: unknown;
+    if (onOff !== undefined) {
+        delete patch[ON_OFF];
+        try {
+            await endpoint.act(agent => agent.get(IndigoOnOffServer).applyIndigoOnOff(onOff.onOff === true));
+        } catch (e) {
+            onOffFailure = e;
+        }
+    }
+
     const { afterApply } = definitionFor(role);
-    if (afterApply === undefined) {
-        await endpoint.set(patch as never);
+    if (Object.keys(patch).length === 0) {
+        // An onOff-only set_state is now fully handled above; `endpoint.set({})`
+        // would be a pointless second write.
+        if (onOffFailure !== undefined) {
+            throw onOffFailure;
+        }
         return;
     }
-    // Read before the write, or "did this actually change anything" cannot be
-    // answered — and only for the one role that asks, so no other push pays for
-    // a state copy it would ignore. Keyed by behaviour like the patch itself,
-    // and derived from the patch's own keys rather than a second table of
-    // role → behaviour that could drift from `statePatch`.
-    //
-    // **Spread, not the object.** `stateOf` hands back a live view: hold onto it
-    // across `set()` and "before" reads back as "after", every comparison finds
-    // nothing changed, and the event this exists to raise never fires. Caught by
-    // the LockOperation test, which is the only thing that would ever notice.
-    const before: Record<string, unknown> = {};
-    for (const behavior of Object.keys(patch)) {
-        before[behavior] = { ...(endpoint.stateOf(behavior) as object) };
+    const applyResidual = async (): Promise<void> => {
+        if (afterApply === undefined) {
+            await endpoint.set(patch as never);
+            return;
+        }
+        // Read before the write, or "did this actually change anything" cannot be
+        // answered — and only for the one role that asks, so no other push pays for
+        // a state copy it would ignore. Keyed by behaviour like the patch itself,
+        // and derived from the patch's own keys rather than a second table of
+        // role → behaviour that could drift from `statePatch`.
+        //
+        // **Spread, not the object.** `stateOf` hands back a live view: hold onto it
+        // across `set()` and "before" reads back as "after", every comparison finds
+        // nothing changed, and the event this exists to raise never fires. Caught by
+        // the LockOperation test, which is the only thing that would ever notice.
+        const before: Record<string, unknown> = {};
+        for (const behavior of Object.keys(patch)) {
+            before[behavior] = { ...(endpoint.stateOf(behavior) as object) };
+        }
+        await endpoint.set(patch as never);
+        await afterApply(endpoint, patch, before);
+    };
+    if (onOffFailure !== undefined) {
+        try {
+            await applyResidual();
+        } catch (residualFailure) {
+            throw new AggregateError(
+                [onOffFailure, residualFailure],
+                "set_state failed on both halves: the onOff act and the residual set",
+            );
+        }
+        throw new Error(
+            `set_state applied the residual attributes but the onOff half failed: ${String(onOffFailure)}`,
+            { cause: onOffFailure },
+        );
     }
-    await endpoint.set(patch as never);
-    await afterApply(endpoint, patch, before);
+    await applyResidual();
 }
 
 /**
