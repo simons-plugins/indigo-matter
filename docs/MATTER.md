@@ -466,8 +466,9 @@ off device — the slider waits on Indigo's confirmation the same way the
 on/off tile does, rather than moving immediately. Colour works the same
 way: picking a new colour or colour temperature on a lamp that is showing off
 is forwarded to Indigo too, and Indigo decides what that means for the device
-— on many RGB lamps a colour write lights the lamp at the new colour, while a
-colour-temperature change is stored without turning the lamp on. Either way
+— on many RGB lamps a colour write lights the lamp at the new colour, while
+on lamps with a white channel a colour-temperature change is normally stored
+without turning the lamp on. Either way
 the accessory's controls only move once Indigo reports what actually
 happened. One boundary to know about: if an ecosystem starts a timed
 "turn off in N minutes" countdown and you turn the device off in Indigo

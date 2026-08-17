@@ -1358,8 +1358,10 @@ function movementPosition(direction: MovementDirection, targetPercent100ths?: nu
  * ("if we send and Indigo turns on then no point handling it ourselves").
  * Two deliberate asymmetries survive plugin-side, both Indigo's own choices
  * rather than this gate's: `_set_color_temp` preserves an off lamp's
- * `whiteLevel` (a CT change stores without turning on — its docstring says
- * why), while `_set_color` on RGB hardware lights the lamp. Stock's
+ * `whiteLevel` where one exists (a CT change on a white-channel lamp
+ * normally stores without turning on — its docstring says why; RGB-only
+ * lamps refuse it with a logged reason), while `_set_color` on RGB hardware
+ * lights the lamp. Stock's
  * `#optionsAllowExecution` gate (`ColorControlServer.js:1444-1446`) would
  * otherwise silently drop direct colour commands while the accessory is
  * unconfirmed-off — under no-auto-confirm the `onOff` attribute means

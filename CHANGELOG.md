@@ -13,10 +13,11 @@ current version is `Info.plist`'s `PluginVersion`.
 - **Picking a colour or colour temperature on a lamp that is showing off now
   reaches Indigo** (issue #235) — the same rule brightness follows: the
   bridge sends, Indigo decides. On many RGB lamps a colour write lights the
-  lamp at the new colour (the device driver's own behaviour); a
-  colour-temperature change is stored without turning the lamp on. Previously
-  direct colour commands were dropped while the accessory was off (scene
-  recalls always went through).
+  lamp at the new colour (the device driver's own behaviour); on lamps with a
+  white channel a colour-temperature change is normally stored without
+  turning the lamp on (an RGB-only lamp refuses it with a logged reason).
+  Previously direct colour commands were dropped while the accessory was off
+  (scene recalls always went through).
 
 ## 2026.19.0 — exported brightness and colour wait for Indigo too
 
@@ -31,10 +32,10 @@ current version is `Info.plist`'s `PluginVersion`.
   colour temperature, in Apple Home/Google/Alexa sends the command to Indigo
   and the control springs back only once Indigo reports the real level or
   colour — the same rule the on/off tile, locks and covers already followed.
-  Brightness and colour differ on one point while the accessory is showing
-  off: a brightness command still forwards and turns the light on to that
-  level (Indigo's own semantics), while a colour command is ignored until
-  the light is confirmed on, matching this bridge's pre-#143 behaviour.
+  Commands while the accessory is showing off forward too — brightness turns
+  the light on to that level (Indigo's own semantics); colour originally
+  stayed gated in this version and was aligned with brightness in 2026.20.0
+  (issue #235), which is the behaviour that actually ships.
   **No accessory is re-created and no room assignment is lost by this
   release** — unlike 2026.18.0's battery migration, this is a behaviour
   change only: the exported accessory's identity, name and room stay exactly
