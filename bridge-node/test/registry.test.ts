@@ -971,6 +971,10 @@ describe("command events and the echo guard (§4.2, §6.4)", () => {
             ecosystemWrite(endpoint, "levelControl", "currentLevel", 152, 1);
             ecosystemWrite(endpoint, "colorControl", "colorTemperatureMireds", 320, 153);
             ecosystemWrite(endpoint, "colorControl", "currentHue", 148, 0);
+            // WATCH_SATURATION is the one backstop the rows above never
+            // exercised — it pairs with hue from state the same way
+            // WATCH_HUE pairs with saturation from state.
+            ecosystemWrite(endpoint, "colorControl", "currentSaturation", 127, 203);
 
             assert.deepEqual(h.commands, [
                 { indigoDeviceId: 7, command: "onOff", args: { value: true } },
@@ -978,6 +982,8 @@ describe("command events and the echo guard (§4.2, §6.4)", () => {
                 { indigoDeviceId: 7, command: "setColorTemp", args: { colorTempMireds: 320 } },
                 // setColor carries both halves; the saturation comes from state.
                 { indigoDeviceId: 7, command: "setColor", args: { hue: 210, saturation: 80 } },
+                // setColor carries both halves; the hue comes from state.
+                { indigoDeviceId: 7, command: "setColor", args: { hue: 210, saturation: 50 } },
             ]);
         } finally {
             await h.close();
@@ -2160,6 +2166,28 @@ describe("LevelControl command conversion (§4.2, #143)", () => {
                 lc => lc.stop({ optionsMask: {}, optionsOverride: {} }),
                 [],
             ],
+            [
+                "stopWithOnOff() — same as stop(), never reaches transition(), emits nothing",
+                lc => lc.stopWithOnOff({ optionsMask: {}, optionsOverride: {} }),
+                [],
+            ],
+            [
+                "step(Up, 300) — a step past maxLevel still clamps to the boundary",
+                lc =>
+                    lc.step({
+                        stepMode: LevelControl.StepMode.Up,
+                        stepSize: 300,
+                        transitionTime: null,
+                        optionsMask: {},
+                        optionsOverride: {},
+                    }),
+                [{ indigoDeviceId: 1, command: "setLevel", args: { level: 100 } }],
+            ],
+            [
+                "moveToLevel(0) — below minLevel clamps UP to the boundary (stock's own cropValueRange)",
+                lc => lc.moveToLevel({ level: 0, transitionTime: null, optionsMask: {}, optionsOverride: {} }),
+                [{ indigoDeviceId: 1, command: "setLevel", args: { level: 0 } }],
+            ],
         ];
 
         for (const [label, run, expected] of CASES) {
@@ -2248,6 +2276,48 @@ describe("LevelControl command conversion (§4.2, #143)", () => {
                     .moveToLevel({ level: 152, transitionTime: null, optionsMask: {}, optionsOverride: {} }),
             );
             assert.deepEqual(h.commands, [{ indigoDeviceId: 1, command: "setLevel", args: { level: 60 } }]);
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("executeIfOff is itself writable, and a plain moveToLevel is gated once it is written false", async () => {
+        // KNOWN LIMITS in LEVEL_CONTROL_INITIAL's own doc: `options` is a
+        // writable attribute, so an ecosystem could in principle turn the
+        // seed back off. This is a genuine attribute write (not
+        // ecosystemWrite(), which only fires the change observable and would
+        // never actually flip what #optionsAllowExecution reads) — the gate
+        // reads `this.state.options` directly (LevelControlServer.js:437),
+        // so only a real write can move it.
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(1, Role.dimmableLight, { states: { onOff: false } })], false);
+            const endpoint = only(h);
+            await endpoint.set({
+                levelControl: { options: { executeIfOff: false, coupleColorTempToLevel: false } },
+            } as never);
+
+            await endpoint.act(agent =>
+                agent
+                    .get(LevelLighting)
+                    .moveToLevel({ level: 152, transitionTime: null, optionsMask: {}, optionsOverride: {} }),
+            );
+            assert.deepEqual(h.commands, [], "a plain moveToLevel must be dropped once executeIfOff reads false");
+
+            // WithOnOff never depended on the gate in the first place — see
+            // the class doc's "KNOWN LIMITS" paragraph.
+            await endpoint.act(agent =>
+                agent.get(LevelLighting).moveToLevelWithOnOff({
+                    level: 152,
+                    transitionTime: null,
+                    optionsMask: {},
+                    optionsOverride: {},
+                }),
+            );
+            assert.deepEqual(h.commands, [
+                { indigoDeviceId: 1, command: "onOff", args: { value: true } },
+                { indigoDeviceId: 1, command: "setLevel", args: { level: 60 } },
+            ]);
         } finally {
             await h.close();
         }
@@ -2476,8 +2546,26 @@ describe("ColorControl command conversion (§4.2, #143)", () => {
                 const endpoint = only(h);
                 await seed(endpoint);
                 h.commands.length = 0;
+                const before = endpoint.stateOf("colorControl") as Record<string, unknown>;
+                const beforeSnapshot = {
+                    currentHue: before.currentHue,
+                    currentSaturation: before.currentSaturation,
+                    colorTemperatureMireds: before.colorTemperatureMireds,
+                };
                 await endpoint.act(agent => run(agent.get(ColorFull)));
                 assert.deepEqual(h.commands, [expected], label);
+                // The core #143 invariant: the override reports the command,
+                // it never writes the attribute.
+                const after = endpoint.stateOf("colorControl") as Record<string, unknown>;
+                assert.deepEqual(
+                    {
+                        currentHue: after.currentHue,
+                        currentSaturation: after.currentSaturation,
+                        colorTemperatureMireds: after.colorTemperatureMireds,
+                    },
+                    beforeSnapshot,
+                    `${label}: colour attributes must not have moved`,
+                );
             } finally {
                 await h.close();
             }
@@ -2523,8 +2611,14 @@ describe("ColorControl command conversion (§4.2, #143)", () => {
                 // unconfirmed-off (commit 1).
                 await h.registry.setState(1, { onOff: true });
                 const endpoint = only(h);
+                const before = (endpoint.stateOf("colorControl") as Record<string, unknown>).colorTemperatureMireds;
                 await endpoint.act(agent => run(agent.get(ColorCt)));
                 assert.deepEqual(h.commands, [expected], label);
+                assert.equal(
+                    (endpoint.stateOf("colorControl") as Record<string, unknown>).colorTemperatureMireds,
+                    before,
+                    `${label}: colorTemperatureMireds must not have moved`,
+                );
             } finally {
                 await h.close();
             }
@@ -2586,6 +2680,9 @@ describe("ColorControl command conversion (§4.2, #143)", () => {
                 }),
             );
             assert.deepEqual(h.commands, [{ indigoDeviceId: 1, command: "setColor", args: { hue: 142, saturation: 79 } }]);
+            const after = endpoint.stateOf("colorControl") as Record<string, unknown>;
+            assert.equal(after.currentHue, 0, "the invocation must not have moved currentHue");
+            assert.equal(after.currentSaturation, 10, "the invocation must not have moved currentSaturation");
         } finally {
             await h.close();
         }
@@ -2684,6 +2781,7 @@ describe("ColorControl command conversion (§4.2, #143)", () => {
             // Colour commands are gated while unconfirmed-off (commit 1).
             await h.registry.setState(1, { onOff: true });
             const endpoint = only(h);
+            const before = endpoint.stateOf("colorControl") as Record<string, unknown>;
             await endpoint.act(agent =>
                 agent.get(ColorFull).moveToColor({
                     colorX: Math.round(0.35 * 65536),
@@ -2694,6 +2792,18 @@ describe("ColorControl command conversion (§4.2, #143)", () => {
                 }),
             );
             assert.deepEqual(h.commands, [{ indigoDeviceId: 1, command: "setColor", args: { hue: 39, saturation: 13 } }]);
+            const after = endpoint.stateOf("colorControl") as Record<string, unknown>;
+            assert.equal(after.currentHue, before.currentHue, "the invocation must not have moved currentHue");
+            assert.equal(
+                after.currentSaturation,
+                before.currentSaturation,
+                "the invocation must not have moved currentSaturation",
+            );
+            assert.equal(
+                after.colorTemperatureMireds,
+                before.colorTemperatureMireds,
+                "the invocation must not have moved colorTemperatureMireds",
+            );
         } finally {
             await h.close();
         }
