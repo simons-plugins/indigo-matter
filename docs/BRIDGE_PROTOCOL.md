@@ -20,6 +20,47 @@ handshake** — launchd deliberately keeps an old bridge node running across
 plugin reloads (PM-B), so plugin/node version skew is the failure mode that
 will actually occur.
 
+## §0 — Measured probes (matter.js 0.17.8)
+
+A handful of `bridge-node/src/` comments cite `§0` for a claim that is not
+derivable from the matter.js typings or docs alone — it was established by
+running the stack and reading back what it actually did. Recorded once here
+rather than re-explained at every call site.
+
+- **(a) The seeding trap.** An endpoint built WITHOUT `batPercentRemaining` in
+  its initial `powerSource` state never gets attribute 12
+  (`batPercentRemaining`) added to its `attributeList` at all — and a LATER
+  `endpoint.set({powerSource: {batPercentRemaining: 48}})` still SUCCEEDS
+  SILENTLY, reading back 48 on this process, even though no controller
+  (Apple, Alexa, anyone) can ever read an attribute that was never declared.
+  Mechanism: matter.js's `ValidatedElements` gates whether an *optional*
+  attribute is enabled at all on `state[name] !== undefined` at construction
+  time — `null` enables it (a real, declared value of "unknown"), an absent
+  key does not. This is why `BATTERY_INITIAL` seeds `batPercentRemaining:
+  null` unconditionally rather than leaving it out until a real reading
+  arrives.
+- **(b) Construction-time defaults.** `PowerSourceServer.with("Battery")`
+  construction, without our supplying them, yields sane values for `status`
+  (`0`), `order` (`0`), `description` (`"Battery power"`), `batReplaceability`
+  (`0`) and `batReplacementNeeded` (`false`) — none of them ours to set.
+  `initialize()` itself touches neither `order` nor `batReplacementNeeded`;
+  their values arrive from the cluster's own schema defaults instead, not
+  from behaviour code. The measured claim is narrower than it might look: it
+  is that construction succeeds with usable values for the whole set, not
+  that any one of them is set by a particular code path.
+- **(c) Endpoint-number stability under a second `.with()`.** Chaining
+  `.with(PowerSourceServer.with("Battery"))` onto a device type that has
+  already been `.with()`-ed once (every role's own device type) retains the
+  endpoint number across a close+re-add at the same `Endpoint.id`. It also
+  adds `47` to `serverList` and `{deviceType: 17}` (`0x0011`) to
+  `deviceTypeList`, via `PowerSourceServer#initialize`'s own
+  `addDeviceTypes("PowerSource")`.
+- **(d) `batPercentRemaining`'s own constraints.** Constrained to `0-200`
+  (writing `201` throws a Matter `Constraint` error), nullable, and carries
+  Matter's `Q` (quality) designation with a 10-second `minimumEmitInterval`
+  on its `$Changed` — i.e. Matter itself, not this bridge, is what rate-limits
+  how often a battery change reaches a controller.
+
 ## 1. Envelope grammar
 
 Identical shapes to the controller protocol:

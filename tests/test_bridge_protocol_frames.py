@@ -328,7 +328,7 @@ class TestCoverage:
         # deliberately: it is role-independent by design, so it is not in any
         # ROLE_STATE_KEYS tuple, but the fixture file is still required to
         # carry it in a real `set_state` frame — `set_state_contact_sensor`
-        # does since §1(d).
+        # does, one of the frames added for issue #220.
         expected = ({key for keys in bridge_protocol.ROLE_STATE_KEYS.values() for key in keys}
                     | set(bridge_protocol.SHARED_STATE_KEYS))
         assert expected - _covered_state_keys() == set()
@@ -377,10 +377,10 @@ class TestCoverage:
             assert EndpointSpec.from_wire(spec).to_wire() == spec
 
     def test_endpoint_spec_round_trips_with_battery(self):
-        # The contactSensor entry in `attach_all_roles` (§1(d)) is the one
-        # spec in the whole file that carries `"battery": true` — pinned here
-        # by name so a future edit that moves the battery flag to a different
-        # spec still exercises this round trip.
+        # The contactSensor entry in `attach_all_roles` (added for issue #220)
+        # is the one spec in the whole file that carries `"battery": true` —
+        # pinned here by name so a future edit that moves the battery flag to
+        # a different spec still exercises this round trip.
         specs = {s["indigoDeviceId"]: s for s in BY_NAME["attach_all_roles"]["request"]["args"]["endpoints"]}
         contact_sensor = specs[900009]
         assert contact_sensor["battery"] is True

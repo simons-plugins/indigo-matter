@@ -16,7 +16,10 @@ current version is `Info.plist`'s `PluginVersion`.
   `PowerSource` cluster the first time it sees one, and every ecosystem then
   shows the reading on its normal update cadence. A device that has never
   polled (Indigo's own `0` at device creation) does not trigger a false
-  "battery critical" alarm.
+  "battery critical" alarm. **Migration note:** on the first reconnect after
+  this update, every already-exported battery-bearing device is re-created
+  once — endpoint identity is preserved, but names/rooms assigned in paired
+  ecosystems may need re-assigning.
 
 ## 2026.17.0 — exported switches, plugs and lights wait for Indigo
 

@@ -426,11 +426,21 @@ and all five roles stay selectable.
 **Battery level appears automatically, for any exported device that reports
 one.** If the underlying Indigo device has a battery reading, your ecosystem
 shows it — no extra setting, no tick-box; the plugin never invents a role for
-this, it just reads what the device already publishes. It updates on Indigo's
-normal ~10s reporting cadence, the same as any other exported reading. A
-brand-new device that has never taken a reading does not show a false "low
-battery" warning: a battery-level of exactly 0% is treated as "not read yet"
-rather than "flat", since Indigo initialises new devices' numeric states to 0.
+this, it just reads what the device already publishes. Battery changes flow
+through immediately, but Matter itself rate-limits how often controllers are
+told about a battery change (at most every ~10s, by the standard's own
+design) — so it reads slightly quieter than other exported readings, which
+have no such limit. A brand-new device that has never taken a reading does
+not show a false "low battery" warning: a battery-level of exactly 0% (or
+below) is treated as "not read yet" rather than "flat", since Indigo
+initialises new devices' numeric states to 0.
+
+**If you are updating from a version before battery support:** every
+already-exported device that has a battery is re-created once, the first
+time the plugin reconnects after the update. The accessory's identity
+(endpoint number) is preserved, but its name and room assignment in your
+paired ecosystem(s) may need re-assigning — the same one-time hedge a role
+change already asks for.
 
 **Locks export, and they do not auto-confirm anything.** A lock or unlock from an
 ecosystem is passed to Indigo and nothing else: no optimistic state, no

@@ -917,7 +917,8 @@ class ExportBridge:
             # does not make the battery stop existing — while the *reading* of
             # 0 is untrustworthy (issue #190) and must not be published as a
             # value. ADR-0003's evidence rule applied correctly to the same
-            # attribute two different ways, two lines apart, on purpose.
+            # attribute two different ways, on purpose — see `states` above
+            # (built from `battery_percent`, which suppresses 0) for the other.
             battery=getattr(dev, "batteryLevel", None) is not None,
         )
 
@@ -973,18 +974,25 @@ class ExportBridge:
         # Issue #220 — a device that just STARTED reporting a battery has to be
         # RE-CREATED with PowerSource, not have `batteryLevel` folded into an
         # ordinary `set_state`: the live endpoint was built without it (§4.1's
-        # `battery` flag was false at the time), and BRIDGE_PROTOCOL §4.1's
-        # measured trap means a `set_state` carrying `batteryLevel` against it
-        # is refused outright. `upsert()` sends a full spec, so the node
-        # recreates it — `registry.upsert`/`planReconcile` both treat a
-        # battery GAIN as recreate-worthy, exactly like a role change. A
-        # battery going away is deliberately NOT symmetric: nothing here does
-        # anything for it, because the node's cluster set is monotonic and
-        # `_report_stopped_keys` (below) already covers a device that stops
-        # answering.
+        # `battery` flag was false at the time), and a `set_state` carrying
+        # `batteryLevel` against it is refused by the node's own §4.1 guard —
+        # a guard that exists BECAUSE of BRIDGE_PROTOCOL §4.1's measured trap
+        # (a write into an undeclared attribute would otherwise succeed
+        # silently into an attribute no controller could ever read), not
+        # because the trap itself refuses anything. `upsert()` sends a full
+        # spec, so the node recreates it — `registry.upsert`/`planReconcile`
+        # both treat a battery GAIN as recreate-worthy, exactly like a role
+        # change. A battery going away is deliberately NOT symmetric: nothing
+        # here does anything for it, because the node's cluster set is
+        # monotonic and `_report_stopped_keys` (below) already covers a
+        # device that stops answering.
         had_battery = getattr(orig_dev, "batteryLevel", None) is not None
         has_battery = getattr(new_dev, "batteryLevel", None) is not None
         if has_battery and not had_battery:
+            self._logger.warning(
+                "Matter bridge: device %s (id %s) started reporting a battery — its accessory is "
+                "being re-created so ecosystems can show it; its name/room in paired ecosystems "
+                "may need re-assigning.", getattr(new_dev, "name", ""), new_dev.id)
             self.upsert(new_dev.id)
             return
         # Order matters only in that frames are applied in receipt order (§1):
@@ -1804,7 +1812,16 @@ class ExportBridge:
         if future.cancelled():
             return
         exc = future.exception()
-        if exc is not None:
+        if exc is None:
+            return
+        if what.startswith("upsert_endpoint"):
+            # Names the consequence, not just the failure: an `upsert_endpoint`
+            # that never lands leaves the device un-exported, and "failed" alone
+            # does not say whether that heals itself or needs a human.
+            self._logger.warning(
+                "Matter bridge: %s failed — %s. The device is not exported until the next "
+                "reconnect/attach.", what, exc)
+        else:
             self._logger.warning("Matter bridge: %s failed — %s", what, exc)
 
 

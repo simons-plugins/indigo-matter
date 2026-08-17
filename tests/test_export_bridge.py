@@ -790,6 +790,22 @@ class TestBatteryDeviceUpdated:
         assert spec.battery is True
         assert spec.states["batteryLevel"] == 80
 
+    def test_a_battery_gain_warns_before_the_identity_destroying_recreate(
+            self, bridge_mod, mock_logger, devices):
+        """The gain branch used to log NOTHING before recreating the
+        accessory — the same accessory-identity churn a role change costs,
+        with no trace of why in the log.
+        """
+        devices.add(RelayDevice(103, "Study Plug", onState=False))
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(103, "onOffLight")])
+        h.start()
+        before = RelayDevice(103, "Study Plug", onState=False)
+        devices[103].batteryLevel = 80
+        h.bridge.device_updated(before, devices[103])
+        warnings = warnings_of(mock_logger)
+        assert "103" in warnings and "started reporting a battery" in warnings
+        assert "may need re-assigning" in warnings
+
     def test_a_battery_loss_triggers_no_upsert__the_cluster_is_monotonic(
             self, bridge_mod, mock_logger, devices):
         devices.add(RelayDevice(300, "Batt Plug", onState=True, batteryLevel=50))
@@ -860,6 +876,18 @@ class TestIncrementalCrud:
         h.bridge.upsert(102)
         _name, spec = h.client.only("upsert_endpoint")
         assert spec.indigo_device_id == 102 and spec.role == "dimmableLight"
+
+    def test_a_failed_upsert_names_the_consequence_not_just_the_failure(
+            self, bridge_mod, mock_logger, devices):
+        """`_log_future`'s generic "X failed" line does not say whether that
+        heals itself — for `upsert_endpoint` it does not, until the next
+        reconnect/attach, and that has to be in the log line itself.
+        """
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(102, "dimmableLight")])
+        h.start()
+        h.client.fail["upsert_endpoint"] = ConnectionError("socket died mid-write")
+        h.bridge.upsert(102)
+        assert "not exported until the next reconnect/attach" in warnings_of(mock_logger)
 
     def test_upsert_of_an_unbridgeable_export_sends_nothing(self, bridge_mod, mock_logger,
                                                             devices, unbridgeable_role):

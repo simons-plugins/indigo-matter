@@ -918,12 +918,20 @@ const LEVEL_CONTROL_INITIAL = { currentLevel: 1, managedTransitionTimeHandling: 
  * today — it is here so a future matter.js default flip cannot silently start
  * every exported battery device out claiming it needs a new cell.
  *
- * **`batChargeLevel` is deliberately ABSENT here — see {@link splitBattery} for
- * why it is never derived from the percentage.** `status`/`order`/
- * `description`/`batReplaceability` are left to matter.js entirely: all four
- * were measured present with sane defaults on `PowerSourceServer.with(
- * "Battery")` (§0 — `status: 0`, `order: 0`, `description: "Battery power"`,
- * `batReplaceability: 0`) and none of them are Indigo's to set.
+ * **`batChargeLevel` is deliberately ABSENT here, and never derived from the
+ * percentage.** The enum (`Ok`/`Warning`/`Critical`) is the device's OWN
+ * judgement against ITS OWN thresholds — Indigo has none, so inventing a
+ * mapping (e.g. "below 20% is Warning") would be this bridge's opinion
+ * standing in for a reading no Indigo device provides, and a wrong guess
+ * triggers an ecosystem's "replace battery" alarm on a device that never
+ * asked for one. Apple derives its own low-battery warning from the
+ * percentage already, so leaving the enum unset costs nothing and keeps one
+ * source of truth (the percentage) instead of two that can disagree.
+ * `status`/`order`/`description`/`batReplaceability` are left to matter.js
+ * entirely: all four were measured present with sane defaults on
+ * `PowerSourceServer.with("Battery")` (§0 — `status: 0`, `order: 0`,
+ * `description: "Battery power"`, `batReplaceability: 0`) and none of them
+ * are Indigo's to set.
  */
 const BATTERY_INITIAL = { batPercentRemaining: null, batReplacementNeeded: false };
 
