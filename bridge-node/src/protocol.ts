@@ -205,6 +205,17 @@ export interface EndpointSpec {
     states: Record<string, unknown>;
     /** Role-specific extras (e.g. window-covering polarity). Unused by E3 roles. */
     options: Record<string, unknown>;
+    /**
+     * §4.1 issue #220 — "ensure this accessory publishes PowerSource". Absent
+     * or `false` on the wire means "no evidence right now", never a removal
+     * request: the live cluster set is monotonic, so a battery loss on an
+     * existing endpoint is left alone (§4.1's own wording) rather than treated
+     * as symmetrical with a gain. Required here (like {@link reachable}) because
+     * the parser ({@link parseEndpointSpec}) is what defaults it — every other
+     * `EndpointSpec` in memory has already made the decision one way or the
+     * other.
+     */
+    battery: boolean;
 }
 
 /** §3.2 */

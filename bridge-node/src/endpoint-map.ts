@@ -199,6 +199,17 @@ export interface EndpointRecord {
      * on every ordinary entry, same convention as `numberVoid`.
      */
     orphaned?: true;
+    /**
+     * Set by {@link recordFor}/{@link noteRestorable} (issue #220): the live
+     * endpoint this entry witnesses was built with PowerSource. **Add-only,
+     * like {@link numberVoid}/{@link orphaned}** — never written `false` and
+     * never cleared once `true`, mirroring the wire rule (BRIDGE_PROTOCOL §4.1:
+     * a battery loss is "no evidence right now", not a removal). Absent on
+     * every ordinary entry and on every pre-#220 file, so an old build reading
+     * a file that has it never looks at the key — same inert-extra-key
+     * tolerance as the other two, and the same reason the schema stays 2.
+     */
+    battery?: true;
 }
 
 /** The on-disk shape (v2). */
@@ -226,6 +237,14 @@ export interface LiveEndpointNumber {
      */
     role?: string;
     label?: string;
+    /**
+     * Issue #220 — whether the LIVE endpoint carries PowerSource. Optional for
+     * the same reason `role`/`label` are: a caller with no live set to report
+     * (the seed path) must not be forced to assert `false` and have that
+     * silently overwrite a `true` {@link EndpointRecord.battery} already on
+     * disk — see {@link noteRestorable}'s add-only handling.
+     */
+    battery?: boolean;
 }
 
 /** An entry complete enough for `node.ts` to reconstruct before going online. */
@@ -234,6 +253,8 @@ export interface RestorableEndpoint {
     endpointNumber: number;
     role: string;
     label: string;
+    /** Issue #220 — `true` only when the persisted entry has ever seen one. */
+    battery?: true;
 }
 
 /** The outcome of reading the file: absent, usable, or present-but-broken. */
@@ -287,6 +308,11 @@ function readRecord(value: unknown): EndpointRecord | undefined {
     // Same tolerance, same reason: an old-format record simply lacks it.
     if (candidate.orphaned === true) {
         record.orphaned = true;
+    }
+    // Same tolerance again (issue #220): anything other than a literal `true`
+    // is simply not evidence of a battery, never a reason to reject the entry.
+    if (candidate.battery === true) {
+        record.battery = true;
     }
     return record;
 }
@@ -378,6 +404,12 @@ function recordFor(entry: LiveEndpointNumber): EndpointRecord {
     if (entry.label !== undefined) {
         record.label = entry.label;
     }
+    // Add-only, like every other call site that touches this field (issue
+    // #220) — an entry is never MINTED with `battery: false`; it simply omits
+    // the key, the same convention `numberVoid`/`orphaned` already use.
+    if (entry.battery === true) {
+        record.battery = true;
+    }
     return record;
 }
 
@@ -405,6 +437,14 @@ function noteRestorable(record: EndpointRecord, entry: LiveEndpointNumber): bool
     }
     if (entry.label !== undefined && record.label !== entry.label) {
         record.label = entry.label;
+        changed = true;
+    }
+    // Add-only (issue #220): a live entry that HAS a battery sets the marker;
+    // one that does not is silently no evidence either way, matching the wire
+    // rule (BRIDGE_PROTOCOL §4.1) rather than clearing what a previous live
+    // pass already recorded.
+    if (entry.battery === true && !record.battery) {
+        record.battery = true;
         changed = true;
     }
     if (record.orphaned) {
@@ -575,6 +615,11 @@ export class EndpointMapStore {
                 endpointNumber: record.number,
                 role: record.role,
                 label: record.label,
+                // Issue #220: add-only, so `restore-on-start` (`node.ts`)
+                // rebuilds the accessory with the same cluster set it had —
+                // the one thing that stops every battery accessory losing
+                // PowerSource on the very next restart.
+                ...(record.battery ? { battery: true as const } : {}),
             });
         }
         return restorable;

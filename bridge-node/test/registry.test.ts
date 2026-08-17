@@ -31,6 +31,7 @@ import { AggregatorEndpoint } from "@matter/main/endpoints/aggregator";
 import {
     applyStates,
     endpointIdFor,
+    percentToBatteryRemaining,
     percentToCurrentLevel,
     SUPPORTED_ROLES,
     uniqueIdFor,
@@ -176,6 +177,7 @@ function spec(indigoDeviceId: number, role: RoleValue, overrides: Partial<Endpoi
         reachable: true,
         states: {},
         options: {},
+        battery: false,
         ...overrides,
     };
 }
@@ -2011,7 +2013,7 @@ describe("onOff commands (§4.2, §7, #143, #201)", () => {
             };
             try {
                 await assert.rejects(
-                    async () => applyStates(endpoint, Role.dimmableLight, { onOff: true, level: 80 }),
+                    async () => applyStates(endpoint, Role.dimmableLight, { onOff: true, level: 80 }, false),
                     (error: Error) => /onOff half failed/.test(error.message),
                     "the error must name the failed half",
                 );
@@ -2111,6 +2113,210 @@ describe("window covering commands (§4.2, E4)", () => {
             await h.registry.setState(6, { position: 40 });
             await h.registry.setState(6, { position: 0 });
             assert.deepEqual(h.commands, []);
+        } finally {
+            await h.close();
+        }
+    });
+});
+
+// ---------------------------------------------------------------------------
+// Issue #220: PowerSource / battery
+// ---------------------------------------------------------------------------
+
+/** The Descriptor cluster's own account of what an endpoint carries. */
+function descriptorOf(endpoint: Endpoint): { deviceTypeList: Array<{ deviceType: unknown }>; serverList: unknown[] } {
+    return endpoint.stateOf("descriptor") as {
+        deviceTypeList: Array<{ deviceType: unknown }>;
+        serverList: unknown[];
+    };
+}
+
+describe("PowerSource / battery (issue #220)", () => {
+    it("adds PowerSource (cluster 47) and device type 0x0011 to every role when battery: true", async () => {
+        const h = await harness();
+        try {
+            await h.registry.reconcile(
+                [
+                    spec(1, Role.contactSensor, { battery: true }),
+                    spec(2, Role.onOffLight, { battery: true }),
+                    spec(3, Role.thermostat, { battery: true, states: { systemMode: "off" } }),
+                ],
+                false,
+            );
+            for (const id of [1, 2, 3]) {
+                const endpoint = [...h.aggregator.parts].find(part => part.id === endpointIdFor(id));
+                assert.ok(endpoint !== undefined, `device ${id} missing`);
+                const descriptor = descriptorOf(endpoint);
+                assert.ok(
+                    descriptor.serverList.map(Number).includes(47),
+                    `device ${id} serverList ${JSON.stringify(descriptor.serverList)} missing PowerSource (47)`,
+                );
+                assert.ok(
+                    descriptor.deviceTypeList.some(dt => Number(dt.deviceType) === 17),
+                    `device ${id} deviceTypeList missing PowerSource device type (17/0x0011)`,
+                );
+                assert.equal(Object.keys(endpoint.state).includes("powerSource"), true);
+            }
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("carries no PowerSource at all when battery: false", async () => {
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(1, Role.onOffLight, { battery: false })], false);
+            const endpoint = only(h);
+            const descriptor = descriptorOf(endpoint);
+            assert.ok(!descriptor.serverList.map(Number).includes(47));
+            assert.equal(Object.keys(endpoint.state).includes("powerSource"), false);
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("REGRESSION (measured trap, §0): seeds batPercentRemaining null even with no batteryLevel in states", async () => {
+        // The whole feature ships dead without this: an endpoint built without
+        // `batPercentRemaining` in its initial state never gets attribute 12
+        // into `attributeList` at all, so a LATER write succeeds silently into
+        // an attribute no controller can ever read.
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(1, Role.contactSensor, { battery: true })], false);
+            const endpoint = only(h);
+            const power = endpoint.stateOf("powerSource") as { batPercentRemaining: unknown; attributeList?: unknown[] };
+            assert.equal(power.batPercentRemaining, null);
+            if (power.attributeList !== undefined) {
+                assert.ok(
+                    power.attributeList.map(Number).includes(12),
+                    `attributeList ${JSON.stringify(power.attributeList)} missing batPercentRemaining (12)`,
+                );
+            }
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("converts batteryLevel via set_state at the documented boundaries", async () => {
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(1, Role.contactSensor, { battery: true })], false);
+            const endpoint = only(h);
+            const read = (): unknown => (endpoint.stateOf("powerSource") as { batPercentRemaining: unknown }).batPercentRemaining;
+            for (const [percent, expected] of [[1, 2], [24, 48], [77, 154], [100, 200]] as const) {
+                await h.registry.setState(1, { batteryLevel: percent });
+                assert.equal(read(), expected, `${percent}% should be ${expected}`);
+            }
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("clamps an out-of-range batteryLevel rather than throwing", async () => {
+        assert.equal(percentToBatteryRemaining(150), 200);
+    });
+
+    it("applies a batteryLevel-only set_state on a battery endpoint of every role, no refusal", async () => {
+        const h = await harness();
+        try {
+            const roles = Object.values(Role) as RoleValue[];
+            await h.registry.reconcile(
+                roles.map((role, index) => spec(920_000 + index, role, { battery: true })),
+                false,
+            );
+            for (const [index, role] of roles.entries()) {
+                const id = 920_000 + index;
+                await h.registry.setState(id, { batteryLevel: 55 });
+                const endpoint = [...h.aggregator.parts].find(part => part.id === endpointIdFor(id));
+                assert.equal(
+                    (endpoint?.stateOf("powerSource") as Record<string, unknown>).batPercentRemaining,
+                    110,
+                    `${role} batteryLevel push`,
+                );
+            }
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("lands onOff AND batteryLevel from the same set_state on a battery onOffLight (no #201 regression)", async () => {
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(1, Role.onOffLight, { battery: true })], false);
+            await h.registry.setState(1, { onOff: true, batteryLevel: 48 });
+            const endpoint = only(h);
+            assert.equal((endpoint.stateOf("onOff") as Record<string, unknown>).onOff, true);
+            assert.equal((endpoint.stateOf("powerSource") as Record<string, unknown>).batPercentRemaining, 96);
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("refuses batteryLevel on a non-battery endpoint, and writes nothing", async () => {
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(123456789, Role.onOffLight, { battery: false })], false);
+            const error = await rejects(
+                () => h.registry.setState(123456789, { batteryLevel: 77 }),
+                ErrorCode.malformedArgs,
+            );
+            assert.equal(
+                error.message,
+                "endpoint 123456789 was not created with a battery, so batteryLevel cannot be " +
+                    "published; re-export the device (§4.1)",
+            );
+            const endpoint = only(h);
+            assert.equal(Object.keys(endpoint.state).includes("powerSource"), false);
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("still refuses a key the role does not speak — the split did not widen acceptance", async () => {
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(1, Role.onOffLight, { battery: true })], false);
+            await rejects(() => h.registry.setState(1, { level: 55 }), ErrorCode.malformedArgs);
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("upsert: a battery GAIN keeps the endpoint number, adds the cluster, and bumps ConfigurationVersion", async () => {
+        const h = await harness();
+        const version = (): number =>
+            (h.node.state.basicInformation as { configurationVersion?: number }).configurationVersion ?? 0;
+        try {
+            const created = await h.registry.upsert(spec(1, Role.onOffLight, { battery: false }));
+            const before = version();
+
+            const upserted = await h.registry.upsert(spec(1, Role.onOffLight, { battery: true }));
+
+            assert.equal(upserted.endpointNumber, created.endpointNumber, "the endpoint number must survive");
+            assert.equal(version(), before + 1, "a battery gain is a configuration change");
+            const endpoint = only(h);
+            assert.ok(descriptorOf(endpoint).serverList.map(Number).includes(47));
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("upsert: a battery LOSS does not recreate, keeps the cluster, and does not bump", async () => {
+        const h = await harness();
+        const version = (): number =>
+            (h.node.state.basicInformation as { configurationVersion?: number }).configurationVersion ?? 0;
+        try {
+            const created = await h.registry.upsert(spec(1, Role.onOffLight, { battery: true }));
+            const before = version();
+
+            const upserted = await h.registry.upsert(spec(1, Role.onOffLight, { battery: false }));
+
+            assert.equal(upserted.endpointNumber, created.endpointNumber);
+            assert.equal(version(), before, "a battery loss alone is not a configuration change");
+            const endpoint = only(h);
+            // §4.1: the cluster set is monotonic — a battery LOSS is "no
+            // evidence right now", never a removal.
+            assert.ok(descriptorOf(endpoint).serverList.map(Number).includes(47));
         } finally {
             await h.close();
         }

@@ -1117,3 +1117,98 @@ describe("bootstrapping a baseline instead of refusing (E5 upgrade path)", () =>
         assert.equal(new EndpointMapStore(dir).load().endpoints.get("indigo-1")?.number, 2);
     });
 });
+
+describe("battery (issue #220)", () => {
+    it("records battery: true add-only, and it is never written false", () => {
+        const dir = storage();
+        const store = new EndpointMapStore(dir);
+        store.load();
+
+        store.check([{ uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Lamp", battery: true }]);
+
+        assert.deepEqual(mapFileIn(dir).endpoints, {
+            "indigo-1": { number: 2, role: "onOffLight", label: "Lamp", battery: true },
+        });
+        assert.deepEqual(store.restorable(), [
+            { uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Lamp", battery: true },
+        ]);
+    });
+
+    it("a battery: false live entry never writes the key at all", () => {
+        const dir = storage();
+        const store = new EndpointMapStore(dir);
+        store.load();
+
+        store.check([{ uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Lamp", battery: false }]);
+
+        assert.deepEqual(mapFileIn(dir).endpoints, {
+            "indigo-1": { number: 2, role: "onOffLight", label: "Lamp" },
+        });
+    });
+
+    it("keeps battery: true once seen, even after a live pass reports battery: false", () => {
+        // §4.1: a battery LOSS is "no evidence right now", never a removal —
+        // the map's own witness has to agree, or a restart would rebuild the
+        // accessory without PowerSource even though it had one.
+        const dir = storage();
+        const store = new EndpointMapStore(dir);
+        store.load();
+        store.check([{ uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Lamp", battery: true }]);
+
+        store.check([{ uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Lamp", battery: false }]);
+
+        assert.deepEqual(mapFileIn(dir).endpoints, {
+            "indigo-1": { number: 2, role: "onOffLight", label: "Lamp", battery: true },
+        });
+    });
+
+    it("an entry with no battery opinion at all (omitted) leaves a recorded true untouched", () => {
+        // The seed/migration path knows nothing about battery — an absent
+        // value must never erase a recorded one, same rule as role/label.
+        const dir = storage();
+        const store = new EndpointMapStore(dir);
+        store.load();
+        store.check([{ uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Lamp", battery: true }]);
+
+        store.check([{ uniqueId: "indigo-1", endpointNumber: 2 }]);
+
+        assert.deepEqual(store.restorable(), [
+            { uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Lamp", battery: true },
+        ]);
+    });
+
+    it("a v2 file lacking the key at all loads exactly as before #220", () => {
+        const dir = storage();
+        writeFileSync(
+            join(dir, ENDPOINT_MAP_FILE),
+            JSON.stringify({
+                version: 2,
+                endpoints: { "indigo-1": { number: 2, role: "onOffLight", label: "Lamp" } },
+            }),
+        );
+        const store = new EndpointMapStore(dir);
+        const loaded = store.load();
+
+        assert.equal(loaded.problem, undefined);
+        assert.deepEqual(store.restorable(), [
+            { uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Lamp" },
+        ]);
+    });
+
+    it("tolerates anything other than a literal true, same convention as numberVoid/orphaned", () => {
+        const dir = storage();
+        writeFileSync(
+            join(dir, ENDPOINT_MAP_FILE),
+            JSON.stringify({
+                version: 2,
+                endpoints: { "indigo-1": { number: 2, role: "onOffLight", label: "Lamp", battery: "yes" } },
+            }),
+        );
+        const store = new EndpointMapStore(dir);
+        store.load();
+
+        assert.deepEqual(store.restorable(), [
+            { uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Lamp" },
+        ]);
+    });
+});

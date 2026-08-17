@@ -26,7 +26,7 @@ import {
     type UpsertResult,
     type WindowClosedReason,
 } from "../src/protocol.js";
-import { planReconcile } from "../src/reconcile.js";
+import { type LiveComposition, planReconcile } from "../src/reconcile.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -75,6 +75,8 @@ export interface GoldenFrames {
     set_state: GoldenExchange;
     set_state_unknown_device: GoldenExchange;
     set_state_bad_keys: GoldenExchange;
+    /** §4.1 issue #220 — `batteryLevel` refused against a non-battery endpoint. */
+    set_state_battery_on_a_mains_endpoint: GoldenExchange;
     set_reachable: GoldenExchange;
     /**
      * The whole §4.2 role table in one `attach`, plus the per-role `set_state`
@@ -148,18 +150,23 @@ export const golden: GoldenFrames = JSON.parse(
  * thing it stands in for.
  */
 class EndpointModel {
-    readonly #endpoints = new Map<number, { role: RoleValue; endpointNumber: number }>();
+    readonly #endpoints = new Map<number, { role: RoleValue; endpointNumber: number; battery: boolean }>();
     /** Every number ever handed out, by device id. Never pruned — see above. */
     readonly #allocated = new Map<number, number>();
     #next = 2;
 
-    roles(): Map<number, RoleValue> {
-        return new Map([...this.#endpoints.entries()].map(([id, entry]) => [id, entry.role]));
+    composition(): Map<number, LiveComposition> {
+        return new Map([...this.#endpoints.entries()].map(([id, entry]) =>
+            [id, { role: entry.role, battery: entry.battery }]));
     }
 
     summaries(): StatusReport["endpoints"] {
+        // `battery` is deliberately NOT part of the §4.3 `EndpointSummary` wire
+        // shape (it is an `endpoint-map.json` concern, not a StatusReport one)
+        // — named fields rather than a spread of `entry`, or the model's own
+        // bookkeeping leaks onto the wire.
         return [...this.#endpoints.entries()]
-            .map(([indigoDeviceId, entry]) => ({ indigoDeviceId, ...entry }))
+            .map(([indigoDeviceId, entry]) => ({ indigoDeviceId, role: entry.role, endpointNumber: entry.endpointNumber }))
             .sort((a, b) => a.indigoDeviceId - b.indigoDeviceId);
     }
 
@@ -168,7 +175,7 @@ class EndpointModel {
     }
 
     reconcile(desired: readonly EndpointSpec[], replaceAll: boolean): void {
-        const plan = planReconcile(this.roles(), desired, replaceAll);
+        const plan = planReconcile(this.composition(), desired, replaceAll);
         for (const indigoDeviceId of plan.remove) {
             this.#endpoints.delete(indigoDeviceId);
         }
@@ -208,7 +215,7 @@ class EndpointModel {
     private add(spec: EndpointSpec): number {
         const endpointNumber = this.#allocated.get(spec.indigoDeviceId) ?? this.#next++;
         this.#allocated.set(spec.indigoDeviceId, endpointNumber);
-        this.#endpoints.set(spec.indigoDeviceId, { role: spec.role, endpointNumber });
+        this.#endpoints.set(spec.indigoDeviceId, { role: spec.role, endpointNumber, battery: spec.battery });
         return endpointNumber;
     }
 }
