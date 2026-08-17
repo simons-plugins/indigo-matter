@@ -2560,9 +2560,10 @@ describe("ColorControl command conversion (§4.2, #143)", () => {
             const before = (endpoint.stateOf("colorControl") as Record<string, unknown>).currentSaturation;
             h.commands.length = 0;
 
-            // HS -> XY. moveToColorLogic is not yet converted (commit 6), so
-            // it still silently writes currentX/currentY today — expected,
-            // and not this test's concern.
+            // HS -> XY. moveToColorLogic is converted (commit 6) and emits
+            // its own setColor from the xy target — it never reads or writes
+            // currentHue/currentSaturation, so it cannot be the mechanism
+            // under test either way.
             await endpoint.act(agent =>
                 agent
                     .get(ColorFull)
@@ -2586,9 +2587,15 @@ describe("ColorControl command conversion (§4.2, #143)", () => {
                 before,
                 "switchColorMode must not have touched currentSaturation in either direction",
             );
-            // moveToHueLogic IS converted, so exactly one setColor is expected
-            // (from the second call only).
-            assert.deepEqual(h.commands, [{ indigoDeviceId: 1, command: "setColor", args: { hue: 210, saturation: 80 } }]);
+            // Both calls now emit: moveToColorLogic reports the xy target
+            // converted through xyToHsv, and moveToHueLogic reports its own
+            // target paired with currentSaturation — which is still the
+            // SEEDED value (203 → 80%), proving switchColorMode never
+            // touched it in between.
+            assert.deepEqual(h.commands, [
+                { indigoDeviceId: 1, command: "setColor", args: { hue: 235, saturation: 9 } },
+                { indigoDeviceId: 1, command: "setColor", args: { hue: 210, saturation: 80 } },
+            ]);
         } finally {
             await h.close();
         }
@@ -2616,6 +2623,51 @@ describe("ColorControl command conversion (§4.2, #143)", () => {
             const after = endpoint.stateOf("colorControl") as { currentX: number; currentY: number };
             assert.equal(after.currentX, before.currentX, "stepColor must not move currentX");
             assert.equal(after.currentY, before.currentY, "stepColor must not move currentY");
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("moveToColor converts CIE xy to setColor via the stock xyToHsv conversion", async () => {
+        // #143 commit 6. 0.35/0.35 is the design's own probe value: xyToHsv
+        // resolves it to ~39.4° hue and ~12.6% saturation, rounding to the
+        // exact figures pinned below — matter.js's own conversion, not a
+        // second one this file maintains.
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(1, Role.extendedColorLight)], false);
+            const endpoint = only(h);
+            await endpoint.act(agent =>
+                agent.get(ColorFull).moveToColor({
+                    colorX: Math.round(0.35 * 65536),
+                    colorY: Math.round(0.35 * 65536),
+                    transitionTime: 10,
+                    optionsMask: {},
+                    optionsOverride: {},
+                }),
+            );
+            assert.deepEqual(h.commands, [{ indigoDeviceId: 1, command: "setColor", args: { hue: 39, saturation: 13 } }]);
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("moveColor still writes and emits nothing — stock's own no-target-value transition", async () => {
+        // Confirms the class doc's claim for the one continuous xy command
+        // that is NOT stepColor: no targetValue means Transitions.start
+        // returns before writing anything (probe-confirmed, unlike stepColor).
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(1, Role.extendedColorLight)], false);
+            const endpoint = only(h);
+            const before = endpoint.stateOf("colorControl") as { currentX: number; currentY: number };
+            await endpoint.act(agent =>
+                agent.get(ColorFull).moveColor({ rateX: 500, rateY: 500, optionsMask: {}, optionsOverride: {} }),
+            );
+            assert.deepEqual(h.commands, []);
+            const after = endpoint.stateOf("colorControl") as { currentX: number; currentY: number };
+            assert.equal(after.currentX, before.currentX, "moveColor must not move currentX");
+            assert.equal(after.currentY, before.currentY, "moveColor must not move currentY");
         } finally {
             await h.close();
         }

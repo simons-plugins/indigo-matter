@@ -38,7 +38,7 @@
 
 import { Endpoint, type EndpointType, Logger, type MaybePromise, type MutableEndpoint, VendorId } from "@matter/main";
 import { BridgedDeviceBasicInformationServer } from "@matter/main/behaviors/bridged-device-basic-information";
-import { ColorControlServer } from "@matter/main/behaviors/color-control";
+import { ColorControlServer, xyToHsv } from "@matter/main/behaviors/color-control";
 import { DoorLockServer } from "@matter/main/behaviors/door-lock";
 import { LevelControlServer } from "@matter/main/behaviors/level-control";
 import { OccupancySensingServer } from "@matter/main/behaviors/occupancy-sensing";
@@ -145,6 +145,15 @@ export const MIREDS_MIN = 153;
 export const MIREDS_MAX = 500;
 /** Matter `CurrentHue` spans 0-254 for a full 0-360° turn. */
 export const HUE_DEGREES_MAX = 360;
+
+/**
+ * The scale `currentX`/`currentY` are carried on the wire at: matter.js's own
+ * `ColorControlServer`'s `x`/`y` convenience getters divide by this exact
+ * value (`#returnAsXyValue`, `ColorControlServer.js:1449`), which is why
+ * {@link IndigoColorControlServer.moveToColorLogic} divides by it too before
+ * handing a CIE fraction to `xyToHsv`.
+ */
+export const CIE_XY_SCALE = 65536;
 
 function clamp(value: number, min: number, max: number): number {
     return Math.min(max, Math.max(min, value));
@@ -1013,6 +1022,30 @@ class IndigoColorControlServer extends ColorControlServer.with("HueSaturation", 
         emitCommand(this.endpoint.id, "setColor", {
             hue: matterHueToDegrees(hue),
             saturation: matterToPercent(saturation),
+        });
+    }
+
+    /**
+     * CIE xy → §4.2 `setColor` (#143 commit 6). There is no xy vocabulary in
+     * §4.2 — `setColor` only ever carries hue/saturation — so an ecosystem
+     * driving the light in its xy representation is converted through the
+     * SAME stock `xyToHsv` matter.js's own `switchColorMode` uses internally
+     * (`ColorConversionUtils.js`, re-exported from
+     * `@matter/main/behaviors/color-control`), rather than this file
+     * inventing a second CIE conversion to maintain.
+     *
+     * `targetX`/`targetY` arrive as raw Matter `uint16` values (0-65279, see
+     * `MAX_CIE_XY_VALUE`); `xyToHsv` expects the 0..1 CIE fraction the same
+     * way the class getters `x`/`y` do (`#returnAsXyValue`,
+     * `ColorControlServer.js:1449`: `value / 65536`) — dividing by
+     * {@link CIE_XY_SCALE} before calling it is not optional, it is the unit
+     * `xyToHsv` was written against.
+     */
+    override moveToColorLogic(targetX: number, targetY: number, _transitionTime: number): MaybePromise {
+        const [hueDegrees, saturationFraction] = xyToHsv(targetX / CIE_XY_SCALE, targetY / CIE_XY_SCALE);
+        emitCommand(this.endpoint.id, "setColor", {
+            hue: clamp(roundHalfUp(hueDegrees), 0, HUE_DEGREES_MAX),
+            saturation: clamp(roundHalfUp(saturationFraction * 100), 0, 100),
         });
     }
 
