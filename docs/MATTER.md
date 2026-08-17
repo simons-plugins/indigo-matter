@@ -442,6 +442,20 @@ time the plugin reconnects after the update. The accessory's identity
 paired ecosystem(s) may need re-assigning — the same one-time hedge a role
 change already asks for.
 
+**If Apple Home gets stuck after a role change** (live-observed 2026-08-17):
+changing an export's role re-creates the accessory at the same endpoint
+number, and Apple can react by dropping it into the Default Room and then
+refusing to move it back — "could not change settings" — because its cached
+accessory structure no longer matches what the bridge advertises. The fix is
+to **restart your Apple home hub** (Apple TV: Settings → System → Restart, or
+power-cycle the HomePod); force-quitting the Home app is not enough. After
+the reboot the hub re-reads the bridge — expect a couple of minutes of "No
+Response" across all bridged accessories while it rebuilds its sessions, then
+room changes work again. Practical ordering: pick the role you want *first*,
+let Apple settle, and assign the room/name after. (A future release may
+adopt the remove-then-re-add approach other bridges use for type changes —
+tracked as issue #240.)
+
 **Locks export, and they do not auto-confirm anything.** A lock or unlock from an
 ecosystem is passed to Indigo and nothing else: no optimistic state, no
 synthesised confirmation. What the ecosystem shows moves only when Indigo's own
