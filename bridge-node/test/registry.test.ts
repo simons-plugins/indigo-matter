@@ -22,11 +22,13 @@ import { after, describe, it } from "node:test";
 import { Endpoint, Environment, Logger, ServerNode, VendorId } from "@matter/main";
 import { BasicInformationServer } from "@matter/main/behaviors/basic-information";
 import { BridgedDeviceBasicInformationServer } from "@matter/main/behaviors/bridged-device-basic-information";
+import { ColorControlServer } from "@matter/main/behaviors/color-control";
 import { DoorLockServer } from "@matter/main/behaviors/door-lock";
 import { LevelControlServer } from "@matter/main/behaviors/level-control";
 import { OnOffServer } from "@matter/main/behaviors/on-off";
 import { PowerSourceServer } from "@matter/main/behaviors/power-source";
 import { WindowCoveringServer } from "@matter/main/behaviors/window-covering";
+import { ColorControl } from "@matter/main/clusters/color-control";
 import { DoorLock } from "@matter/main/clusters/door-lock";
 import { LevelControl } from "@matter/main/clusters/level-control";
 import { OnOffLightDevice } from "@matter/main/devices/on-off-light";
@@ -1243,6 +1245,13 @@ const OnOffLighting = OnOffServer.with("Lighting");
 const LevelLighting = LevelControlServer.with("Lighting", "OnOff");
 
 /**
+ * The ColorControl behaviour as `extendedColorLight`/`colorTemperatureLight`
+ * build it, post-#143. Mirrors {@link LevelLighting}.
+ */
+const ColorFull = ColorControlServer.with("HueSaturation", "Xy", "ColorTemperature");
+const ColorCt = ColorControlServer.with("ColorTemperature");
+
+/**
  * Poll until `check` passes (or the cap expires — the following assertion then
  * reports the real shortfall). The countdown tests used to sleep a fixed 400ms
  * against ~200ms timer deadlines, which a loaded CI runner can blow through;
@@ -2264,6 +2273,265 @@ describe("LevelControl command conversion (§4.2, #143)", () => {
                 0,
                 "super.off() must have stopped the real countdown",
             );
+        } finally {
+            await h.close();
+        }
+    });
+});
+
+describe("ColorControl command conversion (§4.2, #143)", () => {
+    /**
+     * One row per hue/saturation/colour-temperature command on
+     * `extendedColorLight`. `seed` is a plain attribute write (not a command
+     * invocation) that puts the endpoint in the state the row's math assumes;
+     * `run` is the real invocation under test.
+     */
+    it("converts every hue/saturation/CT command to setColor/setColorTemp, clamped", async () => {
+        type Seed = (endpoint: Endpoint) => Promise<void>;
+        type Run = (cc: InstanceType<typeof ColorFull>) => unknown;
+        const CASES: [string, Seed, Run, CommandEventData][] = [
+            [
+                "moveToHue(148, Shortest)",
+                async endpoint => endpoint.set({ colorControl: { currentSaturation: 203 } } as never),
+                cc =>
+                    cc.moveToHue({
+                        hue: 148,
+                        direction: ColorControl.Direction.Shortest,
+                        transitionTime: 10,
+                        optionsMask: {},
+                        optionsOverride: {},
+                    }),
+                { indigoDeviceId: 1, command: "setColor", args: { hue: 210, saturation: 80 } },
+            ],
+            [
+                "stepHue(Up, 100) — cyclic wraparound past 254",
+                async endpoint =>
+                    endpoint.set({ colorControl: { currentHue: 200, currentSaturation: 203 } } as never),
+                cc =>
+                    cc.stepHue({
+                        stepMode: ColorControl.StepMode.Up,
+                        stepSize: 100,
+                        transitionTime: 10,
+                        optionsMask: {},
+                        optionsOverride: {},
+                    }),
+                { indigoDeviceId: 1, command: "setColor", args: { hue: 65, saturation: 80 } },
+            ],
+            [
+                "moveToSaturation(100)",
+                async endpoint => endpoint.set({ colorControl: { currentHue: 148 } } as never),
+                cc => cc.moveToSaturation({ saturation: 100, transitionTime: 10, optionsMask: {}, optionsOverride: {} }),
+                { indigoDeviceId: 1, command: "setColor", args: { hue: 210, saturation: 39 } },
+            ],
+            [
+                "stepSaturation(Down, 50)",
+                async endpoint =>
+                    endpoint.set({ colorControl: { currentHue: 148, currentSaturation: 203 } } as never),
+                cc =>
+                    cc.stepSaturation({
+                        stepMode: ColorControl.StepMode.Down,
+                        stepSize: 50,
+                        transitionTime: 10,
+                        optionsMask: {},
+                        optionsOverride: {},
+                    }),
+                { indigoDeviceId: 1, command: "setColor", args: { hue: 210, saturation: 60 } },
+            ],
+            [
+                "moveToColorTemperature(320)",
+                async () => {},
+                cc =>
+                    cc.moveToColorTemperature({
+                        colorTemperatureMireds: 320,
+                        transitionTime: 10,
+                        optionsMask: {},
+                        optionsOverride: {},
+                    }),
+                { indigoDeviceId: 1, command: "setColorTemp", args: { colorTempMireds: 320 } },
+            ],
+            [
+                "moveColorTemperature(Up, min=200, max=400)",
+                async () => {},
+                cc =>
+                    cc.moveColorTemperature({
+                        moveMode: ColorControl.MoveMode.Up,
+                        rate: 10,
+                        colorTemperatureMinimumMireds: 200,
+                        colorTemperatureMaximumMireds: 400,
+                        optionsMask: {},
+                        optionsOverride: {},
+                    }),
+                { indigoDeviceId: 1, command: "setColorTemp", args: { colorTempMireds: 400 } },
+            ],
+            [
+                "stepColorTemperature(Down, 50) — from a seeded 300 mireds",
+                async endpoint => endpoint.set({ colorControl: { colorTemperatureMireds: 300 } } as never),
+                cc =>
+                    cc.stepColorTemperature({
+                        stepMode: ColorControl.StepMode.Down,
+                        stepSize: 50,
+                        transitionTime: 10,
+                        colorTemperatureMinimumMireds: 0,
+                        colorTemperatureMaximumMireds: 0,
+                        optionsMask: {},
+                        optionsOverride: {},
+                    }),
+                { indigoDeviceId: 1, command: "setColorTemp", args: { colorTempMireds: 250 } },
+            ],
+        ];
+
+        for (const [label, seed, run, expected] of CASES) {
+            const h = await harness();
+            try {
+                await h.registry.reconcile([spec(1, Role.extendedColorLight)], false);
+                const endpoint = only(h);
+                await seed(endpoint);
+                h.commands.length = 0;
+                await endpoint.act(agent => run(agent.get(ColorFull)));
+                assert.deepEqual(h.commands, [expected], label);
+            } finally {
+                await h.close();
+            }
+        }
+    });
+
+    it("carries the CT commands on colorTemperatureLight too, via the CT-only twin class", async () => {
+        // Same math as the matrix above's three CT rows, proving
+        // IndigoColorTemperatureControlServer (not just the full class) is
+        // wired in and overrides its own three *Logic methods.
+        type Run = (cc: InstanceType<typeof ColorCt>) => unknown;
+        const CASES: [string, Run, CommandEventData][] = [
+            [
+                "moveToColorTemperature(320)",
+                cc =>
+                    cc.moveToColorTemperature({
+                        colorTemperatureMireds: 320,
+                        transitionTime: 10,
+                        optionsMask: {},
+                        optionsOverride: {},
+                    }),
+                { indigoDeviceId: 1, command: "setColorTemp", args: { colorTempMireds: 320 } },
+            ],
+            [
+                "moveColorTemperature(Up, min=200, max=400)",
+                cc =>
+                    cc.moveColorTemperature({
+                        moveMode: ColorControl.MoveMode.Up,
+                        rate: 10,
+                        colorTemperatureMinimumMireds: 200,
+                        colorTemperatureMaximumMireds: 400,
+                        optionsMask: {},
+                        optionsOverride: {},
+                    }),
+                { indigoDeviceId: 1, command: "setColorTemp", args: { colorTempMireds: 400 } },
+            ],
+        ];
+        for (const [label, run, expected] of CASES) {
+            const h = await harness();
+            try {
+                await h.registry.reconcile([spec(1, Role.colorTemperatureLight)], false);
+                const endpoint = only(h);
+                await endpoint.act(agent => run(agent.get(ColorCt)));
+                assert.deepEqual(h.commands, [expected], label);
+            } finally {
+                await h.close();
+            }
+        }
+    });
+
+    it("moveToHueAndSaturation emits ONE frame carrying BOTH requested values", async () => {
+        // Regression fence: stock composes moveToHueLogic + moveToSaturationLogic
+        // (ColorControlServer.js:577-582), which — now that neither writes an
+        // attribute — would emit the new hue paired with the STALE saturation
+        // still sitting in state. The override reports both requested values
+        // in one frame instead.
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(1, Role.extendedColorLight)], false);
+            const endpoint = only(h);
+            // A stale saturation the composed-stock bug would have leaked.
+            await endpoint.set({ colorControl: { currentSaturation: 10 } } as never);
+
+            await endpoint.act(agent =>
+                agent.get(ColorFull).moveToHueAndSaturation({
+                    hue: 100,
+                    saturation: 200,
+                    transitionTime: 10,
+                    optionsMask: {},
+                    optionsOverride: {},
+                }),
+            );
+            assert.deepEqual(h.commands, [{ indigoDeviceId: 1, command: "setColor", args: { hue: 142, saturation: 79 } }]);
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("switchColorMode is a no-op — the 0.17.8 hsvToXy/xyToHsv mixup never corrupts currentSaturation", async () => {
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(1, Role.extendedColorLight)], false);
+            const endpoint = only(h);
+            await h.registry.setState(1, { hue: 210, saturation: 80 });
+            const before = (endpoint.stateOf("colorControl") as Record<string, unknown>).currentSaturation;
+            h.commands.length = 0;
+
+            // HS -> XY. moveToColorLogic is not yet converted (commit 6), so
+            // it still silently writes currentX/currentY today — expected,
+            // and not this test's concern.
+            await endpoint.act(agent =>
+                agent
+                    .get(ColorFull)
+                    .moveToColor({ colorX: 20000, colorY: 20000, transitionTime: 10, optionsMask: {}, optionsOverride: {} }),
+            );
+            // XY -> HS. This is the buggy direction in stock 0.17.8 (calls
+            // hsvToXy where xyToHsv is needed) — measured to move
+            // currentSaturation from 200 to 82 in the design's own probe.
+            await endpoint.act(agent =>
+                agent.get(ColorFull).moveToHue({
+                    hue: 148,
+                    direction: ColorControl.Direction.Shortest,
+                    transitionTime: 10,
+                    optionsMask: {},
+                    optionsOverride: {},
+                }),
+            );
+
+            assert.equal(
+                (endpoint.stateOf("colorControl") as Record<string, unknown>).currentSaturation,
+                before,
+                "switchColorMode must not have touched currentSaturation in either direction",
+            );
+            // moveToHueLogic IS converted, so exactly one setColor is expected
+            // (from the second call only).
+            assert.deepEqual(h.commands, [{ indigoDeviceId: 1, command: "setColor", args: { hue: 210, saturation: 80 } }]);
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("stepColor writes nothing — probe-confirmed to write silently in stock, so it is a debug-logged no-op", async () => {
+        // HR-6: stepColorLogic is the one continuous colour command that
+        // contradicts the "move*/step* with no target write nothing" pattern
+        // (moveColorLogic genuinely writes nothing and is left stock). A
+        // silent write nothing here watches is not acceptable, so it is
+        // overridden to no-op + debug log instead of left stock.
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(1, Role.extendedColorLight)], false);
+            const endpoint = only(h);
+            const before = endpoint.stateOf("colorControl") as { currentX: number; currentY: number };
+
+            await endpoint.act(agent =>
+                agent
+                    .get(ColorFull)
+                    .stepColor({ stepX: 500, stepY: 500, transitionTime: 10, optionsMask: {}, optionsOverride: {} }),
+            );
+
+            assert.deepEqual(h.commands, []);
+            const after = endpoint.stateOf("colorControl") as { currentX: number; currentY: number };
+            assert.equal(after.currentX, before.currentX, "stepColor must not move currentX");
+            assert.equal(after.currentY, before.currentY, "stepColor must not move currentY");
         } finally {
             await h.close();
         }

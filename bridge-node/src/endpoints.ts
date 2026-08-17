@@ -843,6 +843,267 @@ class IndigoLevelControlServer extends LevelControlServer.with("Lighting", "OnOf
 }
 
 /**
+ * {@link addValueWithOverflow} from `@matter/general`, mirrored locally.
+ *
+ * `@matter/general` is not a direct dependency (only `@matter/main`/
+ * `@matter/nodejs` are, per `package.json`) — it is a transitive one matter.js
+ * itself imports the real function from (`Number.js:43-50`) to give
+ * `stepHueLogic` its cyclic wraparound. The body below is byte-for-byte the
+ * same three branches; duplicated rather than reached into `node_modules` for,
+ * because a two-line arithmetic helper is not worth a new declared dependency.
+ */
+function addWithOverflow(value: number, add: number, min: number, max: number): number {
+    const next = value + add;
+    if (next < min) {
+        return next - min + max;
+    }
+    if (next > max) {
+        return next - max + min;
+    }
+    return next;
+}
+
+/**
+ * ColorControl, with every write-producing command converted to a `command`
+ * event (#143's ColorControl half — LevelControl's is
+ * {@link IndigoLevelControlServer}).
+ *
+ * **There is no single funnel here** — unlike LevelControl's `transition()`,
+ * ColorControl's `#startTransition` is a private method (P-4), so the
+ * overridable surface is the `*Logic` methods each command dispatches to.
+ * The dispatch map, measured against 0.17.8's source: `moveToHue` →
+ * `moveToHueLogic` (+ a `switchColorMode` call when the mode differs);
+ * `moveHue`/`stepHue` → `moveHueLogic`/`stepHueLogic`, same pattern for
+ * saturation; `moveToHueAndSaturation` → COMPOSES `moveToHueLogic` and
+ * `moveToSaturationLogic` (overridden as ONE method below — see there for
+ * why); `moveToColor`/`moveColor`/`stepColor` → their `*Logic`s (+
+ * `switchColorMode`); `moveToColorTemperature`/`moveColorTemperature`/
+ * `stepColorTemperature` → their `*Logic`s; `stopMoveStep` →
+ * `stopMoveStepLogic`.
+ *
+ * **Enhanced-hue and ColorLoop are unreachable on both roles this class
+ * serves** — `colorTemperatureLight` enables only the `ColorTemperature`
+ * feature (see {@link IndigoColorTemperatureControlServer}) and
+ * `extendedColorLight` enables `HueSaturation`+`Xy`+`ColorTemperature`, never
+ * `EnhancedHue`/`ColorLoop` (matches the stock device type's own feature set,
+ * HR-1) — so `isEnhancedHue` is always `false` when these overrides run;
+ * `moveToHueLogic`/`stepHueLogic` still take the parameter (shared with
+ * `enhancedMoveToHue`/`enhancedStepHue` in the base class) and return early
+ * if it is ever seen `true`, defensively.
+ *
+ * **`switchColorMode` is overridden to a no-op, deliberately dropping a
+ * measured 0.17.8 bug along with it.** Its stock job is optimistically
+ * rewriting the OTHER colour representation's attributes locally when the
+ * ecosystem switches which one it drives — an unconfirmed claim about the
+ * lamp that Indigo never made, and measurably WRONG in one direction: the
+ * xy→HS branch calls `hsvToXy` where `xyToHsv` is needed
+ * (`ColorControlServer.js:1246-1247`, version-scoped to 0.17.8), which
+ * silently moved a measured `currentSaturation` from 200 to 82 in the probe
+ * that found it. `setColorMode`/`setEnhancedColorMode` themselves stay
+ * stock — `colorMode` is a statement about which channel the ecosystem is
+ * currently driving, and `colorPatch` (this file) rewrites it correctly on
+ * Indigo's next push regardless of what `switchColorMode` would have guessed.
+ *
+ * **Continuous `move*` commands with no target value write nothing today,
+ * confirmed by probe, and are left stock**: `moveHueLogic`, `moveSaturationLogic`
+ * and `moveColorLogic` each call `#startTransition` with no `targetValue`,
+ * and `Transitions.start` (unmanaged) returns immediately when the target is
+ * absent (`Transitions.js:74-76`) — there is nothing to report because
+ * nothing happened. `stepColorLogic` looked like it belonged on that list too
+ * (§4.2 P-4 grouped it there) but a probe of this exact matter.js version
+ * proved otherwise — it passes `targetValue: currentX + stepX`, which DOES
+ * reach `transitionImmediately` and silently move `currentX`/`currentY`
+ * (nothing watches them) — so it is overridden to a debug-logged no-op below,
+ * per HR-6, rather than left stock on the strength of the general pattern.
+ *
+ * `stopMoveStepLogic`/`stopHueAndSaturationMovement`/`stopAllColorMovement`
+ * stay stock: with nothing here ever starting a transition (every write path
+ * is overridden to `emitCommand` instead of `#startTransition`), there is
+ * nothing running for them to stop.
+ *
+ * `syncColorTemperatureWithLevelLogic` is unreachable and left stock: its
+ * only caller is `LevelControlServer.couple()` (`LevelControlServer.js:
+ * 400-412`), which {@link IndigoLevelControlServer}'s `transition()` override
+ * never calls.
+ */
+class IndigoColorControlServer extends ColorControlServer.with("HueSaturation", "Xy", "ColorTemperature") {
+    override moveToHueLogic(
+        targetHue: number,
+        _direction: ColorControl.Direction,
+        _transitionTime: number,
+        isEnhancedHue = false,
+    ): MaybePromise {
+        if (isEnhancedHue) {
+            return;
+        }
+        const hue = clamp(targetHue, 0, MATTER_LEVEL_MAX);
+        emitCommand(this.endpoint.id, "setColor", {
+            hue: matterHueToDegrees(hue),
+            saturation: matterToPercent(numberOr(this.state.currentSaturation, 0)),
+        });
+    }
+
+    override stepHueLogic(
+        stepMode: ColorControl.StepMode,
+        stepSize: number,
+        _transitionTime: number,
+        isEnhancedHue = false,
+    ): MaybePromise {
+        if (isEnhancedHue) {
+            return;
+        }
+        const direction = stepMode === ColorControl.StepMode.Up ? 1 : -1;
+        // Cyclic wraparound — mirrors stock's own addValueWithOverflow call
+        // here (ColorControlServer.js:402), see {@link addWithOverflow}.
+        const hue = addWithOverflow(numberOr(this.state.currentHue, 0), stepSize * direction, 0, MATTER_LEVEL_MAX);
+        emitCommand(this.endpoint.id, "setColor", {
+            hue: matterHueToDegrees(hue),
+            saturation: matterToPercent(numberOr(this.state.currentSaturation, 0)),
+        });
+    }
+
+    override moveToSaturationLogic(targetSaturation: number, _transitionTime: number): MaybePromise {
+        const saturation = clamp(targetSaturation, 0, MATTER_LEVEL_MAX);
+        emitCommand(this.endpoint.id, "setColor", {
+            hue: matterHueToDegrees(numberOr(this.state.currentHue, 0)),
+            saturation: matterToPercent(saturation),
+        });
+    }
+
+    override stepSaturationLogic(
+        stepMode: ColorControl.StepMode,
+        stepSize: number,
+        _transitionTime: number,
+    ): MaybePromise {
+        const direction = stepMode === ColorControl.StepMode.Up ? 1 : -1;
+        const saturation = clamp(numberOr(this.state.currentSaturation, 0) + stepSize * direction, 0, MATTER_LEVEL_MAX);
+        emitCommand(this.endpoint.id, "setColor", {
+            hue: matterHueToDegrees(numberOr(this.state.currentHue, 0)),
+            saturation: matterToPercent(saturation),
+        });
+    }
+
+    /**
+     * Overridden as ONE method, not left to compose {@link moveToHueLogic}
+     * and {@link moveToSaturationLogic} the way stock does
+     * (`ColorControlServer.js:577-582`). Composing them here would emit TWO
+     * `setColor` frames, and the second would read the STALE hue back out of
+     * `this.state.currentHue` — nothing here writes the attribute any more,
+     * so "the hue moveToHueLogic just reported" and "the hue
+     * moveToSaturationLogic reads" would permanently disagree. One frame
+     * carrying both requested values is also strictly less than stock's own
+     * double emission (`WATCH_HUE`'s doc used to apologise for exactly this
+     * — see its rewritten doc).
+     */
+    override moveToHueAndSaturationLogic(
+        targetHue: number,
+        targetSaturation: number,
+        _transitionTime: number,
+    ): MaybePromise {
+        const hue = clamp(targetHue, 0, MATTER_LEVEL_MAX);
+        const saturation = clamp(targetSaturation, 0, MATTER_LEVEL_MAX);
+        emitCommand(this.endpoint.id, "setColor", {
+            hue: matterHueToDegrees(hue),
+            saturation: matterToPercent(saturation),
+        });
+    }
+
+    override stepColorLogic(stepX: number, stepY: number, _transitionTime: number): MaybePromise {
+        // See the class doc: unlike moveColorLogic, this DOES write today
+        // (probe-confirmed) — currentX/currentY that nothing watches. Left
+        // unconverted in this PR (commit 6 only lands moveToColorLogic); a
+        // silent write is not an acceptable alternative (HR-6), so it is a
+        // debug-logged no-op instead.
+        logger.debug(
+            `Endpoint ${this.endpoint.id}: dropped stepColor (stepX=${stepX}, stepY=${stepY}) — CIE xy step ` +
+                "commands are not yet converted to §4.2 (only moveToColor is, #143)",
+        );
+    }
+
+    override moveToColorTemperatureLogic(targetMireds: number, _transitionTime: number): MaybePromise {
+        emitCommand(this.endpoint.id, "setColorTemp", { colorTempMireds: clampMireds(targetMireds) });
+    }
+
+    override moveColorTemperatureLogic(
+        moveMode: ColorControl.MoveMode,
+        _rate: number,
+        colorTemperatureMinimumMireds: number,
+        colorTemperatureMaximumMireds: number,
+    ): MaybePromise {
+        const target =
+            moveMode === ColorControl.MoveMode.Up ? colorTemperatureMaximumMireds : colorTemperatureMinimumMireds;
+        emitCommand(this.endpoint.id, "setColorTemp", { colorTempMireds: clampMireds(target) });
+    }
+
+    override stepColorTemperatureLogic(
+        stepMode: ColorControl.StepMode,
+        stepSize: number,
+        _transitionTime: number,
+        colorTemperatureMinimumMireds: number,
+        colorTemperatureMaximumMireds: number,
+    ): MaybePromise {
+        const direction = stepMode === ColorControl.StepMode.Up ? 1 : -1;
+        const target = clamp(
+            numberOr(this.state.colorTemperatureMireds, MIREDS_MIN) + stepSize * direction,
+            colorTemperatureMinimumMireds,
+            colorTemperatureMaximumMireds,
+        );
+        emitCommand(this.endpoint.id, "setColorTemp", { colorTempMireds: clampMireds(target) });
+    }
+
+    override switchColorMode(_oldMode: ColorControl.ColorMode, _newMode: ColorControl.ColorMode): MaybePromise {
+        // No-op — see class doc.
+    }
+}
+
+/**
+ * The `colorTemperatureLight` twin of {@link IndigoColorControlServer},
+ * carrying only the `ColorTemperature` feature — matching the stock device
+ * type's own `ColorControlServer.with("ColorTemperature")`
+ * (`color-temperature-light.js:24`, HR-1). `HueSaturation`/`Xy` do not exist
+ * on this role at all, so there is no hue/saturation/xy surface to override:
+ * only the three colour-temperature `*Logic` methods and `switchColorMode`
+ * (which can still fire between CT and whatever mode the attribute started
+ * in, so it gets the same no-op for the same reason as the full class).
+ */
+class IndigoColorTemperatureControlServer extends ColorControlServer.with("ColorTemperature") {
+    override moveToColorTemperatureLogic(targetMireds: number, _transitionTime: number): MaybePromise {
+        emitCommand(this.endpoint.id, "setColorTemp", { colorTempMireds: clampMireds(targetMireds) });
+    }
+
+    override moveColorTemperatureLogic(
+        moveMode: ColorControl.MoveMode,
+        _rate: number,
+        colorTemperatureMinimumMireds: number,
+        colorTemperatureMaximumMireds: number,
+    ): MaybePromise {
+        const target =
+            moveMode === ColorControl.MoveMode.Up ? colorTemperatureMaximumMireds : colorTemperatureMinimumMireds;
+        emitCommand(this.endpoint.id, "setColorTemp", { colorTempMireds: clampMireds(target) });
+    }
+
+    override stepColorTemperatureLogic(
+        stepMode: ColorControl.StepMode,
+        stepSize: number,
+        _transitionTime: number,
+        colorTemperatureMinimumMireds: number,
+        colorTemperatureMaximumMireds: number,
+    ): MaybePromise {
+        const direction = stepMode === ColorControl.StepMode.Up ? 1 : -1;
+        const target = clamp(
+            numberOr(this.state.colorTemperatureMireds, MIREDS_MIN) + stepSize * direction,
+            colorTemperatureMinimumMireds,
+            colorTemperatureMaximumMireds,
+        );
+        emitCommand(this.endpoint.id, "setColorTemp", { colorTempMireds: clampMireds(target) });
+    }
+
+    override switchColorMode(_oldMode: ColorControl.ColorMode, _newMode: ColorControl.ColorMode): MaybePromise {
+        // No-op — see IndigoColorControlServer's class doc.
+    }
+}
+
+/**
  * DoorLock, with the auto-confirmation removed.
  *
  * matter.js's stock `lockDoor`/`unlockDoor` set `lockState` themselves and emit
@@ -961,6 +1222,14 @@ function movementPosition(direction: MovementDirection, targetPercent100ths?: nu
  * turn). Nothing in the matter.js docs says so — the typings mark them
  * optional, which is why they are pinned here with a reason rather than
  * discovered again.
+ *
+ * `options: { executeIfOff: true }` is #143's ColorControl half of the same
+ * seed {@link LEVEL_CONTROL_INITIAL} carries — read that constant's doc for
+ * the reasoning (Indigo's own semantics, the no-auto-confirm confirmation
+ * loop, the known limits); it applies to `moveToHue`/`moveToColor`/
+ * `moveToColorTemperature` and siblings exactly as it does to LevelControl's
+ * commands, via the identical `#optionsAllowExecution` gate
+ * (`ColorControlServer.js:1444-1446`).
  */
 function colorControlDefaults(hueSaturation: boolean): Record<string, unknown> {
     return {
@@ -971,6 +1240,7 @@ function colorControlDefaults(hueSaturation: boolean): Record<string, unknown> {
         colorTempPhysicalMaxMireds: MIREDS_MAX,
         coupleColorTempToLevelMinMireds: MIREDS_MIN,
         startUpColorTemperatureMireds: null,
+        options: { executeIfOff: true },
         ...(hueSaturation ? { currentHue: 0, currentSaturation: 0 } : {}),
     };
 }
@@ -1529,6 +1799,7 @@ const ROLE_DEFINITIONS: Record<RoleValue, RoleDefinition> = {
                 BridgedDeviceBasicInformationServer,
                 IndigoOnOffServer,
                 IndigoLevelControlServer,
+                IndigoColorTemperatureControlServer,
             ),
         initialState: () => ({
             [LEVEL_CONTROL]: { ...LEVEL_CONTROL_INITIAL },
@@ -1549,7 +1820,7 @@ const ROLE_DEFINITIONS: Record<RoleValue, RoleDefinition> = {
                 BridgedDeviceBasicInformationServer,
                 IndigoOnOffServer,
                 IndigoLevelControlServer,
-                ColorControlServer.with("HueSaturation", "Xy", "ColorTemperature"),
+                IndigoColorControlServer,
             ),
         initialState: () => ({
             [LEVEL_CONTROL]: { ...LEVEL_CONTROL_INITIAL },
