@@ -3,6 +3,43 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
+## 2026.19.0 — exported brightness and colour wait for Indigo too
+
+> Takes effect on a live install only once the paired bridge-node release
+> ships; the plugin pins the bridge node by exact version.
+
+### Changed
+
+- **Exported dimmers and colour lights no longer move optimistically**
+  (issue #143, the LevelControl/ColorControl half — the onOff half shipped
+  in 2026.17.0). Dragging the brightness slider, or picking a new colour or
+  colour temperature, in Apple Home/Google/Alexa sends the command to Indigo
+  and the control springs back only once Indigo reports the real level or
+  colour — the same rule the on/off tile, locks and covers already followed.
+  Brightness and colour differ on one point while the accessory is showing
+  off: a brightness command still forwards and turns the light on to that
+  level (Indigo's own semantics), while a colour command is ignored until
+  the light is confirmed on, matching this bridge's pre-#143 behaviour.
+  **No accessory is re-created and no room assignment is lost by this
+  release** — unlike 2026.18.0's battery migration, this is a behaviour
+  change only: the exported accessory's identity, name and room stay exactly
+  as they were.
+- **CIE xy colour commands now reach Indigo too.** An ecosystem driving an
+  exported colour light in its xy representation used to be silently
+  ignored; it now reports the equivalent hue/saturation, converted through
+  the cluster's own conversion utility for that direction.
+
+### Fixed
+
+- **`extendedColorLight` accessories gain the `RemainingTime` attribute
+  their device type mandates** (conformance fix, HR-1) — attribute addition
+  only, no accessory recreation.
+- **A dimmer command carrying `WithOnOff` can no longer strand a running
+  ecosystem "on for N minutes" countdown** — closes the remaining half of
+  issue #201's ghost-timer defect: the coupling that used to move the on/off
+  state directly, ahead of Indigo's confirmation, is now itself invocation-
+  driven.
+
 ## 2026.18.0 — battery level on exported accessories
 
 > Takes effect on a live install only once the paired bridge-node release

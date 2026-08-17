@@ -127,7 +127,11 @@ export class BridgeWsServer {
         const socket = this.#attached;
         if (socket === undefined) {
             const device = typeof data.indigoDeviceId === "number" ? ` for device ${data.indigoDeviceId}` : "";
-            this.#log(`Dropping ${event} event${device}: no client is attached`);
+            // Names the command too: a slider drag can drop 50 of these in a
+            // row, and 50 anonymous "command event dropped" lines are much
+            // harder to read than 50 lines that each say `setLevel`.
+            const command = typeof data.command === "string" ? ` (${data.command})` : "";
+            this.#log(`Dropping ${event} event${device}${command}: no client is attached`);
             return;
         }
         const frame: EventFrame = { event, data };
