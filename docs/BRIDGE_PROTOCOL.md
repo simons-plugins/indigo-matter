@@ -465,7 +465,12 @@ ecosystem acts. Both are enumerated here in full; there is no other source.
   (a dimmer `*WithOnOff` command) used to write the OnOff attribute directly
   and reach Indigo through an attribute watcher; #143 converted that command
   too, so it now reports through the same per-invocation path as everything
-  else in this row. The watchers that used to be the producers for `onOff`/
+  else in this row. A `*WithOnOff` command's frames depend on direction
+  (issue #239): to the minLevel boundary it emits `setLevel {level: 0}` then
+  `onOff {value: false}`; to any other level it emits `setLevel` ALONE —
+  Indigo's own turn-on-to-level semantics do the turn-on, and a leading
+  `onOff {value: true}` was live-observed racing the level command's Z-Wave
+  reports and landing Indigo's brightness state at a stale 0. The watchers that used to be the producers for `onOff`/
   `setLevel`/`setColorTemp`/`setColor` are still wired, but only as
   backstops — a regression detector in case a future matter.js version
   starts writing one of these attributes again in a remote context, not the

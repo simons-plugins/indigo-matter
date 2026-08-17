@@ -1017,8 +1017,10 @@ describe("command events and the echo guard (§4.2, §6.4)", () => {
                 }),
             );
 
+            // setLevel ALONE for the up direction (#239): Indigo's
+            // turn-on-to-level does the turn-on, and the leading onOff frame
+            // was live-observed racing the level command's Z-Wave reports.
             assert.deepEqual(h.commands, [
-                { indigoDeviceId: 1, command: "onOff", args: { value: true } },
                 { indigoDeviceId: 1, command: "setLevel", args: { level: 50 } },
             ]);
             assert.equal(
@@ -2132,12 +2134,14 @@ describe("LevelControl command conversion (§4.2, #143)", () => {
                 ],
             ],
             [
-                "moveToLevelWithOnOff(152) — any other level emits on THEN level",
+                "moveToLevelWithOnOff(152) — any other level emits setLevel ONLY (#239)",
+                // No onOff frame at all: Indigo's turn-on-to-level semantics
+                // do the turn-on, and a leading turnOn's stale Z-Wave report
+                // (stored level 0 after a slider-to-zero) was live-observed
+                // landing Indigo's brightness state at 0 — then mirrored back
+                // out to every ecosystem. Simon's ruling on #239.
                 lc => lc.moveToLevelWithOnOff({ level: 152, transitionTime: null, optionsMask: {}, optionsOverride: {} }),
-                [
-                    { indigoDeviceId: 1, command: "onOff", args: { value: true } },
-                    { indigoDeviceId: 1, command: "setLevel", args: { level: 60 } },
-                ],
+                [{ indigoDeviceId: 1, command: "setLevel", args: { level: 60 } }],
             ],
             [
                 "moveWithOnOff(Down, 10) — clamped-target boundary, not stock's -Infinity!==minLevel bug",
@@ -2315,7 +2319,6 @@ describe("LevelControl command conversion (§4.2, #143)", () => {
                 }),
             );
             assert.deepEqual(h.commands, [
-                { indigoDeviceId: 1, command: "onOff", args: { value: true } },
                 { indigoDeviceId: 1, command: "setLevel", args: { level: 60 } },
             ]);
         } finally {

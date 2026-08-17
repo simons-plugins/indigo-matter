@@ -895,8 +895,20 @@ class IndigoLevelControlServer extends LevelControlServer.with("Lighting", "OnOf
             setLevel();
             emitCommand(this.endpoint.id, "onOff", { value: false });
         } else {
-            // On-then-level — mirrors couple()'s immediate write ordering.
-            emitCommand(this.endpoint.id, "onOff", { value: true });
+            // Level ONLY — no onOff frame at all, deliberately NOT couple()'s
+            // on-then-level order (issue #239, Simon's ruling). Indigo's
+            // turn-on-to-level semantics make the level command do the
+            // turn-on itself, reporting the right level; every role carrying
+            // LevelControl maps to an Indigo dimmer, so there is no
+            // non-dimmer driver for a belt-and-braces onOff to serve. The
+            // old leading `turnOn` restored the dimmer's stored level (0
+            // after a slider-to-zero) and its stale Z-Wave report arrived
+            // AFTER setBrightness's — Indigo's brightness state landed at 0
+            // and the bridge then faithfully mirrored the wrong truth back
+            // to every ecosystem (~10s later in Apple Home, live-observed).
+            // The min-level branch above keeps its explicit off: "off" is a
+            // state change setBrightness(0) implies but an off frame states,
+            // and it is the direction that was observed working correctly.
             setLevel();
         }
     }
