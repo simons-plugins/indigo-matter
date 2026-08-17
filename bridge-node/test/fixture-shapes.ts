@@ -265,6 +265,20 @@ export const rebuiltStatus = {
 } satisfies StatusReport;
 
 /**
+ * §4.1 issue #220: `batteryLevel` against an endpoint that was not created
+ * with a battery. The onOffLight from {@link attachWithEndpoints}
+ * (123456789) is the target — it is `attach_with_endpoints`' own device,
+ * created without `battery`, chosen because it is the plainest possible
+ * "this device is not battery-capable" fixture already in the file.
+ */
+export const setStateBatteryOnMainsEndpoint = {
+    message_id: "m70",
+    error_code: "malformed_args",
+    details: "endpoint 123456789 was not created with a battery, so batteryLevel cannot be " +
+        "published; re-export the device (§4.1)",
+} satisfies ErrorFrame;
+
+/**
  * §1.1's refuse-to-start refusal (PRD §7).
  *
  * The request it answers is an ordinary `upsert_endpoint`, chosen because it is
