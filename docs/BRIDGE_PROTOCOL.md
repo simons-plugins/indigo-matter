@@ -476,6 +476,18 @@ ecosystem acts. Both are enumerated here in full; there is no other source.
   through the ColorControl cluster's own hue/saturation conversion
   (`xyToHsv`), so Indigo never has to speak a colour space §4.2 does not
   define.
+- This table is the complete producer contract, so it is worth naming what
+  is deliberately absent from it. Commands that yield **no** `command`
+  frame: continuous `moveHue`/`moveSaturation`/`moveColor` (no target value
+  — nothing happens at the cluster level, so nothing is reported, matching
+  stock); `stepColor` (writes silently in stock, so it is a debug-logged
+  drop rather than a reported command — CIE xy step commands are not yet
+  converted); and, as of the level/colour invocation conversion, a direct
+  colour command reaching an accessory the node believes is off (gated
+  behind matter.js's own `executeIfOff`, stock behaviour, unchanged from
+  before #143). A plain `moveToLevel`/`move`/`step` on an off accessory is
+  the opposite case — it *is* forwarded, because Indigo's own semantics
+  treat "set brightness while off" as turn-on-to-that-level.
 - `batteryLevel: 1-100` (issue #220) is the first **role-independent**
   `set_state` key — valid for `set_state` against ANY role whose endpoint was
   built with `battery: true` (§4.1), not listed against any single role above.

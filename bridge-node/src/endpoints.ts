@@ -225,10 +225,16 @@ export function percentToBatteryRemaining(percent: number): number {
 /**
  * The value actually written to `currentLevel`.
  *
- * The Lighting feature constrains `currentLevel` to 1-254 on all four lighting
- * device types (verified against the 0.17.8 device definitions, which `alter`
- * the attribute to `min: 1`), so a literal 0 fails validation. Writing 1
- * instead is lossless at the protocol boundary: {@link matterToPercent}(1) is 0.
+ * The Lighting feature constrains `currentLevel` to 1-254 on every role this
+ * bridge builds — not because of a per-device-type `alter` (the three
+ * converted roles use a bare `.with("Lighting", "OnOff")`, which drops
+ * whatever `currentLevel` alter the stock device definitions carry), but
+ * because `LevelControlServer` itself derives `minLevel` as `1` whenever the
+ * Lighting feature is enabled and enforces `currentLevel` against it at
+ * construction (probed: matter.js 0.17.8 refuses anything else with "The
+ * minLevel value of 0 is invalid according to Matter specification"). So a
+ * literal 0 still fails validation, and writing 1 instead is still lossless
+ * at the protocol boundary: {@link matterToPercent}(1) is 0.
  *
  * Note that this does **not** also write OnOff false: {@link levelPatch} never
  * touches the OnOff cluster. Turning a light off at 0% is the plugin's call —
@@ -700,7 +706,18 @@ function emitCommand(
  * `couple()` at all: the overridden `transition()` replaces the whole method
  * body, so nothing downstream of a dimmer command ever reaches
  * `agent.get(OnOffServer).state.onOff = …` any more. The coupling went
- * invocation-driven in the same PR as `onOff` itself.
+ * invocation-driven under the same issue (#143) as `onOff` itself, but two
+ * releases later: `onOff` shipped in 2026.17.0, this conversion in 2026.19.0.
+ *
+ * **`#applySceneValues`'s own equality guard is pre-existing, and it is
+ * identical to {@link IndigoLevelControlServer}'s.** `OnOffServer.js:197`:
+ * `this.state.onOff === onOff` returns before the scene ever reaches
+ * `on()`/`off()`. Under no-auto-confirm that attribute is Indigo's last
+ * CONFIRMED value, not the device's real one, so a scene recalling the
+ * currently-confirmed on/off state emits nothing even if the device has
+ * since drifted. Private method, not interceptable from here; noted rather
+ * than fixed — see {@link IndigoLevelControlServer}'s own class doc for the
+ * fuller version of this same risk.
  */
 class IndigoOnOffServer extends OnOffServer.with("Lighting") {
     /**
@@ -745,9 +762,14 @@ class IndigoOnOffServer extends OnOffServer.with("Lighting") {
             if (!value && internal?.timedOnTimer?.isRunning) {
                 logger.debug(
                     `Endpoint ${this.endpoint.id}: an off push matched an already-off onOff attribute while a ` +
-                        "timed-on countdown is still running — a replayed push racing its own confirmation " +
-                        "(harmless; the countdown must survive). #143 removed the only other way this state " +
-                        "could arise (LevelControl's onOff coupling writing ahead of Indigo).",
+                        "timed-on countdown is still running — most likely a replayed push racing its own " +
+                        "confirmation (harmless; the countdown must survive). Two other reachable causes: a " +
+                        "countdown whose ON command was dropped while the plugin was detached (the command sink " +
+                        "outlives the socket; ws-server's sendEvent drops that frame per-attempt when nobody is " +
+                        "attached — this IS a genuine ghost, and the countdown's own expiry can turn off a lamp " +
+                        "someone manually re-lit in the meantime), and a spec upsert landing during a " +
+                        "confirmation window. #143 removed a fourth explanation for this state (LevelControl's " +
+                        "onOff coupling writing ahead of Indigo) but is not the only one left.",
                 );
             }
             return;
@@ -780,6 +802,19 @@ class IndigoOnOffServer extends OnOffServer.with("Lighting") {
  * transitions off (see {@link LEVEL_CONTROL_INITIAL}) there is nothing
  * running to stop and nothing to report, so they are left stock.
  *
+ * **`#applySceneValues`'s own equality guard runs BEFORE the funnel above,
+ * and it compares against the LAGGING attribute.** `LevelControlServer.js:
+ * 455`: `this.state.currentLevel === level` returns without ever reaching
+ * `transition()`. Under no-auto-confirm that attribute is Indigo's last
+ * CONFIRMED level, not the device's real one, so a scene recalling the
+ * currently-confirmed level emits nothing even if the device has since
+ * drifted — and a recall landing inside a slider's confirmation window can
+ * silently skip the level half of the scene while colour/onOff (whose own
+ * guards read the same lagging attribute, but happen to differ at that
+ * moment) still apply, a partial scene. This is a private method, so it
+ * cannot be intercepted or overridden from here; noted rather than fixed,
+ * and worth revisiting upstream if it bites in the field.
+ *
  * **`_changePerS` is deliberately unused.** With
  * `managedTransitionTimeHandling: false`, `Transitions.start` collapses
  * every rate and every transition time to ONE immediate write of the final
@@ -793,7 +828,7 @@ class IndigoOnOffServer extends OnOffServer.with("Lighting") {
  * and `step` can arrive below `minLevel`/above `maxLevel` (`stepLogic` adds
  * `stepSize` to `currentLevel` with no crop, `:315`). Stock
  * `Transitions.start` bounds every target against the configured min/max
- * before it ever writes an attribute (`Transitions.js:74-79`); overriding
+ * before it ever writes an attribute (`Transitions.js:71-82`); overriding
  * `transition()` bypasses that clamp entirely, so skipping it here would let
  * an `Infinity` reach {@link matterToPercent} and, from there, Indigo.
  *
@@ -813,8 +848,10 @@ class IndigoOnOffServer extends OnOffServer.with("Lighting") {
  * `moveWithOnOff(Down)` reaches stock `couple()` with `targetLevel =
  * -Infinity`, which is `!== minLevel` *before* clamping, so stock's own logic
  * turns the light ON for a command asking it to dim toward off
- * (`LevelControlServer.js:363,382`) — comparing the already-clamped value to
- * `minLevel` cannot make that mistake.
+ * (`LevelControlServer.js:363,369,382` — 363 is `couple()` itself, 369 the
+ * `targetLevel === this.minLevel` comparison this paragraph is about, 382
+ * the immediate-write `else` branch) — comparing the already-clamped value
+ * to `minLevel` cannot make that mistake.
  *
  * **The `onOff` half emits unconditionally**, even when the pushed value
  * already matches what the attribute (still) says — the same "a frequency
@@ -840,6 +877,12 @@ class IndigoLevelControlServer extends LevelControlServer.with("Lighting", "OnOf
         withOnOff = false,
         _options: LevelControl.Options = {},
     ): MaybePromise {
+        // `this.currentLevel` (the getter, not `this.state.currentLevel`)
+        // THROWS a StatusResponseError if the attribute is ever null, where
+        // stock's own transition() silently no-ops instead. Unreachable
+        // today — LEVEL_CONTROL_INITIAL seeds 1, and every stock caller here
+        // passes a number for targetLevel — but recorded so a future change
+        // that makes it reachable fails loudly instead of surprising.
         const level = clamp(targetLevel ?? this.currentLevel, this.minLevel, this.maxLevel);
         const setLevel = (): void => emitCommand(this.endpoint.id, "setLevel", { level: matterToPercent(level) });
         if (!withOnOff) {
@@ -865,9 +908,10 @@ class IndigoLevelControlServer extends LevelControlServer.with("Lighting", "OnOf
  * `@matter/general` is not a direct dependency (only `@matter/main`/
  * `@matter/nodejs` are, per `package.json`) — it is a transitive one matter.js
  * itself imports the real function from (`Number.js:43-50`) to give
- * `stepHueLogic` its cyclic wraparound. The body below is byte-for-byte the
- * same three branches; duplicated rather than reached into `node_modules` for,
- * because a two-line arithmetic helper is not worth a new declared dependency.
+ * `stepHueLogic` its cyclic wraparound. The body below is branch-for-branch
+ * the same three branches (variable names differ); duplicated rather than
+ * reached into `node_modules` for, because a two-line arithmetic helper is
+ * not worth a new declared dependency.
  */
 function addWithOverflow(value: number, add: number, min: number, max: number): number {
     const next = value + add;
@@ -898,15 +942,21 @@ function addWithOverflow(value: number, add: number, min: number, max: number): 
  * `stepColorTemperature` → their `*Logic`s; `stopMoveStep` →
  * `stopMoveStepLogic`.
  *
- * **Enhanced-hue and ColorLoop are unreachable on both roles this class
- * serves** — `colorTemperatureLight` enables only the `ColorTemperature`
- * feature (see {@link IndigoColorTemperatureControlServer}) and
- * `extendedColorLight` enables `HueSaturation`+`Xy`+`ColorTemperature`, never
- * `EnhancedHue`/`ColorLoop` (matches the stock device type's own feature set,
- * HR-1) — so `isEnhancedHue` is always `false` when these overrides run;
- * `moveToHueLogic`/`stepHueLogic` still take the parameter (shared with
- * `enhancedMoveToHue`/`enhancedStepHue` in the base class) and return early
- * if it is ever seen `true`, defensively.
+ * **Enhanced-hue and ColorLoop are unreachable on the role this class itself
+ * serves (`extendedColorLight`), and on the CT twin's role
+ * (`colorTemperatureLight`, {@link IndigoColorTemperatureControlServer}) —
+ * this class serves exactly ONE role, not two.** `colorTemperatureLight`
+ * enables only the `ColorTemperature` feature and `extendedColorLight`
+ * enables `HueSaturation`+`Xy`+`ColorTemperature`, never `EnhancedHue`/
+ * `ColorLoop`. That absence is the one respect in which this class's
+ * feature set matches the stock device type's own (HR-1) — `HueSaturation`
+ * itself is a deliberate ADDITION over bare stock, not a match (stock builds
+ * `extendedColorLight` with `Xy`+`ColorTemperature` only; see
+ * {@link ROLE_DEFINITIONS}'s own `extendedColorLight` entry) — so
+ * `isEnhancedHue` is always `false` when these overrides run;
+ * `moveToHueLogic`/`stepHueLogic` still
+ * take the parameter (shared with `enhancedMoveToHue`/`enhancedStepHue` in
+ * the base class) and return early if it is ever seen `true`, defensively.
  *
  * **`switchColorMode` is overridden to a no-op, deliberately dropping a
  * measured 0.17.8 bug along with it.** Its stock job is optimistically
@@ -914,7 +964,7 @@ function addWithOverflow(value: number, add: number, min: number, max: number): 
  * ecosystem switches which one it drives — an unconfirmed claim about the
  * lamp that Indigo never made, and measurably WRONG in one direction: the
  * xy→HS branch calls `hsvToXy` where `xyToHsv` is needed
- * (`ColorControlServer.js:1246-1247`, version-scoped to 0.17.8), which
+ * (`ColorControlServer.js:1244-1246`, version-scoped to 0.17.8), which
  * silently moved a measured `currentSaturation` from 200 to 82 in the probe
  * that found it. `setColorMode`/`setEnhancedColorMode` themselves stay
  * stock — `colorMode` is a statement about which channel the ecosystem is
@@ -925,7 +975,7 @@ function addWithOverflow(value: number, add: number, min: number, max: number): 
  * confirmed by probe, and are left stock**: `moveHueLogic`, `moveSaturationLogic`
  * and `moveColorLogic` each call `#startTransition` with no `targetValue`,
  * and `Transitions.start` (unmanaged) returns immediately when the target is
- * absent (`Transitions.js:74-76`) — there is nothing to report because
+ * absent (`Transitions.js:72-74`) — there is nothing to report because
  * nothing happened. `stepColorLogic` looked like it belonged on that list too
  * (§4.2 P-4 grouped it there) but a probe of this exact matter.js version
  * proved otherwise — it passes `targetValue: currentX + stepX`, which DOES
@@ -1023,8 +1073,8 @@ class IndigoColorControlServer extends ColorControlServer.with("HueSaturation", 
      * so "the hue moveToHueLogic just reported" and "the hue
      * moveToSaturationLogic reads" would permanently disagree. One frame
      * carrying both requested values is also strictly less than stock's own
-     * double emission (`WATCH_HUE`'s doc used to apologise for exactly this
-     * — see its rewritten doc).
+     * double emission — the pre-#143 shape {@link WATCH_HUE}'s doc now
+     * records as backstop history.
      */
     override moveToHueAndSaturationLogic(
         targetHue: number,
@@ -1042,11 +1092,14 @@ class IndigoColorControlServer extends ColorControlServer.with("HueSaturation", 
     /**
      * CIE xy → §4.2 `setColor` (#143 commit 6). There is no xy vocabulary in
      * §4.2 — `setColor` only ever carries hue/saturation — so an ecosystem
-     * driving the light in its xy representation is converted through the
-     * SAME stock `xyToHsv` matter.js's own `switchColorMode` uses internally
-     * (`ColorConversionUtils.js`, re-exported from
-     * `@matter/main/behaviors/color-control`), rather than this file
-     * inventing a second CIE conversion to maintain.
+     * driving the light in its xy representation is converted through
+     * `xyToHsv`, the cluster's own conversion utility for exactly this
+     * direction (`ColorConversionUtils.js`, re-exported from
+     * `@matter/main/behaviors/color-control`) — NOT the conversion
+     * `switchColorMode` actually calls today (that direction is the measured
+     * 0.17.8 bug {@link switchColorMode}'s override drops, see the class
+     * doc), but the one it was meant to use, and the one this file would
+     * otherwise have to invent a duplicate of.
      *
      * `targetX`/`targetY` arrive as raw Matter `uint16` values (0-65279, see
      * `MAX_CIE_XY_VALUE`); `xyToHsv` expects the 0..1 CIE fraction the same
@@ -1346,30 +1399,44 @@ function colorControlDefaults(hueSaturation: boolean): Record<string, unknown> {
  * single final value — see that class's own doc). 0.17.8 already defaults it
  * to `false`, so the pin still changes no behaviour today; it is here so a
  * future default flip cannot silently sever the whole `setLevel` family.
- * `ColorControl` defaults the same field `false` too, but is deliberately
- * NOT pinned in {@link colorControlDefaults}: {@link IndigoColorControlServer}
- * overrides every command that would otherwise depend on it, so there is
- * nothing left for a future default flip to sever there.
+ * `ColorControl` defaults the same field `false` too, and it is deliberately
+ * NOT pinned in {@link colorControlDefaults} — but that omission is a real
+ * gap, not a non-issue the way it might read. `moveHueLogic`/
+ * `moveSaturationLogic`/`moveColorLogic` are left STOCK (see
+ * {@link IndigoColorControlServer}'s class doc) and are exactly the commands
+ * this flag gates: today, with no target value, `Transitions.start`'s
+ * unmanaged branch returns immediately and they write nothing
+ * (probe-confirmed). A future matter.js default flip to `true` would start a
+ * MANAGED transition instead, writing `currentHue`/`currentSaturation`/
+ * `currentX`/`currentY` in an offline context {@link isEcosystemChange}
+ * swallows as if the plugin itself had written it — silent local drift
+ * between the attribute and what the plugin believes, with no `command`
+ * event to catch it. Left unpinned rather than fixed here: unlike
+ * {@link LEVEL_CONTROL_INITIAL}'s pin, which protects a path this bridge
+ * actively overrides (`transition()`), there is no equivalent single
+ * override on the ColorControl side to hang the same protection off.
  *
  * **`options: { executeIfOff: true, coupleColorTempToLevel: false }`.**
- * `executeIfOff` is matter.js's own gate (`#optionsAllowExecution`,
- * `LevelControlServer.js:443-445`): left at the cluster's own default
- * (`false`), a `moveToLevel`/`move`/`step` sent while the OnOff *attribute*
- * still reads `false` is silently dropped before
- * {@link IndigoLevelControlServer} ever sees it. In Indigo, setting a
- * brightness level on a device that is off natively means "turn it on at
- * that level" — that is not an edge case the gate is right to refuse, it is
- * the ordinary meaning of the command, and Indigo is the one system here
- * that actually knows it. Seeding the option `true` lets the command reach
- * the override, which reports it as `setLevel`; the confirmation loop is the
- * same no-auto-confirm shape as everywhere else in this file — Indigo turns
- * the device on, pushes `onOff: true` alongside the level, and the tile
- * catches up once that push lands, not before. KNOWN LIMITS: `options` is
- * itself a writable attribute (an ecosystem could in principle write it back
- * to `false`), and a *plain* `MoveToLevel` (no `WithOnOff`) on a genuinely-off
- * lamp now forwards where it used to be dropped — harmless in practice, since
- * Apple's brightness slider sends `MoveToLevelWithOnOff`, which was never
- * gated in the first place, so the common path is unaffected either way.
+ * In Indigo, setting a brightness level on a device that is off natively
+ * means "turn it on at that level" — that is not an edge case worth
+ * refusing, it is the ordinary meaning of the command, and Indigo is the one
+ * system here that actually knows it. `executeIfOff` is matter.js's own gate
+ * for exactly this case (`#optionsAllowExecution`, `LevelControlServer.js:
+ * 443-445`): left at the cluster's own default (`false`), a
+ * `moveToLevel`/`move`/`step` sent while the OnOff *attribute* still reads
+ * `false` is silently dropped before {@link IndigoLevelControlServer} ever
+ * sees it. Seeding the option `true` lets the command reach the override,
+ * which reports it as `setLevel`; the confirmation loop is the same
+ * no-auto-confirm shape as everywhere else in this file — Indigo turns the
+ * device on, pushes `onOff: true` alongside the level, and the tile catches
+ * up once that push lands, not before. KNOWN LIMITS: `options` is itself a
+ * writable attribute (an ecosystem could in principle write it back to
+ * `false` — pinned as a real test, not just a comment, in "executeIfOff is
+ * itself writable…"), and a *plain* `MoveToLevel` (no `WithOnOff`) on a
+ * genuinely-off lamp now forwards where it used to be dropped — harmless in
+ * practice, since Apple's brightness slider sends `MoveToLevelWithOnOff`,
+ * which was never gated in the first place, so the common path is
+ * unaffected either way.
  * `coupleColorTempToLevel: false` is the cluster's own default restated, not
  * a behaviour change — it is here so a reader chasing why `couple()`'s
  * colour-temperature branch (`LevelControlServer.js:400-412`) never fires
@@ -1515,6 +1582,7 @@ const WATCH_LEVEL: WatchSpec = {
         typeof value === "number" ? { command: "setLevel", args: { level: matterToPercent(value) } } : undefined,
 };
 
+/** A backstop, not the producer, as of #143 — same reasoning as {@link WATCH_LEVEL}. */
 const WATCH_COLOR_TEMP: WatchSpec = {
     behavior: COLOR_CONTROL,
     attribute: "colorTemperatureMireds",
@@ -1526,11 +1594,26 @@ const WATCH_COLOR_TEMP: WatchSpec = {
 
 /**
  * Hue and saturation are one §4.2 command (`setColor` carries both), so each
- * observable reads its partner out of the endpoint's current state. Matter
- * changes them in one transaction for `moveToHueAndSaturation`, which yields two
- * events and therefore two `setColor` emissions with the same final values —
- * harmless (the plugin applies the same colour twice) and much simpler than
- * coalescing.
+ * observable reads its partner out of the endpoint's current state.
+ *
+ * **A backstop, not the producer, as of #143 — same status as
+ * {@link WATCH_LEVEL}, for the identical reason.** `moveToHue`/`stepHue`/
+ * `moveToSaturation`/`stepSaturation`/`moveToHueAndSaturation` are now
+ * reported by {@link IndigoColorControlServer}'s `*Logic` overrides, which
+ * never write `currentHue`/`currentSaturation` at all, so under normal
+ * operation neither observable fires. Kept wired for the same two reasons
+ * {@link WATCH_LEVEL} is: a regression detector for a future matter.js
+ * version that starts writing these attributes again in a remote context,
+ * and because {@link watchCommands}'s throw-on-missing-observable check is
+ * itself a live contract test that `currentHue$Changed`/
+ * `currentSaturation$Changed` still exist on this matter.js version.
+ *
+ * Before #143's ColorControl conversion, this pair *was* the producer, and
+ * Matter changing both in one transaction for `moveToHueAndSaturation` meant
+ * two `setColor` emissions with the same final values for one ecosystem
+ * command — harmless (the plugin applies the same colour twice), but worth
+ * closing anyway; see {@link IndigoColorControlServer.moveToHueAndSaturationLogic}
+ * for how the live producer now avoids it in one frame instead of two.
  */
 const WATCH_HUE: WatchSpec = {
     behavior: COLOR_CONTROL,
