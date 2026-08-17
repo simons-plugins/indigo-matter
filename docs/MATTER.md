@@ -459,13 +459,14 @@ notice: a command that matches what the accessory already believes — tapping
 Indigo instead of being silently dropped. (If the real device was off, that
 tap now turns it on; if Indigo already agreed with the tile, Indigo treats it
 as a no-op, so a tile that itself drifted out of sync still waits for the next
-real state change to catch up.) Two boundaries to know about: the brightness
-slider on a lamp that is showing off still flips the accessory's on-state
-immediately — that half rides the dimmer machinery and is tracked for the
-dimmer/colour conversion work. And if an ecosystem starts a timed
-"turn off in N minutes" countdown and you turn the device off in Indigo before
-it fires, the countdown is cancelled rather than firing late on a device that
-is already off.
+real state change to catch up.) Brightness and colour now behave the same
+way: dragging the slider on a lamp that is showing off, or picking a new
+colour or colour temperature, waits on Indigo the same way the on/off tile
+does — the slider or colour wheel springs back to where it was until Indigo
+confirms, rather than moving immediately. One boundary to know about: if an
+ecosystem starts a timed "turn off in N minutes" countdown and you turn the
+device off in Indigo before it fires, the countdown is cancelled rather than
+firing late on a device that is already off.
 
 ### What cannot be exported, and why
 

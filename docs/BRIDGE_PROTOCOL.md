@@ -454,14 +454,28 @@ ecosystem acts. Both are enumerated here in full; there is no other source.
   the node owns all Matter wire conversions (0.01°C, mireds bounds-clamping,
   the illuminance log scale). Exactly one converter per role, in the node,
   next to the cluster it feeds.
-- `onOff` is emitted per ecosystem *invocation* for the whole command surface
-  (on / off / toggle / onWithTimedOff / offWithEffect /
-  onWithRecallGlobalScene) — so a command that matches the accessory's current
-  state is still forwarded, the same way `lock`/`unlock` already were. One
-  attribute-driven producer remains: LevelControl's onOff coupling (a dimmer
-  `*WithOnOff` command) writes the attribute directly, and that change is
-  emitted per attribute change as before. Both producers emit the identical
-  wire shape.
+- Every command in this table is emitted per ecosystem *invocation*, not per
+  attribute change — `lock`/`unlock` and `goToPosition`/`stopMotion` always
+  worked this way; as of #143, `onOff`, `setLevel`, `setColorTemp` and
+  `setColor` do too. A command that matches the accessory's current state is
+  still forwarded (on / off / toggle / onWithTimedOff / offWithEffect /
+  onWithRecallGlobalScene all report even when nothing here moved), the same
+  way `lock`/`unlock` already did. There is no longer an attribute-driven
+  producer anywhere in the light/plug family: LevelControl's onOff coupling
+  (a dimmer `*WithOnOff` command) used to write the OnOff attribute directly
+  and reach Indigo through an attribute watcher; #143 converted that command
+  too, so it now reports through the same per-invocation path as everything
+  else in this row. The watchers that used to be the producers for `onOff`/
+  `setLevel`/`setColorTemp`/`setColor` are still wired, but only as
+  backstops — a regression detector in case a future matter.js version
+  starts writing one of these attributes again in a remote context, not the
+  normal path.
+- `setColor`'s hue/saturation is the only colour vocabulary in v1 — there is
+  no CIE xy command. An ecosystem that drives an `extendedColorLight` in its
+  xy representation (`moveToColor`) still reports as `setColor`, converted
+  through the ColorControl cluster's own hue/saturation conversion
+  (`xyToHsv`), so Indigo never has to speak a colour space §4.2 does not
+  define.
 - `batteryLevel: 1-100` (issue #220) is the first **role-independent**
   `set_state` key — valid for `set_state` against ANY role whose endpoint was
   built with `battery: true` (§4.1), not listed against any single role above.
