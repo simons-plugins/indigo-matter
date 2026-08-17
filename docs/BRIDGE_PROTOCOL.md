@@ -367,6 +367,16 @@ the first is the one nearest the original truth.
   reading — an accessory that greys itself out in every ecosystem because the
   plugin left a field off — is the worse default by far.
 - `options` — role-specific extras (e.g. window-covering polarity).
+- `battery` — issue #220. `true` means "ensure this accessory publishes
+  PowerSource"; **omitted or `false` means "no evidence right now", never a
+  removal request.** The live cluster set is monotonic: once an endpoint is
+  built with PowerSource, the node never takes it away, because removing it
+  would need a recreate — the same accessory-identity churn a role change
+  costs every paired ecosystem — for a trigger as weak as a device going
+  momentarily silent about its battery. Mirrors the inbound side's add-only
+  `SupportsBatteryLevel` policy. `battery: false` is never written on the
+  wire (`to_wire()` omits the key entirely); a client that once said `true`
+  for a device has no way to take it back, by design.
 
 ### 4.2 Roles: state keys and commands (v1)
 
@@ -411,6 +421,14 @@ ecosystem acts. Both are enumerated here in full; there is no other source.
   `*WithOnOff` command) writes the attribute directly, and that change is
   emitted per attribute change as before. Both producers emit the identical
   wire shape.
+- `batteryLevel: 1-100` (issue #220) is the first **role-independent**
+  `set_state` key — valid for `set_state` against ANY role whose endpoint was
+  built with `battery: true` (§4.1), not listed against any single role above.
+  The node owns the 0–200 half-percent `batPercentRemaining` conversion
+  (24% → 48). Sending it against an endpoint built without `battery: true` is
+  refused with `malformed_args` — a silent accept would write a PowerSource
+  attribute no controller could ever read, since the cluster does not exist
+  on that endpoint at all.
 
 ### 4.3 `StatusReport` and `FabricInfo`
 
@@ -518,6 +536,18 @@ version 2** since bridge-node 0.6.0:
   rebuilds every un-exported device before `server.start()`. That is the
   #141 appear-then-vanish ghost churn, once, self-healing after one attach —
   not the equivalence the schema-version note above claims for `numberVoid`.
+- `battery` — issue #220, present (`true`) and absent otherwise, never
+  `false`. Set the first time a *live* endpoint is recorded with PowerSource
+  (mirroring §4.1's own `battery` flag) and never cleared afterwards — the
+  monotonic wire rule applies to the witness too, or a restart would rebuild
+  an accessory without the cluster it actually has. Purpose: restore-on-start
+  (below) rebuilds the accessory with the same cluster set it had. Same
+  inert-extra-key parse tolerance as `numberVoid`/`orphaned`. **Rollback
+  caveat**: an older bridge that has never heard of this key drops it on its
+  next write and restores the accessory without PowerSource on the next
+  start — a visible cluster-set change in every paired ecosystem, which
+  self-heals the moment a newer bridge (or the plugin's next `attach`)
+  recreates the endpoint with `battery: true` again.
 
 **Version 1 files are read, migrated in place, and never treated as corrupt.**
 A v1 entry is a bare number; it keeps that number, is simply not restorable

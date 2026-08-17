@@ -423,6 +423,15 @@ device runs the other way. And the
 plugin's properties, its displayed value, then its name) — it is only a default,
 and all five roles stay selectable.
 
+**Battery level appears automatically, for any exported device that reports
+one.** If the underlying Indigo device has a battery reading, your ecosystem
+shows it — no extra setting, no tick-box; the plugin never invents a role for
+this, it just reads what the device already publishes. It updates on Indigo's
+normal ~10s reporting cadence, the same as any other exported reading. A
+brand-new device that has never taken a reading does not show a false "low
+battery" warning: a battery-level of exactly 0% is treated as "not read yet"
+rather than "flat", since Indigo initialises new devices' numeric states to 0.
+
 **Locks export, and they do not auto-confirm anything.** A lock or unlock from an
 ecosystem is passed to Indigo and nothing else: no optimistic state, no
 synthesised confirmation. What the ecosystem shows moves only when Indigo's own
@@ -643,7 +652,13 @@ recorded here rather than left implicit in the code:
   dropping the endpoint entirely rather than ignoring the extra cluster, so a
   future feature that wants to attach a cluster a role's Matter device type
   does not declare needs a new role (or a new device type), not an addition
-  to an existing one.
+  to an existing one. **The one deliberate carve-out (issue #220):**
+  PowerSource is declared **optional** on `BridgedNode` — a device type every
+  exported accessory already carries — so a battery-evidencing device
+  publishing it satisfies this constraint rather than waiving it; nothing
+  outside a device type's own allowed server list is ever added. Each such
+  endpoint's `deviceTypeList` also gains `0x0011` (PowerSource) alongside the
+  role's own device type, for the same reason.
 - **The widely-quoted "~50 device Alexa ceiling" is community folklore**, not
   a documented matter.js or Alexa limit — repeated often enough in Alexa and
   home-automation forums about large HomeKit/Matter bridges to be worth an
