@@ -37,6 +37,7 @@ import { Endpoint, type EndpointType, Logger, type MaybePromise, type MutableEnd
 import { BridgedDeviceBasicInformationServer } from "@matter/main/behaviors/bridged-device-basic-information";
 import { ColorControlServer } from "@matter/main/behaviors/color-control";
 import { DoorLockServer } from "@matter/main/behaviors/door-lock";
+import { LevelControlServer } from "@matter/main/behaviors/level-control";
 import { OccupancySensingServer } from "@matter/main/behaviors/occupancy-sensing";
 import { OnOffServer } from "@matter/main/behaviors/on-off";
 import { PowerSourceServer } from "@matter/main/behaviors/power-source";
@@ -44,6 +45,7 @@ import { ThermostatServer } from "@matter/main/behaviors/thermostat";
 import { MovementDirection, MovementType, WindowCoveringServer } from "@matter/main/behaviors/window-covering";
 import { ColorControl } from "@matter/main/clusters/color-control";
 import { DoorLock } from "@matter/main/clusters/door-lock";
+import { LevelControl } from "@matter/main/clusters/level-control";
 import { Thermostat } from "@matter/main/clusters/thermostat";
 import { ColorTemperatureLightDevice } from "@matter/main/devices/color-temperature-light";
 import { ContactSensorDevice } from "@matter/main/devices/contact-sensor";
@@ -746,6 +748,101 @@ class IndigoOnOffServer extends OnOffServer.with("Lighting") {
 }
 
 /**
+ * LevelControl, with every write-producing command converted to a `command`
+ * event (#143's LevelControl half — ColorControl's is
+ * {@link IndigoColorControlServer}).
+ *
+ * **One override closes the whole command family.** `moveToLevel(WithOnOff)`,
+ * `move(WithOnOff)` and `step(WithOnOff)` all dispatch through their own
+ * `*Logic` method into {@link transition} (`LevelControlServer.js:172,182,
+ * 214,265,315`), and so does `ScenesManagement`'s scene-apply path
+ * (`#applySceneValues`, `:453-459`) — so one override, not five or six, is
+ * the whole surface (measured, §0/P-1). `stop`/`stopWithOnOff` never reach
+ * `transition()` at all — `stopLogic` only halts a running *managed*
+ * transition (`LevelControlServer.js:331-333`) — and with managed
+ * transitions off (see {@link LEVEL_CONTROL_INITIAL}) there is nothing
+ * running to stop and nothing to report, so they are left stock.
+ *
+ * **`_changePerS` is deliberately unused.** With
+ * `managedTransitionTimeHandling: false`, `Transitions.start` collapses
+ * every rate and every transition time to ONE immediate write of the final
+ * value (`Transitions.js:69-79` — measured, §0/P-1): a stepped emission here
+ * would invent a `setLevel` cadence Indigo has never been asked to support,
+ * for a signal no ecosystem can currently request faster than "as fast as
+ * possible".
+ *
+ * **The clamp is load-bearing, not defensive.** `move` arrives with
+ * `targetLevel` of `±Infinity` (`moveLogic`, `LevelControlServer.js:257-264`)
+ * and `step` can arrive below `minLevel`/above `maxLevel` (`stepLogic` adds
+ * `stepSize` to `currentLevel` with no crop, `:315`). Stock
+ * `Transitions.start` bounds every target against the configured min/max
+ * before it ever writes an attribute (`Transitions.js:74-79`); overriding
+ * `transition()` bypasses that clamp entirely, so skipping it here would let
+ * an `Infinity` reach {@link matterToPercent} and, from there, Indigo.
+ *
+ * **The `WithOnOff` emission order mirrors today's measured attribute-write
+ * order**, so the two `command` events an ecosystem sees carry the same
+ * meaning stock's two attribute writes did: turning the light off at the
+ * minimum level writes `currentLevel` first and `onOff` second (`couple`'s
+ * `preCommit` participant runs at commit, after the level write,
+ * `LevelControlServer.js:369-381`); turning it on at any other level writes
+ * `onOff` first, immediately (`:382-397`), so `setLevel` follows.
+ *
+ * **The boundary decision is the CLAMPED TARGET, never `state.onOff`.**
+ * Gating on the attribute would repeat exactly the defect #143 closes: under
+ * no-auto-confirm the attribute lags whatever Indigo has actually confirmed,
+ * so "is the light on" read from it is stale for the whole confirmation
+ * window. The clamped target also fixes a stock bug in passing:
+ * `moveWithOnOff(Down)` reaches stock `couple()` with `targetLevel =
+ * -Infinity`, which is `!== minLevel` *before* clamping, so stock's own logic
+ * turns the light ON for a command asking it to dim toward off
+ * (`LevelControlServer.js:363,382`) — comparing the already-clamped value to
+ * `minLevel` cannot make that mistake.
+ *
+ * **The `onOff` half emits unconditionally**, even when the pushed value
+ * already matches what the attribute (still) says — the same "a frequency
+ * change is still a report" reasoning {@link IndigoOnOffServer}'s class doc
+ * and `BRIDGE_PROTOCOL.md` §4.2 already make for the plain onOff commands:
+ * two `WithOnOff` invocations five seconds apart both mean something to
+ * Indigo, even when nothing here moved between them.
+ *
+ * `handleOnOffChange` and `blockOnOffCouplingOnce` are inherited unmodified
+ * from `LevelControlBaseServer` and are inert on every role this bridge
+ * builds: `onLevel` is `null` on every one of them (never seeded, never
+ * pushed — §4.2 has no such key), `handleOnOffChange` returns immediately
+ * whenever `state.onLevel === null` (`LevelControlServer.js:430`), and
+ * `blockOnOffCouplingOnce` is set only inside `couple()` when `onLevel` is
+ * non-null (`:388`), so it never becomes `true` either. Noted here only so a
+ * reader chasing `onLevel` down from the Matter spec does not go looking for
+ * where this bridge sets it.
+ */
+class IndigoLevelControlServer extends LevelControlServer.with("Lighting", "OnOff") {
+    override transition(
+        targetLevel?: number,
+        _changePerS?: number | null | ((currentLevel: number) => number),
+        withOnOff = false,
+        _options: LevelControl.Options = {},
+    ): MaybePromise {
+        const level = clamp(targetLevel ?? this.currentLevel, this.minLevel, this.maxLevel);
+        const setLevel = (): void => emitCommand(this.endpoint.id, "setLevel", { level: matterToPercent(level) });
+        if (!withOnOff) {
+            setLevel();
+            return;
+        }
+        if (level === this.minLevel) {
+            // Level-then-off — mirrors couple()'s preCommit ordering (see
+            // class doc).
+            setLevel();
+            emitCommand(this.endpoint.id, "onOff", { value: false });
+        } else {
+            // On-then-level — mirrors couple()'s immediate write ordering.
+            emitCommand(this.endpoint.id, "onOff", { value: true });
+            setLevel();
+        }
+    }
+}
+
+/**
  * DoorLock, with the auto-confirmation removed.
  *
  * matter.js's stock `lockDoor`/`unlockDoor` set `lockState` themselves and emit
@@ -881,21 +978,55 @@ function colorControlDefaults(hueSaturation: boolean): Record<string, unknown> {
 /**
  * The LevelControl state every level-bearing role starts from.
  *
- * `managedTransitionTimeHandling` is pinned `false` rather than left to
- * matter.js's default because the echo guard depends on it. With managed
- * transitions ON, matter.js drives a `moveToLevel` to its target in steps of
- * its own making, and those steps are written by matter.js itself — i.e. in an
- * *offline* context. {@link isEcosystemChange} would read every one of them as
- * our own write and drop it, so an ecosystem dimming a lamp would move the
- * Matter attribute and the plugin would never learn the level changed at all.
- * Unmanaged, the remote `moveToLevel` lands as one attribute change in a remote
- * context, which is exactly what §4.2's `setLevel` is supposed to report.
+ * **`managedTransitionTimeHandling: false`.** Originally pinned so the echo
+ * guard ({@link isEcosystemChange}) could tell "us" from "an ecosystem": with
+ * managed transitions ON, matter.js drives a `moveToLevel` to its target in
+ * steps of its own making, written offline, which the guard would have
+ * swallowed as if the plugin had written them, and an ecosystem dimming a
+ * lamp would never reach Indigo at all. #143's conversion retires that
+ * argument — {@link IndigoLevelControlServer} overrides `transition()`
+ * outright, so nothing here reads `currentLevel`'s change events any more —
+ * but the pin is kept anyway, now purely belt-and-braces: it keeps the
+ * override on the one code path it was written against (`Transitions.start`'s
+ * unmanaged branch, which is what collapses every rate/transition time to a
+ * single final value — see that class's own doc). 0.17.8 already defaults it
+ * to `false`, so the pin still changes no behaviour today; it is here so a
+ * future default flip cannot silently sever the whole `setLevel` family.
+ * `ColorControl` defaults the same field `false` too, but is deliberately
+ * NOT pinned in {@link colorControlDefaults}: {@link IndigoColorControlServer}
+ * overrides every command that would otherwise depend on it, so there is
+ * nothing left for a future default flip to sever there.
  *
- * 0.17.8 already defaults it to `false` (`LevelControlServer.State`), so this
- * pin changes no behaviour today — it is here so that a future default flip
- * cannot silently sever the whole `setLevel` command family.
+ * **`options: { executeIfOff: true, coupleColorTempToLevel: false }`.**
+ * `executeIfOff` is matter.js's own gate (`#optionsAllowExecution`,
+ * `LevelControlServer.js:443-445`): left at the cluster's own default
+ * (`false`), a `moveToLevel`/`move`/`step` sent while the OnOff *attribute*
+ * still reads `false` is silently dropped before
+ * {@link IndigoLevelControlServer} ever sees it. In Indigo, setting a
+ * brightness level on a device that is off natively means "turn it on at
+ * that level" — that is not an edge case the gate is right to refuse, it is
+ * the ordinary meaning of the command, and Indigo is the one system here
+ * that actually knows it. Seeding the option `true` lets the command reach
+ * the override, which reports it as `setLevel`; the confirmation loop is the
+ * same no-auto-confirm shape as everywhere else in this file — Indigo turns
+ * the device on, pushes `onOff: true` alongside the level, and the tile
+ * catches up once that push lands, not before. KNOWN LIMITS: `options` is
+ * itself a writable attribute (an ecosystem could in principle write it back
+ * to `false`), and a *plain* `MoveToLevel` (no `WithOnOff`) on a genuinely-off
+ * lamp now forwards where it used to be dropped — harmless in practice, since
+ * Apple's brightness slider sends `MoveToLevelWithOnOff`, which was never
+ * gated in the first place, so the common path is unaffected either way.
+ * `coupleColorTempToLevel: false` is the cluster's own default restated, not
+ * a behaviour change — it is here so a reader chasing why `couple()`'s
+ * colour-temperature branch (`LevelControlServer.js:400-412`) never fires
+ * does not have to go looking: it is off, on purpose, because this bridge
+ * has no notion of "colour temperature follows brightness" to offer.
  */
-const LEVEL_CONTROL_INITIAL = { currentLevel: 1, managedTransitionTimeHandling: false };
+const LEVEL_CONTROL_INITIAL = {
+    currentLevel: 1,
+    managedTransitionTimeHandling: false,
+    options: { executeIfOff: true, coupleColorTempToLevel: false },
+};
 
 /**
  * The PowerSource state every battery-bearing endpoint starts from (issue
@@ -1386,13 +1517,19 @@ const ROLE_DEFINITIONS: Record<RoleValue, RoleDefinition> = {
         watch: [WATCH_ON_OFF],
     },
     [Role.dimmableLight]: {
-        deviceType: () => DimmableLightDevice.with(BridgedDeviceBasicInformationServer, IndigoOnOffServer),
+        deviceType: () =>
+            DimmableLightDevice.with(BridgedDeviceBasicInformationServer, IndigoOnOffServer, IndigoLevelControlServer),
         initialState: () => ({ [LEVEL_CONTROL]: { ...LEVEL_CONTROL_INITIAL } }),
         statePatch: states => ({ ...onOffPatch(states), ...levelPatch(states) }),
         watch: [WATCH_ON_OFF, WATCH_LEVEL],
     },
     [Role.colorTemperatureLight]: {
-        deviceType: () => ColorTemperatureLightDevice.with(BridgedDeviceBasicInformationServer, IndigoOnOffServer),
+        deviceType: () =>
+            ColorTemperatureLightDevice.with(
+                BridgedDeviceBasicInformationServer,
+                IndigoOnOffServer,
+                IndigoLevelControlServer,
+            ),
         initialState: () => ({
             [LEVEL_CONTROL]: { ...LEVEL_CONTROL_INITIAL },
             [COLOR_CONTROL]: { ...colorControlDefaults(false), colorTemperatureMireds: MIREDS_MIN },
@@ -1411,6 +1548,7 @@ const ROLE_DEFINITIONS: Record<RoleValue, RoleDefinition> = {
             ExtendedColorLightDevice.with(
                 BridgedDeviceBasicInformationServer,
                 IndigoOnOffServer,
+                IndigoLevelControlServer,
                 ColorControlServer.with("HueSaturation", "Xy", "ColorTemperature"),
             ),
         initialState: () => ({

@@ -23,10 +23,12 @@ import { Endpoint, Environment, Logger, ServerNode, VendorId } from "@matter/mai
 import { BasicInformationServer } from "@matter/main/behaviors/basic-information";
 import { BridgedDeviceBasicInformationServer } from "@matter/main/behaviors/bridged-device-basic-information";
 import { DoorLockServer } from "@matter/main/behaviors/door-lock";
+import { LevelControlServer } from "@matter/main/behaviors/level-control";
 import { OnOffServer } from "@matter/main/behaviors/on-off";
 import { PowerSourceServer } from "@matter/main/behaviors/power-source";
 import { WindowCoveringServer } from "@matter/main/behaviors/window-covering";
 import { DoorLock } from "@matter/main/clusters/door-lock";
+import { LevelControl } from "@matter/main/clusters/level-control";
 import { OnOffLightDevice } from "@matter/main/devices/on-off-light";
 import { AggregatorEndpoint } from "@matter/main/endpoints/aggregator";
 
@@ -1234,6 +1236,13 @@ const PositionAwareCovering = WindowCoveringServer.with("Lift", "PositionAwareLi
 const OnOffLighting = OnOffServer.with("Lighting");
 
 /**
+ * The LevelControl behaviour as every level-bearing role builds it, post-#143.
+ * `agent.get()` needs the exact `.with()` the role factory used — mirrors
+ * {@link OnOffLighting}/{@link PositionAwareCovering}.
+ */
+const LevelLighting = LevelControlServer.with("Lighting", "OnOff");
+
+/**
  * Poll until `check` passes (or the cap expires — the following assertion then
  * reports the real shortfall). The countdown tests used to sleep a fixed 400ms
  * against ~200ms timer deadlines, which a loaded CI runner can blow through;
@@ -2027,6 +2036,233 @@ describe("onOff commands (§4.2, §7, #143, #201)", () => {
                 level,
                 percentToCurrentLevel(80),
                 "the residual set must still have applied despite the onOff failure",
+            );
+        } finally {
+            await h.close();
+        }
+    });
+});
+
+describe("LevelControl command conversion (§4.2, #143)", () => {
+    /**
+     * One row per LevelControl command variant. `run` performs the real
+     * invocation (never a synthetic `ecosystemWrite` — the whole point of
+     * #143 is that these commands no longer write an attribute at all, so
+     * only a genuine `agent.get().command()` call proves it), and `expect`
+     * is the exact `command` frame array the invocation must produce.
+     *
+     * The `WithOnOff` boundary (both orders) is deliberately in the same
+     * table as the plain commands (T1+T2 combined): every row is the same
+     * assertion — one frame array, one unmoved attribute — so splitting the
+     * boundary cases into their own test would only duplicate the harness
+     * setup.
+     */
+    it("converts every level command to setLevel/onOff, clamped, in the measured order", async () => {
+        type Run = (lc: InstanceType<typeof LevelLighting>) => unknown;
+        const CASES: [string, Run, CommandEventData[]][] = [
+            [
+                "moveToLevel(152, tt=40)",
+                lc => lc.moveToLevel({ level: 152, transitionTime: 40, optionsMask: {}, optionsOverride: {} }),
+                [{ indigoDeviceId: 1, command: "setLevel", args: { level: 60 } }],
+            ],
+            [
+                "moveToLevel(254)",
+                lc => lc.moveToLevel({ level: 254, transitionTime: null, optionsMask: {}, optionsOverride: {} }),
+                [{ indigoDeviceId: 1, command: "setLevel", args: { level: 100 } }],
+            ],
+            [
+                "move(Up, null) — the +Infinity target clamps to maxLevel",
+                lc => lc.move({ moveMode: LevelControl.MoveMode.Up, rate: null, optionsMask: {}, optionsOverride: {} }),
+                [{ indigoDeviceId: 1, command: "setLevel", args: { level: 100 } }],
+            ],
+            [
+                "move(Down, 20) — the -Infinity target clamps to minLevel",
+                lc => lc.move({ moveMode: LevelControl.MoveMode.Down, rate: 20, optionsMask: {}, optionsOverride: {} }),
+                [{ indigoDeviceId: 1, command: "setLevel", args: { level: 0 } }],
+            ],
+            [
+                "moveToLevelWithOnOff(1) — the minLevel boundary emits level THEN off",
+                lc => lc.moveToLevelWithOnOff({ level: 1, transitionTime: null, optionsMask: {}, optionsOverride: {} }),
+                [
+                    { indigoDeviceId: 1, command: "setLevel", args: { level: 0 } },
+                    { indigoDeviceId: 1, command: "onOff", args: { value: false } },
+                ],
+            ],
+            [
+                "moveToLevelWithOnOff(152) — any other level emits on THEN level",
+                lc => lc.moveToLevelWithOnOff({ level: 152, transitionTime: null, optionsMask: {}, optionsOverride: {} }),
+                [
+                    { indigoDeviceId: 1, command: "onOff", args: { value: true } },
+                    { indigoDeviceId: 1, command: "setLevel", args: { level: 60 } },
+                ],
+            ],
+            [
+                "moveWithOnOff(Down, 10) — clamped-target boundary, not stock's -Infinity!==minLevel bug",
+                lc => lc.moveWithOnOff({ moveMode: LevelControl.MoveMode.Down, rate: 10, optionsMask: {}, optionsOverride: {} }),
+                [
+                    { indigoDeviceId: 1, command: "setLevel", args: { level: 0 } },
+                    { indigoDeviceId: 1, command: "onOff", args: { value: false } },
+                ],
+            ],
+            [
+                "stepWithOnOff(Down, 254) — a step past minLevel still clamps to the boundary",
+                lc => lc.stepWithOnOff({
+                    stepMode: LevelControl.StepMode.Down,
+                    stepSize: 254,
+                    transitionTime: null,
+                    optionsMask: {},
+                    optionsOverride: {},
+                }),
+                [
+                    { indigoDeviceId: 1, command: "setLevel", args: { level: 0 } },
+                    { indigoDeviceId: 1, command: "onOff", args: { value: false } },
+                ],
+            ],
+            [
+                "stop() — never reaches transition(), stays stock, emits nothing",
+                lc => lc.stop({ optionsMask: {}, optionsOverride: {} }),
+                [],
+            ],
+        ];
+
+        for (const [label, run, expected] of CASES) {
+            const h = await harness();
+            try {
+                await h.registry.reconcile([spec(1, Role.dimmableLight)], false);
+                const endpoint = only(h);
+                await endpoint.act(agent => run(agent.get(LevelLighting)));
+                assert.deepEqual(h.commands, expected, label);
+                assert.equal(
+                    (endpoint.stateOf("levelControl") as Record<string, unknown>).currentLevel,
+                    1,
+                    `${label}: currentLevel must not have moved`,
+                );
+            } finally {
+                await h.close();
+            }
+        }
+    });
+
+    it("step(Up, 10, tt=10) clamps against the endpoint's actual current level", async () => {
+        // The one row the table above cannot express without seeding state:
+        // stepLogic's target is `currentLevel + stepSize`, so this proves the
+        // override reads the REAL current level, not a hard-coded one.
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(1, Role.dimmableLight)], false);
+            const endpoint = only(h);
+            // A plain attribute write, not a command invocation — seeds state,
+            // does not exercise the override under test.
+            await endpoint.set({ levelControl: { currentLevel: 128 } } as never);
+
+            await endpoint.act(agent =>
+                agent.get(LevelLighting).step({
+                    stepMode: LevelControl.StepMode.Up,
+                    stepSize: 10,
+                    transitionTime: 10,
+                    optionsMask: {},
+                    optionsOverride: {},
+                }),
+            );
+            assert.deepEqual(h.commands, [{ indigoDeviceId: 1, command: "setLevel", args: { level: 54 } }]);
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("the onOff half emits even when the attribute already agrees with the target", async () => {
+        // A frequency change is still a report — the same reasoning
+        // IndigoOnOffServer's own class doc and BRIDGE_PROTOCOL §4.2 make for
+        // the plain onOff commands. Starting the attribute at `false` and
+        // then hitting the minLevel boundary (which ALSO means "off") must
+        // still emit the onOff half, not skip it as a no-op.
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(1, Role.dimmableLight, { states: { onOff: false } })], false);
+            const endpoint = only(h);
+            await endpoint.act(agent =>
+                agent
+                    .get(LevelLighting)
+                    .moveToLevelWithOnOff({ level: 1, transitionTime: null, optionsMask: {}, optionsOverride: {} }),
+            );
+            assert.deepEqual(h.commands, [
+                { indigoDeviceId: 1, command: "setLevel", args: { level: 0 } },
+                { indigoDeviceId: 1, command: "onOff", args: { value: false } },
+            ]);
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("executeIfOff lets a plain moveToLevel reach the override while the attribute reads off", async () => {
+        // LevelControlServer.js:443-445's #optionsAllowExecution gate answers
+        // from the OnOff ATTRIBUTE, which under no-auto-confirm is Indigo's
+        // last confirmation, not the device's real state (#230). Without the
+        // executeIfOff seed on LEVEL_CONTROL_INITIAL, this command would be
+        // dropped before ever reaching transition() and h.commands would stay
+        // empty — the assertion IS the seed.
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(1, Role.dimmableLight, { states: { onOff: false } })], false);
+            const endpoint = only(h);
+            await endpoint.act(agent =>
+                agent
+                    .get(LevelLighting)
+                    .moveToLevel({ level: 152, transitionTime: null, optionsMask: {}, optionsOverride: {} }),
+            );
+            assert.deepEqual(h.commands, [{ indigoDeviceId: 1, command: "setLevel", args: { level: 60 } }]);
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("closes the ghost-timer chain: a WithOnOff at min no longer moves onOff (PR#230 review)", async () => {
+        // The exact scenario PR#230's review described: a dimmer command
+        // carrying WithOnOff while a timed-on countdown is running. Stock
+        // `couple()` would have written `onOff` to `false` directly here,
+        // stranding the timer between IndigoOnOffServer's "replay" and
+        // "ghost" cases (see that class's own doc). #143 never calls
+        // `couple()` at all — the override replaces `transition()` outright
+        // — so nothing about the countdown is touched by this command.
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(1, Role.dimmableLight)], false);
+            const endpoint = only(h);
+            await h.registry.setState(1, { onOff: true });
+
+            await endpoint.act(agent =>
+                agent
+                    .get(OnOffLighting)
+                    .onWithTimedOff({ onOffControl: { acceptOnlyWhenOn: false }, onTime: 6000, offWaitTime: 0 }),
+            );
+            h.commands.length = 0;
+
+            await endpoint.act(agent =>
+                agent
+                    .get(LevelLighting)
+                    .moveToLevelWithOnOff({ level: 1, transitionTime: null, optionsMask: {}, optionsOverride: {} }),
+            );
+            assert.deepEqual(h.commands, [
+                { indigoDeviceId: 1, command: "setLevel", args: { level: 0 } },
+                { indigoDeviceId: 1, command: "onOff", args: { value: false } },
+            ]);
+            assert.equal(
+                (endpoint.stateOf("onOff") as Record<string, unknown>).onOff,
+                true,
+                "the dimmer command must not have moved onOff by itself — the countdown must not be strandable",
+            );
+            assert.ok(
+                ((endpoint.stateOf("onOff") as Record<string, unknown>).onTime as number) > 0,
+                "the countdown must still be running, untouched by the dimmer command",
+            );
+
+            // Indigo's own confirmation is what closes the countdown for real.
+            await h.registry.setState(1, { onOff: false });
+            assert.equal((endpoint.stateOf("onOff") as Record<string, unknown>).onOff, false);
+            assert.equal(
+                (endpoint.stateOf("onOff") as Record<string, unknown>).onTime,
+                0,
+                "super.off() must have stopped the real countdown",
             );
         } finally {
             await h.close();
