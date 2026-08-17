@@ -327,31 +327,64 @@ def _number(dev: Any, name: str) -> Optional[float]:
     return float(value)
 
 
+#: Devices whose ``battery_percent`` has already warned about a >100 raw
+#: reading. Once per device rather than once per call: a stuck driver reports
+#: the same bad value on every poll, and a per-poll warning would be the
+#: loudest line in the log for a condition that never changes. Module-level
+#: rather than a handler field because :func:`battery_percent` is a free
+#: function several handlers' ``published_states`` call directly, with no
+#: shared instance to hold it on.
+_overrange_warned: set[int] = set()
+
+
 def battery_percent(dev: Any) -> Optional[int]:
     """``dev.batteryLevel`` as the §4.2 ``batteryLevel`` percentage, or ``None``.
 
-    ``None`` for a non-numeric value AND for a literal **0** — the deliberate
-    opposite of :func:`_first_number`'s temperature ruling just above, and not
-    an accident. Indigo initialises every declared Integer state to 0 at
-    device creation (issue #190, ``device_sync.py`` lines 2255-2264), so a bare
-    0 on a freshly commissioned device is indistinguishable from "never
-    polled". Unlike 0 °C — a real reading a working outdoor thermostat gives
-    every winter — 0% is not a reading a working device CAN give: a cell that
+    Rounded FIRST, suppressed second: a value that rounds to 0 or below is
+    ``None``, whatever it was before rounding. ``None`` for a non-numeric
+    value too. The suppression is the deliberate opposite of
+    :func:`_first_number`'s temperature ruling elsewhere in this module, and
+    not an accident. Indigo initialises every declared Integer state to 0 at
+    device creation (issue #190 — see ``device_sync.py``'s
+    ``_warn_of_newly_excluded_battery_devices`` docstring for where that was
+    established), so a bare 0 on a freshly commissioned device is
+    indistinguishable from "never polled". Unlike 0 °C — a real reading a
+    working outdoor thermostat gives every winter — 0% is not a reading a
+    working device CAN give: a cell that
     flat has stopped talking, not reported one last data point. Reporting a
     fresh device's placeholder 0 as a battery level is exactly the false "your
-    device's battery is critically low" alarm issue #220 exists to avoid.
+    device's battery is critically low" alarm issue #220 exists to avoid, and
+    that reasoning covers a negative reading at least as strongly — a driver's
+    "unknown" sentinel (e.g. -1) is even less a real percentage than 0 is.
 
-    Clamped to 100 at the top: a ``batteryLevel`` above 100 is a device/driver
-    bug, and letting it through would just move the failure to the node's own
-    ``percentToBatteryRemaining`` clamp (a debug line there, not a decision
-    here) for no better an answer.
+    Rounding before suppressing (rather than after) closes a real gap: the
+    old order compared the RAW value to 0, so only an exact ``0`` was
+    suppressed — 0.4, 0.49 and 0.5 all failed that comparison, rounded down
+    (or to even) to 0 anyway, and still reached the wire as a literal ``0``,
+    which is exactly the false-alarm value this function exists to keep off
+    it. Rounding first makes "is this reading a real >0 percentage once
+    rounded" the actual question asked, which is what the suppression was
+    always meant to answer.
+
+    Clamped to 100 at the top, and now warned about once per device: a
+    ``batteryLevel`` above 100 is a device/driver bug, not a value a working
+    battery can report, so letting it through silently would just move the
+    failure to the node's own ``percentToBatteryRemaining`` clamp (a debug
+    line there, naming no device) for no better an answer. This is the one
+    line in the module that logs above debug — see :data:`_overrange_warned`.
     """
     value = getattr(dev, "batteryLevel", None)
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    if value == 0:
+    if value > 100 and dev.id not in _overrange_warned:
+        _overrange_warned.add(dev.id)
+        _LOG.warning(
+            "Matter bridge: device %s (id %s) reported batteryLevel %r, above the 0-100 domain — "
+            "clamped to 100.", getattr(dev, "name", ""), dev.id, value)
+    percent = min(100, int(round(value)))
+    if percent <= 0:
         return None
-    return min(100, int(round(value)))
+    return percent
 
 
 # --------------------------------------------------------------------------

@@ -932,10 +932,17 @@ class TestBattery:
         (None, None),
         (0, None),      # issue #190: indistinguishable from "never polled"
         (0.0, None),
+        (0.4, None),    # rounds to 0 — the old raw `== 0` check let this through
+        (0.49, None),
+        (0.5, None),    # Python's banker's rounding also lands on 0
+        (-1, None),     # a driver's "unknown" sentinel, not a real reading
+        (-0.2, None),
         (True, None),   # bool is an int in Python; not a battery reading
         ("77", None),
         (1, 1),
+        (0.51, 1),      # rounds to 1
         (77, 77),
+        (100.4, 100),
         (150, 100),     # clamped
     ])
     def test_battery_percent(self, handlers, value, expected):
@@ -943,6 +950,27 @@ class TestBattery:
 
     def test_battery_percent_is_none_when_the_attribute_is_absent(self, handlers):
         assert handlers.battery_percent(RelayDevice(1, "D")) is None
+
+    def test_an_overrange_reading_warns_once_per_device_not_once_per_call(self, handlers, caplog):
+        dev = RelayDevice(42, "Leaky Sensor", batteryLevel=150)
+        with caplog.at_level("WARNING"):
+            assert handlers.battery_percent(dev) == 100
+            assert handlers.battery_percent(dev) == 100
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert len(warnings) == 1
+        assert "42" in warnings[0].message and "150" in warnings[0].message
+
+    def test_the_overrange_latch_is_keyed_per_device(self, handlers, caplog):
+        with caplog.at_level("WARNING"):
+            handlers.battery_percent(RelayDevice(43, "A", batteryLevel=150))
+            handlers.battery_percent(RelayDevice(44, "B", batteryLevel=150))
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert len(warnings) == 2
+
+    def test_an_in_range_reading_never_warns(self, handlers, caplog):
+        with caplog.at_level("WARNING"):
+            handlers.battery_percent(RelayDevice(45, "Normal", batteryLevel=80))
+        assert [r for r in caplog.records if r.levelname == "WARNING"] == []
 
     @pytest.mark.parametrize("role", ALL_ROLES)
     def test_published_states_adds_battery_level_for_every_role_but_states_for_never_does(

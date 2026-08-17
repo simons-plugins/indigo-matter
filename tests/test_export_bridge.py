@@ -397,6 +397,19 @@ class TestEndpointProviderBattery:
         assert spec.battery is True
         assert "batteryLevel" not in spec.states
 
+    def test_battery_level_negative_one_still_declares_a_battery_but_publishes_no_reading(
+            self, bridge_mod, mock_logger, devices):
+        """Same evidence rule, a different untrustworthy value: `-1` is a real
+        "unknown" sentinel some drivers use, so `is not None` still declares a
+        battery (the device factually has the property) while `battery_percent`
+        suppresses the reading itself. §4.2's 1-100 domain must never see it.
+        """
+        devices.add(RelayDevice(202, "Sentinel Plug", onState=True, batteryLevel=-1))
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(202, "onOffLight")])
+        (spec,) = h.bridge.endpoint_specs()
+        assert spec.battery is True
+        assert "batteryLevel" not in spec.states
+
 
 # ---------------------------------------------------------------------------
 # Client lifecycle (XG5)
