@@ -1195,6 +1195,46 @@ describe("battery (issue #220)", () => {
         ]);
     });
 
+    it("adds battery: true to an EXISTING record on a later check, and persists it (the GAIN case)", () => {
+        // The other half of "records battery: true add-only" above, which
+        // only ever exercised a fresh entry. `noteRestorable` has to notice
+        // the gain on a record that already exists and rewrite the file on
+        // the SAME check() that saw it — not defer it to some later pass.
+        const dir = storage();
+        const store = new EndpointMapStore(dir);
+        store.load();
+        store.check([{ uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Lamp", battery: false }]);
+        assert.deepEqual(mapFileIn(dir).endpoints, {
+            "indigo-1": { number: 2, role: "onOffLight", label: "Lamp" },
+        });
+
+        store.check([{ uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Lamp", battery: true }]);
+
+        assert.deepEqual(mapFileIn(dir).endpoints, {
+            "indigo-1": { number: 2, role: "onOffLight", label: "Lamp", battery: true },
+        });
+        assert.deepEqual(store.restorable(), [
+            { uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Lamp", battery: true },
+        ]);
+    });
+
+    it("un-orphans AND gains a battery in the same check() (issue #219 interaction)", () => {
+        const dir = storage();
+        const store = new EndpointMapStore(dir);
+        store.load();
+        store.check([{ uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Lamp" }]);
+        store.forget(["indigo-1"]);
+
+        store.check([{ uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Lamp", battery: true }]);
+
+        assert.deepEqual(store.restorable(), [
+            { uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Lamp", battery: true },
+        ]);
+        assert.deepEqual(mapFileIn(dir).endpoints, {
+            "indigo-1": { number: 2, role: "onOffLight", label: "Lamp", battery: true },
+        });
+    });
+
     it("tolerates anything other than a literal true, same convention as numberVoid/orphaned", () => {
         const dir = storage();
         writeFileSync(

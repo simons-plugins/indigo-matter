@@ -24,8 +24,10 @@ import { BasicInformationServer } from "@matter/main/behaviors/basic-information
 import { BridgedDeviceBasicInformationServer } from "@matter/main/behaviors/bridged-device-basic-information";
 import { DoorLockServer } from "@matter/main/behaviors/door-lock";
 import { OnOffServer } from "@matter/main/behaviors/on-off";
+import { PowerSourceServer } from "@matter/main/behaviors/power-source";
 import { WindowCoveringServer } from "@matter/main/behaviors/window-covering";
 import { DoorLock } from "@matter/main/clusters/door-lock";
+import { OnOffLightDevice } from "@matter/main/devices/on-off-light";
 import { AggregatorEndpoint } from "@matter/main/endpoints/aggregator";
 
 import {
@@ -2186,12 +2188,45 @@ describe("PowerSource / battery (issue #220)", () => {
             const endpoint = only(h);
             const power = endpoint.stateOf("powerSource") as { batPercentRemaining: unknown; attributeList?: unknown[] };
             assert.equal(power.batPercentRemaining, null);
-            if (power.attributeList !== undefined) {
-                assert.ok(
-                    power.attributeList.map(Number).includes(12),
-                    `attributeList ${JSON.stringify(power.attributeList)} missing batPercentRemaining (12)`,
-                );
-            }
+            // Unconditional, not an if-guard: an if-guard here would pass
+            // vacuously the moment a matter.js upgrade stopped exposing
+            // `attributeList` at all, which is exactly the kind of silent
+            // regression this REGRESSION test exists to catch.
+            assert.ok(power.attributeList !== undefined, "attributeList must exist to check for batPercentRemaining");
+            assert.ok(
+                power.attributeList.map(Number).includes(12),
+                `attributeList ${JSON.stringify(power.attributeList)} missing batPercentRemaining (12)`,
+            );
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("TRAP (measured, §0): an endpoint built WITHOUT batPercentRemaining never gets attribute 12", async () => {
+        // The negative direction of the REGRESSION test above, pinned against
+        // matter.js directly rather than through `createEndpoint` (which
+        // always seeds `BATTERY_INITIAL`) — this is the mechanism itself, so
+        // a future matter.js upgrade that changes it fails loudly here rather
+        // than silently stop mattering.
+        const h = await harness();
+        try {
+            const trap = new Endpoint(
+                OnOffLightDevice.with(BridgedDeviceBasicInformationServer, PowerSourceServer.with("Battery")),
+                { id: "trap-test", bridgedDeviceBasicInformation: { reachable: true } } as never,
+            );
+            await h.aggregator.add(trap);
+            const power = trap.stateOf("powerSource") as { attributeList?: unknown[] };
+            assert.ok(power.attributeList !== undefined, "attributeList must exist to check for batPercentRemaining");
+            assert.ok(
+                !power.attributeList.map(Number).includes(12),
+                `attributeList ${JSON.stringify(power.attributeList)} unexpectedly HAS batPercentRemaining ` +
+                    "without ever seeding it — the trap this test pins has changed",
+            );
+            // The other half of the trap: a later write still succeeds
+            // silently, with no thrown error to say the attribute was never
+            // declared.
+            await trap.set({ powerSource: { batPercentRemaining: 48 } } as never);
+            assert.equal((trap.stateOf("powerSource") as { batPercentRemaining: unknown }).batPercentRemaining, 48);
         } finally {
             await h.close();
         }
@@ -2214,6 +2249,18 @@ describe("PowerSource / battery (issue #220)", () => {
 
     it("clamps an out-of-range batteryLevel rather than throwing", async () => {
         assert.equal(percentToBatteryRemaining(150), 200);
+
+        // The integration claim the name makes, not only the pure conversion:
+        // a live battery endpoint must accept the same out-of-range push.
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(1, Role.onOffLight, { battery: true })], false);
+            await h.registry.setState(1, { batteryLevel: 150 });
+            const endpoint = only(h);
+            assert.equal((endpoint.stateOf("powerSource") as Record<string, unknown>).batPercentRemaining, 200);
+        } finally {
+            await h.close();
+        }
     });
 
     it("applies a batteryLevel-only set_state on a battery endpoint of every role, no refusal", async () => {
@@ -2247,6 +2294,41 @@ describe("PowerSource / battery (issue #220)", () => {
             const endpoint = only(h);
             assert.equal((endpoint.stateOf("onOff") as Record<string, unknown>).onOff, true);
             assert.equal((endpoint.stateOf("powerSource") as Record<string, unknown>).batPercentRemaining, 96);
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("a failed onOff half still lets batteryLevel land via the residual set (half-apply, battery)", async () => {
+        // The battery twin of the plain half-apply test in the onOff commands
+        // describe block below: `applyStates` runs the onOff act and the
+        // residual set (which now carries `powerSource`) as two transactions,
+        // and a failure in the first must not strand the second.
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(1, Role.onOffLight, { battery: true })], false);
+            const endpoint = only(h);
+            const endpointWithAct = endpoint as unknown as { act: (...args: unknown[]) => Promise<unknown> };
+            const originalAct = endpointWithAct.act;
+            let firstCall = true;
+            endpointWithAct.act = function (...args: unknown[]) {
+                if (firstCall) {
+                    firstCall = false;
+                    return Promise.reject(new Error("boom"));
+                }
+                return originalAct.apply(endpoint, args);
+            };
+            try {
+                await assert.rejects(
+                    async () => applyStates(endpoint, Role.onOffLight, { onOff: true, batteryLevel: 48 }, true),
+                    (error: Error) => /onOff half failed/.test(error.message),
+                    "the error must name the failed half",
+                );
+            } finally {
+                endpointWithAct.act = originalAct;
+            }
+            const power = (endpoint.stateOf("powerSource") as Record<string, unknown>).batPercentRemaining;
+            assert.equal(power, 96, "the battery half must still have applied despite the onOff failure");
         } finally {
             await h.close();
         }
@@ -2365,7 +2447,7 @@ describe("PowerSource / battery (issue #220)", () => {
         }
     });
 
-    it("upsert: a role change over a battery gain is refused as role_change — the role check runs first", async () => {
+    it("upsert: a role change over a battery gain is refused as role_change (check order)", async () => {
         // Pins the check ORDERING: the role refusal must sit above the
         // battery-gain branch, or a role change riding a battery gain would
         // recreate under the new role instead of being refused outright.

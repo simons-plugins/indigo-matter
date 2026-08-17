@@ -812,6 +812,46 @@ class TestBatteryDeviceUpdated:
         h.bridge.device_updated(before, devices[301])
         assert h.client.only("set_state") == ("set_state", 301, {"batteryLevel": 49})
 
+    def test_a_battery_gain_and_a_rename_in_the_same_update_is_one_upsert_carrying_the_new_label(
+            self, bridge_mod, mock_logger, devices):
+        """The gain branch returns early, before the ordinary rename check ever
+        runs — so a rename landing in the SAME update must not be dropped.
+        `upsert`'s own spec build (`_spec_for`) re-reads the device's current
+        name, so one upsert already carries it; no separate push is needed.
+        """
+        devices.add(RelayDevice(302, "Study Plug", onState=False))
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(302, "onOffLight")])
+        h.start()
+        before = RelayDevice(302, "Study Plug", onState=False)
+        devices[302].batteryLevel = 80
+        devices[302].name = "Desk Plug"
+        h.bridge.device_updated(before, devices[302])
+        assert h.client.names() == ["upsert_endpoint"]
+        _name, spec = h.client.only("upsert_endpoint")
+        assert spec.battery is True
+        assert spec.states["batteryLevel"] == 80
+        assert spec.label == "Desk Plug"
+
+    def test_a_drain_to_zero_stops_reporting_it_rather_than_upserting_or_pushing_a_zero(
+            self, bridge_mod, mock_logger, devices):
+        """The intended UX (issue #190's reasoning applied to battery): a live
+        77 -> 0 transition is NOT a battery loss (`batteryLevel` is still
+        `is not None`, so neither the gain nor any loss branch fires) and NOT
+        a value to push (0 is suppressed as untrustworthy) — it is exactly the
+        "device stopped answering a key" case. The ecosystem keeps showing
+        77% rather than a false "flat" alarm from a just-commissioned-style 0,
+        and the only trace is the stopped-key streak warning.
+        """
+        devices.add(RelayDevice(303, "Batt Plug", onState=True, batteryLevel=77))
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(303, "onOffLight")])
+        h.start()
+        before = RelayDevice(303, "Batt Plug", onState=True, batteryLevel=77)
+        devices[303].batteryLevel = 0
+        h.bridge.device_updated(before, devices[303])
+        assert h.client.names() == [], "no upsert, and no set_state carrying batteryLevel: 0"
+        warnings = warnings_of(mock_logger)
+        assert "303" in warnings and "batteryLevel" in warnings
+
 
 class TestIncrementalCrud:
     def test_upsert_sends_the_current_spec(self, bridge_mod, mock_logger, devices):
