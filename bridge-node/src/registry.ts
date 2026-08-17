@@ -341,11 +341,29 @@ export class EndpointRegistry {
                 // remove-then-add `reconcileNow` uses for a role change — an
                 // ordinary `update()` (a plain `endpoint.set()`) cannot add a
                 // cluster to a live endpoint. A LOSS is deliberately not
-                // symmetric: see `update`'s call into `applyStates`.
+                // symmetric: see `update`'s call into `applyStates`. Loud for
+                // the same reason `reconcileNow` is loud about its own
+                // recreate: the accessory's name/room MAY not survive in
+                // every paired ecosystem.
+                this.#log(
+                    `Recreating endpoint ${spec.indigoDeviceId}: gained a battery (PowerSource can only be ` +
+                        "declared at construction; the accessory's name/room MAY not survive in every ecosystem)",
+                );
                 await this.closeOne(spec.indigoDeviceId, existing);
-                const created = await this.create(spec);
-                await this.noteConfigurationChange();
-                return { endpointNumber: Number(created.number) };
+                try {
+                    const created = await this.create(spec);
+                    await this.noteConfigurationChange();
+                    return { endpointNumber: Number(created.number) };
+                } catch (error) {
+                    // `closeOne` already succeeded, so the bridged-node set
+                    // changed even though `create` never finished — the exact
+                    // case `reconcileNow`'s own catch handles above ("a
+                    // half-applied set becomes an invisible one"). Skipping
+                    // the bump here would leave every paired controller
+                    // believing the old accessory still exists.
+                    await this.noteConfigurationChange();
+                    throw error;
+                }
             }
             await this.update(spec);
             return { endpointNumber: Number(existing.endpoint.number) };

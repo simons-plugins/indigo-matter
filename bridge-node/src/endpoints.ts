@@ -1727,6 +1727,14 @@ export function createEndpoint(spec: EndpointSpec, identity: BridgedIdentity): E
     if (battery !== undefined && !spec.battery) {
         refuseBatteryLevelWithoutBattery(spec.indigoDeviceId);
     }
+    // A consumed `batteryLevel` counts as consumption for refusal purposes
+    // too, matching `applyStates`' version-skew tolerance below (the
+    // "*partly* consumed `states` still succeeds" paragraph on that
+    // function's own doc): without this, an initial `states` of
+    // `{batteryLevel: 48, futureKey: 1}` left `rest = {futureKey: 1}`, which
+    // `statePatchOrRefuse` refused WHOLESALE — a valid battery reading thrown
+    // away alongside the stranger it arrived with, at construction time.
+    const patch = battery !== undefined ? definition.statePatch(rest) : statePatchOrRefuse(spec.role, rest);
     return new Endpoint(deviceTypeFor(definition, spec.battery) as never, {
         id: endpointIdFor(spec.indigoDeviceId),
         ...mergeBehaviors(
@@ -1738,7 +1746,7 @@ export function createEndpoint(spec: EndpointSpec, identity: BridgedIdentity): E
             // this key never gets the attribute into `attributeList` at all,
             // so seeding it is not optional on a battery-flagged endpoint.
             spec.battery ? { [POWER_SOURCE]: { ...BATTERY_INITIAL, ...battery } } : {},
-            statePatchOrRefuse(spec.role, rest),
+            patch,
         ),
     } as never);
 }
@@ -1801,7 +1809,15 @@ export async function applyStates(
         // endpoint (`endpointIdFor`), so this always parses.
         refuseBatteryLevelWithoutBattery(indigoDeviceIdFrom(endpoint.id) ?? -1);
     }
-    const patch = statePatchOrRefuse(role, rest);
+    // A consumed `batteryLevel` counts as consumption for refusal purposes
+    // too — the version-skew tolerance this function's own doc describes
+    // ("a *partly* consumed `states` still succeeds") is about ANY key this
+    // bridge understood, not only the role's own vocabulary. Without this,
+    // `{batteryLevel: 48, futureKey: 1}` on a battery endpoint left
+    // `rest = {futureKey: 1}`, which `statePatchOrRefuse` refused wholesale —
+    // a valid battery reading thrown away alongside the stranger it arrived
+    // with. A push with no consumable battery key keeps the ordinary refusal.
+    const patch = battery !== undefined ? definitionFor(role).statePatch(rest) : statePatchOrRefuse(role, rest);
     if (battery !== undefined) {
         // Rides the existing residual `endpoint.set()` below — a plain
         // attribute write, no command semantics, no `WatchSpec`, no third

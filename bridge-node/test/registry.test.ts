@@ -2282,6 +2282,45 @@ describe("PowerSource / battery (issue #220)", () => {
         }
     });
 
+    it("a consumed batteryLevel keeps a stranger key from refusing the whole push (skew tolerance)", async () => {
+        // The version-skew case `applyStates`' own doc describes: a battery
+        // reading this bridge understood must not be thrown away just because
+        // it arrived alongside a key this build has never heard of.
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(1, Role.onOffLight, { battery: true })], false);
+            await h.registry.setState(1, { batteryLevel: 48, bogus: 1 });
+            const endpoint = only(h);
+            assert.equal((endpoint.stateOf("powerSource") as Record<string, unknown>).batPercentRemaining, 96);
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("a stranger key ALONE (no consumable battery) is still refused wholesale", async () => {
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(1, Role.onOffLight, { battery: true })], false);
+            await rejects(() => h.registry.setState(1, { bogus: 1 }), ErrorCode.malformedArgs);
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("the same skew tolerance applies to createEndpoint's initial states", async () => {
+        const h = await harness();
+        try {
+            await h.registry.reconcile(
+                [spec(1, Role.onOffLight, { battery: true, states: { batteryLevel: 48, bogus: 1 } })],
+                false,
+            );
+            const endpoint = only(h);
+            assert.equal((endpoint.stateOf("powerSource") as Record<string, unknown>).batPercentRemaining, 96);
+        } finally {
+            await h.close();
+        }
+    });
+
     it("upsert: a battery GAIN keeps the endpoint number, adds the cluster, and bumps ConfigurationVersion", async () => {
         const h = await harness();
         const version = (): number =>
@@ -2296,6 +2335,48 @@ describe("PowerSource / battery (issue #220)", () => {
             assert.equal(version(), before + 1, "a battery gain is a configuration change");
             const endpoint = only(h);
             assert.ok(descriptorOf(endpoint).serverList.map(Number).includes(47));
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("upsert: bumps ConfigurationVersion even when the battery-gain recreate's create() fails", async () => {
+        // `closeOne` succeeds (the old endpoint really is gone) but `create`
+        // throws on a state key `onOffLight` cannot consume — the exact
+        // half-applied shape `reconcileNow`'s own catch handles, now pinned on
+        // the `upsert` path too.
+        const h = await harness();
+        const version = (): number =>
+            (h.node.state.basicInformation as { configurationVersion?: number }).configurationVersion ?? 0;
+        try {
+            await h.registry.upsert(spec(1, Role.onOffLight, { battery: false }));
+            const before = version();
+
+            await rejects(
+                () =>
+                    h.registry.upsert(spec(1, Role.onOffLight, { battery: true, states: { level: 50 } })),
+                ErrorCode.malformedArgs,
+            );
+
+            assert.equal(version(), before + 1, "the set changed even though create failed, so the bump must fire");
+            assert.equal(h.registry.size, 0, "the old endpoint is gone and the new one never landed");
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("upsert: a role change over a battery gain is refused as role_change — the role check runs first", async () => {
+        // Pins the check ORDERING: the role refusal must sit above the
+        // battery-gain branch, or a role change riding a battery gain would
+        // recreate under the new role instead of being refused outright.
+        const h = await harness();
+        try {
+            await h.registry.upsert(spec(1, Role.onOffLight, { battery: false }));
+            await rejects(
+                () => h.registry.upsert(spec(1, Role.dimmableLight, { battery: true })),
+                ErrorCode.roleChange,
+            );
+            assert.equal(h.registry.summaries()[0]?.role, Role.onOffLight, "nothing moved under a refused upsert");
         } finally {
             await h.close();
         }
