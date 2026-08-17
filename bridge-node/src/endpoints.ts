@@ -13,24 +13,27 @@
  * table rather than hand-kept, so the {@link UNSUPPORTED_ROLE_DETAILS} refusal
  * survives only as the gate a *future* enum addition would trip.
  *
- * Two kinds of role live here, and they use different machinery — and as of
- * #143, `onOff` is the one attribute that genuinely belongs to both:
+ * Two kinds of role live here, and they use different machinery:
  *
- * * **Attribute-driven** roles (every sensor, the thermostat, and — for
- *   `onOff` alone — every light and plug) report ecosystem intent through
- *   {@link WatchSpec}s on the cluster attributes an ecosystem writes. `onOff`
- *   stays on this list because `LevelControlServer`'s `couple()` writes
- *   `state.onOff` directly when a dimmer's `*WithOnOff` command turns the
- *   light on or off — bypassing any command override entirely — so
- *   `WATCH_ON_OFF` is still the only path that reaches Indigo for that case.
- * * **Invocation-driven** roles (`doorLock`, `windowCovering`, and — for
- *   `onOff` alone — every light and plug again) cannot rely on attributes:
- *   their ecosystem-facing surface is *commands*, and matter.js's stock
- *   servers answer those by writing the state themselves. All three are
+ * * **Attribute-driven** roles (every sensor and the thermostat) report
+ *   ecosystem intent through {@link WatchSpec}s on the cluster attributes an
+ *   ecosystem writes — there is no other surface for them to speak through.
+ * * **Invocation-driven** roles — `doorLock`, `windowCovering`, and, as of
+ *   #143, the whole light/plug family (`onOff`, `levelControl` and
+ *   `colorControl` together) — cannot rely on attributes: their
+ *   ecosystem-facing surface is *commands*, and matter.js's stock servers
+ *   answer those by writing the state themselves. Every one of them is
  *   overridden here so the write never happens — see
- *   {@link IndigoDoorLockServer}, {@link IndigoWindowCoveringServer} and
- *   {@link IndigoOnOffServer} — and they reach their `command` sink through
- *   {@link COMMAND_SINKS}.
+ *   {@link IndigoDoorLockServer}, {@link IndigoWindowCoveringServer},
+ *   {@link IndigoOnOffServer}, {@link IndigoLevelControlServer} and
+ *   {@link IndigoColorControlServer}/{@link IndigoColorTemperatureControlServer}
+ *   — and they reach their `command` sink through {@link COMMAND_SINKS}.
+ *
+ * The `WATCH_*` specs for `onOff`/`levelControl`/`colorControl` still exist
+ * (§2.5 of the #143 design keeps them as producerless **backstops**, not
+ * because anything here still writes through them) — see their own docs for
+ * why a duplicate frame from a defunct watcher is worth keeping over deleting
+ * the regression detector.
  */
 
 import { Endpoint, type EndpointType, Logger, type MaybePromise, type MutableEndpoint, VendorId } from "@matter/main";
@@ -680,10 +683,15 @@ function emitCommand(
  * `onWithTimedOff` to special-case "unconfirmed" would duplicate stock logic
  * this class otherwise leaves alone.
  *
- * What this does NOT fix: `LevelControlServer`'s `couple()` still
- * writes `onOff` optimistically ahead of Indigo's confirmation when a dimmer
- * command carries `WithOnOff` — a real PRD §7 gap, but LevelControl's to
- * close, not this class's (a later PR's scope).
+ * **This is now FIXED, not a known gap.** `LevelControlServer`'s `couple()`
+ * used to write `onOff` optimistically ahead of Indigo's confirmation
+ * whenever a dimmer command carried `WithOnOff` — a real PRD §7 violation,
+ * reachable only from LevelControl, not from this class. #143's LevelControl
+ * conversion ({@link IndigoLevelControlServer}) closes it by never calling
+ * `couple()` at all: the overridden `transition()` replaces the whole method
+ * body, so nothing downstream of a dimmer command ever reaches
+ * `agent.get(OnOffServer).state.onOff = …` any more. The coupling went
+ * invocation-driven in the same PR as `onOff` itself.
  */
 class IndigoOnOffServer extends OnOffServer.with("Lighting") {
     /**
@@ -702,19 +710,20 @@ class IndigoOnOffServer extends OnOffServer.with("Lighting") {
      * running — would have the restart's replayed push read as "turn it
      * off" and silently kill a countdown nothing asked to cancel.
      *
-     * **The guard is right for that replay case and blind to one other**: when
-     * `LevelControlServer.couple()` has already moved the attribute (a dimmer
-     * `*WithOnOff` command writes `state.onOff` directly, never through
-     * `off()`), an Indigo off-confirmation arrives with `value === state.onOff`
-     * while `timedOnTimer` is still live — the no-op skips `super.off()`'s
-     * timer stop, and the ghost countdown later emits an off nothing asked
-     * for. The two cases are byte-identical here; the ambiguity exists only
-     * because `couple()` writes optimistically ahead of Indigo, so the real
-     * fix is the LevelControl conversion (the "What this does NOT fix"
-     * paragraph above). Until then the branch below makes the ambiguous state
-     * visible instead of silent. (#203 — a bridge-node *restart* dropping a
-     * running countdown, since the timer is in-memory only — is the other,
-     * separate half of countdown correctness; this guard merely governs the
+     * **The ghost case this guard used to be ambiguous about is closed.**
+     * Before #143's LevelControl conversion, `LevelControlServer.couple()`
+     * could move the attribute directly (a dimmer `*WithOnOff` command wrote
+     * `state.onOff`, never through `off()`), which made an Indigo
+     * off-confirmation arriving with `value === state.onOff` while
+     * `timedOnTimer` was still live genuinely ambiguous: a harmless replay
+     * and a ghost countdown were byte-identical here. `couple()` is never
+     * called any more ({@link IndigoLevelControlServer}'s `transition()`
+     * override replaces its whole call site), so the replay case is the
+     * *only* remaining explanation for this state, and the branch below is
+     * debug-level bookkeeping rather than a warning about something that
+     * might be wrong. (#203 — a bridge-node *restart* dropping a running
+     * countdown, since the timer is in-memory only — is a separate, still
+     * open half of countdown correctness; this guard only concerns the
      * replayed push that follows such a restart.)
      */
     applyIndigoOnOff(value: boolean): MaybePromise {
@@ -725,12 +734,11 @@ class IndigoOnOffServer extends OnOffServer.with("Lighting") {
             // countdown tests.
             const internal = (this as unknown as { internal?: { timedOnTimer?: { isRunning?: boolean } } }).internal;
             if (!value && internal?.timedOnTimer?.isRunning) {
-                logger.warn(
+                logger.debug(
                     `Endpoint ${this.endpoint.id}: an off push matched an already-off onOff attribute while a ` +
-                        "timed-on countdown is still running. Either this is a replayed push racing its own " +
-                        "confirmation (harmless; the countdown must survive) or LevelControl's onOff coupling " +
-                        "wrote the attribute ahead of Indigo — in which case this countdown is a ghost and will " +
-                        "emit an off later. Resolution is tracked with the LevelControl conversion (#143).",
+                        "timed-on countdown is still running — a replayed push racing its own confirmation " +
+                        "(harmless; the countdown must survive). #143 removed the only other way this state " +
+                        "could arise (LevelControl's onOff coupling writing ahead of Indigo).",
                 );
             }
             return;
@@ -1058,15 +1066,28 @@ class IndigoColorControlServer extends ColorControlServer.with("HueSaturation", 
 
 /**
  * The `colorTemperatureLight` twin of {@link IndigoColorControlServer},
- * carrying only the `ColorTemperature` feature — matching the stock device
- * type's own `ColorControlServer.with("ColorTemperature")`
- * (`color-temperature-light.js:24`, HR-1). `HueSaturation`/`Xy` do not exist
- * on this role at all, so there is no hue/saturation/xy surface to override:
- * only the three colour-temperature `*Logic` methods and `switchColorMode`
- * (which can still fire between CT and whatever mode the attribute started
- * in, so it gets the same no-op for the same reason as the full class).
+ * carrying only the `ColorTemperature` feature AND the same `remainingTime`
+ * mandatory-alter — matching the stock device type's own composition
+ * byte-for-byte: `ColorControlServer.with("ColorTemperature").alter({
+ * attributes: { remainingTime: { optional: false } } })`
+ * (`color-temperature-light.js:24,32`, HR-1). Unlike
+ * {@link IndigoColorControlServer} — which was already, before #143, a BARE
+ * `ColorControlServer.with(…)` with no `remainingTime` alter, to restore
+ * HueSaturation conformance the Matter spec requires and the stock
+ * `extended-color-light.js` device type omits — `colorTemperatureLight`
+ * never had a ColorControl override before this PR, so it is this class,
+ * not a pre-existing one, whose composition must be pinned exactly or HR-1
+ * regresses silently (caught by the cluster-composition test: without the
+ * `.alter()`, `remainingTime` drops out of `attributeList` entirely).
+ * `HueSaturation`/`Xy` do not exist on this role at all, so there is no
+ * hue/saturation/xy surface to override: only the three colour-temperature
+ * `*Logic` methods and `switchColorMode` (which can still fire between CT
+ * and whatever mode the attribute started in, so it gets the same no-op for
+ * the same reason as the full class).
  */
-class IndigoColorTemperatureControlServer extends ColorControlServer.with("ColorTemperature") {
+class IndigoColorTemperatureControlServer extends ColorControlServer.with("ColorTemperature").alter({
+    attributes: { remainingTime: { optional: false } },
+}) {
     override moveToColorTemperatureLogic(targetMireds: number, _transitionTime: number): MaybePromise {
         emitCommand(this.endpoint.id, "setColorTemp", { colorTempMireds: clampMireds(targetMireds) });
     }
@@ -1408,9 +1429,21 @@ const WATCH_ON_OFF: WatchSpec = {
 };
 
 /**
- * `currentLevel` → §4.2 `setLevel {"level": 0-100}`. Matter's `moveToLevel`,
- * `step`, `move` and the Lighting on/off transitions all land here as an
- * attribute change, which is why one listener covers the whole command family.
+ * `currentLevel` → §4.2 `setLevel {"level": 0-100}`.
+ *
+ * **A backstop, not the producer, as of #143.** `moveToLevel`/`step`/`move`
+ * and their `WithOnOff` twins are now reported by
+ * {@link IndigoLevelControlServer}'s `transition()` override, which never
+ * writes `currentLevel` at all — so under normal operation this observable
+ * never fires. It stays wired for two reasons: (1) a regression detector — if
+ * a future matter.js upgrade ever starts writing this attribute in a remote
+ * context again (a rewritten `LevelControlServer`, a new code path this PR
+ * did not anticipate), a duplicate `setLevel` frame that Indigo treats
+ * idempotently is a far better failure than a silent, permanent loss of the
+ * whole `setLevel` family; (2) {@link watchCommands}'s throw-on-missing-
+ * observable check is itself a live contract test — deleting the watcher
+ * would also delete the guarantee that `currentLevel$Changed` still exists on
+ * this matter.js version.
  */
 const WATCH_LEVEL: WatchSpec = {
     behavior: LEVEL_CONTROL,
@@ -1769,11 +1802,13 @@ function doorLockDefaults(): Record<string, unknown> {
 }
 
 const ROLE_DEFINITIONS: Record<RoleValue, RoleDefinition> = {
-    // #143: every OnOff-bearing role below adds IndigoOnOffServer so the
-    // ecosystem's on/off/toggle/timed commands report through the sink
-    // instead of writing the attribute themselves. WATCH_ON_OFF stays too —
-    // it is still the only path LevelControl's onOff coupling reaches (the
-    // "What this does NOT fix" paragraph of the IndigoOnOffServer doc).
+    // #143: every OnOff-bearing role below adds IndigoOnOffServer, and every
+    // level/colour-bearing one also adds IndigoLevelControlServer and an
+    // IndigoColorControlServer/IndigoColorTemperatureControlServer, so the
+    // ecosystem's on/off/toggle/timed/level/colour commands all report
+    // through the sink instead of writing an attribute themselves.
+    // WATCH_ON_OFF/WATCH_LEVEL/WATCH_COLOR_TEMP/WATCH_HUE/WATCH_SATURATION
+    // stay wired too, now purely as backstops — see their own docs.
     [Role.onOffPlugInUnit]: {
         deviceType: () => OnOffPlugInUnitDevice.with(BridgedDeviceBasicInformationServer, IndigoOnOffServer),
         initialState: () => ({}),

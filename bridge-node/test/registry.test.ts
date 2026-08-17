@@ -19,7 +19,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
 
-import { Endpoint, Environment, Logger, ServerNode, VendorId } from "@matter/main";
+import { Endpoint, type EndpointType, Environment, Logger, ServerNode, VendorId } from "@matter/main";
 import { BasicInformationServer } from "@matter/main/behaviors/basic-information";
 import { BridgedDeviceBasicInformationServer } from "@matter/main/behaviors/bridged-device-basic-information";
 import { ColorControlServer } from "@matter/main/behaviors/color-control";
@@ -31,6 +31,9 @@ import { WindowCoveringServer } from "@matter/main/behaviors/window-covering";
 import { ColorControl } from "@matter/main/clusters/color-control";
 import { DoorLock } from "@matter/main/clusters/door-lock";
 import { LevelControl } from "@matter/main/clusters/level-control";
+import { ColorTemperatureLightDevice } from "@matter/main/devices/color-temperature-light";
+import { DimmableLightDevice } from "@matter/main/devices/dimmable-light";
+import { ExtendedColorLightDevice } from "@matter/main/devices/extended-color-light";
 import { OnOffLightDevice } from "@matter/main/devices/on-off-light";
 import { AggregatorEndpoint } from "@matter/main/endpoints/aggregator";
 
@@ -943,7 +946,18 @@ describe("command events and the echo guard (§4.2, §6.4)", () => {
         }
     });
 
-    it("emits the §4.2 payload for each attribute an ecosystem changes", async () => {
+    it("emits the §4.2 payload for each attribute an ecosystem changes (WATCH_* backstop pin)", async () => {
+        // Since #143, onOff/currentLevel/colorTemperatureMireds/currentHue
+        // are no longer written by any code path this bridge controls — the
+        // command-conversion overrides never write an attribute, so under
+        // normal operation none of these observables ever fires. They stay
+        // wired anyway as backstops (see WATCH_LEVEL's own doc): this test
+        // pins that IF something ever did write one of these attributes in a
+        // remote context again — a matter.js upgrade, a code path this PR
+        // did not anticipate — the watcher would still turn it into the
+        // right §4.2 frame, rather than the change vanishing silently.
+        // ecosystemWrite() simulates that "something", since a real
+        // invocation cannot any more (the overrides intercept it first).
         const h = await harness();
         try {
             await h.registry.reconcile([spec(7, Role.extendedColorLight)], false);
@@ -970,33 +984,47 @@ describe("command events and the echo guard (§4.2, §6.4)", () => {
         }
     });
 
-    it("still lets the dimmer's LevelControl coupling move onOff directly (PR4 boundary fence)", async () => {
-        // LevelControlServer.couple() (LevelControlServer.js:363-390) writes
-        // `agent.get(OnOffServer).state.onOff` DIRECTLY when a *WithOnOff
-        // command turns the light on or off — it never calls on()/off(), so
-        // it is untouched by #143's conversion and reaches Indigo purely
-        // through WATCH_ON_OFF, exactly as before. A real invocation cannot
-        // stand in for the ecosystem here: `endpoint.act()` always opens an
-        // offline LocalActorContext (LocalActorContext.js:93), so this uses
-        // the same ecosystemWrite() lever the test above does — what PR2
-        // must not break is that the two attributes couple() moves, moved
-        // by a real MoveToLevelWithOnOff, still both reach Indigo. (What
-        // couple() still does that PR2 deliberately leaves alone — moving
-        // onOff optimistically before Indigo confirms — is a later PR's,
-        // not this one's; see the IndigoOnOffServer class doc.)
+    it("a real moveToLevelWithOnOff emits both frames and moves NEITHER attribute (#143 boundary fence)", async () => {
+        // Before #143, LevelControlServer.couple() (LevelControlServer.js:
+        // 363-398) wrote `agent.get(OnOffServer).state.onOff` DIRECTLY when a
+        // *WithOnOff command turned the light on or off — it never called
+        // on()/off(), so it reached Indigo purely through WATCH_ON_OFF, and a
+        // real invocation could not exercise it (endpoint.act() always opens
+        // an offline LocalActorContext, which the echo guard would have
+        // swallowed). #143's override never calls couple() at all — the
+        // whole method body is replaced — so this is now a REAL invocation,
+        // and the assertion is stronger than the old fence's: not just that
+        // both frames arrive, but that neither attribute moves. Both facts
+        // are the direct consequence of never calling couple() or writing
+        // `this.state.currentLevel`/`agent.get(OnOffServer).state.onOff`.
         const h = await harness();
         try {
             await h.registry.reconcile([spec(1, Role.dimmableLight, { states: { onOff: false } })], false);
-            const endpoint = [...h.aggregator.parts][0];
-            assert.ok(endpoint !== undefined);
+            const endpoint = only(h);
 
-            ecosystemWrite(endpoint, "onOff", "onOff", true, false);
-            ecosystemWrite(endpoint, "levelControl", "currentLevel", 128, 1);
+            await endpoint.act(agent =>
+                agent.get(LevelLighting).moveToLevelWithOnOff({
+                    level: 128,
+                    transitionTime: null,
+                    optionsMask: {},
+                    optionsOverride: {},
+                }),
+            );
 
             assert.deepEqual(h.commands, [
                 { indigoDeviceId: 1, command: "onOff", args: { value: true } },
                 { indigoDeviceId: 1, command: "setLevel", args: { level: 50 } },
             ]);
+            assert.equal(
+                (endpoint.stateOf("onOff") as Record<string, unknown>).onOff,
+                false,
+                "the invocation must not have moved onOff",
+            );
+            assert.equal(
+                (endpoint.stateOf("levelControl") as Record<string, unknown>).currentLevel,
+                1,
+                "the invocation must not have moved currentLevel",
+            );
         } finally {
             await h.close();
         }
@@ -2277,6 +2305,62 @@ describe("LevelControl command conversion (§4.2, #143)", () => {
             await h.close();
         }
     });
+
+    it("every level-bearing role reports LevelControl invocations through the sink (level fence)", async () => {
+        // Dropping IndigoLevelControlServer from any role's deviceType().with()
+        // is a SILENT regression on that role alone: agent.get() resolves by
+        // behaviour id, so the stock server would answer, write the attribute
+        // itself, and emit nothing — and no other test exercises a level
+        // invocation on colorTemperatureLight. Mirrors the OnOff five-role
+        // fence.
+        const roles = [Role.dimmableLight, Role.colorTemperatureLight, Role.extendedColorLight];
+        for (const role of roles) {
+            const h = await harness();
+            try {
+                await h.registry.reconcile([spec(1, role)], false);
+                const endpoint = only(h);
+                await endpoint.act(agent =>
+                    agent
+                        .get(LevelLighting)
+                        .moveToLevel({ level: 152, transitionTime: null, optionsMask: {}, optionsOverride: {} }),
+                );
+                assert.deepEqual(
+                    h.commands,
+                    [{ indigoDeviceId: 1, command: "setLevel", args: { level: 60 } }],
+                    `role ${role}: the invocation must emit through the sink`,
+                );
+                assert.equal(
+                    (endpoint.stateOf("levelControl") as Record<string, unknown>).currentLevel,
+                    1,
+                    `role ${role}: the invocation must not move the attribute`,
+                );
+            } finally {
+                await h.close();
+            }
+        }
+    });
+
+    it("a level invocation does not also trigger WATCH_LEVEL (no double emission)", async () => {
+        // The override never writes `currentLevel`, so the backstop watcher
+        // must see nothing — a regression here would be a second, spurious
+        // setLevel frame for every real command.
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(1, Role.dimmableLight)], false);
+            const endpoint = only(h);
+            await endpoint.act(agent =>
+                agent.get(LevelLighting).moveToLevel({
+                    level: 152,
+                    transitionTime: null,
+                    optionsMask: {},
+                    optionsOverride: {},
+                }),
+            );
+            assert.equal(h.commands.length, 1, "a level invocation emitted more than one frame");
+        } finally {
+            await h.close();
+        }
+    });
 });
 
 describe("ColorControl command conversion (§4.2, #143)", () => {
@@ -2536,6 +2620,178 @@ describe("ColorControl command conversion (§4.2, #143)", () => {
             await h.close();
         }
     });
+
+    it("every colour-bearing role reports ColorControl invocations through the sink (colour fence)", async () => {
+        // Mirrors the LevelControl fence: dropping IndigoColorControlServer/
+        // IndigoColorTemperatureControlServer from a role's deviceType() is a
+        // silent regression on that role alone.
+        const h1 = await harness();
+        try {
+            await h1.registry.reconcile([spec(1, Role.extendedColorLight)], false);
+            const endpoint = only(h1);
+            await endpoint.act(agent =>
+                agent.get(ColorFull).moveToColorTemperature({
+                    colorTemperatureMireds: 320,
+                    transitionTime: 10,
+                    optionsMask: {},
+                    optionsOverride: {},
+                }),
+            );
+            assert.deepEqual(h1.commands, [
+                { indigoDeviceId: 1, command: "setColorTemp", args: { colorTempMireds: 320 } },
+            ]);
+        } finally {
+            await h1.close();
+        }
+
+        const h2 = await harness();
+        try {
+            await h2.registry.reconcile([spec(1, Role.colorTemperatureLight)], false);
+            const endpoint = only(h2);
+            await endpoint.act(agent =>
+                agent.get(ColorCt).moveToColorTemperature({
+                    colorTemperatureMireds: 320,
+                    transitionTime: 10,
+                    optionsMask: {},
+                    optionsOverride: {},
+                }),
+            );
+            assert.deepEqual(h2.commands, [
+                { indigoDeviceId: 1, command: "setColorTemp", args: { colorTempMireds: 320 } },
+            ]);
+        } finally {
+            await h2.close();
+        }
+    });
+
+    it("a colour invocation does not also trigger WATCH_COLOR_TEMP/WATCH_HUE/WATCH_SATURATION (no double emission)", async () => {
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(1, Role.extendedColorLight)], false);
+            const endpoint = only(h);
+            await endpoint.act(agent =>
+                agent.get(ColorFull).moveToColorTemperature({
+                    colorTemperatureMireds: 320,
+                    transitionTime: 10,
+                    optionsMask: {},
+                    optionsOverride: {},
+                }),
+            );
+            assert.equal(h.commands.length, 1, "a colour invocation emitted more than one frame");
+        } finally {
+            await h.close();
+        }
+    });
+});
+
+describe("cluster composition is unchanged from stock (HR-1)", () => {
+    /**
+     * Per converting role: build the Indigo endpoint via the ordinary
+     * registry path, then build a bare STOCK endpoint — same `.with()`
+     * feature set, no `Indigo*Server` overrides — seeded with the Indigo
+     * endpoint's own already-valid state (sidesteps re-deriving matter.js's
+     * mandatory-conformance seed values by hand, and can never disagree with
+     * what {@link createEndpoint} actually produces). Then diff the two on
+     * exactly what a controller can see: `attributeList`/
+     * `acceptedCommandList`/`featureMap` per behaviour, and the descriptor's
+     * `serverList`/`deviceTypeList`. Equal here is HR-1 made a test: nothing
+     * about a converting role's `.with()` feature composition changed, only
+     * its command HANDLING did — no accessory recreation, no migration.
+     */
+    const CASES: [string, RoleValue, () => EndpointType, string[]][] = [
+        [
+            "dimmableLight",
+            Role.dimmableLight,
+            () => DimmableLightDevice.with(BridgedDeviceBasicInformationServer),
+            ["onOff", "levelControl"],
+        ],
+        [
+            "colorTemperatureLight",
+            Role.colorTemperatureLight,
+            () => ColorTemperatureLightDevice.with(BridgedDeviceBasicInformationServer),
+            ["onOff", "levelControl", "colorControl"],
+        ],
+        [
+            "extendedColorLight",
+            Role.extendedColorLight,
+            () =>
+                ExtendedColorLightDevice.with(
+                    BridgedDeviceBasicInformationServer,
+                    ColorControlServer.with("HueSaturation", "Xy", "ColorTemperature"),
+                ),
+            ["onOff", "levelControl", "colorControl"],
+        ],
+    ];
+
+    for (const [label, role, stockDeviceType, behaviors] of CASES) {
+        it(`${label}: attributeList/acceptedCommandList/featureMap and serverList/deviceTypeList match stock`, async () => {
+            const h = await harness();
+            try {
+                await h.registry.reconcile([spec(1, role)], false);
+                const indigo = only(h);
+
+                const initial: Record<string, unknown> = {
+                    bridgedDeviceBasicInformation: {
+                        ...(indigo.stateOf("bridgedDeviceBasicInformation") as Record<string, unknown>),
+                        uniqueId: "stock-twin-unique-id",
+                        serialNumber: "stock-twin-serial",
+                    },
+                };
+                for (const behavior of behaviors) {
+                    initial[behavior] = { ...(indigo.stateOf(behavior) as Record<string, unknown>) };
+                }
+                const stock = new Endpoint(stockDeviceType() as never, { id: "stock-twin", ...initial } as never);
+                await h.aggregator.add(stock);
+
+                for (const behavior of behaviors) {
+                    const indigoState = indigo.stateOf(behavior) as {
+                        attributeList: number[];
+                        acceptedCommandList: number[];
+                    };
+                    const stockState = stock.stateOf(behavior) as {
+                        attributeList: number[];
+                        acceptedCommandList: number[];
+                    };
+                    assert.deepEqual(
+                        [...indigoState.attributeList].sort(),
+                        [...stockState.attributeList].sort(),
+                        `${label}.${behavior}: attributeList differs from stock`,
+                    );
+                    assert.deepEqual(
+                        [...indigoState.acceptedCommandList].sort(),
+                        [...stockState.acceptedCommandList].sort(),
+                        `${label}.${behavior}: acceptedCommandList differs from stock`,
+                    );
+                    assert.deepEqual(
+                        indigo.featuresOf(behavior),
+                        stock.featuresOf(behavior),
+                        `${label}.${behavior}: featureMap differs from stock`,
+                    );
+                }
+
+                const indigoDescriptor = indigo.stateOf("descriptor") as {
+                    serverList: unknown[];
+                    deviceTypeList: unknown;
+                };
+                const stockDescriptor = stock.stateOf("descriptor") as {
+                    serverList: unknown[];
+                    deviceTypeList: unknown;
+                };
+                assert.deepEqual(
+                    [...indigoDescriptor.serverList].map(Number).sort(),
+                    [...stockDescriptor.serverList].map(Number).sort(),
+                    `${label}: descriptor.serverList differs from stock`,
+                );
+                assert.deepEqual(
+                    indigoDescriptor.deviceTypeList,
+                    stockDescriptor.deviceTypeList,
+                    `${label}: descriptor.deviceTypeList differs from stock`,
+                );
+            } finally {
+                await h.close();
+            }
+        });
+    }
 });
 
 describe("window covering commands (§4.2, E4)", () => {
