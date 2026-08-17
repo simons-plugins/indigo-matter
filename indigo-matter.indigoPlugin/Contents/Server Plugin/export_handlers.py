@@ -114,6 +114,10 @@ STATE_LOCAL_TEMPERATURE_C = "localTemperatureC"
 STATE_HEATING_SETPOINT_C = "heatingSetpointC"
 STATE_COOLING_SETPOINT_C = "coolingSetpointC"
 STATE_SYSTEM_MODE = "systemMode"
+#: Role-independent (§4.2 ``bridge_protocol.SHARED_STATE_KEYS``, issue #220) —
+#: added by :meth:`ExportHandler.published_states`, never by a role's own
+#: ``states_for``.
+STATE_BATTERY_LEVEL = "batteryLevel"
 
 COMMAND_ON_OFF = "onOff"
 COMMAND_SET_LEVEL = "setLevel"
@@ -323,6 +327,33 @@ def _number(dev: Any, name: str) -> Optional[float]:
     return float(value)
 
 
+def battery_percent(dev: Any) -> Optional[int]:
+    """``dev.batteryLevel`` as the §4.2 ``batteryLevel`` percentage, or ``None``.
+
+    ``None`` for a non-numeric value AND for a literal **0** — the deliberate
+    opposite of :func:`_first_number`'s temperature ruling just above, and not
+    an accident. Indigo initialises every declared Integer state to 0 at
+    device creation (issue #190, ``device_sync.py`` lines 2255-2264), so a bare
+    0 on a freshly commissioned device is indistinguishable from "never
+    polled". Unlike 0 °C — a real reading a working outdoor thermostat gives
+    every winter — 0% is not a reading a working device CAN give: a cell that
+    flat has stopped talking, not reported one last data point. Reporting a
+    fresh device's placeholder 0 as a battery level is exactly the false "your
+    device's battery is critically low" alarm issue #220 exists to avoid.
+
+    Clamped to 100 at the top: a ``batteryLevel`` above 100 is a device/driver
+    bug, and letting it through would just move the failure to the node's own
+    ``percentToBatteryRemaining`` clamp (a debug line there, not a decision
+    here) for no better an answer.
+    """
+    value = getattr(dev, "batteryLevel", None)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if value == 0:
+        return None
+    return min(100, int(round(value)))
+
+
 # --------------------------------------------------------------------------
 # Handlers
 # --------------------------------------------------------------------------
@@ -346,6 +377,30 @@ class ExportHandler:
         none and ignore it; ``windowCovering`` reads its polarity from it.
         """
         raise NotImplementedError
+
+    def published_states(self, dev: Any, options: Optional[dict] = None) -> dict:
+        """:meth:`states_for`, plus ``batteryLevel`` when the device has one.
+
+        The ONE place battery is added, deliberately outside every role's own
+        override chain (issue #220). Six of the fifteen handlers below skip
+        ``super().states_for()`` entirely (``OnOffExport``,
+        ``WindowCoveringExport``, ``DoorLockExport``, ``ThermostatExport``,
+        ``BinarySensorExport``, ``NumericSensorExport``), so a battery key
+        added inside ``states_for`` itself would silently vanish for exactly
+        those roles — the Wrong Abstraction fifteen near-identical additions
+        would be, and the reason this is a wrapper rather than a mixin method
+        any subclass could accidentally shadow.
+
+        :meth:`diff_with_gaps` and :meth:`diff_from` both read through THIS,
+        never through ``states_for`` directly — otherwise ``batteryLevel``
+        would show as permanently "stopped" on every single diff, since
+        ``states_for`` never had it to begin with.
+        """
+        states = self.states_for(dev, options)
+        percent = battery_percent(dev)
+        if percent is not None:
+            states = {**states, STATE_BATTERY_LEVEL: percent}
+        return states
 
     def diff(self, orig_dev: Any, new_dev: Any, options: Optional[dict] = None) -> dict:
         """The changed §4.2 keys only. Empty dict = nothing to push.
@@ -388,7 +443,7 @@ class ExportHandler:
         Spelling an explicit "unknown" on the wire would be a protocol
         addition, deliberately not made here.
         """
-        return self.diff_from(self.states_for(orig_dev, options), new_dev, options)
+        return self.diff_from(self.published_states(orig_dev, options), new_dev, options)
 
     def diff_from(self, pushed: Optional[dict], new_dev: Any,
                   options: Optional[dict] = None) -> StateDiff:
@@ -410,7 +465,7 @@ class ExportHandler:
         somebody's Home app.
         """
         before = dict(pushed or {})
-        after = self.states_for(new_dev, options)
+        after = self.published_states(new_dev, options)
         changed = {
             key: value for key, value in after.items()
             if self._changed(key, before.get(key, _MISSING), value)

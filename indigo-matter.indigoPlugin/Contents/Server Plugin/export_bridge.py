@@ -887,7 +887,7 @@ class ExportBridge:
             return self._skip(device_id, f"the role {entry.role!r} is not one this plugin "
                                          "version can bridge")
         try:
-            states = handler.states_for(dev, entry.options)
+            states = handler.published_states(dev, entry.options)
         except Exception as exc:  # pylint: disable=broad-except
             self._logger.exception(exc)
             # The exception TEXT is deliberately not part of the dedupe key: a
@@ -909,6 +909,16 @@ class ExportBridge:
             reachable=reachable_of(dev),
             states=states,
             options=dict(entry.options),
+            # §4.1 issue #220 — evidence, not opinion. `is not None` (INCLUDING
+            # a literal 0) is deliberately the opposite test to
+            # `battery_percent`'s (which suppresses 0): the device factually
+            # HAS a battery attribute the moment `batteryLevel` exists at all,
+            # whatever its current value — a device/driver bug producing 0
+            # does not make the battery stop existing — while the *reading* of
+            # 0 is untrustworthy (issue #190) and must not be published as a
+            # value. ADR-0003's evidence rule applied correctly to the same
+            # attribute two different ways, two lines apart, on purpose.
+            battery=getattr(dev, "batteryLevel", None) is not None,
         )
 
     def _skip(self, device_id: int, why: str, detail: str = "") -> None:
@@ -959,6 +969,23 @@ class ExportBridge:
             return                             # already warned by the provider
         client = self._live_client("the state update", new_dev.id)
         if client is None:
+            return
+        # Issue #220 — a device that just STARTED reporting a battery has to be
+        # RE-CREATED with PowerSource, not have `batteryLevel` folded into an
+        # ordinary `set_state`: the live endpoint was built without it (§4.1's
+        # `battery` flag was false at the time), and BRIDGE_PROTOCOL §4.1's
+        # measured trap means a `set_state` carrying `batteryLevel` against it
+        # is refused outright. `upsert()` sends a full spec, so the node
+        # recreates it — `registry.upsert`/`planReconcile` both treat a
+        # battery GAIN as recreate-worthy, exactly like a role change. A
+        # battery going away is deliberately NOT symmetric: nothing here does
+        # anything for it, because the node's cluster set is monotonic and
+        # `_report_stopped_keys` (below) already covers a device that stops
+        # answering.
+        had_battery = getattr(orig_dev, "batteryLevel", None) is not None
+        has_battery = getattr(new_dev, "batteryLevel", None) is not None
+        if has_battery and not had_battery:
+            self.upsert(new_dev.id)
             return
         # Order matters only in that frames are applied in receipt order (§1):
         # identity first, then availability, then state.

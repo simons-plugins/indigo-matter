@@ -922,3 +922,62 @@ class TestKeysThatStopBeingReported:
                                                   DimmerDevice(1, "L", onState=True, brightness=75))
         assert changed == {"level": 75}
         assert stopped == frozenset()
+
+
+# ---------------------------------------------------------------------------
+# Battery (issue #220) — role-independent, added only by `published_states`
+# ---------------------------------------------------------------------------
+class TestBattery:
+    @pytest.mark.parametrize("value,expected", [
+        (None, None),
+        (0, None),      # issue #190: indistinguishable from "never polled"
+        (0.0, None),
+        (True, None),   # bool is an int in Python; not a battery reading
+        ("77", None),
+        (1, 1),
+        (77, 77),
+        (150, 100),     # clamped
+    ])
+    def test_battery_percent(self, handlers, value, expected):
+        assert handlers.battery_percent(RelayDevice(1, "D", batteryLevel=value)) == expected
+
+    def test_battery_percent_is_none_when_the_attribute_is_absent(self, handlers):
+        assert handlers.battery_percent(RelayDevice(1, "D")) is None
+
+    @pytest.mark.parametrize("role", ALL_ROLES)
+    def test_published_states_adds_battery_level_for_every_role_but_states_for_never_does(
+            self, handlers, role):
+        dev = _capable_device(role)
+        dev.batteryLevel = 61
+        handler = handlers.HANDLERS[role]
+        assert handler.published_states(dev)["batteryLevel"] == 61
+        assert "batteryLevel" not in handler.states_for(dev)
+
+    def test_published_states_omits_the_key_when_there_is_no_reading(self, handlers):
+        handler = handlers.HANDLERS["onOffLight"]
+        dev = RelayDevice(1, "L", onState=True)
+        assert "batteryLevel" not in handler.published_states(dev)
+
+    def test_diff_from_reports_a_battery_change(self, handlers):
+        handler = handlers.HANDLERS["onOffLight"]
+        dev = RelayDevice(1, "L", onState=True, batteryLevel=80)
+        pushed = handler.published_states(dev)
+        after = RelayDevice(1, "L", onState=True, batteryLevel=79)
+        changed, stopped = handler.diff_from(pushed, after)
+        assert changed == {"batteryLevel": 79}
+        assert stopped == frozenset()
+
+    def test_diff_from_is_silent_when_battery_is_unchanged(self, handlers):
+        handler = handlers.HANDLERS["onOffLight"]
+        dev = RelayDevice(1, "L", onState=True, batteryLevel=80)
+        pushed = handler.published_states(dev)
+        changed, _stopped = handler.diff_from(pushed, RelayDevice(1, "L", onState=True, batteryLevel=80))
+        assert changed == {}
+
+    def test_a_device_that_stops_reporting_battery_is_a_stopped_key_streak(self, handlers):
+        handler = handlers.HANDLERS["onOffLight"]
+        pushed = handler.published_states(RelayDevice(1, "L", onState=True, batteryLevel=80))
+        after = RelayDevice(1, "L", onState=True, batteryLevel=None)
+        changed, stopped = handler.diff_from(pushed, after)
+        assert changed == {}
+        assert stopped == frozenset({"batteryLevel"})

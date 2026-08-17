@@ -368,6 +368,36 @@ class TestEndpointProvider:
         assert per_device_warnings(mock_logger) == 2
 
 
+class TestEndpointProviderBattery:
+    """Issue #220 — `_spec_for`'s `battery`/`batteryLevel` composition."""
+
+    def test_a_battery_device_carries_battery_true_and_the_state_key(
+            self, bridge_mod, mock_logger, devices):
+        devices.add(RelayDevice(200, "Battery Plug", onState=True, batteryLevel=80))
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(200, "onOffLight")])
+        (spec,) = h.bridge.endpoint_specs()
+        assert spec.battery is True
+        assert spec.states["batteryLevel"] == 80
+
+    def test_a_mains_device_carries_neither(self, bridge_mod, mock_logger, devices):
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(101, "onOffLight")])
+        (spec,) = h.bridge.endpoint_specs()
+        assert spec.battery is False
+        assert "batteryLevel" not in spec.states
+
+    def test_battery_level_zero_still_declares_a_battery_but_publishes_no_reading(
+            self, bridge_mod, mock_logger, devices):
+        """The asymmetry, pinned: `battery` is `is not None` (0 counts as HAS a
+        battery attribute); the *value* 0 is suppressed as untrustworthy
+        (issue #190) — the same attribute, two different tests, on purpose.
+        """
+        devices.add(RelayDevice(201, "Fresh Plug", onState=True, batteryLevel=0))
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(201, "onOffLight")])
+        (spec,) = h.bridge.endpoint_specs()
+        assert spec.battery is True
+        assert "batteryLevel" not in spec.states
+
+
 # ---------------------------------------------------------------------------
 # Client lifecycle (XG5)
 # ---------------------------------------------------------------------------
@@ -731,6 +761,43 @@ class TestDeviceUpdated:
         h.bridge.upsert(101)
         h.bridge.remove(101)
         assert h.client.names() == []
+
+
+class TestBatteryDeviceUpdated:
+    """Issue #220 — a battery GAIN recreates via `upsert`; a loss does nothing special."""
+
+    def test_a_battery_gain_upserts_instead_of_pushing_state(self, bridge_mod, mock_logger, devices):
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(101, "onOffLight")])
+        h.start()
+        before = RelayDevice(101, "Study Plug", onState=False)
+        devices[101].batteryLevel = 80
+        h.bridge.device_updated(before, devices[101])
+        assert h.client.names() == ["upsert_endpoint"]
+        _name, spec = h.client.only("upsert_endpoint")
+        assert spec.battery is True
+        assert spec.states["batteryLevel"] == 80
+
+    def test_a_battery_loss_triggers_no_upsert__the_cluster_is_monotonic(
+            self, bridge_mod, mock_logger, devices):
+        devices.add(RelayDevice(300, "Batt Plug", onState=True, batteryLevel=50))
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(300, "onOffLight")])
+        h.start()
+        before = RelayDevice(300, "Batt Plug", onState=True, batteryLevel=50)
+        devices[300].batteryLevel = None
+        h.bridge.device_updated(before, devices[300])
+        # No cluster removal exists to ask for, and the vanished reading alone
+        # is reported (if at all) through the ordinary stopped-key path, not a
+        # wire frame.
+        assert h.client.names() == []
+
+    def test_a_device_that_had_a_battery_all_along_is_unaffected(self, bridge_mod, mock_logger, devices):
+        devices.add(RelayDevice(301, "Batt Plug", onState=True, batteryLevel=50))
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(301, "onOffLight")])
+        h.start()
+        before = RelayDevice(301, "Batt Plug", onState=True, batteryLevel=50)
+        devices[301].batteryLevel = 49
+        h.bridge.device_updated(before, devices[301])
+        assert h.client.only("set_state") == ("set_state", 301, {"batteryLevel": 49})
 
 
 class TestIncrementalCrud:

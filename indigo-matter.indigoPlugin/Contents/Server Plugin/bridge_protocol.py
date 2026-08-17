@@ -164,6 +164,16 @@ ROLE_STATE_KEYS = {
     "thermostat": ("localTemperatureC", "heatingSetpointC", "coolingSetpointC", "systemMode"),
 }
 
+#: ``set_state`` keys valid for ANY role whose export carries ``battery: true``
+#: (§4.1/§4.2, issue #220) — the first role-INDEPENDENT state key. Deliberately
+#: **not** folded into :data:`ROLE_STATE_KEYS`: that table is the per-role
+#: contract the zoo test (``tests/test_export_handlers.py``) pins each
+#: handler's ``states_for`` against, and ``batteryLevel`` is published by a
+#: wrapper (``export_handlers.ExportHandler.published_states``) that sits
+#: outside every role's own vocabulary on purpose — a device either has a
+#: battery or it does not, independent of what it is exported *as*.
+SHARED_STATE_KEYS = ("batteryLevel",)
+
 #: role → the ``command`` event names the node emits for it (§5/§4.2). Sensors
 #: are read-only in Matter, so their tuple is empty by design, not by omission.
 ROLE_COMMANDS = {
@@ -221,10 +231,15 @@ class EndpointSpec:
     reachable: bool = True
     states: dict = field(default_factory=dict)
     options: dict = field(default_factory=dict)
+    #: §4.1 issue #220 — "ensure this accessory publishes PowerSource". False
+    #: (the default) means "no evidence right now", never a removal request —
+    #: the node's live cluster set is monotonic (docs/BRIDGE_PROTOCOL.md §4.1).
+    battery: bool = False
 
     def to_wire(self) -> dict:
-        """The §4.1 wire shape."""
-        return {
+        """The §4.1 wire shape. ``battery`` is omitted unless ``True`` — never
+        spelled ``false`` on the wire (round-trip tests are exact)."""
+        wire = {
             ARG_INDIGO_DEVICE_ID: int(self.indigo_device_id),
             "role": self.role,
             "label": self.label,
@@ -232,6 +247,9 @@ class EndpointSpec:
             ARG_STATES: dict(self.states),
             "options": dict(self.options),
         }
+        if self.battery:
+            wire["battery"] = True
+        return wire
 
     @classmethod
     def from_wire(cls, data: dict) -> "EndpointSpec":
@@ -243,6 +261,7 @@ class EndpointSpec:
             reachable=bool(data.get(ARG_REACHABLE, True)),
             states=dict(data.get(ARG_STATES) or {}),
             options=dict(data.get("options") or {}),
+            battery=bool(data.get("battery", False)),
         )
 
 

@@ -487,3 +487,13 @@ def test_concurrent_writers_all_land(prefs, mock_logger):
 def test_label_for_prefers_the_override():
     assert _entry().label_for("Kitchen Lamp") == "Kitchen Lamp"
     assert _entry(name_override="Hall").label_for("Kitchen Lamp") == "Hall"
+
+
+def test_export_entry_did_not_grow_a_battery_field():
+    """Issue #220: battery is automatic and evidence-driven (ADR-0003) — the
+    device's own `batteryLevel` is the authority, never a user declaration.
+    A tick-box here would let someone assert a battery that does not exist,
+    so `ExportEntry`'s shape must stay exactly what it was.
+    """
+    import dataclasses
+    assert "battery" not in {field.name for field in dataclasses.fields(ExportEntry)}
