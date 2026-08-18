@@ -248,6 +248,31 @@ skipped device named. A *genuinely* empty allow-list still carries no intent —
 the guard must keep its teeth against exactly the stale client it was written
 for.
 
+**A driving-device change under a stable identity is a re-key, not a removal**
+(issue #246, ADR-0011). If `endpoints` carries a spec whose `publishedAs` is
+already live, whose `role` is unchanged and which does not gain a battery, but
+whose `indigoDeviceId` names a DIFFERENT device from the one currently driving
+that identity, the node re-keys rather than removes-and-recreates: the live
+`Endpoint` — same `Endpoint.id`, same number, same clusters — simply starts
+being driven by the new device, and `endpoint-map.json`'s record of who drives
+it is updated on the next persist. No endpoint is added or removed:
+`ConfigurationVersion` is not bumped and `PartsList` does not change, so no
+paired ecosystem processes a removal or an addition — which is what room,
+name and scene survival actually rests on. Label, reachability and state DO
+land, as an ordinary subscribable attribute update (a value mismatch between
+the old and new device is visible at migrate time, the same as any other
+`set_state`) — only the identity's continuity is invisible to every
+ecosystem, not every change the rekey carries. This is the mechanism behind
+the plugin's "Migrate an exported accessory…" menu action — a live device
+replaced by another one, or a module
+moved to new hardware, while both Indigo devices exist at once — and it is why
+migrate can honestly promise room/name/scene survival where the `list_orphans`
+re-adopt path (whose identity DID lapse) cannot. A retarget combined with a
+role change or a battery gain cannot be represented this way — a live cluster
+set cannot be reshaped without being rebuilt — and falls back to the ordinary
+`recreate` outcome above, wire activity and all; the plugin refuses cross-role
+migrate at the dialog before it ever reaches here (#219/#240 reasoning).
+
 ### 3.2 `upsert_endpoint`
 
 ```json
@@ -267,6 +292,18 @@ neither can be done to a live endpoint in place:
   the plugin's remove-then-add, which sends the two mutations as two separate
   commands rather than asking this one to move a live endpoint out from under
   itself.
+
+**A third refusal, the transpose of the second (issue #246, ADR-0011).** If
+`endpoint.indigoDeviceId` is not itself live, but `endpoint.publishedAs` IS
+live — on a DIFFERENT device — the node refuses with `error_code:
+"role_change"` rather than creating a second endpoint under an `Endpoint.id`
+the aggregator already holds. Falling through to an ordinary create here is
+not a clean failure: matter.js raises an internal error on the duplicate id,
+not a protocol refusal the plugin can act on. A driving-device change under a
+stable identity is exactly the re-key outcome described in §3.1, and the only
+peer allowed to cause it is `attach` doing a full reconcile — this refusal's
+message names that path (the plugin's migrate flow) rather than leaving the
+caller to guess why an apparently ordinary upsert failed.
 
 ### 3.3 `remove_endpoint`
 

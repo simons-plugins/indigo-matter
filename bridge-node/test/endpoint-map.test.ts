@@ -1276,7 +1276,9 @@ describe("the driving device, the orphan date and supersession (issues #219/#240
             "indigo-1": { number: 2, role: "onOffLight", label: "Lamp", deviceId: 100 },
         });
 
-        // A re-adopt: the SAME identity, now driven by a DIFFERENT device.
+        // A driver change with no orphan step first — a #246 migrate's shape
+        // (a #219 re-adopt would have seen forget() in between): the SAME
+        // identity, now driven by a DIFFERENT device.
         store.check([
             { uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Lamp", deviceId: 200 },
         ]);

@@ -1481,6 +1481,297 @@ function only(h: Harness): Endpoint {
     return endpoint;
 }
 
+describe("driving-device rekey (issue #246/ADR-0011)", () => {
+    it("moves the identity to the new device without touching the endpoint number", async () => {
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(1, Role.onOffLight)], false);
+            const before = h.registry.summaries()[0]?.endpointNumber;
+            assert.ok(before !== undefined);
+
+            // Device 2 takes over the identity device 1 was publishing —
+            // same role, no battery gain: the migrate shape.
+            await h.registry.reconcile([spec(2, Role.onOffLight, { publishedAs: "indigo-1" })], false);
+            const after = h.registry.summaries()[0];
+            assert.equal(after?.indigoDeviceId, 2);
+            assert.equal(after?.publishedAs, "indigo-1");
+            assert.equal(after?.endpointNumber, before, "a rekey must not reallocate the endpoint number");
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("re-keys #live: the old device id is unknown, the new one is live", async () => {
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(1, Role.onOffLight)], false);
+            await h.registry.reconcile([spec(2, Role.onOffLight, { publishedAs: "indigo-1" })], false);
+
+            const error = await rejects(() => h.registry.setState(1, { onOff: true }), ErrorCode.unknownDevice);
+            assert.equal(error.message, "no live endpoint for indigoDeviceId 1");
+            // The new device id is fully live, not just present in `summaries()`.
+            await h.registry.setState(2, { onOff: true });
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("routes a command raised after a rekey to the NEW device id", async () => {
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(1, Role.onOffLight)], false);
+            await h.registry.reconcile([spec(2, Role.onOffLight, { publishedAs: "indigo-1" })], false);
+            const endpoint = only(h);
+            h.commands.length = 0;
+
+            await endpoint.act(agent => agent.get(OnOffLighting).on());
+
+            assert.deepEqual(
+                h.commands,
+                [{ indigoDeviceId: 2, command: "onOff", args: { value: true } }],
+                "a command raised after a rekey must reach the device now driving the accessory",
+            );
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("applies the new label without bumping ConfigurationVersion", async () => {
+        const h = await harness();
+        const version = (): number =>
+            (h.node.state.basicInformation as { configurationVersion?: number }).configurationVersion ?? 0;
+        try {
+            await h.registry.reconcile([spec(1, Role.onOffLight)], false);
+            const start = version();
+
+            await h.registry.reconcile(
+                [spec(2, Role.onOffLight, { label: "Renamed", publishedAs: "indigo-1" })], false,
+            );
+
+            assert.equal(version(), start, "no paired ecosystem needs to re-read PartsList for a rekey");
+            const endpoint = only(h);
+            const info = endpoint.stateOf("bridgedDeviceBasicInformation") as Record<string, unknown>;
+            assert.equal(info.nodeLabel, "Renamed");
+            assert.ok(
+                h.logs.some(
+                    line =>
+                        line.includes("Endpoint 2 now drives accessory identity indigo-1") &&
+                        line.includes("replacing device 1") &&
+                        line.includes("no paired ecosystem sees any change"),
+                ),
+                h.logs.join("\n"),
+            );
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("a rekey does not trip the mass-removal guard on a single-export bridge", async () => {
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(1, Role.onOffLight)], false);
+            // Without the rekey bucket this would plan an ordinary `update`
+            // against device 2 (unknown to `#live`) and throw `unknown_device`
+            // — or, if it were miscounted as a removal, `mass_removal_refused`.
+            await h.registry.reconcile([spec(2, Role.onOffLight, { publishedAs: "indigo-1" })], false);
+            assert.equal(h.registry.size, 1);
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("throws instead of skipping a rekey whose fromDeviceId is no longer live (planner/live disagreement)", async () => {
+        // Two desired specs racing for the SAME identity — a shape
+        // `parseEndpointSpecs` refuses at the wire layer, constructed here
+        // directly against `reconcile()` to reach the registry's own runtime
+        // guard: both plan as a rekey from `fromDeviceId: 1` off the SAME
+        // pre-mutation snapshot, so the second one finds `#live` already
+        // moved by the first. This USED to log and skip — the plugin's
+        // `attach` reported `told=True` over a rekey that never landed
+        // (finding #246/ADR-0011); it must now abort the whole reconcile.
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(1, Role.onOffLight)], false);
+
+            const error = await rejects(
+                () =>
+                    h.registry.reconcile(
+                        [
+                            spec(2, Role.onOffLight, { publishedAs: "indigo-1" }),
+                            spec(3, Role.onOffLight, { publishedAs: "indigo-1" }),
+                        ],
+                        false,
+                    ),
+                ErrorCode.internal,
+            );
+            assert.ok(
+                error.message.includes("indigo-1") &&
+                    error.message.includes("device 3") &&
+                    error.message.includes("device 1") &&
+                    error.message.includes("disagree"),
+                error.message,
+            );
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("combines a rekey with a real removal — the ● migrate-onto-an-exported-target case", async () => {
+        const h = await harness();
+        const version = (): number =>
+            (h.node.state.basicInformation as { configurationVersion?: number }).configurationVersion ?? 0;
+        try {
+            await h.registry.reconcile(
+                [spec(1, Role.onOffLight), spec(106, Role.onOffLight)],
+                false,
+            );
+            const before = h.registry.summaries().find(s => s.indigoDeviceId === 1)?.endpointNumber;
+            assert.ok(before !== undefined);
+            const startVersion = version();
+
+            // Device 106 already has its own accessory ("indigo-106") and now
+            // migrates onto device 1's identity ("indigo-1") — the ●-target
+            // convention: device 106's OWN accessory is removed, and the
+            // migrated identity takes its place, driven by 106.
+            await h.registry.reconcile([spec(106, Role.onOffLight, { publishedAs: "indigo-1" })], false);
+
+            assert.equal(h.registry.size, 1, "exactly one endpoint must survive");
+            const after = h.registry.summaries()[0];
+            assert.equal(after?.indigoDeviceId, 106);
+            assert.equal(after?.publishedAs, "indigo-1");
+            assert.equal(after?.endpointNumber, before, "the surviving endpoint keeps indigo-1's ORIGINAL number");
+            assert.equal([...h.aggregator.parts].length, 1, "indigo-106's endpoint must be closed");
+
+            h.commands.length = 0;
+            const endpoint = only(h);
+            await endpoint.act(agent => agent.get(OnOffLighting).on());
+            assert.deepEqual(
+                h.commands,
+                [{ indigoDeviceId: 106, command: "onOff", args: { value: true } }],
+                "the surviving endpoint must be driven by 106, not the retired device 1",
+            );
+
+            // The removal is real wire activity; the rekey adds nothing on
+            // top of it — exactly one bump, not two.
+            assert.equal(version(), startVersion + 1, "ConfigurationVersion must bump EXACTLY once");
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("swaps two drivers without corrupting #live (a hand-edited .indiPref shape)", async () => {
+        const h = await harness();
+        const version = (): number =>
+            (h.node.state.basicInformation as { configurationVersion?: number }).configurationVersion ?? 0;
+        try {
+            await h.registry.reconcile(
+                [spec(1, Role.onOffLight), spec(106, Role.onOffLight)],
+                false,
+            );
+            const before1 = h.registry.summaries().find(s => s.indigoDeviceId === 1)?.endpointNumber;
+            const before106 = h.registry.summaries().find(s => s.indigoDeviceId === 106)?.endpointNumber;
+            assert.ok(before1 !== undefined && before106 !== undefined);
+            const startVersion = version();
+
+            // `parseEndpointSpecs` accepts this — no duplicate device id or
+            // identity — and sequential (non-two-phase) rekey processing
+            // would corrupt it: the first rekey's `#live.set()` would
+            // overwrite the entry the second one still needs to read.
+            await h.registry.reconcile(
+                [
+                    spec(1, Role.onOffLight, { publishedAs: "indigo-106" }),
+                    spec(106, Role.onOffLight, { publishedAs: "indigo-1" }),
+                ],
+                false,
+            );
+
+            assert.equal(h.registry.size, 2, "both endpoints must survive a swap cycle");
+            const summaries = new Map(h.registry.summaries().map(s => [s.indigoDeviceId, s]));
+            assert.equal(summaries.get(1)?.publishedAs, "indigo-106");
+            assert.equal(summaries.get(1)?.endpointNumber, before106, "1 now drives what 106 used to drive");
+            assert.equal(summaries.get(106)?.publishedAs, "indigo-1");
+            assert.equal(summaries.get(106)?.endpointNumber, before1, "106 now drives what 1 used to drive");
+            assert.equal(version(), startVersion, "a pure rekey pair bumps nothing — no wire activity at all");
+
+            const endpointIndigo1 = [...h.aggregator.parts].find(part => part.id === "indigo-1");
+            const endpointIndigo106 = [...h.aggregator.parts].find(part => part.id === "indigo-106");
+            assert.ok(endpointIndigo1 !== undefined && endpointIndigo106 !== undefined);
+
+            h.commands.length = 0;
+            await endpointIndigo1?.act(agent => agent.get(OnOffLighting).on());
+            await endpointIndigo106?.act(agent => agent.get(OnOffLighting).on());
+            assert.deepEqual(
+                h.commands,
+                [
+                    { indigoDeviceId: 106, command: "onOff", args: { value: true } },
+                    { indigoDeviceId: 1, command: "onOff", args: { value: true } },
+                ],
+                "commands must route to the EXCHANGED device ids after a swap",
+            );
+        } finally {
+            await h.close();
+        }
+    });
+});
+
+describe("upsert claimed-identity refusal (issue #246/ADR-0011)", () => {
+    it("refuses an upsert whose OWN device is not live but whose identity is live on another", async () => {
+        const h = await harness();
+        try {
+            await h.registry.upsert(spec(1, Role.onOffLight));
+            const error = await rejects(
+                () => h.registry.upsert(spec(2, Role.onOffLight, { publishedAs: "indigo-1" })),
+                ErrorCode.roleChange,
+            );
+            assert.equal(
+                error.message,
+                "accessory identity indigo-1 is live on device 1; upsert_endpoint cannot move it to device 2 — " +
+                    "a driving-device change must go through a full attach reconcile (the plugin's migrate flow), " +
+                    "not upsert_endpoint",
+            );
+            // Refused, not half-applied: device 2 was never created, device 1
+            // still drives the identity.
+            assert.equal(h.registry.size, 1);
+            assert.equal(h.registry.summaries()[0]?.indigoDeviceId, 1);
+        } finally {
+            await h.close();
+        }
+    });
+});
+
+describe("recreate removal resolved by publishedAs (issue #246)", () => {
+    it("removes the LIVE endpoint even when a recreate also changes the driving device", async () => {
+        // The pre-#240 version-skew fallback (role change at an unchanged
+        // identity), combined with a device-id change — the one shape
+        // `planReconcile` refuses to treat as a rekey and falls back to
+        // `recreate` for. `spec.indigoDeviceId` (2) is the device taking
+        // over, NOT the one whose endpoint must be closed (1) — resolving
+        // the removal by `spec.indigoDeviceId` would leave device 1's
+        // endpoint behind and then fail `create()` on a duplicate
+        // `Endpoint.id`.
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(1, Role.onOffLight)], false);
+            const before = h.registry.summaries()[0]?.endpointNumber;
+
+            await h.registry.reconcile(
+                [spec(2, Role.dimmableLight, { publishedAs: "indigo-1" })], false,
+            );
+
+            assert.deepEqual(h.registry.summaries().map(s => s.indigoDeviceId), [2]);
+            assert.equal(h.registry.summaries()[0]?.role, Role.dimmableLight);
+            assert.equal([...h.aggregator.parts].length, 1, "device 1's endpoint must not survive the recreate");
+            // Same `Endpoint.id` ("indigo-1" both before and after), so — like
+            // any other in-place recreate — matter.js hands back the SAME
+            // persisted number, not a fresh one.
+            assert.ok(before !== undefined);
+            assert.equal(h.registry.summaries()[0]?.endpointNumber, before);
+        } finally {
+            await h.close();
+        }
+    });
+});
+
 describe("role factory (E4)", () => {
     it("supports every role in the §4.2 enum", () => {
         // The E4 completion criterion, asserted rather than described: the

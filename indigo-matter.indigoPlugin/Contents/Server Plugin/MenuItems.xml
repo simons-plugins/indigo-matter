@@ -461,13 +461,77 @@ If the bridge node is NOT refusing, this does nothing useful and is refused: the
         </ConfigUI>
     </MenuItem>
     <!--
+        Migrate an exported accessory… (issue #246). Moves a LIVE exported
+        accessory's identity to a different Indigo device — replaced
+        hardware, a module moved to new gear, a device rebuilt under a new
+        id, with the OLD Indigo device still present. Placed immediately
+        BEFORE "Re-adopt a Matter accessory…", and the two are a matched
+        pair, not a duplicate:
+
+        * Migrate is the LIVE-source path. The identity never lapses, so no
+          paired ecosystem ever processes a removal, and room, name, scenes
+          and automations survive BY CONSTRUCTION — the 2026-08-18 jarvis
+          measurement behind ADR-0011.
+        * Re-adopt is the recovery fallback for an identity that has
+          ALREADY been left behind — the old device is gone, or stopped
+          exporting, before anyone reached for a menu. By the time it is
+          reachable, most ecosystems (Apple Home within moments) have
+          already purged the room/name/scene context re-adopt cannot get
+          back.
+
+        Reach for migrate FIRST, while the old device still exists; re-adopt
+        is what is left once it does not. Declarative under the hood
+        (ADR-0011): the store retargets the entry in one atomic
+        `replace_all`, and a full mid-session `attach`
+        (`ExportBridge.reattach()`) carries it to the bridge node, which
+        reconciles it as an in-place REKEY — zero wire activity, same
+        `Endpoint.id`, same accessory number. No dedicated protocol command,
+        for the same reason ADR-0010 rejected one for re-adopt.
+
+        Master-detail shape, same reasoning as "Re-adopt a Matter
+        accessory…" below: `migrateSource` gets a CallbackMethod
+        (`migrateSourceChanged`) purely to make Indigo round-trip and re-run
+        `migrateDevice`'s own dynamicReload list, filtered to devices that
+        can take the picked source's role.
+    -->
+    <MenuItem id="migrateExport">
+        <Name>Migrate an exported accessory…</Name>
+        <CallbackMethod>menuMigrateExport</CallbackMethod>
+        <ConfigUI>
+            <Field id="migrateIntro" type="label">
+                <Label>Moves a live exported accessory to a different Indigo device — for replaced hardware, a module moved to new gear, or a device rebuilt under a new id. Nothing is removed and nothing is re-paired: Apple Home and every other paired ecosystem keep the accessory's room, name, scenes and automations, because from their side nothing happened. The old device stays in Indigo, no longer exported.
+
+A ROLE CHANGE is not what this is for — export the replacement device normally instead, and it becomes a new accessory. A device that cannot take the source accessory's role is refused below.</Label>
+            </Field>
+            <Field id="migrateSource" type="menu">
+                <Label>Currently exported as:</Label>
+                <List class="self" method="getMigrateSources" dynamicReload="true"/>
+                <CallbackMethod>migrateSourceChanged</CallbackMethod>
+            </Field>
+            <Field id="migrateSourceHelp" type="label" fontColor="darkgray">
+                <Label>Every accessory this plugin is currently exporting.</Label>
+            </Field>
+            <Field id="migrateDevice" type="menu">
+                <Label>Move it to:</Label>
+                <List class="self" method="getMigrateDevices" dynamicReload="true"/>
+                <Description>Only devices that can take the accessory's role are offered. A ● marks a device that is already exported.</Description>
+            </Field>
+            <Field id="migrateWarning" type="label">
+                <Label>If the device you pick above already has its own accessory (marked ●), migrating removes THAT accessory from every ecosystem and puts the migrated one in its place instead.</Label>
+            </Field>
+            <Field id="migrateConfirm" type="checkbox" defaultValue="false">
+                <Label>I understand this moves the accessory to a different Indigo device.</Label>
+            </Field>
+        </ConfigUI>
+    </MenuItem>
+    <!--
         Re-adopt a Matter accessory… (issue #219). Hands a LEFT-BEHIND
         accessory identity — one orphaned by deleting the Indigo device that
         exported it, or by un-exporting it — to a different Indigo device, so
-        the accessory keeps its room, name, scenes and automations in every
-        paired ecosystem. Placed right after the endpoint-map rebuild: both
-        are identity surgery reached for after something already went wrong,
-        not everyday export management.
+        the accessory's identity, number and no-duplicate continuity always
+        hold. Placed right after the endpoint-map rebuild: both are identity
+        surgery reached for after something already went wrong, not everyday
+        export management.
 
         A ROLE CHANGE's old accessory is deliberately NOT offered here.
         `EndpointMapStore.orphans()` excludes every record carrying
@@ -488,7 +552,7 @@ If the bridge node is NOT refusing, this does nothing useful and is refused: the
         <CallbackMethod>menuReadoptExport</CallbackMethod>
         <ConfigUI>
             <Field id="readoptIntro" type="label">
-                <Label>Hands a left-behind Matter accessory identity to a different Indigo device. Apple Home and every other paired ecosystem keep its room, its name, and every scene and automation built on it — nothing is re-paired and nothing is renumbered. This costs nothing when it succeeds.
+                <Label>Hands a left-behind Matter accessory identity to a different Indigo device. The accessory returns under its original identity and number, and no duplicate is created — but an ecosystem that has already processed the removal (Apple Home does within moments) will show it in the Default Room under a default name, and any scene or automation that referenced it must be rebuilt. If the old Indigo device still exists, "Migrate an exported accessory…" (above) is the right tool instead: the identity never lapses there, so no ecosystem ever processes a removal, and room, name, scenes and automations survive.
 
 An accessory is left behind when the Indigo device that exported it is deleted, or when it stops being exported. It can only be re-adopted onto a device that can take the SAME role as the accessory it is inheriting; a device that cannot is refused below — export it normally instead, and it becomes a new accessory.
 

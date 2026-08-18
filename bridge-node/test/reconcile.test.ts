@@ -243,7 +243,9 @@ describe("planReconcile (§3.1)", () => {
     });
 
     it("does not fire the guard when nothing was live", () => {
-        assert.deepEqual(planReconcile(live(), [], false), { create: [], update: [], recreate: [], remove: [] });
+        assert.deepEqual(planReconcile(live(), [], false), {
+            create: [], update: [], recreate: [], rekey: [], remove: [],
+        });
     });
 
     it("does not fire when one endpoint survives", () => {
@@ -356,6 +358,55 @@ describe("planReconcile (§3.1)", () => {
             const plan = planReconcile(
                 live([1, Role.onOffLight, false]), [spec(1, Role.onOffLight, "L", true)], false,
             );
+            assert.deepEqual(plan.remove, []);
+        });
+    });
+
+    describe("driving-device rekey (issue #246/ADR-0011)", () => {
+        it("buckets a same-role, no-battery-gain device-id change as a rekey, not an update", () => {
+            // Device 1 is exported as indigo-1; device 2 now wants to drive
+            // the SAME identity, unchanged role. This is the migrate shape —
+            // "device B now drives identity X" — and must not reach `update`,
+            // which resolves `#live` by device 2's id and finds nothing there.
+            const plan = planReconcile(live([1, Role.onOffLight]), [spec(2, Role.onOffLight, "L", false, "indigo-1")], false);
+            assert.deepEqual(plan.rekey, [{ spec: spec(2, Role.onOffLight, "L", false, "indigo-1"), fromDeviceId: 1 }]);
+            assert.deepEqual(plan.update, []);
+            assert.deepEqual(plan.recreate, []);
+            assert.deepEqual(plan.create, []);
+        });
+
+        it("keeps an unchanged device id on the update path, not rekey", () => {
+            const plan = planReconcile(live([1, Role.onOffLight]), [spec(1, Role.onOffLight)], false);
+            assert.deepEqual(plan.update.map(s => s.indigoDeviceId), [1]);
+            assert.deepEqual(plan.rekey, []);
+        });
+
+        it("falls back to recreate when a device-id change is combined with a role change", () => {
+            // Cross-role migrate is refused at the plugin layer (owner ruling
+            // 2/E3, #240); this combination only arises from a hand-edited
+            // .indiPref, and recreate — wire activity, logged loud — is the
+            // honest deterministic fallback rather than a silent rekey that
+            // cannot actually retarget a live cluster set.
+            const plan = planReconcile(
+                live([1, Role.onOffLight]), [spec(2, Role.dimmableLight, "L", false, "indigo-1")], false,
+            );
+            assert.deepEqual(plan.recreate.map(s => s.indigoDeviceId), [2]);
+            assert.deepEqual(plan.rekey, []);
+        });
+
+        it("falls back to recreate when a device-id change is combined with a battery gain", () => {
+            const plan = planReconcile(
+                live([1, Role.onOffLight, false]), [spec(2, Role.onOffLight, "L", true, "indigo-1")], false,
+            );
+            assert.deepEqual(plan.recreate.map(s => s.indigoDeviceId), [2]);
+            assert.deepEqual(plan.rekey, []);
+        });
+
+        it("a rekey is not a departure for the mass-removal guard", () => {
+            // The only live identity is retargeted to a different device, not
+            // removed — refusing this as `mass_removal_refused` would make a
+            // single-export bridge unable to migrate at all.
+            const plan = planReconcile(live([1, Role.onOffLight]), [spec(2, Role.onOffLight, "L", false, "indigo-1")], false);
             assert.deepEqual(plan.remove, []);
         });
     });

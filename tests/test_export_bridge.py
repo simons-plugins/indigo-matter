@@ -996,6 +996,151 @@ class TestIncrementalCrud:
 
 
 # ---------------------------------------------------------------------------
+# The migrate nudge — a full mid-session attach (issue #246)
+# ---------------------------------------------------------------------------
+def _migrate_status(endpoint_count=1):
+    return bridge_protocol.parse_status({
+        "commissioned": True, "fabrics": [], "endpointCount": endpoint_count,
+        "endpoints": [], "drift": [], "driftChecked": True,
+    })
+
+
+class TestReattach:
+    """`ExportBridge.reattach` — the §3.1 attach `menuMigrateExport` nudges
+    with once its store commit lands (#246 design §3.3)."""
+
+    def test_submits_attach_with_the_current_specs_and_their_own_deadline(
+            self, bridge_mod, mock_logger, devices):
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(102, "dimmableLight")])
+        h.start()
+        h.client.status = _migrate_status()
+
+        told = h.bridge.reattach()
+
+        assert told is True
+        name, endpoints, replace_all = h.client.only("attach")
+        assert name == "attach"
+        assert [spec.indigo_device_id for spec in endpoints] == [102]
+        assert replace_all is False
+        assert h.client.attach_timeouts == [bridge_mod.attach_timeout_for(1)]
+
+    def test_with_no_client_is_a_no_op_false(self, bridge_mod, mock_logger, devices):
+        """XG5: nothing is exported, so there is no client to nudge at all."""
+        h = Harness(bridge_mod, mock_logger, devices, [])
+        assert h.bridge.reattach() is False
+
+    def test_a_successful_reattach_routes_the_status_through_on_attached(
+            self, bridge_mod, mock_logger, devices):
+        """Unlike `upsert`/`replace`, this is a full attach — so its result has
+        to reach the SAME place a reconnect's does (fabrics, warnings, the
+        outage latches), not just "the RPC did not raise"."""
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(102, "dimmableLight")])
+        h.start()
+        h.client.status = _migrate_status(endpoint_count=3)
+
+        told = h.bridge.reattach()
+
+        assert told is True
+        assert "bridge node attached" in " ".join(
+            str(c.args[0]) % c.args[1:] if len(c.args) > 1 else str(c.args[0])
+            for c in mock_logger.info.call_args_list)
+        assert h.bridge.fabrics == []
+
+    def test_a_failed_reattach_reports_not_told_and_says_the_store_stands(
+            self, bridge_mod, mock_logger, devices):
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(102, "dimmableLight")])
+        h.start()
+        h.client.fail["attach"] = ConnectionError("socket died mid-attach")
+
+        told = h.bridge.reattach()
+
+        assert told is False
+        assert "WAS saved" in errors_of(mock_logger)
+        assert "catches up at the next reconnect/attach" in errors_of(mock_logger)
+
+    def test_a_refusal_on_a_healthy_socket_names_the_code_and_claims_no_self_heal(
+            self, bridge_mod, mock_logger, devices):
+        """Issue #246 review finding 2 — a ``BridgeProtocolError`` is a
+        REFUSAL, not a dropped socket: nothing is reconnecting to retry this,
+        so the message must not borrow the ``ConnectionError`` branch's
+        self-heals-on-its-own claim."""
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(102, "dimmableLight")])
+        h.start()
+        h.client.fail["attach"] = bridge_protocol.BridgeProtocolError(
+            bridge_protocol.ERR_MALFORMED_ARGS, "duplicate publishedAs")
+
+        told = h.bridge.reattach()
+
+        assert told is False
+        said = errors_of(mock_logger)
+        assert "REFUSED by the bridge node" in said
+        assert bridge_protocol.ERR_MALFORMED_ARGS in said
+        assert "duplicate publishedAs" in said
+        assert "UNAPPLIED" in said
+        assert "catches up at the next reconnect/attach" not in said
+
+    def test_a_timeout_names_the_deadline_not_an_empty_string(
+            self, bridge_mod, mock_logger, devices):
+        """Issue #246 review finding 2 — ``TimeoutError`` (which
+        ``asyncio.TimeoutError`` is an alias of since Python 3.11) stringifies
+        to ``""``, so ``str(exc)`` must never be the source of the message —
+        the deadline is."""
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(102, "dimmableLight")])
+        h.start()
+        h.client.fail["attach"] = TimeoutError()
+
+        told = h.bridge.reattach()
+
+        assert told is False
+        said = errors_of(mock_logger)
+        assert "TIMED OUT waiting" in said
+        assert "may or may not have applied" in said
+        assert "— ." not in said, "no empty str(exc) artifact"
+        deadline = bridge_mod.attach_timeout_for(1) + bridge_mod.REATTACH_RESULT_HEADROOM
+        assert f"waiting {deadline:.0f}s" in said
+
+    def test_no_client_logs_a_warning_the_dialogs_see_the_log_promise_needs(
+            self, bridge_mod, mock_logger, devices):
+        """The dialog's error says "see Event Log" for a saved-but-not-told
+        migrate — this is that line for the mid-dialog-disconnect race that
+        leaves no client at all to nudge (issue #246 review finding 2)."""
+        h = Harness(bridge_mod, mock_logger, devices, [])
+
+        told = h.bridge.reattach()
+
+        assert told is False
+        assert "no bridge client" in warnings_of(mock_logger)
+
+    def test_migrate_composition_attach_carries_the_retargeted_device_and_identity(
+            self, bridge_mod, mock_logger, devices):
+        """Composition check for the #246 migrate commit, with the REAL
+        ``ExportBridge.reattach`` against a ``FakeBridgeClient`` rather than a
+        mock: ``ExportStore.replace_all`` moves an entry's DEVICE while
+        KEEPING its identity (``server_menu_mixin._migrate_commit``'s one
+        atomic write), and the resulting attach frame's endpoint spec has to
+        carry exactly that — the TARGET device id, publishing the MIGRATED
+        identity — with nothing in between building or mocking the spec.
+        """
+        devices.add(RelayDevice(106, "Garage Plug"))
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(101, "onOffPlugInUnit")])
+        h.start()
+        h.client.status = _migrate_status()
+        # The migrate commit's one atomic write: source (101) dropped, target
+        # (106) inherits its identity.
+        h.store.replace_all([ExportEntry(106, "onOffPlugInUnit", published_as="indigo-101")])
+
+        told = h.bridge.reattach()
+
+        assert told is True
+        _name, endpoints, replace_all = h.client.only("attach")
+        assert replace_all is False
+        assert len(endpoints) == 1
+        (spec,) = endpoints
+        assert spec.indigo_device_id == 106
+        assert spec.published_as == "indigo-101"
+
+
+# ---------------------------------------------------------------------------
 # Node → Indigo (§5 command events)
 # ---------------------------------------------------------------------------
 class TestOnCommand:

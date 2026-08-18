@@ -15,8 +15,8 @@ from bridge_protocol import next_generation, published_id_for
 from export_store import ExportEntry, OPTION_INVERT
 from plugin_constants import (
     EXCLUDED_OPTION_PREFIX, EXPORT_PICKER_LIMIT, LIST_ERROR_OPTION,
-    MENU_MANAGE_EXPORTS, MENU_READOPT_EXPORT, MENU_UNPAIR_ECOSYSTEM, NO_MATCH_OPTION,
-    NO_SELECTION_ID, NO_SELECTION_LABEL, ROW_ERROR_LABEL, TRUNCATED_OPTION,
+    MENU_MANAGE_EXPORTS, MENU_MIGRATE_EXPORT, MENU_READOPT_EXPORT, MENU_UNPAIR_ECOSYSTEM,
+    NO_MATCH_OPTION, NO_SELECTION_ID, NO_SELECTION_LABEL, ROW_ERROR_LABEL, TRUNCATED_OPTION,
 )
 
 
@@ -261,6 +261,13 @@ class ExportDialogMixin:
             values["readoptOrphan"] = NO_SELECTION_ID
             values["readoptDevice"] = NO_SELECTION_ID
             values["readoptConfirm"] = False
+            return values
+        if menu_id == MENU_MIGRATE_EXPORT:
+            # Issue #246 — same reasoning again: both pickers lead with a
+            # no-selection row.
+            values["migrateSource"] = NO_SELECTION_ID
+            values["migrateDevice"] = NO_SELECTION_ID
+            values["migrateConfirm"] = False
             return values
         if menu_id != MENU_MANAGE_EXPORTS:
             return values
@@ -516,6 +523,32 @@ class ExportDialogMixin:
             values["exportStatus"] = f"{dev.name} is not exported yet."
         return values
 
+    def _first_unclaimed_identity(self, identity: str, device_id: int) -> str:
+        """Walk :func:`next_generation` from ``identity`` until no OTHER
+        ``ExportStore`` entry effectively claims it (issue #246 review finding 1).
+
+        "Migrate an exported accessory…" (``server_menu_mixin.ServerMenuMixin.
+        menuMigrateExport``) moves a device's accessory identity onto ANOTHER
+        device's entry. Re-exporting the original device afterwards through
+        this ordinary dialog must not try to publish that same identity again
+        — the node refuses a duplicate ``publishedAs`` for the WHOLE attach
+        (``parseEndpointSpecs``, ``malformed_args``), which takes every export
+        offline, not just the new one. The same collision can recur one
+        generation later (a role change bumping past a generation someone else
+        has since taken), so this keeps walking rather than trying
+        :func:`next_generation` exactly once.
+
+        Reuses :meth:`server_menu_mixin.ServerMenuMixin._readopt_identity_claimant`
+        for the EFFECTIVE-identity comparison it already makes for the same
+        reason (``published_as`` where an entry has one, otherwise the default
+        derivation it publishes under) — ``device_id``'s OWN entry never counts
+        as a claimant, so an unchanged existing entry stays free to keep
+        publishing the identity it already holds.
+        """
+        while self._readopt_identity_claimant(identity, device_id) is not None:  # pylint: disable=no-member
+            identity = next_generation(identity)
+        return identity
+
     def exportAddOrUpdate(self, valuesDict, typeId="", devId=0):
         # pylint: disable=unused-argument
         """Add or update one export. Validates the role against the catalog.
@@ -570,9 +603,33 @@ class ExportDialogMixin:
         # through unchanged — an ordinary update must never move it on its
         # own (PR5 design §1.3).
         if role_changed:
-            published_as = next_generation(previous.published_as or published_id_for(device_id))
+            # Issue #246 review finding 1 — the bump can ALSO land on a
+            # generation another entry already claims (that entry was
+            # re-exported while this one sat un-role-changed), so this walks
+            # past every claimed generation rather than trying the immediate
+            # next one and trusting it is free.
+            bumped = next_generation(previous.published_as or published_id_for(device_id))
+            published_as = self._first_unclaimed_identity(bumped, device_id)
+        elif existed:
+            published_as = previous.published_as
         else:
-            published_as = previous.published_as if existed else None
+            # Issue #246 review finding 1 — a device whose DEFAULT identity
+            # was migrated onto another device's entry must not silently
+            # publish it again: `None` here means "publish the default
+            # derivation", and that derivation may now belong to someone
+            # else. Only claimed defaults pay the walk; the common case (never
+            # migrated) is untouched and still stores `None`.
+            default_identity = published_id_for(device_id)
+            resolved = self._first_unclaimed_identity(default_identity, device_id)
+            if resolved == default_identity:
+                published_as = None
+            else:
+                published_as = resolved
+                self.logger.info(
+                    "Matter export: %s's original accessory identity (%s) was migrated to "
+                    "another device, so this export becomes a NEW accessory under %s — it does "
+                    "not steal back the migrated one.",
+                    dev.name, default_identity, resolved)
         try:
             self.exports.upsert(ExportEntry(
                 indigo_device_id=device_id, role=role,

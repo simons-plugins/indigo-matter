@@ -51,6 +51,10 @@ MENU_UNPAIR_ECOSYSTEM = "unpairEcosystem"
 #: it has two pickers whose Execute button hands an accessory identity to a
 #: different Indigo device.
 MENU_READOPT_EXPORT = "readoptExport"
+#: Menu id of the migrate dialog (issue #246). Same reasoning as the re-adopt
+#: dialog above — two pickers whose Execute button moves a LIVE accessory
+#: identity to a different Indigo device.
+MENU_MIGRATE_EXPORT = "migrateExport"
 #: Option-id prefix marking a picker row the user may look at but not choose
 #: (PRD §5.2: excluded devices are shown *with a reason*, never hidden — XAC9).
 EXCLUDED_OPTION_PREFIX = "x-"

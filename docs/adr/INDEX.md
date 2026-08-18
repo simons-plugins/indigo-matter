@@ -26,5 +26,6 @@ chosen), see [`../ARCHITECTURE.md`](../ARCHITECTURE.md).
 * [ADR-0008](0008-a-matter-node-is-an-indigo-device.md) - ADR-0008: A Matter node is an Indigo device, and the root of its endpoint devices' group (accepted; the root half is **superseded in part by ADR-0009**)
 * [ADR-0009](0009-indigo-groups-root-by-age-membership-is-the-deliverable.md) - ADR-0009: Indigo roots a device group by age, so membership is what this plugin delivers (accepted; supersedes in part ADR-0008)
 * [ADR-0010](0010-a-published-accessory-identity-is-plugin-owned.md) - ADR-0010: A published accessory identity is a plugin-owned, defaulted field (accepted)
+* [ADR-0011](0011-a-driving-device-change-is-a-reconcile-rekey.md) - ADR-0011: A driving-device change under a stable identity is a reconcile rekey (accepted)
 
 <!-- adrlogstop -->

@@ -383,8 +383,25 @@ export class EndpointRegistry {
             }
             removedDeviceIds.push(indigoDeviceId);
         }
-        const removals = [...removedDeviceIds, ...plan.recreate.map(spec => spec.indigoDeviceId)];
-        const total = removals.length + plan.create.length + plan.recreate.length + plan.update.length;
+        // Issue #246 — resolved via `deviceIdFor(spec.publishedAs)`, NOT
+        // `spec.indigoDeviceId`. A plain `recreate` (role/battery change,
+        // driving device unchanged) has the two agree, but the pre-#240 skew
+        // fallback above also covers a device-id change COMBINED with a role
+        // or battery change (`planReconcile` refuses the pure rekey shape for
+        // those, falling back here instead) — and for that spec, `spec`'s own
+        // device id is the NEW driver, not the live one that must be closed.
+        // Using it directly would leave the true live endpoint behind,
+        // untouched and unremovable, while `create()` below fails trying to
+        // `add()` a second endpoint at the same `Endpoint.id`.
+        const removals = [
+            ...removedDeviceIds,
+            // The live snapshot `plan` was built from guarantees a hit here —
+            // `spec.publishedAs` was live (that is why it is a `recreate`, not
+            // a `create`) and nothing has mutated `#live` yet.
+            ...plan.recreate.map(spec => this.deviceIdFor(spec.publishedAs)!),
+        ];
+        const total =
+            removals.length + plan.create.length + plan.recreate.length + plan.update.length + plan.rekey.length;
         let done = 0;
         let mutated = false;
 
@@ -393,6 +410,63 @@ export class EndpointRegistry {
                 mutated = true;
                 done += 1;
             });
+            // Issue #246/ADR-0011 — removals run BEFORE rekeys, and the order
+            // is LOAD-BEARING, not cosmetic. When a migrate's target device
+            // was previously exported, its OLD identity is in `plan.remove`,
+            // and that removal must free the target's `#live` key before any
+            // rekey can claim it. Reversed, a rekey's `#live.set()` would
+            // overwrite the target's still-live entry — and `removeMany`
+            // (which resolves via `#live.get` at execution time) would then
+            // close the freshly-migrated endpoint while leaving the target's
+            // OLD endpoint an unwatched zombie: still in the Matter tree,
+            // no longer in `#live`, unreachable by any command.
+            //
+            // A rekey touches neither the aggregator's children nor
+            // `ConfigurationVersion`, so it does not set `mutated`. A
+            // part-applied reconcile that got this far and then failed later
+            // still owes no bump for the rekeys alone.
+            //
+            // Applied in two phases so a SWAP CYCLE (desired [spec(1,
+            // publishedAs indigo-106), spec(106, publishedAs indigo-1)]
+            // against live {1: indigo-1, 106: indigo-106} — a shape
+            // `parseEndpointSpecs` accepts and a hand-edited `.indiPref` can
+            // reach) does not corrupt `#live`. Processing rekeys one at a
+            // time would have the first one's `#live.set()` overwrite the
+            // entry the second one still needs to read. Phase 1 frees every
+            // rekey's `fromDeviceId` key before phase 2 claims any target
+            // key, so by the time phase 2 runs every target key is provably
+            // free — the same device id twice in `desired` is refused by
+            // `parseEndpointSpecs`, and an identity that should have vacated
+            // a target key was removed above.
+            const rekeys: { spec: EndpointSpec; fromDeviceId: number; live: LiveEndpoint }[] = [];
+            for (const { spec, fromDeviceId } of plan.rekey) {
+                const fromLive = this.#live.get(fromDeviceId);
+                if (fromLive === undefined) {
+                    // `planReconcile` saw this identity live under
+                    // `fromDeviceId` in the SAME snapshot this reconcile was
+                    // planned from; if it is gone by the time this runs, the
+                    // planner and `#live` disagree. Logging and skipping used
+                    // to let the plugin's `attach` report `told=True` — and
+                    // the Indigo Event Log a "MIGRATED … no ecosystem
+                    // processed any change" WARNING — over a rekey that never
+                    // landed, and the node's own log never reaches Indigo.
+                    // Throwing propagates the abort instead, so the plugin
+                    // reports `told=False` honestly and the part-applied
+                    // `done`/`mutated` accounting above still holds.
+                    throw new ProtocolError(
+                        ErrorCode.internal,
+                        `cannot rekey accessory identity ${spec.publishedAs} to device ${spec.indigoDeviceId}: ` +
+                            `no live endpoint is publishing it under device ${fromDeviceId} — the live set and ` +
+                            "the plan disagree about who currently drives it",
+                    );
+                }
+                this.#live.delete(fromDeviceId);
+                rekeys.push({ spec, fromDeviceId, live: fromLive });
+            }
+            for (const { spec, fromDeviceId, live } of rekeys) {
+                await this.rekeyOne(fromDeviceId, spec, live);
+                done += 1;
+            }
             for (const spec of [...plan.create, ...plan.recreate]) {
                 await this.create(spec);
                 mutated = true;
@@ -422,7 +496,8 @@ export class EndpointRegistry {
         }
         this.#log(
             `Reconciled endpoints: ${plan.create.length} created, ${plan.update.length} updated, ` +
-                `${plan.recreate.length} recreated, ${plan.remove.length} removed (${this.#live.size} live)`,
+                `${plan.recreate.length} recreated, ${plan.rekey.length} rekeyed, ${plan.remove.length} removed ` +
+                `(${this.#live.size} live)`,
         );
     }
 
@@ -432,6 +507,28 @@ export class EndpointRegistry {
             this.assertSupported(spec.role);
             const existing = this.#live.get(spec.indigoDeviceId);
             if (existing === undefined) {
+                const claimedBy = this.deviceIdFor(spec.publishedAs);
+                if (claimedBy !== undefined) {
+                    // Issue #246/ADR-0011 — the transpose of the
+                    // `existing.publishedAs !== spec.publishedAs` refusal
+                    // below. THIS device is not live, but the identity it
+                    // wants IS, under a DIFFERENT device — falling into
+                    // `create()` here would `add()` a second endpoint at the
+                    // same `Endpoint.id` the aggregator already holds, which
+                    // matter.js fails on internally rather than refusing
+                    // cleanly. A driving-device change under a stable
+                    // identity is a reconcile REKEY (`reconcile.ts`), and only
+                    // `attach` — the plugin's migrate flow — is allowed to
+                    // make it; `upsert_endpoint` names the door instead of
+                    // falling through it.
+                    throw new ProtocolError(
+                        ErrorCode.roleChange,
+                        `accessory identity ${spec.publishedAs} is live on device ${claimedBy}; ` +
+                            `upsert_endpoint cannot move it to device ${spec.indigoDeviceId} — a driving-device ` +
+                            "change must go through a full attach reconcile (the plugin's migrate flow), not " +
+                            "upsert_endpoint",
+                    );
+                }
                 const created = await this.create(spec);
                 await this.noteConfigurationChange();
                 return { endpointNumber: Number(created.number) };
@@ -588,6 +685,92 @@ export class EndpointRegistry {
         // alone here (§4.1, monotonic) — the gain case never reaches `update`
         // at all, `upsert`/`reconcileNow` route it to a recreate instead.
         await applyStates(live.endpoint, live.role, spec.states, live.battery, spec.indigoDeviceId);
+    }
+
+    /**
+     * Issue #246/ADR-0011 — retarget a live identity's driving device without
+     * adding, removing, or reallocating its `Endpoint`.
+     *
+     * Called only from `reconcileNow`'s phase 2, on a `live` entry phase 1
+     * has ALREADY removed from `#live` under `fromDeviceId` — this method's
+     * job is putting it back, under `spec.indigoDeviceId`, re-wired. The
+     * command sink is re-watched under the SAME `Endpoint.id`
+     * (`spec.publishedAs` is unchanged — that is what makes this a rekey and
+     * not a `recreate`) so a `command` event raised a moment later is
+     * attributed to the device that will actually receive it, not the one
+     * that used to. Role and `publishedAs` are carried over from the live
+     * entry untouched (the planner only reaches this bucket when both
+     * already match `spec`); battery likewise, for the same monotonic reason
+     * {@link update} leaves it alone. Label/reachable/state ARE applied
+     * fresh, via `update` — a genuine, subscribable attribute write (a value
+     * mismatch between the old and new device is visible at migrate time,
+     * the same as any other `set_state`) — chosen over duplicating its three
+     * lines because after the re-key `require(spec.indigoDeviceId)` resolves
+     * to exactly this entry.
+     *
+     * **The occupied-key check is defensive, not a real branch.** By the time
+     * this runs, `spec.indigoDeviceId` is provably free: removals ran before
+     * any rekey (`reconcileNow`), phase 1 already vacated every rekey's
+     * `fromDeviceId`, and `parseEndpointSpecs` refuses the same device id
+     * twice in one `desired` set. If it is occupied anyway, something this
+     * method cannot safely guess at has gone wrong — throw rather than let
+     * `#live.set()` silently overwrite the occupant, which is the exact
+     * swap-cycle corruption issue #246 exists to fix.
+     *
+     * **Restore-on-failure, matching {@link closeOne}'s order.** If
+     * re-watching throws, the OLD watcher (the one `fromDeviceId` used) is
+     * restored and `live` is put back in `#live` under `fromDeviceId` BEFORE
+     * this throws — the same order `closeOne` uses, and for the same reason:
+     * a caller that gets `internal` back must find the registry exactly as
+     * it was, not half-migrated with no watcher live under either device id.
+     *
+     * Nothing here creates, closes, or reallocates an `Endpoint` — the whole
+     * point. `reconcileNow` therefore never sets `mutated` for a rekey and
+     * never bumps `ConfigurationVersion` on its account: no paired ecosystem
+     * has anything to re-read.
+     */
+    private async rekeyOne(fromDeviceId: number, spec: EndpointSpec, live: LiveEndpoint): Promise<void> {
+        if (this.#live.has(spec.indigoDeviceId)) {
+            throw new ProtocolError(
+                ErrorCode.internal,
+                `cannot rekey accessory identity ${spec.publishedAs} from device ${fromDeviceId} to device ` +
+                    `${spec.indigoDeviceId}: device ${spec.indigoDeviceId} already has a live endpoint — the ` +
+                    "plan and the live set disagree about who is free to take this identity",
+            );
+        }
+        live.unwatch();
+        try {
+            live.unwatch = watchCommands(live.endpoint, spec, this.options.emit, this.#log);
+        } catch (error) {
+            // Restore first, log, THEN throw — closeOne's order, so a caller
+            // that sees `internal` can retry against a registry that still
+            // knows this endpoint, under the device id it drove before this
+            // rekey was ever attempted.
+            live.unwatch = watchCommands(
+                live.endpoint,
+                { indigoDeviceId: fromDeviceId, role: live.role, publishedAs: live.publishedAs },
+                this.options.emit,
+                this.#log,
+            );
+            this.#live.set(fromDeviceId, live);
+            this.#log(
+                `Endpoint ${fromDeviceId} failed to re-key to device ${spec.indigoDeviceId} for accessory ` +
+                    `identity ${spec.publishedAs}; watcher restored under device ${fromDeviceId}: ` +
+                    describeErrorWithStack(error),
+            );
+            throw new ProtocolError(
+                ErrorCode.internal,
+                `endpoint ${fromDeviceId} failed to re-key to device ${spec.indigoDeviceId}: ${describeError(error)}`,
+            );
+        }
+        this.#live.set(spec.indigoDeviceId, live);
+        // Resolves `spec.indigoDeviceId` — the entry moved above.
+        await this.update(spec);
+        this.#log(
+            `Endpoint ${spec.indigoDeviceId} now drives accessory identity ${spec.publishedAs} (number ` +
+                `${Number(live.endpoint.number)}), replacing device ${fromDeviceId}. Nothing changed on the ` +
+                "wire — no paired ecosystem sees any change (issue #246 migrate).",
+        );
     }
 
     /**
