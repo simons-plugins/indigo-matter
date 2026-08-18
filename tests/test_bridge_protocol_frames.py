@@ -369,7 +369,8 @@ class TestCoverage:
         # decision, and this is what stops it being read as an oversight and
         # "fixed" by inventing a command the node would never emit.
         for role in ("occupancySensor", "contactSensor", "waterLeakDetector",
-                     "waterFreezeDetector", "rainSensor", "temperatureSensor",
+                     "waterFreezeDetector", "rainSensor", "smokeAlarm", "coAlarm",
+                     "temperatureSensor",
                      "humiditySensor", "lightSensor", "pressureSensor", "flowSensor"):
             assert bridge_protocol.ROLE_COMMANDS[role] == ()
 

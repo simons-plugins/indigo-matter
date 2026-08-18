@@ -108,6 +108,8 @@ STATE_CONTACT = "contact"
 STATE_LEAK = "leak"
 STATE_FREEZE = "freeze"
 STATE_RAIN = "rain"
+STATE_SMOKE = "smoke"
+STATE_CO = "co"
 STATE_TEMPERATURE_C = "temperatureC"
 STATE_HUMIDITY_PCT = "humidityPct"
 STATE_LUX = "lux"
@@ -971,6 +973,35 @@ class RainSensorExport(BinarySensorExport):
     state_key = STATE_RAIN
 
 
+class SmokeAlarmExport(BinarySensorExport):
+    """``smokeAlarm`` — an Indigo smoke sensor. True = alarming.
+
+    Still a plain boolean on the wire, even though the Matter cluster models
+    alarms as a three-value enum (Normal/Warning/Critical). Indigo has no
+    severity: a smoke sensor's `onState` is alarming or it is not, and the node
+    is where the boolean becomes `Critical` and drives the cluster's mandatory
+    `expressedState`. Inventing a Warning tier here would mean choosing a
+    severity no Indigo device ever reported.
+    """
+
+    role = export_catalog.ROLE_SMOKE_ALARM
+    state_key = STATE_SMOKE
+
+
+class CoAlarmExport(BinarySensorExport):
+    """``coAlarm`` — an Indigo carbon-monoxide sensor. True = alarming.
+
+    A separate role from :class:`SmokeAlarmExport` rather than a second key on
+    one: they share Matter device type 0x0076 but select their sensing half by
+    cluster feature, and one Indigo boolean means one thing. Publishing both
+    halves from it would tell every ecosystem that a smoke-only sensor is also
+    watching for CO.
+    """
+
+    role = export_catalog.ROLE_CO_ALARM
+    state_key = STATE_CO
+
+
 class NumericSensorExport(ExportHandler):
     """The five measured-value sensors — Indigo's ``sensorValue``.
 
@@ -1064,6 +1095,8 @@ HANDLERS: dict[str, ExportHandler] = {
         WaterLeakDetectorExport(),
         WaterFreezeDetectorExport(),
         RainSensorExport(),
+        SmokeAlarmExport(),
+        CoAlarmExport(),
         TemperatureSensorExport(),
         HumiditySensorExport(),
         LightSensorExport(),

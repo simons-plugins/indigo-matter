@@ -175,6 +175,15 @@ ROLE_STATE_KEYS = {
     "waterLeakDetector": ("leak",),
     "waterFreezeDetector": ("freeze",),
     "rainSensor": ("rain",),
+    # Smoke and CO are two roles over ONE Matter device type (issue #179).
+    # Smoke CO Alarm 0x0076 selects its sensing half by cluster feature, and an
+    # Indigo sensor is one boolean that means one thing — publishing both
+    # halves from it would tell an ecosystem a smoke-only sensor is also
+    # watching for CO. The node derives the cluster's mandatory
+    # `expressedState` from whichever of these it was given; the plugin never
+    # sends it, because there is nothing in Indigo to send it from.
+    "smokeAlarm": ("smoke",),
+    "coAlarm": ("co",),
     "temperatureSensor": ("temperatureC",),
     "humiditySensor": ("humidityPct",),
     "lightSensor": ("lux",),
@@ -208,6 +217,12 @@ ROLE_COMMANDS = {
     "waterLeakDetector": (),
     "waterFreezeDetector": (),
     "rainSensor": (),
+    # `SelfTestRequest` is the cluster's only command and its conformance is
+    # "O" — optional. Not declared, so these stay read-only like every other
+    # exported sensor rather than advertising a self-test the plugin would
+    # have nothing to run.
+    "smokeAlarm": (),
+    "coAlarm": (),
     "temperatureSensor": (),
     "humiditySensor": (),
     "lightSensor": (),

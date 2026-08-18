@@ -939,6 +939,26 @@
               "rain": false
             },
             "options": {}
+          },
+          {
+            "indigoDeviceId": 900019,
+            "role": "smokeAlarm",
+            "label": "Hall Smoke Alarm",
+            "reachable": true,
+            "states": {
+              "smoke": false
+            },
+            "options": {}
+          },
+          {
+            "indigoDeviceId": 900020,
+            "role": "coAlarm",
+            "label": "Boiler CO Alarm",
+            "reachable": true,
+            "states": {
+              "co": false
+            },
+            "options": {}
           }
         ]
       }
@@ -954,7 +974,7 @@
             "vendorId": 4937
           }
         ],
-        "endpointCount": 18,
+        "endpointCount": 20,
         "endpoints": [
           {
             "indigoDeviceId": 900001,
@@ -1063,6 +1083,18 @@
             "endpointNumber": 19,
             "publishedAs": "indigo-900018",
             "role": "rainSensor"
+          },
+          {
+            "indigoDeviceId": 900019,
+            "endpointNumber": 20,
+            "publishedAs": "indigo-900019",
+            "role": "smokeAlarm"
+          },
+          {
+            "indigoDeviceId": 900020,
+            "endpointNumber": 21,
+            "publishedAs": "indigo-900020",
+            "role": "coAlarm"
           }
         ],
         "drift": [],
@@ -1542,6 +1574,38 @@
     },
     "response": {
       "message_id": "m75",
+      "result": {}
+    }
+  },
+  "set_state_smoke_alarm": {
+    "request": {
+      "message_id": "m76",
+      "command": "set_state",
+      "args": {
+        "indigoDeviceId": 900019,
+        "states": {
+          "smoke": true
+        }
+      }
+    },
+    "response": {
+      "message_id": "m76",
+      "result": {}
+    }
+  },
+  "set_state_co_alarm": {
+    "request": {
+      "message_id": "m77",
+      "command": "set_state",
+      "args": {
+        "indigoDeviceId": 900020,
+        "states": {
+          "co": true
+        }
+      }
+    },
+    "response": {
+      "message_id": "m77",
       "result": {}
     }
   }

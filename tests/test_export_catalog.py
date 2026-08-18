@@ -78,7 +78,8 @@ ZOO = {
     "sensor_binary": (
         SensorDevice(5, "Hall Motion", supportsOnState=True),
         EligibleDevice(("occupancySensor", "contactSensor", "waterLeakDetector",
-                        "waterFreezeDetector", "rainSensor"), "occupancySensor"),
+                        "waterFreezeDetector", "rainSensor", "smokeAlarm", "coAlarm"),
+                       "occupancySensor"),
     ),
     "sensor_temperature": (
         SensorDevice(6, "Study Temperature", supportsSensorValue=True,
@@ -451,7 +452,7 @@ def test_every_labelled_role_is_a_protocol_role():
 
 
 def test_excluded_roles_are_documented_with_reasons():
-    assert set(export_catalog.EXCLUDED_ROLES) == {"valve", "garageDoor", "fan"}
+    assert set(export_catalog.EXCLUDED_ROLES) == {"valve", "garageDoor", "fan", "heatAlarm"}
     assert all(reason.strip() for reason in export_catalog.EXCLUDED_ROLES.values())
 
 

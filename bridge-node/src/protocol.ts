@@ -121,6 +121,8 @@ export const Role = {
     waterLeakDetector: "waterLeakDetector",
     waterFreezeDetector: "waterFreezeDetector",
     rainSensor: "rainSensor",
+    smokeAlarm: "smokeAlarm",
+    coAlarm: "coAlarm",
     temperatureSensor: "temperatureSensor",
     humiditySensor: "humiditySensor",
     lightSensor: "lightSensor",
