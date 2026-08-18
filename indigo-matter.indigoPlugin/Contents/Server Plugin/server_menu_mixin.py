@@ -26,6 +26,8 @@ from commission_jobs import fabric_counts, node_id_to_str
 from export_store import ExportEntry
 from http_handlers import MatterUnavailable
 from plugin_constants import (
+    EXCLUDED_OPTION_PREFIX,
+    EXPORT_PICKER_LIMIT,
     FACTORY_RESET_TIMEOUT,
     LIST_ERROR_OPTION,
     NODE_TOMBSTONES_PREF,
@@ -34,6 +36,7 @@ from plugin_constants import (
     READOPT_ORPHANS_TIMEOUT,
     RECONCILE_TIMEOUT,
     SHARE_WINDOW_TIMEOUT,
+    TRUNCATED_OPTION,
     server_location,
 )
 from protocol import Protocol
@@ -960,44 +963,75 @@ class ServerMenuMixin:
         """One §4.3 device-picker row, or ``None`` to omit it. May raise —
         the caller contains it, matching ``ExportDialogMixin._candidate_row``.
 
-        Kept — the orphan's role is in ``eligible_roles`` — REFUSED (owner
-        ruling 2, edge case E3) when it is not; kept and marked ● when
-        already exported (that convention's own device, the common "deleted,
-        recreated, re-exported before noticing" case E5/E2); dropped when
-        already re-adopted onto a DIFFERENT orphan.
+        Selectable — a plain ``str(dev.id)`` id — when the orphan's role is in
+        ``eligible_roles``; marked ● when already exported (that convention's
+        own device, the common "deleted, recreated, re-exported before
+        noticing" case, PR5 design E5/E2).
+
+        **Every other device is SHOWN, unselectable, WITH its reason**
+        (XAC9/PRD §5.2, the same rule ``_candidate_row`` follows). All three
+        used to be a bare ``return None``, and each of the three is a device a
+        user has a specific expectation about — "I recreated it, why is it not
+        in this list?" — which an absence answers with nothing at all:
+
+        * not exportable (the classifier's own reason);
+        * exportable, but cannot take this accessory's role — the refusal
+          owner ruling 2/edge case E3 makes at Execute time, said here first;
+        * already publishing a DIFFERENT accessory's identity, i.e. re-adopted
+          onto another orphan, naming which.
+
+        The loop guard stays ABSENT rather than excluded, exactly as XAC6
+        requires of the export picker: every such device shadows one the user
+        already sees.
 
         "A DIFFERENT orphan" is decided by whose device id the identity
         embeds, not merely by it being non-default: a device publishing under
         its OWN ``indigo-<ownId>~<generation>`` (it has changed role at some
-        point, issue #240) has claimed nobody else's accessory and stays in
-        the picker — PR5 design E2 keeps "``indigo-<newId>``, or a generation
-        of it" as the explicitly-allowed already-exported case.
-
-        The identity compared is the EFFECTIVE one — ``published_as`` where an
-        entry has one, otherwise the default derivation it publishes under —
-        so this reads the same way as :meth:`_readopt_identity_claimant`'s
-        step-7 check rather than treating ``published_as is None`` as "claims
+        point, issue #240) has claimed nobody else's accessory and stays
+        selectable — PR5 design E2 keeps "``indigo-<newId>``, or a generation
+        of it" as the explicitly-allowed already-exported case. The identity
+        compared is the EFFECTIVE one — ``published_as`` where an entry has
+        one, otherwise the default derivation it publishes under — so this
+        reads the same way as :meth:`_readopt_identity_claimant`'s step-7
+        check rather than treating ``published_as is None`` as "claims
         nothing".
         """
+        mark = "● " if dev.id in exported else ""
         verdict = export_catalog.classify(dev, plugin_id)
         if isinstance(verdict, export_catalog.Excluded):
-            return None
+            if verdict.reason == export_catalog.REASON_LOOP_GUARD:
+                return None                      # XAC6: absent, not excluded
+            return (f"{EXCLUDED_OPTION_PREFIX}{dev.id}",
+                    f"{mark}{dev.name} — not exportable: {verdict.reason}")
         if orphan.role not in verdict.eligible_roles:
-            return None
+            return (f"{EXCLUDED_OPTION_PREFIX}{dev.id}",
+                    f"{mark}{dev.name} — cannot appear as a "
+                    f"{export_catalog.role_label(orphan.role)}")
         entry = self.exports.get(dev.id)
         if entry is not None:
             publishing_as = entry.published_as or published_id_for(dev.id)
             if publishing_as != orphan.unique_id:
                 claimed = parse_published_id(publishing_as)
                 if claimed is None or claimed.device_id != dev.id:
-                    return None  # already re-adopted onto a DIFFERENT orphan
-        mark = "● " if dev.id in exported else ""
+                    return (f"{EXCLUDED_OPTION_PREFIX}{dev.id}",
+                            f"{mark}{dev.name} — already re-adopted onto accessory "
+                            f"{publishing_as}")
         return (str(dev.id), f"{mark}{dev.name}")
 
     def getReadoptDevices(self, filter="", valuesDict=None, typeId="", targetId=0):  # noqa: N802, A002, ARG002
-        """Device picker for "Re-adopt a Matter accessory…" (§4.3), filtered
-        to the picked orphan's role — see :meth:`_readopt_device_row` for
-        the per-device rule.
+        # pylint: disable=too-many-locals  # same two-list shape as getExportCandidates
+        """Device picker for "Re-adopt a Matter accessory…" (§4.3) — see
+        :meth:`_readopt_device_row` for the per-device rule.
+
+        Selectable rows first and never truncated, the same ordering rule
+        ``getExportCandidates`` uses and for the same reason: this dialog is
+        the only place a re-adopt can be started, so a device buried past
+        :data:`EXPORT_PICKER_LIMIT` by a house full of unselectable rows would
+        be effectively unreachable. The cap therefore applies only to the
+        explained-but-unpickable tail, with the usual truncation row when it
+        bites. There is no filter field to narrow on (the orphan's role
+        already does most of the narrowing), which is exactly why the tail is
+        the half that gets capped.
         """
         try:
             if self.exports is None:
@@ -1018,16 +1052,22 @@ class ServerMenuMixin:
                 return []
             exported = self.exports.ids()
             plugin_id = self._export_plugin_id()  # pylint: disable=no-member  # ExportDialogMixin
-            options = []
+            eligible: list = []
+            explained: list = []
             failures = 0
             for dev in indigo.devices:
                 try:
                     row = self._readopt_device_row(dev, orphan, plugin_id, exported)
-                    if row is not None:
-                        options.append(row)
+                    if row is None:
+                        continue
+                    (explained if row[0].startswith(EXCLUDED_OPTION_PREFIX)
+                     else eligible).append(row)
                 except Exception as exc:  # pylint: disable=broad-except
                     self._log_row_failure(exc, first=not failures)  # pylint: disable=no-member
                     failures += 1
+            options = eligible + explained[:EXPORT_PICKER_LIMIT]
+            if len(explained) > EXPORT_PICKER_LIMIT:
+                options.append(TRUNCATED_OPTION)
             return options
         except Exception as exc:  # pylint: disable=broad-except
             self.logger.exception(exc)
@@ -1170,6 +1210,7 @@ class ServerMenuMixin:
         return orphan
 
     def _readopt_pick_device(self, orphan, valuesDict, errors):
+        # pylint: disable=too-many-return-statements  # one return per §4.4 refusal, by design
         """The picked device (or "select one"), re-verified per §4.4 steps
         5-6: still existing, still classifying as exportable, and still able
         to take the orphan's role (edge case E3, owner ruling 2 — REFUSE,
@@ -1182,6 +1223,16 @@ class ServerMenuMixin:
         selection = str(valuesDict.get("readoptDevice", "") or "")
         if not selection or selection == NO_SELECTION_ID:
             errors["readoptDevice"] = "Select the Indigo device to hand it to."
+            return None
+        if selection.startswith(EXCLUDED_OPTION_PREFIX):
+            # An unselectable XAC9 row. Its label already carries the specific
+            # reason, and re-deriving it here would either repeat the checks
+            # below verbatim or — for the "already re-adopted onto another
+            # orphan" row — miss it entirely, since nothing after this point
+            # looks at the TARGET device's own published identity.
+            self._readopt_refuse(errors, "readoptDevice",
+                                 "That row is listed with the reason it cannot take this "
+                                 "accessory — pick a device offered without one.")
             return None
         try:
             device_id = int(selection)

@@ -463,12 +463,19 @@ If the bridge node is NOT refusing, this does nothing useful and is refused: the
     <!--
         Re-adopt a Matter accessory… (issue #219). Hands a LEFT-BEHIND
         accessory identity — one orphaned by deleting the Indigo device that
-        exported it, or by a role change (issue #240 deliberately removes and
-        re-adds rather than mutating an accessory in place) — to a different
-        Indigo device, so the accessory keeps its room, name, scenes and
-        automations in every paired ecosystem. Placed right after the
-        endpoint-map rebuild: both are identity surgery reached for after
-        something already went wrong, not everyday export management.
+        exported it, or by un-exporting it — to a different Indigo device, so
+        the accessory keeps its room, name, scenes and automations in every
+        paired ecosystem. Placed right after the endpoint-map rebuild: both
+        are identity surgery reached for after something already went wrong,
+        not everyday export management.
+
+        A ROLE CHANGE's old accessory is deliberately NOT offered here.
+        `EndpointMapStore.orphans()` excludes every record carrying
+        `supersededBy`, because re-adopting one would resurrect an old-role
+        accessory under a number every paired ecosystem has already processed
+        a removal for — that number is retired on purpose (issue #240). The
+        intro label below says so, because a promise the picker cannot keep
+        is worse than no promise.
 
         Master-detail shape, same reasoning as "Manage Matter Exports…": a
         `menu` has a CallbackMethod, so `readoptOrphan` gets one
@@ -483,7 +490,9 @@ If the bridge node is NOT refusing, this does nothing useful and is refused: the
             <Field id="readoptIntro" type="label">
                 <Label>Hands a left-behind Matter accessory identity to a different Indigo device. Apple Home and every other paired ecosystem keep its room, its name, and every scene and automation built on it — nothing is re-paired and nothing is renumbered. This costs nothing when it succeeds.
 
-An accessory is left behind when the Indigo device that exported it is deleted, or when its role is changed (changing a role now removes the old accessory and adds a new one rather than changing it in place — issue #240). It can only be re-adopted onto a device that can take the SAME role as the accessory it is inheriting; a device that cannot is refused below — export it normally instead, and it becomes a new accessory.</Label>
+An accessory is left behind when the Indigo device that exported it is deleted, or when it stops being exported. It can only be re-adopted onto a device that can take the SAME role as the accessory it is inheriting; a device that cannot is refused below — export it normally instead, and it becomes a new accessory.
+
+A ROLE CHANGE is not recoverable this way. Changing a role removes the old accessory and adds a new one (issue #240), and the old one's accessory number is retired on purpose — re-adopting it would put an old-role accessory back under a number your ecosystems have already processed a removal for. Those accessories are not offered below.</Label>
             </Field>
             <Field id="readoptOrphan" type="menu">
                 <Label>Left-behind accessory:</Label>

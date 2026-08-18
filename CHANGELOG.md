@@ -17,14 +17,17 @@ current version is `Info.plist`'s `PluginVersion`.
 - **`Plugin ▸ Re-adopt a Matter accessory…`** (issue #219) — hands a
   left-behind accessory identity to a different Indigo device. An accessory
   is left behind when the Indigo device that exported it is deleted, or when
-  its role is changed (see Changed, below); the room, name, scenes and
-  automations built on it in Apple Home and every other paired ecosystem
-  survive untouched, because nothing is re-paired and nothing is renumbered.
-  Only works when the replacement device can take the same role as the
-  accessory it is inheriting — cross-role re-adopt is refused, since that is
-  exactly the wedge this release's role-change fix exists to eliminate. An
+  it stops being exported; the room, name, scenes and automations built on it
+  in Apple Home and every other paired ecosystem survive untouched, because
+  nothing is re-paired and nothing is renumbered. Only works when the
+  replacement device can take the same role as the accessory it is
+  inheriting — cross-role re-adopt is refused, since that is exactly the
+  wedge this release's role-change fix exists to eliminate. **A role change
+  is NOT recoverable this way**: its old accessory number is retired on
+  purpose (see Changed, below), so those accessories are not offered. An
   accessory un-exported by a plugin older than 2026.16.2 has no role/name on
-  record and cannot be re-adopted; export the device normally instead.
+  record and cannot be re-adopted either; export the device normally
+  instead.
 
 ### Changed
 

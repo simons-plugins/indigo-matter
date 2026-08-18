@@ -1397,7 +1397,9 @@ class TestGetReadoptOrphans:
 
 
 class TestGetReadoptDevices:
-    """§4.3 — the device picker, filtered to the picked orphan's role."""
+    """§4.3 — the device picker: selectable rows for devices that can take the
+    orphan's role, and an EXPLAINED row for every device that cannot (XAC9).
+    """
 
     def test_empty_without_a_picked_orphan(self, plug):
         assert plug.getReadoptDevices(valuesDict={}) == []
@@ -1413,7 +1415,7 @@ class TestGetReadoptDevices:
         assert options == [(plugin_mod.NO_SELECTION_ID,
                             "(plugin still starting — re-open this dialog in a moment)")]
 
-    def test_filters_to_devices_offering_the_orphans_role(self, plug):
+    def test_only_devices_offering_the_orphans_role_are_selectable(self, plug):
         _bridge_with(plug, attached=True)
         orphan = _orphan(role="onOffPlugInUnit")
         plug.runtime = _FakeRuntime(result=[orphan])
@@ -1421,14 +1423,53 @@ class TestGetReadoptDevices:
         assert "101" in labels                          # RelayDevice offers onOffPlugInUnit
         assert "102" not in labels                       # DimmerDevice does not
 
-    def test_cross_role_devices_are_excluded_e3(self, plug):
-        """The picker-level half of E3 — never even offered, not just refused
-        later at Execute."""
+    def test_a_role_ineligible_device_is_shown_with_its_reason_not_hidden(self, plug):
+        """XAC9. The picker-level half of E3 — refused, but VISIBLY: "I
+        recreated the device, why is it not in the list?" is exactly the
+        question an absence answers with nothing."""
         _bridge_with(plug, attached=True)
         orphan = _orphan(role="dimmableLight")            # RelayDevice cannot take this role
         plug.runtime = _FakeRuntime(result=[orphan])
         labels = _labels(plug.getReadoptDevices(valuesDict={"readoptOrphan": orphan.unique_id}))
-        assert "101" not in labels
+        assert "101" not in labels, "still unselectable"
+        assert labels["x-101"] == ("Study Plug — cannot appear as a "
+                                   + export_catalog.role_label("dimmableLight"))
+
+    def test_an_unexportable_device_is_shown_with_the_classifiers_reason(self, plug):
+        _bridge_with(plug, attached=True)
+        orphan = _orphan(role="onOffPlugInUnit")
+        plug.runtime = _FakeRuntime(result=[orphan])
+        labels = _labels(plug.getReadoptDevices(valuesDict={"readoptOrphan": orphan.unique_id}))
+        assert labels["x-104"].startswith("Irrigation — not exportable: ")
+        assert export_catalog.REASON_SPRINKLER in labels["x-104"]
+
+    def test_xac6_our_own_device_stays_absent_here_too(self, plug):
+        """The one exclusion that is ABSENT rather than explained: every
+        loop-guarded device shadows one the user already sees."""
+        _bridge_with(plug, attached=True)
+        orphan = _orphan(role="onOffPlugInUnit")
+        plug.runtime = _FakeRuntime(result=[orphan])
+        labels = _labels(plug.getReadoptDevices(valuesDict={"readoptOrphan": orphan.unique_id}))
+        assert not any("105" in option_id for option_id in labels)
+
+    def test_selectable_rows_come_first_and_are_never_truncated(self, plug, plugin_mod, devices):
+        """Same rule as `getExportCandidates`, same reason: this dialog is the
+        only place a re-adopt starts, so a house full of explained rows must
+        not push the pickable one out of reach. There is no filter field to
+        narrow with."""
+        for extra in range(plugin_mod.EXPORT_PICKER_LIMIT + 5):
+            devices.add(SprinklerDevice(900_000 + extra, f"Zone {extra}"))
+        _bridge_with(plug, attached=True)
+        orphan = _orphan(role="onOffPlugInUnit")
+        plug.runtime = _FakeRuntime(result=[orphan])
+
+        options = plug.getReadoptDevices(valuesDict={"readoptOrphan": orphan.unique_id})
+
+        assert options[0] == ("101", "Study Plug")
+        assert options[-1] == plugin_mod.TRUNCATED_OPTION
+        explained = [row for row in options[1:] if row != plugin_mod.TRUNCATED_OPTION]
+        assert len(explained) == plugin_mod.EXPORT_PICKER_LIMIT
+        assert all(key.startswith("x-") for key, _label in explained)
 
     def test_already_exported_device_is_marked(self, plug):
         plug.exports.upsert(ExportEntry(101, "onOffPlugInUnit"))
@@ -1438,13 +1479,14 @@ class TestGetReadoptDevices:
         labels = _labels(plug.getReadoptDevices(valuesDict={"readoptOrphan": orphan.unique_id}))
         assert labels["101"] == "● Study Plug"
 
-    def test_a_device_already_re_adopted_onto_a_different_orphan_is_excluded(self, plug):
+    def test_a_device_already_re_adopted_onto_a_different_orphan_names_which(self, plug):
         plug.exports.upsert(ExportEntry(101, "onOffPlugInUnit", published_as="indigo-999"))
         _bridge_with(plug, attached=True)
         orphan = _orphan(unique_id="indigo-901", role="onOffPlugInUnit")
         plug.runtime = _FakeRuntime(result=[orphan])
         labels = _labels(plug.getReadoptDevices(valuesDict={"readoptOrphan": orphan.unique_id}))
-        assert "101" not in labels
+        assert "101" not in labels, "still unselectable"
+        assert labels["x-101"] == "● Study Plug — already re-adopted onto accessory indigo-999"
 
     def test_a_device_already_re_adopted_onto_THIS_orphan_is_kept(self, plug):
         plug.exports.upsert(ExportEntry(101, "onOffPlugInUnit", published_as="indigo-901"))
@@ -1525,6 +1567,21 @@ class TestMenuReadoptExportValidation:
             {"readoptConfirm": True, "readoptOrphan": "indigo-903", "readoptDevice": "101"})
         assert ok is False and "readoptOrphan" in errors
         assert "older than 2026.16.2" in errors["readoptOrphan"]
+
+    def test_refuses_an_unselectable_row_by_pointing_at_its_reason(self, plug):
+        """The XAC9 rows are shown so the user can see WHY, and the label
+        already says it — but the pick still has to be refused, and the
+        "already re-adopted onto another orphan" one is not caught by any
+        later step."""
+        plug.exports.upsert(ExportEntry(101, "onOffPlugInUnit", published_as="indigo-999"))
+        _bridge_with(plug, attached=True)
+        orphan = _orphan(unique_id="indigo-901", role="onOffPlugInUnit")
+        plug.runtime = _FakeRuntime(result=[orphan])
+        ok, _values_out, errors = plug.menuReadoptExport(
+            {"readoptConfirm": True, "readoptOrphan": orphan.unique_id, "readoptDevice": "x-101"})
+        assert ok is False and "readoptDevice" in errors
+        assert "listed with the reason" in errors["readoptDevice"]
+        assert plug.exports.get(101).published_as == "indigo-999", "nothing was changed"
 
     def test_refuses_without_a_device_selected(self, plug):
         _bridge_with(plug, attached=True)
