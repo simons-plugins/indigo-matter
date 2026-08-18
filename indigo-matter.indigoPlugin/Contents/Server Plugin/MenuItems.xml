@@ -224,6 +224,25 @@ A Matter pairing code is not durable: once used, or once the window expires (up 
             <Field id="exportDetailHeading" type="label" fontColor="darkgray">
                 <Label>2 · How it should appear</Label>
             </Field>
+            <!-- Custom-state mapping (issue #252). Hidden for every device that
+                 has an on/off state of its own; `exportNeedsMapping` is set by
+                 exportDeviceChanged, because visibility can only bind to a
+                 field value and "is this device mappable" is not one. -->
+            <Field id="exportNeedsMapping" type="textfield" hidden="true" defaultValue="false"/>
+            <Field id="exportStateKey" type="menu"
+                   visibleBindingId="exportNeedsMapping" visibleBindingValue="true"
+                   alwaysUseInDialogHeightCalc="true">
+                <Label>Which state is the reading:</Label>
+                <List class="self" method="getExportStateKeys" dynamicReload="true"/>
+                <CallbackMethod>exportStateKeyChanged</CallbackMethod>
+                <Description>This device's plugin keeps its reading in a state of its own rather than in Indigo's on/off flag, so tell the bridge which one it is.</Description>
+            </Field>
+            <Field id="exportStateInvert" type="checkbox" defaultValue="false"
+                   visibleBindingId="exportNeedsMapping" visibleBindingValue="true"
+                   alwaysUseInDialogHeightCalc="true">
+                <Label>State is inverted:</Label>
+                <Description>Tick if the state is true when NOTHING is detected — an alarm zone that reports "healthy", for instance.</Description>
+            </Field>
             <Field id="exportRole" type="menu">
                 <Label>Export as:</Label>
                 <List class="self" method="getExportRoles" dynamicReload="true"/>

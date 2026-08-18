@@ -992,9 +992,19 @@ class ExportBridge:
         dev = self._device_getter(device_id)
         if dev is None:
             return self._skip(device_id, "the Indigo device no longer exists")
-        verdict = export_catalog.classify(dev, self._plugin_id)
-        if isinstance(verdict, export_catalog.Excluded):
-            return self._skip(device_id, f"it is no longer exportable: {verdict.reason}")
+        # The entry's OPTIONS are part of the question (ADR-0012): a custom
+        # device is exportable BECAUSE the user declared which state is its
+        # reading, so classifying without them would re-read every mapped
+        # export as un-exportable and quietly drop it from the bridge.
+        verdict = export_catalog.classify(dev, self._plugin_id, entry.options)
+        # Positive test, not `not isinstance(..., Excluded)`. `classify` has
+        # three outcomes now, and the third — a device that COULD be exported
+        # once mapped — must fail this guard exactly like an exclusion does. A
+        # negative test would let it through to the `eligible_roles` line and
+        # raise there instead of skipping cleanly.
+        if not isinstance(verdict, export_catalog.EligibleDevice):
+            reason = getattr(verdict, "reason", "it is no longer exportable")
+            return self._skip(device_id, f"it is no longer exportable: {reason}")
         if entry.role not in verdict.eligible_roles:
             return self._skip(device_id, f"it no longer offers the role {entry.role!r} "
                                          f"(now: {', '.join(verdict.eligible_roles)})")

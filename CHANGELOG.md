@@ -3,13 +3,30 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
-## Unreleased
+## 2026.23.0 — export every sensor you actually own
 
-Banked for the next release. Releases are opt-in in this repo, so several
-merges accumulate here before one of them ships.
+The sensor half of the export bridge, widened. Five new roles, an on/off
+default that reads the device's name instead of always guessing occupancy, and
+— the big one — devices whose plugin keeps its reading in a state of its own
+can now be exported at all. On the database this was developed against that
+last change moves 229 devices out of "no resolvable Matter role", which was
+the largest exclusion bucket in the product by a factor of ten.
 
 ### Added
 
+- **Export devices whose reading lives in a plugin-named state** (issue #252).
+  Alarm-panel zones are the case that prompted this: a plugin defining its
+  devices as `custom` gives Indigo no on/off flag to read, so every zone —
+  ordinary PIRs, door contacts, smoke and CO detectors — was listed as having
+  no resolvable Matter role. The export dialog now asks **which state is the
+  reading**, offering the boolean states the device actually publishes, with a
+  tick-box for a state that is true when *nothing* is detected. Map the first
+  zone of a panel and every other device of the same type pre-selects the same
+  state, so the rest need only their role. If the plugin later renames or drops
+  that state, the export stops publishing and says so in the log rather than
+  reporting a fabricated "nothing detected". Only on/off states are mappable in
+  this version; a device whose only readings are numbers says so in the picker.
+  See ADR-0012.
 - **Smoke alarm and carbon monoxide alarm export roles** (issue #179). Two
   roles, not one combined accessory: Matter gives both one device type and
   selects the sensing half by feature, while an Indigo sensor is a single

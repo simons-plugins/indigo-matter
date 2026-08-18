@@ -434,7 +434,40 @@ class MultiIODevice(FakeIndigoDevice):
 
 
 class CustomDevice(FakeIndigoDevice):
-    """A plugin-defined `custom` device — no resolvable Matter role."""
+    """A plugin-defined `custom` device — `indigo.Device`, no IOM subclass.
+
+    The measured shape (issue #252): Texecom's `<Device type="custom">` alarm
+    zones instantiate as a plain `indigo.Device`, so `supportsOnState` is False
+    and the real reading sits in a plugin-named state. `states` therefore
+    matters here in a way it does not for the typed doubles, and defaults to
+    empty so the existing "nothing to publish" rows keep meaning that.
+    """
+
+    def __init__(self, *args, **kwargs):
+        self.states = dict(kwargs.pop("states", None) or {})
+        super().__init__(*args, **kwargs)
+
+
+def texecom_zone(dev_id=743389524, name="Study PIR", status=False, **kwargs):
+    """A Texecom alarm zone, as measured on the reference database 2026-08-18.
+
+    The `statusText.*` booleans are Indigo's own enum expansion of the
+    `statusText` state, and they are here on purpose: they are what makes the
+    naive "list every boolean state" mapping picker offer five candidates where
+    only `status` is right.
+    """
+    states = {
+        "lastTripped": "24-09-25 17:33:09",
+        "status": status,
+        "statusText": "Healthy",
+        "statusText.Healthy": not status,
+        "statusText.Shorted": False,
+        "statusText.Tamper": False,
+        "statusText.Tripped": status,
+    }
+    return CustomDevice(dev_id, name, states=states,
+                        plugin_id=kwargs.pop("plugin_id", "com.racarter.indigoplugin.texecom"),
+                        deviceTypeId=kwargs.pop("deviceTypeId", "alarmZone"), **kwargs)
 
 
 class HostileDevice:

@@ -908,13 +908,24 @@ class ThermostatExport(ExportHandler):
         indigo.thermostat.setHvacMode(dev, value=hvac_mode)
 
 
-class BinarySensorExport(ExportHandler):
-    """``occupancySensor`` / ``contactSensor`` — Indigo's ``onState``.
+#: Sentinel for "this export declares no mapping" — distinct from a mapping
+#: whose state has gone, which is `None` and must publish nothing.
+_UNMAPPED = object()
 
-    Both mirror the inbound handlers without inversion: ``sensors.py``'s
-    ``OccupancyHandler`` writes ``onOffState`` from the occupancy bit and its
-    ``ContactHandler`` writes it straight from BooleanState's ``stateValue``,
-    which Matter documents as "TRUE = closed or contact".
+
+class BinarySensorExport(ExportHandler):
+    """The binary sensor family — Indigo's ``onState``, or a mapped state.
+
+    The standard reading mirrors the inbound handlers without inversion:
+    ``sensors.py``'s ``OccupancyHandler`` writes ``onOffState`` from the
+    occupancy bit and its ``ContactHandler`` writes it straight from
+    BooleanState's ``stateValue``, which Matter documents as "TRUE = closed or
+    contact".
+
+    When ``options`` carries a mapping (ADR-0012, issue #252) the reading comes
+    from the named device state instead. That is the whole of the mapping's
+    runtime cost: a device typed ``<Device type="custom">`` has no ``onState``
+    to read, but it has states, and the user has said which one is the sensor.
 
     No :meth:`commands` override — Matter sensors are read-only, and §4.2 gives
     these roles an empty command tuple by design rather than by omission.
@@ -924,10 +935,43 @@ class BinarySensorExport(ExportHandler):
     state_key: str = ""
 
     def states_for(self, dev: Any, options: Optional[dict] = None) -> dict:
+        mapped = self._mapped_reading(dev, options)
+        if mapped is not _UNMAPPED:
+            # `None` here means the mapped state has gone (a plugin renamed or
+            # dropped it). Publishing nothing is the same answer this handler
+            # already gives an `onState` of None, and for the same reason: a
+            # fabricated False would tell every ecosystem the leak sensor is
+            # dry.
+            return {} if mapped is None else {self.state_key: mapped}
         on_state = getattr(dev, "onState", None)
         # Documented as `None` when the sensor has no on/off concept; a
         # fabricated False would tell every ecosystem the door is shut.
         return {} if on_state is None else {self.state_key: bool(on_state)}
+
+    @staticmethod
+    def _mapped_reading(dev: Any, options: Optional[dict]) -> Any:
+        """The mapped state as a bool, ``None`` if it has gone, or
+        :data:`_UNMAPPED` if this export declares no mapping at all.
+
+        Three outcomes rather than two because "no mapping" and "mapping whose
+        state vanished" must not collapse: the first falls back to ``onState``,
+        the second must publish nothing. Only a real ``bool`` counts — the
+        mapping was chosen from `export_catalog.binary_state_keys`, which
+        offers booleans only, so a state that has since changed type is a state
+        that has effectively gone.
+        """
+        if not isinstance(options, dict):
+            return _UNMAPPED
+        key = options.get(export_catalog.OPTION_STATE_KEY)
+        if not isinstance(key, str) or not key:
+            return _UNMAPPED
+        try:
+            value = dict(getattr(dev, "states", None) or {}).get(key)
+        except Exception:  # pylint: disable=broad-except
+            return None
+        if not isinstance(value, bool):
+            return None
+        return not value if options.get(export_catalog.OPTION_STATE_INVERT) is True else value
 
 
 class OccupancySensorExport(BinarySensorExport):
