@@ -6,7 +6,7 @@
 import assert from "node:assert/strict";
 import { after, before, describe, it } from "node:test";
 
-import { ErrorCode, type PairingReport, PROTOCOL_VERSION, ProtocolError } from "../src/protocol.js";
+import { ErrorCode, type OrphanRecord, type PairingReport, PROTOCOL_VERSION, ProtocolError } from "../src/protocol.js";
 import { BridgeWsServer } from "../src/ws-server.js";
 import { TestClient } from "./client.js";
 import { golden, StubBridge } from "./stub-bridge.js";
@@ -361,6 +361,9 @@ describe("gating (§1.1)", () => {
             // Exempt from this gate only while the node is REFUSING (§1.1); with
             // a healthy node it is an ordinary command and needs an attach.
             ["rebuild_endpoint_map", {}],
+            // §3.12: read-only, but NOT a recovery command — an ordinary attach
+            // is still required, like every other row above.
+            ["list_orphans", {}],
         ];
         const client = await connect();
         for (const [command, args] of gated) {
@@ -867,6 +870,51 @@ describe("fabric and reset commands (§3.9-§3.11)", () => {
     });
 });
 
+describe("list_orphans (§3.12, issue #219)", () => {
+    it("answers the golden populated orphan list", async () => {
+        await withColdBridge(async (cold, connectCold) => {
+            const client = await connectCold();
+            await client.request(golden.attach_with_endpoints.request);
+            cold.orphans = structuredClone(golden.list_orphans.response.result) as OrphanRecord[];
+            const exchange = golden.list_orphans;
+            assert.deepEqual(await client.request(exchange.request), exchange.response);
+            client.close();
+        });
+    });
+
+    it("answers an empty array when nothing is orphaned", async () => {
+        await withColdBridge(async (_cold, connectCold) => {
+            const client = await connectCold();
+            await client.request(golden.attach_with_endpoints.request);
+            const exchange = golden.list_orphans_empty;
+            assert.deepEqual(await client.request(exchange.request), exchange.response);
+            client.close();
+        });
+    });
+
+    it("requires attach first, like an ordinary command", async () => {
+        await withColdBridge(async (_cold, connectCold) => {
+            const client = await connectCold();
+            const response = await client.request({ message_id: "lo-gate", command: "list_orphans", args: {} });
+            assert.equal(response.error_code, ErrorCode.notAttached);
+            client.close();
+        });
+    });
+
+    it("is NOT a recovery command: refused during endpoint_map_invalid", async () => {
+        // §1.1's RECOVERY_COMMANDS is deliberately just get_status/get_pairing/
+        // rebuild_endpoint_map: a node refusing over an unreadable map has no
+        // orphans it can vouch for.
+        await withColdBridge(async (cold, connectCold) => {
+            cold.refusal = "endpoint map is unreadable";
+            const client = await connectCold();
+            const response = await client.request({ message_id: "lo-refuse", command: "list_orphans", args: {} });
+            assert.equal(response.error_code, ErrorCode.endpointMapInvalid);
+            client.close();
+        });
+    });
+});
+
 describe("the endpoint_map_invalid refuse-to-start state (§1.1, PRD §7)", () => {
     it("refuses everything outside the recovery trio, attach included", async () => {
         await withColdBridge(async (cold, connectCold) => {
@@ -953,6 +1001,7 @@ describe("the endpoint_map_invalid refuse-to-start state (§1.1, PRD §7)", () =
             { command: "upsert_endpoint", args: golden.upsert_endpoint.request.args },
             { command: "set_reachable", args: { indigoDeviceId: 123456789, reachable: false } },
             { command: "open_commissioning_window", args: { durationSeconds: 900 } },
+            { command: "list_orphans", args: {} },
         ];
         await withColdBridge(async (cold, connectCold) => {
             cold.refusal = "endpoint map is unreadable";

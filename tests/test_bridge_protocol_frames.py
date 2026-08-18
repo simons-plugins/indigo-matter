@@ -95,6 +95,8 @@ def _build(proto: BridgeProtocol, request: dict):
         return proto.build_factory_reset(args["preserveEndpointNumbers"], mid)
     if command == bridge_protocol.CMD_REBUILD_ENDPOINT_MAP:
         return proto.build_rebuild_endpoint_map(mid)
+    if command == bridge_protocol.CMD_LIST_ORPHANS:
+        return proto.build_list_orphans(mid)
     raise AssertionError(f"no builder for command {command!r}")
 
 

@@ -58,12 +58,13 @@ CMD_OPEN_WINDOW = "open_commissioning_window"
 CMD_REMOVE_FABRIC = "remove_fabric"
 CMD_FACTORY_RESET = "factory_reset"
 CMD_REBUILD_ENDPOINT_MAP = "rebuild_endpoint_map"
+CMD_LIST_ORPHANS = "list_orphans"
 
 #: The complete §3 command domain. Anything else gets ``unknown_command``.
 COMMANDS = frozenset({
     CMD_ATTACH, CMD_UPSERT_ENDPOINT, CMD_REMOVE_ENDPOINT, CMD_SET_STATE, CMD_SET_REACHABLE,
     CMD_GET_STATUS, CMD_GET_PAIRING, CMD_OPEN_WINDOW, CMD_REMOVE_FABRIC, CMD_FACTORY_RESET,
-    CMD_REBUILD_ENDPOINT_MAP,
+    CMD_REBUILD_ENDPOINT_MAP, CMD_LIST_ORPHANS,
 })
 
 # attach args (§3.1)
@@ -601,6 +602,10 @@ class BridgeProtocol:
     def build_rebuild_endpoint_map(self, message_id: Optional[str] = None) -> dict:
         """§3.11 — adopt the live endpoint numbers as the new persisted map."""
         return self.build_request(CMD_REBUILD_ENDPOINT_MAP, None, message_id)
+
+    def build_list_orphans(self, message_id: Optional[str] = None) -> dict:
+        """§3.12 — every left-behind accessory identity the re-adopt picker could offer."""
+        return self.build_request(CMD_LIST_ORPHANS, None, message_id)
 
     # ------------------------------------------------------------------
     # Inbound classification

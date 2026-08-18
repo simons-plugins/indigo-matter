@@ -104,6 +104,7 @@ export class BridgeWsServer {
             return {};
         });
         this.#handlers.set("rebuild_endpoint_map", async () => this.options.bridge.rebuildEndpointMap());
+        this.#handlers.set("list_orphans", async () => this.options.bridge.listOrphans());
         options.bridge.onWindowClosed(reason => this.sendEvent(EventName.windowClosed, { reason }));
         options.bridge.onCommand(data => this.sendEvent(EventName.command, data));
         options.bridge.onDriftDetected(drift => this.sendEvent(EventName.driftDetected, { drift }));

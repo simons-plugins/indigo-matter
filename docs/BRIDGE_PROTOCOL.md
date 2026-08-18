@@ -383,6 +383,41 @@ The name is timestamped for the same reason `identity.json.unreadable-<stamp>`
 is: a fixed name means the second quarantine silently destroys the first, and
 the first is the one nearest the original truth.
 
+### 3.12 `list_orphans`
+
+```json
+{"command": "list_orphans", "args": {}}
+```
+
+Read-only, no arguments: every left-behind accessory identity the endpoint map
+still remembers — issue #219's re-adopt picker is built from this. Result is a
+bare array, `[<OrphanRecord>, …]`, in map order (the order numbers were first
+recorded, not necessarily newest-orphan-first):
+
+```json
+[{"uniqueId": "indigo-123456789", "number": 7, "role": "dimmableLight",
+  "label": "Kitchen Lamp", "orphanedAt": "2026-08-12T09:15:00Z", "deviceId": 123456789},
+ {"uniqueId": "indigo-123456790", "number": 4}]
+```
+
+- `role`/`label` are absent for a pre-2026.16.2 orphan (that plugin version
+  deleted them on un-export instead of recording them) — the picker lists it
+  anyway, with nothing to match a replacement device against, and refuses to
+  re-adopt it.
+- `orphanedAt` is absent for an orphan recorded before this field existed — the
+  picker renders that as "date unknown".
+- `deviceId` is the Indigo device that drove the identity before it was
+  un-exported, when recorded.
+- A **superseded** identity (issue #240 — a role change moved its device to a
+  new identity) is never in this list: re-adopting one would resurrect an
+  old-role accessory under a number every paired ecosystem has already
+  processed a removal for.
+
+**Not a recovery command.** `list_orphans` requires an ordinary `attach` first,
+same as any other §3 command — it is deliberately absent from §1.1's recovery
+trio (`get_status`, `get_pairing`, `rebuild_endpoint_map`): a node refusing
+over an unreadable map has no orphans it can vouch for.
+
 ## 4. Shapes
 
 ### 4.1 `EndpointSpec`

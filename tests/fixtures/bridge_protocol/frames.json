@@ -1345,6 +1345,47 @@
       }
     }
   },
+  "list_orphans": {
+    "request": {
+      "message_id": "m71",
+      "command": "list_orphans",
+      "args": {}
+    },
+    "response": {
+      "message_id": "m71",
+      "result": [
+        {
+          "uniqueId": "indigo-223456791",
+          "number": 7,
+          "role": "dimmableLight",
+          "label": "Kitchen Lamp",
+          "orphanedAt": "2026-08-12T09:15:00Z",
+          "deviceId": 223456791
+        },
+        {
+          "uniqueId": "indigo-223456792",
+          "number": 4,
+          "role": "onOffLight",
+          "label": "Porch Light"
+        },
+        {
+          "uniqueId": "indigo-223456793",
+          "number": 9
+        }
+      ]
+    }
+  },
+  "list_orphans_empty": {
+    "request": {
+      "message_id": "m72",
+      "command": "list_orphans",
+      "args": {}
+    },
+    "response": {
+      "message_id": "m72",
+      "result": []
+    }
+  },
   "endpoint_map_invalid": {
     "request": {
       "message_id": "m24",

@@ -480,6 +480,11 @@ export interface BridgeFacade {
     factoryReset(preserveEndpointNumbers: boolean): Promise<void>;
     /** §3.11 — adopt the live endpoint numbers as the new persisted map. */
     rebuildEndpointMap(): Promise<StatusReport>;
+    /**
+     * §3.12 — every left-behind accessory identity the re-adopt picker (#219)
+     * could offer. Read-only: nothing about listing orphans changes the map.
+     */
+    listOrphans(): OrphanRecord[];
 }
 
 /** A protocol-level failure a command handler can throw to shape its response. */

@@ -56,6 +56,7 @@ import {
     ErrorCode,
     type FabricInfo,
     isRole,
+    type OrphanRecord,
     type PairingReport,
     ProtocolError,
     RefuseReason,
@@ -1490,6 +1491,11 @@ export class BridgeNode implements BridgeFacade {
                 : `Endpoint map rebuilt from ${live.length} live endpoint(s); serving normally again`,
         );
         return this.getStatus();
+    }
+
+    /** §3.12 (issue #219) — the re-adopt picker's data, straight off the map. */
+    listOrphans(): OrphanRecord[] {
+        return this.#endpointMap.orphans();
     }
 
     getPairing(): PairingReport {

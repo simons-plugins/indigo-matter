@@ -17,6 +17,7 @@ import {
     type EndpointSpec,
     ErrorCode,
     type FabricInfo,
+    type OrphanRecord,
     type PairingReport,
     ProtocolError,
     type RemoveFabricResult,
@@ -110,6 +111,10 @@ export interface GoldenFrames {
     factory_reset_discard_map: GoldenExchange;
     rebuild_endpoint_map: GoldenExchange;
     endpoint_map_invalid: GoldenExchange;
+    /** §3.12 (issue #219) — the re-adopt picker's data. */
+    list_orphans: GoldenExchange;
+    /** The same command over a map with nothing orphaned. */
+    list_orphans_empty: GoldenExchange;
     /**
      * The holding pen for commands the node does not implement yet — EMPTY
      * since E5, and asserted empty. Kept because it is the mechanism the next
@@ -287,6 +292,8 @@ export class StubBridge implements BridgeFacade {
     readonly removedFabrics: number[] = [];
     readonly factoryResets: boolean[] = [];
     rebuilds = 0;
+    /** §3.12 — what `listOrphans` answers; the re-adopt tests set this. */
+    orphans: OrphanRecord[] = [];
 
     getStatus(): StatusReport {
         if (this.poisonStatus) {
@@ -323,6 +330,10 @@ export class StubBridge implements BridgeFacade {
         this.rebuilds += 1;
         this.refusal = undefined;
         return structuredClone(golden.rebuild_endpoint_map.response.result) as StatusReport;
+    }
+
+    listOrphans(): OrphanRecord[] {
+        return structuredClone(this.orphans);
     }
 
     onDriftDetected(listener: (drift: DriftEntry[]) => void): void {
