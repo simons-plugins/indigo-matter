@@ -214,10 +214,16 @@ export function parseReplaceAll(intent: unknown): boolean {
  * `indigoDeviceId` is a device migrating onto a stable, already-paired
  * accessory — "device B now drives identity X". `Registry.update()` resolves
  * `#live` by the spec's OWN device id; feeding it a rekey spec finds nothing
- * there and aborts the whole reconcile with `unknown_device`. A rekey has
- * ZERO wire activity — same `Endpoint.id`, same number, `ConfigurationVersion`
- * untouched — because nothing about the accessory as Matter sees it changed;
- * only the registry's bookkeeping of who is driving it moves. A retarget
+ * there and aborts the whole reconcile with `unknown_device`. **What a rekey
+ * does NOT do: add or remove an `Endpoint`** — same `Endpoint.id`, same
+ * number, no `PartsList` change, no `ConfigurationVersion` bump — so no
+ * paired ecosystem processes a removal or an addition, which is what room,
+ * name and scene survival actually rests on. Label, reachability and the new
+ * device's state DO still land, as an ordinary subscribable attribute update
+ * (`Registry.update()`, applied once the re-key is in place) — a value
+ * mismatch between the old and new device is visible at migrate time, the
+ * same as any other `set_state`; only the registry's OWN bookkeeping of who
+ * is driving the identity moves silently. A retarget
  * that ALSO changes role or gains a battery is not representable as a rekey
  * (a live cluster set cannot follow the new device's shape in place) and
  * falls back to `recreate`, same as an ordinary role/battery change — wire
@@ -233,6 +239,18 @@ export interface ReconcilePlan {
      * `fromDeviceId` is the live endpoint's CURRENT device id (not `spec`'s),
      * since that is what `Registry`'s `#live` is still keyed on until the
      * rekey moves it.
+     *
+     * **Application order is load-bearing, not cosmetic** (`registry.ts`'s
+     * `reconcileNow`): removals run before rekeys, so a rekey's TARGET key is
+     * free before any rekey can claim it; rekeys run before creates, so a
+     * rekey's `fromDeviceId` key is vacated before a `create` for that SAME
+     * device id (a different `publishedAs`) can reclaim it. The second case
+     * is not exotic — a stale-node catch-up attach can plan a rekey whose
+     * `fromDeviceId` is also the `indigoDeviceId` of an unrelated `create` in
+     * the same `desired` set: one device losing one identity and gaining a
+     * different one in the same reconcile. Reversed, the create's
+     * `#live.set()` would land first and the rekey would then move the WRONG
+     * endpoint out from under it.
      */
     rekey: { spec: EndpointSpec; fromDeviceId: number }[];
     /** Published identities (`publishedAs`), not device ids — issues #219/#240. */

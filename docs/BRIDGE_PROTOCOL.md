@@ -253,13 +253,18 @@ for.
 already live, whose `role` is unchanged and which does not gain a battery, but
 whose `indigoDeviceId` names a DIFFERENT device from the one currently driving
 that identity, the node re-keys rather than removes-and-recreates: the live
-`Endpoint` — same number, same clusters, same attribute values — simply starts
+`Endpoint` — same `Endpoint.id`, same number, same clusters — simply starts
 being driven by the new device, and `endpoint-map.json`'s record of who drives
-it is updated on the next persist. There is zero wire activity:
-`ConfigurationVersion` is not bumped, `PartsList` does not change, and no
-paired ecosystem is told anything happened, because nothing that any ecosystem
-can observe did. This is the mechanism behind the plugin's "Migrate an exported
-accessory…" menu action — a live device replaced by another one, or a module
+it is updated on the next persist. No endpoint is added or removed:
+`ConfigurationVersion` is not bumped and `PartsList` does not change, so no
+paired ecosystem processes a removal or an addition — which is what room,
+name and scene survival actually rests on. Label, reachability and state DO
+land, as an ordinary subscribable attribute update (a value mismatch between
+the old and new device is visible at migrate time, the same as any other
+`set_state`) — only the identity's continuity is invisible to every
+ecosystem, not every change the rekey carries. This is the mechanism behind
+the plugin's "Migrate an exported accessory…" menu action — a live device
+replaced by another one, or a module
 moved to new hardware, while both Indigo devices exist at once — and it is why
 migrate can honestly promise room/name/scene survival where the `list_orphans`
 re-adopt path (whose identity DID lapse) cannot. A retarget combined with a

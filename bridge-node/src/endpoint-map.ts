@@ -1056,6 +1056,12 @@ export class EndpointMapStore {
                 continue;
             }
             const previousDeviceId = record.deviceId;
+            // Read before `noteRestorable` un-orphans the record below — this
+            // is the only way left to tell a MIGRATE (issue #246: the
+            // identity stayed live the whole time, a rekey moved it) from a
+            // RE-ADOPT (issue #219: `forget()` marked it orphaned when it was
+            // un-exported, and this is the first live sighting since).
+            const wasOrphaned = record.orphaned === true;
             // The restoration half is refreshed even when the number drifted:
             // a renamed accessory whose number also moved must still come back
             // under its current name, and role/label are independent facts from
@@ -1064,12 +1070,28 @@ export class EndpointMapStore {
                 refreshed += 1;
             }
             if (previousDeviceId !== undefined && entry.deviceId !== undefined && entry.deviceId !== previousDeviceId) {
+                // Same lead-in sentence either way (device X replacing device
+                // Y at number N) — several tests pin exactly that substring —
+                // only the promise after the dash differs, because the two
+                // paths earn different ones. A migrate's identity NEVER
+                // lapsed (issue #246: this PR's own rekey), so room/name/
+                // scenes provably survive. A re-adopt's identity DID lapse
+                // (it was orphaned first), and this PR corrected that exact
+                // promise elsewhere as measured-false: an ecosystem that
+                // already processed the removal has purged room/name context
+                // within moments, so only identity and number are restored.
                 this.notice(
                     `readopted:${entry.uniqueId}`,
-                    `Accessory ${entry.uniqueId} (number ${record.number}) is now driven by Indigo device ` +
-                        `${entry.deviceId}, replacing device ${previousDeviceId} — nothing on the wire changed, ` +
-                        "so every paired ecosystem keeps the room, name, scenes and automations it had (issue " +
-                        "#219 re-adopt).",
+                    wasOrphaned
+                        ? `Accessory ${entry.uniqueId} (number ${record.number}) is now driven by Indigo device ` +
+                              `${entry.deviceId}, replacing device ${previousDeviceId}. Its identity and number ` +
+                              "are restored, but an ecosystem that already processed its removal may already " +
+                              "have purged its room and name — this identity was orphaned first (issue #219 " +
+                              "re-adopt)."
+                        : `Accessory ${entry.uniqueId} (number ${record.number}) is now driven by Indigo device ` +
+                              `${entry.deviceId}, replacing device ${previousDeviceId} — nothing on the wire ` +
+                              "changed, so every paired ecosystem keeps the room, name, scenes and automations " +
+                              "it had (issue #246 migrate).",
                 );
             }
             if (record.numberVoid) {

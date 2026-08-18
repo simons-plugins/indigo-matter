@@ -403,7 +403,7 @@ describe("issue #141: attach stays authoritative over the restored set", () => {
 
             const reconciled = session.logged.filter(line => line.startsWith("Reconciled endpoints:"));
             assert.deepEqual(reconciled, [
-                "Reconciled endpoints: 0 created, 2 updated, 0 recreated, 0 removed (2 live)",
+                "Reconciled endpoints: 0 created, 2 updated, 0 recreated, 0 rekeyed, 0 removed (2 live)",
             ]);
             assert.deepEqual(numbersOf(session.bridge), numbers, "and nothing was renumbered");
         } finally {
@@ -444,7 +444,7 @@ describe("issue #141: attach stays authoritative over the restored set", () => {
 
             const reconciled = session.logged.filter(line => line.startsWith("Reconciled endpoints:"));
             assert.deepEqual(reconciled, [
-                "Reconciled endpoints: 1 created, 2 updated, 0 recreated, 0 removed (3 live)",
+                "Reconciled endpoints: 1 created, 2 updated, 0 recreated, 0 rekeyed, 0 removed (3 live)",
             ]);
             assert.equal(session.bridge.getStatus().endpointCount, 3);
         } finally {
@@ -553,7 +553,7 @@ describe("issue #141: an un-exported device stops being restored", () => {
             await attach(second.client, "u2", [KITCHEN_SPEC]);
             assert.deepEqual(
                 second.logged.filter(line => line.startsWith("Reconciled endpoints:")),
-                ["Reconciled endpoints: 0 created, 1 updated, 0 recreated, 0 removed (1 live)"],
+                ["Reconciled endpoints: 0 created, 1 updated, 0 recreated, 0 rekeyed, 0 removed (1 live)"],
                 "no ghost to remove, so no removal pacing is spent on one",
             );
         } finally {

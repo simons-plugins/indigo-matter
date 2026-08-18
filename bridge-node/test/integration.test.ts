@@ -16,7 +16,7 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
@@ -241,6 +241,120 @@ describe("plugin ⇄ node, end to end", () => {
             client.close();
             await server.close();
             await bridge.close();
+        }
+    });
+});
+
+describe("driving-device rekey via attach (issue #246/ADR-0011)", () => {
+    it("re-targets a live identity to a new device on a second full attach", async () => {
+        // §3.1's declarative shape, end to end: no dedicated command, just a
+        // second `attach` whose only endpoint drives an identity a PREVIOUS
+        // attach already published under a different device — the plugin's
+        // migrate flow. This is the seam none of the registry-only tests
+        // exercise: that a real `attach` round trip (parse → reconcile →
+        // drift check → persist → StatusReport) carries a rekey through
+        // cleanly rather than just the registry's own `reconcile()` call.
+        const DEVICE_A = 223344551;
+        const DEVICE_B = 223344552;
+        const rekeyStoragePath = mkdtempSync(join(SCRATCH_ROOT, "indigo-matter-rekey-"));
+        const bridge = new BridgeNode(
+            { storagePath: rekeyStoragePath, matterPort: 0, wsPort: 0 },
+            { installId: "integration0003", passcode: 20202021, discriminator: 3840 },
+            BRIDGE_VERSION,
+            () => {},
+        );
+        await bridge.start();
+
+        const server = new BridgeWsServer({
+            port: 0,
+            bridge,
+            bridgeVersion: BRIDGE_VERSION,
+            matterJsVersion,
+            log: () => {},
+        });
+        await server.listen();
+
+        const client = await TestClient.connect(server.port);
+        try {
+            await client.next(); // §2 handshake
+
+            const first = await client.request({
+                message_id: "r1",
+                command: "attach",
+                args: {
+                    protocolVersion: PROTOCOL_VERSION,
+                    pluginVersion: "2026.22.0",
+                    endpoints: [
+                        {
+                            indigoDeviceId: DEVICE_A,
+                            role: "onOffLight",
+                            label: "Original Lamp",
+                            reachable: true,
+                            states: { onOff: false },
+                            options: {},
+                        },
+                    ],
+                },
+            });
+            const firstStatus = first.result as {
+                endpoints: { indigoDeviceId: number; endpointNumber: number }[];
+            };
+            const originalNumber = firstStatus.endpoints[0]?.endpointNumber;
+            assert.ok(originalNumber !== undefined);
+
+            // Second attach: device B, same role, explicitly claiming device
+            // A's published identity — the rekey shape (§3.1), not a plain
+            // create (device B is new) or a supersession (the identity is
+            // unchanged).
+            const second = await client.request({
+                message_id: "r2",
+                command: "attach",
+                args: {
+                    protocolVersion: PROTOCOL_VERSION,
+                    pluginVersion: "2026.22.0",
+                    endpoints: [
+                        {
+                            indigoDeviceId: DEVICE_B,
+                            role: "onOffLight",
+                            label: "Migrated Lamp",
+                            reachable: true,
+                            states: { onOff: false },
+                            options: {},
+                            publishedAs: `indigo-${DEVICE_A}`,
+                        },
+                    ],
+                },
+            });
+            const secondStatus = second.result as {
+                endpointCount: number;
+                endpoints: { indigoDeviceId: number; endpointNumber: number; publishedAs: string }[];
+                drift: unknown[];
+            };
+            assert.equal(secondStatus.endpointCount, 1);
+            assert.equal(secondStatus.endpoints[0]?.indigoDeviceId, DEVICE_B);
+            assert.equal(secondStatus.endpoints[0]?.publishedAs, `indigo-${DEVICE_A}`);
+            assert.equal(
+                secondStatus.endpoints[0]?.endpointNumber,
+                originalNumber,
+                "a rekey must not reallocate the endpoint number",
+            );
+            assert.deepEqual(secondStatus.drift, [], "a rekey changes nothing matter.js allocates");
+
+            // §4.3's persisted witness must also record the new driver, not
+            // just the in-memory StatusReport.
+            const mapFile = JSON.parse(
+                readFileSync(join(rekeyStoragePath, "endpoint-map.json"), "utf8"),
+            ) as { endpoints: Record<string, { deviceId?: number }> };
+            assert.equal(
+                mapFile.endpoints[`indigo-${DEVICE_A}`]?.deviceId,
+                DEVICE_B,
+                "the endpoint map must record the NEW device as the driver",
+            );
+        } finally {
+            client.close();
+            await server.close();
+            await bridge.close();
+            rmSync(rekeyStoragePath, { recursive: true, force: true });
         }
     });
 });

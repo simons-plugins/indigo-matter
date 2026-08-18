@@ -1580,32 +1580,133 @@ describe("driving-device rekey (issue #246/ADR-0011)", () => {
         }
     });
 
-    it("logs and skips a rekey whose fromDeviceId is no longer live (planner/live disagreement)", async () => {
+    it("throws instead of skipping a rekey whose fromDeviceId is no longer live (planner/live disagreement)", async () => {
         // Two desired specs racing for the SAME identity — a shape
         // `parseEndpointSpecs` refuses at the wire layer, constructed here
         // directly against `reconcile()` to reach the registry's own runtime
         // guard: both plan as a rekey from `fromDeviceId: 1` off the SAME
         // pre-mutation snapshot, so the second one finds `#live` already
-        // moved by the first.
+        // moved by the first. This USED to log and skip — the plugin's
+        // `attach` reported `told=True` over a rekey that never landed
+        // (finding #246/ADR-0011); it must now abort the whole reconcile.
         const h = await harness();
         try {
             await h.registry.reconcile([spec(1, Role.onOffLight)], false);
+
+            const error = await rejects(
+                () =>
+                    h.registry.reconcile(
+                        [
+                            spec(2, Role.onOffLight, { publishedAs: "indigo-1" }),
+                            spec(3, Role.onOffLight, { publishedAs: "indigo-1" }),
+                        ],
+                        false,
+                    ),
+                ErrorCode.internal,
+            );
+            assert.ok(
+                error.message.includes("indigo-1") &&
+                    error.message.includes("device 3") &&
+                    error.message.includes("device 1") &&
+                    error.message.includes("disagree"),
+                error.message,
+            );
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("combines a rekey with a real removal — the ● migrate-onto-an-exported-target case", async () => {
+        const h = await harness();
+        const version = (): number =>
+            (h.node.state.basicInformation as { configurationVersion?: number }).configurationVersion ?? 0;
+        try {
+            await h.registry.reconcile(
+                [spec(1, Role.onOffLight), spec(106, Role.onOffLight)],
+                false,
+            );
+            const before = h.registry.summaries().find(s => s.indigoDeviceId === 1)?.endpointNumber;
+            assert.ok(before !== undefined);
+            const startVersion = version();
+
+            // Device 106 already has its own accessory ("indigo-106") and now
+            // migrates onto device 1's identity ("indigo-1") — the ●-target
+            // convention: device 106's OWN accessory is removed, and the
+            // migrated identity takes its place, driven by 106.
+            await h.registry.reconcile([spec(106, Role.onOffLight, { publishedAs: "indigo-1" })], false);
+
+            assert.equal(h.registry.size, 1, "exactly one endpoint must survive");
+            const after = h.registry.summaries()[0];
+            assert.equal(after?.indigoDeviceId, 106);
+            assert.equal(after?.publishedAs, "indigo-1");
+            assert.equal(after?.endpointNumber, before, "the surviving endpoint keeps indigo-1's ORIGINAL number");
+            assert.equal([...h.aggregator.parts].length, 1, "indigo-106's endpoint must be closed");
+
+            h.commands.length = 0;
+            const endpoint = only(h);
+            await endpoint.act(agent => agent.get(OnOffLighting).on());
+            assert.deepEqual(
+                h.commands,
+                [{ indigoDeviceId: 106, command: "onOff", args: { value: true } }],
+                "the surviving endpoint must be driven by 106, not the retired device 1",
+            );
+
+            // The removal is real wire activity; the rekey adds nothing on
+            // top of it — exactly one bump, not two.
+            assert.equal(version(), startVersion + 1, "ConfigurationVersion must bump EXACTLY once");
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("swaps two drivers without corrupting #live (a hand-edited .indiPref shape)", async () => {
+        const h = await harness();
+        const version = (): number =>
+            (h.node.state.basicInformation as { configurationVersion?: number }).configurationVersion ?? 0;
+        try {
+            await h.registry.reconcile(
+                [spec(1, Role.onOffLight), spec(106, Role.onOffLight)],
+                false,
+            );
+            const before1 = h.registry.summaries().find(s => s.indigoDeviceId === 1)?.endpointNumber;
+            const before106 = h.registry.summaries().find(s => s.indigoDeviceId === 106)?.endpointNumber;
+            assert.ok(before1 !== undefined && before106 !== undefined);
+            const startVersion = version();
+
+            // `parseEndpointSpecs` accepts this — no duplicate device id or
+            // identity — and sequential (non-two-phase) rekey processing
+            // would corrupt it: the first rekey's `#live.set()` would
+            // overwrite the entry the second one still needs to read.
             await h.registry.reconcile(
                 [
-                    spec(2, Role.onOffLight, { publishedAs: "indigo-1" }),
-                    spec(3, Role.onOffLight, { publishedAs: "indigo-1" }),
+                    spec(1, Role.onOffLight, { publishedAs: "indigo-106" }),
+                    spec(106, Role.onOffLight, { publishedAs: "indigo-1" }),
                 ],
                 false,
             );
 
-            assert.deepEqual(h.registry.summaries().map(s => s.indigoDeviceId), [2]);
-            assert.ok(
-                h.logs.some(
-                    line =>
-                        line.includes("Cannot rekey accessory identity indigo-1 from device 1") &&
-                        line.includes("Device 3 was NOT attached to it"),
-                ),
-                h.logs.join("\n"),
+            assert.equal(h.registry.size, 2, "both endpoints must survive a swap cycle");
+            const summaries = new Map(h.registry.summaries().map(s => [s.indigoDeviceId, s]));
+            assert.equal(summaries.get(1)?.publishedAs, "indigo-106");
+            assert.equal(summaries.get(1)?.endpointNumber, before106, "1 now drives what 106 used to drive");
+            assert.equal(summaries.get(106)?.publishedAs, "indigo-1");
+            assert.equal(summaries.get(106)?.endpointNumber, before1, "106 now drives what 1 used to drive");
+            assert.equal(version(), startVersion, "a pure rekey pair bumps nothing — no wire activity at all");
+
+            const endpointIndigo1 = [...h.aggregator.parts].find(part => part.id === "indigo-1");
+            const endpointIndigo106 = [...h.aggregator.parts].find(part => part.id === "indigo-106");
+            assert.ok(endpointIndigo1 !== undefined && endpointIndigo106 !== undefined);
+
+            h.commands.length = 0;
+            await endpointIndigo1?.act(agent => agent.get(OnOffLighting).on());
+            await endpointIndigo106?.act(agent => agent.get(OnOffLighting).on());
+            assert.deepEqual(
+                h.commands,
+                [
+                    { indigoDeviceId: 106, command: "onOff", args: { value: true } },
+                    { indigoDeviceId: 1, command: "onOff", args: { value: true } },
+                ],
+                "commands must route to the EXCHANGED device ids after a swap",
             );
         } finally {
             await h.close();
