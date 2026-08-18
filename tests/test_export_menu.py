@@ -1437,6 +1437,43 @@ class TestGetReadoptDevices:
         assert labels["x-101"] == ("Study Plug — cannot appear as a "
                                    + export_catalog.role_label("dimmableLight"))
 
+    def test_a_mappable_device_is_shown_with_its_reason_not_dropped(self, plug, devices):
+        """Regression, live-reported 2026-08-18. ADR-0012 gave `classify` a third
+        outcome; this row builder tested NEGATIVELY for `Excluded`, so a
+        `MappableDevice` fell through to `verdict.eligible_roles` and raised —
+        which the caller turns into a dropped row. Every Texecom zone (229
+        devices on the reference database) vanished from BOTH device pickers
+        with no reason shown, which is the exact failure XAC9 exists to stop.
+        """
+        devices.add(fakes.texecom_zone(301, "Gate Contact"))
+        _bridge_with(plug, attached=True)
+        orphan = _orphan(role="contactSensor")
+        plug.runtime = _FakeRuntime(result=[orphan])
+        labels = _labels(plug.getReadoptDevices(valuesDict={"readoptOrphan": orphan.unique_id}))
+        assert "301" not in labels, "unselectable — inheriting never asks for a mapping"
+        assert "x-301" in labels, "but PRESENT, with a reason"
+        assert "needs a state mapping first" in labels["x-301"]
+
+    def test_a_mappable_device_is_shown_in_the_migrate_picker_too(self, plug, devices):
+        """Same row builder, other dialog — the bug hit both."""
+        devices.add(fakes.texecom_zone(302, "Kitchen PIR"))
+        _bridge_with(plug, attached=True)
+        plug.exports.upsert(ExportEntry(103, "occupancySensor"))
+        labels = _labels(plug.getMigrateDevices(valuesDict={"migrateSource": "103"}))
+        assert "302" not in labels
+        assert "needs a state mapping first" in labels["x-302"]
+
+    def test_migrating_onto_a_mappable_device_is_refused_with_a_next_step(self, plug, devices):
+        """The Execute-time half. Retargeting an entry onto an unmapped device
+        would publish nothing — the accessory goes dark rather than moves."""
+        devices.add(fakes.texecom_zone(303, "Gate Contact"))
+        _bridge_with(plug, attached=True)
+        plug.exports.upsert(ExportEntry(103, "occupancySensor"))
+        errors = {}
+        assert plug._migrate_pick_device(103, plug.exports.get(103),
+                                         {"migrateDevice": "303"}, errors) is None
+        assert "needs a state mapping" in errors["migrateDevice"]
+
     def test_an_unexportable_device_is_shown_with_the_classifiers_reason(self, plug):
         _bridge_with(plug, attached=True)
         orphan = _orphan(role="onOffPlugInUnit")

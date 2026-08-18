@@ -1043,9 +1043,13 @@ class ServerMenuMixin:
                                  "That device no longer exists — refresh the list.")
             return None
         verdict = export_catalog.classify(dev, self._export_plugin_id())  # pylint: disable=no-member
-        if isinstance(verdict, export_catalog.Excluded):
-            self._migrate_refuse(errors, "migrateDevice",
-                                 f"{dev.name} cannot be exported: {verdict.reason}")
+        if not isinstance(verdict, export_catalog.EligibleDevice):  # ADR-0012 — see _readopt_device_row
+            self._migrate_refuse(
+                errors, "migrateDevice",
+                f"{dev.name} needs a state mapping before anything can be migrated onto it — "
+                "export it directly first, which is where that is asked."
+                if isinstance(verdict, export_catalog.MappableDevice)
+                else f"{dev.name} cannot be exported: {getattr(verdict, 'reason', 'not exportable')}")
             return None
         if source_entry.role not in verdict.eligible_roles:
             self._migrate_refuse(
@@ -1353,11 +1357,28 @@ class ServerMenuMixin:
         """
         mark = "● " if dev.id in exported else ""
         verdict = export_catalog.classify(dev, plugin_id)
-        if isinstance(verdict, export_catalog.Excluded):
-            if verdict.reason == export_catalog.REASON_LOOP_GUARD:
+        # Positive test, not `not isinstance(..., Excluded)`. ADR-0012 gave
+        # `classify` a third outcome, and a device that could be exported once
+        # its state is mapped answers False to `Excluded` while carrying no
+        # `eligible_roles` at all — so a negative test fell through to the line
+        # below and raised, which the caller turns into a DROPPED ROW. Every
+        # such device vanished from both device pickers with no reason given:
+        # the one outcome this method's whole docstring exists to prevent.
+        if not isinstance(verdict, export_catalog.EligibleDevice):
+            reason = getattr(verdict, "reason", "not exportable")
+            if reason == export_catalog.REASON_LOOP_GUARD:
                 return None                      # XAC6: absent, not excluded
+            if isinstance(verdict, export_catalog.MappableDevice):
+                # Shown, not selectable. Inheriting an accessory does not ask
+                # which state is the reading, so an entry retargeted onto an
+                # unmapped device would publish nothing — the accessory would
+                # go dark rather than move. Export it directly first (which
+                # does ask), then it is an ordinary target.
+                return (f"{EXCLUDED_OPTION_PREFIX}{dev.id}",
+                        f"{mark}{dev.name} — needs a state mapping first; "
+                        f"export it directly, then retry")
             return (f"{EXCLUDED_OPTION_PREFIX}{dev.id}",
-                    f"{mark}{dev.name} — not exportable: {verdict.reason}")
+                    f"{mark}{dev.name} — not exportable: {reason}")
         if orphan.role not in verdict.eligible_roles:
             return (f"{EXCLUDED_OPTION_PREFIX}{dev.id}",
                     f"{mark}{dev.name} — cannot appear as a "
@@ -1627,9 +1648,13 @@ class ServerMenuMixin:
                                  "That device no longer exists — refresh the list.")
             return None
         verdict = export_catalog.classify(dev, self._export_plugin_id())  # pylint: disable=no-member
-        if isinstance(verdict, export_catalog.Excluded):
-            self._readopt_refuse(errors, "readoptDevice",
-                                 f"{dev.name} cannot be exported: {verdict.reason}")
+        if not isinstance(verdict, export_catalog.EligibleDevice):  # ADR-0012 — see _readopt_device_row
+            self._readopt_refuse(
+                errors, "readoptDevice",
+                f"{dev.name} needs a state mapping before an accessory can be re-adopted onto "
+                "it — export it directly first, which is where that is asked."
+                if isinstance(verdict, export_catalog.MappableDevice)
+                else f"{dev.name} cannot be exported: {getattr(verdict, 'reason', 'not exportable')}")
             return None
         if orphan.role not in verdict.eligible_roles:
             self._readopt_refuse(
