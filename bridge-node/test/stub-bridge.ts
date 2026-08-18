@@ -150,7 +150,10 @@ export const golden: GoldenFrames = JSON.parse(
  * thing it stands in for.
  */
 class EndpointModel {
-    readonly #endpoints = new Map<number, { role: RoleValue; endpointNumber: number; battery: boolean }>();
+    readonly #endpoints = new Map<
+        number,
+        { role: RoleValue; endpointNumber: number; battery: boolean; publishedAs: string }
+    >();
     /** Every number ever handed out, by device id. Never pruned — see above. */
     readonly #allocated = new Map<number, number>();
     #next = 2;
@@ -166,7 +169,12 @@ class EndpointModel {
         // — named fields rather than a spread of `entry`, or the model's own
         // bookkeeping leaks onto the wire.
         return [...this.#endpoints.entries()]
-            .map(([indigoDeviceId, entry]) => ({ indigoDeviceId, role: entry.role, endpointNumber: entry.endpointNumber }))
+            .map(([indigoDeviceId, entry]) => ({
+                indigoDeviceId,
+                role: entry.role,
+                endpointNumber: entry.endpointNumber,
+                publishedAs: entry.publishedAs,
+            }))
             .sort((a, b) => a.indigoDeviceId - b.indigoDeviceId);
     }
 
@@ -215,7 +223,8 @@ class EndpointModel {
     private add(spec: EndpointSpec): number {
         const endpointNumber = this.#allocated.get(spec.indigoDeviceId) ?? this.#next++;
         this.#allocated.set(spec.indigoDeviceId, endpointNumber);
-        this.#endpoints.set(spec.indigoDeviceId, { role: spec.role, endpointNumber, battery: spec.battery });
+        this.#endpoints.set(spec.indigoDeviceId,
+            { role: spec.role, endpointNumber, battery: spec.battery, publishedAs: spec.publishedAs });
         return endpointNumber;
     }
 }

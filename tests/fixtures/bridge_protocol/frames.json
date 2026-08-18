@@ -133,11 +133,13 @@
           {
             "indigoDeviceId": 123456789,
             "endpointNumber": 2,
+            "publishedAs": "indigo-123456789",
             "role": "onOffLight"
           },
           {
             "indigoDeviceId": 123456790,
             "endpointNumber": 3,
+            "publishedAs": "indigo-123456790",
             "role": "dimmableLight"
           }
         ],
@@ -320,11 +322,13 @@
           {
             "indigoDeviceId": 123456789,
             "endpointNumber": 2,
+            "publishedAs": "indigo-123456789",
             "role": "onOffLight"
           },
           {
             "indigoDeviceId": 123456790,
             "endpointNumber": 3,
+            "publishedAs": "indigo-123456790",
             "role": "dimmableLight"
           }
         ],
@@ -899,76 +903,91 @@
           {
             "indigoDeviceId": 900001,
             "endpointNumber": 2,
+            "publishedAs": "indigo-900001",
             "role": "onOffPlugInUnit"
           },
           {
             "indigoDeviceId": 900002,
             "endpointNumber": 3,
+            "publishedAs": "indigo-900002",
             "role": "onOffLight"
           },
           {
             "indigoDeviceId": 900003,
             "endpointNumber": 4,
+            "publishedAs": "indigo-900003",
             "role": "dimmableLight"
           },
           {
             "indigoDeviceId": 900004,
             "endpointNumber": 5,
+            "publishedAs": "indigo-900004",
             "role": "colorTemperatureLight"
           },
           {
             "indigoDeviceId": 900005,
             "endpointNumber": 6,
+            "publishedAs": "indigo-900005",
             "role": "extendedColorLight"
           },
           {
             "indigoDeviceId": 900006,
             "endpointNumber": 7,
+            "publishedAs": "indigo-900006",
             "role": "windowCovering"
           },
           {
             "indigoDeviceId": 900007,
             "endpointNumber": 8,
+            "publishedAs": "indigo-900007",
             "role": "doorLock"
           },
           {
             "indigoDeviceId": 900008,
             "endpointNumber": 9,
+            "publishedAs": "indigo-900008",
             "role": "occupancySensor"
           },
           {
             "indigoDeviceId": 900009,
             "endpointNumber": 10,
+            "publishedAs": "indigo-900009",
             "role": "contactSensor"
           },
           {
             "indigoDeviceId": 900010,
             "endpointNumber": 11,
+            "publishedAs": "indigo-900010",
             "role": "temperatureSensor"
           },
           {
             "indigoDeviceId": 900011,
             "endpointNumber": 12,
+            "publishedAs": "indigo-900011",
             "role": "humiditySensor"
           },
           {
             "indigoDeviceId": 900012,
             "endpointNumber": 13,
+            "publishedAs": "indigo-900012",
             "role": "lightSensor"
           },
           {
             "indigoDeviceId": 900013,
             "endpointNumber": 14,
+            "publishedAs": "indigo-900013",
             "role": "pressureSensor"
           },
           {
             "indigoDeviceId": 900014,
             "endpointNumber": 15,
+            "publishedAs": "indigo-900014",
             "role": "flowSensor"
           },
           {
             "indigoDeviceId": 900015,
             "endpointNumber": 16,
+            "publishedAs": "indigo-900015",
             "role": "thermostat"
           }
         ],
@@ -1310,11 +1329,13 @@
           {
             "indigoDeviceId": 123456789,
             "endpointNumber": 4,
+            "publishedAs": "indigo-123456789",
             "role": "onOffLight"
           },
           {
             "indigoDeviceId": 123456790,
             "endpointNumber": 5,
+            "publishedAs": "indigo-123456790",
             "role": "dimmableLight"
           }
         ],

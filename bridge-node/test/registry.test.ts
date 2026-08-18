@@ -187,6 +187,9 @@ function spec(indigoDeviceId: number, role: RoleValue, overrides: Partial<Endpoi
         states: {},
         options: {},
         battery: false,
+        // Today's default derivation (issues #219/#240) — a test that cares
+        // about a different published identity overrides it explicitly.
+        publishedAs: uniqueIdFor(indigoDeviceId),
         ...overrides,
     };
 }
@@ -1113,7 +1116,9 @@ describe("listener wiring is not allowed to fail quietly (§4.2)", () => {
             };
 
             assert.throws(
-                () => watchCommands(endpoint, { indigoDeviceId: 1, role: Role.dimmableLight }, () => {}),
+                () => watchCommands(
+                    endpoint, { indigoDeviceId: 1, role: Role.dimmableLight, publishedAs: uniqueIdFor(1) }, () => {},
+                ),
                 (error: unknown) => {
                     assert.ok(error instanceof ProtocolError);
                     assert.equal(error.code, ErrorCode.internal);
@@ -2069,7 +2074,7 @@ describe("onOff commands (§4.2, §7, #143, #201)", () => {
             };
             try {
                 await assert.rejects(
-                    async () => applyStates(endpoint, Role.dimmableLight, { onOff: true, level: 80 }, false),
+                    async () => applyStates(endpoint, Role.dimmableLight, { onOff: true, level: 80 }, false, 1),
                     (error: Error) => /onOff half failed/.test(error.message),
                     "the error must name the failed half",
                 );
@@ -3343,7 +3348,7 @@ describe("PowerSource / battery (issue #220)", () => {
             };
             try {
                 await assert.rejects(
-                    async () => applyStates(endpoint, Role.onOffLight, { onOff: true, batteryLevel: 48 }, true),
+                    async () => applyStates(endpoint, Role.onOffLight, { onOff: true, batteryLevel: 48 }, true, 1),
                     (error: Error) => /onOff half failed/.test(error.message),
                     "the error must name the failed half",
                 );

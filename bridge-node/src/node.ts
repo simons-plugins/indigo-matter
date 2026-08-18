@@ -472,6 +472,12 @@ export class BridgeNode implements BridgeFacade {
             }
             specs.push({
                 indigoDeviceId,
+                // Today's derivation (issues #219/#240 land the map's OWN key
+                // as the published identity in a later commit, alongside the
+                // `deviceId` indirection that makes it safe to do so). Byte-
+                // identical to pre-PR5: re-derived from the device id, not
+                // read verbatim off `entry.uniqueId`.
+                publishedAs: uniqueIdFor(indigoDeviceId),
                 role: entry.role,
                 label: entry.label,
                 // §3.5/XAC8: nothing has confirmed this device's state yet.

@@ -47,8 +47,8 @@ export const status = {
     fabrics: [APPLE_HOME],
     endpointCount: 2,
     endpoints: [
-        { indigoDeviceId: 123456789, endpointNumber: 2, role: "onOffLight" },
-        { indigoDeviceId: 123456790, endpointNumber: 3, role: "dimmableLight" },
+        { indigoDeviceId: 123456789, endpointNumber: 2, publishedAs: "indigo-123456789", role: "onOffLight" },
+        { indigoDeviceId: 123456790, endpointNumber: 3, publishedAs: "indigo-123456790", role: "dimmableLight" },
     ],
     drift: [],
     // §4.3: false until E5 persists the endpoint-number map — an empty `drift`
@@ -256,8 +256,8 @@ export const rebuiltStatus = {
     fabrics: [APPLE_HOME],
     endpointCount: 2,
     endpoints: [
-        { indigoDeviceId: 123456789, endpointNumber: 4, role: "onOffLight" },
-        { indigoDeviceId: 123456790, endpointNumber: 5, role: "dimmableLight" },
+        { indigoDeviceId: 123456789, endpointNumber: 4, publishedAs: "indigo-123456789", role: "onOffLight" },
+        { indigoDeviceId: 123456790, endpointNumber: 5, publishedAs: "indigo-123456790", role: "dimmableLight" },
     ],
     drift: [],
     driftChecked: true,

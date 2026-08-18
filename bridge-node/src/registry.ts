@@ -56,6 +56,13 @@ interface LiveEndpoint {
      * mirrors what the Matter tree actually holds, not the most recent spec.
      */
     battery: boolean;
+    /**
+     * Issues #219/#240 — the accessory identity this live endpoint was built
+     * with (`Endpoint.id`/`UniqueID`/`SerialNumber`). Held here rather than
+     * re-derived because a re-adopted identity is no longer a pure function of
+     * `indigoDeviceId` — see {@link EndpointSpec.publishedAs}.
+     */
+    publishedAs: string;
     /** Reassigned when a failed close forces the listeners to be restored. */
     unwatch: () => void;
 }
@@ -160,6 +167,7 @@ export class EndpointRegistry {
                 indigoDeviceId,
                 endpointNumber: Number(live.endpoint.number),
                 role: live.role,
+                publishedAs: live.publishedAs,
             }))
             .sort((a, b) => a.indigoDeviceId - b.indigoDeviceId);
     }
@@ -387,7 +395,7 @@ export class EndpointRegistry {
     async setState(indigoDeviceId: number, states: Record<string, unknown>): Promise<void> {
         return this.serialize("set_state", async () => {
             const live = this.require(indigoDeviceId);
-            await applyStates(live.endpoint, live.role, states, live.battery);
+            await applyStates(live.endpoint, live.role, states, live.battery, indigoDeviceId);
         });
     }
 
@@ -438,8 +446,9 @@ export class EndpointRegistry {
             await endpoint.close().catch(() => undefined);
             throw error;
         }
-        this.#live.set(spec.indigoDeviceId,
-            { endpoint, role: spec.role, label: spec.label, battery: spec.battery, unwatch });
+        this.#live.set(spec.indigoDeviceId, {
+            endpoint, role: spec.role, label: spec.label, battery: spec.battery, publishedAs: spec.publishedAs, unwatch,
+        });
         this.#log(`Endpoint ${spec.indigoDeviceId} (${spec.role}) added as number ${Number(endpoint.number)}`);
         return endpoint;
     }
@@ -465,7 +474,7 @@ export class EndpointRegistry {
         // `live.battery`, not `spec.battery`: a battery LOSS on `spec` is left
         // alone here (§4.1, monotonic) — the gain case never reaches `update`
         // at all, `upsert`/`reconcileNow` route it to a recreate instead.
-        await applyStates(live.endpoint, live.role, spec.states, live.battery);
+        await applyStates(live.endpoint, live.role, spec.states, live.battery, spec.indigoDeviceId);
     }
 
     /**
@@ -489,7 +498,7 @@ export class EndpointRegistry {
         } catch (error) {
             live.unwatch = watchCommands(
                 live.endpoint,
-                { indigoDeviceId, role: live.role },
+                { indigoDeviceId, role: live.role, publishedAs: live.publishedAs },
                 this.options.emit,
                 this.#log,
             );

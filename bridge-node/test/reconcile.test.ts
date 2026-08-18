@@ -19,7 +19,14 @@ import {
 function spec(
     indigoDeviceId: number, role: RoleValue = Role.onOffLight, label = "L", battery = false,
 ): EndpointSpec {
-    return { indigoDeviceId, role, label, reachable: true, states: {}, options: {}, battery };
+    // Today's default derivation, spelled out locally rather than imported
+    // from `endpoints.ts` — this module stays matter.js-free (see its own
+    // header doc), and `publishedIdFor(id)` is `indigo-${id}` for every id
+    // this suite uses.
+    return {
+        indigoDeviceId, role, label, reachable: true, states: {}, options: {}, battery,
+        publishedAs: `indigo-${indigoDeviceId}`,
+    };
 }
 
 function live(...entries: [number, RoleValue, boolean?][]): Map<number, LiveComposition> {
@@ -53,6 +60,10 @@ describe("parseEndpointSpec (§4.1)", () => {
             // "nothing said" — inventing one would publish an unevidenced
             // PowerSource cluster on every accessory that omits the field.
             battery: false,
+            // Issues #219/#240 — absent means "today's derivation", never a
+            // bare omission: every `EndpointSpec` in memory has a real
+            // published identity.
+            publishedAs: "indigo-7",
         });
     });
 
@@ -112,6 +123,52 @@ describe("parseEndpointSpecs / parseReplaceAll (§3.1)", () => {
 
     it("rejects a non-array endpoints", () => {
         assert.equal(refusal(() => parseEndpointSpecs("nope")).code, ErrorCode.malformedArgs);
+    });
+
+    it("rejects the same publishedAs twice, distinctly from a duplicated indigoDeviceId", () => {
+        const error = refusal(() => parseEndpointSpecs([
+            { indigoDeviceId: 1, role: "onOffLight", label: "a", publishedAs: "indigo-99" },
+            { indigoDeviceId: 2, role: "onOffLight", label: "b", publishedAs: "indigo-99" },
+        ]));
+        assert.equal(error.code, ErrorCode.malformedArgs);
+        assert.match(error.message, /publishedAs indigo-99 twice/);
+    });
+});
+
+describe("publishedAs (§4.1, issues #219/#240)", () => {
+    it("defaults publishedAs to indigo-<deviceId> when the wire omits it", () => {
+        assert.equal(
+            parseEndpointSpec({ indigoDeviceId: 42, role: "onOffLight", label: "x" }).publishedAs,
+            "indigo-42",
+        );
+    });
+
+    it("accepts a generation-suffixed publishedAs and round-trips it", () => {
+        const parsed = parseEndpointSpec({
+            indigoDeviceId: 42, role: "onOffLight", label: "x", publishedAs: "indigo-42~2",
+        });
+        assert.equal(parsed.publishedAs, "indigo-42~2");
+    });
+
+    for (const bad of ["indigo-42~1", "indigo-42~0", "indigo-1e3", "matter-42", "indigo-", "indigo-42."]) {
+        it(`rejects "${bad}" as malformed_args`, () => {
+            const error = refusal(() =>
+                parseEndpointSpec({ indigoDeviceId: 42, role: "onOffLight", label: "x", publishedAs: bad }));
+            assert.equal(error.code, ErrorCode.malformedArgs);
+        });
+    }
+
+    it("rejects a non-string publishedAs as malformed_args", () => {
+        const error = refusal(() =>
+            parseEndpointSpec({ indigoDeviceId: 42, role: "onOffLight", label: "x", publishedAs: 42 }));
+        assert.equal(error.code, ErrorCode.malformedArgs);
+    });
+
+    it("rejects a publishedAs longer than the 32-character UniqueID cap", () => {
+        const tooLong = `indigo-${"1".repeat(26)}`; // 33 characters
+        const error = refusal(() =>
+            parseEndpointSpec({ indigoDeviceId: 42, role: "onOffLight", label: "x", publishedAs: tooLong }));
+        assert.equal(error.code, ErrorCode.malformedArgs);
     });
 });
 

@@ -125,6 +125,62 @@ export function isRole(value: unknown): value is RoleValue {
 }
 
 /**
+ * The *published* accessory identity (issues #219/#240) — the one string
+ * `Endpoint.id`, the bridged `UniqueID` and (with its prefix stripped) the
+ * bridged `SerialNumber` are all derived from (`endpoints.ts`'s
+ * `bridgedInfoFor`/`createEndpoint`). Lives here rather than in `endpoints.ts`
+ * so this module can parse and validate it (`reconcile.ts`'s
+ * `parseEndpointSpec`) without pulling matter.js into a module that is
+ * deliberately free of it; `endpoints.ts` re-exports `uniqueIdFor`/
+ * `endpointIdFor` as the generation-1 shorthand so nothing that does not care
+ * about generations has to learn this vocabulary.
+ *
+ * Generation 1 (`indigo-<deviceId>`) is byte-identical to every published
+ * identity this bridge has ever produced. A generation ≥ 2
+ * (`indigo-<deviceId>~<N>`) is #240's role-change supersession — this PR only
+ * makes the *field* real; nothing yet produces a generation above 1.
+ */
+const PUBLISHED_ID_PREFIX = "indigo-";
+
+/** Matter's `UniqueID` cap (F9, measured against matter.js 0.17.8). */
+export const PUBLISHED_ID_MAX = 32;
+
+/** `publishedIdFor(deviceId)` is `uniqueIdFor`/`endpointIdFor`'s generation-1 form. */
+export function publishedIdFor(indigoDeviceId: number, generation = 1): string {
+    return generation === 1
+        ? `${PUBLISHED_ID_PREFIX}${indigoDeviceId}`
+        : `${PUBLISHED_ID_PREFIX}${indigoDeviceId}~${generation}`;
+}
+
+/**
+ * The inverse of {@link publishedIdFor}, or `undefined` for anything that is
+ * not a lawful published identity — strict rather than forgiving, the same
+ * way `indigoDeviceIdFrom` (`endpoints.ts`, which now delegates here) always
+ * has been: `Number("indigo-1e3")`-style coercions would silently invent a
+ * device id, and an invented id is a new accessory in every paired ecosystem.
+ * The length cap is F9's measured `UniqueID` limit, enforced here rather than
+ * discovered as a matter.js `AggregateError` during an attach.
+ */
+export function parsePublishedId(value: string): { deviceId: number; generation: number } | undefined {
+    if (value.length > PUBLISHED_ID_MAX) {
+        return undefined;
+    }
+    const match = /^indigo-(-?\d+)(?:~(\d+))?$/.exec(value);
+    if (match === null) {
+        return undefined;
+    }
+    const deviceId = Number(match[1]);
+    if (!Number.isSafeInteger(deviceId)) {
+        return undefined;
+    }
+    if (match[2] === undefined) {
+        return { deviceId, generation: 1 };
+    }
+    const generation = Number(match[2]);
+    return generation >= 2 ? { deviceId, generation } : undefined;
+}
+
+/**
  * §3.1's opt-in for a reconcile that would empty the live endpoint set. The
  * literal is named because both the guard and its refusal message quote it.
  */
@@ -200,6 +256,16 @@ export interface EndpointSpec {
     indigoDeviceId: number;
     role: RoleValue;
     label: string;
+    /**
+     * Issues #219/#240 — the accessory identity this device publishes as
+     * (`Endpoint.id`/`UniqueID`/`SerialNumber`, see {@link publishedIdFor}).
+     * Required here (like {@link reachable} and {@link battery}) because the
+     * parser ({@link parseEndpointSpec}) is what defaults it — every other
+     * `EndpointSpec` in memory has already made the decision one way or the
+     * other. Defaults to `publishedIdFor(indigoDeviceId)`, today's derivation,
+     * on every path in this PR: nothing yet sends a generation above 1.
+     */
+    publishedAs: string;
     reachable: boolean;
     /** Role-specific state keys (§4.2). Values are Indigo-natural units. */
     states: Record<string, unknown>;
@@ -302,6 +368,8 @@ export interface EndpointSummary {
     indigoDeviceId: number;
     endpointNumber: number;
     role: RoleValue;
+    /** Issues #219/#240 — informational; see {@link EndpointSpec.publishedAs}. */
+    publishedAs: string;
 }
 
 export interface DriftEntry {

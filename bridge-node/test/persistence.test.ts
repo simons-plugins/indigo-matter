@@ -72,6 +72,7 @@ const RESET_TIMEOUT_MS = 20_000;
 const ENDPOINTS = [
     {
         indigoDeviceId: KITCHEN,
+        publishedAs: uniqueIdFor(KITCHEN),
         role: "onOffLight",
         label: "Kitchen Lamp",
         reachable: true,
@@ -80,6 +81,7 @@ const ENDPOINTS = [
     },
     {
         indigoDeviceId: LOUNGE,
+        publishedAs: uniqueIdFor(LOUNGE),
         role: "dimmableLight",
         label: "Lounge Lamp",
         reachable: true,

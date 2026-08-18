@@ -14,7 +14,10 @@ import {
     ErrorCode,
     INTENT_REPLACE_ALL,
     isRole,
+    parsePublishedId,
     ProtocolError,
+    PUBLISHED_ID_MAX,
+    publishedIdFor,
     type RoleValue,
 } from "./protocol.js";
 
@@ -81,6 +84,22 @@ export function parseEndpointSpec(value: unknown): EndpointSpec {
     if (typeof battery !== "boolean") {
         throw new ProtocolError(ErrorCode.malformedArgs, "endpoint.battery must be a boolean");
     }
+    // Issues #219/#240 — `publishedAs` defaults to today's derivation, never to
+    // a bare absence: every `EndpointSpec` in memory has a real published
+    // identity, so nothing downstream has to ask "or is it the default?"
+    // Validated with the same function that builds it, so a client cannot ask
+    // for an identity this bridge would refuse to construct later.
+    const publishedAs = value.publishedAs === undefined ? publishedIdFor(indigoDeviceId) : value.publishedAs;
+    if (typeof publishedAs !== "string") {
+        throw new ProtocolError(ErrorCode.malformedArgs, "endpoint.publishedAs must be a string");
+    }
+    if (parsePublishedId(publishedAs) === undefined) {
+        throw new ProtocolError(
+            ErrorCode.malformedArgs,
+            `endpoint.publishedAs "${publishedAs}" must be indigo-<deviceId> or indigo-<deviceId>~<generation ` +
+                `≥ 2>, at most ${PUBLISHED_ID_MAX} characters (§1.1)`,
+        );
+    }
     return {
         indigoDeviceId,
         role: value.role,
@@ -89,6 +108,7 @@ export function parseEndpointSpec(value: unknown): EndpointSpec {
         states: requireStruct(value.states, "endpoint.states"),
         options: requireStruct(value.options, "endpoint.options"),
         battery,
+        publishedAs,
     };
 }
 
@@ -102,6 +122,11 @@ export function parseEndpointSpecs(value: unknown): EndpointSpec[] {
     }
     const specs = value.map(parseEndpointSpec);
     const seen = new Set<number>();
+    // Issue #219/#240's E12 — two exports must never claim the same published
+    // identity, the backstop for a hand-edited `.indiPref` pointing two
+    // devices at one accessory. A separate set from `seen` (indigoDeviceId):
+    // the two collisions are different mistakes and deserve their own message.
+    const seenPublishedAs = new Set<string>();
     for (const spec of specs) {
         if (seen.has(spec.indigoDeviceId)) {
             throw new ProtocolError(
@@ -110,6 +135,13 @@ export function parseEndpointSpecs(value: unknown): EndpointSpec[] {
             );
         }
         seen.add(spec.indigoDeviceId);
+        if (seenPublishedAs.has(spec.publishedAs)) {
+            throw new ProtocolError(
+                ErrorCode.malformedArgs,
+                `endpoints contains publishedAs ${spec.publishedAs} twice`,
+            );
+        }
+        seenPublishedAs.add(spec.publishedAs);
     }
     return specs;
 }
