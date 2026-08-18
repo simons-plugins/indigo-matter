@@ -225,6 +225,22 @@ class TestEndpointProvider:
         assert spec.reachable is True
         assert spec.states == {"onOff": True, "level": 40}
 
+    def test_a_spec_defaults_to_the_derived_published_identity(
+            self, bridge_mod, mock_logger, devices):
+        """Issues #219/#240 — an entry that has never moved off the default
+        derivation still carries it in the spec, even though `to_wire()`
+        omits it (the golden-frame round trip stays byte-identical)."""
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(102, "dimmableLight")])
+        (spec,) = h.bridge.endpoint_specs()
+        assert spec.published_as == "indigo-102"
+
+    def test_a_spec_carries_the_stored_published_identity(self, bridge_mod, mock_logger, devices):
+        """A re-adopted or role-changed entry's identity rides along verbatim."""
+        h = Harness(bridge_mod, mock_logger, devices,
+                    [ExportEntry(102, "dimmableLight", published_as="indigo-102~2")])
+        (spec,) = h.bridge.endpoint_specs()
+        assert spec.published_as == "indigo-102~2"
+
     def test_the_name_override_wins_over_the_indigo_name(self, bridge_mod, mock_logger, devices):
         h = Harness(bridge_mod, mock_logger, devices,
                     [ExportEntry(101, "onOffLight", name_override="Desk Lamp")])
@@ -911,6 +927,17 @@ class TestIncrementalCrud:
         assert h.client.names() == ["remove_endpoint", "upsert_endpoint"]
         assert h.client.calls[1][1].role == "onOffLight"
 
+    def test_a_role_change_sends_the_new_generation(self, bridge_mod, mock_logger, devices):
+        """Issue #240 — the identity carried by the stored entry, not the old
+        one, is what `replace()`'s add half sends: the node creates a fresh
+        accessory rather than reviving the retired one."""
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(101, "onOffPlugInUnit")])
+        h.start()
+        h.store.upsert(ExportEntry(101, "onOffLight", published_as="indigo-101~2"))
+        h.bridge.replace(101)
+        assert h.client.names() == ["remove_endpoint", "upsert_endpoint"]
+        assert h.client.calls[1][1].published_as == "indigo-101~2"
+
     def test_a_role_change_for_a_vanished_entry_only_removes(self, bridge_mod, mock_logger,
                                                              devices):
         h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(102, "dimmableLight")])
@@ -918,6 +945,54 @@ class TestIncrementalCrud:
         h.store.remove(102)
         h.bridge.replace(102)
         assert h.client.names() == ["remove_endpoint"]
+
+    def test_a_vanished_entry_says_the_old_accessory_is_already_gone(
+            self, bridge_mod, mock_logger, devices):
+        """The remove lands FIRST, so returning here in silence leaves the
+        accessory gone from every paired ecosystem with nothing in the log
+        that says so."""
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(102, "dimmableLight")])
+        h.start()
+        h.store.remove(102)
+        h.bridge.replace(102)
+        said = warnings_of(mock_logger)
+        assert "has been removed from every paired ecosystem" in said
+        assert "no longer in the export list" in said
+
+    def test_an_unbuildable_replacement_says_the_old_accessory_is_already_gone(
+            self, bridge_mod, mock_logger, devices, unbridgeable_role):
+        """Same fault, the other bail-out: the entry is still there but no
+        spec can be built for it (a role this build cannot bridge, a device
+        that vanished)."""
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(101, "onOffPlugInUnit")])
+        h.start()
+        h.store.upsert(ExportEntry(101, unbridgeable_role))
+        h.bridge.replace(101)
+        assert h.client.names() == ["remove_endpoint"]
+        assert "replacement could NOT be built" in warnings_of(mock_logger)
+
+    def test_a_never_scheduled_identity_change_warns_rather_than_whispering(
+            self, bridge_mod, mock_logger, devices):
+        """`_fire`'s `lost` gate: most dropped coroutines are re-delivered by
+        the next attach, so they are debug. This one is not — the remove has
+        no backstop that puts the accessory back on its own."""
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(101, "onOffPlugInUnit")])
+        h.start()
+        h.store.upsert(ExportEntry(101, "onOffLight", published_as="indigo-101~2"))
+        h.runtime.is_running = False
+        h.bridge.replace(101)
+        assert "removed and NOT re-added" in warnings_of(mock_logger)
+
+    def test_a_failed_identity_change_names_the_half_finished_state(
+            self, bridge_mod, mock_logger, devices):
+        """`_log_future`'s generic line cannot say this one: `replace()`
+        removes before it adds, so its failure is not "nothing happened"."""
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(101, "onOffPlugInUnit")])
+        h.start()
+        h.store.upsert(ExportEntry(101, "onOffLight", published_as="indigo-101~2"))
+        h.client.fail["upsert_endpoint"] = ConnectionError("socket died mid-write")
+        h.bridge.replace(101)
+        assert "OLD accessory may already have been removed" in warnings_of(mock_logger)
 
 
 # ---------------------------------------------------------------------------
@@ -1050,10 +1125,15 @@ class TestFailureSurfacing:
         h.bridge._on_attach_refused(bridge_protocol.ERR_ENDPOINT_MAP_INVALID, "unreadable")
         assert "renumbers nothing" in errors_of(mock_logger)
 
-    def test_version_skew_says_restart_the_agent(self, bridge_mod, mock_logger, devices):
+    def test_version_skew_names_what_the_plugin_needs(self, bridge_mod, mock_logger, devices):
         h = self._bridge(bridge_mod, mock_logger, devices)
         h.bridge._on_version_skew(bridge_protocol.Hello(2, "9.9.9", "1.0"))
-        assert "restart the bridge agent" in errors_of(mock_logger)
+        said = errors_of(mock_logger)
+        assert "Install/update the Matter bridge" in said
+        # The requirement, not a promise the menu cannot yet keep: the pinned
+        # bridge-node version bumps in the release commit AFTER this PR.
+        assert "needs the paired bridge-node release" in said
+        assert "installs the exact node version" not in said
 
     def test_drift_is_reported_never_repaired(self, bridge_mod, mock_logger, devices):
         h = self._bridge(bridge_mod, mock_logger, devices)

@@ -20,6 +20,7 @@ import type {
     EventFrame,
     FabricInfo,
     HandshakeFrame,
+    OrphanRecord,
     PairingReport,
     RemoveResult,
     StatusReport,
@@ -31,7 +32,7 @@ const APPLE_HOME = { fabricIndex: 1, label: "Apple Home", vendorId: 4937 } satis
 
 /** Versions are placeholders: the real ones track package.json / matter.js. */
 export const handshake = {
-    protocolVersion: 1,
+    protocolVersion: 2,
     bridgeVersion: "0.0.0-test",
     matterJsVersion: "0.0.0-test",
 } satisfies HandshakeFrame;
@@ -47,8 +48,8 @@ export const status = {
     fabrics: [APPLE_HOME],
     endpointCount: 2,
     endpoints: [
-        { indigoDeviceId: 123456789, endpointNumber: 2, role: "onOffLight" },
-        { indigoDeviceId: 123456790, endpointNumber: 3, role: "dimmableLight" },
+        { indigoDeviceId: 123456789, endpointNumber: 2, publishedAs: "indigo-123456789", role: "onOffLight" },
+        { indigoDeviceId: 123456790, endpointNumber: 3, publishedAs: "indigo-123456790", role: "dimmableLight" },
     ],
     drift: [],
     // §4.3: false until E5 persists the endpoint-number map — an empty `drift`
@@ -189,7 +190,7 @@ export const windowClosedCommissioned = {
 export const versionMismatch = {
     message_id: "m2",
     error_code: "version_mismatch",
-    details: "Node speaks protocol version 1, client sent 2",
+    details: "Node speaks protocol version 2, client sent 1",
 } satisfies ErrorFrame;
 
 export const notAttached = {
@@ -256,8 +257,8 @@ export const rebuiltStatus = {
     fabrics: [APPLE_HOME],
     endpointCount: 2,
     endpoints: [
-        { indigoDeviceId: 123456789, endpointNumber: 4, role: "onOffLight" },
-        { indigoDeviceId: 123456790, endpointNumber: 5, role: "dimmableLight" },
+        { indigoDeviceId: 123456789, endpointNumber: 4, publishedAs: "indigo-123456789", role: "onOffLight" },
+        { indigoDeviceId: 123456790, endpointNumber: 5, publishedAs: "indigo-123456790", role: "dimmableLight" },
     ],
     drift: [],
     driftChecked: true,
@@ -291,3 +292,25 @@ export const endpointMapInvalid = {
     error_code: "endpoint_map_invalid",
     details: "endpoint map is unreadable; only get_status, get_pairing and rebuild_endpoint_map are accepted",
 } satisfies ErrorFrame;
+
+/**
+ * §3.12's answer (issue #219) — three left-behind identities: one with a full
+ * date, one "date unknown" (`orphanedAt` absent, a pre-PR5 orphan), and one
+ * bare `{uniqueId, number}` entry (PR5 design E4) — a pre-2026.16.2 orphan with no
+ * role/label, listed but unmatchable.
+ */
+export const orphanList = [
+    {
+        uniqueId: "indigo-223456791",
+        number: 7,
+        role: "dimmableLight",
+        label: "Kitchen Lamp",
+        orphanedAt: "2026-08-12T09:15:00Z",
+        deviceId: 223456791,
+    },
+    { uniqueId: "indigo-223456792", number: 4, role: "onOffLight", label: "Porch Light" },
+    { uniqueId: "indigo-223456793", number: 9 },
+] satisfies OrphanRecord[];
+
+/** The same command over a map with nothing orphaned. */
+export const orphanListEmpty = [] satisfies OrphanRecord[];

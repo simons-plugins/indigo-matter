@@ -18,12 +18,33 @@ import {
 
 function spec(
     indigoDeviceId: number, role: RoleValue = Role.onOffLight, label = "L", battery = false,
+    publishedAs?: string,
 ): EndpointSpec {
-    return { indigoDeviceId, role, label, reachable: true, states: {}, options: {}, battery };
+    // Today's default derivation, spelled out locally rather than imported
+    // from `endpoints.ts` — this module stays matter.js-free (see its own
+    // header doc), and `publishedIdFor(id)` is `indigo-${id}` for every id
+    // this suite uses. A supersede test overrides it with a generation suffix.
+    return {
+        indigoDeviceId, role, label, reachable: true, states: {}, options: {}, battery,
+        publishedAs: publishedAs ?? `indigo-${indigoDeviceId}`,
+    };
 }
 
-function live(...entries: [number, RoleValue, boolean?][]): Map<number, LiveComposition> {
-    return new Map(entries.map(([id, role, battery = false]) => [id, { role, battery }]));
+/**
+ * Build a `live` map keyed on `publishedAs`, defaulting each entry to today's
+ * derivation (`indigo-<id>`) the same way {@link spec} does. A test that cares
+ * about a re-adopted/superseded identity passes one explicitly as the 5th
+ * tuple element.
+ */
+function live(
+    ...entries: [number, RoleValue, boolean?, string?][]
+): Map<string, LiveComposition> {
+    return new Map(
+        entries.map(([indigoDeviceId, role, battery = false, publishedAs = `indigo-${indigoDeviceId}`]) => [
+            publishedAs,
+            { indigoDeviceId, role, battery },
+        ]),
+    );
 }
 
 function refusal(run: () => unknown): ProtocolError {
@@ -53,6 +74,10 @@ describe("parseEndpointSpec (§4.1)", () => {
             // "nothing said" — inventing one would publish an unevidenced
             // PowerSource cluster on every accessory that omits the field.
             battery: false,
+            // Issues #219/#240 — absent means "today's derivation", never a
+            // bare omission: every `EndpointSpec` in memory has a real
+            // published identity.
+            publishedAs: "indigo-7",
         });
     });
 
@@ -113,6 +138,52 @@ describe("parseEndpointSpecs / parseReplaceAll (§3.1)", () => {
     it("rejects a non-array endpoints", () => {
         assert.equal(refusal(() => parseEndpointSpecs("nope")).code, ErrorCode.malformedArgs);
     });
+
+    it("rejects the same publishedAs twice, distinctly from a duplicated indigoDeviceId", () => {
+        const error = refusal(() => parseEndpointSpecs([
+            { indigoDeviceId: 1, role: "onOffLight", label: "a", publishedAs: "indigo-99" },
+            { indigoDeviceId: 2, role: "onOffLight", label: "b", publishedAs: "indigo-99" },
+        ]));
+        assert.equal(error.code, ErrorCode.malformedArgs);
+        assert.match(error.message, /publishedAs indigo-99 twice/);
+    });
+});
+
+describe("publishedAs (§4.1, issues #219/#240)", () => {
+    it("defaults publishedAs to indigo-<deviceId> when the wire omits it", () => {
+        assert.equal(
+            parseEndpointSpec({ indigoDeviceId: 42, role: "onOffLight", label: "x" }).publishedAs,
+            "indigo-42",
+        );
+    });
+
+    it("accepts a generation-suffixed publishedAs and round-trips it", () => {
+        const parsed = parseEndpointSpec({
+            indigoDeviceId: 42, role: "onOffLight", label: "x", publishedAs: "indigo-42~2",
+        });
+        assert.equal(parsed.publishedAs, "indigo-42~2");
+    });
+
+    for (const bad of ["indigo-42~1", "indigo-42~0", "indigo-1e3", "matter-42", "indigo-", "indigo-42."]) {
+        it(`rejects "${bad}" as malformed_args`, () => {
+            const error = refusal(() =>
+                parseEndpointSpec({ indigoDeviceId: 42, role: "onOffLight", label: "x", publishedAs: bad }));
+            assert.equal(error.code, ErrorCode.malformedArgs);
+        });
+    }
+
+    it("rejects a non-string publishedAs as malformed_args", () => {
+        const error = refusal(() =>
+            parseEndpointSpec({ indigoDeviceId: 42, role: "onOffLight", label: "x", publishedAs: 42 }));
+        assert.equal(error.code, ErrorCode.malformedArgs);
+    });
+
+    it("rejects a publishedAs longer than the 32-character UniqueID cap", () => {
+        const tooLong = `indigo-${"1".repeat(26)}`; // 33 characters
+        const error = refusal(() =>
+            parseEndpointSpec({ indigoDeviceId: 42, role: "onOffLight", label: "x", publishedAs: tooLong }));
+        assert.equal(error.code, ErrorCode.malformedArgs);
+    });
 });
 
 describe("parseDeviceId", () => {
@@ -135,7 +206,7 @@ describe("planReconcile (§3.1)", () => {
         const plan = planReconcile(live([1, Role.onOffLight], [2, Role.onOffLight]), [spec(1), spec(3)], false);
         assert.deepEqual(plan.create.map(s => s.indigoDeviceId), [3]);
         assert.deepEqual(plan.update.map(s => s.indigoDeviceId), [1]);
-        assert.deepEqual(plan.remove, [2]);
+        assert.deepEqual(plan.remove, ["indigo-2"]);
     });
 
     it("buckets a role change as a recreate rather than an update", () => {
@@ -168,7 +239,7 @@ describe("planReconcile (§3.1)", () => {
 
     it("allows the emptying once intent: replace_all is present", () => {
         const plan = planReconcile(live([1, Role.onOffLight], [2, Role.onOffLight]), [], true);
-        assert.deepEqual(plan.remove, [1, 2]);
+        assert.deepEqual(plan.remove, ["indigo-1", "indigo-2"]);
     });
 
     it("does not fire the guard when nothing was live", () => {
@@ -177,7 +248,76 @@ describe("planReconcile (§3.1)", () => {
 
     it("does not fire when one endpoint survives", () => {
         const plan = planReconcile(live([1, Role.onOffLight], [2, Role.onOffLight]), [spec(1)], false);
-        assert.deepEqual(plan.remove, [2]);
+        assert.deepEqual(plan.remove, ["indigo-2"]);
+    });
+
+    describe("published identity (issues #219/#240)", () => {
+        it("plans a superseded identity as a removal and a create, not a recreate", () => {
+            // A role change that DID bump the generation (an up-to-date
+            // plugin): the old identity is simply absent from `desired`, the
+            // new one is simply absent from `live` — a plain removal and a
+            // plain create, never `recreate`, because matter.js gives the new
+            // `Endpoint.id` a fresh number rather than reusing the retired one
+            // (PR5 design F1).
+            const plan = planReconcile(
+                live([1, Role.onOffLight]),
+                [spec(1, Role.dimmableLight, "L", false, "indigo-1~2")],
+                false,
+            );
+            assert.deepEqual(plan.remove, ["indigo-1"]);
+            assert.deepEqual(plan.create.map(s => s.publishedAs), ["indigo-1~2"]);
+            assert.deepEqual(plan.recreate, []);
+        });
+
+        it("keeps an unchanged identity on the update path even when the device id repeats", () => {
+            // The update decision is keyed on `publishedAs` alone: a live map
+            // that (pathologically, e.g. PR5 design E7's half-finished supersede) holds
+            // TWO keys for the same `indigoDeviceId` must not throw the
+            // unrelated, unchanged key's routing off course.
+            const twoKeysOneDevice = new Map<string, LiveComposition>([
+                ["indigo-1", { indigoDeviceId: 1, role: Role.onOffLight, battery: false }],
+                ["indigo-1~2", { indigoDeviceId: 1, role: Role.dimmableLight, battery: false }],
+            ]);
+            const plan = planReconcile(twoKeysOneDevice, [spec(1, Role.onOffLight)], false);
+            assert.deepEqual(plan.update.map(s => s.publishedAs), ["indigo-1"]);
+            assert.deepEqual(plan.remove, ["indigo-1~2"]);
+        });
+
+        it("a supersede does not trip the mass-removal guard on a single-export bridge", () => {
+            // Without the `supersededCount` fix this throws
+            // `mass_removal_refused`: the only live identity is being removed,
+            // and the guard would not otherwise know the create replacing it
+            // is the SAME device continuing to be exported.
+            const plan = planReconcile(
+                live([1, Role.onOffLight]),
+                [spec(1, Role.dimmableLight, "L", false, "indigo-1~2")],
+                false,
+            );
+            assert.deepEqual(plan.remove, ["indigo-1"]);
+            assert.deepEqual(plan.create.map(s => s.indigoDeviceId), [1]);
+        });
+
+        it("still recreates in place when the role changed at an unchanged identity (pre-#240 skew)", () => {
+            // PR5 design §1.3's version-skew fallback: a plugin old enough to never bump
+            // `publishedAs` still gets the pre-#240 in-place recreate rather
+            // than a refusal.
+            const plan = planReconcile(live([1, Role.onOffLight]), [spec(1, Role.dimmableLight)], false);
+            assert.deepEqual(plan.recreate.map(s => s.publishedAs), ["indigo-1"]);
+            assert.deepEqual(plan.remove, []);
+            assert.deepEqual(plan.create, []);
+        });
+
+        it("still recreates in place on a battery gain, identity unmoved", () => {
+            // Owner decision 4 (§9): only a role change supersedes, and only
+            // when the plugin says so. A battery gain never moves the
+            // identity, superseded or not.
+            const plan = planReconcile(
+                live([1, Role.onOffLight, false]), [spec(1, Role.onOffLight, "L", true)], false,
+            );
+            assert.deepEqual(plan.recreate.map(s => s.publishedAs), ["indigo-1"]);
+            assert.deepEqual(plan.remove, []);
+            assert.deepEqual(plan.create, []);
+        });
     });
 
     describe("battery composition (issue #220)", () => {

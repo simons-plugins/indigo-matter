@@ -15,7 +15,15 @@ import json
 import pytest
 
 import bridge_protocol
-from bridge_protocol import BridgeProtocol, BridgeProtocolError, EndpointSpec
+from bridge_protocol import (
+    BridgeProtocol,
+    BridgeProtocolError,
+    EndpointSpec,
+    PublishedId,
+    next_generation,
+    parse_published_id,
+    published_id_for,
+)
 
 from conftest import load_bridge_frames
 
@@ -95,6 +103,8 @@ def _build(proto: BridgeProtocol, request: dict):
         return proto.build_factory_reset(args["preserveEndpointNumbers"], mid)
     if command == bridge_protocol.CMD_REBUILD_ENDPOINT_MAP:
         return proto.build_rebuild_endpoint_map(mid)
+    if command == bridge_protocol.CMD_LIST_ORPHANS:
+        return proto.build_list_orphans(mid)
     raise AssertionError(f"no builder for command {command!r}")
 
 
@@ -178,6 +188,23 @@ class TestResponses:
         assert (reopened.commissioned, reopened.window_open) == (True, True)
         assert reopened.window_expires_at is not None
         assert reopened.manual_pairing_code
+
+    def test_orphan_records_are_normalised(self):
+        orphans = bridge_protocol.parse_orphans(FRAMES["list_orphans"]["response"]["result"])
+        assert len(orphans) == 3
+        full, partial, bare = orphans
+        assert (full.unique_id, full.number) == ("indigo-223456791", 7)
+        assert full.role == "dimmableLight"
+        assert full.label == "Kitchen Lamp"
+        assert full.orphaned_at == "2026-08-12T09:15:00Z"
+        assert full.device_id == 223456791
+        assert partial.orphaned_at is None and partial.device_id is None
+        # PR5 design E4 — the pre-2026.16.2 bare orphan: nothing beyond number/uniqueId.
+        assert bare.role is None and bare.label is None and bare.device_id is None
+
+    def test_empty_orphan_list_normalises_to_empty(self):
+        assert bridge_protocol.parse_orphans(
+            FRAMES["list_orphans_empty"]["response"]["result"]) == []
 
     def test_commissioning_window(self):
         window = bridge_protocol.parse_window(
@@ -404,3 +431,159 @@ class TestCoverage:
         raw = json.dumps(FRAMES)
         assert '"battery": false' not in raw
         assert '"battery":false' not in raw
+
+    def test_endpoint_spec_omits_published_as_at_the_default(self):
+        """Issues #219/#240 — the wire is byte-identical to today's when a
+        spec has never moved off the default derivation, so a fixture that
+        predates `publishedAs` still round-trips unchanged."""
+        wire = BY_NAME["upsert_endpoint"]["request"]["args"]["endpoint"]
+        assert "publishedAs" not in wire
+        spec = EndpointSpec.from_wire(wire)
+        assert spec.indigo_device_id == 123456789
+        assert spec.published_as == ""
+        assert "publishedAs" not in spec.to_wire()
+
+    def test_endpoint_spec_omits_published_as_when_it_equals_the_default(self):
+        spec = EndpointSpec(indigo_device_id=123456789, role="onOffLight", label="x",
+                            published_as="indigo-123456789")
+        assert "publishedAs" not in spec.to_wire()
+
+    def test_endpoint_spec_round_trips_a_non_default_published_as(self):
+        """A role-changed or re-adopted export sends its identity on the wire,
+        and it survives a round trip untouched."""
+        wire = dict(BY_NAME["upsert_endpoint"]["request"]["args"]["endpoint"])
+        wire["publishedAs"] = "indigo-123456789~2"
+        spec = EndpointSpec.from_wire(wire)
+        assert spec.published_as == "indigo-123456789~2"
+        assert spec.to_wire() == wire
+
+    def test_a_golden_frame_carries_a_non_default_published_as(self):
+        """Issues #219/#240 — the hand-built round trip above proves the
+        plugin agrees with ITSELF. Only a GOLDEN frame makes both languages
+        agree, and every frame in this file was default-identity until
+        `upsert_endpoint_published_as` was added: the one field a re-adopt or
+        a role change puts on the wire had no cross-language fixture at all.
+        The node asserts the same exchange in
+        `bridge-node/test/protocol.test.ts`.
+        """
+        wire = BY_NAME["upsert_endpoint_published_as"]["request"]["args"]["endpoint"]
+        assert wire["publishedAs"] == "indigo-123456789~2"
+        assert parse_published_id(wire["publishedAs"]) == PublishedId(
+            device_id=wire["indigoDeviceId"], generation=2)
+        assert EndpointSpec.from_wire(wire).to_wire() == wire
+
+
+class TestPublishedIdentity:
+    """Issues #219/#240 — the Python twin of `bridge-node/src/protocol.ts`'s
+    `publishedIdFor`/`parsePublishedId`. There is no existing cross-language
+    fixture mechanism for a pure function (§7's golden frames only cover wire
+    shapes), so this is a hand-built parallel table: every case here was
+    checked by hand against the TypeScript regex/derivation
+    (`^indigo-(-?\\d+)(?:~(\\d+))?$`, safe-integer device id, generation >= 2,
+    total length <= 32) at the time both were written, and the two must be
+    kept in sync by inspection if either changes.
+
+    Two of the divergences below are not about the pattern's SHAPE but about
+    what the two languages mean by the same metacharacter — `$` (Python also
+    matches before a trailing newline) and `\\d` (Python matches every
+    Unicode decimal digit, JavaScript matches `[0-9]`). Both are fixed on the
+    Python side (`\\Z` and `re.ASCII`) rather than by widening the TypeScript
+    twin, because the node's refusal is the backstop that protects the attach
+    and the plugin must never hand it something it will reject.
+
+    The TypeScript half of the pair is
+    ``bridge-node/test/published-identity.test.ts``, whose tables are the same
+    cases in the same order. Change one, change the other.
+    """
+
+    #: (value, expected (device_id, generation)) — every one of these must
+    #: parse the same way `protocol.ts`'s `parsePublishedId` parses it.
+    VALID = [
+        ("indigo-1", (1, 1)),
+        ("indigo-0", (0, 1)),
+        ("indigo--5", (-5, 1)),
+        ("indigo-123~2", (123, 2)),
+        ("indigo-123~99", (123, 99)),
+        # JavaScript's `Number.MAX_SAFE_INTEGER` — a language constant, not
+        # one of §0's measured matter.js facts. `parsePublishedId` guards it
+        # with `Number.isSafeInteger`; `bridge_protocol` mirrors the same bound
+        # by hand, Python having no equivalent notion.
+        ("indigo-9007199254740991", (9007199254740991, 1)),
+        # Exactly PUBLISHED_ID_MAX (32) characters: "indigo-" (7) +
+        # 16-digit MAX_SAFE_INTEGER + "~" (1) + 8-digit generation.
+        ("indigo-9007199254740991~99999999", (9007199254740991, 99999999)),
+    ]
+
+    #: Every one of these must be refused by `parsePublishedId` too.
+    INVALID = [
+        "indigo-123~1",       # generation must be >= 2
+        "indigo-123~0",
+        "indigo-123.2",       # "." is not the generation separator
+        "indigo-abc",         # non-numeric device id
+        "matter-1",           # wrong prefix
+        "indigo-1~",          # no digits after ~
+        "indigo-",            # no device id at all
+        "",
+        "indigo-1 ",          # trailing whitespace
+        # Python's `$` also matches before a trailing newline; JS's does not.
+        # The two derivations must refuse this identically.
+        "indigo-1\n",
+        # One past `Number.MAX_SAFE_INTEGER` (see VALID above — a JS language
+        # constant, not a measured fact).
+        "indigo-9007199254740992",
+        # One character over PUBLISHED_ID_MAX (33), otherwise lawful.
+        "indigo-9007199254740991~999999999",
+        # Python's `\d` matches every Unicode decimal digit; JavaScript's
+        # matches [0-9] only. Same class of divergence as the `$`/`\Z` one
+        # above, and worse in effect: `int()` is Unicode-aware too, so this
+        # parsed to device id 123 here and was refused outright by
+        # `parsePublishedId`. A hand-edited `.indiPref` carrying one would
+        # pass plugin-side validation and then take the whole attach down
+        # with `malformed_args`.
+        "indigo-\u0661\u0662\u0663",              # Arabic-Indic digits
+        "indigo-1\u0662",                          # ASCII and Arabic-Indic mixed
+        "indigo-1~\u0662",                         # a Unicode-digit GENERATION
+        "indigo-\uff11\uff12\uff13",             # fullwidth digits
+    ]
+
+    @pytest.mark.parametrize("value,expected", VALID)
+    def test_parses_a_lawful_published_id(self, value, expected):
+        parsed = parse_published_id(value)
+        assert parsed is not None
+        assert (parsed.device_id, parsed.generation) == expected
+
+    @pytest.mark.parametrize("value", INVALID)
+    def test_refuses_an_unlawful_published_id(self, value):
+        assert parse_published_id(value) is None
+
+    @pytest.mark.parametrize("value,expected", VALID)
+    def test_published_id_for_is_the_inverse(self, value, expected):
+        device_id, generation = expected
+        assert published_id_for(device_id, generation) == value
+
+    def test_published_id_for_defaults_to_generation_1(self):
+        assert published_id_for(42) == "indigo-42"
+
+    @pytest.mark.parametrize("device_id,generation", [
+        (1, 1), (0, 1), (-5, 1), (123, 2), (123, 5), (9007199254740991, 1),
+    ])
+    def test_published_id_for_and_parse_round_trip(self, device_id, generation):
+        parsed = parse_published_id(published_id_for(device_id, generation))
+        assert parsed is not None
+        assert (parsed.device_id, parsed.generation) == (device_id, generation)
+
+    def test_next_generation_from_the_default(self):
+        assert next_generation("indigo-1") == "indigo-1~2"
+
+    def test_next_generation_from_a_generation(self):
+        assert next_generation("indigo-1~2") == "indigo-1~3"
+
+    def test_next_generation_keeps_incrementing(self):
+        assert next_generation("indigo-1~9") == "indigo-1~10"
+
+    def test_next_generation_preserves_the_device_id(self):
+        assert next_generation("indigo-123~7").startswith("indigo-123~")
+
+    def test_next_generation_rejects_an_unlawful_published_as(self):
+        with pytest.raises(ValueError):
+            next_generation("not-lawful")

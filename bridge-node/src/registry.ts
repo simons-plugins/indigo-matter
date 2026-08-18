@@ -29,6 +29,7 @@ import {
     ProtocolError,
     type RemoveResult,
     type RoleValue,
+    supersedes,
     type UpsertResult,
 } from "./protocol.js";
 import { type LiveComposition, planReconcile } from "./reconcile.js";
@@ -56,6 +57,13 @@ interface LiveEndpoint {
      * mirrors what the Matter tree actually holds, not the most recent spec.
      */
     battery: boolean;
+    /**
+     * Issues #219/#240 — the accessory identity this live endpoint was built
+     * with (`Endpoint.id`/`UniqueID`/`SerialNumber`). Held here rather than
+     * re-derived because a re-adopted identity is no longer a pure function of
+     * `indigoDeviceId` — see {@link EndpointSpec.publishedAs}.
+     */
+    publishedAs: string;
     /** Reassigned when a failed close forces the listeners to be restored. */
     unwatch: () => void;
 }
@@ -68,6 +76,8 @@ export interface EndpointIdentity {
     label: string;
     /** Issue #220 — surfaced so `endpoint-map.json` can record it add-only. */
     battery: boolean;
+    /** Issues #219/#240 — the accessory identity this endpoint is live under. */
+    publishedAs: string;
 }
 
 export interface EndpointRegistryOptions {
@@ -160,6 +170,7 @@ export class EndpointRegistry {
                 indigoDeviceId,
                 endpointNumber: Number(live.endpoint.number),
                 role: live.role,
+                publishedAs: live.publishedAs,
             }))
             .sort((a, b) => a.indigoDeviceId - b.indigoDeviceId);
     }
@@ -183,6 +194,7 @@ export class EndpointRegistry {
                 role: live.role,
                 label: live.label,
                 battery: live.battery,
+                publishedAs: live.publishedAs,
             }))
             .sort((a, b) => a.indigoDeviceId - b.indigoDeviceId);
     }
@@ -228,9 +240,37 @@ export class EndpointRegistry {
         });
     }
 
-    /** The live role+battery of a device — what the reconcile planner diffs. */
-    liveComposition(): Map<number, LiveComposition> {
-        return new Map([...this.#live.entries()].map(([id, live]) => [id, { role: live.role, battery: live.battery }]));
+    /**
+     * The live role+battery of every published identity — what the reconcile
+     * planner diffs (issues #219/#240).
+     *
+     * Keyed on `publishedAs`, not `indigoDeviceId`: `#live` itself stays keyed
+     * on device id below (the wire keys every command that way, and one device
+     * drives at most one live endpoint), so this is a per-call reprojection
+     * rather than a second index to keep in sync.
+     */
+    liveComposition(): Map<string, LiveComposition> {
+        return new Map(
+            [...this.#live.entries()].map(([indigoDeviceId, live]) => [
+                live.publishedAs,
+                { indigoDeviceId, role: live.role, battery: live.battery },
+            ]),
+        );
+    }
+
+    /**
+     * Resolve a published identity back to the device id driving it (issues
+     * #219/#240) — `plan.remove` entries arrive as `publishedAs`, but
+     * `closeOne`/`removeMany` operate on `#live`, which stays keyed on device
+     * id. A linear scan: the live set is a handful of exports, not a hot path.
+     */
+    private deviceIdFor(publishedAs: string): number | undefined {
+        for (const [indigoDeviceId, live] of this.#live) {
+            if (live.publishedAs === publishedAs) {
+                return indigoDeviceId;
+            }
+        }
+        return undefined;
     }
 
     /**
@@ -259,24 +299,91 @@ export class EndpointRegistry {
         const live = this.liveComposition();
         const plan = planReconcile(live, desired, replaceAll);
 
-        for (const spec of plan.recreate) {
-            // §4.1 rejects a role change through `upsert_endpoint`; attach is the
-            // reconcile path and does it the only way Matter allows, which is a
-            // new accessory. Loud, because ecosystems lose the old one's name —
-            // and issue #220 gave this a second reason, worth telling apart from
-            // the first: a role change is a full accessory swap in every paired
-            // ecosystem, while a battery gain keeps the same device type and
-            // only ADDS a cluster, which (per the live probe, §0) a paired
-            // ecosystem may or may not preserve the accessory's name/room across.
-            const existing = live.get(spec.indigoDeviceId);
-            const reason = existing !== undefined && existing.role === spec.role
-                ? "gained a battery (PowerSource can only be declared at construction; " +
-                  "the accessory's name/room MAY not survive in every ecosystem)"
-                : "role changed";
-            this.#log(`Recreating endpoint ${spec.indigoDeviceId}: ${reason}`);
+        // Issues #219/#240 — a removed identity whose `indigoDeviceId` also
+        // appears in `plan.create` is one device changing which identity it
+        // publishes, planned as removal+create rather than an in-place recreate
+        // (`reconcile.ts`'s `planReconcile`). Logged before anything mutates so
+        // the "why" is on record even if the batch later aborts.
+        //
+        // TWO different things have that shape, and they must not share a
+        // sentence. `supersedes()` is the same narrow test `node.ts` uses to
+        // decide whether to write `supersededBy`: only a LATER GENERATION of
+        // the same identity retires the old one for good. A re-adopt (PR5
+        // design E2/E5) is also one removal plus one create for one device, and
+        // the identity it leaves behind is an ORDINARY orphan the map goes on
+        // offering to the re-adopt picker — so saying "retired … never reused"
+        // about it was flatly wrong, and its "role X → X" made the line read
+        // as a role change that had not happened.
+        const createdByDeviceId = new Map(plan.create.map(spec => [spec.indigoDeviceId, spec]));
+        for (const oldPublishedAs of plan.remove) {
+            const old = live.get(oldPublishedAs);
+            const created = old !== undefined ? createdByDeviceId.get(old.indigoDeviceId) : undefined;
+            if (old === undefined || created === undefined) {
+                continue;
+            }
+            const liveEndpoint = this.#live.get(old.indigoDeviceId);
+            const number = liveEndpoint !== undefined ? Number(liveEndpoint.endpoint.number) : "?";
+            if (supersedes(oldPublishedAs, created.publishedAs)) {
+                this.#log(
+                    `Superseding endpoint ${old.indigoDeviceId}: role ${old.role} → ${created.role}. Accessory ` +
+                        `identity ${oldPublishedAs} (number ${number}) is being retired and ${created.publishedAs} ` +
+                        "published in its place, so controllers process a removal and an addition rather than an " +
+                        "in-place device-type change (issue #240). The retired number is never reused.",
+                );
+            } else {
+                this.#log(
+                    `Endpoint ${old.indigoDeviceId} is moving from accessory identity ${oldPublishedAs} ` +
+                        `(number ${number}) to ${created.publishedAs}: controllers process a removal and an ` +
+                        "addition. This is NOT a supersession — the identity it is leaving is an ordinary " +
+                        "left-behind accessory that stays re-adoptable, and its number is kept for it " +
+                        "(issue #219 re-adopt).",
+                );
+            }
         }
 
-        const removals = [...plan.remove, ...plan.recreate.map(spec => spec.indigoDeviceId)];
+        for (const spec of plan.recreate) {
+            // §4.1 rejects a role change through `upsert_endpoint`; attach is the
+            // reconcile path and does it the only way Matter allows for an
+            // identity that keeps its `publishedAs`. A supersede (a role change
+            // that DID bump the generation) never reaches this loop — it is a
+            // remove+create pair, logged above — so everything left here is
+            // either a battery gain or the pre-#240 version-skew fallback
+            // (PR5 design §1.3: an older plugin that never bumps the generation).
+            const existing = live.get(spec.publishedAs);
+            if (existing !== undefined && existing.role === spec.role) {
+                this.#log(
+                    `Recreating endpoint ${spec.indigoDeviceId}: gained a battery (PowerSource can only be ` +
+                        "declared at construction; the accessory's name/room MAY not survive in every ecosystem)",
+                );
+            } else {
+                this.#log(
+                    `Recreating endpoint ${spec.indigoDeviceId} in place: role changed but the plugin asked ` +
+                        `for the same accessory identity ${spec.publishedAs}, so this is the pre-#240 path — ` +
+                        "Apple Home may need a home-hub restart (docs/MATTER.md).",
+                );
+            }
+        }
+
+        const removedDeviceIds: number[] = [];
+        for (const publishedAs of plan.remove) {
+            const indigoDeviceId = this.deviceIdFor(publishedAs);
+            if (indigoDeviceId === undefined) {
+                // `plan.remove` comes from `liveComposition()`, which is built
+                // from `#live` — so a key that resolves to nothing means the
+                // two disagree, and the accessory the plugin asked to remove
+                // is about to stay in every paired ecosystem. A `.filter()`
+                // dropped it without a word; the removal count downstream then
+                // looks correct, which is the worst possible shape for this.
+                this.#log(
+                    `Cannot remove accessory identity ${publishedAs}: no live endpoint is publishing it. ` +
+                        "It is NOT being removed from any paired ecosystem — the live set and the endpoint " +
+                        "map disagree about who publishes it.",
+                );
+                continue;
+            }
+            removedDeviceIds.push(indigoDeviceId);
+        }
+        const removals = [...removedDeviceIds, ...plan.recreate.map(spec => spec.indigoDeviceId)];
         const total = removals.length + plan.create.length + plan.recreate.length + plan.update.length;
         let done = 0;
         let mutated = false;
@@ -328,6 +435,20 @@ export class EndpointRegistry {
                 const created = await this.create(spec);
                 await this.noteConfigurationChange();
                 return { endpointNumber: Number(created.number) };
+            }
+            if (existing.publishedAs !== spec.publishedAs) {
+                // Issues #219/#240 — `upsert_endpoint` must never silently
+                // retire an accessory identity: that is a supersede, and the
+                // only path allowed to do it is the plugin's remove-then-add
+                // `replace()` (`export_bridge.py`), which sends the two mutations as two
+                // separate commands rather than asking this one to move a live
+                // endpoint out from under itself.
+                throw new ProtocolError(
+                    ErrorCode.roleChange,
+                    `endpoint ${spec.indigoDeviceId} is published as ${existing.publishedAs}; upsert_endpoint ` +
+                        `cannot move it to ${spec.publishedAs} — that is a supersession (issue #240); remove ` +
+                        "the old identity and create the new one instead",
+                );
             }
             if (existing.role !== spec.role) {
                 throw new ProtocolError(
@@ -387,7 +508,7 @@ export class EndpointRegistry {
     async setState(indigoDeviceId: number, states: Record<string, unknown>): Promise<void> {
         return this.serialize("set_state", async () => {
             const live = this.require(indigoDeviceId);
-            await applyStates(live.endpoint, live.role, states, live.battery);
+            await applyStates(live.endpoint, live.role, states, live.battery, indigoDeviceId);
         });
     }
 
@@ -438,8 +559,9 @@ export class EndpointRegistry {
             await endpoint.close().catch(() => undefined);
             throw error;
         }
-        this.#live.set(spec.indigoDeviceId,
-            { endpoint, role: spec.role, label: spec.label, battery: spec.battery, unwatch });
+        this.#live.set(spec.indigoDeviceId, {
+            endpoint, role: spec.role, label: spec.label, battery: spec.battery, publishedAs: spec.publishedAs, unwatch,
+        });
         this.#log(`Endpoint ${spec.indigoDeviceId} (${spec.role}) added as number ${Number(endpoint.number)}`);
         return endpoint;
     }
@@ -465,7 +587,7 @@ export class EndpointRegistry {
         // `live.battery`, not `spec.battery`: a battery LOSS on `spec` is left
         // alone here (§4.1, monotonic) — the gain case never reaches `update`
         // at all, `upsert`/`reconcileNow` route it to a recreate instead.
-        await applyStates(live.endpoint, live.role, spec.states, live.battery);
+        await applyStates(live.endpoint, live.role, spec.states, live.battery, spec.indigoDeviceId);
     }
 
     /**
@@ -489,7 +611,7 @@ export class EndpointRegistry {
         } catch (error) {
             live.unwatch = watchCommands(
                 live.endpoint,
-                { indigoDeviceId, role: live.role },
+                { indigoDeviceId, role: live.role, publishedAs: live.publishedAs },
                 this.options.emit,
                 this.#log,
             );

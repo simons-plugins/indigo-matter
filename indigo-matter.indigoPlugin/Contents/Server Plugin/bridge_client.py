@@ -10,7 +10,9 @@ Two things differ from the controller client and both are deliberate:
   bridge node running across plugin reloads (PRD §4.2 PM-B), so plugin/node
   skew is the failure that will actually happen. On a mismatch we do NOT attach,
   we surface ``on_version_skew`` and stop reconnecting — pairings untouched,
-  user told to restart the agent.
+  user told what this plugin needs: the paired bridge-node release, installed
+  from *Plugins ▸ Matter ▸ Install/update the Matter bridge*. Restarting the
+  agent is deliberately NOT the remedy — launchd relaunches the same node.
 * **``set_state`` is fire-and-forget (§3.4).** It is called from Indigo's device
   thread and must never block it. The response still arrives and an error is
   logged by the shared unmatched-response path.
@@ -108,8 +110,10 @@ def rebuild_timeout_for(endpoint_count: int) -> float:
 #: produces an endless connect/attach/refuse loop that also hammers the node.
 TERMINAL_ATTACH_ERRORS = {
     bridge_protocol.ERR_VERSION_MISMATCH: (
-        "the node speaks a different protocol version — restart the bridge agent so launchd "
-        "picks up the node that ships with this plugin"
+        "the node speaks a different protocol version — this plugin speaks bridge protocol "
+        f"v{bridge_protocol.PROTOCOL_VERSION} and needs the paired bridge-node release; install "
+        "it with Plugins ▸ Matter ▸ Install/update the Matter bridge once it is available. "
+        "Restarting the agent alone relaunches the same node"
     ),
     bridge_protocol.ERR_MASS_REMOVAL_REFUSED: (
         "attaching would have un-exported every accessory and the request did not carry the "
@@ -257,8 +261,10 @@ class BridgeClient(WsJsonClient):
             self._notify(self._on_version_skew, hello)
             raise ClientHalted(
                 f"node speaks protocol version {hello.protocol_version}, plugin speaks "
-                f"{bridge_protocol.PROTOCOL_VERSION} (bridge {hello.bridge_version}); "
-                "restart the bridge agent to pick up the matching node",
+                f"{bridge_protocol.PROTOCOL_VERSION} (bridge {hello.bridge_version}); this "
+                "plugin needs the paired bridge-node release — install it with Plugins ▸ "
+                "Matter ▸ Install/update the Matter bridge once it is available. Restarting "
+                "the agent alone relaunches the same node",
                 reason="version_skew",
             )
         self.logger.info(
@@ -798,3 +804,11 @@ class BridgeClient(WsJsonClient):
             self.logger.warning(
                 "the endpoint map was rebuilt, but re-attaching was refused (%s); the ordinary "
                 "reconnect will try again", failed)
+
+    async def list_orphans(self, timeout: float = DEFAULT_TIMEOUT) -> list:
+        """§3.12 — every left-behind accessory identity the re-adopt picker
+        (issue #219) could offer. Read-only: no argument, no state change on
+        the node — the same "local and quick" cost class as :meth:`get_status`.
+        """
+        result = await self._request_frame(self.proto.build_list_orphans(), timeout)
+        return bridge_protocol.parse_orphans(result)

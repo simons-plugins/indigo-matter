@@ -11,10 +11,11 @@ import indigo  # provided by the Indigo runtime
 
 import export_catalog
 import export_handlers
+from bridge_protocol import next_generation, published_id_for
 from export_store import ExportEntry, OPTION_INVERT
 from plugin_constants import (
     EXCLUDED_OPTION_PREFIX, EXPORT_PICKER_LIMIT, LIST_ERROR_OPTION,
-    MENU_MANAGE_EXPORTS, MENU_UNPAIR_ECOSYSTEM, NO_MATCH_OPTION,
+    MENU_MANAGE_EXPORTS, MENU_READOPT_EXPORT, MENU_UNPAIR_ECOSYSTEM, NO_MATCH_OPTION,
     NO_SELECTION_ID, NO_SELECTION_LABEL, ROW_ERROR_LABEL, TRUNCATED_OPTION,
 )
 
@@ -217,11 +218,18 @@ class ExportDialogMixin:
         number that had moved, or a map the node could not write, showed up in
         the log at the moment it happened and nowhere at all afterwards. This
         dialog is where somebody goes when an accessory is behaving oddly.
+
+        Since issues #219/#240 the §4.3 ``warnings`` channel also carries the
+        node's one-shot NOTICES (``EndpointMapStore``'s ``#notices``: a
+        re-adoptable orphan spotted, a re-adopt landed, an entry this bridge
+        version cannot rebuild), so the wording below says "reports" rather
+        than naming them all persistence problems — several of them are not
+        problems at all.
         """
         if status is None:
             return ""
         if status.warnings:
-            return (f" The bridge node reports {len(status.warnings)} persistence problem(s): "
+            return (f" The bridge node reports {len(status.warnings)} thing(s) worth reading: "
                     f"{'; '.join(status.warnings)}")
         if status.drift:
             return (f" WARNING: {len(status.drift)} exported accessory number(s) have DRIFTED — "
@@ -246,6 +254,13 @@ class ExportDialogMixin:
             # first item and the user is one click from unpairing whatever
             # happens to be second.
             values["fabric"] = NO_SELECTION_ID
+            return values
+        if menu_id == MENU_READOPT_EXPORT:
+            # Same reasoning as the unpair dialog above: both pickers lead
+            # with a no-selection row, so both fields are seeded to match it.
+            values["readoptOrphan"] = NO_SELECTION_ID
+            values["readoptDevice"] = NO_SELECTION_ID
+            values["readoptConfirm"] = False
             return values
         if menu_id != MENU_MANAGE_EXPORTS:
             return values
@@ -549,10 +564,20 @@ class ExportDialogMixin:
         previous = self.exports.get(device_id)
         existed = previous is not None
         role_changed = existed and previous.role != role
+        # Issue #240 — a role change bumps the generation, so the node treats
+        # it as a NEW accessory identity (remove-then-add) rather than an
+        # in-place device-type mutation; anything else carries the identity
+        # through unchanged — an ordinary update must never move it on its
+        # own (PR5 design §1.3).
+        if role_changed:
+            published_as = next_generation(previous.published_as or published_id_for(device_id))
+        else:
+            published_as = previous.published_as if existed else None
         try:
             self.exports.upsert(ExportEntry(
                 indigo_device_id=device_id, role=role,
                 name_override=name_override, options=options,
+                published_as=published_as,
             ))
         except Exception as exc:  # pylint: disable=broad-except
             # The store rolled back, so nothing was saved — say so rather than
@@ -575,31 +600,53 @@ class ExportDialogMixin:
         """What a role change actually costs the user, said before they find out.
 
         BRIDGE_PROTOCOL §4.1 rejects changing an existing endpoint's role, so the
-        plugin removes and re-adds it. Ecosystems treat that as a brand-new
-        accessory: the name and room it was given in Apple Home are gone.
+        plugin removes the old accessory identity and adds a new one (issue
+        #240) rather than recreating it in place — recreating in place is what
+        used to leave Apple Home stuck showing "could not change settings"
+        until its home hub was restarted.
         """
         if not role_changed:
             return ""
-        return ("Changing the role RE-CREATES the accessory, so it loses the name and room "
-                "you gave it in Apple Home and any other paired ecosystem. ")
+        return ("Changing the role removes this accessory from your ecosystems and adds it "
+                "back as a NEW one under a fresh accessory number, so you will need to put it "
+                "back in its room. That is deliberate — changing it in place could leave Apple "
+                "Home stuck on \"could not change settings\" until the home hub was restarted "
+                "(issue #240). ")
 
-    def _nudge_export(self, device_id: int, *, role_changed: bool = False) -> None:
+    def _nudge_export(self, device_id: int, *, role_changed: bool = False) -> bool:
         """Tell the bridge about one changed export, without a full reconnect.
 
         A role change is the one case that cannot be an ``upsert``: §4.1 refuses
         it with ``role_change``, so it becomes remove-then-add.
+
+        **Returns whether the bridge was actually told**, because this is only
+        the second of two halves and they can land independently: the store
+        write has already happened by the time anyone calls this, so a caller
+        that reports an outcome to the user (the re-adopt confirmation,
+        PR5 design §4.5) has to be able to report "saved, but not yet applied"
+        rather than announce both. The existing export-dialog caller ignores
+        it: its ``exportStatus`` line already says only what it saved.
         """
         self._exports_changed()  # pylint: disable=no-member  # lifecycle, stays in plugin.py
         bridge = self.export_bridge
         if bridge is None:
-            return
+            return False
         try:
             if role_changed:
                 bridge.replace(device_id)
             else:
                 bridge.upsert(device_id)
         except Exception as exc:  # pylint: disable=broad-except
+            # Names the consequence, not just the failure: the allow-list is
+            # already on disk, so this is "the ecosystems have not caught up
+            # yet", not "the change was lost".
+            self.logger.error(
+                "Matter bridge: the export list WAS saved for device %s, but telling the bridge "
+                "node about it FAILED — %s. Nothing was lost: the accessory catches up at the "
+                "next reconnect/attach, which happens on its own.", device_id, exc)
             self.logger.exception(exc)
+            return False
+        return True
 
     def exportRemove(self, valuesDict, typeId="", devId=0):
         # pylint: disable=unused-argument

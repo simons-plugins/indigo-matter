@@ -187,6 +187,9 @@ function spec(indigoDeviceId: number, role: RoleValue, overrides: Partial<Endpoi
         states: {},
         options: {},
         battery: false,
+        // Today's default derivation (issues #219/#240) — a test that cares
+        // about a different published identity overrides it explicitly.
+        publishedAs: uniqueIdFor(indigoDeviceId),
         ...overrides,
     };
 }
@@ -1113,7 +1116,9 @@ describe("listener wiring is not allowed to fail quietly (§4.2)", () => {
             };
 
             assert.throws(
-                () => watchCommands(endpoint, { indigoDeviceId: 1, role: Role.dimmableLight }, () => {}),
+                () => watchCommands(
+                    endpoint, { indigoDeviceId: 1, role: Role.dimmableLight, publishedAs: uniqueIdFor(1) }, () => {},
+                ),
                 (error: unknown) => {
                     assert.ok(error instanceof ProtocolError);
                     assert.equal(error.code, ErrorCode.internal);
@@ -1235,6 +1240,175 @@ describe("endpoint-number stability (PRD §4.3 / XAC5)", () => {
             assert.deepEqual(second.commands, [], "a restart sprayed command events");
         } finally {
             await second.close();
+        }
+    });
+});
+
+/** A re-adopt's replacement device: drives identity `indigo-1`, is not 1. */
+const REPLACEMENT_DEVICE = 700_000_001;
+
+describe("supersede & published identity (issues #219/#240)", () => {
+    it("publishes the OLD UniqueID and SerialNumber for a re-adopted identity", async () => {
+        // The PR5 design F7/F8 pin, and the whole of #219 in one assertion: the only
+        // identity a controller can see is the endpoint number plus the
+        // bridged Basic Information attributes, and matter.js does NOT
+        // persist `uniqueId`/`serialNumber` — whatever is declared at
+        // construction is what is published. A re-adopted accessory is
+        // therefore only "the same accessory" to Apple Home if BOTH are
+        // derived from `publishedAs` rather than from the device now driving
+        // it; derive either from `indigoDeviceId` and every paired ecosystem
+        // sees a brand-new accessory, room and scenes gone.
+        const h = await harness();
+        try {
+            await h.registry.reconcile(
+                [spec(REPLACEMENT_DEVICE, Role.onOffLight, { publishedAs: uniqueIdFor(1) })], false,
+            );
+            const endpoint = only(h);
+            assert.equal(endpoint.id, uniqueIdFor(1), "Endpoint.id IS the published identity");
+
+            const info = endpoint.stateOf("bridgedDeviceBasicInformation") as Record<string, unknown>;
+            assert.equal(info.uniqueId, uniqueIdFor(1), "the OLD identity, not indigo-<driving device>");
+            assert.equal(info.serialNumber, "1", "stripped from the PUBLISHED identity, not the device id");
+            assert.notEqual(info.uniqueId, info.serialNumber, "Matter rejects a UniqueID equal to the SerialNumber");
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("routes a command from a re-adopted accessory to the NEW Indigo device", async () => {
+        // The COMMAND_SINKS indirection (owner decision 2). The sink is keyed
+        // on `Endpoint.id` — which IS `publishedAs` — while the value carries
+        // the driving `indigoDeviceId`. Key it on `indigo-<indigoDeviceId>`
+        // instead and an ecosystem-originated command on a re-adopted
+        // accessory finds no sink at all: Apple Home says the accessory did
+        // not respond, for ever, and nothing in Indigo moves.
+        const h = await harness();
+        try {
+            await h.registry.reconcile(
+                [spec(REPLACEMENT_DEVICE, Role.onOffLight, { publishedAs: uniqueIdFor(1) })], false,
+            );
+            const endpoint = only(h);
+            h.commands.length = 0;
+
+            await endpoint.act(agent => agent.get(OnOffLighting).on());
+
+            assert.deepEqual(
+                h.commands,
+                [{ indigoDeviceId: REPLACEMENT_DEVICE, command: "onOff", args: { value: true } }],
+                "the command must reach the device driving the accessory NOW, not the one its identity names",
+            );
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("a role change takes a fresh endpoint number and never reuses the retired one", async () => {
+        // The PR5 design F1 pin, at registry level: a role change that bumps the
+        // generation (an up-to-date plugin) is a supersede, not an in-place
+        // recreate — the new `Endpoint.id` gets a number matter.js has never
+        // handed out before, and the retired one stays retired.
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(1, Role.onOffLight)], false);
+            const before = h.registry.summaries()[0]?.endpointNumber;
+            assert.ok(before !== undefined);
+
+            await h.registry.reconcile([spec(1, Role.dimmableLight, { publishedAs: "indigo-1~2" })], false);
+            const after = h.registry.summaries()[0];
+            assert.equal(after?.publishedAs, "indigo-1~2");
+            assert.notEqual(after?.endpointNumber, before, "the new identity must not reuse the retired number");
+            assert.ok(
+                h.logs.some(line => line.startsWith("Superseding endpoint 1: role onOffLight → dimmableLight.")),
+                h.logs.join("\n"),
+            );
+            assert.ok(h.logs.some(line => line.includes("issue #240")));
+            assert.ok(h.logs.some(line => line.includes("The retired number is never reused.")));
+
+            // A brand-new device added in the same batch must not be handed
+            // the number the supersede just retired either (PR5 design F1: the allocator
+            // never reuses anything, regardless of who is asking).
+            await h.registry.reconcile(
+                [spec(1, Role.dimmableLight, { publishedAs: "indigo-1~2" }), spec(2, Role.onOffLight)], false,
+            );
+            const newDevice = h.registry.summaries().find(s => s.indigoDeviceId === 2);
+            assert.notEqual(newDevice?.endpointNumber, before);
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("does not call a re-adopt a supersession, or print role X → X (comment-analyzer C2)", async () => {
+        // The PR5 design E2/E5 shape: ONE device, ONE removal, ONE create, and the
+        // identity left behind is an ORDINARY orphan `orphans()`/§3.12 must
+        // go on offering. The broad "removal + create for the same device"
+        // rule logged "identity … is being retired … never reused" about it —
+        // the opposite of what the map does — and printed "role onOffLight →
+        // onOffLight", which reads as a role change nobody asked for.
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(1, Role.onOffLight)], false);
+            h.logs.length = 0;
+
+            // Device 1 stops publishing indigo-1 and starts publishing
+            // indigo-99 — a re-adopt onto an already-exported device.
+            await h.registry.reconcile(
+                [spec(1, Role.onOffLight, { publishedAs: uniqueIdFor(99) })], false,
+            );
+
+            assert.ok(
+                !h.logs.some(line => line.startsWith("Superseding endpoint")),
+                `a re-adopt is not a supersession: ${h.logs.join("\n")}`,
+            );
+            assert.ok(
+                !h.logs.some(line => line.includes("The retired number is never reused.")),
+                `the old identity stays re-adoptable and keeps its number: ${h.logs.join("\n")}`,
+            );
+            assert.ok(
+                h.logs.some(
+                    line =>
+                        line.includes(`moving from accessory identity ${uniqueIdFor(1)}`) &&
+                        line.includes(`to ${uniqueIdFor(99)}`) &&
+                        line.includes("stays re-adoptable"),
+                ),
+                `expected the identity-move line, got ${h.logs.join("\n")}`,
+            );
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("a battery gain keeps the same endpoint number", async () => {
+        // Guards the existing behaviour: owner decision 4 (§9) — only a role
+        // change supersedes, and only when the plugin bumps the generation. A
+        // battery gain is always the in-place recreate, identity unmoved.
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(1, Role.onOffLight, { battery: false })], false);
+            const before = h.registry.summaries()[0]?.endpointNumber;
+
+            await h.registry.reconcile([spec(1, Role.onOffLight, { battery: true })], false);
+            const after = h.registry.summaries()[0];
+            assert.equal(after?.publishedAs, "indigo-1");
+            assert.equal(after?.endpointNumber, before);
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("refuses an upsert that would move a live endpoint's published identity", async () => {
+        const h = await harness();
+        try {
+            await h.registry.upsert(spec(1, Role.onOffLight));
+            const error = await rejects(
+                () => h.registry.upsert(spec(1, Role.onOffLight, { publishedAs: "indigo-1~2" })),
+                ErrorCode.roleChange,
+            );
+            assert.match(error.message, /supersession/);
+            // Unchanged: the refusal must not half-apply the new identity —
+            // only the plugin's remove-then-add `replace()` may retire one.
+            assert.equal(h.registry.summaries()[0]?.publishedAs, "indigo-1");
+        } finally {
+            await h.close();
         }
     });
 });
@@ -2069,7 +2243,7 @@ describe("onOff commands (§4.2, §7, #143, #201)", () => {
             };
             try {
                 await assert.rejects(
-                    async () => applyStates(endpoint, Role.dimmableLight, { onOff: true, level: 80 }, false),
+                    async () => applyStates(endpoint, Role.dimmableLight, { onOff: true, level: 80 }, false, 1),
                     (error: Error) => /onOff half failed/.test(error.message),
                     "the error must name the failed half",
                 );
@@ -3343,7 +3517,7 @@ describe("PowerSource / battery (issue #220)", () => {
             };
             try {
                 await assert.rejects(
-                    async () => applyStates(endpoint, Role.onOffLight, { onOff: true, batteryLevel: 48 }, true),
+                    async () => applyStates(endpoint, Role.onOffLight, { onOff: true, batteryLevel: 48 }, true, 1),
                     (error: Error) => /onOff half failed/.test(error.message),
                     "the error must name the failed half",
                 );

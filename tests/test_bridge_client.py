@@ -37,6 +37,13 @@ EXCHANGES = {
 
 HELLO = FRAMES["handshake"]
 SKEWED_HELLO = {**HELLO, "protocolVersion": bridge_protocol.PROTOCOL_VERSION + 1}
+#: The DANGEROUS direction, and the one 2026.21.0's v1 → v2 bump actually
+#: produces in the field: launchd keeps the OLD node alive across a plugin
+#: update (PRD §4.2 PM-B), so the node is behind, not ahead. Skew must fail
+#: closed identically both ways — an old node silently ignores `publishedAs`
+#: and publishes the default identity, i.e. a duplicate accessory in every
+#: paired ecosystem (PR5 design E9).
+OLD_NODE_HELLO = {**HELLO, "protocolVersion": bridge_protocol.PROTOCOL_VERSION - 1}
 
 #: Golden responses keyed by the command that provokes them.
 RESPONSES = {
@@ -51,6 +58,7 @@ RESPONSES = {
     bridge_protocol.CMD_REMOVE_FABRIC: EXCHANGES["remove_fabric"]["response"],
     bridge_protocol.CMD_FACTORY_RESET: EXCHANGES["factory_reset"]["response"],
     bridge_protocol.CMD_REBUILD_ENDPOINT_MAP: EXCHANGES["rebuild_endpoint_map"]["response"],
+    bridge_protocol.CMD_LIST_ORPHANS: EXCHANGES["list_orphans"]["response"],
 }
 
 KITCHEN_LAMP = EndpointSpec(
@@ -140,8 +148,9 @@ class TestHandshake:
 
     def test_version_skew_refuses_to_attach_and_stops_reconnecting(self, mock_logger):
         # §2 + invariant 6.5: skew fails closed — no attach, no retry, pairings
-        # untouched. The user is told to restart the agent; the plugin does not
-        # sit in a reconnect loop pretending it might get better.
+        # untouched. The user is told what the plugin NEEDS (the paired
+        # bridge-node release, via the install menu); the plugin does not sit
+        # in a reconnect loop pretending it might get better.
         async def scenario():
             skews = []
             delays = []
@@ -162,8 +171,35 @@ class TestHandshake:
             assert skews[0].bridge_version == HELLO["bridgeVersion"]
             mock_logger.error.assert_called()
 
-            client.resume()          # the agent was restarted; retries allowed again
+            client.resume()          # the paired node was installed; retries allowed again
             assert not client.halted
+        run(scenario())
+
+    def test_an_OLDER_node_fails_closed_the_same_way(self, mock_logger):
+        """The direction that actually happens (PR5 design E9): launchd keeps
+        the old node across a plugin update, so the node is BEHIND. An older
+        node silently ignores `publishedAs` and publishes the default identity
+        — a duplicate accessory in every paired ecosystem — so refusing is the
+        whole safety property, and `!=` must not have been written `<`."""
+        async def scenario():
+            skews = []
+            delays = []
+
+            async def fake_sleep(delay):
+                delays.append(delay)
+                await asyncio.sleep(0)
+
+            fake = _fake(handshake=OLD_NODE_HELLO)
+            client = _client(mock_logger, fake, on_version_skew=skews.append, sleep=fake_sleep)
+            await asyncio.wait_for(client.run(), timeout=2)
+
+            assert client.halted and client.halted_reason == "version_skew"
+            assert delays == [], "an older node must not be retried either"
+            assert bridge_protocol.CMD_ATTACH not in fake.sent_commands()
+            assert skews and skews[0].protocol_version == OLD_NODE_HELLO["protocolVersion"]
+            said = logged(mock_logger, "error")
+            assert "Install/update the Matter bridge" in said
+            assert "paired bridge-node release" in said
         run(scenario())
 
     def test_non_hello_first_frame_is_refused(self, mock_logger):
@@ -324,6 +360,30 @@ class TestCommands:
         # The fixture depicts a post-storage-loss node, so its numbers differ
         # from attach's — §3.11 records, it does not reallocate.
         assert status.endpoints[1].endpoint_number == 5
+
+    def test_list_orphans(self, mock_logger):
+        orphans = self._exchange(mock_logger, lambda c: c.list_orphans(),
+                                 "list_orphans", EXCHANGES)
+        assert len(orphans) == 3
+        assert orphans[0].unique_id == "indigo-223456791"
+        assert orphans[0].number == 7
+        assert orphans[0].role == "dimmableLight"
+        assert orphans[0].device_id == 223456791
+        # The bare pre-2026.16.2 entry (PR5 design E4): no role/label/deviceId at all.
+        assert orphans[2].role is None and orphans[2].label is None
+        assert orphans[2].device_id is None
+
+    def test_list_orphans_empty(self, mock_logger):
+        async def scenario():
+            fake = _fake(responder=golden_responder(
+                {bridge_protocol.CMD_LIST_ORPHANS: EXCHANGES["list_orphans_empty"]["response"]}))
+            client = _client(mock_logger, fake)
+            task = asyncio.create_task(client.run())
+            await client.wait_connected(timeout=2)
+            assert await client.list_orphans() == []
+            await client.close()
+            task.cancel()
+        run(scenario())
 
     def test_error_response_raises(self, mock_logger):
         async def scenario():
@@ -671,7 +731,13 @@ class TestAttachRefused:
         assert state["client"].halted
         assert state["client"].halted_reason == bridge_protocol.ERR_VERSION_MISMATCH
         assert state["delays"] == []
-        assert "restart the bridge agent" in logged(mock_logger, "error")
+        said = logged(mock_logger, "error")
+        assert "Install/update the Matter bridge" in said
+        # States the REQUIREMENT, not a guarantee about what the menu installs:
+        # the pinned bridge-node version is bumped by the release commit AFTER
+        # this PR, so until then the menu installs a node that is still v1.
+        assert "needs the paired bridge-node release" in said
+        assert "installs the exact node version" not in said
 
     def test_a_transient_refusal_reconnects_and_names_the_code(self, mock_logger):
         # `internal` says the node fell over on its own; that genuinely may work

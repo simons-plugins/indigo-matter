@@ -17,11 +17,19 @@ What the rest of the plugin consumes is the normalised dataclasses below —
 from __future__ import annotations
 
 import itertools
+import re
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
 #: Protocol version this plugin speaks (§2). Skew fails closed on both peers.
-PROTOCOL_VERSION = 1
+#:
+#: Bumped 1 -> 2 alongside ``EndpointSpec.published_as`` first being sent
+#: (issues #219/#240, PR5 design owner ruling 1): rather than gate ``published_as`` behind
+#: a ``bridgeVersion`` capability check, the protocol simply requires v2. An
+#: old (pre-#219/#240) node cannot silently ignore a ``publishedAs`` it does
+#: not understand and publish a duplicate default-identity accessory, because
+#: it never gets past the handshake with a v2-speaking plugin at all.
+PROTOCOL_VERSION = 2
 
 #: Loopback WS port the bridge node listens on (§ header); pref-configurable.
 DEFAULT_WS_PORT = "5581"
@@ -58,12 +66,13 @@ CMD_OPEN_WINDOW = "open_commissioning_window"
 CMD_REMOVE_FABRIC = "remove_fabric"
 CMD_FACTORY_RESET = "factory_reset"
 CMD_REBUILD_ENDPOINT_MAP = "rebuild_endpoint_map"
+CMD_LIST_ORPHANS = "list_orphans"
 
 #: The complete §3 command domain. Anything else gets ``unknown_command``.
 COMMANDS = frozenset({
     CMD_ATTACH, CMD_UPSERT_ENDPOINT, CMD_REMOVE_ENDPOINT, CMD_SET_STATE, CMD_SET_REACHABLE,
     CMD_GET_STATUS, CMD_GET_PAIRING, CMD_OPEN_WINDOW, CMD_REMOVE_FABRIC, CMD_FACTORY_RESET,
-    CMD_REBUILD_ENDPOINT_MAP,
+    CMD_REBUILD_ENDPOINT_MAP, CMD_LIST_ORPHANS,
 })
 
 # attach args (§3.1)
@@ -77,6 +86,8 @@ INTENT_REPLACE_ALL = "replace_all"
 # per-command args (§3.2-§3.10)
 ARG_ENDPOINT = "endpoint"
 ARG_INDIGO_DEVICE_ID = "indigoDeviceId"
+#: Issues #219/#240 — the accessory identity this device publishes as (§4.1).
+ARG_PUBLISHED_AS = "publishedAs"
 ARG_STATES = "states"
 ARG_REACHABLE = "reachable"
 ARG_DURATION_SECONDS = "durationSeconds"
@@ -87,7 +98,7 @@ ARG_PRESERVE_ENDPOINT_NUMBERS = "preserveEndpointNumbers"
 DEFAULT_WINDOW_SECONDS = 900
 
 # --------------------------------------------------------------------------
-# Error codes (§1.1) — the complete domain for protocol version 1
+# Error codes (§1.1) — the complete domain for protocol version 2
 # --------------------------------------------------------------------------
 ERR_UNKNOWN_COMMAND = "unknown_command"
 ERR_MALFORMED_ARGS = "malformed_args"
@@ -201,6 +212,88 @@ ROLES = frozenset(ROLE_STATE_KEYS)
 #: The v1 ``systemMode`` domain, in both directions (§4.2).
 SYSTEM_MODES = ("off", "heat", "cool", "auto")
 
+# --------------------------------------------------------------------------
+# Published identity (issues #219/#240) — the Python twin of
+# `bridge-node/src/protocol.ts`'s `publishedIdFor`/`parsePublishedId`. Both
+# derivations MUST agree on every input: this string is what the node keys
+# `Endpoint.id` on, and a plugin/node disagreement about it would create a
+# duplicate accessory rather than update the one the user meant.
+# --------------------------------------------------------------------------
+#: Matter's ``UniqueID`` cap (PR5 design F9, measured against matter.js 0.17.8) — mirrors
+#: `protocol.ts`'s ``PUBLISHED_ID_MAX``.
+PUBLISHED_ID_MAX = 32
+
+_PUBLISHED_ID_PREFIX = "indigo-"
+#: ``\Z``, not ``$``: Python's ``$`` also matches just before a trailing
+#: newline, so ``"indigo-1\n"`` would parse here and be REFUSED by the
+#: TypeScript twin — the one thing these two derivations may never do.
+#:
+#: ``re.ASCII`` for exactly the same reason, and it is the same class of bug:
+#: Python's ``\d`` matches EVERY Unicode decimal digit, JavaScript's matches
+#: ``[0-9]`` only. Without it ``"indigo-١٢٣"`` (Arabic-Indic digits) parses
+#: here — ``int()`` is equally Unicode-aware, so it even yields 123 — while
+#: ``parsePublishedId`` refuses it. A hand-edited ``.indiPref`` carrying one
+#: would pass every plugin-side validation and then kill the whole attach
+#: with ``malformed_args``, taking every export offline.
+_PUBLISHED_ID_RE = re.compile(r"^indigo-(-?\d+)(?:~(\d+))?\Z", re.ASCII)
+#: Python has no native "safe integer" concept (JS's ``Number.isSafeInteger``,
+#: which `parsePublishedId` guards against); this is that same bound, so a
+#: device id round-trips identically through either peer's derivation.
+_JS_MAX_SAFE_INTEGER = 2**53 - 1
+
+
+@dataclass(frozen=True)
+class PublishedId:
+    """The parsed halves of a published identity (see :func:`parse_published_id`)."""
+    device_id: int
+    generation: int
+
+
+def published_id_for(indigo_device_id: int, generation: int = 1) -> str:
+    """``publishedIdFor``'s Python twin — generation 1 is today's derivation."""
+    if generation == 1:
+        return f"{_PUBLISHED_ID_PREFIX}{indigo_device_id}"
+    return f"{_PUBLISHED_ID_PREFIX}{indigo_device_id}~{generation}"
+
+
+def parse_published_id(value: str) -> Optional[PublishedId]:
+    """The inverse of :func:`published_id_for`, or ``None`` for anything that
+    is not a lawful published identity — strict rather than forgiving, the
+    same way ``parsePublishedId`` is on the TypeScript side: a loosely coerced
+    device id is a new accessory in every paired ecosystem, not the one the
+    caller meant. The length cap is PR5 design F9's measured ``UniqueID`` limit.
+    """
+    if not isinstance(value, str) or len(value) > PUBLISHED_ID_MAX:
+        return None
+    match = _PUBLISHED_ID_RE.match(value)
+    if match is None:
+        return None
+    device_id = int(match.group(1))
+    if abs(device_id) > _JS_MAX_SAFE_INTEGER:
+        return None
+    if match.group(2) is None:
+        return PublishedId(device_id=device_id, generation=1)
+    generation = int(match.group(2))
+    if generation < 2:
+        return None
+    return PublishedId(device_id=device_id, generation=generation)
+
+
+def next_generation(published_as: str) -> str:
+    """The published identity one role-change generation past ``published_as``
+    (issue #240) — ``indigo-<id>`` -> ``indigo-<id>~2`` -> ``indigo-<id>~3`` ...
+
+    The plugin is the only peer that ever bumps a generation (PR5 design §1.3): the node
+    only ever receives whatever this produces. Raises ``ValueError`` for an
+    unparseable ``published_as`` — every caller already holds either a stored,
+    previously-validated identity or the default derivation, so an unlawful
+    value here is a bug, not a wire input to tolerate.
+    """
+    parsed = parse_published_id(published_as)
+    if parsed is None:
+        raise ValueError(f"not a lawful published identity: {published_as!r}")
+    return published_id_for(parsed.device_id, parsed.generation + 1)
+
 
 class BridgeProtocolError(Exception):
     """Raised when a response frame carries an ``error_code`` (§1.1)."""
@@ -224,7 +317,13 @@ class Hello:
 
 @dataclass
 class EndpointSpec:
-    """One exported accessory (§4.1). ``indigo_device_id`` is the identity key."""
+    """One exported accessory (§4.1).
+
+    ``indigo_device_id`` is the DRIVING device — what §5 commands are
+    addressed to and what §3.4 state pushes are keyed on. :attr:`published_as`
+    is the accessory's identity (ADR-0010, issues #219/#240), defaulting to
+    ``indigo-<indigo_device_id>``.
+    """
     indigo_device_id: int
     role: str
     label: str
@@ -235,10 +334,18 @@ class EndpointSpec:
     #: (the default) means "no evidence right now", never a removal request —
     #: the node's live cluster set is monotonic (docs/BRIDGE_PROTOCOL.md §4.1).
     battery: bool = False
+    #: Issues #219/#240 — the accessory identity this device publishes as
+    #: (see :func:`published_id_for`). ``""`` means "use today's default
+    #: derivation" — :meth:`to_wire` omits the key in that case (and also when
+    #: the value IS the default), so an ordinary export's wire frame is
+    #: byte-identical to what this plugin has always sent.
+    published_as: str = ""
 
     def to_wire(self) -> dict:
         """The §4.1 wire shape. ``battery`` is omitted unless ``True`` — never
-        spelled ``false`` on the wire (round-trip tests are exact)."""
+        spelled ``false`` on the wire (round-trip tests are exact).
+        ``publishedAs`` is omitted whenever it is empty or equal to the
+        default derivation, for the same reason."""
         wire = {
             ARG_INDIGO_DEVICE_ID: int(self.indigo_device_id),
             "role": self.role,
@@ -249,6 +356,8 @@ class EndpointSpec:
         }
         if self.battery:
             wire["battery"] = True
+        if self.published_as and self.published_as != published_id_for(self.indigo_device_id):
+            wire[ARG_PUBLISHED_AS] = self.published_as
         return wire
 
     @classmethod
@@ -262,6 +371,7 @@ class EndpointSpec:
             states=dict(data.get(ARG_STATES) or {}),
             options=dict(data.get("options") or {}),
             battery=bool(data.get("battery", False)),
+            published_as=str(data.get(ARG_PUBLISHED_AS, "") or ""),
         )
 
 
@@ -271,6 +381,9 @@ class EndpointSummary:
     indigo_device_id: int
     endpoint_number: int
     role: str
+    #: Issues #219/#240 — informational; see :attr:`EndpointSpec.published_as`.
+    #: Tolerant default so a report from a pre-PR5 node still parses.
+    published_as: str = ""
 
 
 @dataclass
@@ -283,6 +396,28 @@ class DriftEntry:
     unique_id: str
     expected: int
     actual: int
+
+
+@dataclass
+class OrphanRecord:
+    """One left-behind accessory identity (§3.12, issues #219/#240) — the
+    re-adopt picker's data. Mirrors `bridge-node/src/protocol.ts`'s
+    ``OrphanRecord`` field-for-field. ``role``/``label`` absent together is
+    the pre-2026.16.2 bare orphan (PR5 design §4.2's third picker row, E4) —
+    a plugin that old deleted them on un-export, so there is nothing left to
+    match a replacement device against and the record can never be
+    re-adopted, only shown so the user can see its number is spoken for.
+    """
+    unique_id: str
+    number: int
+    role: Optional[str] = None
+    label: Optional[str] = None
+    #: ISO-8601, or ``None`` for a pre-PR5 orphan — the picker renders that
+    #: as "date unknown" (§4.2).
+    orphaned_at: Optional[str] = None
+    #: The Indigo device that drove this identity before it was un-exported,
+    #: if the node recorded one (issue #219).
+    device_id: Optional[int] = None
 
 
 @dataclass
@@ -415,6 +550,7 @@ def parse_status(result: Any) -> StatusReport:
                 indigo_device_id=int(item[ARG_INDIGO_DEVICE_ID]),
                 endpoint_number=int(item["endpointNumber"]),
                 role=str(item.get("role", "")),
+                published_as=str(item.get(ARG_PUBLISHED_AS, "") or ""),
             )
             for item in (data.get("endpoints") or [])
         ],
@@ -434,6 +570,22 @@ def parse_drift(data: Any) -> list:
         )
         for item in (data or [])
     ]
+
+
+def parse_orphans(result: Any) -> list:
+    """Normalise a §3.12 ``list_orphans`` payload into :class:`OrphanRecord`."""
+    orphans = []
+    for item in (result or []):
+        raw_device_id = item.get("deviceId")
+        orphans.append(OrphanRecord(
+            unique_id=str(item.get("uniqueId", "")),
+            number=int(item.get("number", 0)),
+            role=item.get("role"),
+            label=item.get("label"),
+            orphaned_at=item.get("orphanedAt"),
+            device_id=int(raw_device_id) if raw_device_id is not None else None,
+        ))
+    return orphans
 
 
 def parse_pairing(result: Any) -> PairingReport:
@@ -601,6 +753,10 @@ class BridgeProtocol:
     def build_rebuild_endpoint_map(self, message_id: Optional[str] = None) -> dict:
         """§3.11 — adopt the live endpoint numbers as the new persisted map."""
         return self.build_request(CMD_REBUILD_ENDPOINT_MAP, None, message_id)
+
+    def build_list_orphans(self, message_id: Optional[str] = None) -> dict:
+        """§3.12 — every left-behind accessory identity the re-adopt picker could offer."""
+        return self.build_request(CMD_LIST_ORPHANS, None, message_id)
 
     # ------------------------------------------------------------------
     # Inbound classification

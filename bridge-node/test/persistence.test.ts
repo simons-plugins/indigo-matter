@@ -72,6 +72,7 @@ const RESET_TIMEOUT_MS = 20_000;
 const ENDPOINTS = [
     {
         indigoDeviceId: KITCHEN,
+        publishedAs: uniqueIdFor(KITCHEN),
         role: "onOffLight",
         label: "Kitchen Lamp",
         reachable: true,
@@ -80,6 +81,7 @@ const ENDPOINTS = [
     },
     {
         indigoDeviceId: LOUNGE,
+        publishedAs: uniqueIdFor(LOUNGE),
         role: "dimmableLight",
         label: "Lounge Lamp",
         reachable: true,
@@ -278,9 +280,20 @@ describe("XAC5: endpoint identity across a bridge-node restart", () => {
 
         // Since #141 the entry carries the role and label too — that is what
         // lets the next start rebuild the accessory before it goes online.
+        // Since #219 it also carries the driving device id.
         assert.deepEqual(persisted.endpoints, {
-            [uniqueIdFor(KITCHEN)]: { number: before[KITCHEN], role: "onOffLight", label: "Kitchen Lamp" },
-            [uniqueIdFor(LOUNGE)]: { number: before[LOUNGE], role: "dimmableLight", label: "Lounge Lamp" },
+            [uniqueIdFor(KITCHEN)]: {
+                number: before[KITCHEN],
+                role: "onOffLight",
+                label: "Kitchen Lamp",
+                deviceId: KITCHEN,
+            },
+            [uniqueIdFor(LOUNGE)]: {
+                number: before[LOUNGE],
+                role: "dimmableLight",
+                label: "Lounge Lamp",
+                deviceId: LOUNGE,
+            },
         });
 
         const second = await boot(storagePath);
@@ -357,8 +370,18 @@ describe("XAC5: endpoint identity across a bridge-node restart", () => {
         assert.equal((status.result as { driftChecked: boolean }).driftChecked, true);
         assert.deepEqual(driftOf(status), []);
         assert.deepEqual(readMap(storagePath).endpoints, {
-            [uniqueIdFor(KITCHEN)]: { number: before[KITCHEN], role: "onOffLight", label: "Kitchen Lamp" },
-            [uniqueIdFor(LOUNGE)]: { number: before[LOUNGE], role: "dimmableLight", label: "Lounge Lamp" },
+            [uniqueIdFor(KITCHEN)]: {
+                number: before[KITCHEN],
+                role: "onOffLight",
+                label: "Kitchen Lamp",
+                deviceId: KITCHEN,
+            },
+            [uniqueIdFor(LOUNGE)]: {
+                number: before[LOUNGE],
+                role: "dimmableLight",
+                label: "Lounge Lamp",
+                deviceId: LOUNGE,
+            },
         });
     });
 });

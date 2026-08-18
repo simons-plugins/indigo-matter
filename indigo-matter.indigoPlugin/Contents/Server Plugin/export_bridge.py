@@ -59,7 +59,7 @@ import bridge_protocol
 import export_catalog
 import export_handlers
 from bridge_client import TERMINAL_ATTACH_ERRORS, BridgeClient, attach_timeout_for
-from bridge_protocol import EndpointSpec
+from bridge_protocol import EndpointSpec, published_id_for
 
 #: How many consecutive watchdog ticks a disconnected bridge client tolerates
 #: before the log escalates from debug to a single warning. Ticks are ~15s, so
@@ -100,8 +100,9 @@ PREF_PENDING_REPLACE_ALL = "matterExportPendingReplaceAll"
 #:   ``reason=code`` — i.e. the reason string is ``"version_mismatch"`` itself.
 #:
 #: ``bridge_client.TERMINAL_ATTACH_ERRORS[ERR_VERSION_MISMATCH]``'s own remedy
-#: text is "restart the bridge agent" — exactly what *Install/update the Matter
-#: bridge* does — so both reason strings are revived here. The other member of
+#: text names *Install/update the Matter bridge* as the way to get the paired
+#: bridge-node release — so both reason strings are revived here, on the way
+#: back from exactly that. The other member of
 #: ``HALTING_ATTACH_ERRORS``, ``mass_removal_refused``, is deliberately NOT in
 #: this set: its remedy is about the allow-list, not the node process, and
 #: reviving it after an install would silently rebuild a client that attaches
@@ -402,9 +403,9 @@ class ExportBridge:
     def revive_after_install(self) -> bool:
         """Replace a client halted on version skew, after a bridge reinstall (#154).
 
-        ``TERMINAL_ATTACH_ERRORS[ERR_VERSION_MISMATCH]``'s remedy tells the user
-        to restart the bridge agent — exactly what *Install/update the Matter
-        bridge* just did — but a version-skew halt is fail-closed
+        ``TERMINAL_ATTACH_ERRORS[ERR_VERSION_MISMATCH]``'s remedy names
+        *Install/update the Matter bridge* — which is what just ran — but a
+        version-skew halt is fail-closed
         (``bridge_client.ClientHalted``) and nothing else in this engine revives
         a halted client: :meth:`ws_json_client.WsJsonClient.resume` only clears
         the latch and its own docstring says the caller must start a fresh
@@ -909,6 +910,10 @@ class ExportBridge:
             reachable=reachable_of(dev),
             states=states,
             options=dict(entry.options),
+            # Issues #219/#240 — whatever identity the entry has adopted
+            # (a role change or a re-adopt), or today's default derivation
+            # for an entry that has never moved off it.
+            published_as=entry.published_as or published_id_for(device_id),
             # §4.1 issue #220 — evidence, not opinion. `is not None` (INCLUDING
             # a literal 0) is deliberately the opposite test to
             # `battery_percent`'s (which suppresses 0): the device factually
@@ -1151,16 +1156,29 @@ class ExportBridge:
         self._fire(client.remove_endpoint(device_id), f"remove_endpoint dev {device_id}")
 
     def replace(self, device_id: int) -> None:
-        """Re-create one endpoint, because its **role** changed.
+        """Remove one endpoint and add it back, because its **published
+        identity** changed.
 
-        §4.1 rejects a role change on an existing endpoint (``role_change``) —
+        Two callers, one shape. A **role change** is the original one: §4.1
+        rejects a role change on an existing endpoint (``role_change``) —
         ecosystems cache the Matter device type per endpoint — so the only way
-        through is remove-then-add. The accessory is genuinely new to every
+        through is remove-then-add, and the accessory is genuinely new to every
         paired ecosystem afterwards: it loses its name and room assignment
         there, which is why the dialog says so out loud rather than letting the
-        user discover it in the Home app.
+        user discover it in the Home app. A **re-adopt** (issue #219, PR5
+        design §4.4) is the other: the role does not move at all, the device
+        simply starts publishing an identity that already exists in the
+        ecosystems, and the lost-name-and-room sentence above does NOT apply to
+        it — keeping that room is the entire point of the feature. What the two
+        share is that the identity on the wire changes, which §3.2 refuses to
+        do in place either way.
+
+        Whichever it is, the remove lands FIRST and unconditionally: if the
+        add half cannot be built the accessory is already gone from every
+        ecosystem, so both bail-outs below say so rather than returning in
+        silence.
         """
-        client = self._live_client("the role change", device_id)
+        client = self._live_client("the identity change", device_id)
         if client is None:
             return
 
@@ -1168,12 +1186,26 @@ class ExportBridge:
             await client.remove_endpoint(device_id)
             entry = self._store.get(device_id)
             if entry is None:
+                self._logger.warning(
+                    "Matter bridge: device %s's OLD accessory has been removed from every paired "
+                    "ecosystem, but it is no longer in the export list, so no replacement was "
+                    "added. If that un-export was deliberate, nothing more is needed; otherwise "
+                    "re-export the device and the accessory comes back at the next "
+                    "reconnect/attach.", device_id)
                 return
             spec = self._spec_for(entry)
-            if spec is not None:
-                await client.upsert_endpoint(spec)
+            if spec is None:
+                self._logger.warning(
+                    "Matter bridge: device %s's OLD accessory has been removed from every paired "
+                    "ecosystem, but the replacement could NOT be built (the reason is logged "
+                    "above). The accessory returns at the next reconnect/attach once the device "
+                    "is exportable again.", device_id)
+                return
+            await client.upsert_endpoint(spec)
 
-        self._fire(_recreate(), f"role change for dev {device_id}")
+        self._fire(_recreate(), f"identity change for dev {device_id}",
+                   lost=f"device {device_id}'s accessory has been removed and NOT re-added; it "
+                        "returns at the next reconnect/attach")
 
     # ------------------------------------------------------------------
     # Node → Indigo (§5 command events; runs on the loop thread)
@@ -1511,8 +1543,10 @@ class ExportBridge:
     def _on_version_skew(self, hello) -> None:
         self._logger.error(
             "Matter bridge: the bridge node speaks protocol version %s, this plugin speaks %s "
-            "(node %s). Export is STOPPED and pairings are untouched — restart the bridge agent "
-            "so it picks up the node that ships with this plugin.",
+            "(node %s). Export is STOPPED and pairings are untouched — this plugin needs the "
+            "paired bridge-node release; install it with Plugins ▸ Matter ▸ Install/update the "
+            "Matter bridge once it is available. Restarting the agent alone relaunches the same "
+            "node.",
             hello.protocol_version, bridge_protocol.PROTOCOL_VERSION, hello.bridge_version)
 
     def _on_drift_detected(self, drift: list) -> None:
@@ -1820,6 +1854,15 @@ class ExportBridge:
             # does not say whether that heals itself or needs a human.
             self._logger.warning(
                 "Matter bridge: %s failed — %s. The device is not exported until the next "
+                "reconnect/attach.", what, exc)
+        elif what.startswith("identity change"):
+            # Worse than the above, and worth its own sentence: `replace()`
+            # removes BEFORE it adds, so a failure anywhere in that coroutine
+            # may leave the old accessory already gone from every ecosystem
+            # with nothing in its place.
+            self._logger.warning(
+                "Matter bridge: %s failed — %s. The OLD accessory may already have been removed "
+                "from your ecosystems with no replacement added; it returns at the next "
                 "reconnect/attach.", what, exc)
         else:
             self._logger.warning("Matter bridge: %s failed — %s", what, exc)

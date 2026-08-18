@@ -43,7 +43,7 @@ import {
 
 import type { BridgeConfig } from "./config.js";
 import { ENDPOINT_MAP_FILE, EndpointMapStore, type LiveEndpointNumber, refuseReasonFor } from "./endpoint-map.js";
-import { type BridgedIdentity, indigoDeviceIdFrom, isSupportedRole, uniqueIdFor } from "./endpoints.js";
+import { type BridgedIdentity, isSupportedRole } from "./endpoints.js";
 import {
     type BridgeFacade,
     type CommandEventData,
@@ -56,9 +56,11 @@ import {
     ErrorCode,
     type FabricInfo,
     isRole,
+    type OrphanRecord,
     type PairingReport,
     ProtocolError,
     RefuseReason,
+    supersedes,
     type RemoveFabricResult,
     type RemoveResult,
     type StatusReport,
@@ -226,6 +228,23 @@ export class BridgeNode implements BridgeFacade {
      * would have to know when that happened.
      */
     readonly #warnings = new Map<string, string>();
+    /**
+     * Issue #240, §3 steps 3/5 — `indigoDeviceId → the published identity it
+     * was last removed under`, for the ONE device that removal drove, kept
+     * only until the next {@link upsertEndpoint} for that same device
+     * consumes it. This is what lets a role-change supersession be recognised
+     * even when its remove and its create arrive as two SEPARATE commands
+     * (`replace()`) rather than one `attach` batch — see
+     * {@link noteSupersessionIfPaired}.
+     *
+     * **Written only when NO identity for that device appeared in the same
+     * mutation.** A create that already landed alongside the removal has
+     * settled the question either way — {@link forgetRemoved} has already
+     * marked it superseded, or decided it was not one (a re-adopt, PR5 design
+     * E2/E5) — and remembering the removal past that is exactly how a much
+     * later, unrelated create for the same device would mispair with it.
+     */
+    readonly #lastRemoved = new Map<number, string>();
 
     /**
      * @param initialRefusal a refuse-to-start reason decided before the node was
@@ -458,8 +477,16 @@ export class BridgeNode implements BridgeFacade {
 
         const specs: EndpointSpec[] = [];
         for (const entry of restorable) {
-            const indigoDeviceId = indigoDeviceIdFrom(entry.uniqueId);
-            if (indigoDeviceId === undefined || !isRole(entry.role) || !isSupportedRole(entry.role)) {
+            // Issues #219/#240 — `entry.indigoDeviceId` is already resolved
+            // ({@link EndpointMapStore.restorable}), from a re-adopt's
+            // `deviceId` where one is recorded, falling back to the published
+            // identity's own derivation otherwise; an entry that resolved to
+            // neither is never returned by `restorable()` at all, and was
+            // already logged and skipped there. The only thing left to check
+            // here is the ROLE, which `restorable()` cannot: it is deliberately
+            // matter.js-free (see its file comment), so it does not know
+            // `isSupportedRole`.
+            if (!isRole(entry.role) || !isSupportedRole(entry.role)) {
                 // A map written by a NEWER node, or hand-edited. Skipped rather
                 // than fatal: the plugin's attach still knows how to create it
                 // if this build can, and refusing to start over one entry would
@@ -471,7 +498,15 @@ export class BridgeNode implements BridgeFacade {
                 continue;
             }
             specs.push({
-                indigoDeviceId,
+                indigoDeviceId: entry.indigoDeviceId,
+                // Issues #219/#240 — the map's OWN key, not a re-derivation
+                // from the device id: a re-adopted identity's `Endpoint.id`
+                // must be the identity a paired ecosystem already knows, not
+                // whatever `indigo-<deviceId>` would derive to for whichever
+                // device currently drives it (`entry.indigoDeviceId` and the
+                // device id embedded in `entry.uniqueId` can now legitimately
+                // differ — that IS a re-adopt).
+                publishedAs: entry.uniqueId,
                 role: entry.role,
                 label: entry.label,
                 // §3.5/XAC8: nothing has confirmed this device's state yet.
@@ -872,21 +907,34 @@ export class BridgeNode implements BridgeFacade {
     /**
      * The live set as `endpoint-map.json` records it: the number, plus the
      * `role`/`label` that let it be rebuilt at the next start (issue #141).
+     *
+     * Issues #219/#240 — `uniqueId` is `identity.publishedAs`, not a re-
+     * derivation from `indigoDeviceId`: a re-adopted or superseded identity is
+     * no longer a pure function of the device id (§1.1). `deviceId` is carried
+     * along too, so {@link EndpointMapStore.check} can tell a re-adopt (the
+     * same identity, a CHANGED driving device) from a first sighting.
      */
     private liveIdentities(): LiveEndpointNumber[] {
         return (this.#registry?.identities() ?? []).map(identity => ({
-            uniqueId: uniqueIdFor(identity.indigoDeviceId),
+            uniqueId: identity.publishedAs,
             endpointNumber: identity.endpointNumber,
             role: identity.role,
             label: identity.label,
             battery: identity.battery,
+            deviceId: identity.indigoDeviceId,
         }));
     }
 
-    /** The live set as the map keys it, for the before/after diff below. */
-    private liveUniqueIds(): Set<string> {
-        return new Set(
-            (this.#registry?.identities() ?? []).map(identity => uniqueIdFor(identity.indigoDeviceId)),
+    /**
+     * The live set as the map keys it, plus which device drives each — the
+     * before/after diff {@link forgetRemoved} needs to tell an ordinary
+     * un-export from one half of a role-change supersession (issues
+     * #219/#240; a plain `Set<string>` was enough before the device id
+     * mattered to the diff).
+     */
+    private livePublishedIdentities(): Map<string, number> {
+        return new Map(
+            (this.#registry?.identities() ?? []).map(identity => [identity.publishedAs, identity.indigoDeviceId]),
         );
     }
 
@@ -910,20 +958,90 @@ export class BridgeNode implements BridgeFacade {
      * nothing at all. A recreate — removed and re-created in one reconcile — is
      * in both snapshots, so it is not a removal; and even if it were, the
      * {@link checkDrift} that follows re-records its role and label.
+     *
+     * **A removed identity whose device gained a LATER GENERATION of that same
+     * identity in this SAME mutation is a supersession (issue #240), not an
+     * ordinary un-export** — `EndpointRegistry.reconcileNow`'s
+     * `plan.remove`/`plan.create` land in one before/after snapshot here (§3's
+     * full-`attach` path), so the pairing is found directly. {@link supersedes}
+     * is what decides, and it is deliberately narrower than "one removal and
+     * one create for the same device": a re-adopt onto an already-exported
+     * device (PR5 design E2/E5) is that shape too, and the identity it leaves behind
+     * is an ORDINARY orphan the re-adopt picker must go on offering.
+     *
+     * A removal with no create for its device at all is remembered in
+     * {@link #lastRemoved}: the plugin's `replace()` sends `remove_endpoint`
+     * then `upsert_endpoint` as two SEPARATE commands (§3 steps 3/5), so the
+     * create half of that supersession has not happened yet when THIS command
+     * finishes — {@link upsertEndpoint} is what closes the gap when it does.
      */
-    private forgetRemoved(before: ReadonlySet<string>): void {
-        const after = this.liveUniqueIds();
-        const removed = [...before].filter(uniqueId => !after.has(uniqueId));
+    private forgetRemoved(before: ReadonlyMap<string, number>): void {
+        const after = this.livePublishedIdentities();
+        const removed = [...before.keys()].filter(uniqueId => !after.has(uniqueId));
         if (removed.length === 0) {
             return;
         }
-        const forgotten = this.#endpointMap.forget(removed);
+        const createdDeviceIds = new Map(
+            [...after]
+                .filter(([uniqueId]) => !before.has(uniqueId))
+                .map(([uniqueId, deviceId]) => [deviceId, uniqueId]),
+        );
+        const ordinary: string[] = [];
+        let forgotten = 0;
+        for (const uniqueId of removed) {
+            const deviceId = before.get(uniqueId)!;
+            const created = createdDeviceIds.get(deviceId);
+            if (created !== undefined && supersedes(uniqueId, created)) {
+                forgotten += this.#endpointMap.forget([uniqueId], { supersededBy: created });
+                continue;
+            }
+            ordinary.push(uniqueId);
+            if (created === undefined) {
+                // Only when NO identity for this device appeared in this
+                // mutation: a create that already landed and was NOT a
+                // supersession (a re-adopt, PR5 design E2/E5) has settled the
+                // question, and remembering the removal past it is exactly
+                // how a much later, unrelated create would mispair.
+                this.#lastRemoved.set(deviceId, uniqueId);
+            }
+        }
+        forgotten += this.#endpointMap.forget(ordinary);
         if (forgotten > 0) {
             this.log(
                 `${forgotten} un-exported endpoint(s) will no longer be restored at startup; their ` +
-                    "endpoint numbers are kept (§3.3) so a re-export returns the same accessory",
+                    "endpoint numbers are kept (§3.3/#240) so they are never handed to another accessory",
             );
         }
+    }
+
+    /**
+     * The other half of a two-command role-change supersession (issue #240,
+     * §3 steps 3/5): `replace()` sends `remove_endpoint` then
+     * `upsert_endpoint` as two SEPARATE commands, so the pairing
+     * {@link forgetRemoved} finds within one mutation cannot see this one —
+     * the create had not happened yet when the remove's `forgetRemoved` ran
+     * and orphaned the old identity with no `supersededBy`. This is called
+     * once a create has actually landed: if the device this spec drives was
+     * last removed under an identity this one {@link supersedes}, that
+     * removal is retroactively marked superseded by this one.
+     *
+     * **Consumed unconditionally — matched or not.** Anything that is not a
+     * generation bump on the SAME identity is an ordinary re-export or a
+     * re-adopt (PR5 design E2/E5), neither of which retires the identity that was
+     * removed; and either way the bookkeeping must not linger to pair against
+     * some unrelated, later create for the same device. `#lastRemoved` is
+     * in-memory only and never persisted: lost on restart is safe, because a
+     * restart means the plugin's next `attach` reconciles from scratch, and a
+     * removal that never got its `supersededBy` this way is simply an
+     * ordinary orphan (PR5 design edge case E7).
+     */
+    private noteSupersessionIfPaired(spec: EndpointSpec): void {
+        const oldPublishedAs = this.#lastRemoved.get(spec.indigoDeviceId);
+        this.#lastRemoved.delete(spec.indigoDeviceId);
+        if (oldPublishedAs === undefined || !supersedes(oldPublishedAs, spec.publishedAs)) {
+            return;
+        }
+        this.#endpointMap.forget([oldPublishedAs], { supersededBy: spec.publishedAs });
     }
 
     /**
@@ -990,7 +1108,7 @@ export class BridgeNode implements BridgeFacade {
 
     /** §3.1 — reconcile the live endpoint set, then answer with the new status. */
     async reconcile(endpoints: readonly EndpointSpec[], replaceAll: boolean): Promise<StatusReport> {
-        const before = this.liveUniqueIds();
+        const before = this.livePublishedIdentities();
         try {
             await this.registry.reconcile(endpoints, replaceAll);
         } finally {
@@ -1009,14 +1127,24 @@ export class BridgeNode implements BridgeFacade {
         return this.getStatus();
     }
 
-    /** §3.2 */
+    /**
+     * §3.2
+     *
+     * The {@link noteSupersessionIfPaired} check runs only after a SUCCESSFUL
+     * upsert — a thrown one created nothing, so there is no new identity to
+     * pair a remembered removal against, and {@link ProtocolError}s (e.g. the
+     * live-identity-move refusal) must still propagate unchanged.
+     */
     async upsertEndpoint(spec: EndpointSpec): Promise<UpsertResult> {
+        let result: UpsertResult;
         try {
-            return await this.registry.upsert(spec);
+            result = await this.registry.upsert(spec);
         } finally {
             this.checkDrift();
             this.warnOnEndpointCount();
         }
+        this.noteSupersessionIfPaired(spec);
+        return result;
     }
 
     /**
@@ -1030,7 +1158,7 @@ export class BridgeNode implements BridgeFacade {
      * upsert happened to notice.
      */
     async removeEndpoint(indigoDeviceId: number): Promise<RemoveResult> {
-        const before = this.liveUniqueIds();
+        const before = this.livePublishedIdentities();
         try {
             return await this.registry.remove(indigoDeviceId);
         } finally {
@@ -1385,6 +1513,11 @@ export class BridgeNode implements BridgeFacade {
                 : `Endpoint map rebuilt from ${live.length} live endpoint(s); serving normally again`,
         );
         return this.getStatus();
+    }
+
+    /** §3.12 (issue #219) — the re-adopt picker's data, straight off the map. */
+    listOrphans(): OrphanRecord[] {
+        return this.#endpointMap.orphans();
     }
 
     getPairing(): PairingReport {

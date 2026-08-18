@@ -460,6 +460,61 @@ If the bridge node is NOT refusing, this does nothing useful and is refused: the
             </Field>
         </ConfigUI>
     </MenuItem>
+    <!--
+        Re-adopt a Matter accessory… (issue #219). Hands a LEFT-BEHIND
+        accessory identity — one orphaned by deleting the Indigo device that
+        exported it, or by un-exporting it — to a different Indigo device, so
+        the accessory keeps its room, name, scenes and automations in every
+        paired ecosystem. Placed right after the endpoint-map rebuild: both
+        are identity surgery reached for after something already went wrong,
+        not everyday export management.
+
+        A ROLE CHANGE's old accessory is deliberately NOT offered here.
+        `EndpointMapStore.orphans()` excludes every record carrying
+        `supersededBy`, because re-adopting one would resurrect an old-role
+        accessory under a number every paired ecosystem has already processed
+        a removal for — that number is retired on purpose (issue #240). The
+        intro label below says so, because a promise the picker cannot keep
+        is worse than no promise.
+
+        Master-detail shape, same reasoning as "Manage Matter Exports…": a
+        `menu` has a CallbackMethod, so `readoptOrphan` gets one
+        (`readoptOrphanChanged`) purely to make Indigo round-trip and re-run
+        `readoptDevice`'s own dynamicReload list, filtered to devices that can
+        take the picked accessory's role.
+    -->
+    <MenuItem id="readoptExport">
+        <Name>Re-adopt a Matter accessory…</Name>
+        <CallbackMethod>menuReadoptExport</CallbackMethod>
+        <ConfigUI>
+            <Field id="readoptIntro" type="label">
+                <Label>Hands a left-behind Matter accessory identity to a different Indigo device. Apple Home and every other paired ecosystem keep its room, its name, and every scene and automation built on it — nothing is re-paired and nothing is renumbered. This costs nothing when it succeeds.
+
+An accessory is left behind when the Indigo device that exported it is deleted, or when it stops being exported. It can only be re-adopted onto a device that can take the SAME role as the accessory it is inheriting; a device that cannot is refused below — export it normally instead, and it becomes a new accessory.
+
+A ROLE CHANGE is not recoverable this way. Changing a role removes the old accessory and adds a new one (issue #240), and the old one's accessory number is retired on purpose — re-adopting it would put an old-role accessory back under a number your ecosystems have already processed a removal for. Those accessories are not offered below.</Label>
+            </Field>
+            <Field id="readoptOrphan" type="menu">
+                <Label>Left-behind accessory:</Label>
+                <List class="self" method="getReadoptOrphans" dynamicReload="true"/>
+                <CallbackMethod>readoptOrphanChanged</CallbackMethod>
+            </Field>
+            <Field id="readoptOrphanHelp" type="label" fontColor="darkgray">
+                <Label>Left-behind accessories your ecosystems still remember.</Label>
+            </Field>
+            <Field id="readoptDevice" type="menu">
+                <Label>Hand it to:</Label>
+                <List class="self" method="getReadoptDevices" dynamicReload="true"/>
+                <Description>Only devices that can take the accessory's role are offered. A ● marks a device that is already exported.</Description>
+            </Field>
+            <Field id="readoptWarning" type="label">
+                <Label>If the device you pick above already has its own accessory (marked ●), re-adopting removes THAT accessory from every ecosystem and puts the left-behind one in its place instead.</Label>
+            </Field>
+            <Field id="readoptConfirm" type="checkbox" defaultValue="false">
+                <Label>I understand this hands the old accessory to a different Indigo device.</Label>
+            </Field>
+        </ConfigUI>
+    </MenuItem>
     <!-- issue #204 / ADR-0008: the ONLY way to bring back a matterNode device
          a user deleted by hand — device_sync deliberately does not recreate
          one it has been told to leave deleted (unlike every endpoint device,

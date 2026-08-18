@@ -44,7 +44,7 @@
     "acted on (§5 / PRD §7 race row): no action, one warning."
   ],
   "handshake": {
-    "protocolVersion": 1,
+    "protocolVersion": 2,
     "bridgeVersion": "0.0.0-test",
     "matterJsVersion": "0.0.0-test"
   },
@@ -53,7 +53,7 @@
       "message_id": "m1",
       "command": "attach",
       "args": {
-        "protocolVersion": 1,
+        "protocolVersion": 2,
         "pluginVersion": "2026.8.1",
         "endpoints": []
       }
@@ -76,7 +76,7 @@
       "message_id": "m2",
       "command": "attach",
       "args": {
-        "protocolVersion": 2,
+        "protocolVersion": 1,
         "pluginVersion": "2026.8.1",
         "endpoints": []
       }
@@ -84,7 +84,7 @@
     "response": {
       "message_id": "m2",
       "error_code": "version_mismatch",
-      "details": "Node speaks protocol version 1, client sent 2"
+      "details": "Node speaks protocol version 2, client sent 1"
     }
   },
   "not_attached": {
@@ -133,11 +133,13 @@
           {
             "indigoDeviceId": 123456789,
             "endpointNumber": 2,
+            "publishedAs": "indigo-123456789",
             "role": "onOffLight"
           },
           {
             "indigoDeviceId": 123456790,
             "endpointNumber": 3,
+            "publishedAs": "indigo-123456790",
             "role": "dimmableLight"
           }
         ],
@@ -277,7 +279,7 @@
       "message_id": "m10",
       "command": "attach",
       "args": {
-        "protocolVersion": 1,
+        "protocolVersion": 2,
         "pluginVersion": "2026.8.1",
         "endpoints": [
           {
@@ -320,11 +322,13 @@
           {
             "indigoDeviceId": 123456789,
             "endpointNumber": 2,
+            "publishedAs": "indigo-123456789",
             "role": "onOffLight"
           },
           {
             "indigoDeviceId": 123456790,
             "endpointNumber": 3,
+            "publishedAs": "indigo-123456790",
             "role": "dimmableLight"
           }
         ],
@@ -339,7 +343,7 @@
       "message_id": "m11",
       "command": "attach",
       "args": {
-        "protocolVersion": 1,
+        "protocolVersion": 2,
         "pluginVersion": "2026.8.1",
         "endpoints": [],
         "intent": "replace_all"
@@ -369,7 +373,7 @@
       "message_id": "m12",
       "command": "attach",
       "args": {
-        "protocolVersion": 1,
+        "protocolVersion": 2,
         "pluginVersion": "2026.8.1",
         "endpoints": []
       }
@@ -399,6 +403,32 @@
     },
     "response": {
       "message_id": "m13",
+      "result": {
+        "endpointNumber": 2
+      }
+    }
+  },
+  "upsert_endpoint_published_as": {
+    "request": {
+      "message_id": "m71",
+      "command": "upsert_endpoint",
+      "args": {
+        "endpoint": {
+          "indigoDeviceId": 123456789,
+          "role": "dimmableLight",
+          "label": "Kitchen Lamp",
+          "reachable": true,
+          "states": {
+            "onOff": true,
+            "level": 60
+          },
+          "options": {},
+          "publishedAs": "indigo-123456789~2"
+        }
+      }
+    },
+    "response": {
+      "message_id": "m71",
       "result": {
         "endpointNumber": 2
       }
@@ -715,7 +745,7 @@
       "message_id": "m28",
       "command": "attach",
       "args": {
-        "protocolVersion": 1,
+        "protocolVersion": 2,
         "pluginVersion": "2026.8.1",
         "endpoints": [
           {
@@ -899,76 +929,91 @@
           {
             "indigoDeviceId": 900001,
             "endpointNumber": 2,
+            "publishedAs": "indigo-900001",
             "role": "onOffPlugInUnit"
           },
           {
             "indigoDeviceId": 900002,
             "endpointNumber": 3,
+            "publishedAs": "indigo-900002",
             "role": "onOffLight"
           },
           {
             "indigoDeviceId": 900003,
             "endpointNumber": 4,
+            "publishedAs": "indigo-900003",
             "role": "dimmableLight"
           },
           {
             "indigoDeviceId": 900004,
             "endpointNumber": 5,
+            "publishedAs": "indigo-900004",
             "role": "colorTemperatureLight"
           },
           {
             "indigoDeviceId": 900005,
             "endpointNumber": 6,
+            "publishedAs": "indigo-900005",
             "role": "extendedColorLight"
           },
           {
             "indigoDeviceId": 900006,
             "endpointNumber": 7,
+            "publishedAs": "indigo-900006",
             "role": "windowCovering"
           },
           {
             "indigoDeviceId": 900007,
             "endpointNumber": 8,
+            "publishedAs": "indigo-900007",
             "role": "doorLock"
           },
           {
             "indigoDeviceId": 900008,
             "endpointNumber": 9,
+            "publishedAs": "indigo-900008",
             "role": "occupancySensor"
           },
           {
             "indigoDeviceId": 900009,
             "endpointNumber": 10,
+            "publishedAs": "indigo-900009",
             "role": "contactSensor"
           },
           {
             "indigoDeviceId": 900010,
             "endpointNumber": 11,
+            "publishedAs": "indigo-900010",
             "role": "temperatureSensor"
           },
           {
             "indigoDeviceId": 900011,
             "endpointNumber": 12,
+            "publishedAs": "indigo-900011",
             "role": "humiditySensor"
           },
           {
             "indigoDeviceId": 900012,
             "endpointNumber": 13,
+            "publishedAs": "indigo-900012",
             "role": "lightSensor"
           },
           {
             "indigoDeviceId": 900013,
             "endpointNumber": 14,
+            "publishedAs": "indigo-900013",
             "role": "pressureSensor"
           },
           {
             "indigoDeviceId": 900014,
             "endpointNumber": 15,
+            "publishedAs": "indigo-900014",
             "role": "flowSensor"
           },
           {
             "indigoDeviceId": 900015,
             "endpointNumber": 16,
+            "publishedAs": "indigo-900015",
             "role": "thermostat"
           }
         ],
@@ -1310,11 +1355,13 @@
           {
             "indigoDeviceId": 123456789,
             "endpointNumber": 4,
+            "publishedAs": "indigo-123456789",
             "role": "onOffLight"
           },
           {
             "indigoDeviceId": 123456790,
             "endpointNumber": 5,
+            "publishedAs": "indigo-123456790",
             "role": "dimmableLight"
           }
         ],
@@ -1322,6 +1369,47 @@
         "driftChecked": true,
         "warnings": []
       }
+    }
+  },
+  "list_orphans": {
+    "request": {
+      "message_id": "m71",
+      "command": "list_orphans",
+      "args": {}
+    },
+    "response": {
+      "message_id": "m71",
+      "result": [
+        {
+          "uniqueId": "indigo-223456791",
+          "number": 7,
+          "role": "dimmableLight",
+          "label": "Kitchen Lamp",
+          "orphanedAt": "2026-08-12T09:15:00Z",
+          "deviceId": 223456791
+        },
+        {
+          "uniqueId": "indigo-223456792",
+          "number": 4,
+          "role": "onOffLight",
+          "label": "Porch Light"
+        },
+        {
+          "uniqueId": "indigo-223456793",
+          "number": 9
+        }
+      ]
+    }
+  },
+  "list_orphans_empty": {
+    "request": {
+      "message_id": "m72",
+      "command": "list_orphans",
+      "args": {}
+    },
+    "response": {
+      "message_id": "m72",
+      "result": []
     }
   },
   "endpoint_map_invalid": {

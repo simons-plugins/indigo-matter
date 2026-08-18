@@ -6,8 +6,17 @@
  * a Matter stack.
  */
 
-/** Protocol version this node speaks. Skew fails closed on both peers (§2). */
-export const PROTOCOL_VERSION = 1;
+/**
+ * Protocol version this node speaks. Skew fails closed on both peers (§2).
+ *
+ * Bumped 1 → 2 alongside `EndpointSpec.publishedAs` first being sent
+ * (issues #219/#240, PR5 design owner ruling 1): rather than gate `publishedAs` behind a
+ * `bridgeVersion` capability check, the protocol simply requires v2. An old
+ * (pre-#219/#240) node cannot silently ignore a `publishedAs` it does not
+ * understand and publish a duplicate default-identity accessory, because it
+ * never gets past the handshake with a v2-speaking plugin at all.
+ */
+export const PROTOCOL_VERSION = 2;
 
 /** Seconds a connection may sit past the handshake without attaching (§2). */
 export const UNATTACHED_TIMEOUT_MS = 10_000;
@@ -24,7 +33,7 @@ export const WINDOW_DURATION_MIN_SECONDS = 180;
 export const WINDOW_DURATION_MAX_SECONDS = 900;
 export const WINDOW_DURATION_DEFAULT_SECONDS = 900;
 
-/** The complete `error_code` domain for protocol version 1 (§1.1). */
+/** The complete `error_code` domain for protocol version 2 (§1.1). */
 export const ErrorCode = {
     unknownCommand: "unknown_command",
     malformedArgs: "malformed_args",
@@ -125,6 +134,85 @@ export function isRole(value: unknown): value is RoleValue {
 }
 
 /**
+ * The *published* accessory identity (issues #219/#240) — the one string
+ * `Endpoint.id`, the bridged `UniqueID` and (with its prefix stripped) the
+ * bridged `SerialNumber` are all derived from (`endpoints.ts`'s
+ * `bridgedInfoFor`/`createEndpoint`). Lives here rather than in `endpoints.ts`
+ * so this module can parse and validate it (`reconcile.ts`'s
+ * `parseEndpointSpec`) without pulling matter.js into a module that is
+ * deliberately free of it; `endpoints.ts` re-exports `uniqueIdFor`/
+ * `endpointIdFor` as the generation-1 shorthand so nothing that does not care
+ * about generations has to learn this vocabulary.
+ *
+ * Generation 1 (`indigo-<deviceId>`) is byte-identical to every published
+ * identity this bridge has ever produced, which is why an ordinary export's
+ * wire frame is unchanged. A generation ≥ 2 (`indigo-<deviceId>~<N>`) is
+ * #240's role-change supersession; the plugin is the only peer that ever
+ * bumps one (PR5 design §1.3), and the node only ever receives what it produces.
+ */
+const PUBLISHED_ID_PREFIX = "indigo-";
+
+/** Matter's `UniqueID` cap (PR5 design F9, measured against matter.js 0.17.8). */
+export const PUBLISHED_ID_MAX = 32;
+
+/** `publishedIdFor(deviceId)` is `uniqueIdFor`/`endpointIdFor`'s generation-1 form. */
+export function publishedIdFor(indigoDeviceId: number, generation = 1): string {
+    return generation === 1
+        ? `${PUBLISHED_ID_PREFIX}${indigoDeviceId}`
+        : `${PUBLISHED_ID_PREFIX}${indigoDeviceId}~${generation}`;
+}
+
+/**
+ * The inverse of {@link publishedIdFor}, or `undefined` for anything that is
+ * not a lawful published identity — strict rather than forgiving, the same
+ * way `indigoDeviceIdFrom` (`endpoints.ts`, which now delegates here) always
+ * has been: `Number("indigo-1e3")`-style coercions would silently invent a
+ * device id, and an invented id is a new accessory in every paired ecosystem.
+ * The length cap is PR5 design F9's measured `UniqueID` limit, enforced here rather than
+ * discovered as a matter.js `AggregateError` during an attach.
+ */
+export function parsePublishedId(value: string): { deviceId: number; generation: number } | undefined {
+    if (value.length > PUBLISHED_ID_MAX) {
+        return undefined;
+    }
+    const match = /^indigo-(-?\d+)(?:~(\d+))?$/.exec(value);
+    if (match === null) {
+        return undefined;
+    }
+    const deviceId = Number(match[1]);
+    if (!Number.isSafeInteger(deviceId)) {
+        return undefined;
+    }
+    if (match[2] === undefined) {
+        return { deviceId, generation: 1 };
+    }
+    const generation = Number(match[2]);
+    return generation >= 2 ? { deviceId, generation } : undefined;
+}
+
+/**
+ * Is `newPublishedAs` the identity that SUPERSEDED `oldPublishedAs` — i.e. a
+ * later generation of the same identity (issue #240's role change)?
+ *
+ * The narrow question, deliberately, because it is the only removal-plus-create
+ * pair that retires an identity for good. A removal and a create for the same
+ * `indigoDeviceId` is NOT enough on its own: a re-adopt onto an
+ * already-exported device (PR5 design E2/E5) is also one removal plus one create for
+ * one device, and the identity it leaves behind is an ordinary orphan the
+ * re-adopt picker must go on offering — PR5 design E5 says so in as many words. Only a
+ * generation bump means "this identity has been replaced and its number is
+ * retired"; everything else means "this identity is simply not live right now".
+ */
+export function supersedes(oldPublishedAs: string, newPublishedAs: string): boolean {
+    const before = parsePublishedId(oldPublishedAs);
+    const after = parsePublishedId(newPublishedAs);
+    return (
+        before !== undefined && after !== undefined &&
+        before.deviceId === after.deviceId && after.generation > before.generation
+    );
+}
+
+/**
  * §3.1's opt-in for a reconcile that would empty the live endpoint set. The
  * literal is named because both the guard and its refusal message quote it.
  */
@@ -200,6 +288,16 @@ export interface EndpointSpec {
     indigoDeviceId: number;
     role: RoleValue;
     label: string;
+    /**
+     * Issues #219/#240 — the accessory identity this device publishes as
+     * (`Endpoint.id`/`UniqueID`/`SerialNumber`, see {@link publishedIdFor}).
+     * Required here (like {@link reachable} and {@link battery}) because the
+     * parser ({@link parseEndpointSpec}) is what defaults it — every other
+     * `EndpointSpec` in memory has already made the decision one way or the
+     * other. Defaults to `publishedIdFor(indigoDeviceId)`, today's derivation,
+     * on every path in this PR: nothing yet sends a generation above 1.
+     */
+    publishedAs: string;
     reachable: boolean;
     /** Role-specific state keys (§4.2). Values are Indigo-natural units. */
     states: Record<string, unknown>;
@@ -302,12 +400,34 @@ export interface EndpointSummary {
     indigoDeviceId: number;
     endpointNumber: number;
     role: RoleValue;
+    /** Issues #219/#240 — informational; see {@link EndpointSpec.publishedAs}. */
+    publishedAs: string;
 }
 
 export interface DriftEntry {
     uniqueId: string;
     expected: number;
     actual: number;
+}
+
+/**
+ * §3.12 `list_orphans` (issue #219) — one left-behind accessory identity the
+ * re-adopt picker could offer. Defined here rather than in `endpoint-map.ts`
+ * (which is where {@link EndpointMapStore.orphans} actually builds these) so
+ * `BridgeFacade.listOrphans()` — landing alongside the `list_orphans` command
+ * itself — can be declared without `endpoint-map.ts` reaching back into a
+ * module that already imports FROM it: the existing direction is
+ * `endpoint-map.ts` → `protocol.ts`, never the reverse.
+ */
+export interface OrphanRecord {
+    uniqueId: string;
+    number: number;
+    role?: string;
+    label?: string;
+    /** ISO-8601, or absent for a pre-PR5 orphan — the picker renders that as "date unknown". */
+    orphanedAt?: string;
+    /** The device that drove this identity before it was un-exported, if recorded. */
+    deviceId?: number;
 }
 
 /** §3.7 */
@@ -392,6 +512,11 @@ export interface BridgeFacade {
     factoryReset(preserveEndpointNumbers: boolean): Promise<void>;
     /** §3.11 — adopt the live endpoint numbers as the new persisted map. */
     rebuildEndpointMap(): Promise<StatusReport>;
+    /**
+     * §3.12 — every left-behind accessory identity the re-adopt picker (#219)
+     * could offer. Read-only: nothing about listing orphans changes the map.
+     */
+    listOrphans(): OrphanRecord[];
 }
 
 /** A protocol-level failure a command handler can throw to shape its response. */

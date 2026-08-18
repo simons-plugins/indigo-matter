@@ -17,6 +17,7 @@ import {
     type EndpointSpec,
     ErrorCode,
     type FabricInfo,
+    type OrphanRecord,
     type PairingReport,
     ProtocolError,
     type RemoveFabricResult,
@@ -68,6 +69,8 @@ export interface GoldenFrames {
     attach_replace_all: GoldenExchange;
     attach_mass_removal_refused: GoldenExchange;
     upsert_endpoint: GoldenExchange;
+    /** Issues #219/#240 — the request direction carrying a non-default `publishedAs`. */
+    upsert_endpoint_published_as: GoldenExchange;
     upsert_endpoint_role_change: GoldenExchange;
     upsert_endpoint_unknown_role: GoldenExchange;
     remove_endpoint: GoldenExchange;
@@ -110,6 +113,10 @@ export interface GoldenFrames {
     factory_reset_discard_map: GoldenExchange;
     rebuild_endpoint_map: GoldenExchange;
     endpoint_map_invalid: GoldenExchange;
+    /** §3.12 (issue #219) — the re-adopt picker's data. */
+    list_orphans: GoldenExchange;
+    /** The same command over a map with nothing orphaned. */
+    list_orphans_empty: GoldenExchange;
     /**
      * The holding pen for commands the node does not implement yet — EMPTY
      * since E5, and asserted empty. Kept because it is the mechanism the next
@@ -150,14 +157,28 @@ export const golden: GoldenFrames = JSON.parse(
  * thing it stands in for.
  */
 class EndpointModel {
-    readonly #endpoints = new Map<number, { role: RoleValue; endpointNumber: number; battery: boolean }>();
+    readonly #endpoints = new Map<
+        number,
+        { role: RoleValue; endpointNumber: number; battery: boolean; publishedAs: string }
+    >();
     /** Every number ever handed out, by device id. Never pruned — see above. */
     readonly #allocated = new Map<number, number>();
     #next = 2;
 
-    composition(): Map<number, LiveComposition> {
-        return new Map([...this.#endpoints.entries()].map(([id, entry]) =>
-            [id, { role: entry.role, battery: entry.battery }]));
+    /** Keyed on `publishedAs` (issues #219/#240) — see `planReconcile`'s own doc. */
+    composition(): Map<string, LiveComposition> {
+        return new Map([...this.#endpoints.entries()].map(([indigoDeviceId, entry]) =>
+            [entry.publishedAs, { indigoDeviceId, role: entry.role, battery: entry.battery }]));
+    }
+
+    /** The reverse of `composition()`'s key — mirrors `EndpointRegistry#deviceIdFor`. */
+    private deviceIdFor(publishedAs: string): number | undefined {
+        for (const [indigoDeviceId, entry] of this.#endpoints) {
+            if (entry.publishedAs === publishedAs) {
+                return indigoDeviceId;
+            }
+        }
+        return undefined;
     }
 
     summaries(): StatusReport["endpoints"] {
@@ -166,7 +187,12 @@ class EndpointModel {
         // — named fields rather than a spread of `entry`, or the model's own
         // bookkeeping leaks onto the wire.
         return [...this.#endpoints.entries()]
-            .map(([indigoDeviceId, entry]) => ({ indigoDeviceId, role: entry.role, endpointNumber: entry.endpointNumber }))
+            .map(([indigoDeviceId, entry]) => ({
+                indigoDeviceId,
+                role: entry.role,
+                endpointNumber: entry.endpointNumber,
+                publishedAs: entry.publishedAs,
+            }))
             .sort((a, b) => a.indigoDeviceId - b.indigoDeviceId);
     }
 
@@ -176,8 +202,11 @@ class EndpointModel {
 
     reconcile(desired: readonly EndpointSpec[], replaceAll: boolean): void {
         const plan = planReconcile(this.composition(), desired, replaceAll);
-        for (const indigoDeviceId of plan.remove) {
-            this.#endpoints.delete(indigoDeviceId);
+        for (const publishedAs of plan.remove) {
+            const indigoDeviceId = this.deviceIdFor(publishedAs);
+            if (indigoDeviceId !== undefined) {
+                this.#endpoints.delete(indigoDeviceId);
+            }
         }
         for (const spec of [...plan.create, ...plan.recreate]) {
             this.#endpoints.delete(spec.indigoDeviceId);
@@ -215,7 +244,8 @@ class EndpointModel {
     private add(spec: EndpointSpec): number {
         const endpointNumber = this.#allocated.get(spec.indigoDeviceId) ?? this.#next++;
         this.#allocated.set(spec.indigoDeviceId, endpointNumber);
-        this.#endpoints.set(spec.indigoDeviceId, { role: spec.role, endpointNumber, battery: spec.battery });
+        this.#endpoints.set(spec.indigoDeviceId,
+            { role: spec.role, endpointNumber, battery: spec.battery, publishedAs: spec.publishedAs });
         return endpointNumber;
     }
 }
@@ -264,6 +294,8 @@ export class StubBridge implements BridgeFacade {
     readonly removedFabrics: number[] = [];
     readonly factoryResets: boolean[] = [];
     rebuilds = 0;
+    /** §3.12 — what `listOrphans` answers; the re-adopt tests set this. */
+    orphans: OrphanRecord[] = [];
 
     getStatus(): StatusReport {
         if (this.poisonStatus) {
@@ -300,6 +332,10 @@ export class StubBridge implements BridgeFacade {
         this.rebuilds += 1;
         this.refusal = undefined;
         return structuredClone(golden.rebuild_endpoint_map.response.result) as StatusReport;
+    }
+
+    listOrphans(): OrphanRecord[] {
+        return structuredClone(this.orphans);
     }
 
     onDriftDetected(listener: (drift: DriftEntry[]) => void): void {

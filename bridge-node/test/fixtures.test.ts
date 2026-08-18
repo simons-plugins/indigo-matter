@@ -42,6 +42,8 @@ describe("golden fixtures match their typed mirror", () => {
         ["attach_replace_all result", golden.attach_replace_all.response.result, shapes.statusReplaceAll],
         ["attach mass_removal_refused", golden.attach_mass_removal_refused.response, shapes.massRemovalRefused],
         ["upsert_endpoint result", golden.upsert_endpoint.response.result, shapes.upsertResult],
+        ["upsert_endpoint (publishedAs) result",
+            golden.upsert_endpoint_published_as.response.result, shapes.upsertResult],
         ["upsert_endpoint role_change", golden.upsert_endpoint_role_change.response, shapes.roleChange],
         ["upsert_endpoint unknown_role", golden.upsert_endpoint_unknown_role.response, shapes.upsertUnknownRole],
         ["remove_endpoint result", golden.remove_endpoint.response.result, shapes.removeResult],
@@ -79,6 +81,8 @@ describe("golden fixtures match their typed mirror", () => {
             shapes.factoryResetResult],
         ["rebuild_endpoint_map result", golden.rebuild_endpoint_map.response.result, shapes.rebuiltStatus],
         ["endpoint_map_invalid", golden.endpoint_map_invalid.response, shapes.endpointMapInvalid],
+        ["list_orphans result", golden.list_orphans.response.result, shapes.orphanList],
+        ["list_orphans_empty result", golden.list_orphans_empty.response.result, shapes.orphanListEmpty],
     ];
 
     for (const [name, actual, expected] of cases) {

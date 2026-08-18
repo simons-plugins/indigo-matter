@@ -121,6 +121,7 @@ def test_write_persists_immediately_to_prefs(prefs, store):
     assert payload["exports"] == [{
         "indigoDeviceId": 7, "role": "windowCovering",
         "nameOverride": "Blind", "options": {OPTION_INVERT: True},
+        "publishedAs": None,
     }]
 
 
@@ -329,6 +330,100 @@ def test_entry_from_dict_rejects_bad_options():
 def test_entry_from_dict_rejects_non_string_name_override():
     with pytest.raises(ValueError):
         ExportEntry.from_dict({"indigoDeviceId": 1, "role": "onOffLight", "nameOverride": 7})
+
+
+# ---------------------------------------------------------------------------
+# Issues #219/#240 — published_as
+# ---------------------------------------------------------------------------
+def test_entry_from_dict_missing_published_as_is_none():
+    """A payload written by an older (pre-PR5) plugin has no key at all."""
+    entry = ExportEntry.from_dict({"indigoDeviceId": 1, "role": "onOffLight"})
+    assert entry.published_as is None
+
+
+def test_entry_from_dict_accepts_the_default_published_as():
+    entry = ExportEntry.from_dict(
+        {"indigoDeviceId": 1, "role": "onOffLight", "publishedAs": "indigo-1"})
+    assert entry.published_as == "indigo-1"
+
+
+def test_entry_from_dict_accepts_a_generation_suffixed_published_as():
+    entry = ExportEntry.from_dict(
+        {"indigoDeviceId": 1, "role": "onOffLight", "publishedAs": "indigo-1~2"})
+    assert entry.published_as == "indigo-1~2"
+
+
+def test_entry_from_dict_rejects_malformed_published_as():
+    with pytest.raises(ValueError):
+        ExportEntry.from_dict(
+            {"indigoDeviceId": 1, "role": "onOffLight", "publishedAs": "not-lawful"})
+
+
+def test_entry_from_dict_accepts_a_re_adopted_published_as():
+    """Issue #219 — a re-adopted entry publishes as the identity of the OLD,
+    deleted device while being driven by a NEW one. The two deliberately do
+    NOT agree, and demanding they did dropped the entry on the next load."""
+    entry = ExportEntry.from_dict(
+        {"indigoDeviceId": 1, "role": "onOffLight", "publishedAs": "indigo-2"})
+    assert entry.published_as == "indigo-2"
+
+
+def test_entry_from_dict_rejects_non_string_published_as():
+    with pytest.raises(ValueError):
+        ExportEntry.from_dict({"indigoDeviceId": 1, "role": "onOffLight", "publishedAs": 7})
+
+
+def test_published_as_round_trips_through_a_second_store(prefs, mock_logger):
+    first = ExportStore(lambda: prefs, mock_logger)
+    first.upsert(_entry(7, "windowCovering", published_as="indigo-7~2"))
+    second = ExportStore(lambda: prefs, mock_logger)
+    assert second.get(7).published_as == "indigo-7~2"
+
+
+def test_a_re_adopted_entry_round_trips_through_a_second_store(prefs, mock_logger):
+    """Issue #219, end to end through the persistence the menu action uses:
+    `menuReadoptExport` writes exactly this shape (a NEW device publishing as
+    the OLD device's identity), so it has to survive a plugin restart — a
+    dropped entry here silently un-exports the accessory the re-adopt existed
+    to preserve."""
+    first = ExportStore(lambda: prefs, mock_logger)
+    first.upsert(_entry(987654321, "onOffLight", published_as="indigo-123456789"))
+    second = ExportStore(lambda: prefs, mock_logger)
+    assert second.load_error is None
+    assert second.get(987654321).published_as == "indigo-123456789"
+
+
+def test_upsert_refuses_an_unlawful_published_as_at_WRITE_time(prefs, mock_logger):
+    """Belt and braces with `from_dict` (PR5 design edge case E12). Validating only at
+    LOAD time means the bad identity reaches the prefs, goes out on the very
+    next attach, and is refused there with `malformed_args` — which stops
+    EVERY export, not just this one — while the dialog that wrote it reported
+    success. Raising here is what lets the caller say it failed."""
+    store = ExportStore(lambda: prefs, mock_logger)
+    with pytest.raises(ValueError):
+        store.upsert(_entry(1, "onOffLight", published_as="indigo-1e3"))
+    assert store.get(1) is None, "nothing was written"
+    assert PREF_KEY not in prefs or "indigo-1e3" not in prefs[PREF_KEY]
+
+
+def test_upsert_still_accepts_a_re_adopted_published_as(prefs, mock_logger):
+    """The write-time check is LAWFULNESS only, exactly like `from_dict`'s —
+    a re-adopt is a NEW device publishing the OLD device's identity, so the
+    two deliberately do not agree."""
+    store = ExportStore(lambda: prefs, mock_logger)
+    store.upsert(_entry(1, "onOffLight", published_as="indigo-2"))
+    assert store.get(1).published_as == "indigo-2"
+
+
+def test_published_as_absent_on_load_of_an_older_payload(mock_logger):
+    """An entry saved before PR5 has no `publishedAs` key at all — it must
+    load, not be dropped as unusable, with `published_as` defaulting to None."""
+    blob = json.dumps({"v": SCHEMA_VERSION, "exports": [
+        {"indigoDeviceId": 1, "role": "onOffLight", "nameOverride": None, "options": {}},
+    ]})
+    store = ExportStore(lambda: {PREF_KEY: blob}, mock_logger)
+    assert store.load_error is None
+    assert store.get(1).published_as is None
 
 
 # ---------------------------------------------------------------------------

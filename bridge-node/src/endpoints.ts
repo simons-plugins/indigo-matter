@@ -72,7 +72,9 @@ import {
     describeErrorWithStack,
     type EndpointSpec,
     ErrorCode,
+    parsePublishedId,
     ProtocolError,
+    publishedIdFor,
     Role,
     type RoleValue,
 } from "./protocol.js";
@@ -84,54 +86,66 @@ import {
  */
 const logger = Logger.get("indigo-matter-endpoints");
 
-/** The one prefix {@link uniqueIdFor} and {@link indigoDeviceIdFrom} share. */
+/** The one prefix {@link serialNumberFrom} strips back off. */
 const UNIQUE_ID_PREFIX = "indigo-";
 
-/** Bridged Device Basic Information `UniqueID`, stable across restarts. */
+/**
+ * Bridged Device Basic Information `UniqueID`, stable across restarts —
+ * `publishedIdFor`'s generation-1 shorthand (issues #219/#240), re-exported
+ * here so every call site that does not yet know about generations keeps
+ * calling this exactly as before, and gets exactly today's value.
+ */
 export function uniqueIdFor(indigoDeviceId: number): string {
-    return `${UNIQUE_ID_PREFIX}${indigoDeviceId}`;
+    return publishedIdFor(indigoDeviceId);
 }
 
 /**
- * The inverse of {@link uniqueIdFor}, or `undefined` for anything that is not
- * one of ours.
+ * The inverse of `publishedIdFor`, or `undefined` for anything that is not a
+ * lawful published identity — re-exported here for the same reason as
+ * {@link uniqueIdFor}.
  *
  * §6.3's "identity flows one way" is about the *protocol*: nothing on the wire
  * is ever keyed on a derived value. `endpoint-map.json` is not on the wire — it
  * is keyed by `UniqueID` because that is what drift is reported against — so
- * restoring an endpoint from it (issue #141) needs the device id back. It lives
- * next to the forward derivation so the two cannot drift apart, and it is
- * strict rather than forgiving: `Number("indigo-1e3")`-style coercions would
- * silently invent a device id, and an invented id is a new accessory in every
- * paired ecosystem.
+ * restoring an endpoint from it (issue #141) needs the device id back. Since
+ * PR5 this also accepts a generation suffix (`indigo-<id>~<gen>`) — documented
+ * here because its only caller is restore-on-start's fallback.
  */
 export function indigoDeviceIdFrom(uniqueId: string): number | undefined {
-    if (!uniqueId.startsWith(UNIQUE_ID_PREFIX)) {
-        return undefined;
-    }
-    const digits = uniqueId.slice(UNIQUE_ID_PREFIX.length);
-    if (!/^-?\d+$/.test(digits)) {
-        return undefined;
-    }
-    const indigoDeviceId = Number(digits);
-    return Number.isSafeInteger(indigoDeviceId) ? indigoDeviceId : undefined;
+    return parsePublishedId(uniqueId)?.deviceId;
 }
 
 /**
- * `Endpoint.id` derivation — the identity key of BRIDGE_PROTOCOL §4.1/§6.3.
- * Deliberately the *same* value as {@link uniqueIdFor}: one derivation means the
- * two can never drift apart, and §6.3's one-way identity flow reads directly.
- * matter.js keys persisted endpoint numbers on this string alone (PRD §4.3), so
- * it must never be reused or mutated.
+ * The `Endpoint.id` a device gets **by default** — i.e. the generation-1
+ * derivation, `indigo-<deviceId>`. Deliberately the *same* value as
+ * {@link uniqueIdFor}: one derivation means the two can never drift apart, and
+ * §6.3's one-way identity flow reads directly. matter.js keys persisted
+ * endpoint numbers on this string alone (PRD §4.3), so it must never be reused
+ * or mutated.
+ *
+ * **It is NOT where a live endpoint's id comes from, and reverting it to that
+ * would be silent.** Since issues #219/#240 an `Endpoint.id` is built from
+ * `spec.publishedAs` (`createEndpoint`), which merely DEFAULTS to this
+ * derivation — a re-adopted or role-changed accessory publishes something
+ * else, and rebuilding the id from `indigoDeviceId` here would hand it a
+ * different `Endpoint.id`, i.e. a different matter.js endpoint number, i.e. a
+ * duplicate accessory in every paired ecosystem. Neither this nor
+ * {@link uniqueIdFor} has a single caller left in `src/` for that reason; both
+ * survive as the named default and for tests. `restore.test.ts`'s "the SAME
+ * `Endpoint.id` gets the SAME number back" case is the mutation-probed pin
+ * that catches a revert.
  */
 export const endpointIdFor = uniqueIdFor;
 
 /**
  * `SerialNumber` must differ from `UniqueID` (Matter rejects equal values), so
- * the device id goes in bare here and prefixed there.
+ * the `indigo-` prefix is stripped here and kept there. Takes the *published*
+ * identity, not the driving device id (issues #219/#240): a re-adopted
+ * accessory keeps publishing the OLD serial number, because §6.3's identity
+ * flow now runs through `publishedAs`, not `indigoDeviceId`, directly.
  */
-export function serialNumberFor(indigoDeviceId: number): string {
-    return String(indigoDeviceId);
+export function serialNumberFrom(publishedAs: string): string {
+    return publishedAs.slice(UNIQUE_ID_PREFIX.length);
 }
 
 // ---------------------------------------------------------------------------
@@ -564,8 +578,10 @@ interface CommandSink {
  * behaviour is constructed by matter.js from a type, with no way to close over
  * the per-endpoint `emit` the way {@link watchCommands} does for the attribute
  * roles. This map is that closure, keyed on the one identifier a behaviour can
- * always reach (`this.endpoint.id`, which {@link endpointIdFor} makes a pure
- * function of `indigoDeviceId`).
+ * always reach: `this.endpoint.id`, which IS the endpoint's `spec.publishedAs`
+ * (see {@link createEndpoint}) — the CommandSink value carries `indigoDeviceId`
+ * separately (issues #219/#240) precisely because, under a re-adopted
+ * identity, the two are no longer a pure function of one another.
  *
  * Registration and teardown both live in {@link watchCommands} so the lifetime
  * is identical to the observable listeners': one place removes both, and a
@@ -2292,8 +2308,8 @@ function bridgedInfoFor(spec: EndpointSpec, identity: BridgedIdentity): Record<s
         nodeLabel: spec.label,
         productName: identity.productName,
         productLabel: spec.label,
-        serialNumber: serialNumberFor(spec.indigoDeviceId),
-        uniqueId: uniqueIdFor(spec.indigoDeviceId),
+        serialNumber: serialNumberFrom(spec.publishedAs),
+        uniqueId: spec.publishedAs,
         reachable: spec.reachable,
         // Branded, not a bare number: matter.js validates the tag at write time,
         // and the root node's BasicInformation already goes through VendorId().
@@ -2349,7 +2365,7 @@ export function createEndpoint(spec: EndpointSpec, identity: BridgedIdentity): E
     // away alongside the stranger it arrived with, at construction time.
     const patch = battery !== undefined ? definition.statePatch(rest) : statePatchOrRefuse(spec.role, rest);
     return new Endpoint(deviceTypeFor(definition, spec.battery) as never, {
-        id: endpointIdFor(spec.indigoDeviceId),
+        id: spec.publishedAs,
         ...mergeBehaviors(
             { [BRIDGED_INFO]: bridgedInfoFor(spec, identity) },
             definition.initialState(),
@@ -2411,6 +2427,7 @@ export async function applyStates(
     role: RoleValue,
     states: Record<string, unknown>,
     hasBattery: boolean,
+    indigoDeviceId: number,
 ): Promise<void> {
     // Split FIRST, before `statePatchOrRefuse` sees `states` — the composition
     // check (does *this* endpoint have a battery) has to run before anything
@@ -2418,9 +2435,12 @@ export async function applyStates(
     // gets.
     const { battery, rest } = splitBattery(states);
     if (battery !== undefined && !hasBattery) {
-        // `endpoint.id` is always `indigo-<indigoDeviceId>` for a bridge-owned
-        // endpoint (`endpointIdFor`), so this always parses.
-        refuseBatteryLevelWithoutBattery(indigoDeviceIdFrom(endpoint.id) ?? -1);
+        // Passed in by the caller (issues #219/#240) rather than derived from
+        // `endpoint.id`: under a re-adopted published identity, `endpoint.id`
+        // no longer parses back to the device driving it, and deriving from it
+        // here would name the WRONG device — the old, deleted one — in the
+        // refusal.
+        refuseBatteryLevelWithoutBattery(indigoDeviceId);
     }
     // A consumed `batteryLevel` counts as consumption for refusal purposes
     // too — the version-skew tolerance this function's own doc describes
@@ -2596,12 +2616,16 @@ export function isEcosystemChange(context: unknown): boolean {
  */
 export function watchCommands(
     endpoint: Endpoint,
-    spec: { indigoDeviceId: number; role: RoleValue },
+    spec: { indigoDeviceId: number; role: RoleValue; publishedAs: string },
     emit: (data: CommandEventData) => void,
     log: (message: string) => void = () => {},
 ): () => void {
     const teardown: (() => void)[] = [];
-    const endpointId = endpointIdFor(spec.indigoDeviceId);
+    // The published identity, not `endpointIdFor(spec.indigoDeviceId)`: under a
+    // re-adopted identity (issue #219) the two differ, and `COMMAND_SINKS` is
+    // keyed on `endpoint.id`/`Endpoint.id`, which IS `spec.publishedAs` (see
+    // {@link createEndpoint}) — the sink has to be found under the same key.
+    const endpointId = spec.publishedAs;
     COMMAND_SINKS.set(endpointId, { indigoDeviceId: spec.indigoDeviceId, emit, log });
     teardown.push(() => COMMAND_SINKS.delete(endpointId));
 

@@ -391,13 +391,58 @@ class TestDialogNudges:
         values = plug.exportAddOrUpdate(
             _values(exportDevice="101", exportRole="onOffLight"), "manageMatterExports")
         plug.export_bridge.replace.assert_called_once_with(101)
-        assert "RE-CREATES" in values["exportStatus"]
+        assert "NEW one" in values["exportStatus"]
         assert "Apple Home" in values["exportStatus"]
+        assert "issue #240" in values["exportStatus"]
 
     def test_an_ordinary_update_does_not_threaten_the_user(self, plug):
         values = plug.exportAddOrUpdate(
             _values(exportDevice="101", exportRole="onOffPlugInUnit"), "manageMatterExports")
-        assert "RE-CREATES" not in values["exportStatus"]
+        assert "NEW one" not in values["exportStatus"]
+
+    def test_a_first_export_gets_no_published_as(self, plug):
+        """Nothing has moved off the default derivation yet (issue #240)."""
+        plug.exportAddOrUpdate(
+            _values(exportDevice="101", exportRole="onOffPlugInUnit"), "manageMatterExports")
+        assert plug.exports.get(101).published_as is None
+
+    def test_an_ordinary_update_does_not_bump_the_generation(self, plug):
+        """An update must never move the identity on its own (PR5 design §1.3)."""
+        plug.exportAddOrUpdate(
+            _values(exportDevice="101", exportRole="onOffPlugInUnit"), "manageMatterExports")
+        plug.exportAddOrUpdate(
+            _values(exportDevice="101", exportRole="onOffPlugInUnit", exportName="Desk"),
+            "manageMatterExports")
+        assert plug.exports.get(101).published_as is None
+
+    def test_a_role_change_bumps_the_generation(self, plug):
+        """Issue #240 — a role change moves the accessory to a fresh identity."""
+        plug.exportAddOrUpdate(
+            _values(exportDevice="101", exportRole="onOffPlugInUnit"), "manageMatterExports")
+        plug.exportAddOrUpdate(
+            _values(exportDevice="101", exportRole="onOffLight"), "manageMatterExports")
+        assert plug.exports.get(101).published_as == "indigo-101~2"
+
+    def test_a_second_role_change_bumps_the_generation_again(self, plug):
+        plug.exportAddOrUpdate(
+            _values(exportDevice="101", exportRole="onOffPlugInUnit"), "manageMatterExports")
+        plug.exportAddOrUpdate(
+            _values(exportDevice="101", exportRole="onOffLight"), "manageMatterExports")
+        plug.exportAddOrUpdate(
+            _values(exportDevice="101", exportRole="doorLock"), "manageMatterExports")
+        assert plug.exports.get(101).published_as == "indigo-101~3"
+
+    def test_a_role_change_after_a_generation_bump_does_not_reset_it(self, plug):
+        """An unrelated update between two role changes must not touch the
+        identity it is not moving (PR5 design §1.3)."""
+        plug.exportAddOrUpdate(
+            _values(exportDevice="101", exportRole="onOffPlugInUnit"), "manageMatterExports")
+        plug.exportAddOrUpdate(
+            _values(exportDevice="101", exportRole="onOffLight"), "manageMatterExports")
+        plug.exportAddOrUpdate(
+            _values(exportDevice="101", exportRole="onOffLight", exportName="Desk"),
+            "manageMatterExports")
+        assert plug.exports.get(101).published_as == "indigo-101~2"
 
     def test_a_refused_add_nudges_nothing(self, plug):
         plug.exportAddOrUpdate(_values(exportDevice="0"), "manageMatterExports")
