@@ -368,7 +368,8 @@ class TestCoverage:
         # §4.2: sensors are read-only in Matter. An empty tuple there is a
         # decision, and this is what stops it being read as an oversight and
         # "fixed" by inventing a command the node would never emit.
-        for role in ("occupancySensor", "contactSensor", "temperatureSensor",
+        for role in ("occupancySensor", "contactSensor", "waterLeakDetector",
+                     "waterFreezeDetector", "rainSensor", "temperatureSensor",
                      "humiditySensor", "lightSensor", "pressureSensor", "flowSensor"):
             assert bridge_protocol.ROLE_COMMANDS[role] == ()
 

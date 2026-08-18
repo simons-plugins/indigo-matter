@@ -52,6 +52,9 @@ import { LevelControl } from "@matter/main/clusters/level-control";
 import { Thermostat } from "@matter/main/clusters/thermostat";
 import { ColorTemperatureLightDevice } from "@matter/main/devices/color-temperature-light";
 import { ContactSensorDevice } from "@matter/main/devices/contact-sensor";
+import { WaterLeakDetectorDevice } from "@matter/main/devices/water-leak-detector";
+import { WaterFreezeDetectorDevice } from "@matter/main/devices/water-freeze-detector";
+import { RainSensorDevice } from "@matter/main/devices/rain-sensor";
 import { DimmableLightDevice } from "@matter/main/devices/dimmable-light";
 import { DoorLockDevice } from "@matter/main/devices/door-lock";
 import { ExtendedColorLightDevice } from "@matter/main/devices/extended-color-light";
@@ -2069,6 +2072,34 @@ const ROLE_DEFINITIONS: Record<RoleValue, RoleDefinition> = {
         // documented "in a Contact Sensor device type, FALSE=open or no
         // contact, TRUE=closed or contact" — the same polarity, so no inversion.
         statePatch: booleanStatePatch(BOOLEAN_STATE, "contact", "stateValue", contact => contact),
+        watch: [],
+    },
+    // The leak family (issue #236). One cluster, three device types: each
+    // ships BooleanState as a MANDATORY behaviour already present in the
+    // device definition — unlike `occupancySensor`, whose cluster has to be
+    // declared with a modality feature — so these are the smallest role
+    // definitions in the file, and deliberately identical to each other.
+    //
+    // The polarity is NOT contactSensor's. `stateValue` in a detector device
+    // type is documented "true = detected", where the same attribute in a
+    // Contact Sensor is "true = closed"; §4.2 gives each its own state key so
+    // the two readings can never be confused across a role change.
+    [Role.waterLeakDetector]: {
+        deviceType: () => WaterLeakDetectorDevice.with(BridgedDeviceBasicInformationServer),
+        initialState: () => ({}),
+        statePatch: booleanStatePatch(BOOLEAN_STATE, "leak", "stateValue", leak => leak),
+        watch: [],
+    },
+    [Role.waterFreezeDetector]: {
+        deviceType: () => WaterFreezeDetectorDevice.with(BridgedDeviceBasicInformationServer),
+        initialState: () => ({}),
+        statePatch: booleanStatePatch(BOOLEAN_STATE, "freeze", "stateValue", freeze => freeze),
+        watch: [],
+    },
+    [Role.rainSensor]: {
+        deviceType: () => RainSensorDevice.with(BridgedDeviceBasicInformationServer),
+        initialState: () => ({}),
+        statePatch: booleanStatePatch(BOOLEAN_STATE, "rain", "stateValue", rain => rain),
         watch: [],
     },
     [Role.temperatureSensor]: {

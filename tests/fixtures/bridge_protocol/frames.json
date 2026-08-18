@@ -909,6 +909,36 @@
               "systemMode": "heat"
             },
             "options": {}
+          },
+          {
+            "indigoDeviceId": 900016,
+            "role": "waterLeakDetector",
+            "label": "Utility Leak Sensor",
+            "reachable": true,
+            "states": {
+              "leak": false
+            },
+            "options": {}
+          },
+          {
+            "indigoDeviceId": 900017,
+            "role": "waterFreezeDetector",
+            "label": "Loft Freeze Sensor",
+            "reachable": true,
+            "states": {
+              "freeze": false
+            },
+            "options": {}
+          },
+          {
+            "indigoDeviceId": 900018,
+            "role": "rainSensor",
+            "label": "Garden Rain Sensor",
+            "reachable": true,
+            "states": {
+              "rain": false
+            },
+            "options": {}
           }
         ]
       }
@@ -924,7 +954,7 @@
             "vendorId": 4937
           }
         ],
-        "endpointCount": 15,
+        "endpointCount": 18,
         "endpoints": [
           {
             "indigoDeviceId": 900001,
@@ -1015,6 +1045,24 @@
             "endpointNumber": 16,
             "publishedAs": "indigo-900015",
             "role": "thermostat"
+          },
+          {
+            "indigoDeviceId": 900016,
+            "endpointNumber": 17,
+            "publishedAs": "indigo-900016",
+            "role": "waterLeakDetector"
+          },
+          {
+            "indigoDeviceId": 900017,
+            "endpointNumber": 18,
+            "publishedAs": "indigo-900017",
+            "role": "waterFreezeDetector"
+          },
+          {
+            "indigoDeviceId": 900018,
+            "endpointNumber": 19,
+            "publishedAs": "indigo-900018",
+            "role": "rainSensor"
           }
         ],
         "drift": [],
@@ -1448,5 +1496,53 @@
       "them from day one — which is what let the plugin half of §3.9-§3.11 ship at",
       "E1 and sit correct until the node caught up."
     ]
+  },
+  "set_state_water_leak_detector": {
+    "request": {
+      "message_id": "m73",
+      "command": "set_state",
+      "args": {
+        "indigoDeviceId": 900016,
+        "states": {
+          "leak": true
+        }
+      }
+    },
+    "response": {
+      "message_id": "m73",
+      "result": {}
+    }
+  },
+  "set_state_water_freeze_detector": {
+    "request": {
+      "message_id": "m74",
+      "command": "set_state",
+      "args": {
+        "indigoDeviceId": 900017,
+        "states": {
+          "freeze": true
+        }
+      }
+    },
+    "response": {
+      "message_id": "m74",
+      "result": {}
+    }
+  },
+  "set_state_rain_sensor": {
+    "request": {
+      "message_id": "m75",
+      "command": "set_state",
+      "args": {
+        "indigoDeviceId": 900018,
+        "states": {
+          "rain": true
+        }
+      }
+    },
+    "response": {
+      "message_id": "m75",
+      "result": {}
+    }
   }
 }

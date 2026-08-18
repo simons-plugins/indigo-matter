@@ -77,7 +77,8 @@ ZOO = {
     # --- Sensor rows ------------------------------------------------------
     "sensor_binary": (
         SensorDevice(5, "Hall Motion", supportsOnState=True),
-        EligibleDevice(("occupancySensor", "contactSensor"), "occupancySensor"),
+        EligibleDevice(("occupancySensor", "contactSensor", "waterLeakDetector",
+                        "waterFreezeDetector", "rainSensor"), "occupancySensor"),
     ),
     "sensor_temperature": (
         SensorDevice(6, "Study Temperature", supportsSensorValue=True,
@@ -430,8 +431,16 @@ def test_humidity_beats_temperature_in_a_combined_name():
 
 
 def test_binary_sensor_beats_the_unit_heuristic():
+    """A device claiming BOTH flags is read as binary, not numeric.
+
+    The role asserted is `contactSensor` because "Door" is what the binary name
+    heuristic sees (issue #236) — the point of the test is the *branch*: a
+    numeric-sounding name does not drag an on/off sensor into the numeric five.
+    """
     dev = SensorDevice(1, "Door Temperature", supportsOnState=True, supportsSensorValue=True)
-    assert classify(dev, OURS).default_role == "occupancySensor"
+    verdict = classify(dev, OURS)
+    assert verdict.default_role == "contactSensor"
+    assert set(verdict.eligible_roles) == set(export_catalog.BINARY_SENSOR_ROLES)
 
 
 # ---------------------------------------------------------------------------

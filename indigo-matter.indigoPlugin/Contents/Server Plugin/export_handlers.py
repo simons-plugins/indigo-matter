@@ -105,6 +105,9 @@ STATE_POSITION = "position"
 STATE_LOCKED = "locked"
 STATE_OCCUPIED = "occupied"
 STATE_CONTACT = "contact"
+STATE_LEAK = "leak"
+STATE_FREEZE = "freeze"
+STATE_RAIN = "rain"
 STATE_TEMPERATURE_C = "temperatureC"
 STATE_HUMIDITY_PCT = "humidityPct"
 STATE_LUX = "lux"
@@ -939,6 +942,35 @@ class ContactSensorExport(BinarySensorExport):
     state_key = STATE_CONTACT
 
 
+class WaterLeakDetectorExport(BinarySensorExport):
+    """``waterLeakDetector`` — an Indigo leak sensor. True = leak detected.
+
+    No inversion, and the polarity is worth stating because it is the OPPOSITE
+    reading of the same cluster attribute :class:`ContactSensorExport` uses:
+    BooleanState's `stateValue` is "true = closed" in a Contact Sensor and
+    "true = detected" in a Water Leak Detector. Indigo's `onState` for a leak
+    sensor is true when wet, so both sides already agree and the handler is a
+    pass-through — the divergence lives in the device type, not in a convert.
+    """
+
+    role = export_catalog.ROLE_WATER_LEAK_DETECTOR
+    state_key = STATE_LEAK
+
+
+class WaterFreezeDetectorExport(BinarySensorExport):
+    """``waterFreezeDetector`` — an Indigo freeze/frost sensor. True = detected."""
+
+    role = export_catalog.ROLE_WATER_FREEZE_DETECTOR
+    state_key = STATE_FREEZE
+
+
+class RainSensorExport(BinarySensorExport):
+    """``rainSensor`` — an Indigo rain sensor. True = rain detected."""
+
+    role = export_catalog.ROLE_RAIN_SENSOR
+    state_key = STATE_RAIN
+
+
 class NumericSensorExport(ExportHandler):
     """The five measured-value sensors — Indigo's ``sensorValue``.
 
@@ -1029,6 +1061,9 @@ HANDLERS: dict[str, ExportHandler] = {
         DoorLockExport(),
         OccupancySensorExport(),
         ContactSensorExport(),
+        WaterLeakDetectorExport(),
+        WaterFreezeDetectorExport(),
+        RainSensorExport(),
         TemperatureSensorExport(),
         HumiditySensorExport(),
         LightSensorExport(),

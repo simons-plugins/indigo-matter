@@ -410,7 +410,7 @@ are offered.
 | Dimmer | **Dimmable light** *(default)*, Window covering | Dimmable Light · Window Covering |
 | Dimmer, colour-temperature capable | **Colour-temperature light** *(default)*, Dimmable light, Window covering | Color Temperature Light |
 | Dimmer, full colour | **Full-colour light** *(default)*, Dimmable light, Colour-temperature light, Window covering | Extended Color Light |
-| Sensor, on/off | **Occupancy (PIR/motion)** *(default)*, Contact | Occupancy Sensor · Contact Sensor |
+| Sensor, on/off | Occupancy (PIR/motion), Contact, Water leak, Freeze, Rain — the default is read from the device's name, and you can correct it | Occupancy Sensor · Contact Sensor · Water Leak Detector · Water Freeze Detector · Rain Sensor |
 | Sensor, numeric | Temperature, Humidity, Light (lux), Pressure, Flow — the default is guessed from the device's units, and you can correct it | the matching Matter sensor type |
 | Thermostat | Thermostat | Thermostat (setpoints and modes; no fan in v1) |
 
@@ -422,6 +422,17 @@ device runs the other way. And the
 **numeric sensor** guess reads whatever unit hints the device carries (its
 plugin's properties, its displayed value, then its name) — it is only a default,
 and all five roles stay selectable.
+
+**On/off sensors now cover the safety family, and the default is read from
+the device's name** (issue #236). A leak sensor exports as Matter's own Water
+Leak Detector, so Apple Home shows it as a leak sensor with leak alerts rather
+than as a mis-labelled occupancy tile; freeze and rain sensors get the adjacent
+Matter types. Because a binary sensor publishes one boolean and no unit, its
+name is the only evidence there is about what it detects — so "Utility Leak
+Sensor" defaults to Water leak, "Front Door" to Contact, "Study PIR" to
+Occupancy. It is only ever a **default**: all five roles stay selectable, and
+picking the right one at first export matters because changing a role later
+costs the accessory's room (see below).
 
 **A motion sensor exports as "Occupancy" — that is Matter's own ceiling, not
 a gap in this plugin** (issue #252). Matter 1.x defines no motion device type.
