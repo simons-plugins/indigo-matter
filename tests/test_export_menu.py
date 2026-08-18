@@ -1474,6 +1474,24 @@ class TestGetReadoptDevices:
                                          {"migrateDevice": "303"}, errors) is None
         assert "needs a state mapping" in errors["migrateDevice"]
 
+    def test_an_already_mapped_device_is_a_selectable_target(self, plug, devices):
+        """Reported live 2026-08-18: "Gate contact is already exported. I'm
+        migrating to an existing export." A custom device that HAS been
+        exported carries its mapping in its own entry — asking the classifier
+        without it read a fully-configured zone back as one still needing a
+        mapping, so it stayed unselectable with advice the user had already
+        followed.
+        """
+        devices.add(fakes.texecom_zone(320, "Gate Contact"))
+        plug.exports.upsert(ExportEntry(320, "contactSensor",
+                                        options={"stateKey": "status", "stateInvert": True}))
+        _bridge_with(plug, attached=True)
+        orphan = _orphan(role="contactSensor")
+        plug.runtime = _FakeRuntime(result=[orphan])
+        labels = _labels(plug.getReadoptDevices(valuesDict={"readoptOrphan": orphan.unique_id}))
+        assert "320" in labels, "selectable — it is already mapped"
+        assert labels["320"] == "● Gate Contact"
+
     def test_rows_are_alphabetical_within_each_block(self, plug, devices):
         """Reported live 2026-08-18: "not fully alphabetical but also not
         published devices first either". Both pickers walked `indigo.devices`,
@@ -2550,3 +2568,56 @@ def test_a_stale_state_key_is_not_saved_onto_a_non_binary_role(plug, devices):
     plug.exportAddOrUpdate(_values(exportDevice="106", exportStateKey="status",
                                    exportRole="temperatureSensor"))
     assert plug.exports.get(106).options == {}
+
+
+# ---------------------------------------------------------------------------
+# Migrating onto a mapped device (issue #252 follow-up)
+# ---------------------------------------------------------------------------
+def test_migrate_takes_the_state_mapping_from_the_target_not_the_source(plug, devices):
+    """The mapping describes the HARDWARE, not the accessory.
+
+    Live case: an accessory on a Masquerade proxy (no mapping — the proxy has
+    a real `onState`) migrated onto a Texecom zone. Carrying the source's
+    empty mapping across left the zone's entry with no state key, so it
+    classified as merely mappable, the endpoint provider skipped it, and the
+    accessory went dark instead of moving.
+    """
+    devices.add(SensorDevice(330, "msqGateContact", supportsOnState=True))
+    devices.add(fakes.texecom_zone(331, "Gate Contact"))
+    plug.exports.upsert(ExportEntry(330, "contactSensor"))                       # the accessory
+    plug.exports.upsert(ExportEntry(331, "contactSensor",                        # the zone
+                                    options={"stateKey": "status", "stateInvert": True}))
+    client = _bridge_with(plug, attached=True)
+    errors = {}
+    plug._migrate_commit(client, 330, plug.exports.get(330),
+                         devices[331], errors, _values())
+    moved = plug.exports.get(331)
+    assert moved.published_as == "indigo-330", "the accessory identity moved"
+    assert moved.options["stateKey"] == "status", "and the zone kept its own mapping"
+    assert moved.options["stateInvert"] is True
+    assert 330 not in plug.exports, "the source entry is gone"
+
+
+def test_migrate_drops_a_mapping_the_new_device_cannot_honour(plug, devices):
+    """The mirror. Migrating OFF a mapped custom device onto ordinary hardware
+    must not carry a state key naming a state the new device never publishes —
+    that would classify as excluded and go dark just as surely."""
+    devices.add(fakes.texecom_zone(340, "Gate Contact"))
+    devices.add(SensorDevice(341, "Z-Wave Gate Contact", supportsOnState=True))
+    plug.exports.upsert(ExportEntry(340, "contactSensor",
+                                    options={"stateKey": "status", "stateInvert": True}))
+    client = _bridge_with(plug, attached=True)
+    plug._migrate_commit(client, 340, plug.exports.get(340),
+                         devices[341], {}, _values())
+    moved = plug.exports.get(341)
+    assert "stateKey" not in moved.options
+    assert "stateInvert" not in moved.options
+
+
+def test_migrate_still_carries_non_mapping_options_from_the_source():
+    """Window-covering polarity and anything else still follows the accessory —
+    only the state mapping is device-scoped."""
+    from server_menu_mixin import _migrated_options
+    carried = _migrated_options({"invert": True, "stateKey": "old"},
+                                {"stateKey": "status", "stateInvert": True})
+    assert carried == {"invert": True, "stateKey": "status", "stateInvert": True}

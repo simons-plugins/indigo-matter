@@ -3,6 +3,27 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
+## 2026.23.3 — migrate onto a device you have already mapped
+
+### Fixed
+
+- **A device you had already exported with a state mapping was still refused
+  as a migrate or re-adopt target**, telling you to do the thing you had just
+  done. Both dialogs asked the classifier about the device *bare*, ignoring
+  the mapping saved in its own export — so a Texecom zone exported five
+  minutes earlier read back as one still needing a mapping. They now ask about
+  the device **as configured**.
+- **Migrating an accessory onto a mapped device would have left it dark.** The
+  new entry took its options from the accessory's old device, so migrating
+  from a Masquerade proxy — which needs no mapping, having a real on/off state
+  — onto an alarm zone produced an entry with no mapping for a device that
+  requires one: nothing would have been published, and the accessory would
+  have gone quiet rather than moved. A state mapping describes *the hardware*,
+  not the accessory riding on it, so it now comes from the device being
+  migrated **to**. The mirror case is fixed with it: migrating off a mapped
+  zone onto ordinary hardware no longer carries a state key the new device
+  never publishes. Re-adopt already worked this way; migrate now agrees.
+
 ## 2026.23.2 — mappable devices come back to the migrate and re-adopt pickers
 
 ### Fixed
