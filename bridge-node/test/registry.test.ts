@@ -1244,7 +1244,64 @@ describe("endpoint-number stability (PRD §4.3 / XAC5)", () => {
     });
 });
 
+/** A re-adopt's replacement device: drives identity `indigo-1`, is not 1. */
+const REPLACEMENT_DEVICE = 700_000_001;
+
 describe("supersede & published identity (issues #219/#240)", () => {
+    it("publishes the OLD UniqueID and SerialNumber for a re-adopted identity", async () => {
+        // The F7/F8 pin, and the whole of #219 in one assertion: the only
+        // identity a controller can see is the endpoint number plus the
+        // bridged Basic Information attributes, and matter.js does NOT
+        // persist `uniqueId`/`serialNumber` — whatever is declared at
+        // construction is what is published. A re-adopted accessory is
+        // therefore only "the same accessory" to Apple Home if BOTH are
+        // derived from `publishedAs` rather than from the device now driving
+        // it; derive either from `indigoDeviceId` and every paired ecosystem
+        // sees a brand-new accessory, room and scenes gone.
+        const h = await harness();
+        try {
+            await h.registry.reconcile(
+                [spec(REPLACEMENT_DEVICE, Role.onOffLight, { publishedAs: uniqueIdFor(1) })], false,
+            );
+            const endpoint = only(h);
+            assert.equal(endpoint.id, uniqueIdFor(1), "Endpoint.id IS the published identity");
+
+            const info = endpoint.stateOf("bridgedDeviceBasicInformation") as Record<string, unknown>;
+            assert.equal(info.uniqueId, uniqueIdFor(1), "the OLD identity, not indigo-<driving device>");
+            assert.equal(info.serialNumber, "1", "stripped from the PUBLISHED identity, not the device id");
+            assert.notEqual(info.uniqueId, info.serialNumber, "Matter rejects a UniqueID equal to the SerialNumber");
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("routes a command from a re-adopted accessory to the NEW Indigo device", async () => {
+        // The COMMAND_SINKS indirection (owner decision 2). The sink is keyed
+        // on `Endpoint.id` — which IS `publishedAs` — while the value carries
+        // the driving `indigoDeviceId`. Key it on `indigo-<indigoDeviceId>`
+        // instead and an ecosystem-originated command on a re-adopted
+        // accessory finds no sink at all: Apple Home says the accessory did
+        // not respond, for ever, and nothing in Indigo moves.
+        const h = await harness();
+        try {
+            await h.registry.reconcile(
+                [spec(REPLACEMENT_DEVICE, Role.onOffLight, { publishedAs: uniqueIdFor(1) })], false,
+            );
+            const endpoint = only(h);
+            h.commands.length = 0;
+
+            await endpoint.act(agent => agent.get(OnOffLighting).on());
+
+            assert.deepEqual(
+                h.commands,
+                [{ indigoDeviceId: REPLACEMENT_DEVICE, command: "onOff", args: { value: true } }],
+                "the command must reach the device driving the accessory NOW, not the one its identity names",
+            );
+        } finally {
+            await h.close();
+        }
+    });
+
     it("a role change takes a fresh endpoint number and never reuses the retired one", async () => {
         // The F1 pin, at registry level: a role change that bumps the
         // generation (an up-to-date plugin) is a supersede, not an in-place
