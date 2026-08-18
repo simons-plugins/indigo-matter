@@ -150,11 +150,16 @@ class ExportEntry:
             if not isinstance(published_as, str):
                 raise ValueError(
                     f"export entry {KEY_PUBLISHED_AS!r} is not a string (device {device_id})")
-            parsed = parse_published_id(published_as)
-            if parsed is None or parsed.device_id != device_id:
+            # Lawfulness is the ONLY check: the identity deliberately need
+            # NOT embed this entry's own device id. A re-adopt (issue #219) is
+            # exactly `indigo-<OLD device>` driven by a NEW one, so demanding
+            # the two agree would drop every re-adopted export the next time
+            # the allow-list was loaded — silently un-exporting the accessory
+            # the re-adopt existed to keep.
+            if parse_published_id(published_as) is None:
                 raise ValueError(
                     f"export entry {KEY_PUBLISHED_AS!r} {published_as!r} is not a lawful "
-                    f"published identity for device {device_id}")
+                    f"published identity (device {device_id})")
         return cls(
             indigo_device_id=device_id,
             role=role,

@@ -359,10 +359,13 @@ def test_entry_from_dict_rejects_malformed_published_as():
             {"indigoDeviceId": 1, "role": "onOffLight", "publishedAs": "not-lawful"})
 
 
-def test_entry_from_dict_rejects_published_as_for_a_different_device():
-    with pytest.raises(ValueError):
-        ExportEntry.from_dict(
-            {"indigoDeviceId": 1, "role": "onOffLight", "publishedAs": "indigo-2"})
+def test_entry_from_dict_accepts_a_re_adopted_published_as():
+    """Issue #219 — a re-adopted entry publishes as the identity of the OLD,
+    deleted device while being driven by a NEW one. The two deliberately do
+    NOT agree, and demanding they did dropped the entry on the next load."""
+    entry = ExportEntry.from_dict(
+        {"indigoDeviceId": 1, "role": "onOffLight", "publishedAs": "indigo-2"})
+    assert entry.published_as == "indigo-2"
 
 
 def test_entry_from_dict_rejects_non_string_published_as():
@@ -375,6 +378,19 @@ def test_published_as_round_trips_through_a_second_store(prefs, mock_logger):
     first.upsert(_entry(7, "windowCovering", published_as="indigo-7~2"))
     second = ExportStore(lambda: prefs, mock_logger)
     assert second.get(7).published_as == "indigo-7~2"
+
+
+def test_a_re_adopted_entry_round_trips_through_a_second_store(prefs, mock_logger):
+    """Issue #219, end to end through the persistence the menu action uses:
+    `menuReadoptExport` writes exactly this shape (a NEW device publishing as
+    the OLD device's identity), so it has to survive a plugin restart — a
+    dropped entry here silently un-exports the accessory the re-adopt existed
+    to preserve."""
+    first = ExportStore(lambda: prefs, mock_logger)
+    first.upsert(_entry(987654321, "onOffLight", published_as="indigo-123456789"))
+    second = ExportStore(lambda: prefs, mock_logger)
+    assert second.load_error is None
+    assert second.get(987654321).published_as == "indigo-123456789"
 
 
 def test_published_as_absent_on_load_of_an_older_payload(mock_logger):
