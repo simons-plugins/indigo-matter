@@ -207,11 +207,34 @@ export function parseReplaceAll(intent: unknown): boolean {
  * (it falls to `create`) — a supersede, planned as removal-plus-create because
  * matter.js hands the new `Endpoint.id` a fresh number rather than reusing the
  * retired one (PR5 design F1).
+ *
+ * `rekey` is the other in-place case, and the reason it is a fourth bucket
+ * rather than a flavour of `update` (issue #246, ADR-0011): a desired spec
+ * whose identity is live under the SAME role but a DIFFERENT
+ * `indigoDeviceId` is a device migrating onto a stable, already-paired
+ * accessory — "device B now drives identity X". `Registry.update()` resolves
+ * `#live` by the spec's OWN device id; feeding it a rekey spec finds nothing
+ * there and aborts the whole reconcile with `unknown_device`. A rekey has
+ * ZERO wire activity — same `Endpoint.id`, same number, `ConfigurationVersion`
+ * untouched — because nothing about the accessory as Matter sees it changed;
+ * only the registry's bookkeeping of who is driving it moves. A retarget
+ * that ALSO changes role or gains a battery is not representable as a rekey
+ * (a live cluster set cannot follow the new device's shape in place) and
+ * falls back to `recreate`, same as an ordinary role/battery change — wire
+ * activity, logged loud, the honest fallback for the pre-#240 skew case this
+ * shares its bucket with.
  */
 export interface ReconcilePlan {
     create: EndpointSpec[];
     update: EndpointSpec[];
     recreate: EndpointSpec[];
+    /**
+     * Issue #246/ADR-0011 — a driving-device change under a stable identity.
+     * `fromDeviceId` is the live endpoint's CURRENT device id (not `spec`'s),
+     * since that is what `Registry`'s `#live` is still keyed on until the
+     * rekey moves it.
+     */
+    rekey: { spec: EndpointSpec; fromDeviceId: number }[];
     /** Published identities (`publishedAs`), not device ids — issues #219/#240. */
     remove: string[];
 }
@@ -256,7 +279,7 @@ export function planReconcile(
     desired: readonly EndpointSpec[],
     replaceAll: boolean,
 ): ReconcilePlan {
-    const plan: ReconcilePlan = { create: [], update: [], recreate: [], remove: [] };
+    const plan: ReconcilePlan = { create: [], update: [], recreate: [], rekey: [], remove: [] };
     const desiredPublishedAs = new Set<string>();
 
     for (const spec of desired) {
@@ -265,7 +288,16 @@ export function planReconcile(
         if (liveEndpoint === undefined) {
             plan.create.push(spec);
         } else if (liveEndpoint.role === spec.role && !(spec.battery && !liveEndpoint.battery)) {
-            plan.update.push(spec);
+            // Issue #246/ADR-0011 — same role, no battery gain: the shape is
+            // unchanged, so a device-id mismatch is a driving-device retarget
+            // (rekey), not a state/label update. `liveEndpoint.indigoDeviceId`
+            // is the CURRENT driver; `spec.indigoDeviceId` is the one taking
+            // over.
+            if (liveEndpoint.indigoDeviceId !== spec.indigoDeviceId) {
+                plan.rekey.push({ spec, fromDeviceId: liveEndpoint.indigoDeviceId });
+            } else {
+                plan.update.push(spec);
+            }
         } else {
             plan.recreate.push(spec);
         }
@@ -279,7 +311,10 @@ export function planReconcile(
 
     // A `recreate` is not a removal: the identity stays live, it just changes
     // shape in place. Counting it as one would refuse a lawful role correction
-    // on a single-export bridge.
+    // on a single-export bridge. A `rekey` (issue #246/ADR-0011) needs no
+    // equivalent carve-out at all: its identity is never pushed to
+    // `plan.remove` in the first place — the `else if` branch above resolves
+    // it before the identity ever gets the chance to look un-desired.
     //
     // Mass-removal guard fix (#240): one `remove` plus one `create` for the
     // SAME `indigoDeviceId` under two DIFFERENT `publishedAs` keys is a device
