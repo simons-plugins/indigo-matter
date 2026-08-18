@@ -1536,6 +1536,88 @@ describe("issues #219/#240 at node level: re-adopt and the two-command supersede
         }
     });
 
+    it("leaves the interim identity an ORDINARY orphan when a re-adopt replaces it (E5)", async () => {
+        // §5 E2/E5: the device was recreated and re-exported under its OWN
+        // identity before the user noticed the empty room, so re-adopt has to
+        // remove THAT accessory and publish the orphaned one in its place.
+        // That is one removal plus one create for one device — the same shape
+        // as a supersede — but it is NOT one: the identity left behind was
+        // never replaced by a later generation of itself, its number is not
+        // retired, and E5 rules it "itself re-adoptable later, which is
+        // harmless". Marking it superseded would hide it from the picker for
+        // good.
+        const storagePath = storage();
+        const session = await boot(storagePath);
+        const answered = async (messageId: string): Promise<void> => {
+            for (;;) {
+                const frame = await session.client.next(10_000);
+                if (frame.message_id === messageId) {
+                    // `error_code`, not `error` — the refusal frame's own key
+                    // (`ws-server.ts`'s `sendError`).
+                    assert.equal(frame.error_code, undefined, JSON.stringify(frame));
+                    return;
+                }
+            }
+        };
+        try {
+            await attach(session.client, "a0", [KITCHEN_SPEC]);
+
+            // The original accessory is un-exported: its identity is now an
+            // orphan, and its number is held for it (§3.3).
+            session.client.send({
+                message_id: "r0",
+                command: "remove_endpoint",
+                args: { indigoDeviceId: KITCHEN },
+            });
+            await answered("r0");
+
+            // The user recreates the device and exports it normally — a
+            // SECOND, brand-new accessory under its own default identity.
+            const REPLACEMENT_DEVICE_ID = 700_000_004;
+            await upsertOne(session.client, "u0", REPLACEMENT_DEVICE_ID);
+
+            // Then notices the empty room and re-adopts, which
+            // `ExportBridge.replace()` sends as remove-then-upsert.
+            session.client.send({
+                message_id: "r1",
+                command: "remove_endpoint",
+                args: { indigoDeviceId: REPLACEMENT_DEVICE_ID },
+            });
+            await answered("r1");
+            session.client.send({
+                message_id: "u1",
+                command: "upsert_endpoint",
+                args: {
+                    endpoint: {
+                        indigoDeviceId: REPLACEMENT_DEVICE_ID,
+                        publishedAs: uniqueIdFor(KITCHEN),
+                        role: "onOffLight",
+                        label: "Kitchen Lamp (new)",
+                        reachable: true,
+                        states: { onOff: false },
+                        options: {},
+                    },
+                },
+            });
+            await answered("u1");
+
+            const interim = uniqueIdFor(REPLACEMENT_DEVICE_ID);
+            const record = readMap(storagePath).endpoints[interim];
+            assert.equal(record?.orphaned, true, "the interim accessory did leave the ecosystems");
+            assert.equal(
+                record?.supersededBy,
+                undefined,
+                "but nothing SUPERSEDED it — no later generation of it was ever published",
+            );
+            assert.ok(
+                session.bridge.listOrphans().some(orphan => orphan.uniqueId === interim),
+                `§3.12 must go on offering it (E5), got ${JSON.stringify(session.bridge.listOrphans())}`,
+            );
+        } finally {
+            await session.close();
+        }
+    });
+
     it("does not pair an unrelated upsert against a stale removal of a DIFFERENT device", async () => {
         // The `#lastRemoved` bookkeeping is keyed per device id — removing
         // KITCHEN must never taint a plain, unrelated create for some other,

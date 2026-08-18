@@ -190,6 +190,28 @@ export function parsePublishedId(value: string): { deviceId: number; generation:
 }
 
 /**
+ * Is `newPublishedAs` the identity that SUPERSEDED `oldPublishedAs` — i.e. a
+ * later generation of the same identity (issue #240's role change)?
+ *
+ * The narrow question, deliberately, because it is the only removal-plus-create
+ * pair that retires an identity for good. A removal and a create for the same
+ * `indigoDeviceId` is NOT enough on its own: a re-adopt onto an
+ * already-exported device (§5 E2/E5) is also one removal plus one create for
+ * one device, and the identity it leaves behind is an ordinary orphan the
+ * re-adopt picker must go on offering — E5 says so in as many words. Only a
+ * generation bump means "this identity has been replaced and its number is
+ * retired"; everything else means "this identity is simply not live right now".
+ */
+export function supersedes(oldPublishedAs: string, newPublishedAs: string): boolean {
+    const before = parsePublishedId(oldPublishedAs);
+    const after = parsePublishedId(newPublishedAs);
+    return (
+        before !== undefined && after !== undefined &&
+        before.deviceId === after.deviceId && after.generation > before.generation
+    );
+}
+
+/**
  * §3.1's opt-in for a reconcile that would empty the live endpoint set. The
  * literal is named because both the guard and its refusal message quote it.
  */

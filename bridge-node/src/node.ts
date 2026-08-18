@@ -60,6 +60,7 @@ import {
     type PairingReport,
     ProtocolError,
     RefuseReason,
+    supersedes,
     type RemoveFabricResult,
     type RemoveResult,
     type StatusReport,
@@ -951,11 +952,17 @@ export class BridgeNode implements BridgeFacade {
      * in both snapshots, so it is not a removal; and even if it were, the
      * {@link checkDrift} that follows re-records its role and label.
      *
-     * **A removed identity paired with a same-device create in this SAME
-     * mutation is a supersession (issue #240), not an ordinary un-export** —
-     * `EndpointRegistry.reconcileNow`'s `plan.remove`/`plan.create` land in
-     * one before/after snapshot here (§3's full-`attach` path), so the pairing
-     * is found directly. An UNPAIRED removal is still remembered in
+     * **A removed identity whose device gained a LATER GENERATION of that same
+     * identity in this SAME mutation is a supersession (issue #240), not an
+     * ordinary un-export** — `EndpointRegistry.reconcileNow`'s
+     * `plan.remove`/`plan.create` land in one before/after snapshot here (§3's
+     * full-`attach` path), so the pairing is found directly. {@link supersedes}
+     * is what decides, and it is deliberately narrower than "one removal and
+     * one create for the same device": a re-adopt onto an already-exported
+     * device (§5 E2/E5) is that shape too, and the identity it leaves behind
+     * is an ORDINARY orphan the re-adopt picker must go on offering.
+     *
+     * A removal with no create for its device at all is remembered in
      * {@link #lastRemoved}: the plugin's `replace()` sends `remove_endpoint`
      * then `upsert_endpoint` as two SEPARATE commands (§3 steps 3/5), so the
      * create half of that supersession has not happened yet when THIS command
@@ -976,11 +983,18 @@ export class BridgeNode implements BridgeFacade {
         let forgotten = 0;
         for (const uniqueId of removed) {
             const deviceId = before.get(uniqueId)!;
-            const supersededBy = createdDeviceIds.get(deviceId);
-            if (supersededBy !== undefined) {
-                forgotten += this.#endpointMap.forget([uniqueId], { supersededBy });
-            } else {
-                ordinary.push(uniqueId);
+            const created = createdDeviceIds.get(deviceId);
+            if (created !== undefined && supersedes(uniqueId, created)) {
+                forgotten += this.#endpointMap.forget([uniqueId], { supersededBy: created });
+                continue;
+            }
+            ordinary.push(uniqueId);
+            if (created === undefined) {
+                // Only when NO identity for this device appeared in this
+                // mutation: a create that already landed and was NOT a
+                // supersession (a re-adopt, §5 E2/E5) has settled the
+                // question, and remembering the removal past it is exactly
+                // how a much later, unrelated create would mispair.
                 this.#lastRemoved.set(deviceId, uniqueId);
             }
         }
@@ -1001,22 +1015,23 @@ export class BridgeNode implements BridgeFacade {
      * the create had not happened yet when the remove's `forgetRemoved` ran
      * and orphaned the old identity with no `supersededBy`. This is called
      * once a create has actually landed: if the device this spec drives was
-     * last removed under a DIFFERENT identity, that removal is retroactively
-     * marked superseded by this one.
+     * last removed under an identity this one {@link supersedes}, that
+     * removal is retroactively marked superseded by this one.
      *
-     * **Consumed unconditionally — matched or not.** A device whose new
-     * `publishedAs` equals the one it was last removed under is an ordinary
-     * re-export, not a role change, and either way the bookkeeping must not
-     * linger to pair against some unrelated, later create for the same
-     * device. `#lastRemoved` is in-memory only and never persisted: lost on
-     * restart is safe, because a restart means the plugin's next `attach`
-     * reconciles from scratch, and a removal that never got its
-     * `supersededBy` this way is simply an ordinary orphan (edge case E7).
+     * **Consumed unconditionally — matched or not.** Anything that is not a
+     * generation bump on the SAME identity is an ordinary re-export or a
+     * re-adopt (§5 E2/E5), neither of which retires the identity that was
+     * removed; and either way the bookkeeping must not linger to pair against
+     * some unrelated, later create for the same device. `#lastRemoved` is
+     * in-memory only and never persisted: lost on restart is safe, because a
+     * restart means the plugin's next `attach` reconciles from scratch, and a
+     * removal that never got its `supersededBy` this way is simply an
+     * ordinary orphan (edge case E7).
      */
     private noteSupersessionIfPaired(spec: EndpointSpec): void {
         const oldPublishedAs = this.#lastRemoved.get(spec.indigoDeviceId);
         this.#lastRemoved.delete(spec.indigoDeviceId);
-        if (oldPublishedAs === undefined || oldPublishedAs === spec.publishedAs) {
+        if (oldPublishedAs === undefined || !supersedes(oldPublishedAs, spec.publishedAs)) {
             return;
         }
         this.#endpointMap.forget([oldPublishedAs], { supersededBy: spec.publishedAs });

@@ -753,10 +753,15 @@ version 2** since bridge-node 0.6.0:
   there is no self-heal because there is nothing to heal, the date was never
   load-bearing.
 - `supersededBy` — issue #240, the published identity that replaced this one
-  on a role change. Set when the node observes a removal and a same-device
-  create land in one mutation (`forgetRemoved`'s pairing logic, or
-  `upsertEndpoint`'s `checkDrift` when the two arrive as separate commands
-  from the plugin's `replace()`). A superseded record is `orphaned` too (it
+  on a role change. Set when the node observes a removal paired with a create
+  of a **later generation of that same identity**
+  (`indigo-<id>` → `indigo-<id>~2`), whether the two land in one mutation
+  (`forgetRemoved`'s pairing logic) or arrive as separate commands from the
+  plugin's `replace()` (`upsertEndpoint`'s). The generation test is the whole
+  test, deliberately: a **re-adopt** onto an already-exported device is also
+  one removal plus one create for one device, and the identity it leaves
+  behind is an ORDINARY orphan that stays re-adoptable — only a generation
+  bump retires an identity. A superseded record is `orphaned` too (it
   is not live) but is **excluded from both `restorable()` and
   `orphans()`/§3.12** — restoring it would resurrect an old-role accessory
   under a number every paired ecosystem has already processed a removal for,
