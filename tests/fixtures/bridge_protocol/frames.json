@@ -408,6 +408,32 @@
       }
     }
   },
+  "upsert_endpoint_published_as": {
+    "request": {
+      "message_id": "m71",
+      "command": "upsert_endpoint",
+      "args": {
+        "endpoint": {
+          "indigoDeviceId": 123456789,
+          "role": "dimmableLight",
+          "label": "Kitchen Lamp",
+          "reachable": true,
+          "states": {
+            "onOff": true,
+            "level": 60
+          },
+          "options": {},
+          "publishedAs": "indigo-123456789~2"
+        }
+      }
+    },
+    "response": {
+      "message_id": "m71",
+      "result": {
+        "endpointNumber": 2
+      }
+    }
+  },
   "upsert_endpoint_role_change": {
     "request": {
       "message_id": "m14",

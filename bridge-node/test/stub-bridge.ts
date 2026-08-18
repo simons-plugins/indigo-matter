@@ -69,6 +69,8 @@ export interface GoldenFrames {
     attach_replace_all: GoldenExchange;
     attach_mass_removal_refused: GoldenExchange;
     upsert_endpoint: GoldenExchange;
+    /** Issues #219/#240 — the request direction carrying a non-default `publishedAs`. */
+    upsert_endpoint_published_as: GoldenExchange;
     upsert_endpoint_role_change: GoldenExchange;
     upsert_endpoint_unknown_role: GoldenExchange;
     remove_endpoint: GoldenExchange;

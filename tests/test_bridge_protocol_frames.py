@@ -19,6 +19,7 @@ from bridge_protocol import (
     BridgeProtocol,
     BridgeProtocolError,
     EndpointSpec,
+    PublishedId,
     next_generation,
     parse_published_id,
     published_id_for,
@@ -456,6 +457,21 @@ class TestCoverage:
         assert spec.published_as == "indigo-123456789~2"
         assert spec.to_wire() == wire
 
+    def test_a_golden_frame_carries_a_non_default_published_as(self):
+        """Issues #219/#240 — the hand-built round trip above proves the
+        plugin agrees with ITSELF. Only a GOLDEN frame makes both languages
+        agree, and every frame in this file was default-identity until
+        `upsert_endpoint_published_as` was added: the one field a re-adopt or
+        a role change puts on the wire had no cross-language fixture at all.
+        The node asserts the same exchange in
+        `bridge-node/test/protocol.test.ts`.
+        """
+        wire = BY_NAME["upsert_endpoint_published_as"]["request"]["args"]["endpoint"]
+        assert wire["publishedAs"] == "indigo-123456789~2"
+        assert parse_published_id(wire["publishedAs"]) == PublishedId(
+            device_id=wire["indigoDeviceId"], generation=2)
+        assert EndpointSpec.from_wire(wire).to_wire() == wire
+
 
 class TestPublishedIdentity:
     """Issues #219/#240 — the Python twin of `bridge-node/src/protocol.ts`'s
@@ -474,6 +490,10 @@ class TestPublishedIdentity:
     Python side (`\\Z` and `re.ASCII`) rather than by widening the TypeScript
     twin, because the node's refusal is the backstop that protects the attach
     and the plugin must never hand it something it will reject.
+
+    The TypeScript half of the pair is
+    ``bridge-node/test/published-identity.test.ts``, whose tables are the same
+    cases in the same order. Change one, change the other.
     """
 
     #: (value, expected (device_id, generation)) — every one of these must

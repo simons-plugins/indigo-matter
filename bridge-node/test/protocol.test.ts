@@ -456,6 +456,30 @@ describe("endpoint CRUD (§3.2-§3.5)", () => {
         });
     });
 
+    it("accepts a request carrying a non-default publishedAs (issues #219/#240)", async () => {
+        // The golden frames were all default-identity, so the ONE wire field
+        // the plugin and the node have to agree about byte for byte had no
+        // cross-language fixture at all. Its Python twin round-trips the same
+        // frame through `EndpointSpec.from_wire`/`to_wire`; a disagreement is
+        // a duplicate accessory in every paired ecosystem, or an attach the
+        // node refuses outright.
+        await withColdBridge(async (cold, connectCold) => {
+            const client = await connectCold();
+            await client.request(golden.attach.request); // empty live set
+
+            assert.deepEqual(
+                await client.request(golden.upsert_endpoint_published_as.request),
+                golden.upsert_endpoint_published_as.response,
+            );
+            assert.deepEqual(
+                [...cold.model.composition().keys()],
+                ["indigo-123456789~2"],
+                "the endpoint must be live under the identity the frame named, not the default",
+            );
+            client.close();
+        });
+    });
+
     it("refuses malformed CRUD args (§1.1)", async () => {
         await withColdBridge(async (_cold, connectCold) => {
             const client = await connectCold();
