@@ -5,16 +5,15 @@ current version is `Info.plist`'s `PluginVersion`.
 
 ## 2026.23.1 — the bridge node for the new sensor roles
 
-**Install this one.** 2026.23.0 added five sensor roles the previously pinned
-bridge node does not know: water leak, freeze, rain, smoke and carbon
-monoxide. Exporting a device under any of them, against the older node, is
-refused as an unknown role — and that refusal fails the **whole** attach, so
-every one of your exports goes quiet, not just the new one.
+The Node half of 2026.23.0's five new sensor roles — water leak, freeze, rain,
+smoke and carbon monoxide. Pins `indigo-matter-bridge@0.13.0`; update the
+plugin, then run *Plugins ▸ Matter ▸ Install/update the Matter bridge*.
 
-Pinning `indigo-matter-bridge@0.13.0` fixes it. Update the plugin, then run
-*Plugins ▸ Matter ▸ Install/update the Matter bridge*. If you already hit this,
-the same update clears it — nothing was un-paired and no accessory was
-renumbered.
+Take the pair together. The older node does not know those roles, and refuses
+an unknown role for the **whole** attach rather than the one endpoint — so
+exporting a leak sensor against it would quieten every export, not just the
+new one. Recovering is only this update: nothing is un-paired and no accessory
+is renumbered.
 
 ## 2026.23.0 — export every sensor you actually own
 
