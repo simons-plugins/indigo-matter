@@ -66,6 +66,8 @@ ROLE_CONTACT_SENSOR = "contactSensor"
 ROLE_WATER_LEAK_DETECTOR = "waterLeakDetector"
 ROLE_WATER_FREEZE_DETECTOR = "waterFreezeDetector"
 ROLE_RAIN_SENSOR = "rainSensor"
+ROLE_SMOKE_ALARM = "smokeAlarm"
+ROLE_CO_ALARM = "coAlarm"
 ROLE_TEMPERATURE_SENSOR = "temperatureSensor"
 ROLE_HUMIDITY_SENSOR = "humiditySensor"
 ROLE_LIGHT_SENSOR = "lightSensor"
@@ -96,6 +98,8 @@ ROLE_LABELS = {
     ROLE_WATER_LEAK_DETECTOR: "Water leak sensor",
     ROLE_WATER_FREEZE_DETECTOR: "Freeze sensor",
     ROLE_RAIN_SENSOR: "Rain sensor",
+    ROLE_SMOKE_ALARM: "Smoke alarm",
+    ROLE_CO_ALARM: "Carbon monoxide alarm",
     ROLE_TEMPERATURE_SENSOR: "Temperature sensor",
     ROLE_HUMIDITY_SENSOR: "Humidity sensor",
     ROLE_LIGHT_SENSOR: "Light (lux) sensor",
@@ -125,6 +129,9 @@ EXCLUDED_ROLES = {
     "garageDoor": "garage-door export is v2 (needs the catalog's role/polarity data; "
                   "mis-mapping is a physical-safety issue)",
     "fan": REASON_FAN,
+    "heatAlarm": "Matter has no heat-alarm device type; Smoke CO Alarm 0x0076 senses "
+                 "smoke and CO only, and exporting a heat zone as either would be a "
+                 "safety lie",
 }
 
 #: The binary (on/off) sensor roles. All are offered for any on/off sensor; the
@@ -136,7 +143,7 @@ EXCLUDED_ROLES = {
 #: motion sensor — the commonest on/off sensor by a wide margin — has to be.
 BINARY_SENSOR_ROLES = (
     ROLE_OCCUPANCY_SENSOR, ROLE_CONTACT_SENSOR, ROLE_WATER_LEAK_DETECTOR,
-    ROLE_WATER_FREEZE_DETECTOR, ROLE_RAIN_SENSOR,
+    ROLE_WATER_FREEZE_DETECTOR, ROLE_RAIN_SENSOR, ROLE_SMOKE_ALARM, ROLE_CO_ALARM,
 )
 
 #: Name hints → binary role as **regexes**, first match wins (issue #236/#252).
@@ -161,6 +168,14 @@ _BINARY_PATTERNS = tuple(
                                     r"\bwater sensor\b")),
         (ROLE_WATER_FREEZE_DETECTOR, (r"\bfreeze\b", r"\bfreezing\b", r"\bfrost\b")),
         (ROLE_RAIN_SENSOR, (r"\brain\b",)),
+        # CO before smoke: a combined "Smoke & CO Alarm" can only take one
+        # role, and CO is the reading a user loses silently — smoke they can
+        # also smell. The explicit phrases lead; bare `\bco\b` comes last
+        # because real names often carry nothing else ("CO Sensor TZ20",
+        # "Living Room CO"), and it is a default a user can override anyway.
+        (ROLE_CO_ALARM, (r"\bcarbon monoxide\b", r"\bco alarm\b", r"\bco detector\b",
+                         r"\bco sensor\b", r"\bco\b")),
+        (ROLE_SMOKE_ALARM, (r"\bsmoke\b", r"\bfire alarm\b")),
         (ROLE_CONTACT_SENSOR, (r"\bcontact\b", r"\bdoor\b", r"\bwindow\b", r"\bgate\b",
                                r"\breed\b", r"\bopen/closed\b")),
     )

@@ -603,6 +603,8 @@ ecosystem acts. Both are enumerated here in full; there is no other source.
 | `waterLeakDetector` | Water Leak Detector (0x0043) | `leak: bool` (true = leak detected) | — |
 | `waterFreezeDetector` | Water Freeze Detector (0x0041) | `freeze: bool` (true = freeze detected) | — |
 | `rainSensor` | Rain Sensor (0x0044) | `rain: bool` (true = rain detected) | — |
+| `smokeAlarm` | Smoke CO Alarm (0x0076), SmokeAlarm feature | `smoke: bool` (true = alarming) | — |
+| `coAlarm` | Smoke CO Alarm (0x0076), CoAlarm feature | `co: bool` (true = alarming) | — |
 | `temperatureSensor` | Temperature Sensor | `temperatureC: float` | — |
 | `humiditySensor` | Humidity Sensor | `humidityPct: float` | — |
 | `lightSensor` | Light Sensor | `lux: float` | — |
@@ -610,6 +612,19 @@ ecosystem acts. Both are enumerated here in full; there is no other source.
 | `flowSensor` | Flow Sensor | `flowM3h: float` | — |
 | `thermostat` | Thermostat | `localTemperatureC: float`, `heatingSetpointC: float`, `coolingSetpointC: float`, `systemMode: str` | `setHeatingSetpoint {"valueC": float}`, `setCoolingSetpoint {"valueC": float}`, `setSystemMode {"mode": str}` |
 
+- **`smokeAlarm` and `coAlarm` are two roles over one Matter device type, and
+  the node writes an attribute the plugin never sends.** Smoke CO Alarm 0x0076
+  selects its sensing half by cluster feature; an Indigo sensor is one boolean
+  meaning one thing, so exporting a smoke-only sensor with both features would
+  have it reporting a CO reading nothing measured. The cluster's mandatory
+  `expressedState` is **derived by the node** from whichever key it was given
+  (`Critical` → the matching expressed state, otherwise `Normal`): the
+  specification requires the two to agree, and Indigo carries nothing to derive
+  `expressedState` from, so it is deliberately absent from this role's state
+  keys rather than left to the plugin. Severity collapses to Normal/Critical —
+  Matter's middle `Warning` tier has no Indigo counterpart. The cluster's one
+  command, `SelfTestRequest`, has conformance `O` and is not declared, so these
+  roles stay read-only like every other sensor.
 - **The leak family and `contactSensor` share one Matter cluster and disagree
   about its polarity, on purpose.** All four carry BooleanState's `stateValue`,
   but the specification reads it as "true = closed or contact" in a Contact

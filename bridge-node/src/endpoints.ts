@@ -44,17 +44,20 @@ import { LevelControlServer } from "@matter/main/behaviors/level-control";
 import { OccupancySensingServer } from "@matter/main/behaviors/occupancy-sensing";
 import { OnOffServer } from "@matter/main/behaviors/on-off";
 import { PowerSourceServer } from "@matter/main/behaviors/power-source";
+import { SmokeCoAlarmServer } from "@matter/main/behaviors/smoke-co-alarm";
 import { ThermostatServer } from "@matter/main/behaviors/thermostat";
 import { MovementDirection, MovementType, WindowCoveringServer } from "@matter/main/behaviors/window-covering";
 import { ColorControl } from "@matter/main/clusters/color-control";
 import { DoorLock } from "@matter/main/clusters/door-lock";
 import { LevelControl } from "@matter/main/clusters/level-control";
+import { SmokeCoAlarm } from "@matter/main/clusters/smoke-co-alarm";
 import { Thermostat } from "@matter/main/clusters/thermostat";
 import { ColorTemperatureLightDevice } from "@matter/main/devices/color-temperature-light";
 import { ContactSensorDevice } from "@matter/main/devices/contact-sensor";
 import { WaterLeakDetectorDevice } from "@matter/main/devices/water-leak-detector";
 import { WaterFreezeDetectorDevice } from "@matter/main/devices/water-freeze-detector";
 import { RainSensorDevice } from "@matter/main/devices/rain-sensor";
+import { SmokeCoAlarmDevice } from "@matter/main/devices/smoke-co-alarm";
 import { DimmableLightDevice } from "@matter/main/devices/dimmable-light";
 import { DoorLockDevice } from "@matter/main/devices/door-lock";
 import { ExtendedColorLightDevice } from "@matter/main/devices/extended-color-light";
@@ -551,6 +554,7 @@ const COLOR_CONTROL = "colorControl";
 const BRIDGED_INFO = "bridgedDeviceBasicInformation";
 const OCCUPANCY_SENSING = "occupancySensing";
 const BOOLEAN_STATE = "booleanState";
+const SMOKE_CO_ALARM = "smokeCoAlarm";
 const TEMPERATURE_MEASUREMENT = "temperatureMeasurement";
 const RELATIVE_HUMIDITY_MEASUREMENT = "relativeHumidityMeasurement";
 const ILLUMINANCE_MEASUREMENT = "illuminanceMeasurement";
@@ -1749,6 +1753,36 @@ function booleanStatePatch(
 }
 
 /**
+ * The SmokeCoAlarm patch (issue #179) — the one sensor patch that writes two
+ * attributes from a single key.
+ *
+ * `expressedState` is a mandatory attribute and is the cluster's answer to "is
+ * this alarming"; `smokeState`/`coState` carry which sensor said so. They must
+ * move together — the specification is explicit that a non-`Normal`
+ * `expressedState` requires the corresponding attribute to be non-`Normal`
+ * too — and the plugin cannot send `expressedState` because Indigo has nothing
+ * to derive it from, so this is where the pair is kept consistent.
+ *
+ * `alarming` maps to `Critical`, not `Warning`: Matter's middle tier has no
+ * Indigo counterpart and choosing it would invent a severity nothing measured.
+ */
+function alarmStatePatch(
+    key: string,
+    attribute: string,
+    expressed: SmokeCoAlarm.ExpressedState,
+): (states: Record<string, unknown>) => Record<string, unknown> {
+    return states =>
+        typeof states[key] === "boolean"
+            ? {
+                  [SMOKE_CO_ALARM]: {
+                      [attribute]: states[key] ? SmokeCoAlarm.AlarmState.Critical : SmokeCoAlarm.AlarmState.Normal,
+                      expressedState: states[key] ? expressed : SmokeCoAlarm.ExpressedState.Normal,
+                  },
+              }
+            : {};
+}
+
+/**
  * The thermostat patch. Every key is independent (§3.4 state maps are partial),
  * and an unmappable `systemMode` is simply not consumed — which
  * {@link statePatchOrRefuse} turns into `malformed_args` when it was the only
@@ -2100,6 +2134,47 @@ const ROLE_DEFINITIONS: Record<RoleValue, RoleDefinition> = {
         deviceType: () => RainSensorDevice.with(BridgedDeviceBasicInformationServer),
         initialState: () => ({}),
         statePatch: booleanStatePatch(BOOLEAN_STATE, "rain", "stateValue", rain => rain),
+        watch: [],
+    },
+    // Smoke and CO (issue #179). One Matter device type (Smoke CO Alarm
+    // 0x0076) whose sensing half is selected by cluster FEATURE, so the two
+    // roles differ only in which feature they declare and which attribute
+    // they drive. Two roles rather than one dual-feature role because an
+    // Indigo sensor is a single boolean meaning a single thing: a smoke-only
+    // sensor exported with both features would sit there telling every
+    // ecosystem its CO reading is Normal, which is a claim nothing measured.
+    //
+    // Unlike every other sensor role, the patch writes TWO attributes. The
+    // cluster's `expressedState` is mandatory and is what a controller reads
+    // to answer "is this alarming"; leaving it at the server's seeded `Normal`
+    // while `smokeState` went `Critical` would be an accessory that is
+    // alarming and reports calm. The plugin never sends `expressedState` —
+    // there is nothing in Indigo to send it from — so deriving it here is the
+    // only place the two can be kept in lockstep.
+    //
+    // Severity collapses to Normal/Critical: Matter's middle `Warning` tier
+    // has no Indigo counterpart, and picking it for some boolean would be
+    // inventing a severity no device reported. `SelfTestRequest` is the
+    // cluster's only command and its conformance is "O" — not declared, so
+    // these stay read-only like every other exported sensor.
+    [Role.smokeAlarm]: {
+        deviceType: () =>
+            SmokeCoAlarmDevice.with(
+                BridgedDeviceBasicInformationServer,
+                SmokeCoAlarmServer.with("SmokeAlarm"),
+            ),
+        initialState: () => ({}),
+        statePatch: alarmStatePatch("smoke", "smokeState", SmokeCoAlarm.ExpressedState.SmokeAlarm),
+        watch: [],
+    },
+    [Role.coAlarm]: {
+        deviceType: () =>
+            SmokeCoAlarmDevice.with(
+                BridgedDeviceBasicInformationServer,
+                SmokeCoAlarmServer.with("CoAlarm"),
+            ),
+        initialState: () => ({}),
+        statePatch: alarmStatePatch("co", "coState", SmokeCoAlarm.ExpressedState.CoAlarm),
         watch: [],
     },
     [Role.temperatureSensor]: {

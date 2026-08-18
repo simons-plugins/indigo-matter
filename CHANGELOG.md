@@ -10,6 +10,16 @@ merges accumulate here before one of them ships.
 
 ### Added
 
+- **Smoke alarm and carbon monoxide alarm export roles** (issue #179). Two
+  roles, not one combined accessory: Matter gives both one device type and
+  selects the sensing half by feature, while an Indigo sensor is a single
+  on/off reading meaning a single thing — exporting a smoke-only sensor as
+  both would leave it permanently reporting a CO reading nothing measured.
+  Read-only, like every other exported sensor; Matter makes the self-test
+  command optional and the plugin has nothing to run. Heat alarms are
+  deliberately not offered a role — Matter's alarm type senses smoke and CO
+  only, and an ecosystem automating on a "smoke alarm" that cannot detect
+  smoke is worse than no export.
 - **Water leak, freeze and rain export roles** (issue #236). An Indigo leak
   sensor exports as Matter's own Water Leak Detector, so Apple Home shows it
   as a leak sensor with leak alerts instead of forcing it out as an occupancy

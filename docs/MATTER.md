@@ -410,7 +410,7 @@ are offered.
 | Dimmer | **Dimmable light** *(default)*, Window covering | Dimmable Light · Window Covering |
 | Dimmer, colour-temperature capable | **Colour-temperature light** *(default)*, Dimmable light, Window covering | Color Temperature Light |
 | Dimmer, full colour | **Full-colour light** *(default)*, Dimmable light, Colour-temperature light, Window covering | Extended Color Light |
-| Sensor, on/off | Occupancy (PIR/motion), Contact, Water leak, Freeze, Rain — the default is read from the device's name, and you can correct it | Occupancy Sensor · Contact Sensor · Water Leak Detector · Water Freeze Detector · Rain Sensor |
+| Sensor, on/off | Occupancy (PIR/motion), Contact, Water leak, Freeze, Rain, Smoke, Carbon monoxide — the default is read from the device's name, and you can correct it | Occupancy Sensor · Contact Sensor · Water Leak Detector · Water Freeze Detector · Rain Sensor · Smoke CO Alarm |
 | Sensor, numeric | Temperature, Humidity, Light (lux), Pressure, Flow — the default is guessed from the device's units, and you can correct it | the matching Matter sensor type |
 | Thermostat | Thermostat | Thermostat (setpoints and modes; no fan in v1) |
 
@@ -433,6 +433,24 @@ Sensor" defaults to Water leak, "Front Door" to Contact, "Study PIR" to
 Occupancy. It is only ever a **default**: all five roles stay selectable, and
 picking the right one at first export matters because changing a role later
 costs the accessory's room (see below).
+
+**Smoke and carbon monoxide sensors export too, as separate roles** (issue
+#179). Matter gives both one device type and picks the sensing half from a
+feature flag, so the plugin offers **Smoke alarm** and **Carbon monoxide
+alarm** as two roles rather than one combined accessory: an Indigo sensor is a
+single on/off reading meaning a single thing, and exporting a smoke-only sensor
+as both would leave it permanently telling your ecosystem that its CO reading
+is fine — a reassurance nothing actually measured. If you have a combined
+smoke/CO unit that Indigo presents as two devices, export each one under its
+own role. There is deliberately no self-test: Matter makes that command
+optional, and the plugin has nothing to run.
+
+**Heat alarms have no Matter equivalent and are not offered a role.** Matter's
+alarm device type senses smoke and carbon monoxide only, so a heat zone would
+have to be exported as one of those, and an ecosystem would then show — and
+automate on — a smoke alarm that cannot detect smoke. The device stays
+exportable under any role you declare for it; there just isn't an honest one
+in this family.
 
 **A motion sensor exports as "Occupancy" — that is Matter's own ceiling, not
 a gap in this plugin** (issue #252). Matter 1.x defines no motion device type.
