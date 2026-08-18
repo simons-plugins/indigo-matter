@@ -1474,6 +1474,41 @@ class TestGetReadoptDevices:
                                          {"migrateDevice": "303"}, errors) is None
         assert "needs a state mapping" in errors["migrateDevice"]
 
+    def test_rows_are_alphabetical_within_each_block(self, plug, devices):
+        """Reported live 2026-08-18: "not fully alphabetical but also not
+        published devices first either". Both pickers walked `indigo.devices`,
+        whose order is Indigo's Finder-style collation ("Apple TV Power Socket"
+        before "AP_78:8a:20:b3:cc:4f") — and concatenating two such runs reads
+        as an alphabet that restarts halfway down. Sorted WITHIN each block, so
+        eligible-first and its never-truncated guarantee are untouched.
+        """
+        devices.add(RelayDevice(310, "Zulu Plug"))
+        devices.add(RelayDevice(311, "alpha Plug"))       # lower case leads: case-insensitive
+        _bridge_with(plug, attached=True)
+        orphan = _orphan(role="onOffPlugInUnit")
+        plug.runtime = _FakeRuntime(result=[orphan])
+        options = plug.getReadoptDevices(valuesDict={"readoptOrphan": orphan.unique_id})
+        selectable = [label for key, label in options if not key.startswith("x-")]
+        explained = [label for key, label in options if key.startswith("x-")]
+        assert selectable == sorted(selectable, key=str.lower)
+        assert explained == sorted(explained, key=str.lower)
+        # ...and every selectable row still precedes every explained one.
+        keys = [key for key, _label in options]
+        assert all(not k.startswith("x-") for k in keys[:len(selectable)])
+
+    def test_the_exported_marker_does_not_file_a_device_under_that_symbol(self, plug, devices):
+        """The sort key is the device NAME, not the row label — the label
+        carries the ● marker and the trailing reason, so sorting on it would
+        file every exported device together under "●"."""
+        devices.add(RelayDevice(312, "Aardvark Plug"))
+        plug.exports.upsert(ExportEntry(312, "onOffPlugInUnit"))
+        _bridge_with(plug, attached=True)
+        orphan = _orphan(role="onOffPlugInUnit")
+        plug.runtime = _FakeRuntime(result=[orphan])
+        options = plug.getReadoptDevices(valuesDict={"readoptOrphan": orphan.unique_id})
+        selectable = [label for key, label in options if not key.startswith("x-")]
+        assert selectable[0] == "● Aardvark Plug", selectable
+
     def test_an_unexportable_device_is_shown_with_the_classifiers_reason(self, plug):
         _bridge_with(plug, attached=True)
         orphan = _orphan(role="onOffPlugInUnit")

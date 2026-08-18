@@ -964,11 +964,12 @@ class ServerMenuMixin:
                     if row is None:
                         continue
                     (explained if row[0].startswith(EXCLUDED_OPTION_PREFIX)
-                     else eligible).append(row)
+                     else eligible).append((str(getattr(dev, "name", "") or "").lower(), row))
                 except Exception as exc:  # pylint: disable=broad-except
                     self._log_row_failure(exc, first=not failures)  # pylint: disable=no-member
                     failures += 1
-            options = eligible + explained[:EXPORT_PICKER_LIMIT]
+            options = (self._sorted_device_rows(eligible)
+                       + self._sorted_device_rows(explained)[:EXPORT_PICKER_LIMIT])
             if len(explained) > EXPORT_PICKER_LIMIT:
                 options.append(TRUNCATED_OPTION)
             return options
@@ -1394,6 +1395,26 @@ class ServerMenuMixin:
                             f"{publishing_as}")
         return (str(dev.id), f"{mark}{dev.name}")
 
+    @staticmethod
+    def _sorted_device_rows(rows: list) -> list:
+        """``(sort_name, row)`` pairs → rows, A→Z, case-insensitively.
+
+        Both device pickers used ``indigo.devices`` order, which is neither
+        alphabetical nor stable-looking to a user: Indigo collates with a
+        Finder-style rule that treats punctuation differently, so "Apple TV
+        Power Socket" sorts BEFORE "AP_78:8a:20:b3:cc:4f". Concatenating two
+        such runs — selectable, then explained — reads as an alphabet that
+        restarts halfway down a list of several hundred devices.
+
+        Sorting is applied WITHIN each block rather than across both, so the
+        eligible-first rule (and its never-truncated guarantee) is untouched:
+        the pickable devices stay at the top, and each block is now scannable.
+        The device NAME is the key, not the row label, because the label
+        carries the ``●`` exported marker and the trailing reason — sorting on
+        it would file every exported device under "●".
+        """
+        return [row for _key, row in sorted(rows, key=lambda pair: pair[0])]
+
     def getReadoptDevices(self, filter="", valuesDict=None, typeId="", targetId=0):  # noqa: N802, A002, ARG002
         # pylint: disable=too-many-locals  # same two-list shape as getExportCandidates
         """Device picker for "Re-adopt a Matter accessory…" (§4.3) — see
@@ -1437,11 +1458,12 @@ class ServerMenuMixin:
                     if row is None:
                         continue
                     (explained if row[0].startswith(EXCLUDED_OPTION_PREFIX)
-                     else eligible).append(row)
+                     else eligible).append((str(getattr(dev, "name", "") or "").lower(), row))
                 except Exception as exc:  # pylint: disable=broad-except
                     self._log_row_failure(exc, first=not failures)  # pylint: disable=no-member
                     failures += 1
-            options = eligible + explained[:EXPORT_PICKER_LIMIT]
+            options = (self._sorted_device_rows(eligible)
+                       + self._sorted_device_rows(explained)[:EXPORT_PICKER_LIMIT])
             if len(explained) > EXPORT_PICKER_LIMIT:
                 options.append(TRUNCATED_OPTION)
             return options

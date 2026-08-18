@@ -22,6 +22,14 @@ current version is `Info.plist`'s `PluginVersion`.
   moved. Export the device directly first, which is where the mapping is
   asked, and it becomes an ordinary target afterwards. The same wording now
   appears if the migration is attempted anyway.
+- **Both device pickers are now in alphabetical order.** They followed
+  Indigo's own device order, which is not alphabetical — it collates
+  punctuation Finder-style, so "Apple TV Power Socket" came before
+  "AP_78:8a:20:b3:cc:4f" — and the list is built as two runs, selectable
+  devices then explained ones. Across several hundred devices that reads as an
+  alphabet restarting halfway down. Each block is now sorted A→Z on its own,
+  so the devices you can pick still come first and never get truncated, but
+  both halves are scannable.
 
 ## 2026.23.1 — the bridge node for the new sensor roles
 
