@@ -23,7 +23,7 @@ import export_catalog
 import protocol
 from bridge_protocol import parse_published_id, published_id_for
 from commission_jobs import fabric_counts, node_id_to_str
-from export_store import ExportEntry
+from export_store import ExportEntry, OPTION_STATE_INVERT, OPTION_STATE_KEY
 from http_handlers import MatterUnavailable
 from plugin_constants import (
     EXCLUDED_OPTION_PREFIX,
@@ -82,6 +82,35 @@ class ReadoptOrphansUnavailable(Exception):
     simply not replied — a wrong story about their house, told from a failure
     to read.
     """
+
+
+def _migrated_options(source_options: dict, target_options: Optional[dict]) -> dict:
+    """Options for a migrated entry: the accessory's, but the TARGET's mapping.
+
+    Everything about an export follows the accessory — role, name override,
+    identity — with one exception, and it is the exception because of what a
+    state mapping actually describes. `stateKey`/`stateInvert` (ADR-0012) say
+    *which boolean on this piece of hardware is the reading*. That is a fact
+    about the device, not about the accessory riding on it, and the two
+    devices in a migration are different hardware.
+
+    Carrying the source's mapping across was the bug: migrating an accessory
+    from a Masquerade proxy (no mapping — it has a real `onState`) onto a
+    Texecom zone produced an entry with no mapping for a device that needs
+    one. It classified as merely mappable, the endpoint provider skipped it,
+    and the accessory went dark instead of moving. The reverse is just as
+    wrong: a mapping naming a state the new device does not publish.
+
+    Re-adopt never had this bug — it already reads options from the device
+    being adopted onto (``_readopt_commit``'s ``previous``). This makes
+    migrate agree with it.
+    """
+    carried = {key: value for key, value in (source_options or {}).items()
+               if key not in (OPTION_STATE_KEY, OPTION_STATE_INVERT)}
+    for key in (OPTION_STATE_KEY, OPTION_STATE_INVERT):
+        if target_options and key in target_options:
+            carried[key] = target_options[key]
+    return carried
 
 
 @dataclass(frozen=True)
@@ -1043,7 +1072,9 @@ class ServerMenuMixin:
             self._migrate_refuse(errors, "migrateDevice",
                                  "That device no longer exists — refresh the list.")
             return None
-        verdict = export_catalog.classify(dev, self._export_plugin_id())  # pylint: disable=no-member
+        own = self.exports.get(dev.id)
+        verdict = export_catalog.classify(dev, self._export_plugin_id(),  # pylint: disable=no-member
+                                          own.options if own else None)
         if not isinstance(verdict, export_catalog.EligibleDevice):  # ADR-0012 — see _readopt_device_row
             self._migrate_refuse(
                 errors, "migrateDevice",
@@ -1153,7 +1184,8 @@ class ServerMenuMixin:
             indigo_device_id=target_id,
             role=source_entry.role,
             name_override=source_entry.name_override,
-            options=dict(source_entry.options),
+            options=_migrated_options(source_entry.options,
+                                      target_previous.options if target_previous else None),
             published_as=identity,
         )
         new_entries = [entry for entry in self.exports.all()
@@ -1357,7 +1389,14 @@ class ServerMenuMixin:
         nothing".
         """
         mark = "● " if dev.id in exported else ""
-        verdict = export_catalog.classify(dev, plugin_id)
+        # Classified WITH the device's OWN saved options (ADR-0012), not
+        # bare. A custom device that has already been exported carries its
+        # state mapping in that entry, and asking without it reads a
+        # perfectly-configured device back as one still needing a mapping —
+        # which is how a zone the user had just exported stayed unselectable
+        # as a migrate target.
+        own = self.exports.get(dev.id) if self.exports is not None else None
+        verdict = export_catalog.classify(dev, plugin_id, own.options if own else None)
         # Positive test, not `not isinstance(..., Excluded)`. ADR-0012 gave
         # `classify` a third outcome, and a device that could be exported once
         # its state is mapped answers False to `Excluded` while carrying no
@@ -1669,7 +1708,9 @@ class ServerMenuMixin:
             self._readopt_refuse(errors, "readoptDevice",
                                  "That device no longer exists — refresh the list.")
             return None
-        verdict = export_catalog.classify(dev, self._export_plugin_id())  # pylint: disable=no-member
+        own = self.exports.get(dev.id)
+        verdict = export_catalog.classify(dev, self._export_plugin_id(),  # pylint: disable=no-member
+                                          own.options if own else None)
         if not isinstance(verdict, export_catalog.EligibleDevice):  # ADR-0012 — see _readopt_device_row
             self._readopt_refuse(
                 errors, "readoptDevice",
