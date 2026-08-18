@@ -83,9 +83,13 @@ LOAD_ERROR_UNREADABLE = ("Export list could not be read — starting empty. "
 class ExportEntry:
     """One allow-listed device and the metadata Indigo cannot supply.
 
-    ``indigo_device_id`` is the identity key everywhere — in this store, in
-    the bridge protocol (§4.1) and in the node's endpoint map (PRD §4.3). It
-    is never re-keyed on name or list position.
+    ``indigo_device_id`` is this store's key, and the device the accessory is
+    DRIVEN by — never re-keyed on name or list position. It is no longer the
+    accessory's identity (ADR-0010, issues #219/#240): ``published_as`` is,
+    both on the wire (§4.1 ``publishedAs``) and in the node's endpoint map
+    (PRD §4.3), and it defaults to ``indigo-<indigo_device_id>``. The two
+    agree for every ordinary export and deliberately disagree for a re-adopted
+    one, which is the whole point of separating them.
     """
 
     indigo_device_id: int
@@ -252,7 +256,7 @@ class ExportStore:
         nothing — see :meth:`_commit`.
 
         ``published_as`` is validated HERE as well as in :meth:`from_dict`
-        (issues #219/#240, edge case E12's plugin-side half). Load-time
+        (issues #219/#240, PR5 design E12's plugin-side half). Load-time
         validation alone means an unlawful identity is written to the prefs,
         sent to the node on the very next attach — which refuses the WHOLE
         attach with ``malformed_args``, taking every export offline — and only

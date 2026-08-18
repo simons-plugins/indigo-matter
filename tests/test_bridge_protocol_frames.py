@@ -198,7 +198,7 @@ class TestResponses:
         assert full.orphaned_at == "2026-08-12T09:15:00Z"
         assert full.device_id == 223456791
         assert partial.orphaned_at is None and partial.device_id is None
-        # E4 — the pre-2026.16.2 bare orphan: nothing beyond number/uniqueId.
+        # PR5 design E4 — the pre-2026.16.2 bare orphan: nothing beyond number/uniqueId.
         assert bare.role is None and bare.label is None and bare.device_id is None
 
     def test_empty_orphan_list_normalises_to_empty(self):
@@ -484,7 +484,10 @@ class TestPublishedIdentity:
         ("indigo--5", (-5, 1)),
         ("indigo-123~2", (123, 2)),
         ("indigo-123~99", (123, 99)),
-        # F9's measured Number.isSafeInteger boundary.
+        # JavaScript's `Number.MAX_SAFE_INTEGER` — a language constant, not
+        # one of §0's measured matter.js facts. `parsePublishedId` guards it
+        # with `Number.isSafeInteger`; `bridge_protocol` mirrors the same bound
+        # by hand, Python having no equivalent notion.
         ("indigo-9007199254740991", (9007199254740991, 1)),
         # Exactly PUBLISHED_ID_MAX (32) characters: "indigo-" (7) +
         # 16-digit MAX_SAFE_INTEGER + "~" (1) + 8-digit generation.
@@ -505,7 +508,8 @@ class TestPublishedIdentity:
         # Python's `$` also matches before a trailing newline; JS's does not.
         # The two derivations must refuse this identically.
         "indigo-1\n",
-        # One past F9's measured Number.isSafeInteger boundary.
+        # One past `Number.MAX_SAFE_INTEGER` (see VALID above — a JS language
+        # constant, not a measured fact).
         "indigo-9007199254740992",
         # One character over PUBLISHED_ID_MAX (33), otherwise lawful.
         "indigo-9007199254740991~999999999",

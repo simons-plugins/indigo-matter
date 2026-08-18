@@ -10,7 +10,7 @@
  * Protocol version this node speaks. Skew fails closed on both peers (§2).
  *
  * Bumped 1 → 2 alongside `EndpointSpec.publishedAs` first being sent
- * (issues #219/#240, owner ruling): rather than gate `publishedAs` behind a
+ * (issues #219/#240, PR5 design owner ruling 1): rather than gate `publishedAs` behind a
  * `bridgeVersion` capability check, the protocol simply requires v2. An old
  * (pre-#219/#240) node cannot silently ignore a `publishedAs` it does not
  * understand and publish a duplicate default-identity accessory, because it
@@ -145,13 +145,14 @@ export function isRole(value: unknown): value is RoleValue {
  * about generations has to learn this vocabulary.
  *
  * Generation 1 (`indigo-<deviceId>`) is byte-identical to every published
- * identity this bridge has ever produced. A generation ≥ 2
- * (`indigo-<deviceId>~<N>`) is #240's role-change supersession — this PR only
- * makes the *field* real; nothing yet produces a generation above 1.
+ * identity this bridge has ever produced, which is why an ordinary export's
+ * wire frame is unchanged. A generation ≥ 2 (`indigo-<deviceId>~<N>`) is
+ * #240's role-change supersession; the plugin is the only peer that ever
+ * bumps one (PR5 design §1.3), and the node only ever receives what it produces.
  */
 const PUBLISHED_ID_PREFIX = "indigo-";
 
-/** Matter's `UniqueID` cap (F9, measured against matter.js 0.17.8). */
+/** Matter's `UniqueID` cap (PR5 design F9, measured against matter.js 0.17.8). */
 export const PUBLISHED_ID_MAX = 32;
 
 /** `publishedIdFor(deviceId)` is `uniqueIdFor`/`endpointIdFor`'s generation-1 form. */
@@ -167,7 +168,7 @@ export function publishedIdFor(indigoDeviceId: number, generation = 1): string {
  * way `indigoDeviceIdFrom` (`endpoints.ts`, which now delegates here) always
  * has been: `Number("indigo-1e3")`-style coercions would silently invent a
  * device id, and an invented id is a new accessory in every paired ecosystem.
- * The length cap is F9's measured `UniqueID` limit, enforced here rather than
+ * The length cap is PR5 design F9's measured `UniqueID` limit, enforced here rather than
  * discovered as a matter.js `AggregateError` during an attach.
  */
 export function parsePublishedId(value: string): { deviceId: number; generation: number } | undefined {
@@ -196,9 +197,9 @@ export function parsePublishedId(value: string): { deviceId: number; generation:
  * The narrow question, deliberately, because it is the only removal-plus-create
  * pair that retires an identity for good. A removal and a create for the same
  * `indigoDeviceId` is NOT enough on its own: a re-adopt onto an
- * already-exported device (§5 E2/E5) is also one removal plus one create for
+ * already-exported device (PR5 design E2/E5) is also one removal plus one create for
  * one device, and the identity it leaves behind is an ordinary orphan the
- * re-adopt picker must go on offering — E5 says so in as many words. Only a
+ * re-adopt picker must go on offering — PR5 design E5 says so in as many words. Only a
  * generation bump means "this identity has been replaced and its number is
  * retired"; everything else means "this identity is simply not live right now".
  */

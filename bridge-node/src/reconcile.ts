@@ -87,8 +87,10 @@ export function parseEndpointSpec(value: unknown): EndpointSpec {
     // Issues #219/#240 — `publishedAs` defaults to today's derivation, never to
     // a bare absence: every `EndpointSpec` in memory has a real published
     // identity, so nothing downstream has to ask "or is it the default?"
-    // Validated with the same function that builds it, so a client cannot ask
-    // for an identity this bridge would refuse to construct later.
+    // Validated with `parsePublishedId`, the exact INVERSE of the
+    // `publishedIdFor` that builds the default — so the two can only disagree
+    // if one of them is wrong, and a client cannot ask for an identity this
+    // bridge would refuse to construct later.
     const publishedAs = value.publishedAs === undefined ? publishedIdFor(indigoDeviceId) : value.publishedAs;
     if (typeof publishedAs !== "string") {
         throw new ProtocolError(ErrorCode.malformedArgs, "endpoint.publishedAs must be a string");
@@ -122,7 +124,7 @@ export function parseEndpointSpecs(value: unknown): EndpointSpec[] {
     }
     const specs = value.map(parseEndpointSpec);
     const seen = new Set<number>();
-    // Issue #219/#240's E12 — two exports must never claim the same published
+    // Issue #219/#240, PR5 design E12 — two exports must never claim the same published
     // identity, the backstop for a hand-edited `.indiPref` pointing two
     // devices at one accessory. A separate set from `seen` (indigoDeviceId):
     // the two collisions are different mistakes and deserve their own message.
@@ -190,7 +192,7 @@ export function parseReplaceAll(intent: unknown): boolean {
  * What an `attach` reconcile has to do to the live endpoint set.
  *
  * `recreate` is the in-place case: an identity present in both sets whose
- * shape changed — a battery gain, or (the pre-#240 version-skew fallback, §1.3)
+ * shape changed — a battery gain, or (the pre-#240 version-skew fallback, PR5 design §1.3)
  * a role change from a plugin that never bumped `publishedAs`. §4.1 rejects
  * both through `upsert_endpoint`, but `attach` is a *full reconcile* from the
  * peer that owns the export set (§6.2), and failing the whole attach would
@@ -204,7 +206,7 @@ export function parseReplaceAll(intent: unknown): boolean {
  * is not in `desired` (it fails `remove`) and the new one is not in `live`
  * (it falls to `create`) — a supersede, planned as removal-plus-create because
  * matter.js hands the new `Endpoint.id` a fresh number rather than reusing the
- * retired one (F1).
+ * retired one (PR5 design F1).
  */
 export interface ReconcilePlan {
     create: EndpointSpec[];
@@ -279,18 +281,26 @@ export function planReconcile(
     // shape in place. Counting it as one would refuse a lawful role correction
     // on a single-export bridge.
     //
-    // Mass-removal guard fix (#240): a supersede is one `remove` plus one
-    // `create` for the SAME `indigoDeviceId` under two DIFFERENT `publishedAs`
-    // keys — the device stays exported, so it must not count as a departure
-    // either. `supersededCount` is how many removed identities have a sibling
-    // create for the same device; without it, changing the role of the only
-    // exported device on a bridge would be refused as emptying the live set.
+    // Mass-removal guard fix (#240): one `remove` plus one `create` for the
+    // SAME `indigoDeviceId` under two DIFFERENT `publishedAs` keys is a device
+    // changing which accessory identity it publishes — the device stays
+    // exported, so it must not count as a departure either. Without this,
+    // changing the role of the only exported device on a bridge would be
+    // refused as emptying the live set.
+    //
+    // **Deliberately the BROAD rule, unlike `supersedes()`.** The narrow
+    // generation test is right for `supersededBy`, which answers "is this
+    // identity retired for good?" — a re-adopt's is not. The guard asks a
+    // different question: "does this device still have an accessory
+    // afterwards?" A re-adopt and a supersession both answer yes, so both
+    // belong here, and `stillExportedCount` is named for what it counts
+    // rather than for one of the two things that produce it.
     const createdDeviceIds = new Set(plan.create.map(spec => spec.indigoDeviceId));
-    const supersededCount = plan.remove.filter(publishedAs => {
+    const stillExportedCount = plan.remove.filter(publishedAs => {
         const removedDeviceId = live.get(publishedAs)?.indigoDeviceId;
         return removedDeviceId !== undefined && createdDeviceIds.has(removedDeviceId);
     }).length;
-    const survivors = live.size - plan.remove.length + supersededCount;
+    const survivors = live.size - plan.remove.length + stillExportedCount;
     if (live.size > 0 && survivors === 0 && !replaceAll) {
         throw new ProtocolError(
             ErrorCode.massRemovalRefused,

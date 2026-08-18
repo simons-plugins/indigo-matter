@@ -144,7 +144,7 @@ bug in the node.
 | `not_attached` | Any command other than `attach` before a successful `attach` on this connection |
 | `unknown_device` | `indigoDeviceId` has no live endpoint |
 | `unknown_role` | `role` not in the §4.2 enum |
-| `role_change` | `upsert_endpoint` tried to change an existing endpoint's role (§4.1) |
+| `role_change` | `upsert_endpoint` tried to change an existing endpoint's role, or to move it to a different `publishedAs` (§3.2/§4.1) |
 | `mass_removal_refused` | `attach` would remove every live endpoint without `"intent": "replace_all"` (§3.1) |
 | `endpoint_map_invalid` | Node is in the refuse-to-start state (PRD §7); only `get_status`, `get_pairing` and `rebuild_endpoint_map` are accepted |
 | `commissioning_window_failed` | Matter stack refused to open the enhanced commissioning window |
@@ -225,6 +225,17 @@ with `error_code: "mass_removal_refused"` unless the args carry
 ecosystem must be deliberate (the §5.1 allow-list being emptied), never the
 side effect of a stale or buggy client attaching with a default state.
 
+**The guard counts DEPARTURES, not removals** (issues #219/#240). A removed
+`publishedAs` whose `indigoDeviceId` also appears among the identities being
+created is one device changing which accessory identity it publishes — a
+role-change supersession, or a re-adopt — and the device stays exported
+throughout, so it is not a departure and does not count towards emptying the
+live set. Without that carve-out, changing the role of the only exported
+device on a bridge would be refused as a mass removal. Note this is
+deliberately the BROAD "one removal plus one create for the same device"
+rule, not the narrow generation test `supersededBy` uses: both shapes keep
+the device exported, which is the only question the guard is asking.
+
 Because restore arms that guard from the first attach, the plugin now carries
 the intent in **two** cases, not one: the un-export debt it already tracked
 (XAC7), and an allow-list that is non-empty but whose every entry the classifier
@@ -245,6 +256,17 @@ for.
 
 Creates the endpoint if absent, updates label/reachable/state if present.
 Idempotent. Result: `{"endpointNumber": <int>}`.
+
+Two things it refuses with `error_code: "role_change"`, for one reason —
+neither can be done to a live endpoint in place:
+
+- a `role` different from the live endpoint's (§4.1: ecosystems cache the
+  Matter device type per endpoint);
+- a `publishedAs` different from the live endpoint's (issues #219/#240).
+  That is a supersession or a re-adopt, and the only path allowed to do it is
+  the plugin's remove-then-add, which sends the two mutations as two separate
+  commands rather than asking this one to move a live endpoint out from under
+  itself.
 
 ### 3.3 `remove_endpoint`
 
@@ -483,9 +505,13 @@ over an unreadable map has no orphans it can vouch for.
  "options": {}}
 ```
 
-- `indigoDeviceId` — the immutable Indigo device ID. The node derives
-  `Endpoint.id` and `UniqueID` from it (PRD §4.3); it is the identity key
-  everywhere in this protocol.
+- `indigoDeviceId` — the immutable Indigo device ID: the device this
+  accessory is **driven by** — every §5 command is addressed to it and every
+  §3.4 state push arrives keyed on it. It is no longer the accessory's
+  identity (ADR-0010, issues #219/#240): `publishedAs` below is what
+  `Endpoint.id`/`UniqueID`/`SerialNumber` are derived from, and it defaults to
+  `indigo-<indigoDeviceId>` — which is why an ordinary export looks exactly as
+  it always has, and why a re-adopted one has the two deliberately disagree.
 - `role` — one of the v1 role enum (§4.2). A role change for an existing
   endpoint is **rejected** (`error_code: "role_change"`); the plugin must
   remove and re-add, because ecosystems cache device types per endpoint.
@@ -506,7 +532,7 @@ over an unreadable map has no orphans it can vouch for.
   and be ≤32 characters (§0 (j)); anything else is refused with
   `malformed_args`. **Duplicate refusal:** `attach` rejects, also with
   `malformed_args`, an endpoint list that names the same `publishedAs` twice
-  — this is edge case E12's backstop, the one that actually matters, because
+  — this is PR5 design edge case E12's backstop, the one that actually matters, because
   it is what stops a hand-edited `.indiPref` pointing two Indigo devices at
   one accessory from ever reaching matter.js.
 - `battery` — issue #220. `true` means "ensure this accessory publishes
@@ -705,8 +731,7 @@ version 2** since bridge-node 0.6.0:
   because every reader here reaches a field by name rather than validating the
   object as a whole, so the extra key is inert rather than a parse failure.
 - `orphaned` — issue #219, present (`true`) and absent otherwise, never
-  `false`. Not yet in a published bridge-node release as of 0.8.0 — the
-  release commit that ships it should update this clause. Set by an
+  `false`. Set by an
   un-export (see "Un-exporting" below); cleared the moment the same
   `UniqueID` is live again. Parses with the same inert-extra-key tolerance as
   `numberVoid` — an old build reaches fields by name, so the unknown key is
@@ -760,7 +785,8 @@ version 2** since bridge-node 0.6.0:
   of a **later generation of that same identity**
   (`indigo-<id>` → `indigo-<id>~2`), whether the two land in one mutation
   (`forgetRemoved`'s pairing logic) or arrive as separate commands from the
-  plugin's `replace()` (`upsertEndpoint`'s). The generation test is the whole
+  plugin's `replace()` (`noteSupersessionIfPaired`'s, called by
+  `upsertEndpoint` once a create has landed). The generation test is the whole
   test, deliberately: a **re-adopt** onto an already-exported device is also
   one removal plus one create for one device, and the identity it leaves
   behind is an ORDINARY orphan that stays re-adoptable — only a generation
@@ -885,7 +911,7 @@ is already gone).
 5. **Version skew fails closed:** mismatched `protocolVersion` means no
    attach (both peers enforce it), an error in the Indigo log, and untouched
    pairings. Applied literally, not just stated, for `publishedAs`
-   (issues #219/#240, owner ruling 1): `PROTOCOL_VERSION` bumped 1 → 2 in the
+   (issues #219/#240, PR5 design owner ruling 1): `PROTOCOL_VERSION` bumped 1 → 2 in the
    same commit that first sends it, rather than adding a permanent
    `bridgeVersion` capability gate around it — an old (pre-#219/#240) node
    cannot silently ignore a `publishedAs` it does not understand and publish

@@ -236,6 +236,13 @@ export class BridgeNode implements BridgeFacade {
      * even when its remove and its create arrive as two SEPARATE commands
      * (`replace()`) rather than one `attach` batch — see
      * {@link noteSupersessionIfPaired}.
+     *
+     * **Written only when NO identity for that device appeared in the same
+     * mutation.** A create that already landed alongside the removal has
+     * settled the question either way — {@link forgetRemoved} has already
+     * marked it superseded, or decided it was not one (a re-adopt, PR5 design
+     * E2/E5) — and remembering the removal past that is exactly how a much
+     * later, unrelated create for the same device would mispair with it.
      */
     readonly #lastRemoved = new Map<number, string>();
 
@@ -959,7 +966,7 @@ export class BridgeNode implements BridgeFacade {
      * full-`attach` path), so the pairing is found directly. {@link supersedes}
      * is what decides, and it is deliberately narrower than "one removal and
      * one create for the same device": a re-adopt onto an already-exported
-     * device (§5 E2/E5) is that shape too, and the identity it leaves behind
+     * device (PR5 design E2/E5) is that shape too, and the identity it leaves behind
      * is an ORDINARY orphan the re-adopt picker must go on offering.
      *
      * A removal with no create for its device at all is remembered in
@@ -992,7 +999,7 @@ export class BridgeNode implements BridgeFacade {
             if (created === undefined) {
                 // Only when NO identity for this device appeared in this
                 // mutation: a create that already landed and was NOT a
-                // supersession (a re-adopt, §5 E2/E5) has settled the
+                // supersession (a re-adopt, PR5 design E2/E5) has settled the
                 // question, and remembering the removal past it is exactly
                 // how a much later, unrelated create would mispair.
                 this.#lastRemoved.set(deviceId, uniqueId);
@@ -1020,13 +1027,13 @@ export class BridgeNode implements BridgeFacade {
      *
      * **Consumed unconditionally — matched or not.** Anything that is not a
      * generation bump on the SAME identity is an ordinary re-export or a
-     * re-adopt (§5 E2/E5), neither of which retires the identity that was
+     * re-adopt (PR5 design E2/E5), neither of which retires the identity that was
      * removed; and either way the bookkeeping must not linger to pair against
      * some unrelated, later create for the same device. `#lastRemoved` is
      * in-memory only and never persisted: lost on restart is safe, because a
      * restart means the plugin's next `attach` reconciles from scratch, and a
      * removal that never got its `supersededBy` this way is simply an
-     * ordinary orphan (edge case E7).
+     * ordinary orphan (PR5 design edge case E7).
      */
     private noteSupersessionIfPaired(spec: EndpointSpec): void {
         const oldPublishedAs = this.#lastRemoved.get(spec.indigoDeviceId);

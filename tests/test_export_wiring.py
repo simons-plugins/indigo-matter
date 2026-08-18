@@ -407,7 +407,7 @@ class TestDialogNudges:
         assert plug.exports.get(101).published_as is None
 
     def test_an_ordinary_update_does_not_bump_the_generation(self, plug):
-        """An update must never move the identity on its own (§1.3)."""
+        """An update must never move the identity on its own (PR5 design §1.3)."""
         plug.exportAddOrUpdate(
             _values(exportDevice="101", exportRole="onOffPlugInUnit"), "manageMatterExports")
         plug.exportAddOrUpdate(
@@ -434,7 +434,7 @@ class TestDialogNudges:
 
     def test_a_role_change_after_a_generation_bump_does_not_reset_it(self, plug):
         """An unrelated update between two role changes must not touch the
-        identity it is not moving (§1.3)."""
+        identity it is not moving (PR5 design §1.3)."""
         plug.exportAddOrUpdate(
             _values(exportDevice="101", exportRole="onOffPlugInUnit"), "manageMatterExports")
         plug.exportAddOrUpdate(

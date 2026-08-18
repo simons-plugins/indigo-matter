@@ -1249,7 +1249,7 @@ const REPLACEMENT_DEVICE = 700_000_001;
 
 describe("supersede & published identity (issues #219/#240)", () => {
     it("publishes the OLD UniqueID and SerialNumber for a re-adopted identity", async () => {
-        // The F7/F8 pin, and the whole of #219 in one assertion: the only
+        // The PR5 design F7/F8 pin, and the whole of #219 in one assertion: the only
         // identity a controller can see is the endpoint number plus the
         // bridged Basic Information attributes, and matter.js does NOT
         // persist `uniqueId`/`serialNumber` — whatever is declared at
@@ -1303,7 +1303,7 @@ describe("supersede & published identity (issues #219/#240)", () => {
     });
 
     it("a role change takes a fresh endpoint number and never reuses the retired one", async () => {
-        // The F1 pin, at registry level: a role change that bumps the
+        // The PR5 design F1 pin, at registry level: a role change that bumps the
         // generation (an up-to-date plugin) is a supersede, not an in-place
         // recreate — the new `Endpoint.id` gets a number matter.js has never
         // handed out before, and the retired one stays retired.
@@ -1325,7 +1325,7 @@ describe("supersede & published identity (issues #219/#240)", () => {
             assert.ok(h.logs.some(line => line.includes("The retired number is never reused.")));
 
             // A brand-new device added in the same batch must not be handed
-            // the number the supersede just retired either (F1: the allocator
+            // the number the supersede just retired either (PR5 design F1: the allocator
             // never reuses anything, regardless of who is asking).
             await h.registry.reconcile(
                 [spec(1, Role.dimmableLight, { publishedAs: "indigo-1~2" }), spec(2, Role.onOffLight)], false,
@@ -1338,7 +1338,7 @@ describe("supersede & published identity (issues #219/#240)", () => {
     });
 
     it("does not call a re-adopt a supersession, or print role X → X (comment-analyzer C2)", async () => {
-        // The E2/E5 shape: ONE device, ONE removal, ONE create, and the
+        // The PR5 design E2/E5 shape: ONE device, ONE removal, ONE create, and the
         // identity left behind is an ORDINARY orphan `orphans()`/§3.12 must
         // go on offering. The broad "removal + create for the same device"
         // rule logged "identity … is being retired … never reused" about it —

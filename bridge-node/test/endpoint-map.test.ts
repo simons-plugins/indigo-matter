@@ -1370,7 +1370,7 @@ describe("the driving device, the orphan date and supersession (issues #219/#240
         assert.equal(mapFileIn(dir).endpoints["indigo-2"]?.supersededBy, "indigo-2~2");
     });
 
-    it("orphans() omits superseded entries but includes bare no-role/label ones (E4)", () => {
+    it("orphans() omits superseded entries but includes bare no-role/label ones (PR5 design E4)", () => {
         const dir = storage();
         writeFileSync(
             join(dir, ENDPOINT_MAP_FILE),
@@ -1403,7 +1403,7 @@ describe("the driving device, the orphan date and supersession (issues #219/#240
 
         // Superseded "indigo-2" is excluded (not re-adoptable); the live
         // "indigo-4" is excluded (not orphaned); the bare "indigo-9" IS
-        // included, per E4 — shown so the picker can tell the user its
+        // included, per PR5 design E4 — shown so the picker can tell the user its
         // number is reserved and why it cannot be re-adopted, rather than
         // hiding it.
         assert.deepEqual(store.orphans(), [
@@ -1447,7 +1447,7 @@ describe("the driving device, the orphan date and supersession (issues #219/#240
         );
     });
 
-    it("nudges towards Re-adopt when a NEW identity's role+label match an existing orphan (owner ruling 4)", () => {
+    it("nudges towards Re-adopt when a NEW identity's role+label match an existing orphan (PR5 design owner ruling 4)", () => {
         const dir = storage();
         const logged: string[] = [];
         const store = new EndpointMapStore(dir, message => logged.push(message));
@@ -1717,7 +1717,7 @@ describe("a map entry that cannot be trusted is named, never silently used (PR5 
         // The picker writes the row's key into the plugin's ExportStore as a
         // `publishedAs`, and the node refuses an unlawful one at the NEXT
         // attach with `malformed_args` — which stops every export, not just
-        // this one. `restorable()` already declines such an entry (E11); the
+        // this one. `restorable()` already declines such an entry (PR5 design E11); the
         // list feeding a user's choice must too.
         const dir = storage();
         writeFileSync(

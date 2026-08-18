@@ -186,8 +186,8 @@ export interface EndpointRecord {
      */
     numberVoid?: true;
     /**
-     * Set by {@link EndpointMapStore.forget} (issue #219, this half only —
-     * the re-adopt UI itself lands separately): the device was un-exported,
+     * Set by {@link EndpointMapStore.forget} (issue #219): the device was
+     * un-exported,
      * so the entry must not be rebuilt by {@link EndpointMapStore.restorable}
      * — but unlike the pre-#219 behaviour, `role`/`label` are KEPT rather
      * than deleted, because they are the only evidence a future re-adopt UI
@@ -233,13 +233,24 @@ export interface EndpointRecord {
      */
     orphanedAt?: string;
     /**
-     * Set by {@link EndpointMapStore.forget} when the caller says a removal
-     * paired with a same-device create — a role-change supersession (issue
-     * #240): the published identity that replaced this one. A superseded
-     * entry is {@link orphaned} too (it is not live), but it is NOT a
-     * re-adopt candidate — {@link EndpointMapStore.restorable} and
-     * {@link EndpointMapStore.orphans} both exclude it, because re-adopting
-     * it would resurrect the OLD-role accessory under a number every paired
+     * Set by {@link EndpointMapStore.forget} when the caller has decided this
+     * identity was RETIRED, not merely un-exported (issue #240): the published
+     * identity that replaced it.
+     *
+     * **The narrow rule, and it is narrow on purpose.** Only a LATER
+     * GENERATION of the same identity — `indigo-7` → `indigo-7~2`, which is
+     * what `protocol.ts`'s `supersedes()` tests — counts. A **re-adopt** is
+     * the same shape at a glance (one removal plus one create, for one device)
+     * and is deliberately NOT one: the identity a re-adopt leaves behind is an
+     * ordinary orphan the picker must go on offering, PR5 design E5 in as many
+     * words. Both node-side writers apply `supersedes()` before setting this,
+     * whether the pair lands in one mutation (`node.ts`'s `forgetRemoved`) or
+     * as two commands (`noteSupersessionIfPaired`).
+     *
+     * A superseded entry is {@link orphaned} too (it is not live), but it is
+     * NOT a re-adopt candidate — {@link EndpointMapStore.restorable} and
+     * {@link EndpointMapStore.orphans} both exclude it, because re-adopting it
+     * would resurrect the OLD-role accessory under a number every paired
      * ecosystem has already processed a removal for.
      */
     supersededBy?: string;
@@ -780,6 +791,15 @@ export class EndpointMapStore {
      * pre-attach rebuild — exactly the churn {@link forget}'s own doc comment
      * exists to prevent, unaffected by role/label now surviving alongside it.
      *
+     * **So is `supersededBy` (issue #240), checked in its own right rather
+     * than left to ride on `orphaned`.** The two are written together, but a
+     * hand-edited or partially-rolled-back map can carry one without the
+     * other, and a RETIRED identity must never be rebuilt whichever way it got
+     * that way — it would put an old-role accessory back under a number every
+     * paired ecosystem has already processed a removal for. So the filter is
+     * four conditions, not three: no `role`, no `label`, `orphaned`, or
+     * `supersededBy`.
+     *
      * **Resolves `indigoDeviceId` — and skips what it cannot (issue #219).**
      * `record.deviceId` wins where a re-adopt has set it; otherwise it falls
      * back to the published identity's own derivation
@@ -795,11 +815,8 @@ export class EndpointMapStore {
     restorable(): RestorableEndpoint[] {
         const restorable: RestorableEndpoint[] = [];
         for (const [uniqueId, record] of this.#endpoints) {
-            // `supersededBy` is checked in its own right, not left to ride
-            // on `orphaned`: the two are written together by `forget`, but a
-            // hand-edited or partially-rolled-back map can carry one without
-            // the other, and a superseded identity must never be rebuilt
-            // whichever way it got that way.
+            // Four conditions, and `supersededBy` is one of them in its own
+            // right rather than riding on `orphaned` — see the doc comment.
             if (
                 record.role === undefined || record.label === undefined ||
                 record.orphaned || record.supersededBy !== undefined
@@ -841,18 +858,18 @@ export class EndpointMapStore {
      * number every paired ecosystem has already processed a removal for —
      * see {@link EndpointRecord.supersededBy}.
      *
-     * **Includes entries with no `role`/`label` (E4, §4.2), unlike
+     * **Includes entries with no `role`/`label` (PR5 design E4, §4.2), unlike
      * {@link restorable}'s filter.** A pre-2026.16.2 bare `{number}` orphan —
      * from a plugin old enough to have deleted them on un-export — carries
      * nothing a replacement device could be matched against, so it can never
-     * be re-adopted, but the ruling (§5 E4) is to show it anyway: "the number
+     * be re-adopted, but the ruling (PR5 design §5 E4) is to show it anyway: "the number
      * is reserved and the user is entitled to see why", as the picker's
      * "no role recorded, cannot be re-adopted" row (§4.2's third row). Callers
      * that need to tell the two shapes apart check `role`/`label` for
      * `undefined`, which {@link restorable}'s own skip-and-log already treats
      * as unrebuildable for the SAME entries.
      *
-     * **Skips a key `parsePublishedId` refuses — E11's `restorable()`
+     * **Skips a key `parsePublishedId` refuses — PR5 design E11's `restorable()`
      * treatment, applied here for a sharper reason.** This list feeds the
      * re-adopt picker, and picking a row writes its key into the plugin's
      * `ExportStore` as a `publishedAs`, which the node then refuses at the

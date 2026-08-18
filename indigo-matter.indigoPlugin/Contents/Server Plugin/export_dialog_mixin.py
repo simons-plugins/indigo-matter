@@ -568,7 +568,7 @@ class ExportDialogMixin:
         # it as a NEW accessory identity (remove-then-add) rather than an
         # in-place device-type mutation; anything else carries the identity
         # through unchanged — an ordinary update must never move it on its
-        # own (§1.3).
+        # own (PR5 design §1.3).
         if role_changed:
             published_as = next_generation(previous.published_as or published_id_for(device_id))
         else:

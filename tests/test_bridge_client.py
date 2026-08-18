@@ -369,7 +369,7 @@ class TestCommands:
         assert orphans[0].number == 7
         assert orphans[0].role == "dimmableLight"
         assert orphans[0].device_id == 223456791
-        # The bare pre-2026.16.2 entry (E4): no role/label/deviceId at all.
+        # The bare pre-2026.16.2 entry (PR5 design E4): no role/label/deviceId at all.
         assert orphans[2].role is None and orphans[2].label is None
         assert orphans[2].device_id is None
 

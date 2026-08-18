@@ -348,7 +348,7 @@ export class EndpointRegistry {
             // that DID bump the generation) never reaches this loop — it is a
             // remove+create pair, logged above — so everything left here is
             // either a battery gain or the pre-#240 version-skew fallback
-            // (§1.3: an older plugin that never bumps the generation).
+            // (PR5 design §1.3: an older plugin that never bumps the generation).
             const existing = live.get(spec.publishedAs);
             if (existing !== undefined && existing.role === spec.role) {
                 this.#log(
@@ -440,7 +440,7 @@ export class EndpointRegistry {
                 // Issues #219/#240 — `upsert_endpoint` must never silently
                 // retire an accessory identity: that is a supersede, and the
                 // only path allowed to do it is the plugin's remove-then-add
-                // `replace()` (commit 5), which sends the two mutations as two
+                // `replace()` (`export_bridge.py`), which sends the two mutations as two
                 // separate commands rather than asking this one to move a live
                 // endpoint out from under itself.
                 throw new ProtocolError(

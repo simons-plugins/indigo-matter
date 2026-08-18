@@ -1377,7 +1377,7 @@ class TestGetReadoptOrphans:
         assert "un-exported (date unknown) (accessory #4)" in label
 
     def test_a_bare_orphan_is_listed_but_unmatchable(self, plug):
-        """E4 — a pre-2026.16.2 orphan with no role/label: shown so the user
+        """PR5 design E4 — a pre-2026.16.2 orphan with no role/label: shown so the user
         can see the number is spoken for, refused only at Execute time."""
         _bridge_with(plug, attached=True)
         orphan = _orphan(unique_id="indigo-903", number=9, role=None, label=None)
@@ -1424,7 +1424,7 @@ class TestGetReadoptDevices:
         assert "102" not in labels                       # DimmerDevice does not
 
     def test_a_role_ineligible_device_is_shown_with_its_reason_not_hidden(self, plug):
-        """XAC9. The picker-level half of E3 — refused, but VISIBLY: "I
+        """XAC9. The picker-level half of PR5 design E3 — refused, but VISIBLY: "I
         recreated the device, why is it not in the list?" is exactly the
         question an absence answers with nothing."""
         _bridge_with(plug, attached=True)
@@ -1498,7 +1498,7 @@ class TestGetReadoptDevices:
 
     def test_a_role_changed_device_stays_in_the_picker(self, plug):
         """Its own `indigo-<ownId>~2` (issue #240) claims nobody else's
-        accessory, so §4.3 rule 3 must not drop it — E2 names
+        accessory, so PR5 design §4.3 rule 3 must not drop it — its E2 names
         "`indigo-<newId>`, or a generation of it" as the allowed
         already-exported case."""
         plug.exports.upsert(ExportEntry(101, "onOffPlugInUnit", published_as="indigo-101~2"))
@@ -1521,7 +1521,7 @@ def test_readopt_orphan_changed_is_a_pure_passthrough(plug):
 
 
 class TestMenuReadoptExportValidation:
-    """§4.4's seven-step order, one refusal at a time."""
+    """PR5 design §4.4's seven-step order, one refusal at a time."""
 
     def test_step1_refuses_without_the_tick(self, plug):
         client = _bridge_with(plug, attached=True)
@@ -1644,7 +1644,7 @@ class TestMenuReadoptExportValidation:
 
 
 class TestMenuReadoptExportSuccess:
-    """§4.4's closing paragraph and §4.5's confirmation log."""
+    """PR5 design §4.4's closing paragraph and §4.5's confirmation log."""
 
     def test_writes_the_store_with_the_orphans_role_and_identity(self, plug):
         _bridge_with(plug, attached=True)
@@ -1667,7 +1667,7 @@ class TestMenuReadoptExportSuccess:
         assert plug.exports.get(101).name_override == "Front Door"
 
     def test_nudges_the_bridge_with_role_changed_true(self, plug):
-        """§4.4's closing paragraph: the remove-then-add path, the same shape
+        """PR5 design §4.4's closing paragraph: the remove-then-add path, the same shape
         as a role change, even though the role itself did not move here."""
         client = _bridge_with(plug, attached=True)
         _fake_bridge = plug.export_bridge
@@ -1692,7 +1692,7 @@ class TestMenuReadoptExportSuccess:
         assert export_catalog.role_label("onOffPlugInUnit") in said
         assert "accessory number 7" in said
         assert 'onto Indigo device "Study Plug" (id 101)' in said
-        assert "left behind when device 123456789 was deleted" in said
+        assert "left behind when device 123456789 stopped exporting it" in said
         assert "nothing is re-paired and nothing is renumbered" in said
         assert "previous accessory" not in said     # device 101 was never exported before
 
@@ -1705,7 +1705,7 @@ class TestMenuReadoptExportSuccess:
             {"readoptConfirm": True, "readoptOrphan": orphan.unique_id, "readoptDevice": "101"})
         said = _said(plug.logger.warning.call_args_list)
         assert "That accessory was left behind." in said
-        assert "was deleted" not in said
+        assert "stopped exporting it" not in said
 
     def test_confirmation_log_names_the_devices_own_previous_accessory(self, plug):
         """The closing sentence: emitted only when the target device was

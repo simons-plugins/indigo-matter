@@ -394,7 +394,7 @@ def test_a_re_adopted_entry_round_trips_through_a_second_store(prefs, mock_logge
 
 
 def test_upsert_refuses_an_unlawful_published_as_at_WRITE_time(prefs, mock_logger):
-    """Belt and braces with `from_dict` (edge case E12). Validating only at
+    """Belt and braces with `from_dict` (PR5 design edge case E12). Validating only at
     LOAD time means the bad identity reaches the prefs, goes out on the very
     next attach, and is refused there with `malformed_args` — which stops
     EVERY export, not just this one — while the dialog that wrote it reported

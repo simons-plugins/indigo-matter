@@ -13,6 +13,11 @@ informed: none
 
 ## Context and Problem Statement
 
+> Citation convention for this ADR: bare `F1`-`F9`, `E1`-`E12`, `§0`-`§9` and
+> "owner ruling N" all refer to the PR5 design note named under
+> [More Information](#more-information) — **not** to this repo's delivery
+> epics, which reuse `E<N>` for something else entirely.
+
 Two issues turn on the same fact: the string a Matter controller actually
 remembers an accessory by. Today that string — `Endpoint.id`, the bridged
 `UniqueID`, the bridged `SerialNumber`, and the `endpoint-map.json` key — is

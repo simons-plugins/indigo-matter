@@ -757,7 +757,7 @@ class ServerMenuMixin:
         `attached`, is the right gate for THEM — requiring an attach would
         make the rebuild unreachable in the only situation that needs it.
 
-        Re-adopt (issue #219) is the opposite case (edge case E1): its
+        Re-adopt (issue #219) is the opposite case (PR5 design E1): its
         picker and its validation both depend on a real, answered ``attach``
         — a node only serving the §1.1 recovery trio has no orphan list to
         offer and no way to verify one — so ``require_attached=True`` demands
@@ -918,7 +918,7 @@ class ServerMenuMixin:
                                 f"{orphan.label} — {export_catalog.role_label(orphan.role)} — "
                                 f"un-exported {when} (accessory #{orphan.number})"))
             else:
-                # E4 — a pre-2026.16.2 bare orphan: shown so the user can see
+                # PR5 design E4 — a pre-2026.16.2 bare orphan: shown so the user can see
                 # its number is spoken for, but it matches nothing a device
                 # could be checked against, so it is refused at Execute time
                 # (menuReadoptExport step 4) rather than hidden here.
@@ -976,7 +976,7 @@ class ServerMenuMixin:
 
         * not exportable (the classifier's own reason);
         * exportable, but cannot take this accessory's role — the refusal
-          owner ruling 2/edge case E3 makes at Execute time, said here first;
+          PR5 design owner ruling 2/E3 makes at Execute time, said here first;
         * already publishing a DIFFERENT accessory's identity, i.e. re-adopted
           onto another orphan, naming which.
 
@@ -1127,18 +1127,23 @@ class ServerMenuMixin:
         return None
 
     def _log_readopt_confirmation(self, client, orphan, dev, device_id: int, previous) -> None:
-        """§4.5 — the one WARNING a successful re-adopt leaves behind.
+        """PR5 design §4.5 — the one WARNING a successful re-adopt leaves behind.
 
         The last sentence is emitted only when ``device_id`` was already
         exported under a DIFFERENT identity than the orphan it is now
-        inheriting — the E2/E5 "recreated and re-exported before noticing"
+        inheriting — PR5 design E2/E5's "recreated and re-exported before noticing"
         case, whose own accessory the ``_nudge_export`` call just before this
         one has already asked the bridge to remove.
         """
         role_label = export_catalog.role_label(orphan.role)
         if orphan.device_id is not None:
+            # "stopped exporting it", not "was deleted": the node records an
+            # orphan whenever an identity goes away, and a deliberate
+            # un-export is at least as common as a deleted device. Naming the
+            # cause we did not observe is how a user ends up hunting for a
+            # deletion that never happened.
             left_behind = (f"That accessory was left behind when device {orphan.device_id} "
-                          "was deleted.")
+                          "stopped exporting it.")
         else:
             left_behind = "That accessory was left behind."
         prior_identity = (previous.published_as or published_id_for(device_id)) \
@@ -1157,7 +1162,7 @@ class ServerMenuMixin:
             orphan.label, role_label, orphan.number, dev.name, device_id, left_behind, superseded)
 
     def _readopt_refuse(self, errors, field: str, msg: str) -> None:
-        """One §4.4 SUBSTANTIVE refusal: dialog error plus a matching
+        """One PR5 design §4.4 SUBSTANTIVE refusal: dialog error plus a matching
         WARNING — ``menuRebuildEndpointMap``'s convention of never reporting
         success over an operation that did not land, extended to a refusal
         that never started. Never used for a plain "tick the box"/"make a
@@ -1169,10 +1174,10 @@ class ServerMenuMixin:
         errors[field] = msg
 
     def _readopt_pick_orphan(self, valuesDict, errors):
-        """The picked orphan (or "select one"), re-verified per §4.4 steps
-        3-4: a FRESHLY-fetched ``list_orphans`` (edge case E6 — never the
+        """The picked orphan (or "select one"), re-verified per PR5 design §4.4 steps
+        3-4: a FRESHLY-fetched ``list_orphans`` (PR5 design E6 — never the
         picker's own read, which may be stale by Execute time), with both a
-        role and a label (edge case E4 — a pre-2026.16.2 bare orphan, which
+        role and a label (PR5 design E4 — a pre-2026.16.2 bare orphan, which
         deleted them on un-export).
 
         Returns the orphan, or ``None`` with ``errors`` filled in.
@@ -1186,7 +1191,7 @@ class ServerMenuMixin:
         except ReadoptOrphansUnavailable:
             orphans = None
         if orphans is None:
-            # NOT the E6 story below: nothing re-exported anything, we simply
+            # NOT the PR5 design E6 story below: nothing re-exported anything, we simply
             # could not re-read the list, and step 3 exists precisely because
             # the picker's own read is not trusted at Execute time.
             self._readopt_refuse(errors, "readoptOrphan",
@@ -1210,10 +1215,10 @@ class ServerMenuMixin:
         return orphan
 
     def _readopt_pick_device(self, orphan, valuesDict, errors):
-        # pylint: disable=too-many-return-statements  # one return per §4.4 refusal, by design
-        """The picked device (or "select one"), re-verified per §4.4 steps
+        # pylint: disable=too-many-return-statements  # one return per PR5 §4.4 refusal
+        """The picked device (or "select one"), re-verified per PR5 design §4.4 steps
         5-6: still existing, still classifying as exportable, and still able
-        to take the orphan's role (edge case E3, owner ruling 2 — REFUSE,
+        to take the orphan's role (PR5 design E3, owner ruling 2 — REFUSE,
         never allow-with-warning: cross-role re-adopt is exactly the
         in-place device-type mutation issue #240 exists to eliminate, since
         the endpoint number is preserved by construction).
@@ -1269,9 +1274,9 @@ class ServerMenuMixin:
         return dev
 
     def _readopt_commit(self, client, orphan, dev, errors, valuesDict):  # pylint: disable=too-many-arguments
-        """The §4.4 closing paragraph: one ``ExportStore.upsert`` preserving
+        """The PR5 design §4.4 closing paragraph: one ``ExportStore.upsert`` preserving
         any existing ``name_override``/``options``, then the remove-then-add
-        nudge and the §4.5 confirmation log.
+        nudge and the PR5 design §4.5 confirmation log.
         """
         device_id = dev.id
         previous = self.exports.get(device_id)
@@ -1294,7 +1299,7 @@ class ServerMenuMixin:
         told = self._nudge_export(device_id, role_changed=True)  # pylint: disable=no-member  # ExportDialogMixin
         if not told:
             # The store write stands (re-attaching WILL apply it), but the
-            # §4.5 WARNING claims every ecosystem has already kept its room —
+            # PR5 design §4.5 WARNING claims every ecosystem has already kept its room —
             # and that has not happened yet. Reporting it here would be the
             # same "success over an operation that did not land" this whole
             # menu is written to avoid.
@@ -1305,9 +1310,9 @@ class ServerMenuMixin:
         return (True, valuesDict)
 
     def menuReadoptExport(self, valuesDict, menuId=""):  # noqa: N802, ARG002
-        """Execute "Re-adopt a Matter accessory…" (§4.4, issue #219).
+        """Execute "Re-adopt a Matter accessory…" (PR5 design §4.4, issue #219).
 
-        Validated in the exact order §4.4 specifies, each step delegated to
+        Validated in the exact order PR5 design §4.4 specifies, each step delegated to
         one helper so later steps can assume earlier ones already hold:
         :meth:`_readopt_pick_orphan` (steps 3-4), :meth:`_readopt_pick_device`
         (steps 5-6), the step-7 identity claim here, then
@@ -1319,7 +1324,7 @@ class ServerMenuMixin:
             errors["readoptConfirm"] = (
                 "Tick the box — re-adopting hands this accessory to a different Indigo device.")
             return (False, valuesDict, errors)
-        # 2. a live, ATTACHED bridge client (edge case E1) — stricter than the
+        # 2. a live, ATTACHED bridge client (PR5 design E1) — stricter than the
         #    rebuild/reset gate; see _recovery_client's own docstring.
         client = self._recovery_client(errors, "readoptConfirm", require_attached=True)
         if client is None:
@@ -1332,7 +1337,7 @@ class ServerMenuMixin:
         if dev is None:
             return (False, valuesDict, errors)
         # 7. the orphan's identity is not already claimed by another
-        #    ExportStore entry (edge case E12).
+        #    ExportStore entry (PR5 design E12).
         claimant = self._readopt_identity_claimant(orphan.unique_id, dev.id)
         if claimant is not None:
             self._readopt_refuse(

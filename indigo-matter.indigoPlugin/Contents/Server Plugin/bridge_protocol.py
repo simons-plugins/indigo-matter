@@ -24,7 +24,7 @@ from typing import Any, Optional
 #: Protocol version this plugin speaks (§2). Skew fails closed on both peers.
 #:
 #: Bumped 1 -> 2 alongside ``EndpointSpec.published_as`` first being sent
-#: (issues #219/#240, owner ruling): rather than gate ``published_as`` behind
+#: (issues #219/#240, PR5 design owner ruling 1): rather than gate ``published_as`` behind
 #: a ``bridgeVersion`` capability check, the protocol simply requires v2. An
 #: old (pre-#219/#240) node cannot silently ignore a ``publishedAs`` it does
 #: not understand and publish a duplicate default-identity accessory, because
@@ -219,7 +219,7 @@ SYSTEM_MODES = ("off", "heat", "cool", "auto")
 # `Endpoint.id` on, and a plugin/node disagreement about it would create a
 # duplicate accessory rather than update the one the user meant.
 # --------------------------------------------------------------------------
-#: Matter's ``UniqueID`` cap (F9, measured against matter.js 0.17.8) — mirrors
+#: Matter's ``UniqueID`` cap (PR5 design F9, measured against matter.js 0.17.8) — mirrors
 #: `protocol.ts`'s ``PUBLISHED_ID_MAX``.
 PUBLISHED_ID_MAX = 32
 
@@ -261,7 +261,7 @@ def parse_published_id(value: str) -> Optional[PublishedId]:
     is not a lawful published identity — strict rather than forgiving, the
     same way ``parsePublishedId`` is on the TypeScript side: a loosely coerced
     device id is a new accessory in every paired ecosystem, not the one the
-    caller meant. The length cap is F9's measured ``UniqueID`` limit.
+    caller meant. The length cap is PR5 design F9's measured ``UniqueID`` limit.
     """
     if not isinstance(value, str) or len(value) > PUBLISHED_ID_MAX:
         return None
@@ -283,7 +283,7 @@ def next_generation(published_as: str) -> str:
     """The published identity one role-change generation past ``published_as``
     (issue #240) — ``indigo-<id>`` -> ``indigo-<id>~2`` -> ``indigo-<id>~3`` ...
 
-    The plugin is the only peer that ever bumps a generation (§1.3): the node
+    The plugin is the only peer that ever bumps a generation (PR5 design §1.3): the node
     only ever receives whatever this produces. Raises ``ValueError`` for an
     unparseable ``published_as`` — every caller already holds either a stored,
     previously-validated identity or the default derivation, so an unlawful
@@ -317,7 +317,13 @@ class Hello:
 
 @dataclass
 class EndpointSpec:
-    """One exported accessory (§4.1). ``indigo_device_id`` is the identity key."""
+    """One exported accessory (§4.1).
+
+    ``indigo_device_id`` is the DRIVING device — what §5 commands are
+    addressed to and what §3.4 state pushes are keyed on. :attr:`published_as`
+    is the accessory's identity (ADR-0010, issues #219/#240), defaulting to
+    ``indigo-<indigo_device_id>``.
+    """
     indigo_device_id: int
     role: str
     label: str
@@ -397,7 +403,7 @@ class OrphanRecord:
     """One left-behind accessory identity (§3.12, issues #219/#240) — the
     re-adopt picker's data. Mirrors `bridge-node/src/protocol.ts`'s
     ``OrphanRecord`` field-for-field. ``role``/``label`` absent together is
-    the pre-2026.16.2 bare orphan (§4.2's third picker row, edge case E4) —
+    the pre-2026.16.2 bare orphan (PR5 design §4.2's third picker row, E4) —
     a plugin that old deleted them on un-export, so there is nothing left to
     match a replacement device against and the record can never be
     re-adopted, only shown so the user can see its number is spoken for.

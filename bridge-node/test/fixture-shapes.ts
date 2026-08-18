@@ -296,7 +296,7 @@ export const endpointMapInvalid = {
 /**
  * §3.12's answer (issue #219) — three left-behind identities: one with a full
  * date, one "date unknown" (`orphanedAt` absent, a pre-PR5 orphan), and one
- * bare `{uniqueId, number}` entry (E4) — a pre-2026.16.2 orphan with no
+ * bare `{uniqueId, number}` entry (PR5 design E4) — a pre-2026.16.2 orphan with no
  * role/label, listed but unmatchable.
  */
 export const orphanList = [

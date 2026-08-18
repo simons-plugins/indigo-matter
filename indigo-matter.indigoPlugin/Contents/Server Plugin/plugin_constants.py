@@ -135,7 +135,7 @@ SHARE_WINDOW_TIMEOUT = 60.0
 ALL_OPTION_ID = "all"
 #: How long "Re-adopt a Matter accessory…" (issue #219) may block the Indigo
 #: UI thread on `list_orphans` — for both its pickers and its own step-3
-#: re-verification (§4.4). A plain, local read like PAIRING_READ_TIMEOUT's
+#: re-verification (PR5 design §4.4). A plain, local read like PAIRING_READ_TIMEOUT's
 #: `get_pairing`, not one of the "real work happens behind it" deadlines
 #: above, so it gets the same number rather than a longer one.
 READOPT_ORPHANS_TIMEOUT = 15.0

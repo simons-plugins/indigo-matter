@@ -258,7 +258,7 @@ describe("planReconcile (§3.1)", () => {
             // new one is simply absent from `live` — a plain removal and a
             // plain create, never `recreate`, because matter.js gives the new
             // `Endpoint.id` a fresh number rather than reusing the retired one
-            // (F1).
+            // (PR5 design F1).
             const plan = planReconcile(
                 live([1, Role.onOffLight]),
                 [spec(1, Role.dimmableLight, "L", false, "indigo-1~2")],
@@ -271,7 +271,7 @@ describe("planReconcile (§3.1)", () => {
 
         it("keeps an unchanged identity on the update path even when the device id repeats", () => {
             // The update decision is keyed on `publishedAs` alone: a live map
-            // that (pathologically, e.g. E7's half-finished supersede) holds
+            // that (pathologically, e.g. PR5 design E7's half-finished supersede) holds
             // TWO keys for the same `indigoDeviceId` must not throw the
             // unrelated, unchanged key's routing off course.
             const twoKeysOneDevice = new Map<string, LiveComposition>([
@@ -298,7 +298,7 @@ describe("planReconcile (§3.1)", () => {
         });
 
         it("still recreates in place when the role changed at an unchanged identity (pre-#240 skew)", () => {
-            // §1.3's version-skew fallback: a plugin old enough to never bump
+            // PR5 design §1.3's version-skew fallback: a plugin old enough to never bump
             // `publishedAs` still gets the pre-#240 in-place recreate rather
             // than a refusal.
             const plan = planReconcile(live([1, Role.onOffLight]), [spec(1, Role.dimmableLight)], false);

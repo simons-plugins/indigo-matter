@@ -116,11 +116,24 @@ export function indigoDeviceIdFrom(uniqueId: string): number | undefined {
 }
 
 /**
- * `Endpoint.id` derivation — the identity key of BRIDGE_PROTOCOL §4.1/§6.3.
- * Deliberately the *same* value as {@link uniqueIdFor}: one derivation means the
- * two can never drift apart, and §6.3's one-way identity flow reads directly.
- * matter.js keys persisted endpoint numbers on this string alone (PRD §4.3), so
- * it must never be reused or mutated.
+ * The `Endpoint.id` a device gets **by default** — i.e. the generation-1
+ * derivation, `indigo-<deviceId>`. Deliberately the *same* value as
+ * {@link uniqueIdFor}: one derivation means the two can never drift apart, and
+ * §6.3's one-way identity flow reads directly. matter.js keys persisted
+ * endpoint numbers on this string alone (PRD §4.3), so it must never be reused
+ * or mutated.
+ *
+ * **It is NOT where a live endpoint's id comes from, and reverting it to that
+ * would be silent.** Since issues #219/#240 an `Endpoint.id` is built from
+ * `spec.publishedAs` (`createEndpoint`), which merely DEFAULTS to this
+ * derivation — a re-adopted or role-changed accessory publishes something
+ * else, and rebuilding the id from `indigoDeviceId` here would hand it a
+ * different `Endpoint.id`, i.e. a different matter.js endpoint number, i.e. a
+ * duplicate accessory in every paired ecosystem. Neither this nor
+ * {@link uniqueIdFor} has a single caller left in `src/` for that reason; both
+ * survive as the named default and for tests. `restore.test.ts`'s "the SAME
+ * `Endpoint.id` gets the SAME number back" case is the mutation-probed pin
+ * that catches a revert.
  */
 export const endpointIdFor = uniqueIdFor;
 

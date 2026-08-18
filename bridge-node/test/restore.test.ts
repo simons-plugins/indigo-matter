@@ -924,7 +924,7 @@ describe("issue #141: one unusable map entry costs only itself", () => {
         // fail on its way into the Matter tree is an entry whose KEY is not a
         // legal one: `deviceId` makes it resolvable (issue #219 — a re-adopted
         // or hand-edited entry need not have a key `parsePublishedId` accepts)
-        // while the key itself violates F9's "no `.` in an `Endpoint.id`" —
+        // while the key itself violates PR5 design F9's "no `.` in an `Endpoint.id`" —
         // exactly the kind of corrupted-but-resolvable entry `restore()`'s
         // per-spec try/catch exists to survive.
         const storagePath = storage();
@@ -1338,7 +1338,7 @@ describe("issues #219/#240 at node level: re-adopt and the two-command supersede
         // #219: a device is deleted, its export is un-exported (`remove_endpoint`),
         // and a REPLACEMENT device claims the same published identity by name —
         // exactly what the (future) Re-adopt menu action sends. Nothing on the
-        // wire should move: same `Endpoint.id`, same number (F1), same UniqueID.
+        // wire should move: same `Endpoint.id`, same number (PR5 design F1), same UniqueID.
         const storagePath = storage();
         const session = await boot(storagePath);
         try {
@@ -1387,7 +1387,7 @@ describe("issues #219/#240 at node level: re-adopt and the two-command supersede
             assert.equal(
                 (upsertFrame?.result as { endpointNumber: number } | undefined)?.endpointNumber,
                 numberBefore,
-                "F1: the SAME Endpoint.id gets the SAME number back",
+                "PR5 design F1: the SAME Endpoint.id gets the SAME number back",
             );
 
             assert.deepEqual(
@@ -1412,7 +1412,7 @@ describe("issues #219/#240 at node level: re-adopt and the two-command supersede
         }
     });
 
-    it("nudges towards Re-adopt when an attach creates a NEW identity matching an orphan's role+label (owner ruling 4)", async () => {
+    it("nudges towards Re-adopt when an attach creates a NEW identity matching an orphan's role+label (PR5 design owner ruling 4)", async () => {
         // Distinct from the re-adopt test above: here the REPLACEMENT device is
         // exported under its OWN brand-new identity (not the orphan's), the way
         // an ordinary export naturally would be if the user never knew the old
@@ -1549,14 +1549,14 @@ describe("issues #219/#240 at node level: re-adopt and the two-command supersede
         }
     });
 
-    it("leaves the interim identity an ORDINARY orphan when a re-adopt replaces it (E5)", async () => {
-        // §5 E2/E5: the device was recreated and re-exported under its OWN
+    it("leaves the interim identity an ORDINARY orphan when a re-adopt replaces it (PR5 design E5)", async () => {
+        // PR5 design E2/E5: the device was recreated and re-exported under its OWN
         // identity before the user noticed the empty room, so re-adopt has to
         // remove THAT accessory and publish the orphaned one in its place.
         // That is one removal plus one create for one device — the same shape
         // as a supersede — but it is NOT one: the identity left behind was
         // never replaced by a later generation of itself, its number is not
-        // retired, and E5 rules it "itself re-adoptable later, which is
+        // retired, and PR5 design E5 rules it "itself re-adoptable later, which is
         // harmless". Marking it superseded would hide it from the picker for
         // good.
         const storagePath = storage();
@@ -1624,7 +1624,7 @@ describe("issues #219/#240 at node level: re-adopt and the two-command supersede
             );
             assert.ok(
                 session.bridge.listOrphans().some(orphan => orphan.uniqueId === interim),
-                `§3.12 must go on offering it (E5), got ${JSON.stringify(session.bridge.listOrphans())}`,
+                `§3.12 must go on offering it (PR5 design E5), got ${JSON.stringify(session.bridge.listOrphans())}`,
             );
         } finally {
             await session.close();
