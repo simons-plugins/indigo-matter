@@ -393,6 +393,28 @@ def test_a_re_adopted_entry_round_trips_through_a_second_store(prefs, mock_logge
     assert second.get(987654321).published_as == "indigo-123456789"
 
 
+def test_upsert_refuses_an_unlawful_published_as_at_WRITE_time(prefs, mock_logger):
+    """Belt and braces with `from_dict` (edge case E12). Validating only at
+    LOAD time means the bad identity reaches the prefs, goes out on the very
+    next attach, and is refused there with `malformed_args` — which stops
+    EVERY export, not just this one — while the dialog that wrote it reported
+    success. Raising here is what lets the caller say it failed."""
+    store = ExportStore(lambda: prefs, mock_logger)
+    with pytest.raises(ValueError):
+        store.upsert(_entry(1, "onOffLight", published_as="indigo-1e3"))
+    assert store.get(1) is None, "nothing was written"
+    assert PREF_KEY not in prefs or "indigo-1e3" not in prefs[PREF_KEY]
+
+
+def test_upsert_still_accepts_a_re_adopted_published_as(prefs, mock_logger):
+    """The write-time check is LAWFULNESS only, exactly like `from_dict`'s —
+    a re-adopt is a NEW device publishing the OLD device's identity, so the
+    two deliberately do not agree."""
+    store = ExportStore(lambda: prefs, mock_logger)
+    store.upsert(_entry(1, "onOffLight", published_as="indigo-2"))
+    assert store.get(1).published_as == "indigo-2"
+
+
 def test_published_as_absent_on_load_of_an_older_payload(mock_logger):
     """An entry saved before PR5 has no `publishedAs` key at all — it must
     load, not be dropped as unusable, with `published_as` defaulting to None."""

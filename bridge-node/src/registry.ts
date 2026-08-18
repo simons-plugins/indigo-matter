@@ -364,12 +364,26 @@ export class EndpointRegistry {
             }
         }
 
-        const removals = [
-            ...plan.remove
-                .map(publishedAs => this.deviceIdFor(publishedAs))
-                .filter((indigoDeviceId): indigoDeviceId is number => indigoDeviceId !== undefined),
-            ...plan.recreate.map(spec => spec.indigoDeviceId),
-        ];
+        const removedDeviceIds: number[] = [];
+        for (const publishedAs of plan.remove) {
+            const indigoDeviceId = this.deviceIdFor(publishedAs);
+            if (indigoDeviceId === undefined) {
+                // `plan.remove` comes from `liveComposition()`, which is built
+                // from `#live` — so a key that resolves to nothing means the
+                // two disagree, and the accessory the plugin asked to remove
+                // is about to stay in every paired ecosystem. A `.filter()`
+                // dropped it without a word; the removal count downstream then
+                // looks correct, which is the worst possible shape for this.
+                this.#log(
+                    `Cannot remove accessory identity ${publishedAs}: no live endpoint is publishing it. ` +
+                        "It is NOT being removed from any paired ecosystem — the live set and the endpoint " +
+                        "map disagree about who publishes it.",
+                );
+                continue;
+            }
+            removedDeviceIds.push(indigoDeviceId);
+        }
+        const removals = [...removedDeviceIds, ...plan.recreate.map(spec => spec.indigoDeviceId)];
         const total = removals.length + plan.create.length + plan.recreate.length + plan.update.length;
         let done = 0;
         let mutated = false;

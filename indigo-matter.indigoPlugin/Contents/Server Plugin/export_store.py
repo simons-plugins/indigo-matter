@@ -250,7 +250,20 @@ class ExportStore:
 
         Raises whatever the prefs write or flush raised, having changed
         nothing — see :meth:`_commit`.
+
+        ``published_as`` is validated HERE as well as in :meth:`from_dict`
+        (issues #219/#240, edge case E12's plugin-side half). Load-time
+        validation alone means an unlawful identity is written to the prefs,
+        sent to the node on the very next attach — which refuses the WHOLE
+        attach with ``malformed_args``, taking every export offline — and only
+        discovered on the reload after that, by which point the dialog that
+        wrote it has long since reported success. Raising at the write is what
+        lets the caller say "FAILED to save the export list" instead.
         """
+        if entry.published_as is not None and parse_published_id(entry.published_as) is None:
+            raise ValueError(
+                f"export entry {KEY_PUBLISHED_AS!r} {entry.published_as!r} is not a lawful "
+                f"published identity (device {entry.indigo_device_id})")
         with self._lock:
             pending = dict(self._entries)
             pending[int(entry.indigo_device_id)] = entry

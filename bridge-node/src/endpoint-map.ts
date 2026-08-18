@@ -316,6 +316,18 @@ export interface EndpointMapLoad {
     present: boolean;
     /** Set only when a file was present and could not be used. */
     problem?: string;
+    /**
+     * Entry-level oddities tolerated during the read, for the caller to put on
+     * the §4.3 channel (issues #219/#240).
+     *
+     * `readRecord` is deliberately forgiving — a bad field costs the field, not
+     * the file (see its own comment) — but "tolerated" is not the same as
+     * "unremarkable", and a DISCARDED `supersededBy` re-arms a retired identity
+     * as an ordinary re-adopt candidate. That is a decision about the user's
+     * accessories, taken from a value we could not read, and it must not be
+     * taken in silence.
+     */
+    notes?: string[];
 }
 
 function isNonEmptyString(value: unknown): value is string {
@@ -334,7 +346,7 @@ function isEndpointNumber(value: unknown): value is number {
  * number is the irreplaceable part, and refusing the whole file over a label
  * would turn a cosmetic corruption into a refuse-to-start.
  */
-function readRecord(value: unknown): EndpointRecord | undefined {
+function readRecord(value: unknown, uniqueId: string, notes: string[]): EndpointRecord | undefined {
     if (isEndpointNumber(value)) {
         return { number: value };
     }
@@ -378,9 +390,22 @@ function readRecord(value: unknown): EndpointRecord | undefined {
         record.orphanedAt = candidate.orphanedAt;
     }
     // Same tolerance: anything other than a non-empty string is simply not a
-    // supersession marker.
+    // supersession marker — but unlike the others, LOSING this one changes
+    // what the node offers the user. A superseded identity is excluded from
+    // `restorable()` and `orphans()`; without the marker it becomes an
+    // ordinary re-adopt candidate again, and re-adopting it resurrects an
+    // old-role accessory under a number every paired ecosystem has already
+    // processed a removal for. Present-but-unusable is therefore said out
+    // loud; absent (every ordinary record) is not.
     if (isNonEmptyString(candidate.supersededBy)) {
         record.supersededBy = candidate.supersededBy;
+    } else if (candidate.supersededBy !== undefined) {
+        notes.push(
+            `Endpoint map entry ${uniqueId} has an unusable supersededBy ` +
+                `(${JSON.stringify(candidate.supersededBy)}); it was discarded, so this retired ` +
+                "accessory identity is a re-adopt candidate again. Re-adopting it would resurrect " +
+                "an old-role accessory under a retired number — check it before you do.",
+        );
     }
     return record;
 }
@@ -389,13 +414,13 @@ function readRecord(value: unknown): EndpointRecord | undefined {
  * Parse the `endpoints` object of either schema version, or `undefined` if the
  * file is not an endpoint map at all.
  */
-function readEndpoints(value: unknown): Map<string, EndpointRecord> | undefined {
+function readEndpoints(value: unknown, notes: string[]): Map<string, EndpointRecord> | undefined {
     if (typeof value !== "object" || value === null || Array.isArray(value)) {
         return undefined;
     }
     const endpoints = new Map<string, EndpointRecord>();
     for (const [uniqueId, entry] of Object.entries(value)) {
-        const record = readRecord(entry);
+        const record = readRecord(entry, uniqueId, notes);
         if (record === undefined) {
             return undefined;
         }
@@ -422,11 +447,12 @@ function isNotFound(error: unknown): boolean {
  */
 export function loadEndpointMap(storagePath: string): EndpointMapLoad {
     const file = join(storagePath, ENDPOINT_MAP_FILE);
+    const notes: string[] = [];
     try {
         const parsed: unknown = JSON.parse(readFileSync(file, "utf8"));
         const version = (parsed as { version?: unknown } | null)?.version;
         const endpoints = isKnownVersion(version)
-            ? readEndpoints((parsed as EndpointMapFile).endpoints)
+            ? readEndpoints((parsed as EndpointMapFile).endpoints, notes)
             : undefined;
         if (endpoints === undefined) {
             return {
@@ -437,7 +463,7 @@ export function loadEndpointMap(storagePath: string): EndpointMapLoad {
                     `(or legacy version ${ENDPOINT_MAP_VERSION_LEGACY}) endpoint map`,
             };
         }
-        return { endpoints, present: true };
+        return { endpoints, present: true, ...(notes.length > 0 ? { notes } : {}) };
     } catch (error) {
         if (isNotFound(error)) {
             return { endpoints: new Map(), present: false };
@@ -648,6 +674,11 @@ export class EndpointMapStore {
         this.#quarantined = false;
         this.#warnings.clear();
         this.#notices.clear();
+        // Before anything else reads the map: `restorable()` below can add its
+        // own notices, and these describe the very bytes it is about to walk.
+        for (const [index, note] of (loaded.notes ?? []).entries()) {
+            this.notice(`load-note:${index}`, note);
+        }
         if (loaded.problem !== undefined) {
             this.log(`Endpoint map unusable: ${loaded.problem}`);
         } else if (!loaded.present) {
@@ -820,11 +851,29 @@ export class EndpointMapStore {
      * that need to tell the two shapes apart check `role`/`label` for
      * `undefined`, which {@link restorable}'s own skip-and-log already treats
      * as unrebuildable for the SAME entries.
+     *
+     * **Skips a key `parsePublishedId` refuses — E11's `restorable()`
+     * treatment, applied here for a sharper reason.** This list feeds the
+     * re-adopt picker, and picking a row writes its key into the plugin's
+     * `ExportStore` as a `publishedAs`, which the node then refuses at the
+     * next attach with `malformed_args` — and an attach refusal takes EVERY
+     * export offline, not just that one. So a hand-edited or newer-node key is
+     * named once on the §4.3 channel and left out, rather than offered as a
+     * route into a whole-bridge outage.
      */
     orphans(): OrphanRecord[] {
         const orphans: OrphanRecord[] = [];
         for (const [uniqueId, record] of this.#endpoints) {
             if (!record.orphaned || record.supersededBy !== undefined) {
+                continue;
+            }
+            if (parsePublishedId(uniqueId) === undefined) {
+                this.notice(
+                    `unofferable:${uniqueId}`,
+                    `Endpoint map key ${JSON.stringify(uniqueId)} is not a published accessory identity ` +
+                        "this bridge version understands, so it is not offered for re-adoption; a re-adopt " +
+                        "onto it would be refused at the next attach and stop every export.",
+                );
                 continue;
             }
             orphans.push({

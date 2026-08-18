@@ -1711,3 +1711,86 @@ describe("re-adopt notices reach the client, not just stdout (PR5 design §4.5, 
         assert.deepEqual(store.warnings, []);
     });
 });
+
+describe("a map entry that cannot be trusted is named, never silently used (PR5 design E11/E12)", () => {
+    it("does not offer an orphan whose key parsePublishedId refuses", () => {
+        // The picker writes the row's key into the plugin's ExportStore as a
+        // `publishedAs`, and the node refuses an unlawful one at the NEXT
+        // attach with `malformed_args` — which stops every export, not just
+        // this one. `restorable()` already declines such an entry (E11); the
+        // list feeding a user's choice must too.
+        const dir = storage();
+        writeFileSync(
+            join(dir, ENDPOINT_MAP_FILE),
+            JSON.stringify({
+                version: ENDPOINT_MAP_VERSION,
+                endpoints: {
+                    "indigo-1": { number: 2, role: "onOffLight", label: "Lamp", orphaned: true },
+                    // `Number("indigo-1e3")` would coerce; `parsePublishedId` refuses.
+                    "indigo-1e3": { number: 3, role: "onOffLight", label: "Not Ours", orphaned: true },
+                    "made-up-key": { number: 4, role: "onOffLight", label: "Mystery", orphaned: true },
+                },
+            }),
+        );
+        const store = new EndpointMapStore(dir);
+        store.load();
+
+        assert.deepEqual(
+            store.orphans().map(orphan => orphan.uniqueId),
+            ["indigo-1"],
+        );
+        for (const key of ["indigo-1e3", "made-up-key"]) {
+            assert.ok(
+                store.warnings.some(line => line.includes(JSON.stringify(key))),
+                `${key} must be named, not merely dropped: ${JSON.stringify(store.warnings)}`,
+            );
+        }
+    });
+
+    it("says so when a present-but-unusable supersededBy is discarded", () => {
+        // The marker's LOSS re-arms a retired identity as an ordinary re-adopt
+        // candidate, and re-adopting it resurrects an old-role accessory under
+        // a number every paired ecosystem has already processed a removal for.
+        // Tolerating the field is right; losing it in silence is not.
+        const dir = storage();
+        writeFileSync(
+            join(dir, ENDPOINT_MAP_FILE),
+            JSON.stringify({
+                version: ENDPOINT_MAP_VERSION,
+                endpoints: {
+                    "indigo-1": {
+                        number: 2,
+                        role: "onOffLight",
+                        label: "Lamp",
+                        orphaned: true,
+                        supersededBy: 42, // not a string: tolerated, and dropped
+                    },
+                },
+            }),
+        );
+        const store = new EndpointMapStore(dir);
+        store.load();
+
+        assert.equal(store.orphans().length, 1, "it IS re-adoptable again — that is the point");
+        assert.ok(
+            store.warnings.some(
+                line => line.includes("unusable supersededBy") && line.includes("indigo-1"),
+            ),
+            `the discard must be said out loud: ${JSON.stringify(store.warnings)}`,
+        );
+    });
+
+    it("says nothing about a record that simply has no supersededBy", () => {
+        const dir = storage();
+        const store = new EndpointMapStore(dir);
+        store.load();
+        store.check([{ uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Lamp" }]);
+        store.forget(["indigo-1"]);
+
+        const reloaded = new EndpointMapStore(dir);
+        reloaded.load();
+
+        assert.equal(reloaded.orphans().length, 1);
+        assert.deepEqual(reloaded.warnings, [], "an ordinary orphan is not an oddity");
+    });
+});

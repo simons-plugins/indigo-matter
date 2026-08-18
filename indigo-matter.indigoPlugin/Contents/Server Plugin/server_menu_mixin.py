@@ -1237,6 +1237,15 @@ class ServerMenuMixin:
         try:
             device_id = int(selection)
         except (TypeError, ValueError):
+            # Not a user mistake — every row this picker emits is either an
+            # integer device id or an `x-`-prefixed one handled above, so a
+            # `valuesDict` that reaches here means the dialog and the list
+            # callback disagree. Nothing in the message tells the user that,
+            # so the log has to.
+            self.logger.error(
+                "Matter bridge: re-adopt got a device selection that is neither a device id nor "
+                "an unselectable row — %r. Nothing was changed; this is a plugin fault, not a "
+                "bad choice.", selection)
             errors["readoptDevice"] = "Invalid selection."
             return None
         dev = self._indigo_device(device_id)  # pylint: disable=no-member  # ExportDialogMixin
