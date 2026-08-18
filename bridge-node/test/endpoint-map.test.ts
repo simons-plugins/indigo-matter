@@ -128,7 +128,7 @@ describe("the restoration half of an entry (issue #141)", () => {
         store.load();
 
         assert.deepEqual(store.restorable(), [
-            { uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Kitchen Lamp" },
+            { uniqueId: "indigo-1", endpointNumber: 2, indigoDeviceId: 1, role: "onOffLight", label: "Kitchen Lamp" },
         ]);
     });
 
@@ -170,7 +170,7 @@ describe("the restoration half of an entry (issue #141)", () => {
         store.check([{ uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Lamp" }]);
 
         assert.deepEqual(store.restorable(), [
-            { uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Lamp" },
+            { uniqueId: "indigo-1", endpointNumber: 2, indigoDeviceId: 1, role: "onOffLight", label: "Lamp" },
         ]);
         assert.deepEqual(mapFileIn(dir), {
             version: ENDPOINT_MAP_VERSION,
@@ -239,7 +239,7 @@ describe("the restoration half of an entry (issue #141)", () => {
         assert.deepEqual(drift, [{ uniqueId: "indigo-1", expected: 2, actual: 9 }], "still reported");
         assert.deepEqual(
             store.restorable(),
-            [{ uniqueId: "indigo-1", endpointNumber: 2, role: "dimmableLight", label: "New" }],
+            [{ uniqueId: "indigo-1", endpointNumber: 2, indigoDeviceId: 1, role: "dimmableLight", label: "New" }],
             "the baseline NUMBER is never repaired, but the name is not held hostage to it",
         );
         assert.deepEqual(mapFileIn(dir).endpoints, {
@@ -259,7 +259,7 @@ describe("the restoration half of an entry (issue #141)", () => {
         store.check([{ uniqueId: "indigo-1", endpointNumber: 2 }]);
 
         assert.deepEqual(store.restorable(), [
-            { uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Lamp" },
+            { uniqueId: "indigo-1", endpointNumber: 2, indigoDeviceId: 1, role: "onOffLight", label: "Lamp" },
         ]);
     });
 });
@@ -571,7 +571,7 @@ describe("EndpointMapStore.voidNumbers — reset renumbering adoption (issue #14
         store.voidNumbers("factory reset");
 
         assert.deepEqual(store.restorable(), [
-            { uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Lamp" },
+            { uniqueId: "indigo-1", endpointNumber: 2, indigoDeviceId: 1, role: "onOffLight", label: "Lamp" },
         ]);
     });
 
@@ -659,7 +659,8 @@ describe("EndpointMapStore.forget — un-export without losing the number (issue
         // the allocation so a re-export comes back as the same accessory rather
         // than a new one in every paired ecosystem.
         const dir = storage();
-        const store = new EndpointMapStore(dir);
+        const now = new Date("2026-08-18T07:21:04.000Z");
+        const store = new EndpointMapStore(dir, undefined, () => now);
         store.load();
         store.check([
             { uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Lamp" },
@@ -670,10 +671,16 @@ describe("EndpointMapStore.forget — un-export without losing the number (issue
 
         assert.equal(store.numberFor("indigo-1"), 2, "§3.3 retains the allocation");
         assert.deepEqual(store.restorable(), [
-            { uniqueId: "indigo-2", endpointNumber: 3, role: "dimmableLight", label: "Other" },
+            { uniqueId: "indigo-2", endpointNumber: 3, indigoDeviceId: 2, role: "dimmableLight", label: "Other" },
         ]);
         assert.deepEqual(mapFileIn(dir).endpoints, {
-            "indigo-1": { number: 2, role: "onOffLight", label: "Lamp", orphaned: true },
+            "indigo-1": {
+                number: 2,
+                role: "onOffLight",
+                label: "Lamp",
+                orphaned: true,
+                orphanedAt: now.toISOString(),
+            },
             "indigo-2": { number: 3, role: "dimmableLight", label: "Other" },
         });
     });
@@ -688,8 +695,11 @@ describe("EndpointMapStore.forget — un-export without losing the number (issue
         store.check([{ uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Lamp" }]);
 
         assert.deepEqual(store.restorable(), [
-            { uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Lamp" },
+            { uniqueId: "indigo-1", endpointNumber: 2, indigoDeviceId: 1, role: "onOffLight", label: "Lamp" },
         ]);
+        // `orphanedAt` is dropped along with `orphaned` itself: a live device
+        // is not orphaned, so a stamp saying when it WAS would be stale
+        // evidence masquerading as current.
         assert.deepEqual(mapFileIn(dir).endpoints, {
             "indigo-1": { number: 2, role: "onOffLight", label: "Lamp" },
         });
@@ -1130,7 +1140,7 @@ describe("battery (issue #220)", () => {
             "indigo-1": { number: 2, role: "onOffLight", label: "Lamp", battery: true },
         });
         assert.deepEqual(store.restorable(), [
-            { uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Lamp", battery: true },
+            { uniqueId: "indigo-1", endpointNumber: 2, indigoDeviceId: 1, role: "onOffLight", label: "Lamp", battery: true },
         ]);
     });
 
@@ -1173,7 +1183,7 @@ describe("battery (issue #220)", () => {
         store.check([{ uniqueId: "indigo-1", endpointNumber: 2 }]);
 
         assert.deepEqual(store.restorable(), [
-            { uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Lamp", battery: true },
+            { uniqueId: "indigo-1", endpointNumber: 2, indigoDeviceId: 1, role: "onOffLight", label: "Lamp", battery: true },
         ]);
     });
 
@@ -1191,7 +1201,7 @@ describe("battery (issue #220)", () => {
 
         assert.equal(loaded.problem, undefined);
         assert.deepEqual(store.restorable(), [
-            { uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Lamp" },
+            { uniqueId: "indigo-1", endpointNumber: 2, indigoDeviceId: 1, role: "onOffLight", label: "Lamp" },
         ]);
     });
 
@@ -1214,7 +1224,7 @@ describe("battery (issue #220)", () => {
             "indigo-1": { number: 2, role: "onOffLight", label: "Lamp", battery: true },
         });
         assert.deepEqual(store.restorable(), [
-            { uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Lamp", battery: true },
+            { uniqueId: "indigo-1", endpointNumber: 2, indigoDeviceId: 1, role: "onOffLight", label: "Lamp", battery: true },
         ]);
     });
 
@@ -1228,7 +1238,7 @@ describe("battery (issue #220)", () => {
         store.check([{ uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Lamp", battery: true }]);
 
         assert.deepEqual(store.restorable(), [
-            { uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Lamp", battery: true },
+            { uniqueId: "indigo-1", endpointNumber: 2, indigoDeviceId: 1, role: "onOffLight", label: "Lamp", battery: true },
         ]);
         assert.deepEqual(mapFileIn(dir).endpoints, {
             "indigo-1": { number: 2, role: "onOffLight", label: "Lamp", battery: true },
@@ -1248,7 +1258,226 @@ describe("battery (issue #220)", () => {
         store.load();
 
         assert.deepEqual(store.restorable(), [
-            { uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Lamp" },
+            { uniqueId: "indigo-1", endpointNumber: 2, indigoDeviceId: 1, role: "onOffLight", label: "Lamp" },
         ]);
+    });
+});
+
+describe("the driving device, the orphan date and supersession (issues #219/#240)", () => {
+    it("records deviceId for a live entry and REPLACES it when the driver changes", () => {
+        const dir = storage();
+        const store = new EndpointMapStore(dir);
+        store.load();
+        store.check([
+            { uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Lamp", deviceId: 100 },
+        ]);
+
+        assert.deepEqual(mapFileIn(dir).endpoints, {
+            "indigo-1": { number: 2, role: "onOffLight", label: "Lamp", deviceId: 100 },
+        });
+
+        // A re-adopt: the SAME identity, now driven by a DIFFERENT device.
+        store.check([
+            { uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Lamp", deviceId: 200 },
+        ]);
+
+        assert.deepEqual(
+            mapFileIn(dir).endpoints,
+            { "indigo-1": { number: 2, role: "onOffLight", label: "Lamp", deviceId: 200 } },
+            "replaced, not added to — the OLD device id must not survive alongside the new one",
+        );
+    });
+
+    it("resolves a restorable entry's device id from deviceId, falling back to the key", () => {
+        const dir = storage();
+        writeFileSync(
+            join(dir, ENDPOINT_MAP_FILE),
+            JSON.stringify({
+                version: 2,
+                endpoints: {
+                    "indigo-1": { number: 2, role: "onOffLight", label: "Kitchen Lamp" },
+                    // The KEY alone would parse to device id 2 — `deviceId` must win.
+                    "indigo-2": { number: 3, role: "dimmableLight", label: "Re-adopted", deviceId: 999 },
+                },
+            }),
+        );
+        const store = new EndpointMapStore(dir);
+        store.load();
+
+        assert.deepEqual(store.restorable(), [
+            { uniqueId: "indigo-1", endpointNumber: 2, indigoDeviceId: 1, role: "onOffLight", label: "Kitchen Lamp" },
+            {
+                uniqueId: "indigo-2",
+                endpointNumber: 3,
+                indigoDeviceId: 999,
+                role: "dimmableLight",
+                label: "Re-adopted",
+            },
+        ]);
+    });
+
+    it("does not restore a superseded entry", () => {
+        const dir = storage();
+        const store = new EndpointMapStore(dir);
+        store.load();
+        store.check([{ uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Lamp" }]);
+        store.check([{ uniqueId: "indigo-1~2", endpointNumber: 5, role: "dimmableLight", label: "Lamp" }]);
+
+        store.forget(["indigo-1"], { supersededBy: "indigo-1~2" });
+
+        assert.deepEqual(
+            store.restorable().map(entry => entry.uniqueId),
+            ["indigo-1~2"],
+            "the superseded identity must never come back — its number is retired for good",
+        );
+    });
+
+    it("stamps orphanedAt from the injected clock when forget() marks an entry", () => {
+        const dir = storage();
+        const now = new Date("2026-08-18T07:21:04.000Z");
+        const store = new EndpointMapStore(dir, undefined, () => now);
+        store.load();
+        store.check([{ uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Lamp" }]);
+
+        store.forget(["indigo-1"]);
+
+        assert.deepEqual(mapFileIn(dir).endpoints["indigo-1"], {
+            number: 2,
+            role: "onOffLight",
+            label: "Lamp",
+            orphaned: true,
+            orphanedAt: now.toISOString(),
+        });
+    });
+
+    it("marks supersededBy only when the caller says the removal was a supersession", () => {
+        const dir = storage();
+        const store = new EndpointMapStore(dir);
+        store.load();
+        store.check([
+            { uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Lamp" },
+            { uniqueId: "indigo-2", endpointNumber: 3, role: "onOffLight", label: "Other" },
+        ]);
+
+        store.forget(["indigo-1"]);
+        store.forget(["indigo-2"], { supersededBy: "indigo-2~2" });
+
+        assert.equal(
+            mapFileIn(dir).endpoints["indigo-1"]?.supersededBy,
+            undefined,
+            "an ordinary un-export never gets a supersededBy",
+        );
+        assert.equal(mapFileIn(dir).endpoints["indigo-2"]?.supersededBy, "indigo-2~2");
+    });
+
+    it("orphans() omits superseded entries but includes bare no-role/label ones (E4)", () => {
+        const dir = storage();
+        writeFileSync(
+            join(dir, ENDPOINT_MAP_FILE),
+            JSON.stringify({
+                version: 2,
+                endpoints: {
+                    "indigo-1": {
+                        number: 2,
+                        role: "onOffLight",
+                        label: "Kitchen Lamp",
+                        orphaned: true,
+                        orphanedAt: "2026-08-01T00:00:00.000Z",
+                    },
+                    "indigo-2": {
+                        number: 3,
+                        role: "dimmableLight",
+                        label: "Lounge Lamp",
+                        orphaned: true,
+                        supersededBy: "indigo-2~2",
+                    },
+                    // Pre-2026.16.2: an older plugin's forget() deleted role/label.
+                    "indigo-9": { number: 7, orphaned: true },
+                    // Live — not orphaned at all.
+                    "indigo-4": { number: 8, role: "onOffLight", label: "Live One" },
+                },
+            }),
+        );
+        const store = new EndpointMapStore(dir);
+        store.load();
+
+        // Superseded "indigo-2" is excluded (not re-adoptable); the live
+        // "indigo-4" is excluded (not orphaned); the bare "indigo-9" IS
+        // included, per E4 — shown so the picker can tell the user its
+        // number is reserved and why it cannot be re-adopted, rather than
+        // hiding it.
+        assert.deepEqual(store.orphans(), [
+            {
+                uniqueId: "indigo-1",
+                number: 2,
+                role: "onOffLight",
+                label: "Kitchen Lamp",
+                orphanedAt: "2026-08-01T00:00:00.000Z",
+            },
+            {
+                uniqueId: "indigo-9",
+                number: 7,
+            },
+        ]);
+    });
+
+    it("clears orphaned and adopts the new deviceId the first time a re-adopted identity is live", () => {
+        const dir = storage();
+        const logged: string[] = [];
+        const store = new EndpointMapStore(dir, message => logged.push(message));
+        store.load();
+        store.check([
+            { uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Lamp", deviceId: 100 },
+        ]);
+        store.forget(["indigo-1"]);
+        logged.length = 0;
+
+        store.check([
+            { uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Lamp", deviceId: 200 },
+        ]);
+
+        assert.deepEqual(
+            mapFileIn(dir).endpoints["indigo-1"],
+            { number: 2, role: "onOffLight", label: "Lamp", deviceId: 200 },
+            "orphaned AND orphanedAt are gone, and the device id is the NEW driver",
+        );
+        assert.ok(
+            logged.some(line => line.includes("is now driven by Indigo device 200, replacing device 100")),
+            `expected the re-adopt log line, got ${JSON.stringify(logged)}`,
+        );
+    });
+
+    it("reads a pre-PR5 file unchanged and writes the new keys only where they apply", () => {
+        const dir = storage();
+        writeFileSync(
+            join(dir, ENDPOINT_MAP_FILE),
+            JSON.stringify({
+                version: 2,
+                endpoints: {
+                    "indigo-1": { number: 2, role: "onOffLight", label: "Kitchen Lamp" },
+                    "indigo-2": { number: 3 },
+                },
+            }),
+        );
+        const store = new EndpointMapStore(dir);
+        const loaded = store.load();
+
+        assert.equal(loaded.problem, undefined);
+        assert.deepEqual([...loaded.endpoints.entries()], [
+            ["indigo-1", { number: 2, role: "onOffLight", label: "Kitchen Lamp" }],
+            ["indigo-2", { number: 3 }],
+        ]);
+
+        // Only the entry actually LIVE this pass gains the new field; the
+        // other, never seen this run, is untouched — no key appears
+        // speculatively.
+        store.check([
+            { uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Kitchen Lamp", deviceId: 1 },
+        ]);
+
+        assert.deepEqual(mapFileIn(dir).endpoints, {
+            "indigo-1": { number: 2, role: "onOffLight", label: "Kitchen Lamp", deviceId: 1 },
+            "indigo-2": { number: 3 },
+        });
     });
 });

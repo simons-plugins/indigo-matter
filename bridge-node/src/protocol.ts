@@ -378,6 +378,26 @@ export interface DriftEntry {
     actual: number;
 }
 
+/**
+ * §3.12 `list_orphans` (issue #219) — one left-behind accessory identity the
+ * re-adopt picker could offer. Defined here rather than in `endpoint-map.ts`
+ * (which is where {@link EndpointMapStore.orphans} actually builds these) so
+ * `BridgeFacade.listOrphans()` — landing alongside the `list_orphans` command
+ * itself — can be declared without `endpoint-map.ts` reaching back into a
+ * module that already imports FROM it: the existing direction is
+ * `endpoint-map.ts` → `protocol.ts`, never the reverse.
+ */
+export interface OrphanRecord {
+    uniqueId: string;
+    number: number;
+    role?: string;
+    label?: string;
+    /** ISO-8601, or absent for a pre-PR5 orphan — the picker renders that as "date unknown". */
+    orphanedAt?: string;
+    /** The device that drove this identity before it was un-exported, if recorded. */
+    deviceId?: number;
+}
+
 /** §3.7 */
 export interface PairingReport {
     commissioned: boolean;
