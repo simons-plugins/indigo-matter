@@ -63,7 +63,7 @@ BRIDGE_PACKAGE = "indigo-matter-bridge"
 #: and matter.js patch releases have changed what Apple Home renders with no code
 #: change on the bridge side. **This is the one line a release bumps**, in step
 #: with ``bridge-node/package.json``'s ``version``.
-DEFAULT_INSTALL_SPEC = f"{BRIDGE_PACKAGE}@0.12.0"
+DEFAULT_INSTALL_SPEC = f"{BRIDGE_PACKAGE}@0.13.0"
 
 #: Fallback entry point when the installed package's ``package.json`` is missing
 #: or unreadable. Must match ``bridge-node/package.json``'s ``main``;
