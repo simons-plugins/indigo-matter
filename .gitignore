@@ -14,3 +14,6 @@ docs/HANDOVER.md
 # Local-only Matter research dumps — raw get_node output kept for reference on
 # this machine, deliberately NOT published (see PR #188, closed for this reason).
 docs/research/
+
+# local secrets (npm publish token)
+.env
