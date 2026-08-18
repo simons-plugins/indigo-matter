@@ -461,6 +461,16 @@ def test_is_exportable_mirrors_classify():
     assert export_catalog.is_exportable(SprinklerDevice(2, "Zones"), OURS) is False
 
 
+def test_the_occupancy_label_names_motion():
+    """Issue #252 — Matter has no motion device type, so the occupancy role IS
+    the export of a PIR. A user hunting the picker for "motion" must find it
+    there, or read its absence as "my motion sensor cannot be exported".
+    """
+    label = export_catalog.role_label(export_catalog.ROLE_OCCUPANCY_SENSOR)
+    assert "motion" in label.lower()
+    assert "occupancy" in label.lower()
+
+
 def test_role_label_falls_back_to_the_role_name():
     assert export_catalog.role_label("onOffLight") == "Light (On/Off)"
     assert export_catalog.role_label("somethingNew") == "somethingNew"

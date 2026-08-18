@@ -410,7 +410,7 @@ are offered.
 | Dimmer | **Dimmable light** *(default)*, Window covering | Dimmable Light · Window Covering |
 | Dimmer, colour-temperature capable | **Colour-temperature light** *(default)*, Dimmable light, Window covering | Color Temperature Light |
 | Dimmer, full colour | **Full-colour light** *(default)*, Dimmable light, Colour-temperature light, Window covering | Extended Color Light |
-| Sensor, on/off | **Occupancy** *(default)*, Contact | Occupancy Sensor · Contact Sensor |
+| Sensor, on/off | **Occupancy (PIR/motion)** *(default)*, Contact | Occupancy Sensor · Contact Sensor |
 | Sensor, numeric | Temperature, Humidity, Light (lux), Pressure, Flow — the default is guessed from the device's units, and you can correct it | the matching Matter sensor type |
 | Thermostat | Thermostat | Thermostat (setpoints and modes; no fan in v1) |
 
@@ -422,6 +422,19 @@ device runs the other way. And the
 **numeric sensor** guess reads whatever unit hints the device carries (its
 plugin's properties, its displayed value, then its name) — it is only a default,
 and all five roles stay selectable.
+
+**A motion sensor exports as "Occupancy" — that is Matter's own ceiling, not
+a gap in this plugin** (issue #252). Matter 1.x defines no motion device type.
+Occupancy Sensor (0x0107) *is* the Matter representation of a PIR — the
+standard's own sensor-type bitmap lists passive infrared as one of the things
+an occupancy sensor is — so an Indigo motion sensor has exactly one honest
+export, and the picker names it "Occupancy sensor (PIR/motion)" so you can find
+it. Measured in Apple Home on 2026-08-18: the exported accessory shows as an
+Occupancy tile, and its automations trigger on occupancy detected/cleared,
+which is the same edge your Indigo motion sensor reports. The asymmetry is
+only in the naming: coming the *other* way, this plugin renders a Matter
+occupancy sensor as an Indigo motion sensor, because that is the Indigo device
+type users expect.
 
 **Battery level appears automatically, for any exported device that reports
 one.** If the underlying Indigo device has a battery reading, your ecosystem
