@@ -1693,7 +1693,8 @@ class TestMenuReadoptExportSuccess:
         assert "accessory number 7" in said
         assert 'onto Indigo device "Study Plug" (id 101)' in said
         assert "left behind when device 123456789 stopped exporting it" in said
-        assert "nothing is re-paired and nothing is renumbered" in said
+        assert "returns under its original identity and number" in said
+        assert "no duplicate is created" in said
         assert "previous accessory" not in said     # device 101 was never exported before
 
     def test_confirmation_log_omits_the_driving_device_when_unrecorded(self, plug):
@@ -1823,3 +1824,389 @@ class TestReadoptOutcomeTruthfulness:
         plug.runtime = _FakeRuntime(error=TimeoutError("node did not answer"))
         assert plug.getReadoptDevices(valuesDict={"readoptOrphan": "indigo-901"}) \
             == [plugin_mod.LIST_ERROR_OPTION]
+
+
+# ---------------------------------------------------------------------------
+# Migrate an exported accessory… (#246 design §3, issue #246)
+# ---------------------------------------------------------------------------
+def _endpoint_status(device_id, number, role):
+    """A minimal ``StatusReport`` naming one live endpoint — enough for
+    ``_previous_accessory_number`` to answer, without a bridge round trip."""
+    return bridge_protocol.StatusReport(
+        commissioned=True, fabrics=[], endpoint_count=1,
+        endpoints=[bridge_protocol.EndpointSummary(
+            indigo_device_id=device_id, endpoint_number=number, role=role)],
+        drift=[], drift_checked=True)
+
+
+class TestMigrateMenuExists:
+    def test_the_migrate_menu_exists_and_is_wired_to_a_callback(self, plugin_mod):
+        item = _menu_item_by_id("migrateExport")
+        assert item.findtext("Name") == "Migrate an exported accessory…"
+        assert item.findtext("CallbackMethod") == "menuMigrateExport"
+        assert hasattr(plugin_mod.Plugin, "menuMigrateExport")
+
+    def test_the_fields_have_the_expected_types(self, plug):
+        item = _menu_item_by_id("migrateExport")
+        fields = {f.get("id"): f for f in item.find("ConfigUI").findall("Field")}
+        assert fields["migrateSource"].get("type") == "menu"     # needs a CallbackMethod
+        assert fields["migrateDevice"].get("type") == "menu"
+        assert fields["migrateConfirm"].get("type") == "checkbox"
+        assert fields["migrateConfirm"].get("defaultValue") == "false"
+        assert fields["migrateSource"].findtext("CallbackMethod") == "migrateSourceChanged"
+        list_el = fields["migrateSource"].find("List")
+        assert list_el.get("class") == "self" and list_el.get("dynamicReload") == "true"
+        assert callable(getattr(plug, list_el.get("method")))
+        list_el = fields["migrateDevice"].find("List")
+        assert list_el.get("class") == "self" and list_el.get("dynamicReload") == "true"
+        assert callable(getattr(plug, list_el.get("method")))
+
+    def test_it_is_immediately_before_the_readopt_menu_item(self):
+        """The design-note pairing (#246): migrate is the live-source path,
+        placed right before re-adopt, its recovery-fallback twin."""
+        ids = [item.get("id") for item in ET.parse(MENU_ITEMS_XML).getroot().findall("MenuItem")]
+        assert ids.index("migrateExport") + 1 == ids.index("readoptExport")
+
+    def test_seeding_matches_the_pickers_no_selection_row(self, plug, plugin_mod):
+        values = plug.get_menu_action_config_ui_values("migrateExport")
+        assert values["migrateSource"] == plugin_mod.NO_SELECTION_ID
+        assert values["migrateDevice"] == plugin_mod.NO_SELECTION_ID
+        assert values["migrateConfirm"] is False
+
+
+class TestGetMigrateSources:
+    """§3.2 — the source picker's contents. Local store truth: no bridge
+    round trip, unlike the re-adopt orphan picker."""
+
+    def test_before_startup_says_so(self, plug, plugin_mod):
+        plug.exports = None
+        options = plug.getMigrateSources(valuesDict={})
+        assert options == [(plugin_mod.NO_SELECTION_ID,
+                            "(plugin still starting — re-open this dialog in a moment)")]
+
+    def test_nothing_exported_is_a_single_row(self, plug, plugin_mod):
+        options = plug.getMigrateSources(valuesDict={})
+        assert options == [(plugin_mod.NO_SELECTION_ID,
+                            "(nothing is currently exported — nothing to migrate)")]
+
+    def test_a_full_entry_is_formatted_with_role_and_identity(self, plug):
+        plug.exports.upsert(ExportEntry(101, "onOffPlugInUnit"))
+        options = plug.getMigrateSources(valuesDict={})
+        assert options == [("101", "Study Plug — "
+                            + export_catalog.role_label("onOffPlugInUnit")
+                            + " — accessory indigo-101")]
+
+    def test_a_custom_published_identity_is_shown_verbatim(self, plug):
+        plug.exports.upsert(ExportEntry(101, "onOffPlugInUnit", published_as="indigo-101~2"))
+        label = plug.getMigrateSources(valuesDict={})[0][1]
+        assert "accessory indigo-101~2" in label
+
+    def test_the_accessory_number_is_appended_when_the_client_knows_it(self, plug):
+        plug.exports.upsert(ExportEntry(101, "onOffPlugInUnit"))
+        client = _bridge_with(plug, attached=True)
+        client.status = _endpoint_status(101, 9, "onOffPlugInUnit")
+        label = plug.getMigrateSources(valuesDict={})[0][1]
+        assert label.endswith("(accessory #9)")
+
+    def test_the_number_is_omitted_when_unknown(self, plug):
+        plug.exports.upsert(ExportEntry(101, "onOffPlugInUnit"))
+        options = plug.getMigrateSources(valuesDict={})
+        assert "#" not in options[0][1]
+
+    def test_a_deleted_source_device_is_still_a_legitimate_source(self, plug):
+        """The allow-list is never auto-pruned when a device disappears — so
+        an entry for a gone device is a real migrate source, not stale junk."""
+        plug.exports.upsert(ExportEntry(987654, "onOffPlugInUnit"))
+        options = plug.getMigrateSources(valuesDict={})
+        assert options == [("987654", "(device 987654 no longer exists) — "
+                            + export_catalog.role_label("onOffPlugInUnit")
+                            + " — accessory indigo-987654")]
+
+    def test_multiple_entries_each_get_their_own_row(self, plug):
+        plug.exports.upsert(ExportEntry(101, "onOffPlugInUnit"))
+        plug.exports.upsert(ExportEntry(102, "dimmableLight"))
+        options = plug.getMigrateSources(valuesDict={})
+        assert [key for key, _label in options] == ["101", "102"]
+
+
+class TestGetMigrateDevices:
+    """§3.2 — the target picker: reuses `_readopt_device_row`'s per-device
+    rule verbatim, keyed off the SOURCE ENTRY's role, plus one migrate-only
+    rule: the source device itself is absent."""
+
+    def test_empty_without_a_picked_source(self, plug):
+        assert plug.getMigrateDevices(valuesDict={}) == []
+        assert plug.getMigrateDevices(valuesDict={"migrateSource": "0"}) == []
+
+    def test_before_startup_says_so_rather_than_showing_no_devices(self, plug, plugin_mod):
+        plug.exports = None
+        options = plug.getMigrateDevices(valuesDict={"migrateSource": "101"})
+        assert options == [(plugin_mod.NO_SELECTION_ID,
+                            "(plugin still starting — re-open this dialog in a moment)")]
+
+    def test_a_vanished_source_yields_no_devices(self, plug):
+        assert plug.getMigrateDevices(valuesDict={"migrateSource": "999999"}) == []
+
+    def test_only_devices_offering_the_sources_role_are_selectable(self, plug):
+        plug.exports.upsert(ExportEntry(101, "onOffPlugInUnit"))
+        labels = _labels(plug.getMigrateDevices(valuesDict={"migrateSource": "101"}))
+        assert "104" not in labels and "x-104" in labels  # SprinklerDevice never exports
+
+    def test_a_role_ineligible_device_is_shown_with_its_reason_not_hidden(self, plug, devices):
+        devices.add(RelayDevice(106, "Garage Plug"))
+        plug.exports.upsert(ExportEntry(106, "onOffPlugInUnit"))
+        labels = _labels(plug.getMigrateDevices(valuesDict={"migrateSource": "106"}))
+        assert "102" not in labels, "still unselectable"
+        assert labels["x-102"] == ("Hall Dimmer — cannot appear as a "
+                                   + export_catalog.role_label("onOffPlugInUnit"))
+
+    def test_an_unexportable_target_is_shown_with_the_classifiers_reason(self, plug):
+        plug.exports.upsert(ExportEntry(101, "onOffPlugInUnit"))
+        labels = _labels(plug.getMigrateDevices(valuesDict={"migrateSource": "101"}))
+        assert labels["x-104"].startswith("Irrigation — not exportable: ")
+
+    def test_xac6_our_own_device_stays_absent(self, plug):
+        plug.exports.upsert(ExportEntry(101, "onOffPlugInUnit"))
+        labels = _labels(plug.getMigrateDevices(valuesDict={"migrateSource": "101"}))
+        assert not any("105" in option_id for option_id in labels)
+
+    def test_the_source_device_itself_is_absent_not_explained(self, plug, devices):
+        """Absent, not merely excluded-with-a-reason: it is the row directly
+        above in the dialog, never a target for itself."""
+        devices.add(RelayDevice(106, "Garage Plug"))
+        plug.exports.upsert(ExportEntry(106, "onOffPlugInUnit"))
+        labels = _labels(plug.getMigrateDevices(valuesDict={"migrateSource": "106"}))
+        assert "106" not in labels and "x-106" not in labels
+
+    def test_already_exported_device_is_marked(self, plug, devices):
+        devices.add(RelayDevice(106, "Garage Plug"))
+        plug.exports.upsert(ExportEntry(101, "onOffPlugInUnit"))
+        plug.exports.upsert(ExportEntry(106, "onOffPlugInUnit"))
+        labels = _labels(plug.getMigrateDevices(valuesDict={"migrateSource": "101"}))
+        assert labels["106"] == "● Garage Plug"
+
+
+def test_migrate_source_changed_is_a_pure_passthrough(plug):
+    values = {"migrateSource": "101"}
+    assert plug.migrateSourceChanged(values) is values
+
+
+class TestMenuMigrateExportValidation:
+    """#246 design §3.2's eight-step order, one refusal at a time."""
+
+    def test_step1_refuses_without_the_tick(self, plug):
+        _bridge_with(plug, attached=True)
+        ok, _values_out, errors = plug.menuMigrateExport({"migrateConfirm": False})
+        assert ok is False and "migrateConfirm" in errors
+
+    def test_step2_refuses_when_not_attached(self, plug):
+        _bridge_with(plug, attached=False)
+        ok, _values_out, errors = plug.menuMigrateExport({"migrateConfirm": True})
+        assert ok is False and "migrateConfirm" in errors
+        assert "Start it, let the plugin attach, then re-open this dialog" \
+            in _said(plug.logger.warning.call_args_list)
+
+    def test_step2_refuses_with_no_bridge_at_all(self, plug):
+        plug.export_bridge = None
+        ok, _values_out, errors = plug.menuMigrateExport({"migrateConfirm": True})
+        assert ok is False and "migrateConfirm" in errors
+
+    def test_refuses_without_a_source_selected(self, plug):
+        _bridge_with(plug, attached=True)
+        ok, _values_out, errors = plug.menuMigrateExport(
+            {"migrateConfirm": True, "migrateSource": "0"})
+        assert ok is False and "migrateSource" in errors
+
+    def test_step3_refuses_a_source_gone_from_the_store_at_execute_time(self, plug):
+        """Re-read at Execute time, never trusted from the picker's own read
+        (#246 design §3.2 step 3) — something un-exported it mid-dialog."""
+        _bridge_with(plug, attached=True)
+        ok, _values_out, errors = plug.menuMigrateExport(
+            {"migrateConfirm": True, "migrateSource": "101", "migrateDevice": "102"})
+        assert ok is False and "migrateSource" in errors
+        assert "no longer exported" in errors["migrateSource"]
+        assert plug.exports.get(102) is None, "nothing was changed"
+
+    def test_refuses_without_a_device_selected(self, plug):
+        plug.exports.upsert(ExportEntry(101, "onOffPlugInUnit"))
+        _bridge_with(plug, attached=True)
+        ok, _values_out, errors = plug.menuMigrateExport(
+            {"migrateConfirm": True, "migrateSource": "101", "migrateDevice": "0"})
+        assert ok is False and "migrateDevice" in errors
+
+    def test_step4_refuses_a_deleted_target_device(self, plug):
+        plug.exports.upsert(ExportEntry(101, "onOffPlugInUnit"))
+        _bridge_with(plug, attached=True)
+        ok, _values_out, errors = plug.menuMigrateExport(
+            {"migrateConfirm": True, "migrateSource": "101", "migrateDevice": "999999"})
+        assert ok is False and "migrateDevice" in errors
+        assert "no longer exists" in errors["migrateDevice"]
+
+    def test_step4_refuses_an_unexportable_target(self, plug):
+        plug.exports.upsert(ExportEntry(101, "onOffPlugInUnit"))
+        _bridge_with(plug, attached=True)
+        ok, _values_out, errors = plug.menuMigrateExport(
+            {"migrateConfirm": True, "migrateSource": "101", "migrateDevice": "104"})
+        assert ok is False and "migrateDevice" in errors
+        assert "cannot be exported" in errors["migrateDevice"]
+
+    def test_step4_refuses_cross_role(self, plug):
+        plug.exports.upsert(ExportEntry(101, "onOffPlugInUnit"))
+        _bridge_with(plug, attached=True)
+        ok, _values_out, errors = plug.menuMigrateExport(
+            {"migrateConfirm": True, "migrateSource": "101", "migrateDevice": "102"})
+        assert ok is False and "migrateDevice" in errors
+        assert '"Hall Dimmer" cannot appear as a' in errors["migrateDevice"]
+        assert "becomes a new accessory" in errors["migrateDevice"]
+
+    def test_step5_refuses_the_target_being_the_source(self, plug):
+        plug.exports.upsert(ExportEntry(101, "onOffPlugInUnit"))
+        _bridge_with(plug, attached=True)
+        ok, _values_out, errors = plug.menuMigrateExport(
+            {"migrateConfirm": True, "migrateSource": "101", "migrateDevice": "101"})
+        assert ok is False and "migrateDevice" in errors
+        assert "already exporting this accessory" in errors["migrateDevice"]
+        assert plug.exports.get(101).role == "onOffPlugInUnit", "nothing was changed"
+
+    def test_refuses_an_unselectable_row_by_pointing_at_its_reason(self, plug):
+        plug.exports.upsert(ExportEntry(101, "onOffPlugInUnit"))
+        _bridge_with(plug, attached=True)
+        ok, _values_out, errors = plug.menuMigrateExport(
+            {"migrateConfirm": True, "migrateSource": "101", "migrateDevice": "x-104"})
+        assert ok is False and "migrateDevice" in errors
+        assert "listed with the reason" in errors["migrateDevice"]
+
+    def test_a_failed_store_write_is_reported_not_claimed_as_success(self, plug, monkeypatch, devices):
+        devices.add(RelayDevice(106, "Garage Plug"))
+        plug.exports.upsert(ExportEntry(101, "onOffPlugInUnit"))
+        _bridge_with(plug, attached=True)
+        monkeypatch.setattr(plug.exports, "replace_all",
+                            Mock(side_effect=RuntimeError("disk full")))
+        ok, _values_out, errors = plug.menuMigrateExport(
+            {"migrateConfirm": True, "migrateSource": "101", "migrateDevice": "106"})
+        assert ok is False and "migrateDevice" in errors
+        assert "FAILED" in errors["migrateDevice"]
+
+
+class TestMenuMigrateExportSuccess:
+    """#246 design §3.2's closing paragraph — the atomic commit, the nudge,
+    and the confirmation WARNING."""
+
+    def test_the_identity_moves_from_source_to_target_in_one_atomic_write(
+            self, plug, monkeypatch, devices):
+        devices.add(RelayDevice(106, "Garage Plug"))
+        plug.exports.upsert(ExportEntry(101, "onOffPlugInUnit"))
+        _bridge_with(plug, attached=True)
+        plug.export_bridge.reattach = Mock(return_value=True)
+        upsert_spy = Mock(wraps=plug.exports.upsert)
+        monkeypatch.setattr(plug.exports, "upsert", upsert_spy)
+        replace_all_spy = Mock(wraps=plug.exports.replace_all)
+        monkeypatch.setattr(plug.exports, "replace_all", replace_all_spy)
+
+        ok, _values_out = plug.menuMigrateExport(
+            {"migrateConfirm": True, "migrateSource": "101", "migrateDevice": "106"})
+
+        assert ok is True
+        upsert_spy.assert_not_called(), "the commit must be ONE replace_all, never two upserts"
+        replace_all_spy.assert_called_once()
+        assert plug.exports.get(101) is None, "the source entry leaves the list"
+        target = plug.exports.get(106)
+        assert target.role == "onOffPlugInUnit"
+        assert target.published_as == "indigo-101"
+        # No entry may ever claim an identity another entry also claims —
+        # checked against the one list actually written, not an intermediate
+        # state nothing outside `replace_all` can observe anyway.
+        (written_entries,) = replace_all_spy.call_args.args
+        identities = [e.published_as or f"indigo-{e.indigo_device_id}" for e in written_entries]
+        assert len(identities) == len(set(identities))
+
+    def test_name_override_and_options_are_carried_from_the_source(self, plug, devices):
+        devices.add(RelayDevice(106, "Garage Plug"))
+        plug.exports.upsert(ExportEntry(101, "onOffPlugInUnit", name_override="Front Plug",
+                                        options={"invert": True}))
+        _bridge_with(plug, attached=True)
+        plug.export_bridge.reattach = Mock(return_value=True)
+        plug.menuMigrateExport(
+            {"migrateConfirm": True, "migrateSource": "101", "migrateDevice": "106"})
+        target = plug.exports.get(106)
+        assert target.name_override == "Front Plug"
+        assert target.options == {"invert": True}
+
+    def test_a_pre_existing_target_entry_is_discarded_with_its_accessory(self, plug, devices):
+        devices.add(RelayDevice(106, "Garage Plug"))
+        plug.exports.upsert(ExportEntry(101, "onOffPlugInUnit", name_override="Front Plug"))
+        plug.exports.upsert(ExportEntry(106, "onOffPlugInUnit", name_override="Garage Own Name"))
+        _bridge_with(plug, attached=True)
+        plug.export_bridge.reattach = Mock(return_value=True)
+        plug.menuMigrateExport(
+            {"migrateConfirm": True, "migrateSource": "101", "migrateDevice": "106"})
+        target = plug.exports.get(106)
+        assert target.name_override == "Front Plug", "the source's config wins, not the target's"
+        assert target.published_as == "indigo-101"
+
+    def test_nudges_via_reattach_not_the_incremental_crud_calls(self, plug, devices):
+        devices.add(RelayDevice(106, "Garage Plug"))
+        plug.exports.upsert(ExportEntry(101, "onOffPlugInUnit"))
+        _bridge_with(plug, attached=True)
+        bridge = plug.export_bridge
+        bridge.reattach = Mock(return_value=True)
+        plug.menuMigrateExport(
+            {"migrateConfirm": True, "migrateSource": "101", "migrateDevice": "106"})
+        bridge.reattach.assert_called_once_with()
+        bridge.upsert.assert_not_called()
+        bridge.replace.assert_not_called()
+
+    def test_confirmation_log_names_source_role_number_and_devices(self, plug, devices):
+        devices.add(RelayDevice(106, "Garage Plug"))
+        plug.exports.upsert(ExportEntry(101, "onOffPlugInUnit"))
+        client = _bridge_with(plug, attached=True)
+        client.status = _endpoint_status(101, 7, "onOffPlugInUnit")
+        plug.export_bridge.reattach = Mock(return_value=True)
+
+        ok, _values_out = plug.menuMigrateExport(
+            {"migrateConfirm": True, "migrateSource": "101", "migrateDevice": "106"})
+
+        assert ok is True
+        said = _said(plug.logger.warning.call_args_list)
+        assert 'MIGRATED accessory "Study Plug"' in said
+        assert export_catalog.role_label("onOffPlugInUnit") in said
+        assert "accessory number 7" in said
+        assert "from Indigo device 101" in said
+        assert 'to "Garage Plug" (id 106)' in said
+        assert "No paired ecosystem processed any change" in said
+        assert "previous accessory" not in said   # device 106 was never exported before
+
+    def test_confirmation_log_names_the_targets_own_previous_accessory(self, plug, devices):
+        devices.add(RelayDevice(106, "Garage Plug"))
+        plug.exports.upsert(ExportEntry(101, "onOffPlugInUnit"))
+        plug.exports.upsert(ExportEntry(106, "onOffPlugInUnit"))
+        client = _bridge_with(plug, attached=True)
+        client.status = _endpoint_status(106, 11, "onOffPlugInUnit")
+        plug.export_bridge.reattach = Mock(return_value=True)
+
+        ok, _values_out = plug.menuMigrateExport(
+            {"migrateConfirm": True, "migrateSource": "101", "migrateDevice": "106"})
+
+        assert ok is True
+        said = _said(plug.logger.warning.call_args_list)
+        assert '"Garage Plug"\'s own previous accessory (number 11) has been removed ' \
+            "from your ecosystems." in said
+
+
+class TestMigrateOutcomeTruthfulness:
+    def test_a_failed_nudge_is_not_reported_as_a_successful_migrate(self, plug, devices):
+        devices.add(RelayDevice(106, "Garage Plug"))
+        plug.exports.upsert(ExportEntry(101, "onOffPlugInUnit"))
+        _bridge_with(plug, attached=True)
+        plug.export_bridge.reattach = Mock(return_value=False)
+
+        ok, _values_out, errors = plug.menuMigrateExport(
+            {"migrateConfirm": True, "migrateSource": "101", "migrateDevice": "106"})
+
+        assert ok is False and "migrateDevice" in errors
+        assert "the bridge node was not told" in errors["migrateDevice"]
+        # The store write DID land — the message says "Saved", and this is
+        # what makes that true.
+        assert plug.exports.get(106).published_as == "indigo-101"
+        assert plug.exports.get(101) is None
+        assert "MIGRATED" not in _said(plug.logger.warning.call_args_list)

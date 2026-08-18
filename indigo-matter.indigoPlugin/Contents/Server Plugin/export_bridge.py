@@ -109,6 +109,15 @@ PREF_PENDING_REPLACE_ALL = "matterExportPendingReplaceAll"
 #: into the exact same refusal a reinstall cannot touch.
 REVIVABLE_HALT_REASONS = frozenset({"version_skew", bridge_protocol.ERR_VERSION_MISMATCH})
 
+#: Slack :meth:`ExportBridge.reattach` (#246) adds on top of the attach's own
+#: :func:`bridge_client.attach_timeout_for` deadline before giving up on the
+#: ``Future`` that carries it, so the OUTER wait is never the tighter of the
+#: two deadlines — the same headroom reasoning as
+#: :data:`bridge_client.REBUILD_TIMEOUT_HEADROOM`, and the same ratio
+#: :data:`plugin_constants.READOPT_ORPHANS_TIMEOUT` keeps over
+#: ``bridge_client.DEFAULT_TIMEOUT``.
+REATTACH_RESULT_HEADROOM = 5.0
+
 #: PRD §5.5's wholesale export switch. **Absent means ON**, because it arrived in
 #: E6 and every install that predates it already has a working allow-list; a
 #: missing key reading as "off" would silently un-run everyone's export on
@@ -825,6 +834,58 @@ class ExportBridge:
                 specs.append(spec)
         self._warn_if_wholly_unbridgeable(len(entries), specs)
         return specs
+
+    def reattach(self) -> bool:
+        """Full mid-session §3.1 ``attach`` — the #246 migrate nudge.
+
+        A migrate (``server_menu_mixin.ServerMenuMixin.menuMigrateExport``)
+        retargets the allow-list, but §3.1's reconcile is what a *rekey* is —
+        the store write alone means nothing to the node until an attach
+        carries it (ADR-0011). This is that attach, callable outside the
+        handshake.
+
+        **Blocks the caller, unlike every other nudge here.** ``upsert``/
+        ``replace``/the un-export path are all fire-and-forget (:meth:`_fire`):
+        their outcome is either self-healing at the next attach or, for the
+        un-export, tracked as a debt. A migrate has neither backstop — its
+        confirmation WARNING (#246 design §3.2 step 8) claims no ecosystem saw
+        a change, and that is only true once this attach has actually landed —
+        so the caller needs a real told/not-told answer before it can decide
+        which message to show, the same reason
+        ``ServerMenuMixin.menuRebuildEndpointMap`` blocks on
+        ``rebuild_endpoint_map()`` rather than firing it.
+
+        **Routes the result through ``_on_attached`` explicitly, like
+        ``BridgeClient.rebuild_endpoint_map`` does after ITS re-attach.**
+        ``client.attach()`` sets ``client.status``/``client.attached`` itself,
+        but — checked against the handshake path (``bridge_client._handshake``)
+        — does NOT call ``_on_attached`` on a mid-session call; only the
+        handshake and the post-rebuild re-attach do that. Skipping this call
+        would mean a migrate lands on the wire but the fabric/warning readouts
+        and the outage latches never hear about it.
+
+        Requires an attached client — the caller
+        (``menuMigrateExport`` step 2) has already verified one via
+        ``ServerMenuMixin._recovery_client(require_attached=True)``, the same
+        precondition re-adopt's execute path demands (PR5 design E1).
+        """
+        client = self.client
+        if client is None:
+            return False
+        specs = self.endpoint_specs()
+        timeout = attach_timeout_for(len(specs))
+        try:
+            status = self._runtime.submit(
+                client.attach(specs, timeout=timeout)).result(timeout=timeout + REATTACH_RESULT_HEADROOM)
+        except Exception as exc:  # pylint: disable=broad-except
+            self._logger.error(
+                "Matter bridge: migrate reattach FAILED — %s. The export list WAS saved; the "
+                "bridge node catches up at the next reconnect/attach, which happens on its own.",
+                exc)
+            self._logger.exception(exc)
+            return False
+        self._on_attached(status, carried_replace_all=False)
+        return True
 
     def _warn_if_wholly_unbridgeable(self, declared: int, specs: list) -> None:
         """Say the thing a warning-per-device does not say.

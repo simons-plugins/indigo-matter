@@ -15,8 +15,8 @@ from bridge_protocol import next_generation, published_id_for
 from export_store import ExportEntry, OPTION_INVERT
 from plugin_constants import (
     EXCLUDED_OPTION_PREFIX, EXPORT_PICKER_LIMIT, LIST_ERROR_OPTION,
-    MENU_MANAGE_EXPORTS, MENU_READOPT_EXPORT, MENU_UNPAIR_ECOSYSTEM, NO_MATCH_OPTION,
-    NO_SELECTION_ID, NO_SELECTION_LABEL, ROW_ERROR_LABEL, TRUNCATED_OPTION,
+    MENU_MANAGE_EXPORTS, MENU_MIGRATE_EXPORT, MENU_READOPT_EXPORT, MENU_UNPAIR_ECOSYSTEM,
+    NO_MATCH_OPTION, NO_SELECTION_ID, NO_SELECTION_LABEL, ROW_ERROR_LABEL, TRUNCATED_OPTION,
 )
 
 
@@ -261,6 +261,13 @@ class ExportDialogMixin:
             values["readoptOrphan"] = NO_SELECTION_ID
             values["readoptDevice"] = NO_SELECTION_ID
             values["readoptConfirm"] = False
+            return values
+        if menu_id == MENU_MIGRATE_EXPORT:
+            # Issue #246 — same reasoning again: both pickers lead with a
+            # no-selection row.
+            values["migrateSource"] = NO_SELECTION_ID
+            values["migrateDevice"] = NO_SELECTION_ID
+            values["migrateConfirm"] = False
             return values
         if menu_id != MENU_MANAGE_EXPORTS:
             return values

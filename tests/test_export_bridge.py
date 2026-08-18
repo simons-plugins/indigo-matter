@@ -996,6 +996,70 @@ class TestIncrementalCrud:
 
 
 # ---------------------------------------------------------------------------
+# The migrate nudge — a full mid-session attach (issue #246)
+# ---------------------------------------------------------------------------
+def _migrate_status(endpoint_count=1):
+    return bridge_protocol.parse_status({
+        "commissioned": True, "fabrics": [], "endpointCount": endpoint_count,
+        "endpoints": [], "drift": [], "driftChecked": True,
+    })
+
+
+class TestReattach:
+    """`ExportBridge.reattach` — the §3.1 attach `menuMigrateExport` nudges
+    with once its store commit lands (#246 design §3.3)."""
+
+    def test_submits_attach_with_the_current_specs_and_their_own_deadline(
+            self, bridge_mod, mock_logger, devices):
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(102, "dimmableLight")])
+        h.start()
+        h.client.status = _migrate_status()
+
+        told = h.bridge.reattach()
+
+        assert told is True
+        name, endpoints, replace_all = h.client.only("attach")
+        assert name == "attach"
+        assert [spec.indigo_device_id for spec in endpoints] == [102]
+        assert replace_all is False
+        assert h.client.attach_timeouts == [bridge_mod.attach_timeout_for(1)]
+
+    def test_with_no_client_is_a_no_op_false(self, bridge_mod, mock_logger, devices):
+        """XG5: nothing is exported, so there is no client to nudge at all."""
+        h = Harness(bridge_mod, mock_logger, devices, [])
+        assert h.bridge.reattach() is False
+
+    def test_a_successful_reattach_routes_the_status_through_on_attached(
+            self, bridge_mod, mock_logger, devices):
+        """Unlike `upsert`/`replace`, this is a full attach — so its result has
+        to reach the SAME place a reconnect's does (fabrics, warnings, the
+        outage latches), not just "the RPC did not raise"."""
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(102, "dimmableLight")])
+        h.start()
+        h.client.status = _migrate_status(endpoint_count=3)
+
+        told = h.bridge.reattach()
+
+        assert told is True
+        assert "bridge node attached" in " ".join(
+            str(c.args[0]) % c.args[1:] if len(c.args) > 1 else str(c.args[0])
+            for c in mock_logger.info.call_args_list)
+        assert h.bridge.fabrics == []
+
+    def test_a_failed_reattach_reports_not_told_and_says_the_store_stands(
+            self, bridge_mod, mock_logger, devices):
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(102, "dimmableLight")])
+        h.start()
+        h.client.fail["attach"] = ConnectionError("socket died mid-attach")
+
+        told = h.bridge.reattach()
+
+        assert told is False
+        assert "WAS saved" in errors_of(mock_logger)
+        assert "catches up at the next reconnect/attach" in errors_of(mock_logger)
+
+
+# ---------------------------------------------------------------------------
 # Node → Indigo (§5 command events)
 # ---------------------------------------------------------------------------
 class TestOnCommand:

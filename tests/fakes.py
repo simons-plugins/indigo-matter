@@ -287,7 +287,12 @@ class FakeBridgeClient:
 
     async def attach(self, endpoints=None, *, replace_all=False, timeout=None):
         self.attach_timeouts.append(timeout)
-        return self._record("attach", endpoints, replace_all)
+        self._record("attach", endpoints, replace_all)
+        # Mirrors the real client: `attach()` returns whatever `self.status`
+        # was just set to (issue #246's `reattach` reads this return value
+        # directly). Tests that only assert on `calls`/`attach_timeouts` are
+        # unaffected — `self.status` defaults to `None`, same as before.
+        return self.status
 
     async def upsert_endpoint(self, spec, timeout=None):
         return self._record("upsert_endpoint", spec)

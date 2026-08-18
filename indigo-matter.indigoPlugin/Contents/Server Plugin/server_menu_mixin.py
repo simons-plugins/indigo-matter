@@ -84,6 +84,20 @@ class ReadoptOrphansUnavailable(Exception):
     """
 
 
+@dataclass(frozen=True)
+class _MigrateSourceIdentity:
+    """Duck-types as the slice of ``bridge_protocol.OrphanRecord`` that
+    :meth:`ServerMenuMixin._readopt_device_row` actually reads (``role``,
+    ``unique_id``) — letting the migrate device picker
+    (:meth:`ServerMenuMixin.getMigrateDevices`, #246 design §3.2) reuse that
+    helper verbatim instead of forking its per-device rule for a second
+    identity shape. Migrating and re-adopting pick a device by the exact
+    same rule; only what is being inherited differs.
+    """
+    role: str
+    unique_id: str
+
+
 class ServerMenuMixin:
     """matter-server install/restart, manual commission/decommission-device,
     export-bridge recovery, and bridge-node LaunchAgent menus.
@@ -851,6 +865,320 @@ class ServerMenuMixin:
         return (True, valuesDict)
 
     # ------------------------------------------------------------------
+    # Migrate an exported accessory… (#246 design §3, issue #246)
+    # ------------------------------------------------------------------
+    def getMigrateSources(self, filter="", valuesDict=None, typeId="", targetId=0):  # noqa: N802, A002, ARG002
+        """Source picker for "Migrate an exported accessory…" (#246 design §3.2).
+
+        Unlike the re-adopt orphan picker, this needs no bridge round trip at
+        all: the allow-list (``self.exports``) IS the export list, so it is
+        local truth rather than something only the node's §3.12 answer can
+        confirm. A row's accessory number is decoration, read the same way
+        :meth:`_readopt_device_row`'s neighbour :meth:`_previous_accessory_number`
+        does — best-effort from the last attached client's status, omitted
+        (not guessed) when there is none.
+
+        A source entry whose Indigo device has been DELETED is still listed.
+        That is not an oversight: it is ALSO a legitimate migrate source — the
+        allow-list is never auto-pruned when a device disappears (see
+        :meth:`export_dialog_mixin.ExportDialogMixin._reconcile_exports`), so
+        an accessory can be moved onto a live replacement without detouring
+        through re-adopt at all. The row names it "(device N no longer
+        exists)" in place of the device's name, since there is nothing else
+        to call it.
+        """
+        if self.exports is None:
+            return [(NO_SELECTION_ID, "(plugin still starting — re-open this dialog in a moment)")]
+        entries = self.exports.all()
+        if not entries:
+            return [(NO_SELECTION_ID, "(nothing is currently exported — nothing to migrate)")]
+        bridge = self.export_bridge
+        client = bridge.client if bridge is not None else None
+        options = []
+        for entry in entries:
+            identity = entry.published_as or published_id_for(entry.indigo_device_id)
+            dev = self._indigo_device(entry.indigo_device_id)  # pylint: disable=no-member  # ExportDialogMixin
+            name = dev.name if dev is not None \
+                else f"(device {entry.indigo_device_id} no longer exists)"
+            number = self._previous_accessory_number(client, entry.indigo_device_id)
+            suffix = f" (accessory #{number})" if number is not None else ""
+            options.append((str(entry.indigo_device_id),
+                            f"{name} — {export_catalog.role_label(entry.role)} — "
+                            f"accessory {identity}{suffix}"))
+        return options
+
+    def migrateSourceChanged(self, valuesDict, typeId="", devId=0):  # noqa: N802, ARG002
+        """No-op callback on the source menu (#246 design §3.2) — see
+        :meth:`readoptOrphanChanged`; the same round-trip mechanism, re-running
+        ``getMigrateDevices`` below it."""
+        return valuesDict
+
+    def getMigrateDevices(self, filter="", valuesDict=None, typeId="", targetId=0):  # noqa: N802, A002, ARG002
+        # pylint: disable=too-many-locals  # same two-list shape as getExportCandidates
+        """Device picker for "Migrate an exported accessory…" (#246 design §3.2).
+
+        Reuses :meth:`_readopt_device_row` verbatim for the per-device rule —
+        selectable when role-eligible, ● when already exported, every other
+        device SHOWN with its reason, loop-guard devices absent — via
+        :class:`_MigrateSourceIdentity`, a two-field stand-in that duck-types
+        as the slice of ``bridge_protocol.OrphanRecord`` that helper actually
+        reads (``role``, ``unique_id``). Migrating and re-adopting pick a
+        device by the exact same rule; only what is being inherited differs.
+
+        The one rule that IS specific to migrate: the source device itself is
+        absent from the list, not merely excluded-with-a-reason — it is the
+        row directly above in the dialog, not a target for itself.
+        """
+        try:
+            if self.exports is None:
+                return [(NO_SELECTION_ID,
+                         "(plugin still starting — re-open this dialog in a moment)")]
+            selected = str((valuesDict or {}).get("migrateSource", "") or "")
+            if not selected or selected == NO_SELECTION_ID:
+                return []
+            try:
+                source_id = int(selected)
+            except (TypeError, ValueError):
+                return []
+            source_entry = self.exports.get(source_id)
+            if source_entry is None:
+                return []
+            source_identity = _MigrateSourceIdentity(
+                role=source_entry.role,
+                unique_id=source_entry.published_as or published_id_for(source_id))
+            exported = self.exports.ids()
+            plugin_id = self._export_plugin_id()  # pylint: disable=no-member  # ExportDialogMixin
+            eligible: list = []
+            explained: list = []
+            failures = 0
+            for dev in indigo.devices:
+                if dev.id == source_id:
+                    continue                     # the row above, not a target for itself
+                try:
+                    row = self._readopt_device_row(dev, source_identity, plugin_id, exported)
+                    if row is None:
+                        continue
+                    (explained if row[0].startswith(EXCLUDED_OPTION_PREFIX)
+                     else eligible).append(row)
+                except Exception as exc:  # pylint: disable=broad-except
+                    self._log_row_failure(exc, first=not failures)  # pylint: disable=no-member
+                    failures += 1
+            options = eligible + explained[:EXPORT_PICKER_LIMIT]
+            if len(explained) > EXPORT_PICKER_LIMIT:
+                options.append(TRUNCATED_OPTION)
+            return options
+        except Exception as exc:  # pylint: disable=broad-except
+            self.logger.exception(exc)
+            return [LIST_ERROR_OPTION]
+
+    def _migrate_refuse(self, errors, field: str, msg: str) -> None:
+        """One #246 design §3.2 SUBSTANTIVE refusal — see :meth:`_readopt_refuse`'s
+        docstring for the WARNING/dialog-only split this mirrors exactly."""
+        self.logger.warning("Matter bridge: migrate REFUSED — %s", msg)
+        errors[field] = msg
+
+    def _migrate_pick_source(self, valuesDict, errors):
+        """The picked export entry (or "select one"), RE-READ from the store at
+        Execute time (#246 design §3.2 step 3) — never trusted from the picker's
+        own read, which may be stale by the time Execute runs (something else
+        un-exported it while the dialog was open).
+
+        Returns ``(source_id, entry)``, or ``(0, None)`` with ``errors`` filled in.
+        """
+        selection = str(valuesDict.get("migrateSource", "") or "")
+        if not selection or selection == NO_SELECTION_ID:
+            errors["migrateSource"] = "Select the exported accessory to migrate."
+            return (0, None)
+        try:
+            source_id = int(selection)
+        except (TypeError, ValueError):
+            self.logger.error(
+                "Matter bridge: migrate got a source selection that is not a device id — %r. "
+                "Nothing was changed; this is a plugin fault, not a bad choice.", selection)
+            errors["migrateSource"] = "Invalid selection."
+            return (0, None)
+        entry = self.exports.get(source_id)
+        if entry is None:
+            self._migrate_refuse(errors, "migrateSource",
+                                 "That accessory is no longer exported — something removed it "
+                                 "while this dialog was open. Nothing was changed.")
+            return (0, None)
+        return (source_id, entry)
+
+    def _migrate_pick_device(self, source_id, source_entry, valuesDict, errors):
+        # pylint: disable=too-many-return-statements  # one return per #246 design §3.2 refusal
+        """The picked target device (or "select one"), re-verified per #246 design
+        §3.2 steps 4-5: still exists, still classifies as exportable, can take
+        the source's role (cross-role REFUSED — owner ruling 2/E3, #219/#240
+        reasoning), and is not the source device itself.
+
+        Returns the device, or ``None`` with ``errors`` filled in.
+        """
+        selection = str(valuesDict.get("migrateDevice", "") or "")
+        if not selection or selection == NO_SELECTION_ID:
+            errors["migrateDevice"] = "Select the Indigo device to migrate it to."
+            return None
+        if selection.startswith(EXCLUDED_OPTION_PREFIX):
+            self._migrate_refuse(errors, "migrateDevice",
+                                 "That row is listed with the reason it cannot take this "
+                                 "accessory — pick a device offered without one.")
+            return None
+        try:
+            device_id = int(selection)
+        except (TypeError, ValueError):
+            self.logger.error(
+                "Matter bridge: migrate got a target selection that is neither a device id nor "
+                "an unselectable row — %r. Nothing was changed; this is a plugin fault, not a "
+                "bad choice.", selection)
+            errors["migrateDevice"] = "Invalid selection."
+            return None
+        dev = self._indigo_device(device_id)  # pylint: disable=no-member  # ExportDialogMixin
+        if dev is None:
+            self._migrate_refuse(errors, "migrateDevice",
+                                 "That device no longer exists — refresh the list.")
+            return None
+        verdict = export_catalog.classify(dev, self._export_plugin_id())  # pylint: disable=no-member
+        if isinstance(verdict, export_catalog.Excluded):
+            self._migrate_refuse(errors, "migrateDevice",
+                                 f"{dev.name} cannot be exported: {verdict.reason}")
+            return None
+        if source_entry.role not in verdict.eligible_roles:
+            self._migrate_refuse(
+                errors, "migrateDevice",
+                f'"{dev.name}" cannot appear as a {export_catalog.role_label(source_entry.role)}. '
+                "Migrating only works when the replacement device can take the same role as "
+                "the accessory it is inheriting; export it normally instead, and it becomes a "
+                "new accessory.")
+            return None
+        # 5. target != source — defensive against a stale/hand-crafted
+        # selection; the picker itself never offers this row (it is absent,
+        # not excluded-with-a-reason — see getMigrateDevices).
+        if device_id == source_id:
+            self._migrate_refuse(errors, "migrateDevice",
+                                 "That is the device already exporting this accessory — pick a "
+                                 "different one to migrate it to.")
+            return None
+        return dev
+
+    def _migrate_source_display_name(self, source_id: int) -> str:
+        """The source device's current Indigo name, or a placeholder naming
+        the id when it no longer exists (:meth:`getMigrateSources`'s "still a
+        legitimate migrate source" case)."""
+        dev = self._indigo_device(source_id)  # pylint: disable=no-member  # ExportDialogMixin
+        return dev.name if dev is not None else f"device {source_id}"
+
+    def _log_migrate_confirmation(self, source_id: int, source_entry, dev, source_number,
+                                  target_previous_number) -> None:  # pylint: disable=too-many-arguments
+        """#246 design §3.2 step 8 — the one WARNING a successful migrate leaves
+        behind. Mirrors :meth:`_log_readopt_confirmation`'s shape, but the
+        promise it makes is the one migrate actually earns: the identity never
+        lapsed, so no ecosystem ever processed a removal, and room, name,
+        scenes and automations survive BECAUSE of that — not despite it, the
+        way re-adopt's corrected wording has to qualify its own promise.
+        """
+        role_label = export_catalog.role_label(source_entry.role)
+        label = source_entry.label_for(self._migrate_source_display_name(source_id))
+        role_and_number = (f"{role_label}, accessory number {source_number}"
+                           if source_number is not None else role_label)
+        superseded = ""
+        if target_previous_number is not None:
+            clause = f" (number {target_previous_number})"
+            superseded = (f' "{dev.name}"\'s own previous accessory{clause} has been removed '
+                          "from your ecosystems.")
+        self.logger.warning(
+            'Matter export: MIGRATED accessory "%s" (%s) from Indigo device %s to "%s" '
+            '(id %s). No paired ecosystem processed any change — the accessory keeps its '
+            'room, its name, and every scene and automation, because nothing was removed and '
+            'nothing was re-added.%s',
+            label, role_and_number, source_id, dev.name, dev.id, superseded)
+
+    def _migrate_commit(self, client, source_id, source_entry, dev, errors, valuesDict):
+        # pylint: disable=too-many-arguments,too-many-locals
+        """#246 design §3.2 steps 6-8: one ATOMIC ``ExportStore.replace_all()`` —
+        never two sequential ``upsert``s, which would transiently leave two
+        entries claiming one published identity, the exact duplicate state
+        that refuses the WHOLE next attach — then the mid-session
+        :meth:`export_bridge.ExportBridge.reattach` nudge and the confirmation
+        WARNING (ADR-0011).
+
+        ``name_override``/``options`` are carried FROM THE SOURCE entry: the
+        export configuration follows the accessory, not the hardware. A
+        pre-existing entry for the TARGET device is discarded along with its
+        own accessory — the ● warning in the dialog already said so.
+
+        The pre-migrate accessory numbers are read BEFORE the store write and
+        the nudge, because both make the bridge's live status describe the
+        NEW arrangement — by the time the confirmation logs, there is nothing
+        left to read the OLD numbers from.
+        """
+        target_id = dev.id
+        identity = source_entry.published_as or published_id_for(source_id)
+        source_number = self._previous_accessory_number(client, source_id)
+        target_previous = self.exports.get(target_id)
+        target_previous_number = (self._previous_accessory_number(client, target_id)
+                                  if target_previous is not None else None)
+        new_entry = ExportEntry(
+            indigo_device_id=target_id,
+            role=source_entry.role,
+            name_override=source_entry.name_override,
+            options=dict(source_entry.options),
+            published_as=identity,
+        )
+        new_entries = [entry for entry in self.exports.all()
+                      if entry.indigo_device_id not in (source_id, target_id)]
+        new_entries.append(new_entry)
+        try:
+            self.exports.replace_all(new_entries)
+        except Exception as exc:  # pylint: disable=broad-except
+            self.logger.error("Matter bridge: migrate FAILED to save the export list — %s", exc)
+            self.logger.exception(exc)
+            errors["migrateDevice"] = "FAILED to save the export list — see Event Log."
+            return (False, valuesDict, errors)
+        self._exports_changed()  # pylint: disable=no-member  # lifecycle, stays in plugin.py
+        told = self.export_bridge.reattach()
+        if not told:
+            # The store write stands (the next reconnect/attach applies it),
+            # but the confirmation below claims no ecosystem saw any change —
+            # and that has not been confirmed yet. Same discipline
+            # `_readopt_commit` follows: never report success over an
+            # operation that has not landed.
+            errors["migrateDevice"] = ("Saved, but the bridge node was not told — "
+                                       "see Event Log.")
+            return (False, valuesDict, errors)
+        self._log_migrate_confirmation(source_id, source_entry, dev, source_number,
+                                       target_previous_number)
+        return (True, valuesDict)
+
+    def menuMigrateExport(self, valuesDict, menuId=""):  # noqa: N802, ARG002
+        """Execute "Migrate an exported accessory…" (#246 design §3.2, issue #246).
+
+        Same discipline as :meth:`menuReadoptExport`: every step re-verified at
+        Execute time rather than trusted from the picker, each step its own
+        helper so later steps can assume earlier ones already hold.
+        """
+        errors = indigo.Dict()
+        # 1. migrateConfirm ticked.
+        if not self._truthy(valuesDict.get("migrateConfirm")):  # pylint: disable=no-member  # ExportDialogMixin
+            errors["migrateConfirm"] = (
+                "Tick the box — migrating moves this accessory to a different Indigo device.")
+            return (False, valuesDict, errors)
+        # 2. a live, ATTACHED bridge client (#246 design §3.2 step 2, E1 precedent) —
+        #    the mid-session reattach the commit ends with needs one to nudge.
+        client = self._recovery_client(errors, "migrateConfirm", require_attached=True)
+        if client is None:
+            return (False, valuesDict, errors)
+        # 3.
+        source_id, source_entry = self._migrate_pick_source(valuesDict, errors)
+        if source_entry is None:
+            return (False, valuesDict, errors)
+        # 4-5.
+        dev = self._migrate_pick_device(source_id, source_entry, valuesDict, errors)
+        if dev is None:
+            return (False, valuesDict, errors)
+        # 6-8.
+        return self._migrate_commit(client, source_id, source_entry, dev, errors, valuesDict)
+
+    # ------------------------------------------------------------------
     # Re-adopt a Matter accessory… (§4, issue #219)
     # ------------------------------------------------------------------
     def _live_readopt_orphans(self):
@@ -1134,6 +1462,17 @@ class ServerMenuMixin:
         inheriting — PR5 design E2/E5's "recreated and re-exported before noticing"
         case, whose own accessory the ``_nudge_export`` call just before this
         one has already asked the bridge to remove.
+
+        The closing sentence states the MEASURED truth (#246 design §3.4,
+        2026-08-18 jarvis validation), not the promise the old text made:
+        identity, accessory number and no-duplicate continuity always hold —
+        that part re-adopt genuinely restores — but room/name/scenes/
+        automations do not, because Apple Home (and, presumably, every other
+        ecosystem) purges them within moments of processing the removal that
+        orphaned this identity in the first place, long before this dialog
+        can run. "Migrate an exported accessory…" is the tool that keeps
+        those, and only while the old device still exists — which by
+        definition it no longer does here.
         """
         role_label = export_catalog.role_label(orphan.role)
         if orphan.device_id is not None:
@@ -1156,9 +1495,11 @@ class ServerMenuMixin:
                           "removed from your ecosystems.")
         self.logger.warning(
             'Matter export: RE-ADOPTED accessory "%s" (%s, accessory number %d) onto Indigo '
-            'device "%s" (id %s). %s Apple Home and every other paired ecosystem keep its room, '
-            'its name, and every scene and automation built on it — nothing is re-paired and '
-            'nothing is renumbered.%s',
+            'device "%s" (id %s). %s The accessory returns under its original identity and '
+            'number, and no duplicate is created — but an ecosystem that has already processed '
+            'the removal (Apple Home does within moments) will show it in the Default Room '
+            'under a default name, and any scene or automation that referenced it must be '
+            'rebuilt.%s',
             orphan.label, role_label, orphan.number, dev.name, device_id, left_behind, superseded)
 
     def _readopt_refuse(self, errors, field: str, msg: str) -> None:
