@@ -21,7 +21,7 @@ import bridge_agent
 import bridge_client            # bridge_client.rebuild_timeout_for
 import export_catalog
 import protocol
-from bridge_protocol import published_id_for
+from bridge_protocol import parse_published_id, published_id_for
 from commission_jobs import fabric_counts, node_id_to_str
 from export_store import ExportEntry
 from http_handlers import MatterUnavailable
@@ -946,6 +946,13 @@ class ServerMenuMixin:
         already exported (that convention's own device, the common "deleted,
         recreated, re-exported before noticing" case E5/E2); dropped when
         already re-adopted onto a DIFFERENT orphan.
+
+        "A DIFFERENT orphan" is decided by whose device id the identity
+        embeds, not merely by it being non-default: a device publishing under
+        its OWN ``indigo-<ownId>~<generation>`` (it has changed role at some
+        point, issue #240) has claimed nobody else's accessory and stays in
+        the picker — E2 keeps "``indigo-<newId>``, or a generation of it" as
+        the explicitly-allowed already-exported case.
         """
         verdict = export_catalog.classify(dev, plugin_id)
         if isinstance(verdict, export_catalog.Excluded):
@@ -954,7 +961,9 @@ class ServerMenuMixin:
             return None
         entry = self.exports.get(dev.id)
         if entry is not None and entry.published_as and entry.published_as != orphan.unique_id:
-            return None  # already re-adopted onto a DIFFERENT orphan
+            claimed = parse_published_id(entry.published_as)
+            if claimed is None or claimed.device_id != dev.id:
+                return None  # already re-adopted onto a DIFFERENT orphan
         mark = "● " if dev.id in exported else ""
         return (str(dev.id), f"{mark}{dev.name}")
 

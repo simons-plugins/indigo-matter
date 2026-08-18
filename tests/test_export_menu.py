@@ -1450,6 +1450,18 @@ class TestGetReadoptDevices:
         labels = _labels(plug.getReadoptDevices(valuesDict={"readoptOrphan": orphan.unique_id}))
         assert "101" in labels
 
+    def test_a_role_changed_device_stays_in_the_picker(self, plug):
+        """Its own `indigo-<ownId>~2` (issue #240) claims nobody else's
+        accessory, so §4.3 rule 3 must not drop it — E2 names
+        "`indigo-<newId>`, or a generation of it" as the allowed
+        already-exported case."""
+        plug.exports.upsert(ExportEntry(101, "onOffPlugInUnit", published_as="indigo-101~2"))
+        _bridge_with(plug, attached=True)
+        orphan = _orphan(unique_id="indigo-901", role="onOffPlugInUnit")
+        plug.runtime = _FakeRuntime(result=[orphan])
+        labels = _labels(plug.getReadoptDevices(valuesDict={"readoptOrphan": orphan.unique_id}))
+        assert labels["101"] == "● Study Plug"
+
     def test_a_bare_role_orphan_yields_no_devices(self, plug):
         _bridge_with(plug, attached=True)
         orphan = _orphan(role=None, label=None)
