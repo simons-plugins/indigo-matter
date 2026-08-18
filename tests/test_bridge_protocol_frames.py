@@ -494,6 +494,9 @@ class TestPublishedIdentity:
         "indigo-",            # no device id at all
         "",
         "indigo-1 ",          # trailing whitespace
+        # Python's `$` also matches before a trailing newline; JS's does not.
+        # The two derivations must refuse this identically.
+        "indigo-1\n",
         # One past F9's measured Number.isSafeInteger boundary.
         "indigo-9007199254740992",
         # One character over PUBLISHED_ID_MAX (33), otherwise lawful.

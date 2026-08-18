@@ -224,7 +224,10 @@ SYSTEM_MODES = ("off", "heat", "cool", "auto")
 PUBLISHED_ID_MAX = 32
 
 _PUBLISHED_ID_PREFIX = "indigo-"
-_PUBLISHED_ID_RE = re.compile(r"^indigo-(-?\d+)(?:~(\d+))?$")
+#: ``\Z``, not ``$``: Python's ``$`` also matches just before a trailing
+#: newline, so ``"indigo-1\n"`` would parse here and be REFUSED by the
+#: TypeScript twin — the one thing these two derivations may never do.
+_PUBLISHED_ID_RE = re.compile(r"^indigo-(-?\d+)(?:~(\d+))?\Z")
 #: Python has no native "safe integer" concept (JS's ``Number.isSafeInteger``,
 #: which `parsePublishedId` guards against); this is that same bound, so a
 #: device id round-trips identically through either peer's derivation.
