@@ -172,9 +172,12 @@ On every new connection, before anything else:
 1. Node sends a bare frame (not an event, mirroring `server_info`):
    `{"protocolVersion": 2, "bridgeVersion": "<npm semver>", "matterJsVersion": "<semver>"}`
 2. Plugin sends `attach` (§3.1). If `protocolVersion` differs from the
-   plugin's own, the plugin does **not** attach: it surfaces an error telling
-   the user to restart/update the bridge agent (typically the plugin was
-   updated while launchd kept the old node alive). Node-side, a mismatched
+   plugin's own, the plugin does **not** attach: it surfaces an error naming
+   what it needs — the bridge-node release paired with this plugin, installed
+   from *Plugins ▸ Matter ▸ Install/update the Matter bridge* (typically the
+   plugin was updated while launchd kept the old node alive; restarting the
+   agent relaunches that same old node, so it is deliberately not the remedy
+   the message gives). Node-side, a mismatched
    `attach` gets `error_code: "version_mismatch"` and the socket is closed —
    skew fails closed from both directions.
 

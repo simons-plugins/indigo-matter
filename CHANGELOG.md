@@ -5,8 +5,12 @@ current version is `Info.plist`'s `PluginVersion`.
 
 ## 2026.21.0 — Re-adopt a Matter accessory…, and role changes cost the room on purpose
 
-> Takes effect on a live install only once the paired bridge-node release
-> ships; the plugin pins the bridge node by exact version.
+> **This release bumps the bridge protocol to v2 — Matter export stops until
+> the paired bridge-node release is installed via
+> *Plugins ▸ Matter ▸ Install/update the Matter bridge*.** Version skew fails
+> closed by design: nothing is un-paired and nothing is renumbered, but no
+> accessory is served until the node matches. Restarting the bridge agent does
+> not help — launchd relaunches the same node.
 
 ### Added
 

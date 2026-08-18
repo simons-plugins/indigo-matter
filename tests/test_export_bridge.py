@@ -1125,10 +1125,15 @@ class TestFailureSurfacing:
         h.bridge._on_attach_refused(bridge_protocol.ERR_ENDPOINT_MAP_INVALID, "unreadable")
         assert "renumbers nothing" in errors_of(mock_logger)
 
-    def test_version_skew_says_restart_the_agent(self, bridge_mod, mock_logger, devices):
+    def test_version_skew_names_what_the_plugin_needs(self, bridge_mod, mock_logger, devices):
         h = self._bridge(bridge_mod, mock_logger, devices)
         h.bridge._on_version_skew(bridge_protocol.Hello(2, "9.9.9", "1.0"))
-        assert "Install/update the Matter bridge" in errors_of(mock_logger)
+        said = errors_of(mock_logger)
+        assert "Install/update the Matter bridge" in said
+        # The requirement, not a promise the menu cannot yet keep: the pinned
+        # bridge-node version bumps in the release commit AFTER this PR.
+        assert "needs the paired bridge-node release" in said
+        assert "installs the exact node version" not in said
 
     def test_drift_is_reported_never_repaired(self, bridge_mod, mock_logger, devices):
         h = self._bridge(bridge_mod, mock_logger, devices)
