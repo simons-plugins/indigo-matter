@@ -25,6 +25,7 @@ from pathlib import Path
 import pytest
 
 import export_catalog
+import fakes
 from bridge_protocol import ROLES
 from export_catalog import EligibleDevice, Excluded, classify
 from fakes import (
@@ -117,7 +118,7 @@ ZOO = {
     ),
     "sensor_neither_state_nor_value": (
         SensorDevice(12, "Odd Sensor"),
-        Excluded(export_catalog.REASON_SENSOR_NO_VALUE),
+        Excluded(export_catalog.REASON_NO_BINARY_STATE),
     ),
     # --- Thermostat -------------------------------------------------------
     "thermostat": (
@@ -139,7 +140,7 @@ ZOO = {
     ),
     "custom_no_role": (
         CustomDevice(17, "Matter Energy Meter"),
-        Excluded(export_catalog.REASON_NO_ROLE),
+        Excluded(export_catalog.REASON_NO_BINARY_STATE),
     ),
     "created_by_this_plugin": (
         RelayDevice(18, "Matter Plug", plugin_id=OURS),
@@ -326,7 +327,7 @@ def test_minimal_dimmer_degrades_to_plain_dimmable():
 
 def test_minimal_sensor_is_excluded_not_crashed():
     dev = minimal_device("SensorDevice", 1, "Bare Sensor")
-    assert classify(dev, OURS) == Excluded(export_catalog.REASON_SENSOR_NO_VALUE)
+    assert classify(dev, OURS) == Excluded(export_catalog.REASON_NO_BINARY_STATE)
 
 
 def test_minimal_relay_still_classifies():
@@ -442,6 +443,82 @@ def test_binary_sensor_beats_the_unit_heuristic():
     verdict = classify(dev, OURS)
     assert verdict.default_role == "contactSensor"
     assert set(verdict.eligible_roles) == set(export_catalog.BINARY_SENSOR_ROLES)
+
+
+# ---------------------------------------------------------------------------
+# Custom-state mapping (ADR-0012, issue #252)
+# ---------------------------------------------------------------------------
+def test_a_texecom_zone_is_mappable_not_excluded():
+    """The measured case. A `<Device type="custom">` zone is a plain
+    `indigo.Device`, so it reaches no kind handler at all — before #252 that
+    made it flatly un-exportable, though it is an ordinary PIR."""
+    verdict = classify(fakes.texecom_zone(), OURS)
+    assert isinstance(verdict, export_catalog.MappableDevice)
+    assert "status" in verdict.candidate_state_keys
+
+
+def test_the_mapping_picker_hides_indigo_enum_expansions():
+    """`statusText.Healthy` and friends are Indigo's expansion of the
+    `statusText` state. Offering all four beside the real `status` boolean
+    turns one question into five with four wrong answers."""
+    verdict = classify(fakes.texecom_zone(), OURS)
+    assert verdict.candidate_state_keys == ("status",)
+
+
+def test_onoffstate_is_suggested_first():
+    """The commonest custom boolean by a wide margin, and the name Indigo
+    itself uses for the state behind `onState` — a plugin publishing one has
+    already said which boolean is the reading."""
+    dev = fakes.CustomDevice(1, "Network Device",
+                             states={"isApOrRouter": True, "onOffState": False})
+    verdict = classify(dev, OURS)
+    assert verdict.suggested_state_key == "onOffState"
+
+
+def test_a_declared_mapping_makes_a_custom_device_eligible():
+    verdict = classify(fakes.texecom_zone(), OURS, {"stateKey": "status"})
+    assert isinstance(verdict, EligibleDevice)
+    assert set(verdict.eligible_roles) == set(export_catalog.BINARY_SENSOR_ROLES)
+    # "Study PIR" — the name heuristic still picks the role.
+    assert verdict.default_role == "occupancySensor"
+
+
+def test_a_mapping_whose_state_vanished_is_excluded_not_eligible():
+    """Fail closed. A plugin that renamed the state must not have the old key
+    read as absent-therefore-False, which would tell every ecosystem that the
+    smoke alarm is quiet."""
+    verdict = classify(fakes.texecom_zone(), OURS, {"stateKey": "gone"})
+    assert verdict == Excluded(export_catalog.REASON_MAPPED_STATE_GONE)
+
+
+def test_a_custom_device_with_only_numbers_says_not_yet():
+    dev = fakes.CustomDevice(1, "Energy Meter", states={"kwh": 12.5, "watts": 40})
+    assert classify(dev, OURS) == Excluded(export_catalog.REASON_ONLY_NUMERIC_STATES)
+
+
+def test_a_custom_device_with_nothing_to_publish_says_so():
+    assert classify(fakes.CustomDevice(1, "Empty"), OURS) == \
+        Excluded(export_catalog.REASON_NO_BINARY_STATE)
+
+
+def test_a_flagless_sensor_device_takes_the_same_mapping_path():
+    """Rare (3 devices against 326 on the reference database) but the remedy
+    is identical, so `_sensor` falls through rather than dead-ending."""
+    dev = SensorDevice(1, "Odd Sensor")
+    dev.states = {"triggered": False}
+    assert isinstance(classify(dev, OURS), export_catalog.MappableDevice)
+
+
+def test_a_mappable_verdict_carries_no_eligible_roles():
+    """The duck-typing guard. Only EligibleDevice may answer `eligible_roles`,
+    so a caller cannot mistake an unmapped device for an exportable one."""
+    verdict = classify(fakes.texecom_zone(), OURS)
+    assert not hasattr(verdict, "eligible_roles")
+    assert export_catalog.is_exportable(fakes.texecom_zone(), OURS) is False
+
+
+def test_binary_state_keys_survives_an_unreadable_device():
+    assert export_catalog.binary_state_keys(fakes.HostileDevice()) == ()
 
 
 # ---------------------------------------------------------------------------

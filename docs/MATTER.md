@@ -434,6 +434,36 @@ Occupancy. It is only ever a **default**: all five roles stay selectable, and
 picking the right one at first export matters because changing a role later
 costs the accessory's room (see below).
 
+**Devices from plugins that keep their reading in their own state can be
+exported too — you just have to say which state** (issue #252). Some plugins
+define their devices in a way that gives Indigo no on/off flag to read: alarm
+panels are the common case, where every zone is a "custom" device whose
+detection sits in a state the plugin named itself. Those devices used to be
+listed as *no resolvable Matter role*, which was misleading — they are
+ordinary motion, door, smoke and CO sensors, and Matter models all of them.
+
+Select one in the export dialog and it now asks **which state is the reading**,
+offering the boolean states the device actually publishes. Pick that, tick
+*State is inverted* if the state is true when nothing is detected (an alarm
+zone that reports "healthy" works this way), then choose the role as normal.
+
+Two things make a large panel bearable. The state list hides Indigo's own
+expansions of a multi-value state, so a Texecom zone offers `status` rather
+than `status` plus four `statusText.*` entries. And once you have mapped the
+first zone, every other device of the same type from the same plugin
+pre-selects the same state — so the remaining zones only need their role, which
+is the part that genuinely differs. The role is still yours to choose: nothing
+in a zone tells the plugin whether it is a PIR or a smoke detector except the
+name you gave it, so name-based pre-selection is a suggestion and never a
+decision.
+
+If the plugin later renames or drops the state you mapped, the export stops
+publishing and says so in the log rather than reporting a fabricated "nothing
+detected" — the one outcome worth failing loudly for on a smoke alarm.
+
+Only on/off states can be mapped in this version. A custom device whose only
+readings are numbers says so in the picker.
+
 **Smoke and carbon monoxide sensors export too, as separate roles** (issue
 #179). Matter gives both one device type and picks the sensing half from a
 feature flag, so the plugin offers **Smoke alarm** and **Carbon monoxide

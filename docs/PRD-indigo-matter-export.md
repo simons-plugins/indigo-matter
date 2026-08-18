@@ -242,10 +242,10 @@ them into a PRD where they can rot.
 | Fan role (Dimmer- or SpeedControl-backed) | **Descoped 2026-08-04.** matter.js's `FanControlServer` only seeds a default `fanMode`; all fan behaviour would be ours to implement. v2 candidate |
 | Sprinkler devices | Matter has no irrigation-controller type; per-zone Water Valve is a lossy fit (and Water Valve itself is descoped). v2 candidate |
 | MultiIO devices | No coherent single-accessory representation |
-| `custom` devices with no resolvable role | Includes the plugin's own energy-meter type |
+| `custom` devices with no resolvable role | **Superseded 2026-08-18 by issue #252 / ADR-0012** — a custom device with a boolean state is now `MappableDevice`, exportable once the user declares which state is its reading. Only one with nothing boolean to publish is still excluded |
 | Garage doors | Needs the polarity handling the catalog doesn't yet carry (`onState` true = closed, turnOn = close), and mis-mapping is a physical-safety issue. Blocked on the catalog role/polarity work |
 | Sensors with units outside the table | No faithful Matter sensor type |
-| Sensors reporting neither an on/off state nor a value | Nothing to publish (`export_catalog.REASON_SENSOR_NO_VALUE`; added to this table 2026-08-05, E8 — it was always in the code) |
+| Sensors reporting neither an on/off state nor a value | Added to this table 2026-08-05, E8 — it was always in the code. **Superseded 2026-08-18 by issue #252 / ADR-0012**: such a sensor takes the same mapping path as a custom device. `REASON_SENSOR_NO_VALUE` is retired, replaced by `REASON_NO_BINARY_STATE` / `REASON_ONLY_NUMERIC_STATES` |
 
 Excluded devices must **appear in the picker as excluded, with reasons** (XAC9),
 not silently missing.

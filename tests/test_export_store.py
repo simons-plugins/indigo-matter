@@ -16,6 +16,8 @@ from bridge_protocol import ROLES
 from export_store import (
     LOAD_ERROR_UNREADABLE,
     OPTION_INVERT,
+    OPTION_STATE_INVERT,
+    OPTION_STATE_KEY,
     PREF_KEY,
     PREF_KEY_CORRUPT,
     SCHEMA_VERSION,
@@ -592,3 +594,61 @@ def test_export_entry_did_not_grow_a_battery_field():
     """
     import dataclasses
     assert "battery" not in {field.name for field in dataclasses.fields(ExportEntry)}
+
+
+# ---------------------------------------------------------------------------
+# Custom-state mapping options (ADR-0012, issue #252)
+# ---------------------------------------------------------------------------
+def _mapped(**options):
+    return {"indigoDeviceId": 7, "role": "occupancySensor", "options": options}
+
+
+def test_a_mapping_round_trips():
+    entry = ExportEntry.from_dict(_mapped(**{OPTION_STATE_KEY: "status",
+                                             OPTION_STATE_INVERT: True}))
+    assert entry.options[OPTION_STATE_KEY] == "status"
+    assert ExportEntry.from_dict(entry.to_dict()).options == entry.options
+
+
+def test_the_option_key_spellings_match_the_catalog():
+    """The catalog defines them (it is the dependency-free module) and the
+    store re-exports them; a drift here would write entries the classifier
+    cannot see, so the export would work until the next plugin restart."""
+    import export_catalog
+    assert OPTION_STATE_KEY == export_catalog.OPTION_STATE_KEY
+    assert OPTION_STATE_INVERT == export_catalog.OPTION_STATE_INVERT
+
+
+@pytest.mark.parametrize("bad", [42, "", None, True])
+def test_a_state_key_that_is_not_a_non_empty_string_is_refused(bad):
+    with pytest.raises(ValueError):
+        ExportEntry.from_dict(_mapped(**{OPTION_STATE_KEY: bad}))
+
+
+def test_a_mapping_on_a_role_that_reads_no_boolean_is_refused():
+    """Same posture as OPTION_INVERT: shape AND role. A hand-edited blob is
+    the one write path the dialog's guards never see."""
+    raw = {"indigoDeviceId": 7, "role": "temperatureSensor",
+           "options": {OPTION_STATE_KEY: "status"}}
+    with pytest.raises(ValueError):
+        ExportEntry.from_dict(raw)
+
+
+def test_every_binary_role_accepts_a_mapping():
+    import export_catalog
+    for role in export_catalog.BINARY_SENSOR_ROLES:
+        raw = {"indigoDeviceId": 7, "role": role, "options": {OPTION_STATE_KEY: "status"}}
+        assert ExportEntry.from_dict(raw).options[OPTION_STATE_KEY] == "status"
+
+
+def test_an_inversion_without_a_state_key_is_refused():
+    """A corrupted mapping, not a harmless extra: the export would read
+    `onState` and silently ignore the polarity the user asked for."""
+    with pytest.raises(ValueError):
+        ExportEntry.from_dict(_mapped(**{OPTION_STATE_INVERT: True}))
+
+
+def test_a_non_boolean_inversion_is_refused():
+    with pytest.raises(ValueError):
+        ExportEntry.from_dict(_mapped(**{OPTION_STATE_KEY: "status",
+                                         OPTION_STATE_INVERT: "yes"}))

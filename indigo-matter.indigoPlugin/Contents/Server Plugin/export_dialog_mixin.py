@@ -12,7 +12,8 @@ import indigo  # provided by the Indigo runtime
 import export_catalog
 import export_handlers
 from bridge_protocol import next_generation, published_id_for
-from export_store import ExportEntry, OPTION_INVERT
+from export_store import (ExportEntry, MAPPABLE_ROLES, OPTION_INVERT, OPTION_STATE_INVERT,
+                          OPTION_STATE_KEY)
 from plugin_constants import (
     EXCLUDED_OPTION_PREFIX, EXPORT_PICKER_LIMIT, LIST_ERROR_OPTION,
     MENU_MANAGE_EXPORTS, MENU_MIGRATE_EXPORT, MENU_READOPT_EXPORT, MENU_UNPAIR_ECOSYSTEM,
@@ -137,13 +138,13 @@ class ExportDialogMixin:
                         "'Manage Matter Exports…'.",
                         entry.indigo_device_id, entry.role)
                     continue
-                verdict = export_catalog.classify(dev, plugin_id)
-                if isinstance(verdict, export_catalog.Excluded):
+                verdict = export_catalog.classify(dev, plugin_id, entry.options)
+                if not isinstance(verdict, export_catalog.EligibleDevice):
                     self.logger.warning(
                         "Matter export allow-list: %s (id %s) is exported as %s but is no longer "
                         "exportable: %s. It will not be bridged.",
                         getattr(dev, "name", ""), entry.indigo_device_id, entry.role,
-                        verdict.reason)
+                        getattr(verdict, "reason", "unknown"))
                 elif entry.role not in verdict.eligible_roles:
                     self.logger.warning(
                         "Matter export allow-list: %s (id %s) is exported as %s, which this "
@@ -290,8 +291,10 @@ class ExportDialogMixin:
         else:
             self.logger.error("Matter bridge: another device could not be read — %s", exc)
 
-    @staticmethod
-    def _candidate_row(dev, name: str, plugin_id: str, exported) -> Optional[tuple[str, str]]:
+    # No longer a staticmethod: an exported device's row depends on its saved
+    # mapping (ADR-0012), which only the store can answer for.
+    def _candidate_row(self, dev, name: str, plugin_id: str,
+                       exported) -> Optional[tuple[str, str]]:
         """One picker row for ``dev``, or None to omit it. May raise — the caller contains it.
 
         Loop-guard devices (created by this plugin) return None: XAC6 requires
@@ -307,12 +310,21 @@ class ExportDialogMixin:
         # about, and hiding half of it reads as a picker bug rather than the
         # stale export it actually is.
         mark = "● " if device_id in exported else ""
-        verdict = export_catalog.classify(dev, plugin_id)
+        # An exported device is classified WITH its saved mapping (ADR-0012),
+        # or a device already being bridged would be listed as one still
+        # waiting to be set up.
+        verdict = export_catalog.classify(dev, plugin_id, self._saved_options(device_id))
         if isinstance(verdict, export_catalog.Excluded):
             if verdict.reason == export_catalog.REASON_LOOP_GUARD:
                 return None
             return (f"{EXCLUDED_OPTION_PREFIX}{device_id}",
                     f"{mark}{name} — not exportable: {verdict.reason}")
+        if isinstance(verdict, export_catalog.MappableDevice):
+            # Selectable, unlike an exclusion: the whole point is that the user
+            # CAN export it, once they say which state is the reading. Marked
+            # so the row is honest about the extra step rather than looking
+            # identical to a device that needs nothing.
+            return (str(device_id), f"{mark}{name} — {verdict.reason}")
         return (str(device_id), f"{mark}{name}")
 
     def getExportCandidates(self, filter="", valuesDict=None, typeId="", targetId=0):
@@ -408,8 +420,12 @@ class ExportDialogMixin:
             dev = self._indigo_device(device_id)
             if dev is None:
                 return []
-            verdict = export_catalog.classify(dev, self._export_plugin_id())
-            if isinstance(verdict, export_catalog.Excluded):
+            # The mapping being composed in the dialog is part of the
+            # question (ADR-0012): a custom device offers no roles until its
+            # state is chosen, and offers all the binary ones the moment it is.
+            verdict = export_catalog.classify(dev, self._export_plugin_id(),
+                                              self._mapping_from_values(valuesDict or {}))
+            if not isinstance(verdict, export_catalog.EligibleDevice):
                 return []
             options = []
             for role in verdict.eligible_roles:
@@ -452,6 +468,123 @@ class ExportDialogMixin:
             self.logger.exception(exc)
             return [LIST_ERROR_OPTION]
 
+    # ----------------------------------------------------------------
+    # Custom-state mapping (ADR-0012, issue #252)
+    # ----------------------------------------------------------------
+    def _saved_options(self, device_id: int) -> dict:
+        """The saved options for ``device_id``, or ``{}``.
+
+        Every classify call about an EXPORTED device has to pass these, or a
+        mapped export classifies as merely mappable and the dialog reports the
+        device it is currently bridging as not yet set up.
+        """
+        entry = self.exports.get(device_id) if self.exports is not None else None
+        return dict(entry.options) if entry is not None else {}
+
+    def _mapping_from_values(self, values: dict) -> dict:
+        """The mapping the dialog currently has on screen, as an options dict.
+
+        Empty when no state is chosen, which is what makes an unmapped device
+        classify as :class:`~export_catalog.MappableDevice` and keeps the role
+        menu empty until the user has answered the question that unlocks it.
+        """
+        key = str(values.get("exportStateKey", "") or "").strip()
+        if not key:
+            return {}
+        options = {OPTION_STATE_KEY: key}
+        if self._truthy(values.get("exportStateInvert")):
+            options[OPTION_STATE_INVERT] = True
+        return options
+
+    def _fleet_state_key(self, dev) -> Optional[str]:
+        """A state key already mapped for another device of the same TYPE.
+
+        The measured motivation (issue #252): a Texecom panel produces 24
+        identical `alarmZone` devices, and having answered "the boolean is
+        `status`" once, a user should not be asked to hunt for it another 23
+        times — only for the role, which genuinely differs per zone.
+
+        Derived from the allow-list rather than stored anywhere. A recipe kept
+        separately would be one more thing to persist, migrate and invalidate;
+        read this way it cannot go stale, because it IS the set of choices the
+        user has actually made and kept.
+        """
+        try:
+            plugin_id = getattr(dev, "pluginId", None)
+            type_id = getattr(dev, "deviceTypeId", None)
+            if not plugin_id or not type_id or self.exports is None:
+                return None
+            for entry in self.exports.all():
+                if entry.indigo_device_id == dev.id:
+                    continue
+                key = entry.options.get(OPTION_STATE_KEY)
+                if not key:
+                    continue
+                other = self._indigo_device(entry.indigo_device_id)
+                if other is None:
+                    continue
+                if getattr(other, "pluginId", None) == plugin_id \
+                        and getattr(other, "deviceTypeId", None) == type_id:
+                    return key
+        except Exception as exc:  # pylint: disable=broad-except
+            # A convenience, never a blocker — the user can still pick by hand.
+            self.logger.debug("Matter export: could not derive a fleet state key — %s", exc)
+        return None
+
+    def getExportStateKeys(self, filter="", valuesDict=None, typeId="", targetId=0):
+        # pylint: disable=redefined-builtin, unused-argument
+        """The boolean states the selected device offers as a mapping.
+
+        Empty for any device that does not need a mapping, which is also what
+        keeps the field hidden — the XML binds its visibility to
+        ``exportNeedsMapping``, set by :meth:`exportDeviceChanged`.
+        """
+        try:
+            kind, device_id = self._export_selection(valuesDict or {})
+            if kind != "device":
+                return []
+            dev = self._indigo_device(device_id)
+            if dev is None:
+                return []
+            return [(key, key) for key in export_catalog.binary_state_keys(dev)]
+        except Exception as exc:  # pylint: disable=broad-except
+            self.logger.exception(exc)
+            return [LIST_ERROR_OPTION]
+
+    def exportStateKeyChanged(self, valuesDict, typeId="", devId=0):
+        # pylint: disable=unused-argument
+        """State-key selection changed: the role menu can now be populated.
+
+        Choosing a state is what turns a :class:`~export_catalog.MappableDevice`
+        into an eligible one, so the roles that were unavailable a moment ago
+        are available now — and the returned dict is what makes Indigo reload
+        the menu that lists them. Seeds the default role too, so the common
+        path is "pick the state, press Add".
+        """
+        values = valuesDict
+        try:
+            kind, device_id = self._export_selection(values)
+            if kind != "device":
+                return values
+            dev = self._indigo_device(device_id)
+            if dev is None:
+                return values
+            verdict = export_catalog.classify(dev, self._export_plugin_id(),
+                                              self._mapping_from_values(values))
+            if not isinstance(verdict, export_catalog.EligibleDevice):
+                values["exportRole"] = ""
+                return values
+            if str(values.get("exportRole", "") or "") not in verdict.eligible_roles:
+                values["exportRole"] = verdict.default_role
+            values["exportStatus"] = (
+                f"{dev.name} will be read from its \"{values.get('exportStateKey')}\" state. "
+                f"Now choose how it should appear.")
+        except Exception as exc:  # pylint: disable=broad-except
+            # A menu callback that raises leaves the dialog wedged; the user
+            # can still press Add / update, which validates everything again.
+            self.logger.exception(exc)
+        return values
+
     def _exported_warning(self, device_id: int) -> str:
         """Suffix warning shown when an EXCLUDED device is nonetheless exported.
 
@@ -484,33 +617,50 @@ class ExportDialogMixin:
         values = valuesDict
         kind, device_id = self._export_selection(values)
         if kind == "none":
-            values["exportRole"] = ""
-            values["exportName"] = ""
-            values["exportInvert"] = False
+            self._clear_export_detail(values)
             values["exportStatus"] = self._export_summary()
             return values
         dev = self._indigo_device(device_id)
         if kind == "excluded" or dev is None:
             reason = "that device no longer exists"
             if dev is not None:
-                verdict = export_catalog.classify(dev, self._export_plugin_id())
+                verdict = export_catalog.classify(dev, self._export_plugin_id(),
+                                                  self._saved_options(device_id))
                 reason = verdict.reason if isinstance(verdict, export_catalog.Excluded) \
                     else "that device is not exportable"
-            values["exportRole"] = ""
-            values["exportName"] = ""
-            values["exportInvert"] = False
+            self._clear_export_detail(values)
             values["exportStatus"] = (f"Not exportable: {reason}"
                                       f"{self._exported_warning(device_id)}")
             return values
-        verdict = export_catalog.classify(dev, self._export_plugin_id())
+        entry = self.exports.get(device_id) if self.exports is not None else None
+        saved = dict(entry.options) if entry is not None else {}
+        verdict = export_catalog.classify(dev, self._export_plugin_id(), saved)
         if isinstance(verdict, export_catalog.Excluded):
-            values["exportRole"] = ""
-            values["exportName"] = ""
-            values["exportInvert"] = False
+            self._clear_export_detail(values)
             values["exportStatus"] = (f"Not exportable: {verdict.reason}"
                                       f"{self._exported_warning(device_id)}")
             return values
-        entry = self.exports.get(device_id) if self.exports is not None else None
+        if isinstance(verdict, export_catalog.MappableDevice):
+            # The device can be exported, but only once the user says which of
+            # its states is the reading (ADR-0012). Everything below assumes a
+            # role, and there is no role to offer yet, so this branch seeds the
+            # mapping fields and stops. The suggestion order is deliberate:
+            # a key already chosen for a SIBLING device of the same type beats
+            # the catalog's own guess, because the fleet answer is the one the
+            # user has already thought about.
+            self._clear_export_detail(values)
+            values["exportNeedsMapping"] = "true"
+            values["exportStateKey"] = (self._fleet_state_key(dev)
+                                        or verdict.suggested_state_key)
+            values["exportStateInvert"] = False
+            values["exportStatus"] = (
+                f"{dev.name} has no on/off state of its own. Pick the state that is its "
+                f"reading, then choose how it should appear."
+                f"{self._exported_warning(device_id)}")
+            return values
+        values["exportNeedsMapping"] = "true" if saved.get(OPTION_STATE_KEY) else "false"
+        values["exportStateKey"] = str(saved.get(OPTION_STATE_KEY, "") or "")
+        values["exportStateInvert"] = bool(saved.get(OPTION_STATE_INVERT, False))
         if entry is not None:
             values["exportRole"] = entry.role
             values["exportName"] = entry.name_override or ""
@@ -522,6 +672,22 @@ class ExportDialogMixin:
             values["exportInvert"] = False
             values["exportStatus"] = f"{dev.name} is not exported yet."
         return values
+
+    @staticmethod
+    def _clear_export_detail(values: dict) -> None:
+        """Blank every detail field, including the mapping pair.
+
+        Extracted when the mapping fields arrived (issue #252): the same four
+        lines were already repeated three times, and adding two more to each
+        copy is how one of them ends up forgotten — leaving a stale state key
+        on screen under a different device.
+        """
+        values["exportRole"] = ""
+        values["exportName"] = ""
+        values["exportInvert"] = False
+        values["exportNeedsMapping"] = "false"
+        values["exportStateKey"] = ""
+        values["exportStateInvert"] = False
 
     def _first_unclaimed_identity(self, identity: str, device_id: int) -> str:
         """Walk :func:`next_generation` from ``identity`` until no OTHER
@@ -578,12 +744,24 @@ class ExportDialogMixin:
         if dev is None:
             values["exportStatus"] = "That device no longer exists — refresh the list."
             return values
-        verdict = export_catalog.classify(dev, self._export_plugin_id())
+        # The mapping on screen is part of the question (ADR-0012), so it is
+        # composed BEFORE classifying: a custom device is eligible precisely
+        # because the user has now answered which state is its reading.
+        mapping = self._mapping_from_values(values)
+        verdict = export_catalog.classify(dev, self._export_plugin_id(), mapping)
         if kind == "excluded" or isinstance(verdict, export_catalog.Excluded):
             reason = verdict.reason if isinstance(verdict, export_catalog.Excluded) \
                 else "not exportable"
             values["exportStatus"] = (f"{dev.name} cannot be exported: {reason}"
                                       f"{self._exported_warning(device_id)}")
+            return values
+        if isinstance(verdict, export_catalog.MappableDevice):
+            # Refused here rather than saved with an empty mapping: an entry
+            # with no state key would fall back to reading `onState`, which
+            # this device does not have, and publish nothing forever.
+            values["exportStatus"] = (
+                f"{dev.name} needs a state before it can be exported — pick which of its "
+                f"states is the reading.")
             return values
         role = str(values.get("exportRole", "") or "")
         if role not in verdict.eligible_roles:
@@ -591,7 +769,15 @@ class ExportDialogMixin:
                                       f"({', '.join(verdict.eligible_roles)}).")
             return values
         name_override = str(values.get("exportName", "") or "").strip() or None
-        options = {}
+        # Only roles that read a boolean may carry the mapping. Saving it on,
+        # say, a numeric sensor role would write an entry `ExportEntry`'s own
+        # validation refuses — so the export would survive until the next
+        # load and then be dropped, which is the worst possible time to find
+        # out. Devices that need a mapping cannot reach a non-mappable role
+        # anyway (their eligible set IS the binary family); this covers the
+        # STANDARD sensor whose dialog still carries a key from a previous
+        # selection.
+        options = dict(mapping) if role in MAPPABLE_ROLES else {}
         if role == export_catalog.ROLE_WINDOW_COVERING and self._truthy(values.get("exportInvert")):
             options[OPTION_INVERT] = True
         previous = self.exports.get(device_id)

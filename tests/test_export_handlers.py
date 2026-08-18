@@ -20,6 +20,7 @@ import importlib
 import pytest
 
 import bridge_protocol
+import fakes
 from fakes import (
     DimmerDevice,
     FakeIndigoDevice,
@@ -1009,3 +1010,58 @@ class TestBattery:
         changed, stopped = handler.diff_from(pushed, after)
         assert changed == {}
         assert stopped == frozenset({"batteryLevel"})
+
+
+# ---------------------------------------------------------------------------
+# Custom-state mapping (ADR-0012, issue #252)
+# ---------------------------------------------------------------------------
+class TestMappedBinarySensor:
+    """A binary sensor whose reading is a plugin-named state, not `onState`."""
+
+    def test_the_mapped_state_is_published(self, handlers):
+        handler = handlers.HANDLERS["occupancySensor"]
+        dev = fakes.texecom_zone(status=True)
+        assert handler.states_for(dev, {"stateKey": "status"}) == {"occupied": True}
+
+    def test_the_mapping_can_be_inverted(self, handlers):
+        """An alarm zone whose boolean is true when HEALTHY reads backwards
+        without this — the tick-box is why the mapping is two questions."""
+        handler = handlers.HANDLERS["contactSensor"]
+        dev = fakes.texecom_zone(status=True)
+        assert handler.states_for(dev, {"stateKey": "status", "stateInvert": True}) \
+            == {"contact": False}
+
+    def test_a_vanished_state_publishes_nothing(self, handlers):
+        """Fail closed, exactly as an `onState` of None already does: a
+        fabricated False would tell every ecosystem the smoke alarm is quiet."""
+        handler = handlers.HANDLERS["smokeAlarm"]
+        assert handler.states_for(fakes.texecom_zone(), {"stateKey": "gone"}) == {}
+
+    def test_a_state_that_stopped_being_boolean_publishes_nothing(self, handlers):
+        handler = handlers.HANDLERS["occupancySensor"]
+        dev = fakes.CustomDevice(1, "Odd", states={"status": "Healthy"})
+        assert handler.states_for(dev, {"stateKey": "status"}) == {}
+
+    def test_no_mapping_still_reads_onstate(self, handlers):
+        """The standard path is untouched — every already-exported sensor
+        keeps reading exactly what it read before."""
+        handler = handlers.HANDLERS["occupancySensor"]
+        assert handler.states_for(SensorDevice(1, "PIR", supportsOnState=True, onState=True)) \
+            == {"occupied": True}
+
+    def test_an_empty_mapping_is_not_a_mapping(self, handlers):
+        """A blank menu selection arrives as "" and must fall back to
+        `onState`, not be read as a state named "" that has vanished."""
+        handler = handlers.HANDLERS["occupancySensor"]
+        dev = SensorDevice(1, "PIR", supportsOnState=True, onState=True)
+        assert handler.states_for(dev, {"stateKey": ""}) == {"occupied": True}
+
+    def test_a_mapped_change_is_diffed_like_any_other(self, handlers):
+        """The push path needs nothing new: `device_updated` diffs published
+        states, and a mapped reading is an ordinary published state."""
+        handler = handlers.HANDLERS["occupancySensor"]
+        options = {"stateKey": "status"}
+        pushed = handler.published_states(fakes.texecom_zone(status=False), options)
+        changed, stopped = handler.diff_from(pushed, fakes.texecom_zone(status=True), options)
+        assert changed == {"occupied": True}
+        assert stopped == frozenset()

@@ -28,4 +28,6 @@ chosen), see [`../ARCHITECTURE.md`](../ARCHITECTURE.md).
 * [ADR-0010](0010-a-published-accessory-identity-is-plugin-owned.md) - ADR-0010: A published accessory identity is a plugin-owned, defaulted field (accepted)
 * [ADR-0011](0011-a-driving-device-change-is-a-reconcile-rekey.md) - ADR-0011: A driving-device change under a stable identity is a reconcile rekey (accepted)
 
+* [ADR-0012](0012-export-eligibility-can-be-a-user-declaration.md) - ADR-0012: For a device Indigo does not type, export eligibility is a user declaration (accepted; narrows ADR-0003)
+
 <!-- adrlogstop -->

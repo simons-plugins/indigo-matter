@@ -30,6 +30,7 @@ import pytest
 
 import bridge_protocol
 import export_catalog
+import fakes
 from export_store import OPTION_INVERT, PREF_KEY, ExportEntry, ExportStore
 from fakes import (
     OTHER_PLUGIN_ID,
@@ -86,7 +87,8 @@ def plug(plugin_mod, devices):  # noqa: ARG001 - devices installs indigo.devices
 
 def _values(**kwargs):
     base = {"exportFilter": "", "exportDevice": "0", "exportRole": "",
-            "exportName": "", "exportInvert": False, "exportStatus": ""}
+            "exportName": "", "exportInvert": False, "exportStatus": "",
+            "exportNeedsMapping": "false", "exportStateKey": "", "exportStateInvert": False}
     base.update(kwargs)
     return base
 
@@ -2365,3 +2367,114 @@ class TestReExportAfterMigrateIdentityCollisionGuard:
         assert entry.published_as == "indigo-101~3"
         identities = [e.published_as or f"indigo-{e.indigo_device_id}" for e in plug.exports.all()]
         assert len(identities) == len(set(identities))
+
+
+# ---------------------------------------------------------------------------
+# Custom-state mapping in the dialog (ADR-0012, issue #252)
+# ---------------------------------------------------------------------------
+def _zone(plug, devices, dev_id=201, name="Study PIR", **kwargs):
+    zone = fakes.texecom_zone(dev_id, name, **kwargs)
+    devices.add(zone)
+    return zone
+
+
+def test_a_mappable_device_is_selectable_in_the_picker(plug, devices):
+    """Not an `x-` row. The whole point is that the user CAN export it — the
+    label carries the extra step instead of a refusal."""
+    _zone(plug, devices)
+    labels = _labels(plug.getExportCandidates(valuesDict=_values()))
+    assert "201" in labels
+    assert "needs a state" in labels["201"]
+
+
+def test_selecting_a_mappable_device_opens_the_mapping_fields(plug, devices):
+    _zone(plug, devices)
+    values = plug.exportDeviceChanged(_values(exportDevice="201"))
+    assert values["exportNeedsMapping"] == "true"
+    assert values["exportStateKey"] == "status"
+    assert values["exportRole"] == ""          # no role until a state is picked
+
+
+def test_no_roles_are_offered_until_a_state_is_chosen(plug, devices):
+    _zone(plug, devices)
+    assert plug.getExportRoles(valuesDict=_values(exportDevice="201")) == []
+    offered = plug.getExportRoles(valuesDict=_values(exportDevice="201", exportStateKey="status"))
+    assert [role for role, _label in offered] == list(export_catalog.BINARY_SENSOR_ROLES)
+
+
+def test_choosing_a_state_seeds_the_default_role(plug, devices):
+    _zone(plug, devices)
+    values = plug.exportStateKeyChanged(_values(exportDevice="201", exportStateKey="status"))
+    assert values["exportRole"] == "occupancySensor"
+
+
+def test_adding_without_a_state_is_refused(plug, devices):
+    """An entry with no state key would fall back to reading `onState`, which
+    this device does not have, and publish nothing forever."""
+    _zone(plug, devices)
+    values = plug.exportAddOrUpdate(_values(exportDevice="201", exportRole="occupancySensor"))
+    assert "needs a state" in values["exportStatus"]
+    assert 201 not in plug.exports
+
+
+def test_a_mapped_export_is_saved_with_its_mapping(plug, devices):
+    _zone(plug, devices)
+    plug.exportAddOrUpdate(_values(exportDevice="201", exportStateKey="status",
+                                   exportRole="occupancySensor"))
+    entry = plug.exports.get(201)
+    assert entry.role == "occupancySensor"
+    assert entry.options["stateKey"] == "status"
+
+
+def test_reselecting_a_mapped_export_shows_its_mapping(plug, devices):
+    """Classified WITH its saved options, or the device being bridged right
+    now would be reported as one still waiting to be set up."""
+    _zone(plug, devices)
+    plug.exportAddOrUpdate(_values(exportDevice="201", exportStateKey="status",
+                                   exportRole="occupancySensor"))
+    values = plug.exportDeviceChanged(_values(exportDevice="201"))
+    assert values["exportStateKey"] == "status"
+    assert values["exportRole"] == "occupancySensor"
+    assert "is exported as" in values["exportStatus"]
+
+
+def test_the_fleet_recipe_prefills_the_next_zone(plug, devices):
+    """The 24-zone motivation: having answered "the boolean is `status`" once,
+    the rest of the panel should only need a role."""
+    _zone(plug, devices, 201, "Study PIR")
+    _zone(plug, devices, 202, "Front Door")
+    plug.exportAddOrUpdate(_values(exportDevice="201", exportStateKey="status",
+                                   exportRole="occupancySensor"))
+    values = plug.exportDeviceChanged(_values(exportDevice="202"))
+    assert values["exportStateKey"] == "status"
+    # The ROLE is still per-zone — the fleet shares a state key, not a meaning.
+    assert values["exportRole"] == ""
+
+
+def test_the_fleet_recipe_does_not_cross_device_types(plug, devices):
+    _zone(plug, devices, 201, "Study PIR")
+    other = fakes.CustomDevice(202, "Camera", states={"recording": False},
+                               plugin_id="org.cynic.indigo.securityspy",
+                               deviceTypeId="camera")
+    devices.add(other)
+    plug.exportAddOrUpdate(_values(exportDevice="201", exportStateKey="status",
+                                   exportRole="occupancySensor"))
+    values = plug.exportDeviceChanged(_values(exportDevice="202"))
+    assert values["exportStateKey"] == "recording"
+
+
+def test_a_standard_sensor_never_shows_the_mapping_fields(plug, devices):
+    values = plug.exportDeviceChanged(_values(exportDevice="103"))
+    assert values["exportNeedsMapping"] == "false"
+    assert values["exportStateKey"] == ""
+
+
+def test_a_stale_state_key_is_not_saved_onto_a_non_binary_role(plug, devices):
+    """`ExportEntry` refuses a mapping on a numeric role, so saving one would
+    produce an entry that survives until the next load and is then dropped —
+    the worst possible time to find out."""
+    devices.add(SensorDevice(106, "Loft Temperature", supportsSensorValue=True,
+                             displayStateValUi="19.5 °C"))
+    plug.exportAddOrUpdate(_values(exportDevice="106", exportStateKey="status",
+                                   exportRole="temperatureSensor"))
+    assert plug.exports.get(106).options == {}

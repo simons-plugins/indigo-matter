@@ -45,6 +45,7 @@ import threading
 from dataclasses import dataclass, field
 from typing import Callable, Iterable, Optional
 
+import export_catalog
 from bridge_protocol import ROLES, parse_published_id
 
 #: pluginPrefs key holding the serialised allow-list.
@@ -68,6 +69,21 @@ KEY_PUBLISHED_AS = "publishedAs"
 #: ``options`` key carrying window-covering polarity (PRD §5.2 / §4.1).
 OPTION_INVERT = "invert"
 
+#: ``options`` keys carrying a custom-state mapping (ADR-0012, issue #252).
+#: :data:`OPTION_STATE_KEY` names the device state the export reads;
+#: :data:`OPTION_STATE_INVERT` says the device reports the opposite sense (a
+#: zone whose boolean is true when *healthy*, for instance). Deliberately not
+#: folded into :data:`OPTION_INVERT`: that one is window-covering position
+#: polarity, validated against :data:`INVERTIBLE_ROLES`, and sharing a key
+#: would make each one's validation lie about the other.
+OPTION_STATE_KEY = export_catalog.OPTION_STATE_KEY
+OPTION_STATE_INVERT = export_catalog.OPTION_STATE_INVERT
+
+#: Roles for which :data:`OPTION_STATE_KEY` means anything — the binary sensor
+#: family. A mapping on a numeric or a light role is a hand-edit or a stale
+#: write, and honouring it would read a boolean into a role with no boolean.
+MAPPABLE_ROLES = tuple(export_catalog.BINARY_SENSOR_ROLES)
+
 #: Roles for which :data:`OPTION_INVERT` means anything. Polarity is a covering
 #: concept (§5.2); on any other role it is either a hand-edit or a stale write,
 #: and honouring it would silently invert a lock or a plug.
@@ -77,6 +93,47 @@ INVERTIBLE_ROLES = ("windowCovering",)
 #: store must never let the UI say "nothing is exported yet" after this.
 LOAD_ERROR_UNREADABLE = ("Export list could not be read — starting empty. "
                          "The previous list is preserved (see Event Log).")
+
+
+def _validate_options(options: dict, role: str, device_id: int) -> None:
+    """Raise ``ValueError`` for any option this role has no business carrying.
+
+    Split out of :meth:`ExportEntry.from_dict` when the mapping options
+    arrived. Every check here is enforced per KEY **and** per ROLE, because a
+    restored backup or a hand-edited ``.indiPref`` is the one write path the
+    dialog's own guards never see: an ``invert`` that rode in on a lock would
+    be a silent polarity flip, and a ``stateKey`` on a numeric role would have
+    the export read a boolean into a role that publishes none.
+    """
+    if OPTION_INVERT in options:
+        if not isinstance(options[OPTION_INVERT], bool):
+            raise ValueError(
+                f"export entry {OPTION_INVERT!r} option is not a boolean (device {device_id})")
+        if role not in INVERTIBLE_ROLES:
+            raise ValueError(
+                f"export entry has the {OPTION_INVERT!r} option on role {role!r}, which has "
+                f"no polarity (device {device_id})")
+    if OPTION_STATE_KEY in options:
+        if not isinstance(options[OPTION_STATE_KEY], str) or not options[OPTION_STATE_KEY]:
+            raise ValueError(
+                f"export entry {OPTION_STATE_KEY!r} option is not a non-empty string "
+                f"(device {device_id})")
+        if role not in MAPPABLE_ROLES:
+            raise ValueError(
+                f"export entry has the {OPTION_STATE_KEY!r} option on role {role!r}, which "
+                f"reads no boolean state (device {device_id})")
+    if OPTION_STATE_INVERT in options:
+        if not isinstance(options[OPTION_STATE_INVERT], bool):
+            raise ValueError(
+                f"export entry {OPTION_STATE_INVERT!r} option is not a boolean "
+                f"(device {device_id})")
+        if OPTION_STATE_KEY not in options:
+            # An inversion with nothing to invert is a corrupted mapping, not a
+            # harmless extra: the export would read `onState` and silently
+            # ignore the polarity the user asked for.
+            raise ValueError(
+                f"export entry has {OPTION_STATE_INVERT!r} without {OPTION_STATE_KEY!r} "
+                f"(device {device_id})")
 
 
 @dataclass(frozen=True)
@@ -138,17 +195,7 @@ class ExportEntry:
         options = raw.get(KEY_OPTIONS) or {}
         if not isinstance(options, dict):
             raise ValueError(f"export entry options are not an object (device {device_id})")
-        if OPTION_INVERT in options:
-            # Shape is enforced per ROLE, not just per key: a restored or
-            # hand-edited blob that carries `invert` on a lock or a plug would
-            # otherwise ride into the endpoint build as a silent polarity flip.
-            if not isinstance(options[OPTION_INVERT], bool):
-                raise ValueError(
-                    f"export entry {OPTION_INVERT!r} option is not a boolean (device {device_id})")
-            if role not in INVERTIBLE_ROLES:
-                raise ValueError(
-                    f"export entry has the {OPTION_INVERT!r} option on role {role!r}, which has "
-                    f"no polarity (device {device_id})")
+        _validate_options(options, role, device_id)
         published_as = raw.get(KEY_PUBLISHED_AS)
         if published_as is not None:
             if not isinstance(published_as, str):

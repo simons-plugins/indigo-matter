@@ -115,9 +115,20 @@ REASON_LOOP_GUARD = "created by this plugin (loop guard)"
 REASON_FAN = "fan export is v2 (matter.js FanControl is a stub)"
 REASON_SPRINKLER = "Matter has no irrigation type; per-zone valve export is v2"
 REASON_MULTI_IO = "no coherent single-accessory representation"
-REASON_NO_ROLE = "no resolvable Matter role"
 REASON_SENSOR_UNITS = "no faithful Matter sensor type"
-REASON_SENSOR_NO_VALUE = "sensor reports neither an on/off state nor a value"
+#: Replaces the former ``REASON_NO_ROLE`` / ``REASON_SENSOR_NO_VALUE`` pair
+#: (issue #252). Both used to say some version of "this device has no Matter
+#: role", which was true of the *type* and misleading about the device: on the
+#: reference database the largest group saying it — Texecom's 24 alarm zones —
+#: were ordinary PIRs and door contacts whose reading simply lived in a
+#: plugin-named state. Now a device with a boolean to map is
+#: :class:`MappableDevice` instead, and these two reasons are what is left:
+#: genuinely nothing to publish, split so a user can tell "never" from
+#: "not yet".
+REASON_NO_BINARY_STATE = "nothing here reports an on/off state Matter could publish"
+REASON_ONLY_NUMERIC_STATES = ("only numeric states, which cannot be mapped yet — "
+                              "mapping covers on/off states in this version")
+REASON_MAPPED_STATE_GONE = "the mapped state is no longer reported by this device"
 REASON_DEVICE_ERROR = "error reading device — see Event Log"
 
 #: Roles a user might reasonably expect and the reason v1 does not offer them
@@ -133,6 +144,19 @@ EXCLUDED_ROLES = {
                  "smoke and CO only, and exporting a heat zone as either would be a "
                  "safety lie",
 }
+
+#: ``options`` key naming the state a mapped export reads (ADR-0012). Defined
+#: here rather than imported from ``export_store`` because this module is
+#: deliberately dependency-free — the store imports the catalog, not the
+#: reverse — and ``tests/test_export_store.py`` pins the two spellings equal.
+OPTION_STATE_KEY = "stateKey"
+#: Companion to :data:`OPTION_STATE_KEY`: the device reports the opposite sense
+#: (an alarm zone whose boolean is true when *healthy*, say).
+OPTION_STATE_INVERT = "stateInvert"
+
+#: Preference order for :func:`binary_state_keys`. Anything unlisted sorts
+#: after these, alphabetically.
+_STATE_KEY_RANK = {"onOffState": 0, "onOff": 1, "state": 2, "status": 3, "active": 4}
 
 #: The binary (on/off) sensor roles. All are offered for any on/off sensor; the
 #: name heuristic only picks the *default* (see :func:`_binary_sensor_role`),
@@ -261,13 +285,45 @@ class EligibleDevice:
 
 
 @dataclass(frozen=True)
+class MappableDevice:
+    """A device with no Matter role of its own, but a boolean the user could map.
+
+    Indigo's typed device classes (:class:`indigo.SensorDevice` and friends)
+    are what :func:`classify` reasons from, and a plugin declaring
+    ``<Device type="custom">`` gets none of them: its device is a plain
+    ``indigo.Device`` whose ``supportsOnState`` is False and whose real reading
+    lives in a plugin-named state. Texecom's alarm zones are the measured case
+    — 24 of them on the reference database, every one a PIR, contact, smoke or
+    CO zone that Matter could publish perfectly well — and they are far from
+    alone: kind-less devices are the single largest exclusion bucket there is.
+
+    This verdict is what lets the picker say "you can export this, tell me
+    which state" instead of "no resolvable Matter role". It deliberately does
+    **not** carry ``eligible_roles``: nothing but :class:`EligibleDevice` may
+    have that attribute, so no caller can accidentally treat an unmapped
+    device as exportable by duck-typing. Re-run :func:`classify` with the
+    declared mapping in ``options`` to get the roles (ADR-0012).
+    """
+
+    #: Boolean states the user may choose between, best guess first.
+    candidate_state_keys: tuple[str, ...]
+    #: The reason shown in the picker (XAC9), phrased as an invitation.
+    reason: str = "needs a state to be mapped — choose one below"
+
+    @property
+    def suggested_state_key(self) -> str:
+        """The best guess, which the dialog pre-selects."""
+        return self.candidate_state_keys[0]
+
+
+@dataclass(frozen=True)
 class Excluded:
     """A device v1 will not export, and the reason shown in the picker (XAC9)."""
 
     reason: str
 
 
-Verdict = Union[EligibleDevice, Excluded]
+Verdict = Union[EligibleDevice, MappableDevice, Excluded]
 
 
 def device_kind(dev) -> str:
@@ -283,13 +339,22 @@ def device_kind(dev) -> str:
     return ""
 
 
-def classify(dev, plugin_id: str = DEFAULT_PLUGIN_ID) -> Verdict:
+def classify(dev, plugin_id: str = DEFAULT_PLUGIN_ID, options: Optional[dict] = None) -> Verdict:
     """Classify one Indigo device for export (§5.2).
 
     ``plugin_id`` is the running plugin's own id — a device carrying it is
     excluded first, before any type reasoning, which is what makes the loop
     guard structural (XNG3/XAC6) rather than a downstream check that a future
     edit could route around.
+
+    ``options`` is the export entry's options dict, or the mapping a dialog is
+    in the middle of composing. It matters for exactly one class of device:
+    one whose reading lives in a plugin-named state, where eligibility is the
+    user's declaration rather than a property of the device (**ADR-0012**).
+    Every caller holding an entry must pass its options, or a mapped export
+    re-classifies as un-exportable the next time the guard runs. Callers that
+    genuinely have no mapping — the picker sweep, which is asking "could this
+    be exported at all?" — pass nothing and get :class:`MappableDevice`.
 
     Never raises. Indigo device objects are live proxies, and one being deleted
     while the picker walks the database can raise from any attribute access —
@@ -302,17 +367,23 @@ def classify(dev, plugin_id: str = DEFAULT_PLUGIN_ID) -> Verdict:
             return Excluded(REASON_LOOP_GUARD)
         handler = _BY_KIND.get(device_kind(dev))
         if handler is None:
-            return Excluded(REASON_NO_ROLE)
-        return handler(dev)
+            return _custom(dev, options)
+        return handler(dev, options)
     except Exception as exc:  # pylint: disable=broad-except
         _LOG.error("Matter bridge: could not classify a device for export — %s", exc,
                    exc_info=True)
         return Excluded(REASON_DEVICE_ERROR)
 
 
-def is_exportable(dev, plugin_id: str = DEFAULT_PLUGIN_ID) -> bool:
-    """True if :func:`classify` yields an :class:`EligibleDevice`."""
-    return isinstance(classify(dev, plugin_id), EligibleDevice)
+def is_exportable(dev, plugin_id: str = DEFAULT_PLUGIN_ID,
+                  options: Optional[dict] = None) -> bool:
+    """True if :func:`classify` yields an :class:`EligibleDevice`.
+
+    A :class:`MappableDevice` is deliberately False: it is a device that
+    *could* be exported once its state is declared, which is not the same
+    thing as one that can be exported now.
+    """
+    return isinstance(classify(dev, plugin_id, options), EligibleDevice)
 
 
 def role_label(role: str) -> str:
@@ -323,7 +394,7 @@ def role_label(role: str) -> str:
 # --------------------------------------------------------------------------
 # Per-class rules (§5.2 table)
 # --------------------------------------------------------------------------
-def _relay(_dev) -> Verdict:
+def _relay(_dev, _options=None) -> Verdict:
     """Relay → plug (default), light or lock.
 
     Valve, garage door and fan are §5.2 exclusions and so are absent from the
@@ -336,7 +407,7 @@ def _relay(_dev) -> Verdict:
     )
 
 
-def _dimmer(dev) -> Verdict:
+def _dimmer(dev, _options=None) -> Verdict:
     """Dimmer → dimmable light, upgraded by colour capability; or a covering."""
     supports_rgb = _flag(dev, "supportsRGB")
     supports_white_temp = _flag(dev, "supportsWhiteTemperature")
@@ -357,7 +428,7 @@ def _dimmer(dev) -> Verdict:
     return EligibleDevice(eligible_roles=_default_first(roles, default), default_role=default)
 
 
-def _sensor(dev) -> Verdict:
+def _sensor(dev, options=None) -> Verdict:
     """Sensor → binary (occupancy/contact) or numeric (by unit heuristic)."""
     if _flag(dev, "supportsOnState"):
         default = _binary_sensor_role(dev) or ROLE_OCCUPANCY_SENSOR
@@ -373,24 +444,131 @@ def _sensor(dev) -> Verdict:
             eligible_roles=_default_first(list(NUMERIC_SENSOR_ROLES), default),
             default_role=default,
         )
-    return Excluded(REASON_SENSOR_NO_VALUE)
+    # A SensorDevice that declares neither flag is in the same position as a
+    # custom device: typed as a sensor, but with its reading somewhere only its
+    # own plugin names. Measured on the reference database this is rare (3
+    # devices, against 326 kind-less ones) — it shares the path because the
+    # remedy is identical, not because the population matters.
+    return _custom(dev, options)
 
 
-def _thermostat(_dev) -> Verdict:
+def _thermostat(_dev, _options=None) -> Verdict:
     """Thermostat → Thermostat. No fan in v1 (the FanControl descope)."""
     return EligibleDevice(eligible_roles=(ROLE_THERMOSTAT,), default_role=ROLE_THERMOSTAT)
 
 
-def _speed_control(_dev) -> Verdict:
+def _speed_control(_dev, _options=None) -> Verdict:
     return Excluded(REASON_FAN)
 
 
-def _sprinkler(_dev) -> Verdict:
+def _sprinkler(_dev, _options=None) -> Verdict:
     return Excluded(REASON_SPRINKLER)
 
 
-def _multi_io(_dev) -> Verdict:
+def _multi_io(_dev, _options=None) -> Verdict:
     return Excluded(REASON_MULTI_IO)
+
+
+def _custom(dev, options=None) -> Verdict:
+    """A device with no IOM class of its own — eligible only once mapped.
+
+    See :class:`MappableDevice` for why this population exists and how large
+    it is. Three outcomes, and the order is the whole safety argument:
+
+    * a declared mapping whose state is **still reported** → an ordinary
+      :class:`EligibleDevice` over the binary roles;
+    * a declared mapping whose state has **gone** → :class:`Excluded`, never
+      eligible. A plugin that renamed or dropped a state must not have its old
+      key silently read as absent-therefore-False, which would tell every
+      ecosystem the leak sensor is dry;
+    * no mapping → :class:`MappableDevice` if there is anything to map,
+      otherwise :class:`Excluded`.
+    """
+    key = _mapped_state_key(options)
+    candidates = binary_state_keys(dev)
+    if key is not None:
+        if key not in candidates:
+            return Excluded(REASON_MAPPED_STATE_GONE)
+        default = _binary_sensor_role(dev) or ROLE_OCCUPANCY_SENSOR
+        return EligibleDevice(
+            eligible_roles=_default_first(list(BINARY_SENSOR_ROLES), default),
+            default_role=default,
+        )
+    if candidates:
+        return MappableDevice(candidate_state_keys=candidates)
+    return Excluded(REASON_ONLY_NUMERIC_STATES if _has_numeric_state(dev)
+                    else REASON_NO_BINARY_STATE)
+
+
+def _mapped_state_key(options) -> Optional[str]:
+    """The declared state key in ``options``, or ``None``.
+
+    Defensive about the whole shape rather than trusting the store: this is
+    also handed dialog values mid-edit, and a blank menu selection arrives as
+    an empty string, which must read as "not chosen yet" and not as a state
+    named "".
+    """
+    if not isinstance(options, dict):
+        return None
+    key = options.get(OPTION_STATE_KEY)
+    return key if isinstance(key, str) and key else None
+
+
+def binary_state_keys(dev) -> tuple[str, ...]:
+    """The device's boolean states, best guess first — the mapping candidates.
+
+    Two filters and one ordering, all of them measured against a real database:
+
+    * **Booleans only.** A plugin state holding 0/1 or "on"/"off" is not
+      offered, because guessing which of those means true is exactly the sort
+      of silent wrong answer this whole feature exists to avoid. Narrow on
+      purpose; widening it is a decision with its own evidence.
+    * **Enum expansions are dropped.** Indigo publishes a state with a value
+      set as booleans named ``parent.Value`` alongside the parent — Texecom's
+      ``statusText`` yields ``statusText.Healthy``, ``.Tamper``, ``.Shorted``
+      and ``.Tripped``. Offering all four next to the real ``status`` boolean
+      turns a one-choice question into a five-choice one with four wrong
+      answers, so a dotted key whose parent is also a state is suppressed.
+    * **``onOffState`` leads.** It is the name Indigo itself gives the state
+      behind ``dev.onState``, so a custom device publishing one has, in
+      effect, already said which boolean is the device's reading — and it is
+      the commonest custom boolean there is (156 devices on the reference
+      database, against 24 for the next).
+    """
+    try:
+        states = dict(getattr(dev, "states", None) or {})
+    except Exception:  # pylint: disable=broad-except
+        # `states` is a live proxy like everything else on a device; an
+        # unreadable one means no candidates, never a raised picker.
+        return ()
+    names = set(states)
+    keys = [name for name, value in states.items()
+            if isinstance(value, bool) and not _is_enum_expansion(name, names)]
+    keys.sort(key=lambda name: (_STATE_KEY_RANK.get(name, len(_STATE_KEY_RANK)), name))
+    return tuple(keys)
+
+
+def _has_numeric_state(dev) -> bool:
+    """True if the device publishes a number but no boolean.
+
+    Only used to choose between two exclusion reasons, so that a plugin device
+    full of readings hears "not yet" rather than the flat "nothing to publish"
+    that fits a device with no states at all. ``bool`` is excluded explicitly:
+    it is a subclass of ``int`` in Python, and without that the two reasons
+    would never distinguish anything.
+    """
+    try:
+        values = dict(getattr(dev, "states", None) or {}).values()
+    except Exception:  # pylint: disable=broad-except
+        return False
+    return any(isinstance(value, (int, float)) and not isinstance(value, bool)
+               for value in values)
+
+
+def _is_enum_expansion(name: str, names: set) -> bool:
+    """True for ``parent.Value`` where ``parent`` is itself a state."""
+    parent, _, suffix = name.partition(".")
+    return bool(suffix) and parent in names
 
 
 _BY_KIND = {
