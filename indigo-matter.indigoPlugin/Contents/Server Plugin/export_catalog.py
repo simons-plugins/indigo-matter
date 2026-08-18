@@ -63,6 +63,9 @@ ROLE_EXTENDED_COLOR_LIGHT = "extendedColorLight"
 ROLE_WINDOW_COVERING = "windowCovering"
 ROLE_OCCUPANCY_SENSOR = "occupancySensor"
 ROLE_CONTACT_SENSOR = "contactSensor"
+ROLE_WATER_LEAK_DETECTOR = "waterLeakDetector"
+ROLE_WATER_FREEZE_DETECTOR = "waterFreezeDetector"
+ROLE_RAIN_SENSOR = "rainSensor"
 ROLE_TEMPERATURE_SENSOR = "temperatureSensor"
 ROLE_HUMIDITY_SENSOR = "humiditySensor"
 ROLE_LIGHT_SENSOR = "lightSensor"
@@ -90,6 +93,9 @@ ROLE_LABELS = {
     ROLE_WINDOW_COVERING: "Window covering",
     ROLE_OCCUPANCY_SENSOR: "Occupancy sensor (PIR/motion)",
     ROLE_CONTACT_SENSOR: "Contact sensor",
+    ROLE_WATER_LEAK_DETECTOR: "Water leak sensor",
+    ROLE_WATER_FREEZE_DETECTOR: "Freeze sensor",
+    ROLE_RAIN_SENSOR: "Rain sensor",
     ROLE_TEMPERATURE_SENSOR: "Temperature sensor",
     ROLE_HUMIDITY_SENSOR: "Humidity sensor",
     ROLE_LIGHT_SENSOR: "Light (lux) sensor",
@@ -120,6 +126,45 @@ EXCLUDED_ROLES = {
                   "mis-mapping is a physical-safety issue)",
     "fan": REASON_FAN,
 }
+
+#: The binary (on/off) sensor roles. All are offered for any on/off sensor; the
+#: name heuristic only picks the *default* (see :func:`_binary_sensor_role`),
+#: exactly as the unit heuristic does for the numeric five.
+#:
+#: Occupancy leads because it is the safe fallback when nothing matches: Matter
+#: has no motion device type, so Occupancy Sensor 0x0107 is what an Indigo
+#: motion sensor — the commonest on/off sensor by a wide margin — has to be.
+BINARY_SENSOR_ROLES = (
+    ROLE_OCCUPANCY_SENSOR, ROLE_CONTACT_SENSOR, ROLE_WATER_LEAK_DETECTOR,
+    ROLE_WATER_FREEZE_DETECTOR, ROLE_RAIN_SENSOR,
+)
+
+#: Name hints → binary role as **regexes**, first match wins (issue #236/#252).
+#:
+#: Unlike the numeric table this leans on the device's *name*, because that is
+#: usually the only evidence there is: a binary sensor publishes one bool and
+#: no unit, so nothing but the prose the user wrote distinguishes a leak sensor
+#: from a door contact. It sets a **default only** — every role in
+#: :data:`BINARY_SENSOR_ROLES` stays selectable — which is what makes a name
+#: heuristic acceptable here at all.
+#:
+#: Order is deliberate. Occupancy needles run first so "Back Door Motion" reads
+#: as motion rather than as a door; a name with no motion word ("Front Door")
+#: then falls through to contact. Every needle is ``\b``-anchored for the same
+#: reason the unit table is: unanchored "rain" matches "Drainage", and "frost"
+#: matches "Defrost".
+_BINARY_PATTERNS = tuple(
+    (role, tuple(re.compile(pattern) for pattern in patterns)) for role, patterns in (
+        (ROLE_OCCUPANCY_SENSOR, (r"\bmotion\b", r"\bpir\b", r"\boccupancy\b",
+                                 r"\boccupied\b", r"\bpresence\b")),
+        (ROLE_WATER_LEAK_DETECTOR, (r"\bleak\b", r"\bflood\b", r"\bwater alarm\b",
+                                    r"\bwater sensor\b")),
+        (ROLE_WATER_FREEZE_DETECTOR, (r"\bfreeze\b", r"\bfreezing\b", r"\bfrost\b")),
+        (ROLE_RAIN_SENSOR, (r"\brain\b",)),
+        (ROLE_CONTACT_SENSOR, (r"\bcontact\b", r"\bdoor\b", r"\bwindow\b", r"\bgate\b",
+                               r"\breed\b", r"\bopen/closed\b")),
+    )
+)
 
 #: The numeric sensor roles, in §5.2 table order. All of them are offered for
 #: any numeric sensor; the unit heuristic only picks the *default* (see
@@ -300,9 +345,10 @@ def _dimmer(dev) -> Verdict:
 def _sensor(dev) -> Verdict:
     """Sensor → binary (occupancy/contact) or numeric (by unit heuristic)."""
     if _flag(dev, "supportsOnState"):
+        default = _binary_sensor_role(dev) or ROLE_OCCUPANCY_SENSOR
         return EligibleDevice(
-            eligible_roles=(ROLE_OCCUPANCY_SENSOR, ROLE_CONTACT_SENSOR),
-            default_role=ROLE_OCCUPANCY_SENSOR,
+            eligible_roles=_default_first(list(BINARY_SENSOR_ROLES), default),
+            default_role=default,
         )
     if _flag(dev, "supportsSensorValue"):
         default = _numeric_sensor_role(dev)
@@ -405,6 +451,34 @@ def _role_for_text(text: str) -> Optional[str]:
     if not text:
         return None
     for role, needles in _UNIT_PATTERNS:
+        for needle in needles:
+            if needle.search(text):
+                return role
+    return None
+
+
+def _binary_sensor_role(dev) -> Optional[str]:
+    """Best-guess role for an on/off sensor from its name, or ``None``.
+
+    ``None`` is not an exclusion here — unlike :func:`_numeric_sensor_role`,
+    where an unrecognised unit means there is no faithful Matter sensor type.
+    Every binary sensor has one (occupancy, the caller's fallback); this only
+    says whether the *name* provided better evidence than that fallback.
+
+    Reads the same two haystacks as the numeric guess (:func:`_unit_texts`),
+    strong tier first, so a plugin that declares something useful in its props
+    beats the prose in the device name — the same precedence, for the same
+    reason.
+    """
+    strong, weak = _unit_texts(dev)
+    return _binary_role_for_text(strong) or _binary_role_for_text(weak)
+
+
+def _binary_role_for_text(text: str) -> Optional[str]:
+    """First :data:`_BINARY_PATTERNS` role whose regex matches ``text``."""
+    if not text:
+        return None
+    for role, needles in _BINARY_PATTERNS:
         for needle in needles:
             if needle.search(text):
                 return role

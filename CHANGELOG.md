@@ -8,6 +8,14 @@ current version is `Info.plist`'s `PluginVersion`.
 Banked for the next release. Releases are opt-in in this repo, so several
 merges accumulate here before one of them ships.
 
+### Added
+
+- **Water leak, freeze and rain export roles** (issue #236). An Indigo leak
+  sensor exports as Matter's own Water Leak Detector, so Apple Home shows it
+  as a leak sensor with leak alerts instead of forcing it out as an occupancy
+  tile; freeze and rain sensors get the adjacent Matter types. All three are
+  read-only, like every other exported sensor.
+
 ### Changed
 
 - **The occupancy export role is now labelled "Occupancy sensor
@@ -18,6 +26,14 @@ merges accumulate here before one of them ships.
   "this sensor cannot be exported". Nothing about the exported accessory
   changes; this is the label, plus the ceiling written down in MATTER.md and
   the bridge field notes.
+- **The default role for an on/off sensor is now read from its name** (issues
+  #236/#252). A binary sensor publishes one boolean and no unit, so its name
+  is the only evidence about what it detects — "Utility Leak Sensor" now
+  defaults to Water leak, "Front Door" to Contact, "Study PIR" to Occupancy,
+  and anything unrecognised still falls back to Occupancy as before. It
+  remains a default only: all five binary roles stay selectable in the picker.
+  This matters more than it used to, because changing a role after export
+  costs the accessory's room in every paired ecosystem.
 
 ## 2026.21.0 — Re-adopt a Matter accessory…, and role changes cost the room on purpose
 

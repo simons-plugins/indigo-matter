@@ -167,6 +167,14 @@ ROLE_STATE_KEYS = {
     "doorLock": ("locked",),
     "occupancySensor": ("occupied",),
     "contactSensor": ("contact",),
+    # The leak family (issue #236). Three device types over one cluster:
+    # BooleanState's `stateValue`, whose polarity for a *detector* is "true =
+    # detected" — the opposite reading to `contactSensor`, where the same
+    # attribute means "true = closed". Separate keys rather than one shared
+    # `detected` so a role change cannot silently reinterpret a pushed state.
+    "waterLeakDetector": ("leak",),
+    "waterFreezeDetector": ("freeze",),
+    "rainSensor": ("rain",),
     "temperatureSensor": ("temperatureC",),
     "humiditySensor": ("humidityPct",),
     "lightSensor": ("lux",),
@@ -197,6 +205,9 @@ ROLE_COMMANDS = {
     "doorLock": ("lock", "unlock"),
     "occupancySensor": (),
     "contactSensor": (),
+    "waterLeakDetector": (),
+    "waterFreezeDetector": (),
+    "rainSensor": (),
     "temperatureSensor": (),
     "humiditySensor": (),
     "lightSensor": (),

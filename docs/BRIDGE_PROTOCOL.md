@@ -600,6 +600,9 @@ ecosystem acts. Both are enumerated here in full; there is no other source.
 | `doorLock` | Door Lock | `locked: bool` | `lock {}`, `unlock {}` |
 | `occupancySensor` | Occupancy Sensor | `occupied: bool` | — (sensors emit no commands) |
 | `contactSensor` | Contact Sensor | `contact: bool` (true = closed) | — |
+| `waterLeakDetector` | Water Leak Detector (0x0043) | `leak: bool` (true = leak detected) | — |
+| `waterFreezeDetector` | Water Freeze Detector (0x0041) | `freeze: bool` (true = freeze detected) | — |
+| `rainSensor` | Rain Sensor (0x0044) | `rain: bool` (true = rain detected) | — |
 | `temperatureSensor` | Temperature Sensor | `temperatureC: float` | — |
 | `humiditySensor` | Humidity Sensor | `humidityPct: float` | — |
 | `lightSensor` | Light Sensor | `lux: float` | — |
@@ -607,6 +610,13 @@ ecosystem acts. Both are enumerated here in full; there is no other source.
 | `flowSensor` | Flow Sensor | `flowM3h: float` | — |
 | `thermostat` | Thermostat | `localTemperatureC: float`, `heatingSetpointC: float`, `coolingSetpointC: float`, `systemMode: str` | `setHeatingSetpoint {"valueC": float}`, `setCoolingSetpoint {"valueC": float}`, `setSystemMode {"mode": str}` |
 
+- **The leak family and `contactSensor` share one Matter cluster and disagree
+  about its polarity, on purpose.** All four carry BooleanState's `stateValue`,
+  but the specification reads it as "true = closed or contact" in a Contact
+  Sensor and as "true = detected" in each detector device type. Each role
+  therefore gets its own state key rather than a shared `detected`: a role
+  change re-creates the accessory (§3.6), and a shared key would let a state
+  pushed under one reading be applied under the other.
 - `systemMode` domain (both directions): `"off" | "heat" | "cool" | "auto"`.
   The node owns the mapping to/from Matter's `SystemModeEnum` integers.
 - `level`/`position` are integers 0–100 in both directions; the node owns the
