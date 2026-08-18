@@ -1080,7 +1080,7 @@ class TestFailureSurfacing:
     def test_version_skew_says_restart_the_agent(self, bridge_mod, mock_logger, devices):
         h = self._bridge(bridge_mod, mock_logger, devices)
         h.bridge._on_version_skew(bridge_protocol.Hello(2, "9.9.9", "1.0"))
-        assert "restart the bridge agent" in errors_of(mock_logger)
+        assert "Install/update the Matter bridge" in errors_of(mock_logger)
 
     def test_drift_is_reported_never_repaired(self, bridge_mod, mock_logger, devices):
         h = self._bridge(bridge_mod, mock_logger, devices)

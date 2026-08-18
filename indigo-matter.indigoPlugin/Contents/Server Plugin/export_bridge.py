@@ -100,8 +100,8 @@ PREF_PENDING_REPLACE_ALL = "matterExportPendingReplaceAll"
 #:   ``reason=code`` — i.e. the reason string is ``"version_mismatch"`` itself.
 #:
 #: ``bridge_client.TERMINAL_ATTACH_ERRORS[ERR_VERSION_MISMATCH]``'s own remedy
-#: text is "restart the bridge agent" — exactly what *Install/update the Matter
-#: bridge* does — so both reason strings are revived here. The other member of
+#: text sends the user to *Install/update the Matter bridge* — so both reason
+#: strings are revived here, on the way back from exactly that. The other member of
 #: ``HALTING_ATTACH_ERRORS``, ``mass_removal_refused``, is deliberately NOT in
 #: this set: its remedy is about the allow-list, not the node process, and
 #: reviving it after an install would silently rebuild a client that attaches
@@ -402,9 +402,9 @@ class ExportBridge:
     def revive_after_install(self) -> bool:
         """Replace a client halted on version skew, after a bridge reinstall (#154).
 
-        ``TERMINAL_ATTACH_ERRORS[ERR_VERSION_MISMATCH]``'s remedy tells the user
-        to restart the bridge agent — exactly what *Install/update the Matter
-        bridge* just did — but a version-skew halt is fail-closed
+        ``TERMINAL_ATTACH_ERRORS[ERR_VERSION_MISMATCH]``'s remedy sends the user
+        to *Install/update the Matter bridge* — which is what just ran — but a
+        version-skew halt is fail-closed
         (``bridge_client.ClientHalted``) and nothing else in this engine revives
         a halted client: :meth:`ws_json_client.WsJsonClient.resume` only clears
         the latch and its own docstring says the caller must start a fresh
@@ -1515,8 +1515,9 @@ class ExportBridge:
     def _on_version_skew(self, hello) -> None:
         self._logger.error(
             "Matter bridge: the bridge node speaks protocol version %s, this plugin speaks %s "
-            "(node %s). Export is STOPPED and pairings are untouched — restart the bridge agent "
-            "so it picks up the node that ships with this plugin.",
+            "(node %s). Export is STOPPED and pairings are untouched — run Plugins ▸ Matter "
+            "▸ Install/update the Matter bridge, which installs the exact node version this "
+            "plugin pins; merely restarting the agent relaunches the same old node.",
             hello.protocol_version, bridge_protocol.PROTOCOL_VERSION, hello.bridge_version)
 
     def _on_drift_detected(self, drift: list) -> None:

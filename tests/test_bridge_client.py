@@ -696,7 +696,7 @@ class TestAttachRefused:
         assert state["client"].halted
         assert state["client"].halted_reason == bridge_protocol.ERR_VERSION_MISMATCH
         assert state["delays"] == []
-        assert "restart the bridge agent" in logged(mock_logger, "error")
+        assert "Install/update the Matter bridge" in logged(mock_logger, "error")
 
     def test_a_transient_refusal_reconnects_and_names_the_code(self, mock_logger):
         # `internal` says the node fell over on its own; that genuinely may work

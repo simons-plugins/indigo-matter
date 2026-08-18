@@ -108,8 +108,9 @@ def rebuild_timeout_for(endpoint_count: int) -> float:
 #: produces an endless connect/attach/refuse loop that also hammers the node.
 TERMINAL_ATTACH_ERRORS = {
     bridge_protocol.ERR_VERSION_MISMATCH: (
-        "the node speaks a different protocol version — restart the bridge agent so launchd "
-        "picks up the node that ships with this plugin"
+        "the node speaks a different protocol version — run Plugins ▸ Matter ▸ "
+        "Install/update the Matter bridge, which installs the exact node version this plugin "
+        "pins; merely restarting the agent relaunches the same old node"
     ),
     bridge_protocol.ERR_MASS_REMOVAL_REFUSED: (
         "attaching would have un-exported every accessory and the request did not carry the "

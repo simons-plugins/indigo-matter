@@ -450,10 +450,10 @@ one deliberate, predictable re-room every time. The dialog warns you at the
 time. This is deliberately NOT an in-place recreate at the same number
 any more: that used to be able to leave Apple Home stuck on "could not
 change settings", because its cached accessory structure no longer matched
-what the bridge advertised under a number it believed was stable. Deleted
-the old accessory and re-created it, your ecosystem's own "new accessory"
-flow handles it the same way any other addition does — no home-hub restart
-needed.
+what the bridge advertised under a number it believed was stable. Because
+the old accessory is deleted and a new one created, your ecosystem's own
+"new accessory" flow handles it the same way it handles any other
+addition — no home-hub restart needed.
 
 **If you are already stuck from an older version** (live-observed
 2026-08-17, pre-2026.21.0): the fix is to **restart your Apple home hub**
