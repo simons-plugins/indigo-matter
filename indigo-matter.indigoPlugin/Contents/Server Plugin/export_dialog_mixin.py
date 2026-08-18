@@ -218,11 +218,18 @@ class ExportDialogMixin:
         number that had moved, or a map the node could not write, showed up in
         the log at the moment it happened and nowhere at all afterwards. This
         dialog is where somebody goes when an accessory is behaving oddly.
+
+        Since issues #219/#240 the §4.3 ``warnings`` channel also carries the
+        node's one-shot NOTICES (``EndpointMapStore``'s ``#notices``: a
+        re-adoptable orphan spotted, a re-adopt landed, an entry this bridge
+        version cannot rebuild), so the wording below says "reports" rather
+        than naming them all persistence problems — several of them are not
+        problems at all.
         """
         if status is None:
             return ""
         if status.warnings:
-            return (f" The bridge node reports {len(status.warnings)} persistence problem(s): "
+            return (f" The bridge node reports {len(status.warnings)} thing(s) worth reading: "
                     f"{'; '.join(status.warnings)}")
         if status.drift:
             return (f" WARNING: {len(status.drift)} exported accessory number(s) have DRIFTED — "

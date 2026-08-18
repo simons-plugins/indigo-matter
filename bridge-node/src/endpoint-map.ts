@@ -601,6 +601,26 @@ export class EndpointMapStore {
     /** Persistence failures worth putting in `StatusReport.warnings` (§4.3). */
     #warnings = new Map<string, string>();
     /**
+     * One-shot NOTICES that ride the same §4.3 channel (issues #219/#240).
+     *
+     * `this.log` is stdout, and the node is started by launchd — so a line
+     * written only there is a line no user will ever see. Three of this file's
+     * most consequential statements were stdout-only: the re-adopt nudge (the
+     * whole discoverability moment for `Re-adopt a Matter accessory…`), the
+     * "this entry cannot be rebuilt by this bridge version" skip, and the
+     * confirmation that a re-adopt actually landed. {@link warnings} therefore
+     * carries these too, which is the one channel `export_bridge.py` already
+     * mirrors into the Indigo event log.
+     *
+     * Kept in a SEPARATE map from {@link #warnings} because the lifetimes are
+     * opposites: a persistence warning is cleared by whatever write finally
+     * succeeded, while a notice is a statement about something that already
+     * happened and nothing can un-happen it. Keyed per identity so a notice is
+     * said once rather than on every attach, and cleared only by {@link load},
+     * which re-reads the file this file's notices are all about.
+     */
+    #notices = new Map<string, string>();
+    /**
      * True once the file {@link load} found unusable has been copied aside.
      *
      * Both {@link rebuild} and {@link persist} quarantine before overwriting,
@@ -627,6 +647,7 @@ export class EndpointMapStore {
         this.#dirty = false;
         this.#quarantined = false;
         this.#warnings.clear();
+        this.#notices.clear();
         if (loaded.problem !== undefined) {
             this.log(`Endpoint map unusable: ${loaded.problem}`);
         } else if (!loaded.present) {
@@ -664,16 +685,34 @@ export class EndpointMapStore {
     }
 
     /**
-     * §4.3 `warnings` — the persistence failures a client has to be told about.
+     * §4.3 `warnings` — what a client has to be told about: the persistence
+     * failures, plus the one-shot {@link #notices}.
      *
-     * The node's log is stdout, and in this milestone the node is started **by
-     * hand**, so stdout is a terminal somebody closed. A map that cannot be
-     * written is exactly the fault this file exists to make visible, and it
-     * would otherwise be visible only there. `get_status` is polled, so this is
-     * the channel that actually reaches a user.
+     * The node's log is stdout, and the node is started by launchd, so stdout
+     * is a terminal nobody is watching. A map that cannot be written is exactly
+     * the fault this file exists to make visible, and it would otherwise be
+     * visible only there. `get_status` is polled and `attach` answers with one,
+     * so this is the channel that actually reaches a user's Indigo event log
+     * (`export_bridge.py`'s `_report_node_warnings`).
      */
     get warnings(): string[] {
-        return [...this.#warnings.values()];
+        return [...this.#warnings.values(), ...this.#notices.values()];
+    }
+
+    /**
+     * Log `message` AND put it on the §4.3 channel, once per `key` — see
+     * {@link #notices} for why stdout alone is not enough.
+     *
+     * The first caller for a key wins: these are statements about a specific
+     * accessory identity, and a second one for the same identity would say
+     * the same thing again.
+     */
+    private notice(key: string, message: string): void {
+        if (this.#notices.has(key)) {
+            return;
+        }
+        this.#notices.set(key, message);
+        this.log(message);
     }
 
     /** The recorded number for a `UniqueID`, if there is one. */
@@ -716,10 +755,11 @@ export class EndpointMapStore {
      * (`parsePublishedId(uniqueId)?.deviceId`), which is every pre-PR5 and
      * un-re-adopted entry. An entry with a `role`/`label` but neither source
      * of a device id — a map written by a NEWER node, or hand-edited — is
-     * skipped and named in the log, the same "cannot be rebuilt by this
-     * bridge version" line `node.ts`'s own loop uses for an unsupported
-     * `role`: this is the only place that ever sees such an entry, since a
-     * skipped one never reaches that loop at all.
+     * skipped and named on the §4.3 {@link warnings} channel (so it reaches
+     * the user's Indigo log, not just stdout), in the same "cannot be rebuilt
+     * by this bridge version" words `node.ts`'s own loop uses for an
+     * unsupported `role`: this is the only place that ever sees such an entry,
+     * since a skipped one never reaches that loop at all.
      */
     restorable(): RestorableEndpoint[] {
         const restorable: RestorableEndpoint[] = [];
@@ -737,7 +777,8 @@ export class EndpointMapStore {
             }
             const indigoDeviceId = record.deviceId ?? parsePublishedId(uniqueId)?.deviceId;
             if (indigoDeviceId === undefined) {
-                this.log(
+                this.notice(
+                    `unrestorable:${uniqueId}`,
                     `Endpoint map entry ${uniqueId} (role ${record.role}) cannot be rebuilt by this ` +
                         "bridge version; leaving it to the plugin's attach",
                 );
@@ -929,9 +970,11 @@ export class EndpointMapStore {
      * defined, and different) can still be told apart from a first sighting
      * (`added`, above — nothing to compare against) and from this build
      * simply filling in a field a pre-PR5 record never had (`record.deviceId`
-     * was `undefined`, not merely different). Logged directly here, the same
+     * was `undefined`, not merely different). Reported directly here, the same
      * place the `numberVoid` adoption above logs itself, because — like that
-     * one — only `check` ever sees both the old and the new value at once.
+     * one — only `check` ever sees both the old and the new value at once; and
+     * on the §4.3 {@link warnings} channel rather than stdout, because it is
+     * the confirmation that the user's re-adopt actually landed.
      */
     check(live: readonly LiveEndpointNumber[]): DriftEntry[] {
         const drift: DriftEntry[] = [];
@@ -955,7 +998,8 @@ export class EndpointMapStore {
                 refreshed += 1;
             }
             if (previousDeviceId !== undefined && entry.deviceId !== undefined && entry.deviceId !== previousDeviceId) {
-                this.log(
+                this.notice(
+                    `readopted:${entry.uniqueId}`,
                     `Accessory ${entry.uniqueId} (number ${record.number}) is now driven by Indigo device ` +
                         `${entry.deviceId}, replacing device ${previousDeviceId} — nothing on the wire changed, ` +
                         "so every paired ecosystem keeps the room, name, scenes and automations it had (issue " +
@@ -1005,8 +1049,9 @@ export class EndpointMapStore {
      * from {@link check}'s `added` branch, before the brand-new record is
      * inserted: when the identity `check` is about to record for the FIRST
      * time has a `role` AND `label` that exactly match an existing
-     * ORPHANED, non-superseded record, log one INFO line naming the
-     * `Re-adopt a Matter accessory…` menu action. This is exactly the
+     * ORPHANED, non-superseded record, say so once — on the §4.3
+     * {@link warnings} channel, because a nudge nobody reads is not a nudge —
+     * naming the `Re-adopt a Matter accessory…` menu action. This is exactly the
      * motivating case for #219 — a device deleted, recreated and
      * re-exported under a brand-new identity, with the room now empty in
      * every ecosystem and no obvious reason why — offered before the user
@@ -1030,7 +1075,8 @@ export class EndpointMapStore {
                 continue;
             }
             if (record.role === entry.role && record.label === entry.label) {
-                this.log(
+                this.notice(
+                    `readoptable:${entry.uniqueId}`,
                     `"${entry.label}" was just exported as a NEW accessory (${entry.uniqueId}), but a ` +
                         `left-behind accessory with the same role and name (${uniqueId}, number ` +
                         `${record.number}) is still in the endpoint map. If this is the same device, ` +

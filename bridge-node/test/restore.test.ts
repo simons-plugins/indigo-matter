@@ -1471,6 +1471,19 @@ describe("issues #219/#240 at node level: re-adopt and the two-command supersede
                 ),
                 `expected the readopt nudge naming both identities, got ${session.logged.join(" | ")}`,
             );
+            // ...and it has to leave stdout. The node is launched by launchd,
+            // so `session.logged` is a terminal nobody is watching; §4.3
+            // `warnings` is what `export_bridge.py` mirrors into the Indigo
+            // event log, and this nudge is the whole discoverability moment
+            // for `Re-adopt a Matter accessory…`.
+            assert.ok(
+                session.bridge
+                    .getStatus()
+                    .warnings.some(line => line.includes("Re-adopt a Matter accessory…")),
+                `the nudge must ride StatusReport.warnings, got ${JSON.stringify(
+                    session.bridge.getStatus().warnings,
+                )}`,
+            );
         } finally {
             await session.close();
         }

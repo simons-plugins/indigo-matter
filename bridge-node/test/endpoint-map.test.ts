@@ -1603,3 +1603,111 @@ describe("the driving device, the orphan date and supersession (issues #219/#240
         });
     });
 });
+
+describe("re-adopt notices reach the client, not just stdout (PR5 design §4.5, issues #219/#240)", () => {
+    // `this.log` is stdout and the node is launched by launchd, so a line
+    // written only there is a line no user will ever see. Each of these three
+    // was stdout-only; `StatusReport.warnings` is the one channel
+    // `export_bridge.py` mirrors into the Indigo event log.
+
+    it("puts the Re-adopt nudge on the warnings channel", () => {
+        const store = new EndpointMapStore(storage());
+        store.load();
+        store.check([
+            { uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Kitchen Lamp", deviceId: 100 },
+        ]);
+        store.forget(["indigo-1"]);
+
+        store.check([
+            { uniqueId: "indigo-2", endpointNumber: 5, role: "onOffLight", label: "Kitchen Lamp", deviceId: 200 },
+        ]);
+
+        assert.ok(
+            store.warnings.some(line => line.includes("Re-adopt a Matter accessory…")),
+            `the nudge must ride StatusReport.warnings, got ${JSON.stringify(store.warnings)}`,
+        );
+    });
+
+    it("says the nudge once, however many attaches follow", () => {
+        const store = new EndpointMapStore(storage());
+        store.load();
+        store.check([
+            { uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Kitchen Lamp", deviceId: 100 },
+        ]);
+        store.forget(["indigo-1"]);
+        store.check([
+            { uniqueId: "indigo-2", endpointNumber: 5, role: "onOffLight", label: "Kitchen Lamp", deviceId: 200 },
+        ]);
+        store.forget(["indigo-2"]);
+        // A second brand-new identity matching the SAME orphan: the nudge
+        // names indigo-1 again, and the channel must not accumulate a copy
+        // per attach — a warning set that grows re-logs plugin-side every
+        // time it changes (`_report_node_warnings` latches on the SET).
+        store.check([
+            { uniqueId: "indigo-3", endpointNumber: 6, role: "onOffLight", label: "Kitchen Lamp", deviceId: 300 },
+        ]);
+
+        assert.equal(
+            store.warnings.filter(line => line.includes("Re-adopt a Matter accessory…")).length,
+            2,
+            `one notice per NEW identity, never a repeat: ${JSON.stringify(store.warnings)}`,
+        );
+    });
+
+    it("puts the landed-re-adopt confirmation on the warnings channel", () => {
+        const store = new EndpointMapStore(storage());
+        store.load();
+        store.check([
+            { uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Lamp", deviceId: 100 },
+        ]);
+        store.forget(["indigo-1"]);
+
+        store.check([
+            { uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Lamp", deviceId: 200 },
+        ]);
+
+        assert.ok(
+            store.warnings.some(line => line.includes("is now driven by Indigo device 200, replacing device 100")),
+            `the confirmation must reach the user, got ${JSON.stringify(store.warnings)}`,
+        );
+    });
+
+    it("puts the cannot-rebuild skip on the warnings channel", () => {
+        const dir = storage();
+        writeFileSync(
+            join(dir, ENDPOINT_MAP_FILE),
+            JSON.stringify({
+                version: ENDPOINT_MAP_VERSION,
+                // A key no `parsePublishedId` can resolve a device id from, and
+                // no `deviceId` field either — a map from a newer node, or a
+                // hand edit.
+                endpoints: { "made-up-key": { number: 4, role: "onOffLight", label: "Mystery" } },
+            }),
+        );
+        const store = new EndpointMapStore(dir);
+        store.load();
+
+        assert.deepEqual(store.restorable(), []);
+        assert.ok(
+            store.warnings.some(line => line.includes("cannot be rebuilt by this bridge version")),
+            `the skip must reach the user, got ${JSON.stringify(store.warnings)}`,
+        );
+    });
+
+    it("clears notices on a re-load — they are statements about the file just read", () => {
+        const store = new EndpointMapStore(storage());
+        store.load();
+        store.check([
+            { uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Lamp", deviceId: 100 },
+        ]);
+        store.forget(["indigo-1"]);
+        store.check([
+            { uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Lamp", deviceId: 200 },
+        ]);
+        assert.equal(store.warnings.length, 1);
+
+        store.load();
+
+        assert.deepEqual(store.warnings, []);
+    });
+});
