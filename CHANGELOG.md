@@ -3,6 +3,34 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
+## 2026.23.2 — mappable devices come back to the migrate and re-adopt pickers
+
+### Fixed
+
+- **A device needing a state mapping vanished from "Migrate an exported
+  accessory…" and "Re-adopt a Matter accessory…"** — no row, no reason, no
+  clue (issue #252 follow-up, reported live). 2026.23.0 gave the classifier a
+  third answer for devices Indigo does not type, and these two dialogs still
+  asked their question the old way, so every such device — all 24 Texecom
+  zones on the reference system — silently disappeared from both lists rather
+  than being shown with a reason.
+
+  They now appear, unselectable, saying *needs a state mapping first; export
+  it directly, then retry*. That is the honest answer: inheriting an accessory
+  never asks which state is the reading, so a migration onto an unmapped
+  device would leave the accessory publishing nothing — dark rather than
+  moved. Export the device directly first, which is where the mapping is
+  asked, and it becomes an ordinary target afterwards. The same wording now
+  appears if the migration is attempted anyway.
+- **Both device pickers are now in alphabetical order.** They followed
+  Indigo's own device order, which is not alphabetical — it collates
+  punctuation Finder-style, so "Apple TV Power Socket" came before
+  "AP_78:8a:20:b3:cc:4f" — and the list is built as two runs, selectable
+  devices then explained ones. Across several hundred devices that reads as an
+  alphabet restarting halfway down. Each block is now sorted A→Z on its own,
+  so the devices you can pick still come first and never get truncated, but
+  both halves are scannable.
+
 ## 2026.23.1 — the bridge node for the new sensor roles
 
 The Node half of 2026.23.0's five new sensor roles — water leak, freeze, rain,

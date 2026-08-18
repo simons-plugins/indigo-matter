@@ -964,11 +964,12 @@ class ServerMenuMixin:
                     if row is None:
                         continue
                     (explained if row[0].startswith(EXCLUDED_OPTION_PREFIX)
-                     else eligible).append(row)
+                     else eligible).append((str(getattr(dev, "name", "") or "").lower(), row))
                 except Exception as exc:  # pylint: disable=broad-except
                     self._log_row_failure(exc, first=not failures)  # pylint: disable=no-member
                     failures += 1
-            options = eligible + explained[:EXPORT_PICKER_LIMIT]
+            options = (self._sorted_device_rows(eligible)
+                       + self._sorted_device_rows(explained)[:EXPORT_PICKER_LIMIT])
             if len(explained) > EXPORT_PICKER_LIMIT:
                 options.append(TRUNCATED_OPTION)
             return options
@@ -1043,9 +1044,13 @@ class ServerMenuMixin:
                                  "That device no longer exists — refresh the list.")
             return None
         verdict = export_catalog.classify(dev, self._export_plugin_id())  # pylint: disable=no-member
-        if isinstance(verdict, export_catalog.Excluded):
-            self._migrate_refuse(errors, "migrateDevice",
-                                 f"{dev.name} cannot be exported: {verdict.reason}")
+        if not isinstance(verdict, export_catalog.EligibleDevice):  # ADR-0012 — see _readopt_device_row
+            self._migrate_refuse(
+                errors, "migrateDevice",
+                f"{dev.name} needs a state mapping before anything can be migrated onto it — "
+                "export it directly first, which is where that is asked."
+                if isinstance(verdict, export_catalog.MappableDevice)
+                else f"{dev.name} cannot be exported: {getattr(verdict, 'reason', 'not exportable')}")
             return None
         if source_entry.role not in verdict.eligible_roles:
             self._migrate_refuse(
@@ -1353,11 +1358,28 @@ class ServerMenuMixin:
         """
         mark = "● " if dev.id in exported else ""
         verdict = export_catalog.classify(dev, plugin_id)
-        if isinstance(verdict, export_catalog.Excluded):
-            if verdict.reason == export_catalog.REASON_LOOP_GUARD:
+        # Positive test, not `not isinstance(..., Excluded)`. ADR-0012 gave
+        # `classify` a third outcome, and a device that could be exported once
+        # its state is mapped answers False to `Excluded` while carrying no
+        # `eligible_roles` at all — so a negative test fell through to the line
+        # below and raised, which the caller turns into a DROPPED ROW. Every
+        # such device vanished from both device pickers with no reason given:
+        # the one outcome this method's whole docstring exists to prevent.
+        if not isinstance(verdict, export_catalog.EligibleDevice):
+            reason = getattr(verdict, "reason", "not exportable")
+            if reason == export_catalog.REASON_LOOP_GUARD:
                 return None                      # XAC6: absent, not excluded
+            if isinstance(verdict, export_catalog.MappableDevice):
+                # Shown, not selectable. Inheriting an accessory does not ask
+                # which state is the reading, so an entry retargeted onto an
+                # unmapped device would publish nothing — the accessory would
+                # go dark rather than move. Export it directly first (which
+                # does ask), then it is an ordinary target.
+                return (f"{EXCLUDED_OPTION_PREFIX}{dev.id}",
+                        f"{mark}{dev.name} — needs a state mapping first; "
+                        f"export it directly, then retry")
             return (f"{EXCLUDED_OPTION_PREFIX}{dev.id}",
-                    f"{mark}{dev.name} — not exportable: {verdict.reason}")
+                    f"{mark}{dev.name} — not exportable: {reason}")
         if orphan.role not in verdict.eligible_roles:
             return (f"{EXCLUDED_OPTION_PREFIX}{dev.id}",
                     f"{mark}{dev.name} — cannot appear as a "
@@ -1372,6 +1394,26 @@ class ServerMenuMixin:
                             f"{mark}{dev.name} — already re-adopted onto accessory "
                             f"{publishing_as}")
         return (str(dev.id), f"{mark}{dev.name}")
+
+    @staticmethod
+    def _sorted_device_rows(rows: list) -> list:
+        """``(sort_name, row)`` pairs → rows, A→Z, case-insensitively.
+
+        Both device pickers used ``indigo.devices`` order, which is neither
+        alphabetical nor stable-looking to a user: Indigo collates with a
+        Finder-style rule that treats punctuation differently, so "Apple TV
+        Power Socket" sorts BEFORE "AP_78:8a:20:b3:cc:4f". Concatenating two
+        such runs — selectable, then explained — reads as an alphabet that
+        restarts halfway down a list of several hundred devices.
+
+        Sorting is applied WITHIN each block rather than across both, so the
+        eligible-first rule (and its never-truncated guarantee) is untouched:
+        the pickable devices stay at the top, and each block is now scannable.
+        The device NAME is the key, not the row label, because the label
+        carries the ``●`` exported marker and the trailing reason — sorting on
+        it would file every exported device under "●".
+        """
+        return [row for _key, row in sorted(rows, key=lambda pair: pair[0])]
 
     def getReadoptDevices(self, filter="", valuesDict=None, typeId="", targetId=0):  # noqa: N802, A002, ARG002
         # pylint: disable=too-many-locals  # same two-list shape as getExportCandidates
@@ -1416,11 +1458,12 @@ class ServerMenuMixin:
                     if row is None:
                         continue
                     (explained if row[0].startswith(EXCLUDED_OPTION_PREFIX)
-                     else eligible).append(row)
+                     else eligible).append((str(getattr(dev, "name", "") or "").lower(), row))
                 except Exception as exc:  # pylint: disable=broad-except
                     self._log_row_failure(exc, first=not failures)  # pylint: disable=no-member
                     failures += 1
-            options = eligible + explained[:EXPORT_PICKER_LIMIT]
+            options = (self._sorted_device_rows(eligible)
+                       + self._sorted_device_rows(explained)[:EXPORT_PICKER_LIMIT])
             if len(explained) > EXPORT_PICKER_LIMIT:
                 options.append(TRUNCATED_OPTION)
             return options
@@ -1627,9 +1670,13 @@ class ServerMenuMixin:
                                  "That device no longer exists — refresh the list.")
             return None
         verdict = export_catalog.classify(dev, self._export_plugin_id())  # pylint: disable=no-member
-        if isinstance(verdict, export_catalog.Excluded):
-            self._readopt_refuse(errors, "readoptDevice",
-                                 f"{dev.name} cannot be exported: {verdict.reason}")
+        if not isinstance(verdict, export_catalog.EligibleDevice):  # ADR-0012 — see _readopt_device_row
+            self._readopt_refuse(
+                errors, "readoptDevice",
+                f"{dev.name} needs a state mapping before an accessory can be re-adopted onto "
+                "it — export it directly first, which is where that is asked."
+                if isinstance(verdict, export_catalog.MappableDevice)
+                else f"{dev.name} cannot be exported: {getattr(verdict, 'reason', 'not exportable')}")
             return None
         if orphan.role not in verdict.eligible_roles:
             self._readopt_refuse(

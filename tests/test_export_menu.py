@@ -1437,6 +1437,78 @@ class TestGetReadoptDevices:
         assert labels["x-101"] == ("Study Plug — cannot appear as a "
                                    + export_catalog.role_label("dimmableLight"))
 
+    def test_a_mappable_device_is_shown_with_its_reason_not_dropped(self, plug, devices):
+        """Regression, live-reported 2026-08-18. ADR-0012 gave `classify` a third
+        outcome; this row builder tested NEGATIVELY for `Excluded`, so a
+        `MappableDevice` fell through to `verdict.eligible_roles` and raised —
+        which the caller turns into a dropped row. Every Texecom zone (229
+        devices on the reference database) vanished from BOTH device pickers
+        with no reason shown, which is the exact failure XAC9 exists to stop.
+        """
+        devices.add(fakes.texecom_zone(301, "Gate Contact"))
+        _bridge_with(plug, attached=True)
+        orphan = _orphan(role="contactSensor")
+        plug.runtime = _FakeRuntime(result=[orphan])
+        labels = _labels(plug.getReadoptDevices(valuesDict={"readoptOrphan": orphan.unique_id}))
+        assert "301" not in labels, "unselectable — inheriting never asks for a mapping"
+        assert "x-301" in labels, "but PRESENT, with a reason"
+        assert "needs a state mapping first" in labels["x-301"]
+
+    def test_a_mappable_device_is_shown_in_the_migrate_picker_too(self, plug, devices):
+        """Same row builder, other dialog — the bug hit both."""
+        devices.add(fakes.texecom_zone(302, "Kitchen PIR"))
+        _bridge_with(plug, attached=True)
+        plug.exports.upsert(ExportEntry(103, "occupancySensor"))
+        labels = _labels(plug.getMigrateDevices(valuesDict={"migrateSource": "103"}))
+        assert "302" not in labels
+        assert "needs a state mapping first" in labels["x-302"]
+
+    def test_migrating_onto_a_mappable_device_is_refused_with_a_next_step(self, plug, devices):
+        """The Execute-time half. Retargeting an entry onto an unmapped device
+        would publish nothing — the accessory goes dark rather than moves."""
+        devices.add(fakes.texecom_zone(303, "Gate Contact"))
+        _bridge_with(plug, attached=True)
+        plug.exports.upsert(ExportEntry(103, "occupancySensor"))
+        errors = {}
+        assert plug._migrate_pick_device(103, plug.exports.get(103),
+                                         {"migrateDevice": "303"}, errors) is None
+        assert "needs a state mapping" in errors["migrateDevice"]
+
+    def test_rows_are_alphabetical_within_each_block(self, plug, devices):
+        """Reported live 2026-08-18: "not fully alphabetical but also not
+        published devices first either". Both pickers walked `indigo.devices`,
+        whose order is Indigo's Finder-style collation ("Apple TV Power Socket"
+        before "AP_78:8a:20:b3:cc:4f") — and concatenating two such runs reads
+        as an alphabet that restarts halfway down. Sorted WITHIN each block, so
+        eligible-first and its never-truncated guarantee are untouched.
+        """
+        devices.add(RelayDevice(310, "Zulu Plug"))
+        devices.add(RelayDevice(311, "alpha Plug"))       # lower case leads: case-insensitive
+        _bridge_with(plug, attached=True)
+        orphan = _orphan(role="onOffPlugInUnit")
+        plug.runtime = _FakeRuntime(result=[orphan])
+        options = plug.getReadoptDevices(valuesDict={"readoptOrphan": orphan.unique_id})
+        selectable = [label for key, label in options if not key.startswith("x-")]
+        explained = [label for key, label in options if key.startswith("x-")]
+        assert selectable == sorted(selectable, key=str.lower)
+        assert explained == sorted(explained, key=str.lower)
+        # ...and every selectable row still precedes every explained one.
+        keys = [key for key, _label in options]
+        assert all(not k.startswith("x-") for k in keys[:len(selectable)])
+
+    def test_the_exported_marker_does_not_file_a_device_under_that_symbol(self, plug, devices):
+        """The sort key is the device NAME, not the row label — the label
+        carries the ● marker and the trailing reason, so sorting on it would
+        file every exported device together under "●"."""
+        devices.add(RelayDevice(312, "Aardvark Plug"))
+        plug.exports.upsert(ExportEntry(312, "onOffPlugInUnit"))
+        _bridge_with(plug, attached=True)
+        orphan = _orphan(role="onOffPlugInUnit")
+        plug.runtime = _FakeRuntime(result=[orphan])
+        options = plug.getReadoptDevices(valuesDict={"readoptOrphan": orphan.unique_id})
+        selectable = [label for key, label in options if not key.startswith("x-")]
+        assert selectable[0] == "● Aardvark Plug", selectable
+
     def test_an_unexportable_device_is_shown_with_the_classifiers_reason(self, plug):
         _bridge_with(plug, attached=True)
         orphan = _orphan(role="onOffPlugInUnit")
