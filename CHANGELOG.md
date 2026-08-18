@@ -62,6 +62,47 @@ the largest exclusion bucket in the product by a factor of ten.
   This matters more than it used to, because changing a role after export
   costs the accessory's room in every paired ecosystem.
 
+## 2026.22.1 — the bridge node for migrate
+
+The Node half of 2026.22.0. Install it with
+*Plugins ▸ Matter ▸ Install/update the Matter bridge* — the plugin pins
+`indigo-matter-bridge@0.12.0`, and the migrate action needs the rekey the node
+release carries. Nothing else changed.
+
+## 2026.22.0 — Migrate an exported accessory…
+
+### Added
+
+- **`Plugin ▸ Migrate an exported accessory…`** (issue #246) — moves a live
+  export onto a **different Indigo device**, for the case that turns out to be
+  the common one: a thing in your house getting replaced while both Indigo
+  devices exist at once. A socket swapped for a new model, a light moved from
+  Zigbee to Matter. Pick the export, pick the device that drives it now, and
+  the accessory's room, name, scenes and automations survive **by
+  construction** in every paired ecosystem — not restored afterwards, but never
+  disturbed, because nothing is removed and re-added and no ecosystem ever sees
+  a change. This is the difference between migrate and re-adopt: re-adopt
+  rescues an accessory whose device is already gone, and by then Apple has
+  purged the room within seconds, so it lands in the Default Room. Migrate,
+  used before you delete the old device, keeps everything. The role must match
+  — a migration cannot also change what the accessory is. See ADR-0011.
+
+### Changed
+
+- **Re-adopt's dialog, log and documentation stopped overclaiming.** They
+  implied the room and name came back with the accessory; measured on live
+  hardware, they do not — only the accessory number, absence of duplicates and
+  correct control routing are restored. The wording now says so, and points at
+  migrate for the case where the room really can be kept.
+
+## 2026.21.1 — the bridge node for protocol v2
+
+The Node half of 2026.21.0, pinned to `indigo-matter-bridge@0.11.0`. Exports
+stay offline until it is installed via
+*Plugins ▸ Matter ▸ Install/update the Matter bridge* — version skew fails
+closed by design, and restarting the bridge agent does not help, because
+launchd relaunches the same node.
+
 ## 2026.21.0 — Re-adopt a Matter accessory…, and role changes cost the room on purpose
 
 > **This release bumps the bridge protocol to v2 — Matter export stops until
