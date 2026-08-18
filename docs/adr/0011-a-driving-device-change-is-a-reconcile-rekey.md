@@ -74,8 +74,13 @@ identity, in one atomic `replace_all` commit — and sends one mid-session
 same role but a different `indigoDeviceId`, plans a **rekey**: the registry
 moves the live entry to the new device id, re-wires command routing to it,
 and applies the new label and states. Nothing is closed, nothing is created,
-the number is untouched, `ConfigurationVersion` is not bumped — no paired
-ecosystem sees anything at all. A retarget combined with a role change or a
+the number is untouched, `ConfigurationVersion` is not bumped, `PartsList`
+does not change — no ecosystem processes a removal or an addition, which is
+the invariant the room/name/scene survival rests on. (The label/reachable/
+state application is an ordinary attribute update, and subscribable: a state
+mismatch between old and new device is visible as a state change — harmless
+in the same-logical-device flow this exists for.) A retarget combined with a
+role change or a
 battery gain is NOT a rekey and falls back to the existing recreate path;
 the plugin refuses cross-role migrate at the dialog anyway (#219 E3, #240).
 
@@ -89,9 +94,12 @@ and dying on a duplicate `Endpoint.id` inside matter.js.
 * Good, because the migrate needs no new protocol surface at all — no command,
   no result shape, no event, no frames.json change, protocolVersion stays 2.
   Version skew degrades loudly, not silently: an old node given a rekey attach
-  aborts its reconcile with `unknown_device` rather than duplicating or
-  removing anything (the pinned install spec and version-together rule make
-  the skew window an install-time concern, not a runtime one).
+  aborts its reconcile with `unknown_device` rather than duplicating anything.
+  The abort is not side-effect-free — an old node applies the plan's removals
+  and creates before the rekey-shaped `update` aborts it, so a ●-target
+  migrate against a skewed node removes the target's old accessory and then
+  fails loudly — but the pinned install spec and version-together rule make
+  the skew window an install-time concern, not a runtime one.
 * Good, because restart-survival is free: the store is the persistent truth
   and every future attach re-asserts the same rekey-free steady state.
 * Good, because re-adopt's honest story gets simpler to tell — the orphan flow
