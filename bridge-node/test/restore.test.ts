@@ -1412,6 +1412,70 @@ describe("issues #219/#240 at node level: re-adopt and the two-command supersede
         }
     });
 
+    it("nudges towards Re-adopt when an attach creates a NEW identity matching an orphan's role+label (owner ruling 4)", async () => {
+        // Distinct from the re-adopt test above: here the REPLACEMENT device is
+        // exported under its OWN brand-new identity (not the orphan's), the way
+        // an ordinary export naturally would be if the user never knew the old
+        // accessory was still sitting in the map. The node cannot act on this —
+        // only the plugin owns publishedAs — so the best it can do is say so.
+        const storagePath = storage();
+        const session = await boot(storagePath);
+        try {
+            await attach(session.client, "a0", [KITCHEN_SPEC]);
+
+            session.client.send({
+                message_id: "r0",
+                command: "remove_endpoint",
+                args: { indigoDeviceId: KITCHEN },
+            });
+            for (;;) {
+                const frame = await session.client.next(10_000);
+                if (frame.message_id === "r0") {
+                    assert.equal(frame.error, undefined, JSON.stringify(frame.error));
+                    break;
+                }
+            }
+            session.logged.length = 0;
+
+            const REPLACEMENT_DEVICE_ID = 700_000_002;
+            session.client.send({
+                message_id: "u0",
+                command: "upsert_endpoint",
+                args: {
+                    endpoint: {
+                        indigoDeviceId: REPLACEMENT_DEVICE_ID,
+                        // No publishedAs — the default derivation, a BRAND-NEW
+                        // identity distinct from the orphaned KITCHEN one.
+                        role: KITCHEN_SPEC.role,
+                        label: KITCHEN_SPEC.label,
+                        reachable: true,
+                        states: { onOff: false },
+                        options: {},
+                    },
+                },
+            });
+            for (;;) {
+                const frame = await session.client.next(10_000);
+                if (frame.message_id === "u0") {
+                    assert.equal(frame.error, undefined, JSON.stringify(frame.error));
+                    break;
+                }
+            }
+
+            assert.ok(
+                session.logged.some(
+                    line =>
+                        line.includes("Re-adopt a Matter accessory…") &&
+                        line.includes(uniqueIdFor(KITCHEN)) &&
+                        line.includes(uniqueIdFor(REPLACEMENT_DEVICE_ID)),
+                ),
+                `expected the readopt nudge naming both identities, got ${session.logged.join(" | ")}`,
+            );
+        } finally {
+            await session.close();
+        }
+    });
+
     it("marks the old identity supersededBy the new one when remove and create arrive as two separate commands", async () => {
         // #240 §3 steps 3/5: the plugin's future `replace()` sends
         // `remove_endpoint` then `upsert_endpoint` as two SEPARATE commands, not

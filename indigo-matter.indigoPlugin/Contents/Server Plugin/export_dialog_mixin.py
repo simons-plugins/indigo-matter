@@ -15,7 +15,7 @@ from bridge_protocol import next_generation, published_id_for
 from export_store import ExportEntry, OPTION_INVERT
 from plugin_constants import (
     EXCLUDED_OPTION_PREFIX, EXPORT_PICKER_LIMIT, LIST_ERROR_OPTION,
-    MENU_MANAGE_EXPORTS, MENU_UNPAIR_ECOSYSTEM, NO_MATCH_OPTION,
+    MENU_MANAGE_EXPORTS, MENU_READOPT_EXPORT, MENU_UNPAIR_ECOSYSTEM, NO_MATCH_OPTION,
     NO_SELECTION_ID, NO_SELECTION_LABEL, ROW_ERROR_LABEL, TRUNCATED_OPTION,
 )
 
@@ -247,6 +247,13 @@ class ExportDialogMixin:
             # first item and the user is one click from unpairing whatever
             # happens to be second.
             values["fabric"] = NO_SELECTION_ID
+            return values
+        if menu_id == MENU_READOPT_EXPORT:
+            # Same reasoning as the unpair dialog above: both pickers lead
+            # with a no-selection row, so both fields are seeded to match it.
+            values["readoptOrphan"] = NO_SELECTION_ID
+            values["readoptDevice"] = NO_SELECTION_ID
+            values["readoptConfirm"] = False
             return values
         if menu_id != MENU_MANAGE_EXPORTS:
             return values

@@ -51,6 +51,7 @@ RESPONSES = {
     bridge_protocol.CMD_REMOVE_FABRIC: EXCHANGES["remove_fabric"]["response"],
     bridge_protocol.CMD_FACTORY_RESET: EXCHANGES["factory_reset"]["response"],
     bridge_protocol.CMD_REBUILD_ENDPOINT_MAP: EXCHANGES["rebuild_endpoint_map"]["response"],
+    bridge_protocol.CMD_LIST_ORPHANS: EXCHANGES["list_orphans"]["response"],
 }
 
 KITCHEN_LAMP = EndpointSpec(
@@ -324,6 +325,30 @@ class TestCommands:
         # The fixture depicts a post-storage-loss node, so its numbers differ
         # from attach's — §3.11 records, it does not reallocate.
         assert status.endpoints[1].endpoint_number == 5
+
+    def test_list_orphans(self, mock_logger):
+        orphans = self._exchange(mock_logger, lambda c: c.list_orphans(),
+                                 "list_orphans", EXCHANGES)
+        assert len(orphans) == 3
+        assert orphans[0].unique_id == "indigo-223456791"
+        assert orphans[0].number == 7
+        assert orphans[0].role == "dimmableLight"
+        assert orphans[0].device_id == 223456791
+        # The bare pre-2026.16.2 entry (E4): no role/label/deviceId at all.
+        assert orphans[2].role is None and orphans[2].label is None
+        assert orphans[2].device_id is None
+
+    def test_list_orphans_empty(self, mock_logger):
+        async def scenario():
+            fake = _fake(responder=golden_responder(
+                {bridge_protocol.CMD_LIST_ORPHANS: EXCHANGES["list_orphans_empty"]["response"]}))
+            client = _client(mock_logger, fake)
+            task = asyncio.create_task(client.run())
+            await client.wait_connected(timeout=2)
+            assert await client.list_orphans() == []
+            await client.close()
+            task.cancel()
+        run(scenario())
 
     def test_error_response_raises(self, mock_logger):
         async def scenario():

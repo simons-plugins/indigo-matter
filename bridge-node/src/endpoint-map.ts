@@ -921,6 +921,7 @@ export class EndpointMapStore {
         for (const entry of live) {
             const record = this.#endpoints.get(entry.uniqueId);
             if (record === undefined) {
+                this.noteReadoptableMatch(entry);
                 this.#endpoints.set(entry.uniqueId, recordFor(entry));
                 added += 1;
                 continue;
@@ -977,6 +978,48 @@ export class EndpointMapStore {
             this.#checked = true;
         }
         return drift;
+    }
+
+    /**
+     * Owner ruling 4 (issue #219) — a cheap nudge, not a decision. Called
+     * from {@link check}'s `added` branch, before the brand-new record is
+     * inserted: when the identity `check` is about to record for the FIRST
+     * time has a `role` AND `label` that exactly match an existing
+     * ORPHANED, non-superseded record, log one INFO line naming the
+     * `Re-adopt a Matter accessory…` menu action. This is exactly the
+     * motivating case for #219 — a device deleted, recreated and
+     * re-exported under a brand-new identity, with the room now empty in
+     * every ecosystem and no obvious reason why — offered before the user
+     * has to notice and go looking for it.
+     *
+     * Deliberately does nothing else: it changes no state, blocks nothing,
+     * and never fires for an update to an EXISTING identity (an ordinary
+     * re-export, or a role-change supersede) — those are not the
+     * "orphaned accessory nobody re-adopted yet" case this exists to
+     * surface. An ambiguous match (more than one orphan with the same
+     * role/label) logs against the first one found, in map order — good
+     * enough for a nudge that only ever points a user at the menu, never
+     * acts on their behalf.
+     */
+    private noteReadoptableMatch(entry: LiveEndpointNumber): void {
+        if (entry.role === undefined || entry.label === undefined) {
+            return;
+        }
+        for (const [uniqueId, record] of this.#endpoints) {
+            if (!record.orphaned || record.supersededBy !== undefined) {
+                continue;
+            }
+            if (record.role === entry.role && record.label === entry.label) {
+                this.log(
+                    `"${entry.label}" was just exported as a NEW accessory (${entry.uniqueId}), but a ` +
+                        `left-behind accessory with the same role and name (${uniqueId}, number ` +
+                        `${record.number}) is still in the endpoint map. If this is the same device, ` +
+                        "'Re-adopt a Matter accessory…' in the plugin menu keeps its room, name, scenes " +
+                        "and automations instead of leaving this one to start from scratch (issue #219).",
+                );
+                return;
+            }
+        }
     }
 
     /**

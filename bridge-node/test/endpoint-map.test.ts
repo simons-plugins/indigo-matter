@@ -1447,6 +1447,70 @@ describe("the driving device, the orphan date and supersession (issues #219/#240
         );
     });
 
+    it("nudges towards Re-adopt when a NEW identity's role+label match an existing orphan (owner ruling 4)", () => {
+        const dir = storage();
+        const logged: string[] = [];
+        const store = new EndpointMapStore(dir, message => logged.push(message));
+        store.load();
+        store.check([
+            { uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Kitchen Lamp", deviceId: 100 },
+        ]);
+        store.forget(["indigo-1"]);
+        logged.length = 0;
+
+        // A DIFFERENT device, exported under a BRAND-NEW identity, with the
+        // same role and the same name — the "deleted, recreated, re-exported"
+        // case #219 exists for.
+        store.check([
+            { uniqueId: "indigo-2", endpointNumber: 5, role: "onOffLight", label: "Kitchen Lamp", deviceId: 200 },
+        ]);
+
+        assert.ok(
+            logged.some(line => line.includes("Re-adopt a Matter accessory…") && line.includes("indigo-1")),
+            `expected the readopt nudge, got ${JSON.stringify(logged)}`,
+        );
+    });
+
+    it("does not nudge for an UPDATE to an existing identity", () => {
+        const dir = storage();
+        const logged: string[] = [];
+        const store = new EndpointMapStore(dir, message => logged.push(message));
+        store.load();
+        store.check([{ uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Kitchen Lamp" }]);
+        store.forget(["indigo-1"]);
+        logged.length = 0;
+
+        // Re-adding the SAME identity — an ordinary re-export, not a new one.
+        store.check([{ uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Kitchen Lamp" }]);
+
+        assert.ok(
+            !logged.some(line => line.includes("Re-adopt a Matter accessory…")),
+            `did not expect a nudge for an existing identity, got ${JSON.stringify(logged)}`,
+        );
+    });
+
+    it("does not nudge against a SUPERSEDED orphan", () => {
+        const dir = storage();
+        const logged: string[] = [];
+        const store = new EndpointMapStore(dir, message => logged.push(message));
+        store.load();
+        store.check([{ uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Lamp" }]);
+        store.check([{ uniqueId: "indigo-1~2", endpointNumber: 5, role: "dimmableLight", label: "Lamp" }]);
+        store.forget(["indigo-1"], { supersededBy: "indigo-1~2" });
+        logged.length = 0;
+
+        // Same role+label as the SUPERSEDED indigo-1 — must not nudge towards
+        // resurrecting a retired role under its retired number.
+        store.check([
+            { uniqueId: "indigo-9", endpointNumber: 9, role: "onOffLight", label: "Lamp", deviceId: 900 },
+        ]);
+
+        assert.ok(
+            !logged.some(line => line.includes("Re-adopt a Matter accessory…")),
+            `did not expect a nudge against a superseded record, got ${JSON.stringify(logged)}`,
+        );
+    });
+
     it("reads a pre-PR5 file unchanged and writes the new keys only where they apply", () => {
         const dir = storage();
         writeFileSync(

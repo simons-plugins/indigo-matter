@@ -188,6 +188,23 @@ class TestResponses:
         assert reopened.window_expires_at is not None
         assert reopened.manual_pairing_code
 
+    def test_orphan_records_are_normalised(self):
+        orphans = bridge_protocol.parse_orphans(FRAMES["list_orphans"]["response"]["result"])
+        assert len(orphans) == 3
+        full, partial, bare = orphans
+        assert (full.unique_id, full.number) == ("indigo-223456791", 7)
+        assert full.role == "dimmableLight"
+        assert full.label == "Kitchen Lamp"
+        assert full.orphaned_at == "2026-08-12T09:15:00Z"
+        assert full.device_id == 223456791
+        assert partial.orphaned_at is None and partial.device_id is None
+        # E4 — the pre-2026.16.2 bare orphan: nothing beyond number/uniqueId.
+        assert bare.role is None and bare.label is None and bare.device_id is None
+
+    def test_empty_orphan_list_normalises_to_empty(self):
+        assert bridge_protocol.parse_orphans(
+            FRAMES["list_orphans_empty"]["response"]["result"]) == []
+
     def test_commissioning_window(self):
         window = bridge_protocol.parse_window(
             FRAMES["open_commissioning_window"]["response"]["result"])

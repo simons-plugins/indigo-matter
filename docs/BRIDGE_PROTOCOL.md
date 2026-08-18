@@ -60,6 +60,55 @@ rather than re-explained at every call site.
   Matter's `Q` (quality) designation with a 10-second `minimumEmitInterval`
   on its `$Changed` — i.e. Matter itself, not this bridge, is what rate-limits
   how often a battery change reaches a controller.
+- **(e) Endpoint numbers are allocated from a monotonic counter keyed on
+  `Endpoint.id` (issues #219/#240).** The same `Endpoint.id` always gets the
+  same number, every time it is (re-)added. A freed number is **never**
+  automatically reused — `__nextNumber__` only ever climbs — and the
+  reservation for a `close()`d id **survives a restart** while that id stays
+  closed. This is the single fact that forces the whole `publishedAs` design:
+  there is no way to get a *fresh* number without a fresh `Endpoint.id`
+  (role-change supersede), and no way to keep an *existing* number except by
+  declaring the *same* `Endpoint.id` again (re-adopt).
+- **(f) `delete()` erases a number's reservation; `close()` does not (issues
+  #219/#240).** This design never calls `delete()` — `close()` is the only
+  removal verb, exactly as `registry.closeOne` already uses, because the
+  whole point of retaining a number is that it comes back.
+- **(g) `PartsList` reports a close+add as two distinct changes, even back to
+  back (issues #219/#240).** A subscribing controller sees the shrunk
+  `PartsList` as its own change notification before the grown one, with or
+  without pacing in between — the same attribute read synchronously right
+  after `close()` is stale for one microtask. `REMOVAL_PACING_MS` exists
+  because of this, and the role-change supersede path inherits it for free
+  because a full reconcile already does every removal (paced) before every
+  create.
+- **(h) An explicit `number` is honoured for a free number and refused for a
+  live one (issues #219/#240).** matter.js *would* let us hand a freed number
+  to a different accessory if we asked for it explicitly
+  (`Endpoint <id> number <n> is allocated to another endpoint` for a live
+  collision). That is a hazard, not a feature — it is precisely the "two
+  accessories swap identities in every paired ecosystem" failure the drift
+  detector exists to catch — so this design **never passes an explicit
+  `number`**; every allocation goes through matter.js's own allocator.
+- **(i) The only controller-visible identity is the endpoint number plus the
+  bridged Basic Information attributes; `Endpoint.id` never reaches the wire
+  (issues #219/#240).** Beyond the number, a controller can notice
+  `UniqueID`, `SerialNumber`, `NodeLabel`, `ProductLabel`,
+  `ConfigurationVersion` and the descriptor's `deviceTypeList` — all of it
+  derived from `publishedAs`, never from `Endpoint.id` itself. Across a
+  restart, matter.js **restores** a bridged accessory's
+  `ConfigurationVersion` from storage, but it does **not** restore
+  `UniqueID`/`SerialNumber` — whatever is declared at construction is what is
+  published. A re-adopt therefore has to declare the OLD `publishedAs`
+  itself; matter.js will not do it for us, and will not fight us either.
+- **(j) `Endpoint.id` charset and `UniqueID` length (issues #219/#240).**
+  `.` is refused outright (matter.js's own storage-key separator). `~` is
+  accepted and appears **unescaped** in the storage key; `#` is accepted but
+  percent-escaped. `~` is therefore the separator `publishedIdFor`'s
+  generation suffix uses. `UniqueID` is capped at **32 characters** — the
+  worst realistic published identity,
+  `indigo-<Number.MAX_SAFE_INTEGER>~99`, is 26, comfortable, but
+  `parsePublishedId`/`parse_published_id` enforce the cap explicitly rather
+  than letting a caller discover it as an `AggregateError` mid-attach.
 
 ## 1. Envelope grammar
 
@@ -444,11 +493,19 @@ over an unreadable map has no orphans it can vouch for.
   plugin left a field off — is the worse default by far.
 - `options` — role-specific extras (e.g. window-covering polarity).
 - `publishedAs` — issues #219/#240. The accessory identity this device
-  publishes as (`Endpoint.id`/`UniqueID`/`SerialNumber`); the plugin owns and
-  persists it. **Omitted (or equal to `indigo-<indigoDeviceId>`) means "use
-  today's default derivation"** — every export that has never changed role
-  sends no key at all, so this field is invisible on the wire until a role
-  change or a re-adopt moves an accessory off its default identity.
+  publishes as (`Endpoint.id`/`UniqueID`/`SerialNumber`) — **the plugin owns
+  and persists it; the node owns only the number that identity gets** (§0
+  (e)-(j), invariant 3). **Omitted (or equal to `indigo-<indigoDeviceId>`)
+  means "use today's default derivation"** — every export that has never
+  changed role sends no key at all, so this field is invisible on the wire
+  until a role change or a re-adopt moves an accessory off its default
+  identity. **Validation:** must match `indigo-<safeInt>[~<generation≥2>]`
+  and be ≤32 characters (§0 (j)); anything else is refused with
+  `malformed_args`. **Duplicate refusal:** `attach` rejects, also with
+  `malformed_args`, an endpoint list that names the same `publishedAs` twice
+  — this is edge case E12's backstop, the one that actually matters, because
+  it is what stops a hand-edited `.indiPref` pointing two Indigo devices at
+  one accessory from ever reaching matter.js.
 - `battery` — issue #220. `true` means "ensure this accessory publishes
   PowerSource"; **omitted or `false` means "no evidence right now", never a
   removal request.** The live cluster set is monotonic: once an endpoint is
@@ -554,7 +611,8 @@ ecosystem acts. Both are enumerated here in full; there is no other source.
 {"commissioned": true,
  "fabrics": [{"fabricIndex": 1, "label": "Apple Home", "vendorId": 4937}],
  "endpointCount": 12,
- "endpoints": [{"indigoDeviceId": 123456789, "endpointNumber": 2, "role": "onOffLight"}],
+ "endpoints": [{"indigoDeviceId": 123456789, "endpointNumber": 2, "role": "onOffLight",
+                "publishedAs": "indigo-123456789"}],
  "drift": [],
  "driftChecked": false,
  "warnings": []}
@@ -609,9 +667,11 @@ and is still never repaired. Each entry is a `DriftEntry`:
   it gets back from `attach` sees none of them, and the user is told nothing at
   all — which is the state this channel was invented to end.
 
-`endpoints[].role` is one of the §4.2 enum; `endpointCount` is
-`endpoints.length` (it is sent explicitly so a client can log the size without
-walking the list).
+`endpoints[].role` is one of the §4.2 enum; `endpoints[].publishedAs` is
+issues #219/#240's accessory identity (§4.1) — informational here, tolerantly
+defaulted so a report from a pre-`publishedAs` node still parses;
+`endpointCount` is `endpoints.length` (it is sent explicitly so a client can
+log the size without walking the list).
 
 #### `endpoint-map.json` — contents, and restore-on-start
 
@@ -666,6 +726,52 @@ version 2** since bridge-node 0.6.0:
   start — a visible cluster-set change in every paired ecosystem, which
   self-heals the moment a newer bridge (or the plugin's next `attach`)
   recreates the endpoint with `battery: true` again.
+- `deviceId` — issues #219/#240, the Indigo device *currently driving* this
+  published identity. Absent means "the key's own derivation" — every
+  pre-`publishedAs` record, and every entry that has never been re-adopted.
+  **Unlike `battery`, this is replace-on-change, not add-only** — a re-adopt
+  is precisely a change of driving device, and add-only-forever would pin
+  the deleted device's id in the record permanently. `restorable()` resolves
+  an entry's device id from this field first, falling back to parsing it out
+  of the `publishedAs` key itself (§4.1) — without it, a restore-on-start
+  after a re-adopt would rebuild the accessory bound to the OLD, deleted
+  device rather than the new one. Same inert-extra-key parse tolerance as
+  the keys above. **Rollback caveat:** an older bridge drops the key on its
+  next write and falls back to deriving the device id from the key itself —
+  which is the *previous* driving device, not the re-adopted one — so a
+  re-adopted accessory restored by a rolled-back bridge rebuilds bound to
+  whichever device the key's own `indigo-<id>` names, self-healing the next
+  time a `publishedAs`-aware plugin attaches and records the real driver.
+- `orphanedAt` — issues #219/#240, an ISO-8601 stamp written by an un-export
+  alongside `orphaned`, from the node's own injected clock. Purely
+  informational — the re-adopt picker's "un-exported on …" column; absent on
+  every orphan recorded before this field existed, which the picker renders
+  as "date unknown" rather than guessing. Same inert-extra-key parse
+  tolerance. **Rollback caveat:** an older bridge drops the key on its next
+  write; the orphan is unaffected (still re-adoptable, still keeps its
+  number), it simply reads as "date unknown" in the picker from then on —
+  there is no self-heal because there is nothing to heal, the date was never
+  load-bearing.
+- `supersededBy` — issue #240, the published identity that replaced this one
+  on a role change. Set when the node observes a removal and a same-device
+  create land in one mutation (`forgetRemoved`'s pairing logic, or
+  `upsertEndpoint`'s `checkDrift` when the two arrive as separate commands
+  from the plugin's `replace()`). A superseded record is `orphaned` too (it
+  is not live) but is **excluded from both `restorable()` and
+  `orphans()`/§3.12** — restoring it would resurrect an old-role accessory
+  under a number every paired ecosystem has already processed a removal for,
+  and re-adopting it would do the same thing by hand. Same inert-extra-key
+  parse tolerance. **Rollback caveat:** an older bridge build drops the key
+  on its next write, and the superseded record becomes an ordinary orphan —
+  visible in `list_orphans` and re-adoptable, which would resurrect the
+  retired role under its retired number if acted on. Reaching this state at
+  all needs an out-of-band swap (a hand-installed older bridge-node build
+  pointed at storage a newer one already wrote to) rather than an ordinary
+  reconnect: invariant 5's fail-closed already refuses any *live* pairing
+  whose `protocolVersion`s disagree, and the ordinary install/reinstall menus
+  always fetch the pinned version. Documented here rather than defended
+  against in code, for the same reason `numberVoid`'s and `orphaned`'s own
+  rollback paths are not.
 
 **Version 1 files are read, migrated in place, and never treated as corrupt.**
 A v1 entry is a bare number; it keeps that number, is simply not restorable
@@ -759,13 +865,24 @@ is already gone).
 2. **The plugin is the source of truth for the export set**; the node is the
    source of truth for commissioning state and endpoint numbers. Neither peer
    caches the other's domain across reconnects — `attach` reconciles.
-3. **Identity flows one way:** `indigoDeviceId` → `Endpoint.id` → persisted
-   endpoint number. Nothing is ever keyed on list position or label.
+3. **Identity flows one way:** `publishedAs` → `Endpoint.id` → persisted
+   endpoint number, and `publishedAs` defaults to `indigo-<indigoDeviceId>`
+   (issues #219/#240) — a narrowing of the earlier
+   `indigoDeviceId` → `Endpoint.id` → number statement, not a reversal:
+   nothing is still ever keyed on list position or label, and every export
+   that has never role-changed or been re-adopted publishes under exactly
+   today's derivation.
 4. **State pushes are echo-guarded** in the node (`ctx.offline`); the plugin
    never receives a `command` event for a change it pushed.
 5. **Version skew fails closed:** mismatched `protocolVersion` means no
    attach (both peers enforce it), an error in the Indigo log, and untouched
-   pairings.
+   pairings. Applied literally, not just stated, for `publishedAs`
+   (issues #219/#240, owner ruling 1): `PROTOCOL_VERSION` bumped 1 → 2 in the
+   same commit that first sends it, rather than adding a permanent
+   `bridgeVersion` capability gate around it — an old (pre-#219/#240) node
+   cannot silently ignore a `publishedAs` it does not understand and publish
+   a duplicate default-identity accessory, because it never gets past this
+   handshake with a v2-speaking plugin at all.
 6. **Destructive operations are explicit:** emptying the endpoint set needs
    `intent: "replace_all"`; discarding endpoint identity needs
    `preserveEndpointNumbers: false` or `rebuild_endpoint_map`. Neither can

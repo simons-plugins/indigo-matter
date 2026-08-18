@@ -798,3 +798,11 @@ class BridgeClient(WsJsonClient):
             self.logger.warning(
                 "the endpoint map was rebuilt, but re-attaching was refused (%s); the ordinary "
                 "reconnect will try again", failed)
+
+    async def list_orphans(self, timeout: float = DEFAULT_TIMEOUT) -> list:
+        """§3.12 — every left-behind accessory identity the re-adopt picker
+        (issue #219) could offer. Read-only: no argument, no state change on
+        the node — the same "local and quick" cost class as :meth:`get_status`.
+        """
+        result = await self._request_frame(self.proto.build_list_orphans(), timeout)
+        return bridge_protocol.parse_orphans(result)

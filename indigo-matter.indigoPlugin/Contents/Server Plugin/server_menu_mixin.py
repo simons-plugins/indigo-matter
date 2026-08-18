@@ -19,8 +19,11 @@ import indigo  # provided by the Indigo runtime
 
 import bridge_agent
 import bridge_client            # bridge_client.rebuild_timeout_for
+import export_catalog
 import protocol
+from bridge_protocol import published_id_for
 from commission_jobs import fabric_counts, node_id_to_str
+from export_store import ExportEntry
 from http_handlers import MatterUnavailable
 from plugin_constants import (
     FACTORY_RESET_TIMEOUT,
@@ -28,6 +31,7 @@ from plugin_constants import (
     NODE_TOMBSTONES_PREF,
     NO_SELECTION_ID,
     NO_SELECTION_LABEL,
+    READOPT_ORPHANS_TIMEOUT,
     RECONCILE_TIMEOUT,
     SHARE_WINDOW_TIMEOUT,
     server_location,
@@ -729,21 +733,33 @@ class ServerMenuMixin:
     # ------------------------------------------------------------------
     # Export-bridge recovery menus (BRIDGE_PROTOCOL §3.10/§3.11)
     # ------------------------------------------------------------------
-    def _recovery_client(self, errors, field: str):
+    def _recovery_client(self, errors, field: str, *, require_attached: bool = False):
         """The bridge client, or ``None`` with ``errors`` filled in.
 
-        Both recovery commands need a live socket, and the state they exist to
-        fix is exactly the one where the plugin holds the connection open
-        UN-attached (§1.1 recovery). So `connected`, not `attached`, is the
-        right gate — requiring an attach would make the rebuild unreachable in
-        the only situation that needs it.
+        The §3.10/§3.11 recovery commands need a live socket, and the state
+        they exist to fix is exactly the one where the plugin holds the
+        connection open UN-attached (§1.1 recovery). So `connected`, not
+        `attached`, is the right gate for THEM — requiring an attach would
+        make the rebuild unreachable in the only situation that needs it.
+
+        Re-adopt (issue #219) is the opposite case (edge case E1): its
+        picker and its validation both depend on a real, answered ``attach``
+        — a node only serving the §1.1 recovery trio has no orphan list to
+        offer and no way to verify one — so ``require_attached=True`` demands
+        :attr:`~bridge_client.BridgeClient.attached` rather than merely
+        :attr:`~bridge_client.BridgeClient.connected`.
         """
         bridge = self.export_bridge
         client = bridge.client if bridge is not None else None
-        if client is None or not client.connected:
-            msg = ("Not connected to the Matter bridge node. Start it (it is launched by "
-                   "hand in this build), export at least one device so the plugin connects, then "
-                   "try again.")
+        ready = client is not None and (client.attached if require_attached else client.connected)
+        if not ready:
+            if require_attached:
+                msg = ("Not connected to the Matter bridge node. Start it, let the plugin "
+                       "attach, then re-open this dialog.")
+            else:
+                msg = ("Not connected to the Matter bridge node. Start it (it is launched by "
+                       "hand in this build), export at least one device so the plugin connects, then "
+                       "try again.")
             self.logger.warning(msg)
             errors[field] = "Not connected to the bridge node — see the log."
             return None
@@ -818,6 +834,371 @@ class ServerMenuMixin:
                 "not. The rebuild does NOT need repeating — exports resume when the connection "
                 "does, and the reason is logged above.")
         return (True, valuesDict)
+
+    # ------------------------------------------------------------------
+    # Re-adopt a Matter accessory… (§4, issue #219)
+    # ------------------------------------------------------------------
+    def _live_readopt_orphans(self):
+        """A fresh §3.12 orphan list, or ``None`` if the bridge is not
+        attached or the read failed.
+
+        Deliberately does its OWN live read every time it is called, rather
+        than one picker populating a cache the other depends on: ConfigUI
+        documents no ordering guarantee for which of a dialog's
+        ``dynamicReload`` lists is (re-)evaluated first on a round trip, and
+        nothing here should have to assume one. `list_orphans` is read-only
+        and "local and quick" (§3.12), so the repeat cost is the same class
+        as the diagnostics explorer re-deriving its own endpoint/cluster
+        lists on every round trip (``DiagnosticsMenuMixin.exploreNodeChanged``).
+        """
+        bridge = self.export_bridge
+        client = bridge.client if bridge is not None else None
+        if client is None or not client.attached:
+            return None
+        try:
+            return self.runtime.submit(
+                client.list_orphans()).result(timeout=READOPT_ORPHANS_TIMEOUT)
+        except Exception as exc:  # pylint: disable=broad-except
+            self.logger.exception(exc)
+            return None
+
+    @staticmethod
+    def _format_orphan_date(orphaned_at) -> str:
+        """"12 Aug 2026" from an ISO-8601 stamp, or "(date unknown)" for a
+        pre-PR5 orphan that has none (§4.2)."""
+        if not orphaned_at:
+            return "(date unknown)"
+        try:
+            return datetime.fromisoformat(str(orphaned_at)).strftime("%-d %b %Y")
+        except (TypeError, ValueError):
+            return "(date unknown)"
+
+    def _readopt_orphan_options(self, orphans) -> list:
+        """§4.2 picker rows, newest orphan first.
+
+        An orphan with no ``orphanedAt`` (a pre-PR5 record) sorts LAST: ``""``
+        is lexicographically smaller than any ISO-8601 stamp, so the same
+        descending sort that puts the newest date first puts an absent one
+        last, with no second pass — ties (including several absent dates)
+        keep their original map order, `sorted` being stable.
+        """
+        if not orphans:
+            return [(NO_SELECTION_ID, "(no left-behind accessories — nothing to re-adopt)")]
+        options = []
+        for orphan in sorted(orphans, key=lambda o: o.orphaned_at or "", reverse=True):
+            if orphan.role and orphan.label:
+                when = self._format_orphan_date(orphan.orphaned_at)
+                options.append((orphan.unique_id,
+                                f"{orphan.label} — {export_catalog.role_label(orphan.role)} — "
+                                f"un-exported {when} (accessory #{orphan.number})"))
+            else:
+                # E4 — a pre-2026.16.2 bare orphan: shown so the user can see
+                # its number is spoken for, but it matches nothing a device
+                # could be checked against, so it is refused at Execute time
+                # (menuReadoptExport step 4) rather than hidden here.
+                options.append((orphan.unique_id,
+                                f"(accessory #{orphan.number} — no role recorded, cannot be "
+                                "re-adopted)"))
+        return options
+
+    def getReadoptOrphans(self, filter="", valuesDict=None, typeId="", targetId=0):  # noqa: N802, A002, ARG002
+        """Orphan picker for "Re-adopt a Matter accessory…" (§4.2).
+
+        Unlike every other picker in this file, there is nothing cached to
+        build this from — fabrics arrive on a ``fabrics_changed`` event
+        (``PairingMenuMixin.getBridgeFabrics``) and orphans have no
+        equivalent push — so this reads §3.12 live. Not attached and the read
+        itself failing are two different facts (only one names a remedy), so
+        this checks the gate itself rather than going through
+        :meth:`_live_readopt_orphans`, which collapses both into ``None`` for
+        its OTHER two callers, where the distinction does not matter.
+        """
+        bridge = self.export_bridge
+        client = bridge.client if bridge is not None else None
+        if client is None or not client.attached:
+            return [(NO_SELECTION_ID, "(not connected to the Matter bridge node — start it, "
+                                       "let the plugin attach, then re-open this dialog)")]
+        try:
+            orphans = self.runtime.submit(
+                client.list_orphans()).result(timeout=READOPT_ORPHANS_TIMEOUT)
+        except Exception as exc:  # pylint: disable=broad-except
+            self.logger.exception(exc)
+            return [LIST_ERROR_OPTION]
+        return self._readopt_orphan_options(orphans)
+
+    def readoptOrphanChanged(self, valuesDict, typeId="", devId=0):  # noqa: N802, ARG002
+        """No-op callback on the orphan menu (§4.1).
+
+        Its only job is making Indigo round-trip to the plugin, which is what
+        re-runs ``getReadoptDevices`` below it — the same master-detail
+        cascade ``DiagnosticsMenuMixin.exploreNodeChanged`` already uses:
+        ConfigUI has no per-field change event, so a menu's own
+        CallbackMethod is the whole mechanism.
+        """
+        return valuesDict
+
+    def _readopt_device_row(self, dev, orphan, plugin_id: str, exported) -> Optional[tuple]:
+        """One §4.3 device-picker row, or ``None`` to omit it. May raise —
+        the caller contains it, matching ``ExportDialogMixin._candidate_row``.
+
+        Kept — the orphan's role is in ``eligible_roles`` — REFUSED (owner
+        ruling 2, edge case E3) when it is not; kept and marked ● when
+        already exported (that convention's own device, the common "deleted,
+        recreated, re-exported before noticing" case E5/E2); dropped when
+        already re-adopted onto a DIFFERENT orphan.
+        """
+        verdict = export_catalog.classify(dev, plugin_id)
+        if isinstance(verdict, export_catalog.Excluded):
+            return None
+        if orphan.role not in verdict.eligible_roles:
+            return None
+        entry = self.exports.get(dev.id)
+        if entry is not None and entry.published_as and entry.published_as != orphan.unique_id:
+            return None  # already re-adopted onto a DIFFERENT orphan
+        mark = "● " if dev.id in exported else ""
+        return (str(dev.id), f"{mark}{dev.name}")
+
+    def getReadoptDevices(self, filter="", valuesDict=None, typeId="", targetId=0):  # noqa: N802, A002, ARG002
+        """Device picker for "Re-adopt a Matter accessory…" (§4.3), filtered
+        to the picked orphan's role — see :meth:`_readopt_device_row` for
+        the per-device rule.
+        """
+        try:
+            if self.exports is None:
+                return []
+            selected = str((valuesDict or {}).get("readoptOrphan", "") or "")
+            if not selected or selected == NO_SELECTION_ID:
+                return []
+            orphans = self._live_readopt_orphans() or []
+            orphan = next((o for o in orphans if o.unique_id == selected), None)
+            if orphan is None or not orphan.role:
+                return []
+            exported = self.exports.ids()
+            plugin_id = self._export_plugin_id()  # pylint: disable=no-member  # ExportDialogMixin
+            options = []
+            failures = 0
+            for dev in indigo.devices:
+                try:
+                    row = self._readopt_device_row(dev, orphan, plugin_id, exported)
+                    if row is not None:
+                        options.append(row)
+                except Exception as exc:  # pylint: disable=broad-except
+                    self._log_row_failure(exc, first=not failures)  # pylint: disable=no-member
+                    failures += 1
+            return options
+        except Exception as exc:  # pylint: disable=broad-except
+            self.logger.exception(exc)
+            return [LIST_ERROR_OPTION]
+
+    @staticmethod
+    def _previous_accessory_number(client, device_id: int) -> Optional[int]:
+        """The endpoint number of ``device_id``'s accessory BEFORE a
+        re-adopt, read from the client's last :class:`StatusReport`
+        (attach/get_status) — the only place a still-live endpoint's number
+        is cached client-side. ``None`` when there is nothing to report (the
+        device was not exported, or no status has landed yet), which the
+        confirmation log then omits rather than guesses.
+        """
+        status = getattr(client, "status", None)
+        if status is None:
+            return None
+        try:
+            for summary in status.endpoints:
+                if summary.indigo_device_id == device_id:
+                    return summary.endpoint_number
+        except TypeError:
+            # A malformed/unexpected `status.endpoints` degrades to "nothing
+            # to report" — the confirmation log must never raise over a
+            # cosmetic omission.
+            return None
+        return None
+
+    def _readopt_identity_claimant(self, unique_id: str, device_id: int) -> Optional[int]:
+        """Another ``ExportStore`` entry already publishing as ``unique_id``
+        (§4.4 step 7, edge case E12) — the plugin-side half of the
+        duplicate-identity guard. The node's own duplicate-``publishedAs``
+        refusal at attach time (``parseEndpointSpecs``) is the backstop that
+        actually matters — a hand-edited ``.indiPref`` bypasses this one.
+        """
+        for entry in self.exports.all():
+            if entry.indigo_device_id != device_id and entry.published_as == unique_id:
+                return entry.indigo_device_id
+        return None
+
+    def _log_readopt_confirmation(self, client, orphan, dev, device_id: int, previous) -> None:
+        """§4.5 — the one WARNING a successful re-adopt leaves behind.
+
+        The last sentence is emitted only when ``device_id`` was already
+        exported under a DIFFERENT identity than the orphan it is now
+        inheriting — the E2/E5 "recreated and re-exported before noticing"
+        case, whose own accessory the ``_nudge_export`` call just before this
+        one has already asked the bridge to remove.
+        """
+        role_label = export_catalog.role_label(orphan.role)
+        if orphan.device_id is not None:
+            left_behind = (f"That accessory was left behind when device {orphan.device_id} "
+                          "was deleted.")
+        else:
+            left_behind = "That accessory was left behind."
+        prior_identity = (previous.published_as or published_id_for(device_id)) \
+            if previous is not None else None
+        superseded = ""
+        if prior_identity is not None and prior_identity != orphan.unique_id:
+            number = self._previous_accessory_number(client, device_id)
+            clause = f" (number {number})" if number is not None else ""
+            superseded = (f" Device {device_id}'s own previous accessory{clause} has been "
+                          "removed from your ecosystems.")
+        self.logger.warning(
+            'Matter export: RE-ADOPTED accessory "%s" (%s, accessory number %d) onto Indigo '
+            'device "%s" (id %s). %s Apple Home and every other paired ecosystem keep its room, '
+            'its name, and every scene and automation built on it — nothing is re-paired and '
+            'nothing is renumbered.%s',
+            orphan.label, role_label, orphan.number, dev.name, device_id, left_behind, superseded)
+
+    def _readopt_refuse(self, errors, field: str, msg: str) -> None:
+        """One §4.4 SUBSTANTIVE refusal: dialog error plus a matching
+        WARNING — ``menuRebuildEndpointMap``'s convention of never reporting
+        success over an operation that did not land, extended to a refusal
+        that never started. Never used for a plain "tick the box"/"make a
+        selection" nag — that stays dialog-only, the same split
+        ``menuRebuildEndpointMap`` already draws between its silent
+        confirm-tick gate and its logged M11 "nothing to rebuild" gate.
+        """
+        self.logger.warning("Matter bridge: re-adopt REFUSED — %s", msg)
+        errors[field] = msg
+
+    def _readopt_pick_orphan(self, valuesDict, errors):
+        """The picked orphan (or "select one"), re-verified per §4.4 steps
+        3-4: a FRESHLY-fetched ``list_orphans`` (edge case E6 — never the
+        picker's own read, which may be stale by Execute time), with both a
+        role and a label (edge case E4 — a pre-2026.16.2 bare orphan, which
+        deleted them on un-export).
+
+        Returns the orphan, or ``None`` with ``errors`` filled in.
+        """
+        orphan_id = str(valuesDict.get("readoptOrphan", "") or "")
+        if not orphan_id or orphan_id == NO_SELECTION_ID:
+            errors["readoptOrphan"] = "Select a left-behind accessory to re-adopt."
+            return None
+        orphans = self._live_readopt_orphans()
+        orphan = next((o for o in (orphans or []) if o.unique_id == orphan_id), None)
+        if orphan is None:
+            self._readopt_refuse(errors, "readoptOrphan",
+                                 "That accessory is in use again — something re-exported it "
+                                 "while this dialog was open. Nothing was changed.")
+            return None
+        if not orphan.role or not orphan.label:
+            self._readopt_refuse(
+                errors, "readoptOrphan",
+                "That accessory has no role or name recorded — it was un-exported by a plugin "
+                "version older than 2026.16.2, which deleted them. It cannot be re-adopted; "
+                "export the device normally instead, and its accessory will be a new one.")
+            return None
+        return orphan
+
+    def _readopt_pick_device(self, orphan, valuesDict, errors):
+        """The picked device (or "select one"), re-verified per §4.4 steps
+        5-6: still existing, still classifying as exportable, and still able
+        to take the orphan's role (edge case E3, owner ruling 2 — REFUSE,
+        never allow-with-warning: cross-role re-adopt is exactly the
+        in-place device-type mutation issue #240 exists to eliminate, since
+        the endpoint number is preserved by construction).
+
+        Returns the device, or ``None`` with ``errors`` filled in.
+        """
+        selection = str(valuesDict.get("readoptDevice", "") or "")
+        if not selection or selection == NO_SELECTION_ID:
+            errors["readoptDevice"] = "Select the Indigo device to hand it to."
+            return None
+        try:
+            device_id = int(selection)
+        except (TypeError, ValueError):
+            errors["readoptDevice"] = "Invalid selection."
+            return None
+        dev = self._indigo_device(device_id)  # pylint: disable=no-member  # ExportDialogMixin
+        if dev is None:
+            self._readopt_refuse(errors, "readoptDevice",
+                                 "That device no longer exists — refresh the list.")
+            return None
+        verdict = export_catalog.classify(dev, self._export_plugin_id())  # pylint: disable=no-member
+        if isinstance(verdict, export_catalog.Excluded):
+            self._readopt_refuse(errors, "readoptDevice",
+                                 f"{dev.name} cannot be exported: {verdict.reason}")
+            return None
+        if orphan.role not in verdict.eligible_roles:
+            self._readopt_refuse(
+                errors, "readoptDevice",
+                f'"{dev.name}" cannot appear as a {export_catalog.role_label(orphan.role)}. '
+                "Re-adopting only works when the replacement device can take the same role as "
+                "the accessory it is inheriting; export it normally instead, and it becomes a "
+                "new accessory.")
+            return None
+        return dev
+
+    def _readopt_commit(self, client, orphan, dev, errors, valuesDict):  # pylint: disable=too-many-arguments
+        """The §4.4 closing paragraph: one ``ExportStore.upsert`` preserving
+        any existing ``name_override``/``options``, then the remove-then-add
+        nudge and the §4.5 confirmation log.
+        """
+        device_id = dev.id
+        previous = self.exports.get(device_id)
+        try:
+            self.exports.upsert(ExportEntry(
+                indigo_device_id=device_id,
+                role=orphan.role,
+                name_override=previous.name_override if previous is not None else None,
+                options=dict(previous.options) if previous is not None else {},
+                published_as=orphan.unique_id,
+            ))
+        except Exception as exc:  # pylint: disable=broad-except
+            self.logger.error("Matter bridge: re-adopt FAILED to save the export list — %s", exc)
+            self.logger.exception(exc)
+            errors["readoptDevice"] = "FAILED to save the export list — see Event Log."
+            return (False, valuesDict, errors)
+        # The remove-then-add path — the device's PUBLISHED IDENTITY changed,
+        # the same shape as a role change (§4.4) even though the role itself
+        # did not move here.
+        self._nudge_export(device_id, role_changed=True)  # pylint: disable=no-member  # ExportDialogMixin
+        self._log_readopt_confirmation(client, orphan, dev, device_id, previous)
+        return (True, valuesDict)
+
+    def menuReadoptExport(self, valuesDict, menuId=""):  # noqa: N802, ARG002
+        """Execute "Re-adopt a Matter accessory…" (§4.4, issue #219).
+
+        Validated in the exact order §4.4 specifies, each step delegated to
+        one helper so later steps can assume earlier ones already hold:
+        :meth:`_readopt_pick_orphan` (steps 3-4), :meth:`_readopt_pick_device`
+        (steps 5-6), the step-7 identity claim here, then
+        :meth:`_readopt_commit`.
+        """
+        errors = indigo.Dict()
+        # 1. readoptConfirm ticked.
+        if not self._truthy(valuesDict.get("readoptConfirm")):  # pylint: disable=no-member  # ExportDialogMixin
+            errors["readoptConfirm"] = (
+                "Tick the box — re-adopting hands this accessory to a different Indigo device.")
+            return (False, valuesDict, errors)
+        # 2. a live, ATTACHED bridge client (edge case E1) — stricter than the
+        #    rebuild/reset gate; see _recovery_client's own docstring.
+        client = self._recovery_client(errors, "readoptConfirm", require_attached=True)
+        if client is None:
+            return (False, valuesDict, errors)
+        # 3-4 (inside _readopt_pick_orphan) and 5-6 (inside _readopt_pick_device).
+        orphan = self._readopt_pick_orphan(valuesDict, errors)
+        if orphan is None:
+            return (False, valuesDict, errors)
+        dev = self._readopt_pick_device(orphan, valuesDict, errors)
+        if dev is None:
+            return (False, valuesDict, errors)
+        # 7. the orphan's identity is not already claimed by another
+        #    ExportStore entry (edge case E12).
+        claimant = self._readopt_identity_claimant(orphan.unique_id, dev.id)
+        if claimant is not None:
+            self._readopt_refuse(
+                errors, "readoptOrphan",
+                f"Accessory {orphan.unique_id!r} is already claimed by Indigo device "
+                f"{claimant} — nothing was changed.")
+            return (False, valuesDict, errors)
+        return self._readopt_commit(client, orphan, dev, errors, valuesDict)
 
     def menuRecreateNodeDevices(self):  # noqa: N802
         """The only way back after a matterNode device was deleted by hand

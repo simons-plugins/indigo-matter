@@ -3,6 +3,38 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
+## 2026.21.0 — Re-adopt a Matter accessory…, and role changes cost the room on purpose
+
+> Takes effect on a live install only once the paired bridge-node release
+> ships; the plugin pins the bridge node by exact version.
+
+### Added
+
+- **`Plugin ▸ Re-adopt a Matter accessory…`** (issue #219) — hands a
+  left-behind accessory identity to a different Indigo device. An accessory
+  is left behind when the Indigo device that exported it is deleted, or when
+  its role is changed (see Changed, below); the room, name, scenes and
+  automations built on it in Apple Home and every other paired ecosystem
+  survive untouched, because nothing is re-paired and nothing is renumbered.
+  Only works when the replacement device can take the same role as the
+  accessory it is inheriting — cross-role re-adopt is refused, since that is
+  exactly the wedge this release's role-change fix exists to eliminate. An
+  accessory un-exported by a plugin older than 2026.16.2 has no role/name on
+  record and cannot be re-adopted; export the device normally instead.
+
+### Changed
+
+- **Changing an export's role now costs the room, on purpose** (issue #240).
+  Previously an in-place role change sometimes left Apple Home stuck on
+  "could not change settings" until the home hub was restarted, because a
+  cached accessory structure changed under a Matter endpoint number a
+  controller believed was stable. A role change now removes the old
+  accessory from every ecosystem and adds a new one under a fresh number —
+  one deliberate re-room every time, predictably, instead of an occasional
+  wedge. `Manage Matter Exports…` states this before you confirm. If you are
+  already stuck from an older version, the hub-restart recipe in
+  `docs/MATTER.md` still applies as a one-time recovery.
+
 ## 2026.20.0 — colour-while-off forwards, like brightness
 
 > Takes effect on a live install only once the paired bridge-node release

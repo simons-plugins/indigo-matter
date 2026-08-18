@@ -382,6 +382,28 @@ class DriftEntry:
 
 
 @dataclass
+class OrphanRecord:
+    """One left-behind accessory identity (§3.12, issues #219/#240) — the
+    re-adopt picker's data. Mirrors `bridge-node/src/protocol.ts`'s
+    ``OrphanRecord`` field-for-field. ``role``/``label`` absent together is
+    the pre-2026.16.2 bare orphan (§4.2's third picker row, edge case E4) —
+    a plugin that old deleted them on un-export, so there is nothing left to
+    match a replacement device against and the record can never be
+    re-adopted, only shown so the user can see its number is spoken for.
+    """
+    unique_id: str
+    number: int
+    role: Optional[str] = None
+    label: Optional[str] = None
+    #: ISO-8601, or ``None`` for a pre-PR5 orphan — the picker renders that
+    #: as "date unknown" (§4.2).
+    orphaned_at: Optional[str] = None
+    #: The Indigo device that drove this identity before it was un-exported,
+    #: if the node recorded one (issue #219).
+    device_id: Optional[int] = None
+
+
+@dataclass
 class FabricInfo:
     """One commissioned ecosystem (§4.3)."""
     fabric_index: int
@@ -531,6 +553,22 @@ def parse_drift(data: Any) -> list:
         )
         for item in (data or [])
     ]
+
+
+def parse_orphans(result: Any) -> list:
+    """Normalise a §3.12 ``list_orphans`` payload into :class:`OrphanRecord`."""
+    orphans = []
+    for item in (result or []):
+        raw_device_id = item.get("deviceId")
+        orphans.append(OrphanRecord(
+            unique_id=str(item.get("uniqueId", "")),
+            number=int(item.get("number", 0)),
+            role=item.get("role"),
+            label=item.get("label"),
+            orphaned_at=item.get("orphanedAt"),
+            device_id=int(raw_device_id) if raw_device_id is not None else None,
+        ))
+    return orphans
 
 
 def parse_pairing(result: Any) -> PairingReport:

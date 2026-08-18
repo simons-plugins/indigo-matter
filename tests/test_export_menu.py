@@ -28,6 +28,7 @@ from unittest.mock import Mock
 
 import pytest
 
+import bridge_protocol
 import export_catalog
 from export_store import OPTION_INVERT, PREF_KEY, ExportEntry, ExportStore
 from fakes import (
@@ -1276,3 +1277,391 @@ class TestResetPairingsMenuCallback:
         assert ok is False and "confirmAgain" in errors
         said = " ".join(str(c.args[0]) for c in plug.logger.error.call_args_list)
         assert "Pairings are unchanged" in said
+
+
+# ---------------------------------------------------------------------------
+# Re-adopt a Matter accessory… (§4, issue #219)
+# ---------------------------------------------------------------------------
+def _orphan(unique_id="indigo-901", number=7, role="onOffPlugInUnit", label="Old Plug",
+           orphaned_at=None, device_id=None):
+    return bridge_protocol.OrphanRecord(
+        unique_id=unique_id, number=number, role=role, label=label,
+        orphaned_at=orphaned_at, device_id=device_id)
+
+
+def _said(mock_calls) -> str:
+    """Every %-formatted call.args[0] from a Mock's call_args_list, joined."""
+    return " ".join(
+        str(c.args[0]) % c.args[1:] if len(c.args) > 1 else str(c.args[0]) for c in mock_calls)
+
+
+class TestReadoptMenuExists:
+    def test_the_readopt_menu_exists_and_is_wired_to_a_callback(self, plugin_mod):
+        item = _menu_item_by_id("readoptExport")
+        assert item.findtext("Name") == "Re-adopt a Matter accessory…"
+        assert item.findtext("CallbackMethod") == "menuReadoptExport"
+        assert hasattr(plugin_mod.Plugin, "menuReadoptExport")
+
+    def test_the_fields_have_the_expected_types(self, plug):
+        item = _menu_item_by_id("readoptExport")
+        fields = {f.get("id"): f for f in item.find("ConfigUI").findall("Field")}
+        assert fields["readoptOrphan"].get("type") == "menu"       # needs a CallbackMethod
+        assert fields["readoptDevice"].get("type") == "menu"
+        assert fields["readoptConfirm"].get("type") == "checkbox"
+        assert fields["readoptConfirm"].get("defaultValue") == "false"
+        assert fields["readoptOrphan"].findtext("CallbackMethod") == "readoptOrphanChanged"
+        list_el = fields["readoptOrphan"].find("List")
+        assert list_el.get("class") == "self" and list_el.get("dynamicReload") == "true"
+        assert callable(getattr(plug, list_el.get("method")))
+        list_el = fields["readoptDevice"].find("List")
+        assert list_el.get("class") == "self" and list_el.get("dynamicReload") == "true"
+        assert callable(getattr(plug, list_el.get("method")))
+
+    def test_it_is_between_the_rebuild_and_recreate_menu_items(self):
+        """Placement is the point (#134's own convention): identity surgery
+        belongs beside the other identity-surgery recovery exits."""
+        ids = [item.get("id") for item in ET.parse(MENU_ITEMS_XML).getroot().findall("MenuItem")]
+        assert ids.index("rebuildEndpointMap") < ids.index("readoptExport") \
+            < ids.index("recreateNodeDevices")
+
+    def test_seeding_matches_the_pickers_no_selection_row(self, plug, plugin_mod):
+        values = plug.get_menu_action_config_ui_values("readoptExport")
+        assert values["readoptOrphan"] == plugin_mod.NO_SELECTION_ID
+        assert values["readoptDevice"] == plugin_mod.NO_SELECTION_ID
+        assert values["readoptConfirm"] is False
+
+
+class TestGetReadoptOrphans:
+    """§4.2 — the orphan picker's contents."""
+
+    def test_not_attached_degrades_to_an_explanatory_row(self, plug, plugin_mod):
+        _bridge_with(plug, attached=False)
+        plug.runtime = _FakeRuntime()
+        options = plug.getReadoptOrphans(valuesDict={})
+        assert options[0][0] == plugin_mod.NO_SELECTION_ID
+        assert "not connected" in options[0][1]
+
+    def test_no_bridge_at_all_degrades_the_same_way(self, plug, plugin_mod):
+        plug.export_bridge = None
+        options = plug.getReadoptOrphans(valuesDict={})
+        assert options[0][0] == plugin_mod.NO_SELECTION_ID
+
+    def test_empty_orphan_list_is_a_single_row(self, plug, plugin_mod):
+        _bridge_with(plug, attached=True)
+        plug.runtime = _FakeRuntime(result=[])
+        options = plug.getReadoptOrphans(valuesDict={})
+        assert options == [(plugin_mod.NO_SELECTION_ID,
+                            "(no left-behind accessories — nothing to re-adopt)")]
+
+    def test_a_failed_read_degrades_to_the_list_error_row(self, plug, plugin_mod):
+        _bridge_with(plug, attached=True)
+        plug.runtime = _FakeRuntime(error=RuntimeError("boom"))
+        assert plug.getReadoptOrphans(valuesDict={}) == [plugin_mod.LIST_ERROR_OPTION]
+
+    def test_a_full_entry_is_formatted_with_role_date_and_number(self, plug):
+        _bridge_with(plug, attached=True)
+        orphan = _orphan(unique_id="indigo-901", number=7, role="onOffPlugInUnit",
+                         label="Kitchen Lamp", orphaned_at="2026-08-12T09:15:00Z")
+        plug.runtime = _FakeRuntime(result=[orphan])
+        options = plug.getReadoptOrphans(valuesDict={})
+        assert options == [("indigo-901",
+                            "Kitchen Lamp — " + export_catalog.role_label("onOffPlugInUnit") +
+                            " — un-exported 12 Aug 2026 (accessory #7)")]
+
+    def test_a_date_unknown_entry_says_so(self, plug):
+        _bridge_with(plug, attached=True)
+        orphan = _orphan(unique_id="indigo-902", number=4, role="onOffLight",
+                         label="Porch Light", orphaned_at=None)
+        plug.runtime = _FakeRuntime(result=[orphan])
+        label = plug.getReadoptOrphans(valuesDict={})[0][1]
+        assert "un-exported (date unknown) (accessory #4)" in label
+
+    def test_a_bare_orphan_is_listed_but_unmatchable(self, plug):
+        """E4 — a pre-2026.16.2 orphan with no role/label: shown so the user
+        can see the number is spoken for, refused only at Execute time."""
+        _bridge_with(plug, attached=True)
+        orphan = _orphan(unique_id="indigo-903", number=9, role=None, label=None)
+        plug.runtime = _FakeRuntime(result=[orphan])
+        options = plug.getReadoptOrphans(valuesDict={})
+        assert options == [("indigo-903",
+                            "(accessory #9 — no role recorded, cannot be re-adopted)")]
+
+    def test_newest_orphan_sorts_first_and_date_unknown_sorts_last(self, plug):
+        older = _orphan(unique_id="indigo-1", number=1, orphaned_at="2026-01-01T00:00:00Z")
+        newer = _orphan(unique_id="indigo-2", number=2, orphaned_at="2026-08-01T00:00:00Z")
+        unknown = _orphan(unique_id="indigo-3", number=3, orphaned_at=None)
+        _bridge_with(plug, attached=True)
+        plug.runtime = _FakeRuntime(result=[older, unknown, newer])
+        options = plug.getReadoptOrphans(valuesDict={})
+        assert [key for key, _label in options] == ["indigo-2", "indigo-1", "indigo-3"]
+
+
+class TestGetReadoptDevices:
+    """§4.3 — the device picker, filtered to the picked orphan's role."""
+
+    def test_empty_without_a_picked_orphan(self, plug):
+        assert plug.getReadoptDevices(valuesDict={}) == []
+        assert plug.getReadoptDevices(valuesDict={"readoptOrphan": "0"}) == []
+
+    def test_before_startup_is_empty_not_an_error(self, plug):
+        plug.exports = None
+        _bridge_with(plug, attached=True)
+        plug.runtime = _FakeRuntime(result=[_orphan()])
+        assert plug.getReadoptDevices(valuesDict={"readoptOrphan": "indigo-901"}) == []
+
+    def test_filters_to_devices_offering_the_orphans_role(self, plug):
+        _bridge_with(plug, attached=True)
+        orphan = _orphan(role="onOffPlugInUnit")
+        plug.runtime = _FakeRuntime(result=[orphan])
+        labels = _labels(plug.getReadoptDevices(valuesDict={"readoptOrphan": orphan.unique_id}))
+        assert "101" in labels                          # RelayDevice offers onOffPlugInUnit
+        assert "102" not in labels                       # DimmerDevice does not
+
+    def test_cross_role_devices_are_excluded_e3(self, plug):
+        """The picker-level half of E3 — never even offered, not just refused
+        later at Execute."""
+        _bridge_with(plug, attached=True)
+        orphan = _orphan(role="dimmableLight")            # RelayDevice cannot take this role
+        plug.runtime = _FakeRuntime(result=[orphan])
+        labels = _labels(plug.getReadoptDevices(valuesDict={"readoptOrphan": orphan.unique_id}))
+        assert "101" not in labels
+
+    def test_already_exported_device_is_marked(self, plug):
+        plug.exports.upsert(ExportEntry(101, "onOffPlugInUnit"))
+        _bridge_with(plug, attached=True)
+        orphan = _orphan(role="onOffPlugInUnit")
+        plug.runtime = _FakeRuntime(result=[orphan])
+        labels = _labels(plug.getReadoptDevices(valuesDict={"readoptOrphan": orphan.unique_id}))
+        assert labels["101"] == "● Study Plug"
+
+    def test_a_device_already_re_adopted_onto_a_different_orphan_is_excluded(self, plug):
+        plug.exports.upsert(ExportEntry(101, "onOffPlugInUnit", published_as="indigo-999"))
+        _bridge_with(plug, attached=True)
+        orphan = _orphan(unique_id="indigo-901", role="onOffPlugInUnit")
+        plug.runtime = _FakeRuntime(result=[orphan])
+        labels = _labels(plug.getReadoptDevices(valuesDict={"readoptOrphan": orphan.unique_id}))
+        assert "101" not in labels
+
+    def test_a_device_already_re_adopted_onto_THIS_orphan_is_kept(self, plug):
+        plug.exports.upsert(ExportEntry(101, "onOffPlugInUnit", published_as="indigo-901"))
+        _bridge_with(plug, attached=True)
+        orphan = _orphan(unique_id="indigo-901", role="onOffPlugInUnit")
+        plug.runtime = _FakeRuntime(result=[orphan])
+        labels = _labels(plug.getReadoptDevices(valuesDict={"readoptOrphan": orphan.unique_id}))
+        assert "101" in labels
+
+    def test_a_bare_role_orphan_yields_no_devices(self, plug):
+        _bridge_with(plug, attached=True)
+        orphan = _orphan(role=None, label=None)
+        plug.runtime = _FakeRuntime(result=[orphan])
+        assert plug.getReadoptDevices(valuesDict={"readoptOrphan": orphan.unique_id}) == []
+
+
+def test_readopt_orphan_changed_is_a_pure_passthrough(plug):
+    values = {"readoptOrphan": "indigo-901"}
+    assert plug.readoptOrphanChanged(values) is values
+
+
+class TestMenuReadoptExportValidation:
+    """§4.4's seven-step order, one refusal at a time."""
+
+    def test_step1_refuses_without_the_tick(self, plug):
+        client = _bridge_with(plug, attached=True)
+        plug.runtime = _FakeRuntime(result=[])
+        ok, _values_out, errors = plug.menuReadoptExport({"readoptConfirm": False})
+        assert ok is False and "readoptConfirm" in errors
+        assert not client.list_orphans.called
+
+    def test_step2_refuses_when_not_attached(self, plug):
+        _bridge_with(plug, attached=False)
+        plug.runtime = _FakeRuntime()
+        ok, _values_out, errors = plug.menuReadoptExport({"readoptConfirm": True})
+        assert ok is False and "readoptConfirm" in errors
+        assert "Start it, let the plugin attach, then re-open this dialog" \
+            in _said(plug.logger.warning.call_args_list)
+
+    def test_step2_refuses_with_no_bridge_at_all(self, plug):
+        plug.export_bridge = None
+        ok, _values_out, errors = plug.menuReadoptExport({"readoptConfirm": True})
+        assert ok is False and "readoptConfirm" in errors
+
+    def test_refuses_without_an_orphan_selected(self, plug):
+        _bridge_with(plug, attached=True)
+        plug.runtime = _FakeRuntime(result=[])
+        ok, _values_out, errors = plug.menuReadoptExport(
+            {"readoptConfirm": True, "readoptOrphan": "0"})
+        assert ok is False and "readoptOrphan" in errors
+
+    def test_step3_e6_refuses_when_the_orphan_went_live_again(self, plug):
+        _bridge_with(plug, attached=True)
+        plug.runtime = _FakeRuntime(result=[])       # freshly-fetched: gone
+        ok, _values_out, errors = plug.menuReadoptExport(
+            {"readoptConfirm": True, "readoptOrphan": "indigo-901", "readoptDevice": "101"})
+        assert ok is False and "readoptOrphan" in errors
+        assert "in use again" in errors["readoptOrphan"]
+        assert "in use again" in _said(plug.logger.warning.call_args_list)
+
+    def test_step4_e4_refuses_a_bare_orphan(self, plug):
+        _bridge_with(plug, attached=True)
+        bare = _orphan(unique_id="indigo-903", number=9, role=None, label=None)
+        plug.runtime = _FakeRuntime(result=[bare])
+        ok, _values_out, errors = plug.menuReadoptExport(
+            {"readoptConfirm": True, "readoptOrphan": "indigo-903", "readoptDevice": "101"})
+        assert ok is False and "readoptOrphan" in errors
+        assert "older than 2026.16.2" in errors["readoptOrphan"]
+
+    def test_refuses_without_a_device_selected(self, plug):
+        _bridge_with(plug, attached=True)
+        orphan = _orphan(role="onOffPlugInUnit")
+        plug.runtime = _FakeRuntime(result=[orphan])
+        ok, _values_out, errors = plug.menuReadoptExport(
+            {"readoptConfirm": True, "readoptOrphan": orphan.unique_id, "readoptDevice": "0"})
+        assert ok is False and "readoptDevice" in errors
+
+    def test_step5_refuses_a_deleted_device(self, plug):
+        _bridge_with(plug, attached=True)
+        orphan = _orphan(role="onOffPlugInUnit")
+        plug.runtime = _FakeRuntime(result=[orphan])
+        ok, _values_out, errors = plug.menuReadoptExport(
+            {"readoptConfirm": True, "readoptOrphan": orphan.unique_id,
+             "readoptDevice": "999999"})
+        assert ok is False and "readoptDevice" in errors
+        assert "no longer exists" in errors["readoptDevice"]
+
+    def test_step5_refuses_an_excluded_device(self, plug):
+        _bridge_with(plug, attached=True)
+        orphan = _orphan(role="onOffPlugInUnit")
+        plug.runtime = _FakeRuntime(result=[orphan])
+        ok, _values_out, errors = plug.menuReadoptExport(
+            {"readoptConfirm": True, "readoptOrphan": orphan.unique_id,
+             "readoptDevice": "104"})  # SprinklerDevice — always excluded
+        assert ok is False and "readoptDevice" in errors
+        assert "cannot be exported" in errors["readoptDevice"]
+
+    def test_step6_e3_refuses_cross_role(self, plug):
+        _bridge_with(plug, attached=True)
+        orphan = _orphan(role="dimmableLight")            # RelayDevice cannot take this role
+        plug.runtime = _FakeRuntime(result=[orphan])
+        ok, _values_out, errors = plug.menuReadoptExport(
+            {"readoptConfirm": True, "readoptOrphan": orphan.unique_id, "readoptDevice": "101"})
+        assert ok is False and "readoptDevice" in errors
+        assert '"Study Plug" cannot appear as a' in errors["readoptDevice"]
+        assert "becomes a new accessory" in errors["readoptDevice"]
+
+    def test_step7_e12_refuses_an_identity_already_claimed(self, plug):
+        plug.exports.upsert(ExportEntry(102, "dimmableLight", published_as="indigo-901"))
+        _bridge_with(plug, attached=True)
+        orphan = _orphan(unique_id="indigo-901", role="onOffPlugInUnit")
+        plug.runtime = _FakeRuntime(result=[orphan])
+        ok, _values_out, errors = plug.menuReadoptExport(
+            {"readoptConfirm": True, "readoptOrphan": orphan.unique_id, "readoptDevice": "101"})
+        assert ok is False and "readoptOrphan" in errors
+        assert "already claimed by Indigo device 102" in errors["readoptOrphan"]
+
+    def test_a_failed_store_write_is_reported_not_claimed_as_success(self, plug, monkeypatch):
+        _bridge_with(plug, attached=True)
+        orphan = _orphan(role="onOffPlugInUnit")
+        plug.runtime = _FakeRuntime(result=[orphan])
+        monkeypatch.setattr(plug.exports, "upsert",
+                            Mock(side_effect=RuntimeError("disk full")))
+        ok, _values_out, errors = plug.menuReadoptExport(
+            {"readoptConfirm": True, "readoptOrphan": orphan.unique_id, "readoptDevice": "101"})
+        assert ok is False and "readoptDevice" in errors
+        assert "FAILED" in errors["readoptDevice"]
+
+
+class TestMenuReadoptExportSuccess:
+    """§4.4's closing paragraph and §4.5's confirmation log."""
+
+    def test_writes_the_store_with_the_orphans_role_and_identity(self, plug):
+        _bridge_with(plug, attached=True)
+        orphan = _orphan(unique_id="indigo-901", role="onOffPlugInUnit", label="Kitchen Lamp")
+        plug.runtime = _FakeRuntime(result=[orphan])
+        ok, _values_out = plug.menuReadoptExport(
+            {"readoptConfirm": True, "readoptOrphan": orphan.unique_id, "readoptDevice": "101"})
+        assert ok is True
+        entry = plug.exports.get(101)
+        assert entry.role == "onOffPlugInUnit"
+        assert entry.published_as == "indigo-901"
+
+    def test_preserves_an_existing_name_override_and_options(self, plug):
+        plug.exports.upsert(ExportEntry(101, "onOffLight", name_override="Front Door"))
+        _bridge_with(plug, attached=True)
+        orphan = _orphan(unique_id="indigo-901", role="onOffPlugInUnit", label="Kitchen Lamp")
+        plug.runtime = _FakeRuntime(result=[orphan])
+        plug.menuReadoptExport(
+            {"readoptConfirm": True, "readoptOrphan": orphan.unique_id, "readoptDevice": "101"})
+        assert plug.exports.get(101).name_override == "Front Door"
+
+    def test_nudges_the_bridge_with_role_changed_true(self, plug):
+        """§4.4's closing paragraph: the remove-then-add path, the same shape
+        as a role change, even though the role itself did not move here."""
+        client = _bridge_with(plug, attached=True)
+        _fake_bridge = plug.export_bridge
+        orphan = _orphan(unique_id="indigo-901", role="onOffPlugInUnit", label="Kitchen Lamp")
+        plug.runtime = _FakeRuntime(result=[orphan])
+        plug.menuReadoptExport(
+            {"readoptConfirm": True, "readoptOrphan": orphan.unique_id, "readoptDevice": "101"})
+        _fake_bridge.replace.assert_called_once_with(101)
+        _fake_bridge.upsert.assert_not_called()
+        assert client is _fake_bridge.client
+
+    def test_confirmation_log_names_device_role_and_accessory_number(self, plug):
+        _bridge_with(plug, attached=True)
+        orphan = _orphan(unique_id="indigo-901", number=7, role="onOffPlugInUnit",
+                         label="Kitchen Lamp", device_id=123456789)
+        plug.runtime = _FakeRuntime(result=[orphan])
+        ok, _values_out = plug.menuReadoptExport(
+            {"readoptConfirm": True, "readoptOrphan": orphan.unique_id, "readoptDevice": "101"})
+        assert ok is True
+        said = _said(plug.logger.warning.call_args_list)
+        assert 'RE-ADOPTED accessory "Kitchen Lamp"' in said
+        assert export_catalog.role_label("onOffPlugInUnit") in said
+        assert "accessory number 7" in said
+        assert 'onto Indigo device "Study Plug" (id 101)' in said
+        assert "left behind when device 123456789 was deleted" in said
+        assert "nothing is re-paired and nothing is renumbered" in said
+        assert "previous accessory" not in said     # device 101 was never exported before
+
+    def test_confirmation_log_omits_the_driving_device_when_unrecorded(self, plug):
+        _bridge_with(plug, attached=True)
+        orphan = _orphan(unique_id="indigo-901", role="onOffPlugInUnit", label="Kitchen Lamp",
+                         device_id=None)
+        plug.runtime = _FakeRuntime(result=[orphan])
+        plug.menuReadoptExport(
+            {"readoptConfirm": True, "readoptOrphan": orphan.unique_id, "readoptDevice": "101"})
+        said = _said(plug.logger.warning.call_args_list)
+        assert "That accessory was left behind." in said
+        assert "was deleted" not in said
+
+    def test_confirmation_log_names_the_devices_own_previous_accessory(self, plug):
+        """The closing sentence: emitted only when the target device was
+        already exported under a DIFFERENT identity than the one it is now
+        inheriting — its own accessory has just been removed too."""
+        client = _bridge_with(plug, attached=True)
+        plug.exports.upsert(ExportEntry(101, "onOffPlugInUnit"))   # default identity
+        client.status = bridge_protocol.StatusReport(
+            commissioned=True, fabrics=[], endpoint_count=1,
+            endpoints=[bridge_protocol.EndpointSummary(
+                indigo_device_id=101, endpoint_number=11, role="onOffPlugInUnit")],
+            drift=[], drift_checked=True)
+        orphan = _orphan(unique_id="indigo-901", role="onOffPlugInUnit", label="Kitchen Lamp")
+        plug.runtime = _FakeRuntime(result=[orphan])
+        ok, _values_out = plug.menuReadoptExport(
+            {"readoptConfirm": True, "readoptOrphan": orphan.unique_id, "readoptDevice": "101"})
+        assert ok is True
+        said = _said(plug.logger.warning.call_args_list)
+        assert "Device 101's own previous accessory (number 11) has been removed " \
+            "from your ecosystems." in said
+
+    def test_confirmation_log_omits_the_number_when_status_has_none(self, plug):
+        client = _bridge_with(plug, attached=True)
+        plug.exports.upsert(ExportEntry(101, "onOffPlugInUnit"))
+        client.status = None
+        orphan = _orphan(unique_id="indigo-901", role="onOffPlugInUnit", label="Kitchen Lamp")
+        plug.runtime = _FakeRuntime(result=[orphan])
+        plug.menuReadoptExport(
+            {"readoptConfirm": True, "readoptOrphan": orphan.unique_id, "readoptDevice": "101"})
+        said = _said(plug.logger.warning.call_args_list)
+        assert "Device 101's own previous accessory has been removed from your ecosystems." \
+            in said

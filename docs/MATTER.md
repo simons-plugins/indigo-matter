@@ -442,19 +442,28 @@ time the plugin reconnects after the update. The accessory's identity
 paired ecosystem(s) may need re-assigning — the same one-time hedge a role
 change already asks for.
 
-**If Apple Home gets stuck after a role change** (live-observed 2026-08-17):
-changing an export's role re-creates the accessory at the same endpoint
-number, and Apple can react by dropping it into the Default Room and then
-refusing to move it back — "could not change settings" — because its cached
-accessory structure no longer matches what the bridge advertises. The fix is
-to **restart your Apple home hub** (Apple TV: Settings → System → Restart, or
-power-cycle the HomePod); force-quitting the Home app is not enough. After
-the reboot the hub re-reads the bridge — expect a couple of minutes of "No
-Response" across all bridged accessories while it rebuilds its sessions, then
-room changes work again. Practical ordering: pick the role you want *first*,
-let Apple settle, and assign the room/name after. (A future release may
-adopt the remove-then-re-add approach other bridges use for type changes —
-tracked as issue #240.)
+**Changing a role now costs the room, on purpose** (issue #240). Matter does
+not allow an endpoint to change device type, so changing an export's role
+removes the old accessory from every ecosystem and adds a new one under a
+fresh accessory number — you will need to put it back in its room, but it is
+one deliberate, predictable re-room every time. The dialog warns you at the
+time. This is deliberately NOT an in-place recreate at the same number
+any more: that used to be able to leave Apple Home stuck on "could not
+change settings", because its cached accessory structure no longer matched
+what the bridge advertised under a number it believed was stable. Deleted
+the old accessory and re-created it, your ecosystem's own "new accessory"
+flow handles it the same way any other addition does — no home-hub restart
+needed.
+
+**If you are already stuck from an older version** (live-observed
+2026-08-17, pre-2026.21.0): the fix is to **restart your Apple home hub**
+(Apple TV: Settings → System → Restart, or power-cycle the HomePod);
+force-quitting the Home app is not enough. After the reboot the hub re-reads
+the bridge — expect a couple of minutes of "No Response" across all bridged
+accessories while it rebuilds its sessions, then room changes work again.
+This is a one-time recovery for a wedge an older plugin version could leave
+behind; a role change on 2026.21.0 or later does not create it in the first
+place.
 
 **Locks export, and they do not auto-confirm anything.** A lock or unlock from an
 ecosystem is passed to Indigo and nothing else: no optimistic state, no
@@ -633,6 +642,35 @@ There is one everyday case that changes identity on purpose: **changing an
 export's role**. Matter does not allow an endpoint to change device type, so the
 accessory is removed and re-added, and every ecosystem treats it as brand new —
 losing the name and room it had. The dialog warns you at the time.
+
+### If you delete and recreate an exported device
+
+Deleting an Indigo device that is exported does not touch your ecosystems —
+its accessory keeps sitting in its room, still remembered, just no longer
+driven by anything. Re-creating the device (or restoring it a different way)
+gets you a NEW Indigo device with a NEW id, and Indigo has no way to know it
+is "the same" device you deleted, so exporting it normally builds a SECOND,
+brand-new accessory — the old one is still there, in its old room, doing
+nothing.
+
+**`Plugin ▸ Re-adopt a Matter accessory…`** is the way back. Pick the
+left-behind accessory (it lists what role it was, and when it was
+un-exported), pick the Indigo device that should drive it now, and confirm.
+Nothing is re-paired and nothing is renumbered — Apple Home and every other
+paired ecosystem keep the accessory's room, its name, and every scene and
+automation you built on it, exactly as if the device had never been deleted.
+It only works when the replacement device can take the SAME role the
+accessory already has — a plug can be re-adopted onto another plug-like
+device, but not onto a light. If it cannot, export the device normally
+instead and accept that it becomes a new accessory.
+
+**One thing re-adopt cannot fix:** an accessory left behind by a plugin
+version **older than 2026.16.2** has no role or name recorded against it —
+that version deleted the record on un-export instead of keeping it. The
+menu still lists it, so you can see its accessory number is spoken for, but
+there is nothing left to match a replacement device against, so it cannot be
+re-adopted; export the device normally and accept a new accessory. Nothing
+un-exported by 2026.16.2 or later has this problem.
 
 ### Which ecosystems this actually works with
 

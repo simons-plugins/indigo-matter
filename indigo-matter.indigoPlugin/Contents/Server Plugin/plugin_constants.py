@@ -47,6 +47,10 @@ MENU_MANAGE_EXPORTS = "manageMatterExports"
 #: — Indigo pre-selects the first row of a picker, and this picker's rows are
 #: real ecosystems whose Execute button removes them.
 MENU_UNPAIR_ECOSYSTEM = "unpairEcosystem"
+#: Menu id of the re-adopt dialog (issue #219). Seeded for the same reason —
+#: it has two pickers whose Execute button hands an accessory identity to a
+#: different Indigo device.
+MENU_READOPT_EXPORT = "readoptExport"
 #: Option-id prefix marking a picker row the user may look at but not choose
 #: (PRD §5.2: excluded devices are shown *with a reason*, never hidden — XAC9).
 EXCLUDED_OPTION_PREFIX = "x-"
@@ -129,6 +133,12 @@ SHARE_WINDOW_TIMEOUT = 60.0
 #: rows in the explorer's endpoint/cluster pickers. Shares NO_SELECTION_ID's
 #: reasoning: never "", which Indigo rejects outright.
 ALL_OPTION_ID = "all"
+#: How long "Re-adopt a Matter accessory…" (issue #219) may block the Indigo
+#: UI thread on `list_orphans` — for both its pickers and its own step-3
+#: re-verification (§4.4). A plain, local read like PAIRING_READ_TIMEOUT's
+#: `get_pairing`, not one of the "real work happens behind it" deadlines
+#: above, so it gets the same number rather than a longer one.
+READOPT_ORPHANS_TIMEOUT = 15.0
 
 
 def server_location(prefs: dict) -> str:
