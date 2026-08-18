@@ -6,6 +6,7 @@
 import assert from "node:assert/strict";
 import { after, before, it } from "node:test";
 
+import { PROTOCOL_VERSION } from "../src/protocol.js";
 import { BridgeWsServer } from "../src/ws-server.js";
 import { TestClient } from "./client.js";
 import { StubBridge } from "./stub-bridge.js";
@@ -40,7 +41,7 @@ it("does not close a socket that attached in time", async () => {
     const response = await client.request({
         message_id: "a",
         command: "attach",
-        args: { protocolVersion: 1, pluginVersion: "test", endpoints: [] },
+        args: { protocolVersion: PROTOCOL_VERSION, pluginVersion: "test", endpoints: [] },
     });
     assert.ok("result" in response);
     await new Promise(resolve => setTimeout(resolve, 400));

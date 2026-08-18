@@ -1,6 +1,6 @@
 # BRIDGE_PROTOCOL.md — plugin ⇄ bridge-node local protocol
 
-**Version:** 1 (`protocolVersion: 1`)
+**Version:** 2 (`protocolVersion: 2`)
 **Transport:** WebSocket, JSON text frames, loopback only, default port **5581**
 (pref-configurable; the controller's WS is 5580)
 **Peers:** the Indigo plugin (client) and the `indigo-matter-bridge` node
@@ -84,7 +84,7 @@ Unknown *events* are logged and dropped by the plugin.
 
 ### 1.1 Error codes
 
-The complete `error_code` domain for protocol version 1. Anything else is a
+The complete `error_code` domain for protocol version 2. Anything else is a
 bug in the node.
 
 | `error_code` | Meaning |
@@ -121,7 +121,7 @@ one door deliberately locked against it. Clients MUST branch on the reason.
 On every new connection, before anything else:
 
 1. Node sends a bare frame (not an event, mirroring `server_info`):
-   `{"protocolVersion": 1, "bridgeVersion": "<npm semver>", "matterJsVersion": "<semver>"}`
+   `{"protocolVersion": 2, "bridgeVersion": "<npm semver>", "matterJsVersion": "<semver>"}`
 2. Plugin sends `attach` (§3.1). If `protocolVersion` differs from the
    plugin's own, the plugin does **not** attach: it surfaces an error telling
    the user to restart/update the bridge agent (typically the plugin was
@@ -144,7 +144,7 @@ Declares the client and delivers the desired endpoint set in one shot.
 
 ```json
 {"command": "attach", "args": {
-  "protocolVersion": 1,
+  "protocolVersion": 2,
   "pluginVersion": "2026.8.1",
   "endpoints": [ <EndpointSpec>, … ]
 }}
@@ -443,6 +443,12 @@ over an unreadable map has no orphans it can vouch for.
   reading — an accessory that greys itself out in every ecosystem because the
   plugin left a field off — is the worse default by far.
 - `options` — role-specific extras (e.g. window-covering polarity).
+- `publishedAs` — issues #219/#240. The accessory identity this device
+  publishes as (`Endpoint.id`/`UniqueID`/`SerialNumber`); the plugin owns and
+  persists it. **Omitted (or equal to `indigo-<indigoDeviceId>`) means "use
+  today's default derivation"** — every export that has never changed role
+  sends no key at all, so this field is invisible on the wire until a role
+  change or a re-adopt moves an accessory off its default identity.
 - `battery` — issue #220. `true` means "ensure this accessory publishes
   PowerSource"; **omitted or `false` means "no evidence right now", never a
   removal request.** The live cluster set is monotonic: once an endpoint is

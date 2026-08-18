@@ -59,7 +59,7 @@ import bridge_protocol
 import export_catalog
 import export_handlers
 from bridge_client import TERMINAL_ATTACH_ERRORS, BridgeClient, attach_timeout_for
-from bridge_protocol import EndpointSpec
+from bridge_protocol import EndpointSpec, published_id_for
 
 #: How many consecutive watchdog ticks a disconnected bridge client tolerates
 #: before the log escalates from debug to a single warning. Ticks are ~15s, so
@@ -909,6 +909,10 @@ class ExportBridge:
             reachable=reachable_of(dev),
             states=states,
             options=dict(entry.options),
+            # Issues #219/#240 — whatever identity the entry has adopted
+            # (a role change or a re-adopt), or today's default derivation
+            # for an entry that has never moved off it.
+            published_as=entry.published_as or published_id_for(device_id),
             # §4.1 issue #220 — evidence, not opinion. `is not None` (INCLUDING
             # a literal 0) is deliberately the opposite test to
             # `battery_percent`'s (which suppresses 0): the device factually

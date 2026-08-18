@@ -45,7 +45,7 @@ import threading
 from dataclasses import dataclass, field
 from typing import Callable, Iterable, Optional
 
-from bridge_protocol import ROLES
+from bridge_protocol import ROLES, parse_published_id
 
 #: pluginPrefs key holding the serialised allow-list.
 PREF_KEY = "matterExports"
@@ -61,6 +61,9 @@ KEY_DEVICE_ID = "indigoDeviceId"
 KEY_ROLE = "role"
 KEY_NAME_OVERRIDE = "nameOverride"
 KEY_OPTIONS = "options"
+#: Issues #219/#240 — the accessory identity this device publishes as (§4.1).
+#: Additive: SCHEMA_VERSION stays 1 (see :class:`ExportEntry`).
+KEY_PUBLISHED_AS = "publishedAs"
 
 #: ``options`` key carrying window-covering polarity (PRD §5.2 / §4.1).
 OPTION_INVERT = "invert"
@@ -89,6 +92,14 @@ class ExportEntry:
     role: str
     name_override: Optional[str] = None
     options: dict = field(default_factory=dict)
+    #: Issues #219/#240 — the accessory identity this device publishes as
+    #: (``bridge_protocol.published_id_for``/``parse_published_id``). ``None``
+    #: means "use today's default derivation" — every entry written before
+    #: this field existed, and every entry an update has not role-changed.
+    #: Additive and optional (SCHEMA_VERSION stays 1): a payload written by an
+    #: older plugin has no key at all, and ``from_dict`` already tolerates a
+    #: missing key the way every other optional field here does.
+    published_as: Optional[str] = None
 
     def to_dict(self) -> dict:
         """The persisted shape (one element of ``exports``)."""
@@ -97,6 +108,7 @@ class ExportEntry:
             KEY_ROLE: self.role,
             KEY_NAME_OVERRIDE: self.name_override,
             KEY_OPTIONS: dict(self.options),
+            KEY_PUBLISHED_AS: self.published_as,
         }
 
     @classmethod
@@ -133,11 +145,22 @@ class ExportEntry:
                 raise ValueError(
                     f"export entry has the {OPTION_INVERT!r} option on role {role!r}, which has "
                     f"no polarity (device {device_id})")
+        published_as = raw.get(KEY_PUBLISHED_AS)
+        if published_as is not None:
+            if not isinstance(published_as, str):
+                raise ValueError(
+                    f"export entry {KEY_PUBLISHED_AS!r} is not a string (device {device_id})")
+            parsed = parse_published_id(published_as)
+            if parsed is None or parsed.device_id != device_id:
+                raise ValueError(
+                    f"export entry {KEY_PUBLISHED_AS!r} {published_as!r} is not a lawful "
+                    f"published identity for device {device_id}")
         return cls(
             indigo_device_id=device_id,
             role=role,
             name_override=name_override or None,
             options=dict(options),
+            published_as=published_as,
         )
 
     def label_for(self, device_name: str) -> str:

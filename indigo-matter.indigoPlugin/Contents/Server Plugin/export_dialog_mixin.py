@@ -11,6 +11,7 @@ import indigo  # provided by the Indigo runtime
 
 import export_catalog
 import export_handlers
+from bridge_protocol import next_generation, published_id_for
 from export_store import ExportEntry, OPTION_INVERT
 from plugin_constants import (
     EXCLUDED_OPTION_PREFIX, EXPORT_PICKER_LIMIT, LIST_ERROR_OPTION,
@@ -549,10 +550,20 @@ class ExportDialogMixin:
         previous = self.exports.get(device_id)
         existed = previous is not None
         role_changed = existed and previous.role != role
+        # Issue #240 — a role change bumps the generation, so the node treats
+        # it as a NEW accessory identity (remove-then-add) rather than an
+        # in-place device-type mutation; anything else carries the identity
+        # through unchanged — an ordinary update must never move it on its
+        # own (§1.3).
+        if role_changed:
+            published_as = next_generation(previous.published_as or published_id_for(device_id))
+        else:
+            published_as = previous.published_as if existed else None
         try:
             self.exports.upsert(ExportEntry(
                 indigo_device_id=device_id, role=role,
                 name_override=name_override, options=options,
+                published_as=published_as,
             ))
         except Exception as exc:  # pylint: disable=broad-except
             # The store rolled back, so nothing was saved — say so rather than
@@ -575,13 +586,18 @@ class ExportDialogMixin:
         """What a role change actually costs the user, said before they find out.
 
         BRIDGE_PROTOCOL §4.1 rejects changing an existing endpoint's role, so the
-        plugin removes and re-adds it. Ecosystems treat that as a brand-new
-        accessory: the name and room it was given in Apple Home are gone.
+        plugin removes the old accessory identity and adds a new one (issue
+        #240) rather than recreating it in place — recreating in place is what
+        used to leave Apple Home stuck showing "could not change settings"
+        until its home hub was restarted.
         """
         if not role_changed:
             return ""
-        return ("Changing the role RE-CREATES the accessory, so it loses the name and room "
-                "you gave it in Apple Home and any other paired ecosystem. ")
+        return ("Changing the role removes this accessory from your ecosystems and adds it "
+                "back as a NEW one under a fresh accessory number, so you will need to put it "
+                "back in its room. That is deliberate — changing it in place could leave Apple "
+                "Home stuck on \"could not change settings\" until the home hub was restarted "
+                "(issue #240). ")
 
     def _nudge_export(self, device_id: int, *, role_changed: bool = False) -> None:
         """Tell the bridge about one changed export, without a full reconnect.

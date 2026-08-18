@@ -6,8 +6,17 @@
  * a Matter stack.
  */
 
-/** Protocol version this node speaks. Skew fails closed on both peers (§2). */
-export const PROTOCOL_VERSION = 1;
+/**
+ * Protocol version this node speaks. Skew fails closed on both peers (§2).
+ *
+ * Bumped 1 → 2 alongside `EndpointSpec.publishedAs` first being sent
+ * (issues #219/#240, owner ruling): rather than gate `publishedAs` behind a
+ * `bridgeVersion` capability check, the protocol simply requires v2. An old
+ * (pre-#219/#240) node cannot silently ignore a `publishedAs` it does not
+ * understand and publish a duplicate default-identity accessory, because it
+ * never gets past the handshake with a v2-speaking plugin at all.
+ */
+export const PROTOCOL_VERSION = 2;
 
 /** Seconds a connection may sit past the handshake without attaching (§2). */
 export const UNATTACHED_TIMEOUT_MS = 10_000;
@@ -24,7 +33,7 @@ export const WINDOW_DURATION_MIN_SECONDS = 180;
 export const WINDOW_DURATION_MAX_SECONDS = 900;
 export const WINDOW_DURATION_DEFAULT_SECONDS = 900;
 
-/** The complete `error_code` domain for protocol version 1 (§1.1). */
+/** The complete `error_code` domain for protocol version 2 (§1.1). */
 export const ErrorCode = {
     unknownCommand: "unknown_command",
     malformedArgs: "malformed_args",

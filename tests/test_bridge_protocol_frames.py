@@ -15,7 +15,14 @@ import json
 import pytest
 
 import bridge_protocol
-from bridge_protocol import BridgeProtocol, BridgeProtocolError, EndpointSpec
+from bridge_protocol import (
+    BridgeProtocol,
+    BridgeProtocolError,
+    EndpointSpec,
+    next_generation,
+    parse_published_id,
+    published_id_for,
+)
 
 from conftest import load_bridge_frames
 
@@ -406,3 +413,114 @@ class TestCoverage:
         raw = json.dumps(FRAMES)
         assert '"battery": false' not in raw
         assert '"battery":false' not in raw
+
+    def test_endpoint_spec_omits_published_as_at_the_default(self):
+        """Issues #219/#240 — the wire is byte-identical to today's when a
+        spec has never moved off the default derivation, so a fixture that
+        predates `publishedAs` still round-trips unchanged."""
+        wire = BY_NAME["upsert_endpoint"]["request"]["args"]["endpoint"]
+        assert "publishedAs" not in wire
+        spec = EndpointSpec.from_wire(wire)
+        assert spec.indigo_device_id == 123456789
+        assert spec.published_as == ""
+        assert "publishedAs" not in spec.to_wire()
+
+    def test_endpoint_spec_omits_published_as_when_it_equals_the_default(self):
+        spec = EndpointSpec(indigo_device_id=123456789, role="onOffLight", label="x",
+                            published_as="indigo-123456789")
+        assert "publishedAs" not in spec.to_wire()
+
+    def test_endpoint_spec_round_trips_a_non_default_published_as(self):
+        """A role-changed or re-adopted export sends its identity on the wire,
+        and it survives a round trip untouched."""
+        wire = dict(BY_NAME["upsert_endpoint"]["request"]["args"]["endpoint"])
+        wire["publishedAs"] = "indigo-123456789~2"
+        spec = EndpointSpec.from_wire(wire)
+        assert spec.published_as == "indigo-123456789~2"
+        assert spec.to_wire() == wire
+
+
+class TestPublishedIdentity:
+    """Issues #219/#240 — the Python twin of `bridge-node/src/protocol.ts`'s
+    `publishedIdFor`/`parsePublishedId`. There is no existing cross-language
+    fixture mechanism for a pure function (§7's golden frames only cover wire
+    shapes), so this is a hand-built parallel table: every case here was
+    checked by hand against the TypeScript regex/derivation
+    (`^indigo-(-?\\d+)(?:~(\\d+))?$`, safe-integer device id, generation >= 2,
+    total length <= 32) at the time both were written, and the two must be
+    kept in sync by inspection if either changes.
+    """
+
+    #: (value, expected (device_id, generation)) — every one of these must
+    #: parse the same way `protocol.ts`'s `parsePublishedId` parses it.
+    VALID = [
+        ("indigo-1", (1, 1)),
+        ("indigo-0", (0, 1)),
+        ("indigo--5", (-5, 1)),
+        ("indigo-123~2", (123, 2)),
+        ("indigo-123~99", (123, 99)),
+        # F9's measured Number.isSafeInteger boundary.
+        ("indigo-9007199254740991", (9007199254740991, 1)),
+        # Exactly PUBLISHED_ID_MAX (32) characters: "indigo-" (7) +
+        # 16-digit MAX_SAFE_INTEGER + "~" (1) + 8-digit generation.
+        ("indigo-9007199254740991~99999999", (9007199254740991, 99999999)),
+    ]
+
+    #: Every one of these must be refused by `parsePublishedId` too.
+    INVALID = [
+        "indigo-123~1",       # generation must be >= 2
+        "indigo-123~0",
+        "indigo-123.2",       # "." is not the generation separator
+        "indigo-abc",         # non-numeric device id
+        "matter-1",           # wrong prefix
+        "indigo-1~",          # no digits after ~
+        "indigo-",            # no device id at all
+        "",
+        "indigo-1 ",          # trailing whitespace
+        # One past F9's measured Number.isSafeInteger boundary.
+        "indigo-9007199254740992",
+        # One character over PUBLISHED_ID_MAX (33), otherwise lawful.
+        "indigo-9007199254740991~999999999",
+    ]
+
+    @pytest.mark.parametrize("value,expected", VALID)
+    def test_parses_a_lawful_published_id(self, value, expected):
+        parsed = parse_published_id(value)
+        assert parsed is not None
+        assert (parsed.device_id, parsed.generation) == expected
+
+    @pytest.mark.parametrize("value", INVALID)
+    def test_refuses_an_unlawful_published_id(self, value):
+        assert parse_published_id(value) is None
+
+    @pytest.mark.parametrize("value,expected", VALID)
+    def test_published_id_for_is_the_inverse(self, value, expected):
+        device_id, generation = expected
+        assert published_id_for(device_id, generation) == value
+
+    def test_published_id_for_defaults_to_generation_1(self):
+        assert published_id_for(42) == "indigo-42"
+
+    @pytest.mark.parametrize("device_id,generation", [
+        (1, 1), (0, 1), (-5, 1), (123, 2), (123, 5), (9007199254740991, 1),
+    ])
+    def test_published_id_for_and_parse_round_trip(self, device_id, generation):
+        parsed = parse_published_id(published_id_for(device_id, generation))
+        assert parsed is not None
+        assert (parsed.device_id, parsed.generation) == (device_id, generation)
+
+    def test_next_generation_from_the_default(self):
+        assert next_generation("indigo-1") == "indigo-1~2"
+
+    def test_next_generation_from_a_generation(self):
+        assert next_generation("indigo-1~2") == "indigo-1~3"
+
+    def test_next_generation_keeps_incrementing(self):
+        assert next_generation("indigo-1~9") == "indigo-1~10"
+
+    def test_next_generation_preserves_the_device_id(self):
+        assert next_generation("indigo-123~7").startswith("indigo-123~")
+
+    def test_next_generation_rejects_an_unlawful_published_as(self):
+        with pytest.raises(ValueError):
+            next_generation("not-lawful")

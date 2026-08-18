@@ -225,6 +225,22 @@ class TestEndpointProvider:
         assert spec.reachable is True
         assert spec.states == {"onOff": True, "level": 40}
 
+    def test_a_spec_defaults_to_the_derived_published_identity(
+            self, bridge_mod, mock_logger, devices):
+        """Issues #219/#240 — an entry that has never moved off the default
+        derivation still carries it in the spec, even though `to_wire()`
+        omits it (the golden-frame round trip stays byte-identical)."""
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(102, "dimmableLight")])
+        (spec,) = h.bridge.endpoint_specs()
+        assert spec.published_as == "indigo-102"
+
+    def test_a_spec_carries_the_stored_published_identity(self, bridge_mod, mock_logger, devices):
+        """A re-adopted or role-changed entry's identity rides along verbatim."""
+        h = Harness(bridge_mod, mock_logger, devices,
+                    [ExportEntry(102, "dimmableLight", published_as="indigo-102~2")])
+        (spec,) = h.bridge.endpoint_specs()
+        assert spec.published_as == "indigo-102~2"
+
     def test_the_name_override_wins_over_the_indigo_name(self, bridge_mod, mock_logger, devices):
         h = Harness(bridge_mod, mock_logger, devices,
                     [ExportEntry(101, "onOffLight", name_override="Desk Lamp")])
@@ -910,6 +926,17 @@ class TestIncrementalCrud:
         h.bridge.replace(101)
         assert h.client.names() == ["remove_endpoint", "upsert_endpoint"]
         assert h.client.calls[1][1].role == "onOffLight"
+
+    def test_a_role_change_sends_the_new_generation(self, bridge_mod, mock_logger, devices):
+        """Issue #240 — the identity carried by the stored entry, not the old
+        one, is what `replace()`'s add half sends: the node creates a fresh
+        accessory rather than reviving the retired one."""
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(101, "onOffPlugInUnit")])
+        h.start()
+        h.store.upsert(ExportEntry(101, "onOffLight", published_as="indigo-101~2"))
+        h.bridge.replace(101)
+        assert h.client.names() == ["remove_endpoint", "upsert_endpoint"]
+        assert h.client.calls[1][1].published_as == "indigo-101~2"
 
     def test_a_role_change_for_a_vanished_entry_only_removes(self, bridge_mod, mock_logger,
                                                              devices):

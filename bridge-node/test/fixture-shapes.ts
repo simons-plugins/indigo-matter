@@ -32,7 +32,7 @@ const APPLE_HOME = { fabricIndex: 1, label: "Apple Home", vendorId: 4937 } satis
 
 /** Versions are placeholders: the real ones track package.json / matter.js. */
 export const handshake = {
-    protocolVersion: 1,
+    protocolVersion: 2,
     bridgeVersion: "0.0.0-test",
     matterJsVersion: "0.0.0-test",
 } satisfies HandshakeFrame;
@@ -190,7 +190,7 @@ export const windowClosedCommissioned = {
 export const versionMismatch = {
     message_id: "m2",
     error_code: "version_mismatch",
-    details: "Node speaks protocol version 1, client sent 2",
+    details: "Node speaks protocol version 2, client sent 1",
 } satisfies ErrorFrame;
 
 export const notAttached = {
