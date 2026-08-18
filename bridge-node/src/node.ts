@@ -42,7 +42,7 @@ import {
 } from "@matter/main/types";
 
 import type { BridgeConfig } from "./config.js";
-import { ENDPOINT_MAP_FILE, EndpointMapStore, type LiveEndpointNumber, refuseReasonFor } from "./endpoint-map.js";
+import { ENDPOINT_MAP_FILE, EndpointMapStore, refuseReasonFor } from "./endpoint-map.js";
 import { type BridgedIdentity, indigoDeviceIdFrom, isSupportedRole, uniqueIdFor } from "./endpoints.js";
 import {
     type BridgeFacade,
@@ -878,22 +878,31 @@ export class BridgeNode implements BridgeFacade {
     /**
      * The live set as `endpoint-map.json` records it: the number, plus the
      * `role`/`label` that let it be rebuilt at the next start (issue #141).
+     *
+     * Issues #219/#240 — `uniqueId` is `identity.publishedAs`, not a re-
+     * derivation from `indigoDeviceId`: a re-adopted or superseded identity is
+     * no longer a pure function of the device id (§1.1). `deviceId` is carried
+     * along too, for commit 3's `EndpointRecord.deviceId`/`LiveEndpointNumber`
+     * addition — this build's `LiveEndpointNumber` does not declare that field
+     * yet, so no explicit return-type annotation here (an annotated one would
+     * excess-property-check the literal below and refuse to compile);
+     * `EndpointMapStore` reads the fields it knows by name and ignores the
+     * rest, same tolerance as every other additive key.
      */
-    private liveIdentities(): LiveEndpointNumber[] {
+    private liveIdentities() {
         return (this.#registry?.identities() ?? []).map(identity => ({
-            uniqueId: uniqueIdFor(identity.indigoDeviceId),
+            uniqueId: identity.publishedAs,
             endpointNumber: identity.endpointNumber,
             role: identity.role,
             label: identity.label,
             battery: identity.battery,
+            deviceId: identity.indigoDeviceId,
         }));
     }
 
     /** The live set as the map keys it, for the before/after diff below. */
     private liveUniqueIds(): Set<string> {
-        return new Set(
-            (this.#registry?.identities() ?? []).map(identity => uniqueIdFor(identity.indigoDeviceId)),
-        );
+        return new Set((this.#registry?.identities() ?? []).map(identity => identity.publishedAs));
     }
 
     /**

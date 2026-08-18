@@ -189,22 +189,40 @@ export function parseReplaceAll(intent: unknown): boolean {
 /**
  * What an `attach` reconcile has to do to the live endpoint set.
  *
- * `recreate` is the role-change case: §4.1 rejects a role change through
- * `upsert_endpoint`, but `attach` is a *full reconcile* from the peer that owns
- * the export set (§6.2), and failing the whole attach would leave the plugin no
- * way to correct a role at all. So attach removes and re-adds instead. It is
- * still an accessory-identity change in every paired ecosystem, hence its own
- * bucket and its own log line rather than hiding inside `update`.
+ * `recreate` is the in-place case: an identity present in both sets whose
+ * shape changed — a battery gain, or (the pre-#240 version-skew fallback, §1.3)
+ * a role change from a plugin that never bumped `publishedAs`. §4.1 rejects
+ * both through `upsert_endpoint`, but `attach` is a *full reconcile* from the
+ * peer that owns the export set (§6.2), and failing the whole attach would
+ * leave the plugin no way to correct either at all. So attach removes and
+ * re-adds instead, at the SAME `Endpoint.id` — still an accessory-identity
+ * change in every paired ecosystem, hence its own bucket and its own log line
+ * rather than hiding inside `update`.
+ *
+ * A role change that DOES bump `publishedAs` (issue #240's normal path, an
+ * up-to-date plugin) never reaches `recreate` at all: the old identity simply
+ * is not in `desired` (it fails `remove`) and the new one is not in `live`
+ * (it falls to `create`) — a supersede, planned as removal-plus-create because
+ * matter.js hands the new `Endpoint.id` a fresh number rather than reusing the
+ * retired one (F1).
  */
 export interface ReconcilePlan {
     create: EndpointSpec[];
     update: EndpointSpec[];
     recreate: EndpointSpec[];
-    remove: number[];
+    /** Published identities (`publishedAs`), not device ids — issues #219/#240. */
+    remove: string[];
 }
 
 /** What the planner needs to know about one live endpoint (§4.1/§4.2). */
 export interface LiveComposition {
+    /**
+     * The device driving this published identity — issues #219/#240. `live`
+     * is now keyed on `publishedAs`, so this is how the planner (and the
+     * mass-removal guard) still knows which removal and which create belong
+     * to the same Indigo device.
+     */
+    indigoDeviceId: number;
     role: RoleValue;
     /**
      * Whether the LIVE endpoint currently carries PowerSource. Compared against
@@ -219,22 +237,29 @@ export interface LiveComposition {
  * Diff the desired set against the live one, enforcing the §3.1 mass-removal
  * guard.
  *
+ * Keyed on `publishedAs` (issues #219/#240), not `indigoDeviceId`: the same
+ * device can drive different published identities over time (a role-change
+ * supersede bumps the generation), and the reconcile has to tell "this
+ * identity's shape changed" (`recreate`, same key) apart from "this identity
+ * was retired and a new one for the same device took its place" (`remove` +
+ * `create`, two different keys).
+ *
  * The guard is about the *effect*, not the literal empty array: an `attach`
  * carrying a completely disjoint device set would also remove every live
  * endpoint, and that is just as much "every exported accessory disappears from
  * every paired ecosystem" as `endpoints: []` is.
  */
 export function planReconcile(
-    live: ReadonlyMap<number, LiveComposition>,
+    live: ReadonlyMap<string, LiveComposition>,
     desired: readonly EndpointSpec[],
     replaceAll: boolean,
 ): ReconcilePlan {
     const plan: ReconcilePlan = { create: [], update: [], recreate: [], remove: [] };
-    const desiredIds = new Set<number>();
+    const desiredPublishedAs = new Set<string>();
 
     for (const spec of desired) {
-        desiredIds.add(spec.indigoDeviceId);
-        const liveEndpoint = live.get(spec.indigoDeviceId);
+        desiredPublishedAs.add(spec.publishedAs);
+        const liveEndpoint = live.get(spec.publishedAs);
         if (liveEndpoint === undefined) {
             plan.create.push(spec);
         } else if (liveEndpoint.role === spec.role && !(spec.battery && !liveEndpoint.battery)) {
@@ -244,16 +269,28 @@ export function planReconcile(
         }
     }
 
-    for (const indigoDeviceId of live.keys()) {
-        if (!desiredIds.has(indigoDeviceId)) {
-            plan.remove.push(indigoDeviceId);
+    for (const publishedAs of live.keys()) {
+        if (!desiredPublishedAs.has(publishedAs)) {
+            plan.remove.push(publishedAs);
         }
     }
 
-    // A `recreate` is not a removal: the device stays exported, it just changes
-    // accessory type. Counting it as one would refuse a lawful role correction
+    // A `recreate` is not a removal: the identity stays live, it just changes
+    // shape in place. Counting it as one would refuse a lawful role correction
     // on a single-export bridge.
-    const survivors = live.size - plan.remove.length;
+    //
+    // Mass-removal guard fix (#240): a supersede is one `remove` plus one
+    // `create` for the SAME `indigoDeviceId` under two DIFFERENT `publishedAs`
+    // keys — the device stays exported, so it must not count as a departure
+    // either. `supersededCount` is how many removed identities have a sibling
+    // create for the same device; without it, changing the role of the only
+    // exported device on a bridge would be refused as emptying the live set.
+    const createdDeviceIds = new Set(plan.create.map(spec => spec.indigoDeviceId));
+    const supersededCount = plan.remove.filter(publishedAs => {
+        const removedDeviceId = live.get(publishedAs)?.indigoDeviceId;
+        return removedDeviceId !== undefined && createdDeviceIds.has(removedDeviceId);
+    }).length;
+    const survivors = live.size - plan.remove.length + supersededCount;
     if (live.size > 0 && survivors === 0 && !replaceAll) {
         throw new ProtocolError(
             ErrorCode.massRemovalRefused,

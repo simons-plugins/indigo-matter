@@ -158,9 +158,20 @@ class EndpointModel {
     readonly #allocated = new Map<number, number>();
     #next = 2;
 
-    composition(): Map<number, LiveComposition> {
-        return new Map([...this.#endpoints.entries()].map(([id, entry]) =>
-            [id, { role: entry.role, battery: entry.battery }]));
+    /** Keyed on `publishedAs` (issues #219/#240) — see `planReconcile`'s own doc. */
+    composition(): Map<string, LiveComposition> {
+        return new Map([...this.#endpoints.entries()].map(([indigoDeviceId, entry]) =>
+            [entry.publishedAs, { indigoDeviceId, role: entry.role, battery: entry.battery }]));
+    }
+
+    /** The reverse of `composition()`'s key — mirrors `EndpointRegistry#deviceIdFor`. */
+    private deviceIdFor(publishedAs: string): number | undefined {
+        for (const [indigoDeviceId, entry] of this.#endpoints) {
+            if (entry.publishedAs === publishedAs) {
+                return indigoDeviceId;
+            }
+        }
+        return undefined;
     }
 
     summaries(): StatusReport["endpoints"] {
@@ -184,8 +195,11 @@ class EndpointModel {
 
     reconcile(desired: readonly EndpointSpec[], replaceAll: boolean): void {
         const plan = planReconcile(this.composition(), desired, replaceAll);
-        for (const indigoDeviceId of plan.remove) {
-            this.#endpoints.delete(indigoDeviceId);
+        for (const publishedAs of plan.remove) {
+            const indigoDeviceId = this.deviceIdFor(publishedAs);
+            if (indigoDeviceId !== undefined) {
+                this.#endpoints.delete(indigoDeviceId);
+            }
         }
         for (const spec of [...plan.create, ...plan.recreate]) {
             this.#endpoints.delete(spec.indigoDeviceId);

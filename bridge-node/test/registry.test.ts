@@ -1244,6 +1244,78 @@ describe("endpoint-number stability (PRD §4.3 / XAC5)", () => {
     });
 });
 
+describe("supersede & published identity (issues #219/#240)", () => {
+    it("a role change takes a fresh endpoint number and never reuses the retired one", async () => {
+        // The F1 pin, at registry level: a role change that bumps the
+        // generation (an up-to-date plugin) is a supersede, not an in-place
+        // recreate — the new `Endpoint.id` gets a number matter.js has never
+        // handed out before, and the retired one stays retired.
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(1, Role.onOffLight)], false);
+            const before = h.registry.summaries()[0]?.endpointNumber;
+            assert.ok(before !== undefined);
+
+            await h.registry.reconcile([spec(1, Role.dimmableLight, { publishedAs: "indigo-1~2" })], false);
+            const after = h.registry.summaries()[0];
+            assert.equal(after?.publishedAs, "indigo-1~2");
+            assert.notEqual(after?.endpointNumber, before, "the new identity must not reuse the retired number");
+            assert.ok(
+                h.logs.some(line => line.startsWith("Superseding endpoint 1: role onOffLight → dimmableLight.")),
+                h.logs.join("\n"),
+            );
+            assert.ok(h.logs.some(line => line.includes("issue #240")));
+            assert.ok(h.logs.some(line => line.includes("The retired number is never reused.")));
+
+            // A brand-new device added in the same batch must not be handed
+            // the number the supersede just retired either (F1: the allocator
+            // never reuses anything, regardless of who is asking).
+            await h.registry.reconcile(
+                [spec(1, Role.dimmableLight, { publishedAs: "indigo-1~2" }), spec(2, Role.onOffLight)], false,
+            );
+            const newDevice = h.registry.summaries().find(s => s.indigoDeviceId === 2);
+            assert.notEqual(newDevice?.endpointNumber, before);
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("a battery gain keeps the same endpoint number", async () => {
+        // Guards the existing behaviour: owner decision 4 (§9) — only a role
+        // change supersedes, and only when the plugin bumps the generation. A
+        // battery gain is always the in-place recreate, identity unmoved.
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(1, Role.onOffLight, { battery: false })], false);
+            const before = h.registry.summaries()[0]?.endpointNumber;
+
+            await h.registry.reconcile([spec(1, Role.onOffLight, { battery: true })], false);
+            const after = h.registry.summaries()[0];
+            assert.equal(after?.publishedAs, "indigo-1");
+            assert.equal(after?.endpointNumber, before);
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("refuses an upsert that would move a live endpoint's published identity", async () => {
+        const h = await harness();
+        try {
+            await h.registry.upsert(spec(1, Role.onOffLight));
+            const error = await rejects(
+                () => h.registry.upsert(spec(1, Role.onOffLight, { publishedAs: "indigo-1~2" })),
+                ErrorCode.roleChange,
+            );
+            assert.match(error.message, /supersession/);
+            // Unchanged: the refusal must not half-apply the new identity —
+            // only the plugin's remove-then-add `replace()` may retire one.
+            assert.equal(h.registry.summaries()[0]?.publishedAs, "indigo-1");
+        } finally {
+            await h.close();
+        }
+    });
+});
+
 // ---------------------------------------------------------------------------
 // E4: the roles that complete the v1 §4.2 table
 // ---------------------------------------------------------------------------
