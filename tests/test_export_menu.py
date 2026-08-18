@@ -1403,11 +1403,15 @@ class TestGetReadoptDevices:
         assert plug.getReadoptDevices(valuesDict={}) == []
         assert plug.getReadoptDevices(valuesDict={"readoptOrphan": "0"}) == []
 
-    def test_before_startup_is_empty_not_an_error(self, plug):
+    def test_before_startup_says_so_rather_than_showing_no_devices(self, plug, plugin_mod):
+        """XAC9: an empty list reads as "no device can take this role", which
+        is a different fact from "the export list has not loaded yet"."""
         plug.exports = None
         _bridge_with(plug, attached=True)
         plug.runtime = _FakeRuntime(result=[_orphan()])
-        assert plug.getReadoptDevices(valuesDict={"readoptOrphan": "indigo-901"}) == []
+        options = plug.getReadoptDevices(valuesDict={"readoptOrphan": "indigo-901"})
+        assert options == [(plugin_mod.NO_SELECTION_ID,
+                            "(plugin still starting — re-open this dialog in a moment)")]
 
     def test_filters_to_devices_offering_the_orphans_role(self, plug):
         _bridge_with(plug, attached=True)
@@ -1677,3 +1681,88 @@ class TestMenuReadoptExportSuccess:
         said = _said(plug.logger.warning.call_args_list)
         assert "Device 101's own previous accessory has been removed from your ecosystems." \
             in said
+
+
+class TestReadoptOutcomeTruthfulness:
+    """The success WARNING is emitted BEFORE the fire-and-forget bridge work
+    lands, so every way that work can fail has to reach the user."""
+
+    def test_a_failed_nudge_is_not_reported_as_a_successful_re_adopt(self, plug):
+        _bridge_with(plug, attached=True)
+        plug.export_bridge.replace = Mock(side_effect=RuntimeError("socket died"))
+        orphan = _orphan(unique_id="indigo-901", role="onOffPlugInUnit", label="Kitchen Lamp")
+        plug.runtime = _FakeRuntime(result=[orphan])
+
+        ok, _values_out, errors = plug.menuReadoptExport(
+            {"readoptConfirm": True, "readoptOrphan": orphan.unique_id, "readoptDevice": "101"})
+
+        assert ok is False and "readoptDevice" in errors
+        assert "the bridge node was not told" in errors["readoptDevice"]
+        # The store write DID land — the message says "Saved", and this is what
+        # makes that true.
+        assert plug.exports.get(101).published_as == "indigo-901"
+        assert "RE-ADOPTED" not in _said(plug.logger.warning.call_args_list)
+        said = _said(plug.logger.error.call_args_list)
+        assert "export list WAS saved" in said and "catches up at the next" in said
+
+    def test_a_reporting_failure_never_unwinds_a_committed_re_adopt(self, plug):
+        """`_previous_accessory_number` reads a cached StatusReport purely to
+        decorate the log. It runs AFTER the store write and the bridge nudge,
+        so anything it raises would fail a re-adopt that already happened."""
+        client = _bridge_with(plug, attached=True)
+        plug.exports.upsert(ExportEntry(101, "onOffPlugInUnit"))
+
+        class _Exploding:
+            @property
+            def endpoints(self):
+                raise ValueError("not a TypeError")
+
+        client.status = _Exploding()
+        orphan = _orphan(unique_id="indigo-901", role="onOffPlugInUnit", label="Kitchen Lamp")
+        plug.runtime = _FakeRuntime(result=[orphan])
+
+        ok, _values_out = plug.menuReadoptExport(
+            {"readoptConfirm": True, "readoptOrphan": orphan.unique_id, "readoptDevice": "101"})
+
+        assert ok is True
+        assert "RE-ADOPTED" in _said(plug.logger.warning.call_args_list)
+
+    def test_step7_refuses_an_identity_an_ORDINARY_export_already_publishes(self, plug):
+        """`published_as is None` does not mean "claims nothing" — it means
+        "publishes as indigo-<own id>". Missing that let a re-adopt write a
+        SECOND entry publishing one identity, which the node refuses for the
+        whole attach (`malformed_args`), taking every export offline."""
+        plug.exports.upsert(ExportEntry(102, "dimmableLight"))   # publishes as indigo-102
+        _bridge_with(plug, attached=True)
+        orphan = _orphan(unique_id="indigo-102", role="onOffPlugInUnit")
+        plug.runtime = _FakeRuntime(result=[orphan])
+
+        ok, _values_out, errors = plug.menuReadoptExport(
+            {"readoptConfirm": True, "readoptOrphan": orphan.unique_id, "readoptDevice": "101"})
+
+        assert ok is False and "readoptOrphan" in errors
+        assert "already claimed by Indigo device 102" in errors["readoptOrphan"]
+        assert plug.exports.get(101) is None
+
+    def test_a_failed_orphan_re_read_does_not_claim_the_accessory_went_live(self, plug):
+        """Step 3's refusal used to be "something re-exported it while this
+        dialog was open" for every reason the list came back empty — including
+        the node simply not answering, which is a story about the user's house
+        that never happened."""
+        _bridge_with(plug, attached=True)
+        plug.runtime = _FakeRuntime(error=TimeoutError("node did not answer"))
+
+        ok, _values_out, errors = plug.menuReadoptExport(
+            {"readoptConfirm": True, "readoptOrphan": "indigo-901", "readoptDevice": "101"})
+
+        assert ok is False and "readoptOrphan" in errors
+        assert "in use again" not in errors["readoptOrphan"]
+        assert "Could not re-check" in errors["readoptOrphan"]
+        assert "Nothing was changed" in errors["readoptOrphan"]
+        assert "list_orphans" in _said(plug.logger.error.call_args_list)
+
+    def test_a_failed_read_gives_the_device_picker_the_list_error_row(self, plug, plugin_mod):
+        _bridge_with(plug, attached=True)
+        plug.runtime = _FakeRuntime(error=TimeoutError("node did not answer"))
+        assert plug.getReadoptDevices(valuesDict={"readoptOrphan": "indigo-901"}) \
+            == [plugin_mod.LIST_ERROR_OPTION]

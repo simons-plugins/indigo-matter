@@ -946,6 +946,54 @@ class TestIncrementalCrud:
         h.bridge.replace(102)
         assert h.client.names() == ["remove_endpoint"]
 
+    def test_a_vanished_entry_says_the_old_accessory_is_already_gone(
+            self, bridge_mod, mock_logger, devices):
+        """The remove lands FIRST, so returning here in silence leaves the
+        accessory gone from every paired ecosystem with nothing in the log
+        that says so."""
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(102, "dimmableLight")])
+        h.start()
+        h.store.remove(102)
+        h.bridge.replace(102)
+        said = warnings_of(mock_logger)
+        assert "has been removed from every paired ecosystem" in said
+        assert "no longer in the export list" in said
+
+    def test_an_unbuildable_replacement_says_the_old_accessory_is_already_gone(
+            self, bridge_mod, mock_logger, devices, unbridgeable_role):
+        """Same fault, the other bail-out: the entry is still there but no
+        spec can be built for it (a role this build cannot bridge, a device
+        that vanished)."""
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(101, "onOffPlugInUnit")])
+        h.start()
+        h.store.upsert(ExportEntry(101, unbridgeable_role))
+        h.bridge.replace(101)
+        assert h.client.names() == ["remove_endpoint"]
+        assert "replacement could NOT be built" in warnings_of(mock_logger)
+
+    def test_a_never_scheduled_identity_change_warns_rather_than_whispering(
+            self, bridge_mod, mock_logger, devices):
+        """`_fire`'s `lost` gate: most dropped coroutines are re-delivered by
+        the next attach, so they are debug. This one is not — the remove has
+        no backstop that puts the accessory back on its own."""
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(101, "onOffPlugInUnit")])
+        h.start()
+        h.store.upsert(ExportEntry(101, "onOffLight", published_as="indigo-101~2"))
+        h.runtime.is_running = False
+        h.bridge.replace(101)
+        assert "removed and NOT re-added" in warnings_of(mock_logger)
+
+    def test_a_failed_identity_change_names_the_half_finished_state(
+            self, bridge_mod, mock_logger, devices):
+        """`_log_future`'s generic line cannot say this one: `replace()`
+        removes before it adds, so its failure is not "nothing happened"."""
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(101, "onOffPlugInUnit")])
+        h.start()
+        h.store.upsert(ExportEntry(101, "onOffLight", published_as="indigo-101~2"))
+        h.client.fail["upsert_endpoint"] = ConnectionError("socket died mid-write")
+        h.bridge.replace(101)
+        assert "OLD accessory may already have been removed" in warnings_of(mock_logger)
+
 
 # ---------------------------------------------------------------------------
 # Node → Indigo (§5 command events)

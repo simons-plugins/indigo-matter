@@ -606,23 +606,40 @@ class ExportDialogMixin:
                 "Home stuck on \"could not change settings\" until the home hub was restarted "
                 "(issue #240). ")
 
-    def _nudge_export(self, device_id: int, *, role_changed: bool = False) -> None:
+    def _nudge_export(self, device_id: int, *, role_changed: bool = False) -> bool:
         """Tell the bridge about one changed export, without a full reconnect.
 
         A role change is the one case that cannot be an ``upsert``: §4.1 refuses
         it with ``role_change``, so it becomes remove-then-add.
+
+        **Returns whether the bridge was actually told**, because this is only
+        the second of two halves and they can land independently: the store
+        write has already happened by the time anyone calls this, so a caller
+        that reports an outcome to the user (the re-adopt confirmation,
+        PR5 design §4.5) has to be able to report "saved, but not yet applied"
+        rather than announce both. The existing export-dialog caller ignores
+        it: its ``exportStatus`` line already says only what it saved.
         """
         self._exports_changed()  # pylint: disable=no-member  # lifecycle, stays in plugin.py
         bridge = self.export_bridge
         if bridge is None:
-            return
+            return False
         try:
             if role_changed:
                 bridge.replace(device_id)
             else:
                 bridge.upsert(device_id)
         except Exception as exc:  # pylint: disable=broad-except
+            # Names the consequence, not just the failure: the allow-list is
+            # already on disk, so this is "the ecosystems have not caught up
+            # yet", not "the change was lost".
+            self.logger.error(
+                "Matter bridge: the export list WAS saved for device %s, but telling the bridge "
+                "node about it FAILED — %s. Nothing was lost: the accessory catches up at the "
+                "next reconnect/attach, which happens on its own.", device_id, exc)
             self.logger.exception(exc)
+            return False
+        return True
 
     def exportRemove(self, valuesDict, typeId="", devId=0):
         # pylint: disable=unused-argument

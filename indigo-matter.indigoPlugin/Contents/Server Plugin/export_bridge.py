@@ -1155,16 +1155,29 @@ class ExportBridge:
         self._fire(client.remove_endpoint(device_id), f"remove_endpoint dev {device_id}")
 
     def replace(self, device_id: int) -> None:
-        """Re-create one endpoint, because its **role** changed.
+        """Remove one endpoint and add it back, because its **published
+        identity** changed.
 
-        §4.1 rejects a role change on an existing endpoint (``role_change``) —
+        Two callers, one shape. A **role change** is the original one: §4.1
+        rejects a role change on an existing endpoint (``role_change``) —
         ecosystems cache the Matter device type per endpoint — so the only way
-        through is remove-then-add. The accessory is genuinely new to every
+        through is remove-then-add, and the accessory is genuinely new to every
         paired ecosystem afterwards: it loses its name and room assignment
         there, which is why the dialog says so out loud rather than letting the
-        user discover it in the Home app.
+        user discover it in the Home app. A **re-adopt** (issue #219, PR5
+        design §4.4) is the other: the role does not move at all, the device
+        simply starts publishing an identity that already exists in the
+        ecosystems, and the lost-name-and-room sentence above does NOT apply to
+        it — keeping that room is the entire point of the feature. What the two
+        share is that the identity on the wire changes, which §3.2 refuses to
+        do in place either way.
+
+        Whichever it is, the remove lands FIRST and unconditionally: if the
+        add half cannot be built the accessory is already gone from every
+        ecosystem, so both bail-outs below say so rather than returning in
+        silence.
         """
-        client = self._live_client("the role change", device_id)
+        client = self._live_client("the identity change", device_id)
         if client is None:
             return
 
@@ -1172,12 +1185,26 @@ class ExportBridge:
             await client.remove_endpoint(device_id)
             entry = self._store.get(device_id)
             if entry is None:
+                self._logger.warning(
+                    "Matter bridge: device %s's OLD accessory has been removed from every paired "
+                    "ecosystem, but it is no longer in the export list, so no replacement was "
+                    "added. If that un-export was deliberate, nothing more is needed; otherwise "
+                    "re-export the device and the accessory comes back at the next "
+                    "reconnect/attach.", device_id)
                 return
             spec = self._spec_for(entry)
-            if spec is not None:
-                await client.upsert_endpoint(spec)
+            if spec is None:
+                self._logger.warning(
+                    "Matter bridge: device %s's OLD accessory has been removed from every paired "
+                    "ecosystem, but the replacement could NOT be built (the reason is logged "
+                    "above). The accessory returns at the next reconnect/attach once the device "
+                    "is exportable again.", device_id)
+                return
+            await client.upsert_endpoint(spec)
 
-        self._fire(_recreate(), f"role change for dev {device_id}")
+        self._fire(_recreate(), f"identity change for dev {device_id}",
+                   lost=f"device {device_id}'s accessory has been removed and NOT re-added; it "
+                        "returns at the next reconnect/attach")
 
     # ------------------------------------------------------------------
     # Node → Indigo (§5 command events; runs on the loop thread)
@@ -1825,6 +1852,15 @@ class ExportBridge:
             # does not say whether that heals itself or needs a human.
             self._logger.warning(
                 "Matter bridge: %s failed — %s. The device is not exported until the next "
+                "reconnect/attach.", what, exc)
+        elif what.startswith("identity change"):
+            # Worse than the above, and worth its own sentence: `replace()`
+            # removes BEFORE it adds, so a failure anywhere in that coroutine
+            # may leave the old accessory already gone from every ecosystem
+            # with nothing in its place.
+            self._logger.warning(
+                "Matter bridge: %s failed — %s. The OLD accessory may already have been removed "
+                "from your ecosystems with no replacement added; it returns at the next "
                 "reconnect/attach.", what, exc)
         else:
             self._logger.warning("Matter bridge: %s failed — %s", what, exc)

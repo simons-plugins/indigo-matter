@@ -69,6 +69,18 @@ class ShareWindowRequest:
         return f"share window for node {node_id_to_str(self.node_id)}"
 
 
+class ReadoptOrphansUnavailable(Exception):
+    """The §3.12 orphan read was ATTEMPTED and did not answer (issue #219).
+
+    Distinct from "there are no orphans" and from "there is no attached client
+    to ask", because only this one means *we do not know*. Collapsing the three
+    into one ``None`` is what let the re-adopt execute path tell a user that
+    something had re-exported their accessory when in fact the bridge node had
+    simply not replied — a wrong story about their house, told from a failure
+    to read.
+    """
+
+
 class ServerMenuMixin:
     """matter-server install/restart, manual commission/decommission-device,
     export-bridge recovery, and bridge-node LaunchAgent menus.
@@ -839,8 +851,15 @@ class ServerMenuMixin:
     # Re-adopt a Matter accessory… (§4, issue #219)
     # ------------------------------------------------------------------
     def _live_readopt_orphans(self):
-        """A fresh §3.12 orphan list, or ``None`` if the bridge is not
-        attached or the read failed.
+        """A fresh §3.12 orphan list; ``None`` when there is no attached
+        bridge client to ask at all.
+
+        Raises :class:`ReadoptOrphansUnavailable` when a client WAS there and
+        the read itself failed (no answer, a timeout, an unparseable reply).
+        Three outcomes, three answers: an empty list means the node says
+        nothing is left behind, ``None`` means nobody was there to ask, and the
+        exception means we asked and do not know. Only the first is safe to act
+        on.
 
         Deliberately does its OWN live read every time it is called, rather
         than one picker populating a cache the other depends on: ConfigUI
@@ -859,8 +878,12 @@ class ServerMenuMixin:
             return self.runtime.submit(
                 client.list_orphans()).result(timeout=READOPT_ORPHANS_TIMEOUT)
         except Exception as exc:  # pylint: disable=broad-except
+            self.logger.error(
+                "Matter bridge: reading the bridge node's left-behind accessory list "
+                "(list_orphans, §3.12) FAILED — %s. Nothing was changed; the re-adopt dialog "
+                "cannot be trusted until the node answers again.", exc)
             self.logger.exception(exc)
-            return None
+            raise ReadoptOrphansUnavailable(str(exc)) from exc
 
     @staticmethod
     def _format_orphan_date(orphaned_at) -> str:
@@ -908,22 +931,18 @@ class ServerMenuMixin:
         build this from — fabrics arrive on a ``fabrics_changed`` event
         (``PairingMenuMixin.getBridgeFabrics``) and orphans have no
         equivalent push — so this reads §3.12 live. Not attached and the read
-        itself failing are two different facts (only one names a remedy), so
-        this checks the gate itself rather than going through
-        :meth:`_live_readopt_orphans`, which collapses both into ``None`` for
-        its OTHER two callers, where the distinction does not matter.
+        itself failing are two different facts (only one names a remedy), and
+        :meth:`_live_readopt_orphans` keeps them apart for every caller —
+        ``None`` for the gate, :class:`ReadoptOrphansUnavailable` for the read
+        — so this simply renders each.
         """
-        bridge = self.export_bridge
-        client = bridge.client if bridge is not None else None
-        if client is None or not client.attached:
+        try:
+            orphans = self._live_readopt_orphans()
+        except ReadoptOrphansUnavailable:
+            return [LIST_ERROR_OPTION]
+        if orphans is None:
             return [(NO_SELECTION_ID, "(not connected to the Matter bridge node — start it, "
                                        "let the plugin attach, then re-open this dialog)")]
-        try:
-            orphans = self.runtime.submit(
-                client.list_orphans()).result(timeout=READOPT_ORPHANS_TIMEOUT)
-        except Exception as exc:  # pylint: disable=broad-except
-            self.logger.exception(exc)
-            return [LIST_ERROR_OPTION]
         return self._readopt_orphan_options(orphans)
 
     def readoptOrphanChanged(self, valuesDict, typeId="", devId=0):  # noqa: N802, ARG002
@@ -951,8 +970,14 @@ class ServerMenuMixin:
         embeds, not merely by it being non-default: a device publishing under
         its OWN ``indigo-<ownId>~<generation>`` (it has changed role at some
         point, issue #240) has claimed nobody else's accessory and stays in
-        the picker — E2 keeps "``indigo-<newId>``, or a generation of it" as
-        the explicitly-allowed already-exported case.
+        the picker — PR5 design E2 keeps "``indigo-<newId>``, or a generation
+        of it" as the explicitly-allowed already-exported case.
+
+        The identity compared is the EFFECTIVE one — ``published_as`` where an
+        entry has one, otherwise the default derivation it publishes under —
+        so this reads the same way as :meth:`_readopt_identity_claimant`'s
+        step-7 check rather than treating ``published_as is None`` as "claims
+        nothing".
         """
         verdict = export_catalog.classify(dev, plugin_id)
         if isinstance(verdict, export_catalog.Excluded):
@@ -960,10 +985,12 @@ class ServerMenuMixin:
         if orphan.role not in verdict.eligible_roles:
             return None
         entry = self.exports.get(dev.id)
-        if entry is not None and entry.published_as and entry.published_as != orphan.unique_id:
-            claimed = parse_published_id(entry.published_as)
-            if claimed is None or claimed.device_id != dev.id:
-                return None  # already re-adopted onto a DIFFERENT orphan
+        if entry is not None:
+            publishing_as = entry.published_as or published_id_for(dev.id)
+            if publishing_as != orphan.unique_id:
+                claimed = parse_published_id(publishing_as)
+                if claimed is None or claimed.device_id != dev.id:
+                    return None  # already re-adopted onto a DIFFERENT orphan
         mark = "● " if dev.id in exported else ""
         return (str(dev.id), f"{mark}{dev.name}")
 
@@ -974,11 +1001,18 @@ class ServerMenuMixin:
         """
         try:
             if self.exports is None:
-                return []
+                return [(NO_SELECTION_ID,
+                         "(plugin still starting — re-open this dialog in a moment)")]
             selected = str((valuesDict or {}).get("readoptOrphan", "") or "")
             if not selected or selected == NO_SELECTION_ID:
                 return []
-            orphans = self._live_readopt_orphans() or []
+            try:
+                orphans = self._live_readopt_orphans() or []
+            except ReadoptOrphansUnavailable:
+                # Same row the orphan picker above it is showing, for the same
+                # read: a list that could not be built must not look like a
+                # list of no eligible devices.
+                return [LIST_ERROR_OPTION]
             orphan = next((o for o in orphans if o.unique_id == selected), None)
             if orphan is None or not orphan.role:
                 return []
@@ -1015,22 +1049,40 @@ class ServerMenuMixin:
             for summary in status.endpoints:
                 if summary.indigo_device_id == device_id:
                     return summary.endpoint_number
-        except TypeError:
+        except Exception:  # pylint: disable=broad-except
             # A malformed/unexpected `status.endpoints` degrades to "nothing
             # to report" — the confirmation log must never raise over a
-            # cosmetic omission.
+            # cosmetic omission, and by the time it runs the store write and
+            # the bridge nudge have both already landed, so an exception here
+            # would unwind the REPORT of a change that is not itself undone.
+            # Deliberately every exception, not just the `TypeError` a
+            # non-iterable produces: the docstring's promise is unconditional
+            # and a summary object with a raising property would break a
+            # narrower one.
             return None
         return None
 
     def _readopt_identity_claimant(self, unique_id: str, device_id: int) -> Optional[int]:
         """Another ``ExportStore`` entry already publishing as ``unique_id``
-        (§4.4 step 7, edge case E12) — the plugin-side half of the
+        (PR5 design §4.4 step 7, edge case E12) — the plugin-side half of the
         duplicate-identity guard. The node's own duplicate-``publishedAs``
         refusal at attach time (``parseEndpointSpecs``) is the backstop that
         actually matters — a hand-edited ``.indiPref`` bypasses this one.
+
+        **Compares EFFECTIVE identities, not the stored field.**
+        ``published_as`` is ``None`` on every ordinary export, and that does
+        not mean "claims nothing": it means "publishes as
+        ``indigo-<own device id>``". Matching the raw field made an ordinary
+        export's claim invisible here, so a re-adopt of that same identity was
+        allowed to write a SECOND entry publishing it — and the node refuses a
+        duplicate ``publishedAs`` for the whole attach (``malformed_args``),
+        which takes every export offline rather than just the new one.
         """
         for entry in self.exports.all():
-            if entry.indigo_device_id != device_id and entry.published_as == unique_id:
+            if entry.indigo_device_id == device_id:
+                continue
+            claimed = entry.published_as or published_id_for(entry.indigo_device_id)
+            if claimed == unique_id:
                 return entry.indigo_device_id
         return None
 
@@ -1089,8 +1141,20 @@ class ServerMenuMixin:
         if not orphan_id or orphan_id == NO_SELECTION_ID:
             errors["readoptOrphan"] = "Select a left-behind accessory to re-adopt."
             return None
-        orphans = self._live_readopt_orphans()
-        orphan = next((o for o in (orphans or []) if o.unique_id == orphan_id), None)
+        try:
+            orphans = self._live_readopt_orphans()
+        except ReadoptOrphansUnavailable:
+            orphans = None
+        if orphans is None:
+            # NOT the E6 story below: nothing re-exported anything, we simply
+            # could not re-read the list, and step 3 exists precisely because
+            # the picker's own read is not trusted at Execute time.
+            self._readopt_refuse(errors, "readoptOrphan",
+                                 "Could not re-check the left-behind accessory list — the bridge "
+                                 "node did not answer. Nothing was changed; try again once the "
+                                 "plugin has reconnected.")
+            return None
+        orphan = next((o for o in orphans if o.unique_id == orphan_id), None)
         if orphan is None:
             self._readopt_refuse(errors, "readoptOrphan",
                                  "That accessory is in use again — something re-exported it "
@@ -1165,9 +1229,18 @@ class ServerMenuMixin:
             errors["readoptDevice"] = "FAILED to save the export list — see Event Log."
             return (False, valuesDict, errors)
         # The remove-then-add path — the device's PUBLISHED IDENTITY changed,
-        # the same shape as a role change (§4.4) even though the role itself
-        # did not move here.
-        self._nudge_export(device_id, role_changed=True)  # pylint: disable=no-member  # ExportDialogMixin
+        # the same shape as a role change (PR5 design §4.4) even though the
+        # role itself did not move here.
+        told = self._nudge_export(device_id, role_changed=True)  # pylint: disable=no-member  # ExportDialogMixin
+        if not told:
+            # The store write stands (re-attaching WILL apply it), but the
+            # §4.5 WARNING claims every ecosystem has already kept its room —
+            # and that has not happened yet. Reporting it here would be the
+            # same "success over an operation that did not land" this whole
+            # menu is written to avoid.
+            errors["readoptDevice"] = ("Saved, but the bridge node was not told — "
+                                       "see Event Log.")
+            return (False, valuesDict, errors)
         self._log_readopt_confirmation(client, orphan, dev, device_id, previous)
         return (True, valuesDict)
 
