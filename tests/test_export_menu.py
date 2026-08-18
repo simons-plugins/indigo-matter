@@ -1928,6 +1928,16 @@ class TestGetMigrateSources:
         options = plug.getMigrateSources(valuesDict={})
         assert [key for key, _label in options] == ["101", "102"]
 
+    def test_it_says_so_when_it_fails_outright(self, plug, plugin_mod, monkeypatch):
+        """Issue #246 review finding 4 — the same outer try/except discipline
+        every sibling picker (``getExportCandidates``, ``getMigrateDevices``,
+        ``getReadoptOrphans``) already has, so a broken store degrades to one
+        error row rather than taking the whole dialog down."""
+        plug.exports.upsert(ExportEntry(101, "onOffPlugInUnit"))
+        monkeypatch.setattr(plug.exports, "all", Mock(side_effect=RuntimeError("boom")))
+        assert plug.getMigrateSources(valuesDict={}) == [plugin_mod.LIST_ERROR_OPTION]
+        plug.logger.exception.assert_called()
+
 
 class TestGetMigrateDevices:
     """§3.2 — the target picker: reuses `_readopt_device_row`'s per-device
@@ -2173,7 +2183,7 @@ class TestMenuMigrateExportSuccess:
         assert "accessory number 7" in said
         assert "from Indigo device 101" in said
         assert 'to "Garage Plug" (id 106)' in said
-        assert "No paired ecosystem processed any change" in said
+        assert "identity never lapsed and nothing about it was removed or re-added" in said
         assert "previous accessory" not in said   # device 106 was never exported before
 
     def test_confirmation_log_names_the_targets_own_previous_accessory(self, plug, devices):
@@ -2191,6 +2201,83 @@ class TestMenuMigrateExportSuccess:
         said = _said(plug.logger.warning.call_args_list)
         assert '"Garage Plug"\'s own previous accessory (number 11) has been removed ' \
             "from your ecosystems." in said
+
+    def test_confirmation_removal_sentence_survives_an_unknown_number(self, plug, devices):
+        """Issue #246 review finding 3 — gated on whether the target's own
+        accessory was actually REMOVED (a pre-existing entry discarded by the
+        atomic commit), not on whether ``_previous_accessory_number`` could
+        read its number from a cached ``StatusReport``. The default fake
+        client here has no status configured at all, so the number is
+        unknown — the sentence must still appear, just without one."""
+        devices.add(RelayDevice(106, "Garage Plug"))
+        plug.exports.upsert(ExportEntry(101, "onOffPlugInUnit"))
+        plug.exports.upsert(ExportEntry(106, "onOffPlugInUnit"))
+        _bridge_with(plug, attached=True)   # client.status left unset -> unreadable
+        plug.export_bridge.reattach = Mock(return_value=True)
+
+        ok, _values_out = plug.menuMigrateExport(
+            {"migrateConfirm": True, "migrateSource": "101", "migrateDevice": "106"})
+
+        assert ok is True
+        said = _said(plug.logger.warning.call_args_list)
+        assert '"Garage Plug"\'s own previous accessory has been removed from your ecosystems.' \
+            in said
+        assert "(number" not in said
+
+    def test_confirmation_headline_present_without_a_removal_sentence_when_the_target_was_bare(
+            self, plug, devices):
+        """The inverse: no pre-existing target entry -> nothing was removed,
+        so the removal sentence stays absent, but the (now correctly scoped)
+        headline still fires."""
+        devices.add(RelayDevice(106, "Garage Plug"))
+        plug.exports.upsert(ExportEntry(101, "onOffPlugInUnit"))
+        _bridge_with(plug, attached=True)
+        plug.export_bridge.reattach = Mock(return_value=True)
+
+        ok, _values_out = plug.menuMigrateExport(
+            {"migrateConfirm": True, "migrateSource": "101", "migrateDevice": "106"})
+
+        assert ok is True
+        said = _said(plug.logger.warning.call_args_list)
+        assert "identity never lapsed and nothing about it was removed or re-added" in said
+        assert "previous accessory" not in said
+
+    def test_a_deleted_source_device_still_commits_with_a_placeholder_label(self, plug, devices):
+        """The allow-list entry is the legitimate migrate source even once its
+        Indigo device is gone (:meth:`ServerMenuMixin.getMigrateSources`'s own
+        contract) — the commit must not depend on a live source device, and
+        the confirmation has to fall back to `_migrate_source_display_name`'s
+        "device <id>" placeholder rather than raising."""
+        devices.add(RelayDevice(106, "Garage Plug"))
+        plug.exports.upsert(ExportEntry(999999, "onOffPlugInUnit"))
+        _bridge_with(plug, attached=True)
+        plug.export_bridge.reattach = Mock(return_value=True)
+
+        ok, _values_out = plug.menuMigrateExport(
+            {"migrateConfirm": True, "migrateSource": "999999", "migrateDevice": "106"})
+
+        assert ok is True
+        assert plug.exports.get(999999) is None
+        assert plug.exports.get(106).published_as == "indigo-999999"
+        said = _said(plug.logger.warning.call_args_list)
+        assert 'MIGRATED accessory "device 999999"' in said
+        assert "from Indigo device 999999" in said
+
+    def test_a_successful_migrate_refreshes_the_exported_ids_hot_path_set(self, plug, devices):
+        """``_exports_changed`` (plugin.py:361) is the seam every store write
+        must call — it refreshes ``_exported_ids``, the set ``deviceUpdated``
+        consults on Indigo's own callback thread. A migrate has to call it
+        too: source out, target in."""
+        devices.add(RelayDevice(106, "Garage Plug"))
+        plug.exports.upsert(ExportEntry(101, "onOffPlugInUnit"))
+        _bridge_with(plug, attached=True)
+        plug.export_bridge.reattach = Mock(return_value=True)
+
+        plug.menuMigrateExport(
+            {"migrateConfirm": True, "migrateSource": "101", "migrateDevice": "106"})
+
+        assert 101 not in plug._exported_ids
+        assert 106 in plug._exported_ids
 
 
 class TestMigrateOutcomeTruthfulness:
@@ -2210,3 +2297,71 @@ class TestMigrateOutcomeTruthfulness:
         assert plug.exports.get(106).published_as == "indigo-101"
         assert plug.exports.get(101) is None
         assert "MIGRATED" not in _said(plug.logger.warning.call_args_list)
+
+
+# ---------------------------------------------------------------------------
+# Re-exporting/role-changing after a migrate — no stolen identities
+# (issue #246 review finding 1)
+# ---------------------------------------------------------------------------
+class TestReExportAfterMigrateIdentityCollisionGuard:
+    """A migrate moves a device's accessory identity onto ANOTHER device's
+    entry. Re-exporting the original device (or role-changing either side)
+    afterwards through the ordinary "Manage Matter Exports…" dialog must
+    never try to publish an identity another entry already claims — the node
+    refuses a duplicate ``publishedAs`` for the WHOLE attach
+    (``parseEndpointSpecs``, ``malformed_args``), taking every export
+    offline, not just the new one.
+    """
+
+    def _migrate_101_to_106(self, plug, devices):
+        devices.add(RelayDevice(106, "Garage Plug"))
+        plug.exports.upsert(ExportEntry(101, "onOffPlugInUnit"))
+        _bridge_with(plug, attached=True)
+        plug.export_bridge.reattach = Mock(return_value=True)
+        ok, _values_out = plug.menuMigrateExport(
+            {"migrateConfirm": True, "migrateSource": "101", "migrateDevice": "106"})
+        assert ok is True
+        assert plug.exports.get(106).published_as == "indigo-101"
+        assert plug.exports.get(101) is None
+
+    def test_reexporting_the_migrated_away_device_gets_a_fresh_identity(self, plug, devices):
+        self._migrate_101_to_106(plug, devices)
+
+        values = plug.exportAddOrUpdate(
+            _values(exportDevice="101", exportRole="onOffPlugInUnit"), "manageMatterExports")
+
+        entry = plug.exports.get(101)
+        assert entry is not None
+        assert entry.published_as == "indigo-101~2", "explicit, not None — indigo-101 is taken"
+        identities = [e.published_as or f"indigo-{e.indigo_device_id}" for e in plug.exports.all()]
+        assert len(identities) == len(set(identities)), "no duplicate identities in the store"
+        assert "Added Study Plug" in values["exportStatus"]
+        said = _said(plug.logger.info.call_args_list)
+        assert "migrated to another device" in said
+        assert "NEW accessory" in said
+        assert "does not steal back the migrated one" in said
+
+    def test_an_unmigrated_re_export_is_unaffected_and_still_stores_none(self, plug):
+        """The common case (nobody has ever migrated anything) is untouched:
+        a fresh export still stores ``published_as=None``, publishing the
+        default derivation, exactly as before this guard existed."""
+        plug.exportAddOrUpdate(
+            _values(exportDevice="101", exportRole="onOffPlugInUnit"), "manageMatterExports")
+        assert plug.exports.get(101).published_as is None
+
+    def test_role_change_after_migrate_walks_past_a_claimed_generation(self, plug, devices):
+        """B's migrated entry (indigo-101) role-changes while indigo-101~2 is
+        ALSO claimed (by A, re-exported in the meantime) — B must land on
+        indigo-101~3, not collide with A."""
+        self._migrate_101_to_106(plug, devices)
+        plug.exportAddOrUpdate(
+            _values(exportDevice="101", exportRole="onOffPlugInUnit"), "manageMatterExports")
+        assert plug.exports.get(101).published_as == "indigo-101~2"
+
+        plug.exportAddOrUpdate(
+            _values(exportDevice="106", exportRole="onOffLight"), "manageMatterExports")
+
+        entry = plug.exports.get(106)
+        assert entry.published_as == "indigo-101~3"
+        identities = [e.published_as or f"indigo-{e.indigo_device_id}" for e in plug.exports.all()]
+        assert len(identities) == len(set(identities))

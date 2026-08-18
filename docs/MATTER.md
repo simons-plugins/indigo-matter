@@ -651,15 +651,23 @@ rebuilt under a new id while the old one is still sitting there — use
 **`Plugin ▸ Migrate an exported accessory…`** rather than deleting anything.
 Pick the currently-exported accessory, pick the Indigo device that should
 drive it from now on, and confirm. The accessory's identity never lapses:
-the old device is simply told to stop, and the new one takes over under the
-SAME identity and the SAME accessory number, so no ecosystem ever processes
-a removal — nothing is lost, not the room, not the name, not a single scene
-or automation. The old Indigo device stays in Indigo, just no longer
-exported.
+the old device's entry simply leaves the export list, and the new device
+takes over under the SAME identity and the SAME accessory number, so no
+ecosystem ever processes a removal — nothing is lost, not the room, not the
+name, not a single scene or automation. The old Indigo device stays in
+Indigo, just no longer exported.
+
+If the device you migrate onto already has its own exported accessory, THAT
+accessory is removed from every ecosystem and replaced by the migrated one —
+the dialog marks it and warns you before you confirm.
 
 It only works onto a device that can take the accessory's role, for the same
 reason re-adopt below has that limit — export the device normally instead if
 it cannot, and accept that it becomes a new accessory.
+
+The old Indigo device is not locked out afterwards — you can export it again
+later — but re-exporting it makes a NEW accessory under a fresh identity; it
+does not steal back the identity you just migrated away.
 
 ### If you delete and recreate an exported device
 

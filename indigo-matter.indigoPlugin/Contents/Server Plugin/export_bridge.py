@@ -113,9 +113,10 @@ REVIVABLE_HALT_REASONS = frozenset({"version_skew", bridge_protocol.ERR_VERSION_
 #: :func:`bridge_client.attach_timeout_for` deadline before giving up on the
 #: ``Future`` that carries it, so the OUTER wait is never the tighter of the
 #: two deadlines — the same headroom reasoning as
-#: :data:`bridge_client.REBUILD_TIMEOUT_HEADROOM`, and the same ratio
-#: :data:`plugin_constants.READOPT_ORPHANS_TIMEOUT` keeps over
-#: ``bridge_client.DEFAULT_TIMEOUT``.
+#: :data:`bridge_client.REBUILD_TIMEOUT_HEADROOM`, and the same 5.0 margin
+#: :data:`plugin_constants.READOPT_ORPHANS_TIMEOUT` (15.0) keeps over
+#: ``bridge_client.DEFAULT_TIMEOUT`` (10.0) — a fixed headroom, not a ratio
+#: (a ratio reading would prescribe 1.5x here, not +5.0).
 REATTACH_RESULT_HEADROOM = 5.0
 
 #: PRD §5.5's wholesale export switch. **Absent means ON**, because it arrived in
@@ -868,20 +869,73 @@ class ExportBridge:
         (``menuMigrateExport`` step 2) has already verified one via
         ``ServerMenuMixin._recovery_client(require_attached=True)``, the same
         precondition re-adopt's execute path demands (PR5 design E1).
+
+        **Three failure classes, three honest messages (issue #246 review
+        finding 2).** A single broad ``except`` used to give every one of them
+        the SAME "the bridge node catches up at the next reconnect/attach,
+        which happens on its own" sentence — true only for the first:
+
+        * :class:`ConnectionError` — the socket is gone. This IS the
+          self-heals-on-its-own case: the next reconnect's handshake attach
+          carries the same specs.
+        * :class:`bridge_protocol.BridgeProtocolError` — a REFUSAL on a
+          healthy socket. Nothing is reconnecting to retry this; the migrate
+          stays unapplied until the cause is fixed and re-run (or the plugin
+          reconnects some other way).
+        * :class:`TimeoutError` — either the inner ``asyncio.wait_for`` deadline
+          or the outer :meth:`concurrent.futures.Future.result` one; since
+          Python 3.11 ``asyncio.TimeoutError``/``concurrent.futures.TimeoutError``
+          are BOTH aliases of the builtin, so one ``except`` catches either.
+          The attach MAY have landed late. It stringifies to ``""``
+          (``ws_json_client._request_frame`` raises the bare ``asyncio.wait_for``
+          timeout, unlike its ``_handshake_request`` sibling), so the message
+          is built from the deadline, not from ``str(exc)``. Returns ``False``
+          regardless — the dialog's "saved, but not told" degradation is the
+          honest one; racing a late result back through :meth:`_on_attached`
+          is out of scope.
         """
         client = self.client
         if client is None:
+            # The dialog's own error says "see Event Log" (server_menu_mixin's
+            # "Saved, but the bridge node was not told") — this is that line,
+            # for the mid-dialog-disconnect race that reaches here with no
+            # client left to nudge at all.
+            self._logger.warning(
+                "Matter bridge: migrate reattach requested but there is no bridge client to "
+                "attach to — the export list WAS saved; it applies at the next connection.")
             return False
         specs = self.endpoint_specs()
         timeout = attach_timeout_for(len(specs))
+        outer_timeout = timeout + REATTACH_RESULT_HEADROOM
         try:
             status = self._runtime.submit(
-                client.attach(specs, timeout=timeout)).result(timeout=timeout + REATTACH_RESULT_HEADROOM)
-        except Exception as exc:  # pylint: disable=broad-except
+                client.attach(specs, timeout=timeout)).result(timeout=outer_timeout)
+        except ConnectionError as exc:
             self._logger.error(
                 "Matter bridge: migrate reattach FAILED — %s. The export list WAS saved; the "
                 "bridge node catches up at the next reconnect/attach, which happens on its own.",
                 exc)
+            return False
+        except bridge_protocol.BridgeProtocolError as exc:
+            self._logger.error(
+                "Matter bridge: migrate reattach REFUSED by the bridge node (%s: %s). The "
+                "export list WAS saved, but no reconnect is coming to apply it — the migrate "
+                "stays UNAPPLIED until the cause is fixed and the migrate is re-run (or the "
+                "plugin reconnects).", exc.code, exc.details)
+            return False
+        except TimeoutError:
+            # Stringifies to "" (see docstring) — the message is built from
+            # the deadline, never from str(exc).
+            self._logger.error(
+                "Matter bridge: migrate reattach TIMED OUT waiting %.0fs for the bridge node's "
+                "answer. The attach may or may not have applied — re-open the dialog or check "
+                "the bridge status before assuming either way.", outer_timeout)
+            return False
+        except Exception as exc:  # pylint: disable=broad-except  # genuinely unforeseen — none of the three above
+            self._logger.error(
+                "Matter bridge: migrate reattach FAILED with an unexpected error — %s. The "
+                "export list WAS saved; whether the bridge node has it is unknown — check the "
+                "bridge status before assuming either way.", exc)
             self._logger.exception(exc)
             return False
         self._on_attached(status, carried_replace_all=False)

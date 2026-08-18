@@ -887,25 +887,30 @@ class ServerMenuMixin:
         exists)" in place of the device's name, since there is nothing else
         to call it.
         """
-        if self.exports is None:
-            return [(NO_SELECTION_ID, "(plugin still starting — re-open this dialog in a moment)")]
-        entries = self.exports.all()
-        if not entries:
-            return [(NO_SELECTION_ID, "(nothing is currently exported — nothing to migrate)")]
-        bridge = self.export_bridge
-        client = bridge.client if bridge is not None else None
-        options = []
-        for entry in entries:
-            identity = entry.published_as or published_id_for(entry.indigo_device_id)
-            dev = self._indigo_device(entry.indigo_device_id)  # pylint: disable=no-member  # ExportDialogMixin
-            name = dev.name if dev is not None \
-                else f"(device {entry.indigo_device_id} no longer exists)"
-            number = self._previous_accessory_number(client, entry.indigo_device_id)
-            suffix = f" (accessory #{number})" if number is not None else ""
-            options.append((str(entry.indigo_device_id),
-                            f"{name} — {export_catalog.role_label(entry.role)} — "
-                            f"accessory {identity}{suffix}"))
-        return options
+        try:
+            if self.exports is None:
+                return [(NO_SELECTION_ID,
+                         "(plugin still starting — re-open this dialog in a moment)")]
+            entries = self.exports.all()
+            if not entries:
+                return [(NO_SELECTION_ID, "(nothing is currently exported — nothing to migrate)")]
+            bridge = self.export_bridge
+            client = bridge.client if bridge is not None else None
+            options = []
+            for entry in entries:
+                identity = entry.published_as or published_id_for(entry.indigo_device_id)
+                dev = self._indigo_device(entry.indigo_device_id)  # pylint: disable=no-member  # ExportDialogMixin
+                name = dev.name if dev is not None \
+                    else f"(device {entry.indigo_device_id} no longer exists)"
+                number = self._previous_accessory_number(client, entry.indigo_device_id)
+                suffix = f" (accessory #{number})" if number is not None else ""
+                options.append((str(entry.indigo_device_id),
+                                f"{name} — {export_catalog.role_label(entry.role)} — "
+                                f"accessory {identity}{suffix}"))
+            return options
+        except Exception as exc:  # pylint: disable=broad-except  # #246 finding 4 — sibling pickers' discipline
+            self.logger.exception(exc)
+            return [LIST_ERROR_OPTION]
 
     def migrateSourceChanged(self, valuesDict, typeId="", devId=0):  # noqa: N802, ARG002
         """No-op callback on the source menu (#246 design §3.2) — see
@@ -1068,28 +1073,47 @@ class ServerMenuMixin:
         return dev.name if dev is not None else f"device {source_id}"
 
     def _log_migrate_confirmation(self, source_id: int, source_entry, dev, source_number,
-                                  target_previous_number) -> None:  # pylint: disable=too-many-arguments
+                                  target_previous, target_previous_number) -> None:
+        # pylint: disable=too-many-arguments
         """#246 design §3.2 step 8 — the one WARNING a successful migrate leaves
         behind. Mirrors :meth:`_log_readopt_confirmation`'s shape, but the
-        promise it makes is the one migrate actually earns: the identity never
-        lapsed, so no ecosystem ever processed a removal, and room, name,
-        scenes and automations survive BECAUSE of that — not despite it, the
-        way re-adopt's corrected wording has to qualify its own promise.
+        promise it makes is the one migrate actually earns: the MIGRATED
+        accessory's identity never lapsed, so no ecosystem ever processed a
+        removal of IT, and its room, name, scenes and automations survive
+        BECAUSE of that — not despite it, the way re-adopt's corrected wording
+        has to qualify its own promise.
+
+        **The headline is scoped to the migrated accessory itself (issue #246
+        review finding 3).** It used to read "nothing was removed and nothing
+        was re-added" unconditionally — false in the ● target-already-exported
+        case, where this very attach DID remove the target's own accessory.
+        The corrective sentence below is what covers that; the headline no
+        longer claims what it cannot promise for the whole operation.
+
+        **The removal sentence is gated on whether a removal actually
+        happened (``target_previous is not None``), not on whether its NUMBER
+        could be read (``target_previous_number``).** Those used to be the
+        same test, but they answer different questions — a target's own
+        accessory can be discarded by the atomic commit even when the client
+        has no cached :class:`~bridge_protocol.StatusReport` naming its
+        number, and gating on the number silently dropped the sentence for
+        that case even though the removal genuinely happened. ``(number N)``
+        is decoration, included only when it happens to be known.
         """
         role_label = export_catalog.role_label(source_entry.role)
         label = source_entry.label_for(self._migrate_source_display_name(source_id))
         role_and_number = (f"{role_label}, accessory number {source_number}"
                            if source_number is not None else role_label)
         superseded = ""
-        if target_previous_number is not None:
-            clause = f" (number {target_previous_number})"
+        if target_previous is not None:
+            clause = f" (number {target_previous_number})" if target_previous_number is not None else ""
             superseded = (f' "{dev.name}"\'s own previous accessory{clause} has been removed '
                           "from your ecosystems.")
         self.logger.warning(
             'Matter export: MIGRATED accessory "%s" (%s) from Indigo device %s to "%s" '
-            '(id %s). No paired ecosystem processed any change — the accessory keeps its '
-            'room, its name, and every scene and automation, because nothing was removed and '
-            'nothing was re-added.%s',
+            '(id %s). The migrated accessory keeps its room, its name, and every scene and '
+            'automation — its identity never lapsed and nothing about it was removed or '
+            're-added.%s',
             label, role_and_number, source_id, dev.name, dev.id, superseded)
 
     def _migrate_commit(self, client, source_id, source_entry, dev, errors, valuesDict):
@@ -1107,9 +1131,12 @@ class ServerMenuMixin:
         own accessory — the ● warning in the dialog already said so.
 
         The pre-migrate accessory numbers are read BEFORE the store write and
-        the nudge, because both make the bridge's live status describe the
-        NEW arrangement — by the time the confirmation logs, there is nothing
-        left to read the OLD numbers from.
+        the nudge. Only the nudge touches ``client.status`` — its reattach is
+        what makes the bridge's live status describe the NEW arrangement (the
+        store write itself does not, though a spontaneous reconnect after it
+        could) — but by the time the confirmation logs, either one may have
+        already happened, so there is nothing left to read the OLD numbers
+        from.
         """
         target_id = dev.id
         identity = source_entry.published_as or published_id_for(source_id)
@@ -1146,7 +1173,7 @@ class ServerMenuMixin:
                                        "see Event Log.")
             return (False, valuesDict, errors)
         self._log_migrate_confirmation(source_id, source_entry, dev, source_number,
-                                       target_previous_number)
+                                       target_previous, target_previous_number)
         return (True, valuesDict)
 
     def menuMigrateExport(self, valuesDict, menuId=""):  # noqa: N802, ARG002
