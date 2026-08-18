@@ -71,6 +71,15 @@ ROLE_FLOW_SENSOR = "flowSensor"
 ROLE_THERMOSTAT = "thermostat"
 
 #: Human labels for the role picker. Keyed by the §4.2 role name.
+#:
+#: The occupancy label names PIR/motion deliberately (issue #252). Matter 1.x
+#: has **no motion device type** — Occupancy Sensor 0x0107 *is* the Matter
+#: export of a PIR, and OccupancySensing's sensor-type bitmap says so — but a
+#: user exporting an Indigo motion sensor goes looking for "motion" in the
+#: picker, finds nothing, and reads the absence as "my sensor cannot be
+#: exported". Measured on live hardware 2026-08-18: Apple Home renders the
+#: exported accessory as an Occupancy tile, so the label sets that expectation
+#: at export time rather than leaving it to be discovered in Apple afterwards.
 ROLE_LABELS = {
     ROLE_ON_OFF_PLUG: "Plug (On/Off Plug-in Unit)",
     ROLE_ON_OFF_LIGHT: "Light (On/Off)",
@@ -79,7 +88,7 @@ ROLE_LABELS = {
     ROLE_COLOR_TEMPERATURE_LIGHT: "Light (Colour temperature)",
     ROLE_EXTENDED_COLOR_LIGHT: "Light (Full colour)",
     ROLE_WINDOW_COVERING: "Window covering",
-    ROLE_OCCUPANCY_SENSOR: "Occupancy sensor",
+    ROLE_OCCUPANCY_SENSOR: "Occupancy sensor (PIR/motion)",
     ROLE_CONTACT_SENSOR: "Contact sensor",
     ROLE_TEMPERATURE_SENSOR: "Temperature sensor",
     ROLE_HUMIDITY_SENSOR: "Humidity sensor",

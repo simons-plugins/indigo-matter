@@ -3,6 +3,22 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
+## Unreleased
+
+Banked for the next release. Releases are opt-in in this repo, so several
+merges accumulate here before one of them ships.
+
+### Changed
+
+- **The occupancy export role is now labelled "Occupancy sensor
+  (PIR/motion)"** (issue #252). Matter 1.x has no motion device type —
+  Occupancy Sensor is the standard's own representation of a PIR — so an
+  Indigo motion sensor already exported correctly, but the picker offered no
+  word a user searching for "motion" would recognise, and the absence read as
+  "this sensor cannot be exported". Nothing about the exported accessory
+  changes; this is the label, plus the ceiling written down in MATTER.md and
+  the bridge field notes.
+
 ## 2026.21.0 — Re-adopt a Matter accessory…, and role changes cost the room on purpose
 
 > **This release bumps the bridge protocol to v2 — Matter export stops until

@@ -102,7 +102,7 @@
         </tr>
         <tr>
           <th scope="row">Sensor, on/off</th>
-          <td><b>Occupancy</b> · Contact</td>
+          <td><b>Occupancy (PIR/motion)</b> · Contact</td>
           <td>Occupancy Sensor · Contact Sensor</td>
         </tr>
         <tr>
@@ -118,6 +118,12 @@
         </tr>
       </tbody>
     </table>
+    <p>A <b>motion</b> sensor exports as <b>Occupancy</b> — Matter&rsquo;s ceiling, not ours.
+    Matter 1.x defines no motion device type; Occupancy Sensor is the standard&rsquo;s own
+    representation of a PIR, and Apple Home renders it as an Occupancy tile whose automations
+    trigger on the same detected/cleared edge your Indigo sensor reports. Coming the other way
+    this plugin creates an Indigo <em>motion</em> sensor from a Matter occupancy sensor, so the
+    naming asymmetry is only ever cosmetic.</p>
     <p>Window covering appears under every dimmer because Indigo represents blinds as dimmers.
     An exported position always means 100&nbsp;% = fully open in your ecosystem app (the bridge
     handles Matter’s own inverted attribute for you), and a per-export tick-box flips it if
