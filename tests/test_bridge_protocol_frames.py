@@ -466,6 +466,14 @@ class TestPublishedIdentity:
     (`^indigo-(-?\\d+)(?:~(\\d+))?$`, safe-integer device id, generation >= 2,
     total length <= 32) at the time both were written, and the two must be
     kept in sync by inspection if either changes.
+
+    Two of the divergences below are not about the pattern's SHAPE but about
+    what the two languages mean by the same metacharacter — `$` (Python also
+    matches before a trailing newline) and `\\d` (Python matches every
+    Unicode decimal digit, JavaScript matches `[0-9]`). Both are fixed on the
+    Python side (`\\Z` and `re.ASCII`) rather than by widening the TypeScript
+    twin, because the node's refusal is the backstop that protects the attach
+    and the plugin must never hand it something it will reject.
     """
 
     #: (value, expected (device_id, generation)) — every one of these must
@@ -501,6 +509,17 @@ class TestPublishedIdentity:
         "indigo-9007199254740992",
         # One character over PUBLISHED_ID_MAX (33), otherwise lawful.
         "indigo-9007199254740991~999999999",
+        # Python's `\d` matches every Unicode decimal digit; JavaScript's
+        # matches [0-9] only. Same class of divergence as the `$`/`\Z` one
+        # above, and worse in effect: `int()` is Unicode-aware too, so this
+        # parsed to device id 123 here and was refused outright by
+        # `parsePublishedId`. A hand-edited `.indiPref` carrying one would
+        # pass plugin-side validation and then take the whole attach down
+        # with `malformed_args`.
+        "indigo-\u0661\u0662\u0663",              # Arabic-Indic digits
+        "indigo-1\u0662",                          # ASCII and Arabic-Indic mixed
+        "indigo-1~\u0662",                         # a Unicode-digit GENERATION
+        "indigo-\uff11\uff12\uff13",             # fullwidth digits
     ]
 
     @pytest.mark.parametrize("value,expected", VALID)

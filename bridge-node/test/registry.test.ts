@@ -1337,6 +1337,46 @@ describe("supersede & published identity (issues #219/#240)", () => {
         }
     });
 
+    it("does not call a re-adopt a supersession, or print role X → X (comment-analyzer C2)", async () => {
+        // The E2/E5 shape: ONE device, ONE removal, ONE create, and the
+        // identity left behind is an ORDINARY orphan `orphans()`/§3.12 must
+        // go on offering. The broad "removal + create for the same device"
+        // rule logged "identity … is being retired … never reused" about it —
+        // the opposite of what the map does — and printed "role onOffLight →
+        // onOffLight", which reads as a role change nobody asked for.
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(1, Role.onOffLight)], false);
+            h.logs.length = 0;
+
+            // Device 1 stops publishing indigo-1 and starts publishing
+            // indigo-99 — a re-adopt onto an already-exported device.
+            await h.registry.reconcile(
+                [spec(1, Role.onOffLight, { publishedAs: uniqueIdFor(99) })], false,
+            );
+
+            assert.ok(
+                !h.logs.some(line => line.startsWith("Superseding endpoint")),
+                `a re-adopt is not a supersession: ${h.logs.join("\n")}`,
+            );
+            assert.ok(
+                !h.logs.some(line => line.includes("The retired number is never reused.")),
+                `the old identity stays re-adoptable and keeps its number: ${h.logs.join("\n")}`,
+            );
+            assert.ok(
+                h.logs.some(
+                    line =>
+                        line.includes(`moving from accessory identity ${uniqueIdFor(1)}`) &&
+                        line.includes(`to ${uniqueIdFor(99)}`) &&
+                        line.includes("stays re-adoptable"),
+                ),
+                `expected the identity-move line, got ${h.logs.join("\n")}`,
+            );
+        } finally {
+            await h.close();
+        }
+    });
+
     it("a battery gain keeps the same endpoint number", async () => {
         // Guards the existing behaviour: owner decision 4 (§9) — only a role
         // change supersedes, and only when the plugin bumps the generation. A

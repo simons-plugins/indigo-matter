@@ -227,7 +227,15 @@ _PUBLISHED_ID_PREFIX = "indigo-"
 #: ``\Z``, not ``$``: Python's ``$`` also matches just before a trailing
 #: newline, so ``"indigo-1\n"`` would parse here and be REFUSED by the
 #: TypeScript twin — the one thing these two derivations may never do.
-_PUBLISHED_ID_RE = re.compile(r"^indigo-(-?\d+)(?:~(\d+))?\Z")
+#:
+#: ``re.ASCII`` for exactly the same reason, and it is the same class of bug:
+#: Python's ``\d`` matches EVERY Unicode decimal digit, JavaScript's matches
+#: ``[0-9]`` only. Without it ``"indigo-١٢٣"`` (Arabic-Indic digits) parses
+#: here — ``int()`` is equally Unicode-aware, so it even yields 123 — while
+#: ``parsePublishedId`` refuses it. A hand-edited ``.indiPref`` carrying one
+#: would pass every plugin-side validation and then kill the whole attach
+#: with ``malformed_args``, taking every export offline.
+_PUBLISHED_ID_RE = re.compile(r"^indigo-(-?\d+)(?:~(\d+))?\Z", re.ASCII)
 #: Python has no native "safe integer" concept (JS's ``Number.isSafeInteger``,
 #: which `parsePublishedId` guards against); this is that same bound, so a
 #: device id round-trips identically through either peer's derivation.

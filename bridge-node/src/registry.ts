@@ -29,6 +29,7 @@ import {
     ProtocolError,
     type RemoveResult,
     type RoleValue,
+    supersedes,
     type UpsertResult,
 } from "./protocol.js";
 import { type LiveComposition, planReconcile } from "./reconcile.js";
@@ -299,10 +300,20 @@ export class EndpointRegistry {
         const plan = planReconcile(live, desired, replaceAll);
 
         // Issues #219/#240 — a removed identity whose `indigoDeviceId` also
-        // appears in `plan.create` is a supersede: the SAME device, a NEW
-        // published identity, planned as removal+create rather than an in-place
-        // recreate (`reconcile.ts`'s `planReconcile`). Logged before anything
-        // mutates so the "why" is on record even if the batch later aborts.
+        // appears in `plan.create` is one device changing which identity it
+        // publishes, planned as removal+create rather than an in-place recreate
+        // (`reconcile.ts`'s `planReconcile`). Logged before anything mutates so
+        // the "why" is on record even if the batch later aborts.
+        //
+        // TWO different things have that shape, and they must not share a
+        // sentence. `supersedes()` is the same narrow test `node.ts` uses to
+        // decide whether to write `supersededBy`: only a LATER GENERATION of
+        // the same identity retires the old one for good. A re-adopt (PR5
+        // design E2/E5) is also one removal plus one create for one device, and
+        // the identity it leaves behind is an ORDINARY orphan the map goes on
+        // offering to the re-adopt picker — so saying "retired … never reused"
+        // about it was flatly wrong, and its "role X → X" made the line read
+        // as a role change that had not happened.
         const createdByDeviceId = new Map(plan.create.map(spec => [spec.indigoDeviceId, spec]));
         for (const oldPublishedAs of plan.remove) {
             const old = live.get(oldPublishedAs);
@@ -312,12 +323,22 @@ export class EndpointRegistry {
             }
             const liveEndpoint = this.#live.get(old.indigoDeviceId);
             const number = liveEndpoint !== undefined ? Number(liveEndpoint.endpoint.number) : "?";
-            this.#log(
-                `Superseding endpoint ${old.indigoDeviceId}: role ${old.role} → ${created.role}. Accessory ` +
-                    `identity ${oldPublishedAs} (number ${number}) is being retired and ${created.publishedAs} ` +
-                    "published in its place, so controllers process a removal and an addition rather than an " +
-                    "in-place device-type change (issue #240). The retired number is never reused.",
-            );
+            if (supersedes(oldPublishedAs, created.publishedAs)) {
+                this.#log(
+                    `Superseding endpoint ${old.indigoDeviceId}: role ${old.role} → ${created.role}. Accessory ` +
+                        `identity ${oldPublishedAs} (number ${number}) is being retired and ${created.publishedAs} ` +
+                        "published in its place, so controllers process a removal and an addition rather than an " +
+                        "in-place device-type change (issue #240). The retired number is never reused.",
+                );
+            } else {
+                this.#log(
+                    `Endpoint ${old.indigoDeviceId} is moving from accessory identity ${oldPublishedAs} ` +
+                        `(number ${number}) to ${created.publishedAs}: controllers process a removal and an ` +
+                        "addition. This is NOT a supersession — the identity it is leaving is an ordinary " +
+                        "left-behind accessory that stays re-adoptable, and its number is kept for it " +
+                        "(issue #219 re-adopt).",
+                );
+            }
         }
 
         for (const spec of plan.recreate) {
