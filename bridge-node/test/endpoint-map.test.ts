@@ -1511,6 +1511,64 @@ describe("the driving device, the orphan date and supersession (issues #219/#240
         );
     });
 
+    it("clears supersededBy when a retired identity is published again", () => {
+        // Un-export a role-changed export and re-export it: the plugin sends
+        // the default `indigo-<deviceId>` the supersession retired, so the
+        // identity is LIVE again and the marker saying another one replaced
+        // it is now false. Left behind, it would hide this record from
+        // `orphans()` the NEXT time it was un-exported — an ordinary orphan
+        // that could never be re-adopted.
+        const dir = storage();
+        const store = new EndpointMapStore(dir);
+        store.load();
+        store.check([{ uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Lamp" }]);
+        store.check([{ uniqueId: "indigo-1~2", endpointNumber: 5, role: "dimmableLight", label: "Lamp" }]);
+        store.forget(["indigo-1"], { supersededBy: "indigo-1~2" });
+
+        store.check([{ uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Lamp" }]);
+
+        assert.deepEqual(
+            mapFileIn(dir).endpoints["indigo-1"],
+            { number: 2, role: "onOffLight", label: "Lamp" },
+            "a live identity carries neither orphan nor supersession markers",
+        );
+        assert.deepEqual(
+            store.restorable().map(entry => entry.uniqueId).sort(),
+            ["indigo-1", "indigo-1~2"],
+            "and it is restorable again",
+        );
+
+        store.forget(["indigo-1"]);
+        assert.deepEqual(
+            store.orphans().map(orphan => orphan.uniqueId),
+            ["indigo-1"],
+            "un-exported again, it is an ORDINARY orphan the re-adopt picker can offer",
+        );
+    });
+
+    it("does not restore a superseded entry even if `orphaned` is missing", () => {
+        // The two are written together by `forget`, but a hand-edited or
+        // partially-rolled-back map can carry one without the other, and the
+        // retired identity must stay retired either way.
+        const dir = storage();
+        writeFileSync(
+            join(dir, ENDPOINT_MAP_FILE),
+            JSON.stringify({
+                version: 2,
+                endpoints: {
+                    "indigo-1": {
+                        number: 2, role: "onOffLight", label: "Lamp", supersededBy: "indigo-1~2",
+                    },
+                    "indigo-1~2": { number: 5, role: "dimmableLight", label: "Lamp" },
+                },
+            }),
+        );
+        const store = new EndpointMapStore(dir);
+        store.load();
+
+        assert.deepEqual(store.restorable().map(entry => entry.uniqueId), ["indigo-1~2"]);
+    });
+
     it("reads a pre-PR5 file unchanged and writes the new keys only where they apply", () => {
         const dir = storage();
         writeFileSync(

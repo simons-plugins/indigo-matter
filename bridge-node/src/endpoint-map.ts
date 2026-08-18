@@ -545,6 +545,18 @@ function noteRestorable(record: EndpointRecord, entry: LiveEndpointNumber): bool
         delete record.orphanedAt;
         changed = true;
     }
+    if (record.supersededBy !== undefined) {
+        // And so does `supersededBy`: this identity is LIVE again, so the
+        // marker saying another one replaced it is now simply false. It gets
+        // here when an identity that was once superseded is published again
+        // — un-export a role-changed export, re-export it, and the plugin
+        // sends the default `indigo-<deviceId>` the supersession retired.
+        // Left in place it would outlive the resurrection and hide the entry
+        // from `orphans()` (§3.12) the NEXT time it was un-exported, making a
+        // perfectly ordinary orphan permanently un-re-adoptable.
+        delete record.supersededBy;
+        changed = true;
+    }
     return changed;
 }
 
@@ -712,7 +724,15 @@ export class EndpointMapStore {
     restorable(): RestorableEndpoint[] {
         const restorable: RestorableEndpoint[] = [];
         for (const [uniqueId, record] of this.#endpoints) {
-            if (record.role === undefined || record.label === undefined || record.orphaned) {
+            // `supersededBy` is checked in its own right, not left to ride
+            // on `orphaned`: the two are written together by `forget`, but a
+            // hand-edited or partially-rolled-back map can carry one without
+            // the other, and a superseded identity must never be rebuilt
+            // whichever way it got that way.
+            if (
+                record.role === undefined || record.label === undefined ||
+                record.orphaned || record.supersededBy !== undefined
+            ) {
                 continue;
             }
             const indigoDeviceId = record.deviceId ?? parsePublishedId(uniqueId)?.deviceId;
