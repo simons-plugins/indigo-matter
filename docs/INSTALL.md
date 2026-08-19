@@ -372,9 +372,11 @@ Three things to know before you start:
   on/off light and a dimmer **have** been controlled from Apple Home and from
   Indigo, each direction showing up on the other side; the managed LaunchAgent
   **has** installed and run the bridge end to end with no hand intervention;
-  and three exported accessories **kept their identities** across a plugin and
-  bridge-node upgrade, with no duplicates in Apple Home. What has not: the
-  reboot leg of the accessory-identity check. Treat the export half as new.
+  three exported accessories **kept their identities** across a plugin and
+  bridge-node upgrade, with no duplicates in Apple Home; and fifty of them
+  **kept their identities across a full reboot of the host** — same endpoint
+  numbers, no re-commissioning, both LaunchAgents back unattended and the
+  bridge serving seconds later (2026-08-19). Treat the export half as new.
 - **Apple Home and Alexa are validated; Google Home and SmartThings are not.**
   Apple Home works end-to-end. Alexa pairs and controls too, with a known
   caveat: newly-exported accessories can show stale or unresponsive in Alexa

@@ -3,6 +3,24 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
+## 2026.23.7 — the reboot leg is validated
+
+Documentation only; no behaviour change.
+
+The last outstanding leg of the export half's live validation is done. On
+2026-08-19 the reference server was fully rebooted with **50 exported
+accessories** paired into Apple Home. All 50 came back on the **same endpoint
+numbers** under the same published identities; the bridge did not
+re-commission itself (its install id and commissioning timestamp were
+unchanged); both LaunchAgents started unattended; and the bridge was serving
+**17 seconds** after the plugin started. Apple Home showed every accessory in
+its own room with no duplicates and nothing unresponsive — including six that
+had been *migrated*, and so publish an identity belonging to a different Indigo
+device than the one driving them.
+
+README, `MATTER.md` and `INSTALL.md` all carried the "still outstanding" note
+and now record what was measured instead.
+
 ## 2026.23.6 — the documentation catches up with the sensors
 
 Documentation only; no behaviour change.
