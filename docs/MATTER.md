@@ -819,9 +819,9 @@ Honestly stated, because the difference matters:
 **What has and has not been proven on live hardware** is stated once, in the
 project [README](https://github.com/simons-plugins/indigo-matter#status), rather
 than restated here where the two copies would drift apart. The short version: the
-bridge has been commissioned into Apple Home and Alexa and exported devices have
-been controlled both ways, but the reboot leg of the accessory-identity check is
-still outstanding. Treat the export half as new.
+bridge has been commissioned into Apple Home and Alexa, exported devices have been
+controlled both ways, and accessory identity has survived both an upgrade and a
+full host reboot without duplicating or renumbering. Treat the export half as new.
 
 ### Alexa conformance: what a code sweep found (issue #222)
 

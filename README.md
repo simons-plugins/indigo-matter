@@ -112,8 +112,11 @@ worked end to end, a second controller **has** joined alongside Apple Home — A
 fabric #3 — an on/off light and a dimmer **have** been controlled in both directions, the
 one-click managed LaunchAgent chain **has** installed and run the bridge without hand
 intervention, and accessory identity **has** survived an upgrade without duplicating
-(2026-08-04 → 06, on the reference server). Still outstanding: the reboot leg of the
-accessory-identity check. Treat the export half as new. See
+(2026-08-04 → 06, on the reference server), and accessory identity **has** survived a
+full **reboot** of the host — 50 exported accessories back on the same endpoint numbers
+under the same identities, no re-commissioning, both LaunchAgents up unattended and the
+bridge serving 17 seconds after the plugin started, with Apple Home showing every one of
+them in its own room and no duplicates (2026-08-19). Treat the export half as new. See
 [MATTER.md](docs/MATTER.md#indigo-as-a-matter-bridge--the-other-direction) for how it
 works.
 
