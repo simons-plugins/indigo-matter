@@ -134,6 +134,12 @@
     the role is suggested from each device&rsquo;s own name, so the remaining zones are one
     click each. If the plugin later renames that state the export stops publishing and says
     so, rather than reporting a fabricated &ldquo;all clear&rdquo;.</p>
+    <p><b>Renaming in Indigo does not rename in your ecosystem.</b> The plugin pushes the new
+    name and the bridge records it within seconds, but Apple Home stores an accessory&rsquo;s
+    name in <em>your home</em> — set when it was added, yours from then on — and a later
+    change from the bridge does not override it. The Indigo name, and the optional
+    <em>Name in ecosystems</em> field, decide what an accessory is called <em>when it first
+    appears</em>. To rename one you already have, rename it in the ecosystem.</p>
     <p><b>Which way round a sensor reads</b> is a per-export tick-box, and contact sensors
     start ticked. Indigo&rsquo;s on/off state means <em>tripped</em> for every binary sensor —
     motion seen, leak seen, door <em>open</em> — and Matter reads all of those the same way
