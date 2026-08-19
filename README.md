@@ -56,10 +56,17 @@ accessory. One bridge, one pairing, however many devices.
   runs no bridge process. Exporting is publishing — the device becomes operable from every
   ecosystem the bridge is paired with — so it is always a deliberate act.
 - **You declare what each device is.** Indigo cannot tell a plug from a lamp from a lock,
-  so the export dialog asks, and defaults to the safest reading. Relays, dimmers, colour
-  and colour-temperature lights, window coverings, locks, the seven sensor types and
-  thermostats are supported; valves, fans, garage doors, sprinklers and MultiIO are not,
-  and appear in the picker **with the reason**.
+  so the export dialog asks, and suggests a role from the device's name. Relays, dimmers,
+  colour and colour-temperature lights, window coverings, locks, thermostats and twelve
+  sensor types — occupancy (PIR/motion), contact, water leak, freeze, rain, smoke, carbon
+  monoxide, temperature, humidity, light, pressure and flow — are supported. Valves, fans,
+  garage doors, sprinklers, heat alarms and MultiIO are not, and appear in the picker
+  **with the reason**.
+- **Devices whose plugin keeps the reading in a state of its own can be exported too.**
+  Alarm-panel zones are the common case: every zone is a "custom" device with no on/off
+  flag Indigo can read, so the dialog asks which of its states is the reading. Map the
+  first zone of a panel and the rest pre-select the same state. Only on/off states can be
+  mapped in this version.
 - **Expect an "uncertified accessory" prompt** and choose *Add Anyway*. The bridge presents
   a development attestation certificate — as Homebridge, matterbridge and Home Assistant's
   bridge all do — and outbound attestation is the commissioning ecosystem's policy, not
