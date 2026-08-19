@@ -1876,7 +1876,13 @@ class DeviceSync:
                     "could not restamp nodeBaseName on node device %s: %s", dev_id, exc)
 
     def _group_warn(self, dev_id: int, kind: str, fmt: str, *args: Any) -> None:
-        """One warning per device per KIND of grouping failure, per plugin run."""
+        """One warning per device per KIND of failure, per plugin run.
+
+        Named for its first caller (grouping) but the dedupe is general — the
+        button-FeatureMap warning in ``_reassert_capability_props`` uses it too,
+        for the same reason: a house full of affected devices must not write one
+        line per device per reconcile.
+        """
         key = (int(dev_id), kind)
         if key in self._group_warned:
             return
@@ -3009,10 +3015,12 @@ class DeviceSync:
             if features:
                 # Stringified to match what the handler stamps at creation, so
                 # the heal below compares like with like and does not rewrite
-                # the prop on every pass. A FeatureMap of 0 is not stamped: a
-                # Switch cluster always declares at least one feature, so zero
-                # means "not reported", and a falsy value would be re-added on
-                # every reconcile anyway.
+                # the prop on every pass — the handler applies the same truthy
+                # test for exactly that reason. A FeatureMap of 0 is not
+                # stamped: a Switch cluster always declares at least one
+                # feature, so zero means "not reported", which under ADR-0003
+                # must leave the device's existing answer alone rather than
+                # overwrite it with a value asserting no features at all.
                 props[PROP_SWITCH_FEATURES] = str(features)
         return props
 
@@ -3066,12 +3074,31 @@ class DeviceSync:
                         if key in ("SupportsPowerMeter", "SupportsEnergyMeter"):
                             if type_id not in _METER_CAPABLE_TYPES:
                                 continue
-                        if key == PROP_SWITCH_FEATURES and type_id != DEVICE_TYPE_BUTTON:
-                            # Only the button handler reads it. An endpoint can
-                            # host more than one Indigo device, and stamping a
-                            # Switch FeatureMap onto a sibling sensor would be
-                            # a props write (and so a device comm restart) that
-                            # buys nothing.
+                        if key == PROP_SWITCH_FEATURES:
+                            if type_id != DEVICE_TYPE_BUTTON:
+                                # Only the button handler reads it. An endpoint
+                                # can host more than one Indigo device, and
+                                # stamping a Switch FeatureMap onto a sibling
+                                # sensor would be a props write (and so a device
+                                # comm restart) that buys nothing.
+                                continue
+                            # EXACT assertion, not add-only — the one prop here
+                            # that is a VALUE rather than a boolean capability.
+                            # Add-only would mean write-once-never-corrected: an
+                            # OTA that adds MSL to a gang (0x02 → 0x0A) leaves
+                            # the device stamped "2", so InitialPress AND
+                            # LongPress both map and pressCount advances TWICE
+                            # per long press — the issue #76 double-count,
+                            # reintroduced through the prop layer and unfixable
+                            # short of deleting the device. Same treatment (and
+                            # same reason) as display_props below: a fixed truth
+                            # about the endpoint, not an interview-dependent
+                            # capability that a flaky pass might under-report.
+                            # The add-only rule still protects it from a
+                            # NON-informative snapshot, because an absent
+                            # FeatureMap never reaches full_cap at all.
+                            if str(current_props.get(key) or "") != value:
+                                missing[key] = value
                             continue
                         if not current_props.get(key):
                             missing[key] = value
@@ -3081,6 +3108,30 @@ class DeviceSync:
                         # be written explicitly, not skipped as already-falsy.
                         if key not in current_props or bool(current_props.get(key)) != bool(value):
                             missing[key] = value
+                    if (type_id == DEVICE_TYPE_BUTTON
+                            and PROP_SWITCH_FEATURES not in current_props
+                            and PROP_SWITCH_FEATURES not in full_cap):
+                        # The one way the #231 fix can fail while looking
+                        # exactly like the bug it fixes. Without a FeatureMap
+                        # the handler cannot know whether InitialPress is this
+                        # switch's only press event, so it takes the safe
+                        # default and discards it — and if the switch really is
+                        # momentary-only, every press is dropped, no state ever
+                        # changes, no error state is set, and the event log is
+                        # empty. That is byte-for-byte the original report, with
+                        # the fix installed. Say so once, here, where the node's
+                        # own snapshot is in hand to prove the attribute is
+                        # genuinely absent rather than merely unread.
+                        self._group_warn(
+                            dev_id, "switch-features",
+                            "Matter button %r (node %s endpoint %s) has not reported its "
+                            "Switch FeatureMap (0xFFFC), so this plugin cannot tell whether "
+                            "it signals a press with InitialPress alone. Presses that carry "
+                            "no release event will be ignored. If this button does nothing "
+                            "in Indigo, please open an issue with the output of "
+                            "'Explore Matter attributes (advanced)…' for this device.",
+                            getattr(dev, "name", dev_id), node.node_id, endpoint.endpoint_id,
+                        )
                     # Heal the type-edit guard's stamp onto devices created
                     # before it existed (issue #58). Records the CURRENT type as
                     # canonical — for a pristine fleet that is the created type.
@@ -3119,7 +3170,13 @@ class DeviceSync:
                     applied = indigo.devices[dev_id].pluginProps
                     stuck = [
                         key for key, value in missing.items()
-                        if key not in applied or bool(applied.get(key)) != bool(value)
+                        if key not in applied
+                        # switchFeatureMap is a value, not a flag: bool("2") and
+                        # bool("30") are both True, so the boolean check below
+                        # would pass a FeatureMap that did not actually persist.
+                        or (str(applied.get(key) or "") != value
+                            if key == PROP_SWITCH_FEATURES
+                            else bool(applied.get(key)) != bool(value))
                     ]
                     if stuck:
                         self.logger.warning(

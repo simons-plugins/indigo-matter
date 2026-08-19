@@ -20,7 +20,14 @@ current version is `Info.plist`'s `PluginVersion`.
 - **Existing button devices are healed at the next reconcile.** The capability
   is read from the endpoint's own FeatureMap and carried on the device; buttons
   created before this release pick it up automatically, with no need to delete
-  and re-add them.
+  and re-add them. If the FeatureMap later *changes* — a firmware update adding
+  long-press to a gang, say — the device is corrected rather than left on the
+  old answer.
+- **A button whose device never reports its FeatureMap now says so.** Without
+  that attribute the plugin cannot tell a momentary-only switch from a
+  release-capable one, so it ignores the press — which looks exactly like the
+  bug above. There is now one warning per such button in the event log, naming
+  the device and what to send in if you hit it.
 
 ## 2026.23.8 — renaming, and what it does not do
 

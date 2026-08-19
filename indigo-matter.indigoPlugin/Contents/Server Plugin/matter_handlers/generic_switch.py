@@ -8,7 +8,7 @@ the ``CurrentPosition`` attribute (subscribed for completeness, but transient �
 no stable state to map in v1).
 
 Matter spec refs:
-  GenericSwitch cluster 0x003B, Matter 1.2 §1.13
+  GenericSwitch cluster 0x003B, Matter 1.2 §1.12
 """
 from __future__ import annotations
 
@@ -24,15 +24,16 @@ ATTR_NUMBER_OF_POSITIONS = 0x0000  # read-only config
 ATTR_CURRENT_POSITION    = 0x0001  # transient — subscribed, but v1 maps nothing
 ATTR_MULTI_PRESS_MAX     = 0x0002  # read-only config
 
-# Event ids (Matter 1.2 §1.13.7)
+# Event ids (Matter 1.2 §1.12.6)
 EVT_INITIAL_PRESS       = 0x01
 EVT_LONG_PRESS          = 0x02
 EVT_SHORT_RELEASE       = 0x03
 EVT_MULTI_PRESS_COMPLETE = 0x06
 
 # FeatureMap (global attribute 0xFFFC) and the Switch feature bits it carries
-# (Matter 1.2 §1.13.4). Which events a switch can EVER emit is decided here and
-# nowhere else — §1.13.7 gates every event on a feature.
+# (Matter 1.2 §1.12.4). Which events a switch can EVER emit is decided here and
+# nowhere else — the Events table's Conformance column (§1.12.6) gates each one
+# on a feature.
 ATTR_FEATURE_MAP              = 0xFFFC
 FEATURE_LATCHING_SWITCH       = 0x01  # LS  — SwitchLatched
 FEATURE_MOMENTARY_SWITCH      = 0x02  # MS  — InitialPress
@@ -70,7 +71,11 @@ def maps_initial_press(features: Optional[int]) -> bool:
     """Whether InitialPress is this switch's ONLY press signal.
 
     True only for a momentary switch (MS) declaring no release, long-press or
-    multi-press feature — the Matter 1.2 §1.13.4 "MS alone" shape. An unknown
+    multi-press feature. Matter 1.2 §1.12.7.3 ("Supports InitialPress (but not
+    LongPress, ShortRelease and LongRelease)") is normative for this shape: such
+    a switch "SHALL generate a single InitialPress event for one interaction
+    cycle" and "SHALL NOT generate any of the ShortRelease, LongPress and
+    LongRelease events". An unknown
     FeatureMap answers False: the safe default is the pre-#231 behaviour
     (suppress), since mapping InitialPress on a switch that ALSO emits
     ShortRelease double-counts every press — the exact regression issue #76
@@ -120,7 +125,7 @@ class GenericSwitchHandler(ClusterHandler):
 
     cluster_id     = CLUSTER_SWITCH
     cluster_name   = "GenericSwitch"
-    device_type_id = "matterButton"
+    device_type_id = DEVICE_TYPE_BUTTON
     # With BOTH Supports* False, Indigo falls back to the Devices.xml
     # <UiDisplayStateId> (lastButtonEvent) even for API-created devices —
     # the props-driven built-in display only takes precedence when one of
@@ -144,8 +149,13 @@ class GenericSwitchHandler(ClusterHandler):
                     # answer has to be carried on it. Omitted, not guessed,
                     # when the node has not reported the FeatureMap yet; the
                     # reconcile heal adds it once it has.
-                    **({PROP_SWITCH_FEATURES: str(features)}
-                       if features is not None else {}),
+                    # Truthy, not "is not None", so this matches
+                    # DeviceSync._capability_props exactly — a heal that
+                    # disagreed with creation about the zero case would write a
+                    # prop on the first reconcile of every button. A Switch
+                    # cluster always declares at least one feature, so 0 means
+                    # "not reported" either way.
+                    **({PROP_SWITCH_FEATURES: str(features)} if features else {}),
                     **self.display_props,
                 },
                 initial_states={
@@ -180,7 +190,7 @@ class GenericSwitchHandler(ClusterHandler):
             # (ShortRelease, LongPress, MultiPressComplete).
             #
             # But a momentary switch declaring NO terminal feature never sends
-            # one (Matter 1.2 §1.13.7 gates every event on its feature), so
+            # one (§1.12.6 gates each event on its feature), so
             # waiting for it means waiting forever: the Indigo device sits at
             # its creation state for the life of the install and the button
             # looks dead. That is issue #231 — an Aqara Light Switch H2 whose
@@ -237,11 +247,16 @@ class GenericSwitchHandler(ClusterHandler):
         Tolerant of the prop being absent (a device created before #231, until
         the next reconcile heals it) or unparseable — both answer "no", which
         is the pre-#231 behaviour, never a double-count.
+
+        Deliberately does NOT guard the ``pluginProps`` read: ``DeviceSync``'s
+        ``_on_node_event`` already wraps this whole call in an ``except
+        Exception`` that logs device, endpoint, cluster and event id. Catching
+        here would convert a logged fault — a deleted device, a bridge error, a
+        refactor passing something that is not an Indigo device — into an
+        unlogged wrong answer that looks exactly like "this switch is not
+        momentary-only".
         """
-        try:
-            raw = (indigo_dev.pluginProps or {}).get(PROP_SWITCH_FEATURES)
-        except Exception:  # noqa: BLE001 - a props read must never lose a press
-            return False
+        raw = (indigo_dev.pluginProps or {}).get(PROP_SWITCH_FEATURES)
         if raw in (None, ""):
             return False
         try:

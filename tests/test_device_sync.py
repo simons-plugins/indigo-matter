@@ -1928,6 +1928,50 @@ def test_reassert_is_idempotent_for_the_feature_map(ds, indigo_env):
     assert dev.replaced_props is False
 
 
+def test_a_changed_feature_map_is_corrected_not_left_stale(ds, indigo_env):
+    """The heal is add-only for boolean capabilities, but this prop is a VALUE.
+    An OTA that adds MSL to a gang takes 0x02 → 0x0A; a device left stamped "2"
+    would map InitialPress AND LongPress, advancing pressCount twice per long
+    press — the issue #76 double-count, reintroduced through the prop layer and
+    unfixable short of deleting the device."""
+    _indigo, devices = indigo_env
+    ds.create_from_raw(AQARA_H2_NODE, "Wall Switch")
+    dev = devices[ds.lookup(0x44, 4, "matterButton")]
+    assert dev.pluginProps.get("switchFeatureMap") == "2"
+
+    upgraded = dict(AQARA_H2_NODE)
+    upgraded["attributes"] = dict(AQARA_H2_NODE["attributes"], **{"4/59/65532": 0x0A})
+    ds.reconcile_all([upgraded])
+    assert dev.pluginProps.get("switchFeatureMap") == "10", "corrected, not left at 2"
+
+
+def test_a_button_whose_node_reports_no_feature_map_is_warned_about_once(ds, indigo_env,
+                                                                        mock_logger):
+    """The one way the #231 fix fails while looking exactly like the bug: with
+    no FeatureMap the handler takes the safe default and drops every press, and
+    without this line there is nothing anywhere to explain it."""
+    _indigo, _devices = indigo_env
+    ds.create_from_raw(BUTTON_NODE, "Hall Button")     # no 0xFFFC in its attributes
+    mock_logger.warning.reset_mock()
+    ds.reconcile_all([BUTTON_NODE])
+    said = [c[0][0] % tuple(c[0][1:]) for c in mock_logger.warning.call_args_list]
+    assert any("has not reported its Switch FeatureMap" in m for m in said), said
+
+    mock_logger.warning.reset_mock()
+    ds.reconcile_all([BUTTON_NODE])
+    said = [c[0][0] % tuple(c[0][1:]) for c in mock_logger.warning.call_args_list]
+    assert not any("FeatureMap" in m for m in said), "once per device per run, not per reconcile"
+
+
+def test_a_button_that_did_report_its_feature_map_is_not_warned_about(ds, indigo_env, mock_logger):
+    _indigo, _devices = indigo_env
+    mock_logger.warning.reset_mock()
+    ds.create_from_raw(AQARA_H2_NODE, "Wall Switch")
+    ds.reconcile_all([AQARA_H2_NODE])
+    said = [c[0][0] % tuple(c[0][1:]) for c in mock_logger.warning.call_args_list]
+    assert not any("FeatureMap" in m for m in said), said
+
+
 def test_a_node_that_has_not_reported_a_feature_map_stamps_nothing(ds, indigo_env):
     """ADR-0003 again: no attribute is no information. The prop stays absent
     (which the handler reads as "suppress"), it is not defaulted to 0."""
