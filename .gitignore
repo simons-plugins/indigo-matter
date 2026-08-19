@@ -15,5 +15,12 @@ docs/HANDOVER.md
 # this machine, deliberately NOT published (see PR #188, closed for this reason).
 docs/research/
 
+# Scratch design docs. These are working notes written while planning a change
+# (they say "Scratch file, not committed." in their own headers) and they
+# describe work in flight, not the repo as it stands. Ignored because `git add
+# -A` had otherwise swept 1190 lines of them into an unrelated fix twice in one
+# session.
+.scratch-*
+
 # local secrets (npm publish token)
 .env
