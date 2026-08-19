@@ -1569,15 +1569,27 @@ class TestGetReadoptDevices:
 
     def test_a_labelless_orphan_matches_nothing_rather_than_everything(self, plug, devices):
         """A pre-PR5 orphan records no label. An absence of evidence must not
-        read as evidence about every device (a blank name would otherwise
-        promote any device whose name is also blank)."""
-        devices.add(RelayDevice(321, "Aardvark Plug"))
+        read as evidence about every device.
+
+        The nameless device is the whole test: without the `bool(label)` guard,
+        `name == label` is True for it, and a device that matches NOTHING is
+        promoted above one with real evidence. An all-named fixture cannot
+        detect that — `"" == "Aardvark Plug"` is False either way.
+
+        The comparison is against an EXPORTED device rather than the first row
+        outright, because a blank name also sorts first alphabetically: leading
+        the list is not on its own proof of a bogus name match. Outranking a ●
+        device is, since only a name match can do that.
+        """
+        devices.add(RelayDevice(324, ""))
+        devices.add(RelayDevice(325, "Zulu Plug"))
+        plug.exports.upsert(ExportEntry(325, "onOffPlugInUnit"))
         _bridge_with(plug, attached=True)
         orphan = _orphan(role="onOffPlugInUnit", label=None)
         plug.runtime = _FakeRuntime(result=[orphan])
         options = plug.getReadoptDevices(valuesDict={"readoptOrphan": orphan.unique_id})
-        selectable = [label for key, label in options if not key.startswith("x-")]
-        assert selectable == sorted(selectable, key=str.lower), selectable
+        keys = [key for key, _label in options if not key.startswith("x-")]
+        assert keys[0] == "325", "the nameless device outranked a ● on an absent label"
 
     def test_relevance_never_promotes_an_explained_row_above_a_selectable_one(self, plug, devices):
         """#247 REORDERS the selectable block; it must not disturb the

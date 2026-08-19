@@ -1444,10 +1444,15 @@ class ServerMenuMixin:
         Simon's 2026-08-18 live observation). Two pieces of evidence say
         "this is the one", and both are already known here:
 
-        * the device's name is the orphan's ``label`` — the SAME rule the
-          bridge node's own re-adopt nudge fires on
-          (``EndpointMap.noteReadoptableMatch``: role and label both equal),
-          so the picker now leads with the device the log already pointed at;
+        * the device's name is the orphan's ``label`` — the label half of the
+          rule the bridge node's own re-adopt nudge fires on
+          (``EndpointMap.noteReadoptableMatch`` requires role AND label to be
+          equal), so the picker now leads with the device the log already
+          pointed at. Only the label half, because the role half is already
+          spent: every row reaching here passed
+          :meth:`_readopt_device_row`'s ``orphan.role in eligible_roles``,
+          which asks the broader "could appear as" question rather than the
+          node's "is". So this ranks by name within a role-ELIGIBLE set;
         * the device is already exported (``●``) — the "deleted, recreated and
           re-exported before noticing" case that motivates #219 in the first
           place.
