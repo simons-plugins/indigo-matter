@@ -570,6 +570,67 @@ class DeviceSync:
                     key = (int(node_id), int(endpoint_id))
                     type_id = getattr(dev, "deviceTypeId", "") or ""
                     self._index.setdefault(key, {})[type_id] = dev.id
+        # Outside the lock: it iterates Indigo and logs, and nothing under the
+        # lock depends on it — same discipline as the capability refresh.
+        self._warn_unconfigured_strays()
+
+    def _warn_unconfigured_strays(self) -> None:
+        """Name any device of ours that Indigo has made INVISIBLE to us (#62).
+
+        Indigo mutates ``deviceTypeId`` the moment a type is picked from the
+        Edit Device Type menu — before, and regardless of, any save — and a
+        device left mid-edit that way is ``configured=False``. Unconfigured
+        devices are excluded from ``indigo.devices.iter("self")`` and never get
+        ``deviceStartComm``, so BOTH of issue #58's type-change guards are
+        structurally blind to this: ``validateDeviceConfigUi`` only fires on a
+        completed save, and the ``deviceStartComm`` backstop never runs at all.
+
+        The device is then missing from the index and from ``_unique_name``'s
+        view, so the next reconcile tries to RE-CREATE it and Indigo refuses
+        server-side with ``NameNotUniqueError`` — because the invisible device
+        still holds the name. PR #61 turned that collision into an actionable
+        warning, but only for endpoints reconcile actually tries to recreate: a
+        stray whose node is offline, decommissioned, or simply not in this
+        pass produces no collision and so says nothing at all, while the device
+        sits there dead.
+
+        This scans the UNFILTERED collection — the only place such a device is
+        still visible — and reports it directly, at reconcile, without waiting
+        for a collision that may never come.
+
+        Identified by ``createdTypeId``, not by plugin id: that prop is stamped
+        by this plugin at creation (and healed onto older devices), so its
+        presence means we made the device and it finished its first save. That
+        matters because a device the user is part-way through adding by hand is
+        ALSO ``configured=False``, and warning about a dialog that is merely
+        still open would be noise on every reconcile it stays open for.
+        """
+        try:
+            strays = [
+                dev for dev in indigo.devices
+                if not getattr(dev, "configured", True)
+                and (dev.pluginProps or {}).get("createdTypeId")
+            ]
+        except Exception as exc:  # noqa: BLE001 - a diagnostic must never sink reconcile
+            self.logger.debug("could not scan for unconfigured devices: %s", exc)
+            return
+        for dev in strays:
+            created = (dev.pluginProps or {}).get("createdTypeId")
+            current = getattr(dev, "deviceTypeId", "") or ""
+            changed = (f" Its type was changed from {created} to {current}."
+                       if current and current != created else "")
+            self._group_warn(
+                dev.id, "unconfigured-stray",
+                'Matter device "%s" (id %s) is in a half-edited state and this plugin '
+                'can no longer see it: Indigo reports it as not configured, which '
+                'excludes it from the plugin\'s device list, so it receives no updates '
+                'and no commands.%s This is what using Indigo\'s "Edit Device Type" '
+                'menu on a Matter device does — the type changes the moment it is '
+                'picked, before any save. To fix it: DELETE the device in Indigo and '
+                'reload the Matter plugin; the next reconcile recreates it correctly '
+                'with the right type.',
+                dev.name, dev.id, changed,
+            )
 
     def lookup(self, node_id: Any, endpoint_id: Any,
                device_type_id: Optional[str] = None) -> Optional[int]:

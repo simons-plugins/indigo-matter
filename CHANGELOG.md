@@ -3,6 +3,24 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
+## 2026.24.2 — a half-edited device now says so
+
+- **A Matter device made invisible by Indigo's "Edit Device Type" menu is now
+  named in the log at every reconcile** (issue #62). Indigo changes a device's
+  type the instant you pick it — before any save, and even if you cancel — and
+  a device left that way is marked *not configured*, which hides it from the
+  plugin completely: no updates, no commands, while it still holds its name.
+  The plugin cannot refuse the change (it happens before any save) and cannot
+  detect it the usual way (the hidden device is never started), so until now the
+  only sign was an obscure name-collision warning, and then only if a reconcile
+  happened to try recreating that exact endpoint. A device on an offline or
+  decommissioned node produced no sign at all. It is now reported directly, by
+  name, with the remedy: delete it and reload — the next reconcile recreates it.
+- The install guide gains a section on this, and a standing warning not to use
+  the Type menu on Matter devices. The Node-pin troubleshooting row is also
+  corrected: that problem was fixed in 2026.24.1 and the guide still described
+  it as open.
+
 ## 2026.24.1 — fans turn on
 
 - **Turn On now works on fans that refuse the "On" mode** (issue #46). The

@@ -178,7 +178,12 @@ class FakeDevices:
         return self._by_id[dev_id]
 
     def iter(self, _filter=None):
-        return list(self._by_id.values())
+        # Real Indigo EXCLUDES unconfigured devices from iter("self") — that
+        # exclusion is the whole mechanism of issue #62, so the fake has to
+        # model it or a test for the stray warning would pass vacuously.
+        # Plain iteration (__iter__) stays unfiltered, like the real
+        # `indigo.devices`, which is the only place a stray is still visible.
+        return [dev for dev in self._by_id.values() if getattr(dev, "configured", True)]
 
 
 class FakeDeviceFactory:
@@ -2019,6 +2024,84 @@ def test_an_initial_press_on_a_momentary_only_gang_reaches_indigo(ds, indigo_env
     ))
     assert devices[dev_id].states["lastButtonEvent"] == "shortPress"
     assert devices[dev_id].states["pressCount"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Issue #62 — a half-edited device is invisible, and used to say nothing
+# ---------------------------------------------------------------------------
+
+def _make_stray(ds, devices, *, configured=False, drop_created_type=False,
+                new_type="matterDimmer"):
+    """Create a device normally, then do to it what the Edit Device Type menu
+    does: flip deviceTypeId immediately and leave it unconfigured."""
+    ds.create_from_raw(TEMP_SENSOR_NODE, "Landing Sensor")
+    dev = devices[ds.lookup(0x40, 1)]
+    if drop_created_type:
+        props = dict(dev.pluginProps)
+        props.pop("createdTypeId", None)
+        dev.pluginProps = props
+    if new_type:
+        dev.deviceTypeId = new_type
+    dev.configured = configured
+    return dev
+
+
+def _warnings(mock_logger):
+    return [c[0][0] % tuple(c[0][1:]) for c in mock_logger.warning.call_args_list]
+
+
+def test_a_half_edited_device_is_named_at_reconcile(ds, indigo_env, mock_logger):
+    """Before this, a stray said nothing at all unless reconcile happened to try
+    recreating its endpoint — so a stray on an offline or decommissioned node
+    sat there dead and silent."""
+    _indigo, devices = indigo_env
+    dev = _make_stray(ds, devices)
+    mock_logger.warning.reset_mock()
+
+    ds.reconcile_all([])          # no live nodes: nothing would collide
+
+    said = _warnings(mock_logger)
+    assert any("Landing Sensor" in m and "no longer see it" in m for m in said), said
+    assert any("DELETE the device" in m and "reload" in m for m in said), "remedy named"
+    assert any("matterTemperatureSensor to matterDimmer" in m for m in said), "names the flip"
+
+
+def test_the_stray_warning_fires_once_per_run(ds, indigo_env, mock_logger):
+    _indigo, devices = indigo_env
+    _make_stray(ds, devices)
+    ds.reconcile_all([])
+    mock_logger.warning.reset_mock()
+    ds.reconcile_all([])
+    assert not any("no longer see it" in m for m in _warnings(mock_logger))
+
+
+def test_a_configured_device_is_not_called_a_stray(ds, indigo_env, mock_logger):
+    _indigo, devices = indigo_env
+    _make_stray(ds, devices, configured=True)
+    mock_logger.warning.reset_mock()
+    ds.reconcile_all([])
+    assert not any("no longer see it" in m for m in _warnings(mock_logger))
+
+
+def test_a_device_still_being_added_by_hand_is_not_a_stray(ds, indigo_env, mock_logger):
+    """A device the user is part-way through adding is ALSO configured=False.
+    createdTypeId is what separates "we made this and it was saved once" from
+    "a dialog is still open" — warning about the latter would be noise on every
+    reconcile for as long as it stayed open."""
+    _indigo, devices = indigo_env
+    _make_stray(ds, devices, drop_created_type=True)
+    mock_logger.warning.reset_mock()
+    ds.reconcile_all([])
+    assert not any("no longer see it" in m for m in _warnings(mock_logger))
+
+
+def test_a_stray_is_invisible_to_the_index_which_is_why_it_needs_saying(ds, indigo_env):
+    """The premise, pinned: an unconfigured device drops out of iter("self"),
+    so the index loses it and reconcile would try to recreate it."""
+    _indigo, devices = indigo_env
+    _make_stray(ds, devices)
+    ds.rebuild_index()
+    assert ds.lookup(0x40, 1) is None
 
 
 def test_reassert_backfills_address_on_legacy_devices(ds, indigo_env):
