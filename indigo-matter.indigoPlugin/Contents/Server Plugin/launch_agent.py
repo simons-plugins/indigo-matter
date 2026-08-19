@@ -58,6 +58,11 @@ STARTUP_GRACE_SECONDS = 120
 # Shared by every agent for the same reason INSTALL_NODE_STAMP is shared: they all run
 # on the one node this plugin resolved.
 MIN_NODE_VERSION = (22, 13)
+
+#: Seconds to wait for a ``node --version`` probe. Small because the probe runs
+#: on the plugin startup path and node answers in milliseconds; generous enough
+#: that a busy Mac is not mistaken for a wedged binary.
+NODE_PROBE_TIMEOUT = 10
 # Records the node version the package was installed with, so preflight can catch an
 # install-node vs run-node mismatch (native-binding ABI crash) before it crash-loops.
 # DELIBERATELY SHARED between agents (not per-label): project_dir holds ONE node_modules
@@ -264,9 +269,10 @@ class LaunchAgent:
              hint rather than a silent dead LaunchAgent.
 
         **Why (a) is validated at all** (issue #101). The pin used to be trusted
-        on an npx-EXISTS check alone, and ``install()`` re-writes it from
-        ``resolved_bin_dir`` after every successful install — so once a pin
-        existed it was self-perpetuating. A user whose pin pointed at a leftover
+        on an npx-EXISTS check alone, and the install menu re-writes it from
+        ``resolved_bin_dir`` after every successful install (the write is in
+        ``ServerMenuMixin._install_matter_server``, not in ``install()`` itself)
+        — so once a pin existed it was self-perpetuating. A user whose pin pointed at a leftover
         ``/usr/local/bin/node`` (an old Node.js ``.pkg``, or Intel Homebrew on an
         Apple-Silicon Mac) got the obvious remedy — install a current node, retry
         — silently shadowed by the pin, and the only symptom was the WS client
@@ -276,9 +282,14 @@ class LaunchAgent:
         remedy work without any pref surgery.
 
         Nothing is written to prefs from here: a fallback simply resolves
-        elsewhere, and the existing post-install pin write re-pins to whatever
-        that was on the next install. A pin whose fallback ALSO fails therefore
-        survives untouched on disk.
+        elsewhere, and ``_install_matter_server``'s existing post-install pin
+        write re-pins to whatever that was on the next CONTROLLER install. (Only
+        that one path writes ``nodeBinDir`` — the bridge node's install does not
+        — which is why the rejection warning below does not tell the user to run
+        "the install menu" and expect the pin to change; this class is shared by
+        both agents.) A pin whose fallback ALSO fails survives untouched on disk
+        and is used anyway, since a path with no node at all is not an
+        improvement on it.
 
         Note: nvm's version dir is version-specific and changes when the user
         upgrades node. ``ensure_installed()`` re-resolves on every plugin startup,
@@ -300,60 +311,33 @@ class LaunchAgent:
                 # Resolved BEFORE the warning so the message can name what the
                 # pin was shadowing — "falling back" without saying to what
                 # leaves the user exactly as stuck as the silent pin did.
-                fallback = self._autodetect_npx()
+                fallback = self._autodetect_npx(exclude_dir=self.node_bin_dir)
+                if fallback is None:
+                    # Nothing better exists. Using the pin anyway beats resolving
+                    # to a path with no node at all: the pin is at least what the
+                    # user (or the last install) chose, and the failure it causes
+                    # is reported downstream by ensure_installed/install with its
+                    # own remedy. Saying so is the point — a warning that claimed
+                    # a fallback which did not happen would be worse than silence.
+                    self.logger.warning(
+                        "The pinned 'Node bin directory' %s is unusable — %s — and "
+                        "auto-detect found no other node to use instead. Continuing "
+                        "with the pin; install a current Node (e.g. 'brew install "
+                        "node'), or point 'Node bin directory' at one under 'Show "
+                        "advanced server settings' (blank = auto-detect).",
+                        self.node_bin_dir, problem,
+                    )
+                    return candidate
                 self.logger.warning(
                     "IGNORING the pinned 'Node bin directory' %s — %s. Falling back to "
-                    "auto-detect, which resolved %s. The pin is left as-is; a successful "
-                    "'%s' re-pins it to the node that ran the install. To pin a different "
-                    "node yourself, set 'Node bin directory' under 'Show advanced server "
-                    "settings' (blank = auto-detect).",
-                    self.node_bin_dir, problem, fallback, self.spec.install_menu_name,
+                    "auto-detect, which resolved %s. Nothing was changed on disk: to pin "
+                    "a different node yourself, or to clear the pin and keep auto-detect, "
+                    "set 'Node bin directory' under 'Show advanced server settings' "
+                    "(blank = auto-detect).",
+                    self.node_bin_dir, problem, fallback,
                 )
                 return fallback
-        return self._autodetect_npx()
-
-    def _pin_problem(self, npx_path: str) -> Optional[str]:
-        """Why the pinned bin dir must not be used, or ``None`` if it is fine.
-
-        Two disqualifiers, both about the ``node`` beside the pinned ``npx``
-        (which is the binary the LaunchAgent actually execs — the npm package
-        exposes no bin entry point):
-
-        * it does not run at all — deleted, not executable, or an architecture
-          this Mac cannot execute;
-        * it runs and reports a version below :data:`MIN_NODE_VERSION`.
-
-        A node that runs but whose ``--version`` output does not parse is NOT a
-        problem: that is an unknown, and ``install()`` already refuses to block
-        on an unreadable version for the same reason — refusing a working node
-        over a string we failed to read would be the worse failure.
-        """
-        node = os.path.join(os.path.dirname(npx_path), "node")
-        version = self._probe_node_version(node)
-        if version is None:
-            return f"the node beside it ({node}) could not be run"
-        parsed = _parse_node_version(version)
-        if parsed is not None and parsed[:2] < MIN_NODE_VERSION:
-            return (f"its node ({node}) is {version}, older than the required "
-                    f"{'.'.join(map(str, MIN_NODE_VERSION))}")
-        return None
-
-    def _autodetect_npx(self) -> str:
-        """Steps (b)–(f) of :meth:`_resolve_npx` — everything but the pin.
-
-        Split out so a rejected pin can fall back WITHOUT re-entering (a) and
-        resolving to itself again.
-        """
-        # b + c. Homebrew
-        for candidate in NPX_CANDIDATES:
-            if os.path.exists(candidate):
-                return candidate
-        # d. nvm
-        nvm_npx = self._resolve_nvm_npx()
-        if nvm_npx:
-            return nvm_npx
-        # e. PATH
-        found = shutil.which("npx")
+        found = self._autodetect_npx()
         if found:
             return found
         # f. last resort
@@ -364,6 +348,86 @@ class LaunchAgent:
             "back to %s.", NPX_CANDIDATES[0],
         )
         return NPX_CANDIDATES[0]
+
+    def _pin_problem(self, npx_path: str) -> Optional[str]:
+        """Why the pinned bin dir must not be used, or ``None`` if it is fine.
+
+        Two disqualifiers, both about the ``node`` beside the pinned ``npx``
+        (which is the binary the LaunchAgent actually execs — the npm package
+        exposes no bin entry point):
+
+        * it yields no version — deleted, not executable, an architecture this
+          Mac cannot execute, exited non-zero, printed nothing, or hung long
+          enough to trip the probe timeout;
+        * it runs and reports a version below :data:`MIN_NODE_VERSION`.
+
+        The reason string carries the underlying diagnostic (errno text, or the
+        first line of stderr) rather than just "could not be run". "Bad CPU type
+        in executable" and "Library not loaded: …libicui18n…" are the answer to
+        WHY, and this warning is the one line a user pastes into a support
+        thread — issue #101 exists because the only symptom was a connection
+        refused that pointed at nothing.
+
+        A node that runs but whose ``--version`` output does not parse is NOT a
+        problem: that is an unknown, and ``install()`` already refuses to block
+        on an unreadable version for the same reason — refusing a working node
+        over a string we failed to read would be the worse failure. Node only
+        prints something unparseable for pre-release builds (``v25.0.0-nightly``
+        and friends), which are NEWER than the minimum, so rejecting them would
+        punish exactly the users most deliberate about their node. Logged at
+        debug so the choice is at least auditable.
+        """
+        node = os.path.join(os.path.dirname(npx_path), "node")
+        version, detail = self._probe_node_version_detail(node)
+        if version is None:
+            return f"the node beside it ({node}) could not be run: {detail}"
+        parsed = _parse_node_version(version)
+        if parsed is None:
+            self.logger.debug(
+                "pinned node %s reports %r, which does not parse as a version — accepting it",
+                node, version,
+            )
+            return None
+        if parsed[:2] < MIN_NODE_VERSION:
+            return (f"its node ({node}) is {version}, older than the required "
+                    f"{'.'.join(map(str, MIN_NODE_VERSION))}")
+        return None
+
+    def _autodetect_npx(self, *, exclude_dir: str = "") -> Optional[str]:
+        """Steps (b)–(e) of :meth:`_resolve_npx` — everything but the pin.
+
+        Split out so a rejected pin can fall back WITHOUT re-entering (a).
+
+        ``exclude_dir`` skips every candidate living in that directory. Splitting
+        the method out is NOT on its own enough to stop a rejected pin resolving
+        back to itself: ``install()`` pins ``resolved_bin_dir``, which is very
+        often ``/opt/homebrew/bin`` or ``/usr/local/bin`` — i.e. steps (b) and
+        (c) themselves. Without this, rejecting such a pin walked straight into
+        the same directory one step later and logged a warning that contradicted
+        itself ("IGNORING …, which resolved <the same path>"), while a healthy
+        node further down the chain (nvm, PATH) was never reached.
+
+        Returns None when nothing was found, so the caller can tell "found a
+        different node" from "there is no alternative" — those need different
+        messages and different outcomes.
+        """
+        skip = os.path.normpath(exclude_dir) if exclude_dir else ""
+
+        def usable(path: Optional[str]) -> Optional[str]:
+            if not path:
+                return None
+            return None if skip and os.path.normpath(os.path.dirname(path)) == skip else path
+
+        # b + c. Homebrew
+        for candidate in NPX_CANDIDATES:
+            if os.path.exists(candidate) and usable(candidate):
+                return candidate
+        # d. nvm
+        nvm_npx = usable(self._resolve_nvm_npx())
+        if nvm_npx:
+            return nvm_npx
+        # e. PATH
+        return usable(shutil.which("npx"))
 
     def _resolve_nvm_npx(self) -> Optional[str]:
         """Find an nvm-installed ``npx``.
@@ -534,21 +598,48 @@ class LaunchAgent:
         return self._probe_node_version(self.node_path)
 
     def _probe_node_version(self, node_path: str) -> Optional[str]:
-        """``{node_path} --version`` → e.g. ``v22.18.0``, or None if it did not run.
+        """``{node_path} --version`` → e.g. ``v22.18.0``, or None if it did not run."""
+        return self._probe_node_version_detail(node_path)[0]
+
+    def _probe_node_version_detail(self, node_path: str) -> tuple[Optional[str], str]:
+        """As :meth:`_probe_node_version`, plus WHY it failed.
+
+        Returns ``(version, detail)``. ``version`` is None when the probe did
+        not yield one, and ``detail`` then says which of the four ways it went
+        wrong — those are genuinely different faults and only one of them is
+        "did not run", so collapsing them into a single message throws away the
+        one string that would tell a user what to do.
 
         Takes the path rather than reading :attr:`node_path` because
         :meth:`_pin_problem` runs during ``__init__``, BEFORE ``node_path``
         exists — it is deciding which bin dir that attribute will be derived
         from.
+
+        ``timeout`` is not optional here. This runs on the plugin startup path
+        (``__init__`` → :meth:`_resolve_npx`), and a node binary on a stale
+        network mount or a sleeping external disk can block on exec
+        indefinitely — which would hang Indigo's plugin startup with nothing in
+        the log, since the warning is only written after the probe returns.
+        ``TimeoutExpired`` is a ``SubprocessError``, NOT an ``OSError``, so it
+        has to be caught explicitly alongside it.
         """
         try:
             result = self._run([node_path, "--version"], capture_output=True,
-                               text=True, check=False)
-        except OSError:
-            return None
-        if result is None or result.returncode != 0:
-            return None
-        return (result.stdout or "").strip() or None
+                               text=True, check=False, timeout=NODE_PROBE_TIMEOUT)
+        except OSError as exc:
+            return None, str(exc)
+        except subprocess.SubprocessError as exc:
+            return None, f"it did not respond within {NODE_PROBE_TIMEOUT}s ({exc.__class__.__name__})"
+        if result is None:
+            return None, "no result from the probe"
+        if result.returncode != 0:
+            stderr = (getattr(result, "stderr", "") or "").strip().splitlines()
+            first = stderr[0] if stderr else "no error output"
+            return None, f"it exited {result.returncode}: {first}"
+        version = (result.stdout or "").strip()
+        if not version:
+            return None, "it ran but reported no version"
+        return version, ""
 
     def _install_stamp_path(self) -> str:
         return os.path.join(self.project_dir, INSTALL_NODE_STAMP)

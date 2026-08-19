@@ -526,6 +526,7 @@ def test_node_bin_dir_pref_wins_over_everything(tmp_path, prefs, mock_logger, mo
     custom_bin.mkdir(parents=True)
     custom_npx = custom_bin / "npx"
     custom_npx.write_text("#!/bin/sh\n")
+    (custom_bin / "node").write_text("#!/bin/sh\n")   # a pin with no node is rejected (#101)
     prefs = dict(prefs, nodeBinDir=str(custom_bin))
     # NodeVersionRunner, not FakeRunner: since #101 a pin is honoured only if the
     # node beside it runs and is new enough, so "the pref wins" now presupposes a
@@ -542,6 +543,7 @@ def test_node_bin_dir_expands_tilde(tmp_path, prefs, mock_logger, monkeypatch):
     bindir.mkdir(parents=True)
     npx = bindir / "npx"
     npx.write_text("#!/bin/sh\n")
+    (bindir / "node").write_text("#!/bin/sh\n")       # a pin with no node is rejected (#101)
     prefs = dict(prefs, nodeBinDir="~/mynode/bin")
     sp = ServerProcess(prefs, mock_logger, home=str(home), runner=NodeVersionRunner())
     assert sp.npx_path == str(npx)
@@ -586,6 +588,10 @@ def test_a_pin_whose_node_is_too_old_falls_back_to_autodetect(tmp_path, prefs, m
     assert str(pinned) in said, "names the pin"
     assert "v18.20.4" in said, "names the version it rejected"
     assert "/opt/homebrew/bin/npx" in said, "names what the pin was shadowing"
+    # LaunchAgent is shared with the bridge agent, whose install menu does NOT
+    # write nodeBinDir (only _install_matter_server does) — so this message must
+    # not tell any user to run "the install" and expect the pin to change.
+    assert "Install/update" not in said
 
 
 class UnrunnableNodeRunner(FakeRunner):
@@ -630,17 +636,164 @@ def test_a_pin_whose_node_version_is_unreadable_is_kept(tmp_path, prefs, mock_lo
     assert sp.npx_path == str(pinned / "npx")
 
 
+class PerPathNodeRunner(FakeRunner):
+    """`node --version` answers per node path — so one machine can hold both a
+    stale node and a healthy one, which is the whole shape of issue #101."""
+
+    def __init__(self, versions: dict, default: str = "v22.18.0"):
+        super().__init__()
+        self.versions = versions
+        self.default = default
+
+    def __call__(self, cmd, **kwargs):
+        self.calls.append(cmd)
+        if len(cmd) >= 2 and cmd[0].endswith("node") and cmd[1] == "--version":
+            version = next((v for prefix, v in self.versions.items()
+                            if cmd[0].startswith(prefix)), self.default)
+            return subprocess.CompletedProcess(cmd, 0, stdout=version + "\n", stderr="")
+        return subprocess.CompletedProcess(cmd, self.returncode, stdout="", stderr="")
+
+
 def test_a_rejected_pin_does_not_resolve_back_to_itself(tmp_path, prefs, mock_logger, monkeypatch):
-    """The fallback must not re-enter step (a). With NOTHING else on the machine
-    the last-resort Homebrew default is the answer — never the pin it just
-    rejected, which would make the whole check a no-op."""
-    monkeypatch.setattr("server_process.os.path.exists", lambda p: False)
+    """The pin is USUALLY one of the auto-detect candidates — `install()` pins
+    `resolved_bin_dir` — so splitting the pin out of auto-detect is not on its
+    own enough. Here the pin IS `/usr/local/bin`, which is also step (c): before
+    the exclusion, rejecting it walked straight back into the same directory one
+    step later and logged a warning that contradicted itself, while the healthy
+    nvm node further down the chain was never reached.
+    """
+    monkeypatch.setattr("server_process.os.path.exists",
+                        lambda p: (_real_exists(p) and "homebrew" not in p)
+                        or p == "/usr/local/bin/npx")
+    home = tmp_path / "home"
+    home.mkdir()
+    want = _make_nvm(home, "v22.18.0", default_alias="v22")
+    sp = ServerProcess(dict(prefs, nodeBinDir="/usr/local/bin"), mock_logger, home=str(home),
+                       runner=PerPathNodeRunner({"/usr/local/bin": "v18.20.4"}))
+    assert sp.npx_path == str(want), "the nvm node, not the rejected pin"
+    said = " ".join(str(c.args[0]) % c.args[1:] for c in mock_logger.warning.call_args_list)
+    assert "/usr/local/bin" in said and str(want) in said
+
+
+def test_an_unusable_pin_with_no_alternative_is_used_anyway(tmp_path, prefs, mock_logger,
+                                                            monkeypatch):
+    """"The fallback also failed" is not a reason to resolve to a path with no
+    node at all. The pin is at least what the user (or the last install) chose,
+    and the message must not claim a fallback that did not happen."""
+    monkeypatch.setattr("server_process.os.path.exists", lambda p: p == "/usr/local/bin/npx")
     monkeypatch.setattr("launch_agent.shutil.which", lambda _name: None)
     home = tmp_path / "home"
     home.mkdir()
-    sp = ServerProcess(dict(prefs, nodeBinDir=str(home / "pinned" / "bin")), mock_logger,
-                       home=str(home), runner=NodeVersionRunner("v18.0.0"))
+    sp = ServerProcess(dict(prefs, nodeBinDir="/usr/local/bin"), mock_logger, home=str(home),
+                       runner=NodeVersionRunner("v18.20.4"))
+    assert sp.npx_path == "/usr/local/bin/npx"
+    said = " ".join(str(c.args[0]) % c.args[1:] for c in mock_logger.warning.call_args_list)
+    assert "Continuing with the pin" in said
+    assert "IGNORING" not in said, "nothing was ignored — there was nowhere else to go"
+
+
+@pytest.mark.parametrize("version, honoured", [
+    ("v22.13.0", True),    # exactly the minimum
+    ("v22.12.9", False),   # one patch series below it
+    ("v23.0.0",  True),
+])
+def test_the_minimum_node_version_boundary(tmp_path, prefs, mock_logger, monkeypatch,
+                                           version, honoured):
+    """MIN_NODE_VERSION is (22, 13) and the comparison is on the first two
+    components — pin the boundary so an off-by-one in `parsed[:2] < ...` cannot
+    pass unnoticed."""
+    monkeypatch.setattr("server_process.os.path.exists",
+                        lambda p: _real_exists(p) or p == "/opt/homebrew/bin/npx")
+    sp, pinned = _pinned(tmp_path, prefs, mock_logger, NodeVersionRunner(version))
+    expected = str(pinned / "npx") if honoured else "/opt/homebrew/bin/npx"
+    assert sp.npx_path == expected
+
+
+class ExitOneNodeRunner(FakeRunner):
+    """`node --version` execs but exits non-zero — a broken shim or a node whose
+    dynamic libraries moved under it (the Homebrew ICU/OpenSSL bump case)."""
+
+    def __call__(self, cmd, **kwargs):
+        self.calls.append(cmd)
+        if len(cmd) >= 2 and cmd[0].endswith("node") and cmd[1] == "--version":
+            return subprocess.CompletedProcess(
+                cmd, 1, stdout="",
+                stderr="dyld[901]: Library not loaded: libicui18n.74.dylib\nReferenced from: node\n")
+        return subprocess.CompletedProcess(cmd, self.returncode, stdout="", stderr="")
+
+
+def test_a_pin_whose_node_exits_non_zero_is_rejected_with_its_own_error(tmp_path, prefs,
+                                                                       mock_logger, monkeypatch):
+    """The captured stderr is the answer to WHY, and it is the line a user
+    pastes into a support thread — #101 exists because the only symptom was a
+    connection refused that pointed at nothing."""
+    monkeypatch.setattr("server_process.os.path.exists",
+                        lambda p: _real_exists(p) or p == "/opt/homebrew/bin/npx")
+    sp, _pin = _pinned(tmp_path, prefs, mock_logger, ExitOneNodeRunner())
     assert sp.npx_path == "/opt/homebrew/bin/npx"
+    said = " ".join(str(c.args[0]) % c.args[1:] for c in mock_logger.warning.call_args_list)
+    assert "exited 1" in said
+    assert "Library not loaded" in said, "the real diagnostic, not just 'could not be run'"
+
+
+class HangingNodeRunner(FakeRunner):
+    """`node --version` never returns — a binary on a stale network mount or a
+    sleeping external disk. Without a timeout this hangs plugin STARTUP."""
+
+    def __call__(self, cmd, **kwargs):
+        self.calls.append(cmd)
+        if len(cmd) >= 2 and cmd[0].endswith("node") and cmd[1] == "--version":
+            raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout", 0))
+        return subprocess.CompletedProcess(cmd, self.returncode, stdout="", stderr="")
+
+
+def test_the_version_probe_is_bounded_by_a_timeout(tmp_path, prefs, mock_logger, monkeypatch):
+    """TimeoutExpired is a SubprocessError, NOT an OSError, so it needs its own
+    clause — an uncaught one would propagate out of __init__ and take plugin
+    startup with it."""
+    monkeypatch.setattr("server_process.os.path.exists",
+                        lambda p: _real_exists(p) or p == "/opt/homebrew/bin/npx")
+    sp, _pin = _pinned(tmp_path, prefs, mock_logger, HangingNodeRunner())
+    assert sp.npx_path == "/opt/homebrew/bin/npx"
+    probe = next(c for c in sp._run.calls if c[-1] == "--version")
+    assert probe, "the probe ran"
+    said = " ".join(str(c.args[0]) % c.args[1:] for c in mock_logger.warning.call_args_list)
+    assert "did not respond within" in said
+
+
+def test_the_probe_passes_a_timeout_to_the_runner(tmp_path, prefs, mock_logger, monkeypatch):
+    """The assertion the test above cannot make: that `timeout=` actually
+    reaches subprocess.run. Without it the hang is unbounded in production even
+    though the fake raises on cue."""
+    monkeypatch.setattr("server_process.os.path.exists",
+                        lambda p: _real_exists(p) or p == "/opt/homebrew/bin/npx")
+    seen = {}
+
+    class RecordingRunner(NodeVersionRunner):
+        def __call__(self, cmd, **kwargs):
+            if len(cmd) >= 2 and cmd[1] == "--version":
+                seen.update(kwargs)
+            return super().__call__(cmd, **kwargs)
+
+    _pinned(tmp_path, prefs, mock_logger, RecordingRunner())
+    assert seen.get("timeout"), "node --version must be bounded"
+
+
+def test_a_rejected_pin_does_not_rewrite_the_pref(tmp_path, prefs, mock_logger, monkeypatch):
+    """The docstring's promise: nothing is written to prefs from resolution. A
+    refactor that "helpfully" cleared the pin would silently destroy an nvm
+    user's deliberate choice."""
+    monkeypatch.setattr("server_process.os.path.exists",
+                        lambda p: _real_exists(p) or p == "/opt/homebrew/bin/npx")
+    home = tmp_path / "home"
+    home.mkdir()
+    pinned = home / "pinned" / "bin"
+    pinned.mkdir(parents=True)
+    for tool in ("npx", "node"):
+        (pinned / tool).write_text("#!/bin/sh\n")
+    live_prefs = dict(prefs, nodeBinDir=str(pinned))
+    ServerProcess(live_prefs, mock_logger, home=str(home), runner=NodeVersionRunner("v18.20.4"))
+    assert live_prefs["nodeBinDir"] == str(pinned)
 
 
 def test_an_absent_pin_still_warns_and_autodetects(tmp_path, prefs, mock_logger, monkeypatch):
