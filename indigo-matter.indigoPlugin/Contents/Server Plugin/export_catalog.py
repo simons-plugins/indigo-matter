@@ -184,11 +184,18 @@ BINARY_SENSOR_ROLES = (
 #: then falls through to contact. Every needle is ``\b``-anchored for the same
 #: reason the unit table is: unanchored "rain" matches "Drainage", and "frost"
 #: matches "Defrost".
+#:
+#: Needles that name a *thing* are pluralised (``doors?``, ``windows?``,
+#: ``gates?``): real alarm zones are named for what they cover, and "Patio
+#: Doors" and "Garden Doors" — both ordinary door contacts — fell through the
+#: singular ``\bdoor\b`` to the occupancy fallback. Words that name a
+#: *phenomenon* stay singular, because "motions" and "floods" are not how
+#: anyone names a sensor.
 _BINARY_PATTERNS = tuple(
     (role, tuple(re.compile(pattern) for pattern in patterns)) for role, patterns in (
-        (ROLE_OCCUPANCY_SENSOR, (r"\bmotion\b", r"\bpir\b", r"\boccupancy\b",
+        (ROLE_OCCUPANCY_SENSOR, (r"\bmotion\b", r"\bpirs?\b", r"\boccupancy\b",
                                  r"\boccupied\b", r"\bpresence\b")),
-        (ROLE_WATER_LEAK_DETECTOR, (r"\bleak\b", r"\bflood\b", r"\bwater alarm\b",
+        (ROLE_WATER_LEAK_DETECTOR, (r"\bleaks?\b", r"\bflood\b", r"\bwater alarm\b",
                                     r"\bwater sensor\b")),
         (ROLE_WATER_FREEZE_DETECTOR, (r"\bfreeze\b", r"\bfreezing\b", r"\bfrost\b")),
         (ROLE_RAIN_SENSOR, (r"\brain\b",)),
@@ -200,8 +207,9 @@ _BINARY_PATTERNS = tuple(
         (ROLE_CO_ALARM, (r"\bcarbon monoxide\b", r"\bco alarm\b", r"\bco detector\b",
                          r"\bco sensor\b", r"\bco\b")),
         (ROLE_SMOKE_ALARM, (r"\bsmoke\b", r"\bfire alarm\b")),
-        (ROLE_CONTACT_SENSOR, (r"\bcontact\b", r"\bdoor\b", r"\bwindow\b", r"\bgate\b",
-                               r"\breed\b", r"\bopen/closed\b")),
+        (ROLE_CONTACT_SENSOR, (r"\bcontacts?\b", r"\bdoors?\b", r"\bwindows?\b",
+                               r"\bgates?\b", r"\breed\b", r"\bopen/closed\b",
+                               r"\bskylights?\b")),
     )
 )
 

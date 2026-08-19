@@ -3,6 +3,26 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
+## 2026.23.4 — the suggested role actually appears
+
+### Fixed
+
+- **Exporting a mapped device left the role blank, so every zone of a panel
+  had to have its role set by hand.** The dialog pre-selects the state to read
+  — from a sibling device of the same type where one exists — and the callback
+  that suggests a role only fires when you *change* that menu. Having chosen
+  for you, it never fired. The role is now suggested at the same moment the
+  state is, and the status line says what it guessed and that you can change
+  it. This is the whole point of the name heuristic, and on the path where it
+  matters most it was doing nothing visible.
+- **Zones named for more than one thing now read correctly.** "Patio Doors"
+  and "Garden Doors" — ordinary door contacts — matched no needle and fell
+  through to occupancy, because the needles were singular. Names of *things*
+  are now matched in the plural too (doors, windows, gates, contacts,
+  skylights); names of *phenomena* stay singular, since nobody calls a sensor
+  "motions". The word-boundary anchors are unchanged, so "Drainage" still does
+  not read as rain and "Defrost" still does not read as frost.
+
 ## 2026.23.3 — migrate onto a device you have already mapped
 
 ### Fixed

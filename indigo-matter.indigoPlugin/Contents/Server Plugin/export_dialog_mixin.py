@@ -650,13 +650,25 @@ class ExportDialogMixin:
             # user has already thought about.
             self._clear_export_detail(values)
             values["exportNeedsMapping"] = "true"
-            values["exportStateKey"] = (self._fleet_state_key(dev)
-                                        or verdict.suggested_state_key)
+            state_key = self._fleet_state_key(dev) or verdict.suggested_state_key
+            values["exportStateKey"] = state_key
             values["exportStateInvert"] = False
+            # Seed the role too. `exportStateKeyChanged` does this — but only
+            # when the user CHANGES the state menu, and the line above has
+            # already chosen for them, so on the common path that callback
+            # never fires and the role stayed blank. Every zone of a 24-zone
+            # panel then had to have its role set by hand, which is exactly the
+            # per-device work the name heuristic exists to remove.
+            mapped = export_catalog.classify(dev, self._export_plugin_id(),
+                                             {OPTION_STATE_KEY: state_key})
+            suggested = getattr(mapped, "default_role", "")
+            values["exportRole"] = suggested
             values["exportStatus"] = (
-                f"{dev.name} has no on/off state of its own. Pick the state that is its "
-                f"reading, then choose how it should appear."
-                f"{self._exported_warning(device_id)}")
+                f'{dev.name} will be read from its "{state_key}" state'
+                + (f", and looks like a {export_catalog.role_label(suggested).lower()} — "
+                   "change that below if it is not." if suggested else
+                   ". Now choose how it should appear.")
+                + self._exported_warning(device_id))
             return values
         values["exportNeedsMapping"] = "true" if saved.get(OPTION_STATE_KEY) else "false"
         values["exportStateKey"] = str(saved.get(OPTION_STATE_KEY, "") or "")
