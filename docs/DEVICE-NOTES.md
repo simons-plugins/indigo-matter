@@ -58,6 +58,43 @@ The plugin maps events to `lastButtonEvent` (`shortPress`, `multiPress<N>`,
 `multiPress<N>` carries the notch count, which is what makes proportional
 scrolling possible.
 
+## Aqara Light Switch H2 (and other momentary-only buttons)
+
+The wired gang is an ordinary On/Off endpoint. Each **wireless** gang is a
+separate GenericSwitch endpoint (4 and 5 on the vertical H2) whose FeatureMap is
+**0x02 — MomentarySwitch and nothing else**: no MomentarySwitchRelease, no
+LongPress, no MultiPress. Matter gates each Switch event on a feature (the
+Events table's Conformance column, Matter 1.2 §1.12.6), and §1.12.7.3 is
+explicit for this shape: such a switch "SHALL generate a single InitialPress
+event for one interaction cycle" and "SHALL NOT generate any of the
+ShortRelease, LongPress and LongRelease events". So it emits **`InitialPress`
+and no other event, ever**.
+
+The plugin used to discard `InitialPress` and wait for the terminal event that
+tells short from long from multi — which never arrives on these, so the button
+devices sat at their creation state forever and looked dead
+([issue #231](https://github.com/simons-plugins/indigo-matter/issues/231)).
+Since 2026.24.0 a momentary-only switch maps `InitialPress` to `shortPress` and
+increments `pressCount`, like any other button. Devices created before that gain
+the capability at the next reconcile — no need to delete and re-add them.
+
+Such a switch cannot report a long or double press: the hardware never sends
+one. `shortPress` is the only label these produce, so wire triggers on
+`pressCount` "any change" as with every other Matter button.
+
+One consequence to know about: if a momentary-only endpoint declares more than
+two positions, `InitialPress` carries which position was pressed and the plugin
+does not surface it — every position reads as `shortPress` on the one device.
+(The release-capable path has always discarded the same field, but before this
+release these switches produced nothing at all, so the ambiguity is newly
+visible.) No such device has been reported; please open an issue if you have
+one.
+
+If a Matter button does nothing in Indigo, check the event log for a warning
+that it "has not reported its Switch FeatureMap" — without that attribute the
+plugin cannot tell a momentary-only switch from a release-capable one, and it
+takes the safe option of ignoring the press.
+
 ## IKEA ALPSTUGA (air quality monitor)
 
 Its OnOff cluster toggles the **display**, not power. The plugin currently treats

@@ -3,6 +3,32 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
+## 2026.24.0 — momentary-only buttons work
+
+- **A button that only reports "pressed" now reports it** (issue #231, reported
+  by @coolcaper777 on an Aqara Light Switch H2). Its wired gang worked; both
+  *wireless* gangs did nothing at all. Their Switch endpoints declare FeatureMap
+  `0x02` — MomentarySwitch and nothing else — and Matter gates every Switch
+  event on its feature, so those gangs emit `InitialPress` and no other event,
+  ever. The plugin discarded `InitialPress` and waited for the release/long/
+  multi-press event that tells one kind of press from another, which for these
+  devices never comes: the Indigo device sat at its creation state for the life
+  of the install. A switch declaring no release, long-press or multi-press
+  feature now maps `InitialPress` to `shortPress` and increments `pressCount`,
+  like any other button. Switches that *do* send a terminal event are unchanged
+  — the leading edge is still discarded there, so a press is still counted once.
+- **Existing button devices are healed at the next reconcile.** The capability
+  is read from the endpoint's own FeatureMap and carried on the device; buttons
+  created before this release pick it up automatically, with no need to delete
+  and re-add them. If the FeatureMap later *changes* — a firmware update adding
+  long-press to a gang, say — the device is corrected rather than left on the
+  old answer.
+- **A button whose device never reports its FeatureMap now says so.** Without
+  that attribute the plugin cannot tell a momentary-only switch from a
+  release-capable one, so it ignores the press — which looks exactly like the
+  bug above. There is now one warning per such button in the event log, naming
+  the device and what to send in if you hit it.
+
 ## 2026.23.10 — a pinned node is checked before it is trusted
 
 - **A stale "Node bin directory" pin no longer shadows a newer node** (issue

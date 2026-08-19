@@ -800,6 +800,9 @@
     <!-- GenericSwitch cluster (0x003B).
          lastButtonEvent carries the press label: "shortPress" / "longPress" /
          "doublePress" / "triplePress" / "multiPressN".
+         A switch whose FeatureMap declares MS and nothing else (no MSR/MSL/MSM)
+         can only ever emit InitialPress, so for those the press label is
+         "shortPress" and there is no long/double/multi to report (issue #231).
          pressCount is an ever-incrementing integer so Indigo triggers fire on
          every button press even when the same label repeats consecutively.
          No onOffState — buttons have no stable on/off concept. -->
