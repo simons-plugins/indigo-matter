@@ -130,10 +130,17 @@
     <p>Devices whose plugin keeps the reading in a state of its own — alarm-panel zones are
     the common case — are exportable too: the dialog asks <b>which state is the reading</b>,
     offering the booleans the device publishes (Indigo&rsquo;s own multi-value expansions are
-    filtered out), plus a tick-box for a state that is true when <em>nothing</em> is detected.
-    Map the first zone of a panel and the rest pre-select the same state, so they only need a
-    role. If the plugin later renames that state the export stops publishing and says so,
-    rather than reporting a fabricated &ldquo;all clear&rdquo;.</p>
+    filtered out). Map the first zone of a panel and the rest pre-select the same state, and
+    the role is suggested from each device&rsquo;s own name, so the remaining zones are one
+    click each. If the plugin later renames that state the export stops publishing and says
+    so, rather than reporting a fabricated &ldquo;all clear&rdquo;.</p>
+    <p><b>Which way round a sensor reads</b> is a per-export tick-box, and contact sensors
+    start ticked. Indigo&rsquo;s on/off state means <em>tripped</em> for every binary sensor —
+    motion seen, leak seen, door <em>open</em> — and Matter reads all of those the same way
+    but one: its contact sensor treats true as <em>closed</em>. A door sensor exported
+    straight through would call every shut door open. Change the role and the tick
+    re-derives; untick it and that is the last word; an export already saved is never
+    re-derived, so a polarity corrected by hand stays corrected.</p>
     <p>Window covering appears under every dimmer because Indigo represents blinds as dimmers.
     An exported position always means 100&nbsp;% = fully open in your ecosystem app (the bridge
     handles Matter’s own inverted attribute for you), and a per-export tick-box flips it if

@@ -443,9 +443,10 @@ listed as *no resolvable Matter role*, which was misleading — they are
 ordinary motion, door, smoke and CO sensors, and Matter models all of them.
 
 Select one in the export dialog and it now asks **which state is the reading**,
-offering the boolean states the device actually publishes. Pick that, tick
-*State is inverted* if the state is true when nothing is detected (an alarm
-zone that reports "healthy" works this way), then choose the role as normal.
+offering the boolean states the device actually publishes. Pick that, then
+choose the role as normal — the role is suggested from the device's name, so a
+zone called "Study PIR" arrives as an occupancy sensor and "Front Door" as a
+contact.
 
 Two things make a large panel bearable. The state list hides Indigo's own
 expansions of a multi-value state, so a Texecom zone offers `status` rather
@@ -463,6 +464,21 @@ detected" — the one outcome worth failing loudly for on a smoke alarm.
 
 Only on/off states can be mapped in this version. A custom device whose only
 readings are numbers says so in the picker.
+
+**Which way round a sensor reads is a per-export tick-box, and contact
+sensors start ticked.** Indigo's on/off state means *tripped* for every binary
+sensor — motion seen, leak seen, door **open**. Matter reads all of those the
+same way but one: its contact sensor treats true as **closed**. So a door
+sensor exported straight through would report every shut door as open, and a
+new contact export therefore arrives with *Reading is inverted* already
+ticked. Nothing else does, because nothing else disagrees.
+
+Change the role and the tick re-derives, since the same boolean means
+something different under a different role. Untick it and that is the last
+word — and an export you have already saved is never re-derived, so a polarity
+you corrected by hand stays corrected. If you exported a contact sensor before
+this behaviour existed and it reads backwards in your ecosystem, open it in
+*Manage Matter Exports…* and tick the box.
 
 **Smoke and carbon monoxide sensors export too, as separate roles** (issue
 #179). Matter gives both one device type and picks the sensing half from a
@@ -583,6 +599,7 @@ it says so and asks you to narrow the name filter.)
 | **Valves** (as a relay role) | matter.js's valve cluster is an empty stub — the whole command surface would have to be written from scratch — and ecosystem support for the type is poor. v2 candidate. |
 | **Fans** — both dimmer-backed and speed-control devices | Same reason: matter.js's fan cluster only seeds a default mode, so all fan behaviour would be ours to implement. v2 candidate. This is also why the exported thermostat has no fan control. |
 | **Garage doors** (as a relay role) | Needs polarity data Indigo does not carry (`onState` true meaning *closed*, "on" meaning *close*), and getting it backwards is a physical-safety problem, not a cosmetic one. Blocked on the device-catalog work. |
+| **Heat alarms** | Matter's alarm device type senses smoke and carbon monoxide only. Exporting a heat zone as either would put a "smoke alarm" in your ecosystem that cannot detect smoke — and anything automating on smoke would then include it. The device stays exportable under any role you declare; there just is not an honest one in this family. |
 | **Sprinkler** devices | Matter has no irrigation-controller type. Per-zone water valves would be a lossy fit, and water valves are descoped anyway. |
 | **MultiIO** devices | No coherent way to represent one as a single accessory. |
 | Sensors whose units aren't in the table above | No faithful Matter sensor type to map them to. |

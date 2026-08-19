@@ -3,6 +3,27 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
+## 2026.23.6 — the documentation catches up with the sensors
+
+Documentation only; no behaviour change.
+
+### Changed
+
+- **README** — the export section still said "the seven sensor types". There
+  are now twelve, and they are named. It also gained the custom-state mapping,
+  which had shipped without ever being mentioned to anyone reading the front
+  page, and heat alarms among the roles deliberately not offered.
+- **The Matter guide and the bridge field notes** — the mapping walkthrough
+  still described a tick-box by its old name and its old meaning ("state is
+  inverted", offered only for mapped devices). Rewritten for what the dialog
+  does now: the role is suggested from the device's name, and *Reading is
+  inverted* belongs to every binary sensor with contact sensors starting
+  ticked. Both pages explain why that asymmetry exists — Indigo's on/off means
+  *tripped*, Matter's contact means *closed* — and that a saved export is
+  never re-derived, so a hand-corrected polarity stays corrected.
+- **Heat alarms** are now in the "what cannot be exported" table rather than
+  only in the prose above it.
+
 ## 2026.23.5 — contact sensors read the right way round
 
 ### Fixed
