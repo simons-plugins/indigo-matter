@@ -551,6 +551,34 @@ class ExportDialogMixin:
             self.logger.exception(exc)
             return [LIST_ERROR_OPTION]
 
+    def exportRoleChanged(self, valuesDict, typeId="", devId=0):
+        # pylint: disable=unused-argument
+        """Role selection changed: re-derive the polarity default.
+
+        Changing the role changes what the device's boolean MEANS — the same
+        `onState` is "motion detected" under occupancy and "door open" under
+        contact, and only the second disagrees with Matter's own reading. So
+        the tick-box follows the role rather than persisting a value chosen for
+        a different one. A user who wants the other polarity unticks it after,
+        which is the last word; nothing re-derives it again unless the role
+        moves again.
+
+        Deliberately does NOT touch an export being edited: an existing entry's
+        polarity is a decision already made and possibly hand-corrected, and
+        silently re-deriving it on the way past would undo that.
+        """
+        values = valuesDict
+        try:
+            kind, device_id = self._export_selection(values)
+            if kind != "device" or (self.exports is not None and device_id in self.exports):
+                return values
+            role = str(values.get("exportRole", "") or "")
+            if role:
+                values["exportStateInvert"] = export_catalog.default_invert_for(role)
+        except Exception as exc:  # pylint: disable=broad-except
+            self.logger.exception(exc)
+        return values
+
     def exportStateKeyChanged(self, valuesDict, typeId="", devId=0):
         # pylint: disable=unused-argument
         """State-key selection changed: the role menu can now be populated.
@@ -576,6 +604,7 @@ class ExportDialogMixin:
                 return values
             if str(values.get("exportRole", "") or "") not in verdict.eligible_roles:
                 values["exportRole"] = verdict.default_role
+                values["exportStateInvert"] = export_catalog.default_invert_for(verdict.default_role)
             values["exportStatus"] = (
                 f"{dev.name} will be read from its \"{values.get('exportStateKey')}\" state. "
                 f"Now choose how it should appear.")
@@ -663,6 +692,7 @@ class ExportDialogMixin:
                                              {OPTION_STATE_KEY: state_key})
             suggested = getattr(mapped, "default_role", "")
             values["exportRole"] = suggested
+            values["exportStateInvert"] = export_catalog.default_invert_for(suggested)
             values["exportStatus"] = (
                 f'{dev.name} will be read from its "{state_key}" state'
                 + (f", and looks like a {export_catalog.role_label(suggested).lower()} — "
@@ -680,6 +710,7 @@ class ExportDialogMixin:
             values["exportStatus"] = f"{dev.name} is exported as {export_catalog.role_label(entry.role)}."
         else:
             values["exportRole"] = verdict.default_role
+            values["exportStateInvert"] = export_catalog.default_invert_for(verdict.default_role)
             values["exportName"] = ""
             values["exportInvert"] = False
             values["exportStatus"] = f"{dev.name} is not exported yet."

@@ -641,11 +641,23 @@ def test_every_binary_role_accepts_a_mapping():
         assert ExportEntry.from_dict(raw).options[OPTION_STATE_KEY] == "status"
 
 
-def test_an_inversion_without_a_state_key_is_refused():
-    """A corrupted mapping, not a harmless extra: the export would read
-    `onState` and silently ignore the polarity the user asked for."""
+def test_an_inversion_without_a_state_key_is_allowed_on_a_binary_role():
+    """It used to be refused — "an inversion with nothing to invert". That was
+    wrong (issue #252, live 2026-08-19): a device with a perfectly good
+    `onState` can still report it the other way round from the reading Matter
+    wants, and refusing the option left a Z-Wave door sensor calling every
+    closed door open with no way to correct it.
+    """
+    entry = ExportEntry.from_dict(_mapped(**{OPTION_STATE_INVERT: True}))
+    assert entry.options[OPTION_STATE_INVERT] is True
+
+
+def test_an_inversion_on_a_role_with_no_boolean_is_still_refused():
+    """Polarity belongs to the binary sensors and nothing else."""
+    raw = {"indigoDeviceId": 7, "role": "temperatureSensor",
+           "options": {OPTION_STATE_INVERT: True}}
     with pytest.raises(ValueError):
-        ExportEntry.from_dict(_mapped(**{OPTION_STATE_INVERT: True}))
+        ExportEntry.from_dict(raw)
 
 
 def test_a_non_boolean_inversion_is_refused():

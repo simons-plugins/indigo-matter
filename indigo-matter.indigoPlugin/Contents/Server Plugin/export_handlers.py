@@ -946,7 +946,21 @@ class BinarySensorExport(ExportHandler):
         on_state = getattr(dev, "onState", None)
         # Documented as `None` when the sensor has no on/off concept; a
         # fabricated False would tell every ecosystem the door is shut.
-        return {} if on_state is None else {self.state_key: bool(on_state)}
+        if on_state is None:
+            return {}
+        # Polarity applies here too, not only on the mapped path (issue #252,
+        # reported live). A device with a perfectly ordinary `onState` can
+        # still report it the other way round from the reading Matter wants —
+        # a Z-Wave contact sensor is `onState` true when the door is OPEN,
+        # while Matter's `contact` is true when it is SHUT.
+        return {self.state_key: self._apply_invert(bool(on_state), options)}
+
+    @staticmethod
+    def _apply_invert(value: bool, options: Optional[dict]) -> bool:
+        """``value``, flipped if this export declares inverted polarity."""
+        if isinstance(options, dict) and options.get(export_catalog.OPTION_STATE_INVERT) is True:
+            return not value
+        return value
 
     @staticmethod
     def _mapped_reading(dev: Any, options: Optional[dict]) -> Any:
@@ -971,7 +985,7 @@ class BinarySensorExport(ExportHandler):
             return None
         if not isinstance(value, bool):
             return None
-        return not value if options.get(export_catalog.OPTION_STATE_INVERT) is True else value
+        return BinarySensorExport._apply_invert(value, options)
 
 
 class OccupancySensorExport(BinarySensorExport):

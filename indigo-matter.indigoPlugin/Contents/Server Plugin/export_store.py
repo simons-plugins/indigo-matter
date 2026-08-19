@@ -127,13 +127,16 @@ def _validate_options(options: dict, role: str, device_id: int) -> None:
             raise ValueError(
                 f"export entry {OPTION_STATE_INVERT!r} option is not a boolean "
                 f"(device {device_id})")
-        if OPTION_STATE_KEY not in options:
-            # An inversion with nothing to invert is a corrupted mapping, not a
-            # harmless extra: the export would read `onState` and silently
-            # ignore the polarity the user asked for.
+        if role not in MAPPABLE_ROLES:
+            # Polarity belongs to the binary sensors and nothing else. It used
+            # to require a state key as well — "an inversion with nothing to
+            # invert" — which was wrong: a device with a perfectly good
+            # `onState` can still report it the other way round from Matter's
+            # reading, and refusing the option left a Z-Wave door sensor
+            # reporting every closed door as open with no way to correct it.
             raise ValueError(
-                f"export entry has {OPTION_STATE_INVERT!r} without {OPTION_STATE_KEY!r} "
-                f"(device {device_id})")
+                f"export entry has the {OPTION_STATE_INVERT!r} option on role {role!r}, "
+                f"which reads no boolean state (device {device_id})")
 
 
 @dataclass(frozen=True)
