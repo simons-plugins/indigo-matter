@@ -3,6 +3,19 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
+## 2026.23.8 — renaming, and what it does not do
+
+Documentation only; no behaviour change.
+
+- **Renaming an exported device in Indigo does not rename it in your
+  ecosystem** (issue #221), and now both the Matter guide and the bridge field
+  notes say so. Measured on 2026-08-19: the plugin *does* push the new name and
+  the bridge records it within seconds — but Apple Home stores an accessory's
+  name in your home, set when it was added, and a later change from the bridge
+  does not override it. The Indigo name, and the optional *Name in ecosystems*
+  field, decide what an accessory is called **when it first appears**, and
+  nothing after that. To rename one you already have, rename it there.
+
 ## 2026.23.7 — the reboot leg is validated
 
 Documentation only; no behaviour change.

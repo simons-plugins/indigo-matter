@@ -530,6 +530,22 @@ time the plugin reconnects after the update. The accessory's identity
 paired ecosystem(s) may need re-assigning — the same one-time hedge a role
 change already asks for.
 
+**Renaming an exported device in Indigo will not rename it in your ecosystem**
+(issue #221, measured 2026-08-19). The plugin does push the new name — it
+updates the accessory's `nodeLabel` and the bridge records it within seconds —
+but Apple Home, and every other controller, stores an accessory's name in
+*your home*, set once when the accessory was added, and treats it as yours from
+then on. A later change coming up from the bridge does not override it. This is
+the same reason renaming a bulb in its vendor's own app does not rename it in
+Home.
+
+So the name you set in Indigo — and the optional *Name in ecosystems* field in
+the export dialog — decides what an accessory is called **when it first
+appears**, and nothing after that. To rename one you already have, rename it
+in the ecosystem. The only thing that forces a fresh name is a role change,
+because that publishes a genuinely new accessory — and it costs you the room
+and the automations along with it, which is far too much to pay for a typo.
+
 **Changing a role now costs the room, on purpose** (issue #240). Matter does
 not allow an endpoint to change device type, so changing an export's role
 removes the old accessory from every ecosystem and adds a new one under a
