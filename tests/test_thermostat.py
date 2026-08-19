@@ -110,6 +110,31 @@ def test_set_fan_mode_writes_fancontrol(mock_indigo_base):
     assert (w.cluster, w.attribute, w.value) == (0x0202, 0x0000, 5)  # FanControl FanMode Auto=5
 
 
+def test_always_on_writes_high_not_the_deprecated_on_mode(mock_indigo_base):
+    """Issue #46's other call site. On(4) is deprecated as of Matter 1.2 and is
+    in no FanModeSequence; a 1.5+ server answers a write of it with
+    CONSTRAINT_ERROR, so "Fan Always On" would silently do nothing. High(3) is
+    in every defined sequence, so it always means the same thing."""
+    import indigo
+    h = ThermostatHandler()
+    w = h.handle_indigo_action(_dev(), SimpleNamespace(
+        thermostatAction=indigo.kThermostatAction.SetFanMode,
+        actionMode=indigo.kFanMode.AlwaysOn))
+    assert (w.cluster, w.attribute, w.value) == (0x0202, 0x0000, 3)
+
+
+def test_a_device_reporting_the_deprecated_on_mode_still_reads_as_always_on(mock_indigo_base):
+    """The inbound direction must keep recognising On(4) — deprecated for
+    WRITING does not mean absent from the field. High(3), which is what this
+    plugin now writes, must round-trip to AlwaysOn as well."""
+    import indigo
+    h = FanControlHandler()
+    thermo_dev = SimpleNamespace(deviceTypeId="matterThermostat")
+    for reported in (4, 3):
+        assert h.on_attribute_update(thermo_dev, 0x0000, reported) == {
+            "hvacFanMode": indigo.kFanMode.AlwaysOn}, reported
+
+
 def test_decrease_setpoints(mock_indigo_base):
     import indigo
     h = ThermostatHandler()

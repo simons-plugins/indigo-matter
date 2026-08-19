@@ -5,17 +5,24 @@ current version is `Info.plist`'s `PluginVersion`.
 
 ## 2026.24.1 — fans turn on
 
-- **Turn On now works on fans that do not offer an "On" mode** (issue #46).
-  Matter fans declare which speeds they have via `FanModeSequence`, and the two
-  most common — `OffLowMedHigh` and `OffLowHigh` — have no "On" in them. The
-  plugin was asking for exactly that, so those fans rejected the request and
+- **Turn On now works on fans that refuse the "On" mode** (issue #46). The
+  plugin asked for a fan mode called "On" — which Matter deprecated in version
+  1.2 and which appears in none of the speed lists a fan can declare. Older fans
+  quietly treated it as "High"; newer ones reject it outright, and on those
   Indigo's Turn On did nothing at all. It now sets the speed to 100% instead,
-  which every Matter fan accepts whatever modes it offers. Turn Off is
-  unchanged — "Off" is the one mode every fan has.
+  which every Matter fan accepts whatever modes it offers. Turn Off is unchanged
+  — "Off" is the one mode every fan has.
 
   Setting a fan's brightness already worked and is untouched. Turn On means full
   speed rather than the speed it was last on; if you want a particular speed,
   set the brightness.
+- **"Fan Always On" on a thermostat had the same problem**, and is fixed the
+  same way — it now asks for "High", which every fan offers, instead of the
+  deprecated "On".
+
+  Both are **untested against real hardware** — there is no Matter fan on the
+  development fabric — so if you own one, please report whether Turn On and Fan
+  Always On behave.
 
 ## 2026.24.0 — momentary-only buttons work
 
