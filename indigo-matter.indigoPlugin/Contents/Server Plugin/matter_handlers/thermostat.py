@@ -29,7 +29,13 @@ ATTR_RUNNING_STATE = 0x0029
 # Matter SystemMode enum
 SYS_OFF, SYS_AUTO, SYS_COOL, SYS_HEAT = 0, 1, 3, 4
 # Matter FanControl FanMode enum
-FAN_ON, FAN_AUTO = 4, 5
+# FanMode values. High(3) is the "run continuously" mode to use: it is present in
+# EVERY defined FanModeSequence. On(4) is DEPRECATED as of Matter 1.2 and appears
+# in no sequence at all — values 4/5 of FanModeSequence were redefined from
+# OffOnAuto/OffOn to OffHighAuto/OffHigh — and what a server does with a write of
+# it is version-dependent: <=1.4 coerces it to High (§4.4.6.1.3 "On Value"),
+# 1.5+ rejects it with CONSTRAINT_ERROR. Kept only to recognise it on the way IN.
+FAN_HIGH, FAN_ON, FAN_AUTO = 3, 4, 5
 
 # FanControl attribute ids (cluster 0x0202)
 ATTR_FAN_MODE = 0x0000       # FanMode: Off=0, On=4, Auto=5 (and others)
@@ -153,8 +159,22 @@ class ThermostatHandler(ClusterHandler):
 
     @staticmethod
     def _indigo_to_matter_fan(mode) -> int:
+        """Indigo fan mode → Matter FanMode, for a fan co-located with a thermostat.
+
+        AlwaysOn maps to High(3), not On(4): On is deprecated and belongs to no
+        FanModeSequence, so writing it is a coin-flip on the server's Matter
+        revision (coerced to High on <=1.4, CONSTRAINT_ERROR on 1.5+). High is in
+        every sequence, so it always means the same thing. This is the same
+        defect as issue #46 on the standalone-fan path, at the plugin's only
+        other On-write — a 1.5+ thermostat would have refused "Fan Always On"
+        and left Indigo showing no change.
+
+        The inbound direction is unchanged and still recognises On: a device
+        REPORTING FanMode 4 maps back to AlwaysOn via on_attribute_update's
+        "anything that is not Auto" rule, which covers High and On alike.
+        """
         import indigo
-        return FAN_AUTO if mode == indigo.kFanMode.Auto else FAN_ON
+        return FAN_AUTO if mode == indigo.kFanMode.Auto else FAN_HIGH
 
 
 class FanControlHandler(ClusterHandler):
@@ -232,6 +252,51 @@ class FanControlHandler(ClusterHandler):
             return {"brightnessLevel": int(value)}
         return {}
 
+    @staticmethod
+    def _turn_on(node_id: int, endpoint_id: int) -> MatterAction:
+        """Turn a standalone fan on WITHOUT naming a FanMode (issue #46).
+
+        The obvious write — ``FanMode = On(4)`` — is unreliable, and not for the
+        reason it first looks. On is DEPRECATED as of Matter 1.2 and appears in
+        no ``FanModeSequence`` at all (sequence values 4/5 were redefined from
+        ``OffOnAuto``/``OffOn`` to ``OffHighAuto``/``OffHigh``). What a server
+        does with a write of it then depends on its Matter revision: <=1.4 is
+        required to coerce it to High (§4.4.6.1.3 "On Value"), while 1.5+ drops
+        that coercion and answers CONSTRAINT_ERROR — at which point Indigo's
+        Turn On silently does nothing, which is how issue #46 was found on the
+        mock fleet on 2026-06-10.
+
+        Writing ``PercentSetting`` instead sidesteps the question entirely
+        rather than answering it: PercentSetting is MANDATORY on every
+        FanControl server, whatever its FanModeSequence, and the server derives
+        its own FanMode from the percentage. So this needs no knowledge of which
+        modes the fan allows — which matters, because ``handle_indigo_action``
+        sees only the Indigo device and could not read FanModeSequence here
+        anyway.
+
+        100 rather than a restored previous speed: nothing tracks the last
+        non-zero PercentSetting today, and inventing that state is a bigger
+        change than this fix. Turn On therefore means full speed; a user who
+        wants a specific speed sets the brightness, which already writes
+        PercentSetting directly.
+
+        Turn Off keeps writing ``FanMode = Off(0)`` — Off is the one mode
+        present in every defined FanModeSequence, so it has never had this
+        problem. (High(3) is universal too, and is what the co-located
+        thermostat path writes for AlwaysOn; PercentSetting is preferred here
+        only because this device is a dimmer, so a percentage is the native
+        thing to say.)
+
+        **Testing caveat.** matter.js's stock ``FanControlServer`` (0.17.8)
+        does not implement the Percent Rules coupling — it accepts a
+        PercentSetting write and leaves FanMode at Off — so a matter.js-based
+        mock will show the write succeeding while ``onOffState`` never flips.
+        That is the mock diverging from the spec, not this handler; confirming
+        this fix needs real hardware.
+        """
+        return MatterWrite(node_id, endpoint_id, CLUSTER_FAN_CONTROL,
+                           ATTR_PERCENT_SETTING, 100)
+
     def handle_indigo_action(self, indigo_dev: Any, action: Any) -> Optional[MatterAction]:
         # Co-located fan actions are dispatched through ThermostatHandler.
         if getattr(indigo_dev, "deviceTypeId", None) == "matterThermostat":
@@ -244,17 +309,16 @@ class FanControlHandler(ClusterHandler):
         device_action = action.deviceAction
 
         if device_action == indigo.kDeviceAction.TurnOn:
-            return MatterWrite(node_id, endpoint_id, CLUSTER_FAN_CONTROL,
-                               ATTR_FAN_MODE, FAN_ON)
+            return self._turn_on(node_id, endpoint_id)
         if device_action == indigo.kDeviceAction.TurnOff:
             return MatterWrite(node_id, endpoint_id, CLUSTER_FAN_CONTROL,
                                ATTR_FAN_MODE, 0)
         if device_action == indigo.kDeviceAction.Toggle:
             # Toggle: flip based on current onOffState.
-            on = getattr(indigo_dev, "onState", False)
-            new_mode = 0 if on else FAN_ON
-            return MatterWrite(node_id, endpoint_id, CLUSTER_FAN_CONTROL,
-                               ATTR_FAN_MODE, new_mode)
+            if getattr(indigo_dev, "onState", False):
+                return MatterWrite(node_id, endpoint_id, CLUSTER_FAN_CONTROL,
+                                   ATTR_FAN_MODE, 0)
+            return self._turn_on(node_id, endpoint_id)
         if device_action == indigo.kDeviceAction.SetBrightness:
             return MatterWrite(node_id, endpoint_id, CLUSTER_FAN_CONTROL,
                                ATTR_PERCENT_SETTING, int(action.actionValue))
