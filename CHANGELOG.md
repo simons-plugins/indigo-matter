@@ -18,6 +18,32 @@ current version is `Info.plist`'s `PluginVersion`.
   and falls back to auto-detect. Nothing is written to your prefs; the next
   successful *Install/update matter-server* re-pins to the node that ran it. A
   healthy pin (an nvm version directory, say) behaves exactly as before.
+- **A rejected pin can no longer resolve straight back to itself.** The pin is
+  usually one of the directories auto-detect checks first (that is where the
+  install put it), so rejecting it used to walk into the same directory one step
+  later — logging that the bad node had been ignored while going on to use it,
+  and never reaching a healthy node further down the chain. When there genuinely
+  is no alternative the pin is kept and the message says so, rather than
+  claiming a fallback that did not happen.
+- **The rejection message carries the real error.** "Bad CPU type in executable"
+  or "Library not loaded: …" is the answer; it now appears in the log line
+  instead of a flat "could not be run".
+- The version check is bounded by a timeout, so a node on a stale network mount
+  or a sleeping external disk cannot hang plugin startup.
+
+## 2026.23.9 — the re-adopt picker leads with the likely answer
+
+- **The re-adopt device picker now sorts its strongest candidates to the top**
+  (issue #247). Selectable rows were alphabetical, which is scannable but says
+  nothing about *which* row is the one you came for — on a large install the
+  right device sat several screens down a list of every plug in the house. Two
+  pieces of evidence already known to the dialog now rank it: a device whose
+  name is the left-behind accessory's name (the same rule the bridge node's own
+  "you could re-adopt this" nudge fires on), and a device that is already
+  exported (`●`). Name match first, so the two together — the exact case the
+  nudge reports — lead the list, then a name match, then any other exported
+  device, then the alphabet as before. Nothing is hidden or dropped: selectable
+  rows still come first and are still never truncated.
 
 ## 2026.23.8 — renaming, and what it does not do
 
