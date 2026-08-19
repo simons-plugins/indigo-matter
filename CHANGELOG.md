@@ -3,7 +3,7 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
-## 2026.23.9 — a pinned node is checked before it is trusted
+## 2026.23.10 — a pinned node is checked before it is trusted
 
 - **A stale "Node bin directory" pin no longer shadows a newer node** (issue
   #101). The pin was honoured on an `npx`-exists check alone, and a successful
