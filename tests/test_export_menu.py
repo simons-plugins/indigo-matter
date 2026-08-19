@@ -1527,6 +1527,72 @@ class TestGetReadoptDevices:
         selectable = [label for key, label in options if not key.startswith("x-")]
         assert selectable[0] == "● Aardvark Plug", selectable
 
+    def test_a_name_matching_device_leads_the_selectable_block(self, plug, devices):
+        """Issue #247. The orphan's label is the same evidence the bridge
+        node's own nudge fires on (`noteReadoptableMatch`), so the device the
+        log already pointed at must not sit several screens down the alphabet.
+        """
+        devices.add(RelayDevice(313, "Aardvark Plug"))    # alphabetically first
+        devices.add(RelayDevice(314, "Old Plug"))         # ...but THIS is the orphan's name
+        _bridge_with(plug, attached=True)
+        orphan = _orphan(role="onOffPlugInUnit", label="Old Plug")
+        plug.runtime = _FakeRuntime(result=[orphan])
+        options = plug.getReadoptDevices(valuesDict={"readoptOrphan": orphan.unique_id})
+        selectable = [label for key, label in options if not key.startswith("x-")]
+        assert selectable[0] == "Old Plug", selectable
+
+    def test_an_exported_device_outranks_an_unexported_one(self, plug, devices):
+        """The other half of #247: ● is the "deleted, recreated and re-exported
+        before noticing" case #219 exists for."""
+        devices.add(RelayDevice(315, "Aardvark Plug"))
+        devices.add(RelayDevice(316, "Zulu Plug"))
+        plug.exports.upsert(ExportEntry(316, "onOffPlugInUnit"))
+        _bridge_with(plug, attached=True)
+        orphan = _orphan(role="onOffPlugInUnit")
+        plug.runtime = _FakeRuntime(result=[orphan])
+        options = plug.getReadoptDevices(valuesDict={"readoptOrphan": orphan.unique_id})
+        selectable = [label for key, label in options if not key.startswith("x-")]
+        assert selectable[0] == "● Zulu Plug", selectable
+
+    def test_a_name_match_outranks_a_bare_export_and_both_beat_the_alphabet(self, plug, devices):
+        """Full rank order: name-match+●, then name-match, then ●, then A→Z."""
+        devices.add(RelayDevice(317, "Aardvark Plug"))            # neither
+        devices.add(RelayDevice(318, "Zulu Plug"))                # exported only
+        plug.exports.upsert(ExportEntry(318, "onOffPlugInUnit"))
+        devices.add(RelayDevice(319, "Old Plug"))                 # name match only
+        _bridge_with(plug, attached=True)
+        orphan = _orphan(role="onOffPlugInUnit", label="Old Plug")
+        plug.runtime = _FakeRuntime(result=[orphan])
+        options = plug.getReadoptDevices(valuesDict={"readoptOrphan": orphan.unique_id})
+        selectable = [label for key, label in options if not key.startswith("x-")]
+        assert selectable[:3] == ["Old Plug", "● Zulu Plug", "Aardvark Plug"], selectable
+
+    def test_a_labelless_orphan_matches_nothing_rather_than_everything(self, plug, devices):
+        """A pre-PR5 orphan records no label. An absence of evidence must not
+        read as evidence about every device (a blank name would otherwise
+        promote any device whose name is also blank)."""
+        devices.add(RelayDevice(321, "Aardvark Plug"))
+        _bridge_with(plug, attached=True)
+        orphan = _orphan(role="onOffPlugInUnit", label=None)
+        plug.runtime = _FakeRuntime(result=[orphan])
+        options = plug.getReadoptDevices(valuesDict={"readoptOrphan": orphan.unique_id})
+        selectable = [label for key, label in options if not key.startswith("x-")]
+        assert selectable == sorted(selectable, key=str.lower), selectable
+
+    def test_relevance_never_promotes_an_explained_row_above_a_selectable_one(self, plug, devices):
+        """#247 REORDERS the selectable block; it must not disturb the
+        eligible-first rule. An ineligible device sharing the orphan's name is
+        the sharpest case — the strongest name evidence on an unpickable row.
+        """
+        devices.add(DimmerDevice(322, "Old Plug"))        # cannot take onOffPlugInUnit
+        devices.add(RelayDevice(323, "Zulu Plug"))
+        _bridge_with(plug, attached=True)
+        orphan = _orphan(role="onOffPlugInUnit", label="Old Plug")
+        plug.runtime = _FakeRuntime(result=[orphan])
+        options = plug.getReadoptDevices(valuesDict={"readoptOrphan": orphan.unique_id})
+        keys = [key for key, _label in options]
+        assert keys.index("323") < keys.index("x-322")
+
     def test_an_unexportable_device_is_shown_with_the_classifiers_reason(self, plug):
         _bridge_with(plug, attached=True)
         orphan = _orphan(role="onOffPlugInUnit")

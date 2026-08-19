@@ -3,6 +3,20 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
+## 2026.23.9 — the re-adopt picker leads with the likely answer
+
+- **The re-adopt device picker now sorts its strongest candidates to the top**
+  (issue #247). Selectable rows were alphabetical, which is scannable but says
+  nothing about *which* row is the one you came for — on a large install the
+  right device sat several screens down a list of every plug in the house. Two
+  pieces of evidence already known to the dialog now rank it: a device whose
+  name is the left-behind accessory's name (the same rule the bridge node's own
+  "you could re-adopt this" nudge fires on), and a device that is already
+  exported (`●`). Name match first, so the two together — the exact case the
+  nudge reports — lead the list, then a name match, then any other exported
+  device, then the alphabet as before. Nothing is hidden or dropped: selectable
+  rows still come first and are still never truncated.
+
 ## 2026.23.8 — renaming, and what it does not do
 
 Documentation only; no behaviour change.

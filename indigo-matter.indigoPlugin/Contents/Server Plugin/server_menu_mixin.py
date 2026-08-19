@@ -1435,8 +1435,50 @@ class ServerMenuMixin:
         return (str(dev.id), f"{mark}{dev.name}")
 
     @staticmethod
+    def _readopt_relevance(dev, orphan, exported) -> tuple:
+        """Relevance rank for one SELECTABLE re-adopt row — lower sorts first.
+
+        Within the selectable block the alphabet alone buries the answer: on a
+        large install the device the user is actually re-adopting can sit
+        several screens down a list of every plug in the house (issue #247,
+        Simon's 2026-08-18 live observation). Two pieces of evidence say
+        "this is the one", and both are already known here:
+
+        * the device's name is the orphan's ``label`` — the SAME rule the
+          bridge node's own re-adopt nudge fires on
+          (``EndpointMap.noteReadoptableMatch``: role and label both equal),
+          so the picker now leads with the device the log already pointed at;
+        * the device is already exported (``●``) — the "deleted, recreated and
+          re-exported before noticing" case that motivates #219 in the first
+          place.
+
+        Ranked name-match first, so the two together (the nudge's exact case)
+        top the list, then a name match, then any other exported device, then
+        the rest — each block still alphabetical, since the caller appends the
+        name key after this one. Evidence only ever REORDERS: nothing is
+        hidden, and the eligible-first/never-truncated guarantee above is
+        untouched.
+
+        A missing/empty orphan label matches nothing rather than everything —
+        it is a pre-PR5 orphan with no name recorded, which is an absence of
+        evidence, not evidence about every device at once.
+        """
+        label = orphan.label or ""
+        name = str(getattr(dev, "name", "") or "")
+        # Exact equality, deliberately: this mirrors the node-side nudge rather
+        # than inventing a second, looser notion of "same name" that would
+        # promote a device the log never mentioned.
+        name_matches = bool(label) and name == label
+        return (not name_matches, dev.id not in exported)
+
+    @staticmethod
     def _sorted_device_rows(rows: list) -> list:
-        """``(sort_name, row)`` pairs → rows, A→Z, case-insensitively.
+        """``(sort_key, row)`` pairs → rows, by that key.
+
+        The key is the lower-cased device name for an A→Z block, or a
+        relevance tuple ENDING in that name (see :meth:`_readopt_relevance`)
+        where a block leads with its strongest candidates. Uniform within any
+        one call, which is all ``sorted`` requires.
 
         Both device pickers used ``indigo.devices`` order, which is neither
         alphabetical nor stable-looking to a user: Indigo collates with a
@@ -1468,6 +1510,11 @@ class ServerMenuMixin:
         bites. There is no filter field to narrow on (the orphan's role
         already does most of the narrowing), which is exactly why the tail is
         the half that gets capped.
+
+        Within the selectable block, rows are ordered by
+        :meth:`_readopt_relevance` before falling back to the alphabet (issue
+        #247) — the alphabet alone is scannable but says nothing about which
+        row is the answer.
         """
         try:
             if self.exports is None:
@@ -1496,8 +1543,15 @@ class ServerMenuMixin:
                     row = self._readopt_device_row(dev, orphan, plugin_id, exported)
                     if row is None:
                         continue
-                    (explained if row[0].startswith(EXCLUDED_OPTION_PREFIX)
-                     else eligible).append((str(getattr(dev, "name", "") or "").lower(), row))
+                    name_key = str(getattr(dev, "name", "") or "").lower()
+                    if row[0].startswith(EXCLUDED_OPTION_PREFIX):
+                        explained.append((name_key, row))
+                    else:
+                        # Selectable rows lead with the strongest candidates
+                        # (issue #247); the explained tail stays plain A→Z,
+                        # having no candidacy to rank.
+                        eligible.append(
+                            (self._readopt_relevance(dev, orphan, exported) + (name_key,), row))
                 except Exception as exc:  # pylint: disable=broad-except
                     self._log_row_failure(exc, first=not failures)  # pylint: disable=no-member
                     failures += 1
