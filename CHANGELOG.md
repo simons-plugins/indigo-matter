@@ -3,6 +3,34 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
+## 2026.23.10 — a pinned node is checked before it is trusted
+
+- **A stale "Node bin directory" pin no longer shadows a newer node** (issue
+  #101). The pin was honoured on an `npx`-exists check alone, and a successful
+  install re-wrote it — so once a pin existed it kept itself alive. A user whose
+  pin pointed at a leftover `/usr/local/bin/node` (an old Node.js `.pkg`, or
+  Intel Homebrew on an Apple-Silicon Mac) could install a current node to fix
+  the problem and have nothing change, because the pin still won; the only
+  symptom was `matter-server connection lost … Connect call failed
+  ('127.0.0.1', 5580)`. The pin is now checked before it is used: if the `node`
+  beside it will not run, or reports a version below the required 22.13, the
+  plugin says so — naming the pin, its version, and the node it was hiding —
+  and falls back to auto-detect. Nothing is written to your prefs; the next
+  successful *Install/update matter-server* re-pins to the node that ran it. A
+  healthy pin (an nvm version directory, say) behaves exactly as before.
+- **A rejected pin can no longer resolve straight back to itself.** The pin is
+  usually one of the directories auto-detect checks first (that is where the
+  install put it), so rejecting it used to walk into the same directory one step
+  later — logging that the bad node had been ignored while going on to use it,
+  and never reaching a healthy node further down the chain. When there genuinely
+  is no alternative the pin is kept and the message says so, rather than
+  claiming a fallback that did not happen.
+- **The rejection message carries the real error.** "Bad CPU type in executable"
+  or "Library not loaded: …" is the answer; it now appears in the log line
+  instead of a flat "could not be run".
+- The version check is bounded by a timeout, so a node on a stale network mount
+  or a sleeping external disk cannot hang plugin startup.
+
 ## 2026.23.9 — the re-adopt picker leads with the likely answer
 
 - **The re-adopt device picker now sorts its strongest candidates to the top**
