@@ -527,7 +527,10 @@ def test_node_bin_dir_pref_wins_over_everything(tmp_path, prefs, mock_logger, mo
     custom_npx = custom_bin / "npx"
     custom_npx.write_text("#!/bin/sh\n")
     prefs = dict(prefs, nodeBinDir=str(custom_bin))
-    sp = ServerProcess(prefs, mock_logger, home=str(home), runner=FakeRunner())
+    # NodeVersionRunner, not FakeRunner: since #101 a pin is honoured only if the
+    # node beside it runs and is new enough, so "the pref wins" now presupposes a
+    # HEALTHY pin. The unhealthy cases have their own tests below.
+    sp = ServerProcess(prefs, mock_logger, home=str(home), runner=NodeVersionRunner())
     assert sp.npx_path == str(custom_npx)
 
 
@@ -540,8 +543,118 @@ def test_node_bin_dir_expands_tilde(tmp_path, prefs, mock_logger, monkeypatch):
     npx = bindir / "npx"
     npx.write_text("#!/bin/sh\n")
     prefs = dict(prefs, nodeBinDir="~/mynode/bin")
-    sp = ServerProcess(prefs, mock_logger, home=str(home), runner=FakeRunner())
+    sp = ServerProcess(prefs, mock_logger, home=str(home), runner=NodeVersionRunner())
     assert sp.npx_path == str(npx)
+
+
+# ---------------------------------------------------------------------------
+# Issue #101 — an auto-pinned nodeBinDir is re-validated, never blindly trusted
+# ---------------------------------------------------------------------------
+# Field case (forum user jroach, 2026-07-12): the pin held a leftover
+# /usr/local/bin/node from an old Node.js .pkg. install() re-wrote the pin from
+# resolved_bin_dir after every install, so the pin was self-perpetuating — the
+# user installed a current Homebrew node to fix it, and the pin shadowed it
+# forever. The only symptom was "matter-server connection lost … Connect call
+# failed ('127.0.0.1', 5580)".
+
+def _pinned(tmp_path, prefs, mock_logger, runner, *, tools=("npx", "node")):
+    """A ServerProcess whose nodeBinDir pin exists on disk, with Homebrew present.
+
+    ``tools`` is what the pinned dir actually contains — drop "node" to model a
+    pin whose npx is there but whose node is not.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    pinned = home / "pinned" / "bin"
+    pinned.mkdir(parents=True)
+    for tool in tools:
+        (pinned / tool).write_text("#!/bin/sh\n")
+    return ServerProcess(dict(prefs, nodeBinDir=str(pinned)), mock_logger,
+                         home=str(home), runner=runner), pinned
+
+
+def test_a_pin_whose_node_is_too_old_falls_back_to_autodetect(tmp_path, prefs, mock_logger,
+                                                              monkeypatch):
+    """Acceptance, #101: stale pin + a valid Homebrew node present → resolve the
+    Homebrew node, with no pref surgery by the user."""
+    monkeypatch.setattr("server_process.os.path.exists",
+                        lambda p: _real_exists(p) or p == "/opt/homebrew/bin/npx")
+    sp, pinned = _pinned(tmp_path, prefs, mock_logger, NodeVersionRunner("v18.20.4"))
+    assert sp.npx_path == "/opt/homebrew/bin/npx"
+    said = " ".join(str(c.args[0]) % c.args[1:] for c in mock_logger.warning.call_args_list)
+    assert "IGNORING" in said
+    assert str(pinned) in said, "names the pin"
+    assert "v18.20.4" in said, "names the version it rejected"
+    assert "/opt/homebrew/bin/npx" in said, "names what the pin was shadowing"
+
+
+class UnrunnableNodeRunner(FakeRunner):
+    """`node --version` raises OSError — the pinned node is gone, is not
+    executable, or is an architecture this Mac cannot exec."""
+
+    def __call__(self, cmd, **kwargs):
+        if len(cmd) >= 2 and cmd[0].endswith("node") and cmd[1] == "--version":
+            raise OSError(8, "Exec format error")
+        return super().__call__(cmd, **kwargs)
+
+
+def test_a_pin_whose_node_will_not_run_falls_back_to_autodetect(tmp_path, prefs, mock_logger,
+                                                                monkeypatch):
+    """The other disqualifier: npx is there but the node beside it cannot exec."""
+    monkeypatch.setattr("server_process.os.path.exists",
+                        lambda p: _real_exists(p) or p == "/opt/homebrew/bin/npx")
+    sp, _pin = _pinned(tmp_path, prefs, mock_logger, UnrunnableNodeRunner(), tools=("npx",))
+    assert sp.npx_path == "/opt/homebrew/bin/npx"
+    said = " ".join(str(c.args[0]) % c.args[1:] for c in mock_logger.warning.call_args_list)
+    assert "could not be run" in said
+
+
+def test_a_healthy_pin_is_still_honoured_silently(tmp_path, prefs, mock_logger, monkeypatch):
+    """Acceptance, #101: a valid explicit pin (the nvm-version-dir case the pref
+    exists for) behaves exactly as before — chosen, and not warned about."""
+    monkeypatch.setattr("server_process.os.path.exists",
+                        lambda p: _real_exists(p) or p == "/opt/homebrew/bin/npx")
+    sp, pinned = _pinned(tmp_path, prefs, mock_logger, NodeVersionRunner("v22.18.0"))
+    assert sp.npx_path == str(pinned / "npx")
+    said = " ".join(str(c.args[0]) % c.args[1:] for c in mock_logger.warning.call_args_list)
+    assert "IGNORING" not in said
+
+
+def test_a_pin_whose_node_version_is_unreadable_is_kept(tmp_path, prefs, mock_logger, monkeypatch):
+    """A node that RUNS but prints something we cannot parse is an unknown, not a
+    fault. install() already refuses to block on an unreadable version; rejecting
+    a working node over a string we failed to read would be the worse failure."""
+    monkeypatch.setattr("server_process.os.path.exists",
+                        lambda p: _real_exists(p) or p == "/opt/homebrew/bin/npx")
+    sp, pinned = _pinned(tmp_path, prefs, mock_logger, NodeVersionRunner("banana"))
+    assert sp.npx_path == str(pinned / "npx")
+
+
+def test_a_rejected_pin_does_not_resolve_back_to_itself(tmp_path, prefs, mock_logger, monkeypatch):
+    """The fallback must not re-enter step (a). With NOTHING else on the machine
+    the last-resort Homebrew default is the answer — never the pin it just
+    rejected, which would make the whole check a no-op."""
+    monkeypatch.setattr("server_process.os.path.exists", lambda p: False)
+    monkeypatch.setattr("launch_agent.shutil.which", lambda _name: None)
+    home = tmp_path / "home"
+    home.mkdir()
+    sp = ServerProcess(dict(prefs, nodeBinDir=str(home / "pinned" / "bin")), mock_logger,
+                       home=str(home), runner=NodeVersionRunner("v18.0.0"))
+    assert sp.npx_path == "/opt/homebrew/bin/npx"
+
+
+def test_an_absent_pin_still_warns_and_autodetects(tmp_path, prefs, mock_logger, monkeypatch):
+    """Unchanged pre-#101 behaviour: a pin with no npx at all never reaches the
+    version probe."""
+    monkeypatch.setattr("server_process.os.path.exists",
+                        lambda p: p == "/opt/homebrew/bin/npx")
+    home = tmp_path / "home"
+    home.mkdir()
+    sp = ServerProcess(dict(prefs, nodeBinDir=str(home / "gone")), mock_logger,
+                       home=str(home), runner=NodeVersionRunner())
+    assert sp.npx_path == "/opt/homebrew/bin/npx"
+    said = " ".join(str(c.args[0]) % c.args[1:] for c in mock_logger.warning.call_args_list)
+    assert "no npx found there" in said
 
 
 def test_homebrew_still_resolves_when_no_pref_or_nvm(tmp_path, prefs, mock_logger, monkeypatch):

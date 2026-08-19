@@ -248,10 +248,12 @@ class LaunchAgent:
         return os.path.dirname(self.npx_path)
 
     def _resolve_npx(self) -> str:
-        """Locate the ``npx`` binary, honouring an explicit pref then auto-detect.
+        """Locate the ``npx`` binary, honouring a USABLE explicit pref then auto-detect.
 
         Resolution order:
-          a. ``nodeBinDir`` pref (``{nodeBinDir}/npx``) — explicit override / pin.
+          a. ``nodeBinDir`` pref (``{nodeBinDir}/npx``) — explicit override / pin,
+             honoured only if the node beside it actually runs and is new enough
+             (see :meth:`_pin_problem`); otherwise auto-detect, loudly.
           b. ``/opt/homebrew/bin/npx`` (Apple-Silicon Homebrew).
           c. ``/usr/local/bin/npx`` (Intel Homebrew).
           d. nvm auto-detect (``~/.nvm/versions/node/<version>/bin/npx``) —
@@ -261,6 +263,23 @@ class LaunchAgent:
              will log if it's absent. We WARN here so a misconfigured user gets a
              hint rather than a silent dead LaunchAgent.
 
+        **Why (a) is validated at all** (issue #101). The pin used to be trusted
+        on an npx-EXISTS check alone, and ``install()`` re-writes it from
+        ``resolved_bin_dir`` after every successful install — so once a pin
+        existed it was self-perpetuating. A user whose pin pointed at a leftover
+        ``/usr/local/bin/node`` (an old Node.js ``.pkg``, or Intel Homebrew on an
+        Apple-Silicon Mac) got the obvious remedy — install a current node, retry
+        — silently shadowed by the pin, and the only symptom was the WS client
+        reporting connection refused. The pref is behind "Show advanced server
+        settings", so most users do not know the pin exists, let alone that
+        clearing it would re-enable auto-detect. Validating it here makes the
+        remedy work without any pref surgery.
+
+        Nothing is written to prefs from here: a fallback simply resolves
+        elsewhere, and the existing post-install pin write re-pins to whatever
+        that was on the next install. A pin whose fallback ALSO fails therefore
+        survives untouched on disk.
+
         Note: nvm's version dir is version-specific and changes when the user
         upgrades node. ``ensure_installed()`` re-resolves on every plugin startup,
         so a node upgrade is picked up on the next plugin restart. Set ``nodeBinDir``
@@ -269,12 +288,62 @@ class LaunchAgent:
         # a. explicit override
         if self.node_bin_dir:
             candidate = os.path.join(self.node_bin_dir, "npx")
-            if os.path.exists(candidate):
-                return candidate
-            self.logger.warning(
-                "nodeBinDir is set to %s but no npx found there; falling back to "
-                "auto-detect", self.node_bin_dir,
-            )
+            if not os.path.exists(candidate):
+                self.logger.warning(
+                    "nodeBinDir is set to %s but no npx found there; falling back to "
+                    "auto-detect", self.node_bin_dir,
+                )
+            else:
+                problem = self._pin_problem(candidate)
+                if problem is None:
+                    return candidate
+                # Resolved BEFORE the warning so the message can name what the
+                # pin was shadowing — "falling back" without saying to what
+                # leaves the user exactly as stuck as the silent pin did.
+                fallback = self._autodetect_npx()
+                self.logger.warning(
+                    "IGNORING the pinned 'Node bin directory' %s — %s. Falling back to "
+                    "auto-detect, which resolved %s. The pin is left as-is; a successful "
+                    "'%s' re-pins it to the node that ran the install. To pin a different "
+                    "node yourself, set 'Node bin directory' under 'Show advanced server "
+                    "settings' (blank = auto-detect).",
+                    self.node_bin_dir, problem, fallback, self.spec.install_menu_name,
+                )
+                return fallback
+        return self._autodetect_npx()
+
+    def _pin_problem(self, npx_path: str) -> Optional[str]:
+        """Why the pinned bin dir must not be used, or ``None`` if it is fine.
+
+        Two disqualifiers, both about the ``node`` beside the pinned ``npx``
+        (which is the binary the LaunchAgent actually execs — the npm package
+        exposes no bin entry point):
+
+        * it does not run at all — deleted, not executable, or an architecture
+          this Mac cannot execute;
+        * it runs and reports a version below :data:`MIN_NODE_VERSION`.
+
+        A node that runs but whose ``--version`` output does not parse is NOT a
+        problem: that is an unknown, and ``install()`` already refuses to block
+        on an unreadable version for the same reason — refusing a working node
+        over a string we failed to read would be the worse failure.
+        """
+        node = os.path.join(os.path.dirname(npx_path), "node")
+        version = self._probe_node_version(node)
+        if version is None:
+            return f"the node beside it ({node}) could not be run"
+        parsed = _parse_node_version(version)
+        if parsed is not None and parsed[:2] < MIN_NODE_VERSION:
+            return (f"its node ({node}) is {version}, older than the required "
+                    f"{'.'.join(map(str, MIN_NODE_VERSION))}")
+        return None
+
+    def _autodetect_npx(self) -> str:
+        """Steps (b)–(f) of :meth:`_resolve_npx` — everything but the pin.
+
+        Split out so a rejected pin can fall back WITHOUT re-entering (a) and
+        resolving to itself again.
+        """
         # b + c. Homebrew
         for candidate in NPX_CANDIDATES:
             if os.path.exists(candidate):
@@ -462,8 +531,18 @@ class LaunchAgent:
 
     def _node_version(self) -> Optional[str]:
         """Return the resolved node's version string (e.g. ``v22.18.0``), or None."""
+        return self._probe_node_version(self.node_path)
+
+    def _probe_node_version(self, node_path: str) -> Optional[str]:
+        """``{node_path} --version`` → e.g. ``v22.18.0``, or None if it did not run.
+
+        Takes the path rather than reading :attr:`node_path` because
+        :meth:`_pin_problem` runs during ``__init__``, BEFORE ``node_path``
+        exists — it is deciding which bin dir that attribute will be derived
+        from.
+        """
         try:
-            result = self._run([self.node_path, "--version"], capture_output=True,
+            result = self._run([node_path, "--version"], capture_output=True,
                                text=True, check=False)
         except OSError:
             return None

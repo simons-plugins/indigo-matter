@@ -3,6 +3,22 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
+## 2026.23.9 — a pinned node is checked before it is trusted
+
+- **A stale "Node bin directory" pin no longer shadows a newer node** (issue
+  #101). The pin was honoured on an `npx`-exists check alone, and a successful
+  install re-wrote it — so once a pin existed it kept itself alive. A user whose
+  pin pointed at a leftover `/usr/local/bin/node` (an old Node.js `.pkg`, or
+  Intel Homebrew on an Apple-Silicon Mac) could install a current node to fix
+  the problem and have nothing change, because the pin still won; the only
+  symptom was `matter-server connection lost … Connect call failed
+  ('127.0.0.1', 5580)`. The pin is now checked before it is used: if the `node`
+  beside it will not run, or reports a version below the required 22.13, the
+  plugin says so — naming the pin, its version, and the node it was hiding —
+  and falls back to auto-detect. Nothing is written to your prefs; the next
+  successful *Install/update matter-server* re-pins to the node that ran it. A
+  healthy pin (an nvm version directory, say) behaves exactly as before.
+
 ## 2026.23.8 — renaming, and what it does not do
 
 Documentation only; no behaviour change.
