@@ -232,6 +232,39 @@ class FanControlHandler(ClusterHandler):
             return {"brightnessLevel": int(value)}
         return {}
 
+    @staticmethod
+    def _turn_on(node_id: int, endpoint_id: int) -> MatterAction:
+        """Turn a standalone fan on WITHOUT naming a FanMode (issue #46).
+
+        The obvious write — ``FanMode = On(4)`` — is only legal on a fan whose
+        ``FanModeSequence`` includes On. The common sequences do not:
+        ``OffLowMedHigh`` and ``OffLowHigh`` are both On-less, and a fan
+        declaring one of those answers the write with a CONSTRAINT_ERROR, so
+        Indigo's Turn On did nothing at all. (Found on the mock fleet
+        2026-06-10, which uses ``OffLowMedHigh`` precisely because real hardware
+        commonly does.)
+
+        Writing ``PercentSetting`` instead sidesteps the question entirely
+        rather than answering it: PercentSetting is MANDATORY on every
+        FanControl server, whatever its FanModeSequence, and the server derives
+        its own FanMode from the percentage. So this needs no knowledge of which
+        modes the fan allows — which matters, because ``handle_indigo_action``
+        sees only the Indigo device and could not read FanModeSequence here
+        anyway.
+
+        100 rather than a restored previous speed: nothing tracks the last
+        non-zero PercentSetting today, and inventing that state is a bigger
+        change than this fix. Turn On therefore means full speed; a user who
+        wants a specific speed sets the brightness, which already writes
+        PercentSetting directly.
+
+        Turn Off keeps writing ``FanMode = Off(0)`` — Off is the one mode
+        present in every defined FanModeSequence, so it has never had this
+        problem.
+        """
+        return MatterWrite(node_id, endpoint_id, CLUSTER_FAN_CONTROL,
+                           ATTR_PERCENT_SETTING, 100)
+
     def handle_indigo_action(self, indigo_dev: Any, action: Any) -> Optional[MatterAction]:
         # Co-located fan actions are dispatched through ThermostatHandler.
         if getattr(indigo_dev, "deviceTypeId", None) == "matterThermostat":
@@ -244,17 +277,16 @@ class FanControlHandler(ClusterHandler):
         device_action = action.deviceAction
 
         if device_action == indigo.kDeviceAction.TurnOn:
-            return MatterWrite(node_id, endpoint_id, CLUSTER_FAN_CONTROL,
-                               ATTR_FAN_MODE, FAN_ON)
+            return self._turn_on(node_id, endpoint_id)
         if device_action == indigo.kDeviceAction.TurnOff:
             return MatterWrite(node_id, endpoint_id, CLUSTER_FAN_CONTROL,
                                ATTR_FAN_MODE, 0)
         if device_action == indigo.kDeviceAction.Toggle:
             # Toggle: flip based on current onOffState.
-            on = getattr(indigo_dev, "onState", False)
-            new_mode = 0 if on else FAN_ON
-            return MatterWrite(node_id, endpoint_id, CLUSTER_FAN_CONTROL,
-                               ATTR_FAN_MODE, new_mode)
+            if getattr(indigo_dev, "onState", False):
+                return MatterWrite(node_id, endpoint_id, CLUSTER_FAN_CONTROL,
+                                   ATTR_FAN_MODE, 0)
+            return self._turn_on(node_id, endpoint_id)
         if device_action == indigo.kDeviceAction.SetBrightness:
             return MatterWrite(node_id, endpoint_id, CLUSTER_FAN_CONTROL,
                                ATTR_PERCENT_SETTING, int(action.actionValue))

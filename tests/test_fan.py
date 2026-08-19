@@ -229,7 +229,13 @@ def _fan_action_dev(on=False, brightness=0):
     )
 
 
-def test_action_turn_on_writes_fan_mode_on(mock_indigo_base):
+def test_action_turn_on_writes_percent_setting_not_fan_mode(mock_indigo_base):
+    """Issue #46. `FanMode = On(4)` is only legal on a fan whose FanModeSequence
+    includes On, and the common sequences (OffLowMedHigh, OffLowHigh) do not —
+    such a fan answers with CONSTRAINT_ERROR and Indigo's Turn On does nothing.
+    PercentSetting is mandatory on every FanControl server whatever its
+    sequence, so writing it sidesteps the question rather than answering it.
+    """
     import indigo
     h = FanControlHandler()
     dev = _fan_action_dev(on=False)
@@ -237,8 +243,9 @@ def test_action_turn_on_writes_fan_mode_on(mock_indigo_base):
     w = h.handle_indigo_action(dev, action)
     assert isinstance(w, MatterWrite)
     assert (w.node_id, w.endpoint, w.cluster, w.attribute, w.value) == (
-        50, 1, CLUSTER_FAN_CONTROL, ATTR_FAN_MODE, FAN_ON
+        50, 1, CLUSTER_FAN_CONTROL, ATTR_PERCENT_SETTING, 100
     )
+    assert w.attribute != ATTR_FAN_MODE, "naming a mode is what #46 is about"
 
 
 def test_action_turn_off_writes_fan_mode_zero(mock_indigo_base):
@@ -250,13 +257,26 @@ def test_action_turn_off_writes_fan_mode_zero(mock_indigo_base):
     assert (w.cluster, w.attribute, w.value) == (CLUSTER_FAN_CONTROL, ATTR_FAN_MODE, 0)
 
 
-def test_action_toggle_from_off_writes_fan_on(mock_indigo_base):
+def test_action_toggle_from_off_takes_the_same_route_as_turn_on(mock_indigo_base):
+    """Toggle-on had its own copy of the FanMode=On write, so it hit #46 too."""
     import indigo
     h = FanControlHandler()
     dev = _fan_action_dev(on=False)
     action = SimpleNamespace(deviceAction=indigo.kDeviceAction.Toggle)
     w = h.handle_indigo_action(dev, action)
-    assert w.value == FAN_ON
+    assert (w.attribute, w.value) == (ATTR_PERCENT_SETTING, 100)
+
+
+def test_turn_off_still_writes_fan_mode_off(mock_indigo_base):
+    """Off is the one mode present in EVERY defined FanModeSequence, so the off
+    path never had #46's problem and deliberately keeps writing FanMode."""
+    import indigo
+    h = FanControlHandler()
+    for on_state, device_action in ((True, indigo.kDeviceAction.TurnOff),
+                                    (True, indigo.kDeviceAction.Toggle)):
+        w = h.handle_indigo_action(_fan_action_dev(on=on_state),
+                                   SimpleNamespace(deviceAction=device_action))
+        assert (w.attribute, w.value) == (ATTR_FAN_MODE, 0), device_action
 
 
 def test_action_toggle_from_on_writes_fan_off(mock_indigo_base):

@@ -3,6 +3,20 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
+## 2026.24.1 — fans turn on
+
+- **Turn On now works on fans that do not offer an "On" mode** (issue #46).
+  Matter fans declare which speeds they have via `FanModeSequence`, and the two
+  most common — `OffLowMedHigh` and `OffLowHigh` — have no "On" in them. The
+  plugin was asking for exactly that, so those fans rejected the request and
+  Indigo's Turn On did nothing at all. It now sets the speed to 100% instead,
+  which every Matter fan accepts whatever modes it offers. Turn Off is
+  unchanged — "Off" is the one mode every fan has.
+
+  Setting a fan's brightness already worked and is untouched. Turn On means full
+  speed rather than the speed it was last on; if you want a particular speed,
+  set the brightness.
+
 ## 2026.24.0 — momentary-only buttons work
 
 - **A button that only reports "pressed" now reports it** (issue #231, reported
