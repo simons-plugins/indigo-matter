@@ -445,6 +445,28 @@ def test_binary_sensor_beats_the_unit_heuristic():
     assert set(verdict.eligible_roles) == set(export_catalog.BINARY_SENSOR_ROLES)
 
 
+def test_plural_names_read_as_the_thing_they_name():
+    """Live 2026-08-19: "Patio Doors" and "Garden Doors" — both ordinary door
+    contacts on a real panel — fell through the singular needle to the
+    occupancy fallback. Real alarm zones are named for what they cover, and
+    what they cover is often plural.
+    """
+    for name, expected in (("Garden Doors", "contactSensor"),
+                           ("Patio Doors", "contactSensor"),
+                           ("Kitchen Skylight", "contactSensor"),
+                           ("Landing PIRs", "occupancySensor")):
+        dev = SensorDevice(1, name, supportsOnState=True)
+        assert classify(dev, OURS).default_role == expected, name
+
+
+def test_the_anchors_still_hold_against_the_words_that_embed_them():
+    """Pluralising must not have widened the needles into ordinary prose."""
+    for name in ("Drainage Level", "Defrost Cycle", "Indoor Temperature"):
+        dev = SensorDevice(1, name, supportsOnState=True)
+        assert classify(dev, OURS).default_role == "occupancySensor", \
+            f"{name} should fall through to the fallback, not match a needle"
+
+
 # ---------------------------------------------------------------------------
 # Custom-state mapping (ADR-0012, issue #252)
 # ---------------------------------------------------------------------------

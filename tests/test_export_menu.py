@@ -2482,7 +2482,11 @@ def test_selecting_a_mappable_device_opens_the_mapping_fields(plug, devices):
     values = plug.exportDeviceChanged(_values(exportDevice="201"))
     assert values["exportNeedsMapping"] == "true"
     assert values["exportStateKey"] == "status"
-    assert values["exportRole"] == ""          # no role until a state is picked
+    # The role is seeded too. This line used to assert "" — "no role until a
+    # state is picked" — which was true of the DESIGN and false of the screen:
+    # a state has just been picked, on the user's behalf, so leaving the role
+    # blank made every zone of a panel a manual role selection.
+    assert values["exportRole"] == "occupancySensor"     # "Study PIR"
 
 
 def test_no_roles_are_offered_until_a_state_is_chosen(plug, devices):
@@ -2537,8 +2541,9 @@ def test_the_fleet_recipe_prefills_the_next_zone(plug, devices):
                                    exportRole="occupancySensor"))
     values = plug.exportDeviceChanged(_values(exportDevice="202"))
     assert values["exportStateKey"] == "status"
-    # The ROLE is still per-zone — the fleet shares a state key, not a meaning.
-    assert values["exportRole"] == ""
+    # The state key comes from the FLEET; the role is still decided per zone,
+    # from this device's own name — the panel shares a boolean, not a meaning.
+    assert values["exportRole"] == "contactSensor"       # "Front Door"
 
 
 def test_the_fleet_recipe_does_not_cross_device_types(plug, devices):
