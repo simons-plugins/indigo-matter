@@ -58,6 +58,26 @@ The plugin maps events to `lastButtonEvent` (`shortPress`, `multiPress<N>`,
 `multiPress<N>` carries the notch count, which is what makes proportional
 scrolling possible.
 
+## Aqara Light Switch H2 (and other momentary-only buttons)
+
+The wired gang is an ordinary On/Off endpoint. Each **wireless** gang is a
+separate GenericSwitch endpoint (4 and 5 on the vertical H2) whose FeatureMap is
+**0x02 — MomentarySwitch and nothing else**: no MomentarySwitchRelease, no
+LongPress, no MultiPress. By Matter 1.2 §1.13.7 every Switch event is gated on
+its feature, so such a switch emits **`InitialPress` and no other event, ever**.
+
+The plugin used to discard `InitialPress` and wait for the terminal event that
+tells short from long from multi — which never arrives on these, so the button
+devices sat at their creation state forever and looked dead
+([issue #231](https://github.com/simons-plugins/indigo-matter/issues/231)).
+Since 2026.24.0 a momentary-only switch maps `InitialPress` to `shortPress` and
+increments `pressCount`, like any other button. Devices created before that gain
+the capability at the next reconcile — no need to delete and re-add them.
+
+Such a switch cannot report a long or double press: the hardware never sends
+one. `shortPress` is the only label these produce, so wire triggers on
+`pressCount` "any change" as with every other Matter button.
+
 ## IKEA ALPSTUGA (air quality monitor)
 
 Its OnOff cluster toggles the **display**, not power. The plugin currently treats

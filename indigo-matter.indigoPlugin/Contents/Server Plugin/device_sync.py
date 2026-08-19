@@ -57,6 +57,12 @@ from matter_handlers.electrical import (
     FEATURE_DYNAMIC_POWER_FLOW,
     FEATURE_SET_TOPOLOGY,
 )
+from matter_handlers.generic_switch import (
+    CLUSTER_SWITCH,
+    DEVICE_TYPE_BUTTON,
+    PROP_SWITCH_FEATURES,
+    switch_features,
+)
 from matter_handlers.power_source import (
     ATTR_ENDPOINT_LIST,
     CLUSTER_POWER_SOURCE,
@@ -2959,6 +2965,15 @@ class DeviceSync:
                                                      node that says it powers THIS
                                                      endpoint — its EndpointList)
 
+        …plus one prop that unlocks no state but decides how a handler READS the
+        device: ``switchFeatureMap`` (cluster 0x003B's FeatureMap), which tells
+        ``GenericSwitchHandler`` whether InitialPress is this switch's only press
+        event (issue #231). It belongs here for the same reason the rest do —
+        it is derived from the node's own attributes, and a device created from
+        an incomplete interview would otherwise carry the wrong answer forever,
+        which for a button means every press is discarded and the device never
+        changes state at all.
+
         The cluster constants are imported from their handler modules — no magic
         numbers here.  The battery check mirrors create_devices' central setdefault
         (issue #205): both ask the same coverage question, one from the pass-local
@@ -2989,6 +3004,16 @@ class DeviceSync:
                 props["SupportsEnergyMeter"] = True
         if int(endpoint.endpoint_id) in self._battery_endpoints(node.node_id):
             props["SupportsBatteryLevel"] = True
+        if endpoint.has(CLUSTER_SWITCH):
+            features = switch_features(node, endpoint)
+            if features:
+                # Stringified to match what the handler stamps at creation, so
+                # the heal below compares like with like and does not rewrite
+                # the prop on every pass. A FeatureMap of 0 is not stamped: a
+                # Switch cluster always declares at least one feature, so zero
+                # means "not reported", and a falsy value would be re-added on
+                # every reconcile anyway.
+                props[PROP_SWITCH_FEATURES] = str(features)
         return props
 
     def _reassert_capability_props(self, node: NodeInfo) -> None:
@@ -3041,6 +3066,13 @@ class DeviceSync:
                         if key in ("SupportsPowerMeter", "SupportsEnergyMeter"):
                             if type_id not in _METER_CAPABLE_TYPES:
                                 continue
+                        if key == PROP_SWITCH_FEATURES and type_id != DEVICE_TYPE_BUTTON:
+                            # Only the button handler reads it. An endpoint can
+                            # host more than one Indigo device, and stamping a
+                            # Switch FeatureMap onto a sibling sensor would be
+                            # a props write (and so a device comm restart) that
+                            # buys nothing.
+                            continue
                         if not current_props.get(key):
                             missing[key] = value
                     for key, value in display_props.items():

@@ -1870,6 +1870,113 @@ def test_healthy_button_reconcile_is_quiet(ds, indigo_env, mock_logger):
     assert not any("display" in m for m in msgs)
 
 
+# ---------------------------------------------------------------------------
+# Issue #231 — the Switch FeatureMap reaches the button device
+# ---------------------------------------------------------------------------
+# Shaped on the reported Aqara Light Switch H2 (vertical): endpoint 1 is the
+# wired relay, endpoints 4 and 5 are the wireless gangs, each a GenericSwitch
+# declaring FeatureMap 0x02 (MS only — InitialPress and nothing else).
+AQARA_H2_NODE = {
+    "node_id": 0x44,
+    "available": True,
+    "attributes": {
+        "0/40/1": "Aqara",
+        "0/40/3": "Aqara Light Switch H2 US",
+        "1/29/0": [{"0": 256}],
+        "1/6/0": False,             # OnOff — the wired gang
+        "4/29/0": [{"0": 15}],
+        "4/59/1": 0,                # GenericSwitch CurrentPosition
+        "4/59/65532": 2,            # FeatureMap 0xFFFC = MS only
+        "5/29/0": [{"0": 15}],
+        "5/59/1": 0,
+        "5/59/65532": 2,
+    },
+}
+
+
+def test_create_stamps_the_switch_feature_map_on_each_button(ds, indigo_env):
+    _indigo, devices = indigo_env
+    ds.create_from_raw(AQARA_H2_NODE, "Wall Switch")
+    for endpoint in (4, 5):
+        dev = devices[ds.lookup(0x44, endpoint, "matterButton")]
+        assert dev.pluginProps.get("switchFeatureMap") == "2", endpoint
+
+
+def test_reassert_heals_the_feature_map_onto_a_button_created_without_it(ds, indigo_env):
+    """The whole point of healing it: a button created before #231 (or from an
+    interview that had not yet reported the FeatureMap) would otherwise discard
+    every press for the life of the install, with no state change to notice."""
+    _indigo, devices = indigo_env
+    ds.create_from_raw(AQARA_H2_NODE, "Wall Switch")
+    dev = devices[ds.lookup(0x44, 4, "matterButton")]
+    props = dict(dev.pluginProps)
+    props.pop("switchFeatureMap", None)
+    dev.pluginProps = props
+
+    ds.reconcile_all([AQARA_H2_NODE])
+    assert dev.pluginProps.get("switchFeatureMap") == "2"
+
+
+def test_reassert_is_idempotent_for_the_feature_map(ds, indigo_env):
+    """Stamping props costs the device a comm restart, so a healthy button must
+    not be rewritten on every reconcile."""
+    _indigo, devices = indigo_env
+    ds.create_from_raw(AQARA_H2_NODE, "Wall Switch")
+    dev = devices[ds.lookup(0x44, 4, "matterButton")]
+    dev.replaced_props = False
+    ds.reconcile_all([AQARA_H2_NODE])
+    assert dev.replaced_props is False
+
+
+def test_a_node_that_has_not_reported_a_feature_map_stamps_nothing(ds, indigo_env):
+    """ADR-0003 again: no attribute is no information. The prop stays absent
+    (which the handler reads as "suppress"), it is not defaulted to 0."""
+    _indigo, devices = indigo_env
+    ds.create_from_raw(BUTTON_NODE, "Hall Button")
+    dev = devices[ds.lookup(0x43, 1)]
+    assert "switchFeatureMap" not in dev.pluginProps
+    ds.reconcile_all([BUTTON_NODE])
+    assert "switchFeatureMap" not in dev.pluginProps
+
+
+def test_the_feature_map_is_not_stamped_on_a_sibling_device(ds, indigo_env):
+    """An endpoint can host more than one Indigo device. Only the button
+    handler reads this prop, and a needless props write is a needless device
+    comm restart."""
+    _indigo, devices = indigo_env
+    combo = {
+        "node_id": 0x45, "available": True,
+        "attributes": {
+            "0/40/1": "Contrived", "0/40/3": "Combo",
+            "1/29/0": [{"0": 15}],
+            "1/59/1": 0,
+            "1/59/65532": 2,
+            "1/1026/0": 2000,        # TemperatureMeasurement on the same endpoint
+        },
+    }
+    ds.create_from_raw(combo, "Combo")
+    ds.reconcile_all([combo])
+    button = devices[ds.lookup(0x45, 1, "matterButton")]
+    sensor = devices[ds.lookup(0x45, 1, "matterTemperatureSensor")]
+    assert button.pluginProps.get("switchFeatureMap") == "2"
+    assert "switchFeatureMap" not in sensor.pluginProps
+
+
+def test_an_initial_press_on_a_momentary_only_gang_reaches_indigo(ds, indigo_env):
+    """End to end, the user-visible fix for #231: the frame the Aqara actually
+    sends now moves the Indigo device."""
+    _indigo, devices = indigo_env
+    ds.create_from_raw(AQARA_H2_NODE, "Wall Switch")
+    dev_id = ds.lookup(0x44, 4, "matterButton")
+
+    ds.handle_event(protocol.MatterEvent(
+        kind=protocol.EVT_NODE_EVENT, node_id=0x44, endpoint=4, cluster=0x003B,
+        event_id=0x01, event_data={"newPosition": 1}, raw={},
+    ))
+    assert devices[dev_id].states["lastButtonEvent"] == "shortPress"
+    assert devices[dev_id].states["pressCount"] == 1
+
+
 def test_reassert_backfills_address_on_legacy_devices(ds, indigo_env):
     """Devices created before the issue #18 address stamping gain the node-id
     address at reconcile — it's what a user needs for decommission."""

@@ -22,12 +22,21 @@ import protocol
 from protocol import MatterEvent, Protocol
 from matter_handlers.generic_switch import (
     ATTR_CURRENT_POSITION,
+    ATTR_FEATURE_MAP,
     CLUSTER_SWITCH,
     EVT_INITIAL_PRESS,
     EVT_LONG_PRESS,
     EVT_MULTI_PRESS_COMPLETE,
     EVT_SHORT_RELEASE,
+    FEATURE_LATCHING_SWITCH,
+    FEATURE_MOMENTARY_LONG_PRESS,
+    FEATURE_MOMENTARY_MULTI_PRESS,
+    FEATURE_MOMENTARY_RELEASE,
+    FEATURE_MOMENTARY_SWITCH,
     GenericSwitchHandler,
+    PROP_SWITCH_FEATURES,
+    maps_initial_press,
+    switch_features,
 )
 from matter_handlers.registry import HandlerRegistry
 
@@ -591,12 +600,17 @@ def test_attributes_to_subscribe_contains_current_position():
 # ---------------------------------------------------------------------------
 
 def _fake_node(node_id=10, product_name="SOMRIG", vendor_name="IKEA",
-               suggested_name=None):
+               suggested_name=None, features=None, feature_endpoint=1):
     node = MagicMock()
     node.node_id = node_id
     node.product_name = product_name
     node.vendor_name = vendor_name
     node.suggested_name = suggested_name
+    # A real NodeInfo.attributes is a plain dict; MagicMock's default .get would
+    # answer every lookup with another Mock, which is not what "the node has not
+    # reported a FeatureMap" looks like.
+    node.attributes = ({} if features is None
+                       else {(feature_endpoint, CLUSTER_SWITCH, ATTR_FEATURE_MAP): features})
     return node
 
 
@@ -636,6 +650,106 @@ def test_create_devices_fallback_name():
     node = _fake_node(node_id=99, suggested_name=None, product_name=None)
     spec = _handler().create_indigo_devices(node, _fake_endpoint())[0]
     assert spec.name == "Matter 99"
+
+
+# ---------------------------------------------------------------------------
+# Issue #231 — a momentary-only switch: InitialPress is the whole press
+# ---------------------------------------------------------------------------
+# Reported by coolcaper777 on an Aqara Light Switch H2 (vertical): the wired
+# gang worked, the two WIRELESS gangs did nothing at all. Their Switch
+# endpoints (4 and 5) report FeatureMap 0x02 — MS and nothing else — so by
+# Matter 1.2 §1.13.7 they can only ever emit InitialPress, and the handler
+# discarded it while waiting for a terminal event that is never coming.
+
+MS_ONLY = FEATURE_MOMENTARY_SWITCH                                   # the Aqara H2: 0x02
+MS_PLUS_RELEASE = FEATURE_MOMENTARY_SWITCH | FEATURE_MOMENTARY_RELEASE
+
+
+@pytest.mark.parametrize("features, expected", [
+    (MS_ONLY,                                                     True),
+    (MS_PLUS_RELEASE,                                             False),
+    (FEATURE_MOMENTARY_SWITCH | FEATURE_MOMENTARY_LONG_PRESS,     False),
+    (FEATURE_MOMENTARY_SWITCH | FEATURE_MOMENTARY_MULTI_PRESS,    False),
+    (0x1E,                                                        False),  # MS+MSR+MSL+MSM (SOMRIG)
+    (FEATURE_LATCHING_SWITCH,                                     False),  # LS: SwitchLatched only
+    (0,                                                           False),
+    (None,                                                        False),  # not reported yet
+])
+def test_maps_initial_press_truth_table(features, expected):
+    assert maps_initial_press(features) is expected
+
+
+def test_switch_features_reads_the_endpoints_feature_map():
+    node = _fake_node(features=MS_ONLY, feature_endpoint=4)
+    assert switch_features(node, _fake_endpoint(endpoint_id=4)) == MS_ONLY
+
+
+def test_switch_features_is_none_when_the_node_has_not_reported_it():
+    """ADR-0003 — an absent attribute is no information, not "no features"."""
+    assert switch_features(_fake_node(), _fake_endpoint()) is None
+
+
+def test_create_devices_stamps_the_feature_map():
+    node = _fake_node(features=MS_ONLY, feature_endpoint=4)
+    spec = _handler().create_indigo_devices(node, _fake_endpoint(endpoint_id=4))[0]
+    assert spec.props[PROP_SWITCH_FEATURES] == "2", "stringified, like nodeId/endpointId"
+
+
+def test_create_devices_omits_the_prop_when_the_feature_map_is_unknown():
+    """Omitted rather than defaulted: a guess here decides whether every press
+    on this device is kept or dropped, and the reconcile heal fills it in."""
+    spec = _handler().create_indigo_devices(_fake_node(), _fake_endpoint())[0]
+    assert PROP_SWITCH_FEATURES not in spec.props
+
+
+def _dev_with_features(features):
+    props = {} if features is None else {PROP_SWITCH_FEATURES: str(features)}
+    return FakeDev(4001, "Aqara Gang 1", "matterButton", props=props,
+                   initial_states={"lastButtonEvent": "", "pressCount": 0})
+
+
+def test_initial_press_is_the_press_on_a_momentary_only_switch():
+    dev = _dev_with_features(MS_ONLY)
+    assert _handler().on_node_event(dev, EVT_INITIAL_PRESS, {"newPosition": 1}) == {
+        "lastButtonEvent": "shortPress", "pressCount": 1}
+
+
+def test_initial_press_is_still_suppressed_when_a_terminal_event_follows():
+    dev = _dev_with_features(MS_PLUS_RELEASE)
+    assert _handler().on_node_event(dev, EVT_INITIAL_PRESS, {"newPosition": 1}) == {}
+
+
+def test_a_release_capable_switch_still_counts_one_press_per_press():
+    """The regression #76 guards. InitialPress then ShortRelease is ONE press —
+    #231 must not reintroduce the double-count by mapping the leading edge."""
+    dev = _dev_with_features(MS_PLUS_RELEASE)
+    for event_id in (EVT_INITIAL_PRESS, EVT_SHORT_RELEASE):
+        states = _handler().on_node_event(dev, event_id, {})
+        dev.states.update(states)
+    assert dev.states["pressCount"] == 1
+
+
+def test_initial_press_is_suppressed_when_the_prop_is_absent():
+    """A button created before #231, before the reconcile heal reaches it. The
+    safe default is the old behaviour — never a double-count on a device we
+    have no evidence about."""
+    assert _handler().on_node_event(_dev_with_features(None), EVT_INITIAL_PRESS, {}) == {}
+
+
+@pytest.mark.parametrize("raw", ["", "banana", None])
+def test_an_unreadable_feature_map_prop_suppresses_rather_than_raises(raw):
+    dev = FakeDev(4002, "Odd", "matterButton", props={PROP_SWITCH_FEATURES: raw},
+                  initial_states={"lastButtonEvent": "", "pressCount": 0})
+    assert _handler().on_node_event(dev, EVT_INITIAL_PRESS, {}) == {}
+
+
+def test_momentary_only_presses_keep_incrementing_the_counter():
+    """Every press repeats the same label, so pressCount is the only thing an
+    Indigo trigger can fire on."""
+    dev = _dev_with_features(MS_ONLY)
+    for expected in (1, 2, 3):
+        dev.states.update(_handler().on_node_event(dev, EVT_INITIAL_PRESS, {}))
+        assert dev.states["pressCount"] == expected
 
 
 # ---------------------------------------------------------------------------

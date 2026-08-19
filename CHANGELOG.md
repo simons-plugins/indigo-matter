@@ -3,6 +3,25 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
+## 2026.24.0 — momentary-only buttons work
+
+- **A button that only reports "pressed" now reports it** (issue #231, reported
+  by @coolcaper777 on an Aqara Light Switch H2). Its wired gang worked; both
+  *wireless* gangs did nothing at all. Their Switch endpoints declare FeatureMap
+  `0x02` — MomentarySwitch and nothing else — and Matter gates every Switch
+  event on its feature, so those gangs emit `InitialPress` and no other event,
+  ever. The plugin discarded `InitialPress` and waited for the release/long/
+  multi-press event that tells one kind of press from another, which for these
+  devices never comes: the Indigo device sat at its creation state for the life
+  of the install. A switch declaring no release, long-press or multi-press
+  feature now maps `InitialPress` to `shortPress` and increments `pressCount`,
+  like any other button. Switches that *do* send a terminal event are unchanged
+  — the leading edge is still discarded there, so a press is still counted once.
+- **Existing button devices are healed at the next reconcile.** The capability
+  is read from the endpoint's own FeatureMap and carried on the device; buttons
+  created before this release pick it up automatically, with no need to delete
+  and re-add them.
+
 ## 2026.23.8 — renaming, and what it does not do
 
 Documentation only; no behaviour change.
