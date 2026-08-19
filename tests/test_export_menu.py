@@ -2626,3 +2626,54 @@ def test_migrate_still_carries_non_mapping_options_from_the_source():
     carried = _migrated_options({"invert": True, "stateKey": "old"},
                                 {"stateKey": "status", "stateInvert": True})
     assert carried == {"invert": True, "stateKey": "status", "stateInvert": True}
+
+
+# ---------------------------------------------------------------------------
+# Contact-sensor polarity (issue #252, live 2026-08-19)
+# ---------------------------------------------------------------------------
+def test_a_new_contact_export_starts_inverted(plug, devices):
+    """Matter's own asymmetry. Indigo's `onState` means TRIPPED for every
+    binary sensor — motion seen, leak seen, door OPEN — and Matter agrees for
+    all of them except contact, where BooleanState is "TRUE = closed". Exported
+    straight through, a Z-Wave door sensor called every shut door open."""
+    devices.add(SensorDevice(401, "Pantry Door", supportsOnState=True))
+    values = plug.exportDeviceChanged(_values(exportDevice="401"))
+    assert values["exportRole"] == "contactSensor"
+    assert values["exportStateInvert"] is True
+
+
+def test_a_new_occupancy_export_does_not(plug, devices):
+    devices.add(SensorDevice(402, "Landing PIR", supportsOnState=True))
+    values = plug.exportDeviceChanged(_values(exportDevice="402"))
+    assert values["exportRole"] == "occupancySensor"
+    assert values["exportStateInvert"] is False
+
+
+def test_changing_the_role_re_derives_the_polarity(plug, devices):
+    """The same boolean means different things under different roles, so the
+    tick follows the role rather than persisting a value chosen for another."""
+    devices.add(SensorDevice(403, "Landing PIR", supportsOnState=True))
+    values = plug.exportRoleChanged(_values(exportDevice="403", exportRole="contactSensor"))
+    assert values["exportStateInvert"] is True
+    values = plug.exportRoleChanged(_values(exportDevice="403", exportRole="occupancySensor"))
+    assert values["exportStateInvert"] is False
+
+
+def test_an_existing_exports_polarity_is_never_re_derived(plug, devices):
+    """A saved entry's polarity is a decision already made, possibly
+    hand-corrected — re-deriving it on the way past would undo that."""
+    devices.add(SensorDevice(404, "Pantry Door", supportsOnState=True))
+    plug.exports.upsert(ExportEntry(404, "contactSensor"))       # deliberately NOT inverted
+    values = plug.exportRoleChanged(_values(exportDevice="404", exportRole="contactSensor",
+                                            exportStateInvert=False))
+    assert values["exportStateInvert"] is False
+
+
+def test_polarity_applies_to_a_plain_onstate_sensor(plug, devices):
+    """The half that was missing entirely: inversion used to apply only on the
+    mapped path, so an ordinary sensor had no way to correct its polarity."""
+    import export_handlers
+    dev = SensorDevice(405, "Pantry Door", supportsOnState=True, onState=False)
+    handler = export_handlers.handler_for("contactSensor")
+    assert handler.states_for(dev, {}) == {"contact": False}
+    assert handler.states_for(dev, {"stateInvert": True}) == {"contact": True}

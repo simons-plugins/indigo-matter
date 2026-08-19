@@ -237,16 +237,18 @@ A Matter pairing code is not durable: once used, or once the window expires (up 
                 <CallbackMethod>exportStateKeyChanged</CallbackMethod>
                 <Description>This device's plugin keeps its reading in a state of its own rather than in Indigo's on/off flag, so tell the bridge which one it is.</Description>
             </Field>
-            <Field id="exportStateInvert" type="checkbox" defaultValue="false"
-                   visibleBindingId="exportNeedsMapping" visibleBindingValue="true"
-                   alwaysUseInDialogHeightCalc="true">
-                <Label>State is inverted:</Label>
-                <Description>Tick if the state is true when NOTHING is detected — an alarm zone that reports "healthy", for instance.</Description>
-            </Field>
             <Field id="exportRole" type="menu">
                 <Label>Export as:</Label>
                 <List class="self" method="getExportRoles" dynamicReload="true"/>
+                <CallbackMethod>exportRoleChanged</CallbackMethod>
                 <Description>Indigo cannot tell a plug from a lamp or a lock, so you declare it. The first option is the safest default.</Description>
+            </Field>
+            <Field id="exportStateInvert" type="checkbox" defaultValue="false"
+                   visibleBindingId="exportRole"
+                   visibleBindingValue="occupancySensor,contactSensor,waterLeakDetector,waterFreezeDetector,rainSensor,smokeAlarm,coAlarm"
+                   alwaysUseInDialogHeightCalc="true">
+                <Label>Reading is inverted:</Label>
+                <Description>Tick if the device reports on/true for the OPPOSITE of what this role publishes. Contact sensors start ticked: Indigo reports a door as on when it is OPEN, while Matter reads it as closed.</Description>
             </Field>
             <Field id="exportName" type="textfield">
                 <Label>Name in ecosystems:</Label>

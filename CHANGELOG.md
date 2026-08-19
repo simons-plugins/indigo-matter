@@ -3,6 +3,29 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
+## 2026.23.5 — contact sensors read the right way round
+
+### Fixed
+
+- **A contact sensor exported as itself reported every closed door as open.**
+  Indigo's on/off state means *tripped* for every binary sensor — motion seen,
+  leak seen, door OPEN. Matter agrees for all of them but one: its contact
+  sensor reads true as **closed**. So exporting a Z-Wave door sensor straight
+  through inverted it, and there was no way to correct it — the polarity
+  tick-box only appeared for devices needing a state mapping, which an
+  ordinary sensor does not.
+
+  The tick-box now belongs to **every** sensor role that publishes a boolean,
+  and a new contact export starts with it **ticked**, which is right for the
+  common device. Change the role and it re-derives, because the same boolean
+  means something different under a different role. Untick it and that is the
+  last word — and an export you have already saved is never re-derived, so a
+  polarity you corrected by hand stays corrected.
+
+  **Existing exports are unchanged.** If you exported a contact sensor before
+  this and its state reads backwards in your ecosystem, open it in
+  *Manage Matter Exports…* and tick *Reading is inverted*.
+
 ## 2026.23.4 — the suggested role actually appears
 
 ### Fixed

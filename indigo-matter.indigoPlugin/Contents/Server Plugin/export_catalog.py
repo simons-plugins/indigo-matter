@@ -170,6 +170,28 @@ BINARY_SENSOR_ROLES = (
     ROLE_WATER_FREEZE_DETECTOR, ROLE_RAIN_SENSOR, ROLE_SMOKE_ALARM, ROLE_CO_ALARM,
 )
 
+#: Binary roles whose Matter polarity is the OPPOSITE of Indigo's, so a new
+#: export of one starts with its inversion ticked (issue #252, reported live
+#: 2026-08-19 against a Z-Wave door sensor).
+#:
+#: Only ``contactSensor``, and the asymmetry is Matter's own. Indigo's
+#: ``onState`` means *tripped* for every binary sensor — motion detected, leak
+#: detected, door OPEN. Matter agrees for all of them except this one:
+#: BooleanState in a Contact Sensor is documented "FALSE=open or no contact,
+#: TRUE=closed or contact", so a door reads true when it is **shut**. Exporting
+#: a contact sensor straight through therefore reports every door as open when
+#: it is closed, which is what a Z-Wave pantry door did.
+#:
+#: A default, not a rule: some plugins do report a contact the Matter way, so
+#: the tick-box remains and this only decides how it starts.
+ROLES_INVERTED_BY_DEFAULT = (ROLE_CONTACT_SENSOR,)
+
+
+def default_invert_for(role: str) -> bool:
+    """Whether a NEW export of ``role`` should start with polarity inverted."""
+    return role in ROLES_INVERTED_BY_DEFAULT
+
+
 #: Name hints → binary role as **regexes**, first match wins (issue #236/#252).
 #:
 #: Unlike the numeric table this leans on the device's *name*, because that is
