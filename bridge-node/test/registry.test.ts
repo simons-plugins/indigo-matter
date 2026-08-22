@@ -1906,10 +1906,18 @@ describe("sensor set_state (§3.4, E4)", () => {
 
     it("emits OccupancyChanged when — and only when — a push moves occupancy (#276)", async () => {
         // The event, not the attribute, is what event-driven ecosystems act
-        // on — Alexa was observed consuming it while never polling
-        // `occupancy`. An attribute-only test passes with the OccupancyEvent
-        // feature missing, which is exactly the bug: the accessory attaches
-        // and the attribute is correct, but nothing downstream ever moves.
+        // on — inferred from #276's instrumentation, since the event never
+        // existed pre-fix so its consumption cannot have been observed
+        // directly: Alexa subscribes events wildcard, was never seen reading
+        // the `occupancy` attribute, and ignored the attribute reports the
+        // bridge did deliver. The sensor roles that DO emit an event
+        // (contactSensor, waterLeakDetector — matter.js's stock
+        // BooleanStateServer ships ChangeEvent unconditionally) update fine
+        // in Alexa; occupancySensor, the one role that emitted none, was the
+        // one that never updated. An attribute-only test passes with the
+        // OccupancyEvent feature missing, which is exactly the bug: the
+        // accessory attaches and the attribute is correct, but nothing
+        // downstream ever moves.
         const h = await harness();
         try {
             await h.registry.reconcile([spec(1, Role.occupancySensor, { states: { occupied: false } })], false);
@@ -1934,6 +1942,32 @@ describe("sensor set_state (§3.4, E4)", () => {
             await h.registry.setState(1, { occupied: false });
             assert.equal(events.length, 2);
             assert.deepEqual(events[1]?.occupancy, { occupied: false });
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("does not phantom-emit OccupancyChanged for a seeded initial state (#276)", async () => {
+        // `occupied: true` here is baked into the endpoint's CONSTRUCTOR
+        // options (createEndpoint's initial patch), not written as a change
+        // from some prior value — there is no "prior value" at construction.
+        // A push that repeats that seeded baseline must therefore raise
+        // nothing, the same as any other unchanged push. If initial-state
+        // application ever stopped seeding the real attribute (e.g. wrote it
+        // through a path matter.js treats as a transition from `undefined`),
+        // this would start phantom-emitting motion to every ecosystem on
+        // every bridge restart, for a sensor that never actually moved.
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(1, Role.occupancySensor, { states: { occupied: true } })], false);
+            const events: Record<string, unknown>[] = [];
+            const observable = (only(h).eventsOf("occupancySensing") as unknown as Record<string, EventObservable>)
+                .occupancyChanged;
+            assert.ok(observable !== undefined, "occupancySensing exposes no occupancyChanged event");
+            observable.on(payload => events.push(payload));
+
+            await h.registry.setState(1, { occupied: true });
+            assert.equal(events.length, 0, "a push repeating the seeded initial state raised an OccupancyChanged");
         } finally {
             await h.close();
         }

@@ -3,19 +3,30 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
-## 2026.24.3 — exported motion sensors reach Alexa
+## 2026.24.3 — exported motion sensors gain the OccupancyChanged event
 
 > Takes effect on a live install only once the paired bridge-node release
 > ships; the plugin pins the bridge node by exact version.
 
-- **Exported motion sensors now update in Alexa, not just Apple Home** (issue
-  #276). Apple reads the `occupancy` attribute directly, so it always showed
-  the right value; Alexa consumes the `OccupancyChanged` event instead, and
-  the bridge never enabled the Matter feature that emits it, so an exported
-  motion sensor appeared in the Alexa app but never moved. The Occupancy
-  Sensing cluster now declares the `OccupancyEvent` feature alongside
-  `PassiveInfrared`, which is enough for matter.js to emit the event itself
-  on every change — no other behaviour changes.
+- **Exported motion sensors now emit Matter's `OccupancyChanged` event, not
+  just the `occupancy` attribute** (issue #276). Apple reads the attribute
+  directly and always showed the right value; #276's instrumentation points
+  to Alexa consuming the event instead of polling the attribute, and the
+  bridge never enabled the Occupancy Sensing cluster's `OccupancyEvent`
+  feature, so a bridged motion sensor's attribute reports went out but
+  nothing downstream ever moved there. The cluster now declares
+  `OccupancyEvent` alongside `PassiveInfrared`, which is enough for
+  matter.js to emit the event itself on every change — no other behaviour
+  changes.
+
+  **Untested against a real Alexa app on the reference rig** — the event
+  hypothesis is inferred from instrumentation, not yet confirmed live, so if
+  you use Alexa with an exported motion sensor, please report whether it now
+  updates. (A directly-commissioned occupancy sensor without this feature —
+  an Aqara FP300 on its own fabric — already updates live in Alexa, which
+  says Alexa does read the attribute on devices it commissions itself; the
+  open question is specifically whether a *bridged* endpoint needed the
+  event.)
 
 ## 2026.24.2 — a half-edited device now says so
 
