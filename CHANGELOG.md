@@ -3,6 +3,20 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
+## 2026.24.3 — exported motion sensors reach Alexa
+
+> Takes effect on a live install only once the paired bridge-node release
+> ships; the plugin pins the bridge node by exact version.
+
+- **Exported motion sensors now update in Alexa, not just Apple Home** (issue
+  #276). Apple reads the `occupancy` attribute directly, so it always showed
+  the right value; Alexa consumes the `OccupancyChanged` event instead, and
+  the bridge never enabled the Matter feature that emits it, so an exported
+  motion sensor appeared in the Alexa app but never moved. The Occupancy
+  Sensing cluster now declares the `OccupancyEvent` feature alongside
+  `PassiveInfrared`, which is enough for matter.js to emit the event itself
+  on every change — no other behaviour changes.
+
 ## 2026.24.2 — a half-edited device now says so
 
 - **A Matter device made invisible by Indigo's "Edit Device Type" menu is now

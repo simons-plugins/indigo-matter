@@ -2088,10 +2088,18 @@ const ROLE_DEFINITIONS: Record<RoleValue, RoleDefinition> = {
         // does not record how a binary sensor detects, and PIR is what almost
         // every Indigo motion sensor is, so it is declared rather than left
         // blank — the alternative is an accessory ecosystems cannot categorise.
+        // OccupancyEvent makes matter.js auto-emit OccupancyChanged whenever
+        // `occupancy` changes — the Occupancy Sensor device type's change
+        // signal, and what event-driven controllers (Alexa, observed) act on
+        // rather than polling the attribute. Without it the accessory
+        // appears but never updates there (#276). Wire delta is FeatureMap
+        // 0x0002→0x0202 plus EventList gaining the event, not a cluster-set
+        // change, so reconcile plans an ordinary update, not a recreate
+        // (ADR-0011 doctrine).
         deviceType: () =>
             OccupancySensorDevice.with(
                 BridgedDeviceBasicInformationServer,
-                OccupancySensingServer.with("PassiveInfrared"),
+                OccupancySensingServer.with("PassiveInfrared", "OccupancyEvent"),
             ),
         initialState: () => ({}),
         // `occupancy` is a bitmap whose bit 0 is the whole meaning — matter.js

@@ -1904,6 +1904,41 @@ describe("sensor set_state (§3.4, E4)", () => {
         }
     });
 
+    it("emits OccupancyChanged when — and only when — a push moves occupancy (#276)", async () => {
+        // The event, not the attribute, is what event-driven ecosystems act
+        // on — Alexa was observed consuming it while never polling
+        // `occupancy`. An attribute-only test passes with the OccupancyEvent
+        // feature missing, which is exactly the bug: the accessory attaches
+        // and the attribute is correct, but nothing downstream ever moves.
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(1, Role.occupancySensor, { states: { occupied: false } })], false);
+            const features = only(h).featuresOf("occupancySensing") as Record<string, boolean>;
+            assert.equal(features.passiveInfrared, true);
+            assert.equal(features.occupancyEvent, true, "occupancySensing exposes no occupancyEvent feature");
+
+            const events: Record<string, unknown>[] = [];
+            const observable = (only(h).eventsOf("occupancySensing") as unknown as Record<string, EventObservable>)
+                .occupancyChanged;
+            assert.ok(observable !== undefined, "occupancySensing exposes no occupancyChanged event");
+            observable.on(payload => events.push(payload));
+
+            await h.registry.setState(1, { occupied: true });
+            assert.equal(events.length, 1, "occupancy becoming true raised no OccupancyChanged");
+            assert.deepEqual(events[0]?.occupancy, { occupied: true });
+
+            // A push that repeats what occupancy already says is not a change.
+            await h.registry.setState(1, { occupied: true });
+            assert.equal(events.length, 1, "an unchanged occupancy raised an OccupancyChanged");
+
+            await h.registry.setState(1, { occupied: false });
+            assert.equal(events.length, 2);
+            assert.deepEqual(events[1]?.occupancy, { occupied: false });
+        } finally {
+            await h.close();
+        }
+    });
+
     it("writes contact with no inversion — both sides call true 'closed'", async () => {
         const h = await harness();
         try {
