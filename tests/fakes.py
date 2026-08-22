@@ -405,6 +405,11 @@ class DimmerDevice(RelayDevice):
         self.blueLevel = kwargs.pop("blueLevel", None)
         self.whiteLevel = kwargs.pop("whiteLevel", None)
         self.whiteTemperature = kwargs.pop("whiteTemperature", None)
+        # z2m (and any driver that publishes one) reports its colour mode here
+        # — real Indigo always has a `.states` dict, empty by default, so a
+        # device with no opinion on colour mode looks exactly like one that
+        # never mentioned it (issue #282's fallback heuristic path).
+        self.states = kwargs.pop("states", None) or {}
         super().__init__(*args, **kwargs)
 
 
