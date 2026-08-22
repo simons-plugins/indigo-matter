@@ -192,6 +192,21 @@ def default_invert_for(role: str) -> bool:
     return role in ROLES_INVERTED_BY_DEFAULT
 
 
+#: Roles Alexa's Matter bridge support cannot model (issue #278). Amazon's
+#: supported-device-types table maps ``waterLeakDetector`` to no capability
+#: interface, and measured on the reference rig (issue #143), exporting even
+#: one causes Alexa to either never subscribe to the WHOLE bridge — every
+#: exported device goes stale in Alexa, not just this one — or silently drop
+#: its own fabric. Apple Home is unaffected. ``waterFreezeDetector`` and
+#: ``rainSensor`` were not independently isolated on the rig, but share the
+#: same Matter device-type family and are documented Alexa-unsupported by
+#: matterbridge, so they carry the same warning until proven otherwise.
+#: Referenced by ``MenuItems.xml``'s ``exportAlexaLeakWarning`` label
+#: (``visibleBindingValue``) — kept in sync by
+#: ``tests/test_export_menu.py::test_alexa_unsupported_warning_matches_roles``.
+ALEXA_UNSUPPORTED_ROLES = (ROLE_WATER_LEAK_DETECTOR, ROLE_WATER_FREEZE_DETECTOR, ROLE_RAIN_SENSOR)
+
+
 #: Name hints → binary role as **regexes**, first match wins (issue #236/#252).
 #:
 #: Unlike the numeric table this leans on the device's *name*, because that is

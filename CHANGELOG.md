@@ -3,6 +3,19 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
+## 2026.24.4 — a warning before you export a leak sensor to Alexa
+
+- **The "Manage Matter Exports…" dialog now warns when you pick the Water
+  Leak, Freeze or Rain Sensor role** (issue #278). Measured on the reference
+  rig: Alexa cannot model the Matter Water Leak Detector device type, and
+  exporting even one causes Alexa to either stop subscribing to the *entire*
+  bridge — every exported device goes stale in Alexa, not just this one — or
+  to silently drop its own pairing. Apple Home is unaffected. The warning is
+  shown before the export goes live, so this is not a behaviour change for
+  anyone already exporting one of these roles — just the label a future
+  export now carries. `docs/MATTER.md`'s Alexa conformance section gains a
+  matching note.
+
 ## 2026.24.2 — a half-edited device now says so
 
 - **A Matter device made invisible by Indigo's "Edit Device Type" menu is now
