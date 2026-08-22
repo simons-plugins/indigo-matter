@@ -19,14 +19,13 @@ current version is `Info.plist`'s `PluginVersion`.
   matter.js to emit the event itself on every change — no other behaviour
   changes.
 
-  **Untested against a real Alexa app on the reference rig** — the event
-  hypothesis is inferred from instrumentation, not yet confirmed live, so if
-  you use Alexa with an exported motion sensor, please report whether it now
-  updates. (A directly-commissioned occupancy sensor without this feature —
-  an Aqara FP300 on its own fabric — already updates live in Alexa, which
-  says Alexa does read the attribute on devices it commissions itself; the
-  open question is specifically whether a *bridged* endpoint needed the
-  event.)
+  **Live-verified on the reference rig 2026-08-22** — with the event
+  enabled, motion now renders in the Alexa app, which it never did before.
+  (A directly-commissioned occupancy sensor without this feature — an Aqara
+  FP300 on its own fabric — already updates live in Alexa from the
+  attribute alone, so Alexa reads attributes on devices it commissions
+  itself; it drives *bridged* sensor state from the event instead, which is
+  exactly the gap this closes.)
 
 ## 2026.24.2 — a half-edited device now says so
 

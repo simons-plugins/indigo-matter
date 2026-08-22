@@ -1906,10 +1906,10 @@ describe("sensor set_state (§3.4, E4)", () => {
 
     it("emits OccupancyChanged when — and only when — a push moves occupancy (#276)", async () => {
         // The event, not the attribute, is what event-driven ecosystems act
-        // on — inferred from #276's instrumentation, since the event never
-        // existed pre-fix so its consumption cannot have been observed
-        // directly: Alexa subscribes events wildcard, was never seen reading
-        // the `occupancy` attribute, and ignored the attribute reports the
+        // on — confirmed live post-fix (#276); pre-fix this was inference
+        // only, since the event never existed to observe directly: Alexa
+        // subscribes events wildcard, was never seen reading the
+        // `occupancy` attribute, and ignored the attribute reports the
         // bridge did deliver. The sensor roles that DO emit an event
         // (contactSensor, waterLeakDetector — matter.js's stock
         // BooleanStateServer ships ChangeEvent unconditionally) update fine
