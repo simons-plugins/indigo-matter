@@ -3,6 +3,16 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
+## 2026.24.5 — the bridge node for the OccupancyChanged fix
+
+The Node half of 2026.24.3's occupancy event fix (issue #276) — pins
+`indigo-matter-bridge@0.14.0`. Update the plugin, then run *Plugins ▸
+Matter ▸ Install/update the Matter bridge*.
+
+Live-verified on the reference rig: with this node installed, motion from
+an exported occupancy sensor renders in the Alexa app, which it never did
+before.
+
 ## 2026.24.3 — exported motion sensors gain the OccupancyChanged event
 
 > Takes effect on a live install only once the paired bridge-node release
