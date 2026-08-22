@@ -1153,10 +1153,11 @@ class ExportBridge:
         self._update_failed.discard(new_dev.id)
         self._report_stopped_keys(new_dev, entry.role, stopped)
         if states:
-            self._note_pushed(new_dev.id, states)
+            self._note_pushed(new_dev.id, states, handler)
             self._fire(client.set_state(new_dev.id, states), f"set_state dev {new_dev.id}")
 
-    def _note_pushed(self, device_id: int, states: dict) -> None:
+    def _note_pushed(self, device_id: int, states: dict,
+                      handler: Optional[export_handlers.ExportHandler] = None) -> None:
         """Fold a push into the device's snapshot.
 
         Merged rather than replaced because ``set_state`` args are partial by
@@ -1169,12 +1170,26 @@ class ExportBridge:
         being gone, which the next ``attach`` fully reconciles from
         ``states_for`` anyway — whereas waiting for an ack would mean holding
         Indigo's device thread on the node.
+
+        ``handler`` closes issue #282 trap (b). A merge alone is wrong for
+        :data:`export_handlers.ExportHandler.mode_alternating_keys`: push hue
+        210, then the device flips to colour-temperature mode (a push carrying
+        ``colorTempMireds``), then it returns to hue 210 — a plain merge still
+        has ``hue: 210`` sitting in the snapshot from the first push, so
+        ``_changed`` sees "unchanged" and the second hue push never goes out,
+        leaving the node showing white for a colour the user just set again.
+        Whenever this push carries any mode-alternating key, the *other*
+        mode-alternating keys are evicted from the snapshot instead of merged
+        over, so the next time the device returns to them they read as
+        changed no matter what value they last held.
         """
-        snapshot = self._pushed.get(device_id)
-        if snapshot is None:
-            self._pushed[device_id] = dict(states)
-        else:
-            snapshot.update(states)
+        snapshot = self._pushed.setdefault(device_id, {})
+        snapshot.update(states)
+        if handler is not None and handler.mode_alternating_keys:
+            published_now = frozenset(states) & handler.mode_alternating_keys
+            if published_now:
+                for key in handler.mode_alternating_keys - published_now:
+                    snapshot.pop(key, None)
 
     def _report_stopped_keys(self, dev: Any, role: str, stopped: frozenset) -> None:
         """Say once when a device stops answering a key it used to publish.
@@ -1481,6 +1496,14 @@ class ExportBridge:
             self._report_no_op(command.command, device_id, entry.role, outcome)
         else:
             self._no_op_reported.pop(device_id, None)
+            # Issue #281 — a successful dispatch used to log nothing at all,
+            # which cost an hour of misattribution (a command was reaching
+            # Indigo fine; the symptom was somewhere else entirely, but there
+            # was no line here to rule this step out quickly). One DEBUG line
+            # per dispatched command is enough to confirm "it got this far".
+            self._logger.debug(
+                "Matter bridge: %r dispatched to device %s (%s, id %s) with args %r",
+                command.command, getattr(dev, "name", ""), entry.role, device_id, command.args)
 
     def _report_no_op(self, command: str, device_id: int, role: str, reason: str) -> None:
         """Say once when a command was accepted and lawfully changed nothing.
@@ -1543,7 +1566,7 @@ class ExportBridge:
                 "Matter bridge: cannot push truth for device %s — it reports no readable state "
                 "at all, so the ecosystem keeps showing the command that failed.", device_id)
             return
-        self._note_pushed(device_id, states)
+        self._note_pushed(device_id, states, handler)
         self._fire(client.set_state(device_id, states),
                    f"corrective set_state dev {device_id}")
 

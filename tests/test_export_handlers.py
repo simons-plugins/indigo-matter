@@ -75,7 +75,12 @@ def test_state_keys_are_a_subset_of_the_roles_4_2_vocabulary(handlers, role):
     assert produced <= allowed, f"{role} emits {produced - allowed}"
 
 
-@pytest.mark.parametrize("role", ALL_ROLES)
+#: extendedColorLight is mode-aware (issue #282) and covered separately below
+#: — no single snapshot carries its whole vocabulary by design.
+_WHOLE_VOCABULARY_ROLES = tuple(role for role in ALL_ROLES if role != "extendedColorLight")
+
+
+@pytest.mark.parametrize("role", _WHOLE_VOCABULARY_ROLES)
 def test_a_capable_device_produces_the_whole_vocabulary(handlers, role):
     """The other direction: a device that CAN answer every key must answer it.
 
@@ -84,6 +89,31 @@ def test_a_capable_device_produces_the_whole_vocabulary(handlers, role):
     """
     assert set(handlers.HANDLERS[role].states_for(_capable_device(role))) == \
         set(bridge_protocol.ROLE_STATE_KEYS[role])
+
+
+def test_extended_color_light_reaches_its_whole_vocabulary_across_both_modes(handlers):
+    """extendedColorLight's version of the invariant above (issue #282).
+
+    ``states_for`` now emits exactly ONE colour channel per snapshot —
+    ``colorTempMireds`` XOR ``hue``/``saturation`` — chosen by the device's
+    colour mode, so no single capable device produces every §4.2 key this
+    role owns; a device that is simultaneously in two colour modes does not
+    exist. The vocabulary is still fully reachable, just across modes rather
+    than within one snapshot: a CT-mode device's snapshot and a hue/sat-mode
+    device's snapshot together cover it, and the only overlap is the
+    mode-independent ``onOff``/``level`` pair.
+    """
+    handler = handlers.handler_for("extendedColorLight")
+    ct_device = DimmerDevice(1, "CT Lamp", onState=True, brightness=60,
+                             redLevel=0, greenLevel=0, blueLevel=0,
+                             whiteTemperature=2700, supportsRGB=True,
+                             supportsWhiteTemperature=True)
+    hue_device = _fully_populated_device()
+    ct_states = set(handler.states_for(ct_device))
+    hue_states = set(handler.states_for(hue_device))
+    assert ct_states == {"onOff", "level", "colorTempMireds"}
+    assert hue_states == {"onOff", "level", "hue", "saturation"}
+    assert ct_states | hue_states == set(bridge_protocol.ROLE_STATE_KEYS["extendedColorLight"])
 
 
 #: The roles E4 added. Kept as a list because several invariants below are true
@@ -388,18 +418,22 @@ class TestColorTemperature:
         _args, kwargs = mock_indigo_base.dimmer.setColorLevels.call_args
         assert kwargs["whiteTemperature"] == 2703          # 1e6 / 370, not 1e6 / 369
 
-    def test_setting_a_temperature_zeroes_the_rgb_channels(self, handlers, mock_indigo_base):
-        """X4: Matter ``colorMode`` is one-of, and the node picks hue/sat over CT.
+    def test_setting_a_temperature_leaves_the_rgb_channels_alone(self, handlers, mock_indigo_base):
+        """Issue #282: this used to also zero redLevel/greenLevel/blueLevel.
 
-        An RGBW lamp left with live RGB levels alongside a new white temperature
-        reports both, and the node's push side then believes the stale colour.
+        That zero was a real ``setColorLevels`` *hardware* command — a
+        channel-publishing driver (z2m) puts ``{"color":{"r":0,"g":0,"b":0}}``
+        on the wire, so an RGBW lamp flashed deep blue on every colour-
+        temperature write. Coherence for the node's colour-mode belief now
+        lives on the reporting side (``ExtendedColorLightExport.states_for``
+        publishes one channel per snapshot), so this write touches only the
+        white channel — exactly the keys, no companions.
         """
         dev = DimmerDevice(1, "Lamp", whiteLevel=40, redLevel=100, greenLevel=0, blueLevel=0)
         handlers.handler_for("colorTemperatureLight").dispatch(
             "setColorTemp", {"colorTempMireds": 370}, dev)
         mock_indigo_base.dimmer.setColorLevels.assert_called_once_with(
-            dev, whiteLevel=40, whiteTemperature=2703,
-            redLevel=0, greenLevel=0, blueLevel=0)
+            dev, whiteLevel=40, whiteTemperature=2703)
 
 
 # ---------------------------------------------------------------------------
@@ -502,13 +536,16 @@ class TestExtendedColor:
                              redLevel=100, greenLevel=80, blueLevel=100)      # sat 20, hue 300
         assert handler.diff(before, after) == {"hue": 300}
 
-    def test_setting_a_colour_zeroes_the_white_channel(self, handlers, mock_indigo_base):
-        """X4: the mirror of the CT path — colourMode is one-of."""
+    def test_setting_a_colour_leaves_the_white_channel_alone(self, handlers, mock_indigo_base):
+        """Issue #282: the mirror of the CT test above — this used to also
+        zero whiteLevel, a hardware write that put ``{"brightness":0}`` on
+        the wire for a channel-publishing driver, switching the lamp off the
+        instant a user picked a colour. Only the RGB keys are written now."""
         dev = DimmerDevice(1, "Lamp", whiteLevel=80)
         handlers.handler_for("extendedColorLight").dispatch(
             "setColor", {"hue": 240, "saturation": 100}, dev)
         mock_indigo_base.dimmer.setColorLevels.assert_called_once_with(
-            dev, redLevel=0, greenLevel=0, blueLevel=100, whiteLevel=0)
+            dev, redLevel=0, greenLevel=0, blueLevel=100)
 
     def test_dispatch_writes_rgb_levels(self, handlers, mock_indigo_base):
         dev = DimmerDevice(1, "Lamp")
@@ -538,6 +575,65 @@ class TestExtendedColor:
         handler = handlers.handler_for("extendedColorLight")
         with pytest.raises(ValueError):
             handler.dispatch("setColor", {"hue": 120}, DimmerDevice(1, "L"))
+
+
+class TestExtendedColorModeAwareness:
+    """Issue #282: ``states_for`` publishes ONE colour channel, chosen by mode.
+
+    A device holding both live RGB levels AND a white temperature (an RGBW
+    bulb between colour writes) used to have both channels emitted together —
+    that is exactly what let the write side believe it had to zero one of
+    them to keep the node coherent. These pin the reporting-side replacement:
+    the mode decides which single channel goes out, adversarially phrased as
+    "does the OTHER channel ever leak through".
+    """
+
+    def _rgbw(self, **overrides):
+        kwargs = dict(onState=True, brightness=50, redLevel=100, greenLevel=0,
+                      blueLevel=0, whiteTemperature=2700, supportsRGB=True,
+                      supportsWhiteTemperature=True)
+        kwargs.update(overrides)
+        return DimmerDevice(1, "Lamp", **kwargs)
+
+    def test_color_temp_mode_carries_ct_not_hue_or_saturation(self, handlers):
+        """z2m ``colorMode: "color_temp"`` selects the CT channel."""
+        dev = self._rgbw(states={"colorMode": "color_temp"})
+        states = handlers.handler_for("extendedColorLight").states_for(dev)
+        assert "colorTempMireds" in states
+        assert "hue" not in states and "saturation" not in states
+
+    @pytest.mark.parametrize("mode", ["xy", "hs"])
+    def test_xy_or_hs_mode_carries_hue_saturation_not_ct(self, handlers, mode):
+        """z2m reports either ``xy`` or ``hs`` for a colour write; both mean hue/sat."""
+        dev = self._rgbw(states={"colorMode": mode})
+        states = handlers.handler_for("extendedColorLight").states_for(dev)
+        assert "hue" in states and "saturation" in states
+        assert "colorTempMireds" not in states
+
+    def test_no_colormode_state_falls_back_to_ct_when_rgb_is_zero_and_white_is_set(
+            self, handlers):
+        """Non-z2m plugins never publish ``colorMode`` at all. RGB all zero plus
+        a usable ``whiteTemperature`` reads as "this device is presenting CT"."""
+        dev = self._rgbw(redLevel=0, states={})
+        states = handlers.handler_for("extendedColorLight").states_for(dev)
+        assert "colorTempMireds" in states
+        assert "hue" not in states and "saturation" not in states
+
+    def test_no_colormode_state_falls_back_to_hue_saturation_when_rgb_is_live(
+            self, handlers):
+        dev = self._rgbw(states={})
+        states = handlers.handler_for("extendedColorLight").states_for(dev)
+        assert "hue" in states and "saturation" in states
+        assert "colorTempMireds" not in states
+
+    def test_a_bogus_colormode_does_not_crash_and_falls_back_to_the_heuristic(
+            self, handlers):
+        """A driver using different vocabulary (or garbage) must still resolve
+        to a single coherent channel rather than raising."""
+        dev = self._rgbw(redLevel=0, states={"colorMode": "rainbow"})
+        states = handlers.handler_for("extendedColorLight").states_for(dev)
+        assert "colorTempMireds" in states
+        assert "hue" not in states and "saturation" not in states
 
 
 # ---------------------------------------------------------------------------

@@ -402,6 +402,12 @@ class ExportHandler:
     role: str = ""
     #: Per-key diff tolerances; anything absent compares exactly.
     tolerances: dict[str, float] = {}
+    #: §4.2 keys this role never publishes together — one replaces another in
+    #: the same snapshot rather than the device losing the ability to report
+    #: it (issue #282). Empty for every role except ``extendedColorLight``;
+    #: see :data:`ExtendedColorLightExport.mode_alternating_keys` for why it
+    #: exists and how ``ExportBridge`` uses it.
+    mode_alternating_keys: frozenset = frozenset()
 
     # -- state (plugin → node) ------------------------------------------
     def states_for(self, dev: Any, options: Optional[dict] = None) -> dict:
@@ -501,6 +507,14 @@ class ExportHandler:
         and every readable key is treated as changed — the safe direction: an
         unnecessary ``set_state`` is idempotent, a missed one is stale state in
         somebody's Home app.
+
+        ``stopped`` excludes :data:`mode_alternating_keys` (issue #282 trap
+        (a)). Those keys are *designed* to vanish from ``after`` every time
+        the device's colour mode is something else — that is not a device
+        that stopped answering, it is the mechanism working, and
+        ``ExportBridge._report_stopped_keys`` would otherwise warn "stopped
+        reporting hue, saturation" on every single mode flip. A genuine
+        stoppage of any other key is unaffected and still reported.
         """
         before = dict(pushed or {})
         after = self.published_states(new_dev, options)
@@ -508,7 +522,8 @@ class ExportHandler:
             key: value for key, value in after.items()
             if self._changed(key, before.get(key, _MISSING), value)
         }
-        return StateDiff(changed, frozenset(before) - frozenset(after))
+        stopped = frozenset(before) - frozenset(after) - self.mode_alternating_keys
+        return StateDiff(changed, stopped)
 
     def _changed(self, key: str, before: Any, after: Any) -> bool:
         if before is _MISSING:
@@ -651,14 +666,24 @@ class ColorTemperatureLightExport(DimmableLightExport):
           colour and on/off orthogonal for exactly this reason: a
           `MoveToColorTemperature` on an off lamp changes its colour, not its
           state;
-        * **RGB is zeroed alongside.** Matter's ``colorMode`` is one-of, and the
-          node's push side picks hue/saturation over colour temperature when a
-          device reports both (``bridge-node/src/endpoints.ts`` ``colorPatch``).
-          An RGBW lamp left holding stale RGB levels would therefore report a
-          colour we did not set, and the node would believe it over the
-          temperature we just wrote. Only touched when the device actually has
-          RGB channels — an all-zero RGB write to a CT-only driver is its own
-          way to black out the room.
+        **RGB is left alone.** This used to zero ``redLevel``/``greenLevel``/
+        ``blueLevel`` alongside, because Matter's ``colorMode`` is one-of and
+        the node's push side picks hue/saturation over colour temperature when
+        a device reports both (``bridge-node/src/endpoints.ts`` ``colorPatch``)
+        — an RGBW lamp left holding stale RGB levels would report a colour we
+        did not set, and the node would believe it over the temperature we
+        just wrote. That reasoning was correct but the fix was in the wrong
+        process: zeroing here is a **hardware** ``setColorLevels`` call, so a
+        channel-publishing driver (z2m) puts ``{"color":{"r":0,"g":0,"b":0}}``
+        on the wire and the bulb actually goes to deep blue before the
+        temperature write lands (issue #282). Coherence for the *node's*
+        colour-mode belief now lives on the reporting side —
+        :meth:`ExtendedColorLightExport.states_for` publishes exactly one
+        colour channel per snapshot, chosen by the device's own colour mode —
+        so ``colorPatch`` derives the right mode from which keys arrive,
+        without this handler ever having to touch a channel nobody asked it
+        to change. Switching the lamp's own hardware mode per write is the
+        bulb/driver's job, and z2m already does it.
         """
         mireds = args.get(STATE_COLOR_TEMP_MIREDS)
         if not isinstance(mireds, (int, float)) or isinstance(mireds, bool) or not mireds:
@@ -678,8 +703,6 @@ class ColorTemperatureLightExport(DimmableLightExport):
             "whiteTemperature": mireds_to_kelvin(
                 int(_clamp(round(mireds), MIREDS_MIN, MIREDS_MAX))),
         }
-        if _number(dev, "redLevel") is not None:
-            levels.update(redLevel=0, greenLevel=0, blueLevel=0)
         indigo.dimmer.setColorLevels(dev, **levels)
         return None
 
@@ -690,12 +713,63 @@ class ExtendedColorLightExport(ColorTemperatureLightExport):
     role = export_catalog.ROLE_EXTENDED_COLOR_LIGHT
     tolerances = {STATE_HUE: HUE_TOLERANCE_DEGREES}
 
+    #: §4.2 keys this role alternates between depending on the device's colour
+    #: mode — never published together (see :meth:`states_for`), so a switch
+    #: from one to the other is not a device that "stopped reporting" the keys
+    #: it dropped. ``ExportBridge._report_stopped_keys`` and ``_note_pushed``
+    #: both consult this set: the former to not warn on a mode flip, the
+    #: latter to evict the suppressed channel's stale value so it is resent in
+    #: full the next time the device returns to it (issue #282 trap (b)).
+    mode_alternating_keys = frozenset({STATE_COLOR_TEMP_MIREDS, STATE_HUE, STATE_SATURATION})
+
     def states_for(self, dev: Any, options: Optional[dict] = None) -> dict:
-        states = super().states_for(dev, options)
+        """Exactly one colour channel per snapshot — never CT *and* hue/sat.
+
+        Matter's ``colorMode`` is one-of, and the fix for issue #282 moved
+        keeping the node's belief coherent from the *write* side (zeroing the
+        channel not in use, which was a real hardware command) to here: what
+        the node believes is built from what we tell it, so telling it about
+        only the active channel is sufficient and it never has to guess.
+        ``bridge-node``'s ``colorPatch`` derives ``colorMode`` per-push from
+        key presence — hue/sat wins only if sent — so sending one channel here
+        **is** the mode signal; no bridge change needed.
+
+        Mode source, in order:
+
+        1. ``dev.states.get("colorMode")`` — z2m vocabulary: ``"color_temp"``
+           means the CT channel is live; ``"xy"``/``"hs"`` mean hue/sat is.
+           Read via ``getattr(dev, "states", {})``, the same defensive pattern
+           ``matter_handlers/color_control.py`` uses inbound — this is the
+           export subsystem's first read of ``.states`` rather than a plain
+           IOM attribute, because no other exported role's mode is ambiguous
+           enough to need it.
+        2. A bogus value (not one of the three above — a non-z2m driver using
+           different vocabulary, or garbage) falls through to the heuristic
+           below rather than raising: an unrecognised mode is still a mode
+           that has to resolve to *something* single-channel.
+        3. ``colorMode`` absent entirely (non-z2m plugins) — heuristic: RGB
+           all zero/absent **and** a usable ``whiteTemperature`` means CT is
+           the channel actually driving the lamp right now; anything else
+           (RGB non-zero, or no CT to fall back on) means hue/sat.
+        """
+        states = DimmableLightExport.states_for(self, dev, options)
         red = _number(dev, "redLevel")
         green = _number(dev, "greenLevel")
         blue = _number(dev, "blueLevel")
-        if None not in (red, green, blue):
+        kelvin = _number(dev, "whiteTemperature")
+        color_mode = (getattr(dev, "states", None) or {}).get("colorMode")
+        if color_mode == "color_temp":
+            use_color_temp = True
+        elif color_mode in ("xy", "hs"):
+            use_color_temp = False
+        else:
+            rgb_is_zero = all(value in (None, 0) for value in (red, green, blue))
+            use_color_temp = bool(rgb_is_zero and kelvin)
+        if use_color_temp:
+            if kelvin:  # 0 and None both mean "this device is not telling us"
+                states[STATE_COLOR_TEMP_MIREDS] = int(
+                    _clamp(kelvin_to_mireds(kelvin), MIREDS_MIN, MIREDS_MAX))
+        elif None not in (red, green, blue):
             hue, saturation = rgb_to_hue_saturation(red, green, blue)
             states[STATE_SATURATION] = saturation
             # Below the floor the recovered hue is noise, not colour — see
@@ -719,12 +793,17 @@ class ExtendedColorLightExport(ColorTemperatureLightExport):
         first call too whenever Indigo's belief has drifted from the hardware.
         Idempotent beats clever.
 
-        The white channel is zeroed with the same colour-mode reasoning as
-        :meth:`ColorTemperatureLightExport._set_color_temp` — an RGBW lamp
-        holding both a colour and a white level reports both, and the node has
-        to pick. It picks the colour, so leaving white lit means the lamp and
-        the ecosystem disagree about what "the colour" is. Only sent when the
-        device has a white channel to zero.
+        **The white channel is left alone.** This used to zero ``whiteLevel``
+        alongside, with the same colour-mode reasoning as
+        :meth:`ColorTemperatureLightExport._set_color_temp` — but that zero is
+        a hardware ``setColorLevels`` call too, and a channel-publishing
+        driver (z2m) puts ``{"brightness":0}`` on the wire, switching the lamp
+        off the instant a user picks a colour (issue #282). Coherence for the
+        node's colour-mode belief now lives on the reporting side
+        (:meth:`ExtendedColorLightExport.states_for`), so this handler no
+        longer has to touch a channel nobody asked it to change; the bulb's
+        own driver switches its hardware mode per write, exactly as it does
+        for :meth:`ColorTemperatureLightExport._set_color_temp`.
         """
         hue = args.get(STATE_HUE)
         saturation = args.get(STATE_SATURATION)
@@ -733,8 +812,6 @@ class ExtendedColorLightExport(ColorTemperatureLightExport):
                 raise ValueError(f"setColor without a numeric {name}: {args!r}")
         red, green, blue = hue_saturation_to_rgb(hue, saturation)
         levels = {"redLevel": red, "greenLevel": green, "blueLevel": blue}
-        if _number(dev, "whiteLevel") is not None:
-            levels["whiteLevel"] = 0
         indigo.dimmer.setColorLevels(dev, **levels)
 
 

@@ -3,6 +3,23 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
+## 2026.24.6 — manual colour/CT changes no longer flash blue or switch off
+
+- **Manual colour and colour-temperature changes on exported RGBW bulbs no
+  longer flash blue, flick off, or fail to stick** (issue #282, broker
+  capture attached). Setting a colour temperature used to zero the RGB
+  channels alongside it, and setting a colour used to zero the white
+  channel — both were real `setColorLevels` hardware writes, so a
+  channel-publishing driver (z2m Bridge) put the zero on the wire and the
+  bulb actually executed it: a deep-blue flash on a CT write, an off flick
+  on a colour write. Coherence for the bridge node's colour-mode belief
+  (which of colour-temperature vs. hue/saturation it should trust) now
+  lives on the reporting side instead — the export publishes exactly one
+  colour channel per snapshot, chosen by the device's own colour mode — so
+  the write side no longer has to touch a channel nobody asked it to
+  change. Interacts with issue #281's still-open re-assert loop but does
+  not close it.
+
 ## 2026.24.5 — the bridge node for the OccupancyChanged fix
 
 The Node half of 2026.24.3's occupancy event fix (issue #276) — pins

@@ -2117,6 +2117,102 @@ class TestPushedSnapshot:
         assert "HALTED" in warnings_of(mock_logger)
 
 
+class TestColorModeCoherence:
+    """Issue #282: the fix moves coherence for the node's colour-mode belief
+    from a hardware write (zeroing the channel not in use) to the reporting
+    side (publishing exactly one channel per snapshot). These pin the two
+    traps that came with that move — see ``export_handlers.diff_from`` and
+    ``ExportBridge._note_pushed`` for the mechanisms.
+    """
+
+    def _rgbw(self, dev_id=300, **overrides):
+        kwargs = dict(onState=True, brightness=100, redLevel=0, greenLevel=0,
+                      blueLevel=100, whiteTemperature=2700, supportsRGB=True,
+                      supportsWhiteTemperature=True, states={})
+        kwargs.update(overrides)
+        return DimmerDevice(dev_id, "Strip", **kwargs)
+
+    def test_hue_returning_after_a_CT_detour_is_resent_not_suppressed(
+            self, bridge_mod, mock_logger, devices):
+        """The load-bearing regression pin (trap (b)).
+
+        push hue 240 (the attach) → device flips to CT mode, a push carries
+        ``colorTempMireds`` → device returns to hue 240. A snapshot that only
+        MERGES pushes still holds ``hue: 240`` from the first push, so the
+        third event compares "unchanged" against itself and the hue push
+        never goes out — the node stays on the CT channel, showing white for
+        a colour the user just set again.
+        """
+        hue_dev = self._rgbw(redLevel=0, greenLevel=0, blueLevel=100,
+                             whiteTemperature=None, states={"colorMode": "hs"})
+        devices.add(hue_dev)
+        h = Harness(bridge_mod, mock_logger, devices,
+                    [ExportEntry(300, "extendedColorLight")])
+        h.start()                                     # attach pushes hue 240
+
+        ct_dev = self._rgbw(redLevel=0, greenLevel=0, blueLevel=0,
+                            whiteTemperature=2700, states={"colorMode": "color_temp"})
+        h.bridge.device_updated(hue_dev, ct_dev)       # the CT detour
+        before_return = len(h.client.calls)
+
+        h.bridge.device_updated(ct_dev, hue_dev)       # back to the SAME hue
+
+        new_pushes = h.client.calls[before_return:]
+        hue_pushes = [call for call in new_pushes
+                      if call[0] == "set_state" and "hue" in call[2]]
+        assert hue_pushes, (
+            "hue must be re-sent when the device returns to it, even though "
+            "the value is identical to what was pushed before the CT detour")
+        assert hue_pushes[-1][2]["hue"] == 240
+
+    def test_a_mode_flip_does_not_warn_but_a_genuinely_stopped_key_still_does(
+            self, bridge_mod, mock_logger, devices):
+        """Trap (a): ``_report_stopped_keys`` must not fire on every colour-
+        mode flip ("stopped reporting hue, saturation" on a device that is
+        working exactly as designed) — but a real stoppage of an unrelated
+        key must still be reported, or the exemption has swallowed too much.
+        """
+        hue_dev = self._rgbw(states={"colorMode": "hs"})
+        devices.add(hue_dev)
+        h = Harness(bridge_mod, mock_logger, devices,
+                    [ExportEntry(300, "extendedColorLight")])
+        h.start()
+
+        ct_dev = self._rgbw(redLevel=0, greenLevel=0, blueLevel=0,
+                            whiteTemperature=2700, states={"colorMode": "color_temp"})
+        h.bridge.device_updated(hue_dev, ct_dev)
+        assert "stopped reporting" not in warnings_of(mock_logger), (
+            "a colour-mode flip is not a device that stopped answering")
+
+        dark_dev = self._rgbw(redLevel=0, greenLevel=0, blueLevel=0,
+                              whiteTemperature=2700, brightness=None,
+                              states={"colorMode": "color_temp"})
+        h.bridge.device_updated(ct_dev, dark_dev)
+        assert "stopped reporting" in warnings_of(mock_logger), (
+            "a genuine stoppage of an unrelated key (level) must still warn")
+        assert "level" in warnings_of(mock_logger)
+
+    def test_attach_snapshot_carries_exactly_one_colour_channel(
+            self, bridge_mod, mock_logger, devices):
+        """The full-snapshot path (``_spec_for``) goes through ``states_for``
+        too, so mode selection must apply there automatically — this is the
+        proof, not an assumption.
+        """
+        dev = self._rgbw(redLevel=100, greenLevel=0, blueLevel=0,
+                         whiteTemperature=2700, states={"colorMode": "hs"})
+        devices.add(dev)
+        h = Harness(bridge_mod, mock_logger, devices,
+                    [ExportEntry(300, "extendedColorLight")])
+        h.start()
+        h.client.status = _migrate_status()
+        h.bridge.reattach()
+
+        _name, endpoints, _replace_all = h.client.only("attach")
+        (spec,) = endpoints
+        assert "hue" in spec.states and "saturation" in spec.states
+        assert "colorTempMireds" not in spec.states
+
+
 # ---------------------------------------------------------------------------
 # E5 — §5 commands leave the loop
 # ---------------------------------------------------------------------------
