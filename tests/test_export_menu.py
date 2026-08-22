@@ -213,9 +213,18 @@ def test_alexa_unsupported_roles_are_real_roles():
 ])
 def test_alexa_warning_does_not_cover_unrelated_or_bogus_roles(safe_role):
     """Negative + adversarial: a role that should NOT warn, and one that does
-    not exist at all, must both be absent from the binding — token-exact, not
-    substring, so e.g. a hypothetical future ``rainSensorV2`` role couldn't
-    accidentally match via ``in``.
+    not exist at all, must both be absent from the XML's own token list.
+
+    Token-exact against the raw comma-split list, not a substring check —
+    this pins what we wrote into ``visibleBindingValue``, not what Indigo does
+    with it at runtime. Indigo's own matching there IS a substring contains
+    (SDK label reference: "the string comparison is a contains — so if any
+    option contains the specified string it will match"), so a future role
+    whose name embeds one of these three — e.g. a hypothetical
+    ``rainSensorV2`` — WOULD inherit this warning. That is fail-safe here
+    (over-warning), the opposite failure mode from the one this test suite
+    guards against elsewhere (a role silently never warning), so it is not
+    asserted against.
     """
     field = _alexa_warning_field()
     xml_roles = field.get("visibleBindingValue").split(",")

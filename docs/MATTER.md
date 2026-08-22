@@ -887,11 +887,17 @@ recorded here rather than left implicit in the code:
   even one `waterLeakDetector` device causes Alexa to either stop
   subscribing to the bridge entirely — every exported device, not just this
   one, goes stale in Alexa — or to silently drop its own pairing outright.
-  `waterFreezeDetector` and `rainSensor` share the same Matter device-type
-  family and carry the same risk (documented Alexa-unsupported by
-  matterbridge), though they were not independently isolated on the rig.
-  Apple Home is unaffected. The "Manage Matter Exports…" dialog now shows a
-  warning when you pick one of these three roles; if you pair Alexa with the
+  The whole-bridge failure is independently reproduced by
+  home-assistant-matter-hub#365 (one leak sensor → their bridge never
+  subscribes again; their v2.0.49 works around it by mapping leak/freeze/rain
+  to a contact sensor by default) — a different codebase hitting the same
+  wall, which rules out an indigo-matter-specific bug. `waterFreezeDetector`
+  and `rainSensor` share the same Matter device-type family; matterbridge's
+  own README separately names both (not just leak) as Alexa-unsupported,
+  though neither was independently reproduced on our rig, so they carry the
+  warning on that citation. Apple Home is unaffected. The "Manage Matter
+  Exports…" dialog now shows a warning when you pick one of these three
+  roles; if you pair Alexa with the
   bridge, don't export them. There is no per-ecosystem export set in v1 (see
   above), so there is no way to give Apple the real sensor while hiding it
   from Alexa short of not exporting it at all — that would need per-ecosystem

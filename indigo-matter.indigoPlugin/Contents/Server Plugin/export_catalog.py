@@ -197,10 +197,13 @@ def default_invert_for(role: str) -> bool:
 #: interface, and measured on the reference rig (issue #143), exporting even
 #: one causes Alexa to either never subscribe to the WHOLE bridge — every
 #: exported device goes stale in Alexa, not just this one — or silently drop
-#: its own fabric. Apple Home is unaffected. ``waterFreezeDetector`` and
-#: ``rainSensor`` were not independently isolated on the rig, but share the
-#: same Matter device-type family and are documented Alexa-unsupported by
-#: matterbridge, so they carry the same warning until proven otherwise.
+#: its own fabric — the same whole-bridge failure independently reproduced
+#: by home-assistant-matter-hub#365 (one leak sensor → their bridge never
+#: subscribes again; their v2.0.49 works around it by mapping leak/freeze/rain
+#: to contactSensor by default). Apple Home is unaffected. matterbridge's own
+#: README separately names ``waterFreezeDetector`` and ``rainSensor`` (not
+#: just leak) as Alexa-unsupported; neither was independently reproduced on
+#: our rig, so they carry the warning on that citation until proven otherwise.
 #: Referenced by ``MenuItems.xml``'s ``exportAlexaLeakWarning`` label
 #: (``visibleBindingValue``) — kept in sync by
 #: ``tests/test_export_menu.py::test_alexa_unsupported_warning_matches_roles``.
