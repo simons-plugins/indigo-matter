@@ -670,6 +670,15 @@ ecosystem acts. Both are enumerated here in full; there is no other source.
   through the ColorControl cluster's own hue/saturation conversion
   (`xyToHsv`), so Indigo never has to speak a colour space §4.2 does not
   define.
+- **`extendedColorLight`'s `set_state` carries exactly ONE colour channel per
+  push — `colorTempMireds` XOR `hue`/`saturation`, never both** (issue #282).
+  The plugin decides which from the Indigo device's own colour mode; the
+  node's `colorPatch` derives the endpoint's Matter `colorMode` from key
+  presence in that same push, preferring hue/saturation only when the push
+  carries it. "CT alone ⇒ `ColorTemperatureMireds`" is therefore a producer
+  **contract** this table records, not an accident of today's plugin
+  behaviour — a future producer sending both keys in one push re-introduces
+  the coherence bug #282 fixed on the plugin side.
 - This table is the complete producer contract, so it is worth naming what
   is deliberately absent from it. Commands that yield **no** `command`
   frame: continuous `moveHue`/`moveSaturation`/`moveColor` (no target value

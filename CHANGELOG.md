@@ -18,7 +18,11 @@ current version is `Info.plist`'s `PluginVersion`.
   colour channel per snapshot, chosen by the device's own colour mode — so
   the write side no longer has to touch a channel nobody asked it to
   change. Interacts with issue #281's still-open re-assert loop but does
-  not close it.
+  not close it. Known limitation: a non-z2m RGBW driver that never reports
+  a colour mode and leaves RGB levels populated after a colour-temperature
+  write can keep the exported tile showing hue/saturation instead of CT —
+  the wire command is still correct, only the reported tile is affected;
+  see the export handler's mode heuristic for when to revisit.
 
 ## 2026.24.5 — the bridge node for the OccupancyChanged fix
 

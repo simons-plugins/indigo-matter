@@ -508,13 +508,18 @@ class ExportHandler:
         unnecessary ``set_state`` is idempotent, a missed one is stale state in
         somebody's Home app.
 
-        ``stopped`` excludes :data:`mode_alternating_keys` (issue #282 trap
-        (a)). Those keys are *designed* to vanish from ``after`` every time
-        the device's colour mode is something else — that is not a device
-        that stopped answering, it is the mechanism working, and
-        ``ExportBridge._report_stopped_keys`` would otherwise warn "stopped
-        reporting hue, saturation" on every single mode flip. A genuine
-        stoppage of any other key is unaffected and still reported.
+        ``stopped`` excludes :data:`mode_alternating_keys` **only when the new
+        snapshot still carries at least one of them** (issue #282 trap (a)). A
+        genuine mode flip always publishes the replacement channel — that is
+        what a mode flip *is* — so "some mode-alternating key is in ``after``"
+        is the actual signal that this is the mechanism working, not a device
+        that stopped answering colour: ``ExportBridge._report_stopped_keys``
+        would otherwise warn "stopped reporting hue, saturation" on every
+        single mode flip. A device that stops answering colour ENTIRELY —
+        driver loses it, no RGB, no white temperature, no colour mode — has
+        *no* mode-alternating key in ``after`` either, so the exemption does
+        not apply and the loss is reported like any other. A genuine stoppage
+        of any other key is unaffected either way.
         """
         before = dict(pushed or {})
         after = self.published_states(new_dev, options)
@@ -522,7 +527,9 @@ class ExportHandler:
             key: value for key, value in after.items()
             if self._changed(key, before.get(key, _MISSING), value)
         }
-        stopped = frozenset(before) - frozenset(after) - self.mode_alternating_keys
+        stopped = frozenset(before) - frozenset(after)
+        if frozenset(after) & self.mode_alternating_keys:
+            stopped -= self.mode_alternating_keys
         return StateDiff(changed, stopped)
 
     def _changed(self, key: str, before: Any, after: Any) -> bool:
@@ -645,14 +652,14 @@ class ColorTemperatureLightExport(DimmableLightExport):
         reading whiteLevel as 0 and turning the lamp off — a colour tweak that
         blacks out the room is a worse bug than a colour tweak that misses.
 
-        Three guards, all about not depending on someone else to be careful:
+        Two guards, all about not depending on someone else to be careful:
 
         * **the mireds are clamped here.** The node clamps too, but that is the
           *other process*: an unclamped 1 mired is a 1,000,000 K write and 10000
           mireds is 100 K, both outside Indigo's own 1200–15000 domain, and both
           would reach the driver if the node ever stopped clamping or a command
           arrived from anywhere else. ``round`` rather than ``int`` because
-          truncating 369.9 to 369 is a different colour, not a rounding detail;
+          truncating 369.9 to 369 is a different colour, not a rounding detail.
         * **no white channel means no command.** ``whiteLevel is None`` is real
           Indigo for "this device has no white channel at all" — inventing 100
           for it asks its driver to drive something it does not have, so the
@@ -665,25 +672,27 @@ class ColorTemperatureLightExport(DimmableLightExport):
           bridge turning a light on that nobody asked it to. Matter keeps
           colour and on/off orthogonal for exactly this reason: a
           `MoveToColorTemperature` on an off lamp changes its colour, not its
-          state;
-        **RGB is left alone.** This used to zero ``redLevel``/``greenLevel``/
-        ``blueLevel`` alongside, because Matter's ``colorMode`` is one-of and
-        the node's push side picks hue/saturation over colour temperature when
-        a device reports both (``bridge-node/src/endpoints.ts`` ``colorPatch``)
+          state.
+
+        A third guard used to sit here too: **RGB was zeroed alongside.**
+        This zeroed ``redLevel``/``greenLevel``/``blueLevel`` alongside the
+        temperature write, because Matter's ``colorMode`` is one-of and the
+        node's push side picks hue/saturation over colour temperature when a
+        device reports both (``bridge-node/src/endpoints.ts`` ``colorPatch``)
         — an RGBW lamp left holding stale RGB levels would report a colour we
         did not set, and the node would believe it over the temperature we
         just wrote. That reasoning was correct but the fix was in the wrong
         process: zeroing here is a **hardware** ``setColorLevels`` call, so a
         channel-publishing driver (z2m) puts ``{"color":{"r":0,"g":0,"b":0}}``
         on the wire and the bulb actually goes to deep blue before the
-        temperature write lands (issue #282). Coherence for the *node's*
-        colour-mode belief now lives on the reporting side —
-        :meth:`ExtendedColorLightExport.states_for` publishes exactly one
-        colour channel per snapshot, chosen by the device's own colour mode —
-        so ``colorPatch`` derives the right mode from which keys arrive,
-        without this handler ever having to touch a channel nobody asked it
-        to change. Switching the lamp's own hardware mode per write is the
-        bulb/driver's job, and z2m already does it.
+        temperature write lands (issue #282). It has been **removed**;
+        coherence for the *node's* colour-mode belief now lives on the
+        reporting side instead — :meth:`ExtendedColorLightExport.states_for`
+        publishes exactly one colour channel per snapshot, chosen by the
+        device's own colour mode — so ``colorPatch`` derives the right mode
+        from which keys arrive, without this handler ever having to touch a
+        channel nobody asked it to change. Switching the lamp's own hardware
+        mode per write is the bulb/driver's job, and z2m already does it.
         """
         mireds = args.get(STATE_COLOR_TEMP_MIREDS)
         if not isinstance(mireds, (int, float)) or isinstance(mireds, bool) or not mireds:
@@ -738,11 +747,17 @@ class ExtendedColorLightExport(ColorTemperatureLightExport):
 
         1. ``dev.states.get("colorMode")`` — z2m vocabulary: ``"color_temp"``
            means the CT channel is live; ``"xy"``/``"hs"`` mean hue/sat is.
-           Read via ``getattr(dev, "states", {})``, the same defensive pattern
-           ``matter_handlers/color_control.py`` uses inbound — this is the
-           export subsystem's first read of ``.states`` rather than a plain
-           IOM attribute, because no other exported role's mode is ambiguous
-           enough to need it.
+           Read as ``dict(getattr(dev, "states", None) or {})``, the same
+           guarded-and-caught shape :func:`export_catalog.custom_boolean_state_keys`
+           (~line 587) and :func:`export_catalog._has_numeric_state` (~line 609)
+           already use for exactly this reason — ``.states`` is a live proxy
+           like every other device attribute, so an exception here degrades to
+           "no ``colorMode``" the same way this file already chose elsewhere,
+           rather than taking the whole snapshot down with it.
+           :meth:`BinarySensorExport._mapped_reading` (line ~1069) reads it the
+           same way for its own state-key lookup, so this is not the export
+           subsystem's first ``.states`` read — just the first one keyed on a
+           *fixed* name (``colorMode``) rather than a user-chosen one.
         2. A bogus value (not one of the three above — a non-z2m driver using
            different vocabulary, or garbage) falls through to the heuristic
            below rather than raising: an unrecognised mode is still a mode
@@ -757,12 +772,26 @@ class ExtendedColorLightExport(ColorTemperatureLightExport):
         green = _number(dev, "greenLevel")
         blue = _number(dev, "blueLevel")
         kelvin = _number(dev, "whiteTemperature")
-        color_mode = (getattr(dev, "states", None) or {}).get("colorMode")
+        try:
+            color_mode = dict(getattr(dev, "states", None) or {}).get("colorMode")
+        except Exception:  # pylint: disable=broad-except
+            color_mode = None
         if color_mode == "color_temp":
             use_color_temp = True
         elif color_mode in ("xy", "hs"):
             use_color_temp = False
         else:
+            # Known limitation, accepted rather than engineered around: a
+            # non-z2m RGBW driver that never publishes `colorMode` AND leaves
+            # RGB levels populated after a CT write will keep reading as
+            # hue/sat here — the pre-#282 zeroing used to make that case look
+            # CT-mode by clearing RGB as a side effect, and this heuristic has
+            # no other signal to replace it with. The wire command is still
+            # correct (CT-only, per `_set_color_temp`); only the REPORTED tile
+            # can go stale for that one driver family. Revisit if a real
+            # report surfaces from a non-colorMode RGBW plugin — not before,
+            # because inventing a heuristic for a driver nobody has seen risks
+            # trading a rare stale tile for a common wrong one.
             rgb_is_zero = all(value in (None, 0) for value in (red, green, blue))
             use_color_temp = bool(rgb_is_zero and kelvin)
         if use_color_temp:

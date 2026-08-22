@@ -2164,6 +2164,9 @@ class TestColorModeCoherence:
             "hue must be re-sent when the device returns to it, even though "
             "the value is identical to what was pushed before the CT detour")
         assert hue_pushes[-1][2]["hue"] == 240
+        assert "saturation" in hue_pushes[-1][2], (
+            "the eviction removes ALL sibling mode-alternating keys, so "
+            "saturation must be resent alongside hue, not just hue alone")
 
     def test_a_mode_flip_does_not_warn_but_a_genuinely_stopped_key_still_does(
             self, bridge_mod, mock_logger, devices):

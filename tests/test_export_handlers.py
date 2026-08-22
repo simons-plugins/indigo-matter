@@ -635,6 +635,54 @@ class TestExtendedColorModeAwareness:
         assert "colorTempMireds" in states
         assert "hue" not in states and "saturation" not in states
 
+    def test_losing_all_colour_sources_reports_the_colour_keys_as_stopped(
+            self, handlers):
+        """The stopped-keys exemption (issue #282 trap (a)) must not swallow a
+        GENUINE total loss of colour capability — the workspace's degradation-
+        path convention forbids a silent swallow. The exemption only fires
+        when the new snapshot still carries a mode-alternating key; a device
+        whose driver has lost it entirely (no RGB, no whiteTemperature, no
+        colorMode) has nothing in ``after`` for that test to key off, so
+        ``hue``/``saturation`` must come back as ``stopped``, not vanish.
+        """
+        handler = handlers.handler_for("extendedColorLight")
+        hue_dev = self._rgbw(redLevel=100, greenLevel=0, blueLevel=0,
+                             whiteTemperature=None, states={"colorMode": "hs"})
+        pushed = handler.states_for(hue_dev)
+        assert "hue" in pushed and "saturation" in pushed
+
+        dark_dev = self._rgbw(redLevel=None, greenLevel=None, blueLevel=None,
+                              whiteTemperature=None, states={})
+        diff = handler.diff_from(pushed, dark_dev)
+        assert {"hue", "saturation"} <= diff.stopped
+
+    def test_ct_mode_with_unusable_kelvin_reports_no_colour_channel_and_does_not_crash(
+            self, handlers):
+        """Pins the degradation branch: ``colorMode == "color_temp"`` but
+        ``whiteTemperature`` is ``None``/``0`` (both real Indigo for "not
+        telling us"). ``use_color_temp`` is still True, but ``kelvin`` is
+        falsy, so ``states_for`` must publish neither colour channel — not
+        crash, and not silently fall back to hue/sat behind the mode's back.
+        The vanished channel must also be reported ``stopped`` by
+        ``diff_from``, exactly like the total-loss case above: ``after`` here
+        carries no mode-alternating key either.
+        """
+        handler = handlers.handler_for("extendedColorLight")
+        hue_dev = self._rgbw(redLevel=100, greenLevel=0, blueLevel=0,
+                             whiteTemperature=None, states={"colorMode": "hs"})
+        pushed = handler.states_for(hue_dev)
+
+        for unusable_kelvin in (None, 0):
+            ct_dev = self._rgbw(redLevel=100, greenLevel=0, blueLevel=0,
+                                whiteTemperature=unusable_kelvin,
+                                states={"colorMode": "color_temp"})
+            states = handler.states_for(ct_dev)
+            assert "colorTempMireds" not in states
+            assert "hue" not in states and "saturation" not in states
+
+            diff = handler.diff_from(pushed, ct_dev)
+            assert {"hue", "saturation"} <= diff.stopped
+
 
 # ---------------------------------------------------------------------------
 # Colour conversion (pure)
