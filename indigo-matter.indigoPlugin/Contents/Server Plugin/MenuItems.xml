@@ -243,6 +243,16 @@ A Matter pairing code is not durable: once used, or once the window expires (up 
                 <CallbackMethod>exportRoleChanged</CallbackMethod>
                 <Description>Indigo cannot tell a plug from a lamp or a lock, so you declare it. The first option is the safest default.</Description>
             </Field>
+            <!-- Alexa cannot model this device-type family (issue #278; roles
+                 kept in sync with export_catalog.ALEXA_UNSUPPORTED_ROLES by
+                 tests/test_export_menu.py). Static XML binding, not a
+                 callback — Indigo evaluates visibleBindingId/Value itself. -->
+            <Field id="exportAlexaLeakWarning" type="label" fontSize="small" fontColor="red"
+                   visibleBindingId="exportRole"
+                   visibleBindingValue="waterLeakDetector,waterFreezeDetector,rainSensor"
+                   alwaysUseInDialogHeightCalc="true">
+                <Label>⚠ Alexa cannot model water leak, freeze or rain sensors over Matter. If an Alexa/Echo is paired with this bridge, exporting this device stops state updates for EVERY exported device in Alexa — or Alexa may silently drop its own pairing (Apple Home is unaffected). Only export it if you don't pair Alexa.</Label>
+            </Field>
             <Field id="exportStateInvert" type="checkbox" defaultValue="false"
                    visibleBindingId="exportRole"
                    visibleBindingValue="occupancySensor,contactSensor,waterLeakDetector,waterFreezeDetector,rainSensor,smokeAlarm,coAlarm"

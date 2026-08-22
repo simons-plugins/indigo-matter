@@ -162,6 +162,76 @@ def test_status_field_is_readonly():
 
 
 # ---------------------------------------------------------------------------
+# Alexa leak/freeze/rain export warning (issue #278) — static XML binding,
+# not a callback. Indigo evaluates visibleBindingId/visibleBindingValue
+# itself, so there is no Python decision logic to unit-test; these tests pin
+# the XML shape and keep it in lockstep with export_catalog's role constant,
+# which is the thing that could silently drift and re-hide the warning.
+# ---------------------------------------------------------------------------
+def _alexa_warning_field():
+    fields = [f for f in _menu_item().findall("./ConfigUI/Field")
+              if f.get("id") == "exportAlexaLeakWarning"]
+    assert fields, "exportAlexaLeakWarning field missing from manageMatterExports"
+    return fields[0]
+
+
+def test_alexa_leak_warning_is_a_conditional_label():
+    field = _alexa_warning_field()
+    assert field.get("type") == "label"
+    assert field.get("visibleBindingId") == "exportRole"
+    assert field.get("alwaysUseInDialogHeightCalc") == "true"
+    assert field.findtext("Label")  # non-empty
+
+
+def test_alexa_unsupported_warning_matches_roles():
+    """The XML's role list must stay exactly the roles export_catalog names.
+
+    A typo or a drift here is a SILENT failure: the dialog would render fine,
+    the picker would still work, and the warning would simply never show for
+    a role it was supposed to cover. Exact-set comparison (not substring)
+    catches both a missing role and an extra one.
+    """
+    field = _alexa_warning_field()
+    xml_roles = set(field.get("visibleBindingValue").split(","))
+    assert xml_roles == set(export_catalog.ALEXA_UNSUPPORTED_ROLES)
+
+
+def test_alexa_unsupported_roles_are_real_roles():
+    """Adversarial: every role named must exist in the protocol's role enum.
+
+    Guards against a hand-typed constant naming a role that was renamed or
+    never existed — which would make the XML binding permanently inert
+    (Indigo just never matches it) without raising anything, anywhere.
+    """
+    for role in export_catalog.ALEXA_UNSUPPORTED_ROLES:
+        assert role in bridge_protocol.ROLES
+
+
+@pytest.mark.parametrize("safe_role", [
+    "contactSensor", "occupancySensor", "smokeAlarm", "coAlarm",
+    "windowCovering", "onOffPlugInUnit", "not-a-real-role",
+])
+def test_alexa_warning_does_not_cover_unrelated_or_bogus_roles(safe_role):
+    """Negative + adversarial: a role that should NOT warn, and one that does
+    not exist at all, must both be absent from the XML's own token list.
+
+    Token-exact against the raw comma-split list, not a substring check —
+    this pins what we wrote into ``visibleBindingValue``, not what Indigo does
+    with it at runtime. Indigo's own matching there IS a substring contains
+    (SDK label reference: "the string comparison is a contains — so if any
+    option contains the specified string it will match"), so a future role
+    whose name embeds one of these three — e.g. a hypothetical
+    ``rainSensorV2`` — WOULD inherit this warning. That is fail-safe here
+    (over-warning), the opposite failure mode from the one this test suite
+    guards against elsewhere (a role silently never warning), so it is not
+    asserted against.
+    """
+    field = _alexa_warning_field()
+    xml_roles = field.get("visibleBindingValue").split(",")
+    assert safe_role not in xml_roles
+
+
+# ---------------------------------------------------------------------------
 # Seeding (menu dialogs never remember their values)
 # ---------------------------------------------------------------------------
 def test_seed_values_only_for_the_export_menu(plug):

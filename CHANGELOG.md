@@ -13,6 +13,19 @@ Live-verified on the reference rig: with this node installed, motion from
 an exported occupancy sensor renders in the Alexa app, which it never did
 before.
 
+## 2026.24.4 — a warning before you export a leak sensor to Alexa
+
+- **The "Manage Matter Exports…" dialog now warns when you pick the Water
+  Leak, Freeze or Rain Sensor role** (issue #278). Measured on the reference
+  rig: Alexa cannot model the Matter Water Leak Detector device type, and
+  exporting even one causes Alexa to either stop subscribing to the *entire*
+  bridge — every exported device goes stale in Alexa, not just this one — or
+  to silently drop its own pairing. Apple Home is unaffected. The warning is
+  shown before the export goes live, so this is not a behaviour change for
+  anyone already exporting one of these roles — just the label a future
+  export now carries. `docs/MATTER.md`'s Alexa conformance section gains a
+  matching note.
+
 ## 2026.24.3 — exported motion sensors gain the OccupancyChanged event
 
 > Takes effect on a live install only once the paired bridge-node release
