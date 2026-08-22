@@ -16,6 +16,30 @@ current version is `Info.plist`'s `PluginVersion`.
   export now carries. `docs/MATTER.md`'s Alexa conformance section gains a
   matching note.
 
+## 2026.24.3 — exported motion sensors gain the OccupancyChanged event
+
+> Takes effect on a live install only once the paired bridge-node release
+> ships; the plugin pins the bridge node by exact version.
+
+- **Exported motion sensors now emit Matter's `OccupancyChanged` event, not
+  just the `occupancy` attribute** (issue #276). Apple reads the attribute
+  directly and always showed the right value; #276's instrumentation points
+  to Alexa consuming the event instead of polling the attribute, and the
+  bridge never enabled the Occupancy Sensing cluster's `OccupancyEvent`
+  feature, so a bridged motion sensor's attribute reports went out but
+  nothing downstream ever moved there. The cluster now declares
+  `OccupancyEvent` alongside `PassiveInfrared`, which is enough for
+  matter.js to emit the event itself on every change — no other behaviour
+  changes.
+
+  **Live-verified on the reference rig 2026-08-22** — with the event
+  enabled, motion now renders in the Alexa app, which it never did before.
+  (A directly-commissioned occupancy sensor without this feature — an Aqara
+  FP300 on its own fabric — already updates live in Alexa from the
+  attribute alone, so Alexa reads attributes on devices it commissions
+  itself; it drives *bridged* sensor state from the event instead, which is
+  exactly the gap this closes.)
+
 ## 2026.24.2 — a half-edited device now says so
 
 - **A Matter device made invisible by Indigo's "Edit Device Type" menu is now
