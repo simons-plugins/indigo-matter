@@ -345,13 +345,20 @@ def test_bridge_health_device_exists_as_custom_type():
 
 
 def test_bridge_health_states_match_what_export_bridge_actually_writes():
-    """review finding 6b: `export_bridge._apply_subscription_churn`'s
-    ``updateStatesOnServer`` call writes exactly the keys ``subscriptionHealth``
-    and ``churnDetail`` — Devices.xml must declare exactly those two, no more
-    (ADR-0007: a shipped state is permanent) and no fewer (a key the code
-    writes but Devices.xml never declared would not exist on the live device
-    at all, and the write would be silently discarded)."""
-    assert _device_state_ids("matterBridgeHealth") == {"subscriptionHealth", "churnDetail"}
+    """review finding 6b (extended by issue #288's fabric slots):
+    `export_bridge._write_health_state`'s ``updateStatesOnServer`` call writes
+    exactly `subscriptionHealth`/`churnDetail` plus the ten
+    `fabric<N>Name`/`fabric<N>Health` slot keys — Devices.xml must declare
+    exactly those twelve, no more (ADR-0007: a shipped state is permanent)
+    and no fewer (a key the code writes but Devices.xml never declared would
+    not exist on the live device at all, and the write would be silently
+    discarded)."""
+    import export_bridge
+    expected = {"subscriptionHealth", "churnDetail"}
+    for slot in range(1, export_bridge.FABRIC_SLOT_COUNT + 1):
+        expected.add(export_bridge._fabric_slot_key(slot, "Name"))
+        expected.add(export_bridge._fabric_slot_key(slot, "Health"))
+    assert _device_state_ids("matterBridgeHealth") == expected
 
 
 def test_bridge_health_is_the_display_state():
@@ -366,7 +373,15 @@ def test_bridge_health_is_the_display_state():
 def _dev(props, type_id="matterTemperatureSensor"):
     from types import SimpleNamespace
     return SimpleNamespace(id=5, name="Landing Sensor", deviceTypeId=type_id,
-                           pluginProps=props)
+                           pluginProps=props,
+                           # Real Indigo devices always have this method
+                           # (deviceStartComm calls it unconditionally); a
+                           # no-op default here matches that, so a test only
+                           # sees the review-finding-E warning path when it
+                           # deliberately overrides this to raise, as
+                           # `test_device_start_comm_warns_when_the_state_
+                           # list_refresh_fails` does.
+                           stateListOrDisplayStateIdChanged=lambda: None)
 
 
 def test_validate_rejects_type_change(plugin_cls, mock_indigo_base):
@@ -457,6 +472,31 @@ def test_device_start_comm_refreshes_state_list(plugin_cls, mock_logger):
     dev.stateListOrDisplayStateIdChanged = MagicMock()
     plugin_cls.deviceStartComm(stub, dev)
     dev.stateListOrDisplayStateIdChanged.assert_called_once_with()
+
+
+def test_device_start_comm_warns_when_the_state_list_refresh_fails(plugin_cls, mock_logger):
+    """review finding E (issue #288): since the per-fabric slot states, a
+    failed refresh can mean ten of matterBridgeHealth's twelve states are
+    missing and the shared write stalls — including `subscriptionHealth`
+    itself — until the device restarts cleanly. That is not something a
+    user should only learn from a DEBUG line they were never tailing."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    stub = SimpleNamespace(logger=mock_logger, device_sync=MagicMock(),
+                           _prime_retired_on_time_state=MagicMock())
+    dev = _dev({"createdTypeId": "matterRelay"}, type_id="matterRelay")
+
+    def _explode():
+        raise RuntimeError("Indigo refused the rebuild")
+
+    dev.stateListOrDisplayStateIdChanged = _explode
+    plugin_cls.deviceStartComm(stub, dev)   # must not raise
+
+    mock_logger.warning.assert_called_once()
+    message = str(mock_logger.warning.call_args.args[0]) % mock_logger.warning.call_args.args[1:]
+    assert "will be missing" in message
+    assert "restarts cleanly" in message
+    mock_logger.debug.assert_not_called()
 
 
 def test_device_start_comm_primes_the_retired_on_time_state_for_relays(

@@ -244,6 +244,29 @@ class TestResponses:
         assert report.subscription_churn.active is True
         assert report.subscription_churn.peers == []
 
+    def test_malformed_fabric_degrades_the_list_not_the_report(self):
+        """review finding D: one bad fabric entry (missing `fabricIndex`, a
+        JSON null, a non-dict) must not detonate the whole `StatusReport` —
+        which, since issue #288, is load-bearing for the per-fabric slot
+        plan, not merely descriptive. The old comprehension's bare `item[...]`
+        escaping failed the entire status poll, and on the attach path the
+        attach itself."""
+        result = dict(FRAMES["get_status_churning"]["response"]["result"])
+        good_fabric = result["fabrics"][0]
+        result = {
+            **result,
+            "fabrics": [
+                None,
+                "not even a dict",
+                {"label": "no fabricIndex at all", "vendorId": 4937},
+                good_fabric,
+            ],
+        }
+        report = bridge_protocol.parse_status(result)  # must not raise
+        assert len(report.fabrics) == 1
+        assert report.fabrics[0].fabric_index == good_fabric["fabricIndex"]
+        assert report.fabrics[0].label == good_fabric["label"]
+
     def test_pairing_states(self):
         never = bridge_protocol.parse_pairing(
             FRAMES["get_pairing_uncommissioned"]["response"]["result"])

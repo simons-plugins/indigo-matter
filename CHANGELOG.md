@@ -3,6 +3,28 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
+## 2026.26.0 — which paired ecosystem is churning, not just that one is
+
+- **"Matter Bridge Health" now shows five per-fabric slots** (issue #288):
+  `fabric1Name`/`fabric1Health` through `fabric5Name`/`fabric5Health`. With
+  more than one ecosystem paired, `subscriptionHealth` alone could say
+  "churning" but not WHICH — these slots name each connected fabric and each
+  one's own health (`healthy`, `churning`, or `unknown`), so a trigger can
+  target the specific ecosystem having trouble. A slot's name is the
+  ecosystem's own vendor ("Apple Home", "Amazon Alexa", ...), not its Matter
+  label — Apple, Alexa and Google never set one on a real fabric, so a
+  label-only name would have read "fabric 1 / fabric 8 / fabric 9" for
+  everyone; an unrecognised vendor falls back to its hex id, and a fabric
+  that DOES carry a label shows it as a suffix. Slots are positional, not
+  tied to a fabric's real index — they fill in order and repack when a
+  fabric leaves, so a slot's occupant can change over time; an unused slot
+  is empty. A house with more than five paired ecosystems (unusual) keeps
+  the first five by fabric index and logs which were left out, once per
+  streak, rather than silently dropping them.
+- **No bridge node update required for this release** — unlike 2026.25.0,
+  everything here is plugin-side: it reads the fabric list and per-fabric
+  churn attribution the node was already sending.
+
 ## 2026.25.0 — a device for the bridge's own health, and Alexa subscription-churn detection
 
 - **A new "Matter Bridge Health" device** now appears once export is in use
