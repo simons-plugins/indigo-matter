@@ -505,9 +505,19 @@ class TestColorTemperature:
         assert handler.diff(before, after)["colorTempMireds"] == 250
 
     def test_the_ct_tolerance_is_declared_on_the_colour_temperature_role(self, handlers):
+        """30, not more: 4000K→5000K is Δ50 mireds and MUST still report —
+        a wider band silently eats first-class Indigo-side preset moves."""
         handler = handlers.handler_for("colorTemperatureLight")
         assert handler.tolerances[handlers.STATE_COLOR_TEMP_MIREDS] == \
-            handlers.CT_TOLERANCE_MIREDS == 50
+            handlers.CT_TOLERANCE_MIREDS == 30
+
+    def test_a_preset_sized_ct_move_is_wider_than_the_tolerance(self, handlers):
+        """Kills the "just widen the band" mutation: 4000K→5000K (Δ50 mireds)
+        is a real Indigo-side change and must reach the ecosystem."""
+        handler = handlers.handler_for("colorTemperatureLight")
+        before = DimmerDevice(1, "L", onState=True, brightness=50, whiteTemperature=4000)
+        after = DimmerDevice(1, "L", onState=True, brightness=50, whiteTemperature=5000)
+        assert handler.diff(before, after)["colorTempMireds"] == 200
 
     def test_commanded_states_returns_the_clamped_ct_and_nothing_else(self, handlers):
         handler = handlers.handler_for("colorTemperatureLight")
@@ -518,12 +528,63 @@ class TestColorTemperature:
         assert handler.commanded_states("setLevel", {"level": 50}) == {}
         assert handler.commanded_states("setColorTemp", {"colorTempMireds": "garbage"}) == {}
         assert handler.commanded_states("setColorTemp", {}) == {}
+        # 0 is "no usable mireds", not a request for infinite Kelvin; JSON true
+        # must not be blessed as MIREDS_MIN by the numeric check (bool is int).
+        assert handler.commanded_states("setColorTemp", {"colorTempMireds": 0}) == {}
+        assert handler.commanded_states("setColorTemp", {"colorTempMireds": True}) == {}
+
+    @pytest.mark.parametrize("mireds", [1, 152, 153, 320, 369.9, 426, 500, 501, 10000])
+    def test_commanded_states_and_the_dispatch_clamp_agree(
+            self, handlers, mock_indigo_base, mireds):
+        """The lockstep pin ADR-0013 names as its duplication cost.
+
+        ``commanded_states`` and ``_set_color_temp`` each apply the mireds
+        clamp; if either drifts (a different bound, ``int`` instead of
+        ``round``), the value pushed to the fabric stops matching the value
+        written to the lamp and the tolerance silently absorbs the skew.
+        The Kelvin actually dispatched, converted back, must equal the
+        mireds the commanded push reports — for in-domain, fractional and
+        out-of-domain inputs alike.
+        """
+        handler = handlers.handler_for("colorTemperatureLight")
+        commanded = handler.commanded_states(
+            "setColorTemp", {"colorTempMireds": mireds})[handlers.STATE_COLOR_TEMP_MIREDS]
+        dev = DimmerDevice(1, "Lamp", whiteLevel=40)
+        handler.dispatch("setColorTemp", {"colorTempMireds": mireds}, dev)
+        _args, kwargs = mock_indigo_base.dimmer.setColorLevels.call_args
+        assert handlers.kelvin_to_mireds(kwargs["whiteTemperature"]) == commanded
+
+    def test_a_lamp_with_no_readable_brightness_falls_back_to_the_stored_white_level(
+            self, handlers, mock_indigo_base):
+        """Pins the docstring's None-safety claim: a device whose ``brightness``
+        attribute is unreadable (``_number`` → None) must fall back to the
+        stored ``whiteLevel``, not raise on the ``> 0`` comparison."""
+        dev = DimmerDevice(1, "Lamp", brightness=None, whiteLevel=35)
+        handlers.handler_for("colorTemperatureLight").dispatch(
+            "setColorTemp", {"colorTempMireds": 250}, dev)
+        _args, kwargs = mock_indigo_base.dimmer.setColorLevels.call_args
+        assert kwargs["whiteLevel"] == 35
 
 
 # ---------------------------------------------------------------------------
 # extendedColorLight
 # ---------------------------------------------------------------------------
 class TestExtendedColor:
+    def test_a_lit_rgbw_lamp_also_sends_brightness_as_the_white_level(
+            self, handlers, mock_indigo_base):
+        """Deliberate (recorded in ``_set_color_temp``'s docstring): a CT write
+        on RGBW is a request to render white mode at the lamp's perceived
+        level, which is ``brightness``. Gating on ``supportsRGB`` to keep the
+        stored ``whiteLevel`` would hand RGBW z2m strips — whose ``whiteLevel``
+        is just as stale — exactly the issue-#281 off-switch this fix removes.
+        """
+        dev = DimmerDevice(1, "Lamp", onState=True, brightness=29, whiteLevel=80,
+                           redLevel=100, greenLevel=0, blueLevel=0)
+        handlers.handler_for("extendedColorLight").dispatch(
+            "setColorTemp", {"colorTempMireds": 250}, dev)
+        _args, kwargs = mock_indigo_base.dimmer.setColorLevels.call_args
+        assert kwargs["whiteLevel"] == 29
+
     def test_rgb_becomes_hue_and_saturation(self, handlers):
         dev = DimmerDevice(1, "Lamp", onState=True, brightness=50,
                            redLevel=100, greenLevel=0, blueLevel=0)

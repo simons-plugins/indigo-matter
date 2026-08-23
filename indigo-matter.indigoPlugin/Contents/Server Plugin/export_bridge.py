@@ -1680,8 +1680,8 @@ class ExportBridge:
                    f"corrective set_state dev {device_id}")
 
     def _push_commanded(self, command, _entry, handler, commanded: dict) -> None:
-        """Push a SUCCESSFUL command's own values as the device's new state (F5,
-        ADR-0013).
+        """Push a SUCCESSFUL command's own values as the device's new state
+        (ADR-0013).
 
         Runs on the command worker, exactly like :meth:`_correct` — both are
         called from :meth:`_apply_command`, after the blocking Indigo call has
@@ -1707,11 +1707,21 @@ class ExportBridge:
         (:data:`export_handlers.ExportHandler.mode_alternating_keys`) rather
         than leaving it stale in the snapshot — the #282 trap (b) this file
         already guards against on every other push.
+
+        ``_entry`` is accepted but deliberately unused: ``commanded_states``
+        sees no export options today because no option can invert or rescale
+        mireds. A future role adopting this hook for an option-bearing key
+        (``windowCovering``'s ``invert`` is the canonical trap — see
+        :meth:`_correct`'s warning) must thread ``_entry.options`` through
+        first.
         """
         device_id = command.indigo_device_id
         client = self._live_client("the commanded-state push", device_id)
         if client is None:
             return
+        self._logger.debug(
+            "Matter bridge: pushing commanded state %r for device %s (ADR-0013)",
+            commanded, device_id)
         self._note_pushed(device_id, commanded, handler)
         self._fire(client.set_state(device_id, commanded),
                    f"commanded set_state dev {device_id}")

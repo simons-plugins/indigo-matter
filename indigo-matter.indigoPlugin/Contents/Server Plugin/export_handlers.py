@@ -211,12 +211,17 @@ SATURATION_HUE_FLOOR = 20
 #: and what the lamp can actually reach never closes — the echo re-asserts every
 #: ~3s, forever. :meth:`ExportBridge._apply_command` pushes the COMMANDED value
 #: optimistically after a successful dispatch (ADR-0013), and this tolerance is
-#: what stops the clamped echo from immediately overwriting that push again. 50
-#: covers the measured 26-mired gap with headroom while staying far below any
-#: deliberate user colour-temperature change — warm-to-cool spans 200+ mireds —
-#: at the bounded cost that a genuine Indigo-originated drift of up to 50 mireds
-#: from the last push is not reported until it accumulates past that.
-CT_TOLERANCE_MIREDS = 50
+#: what stops the clamped echo from immediately overwriting that push again. 30
+#: covers the measured 26-mired gap with margin while keeping real preset moves
+#: reportable: mireds are reciprocal, so a fixed band spans more Kelvin the
+#: cooler you go, and a band of 50 would have swallowed first-class Indigo-side
+#: changes like 4000K→5000K (Δ50 mireds) from every paired ecosystem's tile.
+#: At 30, only a warm micro-adjust (2500K→2700K, Δ30) sits inside the band. A
+#: device whose clamp gap exceeds 30 needs honest physical bounds published to
+#: the fabric, not an ever-wider band — that is issue #293. The bounded cost:
+#: a genuine Indigo-originated drift of up to 30 mireds from the last push is
+#: not reported until it accumulates past that.
+CT_TOLERANCE_MIREDS = 30
 
 #: Sentinel for "this key was absent before", which is a change, not a match.
 _MISSING = object()
@@ -728,9 +733,10 @@ class ColorTemperatureLightExport(DimmableLightExport):
         ``{"brightness": 0}`` on the wire and switched an ON lamp OFF on every
         single Apple adaptive-lighting tick (~3s). For an OFF lamp
         (``brightness`` 0 or ``None``) the stored ``whiteLevel`` is still what
-        is sent — the two existing off-lamp pins below (a lamp reporting
-        ``whiteLevel`` 0, and one reporting some other stored level) remain
-        the contract for that case; only the LIT branch changed. Gate and
+        is sent — the two existing off-lamp test pins (in
+        ``tests/test_export_handlers.py``: a lamp reporting ``whiteLevel`` 0,
+        and one reporting some other stored level) remain the contract for
+        that case; only the LIT branch changed. Gate and
         source both read ``brightness`` so they cannot disagree with each
         other: :class:`DimmableLightExport`'s ``states_for`` already treats
         ``brightness`` as the export-side level, and :func:`_number` keeps the
@@ -740,6 +746,15 @@ class ColorTemperatureLightExport(DimmableLightExport):
         colour-temperature write land on an OFF lamp without touching its
         on/off state at all — not needed while the write already preserves an
         off lamp's stored level.)
+
+        This applies to true RGBW hardware too, deliberately. On an
+        ``extendedColorLight`` a colour-temperature write is a request to
+        render white mode, and the lamp's perceived level in that mode is its
+        ``brightness`` — gating this on ``supportsRGB`` to "protect" a
+        separate white channel would hand RGBW z2m strips (whose stored
+        ``whiteLevel`` is just as stale as a CCT lamp's) exactly the
+        issue-#281 clobber this change removes. ``_set_color`` below stays
+        the counterpart: an RGB write touches no white key at all.
 
         Two guards, all about not depending on someone else to be careful:
 

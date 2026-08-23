@@ -157,6 +157,7 @@ attribute exposing the bulb's own physical limit for the plugin to read.
 Reported back through Indigo, that clamp shows up as mireds 400 for a
 commanded 426: a permanent ~26-mired gap between what was asked for and what
 the lamp can do. Left unhandled, this is what looped Apple adaptive
-lighting every ~3 seconds, forever (issue #281) — the plugin's fix
-(`CT_TOLERANCE_MIREDS`, ADR-0013) is a plugin-side tolerance for exactly
-this gap, not a fix to the bulb's own reporting.
+lighting every ~3 seconds, forever (issue #281) — the plugin's fix (a
+commanded-value push plus `CT_TOLERANCE_MIREDS`, ADR-0013) converges the
+fabric on the commanded value and tolerates exactly this gap; it is not a
+fix to the bulb's own reporting.

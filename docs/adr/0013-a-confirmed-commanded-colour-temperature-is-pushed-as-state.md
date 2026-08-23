@@ -78,15 +78,19 @@ live, nothing is pushed and nothing is noted; the next `attach` reseeds from
 device truth as it always has, and the next real ecosystem write reconverges
 on its own — no new retry logic, no new state to leak.
 
-`CT_TOLERANCE_MIREDS` (50) is the second half: without it, the lamp's next
+`CT_TOLERANCE_MIREDS` (30) is the second half: without it, the lamp's next
 clamped echo (400) would immediately overwrite the commanded push (426) and
 reopen the gap on the very next `deviceUpdated`. Unlike hue — which carries a
 tolerance because the Matter 0–254 round trip is genuinely lossy — an in-range
 mireds→Kelvin→mireds round trip is exact, so this tolerance is not absorbing
 conversion noise. It is headroom for a permanent, one-sided clamp gap: the
-measured #281 gap is 26 mireds, 50 covers it with margin, and 50 stays far
-below any deliberate colour-temperature change a user or ecosystem would make
-(warm↔cool spans 200+ mireds).
+measured #281 gap is 26 mireds and 30 covers it with margin. 30 rather than a
+lazier 50 because mireds are reciprocal — a fixed band spans more Kelvin the
+cooler you go, and 50 would have swallowed first-class Indigo-side preset
+moves (4000K→5000K is exactly Δ50 mireds) from every paired ecosystem's tile.
+At 30, only a warm micro-adjust (2500K→2700K, Δ30) sits inside the band; a
+device whose clamp gap exceeds 30 needs honest physical bounds published to
+the fabric (issue #293), not a wider band.
 
 ### Consequences
 
@@ -102,7 +106,7 @@ below any deliberate colour-temperature change a user or ecosystem would make
   (client not live) is simply not noted either, exactly like every other push
   in this file — the next attach or the next real device report puts it
   right, with no timer to leak or expire wrong.
-* Bad: a genuine Indigo-originated colour-temperature drift of up to 50
+* Bad: a genuine Indigo-originated colour-temperature drift of up to 30
   mireds from the last push is not reported until it accumulates past the
   tolerance — the same trade-off `HUE_TOLERANCE_DEGREES` already accepted for
   hue, applied here at a coarser grain because the gap being absorbed is
@@ -110,7 +114,8 @@ below any deliberate colour-temperature change a user or ecosystem would make
 * Bad: `commanded_states` is a second place (besides `_set_color_temp` itself)
   that has to apply the identical mireds clamp. They are kept in lockstep by
   both reading the same `MIREDS_MIN`/`MIREDS_MAX` and the same `round`/`_clamp`
-  expression; a zoo-style test pins the pair.
+  expression; a parametrised lockstep test
+  (`test_commanded_states_and_the_dispatch_clamp_agree`) pins the pair.
 * Neutral: `_push_commanded` fires on every successful `setColorTemp`
   dispatch, not only the first — a repeated identical command produces a
   repeated identical push. Cheap and idempotent at the node (§3.4), the same

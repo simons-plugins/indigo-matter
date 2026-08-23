@@ -12,7 +12,7 @@ current version is `Info.plist`'s `PluginVersion`.
   every ~3 seconds without end, because the ecosystem's tile never matched
   what the accessory reported. After a successful colour-temperature
   command, the plugin now pushes the value it actually asked for as the
-  accessory's own state, and tolerates a small (≤50 mireds) gap between that
+  accessory's own state, and tolerates a small (≤30 mireds) gap between that
   and the device's own clamped echo — closing the loop instead of
   re-opening it on every tick.
 - **A colour-temperature change on a lit, exported lamp no longer dims or
