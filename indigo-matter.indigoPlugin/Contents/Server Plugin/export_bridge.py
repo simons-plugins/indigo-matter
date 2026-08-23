@@ -155,6 +155,15 @@ HEALTH_CHURNING = "churning"
 #: an honest "unknown".
 HEALTH_POLL_FAIL_TICKS = 2
 
+#: Fixed positional fabric slots `matterBridgeHealth` carries (issue #288).
+#: ADR-0007: a shipped state is permanent, so this count is a one-time
+#: deliberate choice, not a config knob — 5 covers every ecosystem
+#: combination actually run (Apple Home, Apple Keychain, Alexa, Google,
+#: SmartThings...) with room to spare, without an unbounded state list. A
+#: 6th+ connected fabric is dropped from the slots (never silently — see
+#: :meth:`ExportBridge._warn_if_fabrics_dropped`), not made to grow the list.
+FABRIC_SLOT_COUNT = 5
+
 
 class ExportBridge:
     """Owns the bridge client and everything the Indigo callbacks mean for it.
@@ -326,12 +335,22 @@ class ExportBridge:
         #: ``warnings``. Also advanced (with no device touched) once an
         #: "unknown" verdict has been checked against a bridge with no health
         #: device to represent it at all — see :meth:`_apply_subscription_churn`.
+        #: Since issue #288 the tuple is
+        #: ``(subscriptionHealth, churnDetail, slot_names, slot_healths)`` —
+        #: ``slot_names``/``slot_healths`` are ``FABRIC_SLOT_COUNT``-tuples, or
+        #: bare ``None`` for "no device exists to have slots at all".
         self._health_state: Optional[tuple] = None
         #: Consecutive ``get_status`` poll FAILURES while still ``attached``
         #: (issue #286 review finding 2) — a wedged node's socket can stay up
         #: while every poll times out, which ``_disconnect_ticks`` (attach
         #: state, not poll outcome) never sees. Reset on a successful poll.
         self._poll_fail_ticks = 0
+        #: The fabric_index set named in the last "more connected fabrics than
+        #: slots" warning (issue #288), so a STANDING overflow (still the same
+        #: 6 fabrics next tick) is said once per streak — same shape as
+        #: ``_node_warnings``. Cleared the moment the overflow set changes,
+        #: including back to none.
+        self._dropped_fabrics_warned: frozenset = frozenset()
         #: ISO 8601 expiry of the commissioning window the pairing menu opened,
         #: or ``None``. Held here rather than re-read from the node because the
         #: PRD §5.5 config readout is a dialog-open, and a dialog must not block
@@ -1677,7 +1696,8 @@ class ExportBridge:
                           status.endpoint_count,
                           "commissioned" if status.commissioned else "not yet paired")
         self._report_node_warnings(status)
-        self._apply_subscription_churn(getattr(status, "subscription_churn", None))
+        self._apply_subscription_churn(getattr(status, "subscription_churn", None),
+                                       getattr(status, "fabrics", None))
         if carried_replace_all and self._pending_replace_all():
             owed = self._pending_replace_all()
             self._clear_pending_replace_all()
@@ -1778,69 +1798,133 @@ class ExportBridge:
         self._health_device_warned = False
         return device
 
-    def _apply_subscription_churn(self, churn: Optional[Any]) -> None:
+    def _apply_subscription_churn(self, churn: Optional[Any],
+                                  fabrics: Optional[list] = None) -> None:
         """Drive ``matterBridgeHealth``'s states from a §4.3 ``subscriptionChurn``
-        verdict (issue #286), or from ``None`` for "nothing checked it".
+        verdict (issue #286) and the ``fabrics`` it came with (issue #288's
+        per-fabric slots), or from ``None``/no fabrics for "nothing checked it".
 
         ``checked=False`` — including a bare ``None``, an old node's status,
         or a halted/detached client — is ``unknown``, never ``healthy``: this
         must never claim an all-clear it did not actually observe, the same
-        rule BRIDGE_PROTOCOL §4.3 states for ``driftChecked``. An ``unknown``
-        verdict only ever FINDS the device (:meth:`_find_health_device`) —
-        never creates one, because there is nothing yet to correct on a
-        bridge that has never attached. A real verdict (healthy/churning) may
-        create it (:meth:`_ensure_health_device`).
+        rule BRIDGE_PROTOCOL §4.3 states for ``driftChecked``. That branch
+        only ever FINDS the device (:meth:`_find_health_device`) — never
+        creates one, because there is nothing yet to correct on a bridge that
+        has never attached — and it only ever touches the HEALTH half of a
+        slot it finds already occupied (a non-empty Name), read straight off
+        the device's own current states: there is no local memory of the slot
+        plan to fall back on across a plugin restart, and the device itself
+        is the one thing that survived one. A real (checked) verdict may
+        create the device (:meth:`_ensure_health_device`) and fully
+        RECOMPUTES the slot plan from the fresh ``fabrics`` list — slots are
+        positional, not tied to real fabric indices, so a fabric leaving
+        repacks the rest rather than leaving a gap (issue #288 design,
+        Simon's explicit call).
 
         Writes happen only on a CHANGE — the watchdog re-polls every ~15s and
         a standing verdict must not become a rewrite on every tick, matching
-        :meth:`_report_node_warnings`'s own discipline. When there is no
-        device to represent an ``unknown`` verdict at all, the state is still
-        recorded as checked (just not written anywhere), so a bridge that has
-        never exported anything does not rescan ``indigo.devices`` on every
-        tick forever. The warning sentence for an active verdict already
-        rides the §4.3 ``warnings`` channel (`_report_node_warnings`); this
-        only logs the RECOVERY, so the two channels never say the same thing
-        twice.
+        :meth:`_report_node_warnings`'s own discipline; :meth:`_write_health_state`
+        is the shared write/latch/recovery-log tail both branches use. The
+        warning sentence for an active verdict already rides the §4.3
+        ``warnings`` channel (`_report_node_warnings`); this only logs the
+        RECOVERY, so the two channels never say the same thing twice.
         """
         if churn is not None and getattr(churn, "checked", False):
             active = bool(getattr(churn, "active", False))
             health = HEALTH_CHURNING if active else HEALTH_HEALTHY
             detail = _describe_churn(churn) if active else ""
-            may_create = True
-        else:
-            health = HEALTH_UNKNOWN
-            detail = ""
-            may_create = False
-        new_state = (health, detail)
+            slot_names, slot_healths, dropped = _fabric_slot_plan(fabrics or [], churn)
+            self._warn_if_fabrics_dropped(dropped)
+            new_state = (health, detail, tuple(slot_names), tuple(slot_healths))
+            if new_state == self._health_state:
+                return
+            previous = self._health_state
+            device = self._ensure_health_device()
+            if device is None:
+                return  # already logged; retried on the next change
+            self._write_health_state(device, new_state, previous)
+            return
+
+        # Unchecked verdict: never creates, and only ever corrects HEALTH on
+        # slots the device already shows occupied — see the docstring above.
+        device = self._find_health_device()
+        if device is None:
+            # Nothing to represent, and nothing wrong either — remember this
+            # WAS checked, so the same "no device yet" answer is not
+            # rescanned for on every subsequent tick. `None` slots (not empty
+            # tuples) mark "no device", distinct from a real device with
+            # every slot genuinely vacant.
+            new_state = (HEALTH_UNKNOWN, "", None, None)
+            if new_state != self._health_state:
+                self._health_state = new_state
+            return
+        slot_names = tuple(
+            str(device.states.get(_fabric_slot_key(i + 1, "Name"), "") or "")
+            for i in range(FABRIC_SLOT_COUNT))
+        slot_healths = tuple(HEALTH_UNKNOWN if name else "" for name in slot_names)
+        new_state = (HEALTH_UNKNOWN, "", slot_names, slot_healths)
         if new_state == self._health_state:
             return
         previous = self._health_state
-        device = self._ensure_health_device() if may_create else self._find_health_device()
-        if device is None:
-            if not may_create:
-                # Nothing to represent, and nothing wrong either — remember
-                # this WAS checked, so the same "no device yet" answer is not
-                # rescanned for on every subsequent tick.
-                self._health_state = new_state
-            return  # a create failure is already logged; retried on the next change
+        self._write_health_state(device, new_state, previous)
+
+    def _write_health_state(self, device: Any, new_state: tuple,
+                            previous: Optional[tuple]) -> None:
+        """Push ``new_state`` to ``device`` and advance ``_health_state`` on
+        success (issue #288) — the shared tail of both
+        :meth:`_apply_subscription_churn` branches, which differ in how they
+        resolve the device and compute the desired slot plan but not in how
+        the write, the failure latch, or the recovery log line work.
+
+        Never raises: a write failure must not break the poll loop. Latched
+        the same shape as :attr:`_health_device_warned` — the first failure
+        warns, cleared on the next successful write — and ``_health_state``
+        is deliberately NOT advanced on failure, so the next change (or the
+        very next tick, since the unchanged value would otherwise look
+        identical) retries the write rather than believing it landed.
+        """
+        health, detail, slot_names, slot_healths = new_state
+        kv = [
+            {"key": "subscriptionHealth", "value": health},
+            {"key": "churnDetail", "value": detail},
+        ]
+        for i in range(FABRIC_SLOT_COUNT):
+            kv.append({"key": _fabric_slot_key(i + 1, "Name"), "value": slot_names[i]})
+            kv.append({"key": _fabric_slot_key(i + 1, "Health"), "value": slot_healths[i]})
         try:
-            device.updateStatesOnServer([
-                {"key": "subscriptionHealth", "value": health},
-                {"key": "churnDetail", "value": detail},
-            ])
+            device.updateStatesOnServer(kv)
         except Exception as exc:  # pylint: disable=broad-except
             if not self._health_write_warned:
                 self._health_write_warned = True
                 self._logger.warning(
                     "Matter bridge: could not update the bridge health device (%s) — it may be "
                     "showing a stale reading until this is fixed.", exc)
-            return  # not advanced to new_state — retried on the next change
+            return
         self._health_write_warned = False
         self._health_state = new_state
         # Only churning earns the recovery line: unknown -> healthy is an
         # ordinary reattach (node restart, plugin start), not a churn ending.
         if previous is not None and previous[0] == HEALTH_CHURNING and health == HEALTH_HEALTHY:
             self._logger.info("Matter bridge: controller subscription churn has recovered")
+
+    def _warn_if_fabrics_dropped(self, dropped: list) -> None:
+        """Say, once per streak, which connected fabrics did not fit
+        ``FABRIC_SLOT_COUNT`` slots (issue #288) — no silent caps, matching
+        the workspace's degradation-path convention. Cleared the moment the
+        overflow set changes, including back to none, the same latch shape
+        as :meth:`_report_node_warnings`.
+        """
+        indices = frozenset(getattr(fabric, "fabric_index", None) for fabric in dropped)
+        if not indices:
+            self._dropped_fabrics_warned = frozenset()
+            return
+        if indices == self._dropped_fabrics_warned:
+            return
+        self._dropped_fabrics_warned = indices
+        names = ", ".join(_describe_fabric_slot(fabric) for fabric in dropped)
+        self._logger.warning(
+            "Matter bridge: %d connected fabric(s) exceed the %d slots \"%s\" tracks — not "
+            "shown: %s.", len(dropped), FABRIC_SLOT_COUNT, HEALTH_DEVICE_NAME, names)
 
     def _mark_health_unknown(self) -> None:
         """§4.3 issue #286 — the node halted, detached, export was switched
@@ -2159,7 +2243,8 @@ class ExportBridge:
                 return
             self._poll_fail_ticks = 0
             self._report_node_warnings(status)
-            self._apply_subscription_churn(getattr(status, "subscription_churn", None))
+            self._apply_subscription_churn(getattr(status, "subscription_churn", None),
+                                           getattr(status, "fabrics", None))
 
         self._fire(_poll(), "the bridge node status poll")
 
@@ -2317,6 +2402,53 @@ def _describe_churn(churn: Any) -> str:
         for peer in (getattr(churn, "peers", None) or [])
     ]
     return "; ".join(peers)
+
+
+def _fabric_slot_key(slot: int, field: str) -> str:
+    """``fabric1Name``, ``fabric3Health``, ... — 1-based, matching the state
+    ids Devices.xml declares for ``matterBridgeHealth`` (issue #288)."""
+    return f"fabric{slot}{field}"
+
+
+def _describe_fabric_slot(fabric: Any) -> str:
+    """A fabric slot's Name (issue #288): the node's own label, or
+    ``fabric <index>`` when it reports none — a connected fabric with an
+    empty label must still occupy a slot, not be silently skipped."""
+    label = str(getattr(fabric, "label", "") or "").strip()
+    if label:
+        return label
+    return f"fabric {getattr(fabric, 'fabric_index', '?')}"
+
+
+def _fabric_slot_plan(fabrics: list, churn: Optional[Any]) -> tuple:
+    """The desired ``(names, healths, dropped)`` for ``FABRIC_SLOT_COUNT``
+    positional slots (issue #288), from a CHECKED verdict's own fabric list.
+
+    Positional, not tied to real fabric indices: fabrics are sorted by
+    ``fabric_index`` and packed into slots 1..N in order, so a fabric leaving
+    repacks the rest — a vacated slot goes empty, it does not hold the next
+    fabric's OLD position (Simon's explicit design call, issue #288). Slots
+    beyond ``FABRIC_SLOT_COUNT`` connected fabrics are reported in ``dropped``
+    (oldest-index-excess first) rather than silently discarded — the caller
+    is responsible for surfacing that (:meth:`ExportBridge._warn_if_fabrics_dropped`).
+
+    Per-slot health is ``HEALTH_CHURNING`` for a fabric any churn peer names,
+    else ``HEALTH_HEALTHY`` — this helper is only ever called against a
+    CHECKED verdict; the unchecked case is a different, device-state-driven
+    path entirely (see :meth:`ExportBridge._apply_subscription_churn`).
+    """
+    ordered = sorted(fabrics, key=lambda fabric: getattr(fabric, "fabric_index", 0))
+    fitted, dropped = ordered[:FABRIC_SLOT_COUNT], ordered[FABRIC_SLOT_COUNT:]
+    churning_indices = {
+        getattr(peer, "fabric_index", None) for peer in (getattr(churn, "peers", None) or [])
+    }
+    names = [""] * FABRIC_SLOT_COUNT
+    healths = [""] * FABRIC_SLOT_COUNT
+    for i, fabric in enumerate(fitted):
+        names[i] = _describe_fabric_slot(fabric)
+        is_churning = getattr(fabric, "fabric_index", None) in churning_indices
+        healths[i] = HEALTH_CHURNING if is_churning else HEALTH_HEALTHY
+    return names, healths, dropped
 
 
 def reachable_of(dev: Any) -> bool:

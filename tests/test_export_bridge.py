@@ -2768,6 +2768,172 @@ class TestSubscriptionHealthDevice:
         assert dev.states["subscriptionHealth"] == "unknown"
 
 
+class TestFabricSlots:
+    """§4.3 issue #288 — `matterBridgeHealth`'s five positional per-fabric
+    slots.
+
+    `subscriptionHealth` alone can say "churning" but not WHICH paired
+    ecosystem is churning once a house has more than one. Slots are
+    POSITIONAL — sorted by `fabric_index`, packed 1..N — not tied to a real
+    fabric's index, so a fabric leaving repacks the rest rather than leaving
+    a gap (Simon's explicit design call, issue #288).
+    """
+
+    FABRIC_1 = {"fabricIndex": 1, "label": "Apple Home", "vendorId": 4937}
+    FABRIC_2 = {"fabricIndex": 2, "label": "Amazon Alexa", "vendorId": 4442}
+
+    def _churn(self, peers=()):
+        return {"checked": True, "active": bool(peers), "peers": list(peers)}
+
+    def _peer(self, fabric_index):
+        return {"peerNodeId": "41869fbd537ef01", "fabricIndex": fabric_index, "liveSessions": 5,
+                "invalidDeletions": 3, "windowMinutes": 30, "since": "2026-08-23T09:12:00.000Z"}
+
+    def _status(self, fabrics=(), churn=None):
+        payload = {
+            "commissioned": True, "fabrics": list(fabrics), "endpointCount": 1,
+            "endpoints": [], "drift": [], "driftChecked": True, "warnings": [],
+        }
+        if churn is not None:
+            payload["subscriptionChurn"] = churn
+        return bridge_protocol.parse_status(payload)
+
+    def _harness(self, bridge_mod, mock_logger, devices) -> Harness:
+        return Harness(bridge_mod, mock_logger, devices, [ExportEntry(101, "onOffLight")])
+
+    def _attached(self, bridge_mod, mock_logger, devices) -> Harness:
+        h = self._harness(bridge_mod, mock_logger, devices)
+        h.start()
+        h.client.attached = True
+        return h
+
+    def test_two_fabrics_fill_the_first_two_slots_healthy(
+            self, bridge_mod, mock_logger, devices):
+        h = self._harness(bridge_mod, mock_logger, devices)
+        h.bridge._on_attached(
+            self._status([self.FABRIC_1, self.FABRIC_2], self._churn()), False)
+        dev = h.health_devices[0]
+        assert dev.states["fabric1Name"] == "Apple Home"
+        assert dev.states["fabric1Health"] == "healthy"
+        assert dev.states["fabric2Name"] == "Amazon Alexa"
+        assert dev.states["fabric2Health"] == "healthy"
+        for slot in (3, 4, 5):
+            assert dev.states[f"fabric{slot}Name"] == ""
+            assert dev.states[f"fabric{slot}Health"] == ""
+
+    def test_a_fabric_with_no_label_falls_back_to_its_index(
+            self, bridge_mod, mock_logger, devices):
+        h = self._harness(bridge_mod, mock_logger, devices)
+        h.bridge._on_attached(
+            self._status([{"fabricIndex": 7, "label": "", "vendorId": 0}], self._churn()), False)
+        assert h.health_devices[0].states["fabric1Name"] == "fabric 7"
+
+    def test_churn_on_one_fabric_flips_only_that_slots_health(
+            self, bridge_mod, mock_logger, devices):
+        h = self._harness(bridge_mod, mock_logger, devices)
+        churn = self._churn([self._peer(2)])   # fabric 2 (Alexa) churning
+        h.bridge._on_attached(self._status([self.FABRIC_1, self.FABRIC_2], churn), False)
+        dev = h.health_devices[0]
+        assert dev.states["subscriptionHealth"] == "churning"
+        assert dev.states["fabric1Health"] == "healthy"
+        assert dev.states["fabric2Health"] == "churning"
+
+    def test_unchecked_verdict_marks_occupied_slots_unknown_never_healthy(
+            self, bridge_mod, mock_logger, devices):
+        h = self._harness(bridge_mod, mock_logger, devices)
+        h.bridge._on_attached(
+            self._status([self.FABRIC_1, self.FABRIC_2], self._churn()), False)  # both healthy
+        h.bridge._on_attached(self._status(churn=None), False)                   # old-node status now
+
+        dev = h.health_devices[0]
+        assert dev.states["fabric1Health"] == "unknown"
+        assert dev.states["fabric2Health"] == "unknown"
+        assert dev.states["fabric1Health"] != "healthy"
+        # Names retained -- visibility while unobserved is the point.
+        assert dev.states["fabric1Name"] == "Apple Home"
+        assert dev.states["fabric2Name"] == "Amazon Alexa"
+
+    def test_a_fabric_leaving_repacks_slots_and_vacates_the_tail(
+            self, bridge_mod, mock_logger, devices):
+        h = self._harness(bridge_mod, mock_logger, devices)
+        h.bridge._on_attached(
+            self._status([self.FABRIC_1, self.FABRIC_2], self._churn()), False)
+        h.bridge._on_attached(self._status([self.FABRIC_1], self._churn()), False)  # fabric 2 left
+
+        dev = h.health_devices[0]
+        assert dev.states["fabric1Name"] == "Apple Home"
+        assert dev.states["fabric2Name"] == ""
+        assert dev.states["fabric2Health"] == ""
+
+    def test_six_fabrics_fill_five_and_warn_once_naming_the_dropped_one(
+            self, bridge_mod, mock_logger, devices):
+        fabrics = [{"fabricIndex": i, "label": f"Ecosystem {i}", "vendorId": 1}
+                   for i in range(1, 7)]
+        h = self._attached(bridge_mod, mock_logger, devices)
+        h.client.status = self._status(fabrics, self._churn())
+
+        h.bridge.health_tick()
+
+        dev = h.health_devices[0]
+        for slot in range(1, 6):
+            assert dev.states[f"fabric{slot}Name"] == f"Ecosystem {slot}"
+        assert "Ecosystem 6" in warnings_of(mock_logger)
+        said = len(mock_logger.warning.call_args_list)
+
+        h.bridge.health_tick()   # the same six fabrics again -- must not re-log
+
+        assert len(mock_logger.warning.call_args_list) == said
+
+    def test_dropped_fabrics_warning_clears_once_the_overflow_ends(
+            self, bridge_mod, mock_logger, devices):
+        six = [{"fabricIndex": i, "label": f"Ecosystem {i}", "vendorId": 1} for i in range(1, 7)]
+        h = self._attached(bridge_mod, mock_logger, devices)
+        h.client.status = self._status(six, self._churn())
+        h.bridge.health_tick()
+        said = len(mock_logger.warning.call_args_list)
+
+        h.client.status = self._status(six[:5], self._churn())   # back to five -- no overflow
+        h.bridge.health_tick()
+        h.client.status = self._status(six, self._churn())       # overflows again
+        h.bridge.health_tick()
+
+        assert len(mock_logger.warning.call_args_list) == said + 1, \
+            "a cleared-then-recurring overflow is news again"
+
+    def test_a_restart_with_persisted_slot_states_resets_healths_keeps_names(
+            self, bridge_mod, mock_logger, devices):
+        h = self._harness(bridge_mod, mock_logger, devices)
+        stale = FakeHealthDevice(9600)
+        stale.states.update({
+            "subscriptionHealth": "healthy", "churnDetail": "",
+            "fabric1Name": "Apple Home", "fabric1Health": "healthy",
+            "fabric2Name": "Amazon Alexa", "fabric2Health": "churning",
+            "fabric3Name": "", "fabric3Health": "",
+            "fabric4Name": "", "fabric4Health": "",
+            "fabric5Name": "", "fabric5Health": "",
+        })
+        h.health_devices.append(stale)   # persisted from a PREVIOUS session
+
+        h.bridge.health_tick()           # fresh ExportBridge; self.client is None
+
+        assert stale.states["subscriptionHealth"] == "unknown"
+        assert stale.states["fabric1Health"] == "unknown"
+        assert stale.states["fabric2Health"] == "unknown"
+        assert stale.states["fabric1Name"] == "Apple Home"
+        assert stale.states["fabric2Name"] == "Amazon Alexa"
+        assert stale.states["fabric3Health"] == "", "a vacant slot stays vacant, not \"unknown\""
+        assert len(h.health_devices) == 1, "must FIND the existing device, never create a second"
+
+    def test_standing_slot_state_across_five_ticks_writes_once(
+            self, bridge_mod, mock_logger, devices):
+        h = self._attached(bridge_mod, mock_logger, devices)
+        h.client.status = self._status([self.FABRIC_1, self.FABRIC_2], self._churn())
+        for _ in range(5):
+            h.bridge.health_tick()
+        dev = h.health_devices[0]
+        assert len(dev.writes) == 1, "a standing slot plan must not be rewritten every ~15s tick"
+
+
 class TestStalePersistedHealthAcrossARestart:
     """§4.3 issue #286 review finding 1 — the bug a green suite hid.
 

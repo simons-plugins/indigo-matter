@@ -345,13 +345,20 @@ def test_bridge_health_device_exists_as_custom_type():
 
 
 def test_bridge_health_states_match_what_export_bridge_actually_writes():
-    """review finding 6b: `export_bridge._apply_subscription_churn`'s
-    ``updateStatesOnServer`` call writes exactly the keys ``subscriptionHealth``
-    and ``churnDetail`` — Devices.xml must declare exactly those two, no more
-    (ADR-0007: a shipped state is permanent) and no fewer (a key the code
-    writes but Devices.xml never declared would not exist on the live device
-    at all, and the write would be silently discarded)."""
-    assert _device_state_ids("matterBridgeHealth") == {"subscriptionHealth", "churnDetail"}
+    """review finding 6b (extended by issue #288's fabric slots):
+    `export_bridge._write_health_state`'s ``updateStatesOnServer`` call writes
+    exactly `subscriptionHealth`/`churnDetail` plus the ten
+    `fabric<N>Name`/`fabric<N>Health` slot keys — Devices.xml must declare
+    exactly those twelve, no more (ADR-0007: a shipped state is permanent)
+    and no fewer (a key the code writes but Devices.xml never declared would
+    not exist on the live device at all, and the write would be silently
+    discarded)."""
+    import export_bridge
+    expected = {"subscriptionHealth", "churnDetail"}
+    for slot in range(1, export_bridge.FABRIC_SLOT_COUNT + 1):
+        expected.add(f"fabric{slot}Name")
+        expected.add(f"fabric{slot}Health")
+    assert _device_state_ids("matterBridgeHealth") == expected
 
 
 def test_bridge_health_is_the_display_state():
