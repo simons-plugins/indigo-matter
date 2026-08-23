@@ -24,11 +24,23 @@ import type {
     PairingReport,
     RemoveResult,
     StatusReport,
+    SubscriptionChurn,
     UpsertResult,
 } from "../src/protocol.js";
 
 /** The one paired ecosystem the populated fixtures assume. */
 const APPLE_HOME = { fabricIndex: 1, label: "Apple Home", vendorId: 4937 } satisfies FabricInfo;
+
+/** The second ecosystem, present only in the fixture that is ABOUT Alexa (#286). */
+const ALEXA = { fabricIndex: 2, label: "Amazon Alexa", vendorId: 4442 } satisfies FabricInfo;
+
+/**
+ * §4.3 issue #286 — a bridge watching the session layer and seeing nothing
+ * wrong. `checked: true` is what makes the empty `peers` an all-clear rather
+ * than an absence, so every healthy status frame states it rather than
+ * defaulting it.
+ */
+const CHURN_HEALTHY = { checked: true, active: false, peers: [] } satisfies SubscriptionChurn;
 
 /** Versions are placeholders: the real ones track package.json / matter.js. */
 export const handshake = {
@@ -59,6 +71,7 @@ export const status = {
     // the node could not fix, surfaced here because the node's only other
     // channel is a stdout nobody is watching.
     warnings: [],
+    subscriptionChurn: CHURN_HEALTHY,
 } satisfies StatusReport;
 
 /**
@@ -74,6 +87,7 @@ export const statusEmpty = {
     drift: [],
     driftChecked: false,
     warnings: [],
+    subscriptionChurn: CHURN_HEALTHY,
 } satisfies StatusReport;
 
 /** §3.1 with `intent: "replace_all"`: the live set is emptied deliberately. */
@@ -85,6 +99,51 @@ export const statusReplaceAll = {
     drift: [],
     driftChecked: false,
     warnings: [],
+    subscriptionChurn: CHURN_HEALTHY,
+} satisfies StatusReport;
+
+/**
+ * §4.3 issue #286 — `get_status` from a bridge whose Alexa fabric is churning.
+ *
+ * The numbers are the live ones from the #283 recurrence (2026-08-23): one Echo
+ * peer, three terminated-subscription deletions inside the 30-minute window,
+ * five CASE sessions none of which was ever reaped. It carries a second fabric
+ * because that is the only fixture where the ecosystem matters — the notice
+ * names a peer, and a peer with no fabric to belong to would not be actionable.
+ *
+ * The `warnings` entry is the prose half of the same fact, byte-identical to
+ * what `churnWarning` builds: a client that cannot read `subscriptionChurn`
+ * still gets told, which is the whole point of putting it on both channels.
+ */
+export const statusChurning = {
+    commissioned: true,
+    fabrics: [APPLE_HOME, ALEXA],
+    endpointCount: 2,
+    endpoints: [
+        { indigoDeviceId: 123456789, endpointNumber: 2, publishedAs: "indigo-123456789", role: "onOffLight" },
+        { indigoDeviceId: 123456790, endpointNumber: 3, publishedAs: "indigo-123456790", role: "dimmableLight" },
+    ],
+    drift: [],
+    driftChecked: false,
+    warnings: [
+        "Subscription churn detected for controller peer 41869fbd537ef01 (fabric 2): 3 invalid subscription "
+        + "deletion(s) in 30 min, 5 live session(s) since 2026-08-23T09:12:00.000Z — restart the Matter bridge "
+        + "to recover.",
+    ],
+    subscriptionChurn: {
+        checked: true,
+        active: true,
+        peers: [
+            {
+                peerNodeId: "41869fbd537ef01",
+                fabricIndex: 2,
+                liveSessions: 5,
+                invalidDeletions: 3,
+                windowMinutes: 30,
+                since: "2026-08-23T09:12:00.000Z",
+            },
+        ],
+    },
 } satisfies StatusReport;
 
 /** §3.2 — the live endpoint's Matter number, for the plugin's own records. */
@@ -263,6 +322,7 @@ export const rebuiltStatus = {
     drift: [],
     driftChecked: true,
     warnings: [],
+    subscriptionChurn: CHURN_HEALTHY,
 } satisfies StatusReport;
 
 /**

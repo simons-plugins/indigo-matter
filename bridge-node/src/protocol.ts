@@ -367,6 +367,40 @@ export interface RemoveFabricResult {
     remaining: number | null;
 }
 
+/**
+ * §4.3 — one controller peer the churn detector has over threshold (issue
+ * #286). Peers are named individually because a fabric holds several and they
+ * are not interchangeable: two Echoes on one Alexa fabric churn independently.
+ */
+export interface ChurnPeer {
+    /** The peer node id in hex, as matter.js logs it. */
+    peerNodeId: string;
+    fabricIndex: number;
+    liveSessions: number;
+    /** Terminated-subscription deletions inside `windowMinutes`. */
+    invalidDeletions: number;
+    windowMinutes: number;
+    /** ISO-8601 — when this peer first crossed a threshold, not when it last did. */
+    since: string;
+}
+
+/**
+ * §4.3 — controller subscription churn (issues #283/#286).
+ *
+ * `checked: false` means the detector could not observe session state at all,
+ * which is NOT the healthy answer: `active: false` beside it says only that
+ * nothing was seen, and nothing was being looked at. A client must gate on
+ * `checked` before reading `active` as an all-clear — the same rule
+ * {@link StatusReport.driftChecked} carries for `drift`.
+ */
+export interface SubscriptionChurn {
+    checked: boolean;
+    /** At least one peer is currently over threshold. */
+    active: boolean;
+    /** Over-threshold peers only; empty whenever `active` is false. */
+    peers: ChurnPeer[];
+}
+
 /** §4.3 */
 export interface StatusReport {
     commissioned: boolean;
@@ -397,8 +431,24 @@ export interface StatusReport {
      *
      * Empty is the normal state. Entries are current, not historical: a warning
      * disappears the moment the operation it describes succeeds.
+     *
+     * Since 0.15.0 this also carries the issue #286 churn notice, which is not
+     * a persistence failure but is exactly the same kind of thing: a fault the
+     * node cannot fix on its own and the user would otherwise never hear about.
      */
     warnings: string[];
+    /**
+     * Controller subscription churn (issue #286) — the structured half of the
+     * notice that rides {@link warnings}, so a client can drive a device state
+     * from it instead of parsing prose.
+     *
+     * Additive since 0.15.0 with no `protocolVersion` bump, the precedent
+     * `driftChecked` and `warnings` set: a client that does not know the field
+     * ignores it, and a client that does must tolerate its absence from an
+     * older node by defaulting to `{checked: false, active: false, peers: []}`
+     * — the honest reading, since such a node never looked.
+     */
+    subscriptionChurn: SubscriptionChurn;
 }
 
 export interface EndpointSummary {

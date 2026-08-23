@@ -67,7 +67,12 @@
         "endpoints": [],
         "drift": [],
         "driftChecked": false,
-        "warnings": []
+        "warnings": [],
+        "subscriptionChurn": {
+          "checked": true,
+          "active": false,
+          "peers": []
+        }
       }
     }
   },
@@ -145,7 +150,71 @@
         ],
         "drift": [],
         "driftChecked": false,
-        "warnings": []
+        "warnings": [],
+        "subscriptionChurn": {
+          "checked": true,
+          "active": false,
+          "peers": []
+        }
+      }
+    }
+  },
+  "get_status_churning": {
+    "request": {
+      "message_id": "m46",
+      "command": "get_status",
+      "args": {}
+    },
+    "response": {
+      "message_id": "m46",
+      "result": {
+        "commissioned": true,
+        "fabrics": [
+          {
+            "fabricIndex": 1,
+            "label": "Apple Home",
+            "vendorId": 4937
+          },
+          {
+            "fabricIndex": 2,
+            "label": "Amazon Alexa",
+            "vendorId": 4442
+          }
+        ],
+        "endpointCount": 2,
+        "endpoints": [
+          {
+            "indigoDeviceId": 123456789,
+            "endpointNumber": 2,
+            "publishedAs": "indigo-123456789",
+            "role": "onOffLight"
+          },
+          {
+            "indigoDeviceId": 123456790,
+            "endpointNumber": 3,
+            "publishedAs": "indigo-123456790",
+            "role": "dimmableLight"
+          }
+        ],
+        "drift": [],
+        "driftChecked": false,
+        "warnings": [
+          "Subscription churn detected for controller peer 41869fbd537ef01 (fabric 2): 3 invalid subscription deletion(s) in 30 min, 5 live session(s) since 2026-08-23T09:12:00.000Z \u2014 restart the Matter bridge to recover."
+        ],
+        "subscriptionChurn": {
+          "checked": true,
+          "active": true,
+          "peers": [
+            {
+              "peerNodeId": "41869fbd537ef01",
+              "fabricIndex": 2,
+              "liveSessions": 5,
+              "invalidDeletions": 3,
+              "windowMinutes": 30,
+              "since": "2026-08-23T09:12:00.000Z"
+            }
+          ]
+        }
       }
     }
   },
@@ -334,7 +403,12 @@
         ],
         "drift": [],
         "driftChecked": false,
-        "warnings": []
+        "warnings": [],
+        "subscriptionChurn": {
+          "checked": true,
+          "active": false,
+          "peers": []
+        }
       }
     }
   },
@@ -364,7 +438,12 @@
         "endpoints": [],
         "drift": [],
         "driftChecked": false,
-        "warnings": []
+        "warnings": [],
+        "subscriptionChurn": {
+          "checked": true,
+          "active": false,
+          "peers": []
+        }
       }
     }
   },
@@ -1099,7 +1178,12 @@
         ],
         "drift": [],
         "driftChecked": false,
-        "warnings": []
+        "warnings": [],
+        "subscriptionChurn": {
+          "checked": true,
+          "active": false,
+          "peers": []
+        }
       }
     }
   },
@@ -1447,7 +1531,12 @@
         ],
         "drift": [],
         "driftChecked": true,
-        "warnings": []
+        "warnings": [],
+        "subscriptionChurn": {
+          "checked": true,
+          "active": false,
+          "peers": []
+        }
       }
     }
   },

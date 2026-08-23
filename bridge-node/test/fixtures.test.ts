@@ -38,6 +38,8 @@ describe("golden fixtures match their typed mirror", () => {
         // answer against a node with nothing live is an empty live set.
         ["attach result", golden.attach.response.result, shapes.statusEmpty],
         ["get_status result", golden.get_status.response.result, shapes.status],
+        ["get_status (churning) result", golden.get_status_churning.response.result,
+            shapes.statusChurning],
         ["attach_with_endpoints result", golden.attach_with_endpoints.response.result, shapes.status],
         ["attach_replace_all result", golden.attach_replace_all.response.result, shapes.statusReplaceAll],
         ["attach mass_removal_refused", golden.attach_mass_removal_refused.response, shapes.massRemovalRefused],

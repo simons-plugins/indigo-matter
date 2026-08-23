@@ -715,7 +715,8 @@ ecosystem acts. Both are enumerated here in full; there is no other source.
                 "publishedAs": "indigo-123456789"}],
  "drift": [],
  "driftChecked": false,
- "warnings": []}
+ "warnings": [],
+ "subscriptionChurn": {"checked": true, "active": false, "peers": []}}
 ```
 
 `drift` lists any `UniqueID → endpointNumber` mappings that changed since last
@@ -747,11 +748,15 @@ and is still never repaired. Each entry is a `DriftEntry`:
   `drift` as an all-clear unless `driftChecked` is `true`. It is also `false`
   while the map is held **in memory only** because a write failed — a baseline
   the next restart cannot find has not verified anything durable.
-- `warnings` — persistence failures the node has hit and cannot fix on its own:
-  the endpoint map could not be written or deleted, the commissioning witness
-  could not be cleared, `identity.json` could not be saved. Empty is the normal
-  state, and entries are **current, not historical** — a warning disappears the
-  moment the operation it describes succeeds.
+- `warnings` — faults the node has hit and cannot fix on its own, in prose. Most
+  are persistence failures: the endpoint map could not be written or deleted,
+  the commissioning witness could not be cleared, `identity.json` could not be
+  saved. Since bridge-node 0.15.0 the channel also carries two things that are
+  not writes at all — the issues #219/#240 re-adopt notices, and the issue #286
+  subscription-churn notice described below — because they are the same kind of
+  thing: a fault a human has to act on that appears nowhere else. Empty is the
+  normal state, and entries are **current, not historical** — a warning
+  disappears the moment the condition it describes ends.
 
   This exists because the node's only other channel is stdout, and while the
   node is started by hand that is a terminal nobody is watching. A client MUST
@@ -766,6 +771,51 @@ and is still never repaired. Each entry is a `DriftEntry`:
   `upsert_endpoint`/`remove_endpoint`. A client that only reads the `warnings`
   it gets back from `attach` sees none of them, and the user is told nothing at
   all — which is the state this channel was invented to end.
+
+- `subscriptionChurn` — whether a *controller* is churning its subscriptions
+  against this bridge (issues #283/#286). Added in bridge-node 0.15.0 with **no
+  `protocolVersion` bump**, the same additive precedent `driftChecked` and
+  `warnings` set: a client that does not know the field ignores it, and a client
+  that does must tolerate its absence from an older node by defaulting to
+  `{"checked": false, "active": false, "peers": []}`.
+
+  ```json
+  {"checked": true,
+   "active": true,
+   "peers": [{"peerNodeId": "41869fbd537ef01", "fabricIndex": 2, "liveSessions": 5,
+              "invalidDeletions": 3, "windowMinutes": 30,
+              "since": "2026-08-23T09:12:00.000Z"}]}
+  ```
+
+  - `checked` — whether the node could observe its own session layer at all.
+    **`false` is not the healthy answer.** It means the session observables
+    could not be wired, or a handler failed and the detector was switched off
+    rather than left reporting a tally it knows is short; `active: false` beside
+    it says only that nothing was seen, by something that was not looking. Gate
+    on `checked` exactly as you gate on `driftChecked` before reading `drift`.
+  - `active` — at least one peer is currently over a threshold.
+  - `peers` — the over-threshold peers, and only those; empty whenever `active`
+    is `false`. Peers are listed individually because one fabric holds several
+    and they are not interchangeable: two Echoes on one Alexa fabric churn
+    independently, and the user is being asked to act.
+  - `since` is when that peer FIRST crossed a threshold in the current episode,
+    not when it was last seen churning. It holds still while the churn persists
+    and restarts only after a genuine recovery.
+
+  The fault, measured on the reference server (issue #283, 2026-08-23): Alexa
+  opens a CASE session, subscribes, reports the subscription invalid some
+  minutes later, and re-subscribes over a *new* session while the old ones are
+  never reaped — three generations for one Echo peer inside 30 minutes, a
+  ~30-minute cycle, 24 SubscribeRequests a day. The node detects it from the
+  **rate of terminated-subscription deletions per peer** alongside that peer's
+  **live CASE session count**, never from a dependency's log text. Detection is
+  read-only: the node counts and reports, and closes nothing. The only recovery
+  is a bridge restart, which is what the notice says.
+
+  An active verdict also raises a `warnings` entry naming the peer, so a client
+  that reads only the prose channel is still told. Both are cleared together
+  when the fabric goes stable — the rolling window drains, or the piled-up
+  sessions are reaped.
 
 `endpoints[].role` is one of the §4.2 enum; `endpoints[].publishedAs` is
 issues #219/#240's accessory identity (§4.1) — informational here, tolerantly

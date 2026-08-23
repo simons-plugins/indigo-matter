@@ -152,6 +152,30 @@ class PosedNode extends BridgeNode {
     }
 }
 
+/**
+ * A node that cannot reach its own environment — the shape of a `ServerNode`
+ * whose `SessionManager` is not where issue #286's wiring looks for it, which
+ * is what a matter.js upgrade would do to it.
+ *
+ * `env` is the ONLY property the Proxy intercepts, so everything else `start()`
+ * does through `this.server` is the real stack: the failure under test is the
+ * churn wiring's alone, not a node broken into behaving.
+ */
+class ChurnBlindNode extends BridgeNode {
+    override get server(): ServerNode {
+        const real = super.server;
+        return new Proxy(real, {
+            get(target, prop) {
+                if (prop === "env") {
+                    throw new Error("SessionManager is not in this environment");
+                }
+                const value: unknown = Reflect.get(target, prop, target);
+                return typeof value === "function" ? value.bind(target) : value;
+            },
+        });
+    }
+}
+
 /** One posed fabric, shaped as matter.js's own `state.commissioning.fabrics` entries. */
 const POSED_FABRIC = { fabricIndex: 1, label: "Apple Home", rootVendorId: 4937 };
 
@@ -1170,5 +1194,49 @@ describe("noteFabrics never swallows the read it depends on (E5 S2)", () => {
         assert.match(logged[0]!, /Fabric list unavailable/);
         assert.match(logged[0]!, /commissioning witness has NOT been cleared/);
         assert.match(logged[0]!, /fabrics_changed/);
+    });
+});
+
+describe("subscription-churn detection reaches get_status (issue #286)", () => {
+    it("a real started node reports the session layer as CHECKED and quiet", async () => {
+        // The wiring half of #286: `churn.test.ts` owns the thresholds, but
+        // only a live ServerNode can say whether the observables it hangs off
+        // are actually there in matter.js 0.17.8.
+        const session = await boot(storage());
+        try {
+            assert.deepEqual(session.bridge.getStatus().subscriptionChurn, {
+                checked: true,
+                active: false,
+                peers: [],
+            });
+        } finally {
+            await session.close();
+        }
+    });
+
+    it("reports checked:false — not a quiet all-clear — when the wiring fails", async () => {
+        const logged: string[] = [];
+        const bridge = new ChurnBlindNode(
+            { storagePath: storage(), matterPort: 0, wsPort: 0 },
+            { ...IDENTITY },
+            BRIDGE_VERSION,
+            message => logged.push(message),
+        );
+        await bridge.start();
+        try {
+            const status = bridge.getStatus();
+            assert.equal(status.subscriptionChurn.checked, false,
+                "a session layer nobody is watching must never be reported as a quiet one");
+            assert.equal(status.subscriptionChurn.active, false);
+            assert.deepEqual(status.subscriptionChurn.peers, []);
+            assert.deepEqual(status.warnings, [],
+                "…and it must not raise a notice about churn it could not have seen");
+            assert.ok(
+                logged.some(line => line.includes("Subscription-churn detection could not be wired")),
+                logged.join("\n"),
+            );
+        } finally {
+            await bridge.close();
+        }
     });
 });
