@@ -540,8 +540,13 @@ class FakeHealthDevice:
         #: was given — a rewrite of identical states is a bug this exists to
         #: catch, so recording every call (not just the latest) matters.
         self.writes: list = []
+        #: Raise instead of writing — issue #286 review finding 3's
+        #: write-failure latch has no other way to be exercised.
+        self.fail_writes = False
 
     def updateStatesOnServer(self, kvlist):
+        if self.fail_writes:
+            raise RuntimeError("updateStatesOnServer failed (fail_writes)")
         self.writes.append(list(kvlist))
         for kv in kvlist:
             self.states[kv["key"]] = kv["value"]
@@ -578,3 +583,14 @@ class FakeIndigoDevices:
             if device.id == device_id:
                 return device
         raise KeyError(device_id)
+
+    def iter(self, _filter=None):
+        """``indigo.devices.iter("self")`` — this suite has one plugin, so
+        every device here already IS "self"; the filter is accepted and
+        ignored, mirroring ``test_device_sync.py``'s own fake. Real Indigo
+        EXCLUDES unconfigured devices from ``iter("self")`` (issue #62) —
+        modelled the same way, via ``getattr(..., "configured", True)`` so a
+        double without the attribute at all still iterates (most of this
+        module's doubles predate ``configured`` and default to ``True``).
+        """
+        return [dev for dev in self._devices if getattr(dev, "configured", True)]

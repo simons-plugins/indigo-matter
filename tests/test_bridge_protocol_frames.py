@@ -205,6 +205,45 @@ class TestResponses:
         assert report.subscription_churn.active is False
         assert report.subscription_churn.peers == []
 
+    def test_subscription_churn_malformed_peer_degrades_the_list_not_the_report(self):
+        """review finding 4: one bad peer entry must not detonate the whole
+        ``StatusReport`` — the old comprehension's ``.get``/``int()`` escaping
+        failed the entire status poll at DEBUG, silenced `warnings` (the churn
+        warning INCLUDED) for the whole report, and could fail an `attach`."""
+        result = dict(FRAMES["get_status_churning"]["response"]["result"])
+        good_peer = result["subscriptionChurn"]["peers"][0]
+        result = {
+            **result,
+            "subscriptionChurn": {
+                "checked": True, "active": True,
+                "peers": [
+                    "not even a dict",
+                    {"peerNodeId": "ok-peer", "fabricIndex": "not-a-number",
+                     "liveSessions": 5, "invalidDeletions": 3, "windowMinutes": 30,
+                     "since": "2026-08-23T09:12:00.000Z"},
+                    good_peer,
+                ],
+            },
+        }
+        report = bridge_protocol.parse_status(result)  # must not raise
+        churn = report.subscription_churn
+        assert churn.checked is True
+        assert churn.active is True
+        # Both malformed entries dropped; the one good peer survives.
+        assert len(churn.peers) == 1
+        assert churn.peers[0].peer_node_id == good_peer["peerNodeId"]
+
+    def test_subscription_churn_all_peers_malformed_is_active_with_no_peers(self):
+        """A degraded-to-empty peers list must not silently flip `active` to
+        False — the node still said it was active; only the DETAIL is thin."""
+        result = dict(FRAMES["get_status_churning"]["response"]["result"])
+        result = {**result, "subscriptionChurn": {
+            "checked": True, "active": True, "peers": [None, "garbage", 42],
+        }}
+        report = bridge_protocol.parse_status(result)  # must not raise
+        assert report.subscription_churn.active is True
+        assert report.subscription_churn.peers == []
+
     def test_pairing_states(self):
         never = bridge_protocol.parse_pairing(
             FRAMES["get_pairing_uncommissioned"]["response"]["result"])

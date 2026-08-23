@@ -336,6 +336,30 @@ def test_matter_node_configui_has_the_survey_summary_field():
 
 
 # ---------------------------------------------------------------------------
+# issue #286 — the matterBridgeHealth device type
+# ---------------------------------------------------------------------------
+
+def test_bridge_health_device_exists_as_custom_type():
+    dev = _device_element("matterBridgeHealth")
+    assert dev.get("type") == "custom"
+
+
+def test_bridge_health_states_match_what_export_bridge_actually_writes():
+    """review finding 6b: `export_bridge._apply_subscription_churn`'s
+    ``updateStatesOnServer`` call writes exactly the keys ``subscriptionHealth``
+    and ``churnDetail`` — Devices.xml must declare exactly those two, no more
+    (ADR-0007: a shipped state is permanent) and no fewer (a key the code
+    writes but Devices.xml never declared would not exist on the live device
+    at all, and the write would be silently discarded)."""
+    assert _device_state_ids("matterBridgeHealth") == {"subscriptionHealth", "churnDetail"}
+
+
+def test_bridge_health_is_the_display_state():
+    dev = _device_element("matterBridgeHealth")
+    assert dev.findtext("UiDisplayStateId") == "subscriptionHealth"
+
+
+# ---------------------------------------------------------------------------
 # fix/#58 — type-edit guard
 # ---------------------------------------------------------------------------
 

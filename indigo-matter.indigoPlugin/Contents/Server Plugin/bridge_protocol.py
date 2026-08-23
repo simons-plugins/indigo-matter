@@ -636,6 +636,31 @@ def parse_drift(data: Any) -> list:
     ]
 
 
+def _parse_churn_peer(item: Any) -> Optional[ChurnPeer]:
+    """One §4.3 churn peer, tolerantly — ``None`` for anything malformed.
+
+    A single bad entry (not a dict, or a field that will not ``int()``) must
+    degrade the ``peers`` LIST, not detonate the whole ``StatusReport`` (issue
+    #286 review finding 4): an exception escaping here previously failed the
+    entire status poll at DEBUG, which also suppressed
+    ``_report_node_warnings`` for the whole report — including the churn
+    warning itself — and could fail an ``attach`` outright.
+    """
+    if not isinstance(item, dict):
+        return None
+    try:
+        return ChurnPeer(
+            peer_node_id=str(item.get("peerNodeId", "")),
+            fabric_index=int(item.get("fabricIndex", 0)),
+            live_sessions=int(item.get("liveSessions", 0)),
+            invalid_deletions=int(item.get("invalidDeletions", 0)),
+            window_minutes=int(item.get("windowMinutes", 0)),
+            since=str(item.get("since", "")),
+        )
+    except (TypeError, ValueError):
+        return None
+
+
 def parse_subscription_churn(data: Any) -> SubscriptionChurn:
     """Normalise the §4.3 ``subscriptionChurn`` object (issues #283/#286).
 
@@ -649,17 +674,8 @@ def parse_subscription_churn(data: Any) -> SubscriptionChurn:
     return SubscriptionChurn(
         checked=bool(data.get("checked", False)),
         active=bool(data.get("active", False)),
-        peers=[
-            ChurnPeer(
-                peer_node_id=str(item.get("peerNodeId", "")),
-                fabric_index=int(item.get("fabricIndex", 0)),
-                live_sessions=int(item.get("liveSessions", 0)),
-                invalid_deletions=int(item.get("invalidDeletions", 0)),
-                window_minutes=int(item.get("windowMinutes", 0)),
-                since=str(item.get("since", "")),
-            )
-            for item in (data.get("peers") or [])
-        ],
+        peers=[peer for peer in (_parse_churn_peer(item) for item in (data.get("peers") or []))
+               if peer is not None],
     )
 
 

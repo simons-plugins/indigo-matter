@@ -3,6 +3,26 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
+## 2026.25.0 — a device for the bridge's own health, and Alexa subscription-churn detection
+
+- **A new "Matter Bridge Health" device** now appears once export is in use
+  (issue #286). Its `subscriptionHealth` state — `healthy`, `churning`, or
+  `unknown` — is triggerable in an ordinary Indigo trigger, so "Alexa is
+  churning its subscriptions against the bridge again" (issue #283) no
+  longer requires reading the event log. `unknown` is the honest answer
+  whenever nothing has actually been observed: before the first attach, while
+  the bridge node is halted, recovering, or detached, or after a run of
+  failed status polls — it is never read as "healthy". `churnDetail` names
+  the affected controller peer(s) when churning.
+- **Requires the bridge node updated to `0.15.0`** for `subscriptionHealth`
+  to leave `unknown` — the churn detector lives there. Update the plugin,
+  then run *Plugins ▸ Matter ▸ Install/update the Matter bridge* (same
+  step as 2026.24.5). An un-updated 0.14.x node is not an error: the plugin
+  reads its `StatusReport`'s absent field as "never checked" and the device
+  simply stays `unknown`.
+- The detection itself (matter.js session/subscription bookkeeping) is the
+  bridge node's own change, described in its own release notes.
+
 ## 2026.24.6 — manual colour/CT changes no longer flash blue or switch off
 
 - **Manual colour and colour-temperature changes on exported RGBW bulbs no
