@@ -201,6 +201,28 @@ HUE_TOLERANCE_DEGREES = 1
 #: you", which is exactly the truth here.
 SATURATION_HUE_FLOOR = 20
 
+#: Colour-temperature tolerance, in mireds, below which :meth:`ExportHandler.diff`
+#: treats a change as noise. This is **not** a jitter allowance — unlike hue, the
+#: in-range mireds→Kelvin→mireds round trip is near-exact (0-1 mired), so a
+#: colour-temperature echo does not wobble the way a converted hue does. It
+#: absorbs a PERMANENT one-sided clamp gap instead: live-measured on issue #281,
+#: Apple adaptive lighting wrote 426 mireds (≈2347K), the z2m lamp's own warm
+#: limit is 2500K (≈400 mireds), and the 26-mired gap between what was commanded
+#: and what the lamp can actually reach never closes — the echo re-asserts every
+#: ~3s, forever. :meth:`ExportBridge._apply_command` pushes the COMMANDED value
+#: optimistically after a successful dispatch (ADR-0013), and this tolerance is
+#: what stops the clamped echo from immediately overwriting that push again. 30
+#: covers the measured 26-mired gap with margin while keeping real preset moves
+#: reportable: mireds are reciprocal, so a fixed band spans more Kelvin the
+#: cooler you go, and a band of 50 would have swallowed first-class Indigo-side
+#: changes like 4000K→5000K (Δ50 mireds) from every paired ecosystem's tile.
+#: At 30, only a warm micro-adjust (2500K→2700K, Δ30) sits inside the band. A
+#: device whose clamp gap exceeds 30 needs honest physical bounds published to
+#: the fabric, not an ever-wider band — that is issue #293. The bounded cost:
+#: a genuine Indigo-originated drift of up to 30 mireds from the last push is
+#: not reported until it accumulates past that.
+CT_TOLERANCE_MIREDS = 30
+
 #: Sentinel for "this key was absent before", which is a change, not a match.
 _MISSING = object()
 
@@ -600,6 +622,17 @@ class ExportHandler:
             return False
         return handler(dict(args or {}), dev, dict(options or {})) or True
 
+    def commanded_states(self, _command: str, _args: dict) -> dict:
+        """§4.2 states a SUCCESSFUL ``command`` entitles the caller to consider
+        pushed (ADR-0013). Empty for every command by default — the doctrine
+        (#143/#201) that the node reports only Indigo-confirmed truth stands;
+        a role overrides this only for a key where a permanent device-side
+        clamp makes the confirmed echo diverge from the commanded value
+        forever (issue #281). The caller (``ExportBridge._apply_command``)
+        folds the result into the pushed snapshot and pushes it to the node.
+        """
+        return {}
+
 
 class OnOffExport(ExportHandler):
     """``onOffPlugInUnit`` / ``onOffLight`` — the whole of the relay export."""
@@ -653,6 +686,7 @@ class ColorTemperatureLightExport(DimmableLightExport):
     """``colorTemperatureLight`` — adds ``colorTempMireds`` over Indigo's Kelvin."""
 
     role = export_catalog.ROLE_COLOR_TEMPERATURE_LIGHT
+    tolerances = {STATE_COLOR_TEMP_MIREDS: CT_TOLERANCE_MIREDS}
 
     def states_for(self, dev: Any, options: Optional[dict] = None) -> dict:
         states = super().states_for(dev, options)
@@ -665,6 +699,22 @@ class ColorTemperatureLightExport(DimmableLightExport):
     def commands(self) -> dict[str, Callable[[dict, Any, dict], Optional[str]]]:
         return {**super().commands(), COMMAND_SET_COLOR_TEMP: self._set_color_temp}
 
+    def commanded_states(self, command: str, args: dict) -> dict:
+        """ADR-0013 — after a SUCCESSFUL ``setColorTemp``, the pushed value is
+        exactly what we asked Indigo for: the identical clamp expression
+        :meth:`_set_color_temp` itself applies, deliberately kept in sync with
+        it. The fabric attribute converges to what the ecosystem wrote, so it
+        stops re-asserting; :data:`CT_TOLERANCE_MIREDS` keeps the device's own
+        clamped echo from undoing this push again. Inherited unchanged by
+        :class:`ExtendedColorLightExport`.
+        """
+        if command != COMMAND_SET_COLOR_TEMP:
+            return super().commanded_states(command, args)
+        mireds = args.get(STATE_COLOR_TEMP_MIREDS)
+        if not isinstance(mireds, (int, float)) or isinstance(mireds, bool) or not mireds:
+            return {}
+        return {STATE_COLOR_TEMP_MIREDS: int(_clamp(round(mireds), MIREDS_MIN, MIREDS_MAX))}
+
     @staticmethod
     def _set_color_temp(args: dict, dev: Any, _options: dict) -> Optional[str]:
         """Set white temperature, preserving the white channel's own level.
@@ -673,6 +723,38 @@ class ColorTemperatureLightExport(DimmableLightExport):
         with* whiteLevel, so sending the temperature alone risks a driver
         reading whiteLevel as 0 and turning the lamp off — a colour tweak that
         blacks out the room is a worse bug than a colour tweak that misses.
+        "Preserve the white channel's own level" still stands as the goal, but
+        for a LIT lamp the source of truth for that level is ``brightness``,
+        not the stored ``whiteLevel`` — issue #281 proved live that
+        ``whiteLevel`` does not track brightness on channel-publishing drivers
+        (z2m: ``whiteLevel`` sat at 0.0, then stale at 20, while ``brightness``
+        was actually 29, then 49, then 69). Sending the stored ``whiteLevel``
+        with every colour-temperature write published a literal
+        ``{"brightness": 0}`` on the wire and switched an ON lamp OFF on every
+        single Apple adaptive-lighting tick (~3s). For an OFF lamp
+        (``brightness`` 0 or ``None``) the stored ``whiteLevel`` is still what
+        is sent — the two existing off-lamp test pins (in
+        ``tests/test_export_handlers.py``: a lamp reporting ``whiteLevel`` 0,
+        and one reporting some other stored level) remain the contract for
+        that case; only the LIT branch changed. Gate and
+        source both read ``brightness`` so they cannot disagree with each
+        other: :class:`DimmableLightExport`'s ``states_for`` already treats
+        ``brightness`` as the export-side level, and :func:`_number` keeps the
+        read ``None``-safe, falling back to today's off-lamp behaviour when it
+        is absent. (A future shape banked but out of scope here: matter.js
+        ``executeIfOff`` colour staging, referenced on issue #281, would let a
+        colour-temperature write land on an OFF lamp without touching its
+        on/off state at all — not needed while the write already preserves an
+        off lamp's stored level.)
+
+        This applies to true RGBW hardware too, deliberately. On an
+        ``extendedColorLight`` a colour-temperature write is a request to
+        render white mode, and the lamp's perceived level in that mode is its
+        ``brightness`` — gating this on ``supportsRGB`` to "protect" a
+        separate white channel would hand RGBW z2m strips (whose stored
+        ``whiteLevel`` is just as stale as a CCT lamp's) exactly the
+        issue-#281 clobber this change removes. ``_set_color`` below stays
+        the counterpart: an RGB write touches no white key at all.
 
         Two guards, all about not depending on someone else to be careful:
 
@@ -729,8 +811,10 @@ class ColorTemperatureLightExport(DimmableLightExport):
             # that cannot name the device. The caller latches this per device.
             return ("the Indigo device has no white channel, so there is no colour "
                     "temperature to set")
+        brightness = _number(dev, "brightness")
+        level = brightness if brightness is not None and brightness > 0 else white_level
         levels: dict[str, int] = {
-            "whiteLevel": int(_clamp(round(white_level), 0, 100)),
+            "whiteLevel": int(_clamp(round(level), 0, 100)),
             "whiteTemperature": mireds_to_kelvin(
                 int(_clamp(round(mireds), MIREDS_MIN, MIREDS_MAX))),
         }
@@ -742,7 +826,12 @@ class ExtendedColorLightExport(ColorTemperatureLightExport):
     """``extendedColorLight`` — adds ``hue``/``saturation`` over Indigo's RGB."""
 
     role = export_catalog.ROLE_EXTENDED_COLOR_LIGHT
-    tolerances = {STATE_HUE: HUE_TOLERANCE_DEGREES}
+    #: BOTH entries spelled out, deliberately — a subclass ``tolerances`` dict
+    #: REPLACES the parent's rather than merging with it, so inheriting just
+    #: ``STATE_HUE`` here would silently lose the colour-temperature tolerance
+    #: (or vice versa) the moment either changed.
+    tolerances = {STATE_HUE: HUE_TOLERANCE_DEGREES,
+                  STATE_COLOR_TEMP_MIREDS: CT_TOLERANCE_MIREDS}
 
     #: §4.2 keys this role alternates between depending on the device's colour
     #: mode — never published together (see :meth:`states_for`), so a switch
