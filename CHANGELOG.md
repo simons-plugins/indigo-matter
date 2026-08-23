@@ -3,6 +3,19 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
+## 2026.26.1 — a virtual on/off device exported as a lock can now actually be locked
+
+- **Fixed: a plain Indigo relay (e.g. a Virtual On/Off Device) exported under
+  the `doorLock` role showed up correctly in Apple Home/Alexa but ignored
+  every lock/unlock tap — Home briefly showed the requested state, then
+  reverted** (issue #289). The export already read that relay's on/off state
+  as the lock's bolt position; commands now drive the same relay the same
+  way (`lock` turns it on, `unlock` turns it off), so a device like this only
+  needs its own "on = locked" wiring, not a lock sub-type declaration from
+  an owning plugin. A device that genuinely IS a lock sub-type (checked
+  against its owning plugin's own declaration, not this plugin's) is
+  unaffected — it still uses Indigo's real lock/unlock commands.
+
 ## 2026.26.0 — which paired ecosystem is churning, not just that one is
 
 - **"Matter Bridge Health" now shows five per-fabric slots** (issue #288):
