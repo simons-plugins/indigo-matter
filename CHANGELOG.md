@@ -3,6 +3,29 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
+## 2026.26.2 — adaptive lighting no longer fights warm-limited lamps, and a colour-temperature change no longer dims them
+
+- **Apple adaptive lighting no longer loops forever against a lamp that has
+  reached its warm limit** (issue #281). A device that permanently clamps a
+  commanded colour temperature (e.g. a bulb whose warmest setting is 2500K,
+  clamping Apple's requested 2347K) used to echo the clamped value back
+  every ~3 seconds without end, because the ecosystem's tile never matched
+  what the accessory reported. After a successful colour-temperature
+  command, the plugin now pushes the value it actually asked for as the
+  accessory's own state, and tolerates a small (≤50 mireds) gap between that
+  and the device's own clamped echo — closing the loop instead of
+  re-opening it on every tick.
+- **A colour-temperature change on a lit, exported lamp no longer dims or
+  switches it off.** Every `setColorTemp` write used to carry the device's
+  stored `whiteLevel`, which on channel-publishing drivers (z2m) does not
+  track brightness — observed sitting at 0 (and elsewhere stale) while the
+  lamp's real brightness was 29/49/69. That published a literal
+  `{"brightness": 0}` on the wire with every write, switching an ON lamp
+  OFF on each adaptive-lighting tick. The write now carries the lamp's
+  live brightness instead, for any lamp that is actually on.
+- **No bridge node update required for this release** — both fixes are
+  plugin-side.
+
 ## 2026.26.1 — a virtual on/off device exported as a lock can now actually be locked
 
 - **Fixed: a plain Indigo relay (e.g. a Virtual On/Off Device) exported under

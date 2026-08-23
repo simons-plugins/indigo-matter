@@ -29,5 +29,6 @@ chosen), see [`../ARCHITECTURE.md`](../ARCHITECTURE.md).
 * [ADR-0011](0011-a-driving-device-change-is-a-reconcile-rekey.md) - ADR-0011: A driving-device change under a stable identity is a reconcile rekey (accepted)
 
 * [ADR-0012](0012-export-eligibility-can-be-a-user-declaration.md) - ADR-0012: For a device Indigo does not type, export eligibility is a user declaration (accepted; narrows ADR-0003)
+* [ADR-0013](0013-a-confirmed-commanded-colour-temperature-is-pushed-as-state.md) - ADR-0013: A confirmed, commanded colour-temperature is pushed as state (accepted)
 
 <!-- adrlogstop -->

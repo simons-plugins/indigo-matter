@@ -134,3 +134,29 @@ attributes and behave differently — this is why the plugin's settable-attribut
 report records the firmware version and re-reports when it changes. Some firmware
 also **acknowledges a write and silently ignores it**, which is why every setting
 write is confirmed by a subsequent read rather than by the ACK.
+
+## Zigbee2MQTT-bridged CT bulbs (via the z2m Indigo plugin)
+
+These apply to the **export** direction — an Indigo device driven by the z2m
+plugin, bridged back out to Matter as an accessory.
+
+**`whiteLevel` does not track `brightness`.** Measured live: `whiteLevel`
+reporting `0.0` (and elsewhere, on other writes, a stale `20`) while the
+lamp's real `brightness` was actually 29, then 49, then 69. A colour-
+temperature write that sends the *stored* `whiteLevel` back to
+`setColorLevels` is therefore not preserving the lamp's current level at
+all — it publishes whatever stale number `whiteLevel` happens to hold, and on
+this driver that number reaches the wire as a literal brightness, switching
+an ON lamp OFF. The export now sources the white level from `brightness`
+itself for any lamp that is actually on ([issue #281](https://github.com/simons-plugins/indigo-matter/issues/281)).
+
+**Warm-limit clamping is silent and permanent.** A bulb whose warmest
+setting is 2500K accepts a commanded 2347K without complaint and simply
+clamps its hardware to 2500K — there is no error, no rejected write, and no
+attribute exposing the bulb's own physical limit for the plugin to read.
+Reported back through Indigo, that clamp shows up as mireds 400 for a
+commanded 426: a permanent ~26-mired gap between what was asked for and what
+the lamp can do. Left unhandled, this is what looped Apple adaptive
+lighting every ~3 seconds, forever (issue #281) — the plugin's fix
+(`CT_TOLERANCE_MIREDS`, ADR-0013) is a plugin-side tolerance for exactly
+this gap, not a fix to the bulb's own reporting.
