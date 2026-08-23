@@ -120,6 +120,17 @@ const WARN_IDENTITY_WRITE = "identity-write";
 /** §4.3 `warnings` key for the issue #286 churn notice. Cleared when it stops. */
 const WARN_SUBSCRIPTION_CHURN = "subscription-churn";
 
+/**
+ * What {@link BridgeNode.pollChurn} says when a working detector has failed.
+ *
+ * Deliberately keeps the restart advice: whatever churn was being reported has
+ * not stopped, it has only become invisible, and one restart fixes both.
+ */
+const CHURN_DETECTION_OFF =
+    "Subscription-churn detection FAILED and is no longer watching the session layer — any controller "
+    + "churn, including any this bridge already reported, is now invisible. Restart the Matter bridge "
+    + "node to restore detection.";
+
 /** PBKDF iteration count for enhanced-window verifiers. Spec floor is 1000. */
 const PBKDF_ITERATIONS = 1000;
 const PBKDF_SALT_BYTES = 32;
@@ -262,6 +273,12 @@ export class BridgeNode implements BridgeFacade {
      * type; {@link wireChurnDetection} is the whole of the coupling.
      */
     readonly #churn = new ChurnDetector();
+    /**
+     * True when {@link wireChurnDetection} never attached at all, as opposed to
+     * a detector that worked and then failed. The two are different faults with
+     * different advice — see {@link pollChurn}.
+     */
+    #churnNeverWired = false;
     /**
      * Issue #240, §3 steps 3/5 — `indigoDeviceId → the published identity it
      * was last removed under`, for the ONE device that removal drove, kept
@@ -942,6 +959,18 @@ export class BridgeNode implements BridgeFacade {
     private wireChurnDetection(): void {
         try {
             const sessions = this.server.env.get(SessionManager);
+            // Issue #286 review D — seed from what is ALREADY open before
+            // subscribing. Alexa reconnects the instant the node comes up, so
+            // the sessions established between `server.start()` returning and
+            // this line belong to exactly the peer under suspicion. Seeding and
+            // subscribing happen in one synchronous block, so there is no
+            // window between them for an event to fall through.
+            for (const session of sessions.sessions) {
+                if (session.isPase) {
+                    continue;
+                }
+                this.#churn.sessionOpened(session.id, peerNodeIdHex(session), fabricIndexOf(session));
+            }
             sessions.sessions.added.on(session => this.noteChurn(() => {
                 if (session.isPase) {
                     return;
@@ -965,10 +994,15 @@ export class BridgeNode implements BridgeFacade {
             }));
         } catch (error) {
             this.#churn.markBroken();
-            this.log(
-                "Subscription-churn detection could not be wired; get_status will report it unchecked: "
-                + describeError(error),
-            );
+            this.#churnNeverWired = true;
+            try {
+                this.log(
+                    "Subscription-churn detection could not be wired; get_status will report it unchecked: "
+                    + describeError(error),
+                );
+            } catch {
+                // The logger itself failed; there is nowhere left to report.
+            }
         }
     }
 
@@ -1014,8 +1048,28 @@ export class BridgeNode implements BridgeFacade {
             }
             return verdict;
         }
+        if (!verdict.checked) {
+            // Issue #286 review C. A detector that broke mid-flight must NOT
+            // take its "restart the bridge" advice down with it: the churn it
+            // was reporting is most likely still running, we have merely gone
+            // blind to it, and a restart is still the fix — now for both.
+            //
+            // Wiring that never attached is a different fault and stays
+            // warning-free: nothing was ever reported, so there is nothing to
+            // withdraw, and a restart would fail in exactly the same way every
+            // time. A permanent un-actionable warning is how a channel gets
+            // ignored. `subscriptionChurn.checked` is false either way, which
+            // is the honest signal, and the failure is logged once at start.
+            if (!this.#churnNeverWired) {
+                this.#warnings.set(WARN_SUBSCRIPTION_CHURN, CHURN_DETECTION_OFF);
+            }
+            if (changed) {
+                this.log(CHURN_DETECTION_OFF);
+            }
+            return verdict;
+        }
         this.#warnings.delete(WARN_SUBSCRIPTION_CHURN);
-        if (changed && verdict.checked) {
+        if (changed) {
             this.log("Subscription churn has cleared; controller sessions are stable again");
         }
         return verdict;

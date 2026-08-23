@@ -793,6 +793,17 @@ and is still never repaired. Each entry is a `DriftEntry`:
     rather than left reporting a tally it knows is short; `active: false` beside
     it says only that nothing was seen, by something that was not looking. Gate
     on `checked` exactly as you gate on `driftChecked` before reading `drift`.
+
+    The two ways of reaching `false` are told apart on the `warnings` channel,
+    because the advice differs. A detector that **worked and then failed** keeps
+    a warning up (`Subscription-churn detection FAILED …`): whatever churn it
+    was reporting has not stopped, only become invisible, and a restart fixes
+    both — withdrawing the notice exactly when detection died would take away
+    the one actionable thing the user had. Wiring that **never attached** stays
+    warning-free: nothing was ever reported, so there is nothing to withdraw,
+    and a restart would fail identically every time — a permanent un-actionable
+    warning is how a channel gets ignored. `checked: false` is the honest signal
+    in both cases.
   - `active` — at least one peer is currently over a threshold.
   - `peers` — the over-threshold peers, and only those; empty whenever `active`
     is `false`. Peers are listed individually because one fabric holds several
@@ -806,11 +817,27 @@ and is still never repaired. Each entry is a `DriftEntry`:
   opens a CASE session, subscribes, reports the subscription invalid some
   minutes later, and re-subscribes over a *new* session while the old ones are
   never reaped — three generations for one Echo peer inside 30 minutes, a
-  ~30-minute cycle, 24 SubscribeRequests a day. The node detects it from the
-  **rate of terminated-subscription deletions per peer** alongside that peer's
-  **live CASE session count**, never from a dependency's log text. Detection is
-  read-only: the node counts and reports, and closes nothing. The only recovery
-  is a bridge restart, which is what the notice says.
+  ~30-minute cycle, 24 SubscribeRequests a day.
+
+  The node detects it from the **rate of terminated-subscription deletions per
+  peer** *together with* that peer's **live CASE session count**, never from a
+  dependency's log text. The conjunction is load-bearing, not caution.
+  `Subscription.isTerminated` is not a synonym for "the peer reported it
+  invalid": in matter.js 0.17.8 it is set by three unrelated things, and two of
+  them are innocent — `handlePeerCancel()`, which fires on **every** existing
+  subscription whenever a peer re-subscribes with `keepSubscriptions: false`
+  (the routine path for Apple, Alexa and Google), and the give-up branch after
+  three failed updates on a transient network error (a Wi-Fi blip). A deletion
+  count on its own would therefore tell the owner of a perfectly healthy
+  controller to restart a working bridge. What separates the fault is that the
+  deletions land on a peer whose **sessions are also piling up**: a healthy
+  controller re-subscribes over the session it already holds, or closes the old
+  one; the #283 peer does neither. So deletions count only against a peer
+  holding at least two live sessions, while a large enough pile (four) is the
+  fault on its own however it arose.
+
+  Detection is read-only: the node counts and reports, and closes nothing. The
+  only recovery is a bridge restart, which is what the notice says.
 
   An active verdict also raises a `warnings` entry naming the peer, so a client
   that reads only the prose channel is still told. Both are cleared together

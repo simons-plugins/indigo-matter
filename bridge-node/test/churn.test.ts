@@ -5,7 +5,7 @@
  * testing take three controller session generations and half an hour of real
  * Alexa misbehaviour to reach, which is exactly why the decision was pulled out
  * of `node.ts` in the first place. `node.ts`'s share is the wiring, pinned in
- * `registry.test.ts`.
+ * `persistence.test.ts` against a real started node.
  */
 
 import assert from "node:assert/strict";
@@ -13,6 +13,7 @@ import { describe, it } from "node:test";
 
 import {
     CHURN_DELETION_THRESHOLD,
+    CHURN_MIN_PILED_SESSIONS,
     CHURN_SESSION_THRESHOLD,
     CHURN_WINDOW_MINUTES,
     ChurnDetector,
@@ -30,6 +31,20 @@ const MINUTE = 60_000;
 function fakeClock(start = 1_700_000_000_000): { now: () => number; advance: (ms: number) => void } {
     let time = start;
     return { now: () => time, advance: ms => { time += ms; } };
+}
+
+/**
+ * Give `peer` `n` live sessions. Ids are derived from the peer so two peers
+ * cannot collide, and re-calling with a larger `n` tops up rather than resets.
+ */
+function pileSessions(detector: ChurnDetector, peer: string, n: number, fabric = ALEXA_FABRIC): void {
+    for (let i = 0; i < n; i++) {
+        detector.sessionOpened(sessionId(peer, fabric, i), peer, fabric);
+    }
+}
+
+function sessionId(peer: string, fabric: number, index: number): number {
+    return (peer === ECHO ? 1000 : 2000) + fabric * 100 + index;
 }
 
 /** `n` terminated-subscription deletions for one peer, `gapMs` apart. */
@@ -50,6 +65,8 @@ describe("ChurnDetector (issue #286)", () => {
     it("flags a peer once its terminated deletions reach the threshold", () => {
         const clock = fakeClock();
         const detector = new ChurnDetector({ now: clock.now });
+        // Below the session threshold, so it is the DELETION arm under test.
+        pileSessions(detector, ECHO, CHURN_MIN_PILED_SESSIONS);
 
         churnFor(detector, clock, ECHO, CHURN_DELETION_THRESHOLD - 1);
         assert.equal(detector.verdict().active, false, "under the threshold is not churn");
@@ -63,11 +80,29 @@ describe("ChurnDetector (issue #286)", () => {
         assert.equal(verdict.peers[0]?.windowMinutes, CHURN_WINDOW_MINUTES);
     });
 
-    it("ignores ordinary unsubscribes — only TERMINATED deletions count", () => {
-        // A controller saying goodbye cleanly is how every well-behaved
-        // ecosystem reconnects; counting it would flag all of them.
+    it("does NOT flag three terminated deletions from a peer holding ONE session", () => {
+        // The review's adversarial case, and the reason the deletion arm is
+        // conjunctive. `isTerminated` is also set by handlePeerCancel() on
+        // every routine keepSubscriptions:false re-subscribe, and by the
+        // transient-network give-up branch — so a healthy Echo re-subscribing
+        // three times, or riding out three Wi-Fi blips, lands exactly here.
+        // Telling that user to restart a working bridge is the failure mode.
         const clock = fakeClock();
         const detector = new ChurnDetector({ now: clock.now });
+        pileSessions(detector, ECHO, 1);
+        churnFor(detector, clock, ECHO, CHURN_DELETION_THRESHOLD * 2);
+
+        const verdict = detector.verdict();
+        assert.equal(verdict.active, false, "one session is a controller reconnecting, not a pile");
+        assert.equal(verdict.checked, true, "…and that is a real all-clear, not an absence");
+    });
+
+    it("ignores ordinary unsubscribes — only TERMINATED deletions count", () => {
+        // Piled sessions present, so this fails if the wasTerminated filter is
+        // dropped rather than passing because the conjunction was unmet.
+        const clock = fakeClock();
+        const detector = new ChurnDetector({ now: clock.now });
+        pileSessions(detector, ECHO, CHURN_MIN_PILED_SESSIONS);
         for (let i = 0; i < CHURN_DELETION_THRESHOLD * 3; i++) {
             detector.subscriptionRemoved(ECHO, ALEXA_FABRIC, false);
             clock.advance(MINUTE);
@@ -95,8 +130,9 @@ describe("ChurnDetector (issue #286)", () => {
         for (let i = 0; i < CHURN_SESSION_THRESHOLD; i++) {
             detector.sessionOpened(200 + i, ECHO, ALEXA_FABRIC);
         }
+        // Over the deletion threshold but holding ONE session: innocent.
         detector.sessionOpened(300, OTHER_ECHO, ALEXA_FABRIC);
-        churnFor(detector, clock, OTHER_ECHO, CHURN_DELETION_THRESHOLD - 1);
+        churnFor(detector, clock, OTHER_ECHO, CHURN_DELETION_THRESHOLD);
 
         const verdict = detector.verdict();
         assert.deepEqual(verdict.peers.map(peer => peer.peerNodeId), [ECHO],
@@ -130,6 +166,7 @@ describe("ChurnDetector (issue #286)", () => {
     it("self-clears when the rolling window drains", () => {
         const clock = fakeClock();
         const detector = new ChurnDetector({ now: clock.now });
+        pileSessions(detector, ECHO, CHURN_MIN_PILED_SESSIONS);
         churnFor(detector, clock, ECHO, CHURN_DELETION_THRESHOLD);
         assert.equal(detector.verdict().active, true);
 
@@ -143,6 +180,7 @@ describe("ChurnDetector (issue #286)", () => {
     it("holds `since` at the FIRST crossing while the peer stays over threshold", () => {
         const clock = fakeClock();
         const detector = new ChurnDetector({ now: clock.now });
+        pileSessions(detector, ECHO, CHURN_MIN_PILED_SESSIONS);
         churnFor(detector, clock, ECHO, CHURN_DELETION_THRESHOLD);
         const first = detector.verdict().peers[0]?.since;
         assert.ok(first !== undefined);
@@ -156,6 +194,7 @@ describe("ChurnDetector (issue #286)", () => {
     it("restarts `since` after the peer has genuinely recovered", () => {
         const clock = fakeClock();
         const detector = new ChurnDetector({ now: clock.now });
+        pileSessions(detector, ECHO, CHURN_MIN_PILED_SESSIONS);
         churnFor(detector, clock, ECHO, CHURN_DELETION_THRESHOLD);
         const first = detector.verdict().peers[0]?.since;
 
@@ -170,6 +209,7 @@ describe("ChurnDetector (issue #286)", () => {
         it("reports checked:false for good once broken, whatever arrives afterwards", () => {
             const clock = fakeClock();
             const detector = new ChurnDetector({ now: clock.now });
+            pileSessions(detector, ECHO, CHURN_MIN_PILED_SESSIONS);
             churnFor(detector, clock, ECHO, CHURN_DELETION_THRESHOLD);
             assert.equal(detector.verdict().active, true);
 
@@ -200,6 +240,7 @@ describe("ChurnDetector (issue #286)", () => {
         it("reports one transition into churn and none while it persists", () => {
             const clock = fakeClock();
             const detector = new ChurnDetector({ now: clock.now });
+            pileSessions(detector, ECHO, CHURN_MIN_PILED_SESSIONS);
             churnFor(detector, clock, ECHO, CHURN_DELETION_THRESHOLD);
 
             assert.equal(detector.poll().changed, true, "the crossing is the news");
@@ -216,6 +257,7 @@ describe("ChurnDetector (issue #286)", () => {
         it("reports the recovery, then falls quiet again", () => {
             const clock = fakeClock();
             const detector = new ChurnDetector({ now: clock.now });
+            pileSessions(detector, ECHO, CHURN_MIN_PILED_SESSIONS);
             churnFor(detector, clock, ECHO, CHURN_DELETION_THRESHOLD);
             detector.poll();
 
@@ -227,6 +269,8 @@ describe("ChurnDetector (issue #286)", () => {
         it("reports a second peer joining as a transition", () => {
             const clock = fakeClock();
             const detector = new ChurnDetector({ now: clock.now });
+            pileSessions(detector, ECHO, CHURN_MIN_PILED_SESSIONS);
+            pileSessions(detector, OTHER_ECHO, CHURN_MIN_PILED_SESSIONS);
             churnFor(detector, clock, ECHO, CHURN_DELETION_THRESHOLD);
             detector.poll();
 
@@ -239,6 +283,7 @@ describe("ChurnDetector (issue #286)", () => {
         it("reports breaking as a transition, so the notice gets cleared", () => {
             const clock = fakeClock();
             const detector = new ChurnDetector({ now: clock.now });
+            pileSessions(detector, ECHO, CHURN_MIN_PILED_SESSIONS);
             churnFor(detector, clock, ECHO, CHURN_DELETION_THRESHOLD);
             detector.poll();
 

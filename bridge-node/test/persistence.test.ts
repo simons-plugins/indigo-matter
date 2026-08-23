@@ -29,6 +29,7 @@ import { join } from "node:path";
 import { after, describe, it } from "node:test";
 
 import { Logger, type ServerNode } from "@matter/main";
+import { SessionManager } from "@matter/main/protocol";
 
 import {
     ENDPOINT_MAP_FILE,
@@ -36,6 +37,7 @@ import {
     type EndpointMapFile,
     type EndpointMapFileV1,
 } from "../src/endpoint-map.js";
+import { churnWarning } from "../src/churn.js";
 import { uniqueIdFor } from "../src/endpoints.js";
 import { BridgeNode, matterJsVersion } from "../src/node.js";
 import { ErrorCode, PROTOCOL_VERSION, RefuseReason } from "../src/protocol.js";
@@ -1194,6 +1196,225 @@ describe("noteFabrics never swallows the read it depends on (E5 S2)", () => {
         assert.match(logged[0]!, /Fabric list unavailable/);
         assert.match(logged[0]!, /commissioning witness has NOT been cleared/);
         assert.match(logged[0]!, /fabrics_changed/);
+    });
+});
+
+/**
+ * A subscription set shaped like matter.js's `BasicSet`.
+ *
+ * `SessionManager`'s own `sessions.added` observer (SessionManager.js:116)
+ * hooks `subscriptions.added`/`.deleted`, so a bare `Set` makes it throw before
+ * our handler is ever reached.
+ */
+function fakeSubscriptionSet(): Record<string, unknown> {
+    const items = new Set<unknown>();
+    const inert = { on: () => {}, off: () => {} };
+    return {
+        has: (item: unknown) => items.has(item),
+        add: (item: unknown) => items.add(item),
+        delete: (item: unknown) => items.delete(item),
+        get size() {
+            return items.size;
+        },
+        added: inert,
+        deleted: inert,
+    };
+}
+
+/**
+ * A stand-in for matter.js's `NodeSession`.
+ *
+ * It has to satisfy every reactor already on `sessions.added`, not just ours,
+ * because `Observable.emit` runs them in registration order and a throw from an
+ * earlier one means our handler never runs at all:
+ *
+ * - `SessionManager`'s eviction check — skipped via `isInitiator: true`;
+ * - `SessionManager`'s subscription hook (SessionManager.js:116) — needs
+ *   `subscriptions.added`/`.deleted`, hence {@link fakeSubscriptionSet};
+ * - `PeerSet.js:111` — skipped via a `NO_FABRIC` `peerAddress`;
+ * - `PeerSet.js:119` — bails only when `fabric` is `undefined`, which is why
+ *   these doubles carry none. Giving one a real index makes `PeerSet.for()`
+ *   construct a `Peer`, which calls `fabricFor()` and throws
+ *   `Fabric index #2 does not exist`. So these tests exercise
+ *   `fabricIndexOf`'s no-fabric fallback (0) rather than its lookup; the
+ *   lookup needs a genuinely commissioned node, which needs hardware — the
+ *   same wall `PosedNode` above exists because of.
+ * - `SessionsBehavior` — needs the display fields.
+ */
+function fakeSession(options: {
+    id: number;
+    peerNodeId: bigint;
+    isPase?: boolean;
+    throwOnPeerNodeId?: boolean;
+}): Record<string, unknown> {
+    const session: Record<string, unknown> = {
+        id: options.id,
+        isPase: options.isPase ?? false,
+        via: `fake-${options.id}`,
+        nodeId: 1n,
+        fabric: undefined,
+        peerAddress: { fabricIndex: 0, nodeId: options.peerNodeId },
+        isClosed: false,
+        isPeerActive: true,
+        isInitiator: true,
+        isClosing: false,
+        closing: { on: () => {}, off: () => {} },
+        timestamp: 0,
+        activeTimestamp: 0,
+        subscriptions: fakeSubscriptionSet(),
+    };
+    if (options.throwOnPeerNodeId) {
+        // The point of this one: a handler that throws must mark the detector
+        // broken rather than escape into matter.js's observable.
+        Object.defineProperty(session, "peerNodeId", {
+            get: () => { throw new Error("peerNodeId is unreadable"); },
+        });
+    } else {
+        session.peerNodeId = options.peerNodeId;
+    }
+    return session;
+}
+
+/**
+ * Issue #286 review B — drive the WIRED callbacks, not the detector.
+ *
+ * `churn.test.ts` proves the decision and `boot()` proves the observables exist,
+ * but between them sat seven mutations nothing would have caught: inverting the
+ * `isPase` filter, inverting or deleting the add/delete discrimination,
+ * hard-coding `wasTerminated`, breaking the `session.id` plumbing, formatting
+ * the peer id in decimal, and dropping either half of the `#warnings`
+ * bookkeeping. These emit synthetic sessions through the real SessionManager
+ * observables, which is the only way to reach that code.
+ */
+describe("the wired churn callbacks (issue #286)", () => {
+    /** Where `node.ts` hangs its handlers. */
+    function sessionsOf(bridge: BridgeNode): {
+        added: { emit: (session: unknown) => void };
+        deleted: { emit: (session: unknown) => void };
+        subscriptionsChanged: { emit: (session: unknown, subscription: unknown) => void };
+    } {
+        const manager = bridge.server.env.get(SessionManager) as unknown as {
+            sessions: { added: { emit: (s: unknown) => void }; deleted: { emit: (s: unknown) => void } };
+            subscriptionsChanged: { emit: (s: unknown, sub: unknown) => void };
+        };
+        return {
+            added: manager.sessions.added,
+            deleted: manager.sessions.deleted,
+            subscriptionsChanged: manager.subscriptionsChanged,
+        };
+    }
+
+    /** A terminated subscription leaving `session` — the deletion direction. */
+    function terminatedDeletion(
+        events: ReturnType<typeof sessionsOf>,
+        session: Record<string, unknown>,
+    ): void {
+        // NOT in session.subscriptions, which is what makes it a delete.
+        events.subscriptionsChanged.emit(session, { isTerminated: true });
+    }
+
+    it("turns real session + subscription events into an ACTIVE verdict", async () => {
+        const session = await boot(storage());
+        try {
+            const events = sessionsOf(session.bridge);
+            // Two sessions for one peer: the pile the deletion arm requires.
+            const first = fakeSession({ id: 9001, peerNodeId: 0x41869fbd537ef01n });
+            const second = fakeSession({ id: 9002, peerNodeId: 0x41869fbd537ef01n });
+            events.added.emit(first);
+            events.added.emit(second);
+            for (let i = 0; i < 3; i++) {
+                terminatedDeletion(events, first);
+            }
+
+            const status = session.bridge.getStatus();
+            assert.equal(status.subscriptionChurn.active, true);
+            assert.deepEqual(status.subscriptionChurn.peers.map(peer => peer.peerNodeId), ["41869fbd537ef01"],
+                "hex, as matter.js logs it — decimal would not match the evidence a user is reading");
+            assert.equal(status.subscriptionChurn.peers[0]?.fabricIndex, 0,
+                "the no-fabric fallback — see fakeSession for why a real index is unreachable here");
+            assert.equal(status.subscriptionChurn.peers[0]?.liveSessions, 2);
+            assert.equal(status.subscriptionChurn.peers[0]?.invalidDeletions, 3);
+
+            // The prose half must ride along, and must be the real text.
+            assert.deepEqual(status.warnings, [churnWarning(status.subscriptionChurn)]);
+
+            // …and must be withdrawn when the pile is reaped.
+            events.deleted.emit(first);
+            events.deleted.emit(second);
+            const after = session.bridge.getStatus();
+            assert.equal(after.subscriptionChurn.active, false);
+            assert.deepEqual(after.warnings, [], "a cleared fault must stop being reported");
+        } finally {
+            await session.close();
+        }
+    });
+
+    it("counts neither PASE sessions nor subscription ADDS", async () => {
+        const session = await boot(storage());
+        try {
+            const events = sessionsOf(session.bridge);
+            // PASE is commissioning, not a controller subscription.
+            for (let i = 0; i < 6; i++) {
+                events.added.emit(fakeSession({ id: 9100 + i, peerNodeId: 0x1234n, isPase: true }));
+            }
+            // An ADD is a subscription still present in the session's set.
+            const live = fakeSession({ id: 9200, peerNodeId: 0x5678n });
+            const other = fakeSession({ id: 9201, peerNodeId: 0x5678n });
+            events.added.emit(live);
+            events.added.emit(other);
+            for (let i = 0; i < 6; i++) {
+                const subscription = { isTerminated: true };
+                (live.subscriptions as { add: (item: unknown) => void }).add(subscription);
+                events.subscriptionsChanged.emit(live, subscription);
+            }
+
+            const churn = session.bridge.getStatus().subscriptionChurn;
+            assert.equal(churn.checked, true);
+            assert.equal(churn.active, false,
+                "six PASE sessions and six subscription adds are not churn");
+        } finally {
+            await session.close();
+        }
+    });
+
+    it("counts only TERMINATED deletions, not clean unsubscribes", async () => {
+        const session = await boot(storage());
+        try {
+            const events = sessionsOf(session.bridge);
+            const first = fakeSession({ id: 9300, peerNodeId: 0xabcn });
+            events.added.emit(first);
+            events.added.emit(fakeSession({ id: 9301, peerNodeId: 0xabcn }));
+            for (let i = 0; i < 6; i++) {
+                events.subscriptionsChanged.emit(first, { isTerminated: false });
+            }
+
+            assert.equal(session.bridge.getStatus().subscriptionChurn.active, false);
+        } finally {
+            await session.close();
+        }
+    });
+
+    it("marks the detector broken when a handler throws, and says so on the warnings channel", async () => {
+        const session = await boot(storage());
+        try {
+            const events = sessionsOf(session.bridge);
+            assert.equal(session.bridge.getStatus().subscriptionChurn.checked, true, "healthy first");
+
+            assert.doesNotThrow(
+                () => events.added.emit(fakeSession({ id: 9400, peerNodeId: 0n, throwOnPeerNodeId: true })),
+                "a throw must never escape into matter.js's observable",
+            );
+
+            const status = session.bridge.getStatus();
+            assert.equal(status.subscriptionChurn.checked, false,
+                "a detector that dropped an event cannot claim to have checked");
+            // Review C: broke mid-flight, so the channel must confess it.
+            assert.equal(status.warnings.length, 1, status.warnings.join("\n"));
+            assert.match(status.warnings[0]!, /Subscription-churn detection FAILED/);
+            assert.match(status.warnings[0]!, /Restart the Matter bridge node/);
+        } finally {
+            await session.close();
+        }
     });
 });
 

@@ -19,10 +19,26 @@
  * {@link BridgeNode} owns the thin wiring from the matter.js observables.
  *
  * The signature is deliberately NOT the "Subscription reported invalid by peer"
- * log line. That string belongs to a dependency and is one of three causes that
- * set `Subscription.isTerminated`; what identifies the fault is the *rate* of
- * terminated-subscription deletions for one peer alongside the pile of live
- * sessions that peer is holding open.
+ * log line: that string belongs to a dependency. But nor is `isTerminated` a
+ * synonym for it. In matter.js 0.17.8 three distinct things set that flag, and
+ * only the last is the fault:
+ *
+ * 1. `handlePeerCancel()` (`ServerSubscription.ts:249`), which
+ *    `InteractionServer.ts:620` calls on EVERY existing subscription of a peer
+ *    whenever that peer re-subscribes with `keepSubscriptions: false` — the
+ *    routine re-subscribe path for Apple, Alexa and Google alike;
+ * 2. giving up after three failed updates on a transient network error
+ *    (`ServerSubscription.ts:557` — NoResponseTimeout/NetworkError/
+ *    SessionClosedError), i.e. a Wi-Fi blip;
+ * 3. the peer reporting the subscription invalid (`ServerSubscription.ts:870`).
+ *
+ * A deletion count alone therefore cannot separate #283 from a healthy
+ * controller having a bad afternoon: three ordinary re-subscribes or three
+ * Wi-Fi blips inside the window would tell the user to restart a working
+ * bridge. What distinguishes the fault is that the deletions land on a peer
+ * whose sessions are ALSO piling up — a healthy controller re-subscribes over
+ * the session it already has, or closes the old one; the #283 peer does
+ * neither. Hence {@link ChurnDetector.verdict}'s conjunction.
  */
 
 import type { ChurnPeer, SubscriptionChurn } from "./protocol.js";
@@ -37,12 +53,25 @@ import type { ChurnPeer, SubscriptionChurn } from "./protocol.js";
 export const CHURN_WINDOW_MINUTES = 30;
 
 /**
- * Terminated-subscription deletions for ONE peer inside the window that mean
- * churn. Three, because the observed fault produced exactly three generations
- * in 30 minutes and a healthy controller produces none — one deletion is an
- * ordinary reconnect, two is a coincidence worth ignoring.
+ * Terminated-subscription deletions for ONE peer inside the window that, TOGETHER
+ * with {@link CHURN_MIN_PILED_SESSIONS}, mean churn. Three, because the observed
+ * fault produced exactly three generations in 30 minutes.
+ *
+ * Never sufficient on its own — see the module header for the three unrelated
+ * causes that set `isTerminated`, two of which a healthy controller hits.
  */
 export const CHURN_DELETION_THRESHOLD = 3;
+
+/**
+ * Live sessions a peer must ALSO be holding before its deletions count as churn.
+ *
+ * Two, because that is the smallest number that is evidence of a pile: a
+ * controller re-subscribing normally does so over the session it already has,
+ * or closes the old one as it opens the new. The #283 peer does neither, which
+ * is why its sessions accumulate while it deletes subscriptions. One session
+ * plus deletions is a controller reconnecting, and must not be reported.
+ */
+export const CHURN_MIN_PILED_SESSIONS = 2;
 
 /**
  * Live CASE sessions for ONE peer that mean churn on their own.
@@ -60,6 +89,7 @@ export interface ChurnDetectorOptions {
     windowMinutes?: number;
     deletionThreshold?: number;
     sessionThreshold?: number;
+    minPiledSessions?: number;
 }
 
 /** What one poll saw, and whether it is news. */
@@ -99,6 +129,7 @@ export class ChurnDetector {
     readonly #windowMs: number;
     readonly #deletionThreshold: number;
     readonly #sessionThreshold: number;
+    readonly #minPiledSessions: number;
     readonly #peers = new Map<string, PeerState>();
     /** `sessionId → peer key`, so a close needs only the id matter.js gives it. */
     readonly #sessionPeers = new Map<number, string>();
@@ -115,6 +146,7 @@ export class ChurnDetector {
         this.#windowMs = (options.windowMinutes ?? CHURN_WINDOW_MINUTES) * 60_000;
         this.#deletionThreshold = options.deletionThreshold ?? CHURN_DELETION_THRESHOLD;
         this.#sessionThreshold = options.sessionThreshold ?? CHURN_SESSION_THRESHOLD;
+        this.#minPiledSessions = options.minPiledSessions ?? CHURN_MIN_PILED_SESSIONS;
     }
 
     /**
@@ -159,9 +191,14 @@ export class ChurnDetector {
     }
 
     /**
-     * A subscription left a peer's session. Only `wasTerminated` ones count:
-     * an ordinary unsubscribe is how a controller says goodbye, and counting it
-     * would flag every well-behaved ecosystem that ever reconnects.
+     * A subscription left a peer's session.
+     *
+     * `wasTerminated` is the caller's read of `Subscription.isTerminated`, which
+     * is NOT "the peer reported it invalid" — see the module header for all
+     * three causes. It is recorded because it is the cheapest available marker
+     * that the subscription did not end cleanly; the conjunction in
+     * {@link verdict} is what stops the two innocent causes reaching a user. A
+     * clean unsubscribe (`wasTerminated: false`) is never counted at all.
      */
     subscriptionRemoved(peerNodeId: string, fabricIndex: number, wasTerminated: boolean): void {
         if (this.#broken || !wasTerminated) {
@@ -182,8 +219,13 @@ export class ChurnDetector {
         const peers: ChurnPeer[] = [];
         for (const [key, peer] of this.#peers) {
             prune(peer, cutoff);
-            const over = peer.deletions.length >= this.#deletionThreshold
-                || peer.sessions.size >= this.#sessionThreshold;
+            // Two ways in, and the deletion arm is deliberately conjunctive: on
+            // its own it fires on ordinary re-subscribes and Wi-Fi blips
+            // (module header). The session arm stands alone because a pile that
+            // large is already the fault, however it got there.
+            const over = peer.sessions.size >= this.#sessionThreshold
+                || (peer.deletions.length >= this.#deletionThreshold
+                    && peer.sessions.size >= this.#minPiledSessions);
             if (over) {
                 peer.since ??= nowMs;
                 peers.push({
