@@ -455,6 +455,37 @@ class FabricInfo:
 
 
 @dataclass
+class ChurnPeer:
+    """One controller peer the node's churn detector has over threshold
+    (§4.3, issues #283/#286). Peers are individual because a fabric can hold
+    several and they are not interchangeable — two Echoes on one Alexa fabric
+    churn independently.
+    """
+    peer_node_id: str
+    fabric_index: int
+    live_sessions: int
+    invalid_deletions: int
+    window_minutes: int
+    #: ISO-8601 — when this peer FIRST crossed a threshold, not when it last did.
+    since: str
+
+
+@dataclass
+class SubscriptionChurn:
+    """Controller subscription churn against this bridge (§4.3, issues #283/#286).
+
+    ``checked: False`` is **not** the healthy answer — it means the node's
+    detector could not observe session state at all, the same rule
+    :attr:`StatusReport.drift_checked` carries for ``drift``. Defaulted so a
+    report from a pre-0.15.0 node (which never sends this field at all) still
+    parses, to the honest reading: such a node never looked.
+    """
+    checked: bool = False
+    active: bool = False
+    peers: list = field(default_factory=list)
+
+
+@dataclass
 class StatusReport:
     """The result of ``attach``/``get_status``/``rebuild_endpoint_map`` (§4.3)."""
     commissioned: bool
@@ -472,6 +503,12 @@ class StatusReport:
     #: by hand, so stdout is a terminal nobody is watching. Current, not
     #: historical: an entry disappears when the operation it describes succeeds.
     warnings: list = field(default_factory=list)
+    #: §4.3, issue #286 — controller subscription churn, additive since
+    #: bridge-node 0.15.0 with no ``protocolVersion`` bump (the same precedent
+    #: ``drift_checked``/``warnings`` set). Defaulted so a report from an older
+    #: node — which never sends this field — parses as ``checked=False``: it
+    #: never looked, which is "unknown", never "healthy".
+    subscription_churn: SubscriptionChurn = field(default_factory=SubscriptionChurn)
 
 
 @dataclass
@@ -583,6 +620,7 @@ def parse_status(result: Any) -> StatusReport:
         drift=parse_drift(data.get("drift")),
         drift_checked=bool(data.get("driftChecked", False)),
         warnings=[str(item) for item in (data.get("warnings") or [])],
+        subscription_churn=parse_subscription_churn(data.get("subscriptionChurn")),
     )
 
 
@@ -596,6 +634,33 @@ def parse_drift(data: Any) -> list:
         )
         for item in (data or [])
     ]
+
+
+def parse_subscription_churn(data: Any) -> SubscriptionChurn:
+    """Normalise the §4.3 ``subscriptionChurn`` object (issues #283/#286).
+
+    Tolerant of absence — a pre-0.15.0 node's ``StatusReport`` has no such key
+    at all — and of anything not shaped like the object, both of which fall
+    back to the dataclass's own ``checked=False`` default: a node that never
+    sent this field never looked, which is "unknown", never "healthy".
+    """
+    if not isinstance(data, dict):
+        return SubscriptionChurn()
+    return SubscriptionChurn(
+        checked=bool(data.get("checked", False)),
+        active=bool(data.get("active", False)),
+        peers=[
+            ChurnPeer(
+                peer_node_id=str(item.get("peerNodeId", "")),
+                fabric_index=int(item.get("fabricIndex", 0)),
+                live_sessions=int(item.get("liveSessions", 0)),
+                invalid_deletions=int(item.get("invalidDeletions", 0)),
+                window_minutes=int(item.get("windowMinutes", 0)),
+                since=str(item.get("since", "")),
+            )
+            for item in (data.get("peers") or [])
+        ],
+    )
 
 
 def parse_orphans(result: Any) -> list:

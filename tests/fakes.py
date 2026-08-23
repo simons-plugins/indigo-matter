@@ -522,6 +522,37 @@ def minimal_device(class_name, dev_id=1, name="Device", plugin_id=OTHER_PLUGIN_I
     return dev
 
 
+class FakeHealthDevice:
+    """A stand-in for the `matterBridgeHealth` device (issue #286).
+
+    Just enough surface for ``ExportBridge._apply_subscription_churn``: an
+    id (so the ``device_getter`` cache-hit path can look it up again) and a
+    RECORDING ``updateStatesOnServer``, so a test can assert both the final
+    states and how many times a write actually happened — the standing-churn
+    "write once, not every tick" discipline has no other observable.
+    """
+
+    def __init__(self, dev_id):
+        self.id = dev_id
+        self.deviceTypeId = HEALTH_DEVICE_TYPE_ID
+        self.states: dict = {}
+        #: One entry per ``updateStatesOnServer`` call, each the kv-list it
+        #: was given — a rewrite of identical states is a bug this exists to
+        #: catch, so recording every call (not just the latest) matters.
+        self.writes: list = []
+
+    def updateStatesOnServer(self, kvlist):
+        self.writes.append(list(kvlist))
+        for kv in kvlist:
+            self.states[kv["key"]] = kv["value"]
+
+
+#: Mirrors ``export_bridge.HEALTH_DEVICE_TYPE_ID`` without importing that
+#: module here — ``fakes.py`` is imported by suites that mock ``indigo``
+#: differently, and a bare string keeps this fixture-only class import-free.
+HEALTH_DEVICE_TYPE_ID = "matterBridgeHealth"
+
+
 class FakeIndigoDevices:
     """Stands in for ``indigo.devices``: iterable, and subscriptable by id."""
 
