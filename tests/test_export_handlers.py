@@ -383,8 +383,59 @@ class TestColorTemperature:
         # The thing the command WAS for still happens.
         assert kwargs["whiteTemperature"] == 4000
 
-    def test_a_lit_white_channel_keeps_its_level_too(self, handlers, mock_indigo_base):
-        """The general rule the 0 case is an instance of: preserve, never invent."""
+    def test_a_lit_lamp_sends_its_brightness_not_the_stale_white_level(
+            self, handlers, mock_indigo_base):
+        """Issue #281, tonight's exact wire case.
+
+        z2m's ``whiteLevel`` does not track ``brightness`` on a channel-
+        publishing driver — it sat at 0.0 while the lamp was actually at
+        brightness 29. Sending the stored ``whiteLevel`` with every colour-
+        temperature write published a literal ``{"brightness": 0}`` and
+        switched an ON lamp OFF on every single adaptive-lighting tick. This
+        kills the stale-whiteLevel-0 off-switcher.
+        """
+        dev = DimmerDevice(1, "Lamp", onState=True, brightness=29, whiteLevel=0)
+        handlers.handler_for("colorTemperatureLight").dispatch(
+            "setColorTemp", {"colorTempMireds": 250}, dev)
+        _args, kwargs = mock_indigo_base.dimmer.setColorLevels.call_args
+        assert kwargs["whiteLevel"] == 29
+        assert kwargs["whiteTemperature"] == 4000
+
+    def test_a_lit_lamp_overrides_a_stale_high_white_level_too(
+            self, handlers, mock_indigo_base):
+        """Not just the zero case: ANY stored ``whiteLevel`` is stale once the
+        lamp is lit, not only the one that happens to switch it off."""
+        dev = DimmerDevice(1, "Lamp", onState=True, brightness=29, whiteLevel=80)
+        handlers.handler_for("colorTemperatureLight").dispatch(
+            "setColorTemp", {"colorTempMireds": 250}, dev)
+        _args, kwargs = mock_indigo_base.dimmer.setColorLevels.call_args
+        assert kwargs["whiteLevel"] == 29
+
+    def test_the_no_white_channel_guard_fires_before_brightness_is_ever_read(
+            self, handlers, mock_indigo_base):
+        """The ``whiteLevel is None`` tri-state guard must run BEFORE brightness
+        is read at all — a device with no white channel has no colour
+        temperature to set, whatever its brightness is doing."""
+
+        class _RaisesIfBrightnessIsRead(DimmerDevice):
+            @property
+            def brightness(self):
+                raise AssertionError("brightness must not be read")
+
+            @brightness.setter
+            def brightness(self, _value):
+                pass
+
+        dev = _RaisesIfBrightnessIsRead(1, "Lamp", whiteLevel=None)
+        outcome = handlers.handler_for("colorTemperatureLight").dispatch(
+            "setColorTemp", {"colorTempMireds": 250}, dev)
+        assert isinstance(outcome, str) and "no white channel" in outcome
+        mock_indigo_base.dimmer.setColorLevels.assert_not_called()
+
+    def test_an_off_lamp_still_sends_its_stored_white_level(self, handlers, mock_indigo_base):
+        """The off-lamp half of the rule: ``brightness`` 0 (the fixture's
+        default, and now the load-bearing fact) means the stored ``whiteLevel``
+        is still what is preserved — only a LIT lamp's write changed."""
         dev = DimmerDevice(1, "Lamp", whiteLevel=35)
         handlers.handler_for("colorTemperatureLight").dispatch(
             "setColorTemp", {"colorTempMireds": 250}, dev)

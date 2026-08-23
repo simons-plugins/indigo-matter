@@ -673,6 +673,28 @@ class ColorTemperatureLightExport(DimmableLightExport):
         with* whiteLevel, so sending the temperature alone risks a driver
         reading whiteLevel as 0 and turning the lamp off — a colour tweak that
         blacks out the room is a worse bug than a colour tweak that misses.
+        "Preserve the white channel's own level" still stands as the goal, but
+        for a LIT lamp the source of truth for that level is ``brightness``,
+        not the stored ``whiteLevel`` — issue #281 proved live that
+        ``whiteLevel`` does not track brightness on channel-publishing drivers
+        (z2m: ``whiteLevel`` sat at 0.0, then stale at 20, while ``brightness``
+        was actually 29, then 49, then 69). Sending the stored ``whiteLevel``
+        with every colour-temperature write published a literal
+        ``{"brightness": 0}`` on the wire and switched an ON lamp OFF on every
+        single Apple adaptive-lighting tick (~3s). For an OFF lamp
+        (``brightness`` 0 or ``None``) the stored ``whiteLevel`` is still what
+        is sent — the two existing off-lamp pins below (a lamp reporting
+        ``whiteLevel`` 0, and one reporting some other stored level) remain
+        the contract for that case; only the LIT branch changed. Gate and
+        source both read ``brightness`` so they cannot disagree with each
+        other: :class:`DimmableLightExport`'s ``states_for`` already treats
+        ``brightness`` as the export-side level, and :func:`_number` keeps the
+        read ``None``-safe, falling back to today's off-lamp behaviour when it
+        is absent. (A future shape banked but out of scope here: matter.js
+        ``executeIfOff`` colour staging, referenced on issue #281, would let a
+        colour-temperature write land on an OFF lamp without touching its
+        on/off state at all — not needed while the write already preserves an
+        off lamp's stored level.)
 
         Two guards, all about not depending on someone else to be careful:
 
@@ -729,8 +751,10 @@ class ColorTemperatureLightExport(DimmableLightExport):
             # that cannot name the device. The caller latches this per device.
             return ("the Indigo device has no white channel, so there is no colour "
                     "temperature to set")
+        brightness = _number(dev, "brightness")
+        level = brightness if brightness is not None and brightness > 0 else white_level
         levels: dict[str, int] = {
-            "whiteLevel": int(_clamp(round(white_level), 0, 100)),
+            "whiteLevel": int(_clamp(round(level), 0, 100)),
             "whiteTemperature": mireds_to_kelvin(
                 int(_clamp(round(mireds), MIREDS_MIN, MIREDS_MAX))),
         }
