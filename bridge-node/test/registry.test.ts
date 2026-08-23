@@ -710,6 +710,26 @@ describe("set_state (§3.4)", () => {
         }
     });
 
+    it("switches colorMode to mireds when a colour temperature arrives ALONE (issue #285)", async () => {
+        // The other half of the test above. An ecosystem reads `colorMode` to
+        // decide which attributes to believe, so a CT-only write that left the
+        // mode on hue/saturation would move `colorTemperatureMireds` and be
+        // ignored — the bulb stays whatever colour the last hue write made it.
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(2, Role.extendedColorLight)], false);
+            await h.registry.setState(2, { onOff: true, hue: 210, saturation: 80 });
+            await h.registry.setState(2, { colorTempMireds: 320 });
+
+            const ext = [...h.aggregator.parts].find(part => part.id === endpointIdFor(2));
+            const color = ext?.stateOf("colorControl") as Record<string, unknown>;
+            assert.equal(color.colorTemperatureMireds, 320);
+            assert.equal(color.colorMode, ColorControl.ColorMode.ColorTemperatureMireds);
+        } finally {
+            await h.close();
+        }
+    });
+
     it("writes 0% as currentLevel 1, which reads back as 0%", async () => {
         const h = await harness();
         try {
