@@ -1053,4 +1053,55 @@
         <UiDisplayStateId>reachable</UiDisplayStateId>
     </Device>
 
+    <!-- ============================================================ -->
+    <!-- Bridge health: standing device for the export bridge NODE's  -->
+    <!-- own condition (issue #286)                                   -->
+    <!-- ============================================================ -->
+
+    <!-- One matterBridgeHealth device, found-or-created lazily by
+         export_bridge the first time the bridge node attaches with
+         something exported (XG5) — there is no other Indigo device that
+         represents the NODE PROCESS itself, as opposed to an individual
+         exported accessory. Built for issue #286: the node's Alexa
+         subscription-churn detector (bridge-node's churn.ts,
+         BRIDGE_PROTOCOL §4.3 `subscriptionChurn`) already reaches the event
+         log via `warnings`, but a log line cannot be a trigger condition —
+         this device exists so "churning" and "recovered" are ordinary,
+         trigger-able Indigo states.
+         allowUserCreation="false" for the same reason matterNode is: only
+         export_bridge._ensure_health_device creates this type, never the New
+         Device dialog — a user-created one would have no bridge behind it.
+         States are deliberately minimal (ADR-0007: a shipped state is
+         permanent) — `subscriptionHealth` is what a trigger binds to;
+         `churnDetail` is read-along context, naming the peer(s), never
+         meant to be bound to on its own. -->
+    <Device id="matterBridgeHealth" type="custom" allowUserCreation="false">
+        <Name>Matter Bridge Health</Name>
+        <ConfigUI>
+            <Field id="about" type="label">
+                <Label>This device tracks the health of the Matter bridge node process itself (issue #286) — it does not represent a Matter accessory.</Label>
+            </Field>
+        </ConfigUI>
+        <!-- "unknown" is deliberately a real, distinct value from "healthy" —
+             see bridge_protocol.SubscriptionChurn and BRIDGE_PROTOCOL §4.3:
+             `checked: false` (a node that could not observe its own session
+             state, or an old node that never sent this field at all) must
+             never be read as an all-clear. export_bridge's
+             `_apply_subscription_churn` is the one place that gates on this. -->
+        <States>
+            <State id="subscriptionHealth">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Controller Subscription Health</TriggerLabel>
+                <TriggerLabelPrefix>Controller subscription health is</TriggerLabelPrefix>
+                <ControlPageLabel>Subscription Health</ControlPageLabel>
+            </State>
+            <State id="churnDetail">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Subscription Churn Detail</TriggerLabel>
+                <ControlPageLabel>Churn Detail</ControlPageLabel>
+            </State>
+        </States>
+        <UiDisplayStateId>subscriptionHealth</UiDisplayStateId>
+    </Device>
+
 </Devices>

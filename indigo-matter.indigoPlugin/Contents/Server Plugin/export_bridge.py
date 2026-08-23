@@ -131,6 +131,30 @@ REATTACH_RESULT_HEADROOM = 5.0
 #: ticking the box again.
 PREF_EXPORT_ENABLED = "exportEnabled"
 
+#: The `matterBridgeHealth` device type (Devices.xml, issue #286) — the one
+#: standing Indigo device that represents the bridge NODE PROCESS itself,
+#: as opposed to any individual exported accessory. Found-or-created lazily;
+#: see :meth:`ExportBridge._ensure_health_device`.
+HEALTH_DEVICE_TYPE_ID = "matterBridgeHealth"
+HEALTH_DEVICE_NAME = "Matter Bridge Health"
+
+#: `subscriptionHealth` state values (Devices.xml). "unknown" is never read as
+#: an all-clear — see :meth:`ExportBridge._apply_subscription_churn` and
+#: BRIDGE_PROTOCOL §4.3's `checked` gate.
+HEALTH_UNKNOWN = "unknown"
+HEALTH_HEALTHY = "healthy"
+HEALTH_CHURNING = "churning"
+
+#: Consecutive ``get_status`` poll FAILURES (distinct from ``_disconnect_ticks``
+#: — the client stays ``attached`` for a wedged node whose socket is up but
+#: whose responses time out) before the bridge health device is marked
+#: ``unknown`` (issue #286 review finding 2). 2, the same shape as
+#: ``TestNodeWarnings``' one-bad-poll tolerance: a single blip is not itself
+#: news, but a second one back-to-back means nothing has actually been
+#: OBSERVED in ~30s, and a stale "healthy"/"churning" reading is worse than
+#: an honest "unknown".
+HEALTH_POLL_FAIL_TICKS = 2
+
 
 class ExportBridge:
     """Owns the bridge client and everything the Indigo callbacks mean for it.
@@ -161,6 +185,14 @@ class ExportBridge:
         sentence naming what the agent found (and may revive a dead job), or
         ``None`` when it has nothing to add. Purely advisory — export degrades,
         the inbound controller is untouched.
+    :param health_device_finder: finds the standing ``matterBridgeHealth``
+        device WITHOUT creating one (issue #286); injected so this module
+        unit-tests without the Indigo runtime, the same reason
+        ``device_getter`` is. Every "nothing observed" path uses this one —
+        see :meth:`_find_health_device`.
+    :param health_device_factory: CREATES the ``matterBridgeHealth`` device.
+        Only ever called after :attr:`health_device_finder` has confirmed
+        none exists — see :meth:`_ensure_health_device`.
     """
 
     # The seams ARE the API, exactly as BridgeClient's callbacks are.
@@ -174,7 +206,9 @@ class ExportBridge:
                  executor_factory: Optional[Callable[[], Any]] = None,
                  agent_start: Optional[Callable[[], None]] = None,
                  agent_stop: Optional[Callable[[], None]] = None,
-                 agent_diagnose: Optional[Callable[[], Optional[str]]] = None) -> None:
+                 agent_diagnose: Optional[Callable[[], Optional[str]]] = None,
+                 health_device_finder: Optional[Callable[[], Any]] = None,
+                 health_device_factory: Optional[Callable[[], Any]] = None) -> None:
         self._store = store
         self._runtime = runtime
         self._logger = logger
@@ -182,6 +216,10 @@ class ExportBridge:
         self._plugin_version = plugin_version
         self._plugin_id = plugin_id
         self._device_getter = device_getter or (lambda dev_id: _indigo_device(dev_id, logger))
+        self._health_device_finder = health_device_finder or (
+            lambda: _find_health_device_only(logger))
+        self._health_device_factory = health_device_factory or (
+            lambda: _create_health_device(logger))
         self._client_factory = client_factory or BridgeClient
         self._save_prefs = save_prefs
         self._executor_factory = executor_factory or _command_executor
@@ -264,6 +302,36 @@ class ExportBridge:
         #: The last drift set reported, for the same reason — see
         #: :meth:`_on_drift_detected`.
         self._drift_reported: frozenset = frozenset()
+        #: id of the standing `matterBridgeHealth` device (issue #286), once
+        #: resolved — cached so a healthy bridge does not rescan
+        #: ``indigo.devices`` on every ~15s watchdog tick. ``None`` until the
+        #: first churn signal that needs it.
+        self._health_device_id: Optional[int] = None
+        #: Set once the "could not find/create the bridge health device"
+        #: warning has been said, so a standing problem (a full disk, same
+        #: shape as ``_node_warnings``) is not repeated on every subsequent
+        #: change.
+        self._health_device_warned = False
+        #: Same latch shape, for a WRITE that reaches an existing device but
+        #: fails (issue #286 review finding 3) — distinct from
+        #: ``_health_device_warned`` (finding/creating the device itself)
+        #: because either can fail independently and each deserves its own
+        #: one-per-streak line.
+        self._health_write_warned = False
+        #: ``(subscriptionHealth, churnDetail)`` last actually WRITTEN to the
+        #: bridge health device, or ``None`` before the first write. What
+        #: :meth:`_apply_subscription_churn` diffs against, so a standing
+        #: churn verdict is not rewritten — or re-logged — on every ~15s tick,
+        #: the same discipline :meth:`_report_node_warnings` keeps for
+        #: ``warnings``. Also advanced (with no device touched) once an
+        #: "unknown" verdict has been checked against a bridge with no health
+        #: device to represent it at all — see :meth:`_apply_subscription_churn`.
+        self._health_state: Optional[tuple] = None
+        #: Consecutive ``get_status`` poll FAILURES while still ``attached``
+        #: (issue #286 review finding 2) — a wedged node's socket can stay up
+        #: while every poll times out, which ``_disconnect_ticks`` (attach
+        #: state, not poll outcome) never sees. Reset on a successful poll.
+        self._poll_fail_ticks = 0
         #: ISO 8601 expiry of the commissioning window the pairing menu opened,
         #: or ``None``. Held here rather than re-read from the node because the
         #: PRD §5.5 config readout is a dialog-open, and a dialog must not block
@@ -498,6 +566,7 @@ class ExportBridge:
                                   "as unavailable until export is switched back on.")
                 self.stop()
                 self._stopped = False   # a config change is not a shutdown
+                self._mark_health_unknown()
             self._stop_agent()
             return
         if count:
@@ -1586,6 +1655,7 @@ class ExportBridge:
         every ecosystem, and nothing is left that knows they should not.
         """
         self._disconnect_ticks = 0
+        self._poll_fail_ticks = 0
         self._unreachable_reported = False
         self._halted_reported = False
         self._recovery_reported = False
@@ -1607,6 +1677,7 @@ class ExportBridge:
                           status.endpoint_count,
                           "commissioned" if status.commissioned else "not yet paired")
         self._report_node_warnings(status)
+        self._apply_subscription_churn(getattr(status, "subscription_churn", None))
         if carried_replace_all and self._pending_replace_all():
             owed = self._pending_replace_all()
             self._clear_pending_replace_all()
@@ -1645,6 +1716,144 @@ class ExportBridge:
         self._node_warnings = warnings
         for warning in sorted(warnings):
             self._logger.warning("Matter bridge: the bridge node reports — %s", warning)
+
+    def _find_health_device(self) -> Optional[Any]:
+        """Resolve the standing ``matterBridgeHealth`` device WITHOUT creating
+        one (issue #286 review finding 1).
+
+        Checked first by the cached id (a plain ``device_getter`` round trip);
+        failing that — the id unset, e.g. the very first tick after a plugin
+        restart, or the cached device having been deleted out-of-band — by an
+        actual find-only scan (:attr:`_health_device_finder`). This is the
+        ONLY resolver :meth:`_mark_health_unknown` may use: a device already
+        carrying a stale "healthy"/"churning" from a PREVIOUS plugin session
+        must be found and corrected, but a user who deleted it must not have
+        it silently recreated just to be told "unknown".
+        """
+        if self._health_device_id is not None:
+            device = self._device_getter(self._health_device_id)
+            if device is not None:
+                return device
+            self._health_device_id = None
+        device = self._health_device_finder()
+        if device is not None:
+            self._health_device_id = device.id
+        return device
+
+    def _ensure_health_device(self) -> Optional[Any]:
+        """Resolve the standing ``matterBridgeHealth`` device, CREATING one if
+        :meth:`_find_health_device` confirms none exists.
+
+        Only called from a REAL churn signal — an attach or a successful poll
+        (:meth:`_apply_subscription_churn`'s ``may_create`` branch); every
+        "nothing observed" path uses the find-only resolver instead (finding
+        1). Never raises: a creation failure must not break the poll loop, so
+        it is logged once (the same latch shape as :attr:`_node_warnings`) and
+        retried the next time a state changes. A factory that returns
+        ``None`` without raising is not silently accepted either (finding 5)
+        — it gets the same one-per-streak warning as an exception would.
+        """
+        device = self._find_health_device()
+        if device is not None:
+            return device
+        try:
+            device = self._health_device_factory()
+        except Exception as exc:  # pylint: disable=broad-except
+            if not self._health_device_warned:
+                self._health_device_warned = True
+                self._logger.warning(
+                    "Matter bridge: could not find or create the bridge health device (%s) — "
+                    "controller subscription health will not be visible as an Indigo device "
+                    "until this is fixed.", exc)
+            return None
+        if device is None:
+            if not self._health_device_warned:
+                self._health_device_warned = True
+                self._logger.warning(
+                    "Matter bridge: could not create the bridge health device — controller "
+                    "subscription health will not be visible as an Indigo device until this "
+                    "is fixed.")
+            return None
+        self._health_device_id = device.id
+        self._health_device_warned = False
+        return device
+
+    def _apply_subscription_churn(self, churn: Optional[Any]) -> None:
+        """Drive ``matterBridgeHealth``'s states from a §4.3 ``subscriptionChurn``
+        verdict (issue #286), or from ``None`` for "nothing checked it".
+
+        ``checked=False`` — including a bare ``None``, an old node's status,
+        or a halted/detached client — is ``unknown``, never ``healthy``: this
+        must never claim an all-clear it did not actually observe, the same
+        rule BRIDGE_PROTOCOL §4.3 states for ``driftChecked``. An ``unknown``
+        verdict only ever FINDS the device (:meth:`_find_health_device`) —
+        never creates one, because there is nothing yet to correct on a
+        bridge that has never attached. A real verdict (healthy/churning) may
+        create it (:meth:`_ensure_health_device`).
+
+        Writes happen only on a CHANGE — the watchdog re-polls every ~15s and
+        a standing verdict must not become a rewrite on every tick, matching
+        :meth:`_report_node_warnings`'s own discipline. When there is no
+        device to represent an ``unknown`` verdict at all, the state is still
+        recorded as checked (just not written anywhere), so a bridge that has
+        never exported anything does not rescan ``indigo.devices`` on every
+        tick forever. The warning sentence for an active verdict already
+        rides the §4.3 ``warnings`` channel (`_report_node_warnings`); this
+        only logs the RECOVERY, so the two channels never say the same thing
+        twice.
+        """
+        if churn is not None and getattr(churn, "checked", False):
+            active = bool(getattr(churn, "active", False))
+            health = HEALTH_CHURNING if active else HEALTH_HEALTHY
+            detail = _describe_churn(churn) if active else ""
+            may_create = True
+        else:
+            health = HEALTH_UNKNOWN
+            detail = ""
+            may_create = False
+        new_state = (health, detail)
+        if new_state == self._health_state:
+            return
+        previous = self._health_state
+        device = self._ensure_health_device() if may_create else self._find_health_device()
+        if device is None:
+            if not may_create:
+                # Nothing to represent, and nothing wrong either — remember
+                # this WAS checked, so the same "no device yet" answer is not
+                # rescanned for on every subsequent tick.
+                self._health_state = new_state
+            return  # a create failure is already logged; retried on the next change
+        try:
+            device.updateStatesOnServer([
+                {"key": "subscriptionHealth", "value": health},
+                {"key": "churnDetail", "value": detail},
+            ])
+        except Exception as exc:  # pylint: disable=broad-except
+            if not self._health_write_warned:
+                self._health_write_warned = True
+                self._logger.warning(
+                    "Matter bridge: could not update the bridge health device (%s) — it may be "
+                    "showing a stale reading until this is fixed.", exc)
+            return  # not advanced to new_state — retried on the next change
+        self._health_write_warned = False
+        self._health_state = new_state
+        # Only churning earns the recovery line: unknown -> healthy is an
+        # ordinary reattach (node restart, plugin start), not a churn ending.
+        if previous is not None and previous[0] == HEALTH_CHURNING and health == HEALTH_HEALTHY:
+            self._logger.info("Matter bridge: controller subscription churn has recovered")
+
+    def _mark_health_unknown(self) -> None:
+        """§4.3 issue #286 — the node halted, detached, export was switched
+        off, or this is simply the first health tick since a plugin restart
+        with a "healthy"/"churning" device still on disk from a previous
+        session (review finding 1) — any churn verdict this plugin was
+        holding is stale, or was never actually observed this session at all.
+
+        Never CREATES a device (:meth:`_find_health_device`) — only corrects
+        one that already exists (from this session OR a previous one) or
+        leaves a bridge with none alone.
+        """
+        self._apply_subscription_churn(None)
 
     def _on_attach_refused(self, code: str, details: str) -> None:
         """Surface a refusal with its remedy. The client has already triaged it.
@@ -1883,11 +2092,17 @@ class ExportBridge:
         self._check_command_queue()
         client = self.client
         if client is None:
+            # Also covers the very first tick after a plugin restart (review
+            # finding 1): nothing is exported YET this session, but a device
+            # from a PREVIOUS one may still read "healthy" with nothing behind
+            # it. Find-only, never creates — see `_mark_health_unknown`.
+            self._mark_health_unknown()
             return
         # Both of these persist until a human acts, so the tick that notices
         # them is a tick that will notice them again in 15s, and in 15s after
         # that — the same latch the drop path uses, for the same reason.
         if client.halted:
+            self._mark_health_unknown()
             if not self._halted_reported:
                 self._halted_reported = True
                 self._logger.warning(
@@ -1896,6 +2111,7 @@ class ExportBridge:
                     client.halted_reason or "no reason recorded")
             return
         if client.recovery:
+            self._mark_health_unknown()
             if not self._recovery_reported:
                 self._recovery_reported = True
                 self._logger.warning("Matter bridge: the bridge node is awaiting an endpoint-map "
@@ -1905,6 +2121,7 @@ class ExportBridge:
             self._disconnect_ticks = 0
             self._poll_node_status(client)
             return
+        self._mark_health_unknown()
         self._disconnect_ticks += 1
         if self._disconnect_ticks == DISCONNECT_WARN_TICKS:
             self._logger.warning("Matter bridge: still not attached to the bridge node after "
@@ -1922,17 +2139,27 @@ class ExportBridge:
         The answer is handled in the coroutine rather than by awaiting it here,
         because this runs on Indigo's watchdog thread and nothing on that thread
         may block on the node (the whole reason ``health_tick`` was "no I/O").
-        A failed poll is not itself news — the socket being gone is what
-        ``_disconnect_ticks`` is for — so it goes to debug and the next tick
-        tries again.
+        A failed poll is not itself news at the log level — the socket being
+        gone is what ``_disconnect_ticks`` is for — so it goes to debug and the
+        next tick tries again. But it IS news to the health device (review
+        finding 2): ``client.attached`` stays true for a wedged node whose
+        socket is up but whose responses simply stop coming, which
+        ``_disconnect_ticks`` never sees at all — so after
+        :data:`HEALTH_POLL_FAIL_TICKS` consecutive failures the device is
+        marked unknown rather than left on a stale reading indefinitely.
         """
         async def _poll() -> None:
             try:
                 status = await client.get_status()
             except Exception as exc:  # pylint: disable=broad-except
                 self._logger.debug("Matter bridge: status poll failed (%s)", exc)
+                self._poll_fail_ticks += 1
+                if self._poll_fail_ticks >= HEALTH_POLL_FAIL_TICKS:
+                    self._mark_health_unknown()
                 return
+            self._poll_fail_ticks = 0
             self._report_node_warnings(status)
+            self._apply_subscription_churn(getattr(status, "subscription_churn", None))
 
         self._fire(_poll(), "the bridge node status poll")
 
@@ -2076,6 +2303,22 @@ def describe_fabric(fabric: Any) -> str:
     return _describe_fabric(fabric)
 
 
+def _describe_churn(churn: Any) -> str:
+    """The bridge health device's ``churnDetail`` line for an active verdict
+    (§4.3, issue #286): names the peer(s), because "a controller is churning"
+    leaves a user reading the device nothing to act on, and two Echoes on one
+    fabric are not interchangeable.
+    """
+    peers = [
+        f"{getattr(peer, 'peer_node_id', '?')} (fabric {getattr(peer, 'fabric_index', '?')}): "
+        f"{getattr(peer, 'invalid_deletions', 0)} deletion(s)/"
+        f"{getattr(peer, 'window_minutes', 0)}min, "
+        f"{getattr(peer, 'live_sessions', 0)} live session(s)"
+        for peer in (getattr(churn, "peers", None) or [])
+    ]
+    return "; ".join(peers)
+
+
 def reachable_of(dev: Any) -> bool:
     """§4.1 ``reachable`` for an Indigo device (XAC8).
 
@@ -2122,3 +2365,65 @@ def _indigo_device(device_id: int, logger: Any = None) -> Any:
                 "having been deleted — it is Indigo failing to answer.",
                 device_id, type(exc).__name__, exc)
         return None
+
+
+def _find_health_device_only(logger: Any = None) -> Any:
+    """Find the standing ``matterBridgeHealth`` device (Devices.xml, issue
+    #286), or ``None`` — NEVER creates one. Imported lazily, same posture as
+    :func:`_indigo_device`.
+
+    The find-only counterpart of :func:`_create_health_device`. Every
+    "nothing observed" path (:meth:`ExportBridge._mark_health_unknown`, via
+    :meth:`ExportBridge._find_health_device`) uses this one, so a user-deleted
+    device — or one that has simply never been created yet — is never
+    recreated just to be told "unknown" (review finding 1).
+
+    ``indigo.devices.iter("self")`` is this plugin's own devices only, so a
+    same-named device belonging to another plugin can never be mistaken for
+    it. One such device is ever wanted; the first match wins.
+    """
+    import indigo  # pylint: disable=import-outside-toplevel
+
+    for device in indigo.devices.iter("self"):
+        if device.deviceTypeId == HEALTH_DEVICE_TYPE_ID:
+            return device
+    return None
+
+
+def _unique_health_device_name(indigo_module: Any, name: str) -> str:
+    """The same numeric-suffix collision policy ``device_sync._unique_name``
+    uses (review finding 5).
+
+    Indigo device names are server-global, so handing ``indigo.device.create``
+    a fixed name is not safe: ANY existing device already named
+    "Matter Bridge Health" — including one whose type was since changed via
+    Indigo's Edit Device Type menu, which leaves it ``configured=False`` and
+    invisible to ``indigo.devices.iter("self")`` (issue #62's failure mode) —
+    makes ``create`` raise ``NameNotUnique`` forever, with a retry that could
+    never succeed on its own.
+    """
+    existing = {dev.name for dev in indigo_module.devices}
+    if name not in existing:
+        return name
+    suffix = 2
+    while f"{name} {suffix}" in existing:
+        suffix += 1
+    return f"{name} {suffix}"
+
+
+def _create_health_device(logger: Any = None) -> Any:
+    """Create the standing ``matterBridgeHealth`` device (issue #286).
+    Imported lazily, same posture as :func:`_indigo_device`.
+
+    Only ever called after :func:`_find_health_device_only` has confirmed none
+    exists (:meth:`ExportBridge._ensure_health_device`) — this function itself
+    does not check, so calling it twice makes two devices.
+    """
+    import indigo  # pylint: disable=import-outside-toplevel
+
+    name = _unique_health_device_name(indigo, HEALTH_DEVICE_NAME)
+    return indigo.device.create(
+        protocol=indigo.kProtocol.Plugin,
+        deviceTypeId=HEALTH_DEVICE_TYPE_ID,
+        name=name,
+    )

@@ -169,6 +169,81 @@ class TestResponses:
         assert report.fabrics[0].vendor_id == 4937
         assert report.drift == []
 
+    def test_subscription_churn_healthy(self):
+        """§4.3 issue #286 — ``checked: true, active: false`` parses to an
+        empty, non-active verdict."""
+        report = bridge_protocol.parse_status(FRAMES["get_status"]["response"]["result"])
+        assert report.subscription_churn.checked is True
+        assert report.subscription_churn.active is False
+        assert report.subscription_churn.peers == []
+
+    def test_subscription_churn_active_golden_frame(self):
+        """The `get_status_churning` golden frame (§7) — a peer over threshold."""
+        report = bridge_protocol.parse_status(
+            FRAMES["get_status_churning"]["response"]["result"])
+        churn = report.subscription_churn
+        assert churn.checked is True
+        assert churn.active is True
+        assert len(churn.peers) == 1
+        peer = churn.peers[0]
+        assert peer.peer_node_id == "41869fbd537ef01"
+        assert peer.fabric_index == 2
+        assert peer.live_sessions == 5
+        assert peer.invalid_deletions == 3
+        assert peer.window_minutes == 30
+        assert peer.since == "2026-08-23T09:12:00.000Z"
+
+    def test_subscription_churn_absent_defaults_to_unchecked(self):
+        """A pre-0.15.0 node's ``StatusReport`` has no ``subscriptionChurn`` key
+        at all. Absence must default to ``checked=False`` — "never looked",
+        never "healthy" — the same tolerant-default idiom ``driftChecked``
+        and ``warnings`` already use for an old node."""
+        result = dict(FRAMES["get_status"]["response"]["result"])
+        del result["subscriptionChurn"]
+        report = bridge_protocol.parse_status(result)
+        assert report.subscription_churn.checked is False
+        assert report.subscription_churn.active is False
+        assert report.subscription_churn.peers == []
+
+    def test_subscription_churn_malformed_peer_degrades_the_list_not_the_report(self):
+        """review finding 4: one bad peer entry must not detonate the whole
+        ``StatusReport`` — the old comprehension's ``.get``/``int()`` escaping
+        failed the entire status poll at DEBUG, silenced `warnings` (the churn
+        warning INCLUDED) for the whole report, and could fail an `attach`."""
+        result = dict(FRAMES["get_status_churning"]["response"]["result"])
+        good_peer = result["subscriptionChurn"]["peers"][0]
+        result = {
+            **result,
+            "subscriptionChurn": {
+                "checked": True, "active": True,
+                "peers": [
+                    "not even a dict",
+                    {"peerNodeId": "ok-peer", "fabricIndex": "not-a-number",
+                     "liveSessions": 5, "invalidDeletions": 3, "windowMinutes": 30,
+                     "since": "2026-08-23T09:12:00.000Z"},
+                    good_peer,
+                ],
+            },
+        }
+        report = bridge_protocol.parse_status(result)  # must not raise
+        churn = report.subscription_churn
+        assert churn.checked is True
+        assert churn.active is True
+        # Both malformed entries dropped; the one good peer survives.
+        assert len(churn.peers) == 1
+        assert churn.peers[0].peer_node_id == good_peer["peerNodeId"]
+
+    def test_subscription_churn_all_peers_malformed_is_active_with_no_peers(self):
+        """A degraded-to-empty peers list must not silently flip `active` to
+        False — the node still said it was active; only the DETAIL is thin."""
+        result = dict(FRAMES["get_status_churning"]["response"]["result"])
+        result = {**result, "subscriptionChurn": {
+            "checked": True, "active": True, "peers": [None, "garbage", 42],
+        }}
+        report = bridge_protocol.parse_status(result)  # must not raise
+        assert report.subscription_churn.active is True
+        assert report.subscription_churn.peers == []
+
     def test_pairing_states(self):
         never = bridge_protocol.parse_pairing(
             FRAMES["get_pairing_uncommissioned"]["response"]["result"])
@@ -333,6 +408,19 @@ class TestCoverage:
                 continue
             assert "warnings" in result, f"{name} is a StatusReport without warnings"
             assert isinstance(result["warnings"], list)
+
+    def test_every_status_report_carries_the_subscription_churn_field(self):
+        """§4.3 issue #286 ``subscriptionChurn``. Every golden StatusReport is
+        from a 0.15.0+ node, so it must carry the field — absence is the
+        pre-0.15.0 case ``parse_subscription_churn`` tolerates, not a shape any
+        current fixture should model."""
+        for name, exchange in EXCHANGES.items():
+            result = exchange["response"].get("result")
+            if not isinstance(result, dict) or "endpointCount" not in result:
+                continue
+            assert "subscriptionChurn" in result, f"{name} is a StatusReport without subscriptionChurn"
+            churn = result["subscriptionChurn"]
+            assert isinstance(churn, dict) and {"checked", "active", "peers"} <= churn.keys()
 
     def test_every_command_has_a_golden_frame(self):
         covered = {exchange["request"]["command"] for exchange in EXCHANGES.values()}

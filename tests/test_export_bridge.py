@@ -40,6 +40,7 @@ from fakes import (
     OTHER_PLUGIN_ID,
     DimmerDevice,
     FakeBridgeClient,
+    FakeHealthDevice,
     FakeIndigoDevices,
     InlineExecutor,
     RecordingRuntime,
@@ -75,6 +76,17 @@ class Harness:
         self.clients: list[FakeBridgeClient] = []
         self.executor = InlineExecutor()
         self.saves = 0
+        #: The `matterBridgeHealth` doubles this harness knows about, oldest
+        #: first — issue #286. A test seeds this directly (append BEFORE the
+        #: first churn signal) to model a device that already existed —
+        #: from a previous plugin session, or hand-created — rather than one
+        #: this harness's own factory made.
+        self.health_devices: list[FakeHealthDevice] = []
+        #: Raise instead of creating one, for the "creation fails" tests.
+        self.health_device_fail = False
+        #: Return ``None`` without raising — the "factory is silently a
+        #: no-op" case (review finding 5).
+        self.health_device_return_none = False
         self.bridge = module.ExportBridge(
             self.store, self.runtime, mock_logger, lambda: self.prefs,
             plugin_version="2026.7.28", plugin_id=OURS,
@@ -82,6 +94,8 @@ class Harness:
             client_factory=self._client,
             save_prefs=self._save_prefs,
             executor_factory=lambda: self.executor,
+            health_device_finder=self._find_health_device,
+            health_device_factory=self._create_health_device,
         )
 
     def _save_prefs(self) -> None:
@@ -92,6 +106,23 @@ class Harness:
             return self.devices[device_id]
         except KeyError:
             return None
+
+    def _find_health_device(self):
+        """The find-only seam — NEVER creates. Only ever answers with a
+        device this harness already knows about (review finding 1)."""
+        return self.health_devices[0] if self.health_devices else None
+
+    def _create_health_device(self):
+        if self.health_device_fail:
+            raise RuntimeError("bridge health device creation failed")
+        if self.health_device_return_none:
+            return None
+        # Real Indigo ids are not 1, 2, 3 — offset so a test cannot mistake one
+        # for an ordinary allow-listed device by id alone.
+        dev = FakeHealthDevice(9000 + len(self.health_devices))
+        self.health_devices.append(dev)
+        self.devices.add(dev)  # so a re-resolve via device_getter finds it too
+        return dev
 
     def _client(self, logger, prefs, **kwargs):
         client = FakeBridgeClient(logger, prefs, **kwargs)
@@ -142,6 +173,12 @@ def errors_of(logger) -> str:
     return " ".join(str(call.args[0]) % call.args[1:] if len(call.args) > 1
                     else str(call.args[0])
                     for call in logger.error.call_args_list)
+
+
+def infos_of(logger) -> str:
+    return " ".join(str(call.args[0]) % call.args[1:] if len(call.args) > 1
+                    else str(call.args[0])
+                    for call in logger.info.call_args_list)
 
 
 @pytest.fixture
@@ -2530,6 +2567,490 @@ class TestNodeWarningsAreActuallyPolled:
         h.client.attached = False
         h.bridge.health_tick()
         assert "get_status" not in h.client.names()
+
+
+class TestSubscriptionHealthDevice:
+    """§4.3 issue #286 — `matterBridgeHealth`'s states, driven by the node's
+    `subscriptionChurn` verdict.
+
+    The warning SENTENCE for an active verdict already rides `warnings`
+    (`TestNodeWarnings` above); what is new here is the trigger-able DEVICE
+    STATE it drives, and the degradation path: `checked=False` — an old node,
+    a halted/detached client, an unreachable node — must read `unknown`,
+    never `healthy`. `unknown` is the "did not observe" answer, and a test
+    named `..._returns_healthy_when_unchecked` would have pinned the bug this
+    device exists to avoid.
+    """
+
+    HEALTHY_CHURN = {"checked": True, "active": False, "peers": []}
+    CHURNING_CHURN = {
+        "checked": True, "active": True,
+        "peers": [{"peerNodeId": "41869fbd537ef01", "fabricIndex": 2, "liveSessions": 5,
+                    "invalidDeletions": 3, "windowMinutes": 30,
+                    "since": "2026-08-23T09:12:00.000Z"}],
+    }
+
+    def _status(self, churn=None):
+        payload = {
+            "commissioned": True, "fabrics": [], "endpointCount": 1,
+            "endpoints": [], "drift": [], "driftChecked": True, "warnings": [],
+        }
+        if churn is not None:
+            payload["subscriptionChurn"] = churn
+        return bridge_protocol.parse_status(payload)
+
+    def _harness(self, bridge_mod, mock_logger, devices) -> Harness:
+        return Harness(bridge_mod, mock_logger, devices, [ExportEntry(101, "onOffLight")])
+
+    def _attached(self, bridge_mod, mock_logger, devices) -> Harness:
+        """Attached via the watchdog's OWN poll path, not `_on_attached` —
+        the shape `TestNodeWarningsAreActuallyPolled` uses, so `health_tick`'s
+        polling (rather than a bare method call) is what is under test.
+        """
+        h = self._harness(bridge_mod, mock_logger, devices)
+        h.start()
+        h.client.attached = True
+        return h
+
+    def test_the_device_is_created_on_attach_when_export_is_enabled(
+            self, bridge_mod, mock_logger, devices):
+        h = self._harness(bridge_mod, mock_logger, devices)
+        h.bridge._on_attached(self._status(self.HEALTHY_CHURN), False)
+        assert len(h.health_devices) == 1
+        assert h.health_devices[0].states["subscriptionHealth"] == "healthy"
+        assert h.health_devices[0].states["churnDetail"] == ""
+
+    def test_no_client_never_creates_the_health_device(
+            self, bridge_mod, mock_logger, devices):
+        """`health_tick` with nothing exported (or not yet attached) has no
+        churn verdict to report and must not create a device just to say so."""
+        h = self._harness(bridge_mod, mock_logger, devices)
+        h.bridge.health_tick()
+        assert h.health_devices == []
+
+    def test_churn_active_flips_the_state_to_churning_with_peer_detail(
+            self, bridge_mod, mock_logger, devices):
+        h = self._harness(bridge_mod, mock_logger, devices)
+        h.bridge._on_attached(self._status(self.CHURNING_CHURN), False)
+        dev = h.health_devices[0]
+        assert dev.states["subscriptionHealth"] == "churning"
+        assert "41869fbd537ef01" in dev.states["churnDetail"]
+        assert "fabric 2" in dev.states["churnDetail"]
+        # The warning sentence is the OTHER channel's job (TestNodeWarnings);
+        # a churn detection must not ALSO log through this one.
+        assert "recovered" not in infos_of(mock_logger)
+
+    def test_recovery_flips_back_to_healthy_and_logs_once(
+            self, bridge_mod, mock_logger, devices):
+        h = self._harness(bridge_mod, mock_logger, devices)
+        h.bridge._on_attached(self._status(self.CHURNING_CHURN), False)
+        h.bridge._on_attached(self._status(self.HEALTHY_CHURN), False)
+        dev = h.health_devices[0]
+        assert dev.states["subscriptionHealth"] == "healthy"
+        assert dev.states["churnDetail"] == ""
+        assert "recovered" in infos_of(mock_logger)
+
+    def test_a_reattach_after_unknown_does_not_claim_a_recovery(
+            self, bridge_mod, mock_logger, devices):
+        """healthy -> unknown (node halted) -> healthy again is an ordinary
+        node restart, not the end of a churn episode — "recovered" would be a
+        false signal in a log a user is reading precisely because something
+        restarted."""
+        h = self._attached(bridge_mod, mock_logger, devices)
+        h.client.status = self._status(self.HEALTHY_CHURN)
+        h.bridge.health_tick()
+        h.client.halted = True
+        h.bridge.health_tick()
+        h.client.halted = False
+        h.bridge.health_tick()
+        dev = h.health_devices[0]
+        assert dev.states["subscriptionHealth"] == "healthy"
+        assert "recovered" not in infos_of(mock_logger)
+
+    def test_standing_churn_across_five_ticks_writes_and_logs_once(
+            self, bridge_mod, mock_logger, devices):
+        h = self._attached(bridge_mod, mock_logger, devices)
+        h.client.status = self._status(self.CHURNING_CHURN)
+        for _ in range(5):
+            h.bridge.health_tick()
+        assert len(h.health_devices) == 1, "the device is resolved once, not recreated per tick"
+        dev = h.health_devices[0]
+        assert len(dev.writes) == 1, "a standing verdict must not be rewritten every ~15s tick"
+        assert dev.states["subscriptionHealth"] == "churning"
+
+    def test_a_halted_node_reads_unknown(self, bridge_mod, mock_logger, devices):
+        h = self._attached(bridge_mod, mock_logger, devices)
+        h.client.status = self._status(self.CHURNING_CHURN)
+        h.bridge.health_tick()
+        h.client.halted = True
+        h.bridge.health_tick()
+        dev = h.health_devices[0]
+        assert dev.states["subscriptionHealth"] == "unknown"
+        assert dev.states["churnDetail"] == ""
+
+    def test_a_detached_node_reads_unknown(self, bridge_mod, mock_logger, devices):
+        h = self._attached(bridge_mod, mock_logger, devices)
+        h.client.status = self._status(self.CHURNING_CHURN)
+        h.bridge.health_tick()
+        h.client.attached = False
+        h.bridge.health_tick()
+        assert h.health_devices[0].states["subscriptionHealth"] == "unknown"
+
+    def test_status_missing_the_field_creates_no_device_when_none_exists(
+            self, bridge_mod, mock_logger, devices):
+        """An old (pre-0.15.0) node's `StatusReport` has no `subscriptionChurn`
+        key at all — `bridge_protocol.parse_status` already defaults that to
+        `checked=False`. The FIRST thing this plugin ever hears from a node is
+        "unknown" — and unknown must never be the reason a device gets
+        created (review finding 1): there is nothing real yet to correct."""
+        h = self._harness(bridge_mod, mock_logger, devices)
+        h.bridge._on_attached(self._status(churn=None), False)
+        assert h.health_devices == []
+
+    def test_status_missing_the_field_corrects_an_existing_device_to_unknown(
+            self, bridge_mod, mock_logger, devices):
+        """...but a device that already exists — created earlier THIS session
+        by a real signal — must still be corrected, never left standing on a
+        stale "healthy", and never flipped to "healthy" by the absence of the
+        field itself."""
+        h = self._harness(bridge_mod, mock_logger, devices)
+        h.bridge._on_attached(self._status(self.HEALTHY_CHURN), False)   # creates it, healthy
+        h.bridge._on_attached(self._status(churn=None), False)           # old-node status now
+        dev = h.health_devices[0]
+        assert dev.states["subscriptionHealth"] == "unknown"
+        assert dev.states["subscriptionHealth"] != "healthy"
+
+    def test_a_poll_failure_does_not_raise_or_create_the_device(
+            self, bridge_mod, mock_logger, devices):
+        h = self._attached(bridge_mod, mock_logger, devices)
+        h.client.fail["get_status"] = ConnectionError("node went away")
+        h.bridge.health_tick()      # must not raise
+        assert h.health_devices == []
+
+    def test_a_device_creation_failure_does_not_break_the_poll_loop(
+            self, bridge_mod, mock_logger, devices):
+        """Never raises, and is said once (the same latch shape as
+        `_report_node_warnings`) rather than on every subsequent change."""
+        h = self._harness(bridge_mod, mock_logger, devices)
+        h.health_device_fail = True
+
+        h.bridge._on_attached(self._status(self.CHURNING_CHURN), False)  # must not raise
+
+        assert "could not find or create the bridge health device" in warnings_of(mock_logger)
+        said = len(mock_logger.warning.call_args_list)
+        h.bridge._on_attached(self._status(self.HEALTHY_CHURN), False)   # still failing, still must not raise
+        assert len(mock_logger.warning.call_args_list) == said, "a standing failure is said once"
+
+    def test_export_switched_off_reads_unknown(self, bridge_mod, mock_logger, devices):
+        """PRD §5.5 — export off disconnects but leaves accessories paired;
+        the bridge's OWN health is no longer something this plugin can speak
+        to, so it degrades exactly as a halted node does."""
+        h = self._attached(bridge_mod, mock_logger, devices)
+        h.client.status = self._status(self.CHURNING_CHURN)
+        h.bridge.health_tick()
+        h.prefs["exportEnabled"] = False
+
+        h.bridge.exports_changed()
+
+        assert h.health_devices[0].states["subscriptionHealth"] == "unknown"
+
+    def test_a_recovering_node_reads_unknown(self, bridge_mod, mock_logger, devices):
+        """review finding 6a — the ONE `_mark_health_unknown` call site
+        `client.recovery` guards was untested; mirrors
+        `test_a_halted_node_reads_unknown`."""
+        h = self._attached(bridge_mod, mock_logger, devices)
+        h.client.status = self._status(self.CHURNING_CHURN)
+        h.bridge.health_tick()
+        h.client.recovery = True
+        h.client.attached = False
+        h.bridge.health_tick()
+        dev = h.health_devices[0]
+        assert dev.states["subscriptionHealth"] == "unknown"
+
+
+class TestStalePersistedHealthAcrossARestart:
+    """§4.3 issue #286 review finding 1 — the bug a green suite hid.
+
+    `_mark_health_unknown` used to gate on the IN-MEMORY `_health_device_id`
+    cache. After a plugin restart that cache is always empty, so every
+    halted/recovering/detached/no-client tick was a no-op — a device that
+    read "healthy" (or "churning") at the moment the plugin last stopped
+    stood exactly that way, with zero observation behind it, for as long as
+    the new session took to get a REAL signal (an attach, or a successful
+    poll). That is precisely the quiet-healthy this feature exists to
+    forbid; a test asserting only "no client -> nothing happens" would have
+    blessed it as intended behaviour.
+    """
+
+    def _harness(self, bridge_mod, mock_logger, devices) -> Harness:
+        return Harness(bridge_mod, mock_logger, devices, [ExportEntry(101, "onOffLight")])
+
+    def _stale_device(self, health="healthy") -> FakeHealthDevice:
+        dev = FakeHealthDevice(9500)
+        dev.states["subscriptionHealth"] = health
+        dev.states["churnDetail"] = ""
+        return dev
+
+    def test_first_health_tick_with_no_client_corrects_a_stale_healthy_device(
+            self, bridge_mod, mock_logger, devices):
+        h = self._harness(bridge_mod, mock_logger, devices)
+        stale = self._stale_device()
+        h.health_devices.append(stale)   # persisted from a PREVIOUS session
+
+        h.bridge.health_tick()           # fresh ExportBridge; self.client is None
+
+        assert stale.states["subscriptionHealth"] == "unknown"
+        assert len(h.health_devices) == 1, "must FIND the existing device, never create a second"
+
+    def test_a_halted_node_on_a_fresh_bridge_corrects_a_stale_healthy_device(
+            self, bridge_mod, mock_logger, devices):
+        h = self._harness(bridge_mod, mock_logger, devices)
+        stale = self._stale_device()
+        h.health_devices.append(stale)
+        h.start()
+        h.client.attached = True
+        h.client.halted = True
+
+        h.bridge.health_tick()
+
+        assert stale.states["subscriptionHealth"] == "unknown"
+
+    def test_mark_unknown_never_recreates_a_device_the_user_deleted(
+            self, bridge_mod, mock_logger, devices):
+        """The cached-id -> factory fall-through `_mark_health_unknown` used
+        to have contradicted its own "only resets, never creates" docstring:
+        once the cache was cleared (the device gone), the OLD code's shared
+        `_ensure_health_device` call would recreate it. The find-only path
+        must not."""
+        h = self._harness(bridge_mod, mock_logger, devices)
+        h.start()
+        h.bridge._on_attached(bridge_protocol.parse_status({
+            "commissioned": True, "fabrics": [], "endpointCount": 1,
+            "endpoints": [], "drift": [], "driftChecked": True, "warnings": [],
+            "subscriptionChurn": {"checked": True, "active": False, "peers": []},
+        }), False)                                     # creates it, healthy
+        assert len(h.health_devices) == 1
+        h.devices.drop(h.bridge._health_device_id)
+        h.health_devices.clear()                        # the user deleted it out-of-band
+        h.client.halted = True
+
+        h.bridge.health_tick()                           # must not recreate it
+
+        assert h.health_devices == []
+
+
+class TestConsecutivePollFailuresMarkUnknown:
+    """§4.3 issue #286 review finding 2.
+
+    ``client.attached`` stays true for a node whose SOCKET is up but whose
+    responses have simply stopped coming — the wedged case — so
+    ``_disconnect_ticks`` (attach state) never fires, and a poll failure alone
+    only ever reached DEBUG. A device left on its last reading (typically
+    "healthy") is exactly the stale-good-news case this feature exists to
+    prevent.
+    """
+
+    def _status(self, churn):
+        return bridge_protocol.parse_status({
+            "commissioned": True, "fabrics": [], "endpointCount": 1,
+            "endpoints": [], "drift": [], "driftChecked": True, "warnings": [],
+            "subscriptionChurn": churn,
+        })
+
+    HEALTHY_CHURN = {"checked": True, "active": False, "peers": []}
+
+    def _attached(self, bridge_mod, mock_logger, devices) -> Harness:
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(101, "onOffLight")])
+        h.start()
+        h.client.attached = True
+        return h
+
+    def test_n_consecutive_failures_mark_the_stale_value_unknown(
+            self, bridge_mod, mock_logger, devices):
+        h = self._attached(bridge_mod, mock_logger, devices)
+        h.client.status = self._status(self.HEALTHY_CHURN)
+        h.bridge.health_tick()                                     # healthy, device created
+        assert h.health_devices[0].states["subscriptionHealth"] == "healthy"
+
+        h.client.fail["get_status"] = ConnectionError("node went quiet")
+        for _ in range(bridge_mod.HEALTH_POLL_FAIL_TICKS - 1):
+            h.bridge.health_tick()                                 # not yet N — must not raise
+            assert h.health_devices[0].states["subscriptionHealth"] == "healthy"
+        h.bridge.health_tick()                                     # the Nth failure
+
+        assert h.health_devices[0].states["subscriptionHealth"] == "unknown"
+
+    def test_a_successful_poll_resets_the_failure_counter(
+            self, bridge_mod, mock_logger, devices):
+        h = self._attached(bridge_mod, mock_logger, devices)
+        h.client.status = self._status(self.HEALTHY_CHURN)
+        h.bridge.health_tick()
+        h.client.fail["get_status"] = ConnectionError("blip")
+        h.bridge.health_tick()                                     # failure 1
+        del h.client.fail["get_status"]
+        h.bridge.health_tick()                                     # success -> resets the counter
+        h.client.fail["get_status"] = ConnectionError("blip again")
+        h.bridge.health_tick()                                     # failure 1 again, not 2
+
+        assert h.health_devices[0].states["subscriptionHealth"] == "healthy"
+
+
+class TestHealthDeviceWriteFailureLatch:
+    """§4.3 issue #286 review finding 3 — a failed WRITE (not a failed find or
+    create) used to reach only DEBUG, and on the export-disabled path there is
+    no next watchdog tick to retry it, so one failed write left "churning"
+    standing for as long as export stayed off.
+    """
+
+    def _status(self, churn):
+        return bridge_protocol.parse_status({
+            "commissioned": True, "fabrics": [], "endpointCount": 1,
+            "endpoints": [], "drift": [], "driftChecked": True, "warnings": [],
+            "subscriptionChurn": churn,
+        })
+
+    HEALTHY_CHURN = {"checked": True, "active": False, "peers": []}
+    CHURNING_CHURN = {
+        "checked": True, "active": True,
+        "peers": [{"peerNodeId": "41869fbd537ef01", "fabricIndex": 2, "liveSessions": 5,
+                    "invalidDeletions": 3, "windowMinutes": 30,
+                    "since": "2026-08-23T09:12:00.000Z"}],
+    }
+
+    def _harness(self, bridge_mod, mock_logger, devices) -> Harness:
+        return Harness(bridge_mod, mock_logger, devices, [ExportEntry(101, "onOffLight")])
+
+    def test_a_write_failure_is_retried_and_warned_exactly_once(
+            self, bridge_mod, mock_logger, devices):
+        h = self._harness(bridge_mod, mock_logger, devices)
+        h.bridge._on_attached(self._status(self.HEALTHY_CHURN), False)   # creates it, healthy
+        dev = h.health_devices[0]
+        dev.fail_writes = True
+
+        h.bridge._on_attached(self._status(self.CHURNING_CHURN), False)  # write fails
+
+        assert "could not update the bridge health device" in warnings_of(mock_logger)
+        assert dev.states["subscriptionHealth"] == "healthy", "a failed write must not be believed"
+        said = len(mock_logger.warning.call_args_list)
+
+        dev.fail_writes = False
+        h.bridge._on_attached(self._status(self.CHURNING_CHURN), False)  # retried; succeeds
+
+        assert dev.states["subscriptionHealth"] == "churning"
+        assert len(mock_logger.warning.call_args_list) == said, "success adds no new warning"
+
+    def test_fail_succeed_fail_warns_twice(self, bridge_mod, mock_logger, devices):
+        h = self._harness(bridge_mod, mock_logger, devices)
+        h.bridge._on_attached(self._status(self.HEALTHY_CHURN), False)
+        dev = h.health_devices[0]
+
+        dev.fail_writes = True
+        h.bridge._on_attached(self._status(self.CHURNING_CHURN), False)  # fail 1
+        dev.fail_writes = False
+        h.bridge._on_attached(self._status(self.CHURNING_CHURN), False)  # succeed; clears latch
+        dev.fail_writes = True
+        h.bridge._on_attached(self._status(self.HEALTHY_CHURN), False)   # fail 2
+
+        said = [call for call in mock_logger.warning.call_args_list
+                if "could not update the bridge health device" in str(call.args[0])]
+        assert len(said) == 2
+
+
+class TestHealthDeviceFactory:
+    """§4.3 issue #286 review finding 5 — the ONE production seam that finds
+    or creates `matterBridgeHealth` was untested, and used a fixed name with
+    none of `device_sync._create_one`'s collision handling: Indigo device
+    names are server-global, so a stray existing "Matter Bridge Health"
+    (including issue #62's `configured=False`, invisible-to-iter case) would
+    make `indigo.device.create` raise `NameNotUnique` forever, and the
+    swallowed exception's retry could never succeed on its own.
+    """
+
+    def test_find_only_returns_an_existing_device_without_creating(
+            self, bridge_mod, mock_logger, mock_indigo_base):
+        existing = RelayDevice(9001, bridge_mod.HEALTH_DEVICE_NAME,
+                               deviceTypeId=bridge_mod.HEALTH_DEVICE_TYPE_ID)
+        mock_indigo_base.devices = FakeIndigoDevices([existing])
+        found = bridge_mod._find_health_device_only(mock_logger)
+        assert found is existing
+        assert not mock_indigo_base.device.create.called
+
+    def test_find_only_returns_none_when_absent(
+            self, bridge_mod, mock_logger, mock_indigo_base):
+        mock_indigo_base.devices = FakeIndigoDevices([])
+        assert bridge_mod._find_health_device_only(mock_logger) is None
+
+    def test_find_only_ignores_a_device_of_a_different_type(
+            self, bridge_mod, mock_logger, mock_indigo_base):
+        other = RelayDevice(9002, "Something Else", deviceTypeId="matterRelay")
+        mock_indigo_base.devices = FakeIndigoDevices([other])
+        assert bridge_mod._find_health_device_only(mock_logger) is None
+
+    def test_create_uses_the_plain_name_when_unused(
+            self, bridge_mod, mock_logger, mock_indigo_base):
+        mock_indigo_base.devices = FakeIndigoDevices([])
+        created = object()
+        mock_indigo_base.device.create.return_value = created
+
+        result = bridge_mod._create_health_device(mock_logger)
+
+        assert result is created
+        _, kwargs = mock_indigo_base.device.create.call_args
+        assert kwargs["name"] == bridge_mod.HEALTH_DEVICE_NAME
+        assert kwargs["deviceTypeId"] == bridge_mod.HEALTH_DEVICE_TYPE_ID
+
+    def test_create_resolves_a_name_collision_with_a_numeric_suffix(
+            self, bridge_mod, mock_logger, mock_indigo_base):
+        """Issue #62: a device already named "Matter Bridge Health" — of ANY
+        type, including one a user re-typed away from matterBridgeHealth and
+        is therefore invisible to `iter("self")` — must not make `create`
+        raise forever."""
+        collision = RelayDevice(555, bridge_mod.HEALTH_DEVICE_NAME)
+        mock_indigo_base.devices = FakeIndigoDevices([collision])
+        mock_indigo_base.device.create.return_value = object()
+
+        bridge_mod._create_health_device(mock_logger)
+
+        _, kwargs = mock_indigo_base.device.create.call_args
+        assert kwargs["name"] == f"{bridge_mod.HEALTH_DEVICE_NAME} 2"
+
+    def test_create_skips_a_taken_suffix_too(
+            self, bridge_mod, mock_logger, mock_indigo_base):
+        taken = [RelayDevice(555, bridge_mod.HEALTH_DEVICE_NAME),
+                 RelayDevice(556, f"{bridge_mod.HEALTH_DEVICE_NAME} 2")]
+        mock_indigo_base.devices = FakeIndigoDevices(taken)
+        mock_indigo_base.device.create.return_value = object()
+
+        bridge_mod._create_health_device(mock_logger)
+
+        _, kwargs = mock_indigo_base.device.create.call_args
+        assert kwargs["name"] == f"{bridge_mod.HEALTH_DEVICE_NAME} 3"
+
+    def test_a_factory_returning_none_is_latch_logged(
+            self, bridge_mod, mock_logger, devices):
+        """A factory that returns `None` without raising used to be fully
+        silent — same one-per-streak latch as the exception path."""
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(101, "onOffLight")])
+        h.health_device_return_none = True
+
+        h.bridge._on_attached(bridge_protocol.parse_status({
+            "commissioned": True, "fabrics": [], "endpointCount": 1,
+            "endpoints": [], "drift": [], "driftChecked": True, "warnings": [],
+            "subscriptionChurn": {"checked": True, "active": False, "peers": []},
+        }), False)
+
+        assert "could not create the bridge health device" in warnings_of(mock_logger)
+        assert h.health_devices == []
+        said = len(mock_logger.warning.call_args_list)
+
+        h.bridge._on_attached(bridge_protocol.parse_status({
+            "commissioned": True, "fabrics": [], "endpointCount": 1,
+            "endpoints": [], "drift": [], "driftChecked": True, "warnings": [],
+            "subscriptionChurn": {"checked": True, "active": True, "peers": [
+                {"peerNodeId": "x", "fabricIndex": 1, "liveSessions": 5,
+                 "invalidDeletions": 3, "windowMinutes": 30, "since": "2026-08-23T09:12:00.000Z"}]},
+        }), False)
+        assert len(mock_logger.warning.call_args_list) == said, "a standing failure is said once"
 
 
 class TestRefusalRemedies:

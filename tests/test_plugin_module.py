@@ -237,15 +237,21 @@ def test_matter_node_device_exists_as_custom_type():
 
 
 def test_matter_node_is_the_only_type_with_allowUserCreation_false():
-    """This type is only ever created by device_sync — a user-created one
-    would have no Matter node behind it at all (ADR-0008)."""
+    """Both carry ``allowUserCreation="false"`` for the same reason, on
+    opposite directions of the plugin: ``matterNode`` is only ever created by
+    ``device_sync`` (inbound — a user-created one would have no Matter node
+    behind it, ADR-0008); ``matterBridgeHealth`` is only ever created by
+    ``export_bridge`` (outbound — a user-created one would have no bridge
+    node behind it, issue #286). No other type should ever gain this
+    attribute without a matching "only the plugin creates this" story."""
     root = ET.parse(SERVER_PLUGIN / "Devices.xml").getroot()
     no_creation = [
         dev.get("id") for dev in root.findall("Device")
         if dev.get("allowUserCreation") == "false"
     ]
-    assert no_creation == ["matterNode"], (
-        f"expected only matterNode to carry allowUserCreation=\"false\", got {no_creation}")
+    assert no_creation == ["matterNode", "matterBridgeHealth"], (
+        "expected only matterNode/matterBridgeHealth to carry "
+        f"allowUserCreation=\"false\", got {no_creation}")
 
 
 def test_every_endpoint_device_type_has_a_role_label():
@@ -253,10 +259,17 @@ def test_every_endpoint_device_type_has_a_role_label():
     the bare base is the NODE device's name. A type missing from
     ``_ROLE_LABELS`` silently falls back to the bare base on a single-endpoint
     node and then collides with its own node device — so a new device class
-    shipping without a label must fail here, not in the field."""
+    shipping without a label must fail here, not in the field.
+
+    ``matterBridgeHealth`` is excluded alongside ``matterNode``: it is an
+    OUTBOUND device (issue #286, created by ``export_bridge``), never part of
+    ``device_sync``'s inbound node/endpoint reconciliation or its role-suffix
+    naming scheme at all.
+    """
     import device_sync
     root = ET.parse(SERVER_PLUGIN / "Devices.xml").getroot()
-    declared = {dev.get("id") for dev in root.findall("Device")} - {"matterNode"}
+    declared = ({dev.get("id") for dev in root.findall("Device")}
+                - {"matterNode", "matterBridgeHealth"})
     missing = sorted(declared - set(device_sync._ROLE_LABELS))
     assert not missing, f"device types with no role suffix in _ROLE_LABELS: {missing}"
 
@@ -320,6 +333,30 @@ def test_matter_node_configui_has_the_survey_summary_field():
     fields = _device_config_fields("matterNode")
     assert "lastSurveySummary" in fields
     assert fields["lastSurveySummary"].get("readonly") == "yes"
+
+
+# ---------------------------------------------------------------------------
+# issue #286 — the matterBridgeHealth device type
+# ---------------------------------------------------------------------------
+
+def test_bridge_health_device_exists_as_custom_type():
+    dev = _device_element("matterBridgeHealth")
+    assert dev.get("type") == "custom"
+
+
+def test_bridge_health_states_match_what_export_bridge_actually_writes():
+    """review finding 6b: `export_bridge._apply_subscription_churn`'s
+    ``updateStatesOnServer`` call writes exactly the keys ``subscriptionHealth``
+    and ``churnDetail`` — Devices.xml must declare exactly those two, no more
+    (ADR-0007: a shipped state is permanent) and no fewer (a key the code
+    writes but Devices.xml never declared would not exist on the live device
+    at all, and the write would be silently discarded)."""
+    assert _device_state_ids("matterBridgeHealth") == {"subscriptionHealth", "churnDetail"}
+
+
+def test_bridge_health_is_the_display_state():
+    dev = _device_element("matterBridgeHealth")
+    assert dev.findtext("UiDisplayStateId") == "subscriptionHealth"
 
 
 # ---------------------------------------------------------------------------

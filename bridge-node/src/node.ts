@@ -33,7 +33,14 @@ import {
 import { BasicInformationServer } from "@matter/main/behaviors/basic-information";
 import { AggregatorEndpoint } from "@matter/main/endpoints/aggregator";
 import { Crypto } from "@matter/main";
-import { DeviceCommissioner, FabricManager, PaseClient, PaseServer, SessionManager } from "@matter/main/protocol";
+import {
+    DeviceCommissioner,
+    FabricManager,
+    type NodeSession,
+    PaseClient,
+    PaseServer,
+    SessionManager,
+} from "@matter/main/protocol";
 import {
     CommissioningFlowType,
     FabricIndex,
@@ -41,6 +48,7 @@ import {
     QrPairingCodeCodec,
 } from "@matter/main/types";
 
+import { ChurnDetector, churnWarning } from "./churn.js";
 import type { BridgeConfig } from "./config.js";
 import { ENDPOINT_MAP_FILE, EndpointMapStore, type LiveEndpointNumber, refuseReasonFor } from "./endpoint-map.js";
 import { type BridgedIdentity, isSupportedRole } from "./endpoints.js";
@@ -64,6 +72,7 @@ import {
     type RemoveFabricResult,
     type RemoveResult,
     type StatusReport,
+    type SubscriptionChurn,
     type UpsertResult,
     type WindowClosedReason,
 } from "./protocol.js";
@@ -108,6 +117,20 @@ export const ENDPOINT_COUNT_ADVISORY = 50;
 /** §4.3 `warnings` key for identity-file writes. Stable, so it replaces itself. */
 const WARN_IDENTITY_WRITE = "identity-write";
 
+/** §4.3 `warnings` key for the issue #286 churn notice. Cleared when it stops. */
+const WARN_SUBSCRIPTION_CHURN = "subscription-churn";
+
+/**
+ * What {@link BridgeNode.pollChurn} says when a working detector has failed.
+ *
+ * Deliberately keeps the restart advice: whatever churn was being reported has
+ * not stopped, it has only become invisible, and one restart fixes both.
+ */
+const CHURN_DETECTION_OFF =
+    "Subscription-churn detection FAILED and is no longer watching the session layer — any controller "
+    + "churn, including any this bridge already reported, is now invisible. Restart the Matter bridge "
+    + "node to restore detection.";
+
 /** PBKDF iteration count for enhanced-window verifiers. Spec floor is 1000. */
 const PBKDF_ITERATIONS = 1000;
 const PBKDF_SALT_BYTES = 32;
@@ -139,6 +162,23 @@ const PAIRING_SETTLE_INTERVAL_MS = 75;
  */
 function isTransientUninitialized(error: unknown): boolean {
     return error instanceof UninitializedDependencyError;
+}
+
+/**
+ * The peer's node id in hex — how matter.js writes it in the session logs the
+ * issue #283 evidence was read from, so a user can match the two.
+ */
+function peerNodeIdHex(session: NodeSession): string {
+    return session.peerNodeId.toString(16);
+}
+
+/**
+ * A session with no fabric is not a CASE session and cannot be Alexa; 0 is not
+ * a valid `FabricIndex`, so it groups those harmlessly under a peer key that no
+ * real fabric can collide with.
+ */
+function fabricIndexOf(session: NodeSession): number {
+    return Number(session.fabric?.fabricIndex ?? 0);
 }
 
 /** Real timer, unref'd: a pending retry must never keep the process alive
@@ -228,6 +268,17 @@ export class BridgeNode implements BridgeFacade {
      * would have to know when that happened.
      */
     readonly #warnings = new Map<string, string>();
+    /**
+     * Issue #286 — the read-only controller-churn detector. Owns no matter.js
+     * type; {@link wireChurnDetection} is the whole of the coupling.
+     */
+    readonly #churn = new ChurnDetector();
+    /**
+     * True when {@link wireChurnDetection} never attached at all, as opposed to
+     * a detector that worked and then failed. The two are different faults with
+     * different advice — see {@link pollChurn}.
+     */
+    #churnNeverWired = false;
     /**
      * Issue #240, §3 steps 3/5 — `indigoDeviceId → the published identity it
      * was last removed under`, for the ONE device that removal drove, kept
@@ -394,6 +445,10 @@ export class BridgeNode implements BridgeFacade {
         await this.restoreEndpoints();
 
         await server.start();
+
+        // After `start()`: SessionManager is only in the environment once the
+        // node is online, and a detector wired before it would be born broken.
+        this.wireChurnDetection();
 
         // The §5 transition baseline. Taken before the identity assertion so a
         // fabric that arrives during it is a transition rather than the start.
@@ -888,8 +943,143 @@ export class BridgeNode implements BridgeFacade {
         return this.#registry;
     }
 
+    /**
+     * Issue #286 — watch the session layer for the Alexa churn signature.
+     *
+     * `SessionManager` rather than `SessionsBehavior`: the behaviour's events
+     * announce that a session's subscription COUNT moved, which cannot tell a
+     * deletion from an add, and the deletion is half the signature. The manager
+     * hands over the subscription itself, so `isTerminated` is readable and the
+     * add/delete direction is the same `session.subscriptions.has(...)` test
+     * SessionsBehavior makes.
+     *
+     * Wiring that fails leaves the detector permanently `checked: false` — an
+     * unwatched session layer must not be reported as a quiet one.
+     */
+    private wireChurnDetection(): void {
+        try {
+            const sessions = this.server.env.get(SessionManager);
+            // Issue #286 review D — seed from what is ALREADY open before
+            // subscribing. Alexa reconnects the instant the node comes up, so
+            // the sessions established between `server.start()` returning and
+            // this line belong to exactly the peer under suspicion. Seeding and
+            // subscribing happen in one synchronous block, so there is no
+            // window between them for an event to fall through.
+            for (const session of sessions.sessions) {
+                if (session.isPase) {
+                    continue;
+                }
+                this.#churn.sessionOpened(session.id, peerNodeIdHex(session), fabricIndexOf(session));
+            }
+            sessions.sessions.added.on(session => this.noteChurn(() => {
+                if (session.isPase) {
+                    return;
+                }
+                this.#churn.sessionOpened(session.id, peerNodeIdHex(session), fabricIndexOf(session));
+            }));
+            sessions.sessions.deleted.on(session => this.noteChurn(() => {
+                this.#churn.sessionClosed(session.id);
+            }));
+            sessions.subscriptionsChanged.on((session, subscription) => this.noteChurn(() => {
+                // The observable fires for both directions; a subscription
+                // still in the session's set was ADDED.
+                if (session.isPase || session.subscriptions.has(subscription)) {
+                    return;
+                }
+                this.#churn.subscriptionRemoved(
+                    peerNodeIdHex(session),
+                    fabricIndexOf(session),
+                    subscription.isTerminated,
+                );
+            }));
+        } catch (error) {
+            this.#churn.markBroken();
+            this.#churnNeverWired = true;
+            try {
+                this.log(
+                    "Subscription-churn detection could not be wired; get_status will report it unchecked: "
+                    + describeError(error),
+                );
+            } catch {
+                // The logger itself failed; there is nowhere left to report.
+            }
+        }
+    }
+
+    /**
+     * Run one churn handler inside a matter.js observable.
+     *
+     * Two constraints, both of them the `fabricsChanged` discipline: a throw
+     * would propagate into the stack, and a handler that threw has dropped an
+     * event — so the detector is marked broken rather than left answering from
+     * a tally it knows is short. Logged once, at the transition.
+     */
+    private noteChurn(update: () => void): void {
+        try {
+            update();
+        } catch (error) {
+            const wasBroken = this.#churn.isBroken;
+            this.#churn.markBroken();
+            if (wasBroken) {
+                return;
+            }
+            try {
+                this.log(`Subscription-churn detection failed and is now off: ${describeError(error)}`);
+            } catch {
+                // The logger itself failed; there is nowhere left to report.
+            }
+        }
+    }
+
+    /**
+     * The churn verdict, with §4.3's notice raised or cleared by this poll.
+     *
+     * Read-time, because `get_status` is the plugin's 15s watchdog tick: the
+     * notice text is refreshed every poll so its counts are current, but only a
+     * TRANSITION reaches the log. Same reason `drift` is not recomputed here.
+     */
+    private pollChurn(): SubscriptionChurn {
+        const { verdict, changed } = this.#churn.poll();
+        if (verdict.active) {
+            const message = churnWarning(verdict);
+            this.#warnings.set(WARN_SUBSCRIPTION_CHURN, message);
+            if (changed) {
+                this.log(message);
+            }
+            return verdict;
+        }
+        if (!verdict.checked) {
+            // Issue #286 review C. A detector that broke mid-flight must NOT
+            // take its "restart the bridge" advice down with it: the churn it
+            // was reporting is most likely still running, we have merely gone
+            // blind to it, and a restart is still the fix — now for both.
+            //
+            // Wiring that never attached is a different fault and stays
+            // warning-free: nothing was ever reported, so there is nothing to
+            // withdraw, and a restart would fail in exactly the same way every
+            // time. A permanent un-actionable warning is how a channel gets
+            // ignored. `subscriptionChurn.checked` is false either way, which
+            // is the honest signal, and the failure is logged once at start.
+            if (!this.#churnNeverWired) {
+                this.#warnings.set(WARN_SUBSCRIPTION_CHURN, CHURN_DETECTION_OFF);
+            }
+            if (changed) {
+                this.log(CHURN_DETECTION_OFF);
+            }
+            return verdict;
+        }
+        this.#warnings.delete(WARN_SUBSCRIPTION_CHURN);
+        if (changed) {
+            this.log("Subscription churn has cleared; controller sessions are stable again");
+        }
+        return verdict;
+    }
+
     getStatus(): StatusReport {
         const endpoints = this.#registry?.summaries() ?? [];
+        // Before the literal below: this is what raises or clears the §4.3
+        // churn notice that `warnings` is about to be read from.
+        const subscriptionChurn = this.pollChurn();
         return {
             commissioned: this.server.lifecycle.isCommissioned,
             fabrics: this.fabrics(),
@@ -901,6 +1091,7 @@ export class BridgeNode implements BridgeFacade {
             drift: [...this.#drift],
             driftChecked: this.#endpointMap.checked,
             warnings: [...this.#warnings.values(), ...this.#endpointMap.warnings],
+            subscriptionChurn,
         };
     }
 

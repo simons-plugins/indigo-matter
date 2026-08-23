@@ -24,6 +24,7 @@ import {
     type RemoveResult,
     type RoleValue,
     type StatusReport,
+    type SubscriptionChurn,
     type UpsertResult,
     type WindowClosedReason,
 } from "../src/protocol.js";
@@ -49,6 +50,7 @@ export interface GoldenFrames {
     not_attached: GoldenExchange;
     unknown_command: GoldenExchange;
     get_status: GoldenExchange;
+    get_status_churning: GoldenExchange;
     get_pairing_uncommissioned: GoldenExchange;
     get_pairing_commissioned: GoldenExchange;
     get_pairing_commissioned_window_open: GoldenExchange;
@@ -288,6 +290,12 @@ export class StubBridge implements BridgeFacade {
     driftChecked = false;
     /** §4.3 — persistence failures the node wants the plugin to surface. */
     warnings: string[] = [];
+    /**
+     * §4.3 issue #286. The double watches no session layer, so the honest
+     * default is the one a real node reports when its wiring succeeded and
+     * nothing has churned — the churn tests overwrite it.
+     */
+    subscriptionChurn: SubscriptionChurn = { checked: true, active: false, peers: [] };
     /** §1.1 — non-undefined puts the double in the refuse-to-start state. */
     refusal?: string;
     /** Calls recorded by the §3.9/§3.10/§3.11 tests. */
@@ -312,6 +320,7 @@ export class StubBridge implements BridgeFacade {
             drift: structuredClone(this.drift),
             driftChecked: this.driftChecked,
             warnings: [...this.warnings],
+            subscriptionChurn: structuredClone(this.subscriptionChurn),
         };
     }
 

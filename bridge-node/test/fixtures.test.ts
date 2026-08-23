@@ -8,8 +8,9 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
+import { churnWarning } from "../src/churn.js";
 import { rejectedStateKeys } from "../src/endpoints.js";
-import { type EndpointSpec, EventName, Role, type RoleValue } from "../src/protocol.js";
+import { type EndpointSpec, EventName, Role, type RoleValue, type StatusReport } from "../src/protocol.js";
 import * as shapes from "./fixture-shapes.js";
 import type { GoldenEvent, GoldenExchange } from "./stub-bridge.js";
 import { golden } from "./stub-bridge.js";
@@ -38,6 +39,8 @@ describe("golden fixtures match their typed mirror", () => {
         // answer against a node with nothing live is an empty live set.
         ["attach result", golden.attach.response.result, shapes.statusEmpty],
         ["get_status result", golden.get_status.response.result, shapes.status],
+        ["get_status (churning) result", golden.get_status_churning.response.result,
+            shapes.statusChurning],
         ["attach_with_endpoints result", golden.attach_with_endpoints.response.result, shapes.status],
         ["attach_replace_all result", golden.attach_replace_all.response.result, shapes.statusReplaceAll],
         ["attach mass_removal_refused", golden.attach_mass_removal_refused.response, shapes.massRemovalRefused],
@@ -90,6 +93,16 @@ describe("golden fixtures match their typed mirror", () => {
             assert.deepEqual(actual, expected);
         });
     }
+
+    it("the churning frame's warning is the text churnWarning actually builds", () => {
+        // Closes a hand-copied-string triangle: frames.json, fixture-shapes.ts
+        // and churn.ts each state this sentence, and the two shape assertions
+        // above only prove the first two agree with each other. This is what
+        // catches the notice wording drifting away from the golden frame the
+        // Python suite also reads.
+        const result = golden.get_status_churning.response.result as StatusReport;
+        assert.equal(result.warnings[0], churnWarning(result.subscriptionChurn));
+    });
 
     describe("the §4.2 role table, from the golden frames", () => {
         /** `attach_all_roles`' endpoint specs — one per v1 role, by contract. */
