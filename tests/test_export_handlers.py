@@ -486,6 +486,39 @@ class TestColorTemperature:
         mock_indigo_base.dimmer.setColorLevels.assert_called_once_with(
             dev, whiteLevel=40, whiteTemperature=2703)
 
+    def test_a_sub_tolerance_mireds_wobble_is_not_a_change(self, handlers):
+        """Issue #281's literal live gap: Apple wrote 426 mireds (≈2347K), the
+        z2m lamp's warm limit clamped the echo to 2500K (400 mireds). Without
+        the tolerance that clamped echo reads as a real change and fights the
+        commanded push straight back."""
+        handler = handlers.handler_for("colorTemperatureLight")
+        before = DimmerDevice(1, "L", onState=True, brightness=50, whiteTemperature=2500)
+        after = DimmerDevice(1, "L", onState=True, brightness=50, whiteTemperature=2347)
+        assert handler.states_for(before)["colorTempMireds"] == 400
+        assert handler.states_for(after)["colorTempMireds"] == 426
+        assert handler.diff(before, after) == {}
+
+    def test_a_real_ct_change_is_still_reported(self, handlers):
+        handler = handlers.handler_for("colorTemperatureLight")
+        before = DimmerDevice(1, "L", onState=True, brightness=50, whiteTemperature=2700)
+        after = DimmerDevice(1, "L", onState=True, brightness=50, whiteTemperature=4000)
+        assert handler.diff(before, after)["colorTempMireds"] == 250
+
+    def test_the_ct_tolerance_is_declared_on_the_colour_temperature_role(self, handlers):
+        handler = handlers.handler_for("colorTemperatureLight")
+        assert handler.tolerances[handlers.STATE_COLOR_TEMP_MIREDS] == \
+            handlers.CT_TOLERANCE_MIREDS == 50
+
+    def test_commanded_states_returns_the_clamped_ct_and_nothing_else(self, handlers):
+        handler = handlers.handler_for("colorTemperatureLight")
+        assert handler.commanded_states("setColorTemp", {"colorTempMireds": 426}) == \
+            {"colorTempMireds": 426}
+        assert handler.commanded_states("setColorTemp", {"colorTempMireds": 10000}) == \
+            {"colorTempMireds": 500}
+        assert handler.commanded_states("setLevel", {"level": 50}) == {}
+        assert handler.commanded_states("setColorTemp", {"colorTempMireds": "garbage"}) == {}
+        assert handler.commanded_states("setColorTemp", {}) == {}
+
 
 # ---------------------------------------------------------------------------
 # extendedColorLight
@@ -626,6 +659,30 @@ class TestExtendedColor:
         handler = handlers.handler_for("extendedColorLight")
         with pytest.raises(ValueError):
             handler.dispatch("setColor", {"hue": 120}, DimmerDevice(1, "L"))
+
+    def test_extended_colour_carries_the_ct_tolerance_as_well(self, handlers):
+        """A subclass ``tolerances`` dict REPLACES the parent's, so this pins
+        that ``extendedColorLight`` did not lose the CT tolerance in the
+        process of adding the hue one."""
+        handler = handlers.handler_for("extendedColorLight")
+        assert handler.tolerances[handlers.STATE_COLOR_TEMP_MIREDS] == \
+            handlers.CT_TOLERANCE_MIREDS
+
+    def test_extended_colour_still_carries_the_hue_tolerance(self, handlers):
+        """The mirror of the test above — kills a mutation that overwrites
+        rather than extends the dict and loses hue instead of CT."""
+        handler = handlers.handler_for("extendedColorLight")
+        assert handler.tolerances == {
+            handlers.STATE_HUE: handlers.HUE_TOLERANCE_DEGREES,
+            handlers.STATE_COLOR_TEMP_MIREDS: handlers.CT_TOLERANCE_MIREDS,
+        }
+
+    def test_the_base_handler_commands_no_optimistic_states(self, handlers):
+        """Pins the doctrine default (#143/#201): a role that does not
+        override ``commanded_states`` never pushes an optimistic value,
+        whatever command it was sent."""
+        handler = handlers.ExportHandler()
+        assert handler.commanded_states("anything", {"anything": 1}) == {}
 
 
 class TestExtendedColorModeAwareness:

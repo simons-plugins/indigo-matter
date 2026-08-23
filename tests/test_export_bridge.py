@@ -2166,6 +2166,168 @@ class TestPushedSnapshot:
         assert "HALTED" in warnings_of(mock_logger)
 
 
+# ---------------------------------------------------------------------------
+# ADR-0013 / issue #281 — a confirmed CT dispatch pushes its own commanded
+# value, so a device that permanently clamps the colour temperature stops
+# fighting Apple's adaptive-lighting loop.
+# ---------------------------------------------------------------------------
+class TestCommandedStatePush:
+    def _ct_lamp(self, dev_id=800, **overrides):
+        kwargs = dict(name="CT Lamp", onState=True, brightness=29, whiteLevel=29,
+                      whiteTemperature=2700, supportsWhiteTemperature=True)
+        kwargs.update(overrides)
+        name = kwargs.pop("name")
+        return DimmerDevice(dev_id, name, **kwargs)
+
+    def _ct_count(self, h):
+        return len([call for call in h.client.calls
+                   if call[0] == "set_state" and "colorTempMireds" in call[2]])
+
+    def test_a_confirmed_ct_dispatch_pushes_the_commanded_mireds(
+            self, bridge_mod, mock_logger, devices, mock_indigo_base):
+        dev = self._ct_lamp()
+        devices.add(dev)
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(800, "colorTemperatureLight")])
+        h.start()
+        h.bridge.on_command(bridge_protocol.BridgeCommand(
+            indigo_device_id=800, command="setColorTemp", args={"colorTempMireds": 426}))
+        assert ("set_state", 800, {"colorTempMireds": 426}) in h.client.calls
+        assert h.bridge._pushed[800]["colorTempMireds"] == 426
+
+    def test_the_clamped_device_echo_after_a_commanded_push_sends_nothing(
+            self, bridge_mod, mock_logger, devices, mock_indigo_base):
+        """The live ~3s permanent re-assert issue #281 exists for: Apple wrote
+        426 mireds, the z2m lamp's own warm limit clamped its echo to 400 —
+        26 mireds short, forever, without the tolerance the commanded push
+        relies on."""
+        dev = self._ct_lamp()
+        devices.add(dev)
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(800, "colorTemperatureLight")])
+        h.start()
+        h.bridge.on_command(bridge_protocol.BridgeCommand(
+            indigo_device_id=800, command="setColorTemp", args={"colorTempMireds": 426}))
+        before = self._ct_count(h)
+
+        h.bridge.device_updated(dev, self._ct_lamp(whiteTemperature=2500))    # clamped → 400
+        assert self._ct_count(h) == before
+
+    def test_an_echo_far_outside_the_tolerance_still_pushes(
+            self, bridge_mod, mock_logger, devices, mock_indigo_base):
+        dev = self._ct_lamp()
+        devices.add(dev)
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(800, "colorTemperatureLight")])
+        h.start()
+        h.bridge.on_command(bridge_protocol.BridgeCommand(
+            indigo_device_id=800, command="setColorTemp", args={"colorTempMireds": 426}))
+        before = self._ct_count(h)
+
+        h.bridge.device_updated(dev, self._ct_lamp(whiteTemperature=4000))    # a real change → 250
+        assert self._ct_count(h) == before + 1
+
+    def test_a_failed_ct_dispatch_pushes_truth_not_the_command(
+            self, bridge_mod, mock_logger, devices, mock_indigo_base):
+        dev = self._ct_lamp()
+        devices.add(dev)
+        mock_indigo_base.dimmer.setColorLevels.side_effect = RuntimeError("driver blew up")
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(800, "colorTemperatureLight")])
+        h.start()
+        h.bridge.on_command(bridge_protocol.BridgeCommand(
+            indigo_device_id=800, command="setColorTemp", args={"colorTempMireds": 426}))
+
+        pushes = [call[2]["colorTempMireds"] for call in h.client.calls
+                 if call[0] == "set_state" and "colorTempMireds" in call[2]]
+        assert 426 not in pushes, "a failed dispatch must never push the command it could not apply"
+        assert pushes == [370], "the truth push (_correct) is the device's real, unchanged state"
+        assert h.bridge._pushed[800]["colorTempMireds"] == 370
+
+    def test_a_no_op_ct_dispatch_pushes_nothing(
+            self, bridge_mod, mock_logger, devices, mock_indigo_base):
+        dev = self._ct_lamp(whiteLevel=None)
+        devices.add(dev)
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(800, "colorTemperatureLight")])
+        h.start()
+        h.bridge.on_command(bridge_protocol.BridgeCommand(
+            indigo_device_id=800, command="setColorTemp", args={"colorTempMireds": 426}))
+        assert [call for call in h.client.calls if call[0] == "set_state"] == []
+
+    def test_a_commanded_push_is_gated_on_a_live_client(
+            self, bridge_mod, mock_logger, devices, mock_indigo_base):
+        """Mirrors the existing ``_correct`` live-client-gate test: `self.client`
+        is not the same question as "can it take a frame"."""
+        dev = self._ct_lamp()
+        devices.add(dev)
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(800, "colorTemperatureLight")])
+        h.start()
+        h.client.attached = False
+        h.client.halted = True
+        h.client.halted_reason = "version_skew"
+        before_pushed = dict(h.bridge._pushed[800])
+        before = self._ct_count(h)
+
+        h.bridge.on_command(bridge_protocol.BridgeCommand(
+            indigo_device_id=800, command="setColorTemp", args={"colorTempMireds": 426}))
+
+        assert self._ct_count(h) == before, "nothing may be pushed into a halted node"
+        assert h.bridge._pushed[800] == before_pushed
+        assert "HALTED" in warnings_of(mock_logger)
+
+    def test_hue_returns_after_a_commanded_ct_detour(
+            self, bridge_mod, mock_logger, devices, mock_indigo_base):
+        """Kills "forgot to pass handler to _note_pushed": without eviction the
+        snapshot still holds the pre-detour hue, so the device's return to it
+        compares "unchanged" and the wire never hears about it again — the
+        same #282 trap (b) ``TestColorModeCoherence`` pins for the
+        ``device_updated`` path, reached here through a command instead.
+        """
+        hue_dev = DimmerDevice(810, "Strip", onState=True, brightness=100,
+                               redLevel=0, greenLevel=0, blueLevel=100,
+                               whiteLevel=50, whiteTemperature=None,
+                               supportsRGB=True, supportsWhiteTemperature=True,
+                               states={"colorMode": "hs"})
+        devices.add(hue_dev)
+        h = Harness(bridge_mod, mock_logger, devices,
+                    [ExportEntry(810, "extendedColorLight")])
+        h.start()                                          # attach pushes hue 240
+
+        h.bridge.on_command(bridge_protocol.BridgeCommand(
+            indigo_device_id=810, command="setColorTemp", args={"colorTempMireds": 400}))
+        before_return = len(h.client.calls)
+
+        h.bridge.device_updated(hue_dev, hue_dev)           # reports the SAME hue again
+        new_pushes = h.client.calls[before_return:]
+        hue_pushes = [call for call in new_pushes if call[0] == "set_state" and "hue" in call[2]]
+        assert hue_pushes, "hue must be resent after the commanded CT detour evicted it"
+        assert hue_pushes[-1][2]["hue"] == 240
+        assert "saturation" in hue_pushes[-1][2], (
+            "eviction removes ALL sibling mode-alternating keys, not hue alone")
+
+    def test_the_adaptive_lighting_loop_terminates_after_one_round_trip(
+            self, bridge_mod, mock_logger, devices, mock_indigo_base):
+        """The issue #281 loop, driven three times over: Apple re-asserts 426,
+        the lamp echoes its clamped 400 back. Once the commanded push has
+        landed, every echo is absorbed by the tolerance — the wire never
+        carries anything but 426 again. This is what makes the real Apple
+        itself stop re-asserting: the node's reported attribute agrees with
+        what it commanded, so there is nothing left to correct.
+        """
+        dev = self._ct_lamp()
+        devices.add(dev)
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(800, "colorTemperatureLight")])
+        h.start()
+
+        for _ in range(3):
+            h.bridge.on_command(bridge_protocol.BridgeCommand(
+                indigo_device_id=800, command="setColorTemp", args={"colorTempMireds": 426}))
+            h.bridge.device_updated(dev, self._ct_lamp(whiteTemperature=2500))    # clamped echo
+
+        assert mock_indigo_base.dimmer.setColorLevels.call_count == 3
+        ct_pushes = [call[2]["colorTempMireds"] for call in h.client.calls
+                    if call[0] == "set_state" and "colorTempMireds" in call[2]]
+        assert set(ct_pushes) == {426}, (
+            f"the clamped echo must never reach the wire once commanded, got {ct_pushes}")
+        assert h.bridge._pushed[800]["colorTempMireds"] == 426
+
+
 class TestColorModeCoherence:
     """Issue #282: the fix moves coherence for the node's colour-mode belief
     from a hardware write (zeroing the channel not in use) to the reporting

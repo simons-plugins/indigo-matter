@@ -201,6 +201,23 @@ HUE_TOLERANCE_DEGREES = 1
 #: you", which is exactly the truth here.
 SATURATION_HUE_FLOOR = 20
 
+#: Colour-temperature tolerance, in mireds, below which :meth:`ExportHandler.diff`
+#: treats a change as noise. This is **not** a jitter allowance — unlike hue, the
+#: in-range mireds→Kelvin→mireds round trip is near-exact (0-1 mired), so a
+#: colour-temperature echo does not wobble the way a converted hue does. It
+#: absorbs a PERMANENT one-sided clamp gap instead: live-measured on issue #281,
+#: Apple adaptive lighting wrote 426 mireds (≈2347K), the z2m lamp's own warm
+#: limit is 2500K (≈400 mireds), and the 26-mired gap between what was commanded
+#: and what the lamp can actually reach never closes — the echo re-asserts every
+#: ~3s, forever. :meth:`ExportBridge._apply_command` pushes the COMMANDED value
+#: optimistically after a successful dispatch (ADR-0013), and this tolerance is
+#: what stops the clamped echo from immediately overwriting that push again. 50
+#: covers the measured 26-mired gap with headroom while staying far below any
+#: deliberate user colour-temperature change — warm-to-cool spans 200+ mireds —
+#: at the bounded cost that a genuine Indigo-originated drift of up to 50 mireds
+#: from the last push is not reported until it accumulates past that.
+CT_TOLERANCE_MIREDS = 50
+
 #: Sentinel for "this key was absent before", which is a change, not a match.
 _MISSING = object()
 
@@ -600,6 +617,17 @@ class ExportHandler:
             return False
         return handler(dict(args or {}), dev, dict(options or {})) or True
 
+    def commanded_states(self, _command: str, _args: dict) -> dict:
+        """§4.2 states a SUCCESSFUL ``command`` entitles the caller to consider
+        pushed (ADR-0013). Empty for every command by default — the doctrine
+        (#143/#201) that the node reports only Indigo-confirmed truth stands;
+        a role overrides this only for a key where a permanent device-side
+        clamp makes the confirmed echo diverge from the commanded value
+        forever (issue #281). The caller (``ExportBridge._apply_command``)
+        folds the result into the pushed snapshot and pushes it to the node.
+        """
+        return {}
+
 
 class OnOffExport(ExportHandler):
     """``onOffPlugInUnit`` / ``onOffLight`` — the whole of the relay export."""
@@ -653,6 +681,7 @@ class ColorTemperatureLightExport(DimmableLightExport):
     """``colorTemperatureLight`` — adds ``colorTempMireds`` over Indigo's Kelvin."""
 
     role = export_catalog.ROLE_COLOR_TEMPERATURE_LIGHT
+    tolerances = {STATE_COLOR_TEMP_MIREDS: CT_TOLERANCE_MIREDS}
 
     def states_for(self, dev: Any, options: Optional[dict] = None) -> dict:
         states = super().states_for(dev, options)
@@ -664,6 +693,22 @@ class ColorTemperatureLightExport(DimmableLightExport):
 
     def commands(self) -> dict[str, Callable[[dict, Any, dict], Optional[str]]]:
         return {**super().commands(), COMMAND_SET_COLOR_TEMP: self._set_color_temp}
+
+    def commanded_states(self, command: str, args: dict) -> dict:
+        """ADR-0013 — after a SUCCESSFUL ``setColorTemp``, the pushed value is
+        exactly what we asked Indigo for: the identical clamp expression
+        :meth:`_set_color_temp` itself applies, deliberately kept in sync with
+        it. The fabric attribute converges to what the ecosystem wrote, so it
+        stops re-asserting; :data:`CT_TOLERANCE_MIREDS` keeps the device's own
+        clamped echo from undoing this push again. Inherited unchanged by
+        :class:`ExtendedColorLightExport`.
+        """
+        if command != COMMAND_SET_COLOR_TEMP:
+            return super().commanded_states(command, args)
+        mireds = args.get(STATE_COLOR_TEMP_MIREDS)
+        if not isinstance(mireds, (int, float)) or isinstance(mireds, bool) or not mireds:
+            return {}
+        return {STATE_COLOR_TEMP_MIREDS: int(_clamp(round(mireds), MIREDS_MIN, MIREDS_MAX))}
 
     @staticmethod
     def _set_color_temp(args: dict, dev: Any, _options: dict) -> Optional[str]:
@@ -766,7 +811,12 @@ class ExtendedColorLightExport(ColorTemperatureLightExport):
     """``extendedColorLight`` — adds ``hue``/``saturation`` over Indigo's RGB."""
 
     role = export_catalog.ROLE_EXTENDED_COLOR_LIGHT
-    tolerances = {STATE_HUE: HUE_TOLERANCE_DEGREES}
+    #: BOTH entries spelled out, deliberately — a subclass ``tolerances`` dict
+    #: REPLACES the parent's rather than merging with it, so inheriting just
+    #: ``STATE_HUE`` here would silently lose the colour-temperature tolerance
+    #: (or vice versa) the moment either changed.
+    tolerances = {STATE_HUE: HUE_TOLERANCE_DEGREES,
+                  STATE_COLOR_TEMP_MIREDS: CT_TOLERANCE_MIREDS}
 
     #: §4.2 keys this role alternates between depending on the device's colour
     #: mode — never published together (see :meth:`states_for`), so a switch

@@ -1610,6 +1610,9 @@ class ExportBridge:
             self._logger.debug(
                 "Matter bridge: %r dispatched to device %s (%s, id %s) with args %r",
                 command.command, getattr(dev, "name", ""), entry.role, device_id, command.args)
+            commanded = handler.commanded_states(command.command, command.args)
+            if commanded:
+                self._push_commanded(command, entry, handler, commanded)
 
     def _report_no_op(self, command: str, device_id: int, role: str, reason: str) -> None:
         """Say once when a command was accepted and lawfully changed nothing.
@@ -1675,6 +1678,43 @@ class ExportBridge:
         self._note_pushed(device_id, states, handler)
         self._fire(client.set_state(device_id, states),
                    f"corrective set_state dev {device_id}")
+
+    def _push_commanded(self, command, _entry, handler, commanded: dict) -> None:
+        """Push a SUCCESSFUL command's own values as the device's new state (F5,
+        ADR-0013).
+
+        Runs on the command worker, exactly like :meth:`_correct` — both are
+        called from :meth:`_apply_command`, after the blocking Indigo call has
+        already returned.
+
+        This is the deliberate, scoped exception to "the node reports only
+        Indigo-confirmed truth" (#143/#201): a device that permanently clamps
+        a commanded colour temperature echoes a value the ecosystem never
+        wrote, and the pair loops forever — issue #281, Apple adaptive
+        lighting re-asserting on a ~3s cadence across seven lights in one
+        evening. Pushing the commanded, plugin-clamped value converges the
+        fabric attribute to what was actually asked for; the handler's own
+        tolerance (:data:`export_handlers.CT_TOLERANCE_MIREDS`) is what stops
+        the device's next, contradicting echo from reopening the gap.
+
+        If the client is not live, nothing is noted either — same as every
+        other push in this file. The next ``attach`` reseeds the snapshot from
+        device truth, and the next real ecosystem write reconverges on its
+        own; nothing here needs to retry (self-healing, per ADR-0013).
+
+        Passing ``handler`` through to :meth:`_note_pushed` is load-bearing,
+        not incidental: it is what evicts a mode-alternating sibling
+        (:data:`export_handlers.ExportHandler.mode_alternating_keys`) rather
+        than leaving it stale in the snapshot — the #282 trap (b) this file
+        already guards against on every other push.
+        """
+        device_id = command.indigo_device_id
+        client = self._live_client("the commanded-state push", device_id)
+        if client is None:
+            return
+        self._note_pushed(device_id, commanded, handler)
+        self._fire(client.set_state(device_id, commanded),
+                   f"commanded set_state dev {device_id}")
 
     # ------------------------------------------------------------------
     # Client callbacks
