@@ -589,16 +589,35 @@ def parse_hello(frame: Any) -> Hello:
     )
 
 
-def parse_fabrics(data: Any) -> list:
-    """Normalise a list of §4.3 ``FabricInfo`` objects."""
-    return [
-        FabricInfo(
+def _parse_fabric(item: Any) -> Optional[FabricInfo]:
+    """One §4.3 fabric, tolerantly — ``None`` for anything malformed.
+
+    A single bad entry (not a dict, a missing ``fabricIndex``, a JSON
+    ``null``, a field that will not ``int()``) must degrade the ``fabrics``
+    LIST, not detonate the whole ``StatusReport`` (issue #288 review finding
+    D, the same reasoning :func:`_parse_churn_peer` documents for
+    ``peers``): an exception escaping here used to fail the entire status
+    poll — and, on the attach path, the attach itself — over one fabric
+    entry, which since issue #288 is load-bearing for the per-fabric slot
+    plan, not merely descriptive.
+    """
+    if not isinstance(item, dict):
+        return None
+    try:
+        return FabricInfo(
             fabric_index=int(item[ARG_FABRIC_INDEX]),
-            label=str(item.get("label", "")),
+            label=str(item.get("label", "") or ""),
             vendor_id=int(item.get("vendorId", 0)),
         )
-        for item in (data or [])
-    ]
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def parse_fabrics(data: Any) -> list:
+    """Normalise a list of §4.3 ``FabricInfo`` objects. Tolerant per-entry —
+    see :func:`_parse_fabric`."""
+    return [fabric for fabric in (_parse_fabric(item) for item in (data or []))
+            if fabric is not None]
 
 
 def parse_status(result: Any) -> StatusReport:

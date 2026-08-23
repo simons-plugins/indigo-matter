@@ -1448,7 +1448,16 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, ServerMenuMixin,
         try:
             dev.stateListOrDisplayStateIdChanged()
         except Exception as exc:  # noqa: BLE001 - refresh failure must not block startComm
-            self.logger.debug("state list refresh failed for %s: %s", dev.id, exc)
+            # WARNING, not debug (issue #288 review finding E): since #288 a
+            # failure here can mean ten of matterBridgeHealth's twelve states
+            # are missing — Indigo silently discards a write to an undeclared
+            # key, so the shared `_write_health_state` call stalls (including
+            # `subscriptionHealth` itself) until the device is next restarted
+            # cleanly. That is not a fact a user should only learn from a
+            # debug log they were not tailing.
+            self.logger.warning(
+                "could not refresh device %s's state list (%s) — any states added by a "
+                "plugin upgrade will be missing until this device restarts cleanly", dev.id, exc)
         # Backstop for type edits made while the plugin was not running (the
         # validateDeviceConfigUi guard can't fire then) — issue #58.
         created = dev.pluginProps.get("createdTypeId", "")

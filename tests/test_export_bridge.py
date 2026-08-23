@@ -87,6 +87,13 @@ class Harness:
         #: Return ``None`` without raising — the "factory is silently a
         #: no-op" case (review finding 5).
         self.health_device_return_none = False
+        #: How many times the find-only seam was actually CALLED (issue #288
+        #: review finding C's pin: the throttled unchecked path must scan at
+        #: most once per session).
+        self.health_device_finder_calls = 0
+        #: Raise this instead of answering, for the "a read failure must not
+        #: propagate out of health_tick" pin (review finding C).
+        self.health_device_finder_raises: Exception | None = None
         self.bridge = module.ExportBridge(
             self.store, self.runtime, mock_logger, lambda: self.prefs,
             plugin_version="2026.7.28", plugin_id=OURS,
@@ -110,6 +117,9 @@ class Harness:
     def _find_health_device(self):
         """The find-only seam — NEVER creates. Only ever answers with a
         device this harness already knows about (review finding 1)."""
+        self.health_device_finder_calls += 1
+        if self.health_device_finder_raises is not None:
+            raise self.health_device_finder_raises
         return self.health_devices[0] if self.health_devices else None
 
     def _create_health_device(self):
@@ -2779,11 +2789,22 @@ class TestFabricSlots:
     a gap (Simon's explicit design call, issue #288).
     """
 
-    FABRIC_1 = {"fabricIndex": 1, "label": "Apple Home", "vendorId": 4937}
-    FABRIC_2 = {"fabricIndex": 2, "label": "Amazon Alexa", "vendorId": 4442}
+    #: Real DCL vendor ids (`export_bridge.VENDOR_NAMES`) with EMPTY labels —
+    #: issue #288 review finding A: Apple/Alexa/Google never call
+    #: `UpdateFabricLabel`, so a real fabric's label is blank on Simon's own
+    #: rig, and slot names must be built vendor-first or every slot would
+    #: read "fabric 1 / fabric 8 / fabric 9". `test_a_labelled_fabric_gets_
+    #: the_vendor_prefixed_suffix` pins the one case a label DOES show up.
+    APPLE = {"fabricIndex": 1, "label": "", "vendorId": 0x1349}
+    ALEXA = {"fabricIndex": 2, "label": "", "vendorId": 0x1217}
 
-    def _churn(self, peers=()):
-        return {"checked": True, "active": bool(peers), "peers": list(peers)}
+    def _churn(self, peers=(), active=None):
+        """``active`` defaults to ``bool(peers)`` but is overridable — issue
+        #288 review finding B needs an ACTIVE verdict whose peers name no
+        connected fabric at all, which ``bool(peers)`` alone cannot build
+        once ``peers`` itself is empty."""
+        return {"checked": True, "active": bool(peers) if active is None else active,
+                "peers": list(peers)}
 
     def _peer(self, fabric_index):
         return {"peerNodeId": "41869fbd537ef01", "fabricIndex": fabric_index, "liveSessions": 5,
@@ -2811,7 +2832,7 @@ class TestFabricSlots:
             self, bridge_mod, mock_logger, devices):
         h = self._harness(bridge_mod, mock_logger, devices)
         h.bridge._on_attached(
-            self._status([self.FABRIC_1, self.FABRIC_2], self._churn()), False)
+            self._status([self.APPLE, self.ALEXA], self._churn()), False)
         dev = h.health_devices[0]
         assert dev.states["fabric1Name"] == "Apple Home"
         assert dev.states["fabric1Health"] == "healthy"
@@ -2821,29 +2842,91 @@ class TestFabricSlots:
             assert dev.states[f"fabric{slot}Name"] == ""
             assert dev.states[f"fabric{slot}Health"] == ""
 
-    def test_a_fabric_with_no_label_falls_back_to_its_index(
+    def test_a_fabric_with_no_vendor_or_label_falls_back_to_its_index(
             self, bridge_mod, mock_logger, devices):
         h = self._harness(bridge_mod, mock_logger, devices)
         h.bridge._on_attached(
             self._status([{"fabricIndex": 7, "label": "", "vendorId": 0}], self._churn()), False)
         assert h.health_devices[0].states["fabric1Name"] == "fabric 7"
 
+    def test_an_unrecognised_vendor_falls_back_to_the_hex_form(
+            self, bridge_mod, mock_logger, devices):
+        """review finding A: ``vendor 0x%04X``, not a bare (and blank) label —
+        the only thing that can distinguish two unrecognised-vendor fabrics
+        from each other when both leave the label empty, as real ones do."""
+        h = self._harness(bridge_mod, mock_logger, devices)
+        h.bridge._on_attached(
+            self._status([{"fabricIndex": 3, "label": "", "vendorId": 0x9999}],
+                         self._churn()), False)
+        assert h.health_devices[0].states["fabric1Name"] == "vendor 0x9999"
+
+    def test_a_labelled_fabric_gets_the_vendor_prefixed_suffix(
+            self, bridge_mod, mock_logger, devices):
+        """review finding A: vendor FIRST, the label appended only as a
+        suffix — never the label alone, which two Apple fabrics with the
+        same blank label could never tell apart."""
+        h = self._harness(bridge_mod, mock_logger, devices)
+        labelled = {"fabricIndex": 1, "label": "Simon's House", "vendorId": 0x1349}
+        h.bridge._on_attached(self._status([labelled], self._churn()), False)
+        assert h.health_devices[0].states["fabric1Name"] == "Apple Home — Simon's House"
+
     def test_churn_on_one_fabric_flips_only_that_slots_health(
             self, bridge_mod, mock_logger, devices):
         h = self._harness(bridge_mod, mock_logger, devices)
         churn = self._churn([self._peer(2)])   # fabric 2 (Alexa) churning
-        h.bridge._on_attached(self._status([self.FABRIC_1, self.FABRIC_2], churn), False)
+        h.bridge._on_attached(self._status([self.APPLE, self.ALEXA], churn), False)
         dev = h.health_devices[0]
         assert dev.states["subscriptionHealth"] == "churning"
         assert dev.states["fabric1Health"] == "healthy"
         assert dev.states["fabric2Health"] == "churning"
 
+    def test_unattributable_active_churn_marks_fitted_slots_unknown_not_healthy(
+            self, bridge_mod, mock_logger, devices):
+        """review finding B: an ACTIVE verdict whose only peer names a
+        fabric_index that is not one of the connected (FITTED) fabrics must
+        not assert "healthy" on slots it never actually cleared — the
+        churn is real, only its attribution is missing."""
+        h = self._harness(bridge_mod, mock_logger, devices)
+        churn = self._churn([self._peer(99)])   # fabric 99 is not connected at all
+        h.bridge._on_attached(self._status([self.APPLE, self.ALEXA], churn), False)
+        dev = h.health_devices[0]
+        assert dev.states["subscriptionHealth"] == "churning"
+        assert dev.states["fabric1Health"] == "unknown"
+        assert dev.states["fabric2Health"] == "unknown"
+        assert dev.states["fabric1Health"] != "healthy"
+
+    def test_active_with_no_peers_at_all_marks_fitted_slots_unknown(
+            self, bridge_mod, mock_logger, devices):
+        """review finding B: `active=True` with an EMPTY peers list — every
+        entry was malformed and dropped by `_parse_churn_peer` — is the
+        other unattributable shape `bool(peers)` alone cannot construct."""
+        h = self._harness(bridge_mod, mock_logger, devices)
+        churn = self._churn([], active=True)
+        h.bridge._on_attached(self._status([self.APPLE, self.ALEXA], churn), False)
+        dev = h.health_devices[0]
+        assert dev.states["fabric1Health"] == "unknown"
+        assert dev.states["fabric2Health"] == "unknown"
+
+    def test_unattributable_churn_on_a_dropped_sixth_fabric_also_demotes(
+            self, bridge_mod, mock_logger, devices):
+        """review finding B: a churning peer whose fabric is the 6th
+        (DROPPED, not fitted into any slot) is exactly as unattributable to
+        a VISIBLE slot as a garbage index — same demotion."""
+        six = [{"fabricIndex": i, "label": "", "vendorId": 0x9990 + i} for i in range(1, 7)]
+        churn = self._churn([self._peer(6)])   # the dropped fabric is the one churning
+        h = self._harness(bridge_mod, mock_logger, devices)
+        h.bridge._on_attached(self._status(six, churn), False)
+        dev = h.health_devices[0]
+        assert dev.states["subscriptionHealth"] == "churning"
+        for slot in range(1, 6):
+            assert dev.states[f"fabric{slot}Health"] == "unknown"
+
     def test_unchecked_verdict_marks_occupied_slots_unknown_never_healthy(
             self, bridge_mod, mock_logger, devices):
         h = self._harness(bridge_mod, mock_logger, devices)
         h.bridge._on_attached(
-            self._status([self.FABRIC_1, self.FABRIC_2], self._churn()), False)  # both healthy
-        h.bridge._on_attached(self._status(churn=None), False)                   # old-node status now
+            self._status([self.APPLE, self.ALEXA], self._churn()), False)  # both healthy
+        h.bridge._on_attached(self._status(churn=None), False)             # old-node status now
 
         dev = h.health_devices[0]
         assert dev.states["fabric1Health"] == "unknown"
@@ -2857,17 +2940,40 @@ class TestFabricSlots:
             self, bridge_mod, mock_logger, devices):
         h = self._harness(bridge_mod, mock_logger, devices)
         h.bridge._on_attached(
-            self._status([self.FABRIC_1, self.FABRIC_2], self._churn()), False)
-        h.bridge._on_attached(self._status([self.FABRIC_1], self._churn()), False)  # fabric 2 left
+            self._status([self.APPLE, self.ALEXA], self._churn()), False)
+        h.bridge._on_attached(self._status([self.APPLE], self._churn()), False)  # Alexa left
 
         dev = h.health_devices[0]
         assert dev.states["fabric1Name"] == "Apple Home"
         assert dev.states["fabric2Name"] == ""
         assert dev.states["fabric2Health"] == ""
 
+    def test_a_fabric_leaving_pulls_the_survivor_into_slot_one(
+            self, bridge_mod, mock_logger, devices):
+        """review finding F.1 — the sticky-slot mutant: slot 1 must become
+        whichever fabric is now lowest by index, not stay whatever happened
+        to occupy slot 1 before."""
+        h = self._harness(bridge_mod, mock_logger, devices)
+        h.bridge._on_attached(self._status([self.APPLE, self.ALEXA], self._churn()), False)
+        h.bridge._on_attached(self._status([self.ALEXA], self._churn()), False)  # Apple left
+
+        dev = h.health_devices[0]
+        assert dev.states["fabric1Name"] == "Amazon Alexa"
+        assert dev.states["fabric2Name"] == ""
+
+    def test_fabrics_are_packed_by_index_not_by_arrival_order(
+            self, bridge_mod, mock_logger, devices):
+        """review finding F.2 — kills deleting the `sorted()` call: fed as
+        [Alexa (index 2), Apple (index 1)], slot 1 must still be Apple."""
+        h = self._harness(bridge_mod, mock_logger, devices)
+        h.bridge._on_attached(self._status([self.ALEXA, self.APPLE], self._churn()), False)
+        dev = h.health_devices[0]
+        assert dev.states["fabric1Name"] == "Apple Home"
+        assert dev.states["fabric2Name"] == "Amazon Alexa"
+
     def test_six_fabrics_fill_five_and_warn_once_naming_the_dropped_one(
             self, bridge_mod, mock_logger, devices):
-        fabrics = [{"fabricIndex": i, "label": f"Ecosystem {i}", "vendorId": 1}
+        fabrics = [{"fabricIndex": i, "label": "", "vendorId": 0x9990 + i}
                    for i in range(1, 7)]
         h = self._attached(bridge_mod, mock_logger, devices)
         h.client.status = self._status(fabrics, self._churn())
@@ -2876,8 +2982,8 @@ class TestFabricSlots:
 
         dev = h.health_devices[0]
         for slot in range(1, 6):
-            assert dev.states[f"fabric{slot}Name"] == f"Ecosystem {slot}"
-        assert "Ecosystem 6" in warnings_of(mock_logger)
+            assert dev.states[f"fabric{slot}Name"] == f"vendor 0x{0x9990 + slot:04X}"
+        assert f"vendor 0x{0x9990 + 6:04X}" in warnings_of(mock_logger)
         said = len(mock_logger.warning.call_args_list)
 
         h.bridge.health_tick()   # the same six fabrics again -- must not re-log
@@ -2886,7 +2992,7 @@ class TestFabricSlots:
 
     def test_dropped_fabrics_warning_clears_once_the_overflow_ends(
             self, bridge_mod, mock_logger, devices):
-        six = [{"fabricIndex": i, "label": f"Ecosystem {i}", "vendorId": 1} for i in range(1, 7)]
+        six = [{"fabricIndex": i, "label": "", "vendorId": 0x9990 + i} for i in range(1, 7)]
         h = self._attached(bridge_mod, mock_logger, devices)
         h.client.status = self._status(six, self._churn())
         h.bridge.health_tick()
@@ -2899,6 +3005,25 @@ class TestFabricSlots:
 
         assert len(mock_logger.warning.call_args_list) == said + 1, \
             "a cleared-then-recurring overflow is news again"
+
+    def test_overflow_set_changing_without_ever_emptying_still_re_warns(
+            self, bridge_mod, mock_logger, devices):
+        """review finding F.5 — {6} -> {7} (fabric 6 leaves, fabric 7 takes
+        its place; the COUNT of connected fabrics never dips below six) must
+        still be news: kills weakening "did the DROPPED SET change" down to
+        a mere "is something dropped" check."""
+        base = [{"fabricIndex": i, "label": "", "vendorId": 0x9990 + i} for i in range(1, 7)]
+        h = self._attached(bridge_mod, mock_logger, devices)
+        h.client.status = self._status(base, self._churn())
+        h.bridge.health_tick()
+        said = len(mock_logger.warning.call_args_list)
+
+        swapped = base[:5] + [{"fabricIndex": 7, "label": "", "vendorId": 0x9999}]
+        h.client.status = self._status(swapped, self._churn())
+        h.bridge.health_tick()
+
+        assert len(mock_logger.warning.call_args_list) == said + 1
+        assert "vendor 0x9999" in warnings_of(mock_logger)
 
     def test_a_restart_with_persisted_slot_states_resets_healths_keeps_names(
             self, bridge_mod, mock_logger, devices):
@@ -2927,11 +3052,107 @@ class TestFabricSlots:
     def test_standing_slot_state_across_five_ticks_writes_once(
             self, bridge_mod, mock_logger, devices):
         h = self._attached(bridge_mod, mock_logger, devices)
-        h.client.status = self._status([self.FABRIC_1, self.FABRIC_2], self._churn())
+        h.client.status = self._status([self.APPLE, self.ALEXA], self._churn())
         for _ in range(5):
             h.bridge.health_tick()
         dev = h.health_devices[0]
         assert len(dev.writes) == 1, "a standing slot plan must not be rewritten every ~15s tick"
+
+    def test_standing_unchecked_verdict_across_five_ticks_writes_once(
+            self, bridge_mod, mock_logger, devices):
+        """review finding F.4 — the UNCHECKED branch's own no-change gate,
+        pinned on its own rather than only alongside a CHECKED write."""
+        h = self._attached(bridge_mod, mock_logger, devices)
+        h.client.status = self._status([self.APPLE, self.ALEXA], self._churn())
+        h.bridge.health_tick()          # healthy, device created (write 1)
+        dev = h.health_devices[0]
+        h.client.halted = True
+        h.bridge.health_tick()          # flips to unknown (write 2)
+        writes_so_far = len(dev.writes)
+
+        for _ in range(5):
+            h.bridge.health_tick()      # standing halted/unknown
+
+        assert len(dev.writes) == writes_so_far, \
+            "a standing UNCHECKED verdict must not be rewritten every ~15s tick"
+
+
+class TestFabricSlotFinderThrottle:
+    """§4.3 issue #288 review finding C.
+
+    Contract implemented: the UNCHECKED branch resolves the health device
+    through `_find_health_device_for_unknown`, which (1) uses the cheap
+    cached-id `device_getter` round trip whenever `_health_device_id` is
+    already known: (2) otherwise performs the full
+    `indigo.devices.iter("self")` scan AT MOST ONCE PER PLUGIN SESSION —
+    exactly the one scan issue #286's restart-reconcile needs — and
+    remembers the answer via `_health_reconcile_scanned`, found or not, so a
+    bridge that never attaches does not pay a fresh scan on every ~15s
+    watchdog tick forever; and (3) every Indigo read the branch makes (that
+    resolution AND the device's own `.states`) is inside ONE try/except in
+    `_apply_subscription_churn`, latched via `_health_read_warned`, so a read
+    failure degrades — logged once — instead of propagating out of
+    `health_tick` on the watchdog thread. A CHECKED verdict's own
+    `_ensure_health_device` (via the unthrottled `_find_health_device`) is
+    NOT gated by any of this — it may still scan/create on every call.
+    """
+
+    def _harness(self, bridge_mod, mock_logger, devices) -> Harness:
+        return Harness(bridge_mod, mock_logger, devices, [ExportEntry(101, "onOffLight")])
+
+    def test_five_no_device_unchecked_ticks_perform_exactly_one_finder_scan(
+            self, bridge_mod, mock_logger, devices):
+        h = self._harness(bridge_mod, mock_logger, devices)
+        for _ in range(5):
+            h.bridge.health_tick()      # self.client is None every time
+        assert h.health_device_finder_calls == 1
+        assert h.health_devices == []
+
+    def test_a_raising_device_read_warns_once_and_does_not_propagate(
+            self, bridge_mod, mock_logger, devices):
+        h = self._harness(bridge_mod, mock_logger, devices)
+        h.health_device_finder_raises = ConnectionError("IndigoServer went away")
+
+        h.bridge.health_tick()          # must not raise
+        h.bridge.health_tick()          # must not raise, and not re-warn
+
+        assert "could not read the bridge health device" in warnings_of(mock_logger)
+        said = [call for call in mock_logger.warning.call_args_list
+                if "could not read the bridge health device" in str(call.args[0])]
+        assert len(said) == 1
+
+    def test_the_no_device_sentinel_is_distinct_from_a_real_all_vacant_device(
+            self, bridge_mod, mock_logger, devices):
+        """review finding F.3 — pins that the internal
+        `(unknown, "", None, None)` "no device at all" sentinel is never
+        confused with a real device's genuinely all-vacant state. Once the
+        one scan this session finds nothing, a device that appears
+        afterwards (out of band) is not looked for again by this throttled
+        path — only a later CHECKED verdict would find it — so it must be
+        left completely untouched, not silently treated as already handled.
+        """
+        h = self._harness(bridge_mod, mock_logger, devices)
+
+        h.bridge.health_tick()          # no client at all -- the one scan, finds nothing
+        assert h.bridge._health_state == (bridge_mod.HEALTH_UNKNOWN, "", None, None)
+        assert h.health_devices == []
+
+        # A device now exists (out of band) -- persisted "healthy", vacant slots.
+        late = FakeHealthDevice(9700)
+        late.states["subscriptionHealth"] = "healthy"
+        late.states["churnDetail"] = ""
+        for slot in range(1, 6):
+            late.states[f"fabric{slot}Name"] = ""
+            late.states[f"fabric{slot}Health"] = ""
+        h.health_devices.append(late)
+
+        h.bridge.health_tick()          # the one-scan throttle means this is NOT found
+
+        assert h.bridge._health_state == (bridge_mod.HEALTH_UNKNOWN, "", None, None), (
+            "the sentinel must not be confused with (or replaced by) a real all-vacant reading")
+        assert late.writes == [], "an out-of-band device the throttled path never found stays untouched"
+        assert late.states["subscriptionHealth"] == "healthy", "left exactly as found -- not corrected"
+
 
 
 class TestStalePersistedHealthAcrossARestart:
