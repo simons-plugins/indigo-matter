@@ -89,7 +89,29 @@ from matter_handlers.color_control import kelvin_to_mireds, mireds_to_kelvin
 #: injected, so the one line they need to say goes to the module logger — the
 #: same posture ``export_catalog`` takes. It is debug-only by design: everything
 #: a user must act on is logged by ``export_bridge``, which knows the device.
+#:
+#: ``DoorLockExport`` is the one exception on both counts (issue #289 review
+#: findings 2/3): it is not stateless — it holds a per-device relay-fallback
+#: latch — and its fallback notice IS something a user must act on (it names
+#: a device that cannot actually be locked/unlocked the way its export
+#: implies). ``_LOG`` reaches no handler in production — live-verified:
+#: root at WARNING with no handlers installed, so ``isEnabledFor(INFO)`` is
+#: ``False`` and an INFO line through it is discarded before any handler ever
+#: sees it (a WARNING-or-above line at least reaches the interpreter's
+#: last-resort stderr handler, which is the only reason the other lines in
+#: this module have ever appeared to work). ``DoorLockExport`` therefore logs
+#: through :data:`_PLUGIN_LOG` instead — see its own comment.
 _LOG = logging.getLogger(__name__)
+
+#: The real plugin logger (Indigo SDK reference, "Logging from Another Class
+#: or Submodule": ``self.logger``/``self.indigo_log_handler`` is always
+#: ``logging.getLogger("Plugin")`` — the SDK's own documented way for a
+#: submodule to reach the SAME Event Log handler ``self.logger`` uses,
+#: without ``export_bridge`` threading a logger argument through every
+#: handler for the sake of one line). Reserved for ``DoorLockExport``'s
+#: relay-fallback notice (issue #289 review finding 2) — nothing else in
+#: this module needs to reach a user this way.
+_PLUGIN_LOG = logging.getLogger("Plugin")
 
 # --------------------------------------------------------------------------
 # §4.2 state keys and command names. Spelled once here; the zoo test pins each
@@ -959,32 +981,67 @@ class DoorLockExport(ExportHandler):
 
         ``indigo.device.lock``/``unlock`` only work for a device whose
         ``pluginProps["IsLockSubType"]`` is set (Indigo SDK, `Lock`/`Unlock`)
-        — the owning plugin's declaration, checked statically here rather
+        — the OWNING plugin's declaration, checked statically here rather
         than by catching IndigoServer's ``TypeError``, so a real lock's
         command NEVER silently becomes the relay path even if ``lock``/
-        ``unlock`` itself were to fail for some other reason. For anything
-        else — a plain relay, exactly the shape :meth:`states_for` already
-        reads ``onState`` from and reports as the bolt — this used to just
-        refuse forever: the refusal comment here argued a ``turnOn``
-        fallback would drive "a path with no lock semantics", but
-        ``states_for`` was already treating that relay's ``onState`` AS the
-        lock semantics. Trusting the state direction while refusing the
-        command direction was the actual inconsistency (issue #289); the
-        node side already relies on this exact polarity
-        (``matter_handlers/door_lock.py``, ``bridge-node``'s
+        ``unlock`` itself were to fail for some other reason.
+
+        **The namespace trap (issue #289 review finding 1 — this exact
+        mistake shipped once).** ``dev.pluginProps`` is the CALLING script's
+        own slot in the device's per-plugin props map, not the owning
+        plugin's — live-probed on jarvis: a native Z-Wave relay showed
+        ``pluginProps={}`` from here while ``ownerProps`` carried its real
+        61 props (Indigo SDK, "Generating a Dictionary for a Device":
+        ``globalProps`` is keyed by owning plugin id, ``pluginProps`` is
+        this script's own entry in it, ``ownerProps`` is the flat
+        convenience view of the OWNER's entry regardless of who is asking).
+        Since :func:`export_catalog.classify` structurally excludes
+        self-owned devices (the loop guard), every device this handler ever
+        sees is owned by someone else — so reading ``pluginProps`` here
+        would read ``IsLockSubType`` as unset for literally every exportable
+        device, including real Z-Wave/Yale locks, misrouting them all to the
+        relay fallback. ``ownerProps`` (falling back to
+        ``globalProps[dev.pluginId]`` for anything that predates it) is the
+        only read that can ever come back populated.
+
+        For anything that is not a lock sub-type — a plain relay, exactly
+        the shape :meth:`states_for` already reads ``onState`` from and
+        reports as the bolt — this used to just refuse forever: the refusal
+        comment here argued a ``turnOn`` fallback would drive "a path with
+        no lock semantics", but ``states_for`` was already treating that
+        relay's ``onState`` AS the lock semantics. Trusting the state
+        direction while refusing the command direction was the actual
+        inconsistency (issue #289); the node side already relies on this
+        exact polarity (``matter_handlers/door_lock.py``, ``bridge-node``'s
         ``IndigoDoorLockServer``), so driving it here is not a new
         assumption, only the missing half of one already made. A device
         that genuinely cannot be driven (``turnOn``/``turnOff`` itself
         raises) still fails loudly through :meth:`ExportBridge._apply_command`'s
         existing error path — nothing here swallows that.
+
+        **Residual risk, unverified**: no lock was paired on jarvis to
+        confirm a real Z-Wave/Yale lock's ``ownerProps`` actually carries
+        ``IsLockSubType`` for its OWNING plugin the way the dictionary
+        reference shows for a plain Z-Wave relay. If some plugin's lock
+        device does not set it there, this degrades to the relay fallback —
+        which historically is exactly how such locks were driven before
+        ``IsLockSubType`` existed — and the notice below is what makes that
+        visible instead of silent.
         """
-        is_lock = bool((getattr(dev, "pluginProps", None) or {}).get("IsLockSubType"))
+        props = (getattr(dev, "ownerProps", None)
+                or (getattr(dev, "globalProps", None) or {}).get(getattr(dev, "pluginId", ""), {})
+                or {})
+        is_lock = bool(props.get("IsLockSubType"))
         if is_lock:
             (indigo.device.lock if locked else indigo.device.unlock)(dev)
             return
         if dev.id not in self._relay_fallback_logged:
             self._relay_fallback_logged.add(dev.id)
-            _LOG.info(
+            # `_PLUGIN_LOG`, not `_LOG` — see the module header. This line is
+            # exactly the kind `_LOG` was built for (debug-only, no user
+            # needs it) EXCEPT that a user does need it: it names a device
+            # whose export cannot work the way its role implies.
+            _PLUGIN_LOG.info(
                 "Matter bridge: device %s (%s) is exported as doorLock but is not a lock "
                 "sub-type — driving its lock/unlock commands as the relay it actually is "
                 "(turnOn=locked, turnOff=unlocked, matching states_for's own polarity).",

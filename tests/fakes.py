@@ -370,6 +370,15 @@ class FakeIndigoDevice:
         self.enabled = attrs.pop("enabled", True)
         self.configured = attrs.pop("configured", True)
         self.pluginProps = dict(attrs.pop("pluginProps", None) or {})
+        # Real Indigo always carries this too — it is the OWNER's props
+        # (Indigo SDK, "Generating a Dictionary for a Device"), unlike
+        # `pluginProps` above, which is the CALLING script's own (usually
+        # empty) slot in the device's per-plugin props map. issue #289
+        # review finding 1: reading `pluginProps` for a capability an owning
+        # plugin declares (e.g. `IsLockSubType`) is the namespace trap that
+        # shipped once — `ownerProps` is the one that is ever populated for
+        # a device this plugin does not itself own.
+        self.ownerProps = dict(attrs.pop("ownerProps", None) or {})
         self.deviceTypeId = attrs.pop("deviceTypeId", "")
         self.displayStateValUi = attrs.pop("displayStateValUi", "")
         self.model = attrs.pop("model", "")

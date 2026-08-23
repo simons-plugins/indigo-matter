@@ -813,17 +813,39 @@ class TestDoorLock:
         assert self._handler(handlers).states_for(RelayDevice(1, "Door", onState=None)) == {}
 
     def test_lock_dispatches_the_indigo_lock_command(self, handlers, mock_indigo_base):
-        """A true lock sub-type device (``IsLockSubType``) uses the real
-        ``indigo.device.lock``/``unlock`` path (issue #289: this must NOT
-        change for a device that actually has lock semantics)."""
-        dev = RelayDevice(1, "Door", onState=False, pluginProps={"IsLockSubType": True})
+        """A true lock sub-type device (``ownerProps["IsLockSubType"]`` — the
+        OWNING plugin's declaration, issue #289 review finding 1) uses the
+        real ``indigo.device.lock``/``unlock`` path (issue #289: this must
+        NOT change for a device that actually has lock semantics)."""
+        dev = RelayDevice(1, "Door", onState=False, ownerProps={"IsLockSubType": True})
         self._handler(handlers).dispatch("lock", {}, dev)
         mock_indigo_base.device.lock.assert_called_once_with(dev)
 
     def test_unlock_dispatches_the_indigo_unlock_command(self, handlers, mock_indigo_base):
-        dev = RelayDevice(1, "Door", onState=True, pluginProps={"IsLockSubType": True})
+        dev = RelayDevice(1, "Door", onState=True, ownerProps={"IsLockSubType": True})
         self._handler(handlers).dispatch("unlock", {}, dev)
         mock_indigo_base.device.unlock.assert_called_once_with(dev)
+
+    def test_pluginProps_is_the_namespace_trap_not_the_discriminator(
+            self, handlers, mock_indigo_base):
+        """issue #289 review finding 1 — the regression pin.
+
+        ``dev.pluginProps`` is the CALLING script's own (structurally always
+        empty, since ``export_catalog`` excludes self-owned devices) slot in
+        the device's per-plugin props map, not the OWNING plugin's. A device
+        that happens to carry ``IsLockSubType`` under ``pluginProps`` (e.g. a
+        stale/malformed fixture, or a future caller-side prop of the same
+        name) but nothing under ``ownerProps`` must still take the relay
+        path — reading ``pluginProps`` here is exactly the mistake that
+        shipped once and misrouted every real lock to ``turnOn``/``turnOff``.
+        """
+        dev = RelayDevice(1, "Door", onState=False, pluginProps={"IsLockSubType": True})
+        assert dev.ownerProps == {}   # the fixture default — nothing under the OWNER's props
+
+        self._handler(handlers).dispatch("lock", {}, dev)
+
+        mock_indigo_base.device.turnOn.assert_called_once_with(dev)
+        mock_indigo_base.device.lock.assert_not_called()
 
     def test_a_lock_sub_type_device_never_reaches_the_relay_fallback(
             self, handlers, mock_indigo_base):
@@ -837,7 +859,7 @@ class TestDoorLock:
             "the relay fallback must be unreachable for a lock sub-type device")
         mock_indigo_base.device.turnOff.side_effect = AssertionError(
             "the relay fallback must be unreachable for a lock sub-type device")
-        dev = RelayDevice(1, "Door", onState=False, pluginProps={"IsLockSubType": True})
+        dev = RelayDevice(1, "Door", onState=False, ownerProps={"IsLockSubType": True})
 
         self._handler(handlers).dispatch("lock", {}, dev)
         mock_indigo_base.device.lock.assert_called_once_with(dev)
@@ -892,25 +914,44 @@ class TestDoorLock:
 
     def test_the_relay_fallback_notice_is_said_once_per_device(self, handlers, caplog):
         """A WORKING fallback is not a fault — one INFO line per device, not
-        one per command."""
+        one per command. issue #289 review finding 2: this notice must
+        reach the REAL plugin logger (``logging.getLogger("Plugin")``, the
+        one ``self.logger``/the Indigo Event Log actually use) — asserting
+        the record's logger ``name`` pins that this test is exercising the
+        path production does, not merely a caplog-only coincidence.
+        """
         dev = RelayDevice(1, "Gate Lock", onState=False)
         with caplog.at_level("INFO"):
             self._handler(handlers).dispatch("lock", {}, dev)
             self._handler(handlers).dispatch("unlock", {}, dev)
         infos = [r for r in caplog.records if r.levelname == "INFO"]
         assert len(infos) == 1
-        assert "1" in infos[0].message and "Gate Lock" in infos[0].message
+        assert infos[0].name == "Plugin"
+        assert "Gate Lock" in infos[0].message
+
+    def test_the_relay_fallback_latch_is_keyed_per_device_not_globally(
+            self, handlers, caplog):
+        """issue #289 review finding 3 — the ONE-device version of this test
+        cannot distinguish a per-device latch from a global one; a second,
+        DIFFERENT device must still get its own notice."""
+        with caplog.at_level("INFO"):
+            self._handler(handlers).dispatch("lock", {}, RelayDevice(1, "Gate Lock", onState=False))
+            self._handler(handlers).dispatch("lock", {}, RelayDevice(2, "Side Door", onState=False))
+        infos = [r for r in caplog.records if r.levelname == "INFO"]
+        assert len(infos) == 2
+        assert any("Gate Lock" in r.message for r in infos)
+        assert any("Side Door" in r.message for r in infos)
 
     def test_the_relay_fallback_notice_does_not_fire_for_a_true_lock(
             self, handlers, caplog):
-        dev = RelayDevice(1, "Door", onState=False, pluginProps={"IsLockSubType": True})
+        dev = RelayDevice(1, "Door", onState=False, ownerProps={"IsLockSubType": True})
         with caplog.at_level("INFO"):
             self._handler(handlers).dispatch("lock", {}, dev)
         assert [r for r in caplog.records if r.levelname == "INFO"] == []
 
     def test_dispatch_confirms_nothing(self, handlers, mock_indigo_base):
         """No state write, no read-back, no synthesised confirmation."""
-        dev = RelayDevice(1, "Door", onState=False, pluginProps={"IsLockSubType": True})
+        dev = RelayDevice(1, "Door", onState=False, ownerProps={"IsLockSubType": True})
         self._handler(handlers).dispatch("lock", {}, dev)
         assert dev.onState is False, "the handler wrote the state it was hoping for"
         mock_indigo_base.device.statusRequest.assert_not_called()

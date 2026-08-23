@@ -11,9 +11,10 @@ current version is `Info.plist`'s `PluginVersion`.
   reverted** (issue #289). The export already read that relay's on/off state
   as the lock's bolt position; commands now drive the same relay the same
   way (`lock` turns it on, `unlock` turns it off), so a device like this only
-  needs its own "on = locked" wiring, not Indigo's separate lock sub-type
-  flag. A device that genuinely IS a lock sub-type is unaffected — it still
-  uses Indigo's real lock/unlock commands.
+  needs its own "on = locked" wiring, not a lock sub-type declaration from
+  an owning plugin. A device that genuinely IS a lock sub-type (checked
+  against its owning plugin's own declaration, not this plugin's) is
+  unaffected — it still uses Indigo's real lock/unlock commands.
 
 ## 2026.26.0 — which paired ecosystem is churning, not just that one is
 
