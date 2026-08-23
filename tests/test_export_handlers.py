@@ -813,30 +813,104 @@ class TestDoorLock:
         assert self._handler(handlers).states_for(RelayDevice(1, "Door", onState=None)) == {}
 
     def test_lock_dispatches_the_indigo_lock_command(self, handlers, mock_indigo_base):
-        dev = RelayDevice(1, "Door", onState=False)
+        """A true lock sub-type device (``IsLockSubType``) uses the real
+        ``indigo.device.lock``/``unlock`` path (issue #289: this must NOT
+        change for a device that actually has lock semantics)."""
+        dev = RelayDevice(1, "Door", onState=False, pluginProps={"IsLockSubType": True})
         self._handler(handlers).dispatch("lock", {}, dev)
         mock_indigo_base.device.lock.assert_called_once_with(dev)
 
     def test_unlock_dispatches_the_indigo_unlock_command(self, handlers, mock_indigo_base):
-        dev = RelayDevice(1, "Door", onState=True)
+        dev = RelayDevice(1, "Door", onState=True, pluginProps={"IsLockSubType": True})
         self._handler(handlers).dispatch("unlock", {}, dev)
         mock_indigo_base.device.unlock.assert_called_once_with(dev)
 
-    def test_a_lock_never_falls_back_to_turn_on(self, handlers, mock_indigo_base):
-        """PRD §7: no fallback path with no lock semantics.
-
-        ``indigo.device.lock`` needs ``IsLockSubType``; if the device is not one,
-        IndigoServer refuses — which is the right place for that refusal.
-        Quietly driving a relay the user declared a lock through ``turnOn``
-        instead would work often enough to hide the misconfiguration.
+    def test_a_lock_sub_type_device_never_reaches_the_relay_fallback(
+            self, handlers, mock_indigo_base):
+        """issue #289 review: the true-lock path must be unable to become
+        the relay path — not merely observed not to, in case ``lock``/
+        ``unlock`` itself were ever to fail for some other reason.
+        ``turnOn``/``turnOff`` raising if touched (rather than a bare
+        ``assert_not_called()`` afterwards) is what actually pins that.
         """
-        self._handler(handlers).dispatch("lock", {}, RelayDevice(1, "Door"))
-        mock_indigo_base.device.turnOn.assert_not_called()
-        mock_indigo_base.device.turnOff.assert_not_called()
+        mock_indigo_base.device.turnOn.side_effect = AssertionError(
+            "the relay fallback must be unreachable for a lock sub-type device")
+        mock_indigo_base.device.turnOff.side_effect = AssertionError(
+            "the relay fallback must be unreachable for a lock sub-type device")
+        dev = RelayDevice(1, "Door", onState=False, pluginProps={"IsLockSubType": True})
+
+        self._handler(handlers).dispatch("lock", {}, dev)
+        mock_indigo_base.device.lock.assert_called_once_with(dev)
+
+        self._handler(handlers).dispatch("unlock", {}, dev)
+        mock_indigo_base.device.unlock.assert_called_once_with(dev)
+
+    def test_a_plain_relay_falls_back_to_turn_on_and_turn_off(self, handlers, mock_indigo_base):
+        """issue #289 — the live repro: "Gate Lock", a plain relay
+        (``pseudoRelay``) exported as ``doorLock``, no ``IsLockSubType``.
+        ``indigo.device.lock`` raises ``TypeError`` for exactly this shape on
+        a real server; the static ``IsLockSubType`` check means this plugin
+        never even calls it — ``lock``/``unlock`` are never touched.
+        """
+        dev = RelayDevice(1, "Gate Lock", onState=False)   # no IsLockSubType
+
+        self._handler(handlers).dispatch("lock", {}, dev)
+        mock_indigo_base.device.turnOn.assert_called_once_with(dev)
+        mock_indigo_base.device.lock.assert_not_called()
+
+        self._handler(handlers).dispatch("unlock", {}, dev)
+        mock_indigo_base.device.turnOff.assert_called_once_with(dev)
+        mock_indigo_base.device.unlock.assert_not_called()
+
+    def test_relay_fallback_polarity_matches_states_for(self, handlers, mock_indigo_base):
+        """``lock`` drives the SAME ``onState`` reading ``states_for`` treats
+        as locked, and ``unlock`` the same reading it treats as unlocked —
+        the exact inverse pairing issue #289 exists to restore."""
+        handler = self._handler(handlers)
+        dev = RelayDevice(1, "Gate Lock", onState=False)
+
+        handler.dispatch("lock", {}, dev)
+        mock_indigo_base.device.turnOn.assert_called_once_with(dev)
+        assert handler.states_for(RelayDevice(1, "Gate Lock", onState=True)) == {"locked": True}
+
+        handler.dispatch("unlock", {}, dev)
+        mock_indigo_base.device.turnOff.assert_called_once_with(dev)
+        assert handler.states_for(RelayDevice(1, "Gate Lock", onState=False)) == {"locked": False}
+
+    def test_a_relay_fallback_failure_propagates_not_swallowed(self, handlers, mock_indigo_base):
+        """issue #289 review: "genuine failures must stay loud". A device
+        whose ``turnOff`` itself raises must have that exception ESCAPE
+        ``dispatch`` — ``ExportBridge._apply_command`` is what turns it into
+        an ERROR log and a state push-back; nothing in this handler may
+        catch and hide it."""
+        mock_indigo_base.device.turnOff.side_effect = RuntimeError(
+            "Indigo refused the relay write")
+        dev = RelayDevice(1, "Gate Lock", onState=True)
+
+        with pytest.raises(RuntimeError, match="Indigo refused the relay write"):
+            self._handler(handlers).dispatch("unlock", {}, dev)
+
+    def test_the_relay_fallback_notice_is_said_once_per_device(self, handlers, caplog):
+        """A WORKING fallback is not a fault — one INFO line per device, not
+        one per command."""
+        dev = RelayDevice(1, "Gate Lock", onState=False)
+        with caplog.at_level("INFO"):
+            self._handler(handlers).dispatch("lock", {}, dev)
+            self._handler(handlers).dispatch("unlock", {}, dev)
+        infos = [r for r in caplog.records if r.levelname == "INFO"]
+        assert len(infos) == 1
+        assert "1" in infos[0].message and "Gate Lock" in infos[0].message
+
+    def test_the_relay_fallback_notice_does_not_fire_for_a_true_lock(
+            self, handlers, caplog):
+        dev = RelayDevice(1, "Door", onState=False, pluginProps={"IsLockSubType": True})
+        with caplog.at_level("INFO"):
+            self._handler(handlers).dispatch("lock", {}, dev)
+        assert [r for r in caplog.records if r.levelname == "INFO"] == []
 
     def test_dispatch_confirms_nothing(self, handlers, mock_indigo_base):
         """No state write, no read-back, no synthesised confirmation."""
-        dev = RelayDevice(1, "Door", onState=False)
+        dev = RelayDevice(1, "Door", onState=False, pluginProps={"IsLockSubType": True})
         self._handler(handlers).dispatch("lock", {}, dev)
         assert dev.onState is False, "the handler wrote the state it was hoping for"
         mock_indigo_base.device.statusRequest.assert_not_called()

@@ -928,6 +928,12 @@ class DoorLockExport(ExportHandler):
 
     role = export_catalog.ROLE_DOOR_LOCK
 
+    def __init__(self) -> None:
+        #: Device ids the relay-fallback notice (issue #289) has already been
+        #: said for. A WORKING fallback is not a fault, so it earns one INFO
+        #: line per device — not a warning repeated on every lock/unlock.
+        self._relay_fallback_logged: set[int] = set()
+
     def states_for(self, dev: Any, options: Optional[dict] = None) -> dict:
         on_state = getattr(dev, "onState", None)
         # `None` is real Indigo for "this device does not report on/off", and a
@@ -941,18 +947,49 @@ class DoorLockExport(ExportHandler):
             COMMAND_UNLOCK: self._unlock,
         }
 
-    @staticmethod
-    def _lock(_args: dict, dev: Any, _options: dict) -> None:
-        # `indigo.device.lock` needs pluginProps["IsLockSubType"], which is the
-        # owning plugin's business — if the device is not a lock sub-type the
-        # call is refused by IndigoServer, which is the right place for that
-        # refusal. Guessing a turnOn fallback here would silently drive a relay
-        # the user declared as a lock through a path with no lock semantics.
-        indigo.device.lock(dev)
+    def _lock(self, _args: dict, dev: Any, _options: dict) -> None:
+        self._drive(dev, locked=True)
 
-    @staticmethod
-    def _unlock(_args: dict, dev: Any, _options: dict) -> None:
-        indigo.device.unlock(dev)
+    def _unlock(self, _args: dict, dev: Any, _options: dict) -> None:
+        self._drive(dev, locked=False)
+
+    def _drive(self, dev: Any, *, locked: bool) -> None:
+        """Issue #289: a relay a user declared ``doorLock`` must be as
+        DRIVABLE as it is READABLE.
+
+        ``indigo.device.lock``/``unlock`` only work for a device whose
+        ``pluginProps["IsLockSubType"]`` is set (Indigo SDK, `Lock`/`Unlock`)
+        — the owning plugin's declaration, checked statically here rather
+        than by catching IndigoServer's ``TypeError``, so a real lock's
+        command NEVER silently becomes the relay path even if ``lock``/
+        ``unlock`` itself were to fail for some other reason. For anything
+        else — a plain relay, exactly the shape :meth:`states_for` already
+        reads ``onState`` from and reports as the bolt — this used to just
+        refuse forever: the refusal comment here argued a ``turnOn``
+        fallback would drive "a path with no lock semantics", but
+        ``states_for`` was already treating that relay's ``onState`` AS the
+        lock semantics. Trusting the state direction while refusing the
+        command direction was the actual inconsistency (issue #289); the
+        node side already relies on this exact polarity
+        (``matter_handlers/door_lock.py``, ``bridge-node``'s
+        ``IndigoDoorLockServer``), so driving it here is not a new
+        assumption, only the missing half of one already made. A device
+        that genuinely cannot be driven (``turnOn``/``turnOff`` itself
+        raises) still fails loudly through :meth:`ExportBridge._apply_command`'s
+        existing error path — nothing here swallows that.
+        """
+        is_lock = bool((getattr(dev, "pluginProps", None) or {}).get("IsLockSubType"))
+        if is_lock:
+            (indigo.device.lock if locked else indigo.device.unlock)(dev)
+            return
+        if dev.id not in self._relay_fallback_logged:
+            self._relay_fallback_logged.add(dev.id)
+            _LOG.info(
+                "Matter bridge: device %s (%s) is exported as doorLock but is not a lock "
+                "sub-type — driving its lock/unlock commands as the relay it actually is "
+                "(turnOn=locked, turnOff=unlocked, matching states_for's own polarity).",
+                dev.id, getattr(dev, "name", "?"))
+        (indigo.device.turnOn if locked else indigo.device.turnOff)(dev)
 
 
 class ThermostatExport(ExportHandler):

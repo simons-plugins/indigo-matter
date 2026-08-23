@@ -1273,7 +1273,8 @@ class TestOnCommand:
             self, bridge_mod, mock_logger, devices, mock_indigo_base):
         """PRD §7: dispatch the lock, then stop. No optimistic state write."""
         lock_id = FRAMES["command_lock"]["data"]["indigoDeviceId"]
-        dev = RelayDevice(lock_id, "Front Door", onState=False)
+        dev = RelayDevice(lock_id, "Front Door", onState=False,
+                          pluginProps={"IsLockSubType": True})
         devices.add(dev)
         h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(lock_id, "doorLock")])
         h.start()
@@ -1672,7 +1673,8 @@ class TestSilentFailures:
         already said it would. Silence there is the worst possible outcome for
         the one role where the user is standing at the door.
         """
-        dev = RelayDevice(701, "Front Door", onState=None)
+        dev = RelayDevice(701, "Front Door", onState=None,
+                          pluginProps={"IsLockSubType": True})
         devices.add(dev)
         mock_indigo_base.device.lock.side_effect = RuntimeError("mesh unreachable")
         h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(701, "doorLock")])
