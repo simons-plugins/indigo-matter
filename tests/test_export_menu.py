@@ -2243,6 +2243,58 @@ class TestMenuReadoptExportSuccess:
         assert "Device 101's own previous accessory has been removed from your ecosystems." \
             in said
 
+    def test_cross_role_readopt_drops_the_old_roles_ct_bounds(self, plug, devices):
+        """Issue #293 review: `export_catalog._dimmer` makes a dimmer eligible
+        for both a CT light role and `windowCovering`. Carrying the device's
+        previous colorTemperatureLight export's learned CT bounds onto a
+        windowCovering identity would hand `upsert`'s options validation a
+        pair `windowCovering` cannot lawfully carry — the re-adopt must
+        succeed anyway, with those keys dropped rather than the whole save
+        failing."""
+        devices.add(DimmerDevice(106, "Garage Dimmer", supportsWhiteTemperature=True))
+        plug.exports.upsert(ExportEntry(
+            106, "colorTemperatureLight",
+            options={OPTION_CT_LEARNED_MIN_MIREDS: 153, OPTION_CT_LEARNED_MAX_MIREDS: 370}))
+        _bridge_with(plug, attached=True)
+        orphan = _orphan(unique_id="indigo-901", role="windowCovering", label="Old Blind")
+        plug.runtime = _FakeRuntime(result=[orphan])
+        ok, _values_out = plug.menuReadoptExport(
+            {"readoptConfirm": True, "readoptOrphan": orphan.unique_id, "readoptDevice": "106"})
+        assert ok is True
+        entry = plug.exports.get(106)
+        assert entry.role == "windowCovering"
+        assert entry.options == {}
+
+    def test_cross_role_readopt_drops_the_old_roles_invert(self, plug, devices):
+        """Mirrored case: a windowCovering's `invert` carried onto a light
+        role it means nothing on."""
+        devices.add(DimmerDevice(106, "Garage Dimmer", supportsWhiteTemperature=True))
+        plug.exports.upsert(ExportEntry(106, "windowCovering", options={OPTION_INVERT: True}))
+        _bridge_with(plug, attached=True)
+        orphan = _orphan(unique_id="indigo-901", role="colorTemperatureLight", label="Old Light")
+        plug.runtime = _FakeRuntime(result=[orphan])
+        ok, _values_out = plug.menuReadoptExport(
+            {"readoptConfirm": True, "readoptOrphan": orphan.unique_id, "readoptDevice": "106"})
+        assert ok is True
+        entry = plug.exports.get(106)
+        assert entry.role == "colorTemperatureLight"
+        assert entry.options == {}
+
+    def test_same_role_readopt_still_carries_options_unchanged(self, plug, devices):
+        """The common case the cross-role guard above must not disturb: a
+        re-adopt onto the SAME role keeps every option verbatim."""
+        devices.add(fakes.texecom_zone(320, "Gate Contact"))
+        plug.exports.upsert(ExportEntry(
+            320, "contactSensor", options={"stateKey": "status", "stateInvert": True}))
+        _bridge_with(plug, attached=True)
+        orphan = _orphan(unique_id="indigo-901", role="contactSensor", label="Old Contact")
+        plug.runtime = _FakeRuntime(result=[orphan])
+        ok, _values_out = plug.menuReadoptExport(
+            {"readoptConfirm": True, "readoptOrphan": orphan.unique_id, "readoptDevice": "320"})
+        assert ok is True
+        entry = plug.exports.get(320)
+        assert entry.options == {"stateKey": "status", "stateInvert": True}
+
 
 class TestReadoptOutcomeTruthfulness:
     """The success WARNING is emitted BEFORE the fire-and-forget bridge work

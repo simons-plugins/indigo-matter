@@ -23,7 +23,7 @@ import export_catalog
 import protocol
 from bridge_protocol import parse_published_id, published_id_for
 from commission_jobs import fabric_counts, node_id_to_str
-from export_store import ExportEntry, OPTION_STATE_INVERT, OPTION_STATE_KEY
+from export_store import ExportEntry, OPTION_STATE_INVERT, OPTION_STATE_KEY, options_lawful_for_role
 from http_handlers import MatterUnavailable
 from plugin_constants import (
     EXCLUDED_OPTION_PREFIX,
@@ -1792,6 +1792,17 @@ class ServerMenuMixin:
         """The PR5 design §4.4 closing paragraph: one ``ExportStore.upsert`` preserving
         any existing ``name_override``/``options``, then the remove-then-add
         nudge and the PR5 design §4.5 confirmation log.
+
+        ``options`` is filtered to what ``orphan.role`` can lawfully carry
+        (issue #293 review) before it reaches ``upsert``: ``previous`` is the
+        DEVICE's own prior export, which can be a different role than the
+        orphan it is being re-adopted onto (``export_catalog``'s dimmer rule
+        makes one device eligible for both a light role and
+        ``windowCovering``) — carrying those options wholesale would hand
+        ``upsert``'s own options validation a pair it must reject, turning a
+        legitimate cross-role re-adopt into a hard failure. Dropping what the
+        new role cannot carry is correct: those options described the OLD
+        role's semantics, not this one's.
         """
         device_id = dev.id
         previous = self.exports.get(device_id)
@@ -1800,7 +1811,8 @@ class ServerMenuMixin:
                 indigo_device_id=device_id,
                 role=orphan.role,
                 name_override=previous.name_override if previous is not None else None,
-                options=dict(previous.options) if previous is not None else {},
+                options=(options_lawful_for_role(previous.options, orphan.role)
+                        if previous is not None else {}),
                 published_as=orphan.unique_id,
             ))
         except Exception as exc:  # pylint: disable=broad-except
