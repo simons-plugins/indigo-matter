@@ -15,6 +15,7 @@ import pytest
 
 import ct_bounds
 import ct_learner
+import export_store
 
 
 @dataclasses.dataclass(frozen=True)
@@ -106,7 +107,7 @@ def test_a_single_shortfall_does_not_adopt(learner, store, republish):
 def test_two_consistent_shortfalls_adopt_the_warm_bound(learner, store, republish, clock):
     learner.record_commanded(800, 426)
     learner.observe(_entry(store), 400)
-    clock.advance(1.0)
+    clock.advance(2.0)
     learner.record_commanded(800, 426)  # a second, distinct dispatch of the same ask
     learner.observe(_entry(store), 400)
     updated = store.get(800)
@@ -117,7 +118,7 @@ def test_two_consistent_shortfalls_adopt_the_warm_bound(learner, store, republis
 def test_two_consistent_shortfalls_adopt_the_cool_bound(learner, store, republish, clock):
     learner.record_commanded(800, 200)
     learner.observe(_entry(store), 230)  # cool shortfall: echo HIGHER than the ask
-    clock.advance(1.0)
+    clock.advance(2.0)
     learner.record_commanded(800, 200)  # a second, distinct dispatch of the same ask
     learner.observe(_entry(store), 230)
     updated = store.get(800)
@@ -129,7 +130,7 @@ def test_a_repeat_within_tolerance_still_counts_as_the_same_value(learner, store
     """Round-trip noise of +/-1 mired must not defeat the "same value twice" test."""
     learner.record_commanded(800, 426)
     learner.observe(_entry(store), 400)
-    clock.advance(1.0)
+    clock.advance(2.0)
     learner.record_commanded(800, 426)  # a second, distinct dispatch of the same ask
     learner.observe(_entry(store), 401)
     assert store.get(800).options[ct_bounds.OPTION_CT_LEARNED_MAX_MIREDS] == 401
@@ -145,7 +146,7 @@ def test_inconsistent_echo_values_do_not_adopt(learner, store, republish, clock)
     republish.assert_not_called()
     # The restarted streak still adopts on ITS OWN second confirmation, from
     # a second, distinct dispatch answering the same ask.
-    clock.advance(1.0)
+    clock.advance(2.0)
     learner.record_commanded(800, 426)
     learner.observe(_entry(store), 390)
     assert store.get(800).options[ct_bounds.OPTION_CT_LEARNED_MAX_MIREDS] == 390
@@ -221,6 +222,35 @@ def test_the_2026_08_24_1640_duplicate_callback_incident_does_not_adopt(
     republish.assert_not_called()
 
 
+def test_the_pr295_review_late_duplicate_race_does_not_adopt_early(
+        learner, store, republish, clock):
+    """PR #295 review (2026-08-24) — the race variant of the 16:40 incident
+    above. The distinct-dispatch rule compares the LIVE ``commanded.at``
+    against the streak's own reference, so a DELAYED duplicate echo of
+    dispatch N, delivered after a same-valued dispatch N+1 has already been
+    recorded, reads its ``commanded.at`` as N+1's and looks like "a
+    different dispatch" even though it is still an echo of N — timing alone
+    cannot prove which dispatch it is answering. A minimum confirmation gap
+    closes it: a duplicate that clears the distinct-dispatch check but
+    arrives too soon after the streak started is treated exactly like a
+    same-dispatch duplicate — inert, and the streak survives unchanged for a
+    later, genuine confirmation to complete."""
+    learner.record_commanded(800, 426)
+    learner.observe(_entry(store), 400)  # starts the streak at T
+    clock.advance(1.0)
+    learner.record_commanded(800, 426)  # dispatch N+1 recorded
+    clock.advance(0.05)  # the late duplicate of dispatch N arrives moments later
+    learner.observe(_entry(store), 400)  # distinct commanded.at, but only 1.05s into the streak
+    assert store.upserts == []
+    republish.assert_not_called()
+
+    clock.advance(3.0)  # a genuine confirmation, riding the storm's re-assert cadence
+    learner.record_commanded(800, 426)  # a further, distinct dispatch
+    learner.observe(_entry(store), 400)
+    assert store.get(800).options[ct_bounds.OPTION_CT_LEARNED_MAX_MIREDS] == 400
+    republish.assert_called_once_with(800)
+
+
 def test_a_real_clamp_still_learns_across_two_distinct_dispatches(learner, store, republish, clock):
     """THE discriminator (#293): a real hardware clamp echoes the SAME value
     in answer to TWO DISTINCT dispatches seconds apart (the #281 storm
@@ -263,7 +293,7 @@ def test_duplicate_callbacks_are_inert_until_a_second_dispatch_confirms(
     assert store.upserts == []
     republish.assert_not_called()
 
-    clock.advance(1.0)
+    clock.advance(2.0)
     learner.record_commanded(800, 426)  # a second, distinct dispatch of the same ask
     learner.observe(_entry(store), 400)
     assert store.get(800).options[ct_bounds.OPTION_CT_LEARNED_MAX_MIREDS] == 400
@@ -309,6 +339,7 @@ def test_a_reading_just_inside_the_window_still_counts(learner, store, republish
     learner.record_commanded(800, 426)
     clock.advance(14.0)
     learner.observe(_entry(store), 400)
+    clock.advance(2.0)  # clear MIN_CONFIRMATION_GAP_SECONDS between the two observations
     learner.record_commanded(800, 426)  # a second, distinct dispatch of the same ask
     learner.observe(_entry(store), 400)
     assert store.get(800).options[ct_bounds.OPTION_CT_LEARNED_MAX_MIREDS] == 400
@@ -378,12 +409,15 @@ def test_an_adoption_that_would_collapse_the_range_to_a_point_is_refused(
         learner, store, republish, clock):
     """Bounds sanity (#293): an adoption may never produce ``min >= max``.
 
-    A genuine STRICT inversion cannot arise from ``observe`` at all — the
-    re-widen check above intercepts anything outside the current bounds
-    before the shortfall path ever runs, so a shortfall candidate is always
-    within ``[current_min, current_max]``, and replacing one side with it can
-    at worst COLLAPSE the range to a point, never invert it. This is the
-    reachable case, and the one the sanity check exists to catch.
+    This test pins the COLLAPSE case: a candidate equal to the OTHER side,
+    reached through the shortfall path here. ``_adopt``'s guard now catches
+    genuine INVERSION too, not just collapse (see its own docstring) — it
+    re-reads the store FRESH rather than trusting a caller's own current-
+    bounds reasoning, and a second adoption landing on the OTHER side in
+    between (two sides of the same sweep, or two concurrent adoptions) can
+    move ``current_min``/``current_max`` past a caller's ``candidate`` in
+    either direction, so the guard is no longer provably collapse-only —
+    it just happens to be a collapse in THIS scenario.
     """
     store.upsert(_Entry(800, options={ct_bounds.OPTION_CT_MIN_MIREDS: 200,
                                       ct_bounds.OPTION_CT_MAX_MIREDS: 400}))
@@ -393,7 +427,7 @@ def test_an_adoption_that_would_collapse_the_range_to_a_point_is_refused(
     # equal to the OTHER side.
     learner.record_commanded(800, 200)
     learner.observe(_entry(store), 400)  # cool shortfall candidate == current max
-    clock.advance(1.0)
+    clock.advance(2.0)
     learner.record_commanded(800, 200)  # a second, distinct dispatch of the same ask
     learner.observe(_entry(store), 400)
     assert store.upserts == []
@@ -409,7 +443,7 @@ def test_a_store_write_failure_is_logged_and_does_not_raise(store, republish, cl
     store.raise_on_upsert = RuntimeError("prefs write failed")
     learner.record_commanded(800, 426)
     learner.observe(_entry(store), 400)
-    clock.advance(1.0)
+    clock.advance(2.0)
     learner.record_commanded(800, 426)  # a second, distinct dispatch of the same ask
     learner.observe(_entry(store), 400)  # must not raise
     logger.error.assert_called()
@@ -423,7 +457,7 @@ def test_a_republish_failure_does_not_raise_and_the_learned_value_stays_saved(
     learner = ct_learner.CTBoundsLearner(store, logger, republish, now=clock)
     learner.record_commanded(800, 426)
     learner.observe(_entry(store), 400)
-    clock.advance(1.0)
+    clock.advance(2.0)
     learner.record_commanded(800, 426)  # a second, distinct dispatch of the same ask
     learner.observe(_entry(store), 400)  # must not raise
     assert store.get(800).options[ct_bounds.OPTION_CT_LEARNED_MAX_MIREDS] == 400
@@ -443,10 +477,21 @@ def test_forget_drops_the_pending_streak_so_a_stale_echo_cannot_complete_it(
         learner, store, republish, clock):
     """A device un-exported mid-streak, then re-exported (or its id reused by
     a deleted-and-recreated Indigo device), must start with a clean slate —
-    not adopt on a streak that has nothing to do with the new hardware."""
+    not adopt on a streak that has nothing to do with the new hardware.
+
+    Two DISTINCT dispatches, with the clock cleared past
+    ``MIN_CONFIRMATION_GAP_SECONDS`` between them: without ``forget()`` this
+    exact sequence completes the streak and adopts (see
+    ``test_a_real_clamp_still_learns_across_two_distinct_dispatches``) — a
+    one-dispatch version of this test would pass even with a no-op
+    ``forget()``, now that completion always requires two distinct
+    dispatches, so it would no longer be testing ``forget`` at all.
+    """
     learner.record_commanded(800, 426)
-    learner.observe(_entry(store), 400)  # pending: max, 400
-    learner.forget(800)
+    learner.observe(_entry(store), 400)  # pending: max, 400, streak starts at T
+    clock.advance(2.0)  # clear MIN_CONFIRMATION_GAP_SECONDS
+    learner.record_commanded(800, 426)  # a second, distinct dispatch of the same ask
+    learner.forget(800)  # the export is removed mid-streak, between the two dispatches
     learner.observe(_entry(store), 400)  # would complete the OLD streak if not forgotten
     assert store.upserts == []
     republish.assert_not_called()
@@ -491,13 +536,52 @@ def test_a_reading_outside_the_generic_domain_that_the_store_refuses_does_not_cr
     logger.error.assert_called_once()
 
 
-def test_an_entry_removed_before_adoption_is_not_resurrected(learner, store, republish):
+def test_a_reading_outside_the_domain_is_refused_by_the_real_store_end_to_end(clock):
+    """The companion to the test above, run against the REAL
+    ``export_store.ExportStore`` rather than a simulated refusal — pinning
+    the defence-in-depth chain issue #293's follow-up (a7b80b0) actually
+    built: ``_adopt``'s own min-vs-max guard only compares the two SIDES,
+    never the §4.2 domain, so a raw out-of-domain reading (a driver glitch,
+    not a real clamp) sails past it and reaches ``ExportStore.upsert`` —
+    which is the one place that domain IS enforced (issue #294 review). No
+    crash, nothing persisted, and the save-failure error names the reason.
+    """
+    logger = Mock()
+    prefs: dict = {}
+    real_store = export_store.ExportStore(lambda: prefs, logger)
+    # Seeded with no options: generic (153, 500) bounds.
+    real_store.upsert(export_store.ExportEntry(800, "colorTemperatureLight"))
+    learner = ct_learner.CTBoundsLearner(real_store, logger, republish=Mock(), now=clock)
+    # No seed on the entry, so the effective floor is the generic 153 —
+    # 90 sits below it, so this is a re-widen candidate, not a shortfall.
+    learner.observe(_Entry(800), 90)  # must not raise
+    assert real_store.get(800).options == {}, "nothing was persisted from the refused write"
+    logger.error.assert_called_once()
+    error_message = logger.error.call_args[0][0] % logger.error.call_args[0][1:]
+    assert "800" in error_message and "could not be saved" in error_message
+
+
+def test_an_entry_removed_before_adoption_is_not_resurrected(learner, store, republish, clock):
+    """Two DISTINCT dispatches, the clock advanced past the confirmation gap,
+    so the streak genuinely COMPLETES and reaches ``_adopt`` — not merely
+    "never completes at all", which would pass this assertion for the wrong
+    reason (issue #293 review: the original version of this test predates
+    the two-distinct-dispatch rule and never actually exercised ``_adopt``'s
+    own ``fresh is None`` guard). The debug log that guard now leaves is the
+    proof ``_adopt`` genuinely ran."""
+    logger = Mock()
+    learner._logger = logger
     learner.record_commanded(800, 426)
-    learner.observe(_entry(store), 400)
+    learner.observe(_entry(store), 400)  # starts the streak
+    clock.advance(2.0)  # clear MIN_CONFIRMATION_GAP_SECONDS
+    learner.record_commanded(800, 426)  # a second, distinct dispatch of the same ask
     store._entries.pop(800)  # the export was removed between the two observations
-    learner.observe(_Entry(800), 400)
+    learner.observe(_Entry(800), 400)  # completes the streak -> reaches `_adopt`
     assert store.upserts == []
     republish.assert_not_called()
+    logger.debug.assert_called_once()
+    message = logger.debug.call_args[0][0] % logger.debug.call_args[0][1:]
+    assert "800" in message and "400" in message
 
 
 def test_adoption_logs_one_clear_info_line_naming_mireds_kelvin_and_reason(
@@ -506,7 +590,7 @@ def test_adoption_logs_one_clear_info_line_naming_mireds_kelvin_and_reason(
     learner._logger = logger
     learner.record_commanded(800, 426)
     learner.observe(_entry(store), 400)
-    clock.advance(1.0)
+    clock.advance(2.0)
     learner.record_commanded(800, 426)  # a second, distinct dispatch of the same ask
     learner.observe(_entry(store), 400)
     logger.info.assert_called_once()
@@ -605,7 +689,7 @@ def test_observe_with_a_stale_snapshot_is_also_refused_via_the_fresh_re_read(
     store.upserts.clear()
     learner.record_commanded(800, 500)   # asked for the warm extreme
     learner.observe(stale_entry, 215)    # warm shortfall candidate, by the STALE (153, 500)
-    clock.advance(1.0)
+    clock.advance(2.0)
     learner.record_commanded(800, 500)   # a second, distinct dispatch of the same ask
     learner.observe(stale_entry, 215)    # second, matching echo -> completes the streak
 

@@ -2264,6 +2264,13 @@ class TestMenuReadoptExportSuccess:
         entry = plug.exports.get(106)
         assert entry.role == "windowCovering"
         assert entry.options == {}
+        # PR #295 review: the dropped keys are not silent — a covering's
+        # `invert` (or here, a light's learned CT bounds) vanishing on
+        # re-adopt is user-invisible until the accessory misbehaves, so the
+        # confirmation WARNING names what was dropped and why.
+        said = _said(plug.logger.warning.call_args_list)
+        assert OPTION_CT_LEARNED_MIN_MIREDS in said and OPTION_CT_LEARNED_MAX_MIREDS in said
+        assert "do not apply to a" in said and "were not carried over" in said
 
     def test_cross_role_readopt_drops_the_old_roles_invert(self, plug, devices):
         """Mirrored case: a windowCovering's `invert` carried onto a light
@@ -2279,6 +2286,9 @@ class TestMenuReadoptExportSuccess:
         entry = plug.exports.get(106)
         assert entry.role == "colorTemperatureLight"
         assert entry.options == {}
+        said = _said(plug.logger.warning.call_args_list)
+        assert OPTION_INVERT in said
+        assert "do not apply to a" in said and "were not carried over" in said
 
     def test_same_role_readopt_still_carries_options_unchanged(self, plug, devices):
         """The common case the cross-role guard above must not disturb: a
@@ -2294,6 +2304,10 @@ class TestMenuReadoptExportSuccess:
         assert ok is True
         entry = plug.exports.get(320)
         assert entry.options == {"stateKey": "status", "stateInvert": True}
+        # Nothing was dropped on a same-role re-adopt, so no dropped-options
+        # clause should appear in the confirmation WARNING.
+        said = _said(plug.logger.warning.call_args_list)
+        assert "were not carried over" not in said
 
 
 class TestReadoptOutcomeTruthfulness:
