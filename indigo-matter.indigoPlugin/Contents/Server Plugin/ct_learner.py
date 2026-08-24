@@ -144,6 +144,23 @@ class CTBoundsLearner:
         #: device_id -> the in-progress shortfall streak, if any.
         self._pending: dict[int, _Pending] = {}
 
+    def forget(self, device_id: int) -> None:
+        """Drop a removed device's in-progress learner state (#293).
+
+        Called from ``ExportBridge.remove()`` alongside its other per-device
+        dicts. Without this, ``_commanded``/``_pending`` entries for an
+        un-exported device sit forever: a device_id later reused by a
+        different Indigo device (deleted-and-recreated) would inherit a
+        stale commanded reference or shortfall streak that has nothing to do
+        with the new device's hardware. The learned bound itself is not
+        touched here — that lives in the export's own ``options`` in the
+        store, which ``ExportBridge.remove()`` already drops by dropping the
+        export entry.
+        """
+        with self._lock:
+            self._commanded.pop(int(device_id), None)
+            self._pending.pop(int(device_id), None)
+
     def record_commanded(self, device_id: int, mireds: int) -> None:
         """Note a CONFIRMED ``setColorTemp`` dispatch as the reference point.
 
@@ -289,4 +306,9 @@ class CTBoundsLearner:
             # failure just means the fabric catches up on the next reconnect
             # or export edit, exactly like every other `upsert` failure in
             # this file's family — never a reason to lose or re-raise here.
+            self._logger.error(
+                "Matter export: republishing the learned %s bound for device %s could not be "
+                "sent — %s. It is safely saved and will reach the fabric at the next reconnect "
+                "or export edit.",
+                "cool" if side == "min" else "warm", device_id, exc)
             self._logger.exception(exc)

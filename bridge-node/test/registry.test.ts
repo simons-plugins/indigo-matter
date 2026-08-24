@@ -3671,6 +3671,46 @@ describe("CT physical bounds (issue #293)", () => {
         }
     });
 
+    it("orders colorTemperatureMireds before coupleColorTempToLevelMinMireds", async () => {
+        // Issue #293 review — measured against matter.js 0.17.8:
+        // `endpoint.set()` applies a patch's keys IN ORDER, validating each
+        // key against whatever the OTHER referenced fields hold at THAT
+        // point in the sequence, not against the patch's final merged
+        // state. `applyCtBoundsUpdate` (endpoints.ts) relies on
+        // `colorTemperatureMireds` landing before
+        // `coupleColorTempToLevelMinMireds` in its patch object; reversed,
+        // the couple write is validated against the STALE (pre-reclamp)
+        // colour temperature and throws a `CONSTRAINT_ERROR` even though
+        // the two keys are perfectly consistent once both have landed.
+        //
+        // This scenario pins it directly: the live CT (200) sits BELOW the
+        // new floor (250), so the new `coupleColorTempToLevelMinMireds`
+        // (250) exceeds the STALE `colorTemperatureMireds` (200) — exactly
+        // the shape that throws if the two keys were ever reordered.
+        const h = await harness();
+        try {
+            await h.registry.reconcile(
+                [spec(1, Role.extendedColorLight, { states: { colorTempMireds: 200 } })],
+                false,
+            );
+            const endpoint = only(h);
+            assert.equal((endpoint.stateOf("colorControl") as Record<string, unknown>).colorTemperatureMireds, 200);
+
+            await assert.doesNotReject(
+                h.registry.reconcile(
+                    [spec(1, Role.extendedColorLight, { options: { ctMinMireds: 250, ctMaxMireds: 300 } })],
+                    false,
+                ),
+            );
+
+            const color = endpoint.stateOf("colorControl") as Record<string, unknown>;
+            assert.equal(color.coupleColorTempToLevelMinMireds, 250);
+            assert.equal(color.colorTemperatureMireds, 250, "reclamped before couple was validated against it");
+        } finally {
+            await h.close();
+        }
+    });
+
     it("live update: bounds already matching the live pair is a true no-op (no write, no bump)", async () => {
         const h = await harness();
         try {
@@ -3771,6 +3811,70 @@ describe("CT physical bounds (issue #293)", () => {
             const color = after.stateOf("colorControl") as Record<string, unknown>;
             assert.equal(color.colorTempPhysicalMinMireds, 300);
             assert.equal(color.colorTempPhysicalMaxMireds, 400);
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("a failed CT bounds update does not stop the state push, and names the device (#294 review)", async () => {
+        // registry.ts#update wraps applyCtBoundsUpdate in its own try/catch:
+        // bounds are advisory (ADR-0014 — "a refused attach takes every
+        // export offline over one bad option" applies to a live update too),
+        // and `applyStates` already clamps CT to the endpoint's LIVE bounds,
+        // so continuing past a bounds-write failure is safe. Left uncaught,
+        // this failure would both lose THIS device's real state push (the
+        // catch never reaches it) and abort the WHOLE reconcile batch (the
+        // `plan.update` loop in `reconcileNow` has no per-spec catch).
+        //
+        // Stubs `endpoint.set` to fail only the CT-bounds patch (identified
+        // by its own `colorTempPhysicalMinMireds` key) — the same
+        // shadow-the-instance seam "a failed onOff half..." above uses —
+        // rather than a blanket stub, which would also take down the
+        // `reachable`/state writes this test needs to prove survived.
+        const h = await harness();
+        try {
+            await h.registry.reconcile(
+                [spec(1, Role.extendedColorLight, { states: { colorTempMireds: 200 } })],
+                false,
+            );
+            const endpoint = only(h);
+            const startLogCount = h.logs.length; // discard whatever the first reconcile logged
+            const endpointWithSet = endpoint as unknown as { set: (...args: unknown[]) => Promise<unknown> };
+            const originalSet = endpointWithSet.set;
+            endpointWithSet.set = function (...args: unknown[]) {
+                const patch = args[0] as Record<string, unknown>;
+                const color = patch["colorControl"] as Record<string, unknown> | undefined;
+                if (color?.["colorTempPhysicalMinMireds"] !== undefined) {
+                    return Promise.reject(new Error("boom"));
+                }
+                return originalSet.apply(endpoint, args);
+            };
+            try {
+                await assert.doesNotReject(
+                    h.registry.reconcile(
+                        [
+                            spec(1, Role.extendedColorLight, {
+                                options: { ctMinMireds: 250, ctMaxMireds: 300 },
+                                states: { level: 80 },
+                            }),
+                        ],
+                        false,
+                    ),
+                );
+            } finally {
+                endpointWithSet.set = originalSet;
+            }
+            const level = (endpoint.stateOf("levelControl") as Record<string, unknown>).currentLevel;
+            assert.equal(
+                level,
+                percentToCurrentLevel(80),
+                "the state push must still have applied despite the bounds-write failure",
+            );
+            const newLogs = h.logs.slice(startLogCount);
+            const boundsFailure = newLogs.filter(line => line.includes("CT bounds update failed"));
+            assert.equal(boundsFailure.length, 1, newLogs.join("\n"));
+            assert.match(boundsFailure[0]!, /\b1\b/, "the log line must name the failing device id");
+            assert.match(boundsFailure[0]!, /boom/, "the log line must carry the underlying error");
         } finally {
             await h.close();
         }

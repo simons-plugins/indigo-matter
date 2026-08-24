@@ -882,6 +882,35 @@ class TestDeviceUpdated:
         # It failed, it did not raise into Indigo, and it was NOT silent.
         assert "set_state dev 101 failed" in warnings_of(mock_logger)
 
+    def test_a_learner_failure_does_not_stop_the_real_state_push(self, bridge_mod, mock_logger,
+                                                                  devices):
+        """Issue #294 review — `_feed_ct_learner` runs BEFORE the diff/push in
+        `device_updated`, so a `_ct_learner.observe` exception must never be
+        able to take the device's real state push down with it (the
+        degradation-path convention: speculative code cannot discard a
+        result the reliable path already found)."""
+        dev = DimmerDevice(800, "CT Lamp", onState=True, brightness=29, whiteLevel=29,
+                            whiteTemperature=2700, supportsWhiteTemperature=True)
+        devices.add(dev)
+        h = self._harness(bridge_mod, mock_logger, devices,
+                          ExportEntry(800, "colorTemperatureLight"))
+
+        def _blows_up(*_args, **_kwargs):
+            raise RuntimeError("learner blew up")
+
+        h.bridge._ct_learner.observe = _blows_up
+        before = DimmerDevice(800, "CT Lamp", onState=True, brightness=29, whiteLevel=29,
+                              whiteTemperature=2700, supportsWhiteTemperature=True)
+        # A change well past CT_TOLERANCE_MIREDS (30) — a change within it
+        # would be suppressed by the diff's own tolerance regardless of the
+        # learner, and this test needs the push to be genuinely due.
+        after = DimmerDevice(800, "CT Lamp", onState=True, brightness=29, whiteLevel=29,
+                             whiteTemperature=2000, supportsWhiteTemperature=True)
+        h.bridge.device_updated(before, after)
+        _name, dev_id, states = h.client.only("set_state")
+        assert dev_id == 800
+        assert "colorTempMireds" in states
+
     def test_nothing_is_sent_before_the_attach_completes(self, bridge_mod, mock_logger, devices):
         """An incremental frame sent un-attached is refused (§1.1) and pointless."""
         h = self._harness(bridge_mod, mock_logger, devices, ExportEntry(101, "onOffLight"))
@@ -2482,6 +2511,27 @@ class TestCTBoundsLearnerWiring:
         assert h.store.get(800).options["ctLearnedMaxMireds"] == 300  # kelvin_to_mireds(3333)
         upserts_after = len([c for c in h.client.calls if c[0] == "upsert_endpoint"])
         assert upserts_after == upserts_before + 1
+
+    def test_remove_forgets_the_learner_state(
+            self, bridge_mod, mock_logger, devices, mock_indigo_base):
+        """Issue #294 review — `remove()` must drop this device's `_commanded`/
+        `_pending` learner state alongside its other per-device dicts, or a
+        device_id later reused by a deleted-and-recreated Indigo device would
+        inherit evidence about entirely different hardware."""
+        dev = self._ct_lamp()
+        devices.add(dev)
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(800, "colorTemperatureLight")])
+        h.start()
+        h.bridge.on_command(bridge_protocol.BridgeCommand(
+            indigo_device_id=800, command="setColorTemp", args={"colorTempMireds": 426}))
+        h.bridge.device_updated(dev, self._ct_lamp(whiteTemperature=2500))  # pending: max, 400
+        assert 800 in h.bridge._ct_learner._commanded
+        assert 800 in h.bridge._ct_learner._pending
+
+        h.bridge.remove(800)
+
+        assert 800 not in h.bridge._ct_learner._commanded
+        assert 800 not in h.bridge._ct_learner._pending
 
 
 class TestColorModeCoherence:

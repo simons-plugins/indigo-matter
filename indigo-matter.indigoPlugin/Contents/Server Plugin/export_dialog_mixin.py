@@ -15,7 +15,7 @@ from bridge_protocol import next_generation, published_id_for
 from export_store import (CT_BOUNDS_ROLES, ExportEntry, MAPPABLE_ROLES, OPTION_CT_LEARNED_MAX_MIREDS,
                           OPTION_CT_LEARNED_MIN_MIREDS, OPTION_CT_MAX_MIREDS, OPTION_CT_MIN_MIREDS,
                           OPTION_INVERT, OPTION_STATE_INVERT, OPTION_STATE_KEY)
-from ct_bounds import GENERIC_MAX_MIREDS, GENERIC_MIN_MIREDS
+from ct_bounds import GENERIC_MAX_MIREDS, GENERIC_MIN_MIREDS, effective_ct_bounds
 from matter_handlers.color_control import kelvin_to_mireds, mireds_to_kelvin
 from plugin_constants import (
     EXCLUDED_OPTION_PREFIX, EXPORT_PICKER_LIMIT, LIST_ERROR_OPTION,
@@ -913,17 +913,6 @@ class ExportDialogMixin:
                 values["exportStatus"] = ct_error
                 return values
             options.update(ct_seed)
-            # Issue #293 — the learner's own record is never a dialog field
-            # and this rebuild must not silently wipe it: without carrying
-            # it forward here, saving the dialog for ANY reason (a rename, a
-            # seed tweak) would drop every learned bound and hand the
-            # learner back to a cold start. Carried across a role change
-            # between the two CT roles too — same physical bulb, same
-            # evidence — but not onto a non-CT role, where the block above
-            # never runs at all and `options` was already rebuilt without it.
-            for learned_key in (OPTION_CT_LEARNED_MIN_MIREDS, OPTION_CT_LEARNED_MAX_MIREDS):
-                if previous is not None and learned_key in previous.options:
-                    options[learned_key] = previous.options[learned_key]
         existed = previous is not None
         role_changed = existed and previous.role != role
         # Issue #240 — a role change bumps the generation, so the node treats
@@ -959,6 +948,41 @@ class ExportDialogMixin:
                     "another device, so this export becomes a NEW accessory under %s — it does "
                     "not steal back the migrated one.",
                     dev.name, default_identity, resolved)
+        ct_coherence_note = ""
+        if role in CT_BOUNDS_ROLES:
+            # Issue #293 review — the learner's own record is carried
+            # forward from a RE-READ taken here, immediately before the
+            # write, not from `previous` above: `previous` may be a
+            # snapshot from moments ago, and a learner adoption
+            # (`ct_learner.CTBoundsLearner._adopt`, which runs on Indigo's
+            # device thread, not this dialog callback's thread) landing on
+            # THIS device in between must not be silently clobbered by a
+            # carry-forward built from the stale copy. Mirrors `_adopt`'s
+            # own re-read-immediately-before-write, for the identical
+            # reason.
+            fresh_previous = self.exports.get(device_id)
+            for learned_key in (OPTION_CT_LEARNED_MIN_MIREDS, OPTION_CT_LEARNED_MAX_MIREDS):
+                options.pop(learned_key, None)
+                if fresh_previous is not None and learned_key in fresh_previous.options:
+                    options[learned_key] = fresh_previous.options[learned_key]
+            # Coherence guard — a carried-forward learned bound can now
+            # conflict with the FRESH seed just entered above (e.g. a stale
+            # learned min of 250 mireds against a new seed max of 200): the
+            # seed is the newer intent, so the conflicting learned key(s)
+            # are dropped rather than saving an entry whose
+            # `ct_bounds.effective_ct_bounds` would come out inverted or
+            # collapsed — the learner simply re-earns the evidence from the
+            # device again.
+            eff_min, eff_max = effective_ct_bounds(options)
+            if eff_min >= eff_max:
+                dropped_any = False
+                for learned_key in (OPTION_CT_LEARNED_MIN_MIREDS, OPTION_CT_LEARNED_MAX_MIREDS):
+                    if options.pop(learned_key, None) is not None:
+                        dropped_any = True
+                if dropped_any:
+                    ct_coherence_note = (
+                        " A previously learned colour-temperature bound conflicted with this "
+                        "seed and was dropped; the learner will re-confirm it from the device.")
         try:
             self.exports.upsert(ExportEntry(
                 indigo_device_id=device_id, role=role,
@@ -978,7 +1002,8 @@ class ExportDialogMixin:
                          f' named "{name_override}"' if name_override else "")
         self._nudge_export(device_id, role_changed=role_changed)
         values["exportStatus"] = f"{verb} {dev.name} as {export_catalog.role_label(role)}. " \
-                                 f"{self._role_change_warning(role_changed)}{self._export_summary()}"
+                                 f"{self._role_change_warning(role_changed)}{ct_coherence_note}" \
+                                 f"{self._export_summary()}"
         return values
 
     @staticmethod

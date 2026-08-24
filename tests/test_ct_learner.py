@@ -311,6 +311,67 @@ def test_a_republish_failure_does_not_raise_and_the_learned_value_stays_saved(
     learner.observe(_entry(store), 400)  # must not raise
     assert store.get(800).options[ct_bounds.OPTION_CT_LEARNED_MAX_MIREDS] == 400
     logger.exception.assert_called()
+    # Issue #294 review — the contextual line ahead of `logger.exception`
+    # must actually name the device: a bare `logger.exception(exc)` with no
+    # context is useless once more than one device is exporting.
+    logger.error.assert_called_once()
+    error_message = logger.error.call_args[0][0] % logger.error.call_args[0][1:]
+    assert "800" in error_message
+
+
+# ---------------------------------------------------------------------------
+# forget() — dropping per-device learner state on export removal (#294 review)
+# ---------------------------------------------------------------------------
+def test_forget_drops_the_pending_streak_so_a_stale_echo_cannot_complete_it(
+        learner, store, republish, clock):
+    """A device un-exported mid-streak, then re-exported (or its id reused by
+    a deleted-and-recreated Indigo device), must start with a clean slate —
+    not adopt on a streak that has nothing to do with the new hardware."""
+    learner.record_commanded(800, 426)
+    learner.observe(_entry(store), 400)  # pending: max, 400
+    learner.forget(800)
+    learner.observe(_entry(store), 400)  # would complete the OLD streak if not forgotten
+    assert store.upserts == []
+    republish.assert_not_called()
+
+
+def test_forget_drops_the_commanded_reference_too(learner, store, republish, clock):
+    learner.record_commanded(800, 426)
+    learner.forget(800)
+    # No commanded reference survives `forget` — a shortfall-shaped reading
+    # now has nothing to be a shortfall AGAINST, so even two consecutive
+    # matching echoes must not adopt.
+    learner.observe(_entry(store), 400)
+    learner.observe(_entry(store), 400)
+    assert store.upserts == []
+    republish.assert_not_called()
+
+
+def test_forget_on_an_unknown_device_does_not_raise(learner):
+    learner.forget(999999)  # never seen — must be a quiet no-op
+
+
+def test_a_reading_outside_the_generic_domain_that_the_store_refuses_does_not_crash_or_adopt(
+        store, clock):
+    """Degradation path (#294 review): a raw reading outside 153-500 mireds
+    (a driver glitch, not a real clamp) still passes `_adopt`'s own
+    min-vs-max sanity check — it only compares the two SIDES, never the
+    §4.2 domain — and reaches `self._store.upsert`. The REAL `export_store`
+    is the one place that domain is enforced; simulate its refusal the same
+    way `test_a_store_write_failure_is_logged_and_does_not_raise` does,
+    to pin that `_adopt`'s guarded upsert survives a validation refusal
+    exactly like it survives any other store failure: no crash, nothing
+    persisted, the save-failure error logged.
+    """
+    logger = Mock()
+    store.raise_on_upsert = ValueError("ctLearnedMinMireds option (90) is outside the 153-500 "
+                                        "mired domain")
+    learner = ct_learner.CTBoundsLearner(store, logger, republish=Mock(), now=clock)
+    # No seed on the entry, so the effective floor is the generic 153 —
+    # 90 sits below it, so this is a re-widen candidate, not a shortfall.
+    learner.observe(_entry(store), 90)  # must not raise
+    assert store.upserts == []
+    logger.error.assert_called_once()
 
 
 def test_an_entry_removed_before_adoption_is_not_resurrected(learner, store, republish):

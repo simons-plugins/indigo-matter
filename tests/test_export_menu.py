@@ -31,8 +31,9 @@ import pytest
 import bridge_protocol
 import export_catalog
 import fakes
-from export_store import (OPTION_CT_LEARNED_MAX_MIREDS, OPTION_CT_MAX_MIREDS,
-                          OPTION_CT_MIN_MIREDS, OPTION_INVERT, PREF_KEY, ExportEntry, ExportStore)
+from export_store import (OPTION_CT_LEARNED_MAX_MIREDS, OPTION_CT_LEARNED_MIN_MIREDS,
+                          OPTION_CT_MAX_MIREDS, OPTION_CT_MIN_MIREDS, OPTION_INVERT, PREF_KEY,
+                          ExportEntry, ExportStore)
 from fakes import (
     OTHER_PLUGIN_ID,
     DimmerDevice,
@@ -956,6 +957,75 @@ def test_add_preserves_the_learned_bound_alongside_a_new_seed(plug, devices):
     assert plug.exports.get(device_id).options == {
         OPTION_CT_MIN_MIREDS: 200, OPTION_CT_MAX_MIREDS: 400,
         OPTION_CT_LEARNED_MAX_MIREDS: 400}
+
+
+def test_add_carries_the_learned_bound_across_a_role_change_between_the_two_ct_roles(
+        plug, devices):
+    """The carry-forward comment's own claim: same physical bulb, same
+    evidence, whichever of the two CT-bearing roles it is currently exported
+    as — only a change AWAY from both CT roles drops it (the block that
+    carries it forward never runs at all for a non-CT role)."""
+    device_id = _ct_device(devices, supportsRGB=True)
+    plug.exports.upsert(ExportEntry(device_id, "colorTemperatureLight",
+                                    options={OPTION_CT_LEARNED_MAX_MIREDS: 400}))
+    plug.exportAddOrUpdate(
+        _values(exportDevice=str(device_id), exportRole="extendedColorLight"),
+        "manageMatterExports")
+    assert plug.exports.get(device_id).role == "extendedColorLight"
+    assert plug.exports.get(device_id).options == {OPTION_CT_LEARNED_MAX_MIREDS: 400}
+
+
+def test_add_carries_the_freshest_learned_bound_despite_a_race_with_the_top_of_handler_read(
+        plug, devices):
+    """Issue #294 review — the carry-forward must be built from a RE-READ of
+    the store taken immediately before the write, not from the snapshot the
+    handler read at the top: a learner adoption (a different thread) landing
+    in between must survive the save, not be overwritten by the stale copy.
+    """
+    device_id = _ct_device(devices)
+    stale_entry = ExportEntry(device_id, "colorTemperatureLight",
+                              options={OPTION_CT_LEARNED_MAX_MIREDS: 400})
+    fresh_entry = ExportEntry(device_id, "colorTemperatureLight",
+                              options={OPTION_CT_LEARNED_MAX_MIREDS: 410})
+    calls = {"n": 0}
+    real_get = plug.exports.get
+
+    def racy_get(dev_id):
+        calls["n"] += 1
+        # First read is the handler's own `previous` snapshot; every read
+        # from here on (including the re-read this fix adds) sees what a
+        # concurrent learner adoption landed in between.
+        return stale_entry if calls["n"] == 1 else fresh_entry
+
+    plug.exports.get = racy_get
+    try:
+        plug.exportAddOrUpdate(
+            _values(exportDevice=str(device_id), exportRole="colorTemperatureLight"),
+            "manageMatterExports")
+    finally:
+        plug.exports.get = real_get
+    assert plug.exports.get(device_id).options == {OPTION_CT_LEARNED_MAX_MIREDS: 410}
+
+
+def test_add_drops_a_stale_learned_bound_that_would_invert_the_effective_range(plug, devices):
+    """Issue #294 review — the coherence guard: a stale learned bound the
+    fresh seed now conflicts with must not survive the save silently
+    producing an inverted/collapsed effective range. The user's fresh seed
+    is the newer intent; the learner re-earns the evidence."""
+    device_id = _ct_device(devices)
+    plug.exports.upsert(ExportEntry(device_id, "colorTemperatureLight",
+                                    options={OPTION_CT_LEARNED_MIN_MIREDS: 250}))
+    # warm_k=5000 -> ctMaxMireds=200; cool_k=6250 -> ctMinMireds=160. The
+    # stale learned min (250) would make the effective range 250-200 —
+    # inverted — once combined with this fresh seed.
+    values = plug.exportAddOrUpdate(
+        _values(exportDevice=str(device_id), exportRole="colorTemperatureLight",
+               exportCtWarmestK="5000", exportCtCoolestK="6250"),
+        "manageMatterExports")
+    assert plug.exports.get(device_id).options == {
+        OPTION_CT_MIN_MIREDS: 160, OPTION_CT_MAX_MIREDS: 200}
+    assert OPTION_CT_LEARNED_MIN_MIREDS not in plug.exports.get(device_id).options
+    assert "learn" in values["exportStatus"].lower()
 
 
 # ---------------------------------------------------------------------------

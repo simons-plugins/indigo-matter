@@ -1296,14 +1296,24 @@ class ExportBridge:
         rather than `states_for` so `entry.options` (needed to read the
         role's own colour channel correctly) is honoured identically to
         every other read of this device in this file.
+
+        The read AND the ``observe`` call both live inside this one broad
+        try: a read failure is re-reported by `diff_from`'s own guard a few
+        lines below (same underlying handler, same device), so this method
+        owes it no separate log — but a `_ct_learner.observe` failure has
+        nowhere else to surface, and this call runs BEFORE the diff/push in
+        `device_updated`, so letting it raise out of here would abort that
+        device's real state push over what is only speculative bookkeeping.
+        Degradation-path convention: the learner is best-effort and must
+        never be able to take the reliable push down with it.
         """
         try:
             mireds = handler.published_states(new_dev, entry.options).get(
                 export_handlers.STATE_COLOR_TEMP_MIREDS)
+            if isinstance(mireds, int) and not isinstance(mireds, bool):
+                self._ct_learner.observe(entry, mireds)
         except Exception:  # pylint: disable=broad-except
             return
-        if isinstance(mireds, int) and not isinstance(mireds, bool):
-            self._ct_learner.observe(entry, mireds)
 
     def _note_pushed(self, device_id: int, states: dict,
                       handler: Optional[export_handlers.ExportHandler] = None) -> None:
@@ -1439,6 +1449,11 @@ class ExportBridge:
         self._no_op_reported.pop(device_id, None)
         # The snapshot dies with the export — that is what bounds it (E5).
         self._pushed.pop(device_id, None)
+        # #293 — the learner's own in-progress state (a commanded reference,
+        # a shortfall streak) is per-device too and must not outlive the
+        # export, or a device_id later reused by a deleted-and-recreated
+        # Indigo device would inherit evidence about different hardware.
+        self._ct_learner.forget(device_id)
         client = self._live_client("remove_endpoint", device_id)
         if client is None:
             return
