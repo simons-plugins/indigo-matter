@@ -421,6 +421,63 @@ def test_upsert_still_accepts_a_re_adopted_published_as(prefs, mock_logger):
     assert store.get(1).published_as == "indigo-2"
 
 
+# ---------------------------------------------------------------------------
+# options validated at WRITE time (issue #294 review, incident 2026-08-24
+# 15:39) — mirrors published_as's own upsert/replace_all guard above.
+# `ExportEntry.from_dict` (the LOAD path) always caught a collapsed
+# min/max pair; `upsert`/`replace_all` did not, until `ct_learner._adopt`'s
+# own re-read-before-write raced a concurrent adoption and persisted an
+# invalid (215, 215) pair straight past it — only for `from_dict` to have
+# rejected it as corrupt at the NEXT restart. See
+# `tests/test_ct_learner.py`'s incident-pinned tests for the learner-level
+# reproduction; this is the store-level guard that now backstops it.
+# ---------------------------------------------------------------------------
+def test_upsert_refuses_a_collapsed_ct_bounds_pair_at_write_time(prefs, mock_logger):
+    store = ExportStore(lambda: prefs, mock_logger)
+    with pytest.raises(ValueError, match="min < max"):
+        store.upsert(_entry(1, "colorTemperatureLight",
+                            options={OPTION_CT_LEARNED_MIN_MIREDS: 215,
+                                     OPTION_CT_LEARNED_MAX_MIREDS: 215}))
+    assert store.get(1) is None, "nothing was written"
+    assert PREF_KEY not in prefs
+
+
+def test_upsert_still_accepts_a_valid_ct_bounds_pair(prefs, mock_logger):
+    store = ExportStore(lambda: prefs, mock_logger)
+    store.upsert(_entry(1, "colorTemperatureLight",
+                        options={OPTION_CT_LEARNED_MIN_MIREDS: 200,
+                                 OPTION_CT_LEARNED_MAX_MIREDS: 400}))
+    assert store.get(1).options == {OPTION_CT_LEARNED_MIN_MIREDS: 200,
+                                    OPTION_CT_LEARNED_MAX_MIREDS: 400}
+
+
+def test_replace_all_refuses_a_collapsed_ct_bounds_pair_and_persists_nothing(prefs, mock_logger):
+    """One bad entry among several refuses the WHOLE replacement — the same
+    "changed nothing" promise `upsert` makes on failure — not a partial
+    commit that silently drops just the bad one."""
+    store = ExportStore(lambda: prefs, mock_logger)
+    store.upsert(_entry(1))
+    with pytest.raises(ValueError, match="min < max"):
+        store.replace_all([
+            _entry(2),
+            _entry(3, "colorTemperatureLight",
+                  options={OPTION_CT_LEARNED_MIN_MIREDS: 300,
+                           OPTION_CT_LEARNED_MAX_MIREDS: 300}),
+        ])
+    assert store.ids() == frozenset({1}), "the old list survives untouched"
+
+
+def test_replace_all_still_accepts_a_valid_ct_bounds_pair(prefs, mock_logger):
+    store = ExportStore(lambda: prefs, mock_logger)
+    store.replace_all([
+        _entry(1, "colorTemperatureLight",
+              options={OPTION_CT_LEARNED_MIN_MIREDS: 200,
+                       OPTION_CT_LEARNED_MAX_MIREDS: 400}),
+    ])
+    assert store.get(1).options == {OPTION_CT_LEARNED_MIN_MIREDS: 200,
+                                    OPTION_CT_LEARNED_MAX_MIREDS: 400}
+
+
 def test_published_as_absent_on_load_of_an_older_payload(mock_logger):
     """An entry saved before PR5 has no `publishedAs` key at all — it must
     load, not be dropped as unusable, with `published_as` defaulting to None."""

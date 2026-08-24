@@ -468,3 +468,57 @@ def test_adopt_measured_collapse_refusal_reuses_adopt_s_own_guard(learner, store
     assert store.upserts == []
     republish.assert_not_called()
     learner._logger.warning.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# The 2026-08-24 15:39 incident — a stale caller snapshot must never gate
+# the write. `_adopt` re-reads the store itself for its guard; the `entry`
+# a caller passes in is used only for `indigo_device_id`/role, never trusted
+# for what "current" means (see `_adopt`'s own docstring for the mechanism).
+# ---------------------------------------------------------------------------
+def test_the_2026_08_24_15_39_incident_is_refused_via_the_fresh_re_read(
+        learner, store, republish):
+    """THE incident this fix exists for, pinned verbatim (issue #293,
+    2026-08-24 15:39, device 1894385558 — a MiBoxer strip): a calibration
+    sweep's cool-extreme adoption already wrote ``ctLearnedMinMireds: 215``
+    to the store, but the SAME sweep's warm-extreme call still holds its own
+    ``entry`` snapshot from BEFORE the sweep started — options still empty,
+    so its own idea of the current bounds is the unlearned (153, 500).
+    Before this fix, ``_adopt``'s collapse guard trusted that stale snapshot
+    and let a warm candidate of 215 sail straight past it, merging onto the
+    FRESH options that already held min=215 and persisting an invalid
+    (215, 215) pair. The guard must refuse it instead."""
+    stale_entry = _Entry(800)  # options={} — the sweep's own pre-loop snapshot
+    store.upsert(_Entry(800, options={ct_bounds.OPTION_CT_LEARNED_MIN_MIREDS: 215}))
+    store.upserts.clear()  # the setup write above is not what this test asserts on
+
+    learner.adopt_measured(stale_entry, "max", 215, reason="calibration sweep")
+
+    assert store.upserts == [], "no invalid (215, 215) pair was ever persisted"
+    assert store.get(800).options == {ct_bounds.OPTION_CT_LEARNED_MIN_MIREDS: 215}, \
+        "the store is left exactly as valid as it was — a lone learned min"
+    republish.assert_not_called()
+    learner._logger.warning.assert_called_once()
+
+
+def test_observe_with_a_stale_snapshot_is_also_refused_via_the_fresh_re_read(
+        learner, store, republish):
+    """The mirrored case through :meth:`observe`/:meth:`_observe_locked`:
+    that path takes its ``entry`` from whatever the CALLER last read (its own
+    docstring says so), so a caller that reuses one stale snapshot across two
+    calls — exactly the shape the incident above shows for a multi-side
+    sweep — can build a shortfall streak whose OWN current-bounds reasoning
+    (153, 500) disagrees with what the store now holds (215, 500). The
+    streak's completion still has to go through ``_adopt``'s fresh re-read,
+    which is what actually refuses the resulting collapse."""
+    stale_entry = _Entry(800)  # options={} — read before the store gained a learned min
+    store.upsert(_Entry(800, options={ct_bounds.OPTION_CT_LEARNED_MIN_MIREDS: 215}))
+    store.upserts.clear()
+    learner.record_commanded(800, 500)   # asked for the warm extreme
+    learner.observe(stale_entry, 215)    # warm shortfall candidate, by the STALE (153, 500)
+    learner.observe(stale_entry, 215)    # second, matching echo -> completes the streak
+
+    assert store.upserts == []
+    assert store.get(800).options == {ct_bounds.OPTION_CT_LEARNED_MIN_MIREDS: 215}
+    republish.assert_not_called()
+    learner._logger.warning.assert_called_once()

@@ -2634,8 +2634,14 @@ class TestMenuMigrateExportSuccess:
         assert len(identities) == len(set(identities))
 
     def test_name_override_and_options_are_carried_from_the_source(self, plug, devices):
-        devices.add(RelayDevice(106, "Garage Plug"))
-        plug.exports.upsert(ExportEntry(101, "onOffPlugInUnit", name_override="Front Plug",
+        # A DimmerDevice (not RelayDevice), and "windowCovering" (not
+        # "onOffPlugInUnit"): `invert` is only a lawful option on a role in
+        # `INVERTIBLE_ROLES` (`export_store._validate_options`) — the store
+        # now enforces that on `upsert`/`replace_all` too (issue #294), not
+        # just on load, so the source entry itself has to be a role that
+        # legitimately carries `invert`.
+        devices.add(DimmerDevice(106, "Garage Plug"))
+        plug.exports.upsert(ExportEntry(101, "windowCovering", name_override="Front Plug",
                                         options={"invert": True}))
         _bridge_with(plug, attached=True)
         plug.export_bridge.reattach = Mock(return_value=True)

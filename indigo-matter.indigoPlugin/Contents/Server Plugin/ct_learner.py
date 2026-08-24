@@ -209,14 +209,19 @@ class CTBoundsLearner:
         C extension — active probing, rejected as an AUTOMATIC mechanism, now
         shipped as an operator-invoked action that feeds this same store).
 
-        Deliberately thin: it computes the two inputs :meth:`_adopt` needs
-        that :meth:`_observe_locked` would otherwise compute for it
-        (``current_min``/``current_max``) and then funnels straight into
-        :meth:`_adopt` under the SAME lock — so a sweep's measurement gets
-        the identical collapse-refusal guard, re-read-before-write, one INFO
-        log, and republish that passive shortfall/re-widen evidence already
-        gets. No second adoption path is written; that would be exactly the
-        "one fact said twice" this module's own docstring warns against.
+        Deliberately thin: it funnels straight into :meth:`_adopt` under the
+        SAME lock — so a sweep's measurement gets the identical collapse-
+        refusal guard, re-read-before-write, one INFO log, and republish that
+        passive shortfall/re-widen evidence already gets. No second adoption
+        path is written; that would be exactly the "one fact said twice" this
+        module's own docstring warns against.
+
+        ``entry`` here is deliberately NOT used to compute the guard's
+        current bounds — only its ``indigo_device_id``/``role`` matter, and
+        :meth:`_adopt` re-reads the store itself for the rest (see its own
+        docstring for why: a live incident showed this caller's own ``entry``
+        can be a snapshot taken before a MULTI-SIDE sweep started, stale by
+        the time the second side's call lands here).
 
         Unlike :meth:`observe`, there is no streak to build and no freshness
         window to check: the caller (the calibration engine) already knows
@@ -229,8 +234,7 @@ class CTBoundsLearner:
         if entry.role not in ct_bounds.CT_ROLES:
             return
         with self._lock:
-            current_min, current_max = ct_bounds.effective_ct_bounds(entry.options)
-            self._adopt(entry, side, int(mireds), current_min, current_max, reason=reason)
+            self._adopt(entry, side, int(mireds), reason=reason)
 
     def _observe_locked(self, entry, mireds: int) -> None:
         device_id = entry.indigo_device_id
@@ -241,12 +245,12 @@ class CTBoundsLearner:
         # right now. This is what self-heals a seed or a stale learned value
         # that turns out to be too narrow.
         if mireds < current_min:
-            self._adopt(entry, "min", mireds, current_min, current_max,
+            self._adopt(entry, "min", mireds,
                         reason=f"a reading of {mireds} mired is past its {current_min}-mired "
                                "learned/seeded floor, proving the device reaches further")
             return
         if mireds > current_max:
-            self._adopt(entry, "max", mireds, current_min, current_max,
+            self._adopt(entry, "max", mireds,
                         reason=f"a reading of {mireds} mired is past its {current_max}-mired "
                                "learned/seeded ceiling, proving the device reaches further")
             return
@@ -275,7 +279,7 @@ class CTBoundsLearner:
         pending = self._pending.get(device_id)
         if pending is not None and pending.side == side \
                 and abs(pending.mireds - mireds) <= REPEAT_TOLERANCE_MIREDS:
-            self._adopt(entry, side, mireds, current_min, current_max,
+            self._adopt(entry, side, mireds,
                         reason=(f"two consecutive {'warm' if side == 'max' else 'cool'} "
                                 f"shortfalls confirmed a commanded {commanded.mireds}-mired "
                                 f"write echoed back as {mireds}"))
@@ -287,9 +291,38 @@ class CTBoundsLearner:
         # came before it.
         self._pending[device_id] = _Pending(side=side, mireds=mireds)
 
-    def _adopt(self, entry, side: str, candidate: int, current_min: int, current_max: int,
-              *, reason: str) -> None:
-        """Persist ``candidate`` as the learned bound for ``side``, if it says anything new."""
+    def _adopt(self, entry, side: str, candidate: int, *, reason: str) -> None:
+        """Persist ``candidate`` as the learned bound for ``side``, if it says anything new.
+
+        Re-reads the store FIRST and derives the current effective bounds
+        from THAT — never from ``entry``, whatever bounds a caller happens to
+        have computed for its own pre-check — because ``entry`` is only ever
+        a snapshot, and the guard below has to be right about what is
+        actually stored right now, not what it was when the caller read it.
+
+        This is the issue #293 2026-08-24 15:39 incident, fixed at its root:
+        a calibration sweep's ``adopt_measured`` reused ONE ``entry`` snapshot
+        (options empty) across both the cool and warm extremes of the same
+        device. The cool adoption wrote ``ctLearnedMinMireds: 215`` to the
+        store; the warm call, still holding the stale empty-options snapshot,
+        computed its guard against (153, 500) instead of the now-current
+        (215, 500) — so a warm candidate of 215 sailed past a guard that
+        should have refused it, and the write then merged the new
+        ``ctLearnedMaxMireds: 215`` onto the FRESH options that already held
+        ``ctLearnedMinMireds: 215``, persisting an invalid (215, 215) pair.
+        Production self-healed four seconds later when a settled reading
+        re-widened it back to (153, 500), but the invalid pair was genuinely
+        stored in that window, and ``ExportStore.upsert`` had nothing that
+        would have caught it either (see its own docstring on this point).
+        Recomputing from a fresh re-read, right here, closes both gaps at
+        once: no caller's bounds are trusted for the write decision, and the
+        guard and the write always agree on what they are guarding.
+        """
+        device_id = entry.indigo_device_id
+        fresh = self._store.get(device_id)
+        if fresh is None:
+            return  # the export was removed since this reading arrived
+        current_min, current_max = ct_bounds.effective_ct_bounds(fresh.options)
         if side == "min":
             if candidate == current_min:
                 return  # already the effective value — nothing to say twice
@@ -306,27 +339,23 @@ class CTBoundsLearner:
             # widening the OTHER side to compensate — that would be this
             # module inventing evidence for a side that offered none.
             #
-            # In practice only COLLAPSE (equality) is reachable through
-            # `observe`: the re-widen branch above intercepts anything
-            # outside the current bounds before this shortfall path ever
-            # runs, so `candidate` here is always within
-            # `[current_min, current_max]`, and replacing one side with it
-            # can shrink the range to a point but never invert it. The `>=`
-            # check still covers strict inversion too, on the chance a
-            # future caller of `_adopt` is less constrained than this one.
+            # Both COLLAPSE and genuine INVERSION are reachable here now that
+            # this guard runs against a FRESH re-read rather than the value
+            # that produced `candidate`: a caller's own current-bounds
+            # reasoning (the re-widen-vs-shortfall split in
+            # `_observe_locked`, or a sweep's single-shot ask/echo pair in
+            # `adopt_measured`) is computed against ITS OWN snapshot, which
+            # can disagree with what the store holds by the time this runs —
+            # exactly the gap the incident above exploited. A second
+            # adoption landing on the OTHER side in between (two sides of
+            # the same sweep, or two concurrent adoptions) can move
+            # `current_min`/`current_max` past `candidate` in either
+            # direction, so this is no longer provably collapse-only.
             self._logger.warning(
                 "Matter export: device %s's observed colour-temperature bound (%s mireds, side "
                 "%s) would make its learned range %s-%s invalid (min must be < max) — refusing "
-                "to adopt it.", entry.indigo_device_id, candidate, side, new_min, new_max)
+                "to adopt it.", device_id, candidate, side, new_min, new_max)
             return
-        device_id = entry.indigo_device_id
-        # Re-read immediately before writing: `entry` may be the caller's
-        # snapshot from moments ago, and another thread's `store.upsert`
-        # (a role change, a name edit, a concurrent adoption on the other
-        # side) landing in between must not be clobbered by a stale copy.
-        fresh = self._store.get(device_id)
-        if fresh is None:
-            return  # the export was removed since this reading arrived
         updated = dataclasses.replace(fresh, options={**fresh.options, learned_key: candidate})
         try:
             self._store.upsert(updated)

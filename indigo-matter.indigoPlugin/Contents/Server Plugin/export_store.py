@@ -394,11 +394,27 @@ class ExportStore:
         discovered on the reload after that, by which point the dialog that
         wrote it has long since reported success. Raising at the write is what
         lets the caller say "FAILED to save the export list" instead.
+
+        ``options`` is validated HERE too (issue #294 review), for the exact
+        same reason ``published_as`` already is: :meth:`ExportEntry.from_dict`
+        is the LOAD path's guard, and every ordinary write goes through
+        already-validated callers (the export dialog, ``ct_learner._adopt``'s
+        own re-read-then-merge). But the 2026-08-24 15:39 incident proved a
+        caller CAN construct an invalid pair despite its own guard racing a
+        concurrent write (see ``ct_learner.CTBoundsLearner._adopt``'s
+        docstring for the full mechanism) — and without a check here, that
+        invalid blob is persisted silently and only rejected as corrupt at
+        the NEXT plugin restart's load, by which point the evidence of what
+        went wrong is long gone. Raising here instead gives the caller (in
+        practice, ``_adopt``'s own try/except) an immediate, attributable
+        failure to log — "could not be saved" — rather than a delayed,
+        unexplained one.
         """
         if entry.published_as is not None and parse_published_id(entry.published_as) is None:
             raise ValueError(
                 f"export entry {KEY_PUBLISHED_AS!r} {entry.published_as!r} is not a lawful "
                 f"published identity (device {entry.indigo_device_id})")
+        _validate_options(entry.options, entry.role, entry.indigo_device_id)
         with self._lock:
             pending = dict(self._entries)
             pending[int(entry.indigo_device_id)] = entry
@@ -417,9 +433,26 @@ class ExportStore:
             return True
 
     def replace_all(self, entries: Iterable[ExportEntry]) -> None:
-        """Replace the whole allow-list in one persisted write."""
+        """Replace the whole allow-list in one persisted write.
+
+        Validated the same way :meth:`upsert` is (issue #294 review) and for
+        the same reason: ``_migrate_commit`` (``server_menu_mixin.py``) is
+        this method's one production caller, and it already wraps the call
+        in a try/except reporting "FAILED to save the export list" — exactly
+        the failure mode a raised ``ValueError`` here produces. Validated
+        BEFORE ``_commit`` runs, over every entry, so one bad entry among many
+        refuses the whole replacement rather than partially persisting it —
+        matching :meth:`upsert`'s own "changed nothing" promise on failure.
+        """
+        materialized = list(entries)
+        for entry in materialized:
+            if entry.published_as is not None and parse_published_id(entry.published_as) is None:
+                raise ValueError(
+                    f"export entry {KEY_PUBLISHED_AS!r} {entry.published_as!r} is not a lawful "
+                    f"published identity (device {entry.indigo_device_id})")
+            _validate_options(entry.options, entry.role, entry.indigo_device_id)
         with self._lock:
-            self._commit({int(e.indigo_device_id): e for e in entries})
+            self._commit({int(e.indigo_device_id): e for e in materialized})
 
     # ------------------------------------------------------------------
     # Persistence
