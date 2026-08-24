@@ -3,6 +3,52 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
+## 2026.27.0 — physical colour-temperature bounds, learned from what the device actually does
+
+- **Exported colour-temperature and extended-colour lights can now publish
+  their REAL warm/cool limits to paired ecosystems, instead of the generic
+  2000-6500K range** (issue #293). A device that permanently clamps a
+  commanded colour temperature (issue #281's Hue/Innr warm-limit case) used
+  to rely entirely on the 2026.26.2 commanded-push-and-tolerance workaround;
+  now the fabric itself is told the device's honest range, so Apple's own
+  adaptive-lighting curve stops asking for a colour the bulb was never going
+  to reach in the first place.
+- **The bounds are learned, not merely declared.** A user-set or plugin-
+  reported range is still only a claim — nothing guarantees it matches the
+  hardware (a MiBoxer strip's z2m props claimed 2200K while the silicon
+  clamps at 2500K). The plugin instead watches a commanded colour-
+  temperature write against the device's own confirmed echo: two consistent
+  shortfalls adopt the echoed value as that side's learned bound, and any
+  reading outside the current bounds immediately proves reach and widens
+  them again — self-healing a wrong seed with no manual configuration. A
+  stale commanded reference (anything more than 15 seconds old) is never
+  read as evidence, so an unrelated Indigo-side change hours later cannot be
+  mistaken for a hardware clamp.
+- **"Manage Matter Exports…" gained two optional fields** — "Warmest white
+  (K):" and "Coolest white (K):" — for a device's own colour-temperature
+  role. Left empty, the generic range is used until the learner has
+  evidence of its own; filled in, they seed the learner's starting point
+  rather than being taken as ground truth.
+- The ADR-0013 commanded-push-and-tolerance mechanism (2026.26.2) is
+  unchanged: it is still what keeps the fabric attribute converged while the
+  learner gathers evidence, and it never clamps to the learned/seeded range
+  — only to the generic domain, as before.
+- **Requires the bridge node update to `indigo-matter-bridge@0.16.0`**,
+  which declares the effective bounds on the ColorControl cluster
+  (`colorTempPhysicalMinMireds`/`MaxMireds`) when they differ from the
+  generic 153-500 mired domain.
+- **New plugin action: "Calibrate Colour-Temperature Bounds"** (issue #293's
+  calibration extension). Passive learning only ever adopts a shortfall
+  against a command the FABRIC sent, so a lamp nobody's paired ecosystem has
+  driven yet has no reference to learn from, however many times its colour
+  temperature changes in Indigo. This action closes that gap on request: it
+  sweeps chosen (or all) exported colour-temperature lights through both
+  extremes via the same dispatch path a real fabric command takes, reads the
+  echo, and persists whatever it measures through the same learner used for
+  passive evidence — no new mechanism, no automatic probing (still rejected
+  as automatic behaviour per ADR-0014 Option C), and no lamp that stays off
+  the whole time ever visibly reacts.
+
 ## 2026.26.2 — adaptive lighting no longer fights warm-limited lamps, and a colour-temperature change no longer dims them
 
 - **Apple adaptive lighting no longer loops forever against a lamp that has

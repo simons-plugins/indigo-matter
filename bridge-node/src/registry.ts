@@ -10,6 +10,7 @@
 import type { Endpoint } from "@matter/main";
 
 import {
+    applyCtBoundsUpdate,
     applyLabel,
     applyReachable,
     applyStates,
@@ -663,7 +664,7 @@ export class EndpointRegistry {
         return endpoint;
     }
 
-    /** Label, reachability and state — everything an existing endpoint can change. */
+    /** Label, reachability, CT physical bounds (#293) and state — everything an existing endpoint can change. */
     private async update(spec: EndpointSpec): Promise<void> {
         const live = this.require(spec.indigoDeviceId);
         // Both labels, because {@link applyLabel} writes both: comparing only
@@ -681,6 +682,28 @@ export class EndpointRegistry {
         // the cluster would restore yesterday's name after a restart.
         live.label = spec.label;
         await applyReachable(live.endpoint, spec.reachable);
+        // #293 — before `applyStates`: a `set_state` in the SAME push that
+        // changes bounds must clamp against the NEW bounds, not the ones this
+        // endpoint had a moment ago.
+        //
+        // Caught and logged rather than left to propagate: bounds are
+        // advisory (ADR-0014 — "a refused attach takes every export offline
+        // over one bad option" applies just as much to a live update as to
+        // an attach), and `applyStates` below already clamps CT to the
+        // endpoint's LIVE bounds, so continuing with the OLD bounds still
+        // in place is safe. Left uncaught, one device's bad bounds would
+        // both lose that device's own state push AND abort the whole
+        // `reconcileNow` batch (its `plan.update` loop has no per-spec
+        // catch of its own), taking every other device in the batch down
+        // with it over an advisory write.
+        try {
+            await applyCtBoundsUpdate(live.endpoint, live.role, spec.options, spec.indigoDeviceId);
+        } catch (error) {
+            this.#log(
+                `endpoint ${spec.indigoDeviceId} CT bounds update failed, keeping its previous ` +
+                    `bounds: ${describeError(error)}`,
+            );
+        }
         // `live.battery`, not `spec.battery`: a battery LOSS on `spec` is left
         // alone here (§4.1, monotonic) — the gain case never reaches `update`
         // at all, `upsert`/`reconcileNow` route it to a recreate instead.

@@ -10,12 +10,15 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
+import { Logger, LogLevel } from "@matter/main";
+
 import {
     celsiusToMatter,
     clampMireds,
     clampSetpoint,
     cubicMetresPerHourToMatter,
     degreesToMatterHue,
+    extractCtBounds,
     HUE_DEGREES_MAX,
     HUMIDITY_CENTI_MAX,
     humidityToMatter,
@@ -48,6 +51,22 @@ import {
     uniqueIdFor,
     TEMPERATURE_CENTI_MIN,
 } from "../src/endpoints.js";
+
+/**
+ * `extractCtBounds` logs its one warn line through matter.js's own `Logger`,
+ * not through a callback this module controls — `registry.test.ts` sets
+ * `Logger.level = "fatal"` process-wide to keep TAP output readable, which
+ * would silently swallow a `warn` on any destination that inherits it. A
+ * dedicated destination with its OWN `level` (via the legacy `addLogger`
+ * `defaultLogLevel` option, which sets it directly rather than inheriting the
+ * global default) sidesteps that rather than fighting over the shared one.
+ */
+function captureWarnLogs(): { lines: string[]; stop: () => void } {
+    const lines: string[] = [];
+    const id = `ct-bounds-test-${Math.random().toString(36).slice(2)}`;
+    Logger.addLogger(id, (_level, formattedLog) => lines.push(formattedLog), { defaultLogLevel: LogLevel.WARN });
+    return { lines, stop: () => Logger.removeLogger(id) };
+}
 
 /** 0..100 inclusive — the whole §4.2 percent domain, not a sample of it. */
 const ALL_PERCENTS = Array.from({ length: 101 }, (_, index) => index);
@@ -418,4 +437,76 @@ describe("UniqueID ↔ indigoDeviceId (§6.3, issue #141)", () => {
         // quieter route.
         assert.equal(indigoDeviceIdFrom("indigo-9007199254740993"), undefined);
     });
+});
+
+describe("extractCtBounds validity rule (issue #293)", () => {
+    it("returns undefined silently when neither key is present", () => {
+        const capture = captureWarnLogs();
+        try {
+            assert.equal(extractCtBounds({}, 1), undefined);
+            assert.equal(extractCtBounds({ someOtherOption: true }, 1), undefined);
+            assert.deepEqual(capture.lines, [], "the ordinary no-seed case must not log");
+        } finally {
+            capture.stop();
+        }
+    });
+
+    it("accepts a usable pair without logging", () => {
+        const capture = captureWarnLogs();
+        try {
+            assert.deepEqual(extractCtBounds({ ctMinMireds: 250, ctMaxMireds: 400 }, 1), {
+                minMireds: 250,
+                maxMireds: 400,
+            });
+            // The narrowest and widest legal pairs — MIREDS_MIN/MAX themselves
+            // are in bounds (`>=`/`<=`, not strict).
+            assert.deepEqual(extractCtBounds({ ctMinMireds: MIREDS_MIN, ctMaxMireds: MIREDS_MAX }, 1), {
+                minMireds: MIREDS_MIN,
+                maxMireds: MIREDS_MAX,
+            });
+            assert.deepEqual(extractCtBounds({ ctMinMireds: 199, ctMaxMireds: 200 }, 1), {
+                minMireds: 199,
+                maxMireds: 200,
+            });
+            assert.deepEqual(capture.lines, [], "a usable pair must not log");
+        } finally {
+            capture.stop();
+        }
+    });
+
+    /**
+     * Adversarial per the repo's degradation-path convention: each of these
+     * shapes must be ignored (treated exactly as absent) rather than refuse
+     * the whole attach — a refused attach takes every OTHER export on the
+     * bridge offline too over one device's cosmetic seed value.
+     */
+    const unusable: { name: string; options: Record<string, unknown> }[] = [
+        { name: "min present, max missing", options: { ctMinMireds: 300 } },
+        { name: "max present, min missing", options: { ctMaxMireds: 400 } },
+        { name: "min is a float", options: { ctMinMireds: 250.5, ctMaxMireds: 400 } },
+        { name: "max is a float", options: { ctMinMireds: 250, ctMaxMireds: 400.1 } },
+        { name: "min is a boolean", options: { ctMinMireds: true, ctMaxMireds: 400 } },
+        { name: "max is a boolean", options: { ctMinMireds: 250, ctMaxMireds: false } },
+        { name: "min is a string", options: { ctMinMireds: "250", ctMaxMireds: 400 } },
+        { name: "min equals max", options: { ctMinMireds: 300, ctMaxMireds: 300 } },
+        { name: "min greater than max", options: { ctMinMireds: 400, ctMaxMireds: 300 } },
+        { name: "min below the generic floor", options: { ctMinMireds: 100, ctMaxMireds: 400 } },
+        { name: "max above the generic ceiling", options: { ctMinMireds: 250, ctMaxMireds: 600 } },
+    ];
+
+    for (const { name, options } of unusable) {
+        it(`ignores an unusable pair (${name}) and warns exactly once, naming the device`, () => {
+            const capture = captureWarnLogs();
+            try {
+                // The adversarial claim: this must return undefined, not throw —
+                // an unusable pair can never take the attach down.
+                assert.equal(extractCtBounds(options, 4271), undefined);
+                assert.equal(capture.lines.length, 1, capture.lines.join("\n"));
+                assert.match(capture.lines[0]!, /4271/);
+                assert.match(capture.lines[0]!, /ctMinMireds/);
+            } finally {
+                capture.stop();
+            }
+        });
+    }
 });

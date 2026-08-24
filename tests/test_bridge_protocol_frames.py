@@ -15,6 +15,7 @@ import json
 import pytest
 
 import bridge_protocol
+import ct_bounds
 from bridge_protocol import (
     BridgeProtocol,
     BridgeProtocolError,
@@ -584,6 +585,28 @@ class TestCoverage:
         assert parse_published_id(wire["publishedAs"]) == PublishedId(
             device_id=wire["indigoDeviceId"], generation=2)
         assert EndpointSpec.from_wire(wire).to_wire() == wire
+
+
+def test_ct_bounds_wire_options_matches_the_golden_colorTemperatureLight_spec():
+    """Issue #294 review — cross-checks the Python transform
+    (`ct_bounds.wire_options`) directly against the SHARED golden fixture,
+    not just against itself: a divergence between what the plugin actually
+    computes for a seeded CT range and what `attach_all_roles`'s
+    `colorTemperatureLight` spec (indigoDeviceId 900004) carries on the wire
+    must fail the PYTHON suite too, not only `bridge-node`'s.
+
+    The seed below (``ctMinMireds: 200, ctMaxMireds: 450``) is the exact
+    stored-options shape the golden spec's own ``options`` already shows —
+    both a seed pair, no learned keys — so this pins that ``wire_options``
+    reproduces it byte-for-byte, not merely that the fixture round-trips
+    through ``EndpointSpec`` (``test_every_role_spec_round_trips`` already
+    covers that separate claim).
+    """
+    seed = {ct_bounds.OPTION_CT_MIN_MIREDS: 200, ct_bounds.OPTION_CT_MAX_MIREDS: 450}
+    specs = BY_NAME["attach_all_roles"]["request"]["args"]["endpoints"]
+    golden = next(s for s in specs if s["indigoDeviceId"] == 900004)
+    assert golden["role"] == "colorTemperatureLight"
+    assert ct_bounds.wire_options(seed) == golden["options"]
 
 
 class TestPublishedIdentity:

@@ -15,6 +15,10 @@ import pytest
 from bridge_protocol import ROLES
 from export_store import (
     LOAD_ERROR_UNREADABLE,
+    OPTION_CT_LEARNED_MAX_MIREDS,
+    OPTION_CT_LEARNED_MIN_MIREDS,
+    OPTION_CT_MAX_MIREDS,
+    OPTION_CT_MIN_MIREDS,
     OPTION_INVERT,
     OPTION_STATE_INVERT,
     OPTION_STATE_KEY,
@@ -594,6 +598,118 @@ def test_export_entry_did_not_grow_a_battery_field():
     """
     import dataclasses
     assert "battery" not in {field.name for field in dataclasses.fields(ExportEntry)}
+
+
+# ---------------------------------------------------------------------------
+# Colour-temperature bounds (issue #293)
+# ---------------------------------------------------------------------------
+def test_a_complete_seed_pair_is_accepted_on_a_ct_role():
+    entry = ExportEntry.from_dict({
+        "indigoDeviceId": 1, "role": "colorTemperatureLight",
+        "options": {OPTION_CT_MIN_MIREDS: 200, OPTION_CT_MAX_MIREDS: 400}})
+    assert entry.options == {OPTION_CT_MIN_MIREDS: 200, OPTION_CT_MAX_MIREDS: 400}
+
+
+def test_a_complete_seed_pair_is_accepted_on_extended_color_light():
+    entry = ExportEntry.from_dict({
+        "indigoDeviceId": 1, "role": "extendedColorLight",
+        "options": {OPTION_CT_MIN_MIREDS: 153, OPTION_CT_MAX_MIREDS: 500}})
+    assert entry.options[OPTION_CT_MIN_MIREDS] == 153
+
+
+def test_ct_bounds_on_a_role_with_no_colour_temperature_is_rejected():
+    with pytest.raises(ValueError, match="no colour temperature"):
+        ExportEntry.from_dict({
+            "indigoDeviceId": 1, "role": "doorLock",
+            "options": {OPTION_CT_MIN_MIREDS: 200, OPTION_CT_MAX_MIREDS: 400}})
+
+
+def test_a_lone_seed_key_is_rejected_as_incomplete():
+    with pytest.raises(ValueError, match="incomplete"):
+        ExportEntry.from_dict({
+            "indigoDeviceId": 1, "role": "colorTemperatureLight",
+            "options": {OPTION_CT_MIN_MIREDS: 200}})
+    with pytest.raises(ValueError, match="incomplete"):
+        ExportEntry.from_dict({
+            "indigoDeviceId": 1, "role": "colorTemperatureLight",
+            "options": {OPTION_CT_MAX_MIREDS: 400}})
+
+
+def test_a_lone_learned_key_is_accepted_on_either_side():
+    entry = ExportEntry.from_dict({
+        "indigoDeviceId": 1, "role": "colorTemperatureLight",
+        "options": {OPTION_CT_LEARNED_MAX_MIREDS: 400}})
+    assert entry.options == {OPTION_CT_LEARNED_MAX_MIREDS: 400}
+    entry = ExportEntry.from_dict({
+        "indigoDeviceId": 1, "role": "colorTemperatureLight",
+        "options": {OPTION_CT_LEARNED_MIN_MIREDS: 200}})
+    assert entry.options == {OPTION_CT_LEARNED_MIN_MIREDS: 200}
+
+
+@pytest.mark.parametrize("options", [
+    {OPTION_CT_MIN_MIREDS: 400, OPTION_CT_MAX_MIREDS: 200},   # inverted
+    {OPTION_CT_MIN_MIREDS: 300, OPTION_CT_MAX_MIREDS: 300},   # collapsed to a point
+    {OPTION_CT_MIN_MIREDS: 100, OPTION_CT_MAX_MIREDS: 400},   # min below the fabric's own floor
+    {OPTION_CT_MIN_MIREDS: 200, OPTION_CT_MAX_MIREDS: 600},   # max above the fabric's own ceiling
+])
+def test_a_complete_pair_outside_the_domain_is_rejected(options):
+    with pytest.raises(ValueError, match="153"):
+        ExportEntry.from_dict({
+            "indigoDeviceId": 1, "role": "colorTemperatureLight", "options": options})
+
+
+def test_a_complete_learned_pair_outside_the_domain_is_also_rejected():
+    with pytest.raises(ValueError, match="153"):
+        ExportEntry.from_dict({
+            "indigoDeviceId": 1, "role": "colorTemperatureLight",
+            "options": {OPTION_CT_LEARNED_MIN_MIREDS: 400, OPTION_CT_LEARNED_MAX_MIREDS: 200}})
+
+
+@pytest.mark.parametrize("options", [
+    {OPTION_CT_LEARNED_MAX_MIREDS: 9999},   # above the fabric's own ceiling
+    {OPTION_CT_LEARNED_MIN_MIREDS: 1},      # below the fabric's own floor
+])
+def test_a_lone_learned_key_outside_the_domain_is_rejected(options):
+    """The complete-pair inequality never sees a lone learned side, so it
+    needs its own domain check: without one, a hand-edited
+    ``ctLearnedMaxMireds: 9999`` loads cleanly here and is only caught by
+    the NODE's validity warn — leaving the plugin believing a bound the
+    fabric never adopted."""
+    with pytest.raises(ValueError, match="domain"):
+        ExportEntry.from_dict({
+            "indigoDeviceId": 1, "role": "colorTemperatureLight", "options": options})
+
+
+@pytest.mark.parametrize("options", [
+    {OPTION_CT_MIN_MIREDS: True, OPTION_CT_MAX_MIREDS: 400},
+    {OPTION_CT_MIN_MIREDS: 200, OPTION_CT_MAX_MIREDS: False},
+    {OPTION_CT_LEARNED_MIN_MIREDS: True},
+    {OPTION_CT_LEARNED_MAX_MIREDS: False},
+])
+def test_a_non_integer_ct_bound_is_rejected(options):
+    """A bool must not be silently treated as an int (``isinstance(True,
+    int)`` is ``True`` in Python) — a hand-edited ``.indiPref`` is the one
+    write path this guard exists for."""
+    with pytest.raises(ValueError, match="integer"):
+        ExportEntry.from_dict({
+            "indigoDeviceId": 1, "role": "colorTemperatureLight", "options": options})
+
+
+def test_a_float_ct_bound_is_rejected_even_with_an_integral_value():
+    with pytest.raises(ValueError, match="integer"):
+        ExportEntry.from_dict({
+            "indigoDeviceId": 1, "role": "colorTemperatureLight",
+            "options": {OPTION_CT_MIN_MIREDS: 200.0, OPTION_CT_MAX_MIREDS: 400}})
+
+
+def test_ct_bounds_round_trip_through_a_second_store(prefs, mock_logger):
+    store = ExportStore(lambda: prefs, mock_logger)
+    store.upsert(ExportEntry(1, "colorTemperatureLight",
+                              options={OPTION_CT_MIN_MIREDS: 200, OPTION_CT_MAX_MIREDS: 400,
+                                       OPTION_CT_LEARNED_MAX_MIREDS: 390}))
+    reloaded = ExportStore(lambda: prefs, mock_logger)
+    assert reloaded.get(1).options == {
+        OPTION_CT_MIN_MIREDS: 200, OPTION_CT_MAX_MIREDS: 400, OPTION_CT_LEARNED_MAX_MIREDS: 390}
 
 
 # ---------------------------------------------------------------------------

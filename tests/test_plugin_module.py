@@ -1217,6 +1217,106 @@ def plugin_module(mock_indigo_base):
     return pm
 
 
+# ---------------------------------------------------------------------------
+# issue #293's calibration extension — "Calibrate Colour-Temperature Bounds"
+# action wiring (actionCalibrateCtBounds / getCtCalibrationScope). The sweep
+# itself is unit-tested in tests/test_ct_calibration.py; this pins only that
+# the action callback parses props correctly and delegates to the engine.
+# ---------------------------------------------------------------------------
+def test_action_calibrate_ct_bounds_all_scope_starts_the_engine_for_every_device(
+        plugin_cls, plugin_module, mock_logger):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    stub = SimpleNamespace(
+        logger=mock_logger, _ct_calibration=MagicMock(),
+        _truthy=plugin_cls._truthy,
+    )
+    action = SimpleNamespace(props={"scope": plugin_module.ALL_OPTION_ID, "skipLit": True})
+    plugin_cls.actionCalibrateCtBounds(stub, action)
+    stub._ct_calibration.start.assert_called_once_with(device_ids=None, skip_lit=True)
+
+
+def test_action_calibrate_ct_bounds_one_device_scope_starts_the_engine_for_that_id(
+        plugin_cls, mock_logger):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    stub = SimpleNamespace(
+        logger=mock_logger, _ct_calibration=MagicMock(),
+        _truthy=plugin_cls._truthy,
+    )
+    # A scripted executeAction call can hand an int where the picker would
+    # have handed a str — both must resolve to the same device id.
+    action = SimpleNamespace(props={"scope": 123, "skipLit": False})
+    plugin_cls.actionCalibrateCtBounds(stub, action)
+    stub._ct_calibration.start.assert_called_once_with(device_ids=[123], skip_lit=False)
+
+
+def test_action_calibrate_ct_bounds_missing_scope_defaults_to_all(
+        plugin_cls, plugin_module, mock_logger):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    stub = SimpleNamespace(
+        logger=mock_logger, _ct_calibration=MagicMock(),
+        _truthy=plugin_cls._truthy,
+    )
+    action = SimpleNamespace(props={})  # no ConfigUI ran (trigger/schedule call)
+    plugin_cls.actionCalibrateCtBounds(stub, action)
+    stub._ct_calibration.start.assert_called_once_with(device_ids=None, skip_lit=True)
+
+
+def test_action_calibrate_ct_bounds_invalid_device_scope_logs_error_and_does_not_start(
+        plugin_cls, mock_logger):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    stub = SimpleNamespace(
+        logger=mock_logger, _ct_calibration=MagicMock(),
+        _truthy=plugin_cls._truthy,
+    )
+    action = SimpleNamespace(props={"scope": "not-a-device-id"})
+    plugin_cls.actionCalibrateCtBounds(stub, action)
+    stub._ct_calibration.start.assert_not_called()
+    assert mock_logger.error.called
+
+
+def test_action_calibrate_ct_bounds_before_startup_logs_error_and_does_not_raise(
+        plugin_cls, plugin_module, mock_logger):
+    from types import SimpleNamespace
+    stub = SimpleNamespace(logger=mock_logger, _ct_calibration=None, _truthy=plugin_cls._truthy)
+    action = SimpleNamespace(props={"scope": plugin_module.ALL_OPTION_ID})
+    plugin_cls.actionCalibrateCtBounds(stub, action)  # must not raise
+    assert mock_logger.error.called
+
+
+def test_get_ct_calibration_scope_lists_all_then_ct_role_exports_only(plugin_cls, mock_logger):
+    from types import SimpleNamespace
+
+    class _FakeExports:
+        def __init__(self, entries):
+            self._entries = entries
+
+        def all(self):
+            return self._entries
+
+    entry_ct = SimpleNamespace(indigo_device_id=800, role="colorTemperatureLight")
+    entry_other = SimpleNamespace(indigo_device_id=801, role="onOffLight")
+    stub = SimpleNamespace(
+        logger=mock_logger,
+        exports=_FakeExports([entry_ct, entry_other]),
+        _indigo_device=lambda device_id: SimpleNamespace(name="CT Lamp") if device_id == 800 else None,
+    )
+    options = plugin_cls.getCtCalibrationScope(stub)
+    assert options[0][0] == "all"
+    assert ("800", "CT Lamp") in options
+    assert not any(value == "801" for value, _label in options)
+
+
+def test_get_ct_calibration_scope_before_startup_still_offers_all(plugin_cls, mock_logger):
+    from types import SimpleNamespace
+    stub = SimpleNamespace(logger=mock_logger, exports=None)
+    options = plugin_cls.getCtCalibrationScope(stub)
+    assert options == [("all", "All exported colour-temperature lights")]
+
+
 class TestServerLocation:
     def test_explicit_local(self, plugin_module):
         assert plugin_module.server_location({"serverLocation": "local"}) == "local"

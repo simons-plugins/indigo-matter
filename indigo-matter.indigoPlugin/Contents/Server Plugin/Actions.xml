@@ -49,6 +49,33 @@
         <Name>Report this node's settable attributes</Name>
         <CallbackMethod>actionReportNodeSettings</CallbackMethod>
     </Action>
+    <!-- Issue #293's calibration extension (ADR-0014 Option C, rejected as an
+         AUTOMATIC mechanism, now shipped as an explicit, operator-invoked
+         one): sweeps CT-capable exports through both colour-temperature
+         extremes and persists whatever the device echoes back through
+         ct_learner's own adoption path — closing the gap the passive
+         mechanism cannot: an unseeded lamp Indigo never drives through a
+         paired ecosystem has no commanded reference to learn a shortfall
+         against, however many times its colour temperature changes. Not
+         deviceFilter-scoped — deviceFilter offers exactly ONE picker and
+         cannot ALSO offer "every CT export", which the scope field below
+         does via its own dynamic list. -->
+    <Action id="calibrateCtBounds">
+        <Name>Calibrate Colour-Temperature Bounds</Name>
+        <CallbackMethod>actionCalibrateCtBounds</CallbackMethod>
+        <ConfigUI>
+            <Field id="scope" type="menu" defaultValue="all">
+                <Label>Sweep:</Label>
+                <List class="self" method="getCtCalibrationScope" dynamicReload="true"/>
+            </Field>
+            <Field id="skipLit" type="checkbox" defaultValue="true">
+                <Label>Skip lamps that are currently on:</Label>
+                <Description>A lit lamp visibly shifts colour during the sweep; an off lamp
+                    does not light at all (issue #281's off-lamp-safe colour-temperature
+                    write).</Description>
+            </Field>
+        </ConfigUI>
+    </Action>
     <!-- Device-targeted twin of "Share a Matter device with another
          ecosystem…" (Plugins ▸ Matter, issue #210): opens a commissioning
          window on this node so a second ecosystem can add it too, reachable

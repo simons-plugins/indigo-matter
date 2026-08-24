@@ -260,6 +260,28 @@ A Matter pairing code is not durable: once used, or once the window expires (up 
                 <Label>Reading is inverted:</Label>
                 <Description>Tick if the device reports on/true for the OPPOSITE of what this role publishes. Contact sensors start ticked: Indigo reports a door as on when it is OPEN, while Matter reads it as closed.</Description>
             </Field>
+            <!-- Physical colour-temperature bounds (issue #293). Visible for
+                 both CT roles, matching the exportStateInvert precedent
+                 above. Reciprocal: warmest Kelvin -> ctMaxMireds, coolest
+                 Kelvin -> ctMinMireds (export_dialog_mixin._ct_seed_from_values). -->
+            <Field id="exportCtWarmestK" type="textfield"
+                   visibleBindingId="exportRole"
+                   visibleBindingValue="colorTemperatureLight,extendedColorLight"
+                   alwaysUseInDialogHeightCalc="true">
+                <Label>Warmest white (K):</Label>
+            </Field>
+            <Field id="exportCtCoolestK" type="textfield"
+                   visibleBindingId="exportRole"
+                   visibleBindingValue="colorTemperatureLight,extendedColorLight"
+                   alwaysUseInDialogHeightCalc="true">
+                <Label>Coolest white (K):</Label>
+            </Field>
+            <Field id="exportCtBoundsHelp" type="label" fontColor="darkgray"
+                   visibleBindingId="exportRole"
+                   visibleBindingValue="colorTemperatureLight,extendedColorLight"
+                   alwaysUseInDialogHeightCalc="true">
+                <Label>Optional, 2000-6535K. Declares the bulb's real warm/cool limits so paired ecosystems never ask for a colour it cannot reach. Leave both empty for the generic range. The plugin also learns this automatically from what the device actually does — this is only a starting point.</Label>
+            </Field>
             <Field id="exportName" type="textfield">
                 <Label>Name in ecosystems:</Label>
             </Field>

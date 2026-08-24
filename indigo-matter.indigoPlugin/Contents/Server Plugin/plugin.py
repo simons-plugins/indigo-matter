@@ -32,6 +32,8 @@ import indigo  # provided by the Indigo runtime
 
 from async_runtime import AsyncRuntime
 from commission_jobs import CommissionJobs
+import ct_bounds
+from ct_calibration import CTCalibrationEngine
 import device_settings
 from device_sync import DeviceSync, NodeDeviceTombstones
 from diagnostics_menu_mixin import DiagnosticsMenuMixin, MatterUnavailable
@@ -124,6 +126,11 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, ServerMenuMixin,
         # startup; it owns the bridge client and starts one only when something
         # is actually exported (XG5).
         self.export_bridge: ExportBridge | None = None
+        # Issue #293's calibration action — built in startup, once
+        # export_bridge (and its ct_learner) exists; the action callback
+        # checks for None the same way every export callback checks
+        # export_bridge itself.
+        self._ct_calibration: CTCalibrationEngine | None = None
         #: The allow-listed device ids, cached as a plain frozenset attribute.
         #: ``deviceUpdated`` fires for EVERY device on the server, so its guard
         #: has to be one attribute load and one hash lookup — no lock, no
@@ -278,6 +285,8 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, ServerMenuMixin,
             agent_stop=self._stop_bridge_agent,
             agent_diagnose=self._bridge_agent_diagnosis,
         )
+        self._ct_calibration = CTCalibrationEngine(
+            self.exports, self._indigo_device, self.export_bridge.ct_learner, self.logger)
         self._exports_changed()
 
         run_future = self.runtime.submit(self.matter.run())
@@ -1633,6 +1642,73 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, ServerMenuMixin,
         else:
             labels = [f"Level {i}" for i in range(3)]  # unconfirmed — generic 3-level fallback
         return [(str(i), label) for i, label in enumerate(labels)]
+
+    def getCtCalibrationScope(self, filter="", valuesDict=None, typeId="", targetId=0):  # noqa: N802, A002, ARG002
+        """List-callback for the Calibrate Colour-Temperature Bounds action's
+        "Sweep:" field (issue #293's calibration extension): "all" plus one
+        row per currently-exported CT-role device, so a person (or an
+        automation calling executeAction) can target everything or one lamp.
+
+        A device that fails to resolve costs its row, not the whole list —
+        same discipline as ``ExportDialogMixin.getExportCandidates``'s own
+        per-row try/except, just without that method's truncation/dedup
+        machinery, because this list is bounded by the export allow-list,
+        not by every Indigo device.
+        """
+        options = [(ALL_OPTION_ID, "All exported colour-temperature lights")]
+        if self.exports is None:
+            return options
+        try:
+            for entry in self.exports.all():
+                if entry.role not in ct_bounds.CT_ROLES:
+                    continue
+                dev = self._indigo_device(entry.indigo_device_id)  # pylint: disable=no-member  # ExportDialogMixin (issue #146)
+                name = str(getattr(dev, "name", "") or "") if dev is not None else \
+                    f"(deleted device {entry.indigo_device_id})"
+                options.append((str(entry.indigo_device_id), name))
+        except Exception as exc:  # noqa: BLE001 - a broken picker must still offer "all"
+            self.logger.debug("getCtCalibrationScope: could not list CT exports: %s", exc)
+        return options
+
+    def actionCalibrateCtBounds(self, action, dev=None, caller_waiting_for_result=None):  # noqa: N802
+        """Issue #293's calibration action: parse the "Sweep:"/"Skip lamps
+        that are currently on" props and hand off to
+        ``CTCalibrationEngine.start``, which does the actual work on its own
+        background thread — see ``ct_calibration.py``'s module docstring for
+        why this callback must not do any of that work itself.
+
+        Returns promptly whether or not ``callerWaitingForResult`` (an
+        ``executeAction(..., waitUntilDone=True)`` caller) is set: Indigo's
+        wait is satisfied by this method RETURNING, not by the sweep
+        finishing, and there is nothing about this action worth a result
+        value — its outcome is the log, exactly like
+        ``actionShareMatterNode``.
+
+        Props are read tolerantly (``action.props`` is an ``indigo.Dict``-
+        like mapping, but a scripted ``executeAction`` call can hand either a
+        ``str`` or an ``int`` for a device-id-shaped field) — ``scope`` is
+        coerced through ``str`` before comparing to :data:`ALL_OPTION_ID` and
+        through ``int`` before use as a device id, and either failure is
+        reported here rather than left for the engine to discover, because
+        the engine's own device-id filtering only ever silently DROPS an
+        unparseable id (see ``CTCalibrationEngine.start``).
+        """
+        if self._ct_calibration is None:
+            self.logger.error(
+                "Calibrate Colour-Temperature Bounds: the export bridge has not started yet — "
+                "try again once the plugin has finished starting.")
+            return
+        skip_lit = self._truthy(action.props.get("skipLit", True))  # pylint: disable=no-member  # ExportDialogMixin (issue #146)
+        scope = str(action.props.get("scope", ALL_OPTION_ID) or ALL_OPTION_ID)
+        device_ids = None
+        if scope != ALL_OPTION_ID:
+            try:
+                device_ids = [int(scope)]
+            except (TypeError, ValueError):
+                self.logger.error(
+                    "Calibrate Colour-Temperature Bounds: invalid device selection %r", scope)
+                return
+        self._ct_calibration.start(device_ids=device_ids, skip_lit=skip_lit)
 
     def actionSetSensitivityLevel(self, action, dev):  # noqa: N802
         """Custom device action (issue #85): write BooleanStateConfiguration's

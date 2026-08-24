@@ -30,5 +30,6 @@ chosen), see [`../ARCHITECTURE.md`](../ARCHITECTURE.md).
 
 * [ADR-0012](0012-export-eligibility-can-be-a-user-declaration.md) - ADR-0012: For a device Indigo does not type, export eligibility is a user declaration (accepted; narrows ADR-0003)
 * [ADR-0013](0013-a-confirmed-commanded-colour-temperature-is-pushed-as-state.md) - ADR-0013: A confirmed, commanded colour-temperature is pushed as state (accepted)
+* [ADR-0014](0014-ct-physical-bounds-are-learned-declarations-only-seed-them.md) - ADR-0014: Colour-temperature physical bounds are learned from clamped echoes; declarations only seed them (accepted)
 
 <!-- adrlogstop -->

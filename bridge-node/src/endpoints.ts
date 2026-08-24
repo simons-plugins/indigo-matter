@@ -1420,6 +1420,85 @@ function colorControlDefaults(hueSaturation: boolean): Record<string, unknown> {
     };
 }
 
+/** The two §4.2 roles whose ColorControl carries the ColorTemperature feature (issue #293). */
+function isCtRole(role: RoleValue): boolean {
+    return role === Role.colorTemperatureLight || role === Role.extendedColorLight;
+}
+
+/** Per-device ColorControl physical bounds, once validated (issue #293). */
+export interface CtBounds {
+    minMireds: number;
+    maxMireds: number;
+}
+
+/**
+ * §4.1's `ctMinMireds`/`ctMaxMireds` validity rule (issue #293), read off an
+ * `EndpointSpec.options` struct: usable iff BOTH keys are present, BOTH are
+ * integers, and `MIREDS_MIN <= min < max <= MIREDS_MAX`. A boolean already
+ * fails the `typeof === "number"` half of that on its own — `JSON.parse`
+ * turns `true`/`false` into JS booleans, not numbers — so there is no separate
+ * "and not a boolean" branch to write here the way the Python side needs one.
+ *
+ * Neither key present is the ordinary case (no seed, no learned bound yet on
+ * this device) and returns `undefined` silently. Any OTHER shape — one key
+ * missing, a float, an inverted or out-of-range pair — is unusable and ALSO
+ * returns `undefined`, but is worth a warn naming the device: refusing the
+ * attach over a malformed seed would take the WHOLE export offline, so
+ * falling back to the generic bounds is the only lawful response, and the
+ * warn is the only trace that it happened. One line for the pair, not one per
+ * malformed key — the two keys describe a single value.
+ */
+export function extractCtBounds(options: Record<string, unknown>, indigoDeviceId: number): CtBounds | undefined {
+    const { ctMinMireds: min, ctMaxMireds: max } = options;
+    if (min === undefined && max === undefined) {
+        return undefined;
+    }
+    const isMiredsInt = (value: unknown): value is number => typeof value === "number" && Number.isInteger(value);
+    if (isMiredsInt(min) && isMiredsInt(max) && min >= MIREDS_MIN && min < max && max <= MIREDS_MAX) {
+        return { minMireds: min, maxMireds: max };
+    }
+    logger.warn(
+        `Ignoring unusable ctMinMireds/ctMaxMireds (${JSON.stringify(min)}/${JSON.stringify(max)}) for device ` +
+            `${indigoDeviceId}: falling back to the generic ${MIREDS_MIN}-${MIREDS_MAX} range`,
+    );
+    return undefined;
+}
+
+/**
+ * The ColorControl override {@link createEndpoint} merges in LAST when a spec
+ * carries usable ct bounds: the per-device physical/couple bounds, and
+ * whichever `colorTemperatureMireds` the merge would otherwise have used —
+ * the spec's own `states` value if it sent one (already in `patch`,
+ * static-clamped to the generic band by `colorPatch`) else
+ * {@link colorControlDefaults}'s generic `MIREDS_MIN` seed — reclamped into
+ * the narrower pair.
+ *
+ * That reclamp is load-bearing, not tidiness: matter.js 0.17.8 refuses to
+ * construct a ColorControl behaviour whose seeded `colorTemperatureMireds`
+ * sits outside `colorTempPhysicalMinMireds`/`MaxMireds` (measured — see
+ * "construction with an out-of-bounds initial CT does not throw" in
+ * registry.test.ts), and a refused construction takes the WHOLE endpoint
+ * offline, not just the colour temperature.
+ */
+function ctBoundsOverride(
+    bounds: CtBounds,
+    patch: Record<string, unknown>,
+    initialState: Record<string, unknown>,
+): Record<string, unknown> {
+    const seeded = numberOr(
+        (patch[COLOR_CONTROL] as Record<string, unknown> | undefined)?.colorTemperatureMireds,
+        numberOr((initialState[COLOR_CONTROL] as Record<string, unknown> | undefined)?.colorTemperatureMireds, MIREDS_MIN),
+    );
+    return {
+        [COLOR_CONTROL]: {
+            colorTempPhysicalMinMireds: bounds.minMireds,
+            colorTempPhysicalMaxMireds: bounds.maxMireds,
+            coupleColorTempToLevelMinMireds: bounds.minMireds,
+            colorTemperatureMireds: clamp(seeded, bounds.minMireds, bounds.maxMireds),
+        },
+    };
+}
+
 /**
  * The LevelControl state every level-bearing role starts from.
  *
@@ -2482,11 +2561,17 @@ export function createEndpoint(spec: EndpointSpec, identity: BridgedIdentity): E
     // `statePatchOrRefuse` refused WHOLESALE — a valid battery reading thrown
     // away alongside the stranger it arrived with, at construction time.
     const patch = battery !== undefined ? definition.statePatch(rest) : statePatchOrRefuse(spec.role, rest);
+    const initialState = definition.initialState();
+    // #293 — a per-device seed/learned bound pair overrides the generic
+    // 153-500 `colorControlDefaults` physical bounds; gated to the two CT
+    // roles so an unrelated role's `options` (e.g. window-covering polarity)
+    // is never even handed to {@link extractCtBounds}.
+    const ctBounds = isCtRole(spec.role) ? extractCtBounds(spec.options, spec.indigoDeviceId) : undefined;
     return new Endpoint(deviceTypeFor(definition, spec.battery) as never, {
         id: spec.publishedAs,
         ...mergeBehaviors(
             { [BRIDGED_INFO]: bridgedInfoFor(spec, identity) },
-            definition.initialState(),
+            initialState,
             // `BATTERY_INITIAL` seeds `batPercentRemaining: null` even when
             // `battery` is undefined (no `batteryLevel` in the initial
             // `states`) — the measured trap (§0): an endpoint built without
@@ -2494,6 +2579,7 @@ export function createEndpoint(spec: EndpointSpec, identity: BridgedIdentity): E
             // so seeding it is not optional on a battery-flagged endpoint.
             spec.battery ? { [POWER_SOURCE]: { ...BATTERY_INITIAL, ...battery } } : {},
             patch,
+            ctBounds !== undefined ? ctBoundsOverride(ctBounds, patch, initialState) : {},
         ),
     } as never);
 }
@@ -2569,6 +2655,31 @@ export async function applyStates(
     // a valid battery reading thrown away alongside the stranger it arrived
     // with. A push with no consumable battery key keeps the ordinary refusal.
     const patch = battery !== undefined ? definitionFor(role).statePatch(rest) : statePatchOrRefuse(role, rest);
+    // #293 — `colorPatch()` (inside `statePatch` above) already clamped a
+    // `colorTempMireds` write to the generic 153-500 band via `clampMireds`.
+    // Re-clamp into whatever THIS endpoint currently advertises as physical
+    // bounds — always a subset of the generic band by construction
+    // (`extractCtBounds`'s own validity rule), so this can only narrow
+    // further, never widen, and is a no-op on every endpoint that never set
+    // per-device bounds (`colorTempPhysicalMinMireds`/`MaxMireds` still read
+    // back MIREDS_MIN/MAX there). Read from the endpoint rather than passed
+    // in: unlike `createEndpoint`, there is no "spec bounds" here — the
+    // bounds this write must respect are whatever the LAST reconcile/rekey
+    // already landed via {@link applyCtBoundsUpdate}, which runs before this
+    // function in `registry.ts#update`.
+    const ctPatch = patch[COLOR_CONTROL] as { colorTemperatureMireds?: number } | undefined;
+    if (ctPatch?.colorTemperatureMireds !== undefined) {
+        const liveColor = endpoint.stateOf(COLOR_CONTROL) as {
+            colorTempPhysicalMinMireds?: number;
+            colorTempPhysicalMaxMireds?: number;
+        };
+        ctPatch.colorTemperatureMireds = clampLogged(
+            ctPatch.colorTemperatureMireds,
+            numberOr(liveColor.colorTempPhysicalMinMireds, MIREDS_MIN),
+            numberOr(liveColor.colorTempPhysicalMaxMireds, MIREDS_MAX),
+            "colour temperature (mireds), live physical bounds",
+        );
+    }
     if (battery !== undefined) {
         // Rides the existing residual `endpoint.set()` below — a plain
         // attribute write, no command semantics, no `WatchSpec`, no third
@@ -2690,6 +2801,93 @@ export async function applyReachable(endpoint: Endpoint, reachable: boolean): Pr
 /** §4.1 — `NodeLabel` follows the export's display name. */
 export async function applyLabel(endpoint: Endpoint, label: string): Promise<void> {
     await endpoint.set({ [BRIDGED_INFO]: { nodeLabel: label, productLabel: label } } as never);
+}
+
+/**
+ * Issue #293 — apply a live CT-bounds change. Called from `registry.ts#update`,
+ * which is itself the tail of `rekeyOne`, so this one function is what both
+ * the reconcile UPDATE bucket and the driving-device REKEY path get it from —
+ * there is no second copy to keep in step with this one.
+ *
+ * A silent no-op whenever the desired bounds are absent/unusable (leaves live
+ * bounds untouched — an unusable pair on an UPDATE must never reset a working
+ * per-device pair back to generic) OR already match what the endpoint
+ * advertises: an ordinary reconcile touches every CT-role export on every
+ * pass, and logging "nothing changed" on each one would drown the log for the
+ * overwhelmingly common case. `extractCtBounds` already owns the one warn
+ * that a genuinely malformed pair deserves.
+ *
+ * When the bounds DO differ, the new physical bounds and the live
+ * `colorTemperatureMireds` reclamped into them are written in the SAME
+ * `endpoint.set()` — a fabric holding a colour temperature the new bounds no
+ * longer cover, even for one intermediate report, is the same shape of bug
+ * {@link clampSetpoint}'s doc names for a thermostat write.
+ *
+ * **`colorTemperatureMireds` is keyed before `coupleColorTempToLevelMinMireds`
+ * in the patch object, and that ordering is load-bearing, not cosmetic
+ * (measured against 0.17.8, "orders colorTemperatureMireds before
+ * coupleColorTempToLevelMinMireds" in registry.test.ts).** Unlike
+ * `new Endpoint(...)` — which validates the FINAL merged state as one unit,
+ * so {@link ctBoundsOverride}'s own key order is free — `endpoint.set()`
+ * applies a patch's keys one at a time and validates each against whatever
+ * the OTHER referenced fields hold at THAT point in the sequence.
+ * `coupleColorTempToLevelMinMireds`'s own constraint is "physical min to
+ * colorTemperatureMireds", so writing it before `colorTemperatureMireds` has
+ * moved checks the new couple value against the STALE colour temperature and
+ * throws a `CONSTRAINT_ERROR` — even though the two keys sit in the very same
+ * `set()` call and the state is perfectly consistent once both land.
+ * `colorTempPhysicalMinMireds`/`MaxMireds` were probed too and are NOT
+ * order-sensitive against each other or against `colorTemperatureMireds`, so
+ * they are left first for readability; only the couple/CT pair's order is a
+ * real constraint.
+ *
+ * The bridged accessory's OWN `ConfigurationVersion` is then bumped so
+ * capability-caching ecosystems re-read this one accessory's clusters rather
+ * than trusting a physical-bounds pair cached at commissioning. That is
+ * deliberately NOT the ROOT bump `node.ts#bumpConfigurationVersion` drives
+ * for a changed bridged-node SET (children added/removed) — a different
+ * signal for a different change shape — though `increaseConfigurationVersion`
+ * called standalone (no `change` callback) bumps the root too as a documented
+ * side effect (confirmed live against 0.17.8 by the existing "matter.js
+ * RESTORES a bridged accessory's ConfigurationVersion" test), which is
+ * harmless here: an extra hint on top of a real one costs nothing.
+ */
+export async function applyCtBoundsUpdate(
+    endpoint: Endpoint,
+    role: RoleValue,
+    options: Record<string, unknown>,
+    indigoDeviceId: number,
+): Promise<void> {
+    if (!isCtRole(role)) {
+        return;
+    }
+    const desired = extractCtBounds(options, indigoDeviceId);
+    if (desired === undefined) {
+        return;
+    }
+    const live = endpoint.stateOf(COLOR_CONTROL) as {
+        colorTempPhysicalMinMireds?: number;
+        colorTempPhysicalMaxMireds?: number;
+        colorTemperatureMireds?: number;
+    };
+    if (live.colorTempPhysicalMinMireds === desired.minMireds && live.colorTempPhysicalMaxMireds === desired.maxMireds) {
+        return;
+    }
+    await endpoint.set({
+        [COLOR_CONTROL]: {
+            colorTempPhysicalMinMireds: desired.minMireds,
+            colorTempPhysicalMaxMireds: desired.maxMireds,
+            // Must precede `coupleColorTempToLevelMinMireds` below — see this
+            // function's own doc for the measured reason.
+            colorTemperatureMireds: clamp(
+                numberOr(live.colorTemperatureMireds, desired.minMireds),
+                desired.minMireds,
+                desired.maxMireds,
+            ),
+            coupleColorTempToLevelMinMireds: desired.minMireds,
+        },
+    } as never);
+    await endpoint.act(agent => agent.get(BridgedDeviceBasicInformationServer).increaseConfigurationVersion());
 }
 
 /**

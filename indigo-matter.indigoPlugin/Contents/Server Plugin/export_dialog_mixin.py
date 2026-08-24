@@ -12,8 +12,11 @@ import indigo  # provided by the Indigo runtime
 import export_catalog
 import export_handlers
 from bridge_protocol import next_generation, published_id_for
-from export_store import (ExportEntry, MAPPABLE_ROLES, OPTION_INVERT, OPTION_STATE_INVERT,
-                          OPTION_STATE_KEY)
+from export_store import (CT_BOUNDS_ROLES, ExportEntry, MAPPABLE_ROLES, OPTION_CT_LEARNED_MAX_MIREDS,
+                          OPTION_CT_LEARNED_MIN_MIREDS, OPTION_CT_MAX_MIREDS, OPTION_CT_MIN_MIREDS,
+                          OPTION_INVERT, OPTION_STATE_INVERT, OPTION_STATE_KEY)
+from ct_bounds import GENERIC_MAX_MIREDS, GENERIC_MIN_MIREDS, effective_ct_bounds
+from matter_handlers.color_control import kelvin_to_mireds, mireds_to_kelvin
 from plugin_constants import (
     EXCLUDED_OPTION_PREFIX, EXPORT_PICKER_LIMIT, LIST_ERROR_OPTION,
     MENU_MANAGE_EXPORTS, MENU_MIGRATE_EXPORT, MENU_READOPT_EXPORT, MENU_UNPAIR_ECOSYSTEM,
@@ -277,6 +280,8 @@ class ExportDialogMixin:
         values["exportRole"] = ""
         values["exportName"] = ""
         values["exportInvert"] = False
+        values["exportCtWarmestK"] = ""
+        values["exportCtCoolestK"] = ""
         values["exportStatus"] = self._export_summary()
         return values
 
@@ -496,6 +501,64 @@ class ExportDialogMixin:
             options[OPTION_STATE_INVERT] = True
         return options
 
+    #: The Kelvin range the two colour-temperature seed fields accept.
+    #: 2000K/6535K rather than a rounder 2000/6500: `kelvin_to_mireds(6535)`
+    #: is 153 (the fabric's exact floor) after rounding, while 6500 rounds to
+    #: 154 — a user typing the fabric's own advertised "6500K" would then be
+    #: refused by the post-conversion domain check below for reasons that
+    #: read as a plugin bug. 6535 is the largest Kelvin value that still
+    #: converts to a legal mired, so the field's own bound and the domain
+    #: check downstream can never disagree.
+    _CT_SEED_KELVIN_MIN = 2000
+    _CT_SEED_KELVIN_MAX = 6535
+
+    def _ct_seed_from_values(self, values: dict) -> tuple[dict, Optional[str]]:
+        """The ``ctMinMireds``/``ctMaxMireds`` seed pair the dialog fields describe.
+
+        Returns ``(options, None)`` on success — ``options`` is ``{}`` when
+        both Kelvin fields are empty (no seed; also how an existing seed is
+        DELETED, since :meth:`exportDeviceChanged` pre-fills these fields
+        from any saved one) or the two-key pair when both are filled — or
+        ``({}, reason)`` when what is on screen cannot become a seed at all.
+
+        **Reciprocal by design.** The WARMEST Kelvin the user can name is the
+        HIGHEST mireds value (§4.2's ``colorTempMireds`` runs cool-to-warm as
+        low-to-high mireds), so it becomes ``ctMaxMireds``; the coolest
+        becomes ``ctMinMireds``. Get the two fields backwards and the export
+        would silently declare an inverted range that ``export_store``
+        would then refuse to load back — this function is the one place
+        that mapping happens, so it cannot be gotten backwards in two places
+        that disagree.
+        """
+        warm_raw = str(values.get("exportCtWarmestK", "") or "").strip()
+        cool_raw = str(values.get("exportCtCoolestK", "") or "").strip()
+        if not warm_raw and not cool_raw:
+            return {}, None
+        if not warm_raw or not cool_raw:
+            return {}, ("Set both the warmest and coolest colour temperature, or leave both "
+                        "empty to use the generic range.")
+        try:
+            warm_k, cool_k = int(warm_raw), int(cool_raw)
+        except ValueError:
+            return {}, "Warmest/coolest colour temperature must be whole numbers of Kelvin."
+        if not (self._CT_SEED_KELVIN_MIN <= warm_k <= self._CT_SEED_KELVIN_MAX
+                and self._CT_SEED_KELVIN_MIN <= cool_k <= self._CT_SEED_KELVIN_MAX):
+            return {}, (f"Colour temperature must be between {self._CT_SEED_KELVIN_MIN}K and "
+                        f"{self._CT_SEED_KELVIN_MAX}K.")
+        if not warm_k < cool_k:
+            return {}, "The warmest colour temperature must be lower, in Kelvin, than the coolest."
+        ct_max = max(GENERIC_MIN_MIREDS, min(GENERIC_MAX_MIREDS, kelvin_to_mireds(warm_k)))
+        ct_min = max(GENERIC_MIN_MIREDS, min(GENERIC_MAX_MIREDS, kelvin_to_mireds(cool_k)))
+        if not (GENERIC_MIN_MIREDS <= ct_min < ct_max <= GENERIC_MAX_MIREDS):
+            # Two distinct Kelvin values close to the fabric's own cool edge
+            # can round to the SAME mired value (e.g. 6534K and 6535K both
+            # round to 153) — a real but rare case the Kelvin-range check
+            # above cannot catch on its own, because it is a property of the
+            # rounding, not of either value individually.
+            return {}, ("That Kelvin range is too narrow to express as a valid colour-"
+                        "temperature bound — widen the gap between the two values.")
+        return {OPTION_CT_MIN_MIREDS: ct_min, OPTION_CT_MAX_MIREDS: ct_max}, None
+
     def _fleet_state_key(self, dev) -> Optional[str]:
         """A state key already mapped for another device of the same TYPE.
 
@@ -707,14 +770,32 @@ class ExportDialogMixin:
             values["exportRole"] = entry.role
             values["exportName"] = entry.name_override or ""
             values["exportInvert"] = bool(entry.options.get(OPTION_INVERT, False))
+            values["exportCtWarmestK"] = self._kelvin_field(entry.options.get(OPTION_CT_MAX_MIREDS))
+            values["exportCtCoolestK"] = self._kelvin_field(entry.options.get(OPTION_CT_MIN_MIREDS))
             values["exportStatus"] = f"{dev.name} is exported as {export_catalog.role_label(entry.role)}."
         else:
             values["exportRole"] = verdict.default_role
             values["exportStateInvert"] = export_catalog.default_invert_for(verdict.default_role)
             values["exportName"] = ""
             values["exportInvert"] = False
+            values["exportCtWarmestK"] = ""
+            values["exportCtCoolestK"] = ""
             values["exportStatus"] = f"{dev.name} is not exported yet."
         return values
+
+    @staticmethod
+    def _kelvin_field(mireds: object) -> str:
+        """One Kelvin dialog field's text for a stored seed mireds value.
+
+        ``""`` for anything not a usable stored mireds value (absent, the
+        wrong type, a hand-edited non-int) — the same "absent means no seed"
+        reading :meth:`_ct_seed_from_values` uses on the way back in, so a
+        round trip through the dialog cannot silently invent a seed that was
+        never actually saved.
+        """
+        if not isinstance(mireds, int) or isinstance(mireds, bool):
+            return ""
+        return str(mireds_to_kelvin(mireds))
 
     @staticmethod
     def _clear_export_detail(values: dict) -> None:
@@ -731,6 +812,8 @@ class ExportDialogMixin:
         values["exportNeedsMapping"] = "false"
         values["exportStateKey"] = ""
         values["exportStateInvert"] = False
+        values["exportCtWarmestK"] = ""
+        values["exportCtCoolestK"] = ""
 
     def _first_unclaimed_identity(self, identity: str, device_id: int) -> str:
         """Walk :func:`next_generation` from ``identity`` until no OTHER
@@ -824,6 +907,12 @@ class ExportDialogMixin:
         if role == export_catalog.ROLE_WINDOW_COVERING and self._truthy(values.get("exportInvert")):
             options[OPTION_INVERT] = True
         previous = self.exports.get(device_id)
+        if role in CT_BOUNDS_ROLES:
+            ct_seed, ct_error = self._ct_seed_from_values(values)
+            if ct_error:
+                values["exportStatus"] = ct_error
+                return values
+            options.update(ct_seed)
         existed = previous is not None
         role_changed = existed and previous.role != role
         # Issue #240 — a role change bumps the generation, so the node treats
@@ -859,6 +948,41 @@ class ExportDialogMixin:
                     "another device, so this export becomes a NEW accessory under %s — it does "
                     "not steal back the migrated one.",
                     dev.name, default_identity, resolved)
+        ct_coherence_note = ""
+        if role in CT_BOUNDS_ROLES:
+            # Issue #293 review — the learner's own record is carried
+            # forward from a RE-READ taken here, immediately before the
+            # write, not from `previous` above: `previous` may be a
+            # snapshot from moments ago, and a learner adoption
+            # (`ct_learner.CTBoundsLearner._adopt`, which runs on Indigo's
+            # device thread, not this dialog callback's thread) landing on
+            # THIS device in between must not be silently clobbered by a
+            # carry-forward built from the stale copy. Mirrors `_adopt`'s
+            # own re-read-immediately-before-write, for the identical
+            # reason.
+            fresh_previous = self.exports.get(device_id)
+            for learned_key in (OPTION_CT_LEARNED_MIN_MIREDS, OPTION_CT_LEARNED_MAX_MIREDS):
+                options.pop(learned_key, None)
+                if fresh_previous is not None and learned_key in fresh_previous.options:
+                    options[learned_key] = fresh_previous.options[learned_key]
+            # Coherence guard — a carried-forward learned bound can now
+            # conflict with the FRESH seed just entered above (e.g. a stale
+            # learned min of 250 mireds against a new seed max of 200): the
+            # seed is the newer intent, so the conflicting learned key(s)
+            # are dropped rather than saving an entry whose
+            # `ct_bounds.effective_ct_bounds` would come out inverted or
+            # collapsed — the learner simply re-earns the evidence from the
+            # device again.
+            eff_min, eff_max = effective_ct_bounds(options)
+            if eff_min >= eff_max:
+                dropped_any = False
+                for learned_key in (OPTION_CT_LEARNED_MIN_MIREDS, OPTION_CT_LEARNED_MAX_MIREDS):
+                    if options.pop(learned_key, None) is not None:
+                        dropped_any = True
+                if dropped_any:
+                    ct_coherence_note = (
+                        " A previously learned colour-temperature bound conflicted with this "
+                        "seed and was dropped; the learner will re-confirm it from the device.")
         try:
             self.exports.upsert(ExportEntry(
                 indigo_device_id=device_id, role=role,
@@ -878,7 +1002,8 @@ class ExportDialogMixin:
                          f' named "{name_override}"' if name_override else "")
         self._nudge_export(device_id, role_changed=role_changed)
         values["exportStatus"] = f"{verb} {dev.name} as {export_catalog.role_label(role)}. " \
-                                 f"{self._role_change_warning(role_changed)}{self._export_summary()}"
+                                 f"{self._role_change_warning(role_changed)}{ct_coherence_note}" \
+                                 f"{self._export_summary()}"
         return values
 
     @staticmethod

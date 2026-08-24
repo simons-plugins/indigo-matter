@@ -557,7 +557,31 @@ over an unreadable map has no orphans it can vouch for.
   means `true`.** An absent flag says nothing about availability, and the other
   reading — an accessory that greys itself out in every ecosystem because the
   plugin left a field off — is the worse default by far.
-- `options` — role-specific extras (e.g. window-covering polarity).
+- `options` — role-specific extras (e.g. window-covering polarity). For
+  `colorTemperatureLight`/`extendedColorLight` (issue #293), `options` MAY
+  carry `ctMinMireds`/`ctMaxMireds` (ints) — the endpoint's physical
+  `ColorTempPhysicalMinMireds`/`MaxMireds`. **Usable iff BOTH keys are
+  present, both are integers (a JSON number with an integral value; a
+  boolean is NOT an integer), and `153 <= ctMinMireds < ctMaxMireds <=
+  500`.** Anything else (one key present without the other, a non-integer, a
+  pair outside that inequality) is treated exactly as absent — never a
+  refusal; a refused attach takes every export offline over one bad pair —
+  with one warn log naming the device. When usable: on **construction**
+  (create/recreate) the node sets `colorTempPhysicalMinMireds`/
+  `MaxMireds` and `coupleColorTempToLevelMinMireds` to the declared pair,
+  and clamps the initial `colorTemperatureMireds` (from `states`, default
+  `MIREDS_MIN`) into it. On an **update** to a live endpoint (`upsert_
+  endpoint`, §3.2) whose desired bounds differ from the live ones, the node
+  applies them to the ColorControl state via `endpoint.set()`, clamps the
+  endpoint's current `colorTemperatureMireds` into the new bounds in the
+  same patch, and bumps BridgedDeviceBasicInformation `ConfigurationVersion`
+  (`increaseConfigurationVersion`) so capability-caching ecosystems re-read
+  the new physical range. Absent/unusable behaves byte-for-byte as today
+  (static 153/500); an endpoint restored from the map with no plugin
+  attached keeps the generic bounds until the next attach's update applies
+  them. The plugin never sends its own SEED/LEARNED bookkeeping keys on the
+  wire, only this effective pair, and only when it differs from the generic
+  153/500 domain — see `ct_bounds.wire_options` in the plugin source.
 - `publishedAs` — issues #219/#240. The accessory identity this device
   publishes as (`Endpoint.id`/`UniqueID`/`SerialNumber`) — **the plugin owns
   and persists it; the node owns only the number that identity gets** (§0
@@ -670,6 +694,13 @@ ecosystem acts. Both are enumerated here in full; there is no other source.
   through the ColorControl cluster's own hue/saturation conversion
   (`xyToHsv`), so Indigo never has to speak a colour space §4.2 does not
   define.
+- **`colorTemperatureLight`/`extendedColorLight` physical bounds (issue
+  #293).** `colorTempMireds`'s domain is the generic 153-500 UNLESS the
+  endpoint's `options` carry a usable `ctMinMireds`/`ctMaxMireds` pair (§4.1),
+  in which case the node declares and clamps to that narrower, honest range
+  instead — see §4.1 for the full construction/update behaviour. The plugin
+  populates this from a learner that watches confirmed commanded writes
+  against the device's own echo, not from a declared value taken as fact.
 - **`extendedColorLight`'s `set_state` carries exactly ONE colour channel per
   push — `colorTempMireds` XOR `hue`/`saturation`, never both** (issue #282).
   The plugin decides which from the Indigo device's own colour mode; the
