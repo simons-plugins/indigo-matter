@@ -35,7 +35,14 @@ republished via the injected ``republish`` callable (``ExportBridge.upsert``):
   freshness window is what stops an unrelated Indigo-side change hours later
   from ever being misread as hardware evidence — see
   :data:`FRESHNESS_WINDOW_SECONDS`'s own docstring for the measured trap this
-  guards against.
+  guards against. The two confirmations must also answer two DISTINCT
+  commanded dispatches, not one dispatch heard twice — a live incident
+  (2026-08-24 16:40, device 1894385558, on the 2026.27.1 build) showed a
+  single z2m state change firing ``deviceUpdated`` more than once with the
+  same lagged value, which satisfied a same-dispatch "two observations" rule
+  without the hardware ever having been asked twice; see :class:`_Pending`'s
+  ``commanded_at`` field and :meth:`CTBoundsLearner._observe_locked` for the
+  mechanism.
 * **re-widening** — ANY reading outside the CURRENT effective bounds proves
   reach immediately, no streak needed: the device just did the thing the
   bounds said it could not, which is its own proof. This is what self-heals
@@ -122,6 +129,12 @@ class _Pending:
     """One side's shortfall streak, one confirming observation away from adoption."""
     side: str    # "min" (cool shortfall) or "max" (warm shortfall)
     mireds: int  # the value the streak is converging on
+    #: The `at` of the `_Commanded` reference that STARTED this streak — the
+    #: dispatch the streak's first observation was a shortfall against. Kept
+    #: so a later observation can tell "a second answer to a second question"
+    #: (a different dispatch's `at`) from "the same answer heard twice" (see
+    #: the module docstring's 2026-08-24 16:40 incident).
+    commanded_at: float
 
 
 class CTBoundsLearner:
@@ -279,17 +292,35 @@ class CTBoundsLearner:
         pending = self._pending.get(device_id)
         if pending is not None and pending.side == side \
                 and abs(pending.mireds - mireds) <= REPEAT_TOLERANCE_MIREDS:
+            if commanded.at == pending.commanded_at:
+                # A duplicate callback answering the SAME dispatch that
+                # started this streak, not a second confirming observation —
+                # z2m (and others) publish several attributes per state
+                # change, so one command can fire `deviceUpdated` more than
+                # once with the identical lagged value (2026-08-24 16:40
+                # incident, device 1894385558, on the 2026.27.1 build: Apple
+                # re-asked at 241 mireds while the driver's Indigo state
+                # still held the previous 227-mired target, and two
+                # deviceUpdated callbacks off that ONE dispatch both echoed
+                # the stale 227). Left pending, unchanged: two confirmations
+                # must be two answers to two DISTINCT dispatches, not one
+                # answer heard twice — a real hardware clamp echoes the same
+                # value in response to two separate commands seconds apart
+                # (the #281 storm re-asserts, so distinct dispatches keep
+                # arriving); driver lag cannot do that, because by the next
+                # dispatch the lagged value has moved with the ask.
+                return
             self._adopt(entry, side, mireds,
                         reason=(f"two consecutive {'warm' if side == 'max' else 'cool'} "
-                                f"shortfalls confirmed a commanded {commanded.mireds}-mired "
-                                f"write echoed back as {mireds}"))
+                                f"shortfalls, answering two distinct commanded writes, both "
+                                f"echoed back as {mireds}"))
             self._pending.pop(device_id, None)
             return
         # Either the first observation of a new streak, or one that
         # disagrees with the streak in progress — either way the streak
         # restarts on THIS reading; a mismatch is never averaged with what
         # came before it.
-        self._pending[device_id] = _Pending(side=side, mireds=mireds)
+        self._pending[device_id] = _Pending(side=side, mireds=mireds, commanded_at=commanded.at)
 
     def _adopt(self, entry, side: str, candidate: int, *, reason: str) -> None:
         """Persist ``candidate`` as the learned bound for ``side``, if it says anything new.

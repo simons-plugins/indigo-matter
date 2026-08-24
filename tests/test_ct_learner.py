@@ -103,33 +103,39 @@ def test_a_single_shortfall_does_not_adopt(learner, store, republish):
     republish.assert_not_called()
 
 
-def test_two_consistent_shortfalls_adopt_the_warm_bound(learner, store, republish):
+def test_two_consistent_shortfalls_adopt_the_warm_bound(learner, store, republish, clock):
     learner.record_commanded(800, 426)
     learner.observe(_entry(store), 400)
+    clock.advance(1.0)
+    learner.record_commanded(800, 426)  # a second, distinct dispatch of the same ask
     learner.observe(_entry(store), 400)
     updated = store.get(800)
     assert updated.options[ct_bounds.OPTION_CT_LEARNED_MAX_MIREDS] == 400
     republish.assert_called_once_with(800)
 
 
-def test_two_consistent_shortfalls_adopt_the_cool_bound(learner, store, republish):
+def test_two_consistent_shortfalls_adopt_the_cool_bound(learner, store, republish, clock):
     learner.record_commanded(800, 200)
     learner.observe(_entry(store), 230)  # cool shortfall: echo HIGHER than the ask
+    clock.advance(1.0)
+    learner.record_commanded(800, 200)  # a second, distinct dispatch of the same ask
     learner.observe(_entry(store), 230)
     updated = store.get(800)
     assert updated.options[ct_bounds.OPTION_CT_LEARNED_MIN_MIREDS] == 230
     republish.assert_called_once_with(800)
 
 
-def test_a_repeat_within_tolerance_still_counts_as_the_same_value(learner, store):
+def test_a_repeat_within_tolerance_still_counts_as_the_same_value(learner, store, clock):
     """Round-trip noise of +/-1 mired must not defeat the "same value twice" test."""
     learner.record_commanded(800, 426)
     learner.observe(_entry(store), 400)
+    clock.advance(1.0)
+    learner.record_commanded(800, 426)  # a second, distinct dispatch of the same ask
     learner.observe(_entry(store), 401)
     assert store.get(800).options[ct_bounds.OPTION_CT_LEARNED_MAX_MIREDS] == 401
 
 
-def test_inconsistent_echo_values_do_not_adopt(learner, store, republish):
+def test_inconsistent_echo_values_do_not_adopt(learner, store, republish, clock):
     """Two DIFFERENT shortfall values must restart the streak, not average it —
     an adoption on disagreeing evidence would invent a bound nothing proved."""
     learner.record_commanded(800, 426)
@@ -137,7 +143,10 @@ def test_inconsistent_echo_values_do_not_adopt(learner, store, republish):
     learner.observe(_entry(store), 390)  # a different clamp value: restarts, does not adopt
     assert store.upserts == []
     republish.assert_not_called()
-    # The restarted streak still adopts on ITS OWN second confirmation.
+    # The restarted streak still adopts on ITS OWN second confirmation, from
+    # a second, distinct dispatch answering the same ask.
+    clock.advance(1.0)
+    learner.record_commanded(800, 426)
     learner.observe(_entry(store), 390)
     assert store.get(800).options[ct_bounds.OPTION_CT_LEARNED_MAX_MIREDS] == 390
 
@@ -190,6 +199,77 @@ def test_the_2026_08_24_transient_echo_incident_does_not_adopt(learner, store, r
     republish.assert_not_called()
 
 
+# ---------------------------------------------------------------------------
+# Two distinct dispatches, not one dispatch heard twice — the 2026-08-24
+# 16:40 incident (#293, device 1894385558, 2026.27.1 build).
+# ---------------------------------------------------------------------------
+def test_the_2026_08_24_1640_duplicate_callback_incident_does_not_adopt(
+        learner, store, republish):
+    """The live incident this fix exists for, pinned verbatim: Apple's
+    adaptive lighting stepped its ask to 241 mireds while the z2m driver's
+    Indigo state still held the PREVIOUS 227-mired target (a 14-mired
+    adaptive step, clearing the raised 10-mired threshold). z2m publishes
+    several attributes per state change, so ``deviceUpdated`` fired MORE
+    THAN ONCE for that ONE dispatch, both times with the same lagged 227 —
+    and under the old rule those duplicate callbacks alone satisfied "two
+    consecutive observations". They must not: only a SECOND, distinct
+    dispatch's matching echo may complete the streak."""
+    learner.record_commanded(1894385558, 241)
+    learner.observe(_Entry(1894385558), 227)  # first callback off the one dispatch
+    learner.observe(_Entry(1894385558), 227)  # a duplicate callback off the SAME dispatch
+    assert store.upserts == []
+    republish.assert_not_called()
+
+
+def test_a_real_clamp_still_learns_across_two_distinct_dispatches(learner, store, republish, clock):
+    """THE discriminator (#293): a real hardware clamp echoes the SAME value
+    in answer to TWO DISTINCT dispatches seconds apart (the #281 storm
+    re-asserts, so a real command keeps being re-issued) — driver lag cannot
+    do that, because by the next dispatch the lagged value has moved with
+    the ask. Two separate commands, each answered with a matching shortfall,
+    must still adopt."""
+    learner.record_commanded(800, 426)
+    learner.observe(_entry(store), 400)
+    clock.advance(2.0)  # "seconds apart" — a distinct, later dispatch
+    learner.record_commanded(800, 426)  # a second, distinct dispatch of the same ask
+    learner.observe(_entry(store), 400)
+    assert store.get(800).options[ct_bounds.OPTION_CT_LEARNED_MAX_MIREDS] == 400
+    republish.assert_called_once_with(800)
+
+
+def test_lag_across_distinct_dispatches_never_completes_a_streak(learner, store, republish, clock):
+    """A lagging driver's echo tracks the PREVIOUS ask, not the current one —
+    so as Apple's adaptive lighting keeps stepping its command, each new
+    dispatch's echo disagrees with the streak the last one started, and the
+    streak keeps resetting instead of ever completing."""
+    learner.record_commanded(1894385558, 206)
+    learner.observe(_Entry(1894385558), 202)  # lagged echo of an earlier ask; starts a streak
+    clock.advance(1.0)
+    learner.record_commanded(1894385558, 241)  # a new, distinct dispatch — the ask moved on
+    learner.observe(_Entry(1894385558), 227)  # lagged echo of THIS ask — disagrees, resets
+    assert store.upserts == []
+    republish.assert_not_called()
+
+
+def test_duplicate_callbacks_are_inert_until_a_second_dispatch_confirms(
+        learner, store, republish, clock):
+    """Any number of duplicate callbacks off the SAME dispatch leave the
+    streak pending, unchanged — never completing and never resetting it —
+    until a second, distinct dispatch's matching echo arrives."""
+    learner.record_commanded(800, 426)
+    learner.observe(_entry(store), 400)  # starts the streak
+    for _ in range(5):
+        learner.observe(_entry(store), 400)  # duplicate callbacks off the same dispatch
+    assert store.upserts == []
+    republish.assert_not_called()
+
+    clock.advance(1.0)
+    learner.record_commanded(800, 426)  # a second, distinct dispatch of the same ask
+    learner.observe(_entry(store), 400)
+    assert store.get(800).options[ct_bounds.OPTION_CT_LEARNED_MAX_MIREDS] == 400
+    republish.assert_called_once_with(800)
+
+
 def test_adoption_no_ops_when_the_value_already_equals_the_learned_one(
         learner, store, republish):
     store.upsert(_Entry(800, options={ct_bounds.OPTION_CT_LEARNED_MAX_MIREDS: 400}))
@@ -229,6 +309,7 @@ def test_a_reading_just_inside_the_window_still_counts(learner, store, republish
     learner.record_commanded(800, 426)
     clock.advance(14.0)
     learner.observe(_entry(store), 400)
+    learner.record_commanded(800, 426)  # a second, distinct dispatch of the same ask
     learner.observe(_entry(store), 400)
     assert store.get(800).options[ct_bounds.OPTION_CT_LEARNED_MAX_MIREDS] == 400
 
@@ -294,7 +375,7 @@ def test_re_widening_a_learned_bound_that_already_matches_is_a_no_op(
 # Bounds sanity — an adoption may never invert or collapse the range
 # ---------------------------------------------------------------------------
 def test_an_adoption_that_would_collapse_the_range_to_a_point_is_refused(
-        learner, store, republish):
+        learner, store, republish, clock):
     """Bounds sanity (#293): an adoption may never produce ``min >= max``.
 
     A genuine STRICT inversion cannot arise from ``observe`` at all — the
@@ -312,6 +393,8 @@ def test_an_adoption_that_would_collapse_the_range_to_a_point_is_refused(
     # equal to the OTHER side.
     learner.record_commanded(800, 200)
     learner.observe(_entry(store), 400)  # cool shortfall candidate == current max
+    clock.advance(1.0)
+    learner.record_commanded(800, 200)  # a second, distinct dispatch of the same ask
     learner.observe(_entry(store), 400)
     assert store.upserts == []
     learner._logger.warning.assert_called_once()
@@ -326,6 +409,8 @@ def test_a_store_write_failure_is_logged_and_does_not_raise(store, republish, cl
     store.raise_on_upsert = RuntimeError("prefs write failed")
     learner.record_commanded(800, 426)
     learner.observe(_entry(store), 400)
+    clock.advance(1.0)
+    learner.record_commanded(800, 426)  # a second, distinct dispatch of the same ask
     learner.observe(_entry(store), 400)  # must not raise
     logger.error.assert_called()
     republish.assert_not_called()
@@ -338,6 +423,8 @@ def test_a_republish_failure_does_not_raise_and_the_learned_value_stays_saved(
     learner = ct_learner.CTBoundsLearner(store, logger, republish, now=clock)
     learner.record_commanded(800, 426)
     learner.observe(_entry(store), 400)
+    clock.advance(1.0)
+    learner.record_commanded(800, 426)  # a second, distinct dispatch of the same ask
     learner.observe(_entry(store), 400)  # must not raise
     assert store.get(800).options[ct_bounds.OPTION_CT_LEARNED_MAX_MIREDS] == 400
     logger.exception.assert_called()
@@ -414,11 +501,13 @@ def test_an_entry_removed_before_adoption_is_not_resurrected(learner, store, rep
 
 
 def test_adoption_logs_one_clear_info_line_naming_mireds_kelvin_and_reason(
-        learner, store, republish):
+        learner, store, republish, clock):
     logger = Mock()
     learner._logger = logger
     learner.record_commanded(800, 426)
     learner.observe(_entry(store), 400)
+    clock.advance(1.0)
+    learner.record_commanded(800, 426)  # a second, distinct dispatch of the same ask
     learner.observe(_entry(store), 400)
     logger.info.assert_called_once()
     message = logger.info.call_args[0][0] % logger.info.call_args[0][1:]
@@ -502,7 +591,7 @@ def test_the_2026_08_24_15_39_incident_is_refused_via_the_fresh_re_read(
 
 
 def test_observe_with_a_stale_snapshot_is_also_refused_via_the_fresh_re_read(
-        learner, store, republish):
+        learner, store, republish, clock):
     """The mirrored case through :meth:`observe`/:meth:`_observe_locked`:
     that path takes its ``entry`` from whatever the CALLER last read (its own
     docstring says so), so a caller that reuses one stale snapshot across two
@@ -516,6 +605,8 @@ def test_observe_with_a_stale_snapshot_is_also_refused_via_the_fresh_re_read(
     store.upserts.clear()
     learner.record_commanded(800, 500)   # asked for the warm extreme
     learner.observe(stale_entry, 215)    # warm shortfall candidate, by the STALE (153, 500)
+    clock.advance(1.0)
+    learner.record_commanded(800, 500)   # a second, distinct dispatch of the same ask
     learner.observe(stale_entry, 215)    # second, matching echo -> completes the streak
 
     assert store.upserts == []
