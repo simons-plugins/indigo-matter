@@ -23,6 +23,17 @@
  *    cap of ONE session per peer rather than matter.js's own built-in cap of
  *    five (§0(k)), which the reference-server recurrence proved too high —
  *    the routing defect bit at three piled sessions, not six.
+ *
+ *    **Deliberately closes a session even while it still holds a live
+ *    subscription** — unlike items 2/3 below, which both refuse to (§0(n)).
+ *    Orphaning the OLD session's subscription is the point, not a side
+ *    effect to tolerate: the peer that superseded it has, by definition, a
+ *    NEW session already open, and the HAMH-proven behaviour is that it
+ *    re-subscribes over that one. Items 2/3 have no such replacement in
+ *    hand for the session they would be closing — closing one of THOSE
+ *    under a live subscription would strand it with nothing to recover
+ *    onto, which is the staleness pattern this whole module exists to
+ *    prevent. Same bet, opposite session, hence the opposite rule.
  * 2. **Dead-session force-close** ({@link deadSessions}) — a CASE session
  *    holding zero subscriptions that has been quiet for
  *    {@link DEAD_SESSION_QUIET_MS} is closed. A session that was never
@@ -161,6 +172,14 @@ export const SESSION_MAX_AGE_MS = 4 * 60 * 60 * 1000;
  * actually present in `peerSessions` — a caller-side inconsistency (the
  * event fired for a session that has since closed) must degrade to "nothing
  * to sweep", not crash the caller's event handler.
+ *
+ * **Every OTHER session for the peer is a candidate, `subscriptionCount`
+ * included** — unlike {@link deadSessions}/{@link rotatableSessions}, this
+ * function never checks it. That is the deliberate bet the module docstring
+ * (item 1) explains: `justOpened` IS the replacement the controller will
+ * re-subscribe over, so orphaning an older session's subscription here is
+ * the intended outcome, not a hazard to guard against the way it would be
+ * for a dead or aged-out session with no such replacement in hand.
  */
 export function supersededSessions(
     peerSessions: readonly SessionDescriptor[],

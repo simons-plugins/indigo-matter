@@ -521,10 +521,18 @@ class SessionHygiene:
     needed closing. Defaulted so a report from a pre-0.17.0 node (which never
     sends this field at all) still parses, to the honest reading: such a node
     never looked and never acted.
+
+    ``sent`` is what lets a caller tell that absence apart from a CURRENT node
+    reporting ``checked=False`` — both collapse to the same ``checked=False``
+    default above (deliberately: an absent field means "never looked" too),
+    but they warrant different treatment: a pre-0.17.0 node has nothing wrong
+    with it, while a 0.17.0+ node with ``checked=False`` has a mitigation that
+    just stopped running. See :meth:`ExportBridge._apply_session_hygiene`.
     """
     checked: bool = False
     peers: list = field(default_factory=list)
     closed: SessionHygieneClosed = field(default_factory=SessionHygieneClosed)
+    sent: bool = False
 
 
 @dataclass
@@ -774,6 +782,11 @@ def parse_session_hygiene(data: Any) -> SessionHygiene:
     A malformed ``closed`` block degrades to all-zero rather than failing the
     whole report — the counts are informational, and a status poll must
     never fail over them.
+
+    ``sent`` records only whether ``data`` was present and dict-shaped, NOT
+    whether it parsed cleanly — that is what ``ExportBridge._apply_session_hygiene``
+    needs to tell "an old node never sent this" apart from "a current node
+    sent it and reports ``checked=False``".
     """
     if not isinstance(data, dict):
         return SessionHygiene()
@@ -793,6 +806,7 @@ def parse_session_hygiene(data: Any) -> SessionHygiene:
         peers=[peer for peer in (_parse_hygiene_peer(item) for item in (data.get("peers") or []))
                if peer is not None],
         closed=closed,
+        sent=True,
     )
 
 

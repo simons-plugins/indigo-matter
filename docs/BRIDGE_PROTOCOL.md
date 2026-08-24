@@ -126,10 +126,19 @@ rather than re-explained at every call site.
   (updated on every received message — `Session.ts:127-133`),
   `Session.initiateForceClose(context: {cause: Error; keepSubscriptions?:
   boolean})` (terminates the session and, unless `keepSubscriptions` is set,
-  its subscriptions too, without notifying the peer — `Session.ts:266-287`)
-  and `NodeSession.subscriptions` (a `BasicSet`, `.size` readable — already
-  used by `churn.ts`'s wiring) are all public, all exactly what
-  `SessionManager`'s own internal eviction (k) uses on itself.
+  its subscriptions too — `Session.ts:266-287`) and `NodeSession.subscriptions`
+  (a `BasicSet`, `.size` readable — already used by `churn.ts`'s wiring) are
+  all public, all exactly what `SessionManager`'s own internal eviction (k)
+  uses on itself.
+
+  **`initiateForceClose` raises no session-teardown handshake with the
+  peer, but it is not silent on the wire either — corrected here from an
+  earlier version of this doc that claimed "no network send".** It closes
+  the session's active `MessageExchange`s, and `MessageExchange#close` can
+  still send a benign `StandaloneAck` for a message that was received but
+  not yet acknowledged. There is no Matter close/goodbye exchange initiated
+  with the peer — that is the accurate claim — but "no network send"
+  overstated it.
 - **(m) The wedge-watchdog signal (Finding 2 item 4) is NOT publicly
   observable — confirmed, not assumed.** `MessageExchange.onMessageReceived`
   calls `this.#notifyActivity(true)` (which sets `Session.activeTimestamp`)
@@ -969,6 +978,17 @@ and is still never repaired. Each entry is a `DriftEntry`:
      peer, well below matter.js's own built-in `MAX_SESSIONS_PER_PEER`
      eviction of five (§0(k)), which the reference-server recurrence proved
      too high to prevent the defect from biting.
+
+     **Closes a superseded session even while it still holds a live
+     subscription — deliberately**, the opposite rule from items 2/3 below.
+     Orphaning the old session's subscription is the point, not a risk to
+     mitigate: the peer that superseded it has, by definition, a NEW session
+     already open, and the HAMH-proven behaviour is that it re-subscribes
+     over that one. Items 2/3 have no such replacement in hand for the
+     session they close — stranding a subscription there, with nothing for
+     the controller to fall back to, would be the exact staleness pattern
+     this mechanism exists to prevent. Same bet, opposite session, hence the
+     opposite rule.
   2. **Dead-session force-close** — a CASE session holding zero
      subscriptions, quiet for 60s, is closed.
   3. **Age-based rotation** — a subscription-FREE CASE session older than 4h

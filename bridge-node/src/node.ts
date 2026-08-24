@@ -1154,8 +1154,18 @@ export class BridgeNode implements BridgeFacade {
      * dispatch, and a handler that threw has an unknown number of missed
      * events behind it, so hygiene goes one-way broken rather than carrying
      * on from a state it knows is short.
+     *
+     * Self-gates on `#hygieneBroken` FIRST, before `update` ever runs — the
+     * same discipline every {@link ChurnDetector} method opens with for
+     * `#broken` (`churn.ts`). Without this, `checked: false` documented
+     * (BRIDGE_PROTOCOL §4.3) "no automatic sweep is running" while the
+     * `sessions.added` listener kept sweeping regardless — a broken latch
+     * that did not actually stop the thing it claimed to have stopped.
      */
     private noteHygiene(update: () => void): void {
+        if (this.#hygieneBroken) {
+            return;
+        }
         try {
             update();
         } catch (error) {
@@ -1189,6 +1199,19 @@ export class BridgeNode implements BridgeFacade {
      * for that same peer+fabric is a candidate to close — the same
      * `peerNodeIdHex`/`fabricIndexOf` identity `churn.ts`'s wiring already
      * groups sessions by.
+     *
+     * **Deliberately closes a superseded session even while it still holds a
+     * live subscription** — unlike {@link deadSessions}/{@link
+     * rotatableSessions}, which both refuse to touch one (`session-hygiene.ts`
+     * §0(n)). This is not an inconsistency: orphaning the OLD session's
+     * subscription is the whole point here, because the controller that just
+     * opened `justOpened` has, by definition, a NEW session to fall back to —
+     * the HAMH-proven behaviour is that it re-subscribes over it. Dead/rotated
+     * sessions have no such replacement in hand; closing one under a live
+     * subscription there would strand it with nothing to recover onto, which
+     * is exactly the staleness pattern this module exists to prevent, not
+     * fix. See {@link supersededSessions}'s own docstring for the same
+     * reasoning at the pure-decision layer.
      */
     private sweepSuperseded(sessions: SessionManager, justOpened: NodeSession): void {
         const peerId = peerNodeIdHex(justOpened);
@@ -1208,6 +1231,18 @@ export class BridgeNode implements BridgeFacade {
             const target = peerSessions.find(session => session.id === closure.sessionId);
             if (target !== undefined) {
                 this.closeSession(target, closure);
+            } else {
+                // Unreachable today: `descriptors` is built directly from
+                // `peerSessions` above, so every closure `supersededSessions`
+                // returns names an id already in that same array — say so
+                // rather than silently dropping the decision, so a future
+                // refactor that breaks the guarantee (this snapshot and the
+                // closure list drifting apart) fails loudly instead of a
+                // session hygiene decided to close simply vanishing.
+                this.log(
+                    `Session hygiene: superseded-sweep closure for session ${closure.sessionId} matched no ` +
+                        "live session in this peer's snapshot — decision dropped (should be unreachable)",
+                );
             }
         }
     }
@@ -1216,17 +1251,40 @@ export class BridgeNode implements BridgeFacade {
      * Force-close one session for a hygiene reason, log it once (this
      * repo's loud-but-once convention — a session can only ever be closed
      * once, so no separate latch is needed), and count it into §4.3's
-     * cumulative totals.
+     * cumulative totals — but only once the close has actually SUCCEEDED.
+     *
+     * A no-op, before any of that, when `session.isClosing` is already
+     * true: this is not a fresh decision, it is the same session a close is
+     * already in flight for — from an earlier hygiene decision this same
+     * sweep/poll made, or from matter.js's own teardown — and both
+     * {@link sweepSuperseded} and {@link pollHygiene} already exclude
+     * `isClosing` sessions from the snapshots they build. This is the
+     * second, later-checked line of defence against the same session being
+     * selected twice, not a duplicate of it.
      *
      * Fire-and-forget: `initiateForceClose` is async, but both callers
      * ({@link sweepSuperseded}, an event handler, and {@link pollHygiene},
      * which `getStatus()` — a *synchronous* method — calls) must not block
-     * on it. §0(l): force-close never talks to the peer, so nothing here is
-     * racing a network round trip; a failure can only be the local close
-     * itself going wrong, logged separately so it is never mistaken for the
-     * decision succeeding.
+     * on it. §0(l): force-close raises no session-teardown handshake with
+     * the peer, but it is NOT silent on the wire — closing active exchanges
+     * can still send a benign `StandaloneAck` for a message already
+     * received but not yet acknowledged. Nothing here is racing a
+     * meaningful round trip either way.
+     *
+     * `#hygieneClosed[reason]++` moves to the SUCCESS branch of
+     * `initiateForceClose` (issue #283 review) rather than running
+     * unconditionally before the async close settles: counting before the
+     * outcome is known both miscounts a failed close as a success and,
+     * because a session a failed close left live would otherwise still
+     * satisfy the same hygiene decision, gets that same session re-selected
+     * and re-counted on every subsequent sweep/poll. The `.catch` keeps
+     * logging the failure — separately, so it is never mistaken for the
+     * decision succeeding — but no longer touches the counters.
      */
     private closeSession(session: NodeSession, closure: HygieneClosure): void {
+        if (session.isClosing) {
+            return;
+        }
         const detail =
             closure.reason === "superseded"
                 ? `superseded — peer now holds ${closure.peerSessionCount} session(s), this one ${closure.ageMs}ms old`
@@ -1237,16 +1295,17 @@ export class BridgeNode implements BridgeFacade {
             `Session hygiene: closing session ${session.id} for peer ${closure.peerNodeId} `
             + `(fabric ${closure.fabricIndex}) — ${detail}`,
         );
-        this.#hygieneClosed[closure.reason]++;
-        session.initiateForceClose({ cause: new Error(`session-hygiene: ${closure.reason}`) }).catch(
-            (error: unknown) => {
+        session.initiateForceClose({ cause: new Error(`session-hygiene: ${closure.reason}`) })
+            .then(() => {
+                this.#hygieneClosed[closure.reason]++;
+            })
+            .catch((error: unknown) => {
                 try {
                     this.log(`Session hygiene: force-closing session ${session.id} failed: ${describeError(error)}`);
                 } catch {
                     // The logger itself failed; there is nowhere left to report.
                 }
-            },
-        );
+            });
     }
 
     /**
@@ -1269,7 +1328,12 @@ export class BridgeNode implements BridgeFacade {
             const descriptors: SessionDescriptor[] = [];
             const byId = new Map<number, NodeSession>();
             for (const session of this.#sessionManager.sessions) {
-                if (session.isPase) {
+                // Same `isClosing` guard {@link sweepSuperseded} already
+                // applies to its own snapshot — the two snapshot-builders
+                // must not differ without a stated reason, and there isn't
+                // one here: a session already closing is never a candidate
+                // to close again (see {@link closeSession}).
+                if (session.isPase || session.isClosing) {
                     continue;
                 }
                 const descriptor = this.describeSession(session);
@@ -1281,6 +1345,17 @@ export class BridgeNode implements BridgeFacade {
                 const session = byId.get(closure.sessionId);
                 if (session !== undefined) {
                     this.closeSession(session, closure);
+                } else {
+                    // Unreachable today, for the same reason as
+                    // `sweepSuperseded`'s own else-branch: `byId` is keyed
+                    // directly from `descriptors`, and `periodicSweep` never
+                    // invents a `sessionId` that was not in it. Logged, not
+                    // silently dropped, so a future refactor that breaks that
+                    // guarantee is caught rather than quietly losing a close.
+                    this.log(
+                        `Session hygiene: periodic-sweep closure for session ${closure.sessionId} matched no ` +
+                            "live session in this poll's snapshot — decision dropped (should be unreachable)",
+                    );
                 }
             }
             return { checked: true, peers, closed: { ...this.#hygieneClosed } };

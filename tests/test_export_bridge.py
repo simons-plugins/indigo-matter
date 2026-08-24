@@ -192,6 +192,12 @@ def infos_of(logger) -> str:
                     for call in logger.info.call_args_list)
 
 
+def debugs_of(logger) -> str:
+    return " ".join(str(call.args[0]) % call.args[1:] if len(call.args) > 1
+                    else str(call.args[0])
+                    for call in logger.debug.call_args_list)
+
+
 @pytest.fixture
 def unbridgeable_role(bridge_mod, monkeypatch):
     """Make ``doorLock`` a role this build has no handler for, and return it.
@@ -3198,6 +3204,126 @@ class TestSubscriptionHealthDevice:
         h.bridge.health_tick()
         dev = h.health_devices[0]
         assert dev.states["subscriptionHealth"] == "unknown"
+
+
+class TestSessionHygiene:
+    """§4.3 issue #283 "Finding 2" review — `sessionHygiene` had NO plugin-side
+    consumer at all: `checked: false` (the mitigation going quiet) and the
+    per-peer/per-reason `closed` counts reached nobody. Deliberately minimal
+    beside `TestSubscriptionHealthDevice` — log lines only, no device, no UI,
+    because the node ACTS on its own (force-closes sessions) and nothing here
+    gates behaviour.
+    """
+
+    CHECKED_QUIET = {"checked": True, "peers": [], "closed": {"superseded": 0, "dead": 0, "rotated": 0}}
+    UNCHECKED = {"checked": False, "peers": [], "closed": {"superseded": 0, "dead": 0, "rotated": 0}}
+
+    def _status(self, hygiene=None, sent=True):
+        payload = {
+            "commissioned": True, "fabrics": [], "endpointCount": 1,
+            "endpoints": [], "drift": [], "driftChecked": True, "warnings": [],
+        }
+        if sent:
+            payload["sessionHygiene"] = hygiene if hygiene is not None else self.CHECKED_QUIET
+        return bridge_protocol.parse_status(payload)
+
+    def _harness(self, bridge_mod, mock_logger, devices) -> Harness:
+        return Harness(bridge_mod, mock_logger, devices, [ExportEntry(101, "onOffLight")])
+
+    def test_a_current_node_reporting_unchecked_warns(
+            self, bridge_mod, mock_logger, devices):
+        h = self._harness(bridge_mod, mock_logger, devices)
+        h.bridge._on_attached(self._status(self.UNCHECKED), False)
+        assert "session hygiene has stopped watching" in warnings_of(mock_logger)
+
+    def test_the_unchecked_warning_is_said_once_per_streak(
+            self, bridge_mod, mock_logger, devices):
+        h = self._harness(bridge_mod, mock_logger, devices)
+        status = self._status(self.UNCHECKED)
+        h.bridge._on_attached(status, False)
+        h.bridge._on_attached(status, False)
+        said = [call for call in mock_logger.warning.call_args_list
+                if "session hygiene has stopped watching" in str(call.args)]
+        assert len(said) == 1
+
+    def test_an_old_node_that_never_sent_the_field_stays_silent(
+            self, bridge_mod, mock_logger, devices):
+        """The default `checked=False` a pre-0.17.0 node's absent field
+        parses to must NOT be reported — it never looked, and it never
+        claimed to. Reported repeatedly so the latch cannot mask a bug that
+        would otherwise only show up on the second call."""
+        h = self._harness(bridge_mod, mock_logger, devices)
+        status = self._status(sent=False)
+        for _ in range(3):
+            h.bridge._on_attached(status, False)
+        assert "session hygiene" not in warnings_of(mock_logger)
+
+    def test_recovery_from_unchecked_logs_once_at_info(
+            self, bridge_mod, mock_logger, devices):
+        h = self._harness(bridge_mod, mock_logger, devices)
+        h.bridge._on_attached(self._status(self.UNCHECKED), False)
+        h.bridge._on_attached(self._status(self.CHECKED_QUIET), False)
+        assert "session hygiene has recovered" in infos_of(mock_logger)
+
+    def test_a_standing_checked_verdict_does_not_re_log_recovery(
+            self, bridge_mod, mock_logger, devices):
+        """Recovery is a TRANSITION, not a restatement of "all is well" on
+        every checked report — an unbroken run of `checked: True` must never
+        have warned in the first place, so there is nothing to recover from."""
+        h = self._harness(bridge_mod, mock_logger, devices)
+        h.bridge._on_attached(self._status(self.CHECKED_QUIET), False)
+        h.bridge._on_attached(self._status(self.CHECKED_QUIET), False)
+        assert "session hygiene has recovered" not in infos_of(mock_logger)
+
+    def test_the_first_checked_report_is_a_baseline_not_a_delta(
+            self, bridge_mod, mock_logger, devices):
+        """Nothing to diff the very first `closed` totals against — logging
+        a "delta" from an assumed all-zero start would misreport a node that
+        had already been closing sessions before this plugin session began."""
+        h = self._harness(bridge_mod, mock_logger, devices)
+        hygiene = {"checked": True, "peers": [], "closed": {"superseded": 4, "dead": 1, "rotated": 0}}
+        h.bridge._on_attached(self._status(hygiene), False)
+        assert "session hygiene closed" not in debugs_of(mock_logger)
+
+    def test_a_closed_total_change_logs_the_per_reason_delta_and_live_peers(
+            self, bridge_mod, mock_logger, devices):
+        h = self._harness(bridge_mod, mock_logger, devices)
+        first = {"checked": True, "peers": [], "closed": {"superseded": 1, "dead": 0, "rotated": 0}}
+        second = {
+            "checked": True,
+            "peers": [{"peerNodeId": "41869fbd537ef01", "fabricIndex": 2, "liveSessions": 2}],
+            "closed": {"superseded": 4, "dead": 1, "rotated": 0},
+        }
+        h.bridge._on_attached(self._status(first), False)
+        h.bridge._on_attached(self._status(second), False)
+        line = debugs_of(mock_logger)
+        assert "superseded +3" in line
+        assert "dead +1" in line
+        assert "rotated" not in line, "an unchanged reason must not appear in the delta"
+        assert "41869fbd537ef01" in line and "fabric 2" in line
+
+    def test_an_unchanged_closed_total_does_not_re_log(
+            self, bridge_mod, mock_logger, devices):
+        h = self._harness(bridge_mod, mock_logger, devices)
+        hygiene = {"checked": True, "peers": [], "closed": {"superseded": 2, "dead": 0, "rotated": 0}}
+        h.bridge._on_attached(self._status(hygiene), False)
+        h.bridge._on_attached(self._status(hygiene), False)
+        said = [call for call in mock_logger.debug.call_args_list
+                if "session hygiene closed" in str(call.args)]
+        assert len(said) == 0
+
+    def test_the_watchdog_poll_path_also_drives_hygiene(
+            self, bridge_mod, mock_logger, devices):
+        """Finding 1's own point: BOTH call sites (`_on_attached` and the
+        `get_status` watchdog poll) must feed `_apply_session_hygiene`, the
+        same double-wiring `TestNodeWarningsAreActuallyPolled` pins for
+        `warnings`."""
+        h = self._harness(bridge_mod, mock_logger, devices)
+        h.start()
+        h.client.attached = True
+        h.client.status = self._status(self.UNCHECKED)
+        h.bridge.health_tick()
+        assert "session hygiene has stopped watching" in warnings_of(mock_logger)
 
 
 class TestFabricSlots:

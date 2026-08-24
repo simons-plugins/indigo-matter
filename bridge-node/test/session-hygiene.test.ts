@@ -72,6 +72,19 @@ describe("supersededSessions (issue #283 item 1)", () => {
     it("closes nothing when the peer holds only the just-opened session", () => {
         assert.deepEqual(supersededSessions([session({ sessionId: 1 })], 1), []);
     });
+
+    it("closes a superseded session even while it holds a live subscription — deliberately, unlike deadSessions/rotatableSessions", () => {
+        // The bet: `justOpened` (session 2) IS the replacement the controller
+        // will re-subscribe over, so orphaning session 1's subscription here
+        // is the intended outcome — not an oversight `subscriptionCount`
+        // should have guarded against, the way it does for items 2/3.
+        const peerSessions = [
+            session({ sessionId: 1, createdAt: NOW - 10_000, subscriptionCount: 1 }),
+            session({ sessionId: 2, createdAt: NOW }),
+        ];
+        const closures = supersededSessions(peerSessions, 2);
+        assert.deepEqual(closures.map(c => c.sessionId), [1]);
+    });
 });
 
 describe("deadSessions (issue #283 item 2)", () => {

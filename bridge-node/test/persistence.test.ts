@@ -1502,17 +1502,32 @@ function hygieneSession(
         subscriptions.add({});
     }
     session.forceCloseCount = 0;
-    // Real `initiateForceClose` never notifies the peer and never round-trips
-    // the network (§0(l)) — this double models exactly that: synchronous,
-    // no await, so by the time `node.ts`'s fire-and-forget caller's `.catch`
-    // is attached the removal has already happened, matching what a real
-    // force-close achieves (removal from `SessionManager`'s live set).
+    // Real `initiateForceClose` raises no session-teardown handshake with the
+    // peer (§0(l)) — this double models the shape that matters here:
+    // synchronous, no await, so by the time `node.ts`'s fire-and-forget
+    // caller's `.then`/`.catch` are attached the removal has already
+    // happened, matching what a real force-close achieves (removal from
+    // `SessionManager`'s live set).
     session.initiateForceClose = async () => {
         session.forceCloseCount++;
         session.isClosing = true;
         liveSessions.delete(session as unknown as NodeSession);
     };
     return session;
+}
+
+/**
+ * Flush the microtask queue (via a macrotask boundary, for safety regardless
+ * of how many `.then()` hops `closeSession`'s promise chain takes) so its
+ * now-deferred `#hygieneClosed[reason]++` (issue #283 review, Finding 2 — it
+ * only counts once `initiateForceClose` actually SETTLES) has landed before a
+ * test reads `sessionHygiene.closed`. `hygieneSession`'s own
+ * `initiateForceClose` above resolves with no internal `await`, so the
+ * synchronous side effects (`forceCloseCount`, `isClosing`, removal from the
+ * live set) are visible immediately — only the COUNT needs this.
+ */
+async function flushHygiene(): Promise<void> {
+    await new Promise(resolve => setTimeout(resolve, 0));
 }
 
 describe("the wired session-hygiene superseded sweep (issue #283 item 1)", () => {
@@ -1532,6 +1547,10 @@ describe("the wired session-hygiene superseded sweep (issue #283 item 1)", () =>
             assert.equal(peerNew.forceCloseCount, 0, "the just-opened session must never close itself");
             assert.equal(otherPeer.forceCloseCount, 0, "a different peer's session must never be touched");
 
+            // Finding 2: the cumulative count only lands once `initiateForceClose`
+            // SETTLES, so it needs a flush even though the synchronous side
+            // effects above (forceCloseCount, the live-session removal) do not.
+            await flushHygiene();
             const status = session.bridge.getStatus();
             assert.equal(status.sessionHygiene.closed.superseded, 1);
             const peerCount = status.sessionHygiene.peers.find(peer => peer.peerNodeId === "41869fbd537ef01");
@@ -1586,8 +1605,16 @@ describe("the wired session-hygiene periodic sweep (issue #283 items 2/3)", () =
             });
             manager.sessions.add(dead as unknown as NodeSession);
 
-            const status = session.bridge.getStatus();
+            // The dead/rotated checks are POLL-driven (`pollHygiene`, from
+            // `getStatus()`), unlike the superseded sweep above — so this
+            // FIRST call is what triggers `closeSession` at all. Finding 2:
+            // its cumulative count only lands once `initiateForceClose`
+            // settles, which is after this call returns, so the count is
+            // read from a SECOND call, once flushed.
+            session.bridge.getStatus();
             assert.equal(dead.forceCloseCount, 1);
+            await flushHygiene();
+            const status = session.bridge.getStatus();
             assert.equal(status.sessionHygiene.closed.dead, 1);
         } finally {
             await session.close();
@@ -1627,8 +1654,10 @@ describe("the wired session-hygiene periodic sweep (issue #283 items 2/3)", () =
             });
             manager.sessions.add(old as unknown as NodeSession);
 
-            const status = session.bridge.getStatus();
+            session.bridge.getStatus();  // triggers the poll-driven close (see the dead-session test above)
             assert.equal(old.forceCloseCount, 1);
+            await flushHygiene();
+            const status = session.bridge.getStatus();
             assert.equal(status.sessionHygiene.closed.rotated, 1);
         } finally {
             await session.close();
@@ -1656,6 +1685,192 @@ describe("the wired session-hygiene periodic sweep (issue #283 items 2/3)", () =
             );
         } finally {
             await bridge.close();
+        }
+    });
+});
+
+describe("closeSession's async-outcome discipline (issue #283 review, Finding 2)", () => {
+    it("does not count a rejected force-close, logs the failure once, and a later poll does not re-select or re-log it", async () => {
+        const logged: string[] = [];
+        const bridge = new BridgeNode(
+            { storagePath: storage(), matterPort: 0, wsPort: 0 },
+            { ...IDENTITY },
+            BRIDGE_VERSION,
+            message => logged.push(message),
+        );
+        await bridge.start();
+        try {
+            const manager = bridge.server.env.get(SessionManager);
+            const flaky = fakeSession({ id: 9560, peerNodeId: 0x4444n }) as Record<string, unknown> & {
+                closeAttempts: number;
+            };
+            flaky.createdAt = Date.now();
+            // Quiet well past DEAD_SESSION_QUIET_MS, so the very first poll
+            // selects it.
+            flaky.activeTimestamp = Date.now() - DEAD_SESSION_QUIET_MS - 1000;
+            flaky.closeAttempts = 0;
+            // Models a close matter.js marks as STARTED (`isClosing`) but
+            // that then fails — the shape that used to get re-selected and
+            // re-counted on every subsequent poll (the bug Finding 2 fixes).
+            flaky.initiateForceClose = async () => {
+                flaky.closeAttempts++;
+                flaky.isClosing = true;
+                throw new Error("close refused by the peer's stack");
+            };
+            manager.sessions.add(flaky as unknown as NodeSession);
+
+            const first = bridge.getStatus();
+            assert.equal(first.sessionHygiene.closed.dead, 0,
+                "a close whose outcome is not yet known must not be counted");
+            assert.equal(flaky.closeAttempts, 1);
+
+            await flushHygiene();
+            assert.ok(
+                logged.some(line => line.includes("force-closing session 9560 failed")),
+                logged.join("\n"),
+            );
+            assert.equal(
+                // The narrower "Session hygiene: closing session" prefix,
+                // not the bare id — "force-closing session 9560 failed"
+                // also contains "closing session 9560" as a substring and
+                // would otherwise double-count the FAILURE log as a second
+                // decision-to-close log.
+                logged.filter(line => line.includes("Session hygiene: closing session 9560")).length, 1,
+                "the decision to close is logged once, before the outcome is known",
+            );
+
+            const second = bridge.getStatus();
+            assert.equal(second.sessionHygiene.closed.dead, 0,
+                "a REJECTED close must never be counted as a success");
+            assert.equal(flaky.closeAttempts, 1,
+                "isClosing (set before the rejection) must stop the session being re-selected");
+            assert.equal(
+                logged.filter(line => line.includes("Session hygiene: closing session 9560")).length, 1,
+                "a session already isClosing must not be re-logged on a later poll",
+            );
+        } finally {
+            await bridge.close();
+        }
+    });
+});
+
+describe("PASE immunity across the session-hygiene paths (issue #283 review, Finding 7a)", () => {
+    it("a PASE session, however old and quiet, is never swept, never dead/rotated-closed, and never counted in peers", async () => {
+        // Mirrors the churn section's "counts neither PASE sessions nor
+        // subscription ADDS" — same principle, the hygiene mechanisms
+        // instead of the churn detector.
+        const session = await boot(storage());
+        try {
+            const manager = session.bridge.server.env.get(SessionManager);
+            const pase = hygieneSession(manager.sessions, {
+                id: 9570,
+                peerNodeId: 0x5555n,
+                // Old and quiet enough to qualify for BOTH dead and rotated
+                // on age/quiet-time alone — isPase is the only thing that
+                // may stand between it and a close.
+                createdAt: Date.now() - SESSION_MAX_AGE_MS * 2,
+                activeTimestamp: Date.now() - SESSION_MAX_AGE_MS * 2,
+            });
+            pase.isPase = true;
+            manager.sessions.add(pase as unknown as NodeSession);
+
+            // A second CASE session for the SAME peer — the shape that would
+            // trigger the superseded sweep if PASE sessions were not
+            // filtered out of the peer's own snapshot.
+            const real = hygieneSession(manager.sessions, { id: 9571, peerNodeId: 0x5555n });
+            manager.sessions.add(real as unknown as NodeSession);
+
+            await flushHygiene();
+            const status = session.bridge.getStatus();
+            assert.equal(pase.forceCloseCount, 0,
+                "a PASE session must never be force-closed by any hygiene path, however old or quiet");
+            assert.equal(status.sessionHygiene.closed.dead, 0);
+            assert.equal(status.sessionHygiene.closed.rotated, 0);
+            assert.equal(status.sessionHygiene.closed.superseded, 0);
+            // `real` is a genuine live CASE session for this peer and DOES
+            // belong in the diagnostic — the claim under test is narrower:
+            // the count must be 1 (real alone), not 2, which is what it
+            // would be if `pase` were counted alongside it.
+            const peerCount = status.sessionHygiene.peers.find(peer => peer.peerNodeId === "5555");
+            assert.equal(peerCount?.liveSessions, 1,
+                "a PASE session must never be counted in the live-CASE-session diagnostic");
+        } finally {
+            await session.close();
+        }
+    });
+});
+
+describe("the #hygieneBroken latch actually stops the sweep (issue #283 review, Finding 4)", () => {
+    it("once broken, a new session-open for a HEALTHY peer performs no closes and bumps no counters", async () => {
+        const session = await boot(storage());
+        try {
+            const manager = session.bridge.server.env.get(SessionManager);
+            // Break hygiene the same way the existing "marks hygiene broken" test does.
+            const broken = fakeSession({ id: 9580, peerNodeId: 0n, throwOnPeerNodeId: true });
+            assert.doesNotThrow(() => manager.sessions.add(broken as unknown as NodeSession));
+            assert.equal(session.bridge.getStatus().sessionHygiene.checked, false,
+                "hygiene must already be broken before this test's own scenario runs");
+
+            // A brand-new, entirely healthy peer opening two sessions — the
+            // second of which WOULD trigger a real superseded close if the
+            // listener still ran despite the latch (the bug this fixes:
+            // the OLD `noteHygiene` only checked `#hygieneBroken` inside its
+            // own catch block, never before calling `update()`).
+            const healthyFirst = hygieneSession(manager.sessions, { id: 9581, peerNodeId: 0x6666n });
+            manager.sessions.add(healthyFirst as unknown as NodeSession);
+            const healthySecond = hygieneSession(manager.sessions, { id: 9582, peerNodeId: 0x6666n });
+            manager.sessions.add(healthySecond as unknown as NodeSession);
+
+            await flushHygiene();
+            assert.equal(healthyFirst.forceCloseCount, 0,
+                "a broken hygiene latch must stop the sweep from RUNNING at all, not merely from acting");
+            assert.equal(healthySecond.forceCloseCount, 0);
+            assert.deepEqual(session.bridge.getStatus().sessionHygiene.closed,
+                { superseded: 0, dead: 0, rotated: 0 });
+        } finally {
+            await session.close();
+        }
+    });
+});
+
+describe("cross-failure independence (issue #283 review, Finding 7c)", () => {
+    it("a fault reachable only through session hygiene's own logic leaves subscriptionChurn.checked true", async () => {
+        const session = await boot(storage());
+        try {
+            const manager = session.bridge.server.env.get(SessionManager);
+            // `subscriptions.SIZE` is read by `describeSession` (hygiene's
+            // own path, via `sweepSuperseded`) but NOT by churn's `added`
+            // handler, which only reads `session.id`/`peerNodeId`/`fabric`
+            // — so a session whose `subscriptions.size` getter throws
+            // breaks hygiene alone, unlike the shared `peerNodeId` fault the
+            // existing "marks hygiene broken… independently of
+            // subscriptionChurn" test uses, which breaks both at once.
+            // Only `.size` may throw here — matter.js's OWN `sessions.added`
+            // wiring (registered ahead of ours) reads `subscriptions.added`
+            // on every new session regardless of either detector, so making
+            // the whole `subscriptions` object unreadable breaks the add
+            // itself, before either detector's own handler ever runs.
+            const hygieneOnly = fakeSession({ id: 9590, peerNodeId: 0x7777n });
+            const inert = { on: () => {}, off: () => {} };
+            hygieneOnly.subscriptions = {
+                has: () => false,
+                add: () => {},
+                delete: () => {},
+                get size(): number {
+                    throw new Error("subscriptions.size unreadable");
+                },
+                added: inert,
+                deleted: inert,
+            };
+
+            assert.doesNotThrow(() => manager.sessions.add(hygieneOnly as unknown as NodeSession));
+
+            const status = session.bridge.getStatus();
+            assert.equal(status.sessionHygiene.checked, false, "hygiene's own fault must break hygiene");
+            assert.equal(status.subscriptionChurn.checked, true,
+                "…but must not take churn down with it — the two are independently wired");
+        } finally {
+            await session.close();
         }
     });
 });
