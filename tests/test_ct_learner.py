@@ -152,12 +152,42 @@ def test_an_echo_matching_the_command_is_not_a_shortfall(learner, store, republi
 
 def test_a_shortfall_below_the_detection_threshold_is_not_a_candidate(learner, store):
     """A 1-mired gap is conversion noise, not evidence — the detection
-    threshold is 2, deliberately narrower than the diff path's own 30-mired
-    suppression tolerance."""
+    threshold is 10, well clear of round-trip noise this small."""
     learner.record_commanded(800, 401)
     learner.observe(_entry(store), 400)
     learner.observe(_entry(store), 400)
     assert store.upserts == []
+
+
+def test_a_sub_tolerance_clamp_is_deliberately_not_learned(learner, store, republish):
+    """A genuine 8-mired clamp is real, repeatable evidence — but it is
+    smaller than ``export_handlers.CT_TOLERANCE_MIREDS`` (30), so ADR-0013's
+    own diff tolerance already absorbs it silently and no published bound is
+    needed at all. This is the deliberate reason the detection threshold
+    lives at 10, not just above measured transients (see the module's own
+    ``SHORTFALL_THRESHOLD_MIREDS`` docstring): a clamp this small has no
+    reason to ever become a learned bound."""
+    learner.record_commanded(800, 408)
+    learner.observe(_entry(store), 400)  # 8-mired warm shortfall, repeatable
+    learner.observe(_entry(store), 400)
+    assert store.upserts == []
+    republish.assert_not_called()
+
+
+def test_the_2026_08_24_transient_echo_incident_does_not_adopt(learner, store, republish):
+    """The live incident that forced the threshold from 2 to 10 (2026-08-24
+    15:07, device 1894385558): Apple adaptive lighting commanded 206 mireds
+    to a MiBoxer FUT035Z+ strip, and the z2m driver echoed a mid-transition/
+    quantized 202 TWICE inside the freshness window — a 4-mired gap that
+    used to clear the old threshold (2) and get adopted as a false warm
+    bound, before the settled 206 reading re-widened it back moments later
+    (75ms of pure store-write/republish churn for nothing learned). At the
+    new threshold (10), a 4-mired gap is never even a candidate."""
+    learner.record_commanded(1894385558, 206)
+    learner.observe(_Entry(1894385558), 202)
+    learner.observe(_Entry(1894385558), 202)
+    assert store.upserts == []
+    republish.assert_not_called()
 
 
 def test_adoption_no_ops_when_the_value_already_equals_the_learned_one(

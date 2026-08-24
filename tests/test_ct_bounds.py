@@ -68,6 +68,10 @@ def test_a_non_int_stored_value_is_treated_as_absent():
 # wire_options — the transform `_spec_for` applies
 # ---------------------------------------------------------------------------
 def test_an_ordinary_export_produces_an_empty_wire_options():
+    """The byte-identity guarantee the un-trapdoor rule preserves: with NONE
+    of the four stored CT keys present, the wire stays empty exactly as it
+    did before issue #293 — this is the one case the presence gate still
+    omits."""
     assert ct_bounds.wire_options({}) == {}
     assert ct_bounds.wire_options(None) == {}
 
@@ -99,12 +103,28 @@ def test_seed_keys_are_stripped_when_a_learned_value_supersedes_them():
     assert wire == {"ctMinMireds": 250, "ctMaxMireds": 400}
 
 
-def test_bounds_that_equal_generic_are_omitted_from_the_wire():
-    """A seed that happens to equal 153/500 must produce the SAME empty wire
-    options as no seed at all — the gate is "differs from generic", not
-    "a key exists"."""
+def test_a_seed_equal_to_generic_still_reaches_the_wire_when_stored():
+    """The gate is "a stored key is present", not "the pair differs from
+    generic" — a seed that happens to equal 153/500 still reaches the wire,
+    because the un-trapdoor rule (issue #293's 2026-08-24 revision) has no
+    way to tell "seeded to exactly generic" apart from "re-widened back to
+    exactly generic" other than by key presence. See
+    ``test_un_trapdoor_a_bound_re_widened_back_to_generic_still_reaches_the_wire``
+    for the re-widen case this exists to fix."""
     options = {ct_bounds.OPTION_CT_MIN_MIREDS: 153, ct_bounds.OPTION_CT_MAX_MIREDS: 500}
-    assert ct_bounds.wire_options(options) == {}
+    assert ct_bounds.wire_options(options) == {"ctMinMireds": 153, "ctMaxMireds": 500}
+
+
+def test_un_trapdoor_a_bound_re_widened_back_to_generic_still_reaches_the_wire():
+    """THE fix pin: a device learned back to the full generic range must not
+    fall silent on the wire. Before this change, a learned pair resolving to
+    exactly (153, 500) produced empty wire options — indistinguishable from
+    a device that never published bounds at all — and the node's own
+    never-clobber-on-absence rule left a stale narrow pair live forever,
+    with an endpoint recreate as the only escape. Presence of the stored
+    learned key, not the resolved value, is what decides now."""
+    options = {ct_bounds.OPTION_CT_LEARNED_MAX_MIREDS: 500}
+    assert ct_bounds.wire_options(options) == {"ctMinMireds": 153, "ctMaxMireds": 500}
 
 
 def test_ct_roles_are_the_two_colour_temperature_roles():

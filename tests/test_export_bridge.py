@@ -333,15 +333,20 @@ class TestEndpointProvider:
         assert "ctLearnedMaxMireds" not in options
         assert "ctLearnedMinMireds" not in options
 
-    def test_a_seed_equal_to_generic_produces_no_wire_options(
+    def test_a_seed_equal_to_generic_still_reaches_the_wire(
             self, bridge_mod, mock_logger, devices):
+        """The un-trapdoor rule (issue #293's 2026-08-24 revision): a stored
+        seed reaches the wire even when it resolves to exactly the generic
+        153/500 pair — the gate is key PRESENCE, not "differs from
+        generic". See ``ct_bounds.wire_options`` for the re-widen case
+        (a learned bound settling back to generic) this exists to fix."""
         dev = DimmerDevice(800, "CT Lamp", onState=True, brightness=50, whiteTemperature=2700,
                             supportsWhiteTemperature=True)
         devices.add(dev)
         h = Harness(bridge_mod, mock_logger, devices, [
             ExportEntry(800, "colorTemperatureLight",
                        options={"ctMinMireds": 153, "ctMaxMireds": 500})])
-        assert h.bridge.endpoint_specs()[0].options == {}
+        assert h.bridge.endpoint_specs()[0].options == {"ctMinMireds": 153, "ctMaxMireds": 500}
 
     def test_ct_bounds_never_leak_into_an_unrelated_roles_wire_options(
             self, bridge_mod, mock_logger, devices):

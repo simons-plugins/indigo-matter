@@ -116,17 +116,29 @@ def wire_options(options: Optional[dict]) -> dict:
       are this plugin's own record of where a bound came from, which the
       node has no use for and no vocabulary to receive; it only ever wants
       the two effective numbers.
-    * the effective pair is added back to the wire options ONLY when it
-      differs from the generic 153/500 domain. An ordinary export — no seed,
-      nothing learned yet — must produce a byte-identical wire frame to
-      before this feature existed (the exact round-trip tests pin this): the
-      node already assumes 153/500 the moment the keys are absent (§4.2), so
-      sending them anyway would be a pure no-op that costs bytes and, worse,
-      diffs every existing golden frame for no behavioural gain.
+    * the effective pair is added back to the wire options whenever ANY of
+      the four stored keys is present in ``options`` — even if the pair it
+      resolves to happens to equal the generic 153/500 domain. Gating on
+      "differs from generic" instead (the original #293 rule) was a
+      ONE-WAY TRAPDOOR: a device that had published a narrow learned bound
+      and was then re-widened by evidence back to the full range would
+      resolve to (153, 500), the wire would carry no keys, and the node —
+      which deliberately never resets bounds on an ABSENT pair, precisely so
+      an unrelated update can never clobber a working one — would leave the
+      stale narrow pair live forever, with an endpoint recreate as the only
+      escape. Gating on key PRESENCE instead closes that trap: a device that
+      re-widens all the way back to generic still has a stored key (the
+      learned one, now equal to generic), so the pair still reaches the
+      wire and the node's own validity rule accepts (153, 500) like any
+      other pair. Only when NONE of the four keys are present — no seed, no
+      learned value, this feature never touched the export at all — does the
+      wire stay empty; an ordinary export with nothing stored must still
+      produce a byte-identical frame to before this feature existed (the
+      exact round-trip tests pin this).
     """
     result = {key: value for key, value in (options or {}).items() if key not in _STORED_KEYS}
-    min_mireds, max_mireds = effective_ct_bounds(options)
-    if (min_mireds, max_mireds) != (GENERIC_MIN_MIREDS, GENERIC_MAX_MIREDS):
+    if any(key in (options or {}) for key in _STORED_KEYS):
+        min_mireds, max_mireds = effective_ct_bounds(options)
         result[OPTION_CT_MIN_MIREDS] = min_mireds
         result[OPTION_CT_MAX_MIREDS] = max_mireds
     return result

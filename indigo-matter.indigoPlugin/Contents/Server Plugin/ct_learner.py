@@ -78,16 +78,29 @@ from matter_handlers.color_control import mireds_to_kelvin
 FRESHNESS_WINDOW_SECONDS = 15.0
 
 #: An echo has to differ from what was commanded by at least this many
-#: mireds to count as a candidate shortfall at all. Deliberately smaller
-#: than ``export_handlers.CT_TOLERANCE_MIREDS`` (30): that constant is a
-#: SUPPRESSION band (how much drift the diff path lets through as noise
-#: before reporting it), and this one is a DETECTION threshold (how much of
-#: a gap is worth treating as possible hardware evidence) — a shortfall as
-#: small as 2 mireds is still real once it repeats twice, and using the
-#: larger constant here would make the learner blind to exactly the
-#: shortfalls smaller than 30 that ADR-0013's tolerance already hides from
-#: the ordinary diff.
-SHORTFALL_THRESHOLD_MIREDS = 2
+#: mireds to count as a candidate shortfall at all. Every hardware clamp
+#: this project has actually measured is 26-47 mireds: the MiBoxer strip
+#: that opened issue #281 (426 asked, 400 echoed — a 26-mired gap, see
+#: ``docs/DEVICE-NOTES.md``), Innr sideboards (153 -> 200 = 47 mireds cool,
+#: 500 -> 454 = 46 mireds warm) and Hue pendants (500 -> 454 = 46 mireds
+#: warm) — ADR-0014's own measured-hardware table. A transition/quantization
+#: transient measures nothing like that: the live incident that forced this
+#: threshold up (2026-08-24 15:07, device 1894385558) commanded 206 mireds
+#: and got a mid-transition echo of 202 TWICE — a 4-mired gap that
+#: nonetheless repeated identically and was adopted as a false warm bound,
+#: only for the settled 206 reading to re-widen it back moments later (75ms
+#: of pure store-write/republish churn for nothing learned). And a genuine
+#: clamp smaller than ``export_handlers.CT_TOLERANCE_MIREDS`` (30) needs no
+#: published bound at all — ADR-0013's own tolerance already absorbs it
+#: silently, so there is no reason for the detection threshold to sit below
+#: 10, and every reason for it to sit above the measured transient band. 10
+#: leaves comfortable headroom under every measured clamp and above the
+#: measured transient. ``ct_calibration.py``'s sweep deliberately reuses
+#: this same constant rather than keeping its own: its echoes are read back
+#: after ``SETTLE_SECONDS`` (2.5s) of settling, so it never sees a transient
+#: this threshold would need to reject, and every real clamp it measures
+#: clears 10 as comfortably as the passive path's does.
+SHORTFALL_THRESHOLD_MIREDS = 10
 
 #: Two shortfall readings count as "the same value" within this many mireds.
 #: The in-range mireds↔Kelvin round trip is near-exact (see
