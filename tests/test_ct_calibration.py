@@ -324,3 +324,42 @@ def test_a_second_sweep_is_refused_while_one_is_in_flight(
 # test_adopt_measured_collapse_refusal_reuses_adopt_s_own_guard for the
 # learner-level pin; the engine never bypasses that guard, it only calls in.
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# 7. THE 2026-08-24 15:39 incident, end to end through a real sweep (issue
+# #293/#294): both extremes echo the SAME value on a device with no prior
+# options at all. `_resolve_targets` reads its `entry` from the store ONCE,
+# before the loop over both sides — the same stale-snapshot shape the
+# learner-level tests pin directly, reached here through the real engine.
+# ---------------------------------------------------------------------------
+def test_a_matching_echo_on_both_extremes_adopts_cool_and_refuses_warm(
+        calibration_mod, ct_learner_mod, mock_indigo_base, logger, republish):
+    """The live incident (device 1894385558, a MiBoxer strip): a laggy driver
+    echoed 215 mireds for BOTH the cool and warm extreme. The cool side
+    (asked first) has nothing to collide with and adopts cleanly. The warm
+    side then echoes the SAME 215 — which would collapse the range to a
+    point — and `_adopt`'s fresh store re-read is what has to refuse it, not
+    the sweep's own single `entry` snapshot (still empty options) reused for
+    both calls. The store is left valid: one learned bound, not an invalid
+    pair."""
+    import ct_bounds
+    store = FakeStore([_Entry(800)])
+    learner = ct_learner_mod.CTBoundsLearner(store, logger, republish)
+    devices = ScriptedDevices()
+    devices.add(
+        DimmerDevice(dev_id=800, name="Test Lamp", onState=False, brightness=0,
+                     whiteLevel=60, whiteTemperature=_mireds_to_kelvin(300)),
+        # Both extremes echo back the SAME laggy 215 mireds.
+        echoes_kelvin=[_mireds_to_kelvin(215), _mireds_to_kelvin(215)])
+    engine = _engine(calibration_mod, store, devices, learner, logger)
+
+    assert engine.start(device_ids=[800], skip_lit=True) is True
+
+    entry = store.get(800)
+    assert entry.options == {ct_bounds.OPTION_CT_LEARNED_MIN_MIREDS: 215}, \
+        "cool adopted; warm refused — no invalid (215, 215) pair"
+    assert republish.call_count == 1  # only the cool adoption republished
+    logger.warning.assert_called_once()
+    warning = logger.warning.call_args[0][0] % logger.warning.call_args[0][1:]
+    assert "invalid" in warning

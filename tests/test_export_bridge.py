@@ -47,6 +47,7 @@ from fakes import (
     RelayDevice,
     SprinklerDevice,
 )
+from test_ct_learner import Clock
 
 FRAMES = load_bridge_frames()
 OURS = export_catalog.DEFAULT_PLUGIN_ID
@@ -2453,11 +2454,22 @@ class TestCTBoundsLearnerWiring:
         devices.add(dev)
         h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(800, "colorTemperatureLight")])
         h.start()
+        # PR #295 review: completion also requires the streak to have been
+        # open at least MIN_CONFIRMATION_GAP_SECONDS — swap in a
+        # controllable clock so the two genuine dispatches below can be
+        # advanced past it, same as the ct_learner unit tests.
+        h.bridge.ct_learner._now = Clock()  # pylint: disable=protected-access
         upserts_before = len([c for c in h.client.calls if c[0] == "upsert_endpoint"])
 
         h.bridge.on_command(bridge_protocol.BridgeCommand(
             indigo_device_id=800, command="setColorTemp", args={"colorTempMireds": 426}))
         h.bridge.device_updated(dev, self._ct_lamp(whiteTemperature=2500))   # echo -> 400
+        h.bridge.ct_learner._now.advance(2.0)  # pylint: disable=protected-access
+        # A second, distinct dispatch of the same ask — two confirmations
+        # must answer two commands, not one command heard twice (#293
+        # 2026-08-24 16:40 incident).
+        h.bridge.on_command(bridge_protocol.BridgeCommand(
+            indigo_device_id=800, command="setColorTemp", args={"colorTempMireds": 426}))
         h.bridge.device_updated(dev, self._ct_lamp(whiteTemperature=2500))   # same echo again
 
         assert h.store.get(800).options["ctLearnedMaxMireds"] == 400
@@ -2465,6 +2477,41 @@ class TestCTBoundsLearnerWiring:
         assert upserts_after == upserts_before + 1, "a learned bound must republish the endpoint"
         last_spec = [c for c in h.client.calls if c[0] == "upsert_endpoint"][-1][1]
         assert last_spec.options["ctMaxMireds"] == 400
+
+    def test_duplicate_callbacks_off_one_dispatch_do_not_adopt(
+            self, bridge_mod, mock_logger, devices, mock_indigo_base):
+        """The incident pin at the wiring level (#293, 2026-08-24 16:40,
+        device 1894385558, 2026.27.1 build): z2m can publish several
+        attributes per state change, so ONE ``setColorTemp`` dispatch can
+        fire ``device_updated`` more than once with the same lagged echo.
+        Those duplicate callbacks must not satisfy the two-observations rule
+        on their own — only a SECOND, distinct dispatch's matching echo may
+        complete the streak."""
+        dev = self._ct_lamp()
+        devices.add(dev)
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(800, "colorTemperatureLight")])
+        h.start()
+        # PR #295 review: completion also requires the streak to have been
+        # open at least MIN_CONFIRMATION_GAP_SECONDS — swap in a
+        # controllable clock so the genuine second dispatch below can be
+        # advanced past it, same as the ct_learner unit tests.
+        h.bridge.ct_learner._now = Clock()  # pylint: disable=protected-access
+
+        h.bridge.on_command(bridge_protocol.BridgeCommand(
+            indigo_device_id=800, command="setColorTemp", args={"colorTempMireds": 426}))
+        h.bridge.device_updated(dev, self._ct_lamp(whiteTemperature=2500))  # echo -> 400
+        h.bridge.device_updated(dev, self._ct_lamp(whiteTemperature=2500))  # duplicate callback
+        h.bridge.device_updated(dev, self._ct_lamp(whiteTemperature=2500))  # duplicate callback
+
+        assert "ctLearnedMaxMireds" not in h.store.get(800).options
+
+        # A second, distinct dispatch's matching echo still completes it.
+        h.bridge.ct_learner._now.advance(2.0)  # pylint: disable=protected-access
+        h.bridge.on_command(bridge_protocol.BridgeCommand(
+            indigo_device_id=800, command="setColorTemp", args={"colorTempMireds": 426}))
+        h.bridge.device_updated(dev, self._ct_lamp(whiteTemperature=2500))
+
+        assert h.store.get(800).options["ctLearnedMaxMireds"] == 400
 
     def test_a_single_shortfall_does_not_learn_anything(
             self, bridge_mod, mock_logger, devices, mock_indigo_base):

@@ -35,7 +35,19 @@ republished via the injected ``republish`` callable (``ExportBridge.upsert``):
   freshness window is what stops an unrelated Indigo-side change hours later
   from ever being misread as hardware evidence — see
   :data:`FRESHNESS_WINDOW_SECONDS`'s own docstring for the measured trap this
-  guards against.
+  guards against. The two confirmations must also answer two DISTINCT
+  commanded dispatches, not one dispatch heard twice — a live incident
+  (2026-08-24 16:40, device 1894385558, on the 2026.27.1 build) showed a
+  single z2m state change firing ``deviceUpdated`` more than once with the
+  same lagged value, which satisfied a same-dispatch "two observations" rule
+  without the hardware ever having been asked twice; see :class:`_Pending`'s
+  ``commanded_at`` field and :meth:`CTBoundsLearner._observe_locked` for the
+  mechanism. Distinct ``commanded_at`` values alone are not enough either: a
+  DELAYED duplicate of one dispatch can be answered after a later, distinct
+  dispatch was already recorded and so inherit that dispatch's timestamp
+  without being a genuine second confirmation (PR #295 review, 2026-08-24 —
+  the race variant of the same 16:40 incident). Completion also requires the
+  streak to have been open at least :data:`MIN_CONFIRMATION_GAP_SECONDS`.
 * **re-widening** — ANY reading outside the CURRENT effective bounds proves
   reach immediately, no streak needed: the device just did the thing the
   bounds said it could not, which is its own proof. This is what self-heals
@@ -109,6 +121,23 @@ SHORTFALL_THRESHOLD_MIREDS = 10
 #: different ones.
 REPEAT_TOLERANCE_MIREDS = 1
 
+#: The minimum time a shortfall streak must have been open before its
+#: second, distinct-dispatch confirmation may complete it (PR #295 review,
+#: 2026-08-24 — the race variant of the 16:40 incident). The distinct-
+#: dispatch rule (:data:`_Pending.commanded_at`) compares the LIVE
+#: ``commanded.at`` against the streak's own reference, but timing alone
+#: cannot prove which dispatch a DELAYED duplicate echo is answering: a
+#: late-arriving duplicate of dispatch N, delivered after a same-valued
+#: dispatch N+1 has already been recorded (the #281 storm re-asserts every
+#: ~3-9s), reads its ``commanded.at`` as N+1's and is indistinguishable from
+#: a genuine second confirmation of N+1. Duplicates of one physical report
+#: arrive within milliseconds of each other; genuine second confirmations
+#: ride the storm's re-assert cadence seconds apart. 2s separates the two
+#: populations with margin on both sides. An observation that clears the
+#: distinct-dispatch check but not this gap is treated exactly like a
+#: same-dispatch duplicate: inert, and it does not reset the streak.
+MIN_CONFIRMATION_GAP_SECONDS = 2.0
+
 
 @dataclasses.dataclass
 class _Commanded:
@@ -122,6 +151,19 @@ class _Pending:
     """One side's shortfall streak, one confirming observation away from adoption."""
     side: str    # "min" (cool shortfall) or "max" (warm shortfall)
     mireds: int  # the value the streak is converging on
+    #: The `at` of the `_Commanded` reference that STARTED this streak — the
+    #: dispatch the streak's first observation was a shortfall against. Kept
+    #: so a later observation can tell "a second answer to a second question"
+    #: (a different dispatch's `at`) from "the same answer heard twice" (see
+    #: the module docstring's 2026-08-24 16:40 incident).
+    commanded_at: float
+    #: When THIS streak started (:func:`CTBoundsLearner._now`, not the
+    #: commanded reference's own timestamp) — the completion gap
+    #: (:data:`MIN_CONFIRMATION_GAP_SECONDS`) is measured from here, because a
+    #: DELAYED duplicate echo can carry a distinct `commanded.at` and still
+    #: not be a genuine second confirmation (PR #295 review, the race variant
+    #: of the 16:40 incident — see that constant's own docstring).
+    started_at: float
 
 
 class CTBoundsLearner:
@@ -209,14 +251,19 @@ class CTBoundsLearner:
         C extension — active probing, rejected as an AUTOMATIC mechanism, now
         shipped as an operator-invoked action that feeds this same store).
 
-        Deliberately thin: it computes the two inputs :meth:`_adopt` needs
-        that :meth:`_observe_locked` would otherwise compute for it
-        (``current_min``/``current_max``) and then funnels straight into
-        :meth:`_adopt` under the SAME lock — so a sweep's measurement gets
-        the identical collapse-refusal guard, re-read-before-write, one INFO
-        log, and republish that passive shortfall/re-widen evidence already
-        gets. No second adoption path is written; that would be exactly the
-        "one fact said twice" this module's own docstring warns against.
+        Deliberately thin: it funnels straight into :meth:`_adopt` under the
+        SAME lock — so a sweep's measurement gets the identical collapse-
+        refusal guard, re-read-before-write, one INFO log, and republish that
+        passive shortfall/re-widen evidence already gets. No second adoption
+        path is written; that would be exactly the "one fact said twice" this
+        module's own docstring warns against.
+
+        ``entry`` here is deliberately NOT used to compute the guard's
+        current bounds — only its ``indigo_device_id``/``role`` matter, and
+        :meth:`_adopt` re-reads the store itself for the rest (see its own
+        docstring for why: a live incident showed this caller's own ``entry``
+        can be a snapshot taken before a MULTI-SIDE sweep started, stale by
+        the time the second side's call lands here).
 
         Unlike :meth:`observe`, there is no streak to build and no freshness
         window to check: the caller (the calibration engine) already knows
@@ -229,8 +276,7 @@ class CTBoundsLearner:
         if entry.role not in ct_bounds.CT_ROLES:
             return
         with self._lock:
-            current_min, current_max = ct_bounds.effective_ct_bounds(entry.options)
-            self._adopt(entry, side, int(mireds), current_min, current_max, reason=reason)
+            self._adopt(entry, side, int(mireds), reason=reason)
 
     def _observe_locked(self, entry, mireds: int) -> None:
         device_id = entry.indigo_device_id
@@ -241,12 +287,12 @@ class CTBoundsLearner:
         # right now. This is what self-heals a seed or a stale learned value
         # that turns out to be too narrow.
         if mireds < current_min:
-            self._adopt(entry, "min", mireds, current_min, current_max,
+            self._adopt(entry, "min", mireds,
                         reason=f"a reading of {mireds} mired is past its {current_min}-mired "
                                "learned/seeded floor, proving the device reaches further")
             return
         if mireds > current_max:
-            self._adopt(entry, "max", mireds, current_min, current_max,
+            self._adopt(entry, "max", mireds,
                         reason=f"a reading of {mireds} mired is past its {current_max}-mired "
                                "learned/seeded ceiling, proving the device reaches further")
             return
@@ -275,21 +321,91 @@ class CTBoundsLearner:
         pending = self._pending.get(device_id)
         if pending is not None and pending.side == side \
                 and abs(pending.mireds - mireds) <= REPEAT_TOLERANCE_MIREDS:
-            self._adopt(entry, side, mireds, current_min, current_max,
+            if commanded.at == pending.commanded_at:
+                # A duplicate callback answering the SAME dispatch that
+                # started this streak, not a second confirming observation —
+                # z2m (and others) publish several attributes per state
+                # change, so one command can fire `deviceUpdated` more than
+                # once with the identical lagged value (2026-08-24 16:40
+                # incident, device 1894385558, on the 2026.27.1 build: Apple
+                # re-asked at 241 mireds while the driver's Indigo state
+                # still held the previous 227-mired target, and two
+                # deviceUpdated callbacks off that ONE dispatch both echoed
+                # the stale 227). Left pending, unchanged: two confirmations
+                # must be two answers to two DISTINCT dispatches, not one
+                # answer heard twice — a real hardware clamp echoes the same
+                # value in response to two separate commands seconds apart
+                # (the #281 storm re-asserts, so distinct dispatches keep
+                # arriving); driver lag cannot do that, because by the next
+                # dispatch the lagged value has moved with the ask.
+                return
+            if self._now() - pending.started_at < MIN_CONFIRMATION_GAP_SECONDS:
+                # A DISTINCT dispatch by `commanded.at`, but arriving too soon
+                # after the streak started to be a genuine second
+                # confirmation (PR #295 review — the race variant of the
+                # 16:40 incident above): timing cannot prove which dispatch a
+                # DELAYED duplicate echo is answering, and a duplicate of one
+                # physical report can land after a same-valued dispatch N+1
+                # has already been recorded, inheriting N+1's `commanded.at`
+                # while still being an echo of N. See
+                # `MIN_CONFIRMATION_GAP_SECONDS`'s own docstring for why 2s
+                # separates the two populations. Treated exactly like a
+                # same-dispatch duplicate: inert, streak left unchanged.
+                return
+            self._adopt(entry, side, mireds,
                         reason=(f"two consecutive {'warm' if side == 'max' else 'cool'} "
-                                f"shortfalls confirmed a commanded {commanded.mireds}-mired "
-                                f"write echoed back as {mireds}"))
+                                f"shortfalls, answering two distinct commanded writes at least "
+                                f"{MIN_CONFIRMATION_GAP_SECONDS:.0f}s apart, both echoed back as "
+                                f"{mireds}"))
             self._pending.pop(device_id, None)
             return
         # Either the first observation of a new streak, or one that
         # disagrees with the streak in progress — either way the streak
         # restarts on THIS reading; a mismatch is never averaged with what
         # came before it.
-        self._pending[device_id] = _Pending(side=side, mireds=mireds)
+        self._pending[device_id] = _Pending(side=side, mireds=mireds, commanded_at=commanded.at,
+                                            started_at=self._now())
 
-    def _adopt(self, entry, side: str, candidate: int, current_min: int, current_max: int,
-              *, reason: str) -> None:
-        """Persist ``candidate`` as the learned bound for ``side``, if it says anything new."""
+    def _adopt(self, entry, side: str, candidate: int, *, reason: str) -> None:
+        """Persist ``candidate`` as the learned bound for ``side``, if it says anything new.
+
+        Re-reads the store FIRST and derives the current effective bounds
+        from THAT — never from ``entry``, whatever bounds a caller happens to
+        have computed for its own pre-check — because ``entry`` is only ever
+        a snapshot, and the guard below has to be right about what is
+        actually stored right now, not what it was when the caller read it.
+
+        This is the issue #293 2026-08-24 15:39 incident, fixed at its root:
+        a calibration sweep's ``adopt_measured`` reused ONE ``entry`` snapshot
+        (options empty) across both the cool and warm extremes of the same
+        device. The cool adoption wrote ``ctLearnedMinMireds: 215`` to the
+        store; the warm call, still holding the stale empty-options snapshot,
+        computed its guard against (153, 500) instead of the now-current
+        (215, 500) — so a warm candidate of 215 sailed past a guard that
+        should have refused it, and the write then merged the new
+        ``ctLearnedMaxMireds: 215`` onto the FRESH options that already held
+        ``ctLearnedMinMireds: 215``, persisting an invalid (215, 215) pair.
+        Production self-healed four seconds later when a settled reading
+        re-widened it back to (153, 500), but the invalid pair was genuinely
+        stored in that window, and ``ExportStore.upsert`` had nothing that
+        would have caught it either (see its own docstring on this point).
+        Recomputing from a fresh re-read, right here, closes both gaps at
+        once: no caller's bounds are trusted for the write decision, and the
+        guard and the write always agree on what they are guarding.
+        """
+        device_id = entry.indigo_device_id
+        fresh = self._store.get(device_id)
+        if fresh is None:
+            # The export was removed since this reading arrived — debug, not
+            # a warning: this is routine (un-export mid-streak), not a fault,
+            # but a silent discard with nothing logged at all left issue #293
+            # review with no way to tell "candidate discarded" from "adoption
+            # never even ran" when a device_sync race is being chased.
+            self._logger.debug(
+                "Matter export: device %s's %s-side colour-temperature candidate (%s mireds) "
+                "discarded — the export no longer exists.", device_id, side, candidate)
+            return
+        current_min, current_max = ct_bounds.effective_ct_bounds(fresh.options)
         if side == "min":
             if candidate == current_min:
                 return  # already the effective value — nothing to say twice
@@ -306,27 +422,23 @@ class CTBoundsLearner:
             # widening the OTHER side to compensate — that would be this
             # module inventing evidence for a side that offered none.
             #
-            # In practice only COLLAPSE (equality) is reachable through
-            # `observe`: the re-widen branch above intercepts anything
-            # outside the current bounds before this shortfall path ever
-            # runs, so `candidate` here is always within
-            # `[current_min, current_max]`, and replacing one side with it
-            # can shrink the range to a point but never invert it. The `>=`
-            # check still covers strict inversion too, on the chance a
-            # future caller of `_adopt` is less constrained than this one.
+            # Both COLLAPSE and genuine INVERSION are reachable here now that
+            # this guard runs against a FRESH re-read rather than the value
+            # that produced `candidate`: a caller's own current-bounds
+            # reasoning (the re-widen-vs-shortfall split in
+            # `_observe_locked`, or a sweep's single-shot ask/echo pair in
+            # `adopt_measured`) is computed against ITS OWN snapshot, which
+            # can disagree with what the store holds by the time this runs —
+            # exactly the gap the incident above exploited. A second
+            # adoption landing on the OTHER side in between (two sides of
+            # the same sweep, or two concurrent adoptions) can move
+            # `current_min`/`current_max` past `candidate` in either
+            # direction, so this is no longer provably collapse-only.
             self._logger.warning(
                 "Matter export: device %s's observed colour-temperature bound (%s mireds, side "
                 "%s) would make its learned range %s-%s invalid (min must be < max) — refusing "
-                "to adopt it.", entry.indigo_device_id, candidate, side, new_min, new_max)
+                "to adopt it.", device_id, candidate, side, new_min, new_max)
             return
-        device_id = entry.indigo_device_id
-        # Re-read immediately before writing: `entry` may be the caller's
-        # snapshot from moments ago, and another thread's `store.upsert`
-        # (a role change, a name edit, a concurrent adoption on the other
-        # side) landing in between must not be clobbered by a stale copy.
-        fresh = self._store.get(device_id)
-        if fresh is None:
-            return  # the export was removed since this reading arrived
         updated = dataclasses.replace(fresh, options={**fresh.options, learned_key: candidate})
         try:
             self._store.upsert(updated)

@@ -27,6 +27,7 @@ from export_store import (
     SCHEMA_VERSION,
     ExportEntry,
     ExportStore,
+    options_lawful_for_role,
 )
 
 
@@ -421,6 +422,63 @@ def test_upsert_still_accepts_a_re_adopted_published_as(prefs, mock_logger):
     assert store.get(1).published_as == "indigo-2"
 
 
+# ---------------------------------------------------------------------------
+# options validated at WRITE time (issue #294 review, incident 2026-08-24
+# 15:39) — mirrors published_as's own upsert/replace_all guard above.
+# `ExportEntry.from_dict` (the LOAD path) always caught a collapsed
+# min/max pair; `upsert`/`replace_all` did not, until `ct_learner._adopt`'s
+# own re-read-before-write raced a concurrent adoption and persisted an
+# invalid (215, 215) pair straight past it — only for `from_dict` to have
+# rejected it as corrupt at the NEXT restart. See
+# `tests/test_ct_learner.py`'s incident-pinned tests for the learner-level
+# reproduction; this is the store-level guard that now backstops it.
+# ---------------------------------------------------------------------------
+def test_upsert_refuses_a_collapsed_ct_bounds_pair_at_write_time(prefs, mock_logger):
+    store = ExportStore(lambda: prefs, mock_logger)
+    with pytest.raises(ValueError, match="min < max"):
+        store.upsert(_entry(1, "colorTemperatureLight",
+                            options={OPTION_CT_LEARNED_MIN_MIREDS: 215,
+                                     OPTION_CT_LEARNED_MAX_MIREDS: 215}))
+    assert store.get(1) is None, "nothing was written"
+    assert PREF_KEY not in prefs
+
+
+def test_upsert_still_accepts_a_valid_ct_bounds_pair(prefs, mock_logger):
+    store = ExportStore(lambda: prefs, mock_logger)
+    store.upsert(_entry(1, "colorTemperatureLight",
+                        options={OPTION_CT_LEARNED_MIN_MIREDS: 200,
+                                 OPTION_CT_LEARNED_MAX_MIREDS: 400}))
+    assert store.get(1).options == {OPTION_CT_LEARNED_MIN_MIREDS: 200,
+                                    OPTION_CT_LEARNED_MAX_MIREDS: 400}
+
+
+def test_replace_all_refuses_a_collapsed_ct_bounds_pair_and_persists_nothing(prefs, mock_logger):
+    """One bad entry among several refuses the WHOLE replacement — the same
+    "changed nothing" promise `upsert` makes on failure — not a partial
+    commit that silently drops just the bad one."""
+    store = ExportStore(lambda: prefs, mock_logger)
+    store.upsert(_entry(1))
+    with pytest.raises(ValueError, match="min < max"):
+        store.replace_all([
+            _entry(2),
+            _entry(3, "colorTemperatureLight",
+                  options={OPTION_CT_LEARNED_MIN_MIREDS: 300,
+                           OPTION_CT_LEARNED_MAX_MIREDS: 300}),
+        ])
+    assert store.ids() == frozenset({1}), "the old list survives untouched"
+
+
+def test_replace_all_still_accepts_a_valid_ct_bounds_pair(prefs, mock_logger):
+    store = ExportStore(lambda: prefs, mock_logger)
+    store.replace_all([
+        _entry(1, "colorTemperatureLight",
+              options={OPTION_CT_LEARNED_MIN_MIREDS: 200,
+                       OPTION_CT_LEARNED_MAX_MIREDS: 400}),
+    ])
+    assert store.get(1).options == {OPTION_CT_LEARNED_MIN_MIREDS: 200,
+                                    OPTION_CT_LEARNED_MAX_MIREDS: 400}
+
+
 def test_published_as_absent_on_load_of_an_older_payload(mock_logger):
     """An entry saved before PR5 has no `publishedAs` key at all — it must
     load, not be dropped as unusable, with `published_as` defaulting to None."""
@@ -780,3 +838,49 @@ def test_a_non_boolean_inversion_is_refused():
     with pytest.raises(ValueError):
         ExportEntry.from_dict(_mapped(**{OPTION_STATE_KEY: "status",
                                          OPTION_STATE_INVERT: "yes"}))
+
+
+# ---------------------------------------------------------------------------
+# options_lawful_for_role (issue #293 review) — the readopt cross-role guard
+# ---------------------------------------------------------------------------
+def test_options_lawful_for_role_keeps_everything_on_a_same_role_carry():
+    options = {OPTION_STATE_KEY: "status", OPTION_STATE_INVERT: True}
+    assert options_lawful_for_role(options, "occupancySensor") == options
+
+
+def test_options_lawful_for_role_drops_invert_for_a_non_covering_role():
+    filtered = options_lawful_for_role({OPTION_INVERT: True}, "onOffLight")
+    assert filtered == {}
+
+
+def test_options_lawful_for_role_keeps_invert_for_window_covering():
+    options = {OPTION_INVERT: True}
+    assert options_lawful_for_role(options, "windowCovering") == options
+
+
+def test_options_lawful_for_role_drops_a_mapping_for_a_non_mappable_role():
+    filtered = options_lawful_for_role(
+        {OPTION_STATE_KEY: "status", OPTION_STATE_INVERT: True}, "onOffPlugInUnit")
+    assert filtered == {}
+
+
+def test_options_lawful_for_role_drops_ct_bounds_for_a_role_with_no_colour_temperature():
+    options = {OPTION_CT_MIN_MIREDS: 153, OPTION_CT_MAX_MIREDS: 400,
+              OPTION_CT_LEARNED_MIN_MIREDS: 200, OPTION_CT_LEARNED_MAX_MIREDS: 350}
+    assert options_lawful_for_role(options, "windowCovering") == {}
+
+
+def test_options_lawful_for_role_keeps_ct_bounds_for_a_ct_role():
+    options = {OPTION_CT_MIN_MIREDS: 153, OPTION_CT_MAX_MIREDS: 400}
+    assert options_lawful_for_role(options, "colorTemperatureLight") == options
+
+
+def test_options_lawful_for_role_result_is_lawful_input_to_upsert(prefs, mock_logger):
+    """The point of the helper: whatever it returns must itself pass
+    `_validate_options` for the target role, so `upsert` never re-rejects it."""
+    store = ExportStore(lambda: prefs, mock_logger)
+    filtered = options_lawful_for_role(
+        {OPTION_CT_LEARNED_MIN_MIREDS: 153, OPTION_CT_LEARNED_MAX_MIREDS: 370,
+         OPTION_INVERT: True}, "windowCovering")
+    entry = store.upsert(ExportEntry(101, "windowCovering", options=filtered))
+    assert entry.options == {OPTION_INVERT: True}

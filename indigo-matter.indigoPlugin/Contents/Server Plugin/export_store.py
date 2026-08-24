@@ -220,6 +220,39 @@ def _validate_ct_bounds(options: dict, role: str, device_id: int) -> None:
                 f"{ct_bounds.GENERIC_MAX_MIREDS} (device {device_id})")
 
 
+def options_lawful_for_role(options: dict, role: str) -> dict:
+    """The subset of ``options`` that :func:`_validate_options` accepts for ``role``.
+
+    Driven by the SAME per-role tables ``_validate_options`` checks against —
+    :data:`INVERTIBLE_ROLES`, :data:`MAPPABLE_ROLES`, :data:`CT_BOUNDS_ROLES` —
+    rather than a hand-copied key list that can drift out of step with them.
+
+    For ``server_menu_mixin._readopt_commit`` (issue #293 review): re-adopting
+    an orphaned accessory onto a device carries that device's OWN previous
+    export options forward, and the orphan's role need not match the role
+    those options were validated against (``export_catalog``'s dimmer rule
+    makes one device eligible for both a light role and ``windowCovering``,
+    for instance). Filtering here before the entry is built keeps
+    ``ExportStore.upsert``'s options validation from hard-failing the
+    re-adopt outright. Dropping the unlawful keys is correct, not a
+    compromise: they described the OLD role's semantics, not this one's, and
+    the learner/dialog re-earn or re-seed whatever the new role needs.
+    """
+    lawful = {}
+    if OPTION_INVERT in options and role in INVERTIBLE_ROLES:
+        lawful[OPTION_INVERT] = options[OPTION_INVERT]
+    if role in MAPPABLE_ROLES:
+        for key in (OPTION_STATE_KEY, OPTION_STATE_INVERT):
+            if key in options:
+                lawful[key] = options[key]
+    if role in CT_BOUNDS_ROLES:
+        for key in (OPTION_CT_MIN_MIREDS, OPTION_CT_MAX_MIREDS,
+                    OPTION_CT_LEARNED_MIN_MIREDS, OPTION_CT_LEARNED_MAX_MIREDS):
+            if key in options:
+                lawful[key] = options[key]
+    return lawful
+
+
 @dataclass(frozen=True)
 class ExportEntry:
     """One allow-listed device and the metadata Indigo cannot supply.
@@ -394,11 +427,27 @@ class ExportStore:
         discovered on the reload after that, by which point the dialog that
         wrote it has long since reported success. Raising at the write is what
         lets the caller say "FAILED to save the export list" instead.
+
+        ``options`` is validated HERE too (issue #294 review), for the exact
+        same reason ``published_as`` already is: :meth:`ExportEntry.from_dict`
+        is the LOAD path's guard, and every ordinary write goes through
+        already-validated callers (the export dialog, ``ct_learner._adopt``'s
+        own re-read-then-merge). But the 2026-08-24 15:39 incident proved a
+        caller CAN construct an invalid pair despite its own guard racing a
+        concurrent write (see ``ct_learner.CTBoundsLearner._adopt``'s
+        docstring for the full mechanism) — and without a check here, that
+        invalid blob is persisted silently and only rejected as corrupt at
+        the NEXT plugin restart's load, by which point the evidence of what
+        went wrong is long gone. Raising here instead gives the caller (in
+        practice, ``_adopt``'s own try/except) an immediate, attributable
+        failure to log — "could not be saved" — rather than a delayed,
+        unexplained one.
         """
         if entry.published_as is not None and parse_published_id(entry.published_as) is None:
             raise ValueError(
                 f"export entry {KEY_PUBLISHED_AS!r} {entry.published_as!r} is not a lawful "
                 f"published identity (device {entry.indigo_device_id})")
+        _validate_options(entry.options, entry.role, entry.indigo_device_id)
         with self._lock:
             pending = dict(self._entries)
             pending[int(entry.indigo_device_id)] = entry
@@ -417,9 +466,26 @@ class ExportStore:
             return True
 
     def replace_all(self, entries: Iterable[ExportEntry]) -> None:
-        """Replace the whole allow-list in one persisted write."""
+        """Replace the whole allow-list in one persisted write.
+
+        Validated the same way :meth:`upsert` is (issue #294 review) and for
+        the same reason: ``_migrate_commit`` (``server_menu_mixin.py``) is
+        this method's one production caller, and it already wraps the call
+        in a try/except reporting "FAILED to save the export list" — exactly
+        the failure mode a raised ``ValueError`` here produces. Validated
+        BEFORE ``_commit`` runs, over every entry, so one bad entry among many
+        refuses the whole replacement rather than partially persisting it —
+        matching :meth:`upsert`'s own "changed nothing" promise on failure.
+        """
+        materialized = list(entries)
+        for entry in materialized:
+            if entry.published_as is not None and parse_published_id(entry.published_as) is None:
+                raise ValueError(
+                    f"export entry {KEY_PUBLISHED_AS!r} {entry.published_as!r} is not a lawful "
+                    f"published identity (device {entry.indigo_device_id})")
+            _validate_options(entry.options, entry.role, entry.indigo_device_id)
         with self._lock:
-            self._commit({int(e.indigo_device_id): e for e in entries})
+            self._commit({int(e.indigo_device_id): e for e in materialized})
 
     # ------------------------------------------------------------------
     # Persistence

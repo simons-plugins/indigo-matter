@@ -23,7 +23,7 @@ import export_catalog
 import protocol
 from bridge_protocol import parse_published_id, published_id_for
 from commission_jobs import fabric_counts, node_id_to_str
-from export_store import ExportEntry, OPTION_STATE_INVERT, OPTION_STATE_KEY
+from export_store import ExportEntry, OPTION_STATE_INVERT, OPTION_STATE_KEY, options_lawful_for_role
 from http_handlers import MatterUnavailable
 from plugin_constants import (
     EXCLUDED_OPTION_PREFIX,
@@ -1622,7 +1622,8 @@ class ServerMenuMixin:
                 return entry.indigo_device_id
         return None
 
-    def _log_readopt_confirmation(self, client, orphan, dev, device_id: int, previous) -> None:
+    def _log_readopt_confirmation(  # pylint: disable=too-many-arguments
+            self, client, orphan, dev, device_id: int, previous, dropped_options=frozenset()) -> None:
         """PR5 design §4.5 — the one WARNING a successful re-adopt leaves behind.
 
         The last sentence is emitted only when ``device_id`` was already
@@ -1641,6 +1642,13 @@ class ServerMenuMixin:
         can run. "Migrate an exported accessory…" is the tool that keeps
         those, and only while the old device still exists — which by
         definition it no longer does here.
+
+        ``dropped_options`` (PR #295 review) names whatever
+        ``_readopt_commit``'s cross-role filtering discarded — a covering's
+        ``invert`` silently vanishing on re-adopt is user-invisible until the
+        covering moves backwards, so it is not left for the user to discover
+        the hard way. Empty on every same-role re-adopt, which is most of
+        them.
         """
         role_label = export_catalog.role_label(orphan.role)
         if orphan.device_id is not None:
@@ -1661,14 +1669,21 @@ class ServerMenuMixin:
             clause = f" (number {number})" if number is not None else ""
             superseded = (f" Device {device_id}'s own previous accessory{clause} has been "
                           "removed from your ecosystems.")
+        dropped_clause = ""
+        if dropped_options:
+            keys = ", ".join(sorted(dropped_options))
+            noun = "option" if len(dropped_options) == 1 else "options"
+            dropped_clause = (f" Its previous export's {keys} {noun} do not apply to a "
+                              f"{role_label} and were not carried over.")
         self.logger.warning(
             'Matter export: RE-ADOPTED accessory "%s" (%s, accessory number %d) onto Indigo '
             'device "%s" (id %s). %s The accessory returns under its original identity and '
             'number, and no duplicate is created — but an ecosystem that has already processed '
             'the removal (Apple Home does within moments) will show it in the Default Room '
             'under a default name, and any scene or automation that referenced it must be '
-            'rebuilt.%s',
-            orphan.label, role_label, orphan.number, dev.name, device_id, left_behind, superseded)
+            'rebuilt.%s%s',
+            orphan.label, role_label, orphan.number, dev.name, device_id, left_behind, superseded,
+            dropped_clause)
 
     def _readopt_refuse(self, errors, field: str, msg: str) -> None:
         """One PR5 design §4.4 SUBSTANTIVE refusal: dialog error plus a matching
@@ -1792,15 +1807,36 @@ class ServerMenuMixin:
         """The PR5 design §4.4 closing paragraph: one ``ExportStore.upsert`` preserving
         any existing ``name_override``/``options``, then the remove-then-add
         nudge and the PR5 design §4.5 confirmation log.
+
+        ``options`` is filtered to what ``orphan.role`` can lawfully carry
+        (issue #293 review) before it reaches ``upsert``: ``previous`` is the
+        DEVICE's own prior export, which can be a different role than the
+        orphan it is being re-adopted onto (``export_catalog``'s dimmer rule
+        makes one device eligible for both a light role and
+        ``windowCovering``) — carrying those options wholesale would hand
+        ``upsert``'s own options validation a pair it must reject, turning a
+        legitimate cross-role re-adopt into a hard failure. Dropping what the
+        new role cannot carry is correct: those options described the OLD
+        role's semantics, not this one's.
+
+        The dropped keys themselves (PR #295 review) are not silent: a
+        covering's ``invert`` vanishing on a cross-role re-adopt is
+        user-invisible until the covering moves backwards, so
+        :meth:`_log_readopt_confirmation` names them in the same confirmation
+        WARNING this commit already leaves behind.
         """
         device_id = dev.id
         previous = self.exports.get(device_id)
+        filtered_options = (options_lawful_for_role(previous.options, orphan.role)
+                            if previous is not None else {})
+        dropped_options = (set(previous.options) - set(filtered_options)
+                           if previous is not None else set())
         try:
             self.exports.upsert(ExportEntry(
                 indigo_device_id=device_id,
                 role=orphan.role,
                 name_override=previous.name_override if previous is not None else None,
-                options=dict(previous.options) if previous is not None else {},
+                options=filtered_options,
                 published_as=orphan.unique_id,
             ))
         except Exception as exc:  # pylint: disable=broad-except
@@ -1821,7 +1857,7 @@ class ServerMenuMixin:
             errors["readoptDevice"] = ("Saved, but the bridge node was not told — "
                                        "see Event Log.")
             return (False, valuesDict, errors)
-        self._log_readopt_confirmation(client, orphan, dev, device_id, previous)
+        self._log_readopt_confirmation(client, orphan, dev, device_id, previous, dropped_options)
         return (True, valuesDict)
 
     def menuReadoptExport(self, valuesDict, menuId=""):  # noqa: N802, ARG002

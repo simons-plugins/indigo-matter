@@ -3,6 +3,58 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
+## 2026.27.1 — a fresh re-read gates every learned colour-temperature adoption
+
+- **Fixed: a stale caller snapshot could let a colour-temperature bounds
+  adoption collapse the learned range instead of being refused** (issue
+  #293 review, live-demonstrated 2026-08-24 15:39 on device 1894385558, a
+  MiBoxer strip). A calibration sweep's cool-extreme adoption wrote a
+  learned bound to the store; the SAME sweep's warm-extreme call still held
+  its own pre-loop `entry` snapshot with empty options, so its collapse
+  guard checked against the unlearned generic domain instead of what was
+  actually stored — a warm candidate equal to the just-adopted cool bound
+  sailed past the guard and was persisted as an invalid (215, 215) pair.
+  Production self-healed a few seconds later when a settled reading
+  re-widened it, but the invalid pair was genuinely stored in that window.
+  `CTBoundsLearner._adopt` now re-reads the store FIRST and derives the
+  guard's current bounds from that fresh read, never from a caller's own
+  snapshot.
+- **`ExportStore.upsert`/`replace_all` now validate the options they
+  persist**, the same checks `ExportEntry.from_dict` (the load path) has
+  always enforced. Previously only the LOAD path caught an invalid stored
+  entry, so a bad write from anywhere else was silently persisted and only
+  surfaced as a rejected/corrupt entry at the next plugin restart. A write
+  that fails validation now raises immediately instead — for the learner,
+  this is exactly the "could not be saved" failure its own adoption code
+  already logs and recovers from.
+- **Fixed: re-adopting an orphaned accessory onto a device could hard-fail
+  the save when its previous export's options did not belong to the new
+  role** (issue #293 review, exposed by the write-time validation above). A
+  CT-light's learned colour-temperature bounds carried onto a `windowCovering`
+  orphan (or a covering's `invert` carried the other way) is a legitimate
+  cross-role re-adopt (`export_catalog`'s dimmer rule makes one device
+  eligible for both), but `_readopt_commit` was carrying `previous.options`
+  wholesale onto the orphan's role — handing `upsert`'s new validation a pair
+  it had to reject. `options_lawful_for_role()` now filters the carry-forward
+  using the same role tables `_validate_options` enforces: a cross-role
+  re-adopt drops what the new role cannot carry (and now names the dropped
+  key(s) in its confirmation log, so the loss is not silent) while a
+  same-role re-adopt keeps everything unchanged.
+- **Fixed: a shortfall streak could complete on a delayed duplicate echo
+  answering an EARLIER dispatch, not the one it was recorded against** (PR
+  #295 review, the race variant of the 2026-08-24 16:40 incident above).
+  The distinct-dispatch rule compares the live commanded reference against
+  the streak's own — but a duplicate of dispatch N delivered late, after a
+  same-valued dispatch N+1 was already recorded (the #281 storm re-asserts
+  every ~3-9s), inherits N+1's timestamp and reads as "a different dispatch"
+  even though it never answered one. Timing alone cannot tell the two
+  apart, so completion now also requires the streak to have been open at
+  least `MIN_CONFIRMATION_GAP_SECONDS` (2.0s) — comfortably separating a
+  duplicate callback's millisecond-scale echo from a genuine second
+  confirmation riding the storm's re-assert cadence. An observation that
+  clears the distinct-dispatch check but not this gap is inert, exactly
+  like a same-dispatch duplicate.
+
 ## 2026.27.0 — physical colour-temperature bounds, learned from what the device actually does
 
 - **Exported colour-temperature and extended-colour lights can now publish
