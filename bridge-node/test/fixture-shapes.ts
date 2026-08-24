@@ -23,6 +23,7 @@ import type {
     OrphanRecord,
     PairingReport,
     RemoveResult,
+    SessionHygiene,
     StatusReport,
     SubscriptionChurn,
     UpsertResult,
@@ -41,6 +42,17 @@ const ALEXA = { fabricIndex: 2, label: "Amazon Alexa", vendorId: 4442 } satisfie
  * defaulting it.
  */
 const CHURN_HEALTHY = { checked: true, active: false, peers: [] } satisfies SubscriptionChurn;
+
+/**
+ * §4.3 issue #283 "Finding 2" — a bridge whose session-hygiene sweep is
+ * wired and has closed nothing, because nothing has needed closing. Same
+ * "state it, don't default it" reasoning as {@link CHURN_HEALTHY}.
+ */
+const HYGIENE_HEALTHY = {
+    checked: true,
+    peers: [],
+    closed: { superseded: 0, dead: 0, rotated: 0 },
+} satisfies SessionHygiene;
 
 /** Versions are placeholders: the real ones track package.json / matter.js. */
 export const handshake = {
@@ -72,6 +84,7 @@ export const status = {
     // channel is a stdout nobody is watching.
     warnings: [],
     subscriptionChurn: CHURN_HEALTHY,
+    sessionHygiene: HYGIENE_HEALTHY,
 } satisfies StatusReport;
 
 /**
@@ -88,6 +101,7 @@ export const statusEmpty = {
     driftChecked: false,
     warnings: [],
     subscriptionChurn: CHURN_HEALTHY,
+    sessionHygiene: HYGIENE_HEALTHY,
 } satisfies StatusReport;
 
 /** §3.1 with `intent: "replace_all"`: the live set is emptied deliberately. */
@@ -100,6 +114,7 @@ export const statusReplaceAll = {
     driftChecked: false,
     warnings: [],
     subscriptionChurn: CHURN_HEALTHY,
+    sessionHygiene: HYGIENE_HEALTHY,
 } satisfies StatusReport;
 
 /**
@@ -143,6 +158,16 @@ export const statusChurning = {
                 since: "2026-08-23T09:12:00.000Z",
             },
         ],
+    },
+    // The same live-session count as `subscriptionChurn.peers[0]` above —
+    // this is issue #283's OWN "diagnostic to run first" recipe (count live
+    // CASE sessions per peer), which is exactly what a human reads this
+    // field for. `closed` is zero: this fixture predates session hygiene
+    // existing to act on the pile it shows.
+    sessionHygiene: {
+        checked: true,
+        peers: [{ peerNodeId: "41869fbd537ef01", fabricIndex: 2, liveSessions: 5 }],
+        closed: { superseded: 0, dead: 0, rotated: 0 },
     },
 } satisfies StatusReport;
 
@@ -323,6 +348,7 @@ export const rebuiltStatus = {
     driftChecked: true,
     warnings: [],
     subscriptionChurn: CHURN_HEALTHY,
+    sessionHygiene: HYGIENE_HEALTHY,
 } satisfies StatusReport;
 
 /**

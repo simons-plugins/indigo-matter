@@ -72,6 +72,15 @@
           "checked": true,
           "active": false,
           "peers": []
+        },
+        "sessionHygiene": {
+          "checked": true,
+          "peers": [],
+          "closed": {
+            "superseded": 0,
+            "dead": 0,
+            "rotated": 0
+          }
         }
       }
     }
@@ -155,6 +164,15 @@
           "checked": true,
           "active": false,
           "peers": []
+        },
+        "sessionHygiene": {
+          "checked": true,
+          "peers": [],
+          "closed": {
+            "superseded": 0,
+            "dead": 0,
+            "rotated": 0
+          }
         }
       }
     }
@@ -199,7 +217,7 @@
         "drift": [],
         "driftChecked": false,
         "warnings": [
-          "Subscription churn detected for controller peer 41869fbd537ef01 (fabric 2): 3 invalid subscription deletion(s) in 30 min, 5 live session(s) since 2026-08-23T09:12:00.000Z \u2014 restart the Matter bridge to recover."
+          "Subscription churn detected for controller peer 41869fbd537ef01 (fabric 2): 3 invalid subscription deletion(s) in 30 min, 5 live session(s) since 2026-08-23T09:12:00.000Z — restart the Matter bridge to recover."
         ],
         "subscriptionChurn": {
           "checked": true,
@@ -214,6 +232,21 @@
               "since": "2026-08-23T09:12:00.000Z"
             }
           ]
+        },
+        "sessionHygiene": {
+          "checked": true,
+          "peers": [
+            {
+              "peerNodeId": "41869fbd537ef01",
+              "fabricIndex": 2,
+              "liveSessions": 5
+            }
+          ],
+          "closed": {
+            "superseded": 0,
+            "dead": 0,
+            "rotated": 0
+          }
         }
       }
     }
@@ -408,6 +441,15 @@
           "checked": true,
           "active": false,
           "peers": []
+        },
+        "sessionHygiene": {
+          "checked": true,
+          "peers": [],
+          "closed": {
+            "superseded": 0,
+            "dead": 0,
+            "rotated": 0
+          }
         }
       }
     }
@@ -443,6 +485,15 @@
           "checked": true,
           "active": false,
           "peers": []
+        },
+        "sessionHygiene": {
+          "checked": true,
+          "peers": [],
+          "closed": {
+            "superseded": 0,
+            "dead": 0,
+            "rotated": 0
+          }
         }
       }
     }
@@ -1189,6 +1240,15 @@
           "checked": true,
           "active": false,
           "peers": []
+        },
+        "sessionHygiene": {
+          "checked": true,
+          "peers": [],
+          "closed": {
+            "superseded": 0,
+            "dead": 0,
+            "rotated": 0
+          }
         }
       }
     }
@@ -1542,6 +1602,15 @@
           "checked": true,
           "active": false,
           "peers": []
+        },
+        "sessionHygiene": {
+          "checked": true,
+          "peers": [],
+          "closed": {
+            "superseded": 0,
+            "dead": 0,
+            "rotated": 0
+          }
         }
       }
     }

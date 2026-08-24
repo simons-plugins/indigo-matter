@@ -3,6 +3,38 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
+## 2026.28.0 — app-level session hygiene against the matter.js report-routing defect (issue #283 "Finding 2")
+
+- **New: the bridge node now closes stale CASE sessions on its own**, ahead
+  of any recurrence of the Alexa subscription-staleness fault banked in issue
+  #283. Built entirely through matter.js 0.17.8's public session-layer API —
+  no dependency patching (`bridge-node/src/session-hygiene.ts`):
+  - **Superseded-session sweep** (the core deliverable) — when a peer opens
+    a new CASE session, its older ones are closed immediately, removing the
+    pile-up precondition for the still-open matter.js routing defect that
+    Finding 1 documents (that defect itself remains an upstream matter.js
+    fix, not addressed here).
+  - **Dead-session force-close** — a subscription-free CASE session quiet
+    for 60s is closed.
+  - **Age-based rotation** — a subscription-free CASE session older than 4h
+    is closed. A session holding a live subscription is never rotated by
+    age: probing confirmed a `ServerSubscription` cannot be migrated to a
+    replacement session, so doing so would strand it rather than rotate it
+    cleanly.
+  - A fourth mechanism (a "wedge watchdog" for a controller that keeps
+    MRP-acking pushed reports while it has stopped issuing new requests) was
+    assessed and **not built** — the one matter.js internal that could
+    distinguish "acked" from "consumed" is private with no public path to it.
+  - Every closure is logged once and counted; a new `sessionHygiene` field on
+    the §4.3 `get_status`/`attach` `StatusReport` reports live CASE-session
+    counts per peer (issue #283's own "diagnostic to run first" recipe) and
+    the cumulative close counts. Additive, no `protocolVersion` bump — an
+    older plugin ignores the field. See `docs/BRIDGE_PROTOCOL.md` §0(k)-(o)
+    for the matter.js internals this was probed against, and §4.3 for the
+    field.
+  - Plugin-side: `bridge_protocol.py` parses the new field (tolerant of
+    absence from an older node); no UI/log surfacing yet.
+
 ## 2026.27.1 — a fresh re-read gates every learned colour-temperature adoption
 
 - **Fixed: a stale caller snapshot could let a colour-temperature bounds

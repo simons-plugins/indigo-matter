@@ -486,6 +486,56 @@ class SubscriptionChurn:
 
 
 @dataclass
+class SessionHygienePeer:
+    """One peer's live CASE session count (§4.3, issue #283 "Finding 2").
+
+    Unlike :class:`ChurnPeer` this is EVERY peer holding a live CASE session,
+    not only ones over a churn threshold — it is issue #283's own "diagnostic
+    to run first when staleness recurs" (count live CASE sessions per peer),
+    so a human can see a pile *forming* before ``subscription_churn`` (which
+    only reports over-threshold peers) would.
+    """
+    peer_node_id: str
+    fabric_index: int
+    live_sessions: int
+
+
+@dataclass
+class SessionHygieneClosed:
+    """Sessions this node has force-closed since it started, by reason
+    (§4.3, issue #283 "Finding 2"). Cumulative — never decreases within a run.
+    """
+    superseded: int = 0
+    dead: int = 0
+    rotated: int = 0
+
+
+@dataclass
+class SessionHygiene:
+    """App-level CASE session hygiene against this bridge (§4.3, issue #283
+    "Finding 2").
+
+    ``checked: False`` is **not** the healthy answer, the same rule
+    :class:`SubscriptionChurn` carries: it means the node's hygiene machinery
+    could not observe/act on the session layer at all, not that nothing
+    needed closing. Defaulted so a report from a pre-0.17.0 node (which never
+    sends this field at all) still parses, to the honest reading: such a node
+    never looked and never acted.
+
+    ``sent`` is what lets a caller tell that absence apart from a CURRENT node
+    reporting ``checked=False`` — both collapse to the same ``checked=False``
+    default above (deliberately: an absent field means "never looked" too),
+    but they warrant different treatment: a pre-0.17.0 node has nothing wrong
+    with it, while a 0.17.0+ node with ``checked=False`` has a mitigation that
+    just stopped running. See :meth:`ExportBridge._apply_session_hygiene`.
+    """
+    checked: bool = False
+    peers: list = field(default_factory=list)
+    closed: SessionHygieneClosed = field(default_factory=SessionHygieneClosed)
+    sent: bool = False
+
+
+@dataclass
 class StatusReport:
     """The result of ``attach``/``get_status``/``rebuild_endpoint_map`` (§4.3)."""
     commissioned: bool
@@ -509,6 +559,12 @@ class StatusReport:
     #: node — which never sends this field — parses as ``checked=False``: it
     #: never looked, which is "unknown", never "healthy".
     subscription_churn: SubscriptionChurn = field(default_factory=SubscriptionChurn)
+    #: §4.3, issue #283 "Finding 2" — app-level CASE session hygiene,
+    #: additive since bridge-node 0.17.0 with no ``protocolVersion`` bump
+    #: (the same precedent ``subscription_churn`` set). Defaulted so a report
+    #: from an older node — which never sends this field — parses as
+    #: ``checked=False``: it never looked, which is "unknown", never "healthy".
+    session_hygiene: SessionHygiene = field(default_factory=SessionHygiene)
 
 
 @dataclass
@@ -640,6 +696,7 @@ def parse_status(result: Any) -> StatusReport:
         drift_checked=bool(data.get("driftChecked", False)),
         warnings=[str(item) for item in (data.get("warnings") or [])],
         subscription_churn=parse_subscription_churn(data.get("subscriptionChurn")),
+        session_hygiene=parse_session_hygiene(data.get("sessionHygiene")),
     )
 
 
@@ -695,6 +752,61 @@ def parse_subscription_churn(data: Any) -> SubscriptionChurn:
         active=bool(data.get("active", False)),
         peers=[peer for peer in (_parse_churn_peer(item) for item in (data.get("peers") or []))
                if peer is not None],
+    )
+
+
+def _parse_hygiene_peer(item: Any) -> Optional[SessionHygienePeer]:
+    """One §4.3 session-hygiene peer, tolerantly — ``None`` for anything
+    malformed. Same per-entry degradation as :func:`_parse_churn_peer`
+    (issue #286 review finding 4): one bad entry must thin the ``peers``
+    LIST, not fail the whole ``StatusReport``."""
+    if not isinstance(item, dict):
+        return None
+    try:
+        return SessionHygienePeer(
+            peer_node_id=str(item.get("peerNodeId", "")),
+            fabric_index=int(item.get("fabricIndex", 0)),
+            live_sessions=int(item.get("liveSessions", 0)),
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_session_hygiene(data: Any) -> SessionHygiene:
+    """Normalise the §4.3 ``sessionHygiene`` object (issue #283 "Finding 2").
+
+    Tolerant of absence — a pre-0.17.0 node's ``StatusReport`` has no such
+    key at all — and of anything not shaped like the object, both of which
+    fall back to the dataclass's own ``checked=False`` default: a node that
+    never sent this field never looked, which is "unknown", never "healthy".
+    A malformed ``closed`` block degrades to all-zero rather than failing the
+    whole report — the counts are informational, and a status poll must
+    never fail over them.
+
+    ``sent`` records only whether ``data`` was present and dict-shaped, NOT
+    whether it parsed cleanly — that is what ``ExportBridge._apply_session_hygiene``
+    needs to tell "an old node never sent this" apart from "a current node
+    sent it and reports ``checked=False``".
+    """
+    if not isinstance(data, dict):
+        return SessionHygiene()
+    closed_data = data.get("closed")
+    closed = SessionHygieneClosed()
+    if isinstance(closed_data, dict):
+        try:
+            closed = SessionHygieneClosed(
+                superseded=int(closed_data.get("superseded", 0)),
+                dead=int(closed_data.get("dead", 0)),
+                rotated=int(closed_data.get("rotated", 0)),
+            )
+        except (TypeError, ValueError):
+            closed = SessionHygieneClosed()
+    return SessionHygiene(
+        checked=bool(data.get("checked", False)),
+        peers=[peer for peer in (_parse_hygiene_peer(item) for item in (data.get("peers") or []))
+               if peer is not None],
+        closed=closed,
+        sent=True,
     )
 
 

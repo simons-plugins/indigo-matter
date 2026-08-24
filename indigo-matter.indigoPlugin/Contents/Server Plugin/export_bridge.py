@@ -390,6 +390,18 @@ class ExportBridge:
         #: class body, because attribute lookup on `self` happens at CALL
         #: time, not at this assignment.
         self._ct_learner = ct_learner.CTBoundsLearner(self._store, self._logger, self.upsert)
+        #: Set while the "session hygiene has stopped watching" warning has
+        #: been said for this streak (issue #283 "Finding 2" review) — same
+        #: latch shape as `_health_device_warned`. Cleared the moment
+        #: `sessionHygiene.checked` goes back to `true`, which is what draws
+        #: the one-off recovery INFO line in `_apply_session_hygiene`.
+        self._hygiene_warned = False
+        #: `sessionHygiene.closed`'s totals as of the last CHECKED report,
+        #: keyed by reason — what `_apply_session_hygiene` diffs the next
+        #: report against to log a per-reason DELTA rather than restating a
+        #: running total on every ~15s tick. `None` before the first checked
+        #: report this session has seen.
+        self._hygiene_closed_totals: Optional[dict] = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -1847,6 +1859,7 @@ class ExportBridge:
         self._report_node_warnings(status)
         self._apply_subscription_churn(getattr(status, "subscription_churn", None),
                                        getattr(status, "fabrics", None))
+        self._apply_session_hygiene(getattr(status, "session_hygiene", None))
         if carried_replace_all and self._pending_replace_all():
             owed = self._pending_replace_all()
             self._clear_pending_replace_all()
@@ -2145,6 +2158,64 @@ class ExportBridge:
         self._logger.warning(
             "Matter bridge: %d connected fabric(s) exceed the %d slots \"%s\" tracks — not "
             "shown: %s.", len(dropped), FABRIC_SLOT_COUNT, HEALTH_DEVICE_NAME, names)
+
+    def _apply_session_hygiene(self, hygiene: Optional[Any]) -> None:
+        """Surface §4.3's ``sessionHygiene`` verdict (issue #283 "Finding 2"
+        review) — until this, ``checked: False`` and the per-peer/per-reason
+        counts reached nobody: the node ACTS on its own (it force-closes
+        sessions through matter.js's session-layer API), so nothing here
+        gates behaviour, and this stays deliberately minimal beside
+        :meth:`_apply_subscription_churn` — log lines only, no device, no UI.
+
+        ``hygiene.sent`` is what makes the WARNING meaningful: a pre-0.17.0
+        node never sends the ``sessionHygiene`` field at all, and
+        :func:`bridge_protocol.parse_session_hygiene` collapses that absence
+        to the same ``checked=False`` a CURRENT node reports when its
+        mitigation has failed — both mean "never looked", but only the
+        second is news. An old node must stay silent forever; a current one
+        that goes from checked to unchecked must say so once, the same latch
+        shape :meth:`_report_node_warnings` uses for the persistence-failure
+        set.
+        """
+        if hygiene is None or not getattr(hygiene, "sent", False):
+            return
+        if not hygiene.checked:
+            if not self._hygiene_warned:
+                self._hygiene_warned = True
+                self._logger.warning(
+                    "Matter bridge: session hygiene has stopped watching the bridge node's "
+                    "session layer — the superseded/dead/rotated-session mitigations for "
+                    "issue #283 are no longer running. Restart the Matter bridge node to "
+                    "restore it.")
+            return
+        if self._hygiene_warned:
+            self._hygiene_warned = False
+            self._logger.info(
+                "Matter bridge: session hygiene has recovered and is watching the bridge "
+                "node's session layer again.")
+        closed = hygiene.closed
+        totals = {
+            "superseded": closed.superseded,
+            "dead": closed.dead,
+            "rotated": closed.rotated,
+        }
+        previous = self._hygiene_closed_totals
+        self._hygiene_closed_totals = totals
+        if previous is None:
+            # The first checked report this session — a baseline, not a
+            # change, so there is nothing yet to diff it against.
+            return
+        deltas = {reason: totals[reason] - previous[reason]
+                  for reason in totals if totals[reason] != previous[reason]}
+        if not deltas:
+            return
+        peers = ", ".join(
+            f"{peer.peer_node_id} (fabric {peer.fabric_index}): {peer.live_sessions}"
+            for peer in hygiene.peers) or "none"
+        self._logger.debug(
+            "Matter bridge: session hygiene closed %s since the last report; live CASE "
+            "sessions per peer now: %s",
+            ", ".join(f"{reason} +{delta}" for reason, delta in deltas.items()), peers)
 
     def _mark_health_unknown(self) -> None:
         """§4.3 issue #286 — the node halted, detached, export was switched
@@ -2465,6 +2536,7 @@ class ExportBridge:
             self._report_node_warnings(status)
             self._apply_subscription_churn(getattr(status, "subscription_churn", None),
                                            getattr(status, "fabrics", None))
+            self._apply_session_hygiene(getattr(status, "session_hygiene", None))
 
         self._fire(_poll(), "the bridge node status poll")
 
