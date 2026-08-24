@@ -868,7 +868,10 @@
               "level": 60,
               "colorTempMireds": 320
             },
-            "options": {}
+            "options": {
+              "ctMinMireds": 200,
+              "ctMaxMireds": 450
+            }
           },
           {
             "indigoDeviceId": 900005,
@@ -882,7 +885,10 @@
               "hue": 210,
               "saturation": 80
             },
-            "options": {}
+            "options": {
+              "ctMinMireds": 200,
+              "ctMaxMireds": 450
+            }
           },
           {
             "indigoDeviceId": 900006,

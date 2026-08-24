@@ -10,6 +10,7 @@
 import type { Endpoint } from "@matter/main";
 
 import {
+    applyCtBoundsUpdate,
     applyLabel,
     applyReachable,
     applyStates,
@@ -663,7 +664,7 @@ export class EndpointRegistry {
         return endpoint;
     }
 
-    /** Label, reachability and state — everything an existing endpoint can change. */
+    /** Label, reachability, CT physical bounds (#293) and state — everything an existing endpoint can change. */
     private async update(spec: EndpointSpec): Promise<void> {
         const live = this.require(spec.indigoDeviceId);
         // Both labels, because {@link applyLabel} writes both: comparing only
@@ -681,6 +682,10 @@ export class EndpointRegistry {
         // the cluster would restore yesterday's name after a restart.
         live.label = spec.label;
         await applyReachable(live.endpoint, spec.reachable);
+        // #293 — before `applyStates`: a `set_state` in the SAME push that
+        // changes bounds must clamp against the NEW bounds, not the ones this
+        // endpoint had a moment ago.
+        await applyCtBoundsUpdate(live.endpoint, live.role, spec.options, spec.indigoDeviceId);
         // `live.battery`, not `spec.battery`: a battery LOSS on `spec` is left
         // alone here (§4.1, monotonic) — the gain case never reaches `update`
         // at all, `upsert`/`reconcileNow` route it to a recreate instead.

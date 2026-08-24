@@ -19,7 +19,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
 
-import { Endpoint, type EndpointType, Environment, Logger, ServerNode, VendorId } from "@matter/main";
+import { Endpoint, type EndpointType, Environment, Logger, LogLevel, ServerNode, VendorId } from "@matter/main";
 import { BasicInformationServer } from "@matter/main/behaviors/basic-information";
 import { BridgedDeviceBasicInformationServer } from "@matter/main/behaviors/bridged-device-basic-information";
 import { ColorControlServer } from "@matter/main/behaviors/color-control";
@@ -40,6 +40,8 @@ import { AggregatorEndpoint } from "@matter/main/endpoints/aggregator";
 import {
     applyStates,
     endpointIdFor,
+    MIREDS_MAX,
+    MIREDS_MIN,
     percentToBatteryRemaining,
     percentToCurrentLevel,
     SUPPORTED_ROLES,
@@ -1499,6 +1501,27 @@ function only(h: Harness): Endpoint {
     const endpoint = [...h.aggregator.parts][0];
     assert.ok(endpoint !== undefined, "the reconcile built no endpoint");
     return endpoint;
+}
+
+/**
+ * `extractCtBounds`'s one warn line goes through matter.js's own `Logger`,
+ * not `h.logs` — this file's `Logger.level = "fatal"` (above) keeps that
+ * quiet for every OTHER destination, so a dedicated destination with its own
+ * `level` (the legacy `addLogger` `defaultLogLevel` option sets it directly
+ * rather than inheriting the process-wide default) is what actually observes
+ * it.
+ */
+function captureWarnLogs(): { lines: string[]; stop: () => void } {
+    const lines: string[] = [];
+    const id = `ct-bounds-registry-test-${Math.random().toString(36).slice(2)}`;
+    Logger.addLogger(id, (_level, formattedLog) => lines.push(formattedLog), { defaultLogLevel: LogLevel.WARN });
+    return { lines, stop: () => Logger.removeLogger(id) };
+}
+
+/** A single endpoint's own `BridgedDeviceBasicInformation.ConfigurationVersion`. */
+function childVersion(endpoint: Endpoint): number {
+    return (endpoint.stateOf("bridgedDeviceBasicInformation") as { configurationVersion?: number })
+        .configurationVersion as number;
 }
 
 describe("driving-device rekey (issue #246/ADR-0011)", () => {
@@ -3483,6 +3506,314 @@ describe("ColorControl command conversion (§4.2, #143)", () => {
                 }),
             );
             assert.equal(h.commands.length, 1, "a colour invocation emitted more than one frame");
+        } finally {
+            await h.close();
+        }
+    });
+});
+
+describe("CT physical bounds (issue #293)", () => {
+    const CT_ROLES: RoleValue[] = [Role.colorTemperatureLight, Role.extendedColorLight];
+
+    /**
+     * Confirms the platform fact that motivates every clamp in this feature:
+     * matter.js 0.17.8 refuses to construct a ColorControl behaviour whose
+     * seeded `colorTemperatureMireds` sits outside
+     * `colorTempPhysicalMinMireds`/`MaxMireds` — a bare stock endpoint, no
+     * Indigo overrides, so the refusal is provably the platform's, not
+     * something `createEndpoint` introduced. A refused construction takes the
+     * WHOLE endpoint down (`aggregator.add` rejects), which is exactly why
+     * {@link ctBoundsOverride}-equivalent clamping in `createEndpoint` cannot
+     * be optional.
+     */
+    it("matter.js 0.17.8 refuses ColorControl construction when colorTemperatureMireds sits outside the physical bounds (measured)", async () => {
+        const h = await harness();
+        try {
+            const bad = new Endpoint(ColorTemperatureLightDevice.with(BridgedDeviceBasicInformationServer) as never, {
+                id: "ct-bounds-probe",
+                bridgedDeviceBasicInformation: {
+                    nodeLabel: "probe",
+                    reachable: true,
+                    uniqueId: "ct-bounds-probe-unique",
+                    configurationVersion: 1,
+                },
+                levelControl: { currentLevel: 1 },
+                colorControl: {
+                    colorMode: ColorControl.ColorMode.ColorTemperatureMireds,
+                    enhancedColorMode: ColorControl.EnhancedColorMode.ColorTemperatureMireds,
+                    colorCapabilities: { colorTemperature: true, xy: true, hueSaturation: false },
+                    colorTempPhysicalMinMireds: 300,
+                    colorTempPhysicalMaxMireds: 400,
+                    coupleColorTempToLevelMinMireds: 300,
+                    startUpColorTemperatureMireds: null,
+                    options: { executeIfOff: true },
+                    colorTemperatureMireds: 200, // outside [300, 400] — the probe
+                },
+            } as never);
+            await assert.rejects(
+                () => h.aggregator.add(bad),
+                /colorTemperatureMireds|Constraint|Behaviors have errors/,
+            );
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("construction with usable bounds publishes them and clamps the generic default CT into range", async () => {
+        const h = await harness();
+        try {
+            await h.registry.reconcile(
+                [
+                    spec(1, Role.colorTemperatureLight, { options: { ctMinMireds: 300, ctMaxMireds: 400 } }),
+                    spec(2, Role.extendedColorLight, { options: { ctMinMireds: 300, ctMaxMireds: 400 } }),
+                ],
+                false,
+            );
+            for (const id of [1, 2]) {
+                const endpoint = [...h.aggregator.parts].find(part => part.id === endpointIdFor(id));
+                const color = endpoint?.stateOf("colorControl") as Record<string, unknown>;
+                assert.equal(color.colorTempPhysicalMinMireds, 300, `device ${id}`);
+                assert.equal(color.colorTempPhysicalMaxMireds, 400, `device ${id}`);
+                assert.equal(color.coupleColorTempToLevelMinMireds, 300, `device ${id}`);
+                // MIREDS_MIN (153) is the generic default and sits below 300 —
+                // clamped up to the new floor, not left outside it.
+                assert.equal(color.colorTemperatureMireds, 300, `device ${id}`);
+            }
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("construction with an out-of-bounds initial CT does not throw, in either direction", async () => {
+        const h = await harness();
+        try {
+            await h.registry.reconcile(
+                [
+                    spec(1, Role.extendedColorLight, {
+                        options: { ctMinMireds: 300, ctMaxMireds: 400 },
+                        states: { colorTempMireds: 153 }, // below the new floor
+                    }),
+                    spec(2, Role.extendedColorLight, {
+                        options: { ctMinMireds: 300, ctMaxMireds: 400 },
+                        states: { colorTempMireds: 500 }, // above the new ceiling
+                    }),
+                ],
+                false,
+            );
+            const below = [...h.aggregator.parts].find(part => part.id === endpointIdFor(1));
+            const above = [...h.aggregator.parts].find(part => part.id === endpointIdFor(2));
+            assert.equal((below?.stateOf("colorControl") as Record<string, unknown>).colorTemperatureMireds, 300);
+            assert.equal((above?.stateOf("colorControl") as Record<string, unknown>).colorTemperatureMireds, 400);
+        } finally {
+            await h.close();
+        }
+    });
+
+    /**
+     * Adversarial per the repo's degradation-path convention: an unusable
+     * pair must be indistinguishable from "no seed at all" (generic 153-500,
+     * warned once) and — the real claim here — must NEVER take the rest of
+     * the SAME reconcile batch down with it. A construction-time refusal on
+     * device 1 would, per §3.1, abort the whole `attach` and leave device 2
+     * unexported too.
+     */
+    for (const role of CT_ROLES) {
+        it(`${role}: an unusable ctMinMireds/ctMaxMireds pair falls back to generic bounds without failing the attach`, async () => {
+            const h = await harness();
+            const capture = captureWarnLogs();
+            try {
+                await h.registry.reconcile(
+                    [
+                        spec(1, role, { options: { ctMinMireds: 300 } }), // max missing — unusable
+                        spec(2, Role.onOffLight), // must NOT be caught in the blast radius
+                    ],
+                    false,
+                );
+                assert.equal(h.registry.size, 2, "the malformed pair must not have aborted the whole attach");
+                const endpoint1 = [...h.aggregator.parts].find(part => part.id === endpointIdFor(1));
+                const state = endpoint1?.stateOf("colorControl") as Record<string, unknown>;
+                assert.equal(state.colorTempPhysicalMinMireds, MIREDS_MIN);
+                assert.equal(state.colorTempPhysicalMaxMireds, MIREDS_MAX);
+                assert.equal(capture.lines.length, 1, capture.lines.join("\n"));
+                assert.match(capture.lines[0]!, /1\b/);
+            } finally {
+                capture.stop();
+                await h.close();
+            }
+        });
+    }
+
+    it("live update: new bounds are applied, the live CT is reclamped, and the CHILD's own ConfigurationVersion bumps exactly once", async () => {
+        const h = await harness();
+        try {
+            await h.registry.reconcile(
+                [spec(1, Role.extendedColorLight, { states: { colorTempMireds: 200 } })],
+                false,
+            );
+            const endpoint = only(h);
+            assert.equal((endpoint.stateOf("colorControl") as Record<string, unknown>).colorTemperatureMireds, 200);
+            const startVersion = childVersion(endpoint);
+            assert.equal(startVersion, 1);
+
+            await h.registry.reconcile(
+                [spec(1, Role.extendedColorLight, { options: { ctMinMireds: 250, ctMaxMireds: 300 } })],
+                false,
+            );
+
+            const color = endpoint.stateOf("colorControl") as Record<string, unknown>;
+            assert.equal(color.colorTempPhysicalMinMireds, 250);
+            assert.equal(color.colorTempPhysicalMaxMireds, 300);
+            assert.equal(color.coupleColorTempToLevelMinMireds, 250);
+            assert.equal(color.colorTemperatureMireds, 250, "200 was below the new floor");
+            assert.equal(childVersion(endpoint), startVersion + 1, "ConfigurationVersion must bump EXACTLY once");
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("live update: bounds already matching the live pair is a true no-op (no write, no bump)", async () => {
+        const h = await harness();
+        try {
+            await h.registry.reconcile(
+                [spec(1, Role.extendedColorLight, { options: { ctMinMireds: 250, ctMaxMireds: 300 } })],
+                false,
+            );
+            const endpoint = only(h);
+            const startVersion = childVersion(endpoint);
+
+            await h.registry.reconcile(
+                [spec(1, Role.extendedColorLight, { options: { ctMinMireds: 250, ctMaxMireds: 300 } })],
+                false,
+            );
+
+            assert.equal(childVersion(endpoint), startVersion, "identical bounds must not bump ConfigurationVersion");
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("live update: absent bounds leave the live pair untouched (never resets to generic)", async () => {
+        const h = await harness();
+        try {
+            await h.registry.reconcile(
+                [spec(1, Role.extendedColorLight, { options: { ctMinMireds: 250, ctMaxMireds: 300 } })],
+                false,
+            );
+            const endpoint = only(h);
+            const startVersion = childVersion(endpoint);
+
+            // A later reconcile that never mentions ctMinMireds/ctMaxMireds —
+            // e.g. the export dialog re-saved with the fields left blank —
+            // must not silently widen the device back to 153-500.
+            await h.registry.reconcile([spec(1, Role.extendedColorLight, { label: "Renamed" })], false);
+
+            const color = endpoint.stateOf("colorControl") as Record<string, unknown>;
+            assert.equal(color.colorTempPhysicalMinMireds, 250);
+            assert.equal(color.colorTempPhysicalMaxMireds, 300);
+            assert.equal(childVersion(endpoint), startVersion, "no bounds change means no bump");
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("live update: an unusable pair also leaves the live pair untouched, and warns once", async () => {
+        const h = await harness();
+        const capture = captureWarnLogs();
+        try {
+            await h.registry.reconcile(
+                [spec(1, Role.extendedColorLight, { options: { ctMinMireds: 250, ctMaxMireds: 300 } })],
+                false,
+            );
+            const endpoint = only(h);
+            const startVersion = childVersion(endpoint);
+            capture.lines.length = 0; // discard anything the first reconcile logged
+
+            await h.registry.reconcile(
+                [spec(1, Role.extendedColorLight, { options: { ctMinMireds: 500, ctMaxMireds: 300 } })], // inverted
+                false,
+            );
+
+            const color = endpoint.stateOf("colorControl") as Record<string, unknown>;
+            assert.equal(color.colorTempPhysicalMinMireds, 250, "must not fall back to generic on an update");
+            assert.equal(color.colorTempPhysicalMaxMireds, 300);
+            assert.equal(childVersion(endpoint), startVersion);
+            assert.equal(capture.lines.length, 1, capture.lines.join("\n"));
+        } finally {
+            capture.stop();
+            await h.close();
+        }
+    });
+
+    it("rekey applies new bounds too — the update path rekeyOne funnels through is the SAME helper", async () => {
+        // issue #246/ADR-0011 migrate: device 2 takes over device 1's
+        // published identity. `rekeyOne` ends by calling the very `update()`
+        // the plain-update tests above exercise, so this pins that there is
+        // no second copy of the bounds logic for the rekey path to drift from.
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(1, Role.extendedColorLight)], false);
+            const before = only(h);
+            assert.equal((before.stateOf("colorControl") as Record<string, unknown>).colorTempPhysicalMinMireds, MIREDS_MIN);
+
+            await h.registry.reconcile(
+                [
+                    spec(2, Role.extendedColorLight, {
+                        publishedAs: "indigo-1",
+                        options: { ctMinMireds: 300, ctMaxMireds: 400 },
+                    }),
+                ],
+                false,
+            );
+
+            assert.equal(h.registry.size, 1);
+            const after = only(h);
+            assert.equal(after, before, "a rekey reuses the SAME Endpoint object, not a new one");
+            const color = after.stateOf("colorControl") as Record<string, unknown>;
+            assert.equal(color.colorTempPhysicalMinMireds, 300);
+            assert.equal(color.colorTempPhysicalMaxMireds, 400);
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("set_state: a colorTempMireds write clamps to the endpoint's LIVE bounds, not the generic 153-500", async () => {
+        const h = await harness();
+        try {
+            await h.registry.reconcile(
+                [spec(1, Role.extendedColorLight, { options: { ctMinMireds: 300, ctMaxMireds: 400 } })],
+                false,
+            );
+            const endpoint = only(h);
+
+            // 150 is inside the generic band (would clamp to itself under
+            // clampMireds alone) but below the live floor.
+            await h.registry.setState(1, { colorTempMireds: 150 });
+            assert.equal((endpoint.stateOf("colorControl") as Record<string, unknown>).colorTemperatureMireds, 300);
+
+            // 450 is inside the generic band but above the live ceiling.
+            await h.registry.setState(1, { colorTempMireds: 450 });
+            assert.equal((endpoint.stateOf("colorControl") as Record<string, unknown>).colorTemperatureMireds, 400);
+
+            // A value already within the live bounds passes through exactly.
+            await h.registry.setState(1, { colorTempMireds: 350 });
+            assert.equal((endpoint.stateOf("colorControl") as Record<string, unknown>).colorTemperatureMireds, 350);
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("upsert_endpoint (§3.2) also runs the bounds update, not just reconcile (§3.1)", async () => {
+        // `upsert`'s plain-update branch calls the same `update()` a
+        // reconcile does — this pins that entry point too, since it is the
+        // one `set_state`-adjacent RPC a client can call standalone.
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(1, Role.colorTemperatureLight)], false);
+            const endpoint = only(h);
+            await h.registry.upsert(spec(1, Role.colorTemperatureLight, { options: { ctMinMireds: 260, ctMaxMireds: 280 } }));
+            const color = endpoint.stateOf("colorControl") as Record<string, unknown>;
+            assert.equal(color.colorTempPhysicalMinMireds, 260);
+            assert.equal(color.colorTempPhysicalMaxMireds, 280);
         } finally {
             await h.close();
         }
