@@ -29,7 +29,7 @@ import { join } from "node:path";
 import { after, describe, it } from "node:test";
 
 import { Logger, type ServerNode } from "@matter/main";
-import { SessionManager } from "@matter/main/protocol";
+import { type NodeSession, SessionManager } from "@matter/main/protocol";
 
 import {
     ENDPOINT_MAP_FILE,
@@ -41,6 +41,7 @@ import { churnWarning } from "../src/churn.js";
 import { uniqueIdFor } from "../src/endpoints.js";
 import { BridgeNode, matterJsVersion } from "../src/node.js";
 import { ErrorCode, PROTOCOL_VERSION, RefuseReason } from "../src/protocol.js";
+import { DEAD_SESSION_QUIET_MS, SESSION_MAX_AGE_MS } from "../src/session-hygiene.js";
 import { BridgeWsServer } from "../src/ws-server.js";
 import { TestClient } from "./client.js";
 
@@ -1454,6 +1455,203 @@ describe("subscription-churn detection reaches get_status (issue #286)", () => {
                 "…and it must not raise a notice about churn it could not have seen");
             assert.ok(
                 logged.some(line => line.includes("Subscription-churn detection could not be wired")),
+                logged.join("\n"),
+            );
+        } finally {
+            await bridge.close();
+        }
+    });
+});
+
+/**
+ * A `NodeSession` double for the issue #283 session-hygiene wiring tests.
+ *
+ * Unlike the churn section's `fakeSession()` + `events.added.emit(...)`
+ * pattern, session hygiene reads the REAL live set (`sessions.sessions`,
+ * iterated by `pollHygiene`/`sweepSuperseded`), so these are `.add()`-ed to
+ * it instead — which is safe for the same reason `fakeSession`'s own
+ * docstring already establishes: `BasicSet.add()` fires the identical
+ * `.added` observable `.emit()` does (`Set.ts`'s `add()` ends with
+ * `this.#added?.emit(created)`), so every reactor `fakeSession` was built to
+ * survive runs either way. `.add()` additionally makes the fake genuinely
+ * enumerable via `for...of sessions.sessions`, which `pollHygiene` and
+ * `sweepSuperseded` both need and `.emit()` alone does not provide.
+ *
+ * `createdAt`/`activeTimestamp` default to "now" — `fakeSession`'s own
+ * defaults (`activeTimestamp: 0`, no `createdAt` at all) would otherwise
+ * read as hours old and trip the dead/rotation checks in tests that are not
+ * about them.
+ */
+function hygieneSession(
+    liveSessions: { delete: (item: NodeSession) => boolean },
+    options: {
+        id: number;
+        peerNodeId: bigint;
+        createdAt?: number;
+        activeTimestamp?: number;
+        subscriptionCount?: number;
+    },
+): Record<string, unknown> & { forceCloseCount: number } {
+    const session = fakeSession({ id: options.id, peerNodeId: options.peerNodeId }) as Record<string, unknown> & {
+        forceCloseCount: number;
+    };
+    session.createdAt = options.createdAt ?? Date.now();
+    session.activeTimestamp = options.activeTimestamp ?? Date.now();
+    const subscriptions = session.subscriptions as { add: (item: unknown) => void };
+    for (let i = 0; i < (options.subscriptionCount ?? 0); i++) {
+        subscriptions.add({});
+    }
+    session.forceCloseCount = 0;
+    // Real `initiateForceClose` never notifies the peer and never round-trips
+    // the network (§0(l)) — this double models exactly that: synchronous,
+    // no await, so by the time `node.ts`'s fire-and-forget caller's `.catch`
+    // is attached the removal has already happened, matching what a real
+    // force-close achieves (removal from `SessionManager`'s live set).
+    session.initiateForceClose = async () => {
+        session.forceCloseCount++;
+        session.isClosing = true;
+        liveSessions.delete(session as unknown as NodeSession);
+    };
+    return session;
+}
+
+describe("the wired session-hygiene superseded sweep (issue #283 item 1)", () => {
+    it("closes the peer's older session when it opens a new one, and never touches another peer's", async () => {
+        const session = await boot(storage());
+        try {
+            const manager = session.bridge.server.env.get(SessionManager);
+            const peerOld = hygieneSession(manager.sessions, { id: 9500, peerNodeId: 0x41869fbd537ef01n });
+            const otherPeer = hygieneSession(manager.sessions, { id: 9501, peerNodeId: 0x9f2c00114b3d201n });
+            manager.sessions.add(peerOld as unknown as NodeSession);
+            manager.sessions.add(otherPeer as unknown as NodeSession);
+
+            const peerNew = hygieneSession(manager.sessions, { id: 9502, peerNodeId: 0x41869fbd537ef01n });
+            manager.sessions.add(peerNew as unknown as NodeSession);
+
+            assert.equal(peerOld.forceCloseCount, 1, "the superseded session must be force-closed");
+            assert.equal(peerNew.forceCloseCount, 0, "the just-opened session must never close itself");
+            assert.equal(otherPeer.forceCloseCount, 0, "a different peer's session must never be touched");
+
+            const status = session.bridge.getStatus();
+            assert.equal(status.sessionHygiene.closed.superseded, 1);
+            const peerCount = status.sessionHygiene.peers.find(peer => peer.peerNodeId === "41869fbd537ef01");
+            assert.equal(peerCount?.liveSessions, 1, "the superseded session is gone from the live count");
+        } finally {
+            await session.close();
+        }
+    });
+
+    it("closes nothing when a peer opens its first session", async () => {
+        const session = await boot(storage());
+        try {
+            const manager = session.bridge.server.env.get(SessionManager);
+            const first = hygieneSession(manager.sessions, { id: 9510, peerNodeId: 0xabcn });
+            manager.sessions.add(first as unknown as NodeSession);
+            assert.equal(first.forceCloseCount, 0);
+            assert.equal(session.bridge.getStatus().sessionHygiene.closed.superseded, 0);
+        } finally {
+            await session.close();
+        }
+    });
+
+    it("marks hygiene broken (checked:false) when a handler throws, independently of subscriptionChurn", async () => {
+        const session = await boot(storage());
+        try {
+            const manager = session.bridge.server.env.get(SessionManager);
+            const broken = fakeSession({ id: 9520, peerNodeId: 0n, throwOnPeerNodeId: true });
+            assert.doesNotThrow(() => manager.sessions.add(broken as unknown as NodeSession));
+
+            const status = session.bridge.getStatus();
+            assert.equal(status.sessionHygiene.checked, false);
+            // Churn's own handler throws on the same fake (same
+            // `peerNodeIdHex` read) — both wrap their own work in a
+            // `note*` try/catch, so one breaking must not mask or prevent
+            // the other's own independent breakage.
+            assert.equal(status.subscriptionChurn.checked, false);
+        } finally {
+            await session.close();
+        }
+    });
+});
+
+describe("the wired session-hygiene periodic sweep (issue #283 items 2/3)", () => {
+    it("closes a subscription-free session quiet for the dead-session window, and counts it", async () => {
+        const session = await boot(storage());
+        try {
+            const manager = session.bridge.server.env.get(SessionManager);
+            const dead = hygieneSession(manager.sessions, {
+                id: 9530,
+                peerNodeId: 0x1111n,
+                activeTimestamp: Date.now() - DEAD_SESSION_QUIET_MS - 1000,
+            });
+            manager.sessions.add(dead as unknown as NodeSession);
+
+            const status = session.bridge.getStatus();
+            assert.equal(dead.forceCloseCount, 1);
+            assert.equal(status.sessionHygiene.closed.dead, 1);
+        } finally {
+            await session.close();
+        }
+    });
+
+    it("never closes a session holding a subscription, however quiet or old", async () => {
+        const session = await boot(storage());
+        try {
+            const manager = session.bridge.server.env.get(SessionManager);
+            const busy = hygieneSession(manager.sessions, {
+                id: 9540,
+                peerNodeId: 0x2222n,
+                createdAt: Date.now() - SESSION_MAX_AGE_MS * 2,
+                activeTimestamp: Date.now() - DEAD_SESSION_QUIET_MS * 10,
+                subscriptionCount: 1,
+            });
+            manager.sessions.add(busy as unknown as NodeSession);
+
+            const status = session.bridge.getStatus();
+            assert.equal(busy.forceCloseCount, 0);
+            assert.equal(status.sessionHygiene.closed.dead, 0);
+            assert.equal(status.sessionHygiene.closed.rotated, 0);
+        } finally {
+            await session.close();
+        }
+    });
+
+    it("closes a subscription-free session past the age ceiling, and counts it as rotated", async () => {
+        const session = await boot(storage());
+        try {
+            const manager = session.bridge.server.env.get(SessionManager);
+            const old = hygieneSession(manager.sessions, {
+                id: 9550,
+                peerNodeId: 0x3333n,
+                createdAt: Date.now() - SESSION_MAX_AGE_MS - 1000,
+            });
+            manager.sessions.add(old as unknown as NodeSession);
+
+            const status = session.bridge.getStatus();
+            assert.equal(old.forceCloseCount, 1);
+            assert.equal(status.sessionHygiene.closed.rotated, 1);
+        } finally {
+            await session.close();
+        }
+    });
+
+    it("reports checked:false — not a quiet all-clear — when the wiring fails", async () => {
+        const logged: string[] = [];
+        const bridge = new ChurnBlindNode(
+            { storagePath: storage(), matterPort: 0, wsPort: 0 },
+            { ...IDENTITY },
+            BRIDGE_VERSION,
+            message => logged.push(message),
+        );
+        await bridge.start();
+        try {
+            const status = bridge.getStatus();
+            assert.equal(status.sessionHygiene.checked, false,
+                "a session layer nobody is watching must never be reported as a quiet one");
+            assert.deepEqual(status.sessionHygiene.peers, []);
+            assert.deepEqual(status.sessionHygiene.closed, { superseded: 0, dead: 0, rotated: 0 });
+            assert.ok(
+                logged.some(line => line.includes("Session hygiene could not be wired")),
                 logged.join("\n"),
             );
         } finally {

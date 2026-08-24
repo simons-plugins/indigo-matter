@@ -401,6 +401,59 @@ export interface SubscriptionChurn {
     peers: ChurnPeer[];
 }
 
+/**
+ * §4.3 — one peer's live CASE session count (issue #283 "Finding 2"
+ * diagnostics, `session-hygiene.ts`).
+ *
+ * Unlike {@link ChurnPeer} this lists EVERY peer currently holding a CASE
+ * session, not only ones over a churn threshold: it is issue #283's own
+ * "diagnostic to run first when staleness recurs" (count live CASE sessions
+ * per peer), surfaced so a human can see a pile *forming* — `subscriptionChurn`
+ * already covers "act now".
+ */
+export interface SessionHygienePeer {
+    peerNodeId: string;
+    fabricIndex: number;
+    liveSessions: number;
+}
+
+/**
+ * §4.3 — sessions this node has force-closed since it started, by reason
+ * (issue #283 "Finding 2"). Cumulative, never reset except by a restart —
+ * the same "never decreases within a run" contract a counter earns just by
+ * being a count of things that happened, not a snapshot of current state.
+ */
+export interface SessionHygieneClosed {
+    /** Older sessions closed because the same peer opened a newer one. */
+    superseded: number;
+    /** Subscription-free sessions closed after going quiet. */
+    dead: number;
+    /** Subscription-free sessions closed for being past the age ceiling. */
+    rotated: number;
+}
+
+/**
+ * §4.3 — app-level CASE session hygiene (issue #283 "Finding 2",
+ * `session-hygiene.ts`). Additive, same precedent as `subscriptionChurn`: a
+ * client that does not know the field ignores it, and one that does must
+ * tolerate its absence from an older node by defaulting to
+ * `{checked: false, peers: [], closed: {superseded: 0, dead: 0, rotated: 0}}`.
+ */
+export interface SessionHygiene {
+    /**
+     * Whether the hygiene machinery could observe/act on the session layer
+     * at all. `false` is NOT "nothing to report" — it means the wiring never
+     * attached, so no automatic sweep is running and the counts below are
+     * frozen at whatever they last were (0, on a node that never wired at
+     * all). Same discipline `SubscriptionChurn.checked` uses, deliberately:
+     * the two features share the same `SessionManager` dependency and fail
+     * the same way if it is ever unreachable.
+     */
+    checked: boolean;
+    peers: SessionHygienePeer[];
+    closed: SessionHygieneClosed;
+}
+
 /** §4.3 */
 export interface StatusReport {
     commissioned: boolean;
@@ -449,6 +502,12 @@ export interface StatusReport {
      * — the honest reading, since such a node never looked.
      */
     subscriptionChurn: SubscriptionChurn;
+    /**
+     * App-level CASE session hygiene (issue #283 "Finding 2"). Additive
+     * since bridge-node 0.17.0 with no `protocolVersion` bump, the same
+     * precedent `subscriptionChurn` set.
+     */
+    sessionHygiene: SessionHygiene;
 }
 
 export interface EndpointSummary {

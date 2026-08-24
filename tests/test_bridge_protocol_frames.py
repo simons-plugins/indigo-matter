@@ -234,6 +234,83 @@ class TestResponses:
         assert len(churn.peers) == 1
         assert churn.peers[0].peer_node_id == good_peer["peerNodeId"]
 
+    def test_session_hygiene_healthy(self):
+        """§4.3 issue #283 "Finding 2" — a bridge whose hygiene sweep is wired
+        and has closed nothing parses to a checked, empty, all-zero verdict."""
+        report = bridge_protocol.parse_status(FRAMES["get_status"]["response"]["result"])
+        hygiene = report.session_hygiene
+        assert hygiene.checked is True
+        assert hygiene.peers == []
+        assert hygiene.closed.superseded == 0
+        assert hygiene.closed.dead == 0
+        assert hygiene.closed.rotated == 0
+
+    def test_session_hygiene_golden_frame(self):
+        """The `get_status_churning` golden frame (§7) also carries a
+        `sessionHygiene` peer count for the same piled peer — issue #283's own
+        "diagnostic to run first" recipe."""
+        report = bridge_protocol.parse_status(
+            FRAMES["get_status_churning"]["response"]["result"])
+        hygiene = report.session_hygiene
+        assert hygiene.checked is True
+        assert len(hygiene.peers) == 1
+        peer = hygiene.peers[0]
+        assert peer.peer_node_id == "41869fbd537ef01"
+        assert peer.fabric_index == 2
+        assert peer.live_sessions == 5
+
+    def test_session_hygiene_absent_defaults_to_unchecked(self):
+        """A pre-0.17.0 node's ``StatusReport`` has no ``sessionHygiene`` key
+        at all. Absence must default to ``checked=False`` — "never looked and
+        never acted", never "healthy" — the same tolerant-default idiom
+        ``subscription_churn`` already uses for an old node."""
+        result = dict(FRAMES["get_status"]["response"]["result"])
+        del result["sessionHygiene"]
+        report = bridge_protocol.parse_status(result)
+        assert report.session_hygiene.checked is False
+        assert report.session_hygiene.peers == []
+        assert report.session_hygiene.closed.superseded == 0
+        assert report.session_hygiene.closed.dead == 0
+        assert report.session_hygiene.closed.rotated == 0
+
+    def test_session_hygiene_malformed_peer_degrades_the_list_not_the_report(self):
+        """One bad peer entry must not detonate the whole ``StatusReport`` —
+        same degradation rule ``_parse_churn_peer`` established (issue #286
+        review finding 4)."""
+        result = dict(FRAMES["get_status_churning"]["response"]["result"])
+        good_peer = result["sessionHygiene"]["peers"][0]
+        result = {
+            **result,
+            "sessionHygiene": {
+                "checked": True,
+                "peers": [
+                    "not even a dict",
+                    {"peerNodeId": "ok-peer", "fabricIndex": "not-a-number", "liveSessions": 2},
+                    good_peer,
+                ],
+                "closed": {"superseded": 1, "dead": 0, "rotated": 0},
+            },
+        }
+        report = bridge_protocol.parse_status(result)  # must not raise
+        hygiene = report.session_hygiene
+        assert hygiene.checked is True
+        assert len(hygiene.peers) == 1
+        assert hygiene.peers[0].peer_node_id == good_peer["peerNodeId"]
+        # The degraded peer list must not thin `closed` — they are unrelated.
+        assert hygiene.closed.superseded == 1
+
+    def test_session_hygiene_malformed_closed_block_degrades_to_zero(self):
+        """A malformed ``closed`` object must not fail the whole report —
+        the counts are informational, and a status poll must never fail
+        over them."""
+        result = dict(FRAMES["get_status"]["response"]["result"])
+        result = {**result, "sessionHygiene": {"checked": True, "peers": [], "closed": "not a dict"}}
+        report = bridge_protocol.parse_status(result)  # must not raise
+        assert report.session_hygiene.checked is True
+        assert report.session_hygiene.closed.superseded == 0
+        assert report.session_hygiene.closed.dead == 0
+        assert report.session_hygiene.closed.rotated == 0
+
     def test_subscription_churn_all_peers_malformed_is_active_with_no_peers(self):
         """A degraded-to-empty peers list must not silently flip `active` to
         False — the node still said it was active; only the DETAIL is thin."""
@@ -445,6 +522,20 @@ class TestCoverage:
             assert "subscriptionChurn" in result, f"{name} is a StatusReport without subscriptionChurn"
             churn = result["subscriptionChurn"]
             assert isinstance(churn, dict) and {"checked", "active", "peers"} <= churn.keys()
+
+    def test_every_status_report_carries_the_session_hygiene_field(self):
+        """§4.3 issue #283 "Finding 2" ``sessionHygiene``. Every golden
+        StatusReport is from a 0.17.0+ node, so it must carry the field —
+        absence is the pre-0.17.0 case ``parse_session_hygiene`` tolerates,
+        not a shape any current fixture should model."""
+        for name, exchange in EXCHANGES.items():
+            result = exchange["response"].get("result")
+            if not isinstance(result, dict) or "endpointCount" not in result:
+                continue
+            assert "sessionHygiene" in result, f"{name} is a StatusReport without sessionHygiene"
+            hygiene = result["sessionHygiene"]
+            assert isinstance(hygiene, dict) and {"checked", "peers", "closed"} <= hygiene.keys()
+            assert {"superseded", "dead", "rotated"} <= hygiene["closed"].keys()
 
     def test_every_command_has_a_golden_frame(self):
         covered = {exchange["request"]["command"] for exchange in EXCHANGES.values()}

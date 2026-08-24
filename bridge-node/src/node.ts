@@ -71,12 +71,20 @@ import {
     supersedes,
     type RemoveFabricResult,
     type RemoveResult,
+    type SessionHygiene,
     type StatusReport,
     type SubscriptionChurn,
     type UpsertResult,
     type WindowClosedReason,
 } from "./protocol.js";
 import { EndpointRegistry } from "./registry.js";
+import {
+    type HygieneClosure,
+    periodicSweep,
+    peerSessionCounts,
+    type SessionDescriptor,
+    supersededSessions,
+} from "./session-hygiene.js";
 import {
     type BridgeIdentity,
     clearCommissioned,
@@ -280,6 +288,30 @@ export class BridgeNode implements BridgeFacade {
      */
     #churnNeverWired = false;
     /**
+     * Issue #283 "Finding 2" — the `SessionManager` handle
+     * {@link wireSessionHygiene} obtains, so {@link pollHygiene} and the
+     * superseded-sweep handler share the one lookup rather than each
+     * re-fetching it from the environment. `undefined` before wiring runs
+     * and forever after it fails — session hygiene, like churn detection,
+     * decides once at boot and does not retry.
+     */
+    #sessionManager?: SessionManager;
+    /**
+     * One-way, mirroring {@link ChurnDetector.markBroken}: set the moment
+     * either the initial wiring or a later poll/event handler throws, and
+     * never cleared. Unlike churn, a broken hygiene detector raises no
+     * `warnings` entry — nothing here is a fault a user must act on, only a
+     * mitigation that has gone quiet — but `sessionHygiene.checked: false`
+     * still has to mean it, not "nothing to report".
+     */
+    #hygieneBroken = false;
+    /**
+     * Cumulative sessions this node has force-closed, by reason (§4.3). Never
+     * reset except by a restart — a count of things that already happened,
+     * not a snapshot `pollHygiene` could recompute from live state.
+     */
+    readonly #hygieneClosed = { superseded: 0, dead: 0, rotated: 0 };
+    /**
      * Issue #240, §3 steps 3/5 — `indigoDeviceId → the published identity it
      * was last removed under`, for the ONE device that removal drove, kept
      * only until the next {@link upsertEndpoint} for that same device
@@ -449,6 +481,11 @@ export class BridgeNode implements BridgeFacade {
         // After `start()`: SessionManager is only in the environment once the
         // node is online, and a detector wired before it would be born broken.
         this.wireChurnDetection();
+        // Issue #283 "Finding 2" — independent of churn detection (separate
+        // try/catch in `wireSessionHygiene`) even though both fetch the same
+        // `SessionManager`: a fault in one must not silently take the other
+        // down with it.
+        this.wireSessionHygiene();
 
         // The §5 transition baseline. Taken before the identity assertion so a
         // fabric that arrives during it is a transition rather than the start.
@@ -1075,11 +1112,197 @@ export class BridgeNode implements BridgeFacade {
         return verdict;
     }
 
+    /**
+     * Issue #283 "Finding 2" — wire the superseded-session sweep and obtain
+     * the `SessionManager` handle {@link pollHygiene} reads from.
+     *
+     * Event-driven, like `wireChurnDetection`'s subscription tracking: the
+     * sweep has to fire the moment a peer's new CASE session is added, not
+     * on the next `get_status` poll — the whole point is to close the
+     * pile-up precondition before a report can misroute onto it (§0(o)).
+     * `pollChurn`'s dead-session/age-rotation checks are poll-driven instead
+     * (see {@link pollHygiene}), because they need no such immediacy.
+     */
+    private wireSessionHygiene(): void {
+        try {
+            const sessions = this.server.env.get(SessionManager);
+            this.#sessionManager = sessions;
+            sessions.sessions.added.on(session => this.noteHygiene(() => {
+                // PASE is commissioning, not a controller subscription
+                // session — same filter `churn.ts`'s wiring uses.
+                if (session.isPase) {
+                    return;
+                }
+                this.sweepSuperseded(sessions, session);
+            }));
+        } catch (error) {
+            this.#hygieneBroken = true;
+            try {
+                this.log(
+                    "Session hygiene could not be wired; get_status will report it unchecked: "
+                    + describeError(error),
+                );
+            } catch {
+                // The logger itself failed; there is nowhere left to report.
+            }
+        }
+    }
+
+    /**
+     * Run one hygiene handler inside a matter.js observable. Same discipline
+     * as `noteChurn`: a throw must never escape into matter.js's own event
+     * dispatch, and a handler that threw has an unknown number of missed
+     * events behind it, so hygiene goes one-way broken rather than carrying
+     * on from a state it knows is short.
+     */
+    private noteHygiene(update: () => void): void {
+        try {
+            update();
+        } catch (error) {
+            if (this.#hygieneBroken) {
+                return;
+            }
+            this.#hygieneBroken = true;
+            try {
+                this.log(`Session hygiene FAILED and is no longer watching the session layer: ${describeError(error)}`);
+            } catch {
+                // The logger itself failed; there is nowhere left to report.
+            }
+        }
+    }
+
+    /** A live `NodeSession`, reduced to what `session-hygiene.ts`'s pure decisions need. */
+    private describeSession(session: NodeSession): SessionDescriptor {
+        return {
+            sessionId: session.id,
+            peerNodeId: peerNodeIdHex(session),
+            fabricIndex: fabricIndexOf(session),
+            createdAt: session.createdAt,
+            activeTimestamp: session.activeTimestamp,
+            subscriptionCount: session.subscriptions.size,
+        };
+    }
+
+    /**
+     * Issue #283 "Finding 2" item 1, the core deliverable: `justOpened` is a
+     * peer's newly-added CASE session, so every OTHER live, non-PASE session
+     * for that same peer+fabric is a candidate to close — the same
+     * `peerNodeIdHex`/`fabricIndexOf` identity `churn.ts`'s wiring already
+     * groups sessions by.
+     */
+    private sweepSuperseded(sessions: SessionManager, justOpened: NodeSession): void {
+        const peerId = peerNodeIdHex(justOpened);
+        const fabricIdx = fabricIndexOf(justOpened);
+        const peerSessions: NodeSession[] = [];
+        for (const session of sessions.sessions) {
+            if (session.isPase || session.isClosing) {
+                continue;
+            }
+            if (peerNodeIdHex(session) !== peerId || fabricIndexOf(session) !== fabricIdx) {
+                continue;
+            }
+            peerSessions.push(session);
+        }
+        const descriptors = peerSessions.map(session => this.describeSession(session));
+        for (const closure of supersededSessions(descriptors, justOpened.id)) {
+            const target = peerSessions.find(session => session.id === closure.sessionId);
+            if (target !== undefined) {
+                this.closeSession(target, closure);
+            }
+        }
+    }
+
+    /**
+     * Force-close one session for a hygiene reason, log it once (this
+     * repo's loud-but-once convention — a session can only ever be closed
+     * once, so no separate latch is needed), and count it into §4.3's
+     * cumulative totals.
+     *
+     * Fire-and-forget: `initiateForceClose` is async, but both callers
+     * ({@link sweepSuperseded}, an event handler, and {@link pollHygiene},
+     * which `getStatus()` — a *synchronous* method — calls) must not block
+     * on it. §0(l): force-close never talks to the peer, so nothing here is
+     * racing a network round trip; a failure can only be the local close
+     * itself going wrong, logged separately so it is never mistaken for the
+     * decision succeeding.
+     */
+    private closeSession(session: NodeSession, closure: HygieneClosure): void {
+        const detail =
+            closure.reason === "superseded"
+                ? `superseded — peer now holds ${closure.peerSessionCount} session(s), this one ${closure.ageMs}ms old`
+                : closure.reason === "dead"
+                  ? `dead — 0 subscriptions, quiet ${closure.quietMs}ms`
+                  : `rotated — ${closure.ageMs}ms old, 0 subscriptions`;
+        this.log(
+            `Session hygiene: closing session ${session.id} for peer ${closure.peerNodeId} `
+            + `(fabric ${closure.fabricIndex}) — ${detail}`,
+        );
+        this.#hygieneClosed[closure.reason]++;
+        session.initiateForceClose({ cause: new Error(`session-hygiene: ${closure.reason}`) }).catch(
+            (error: unknown) => {
+                try {
+                    this.log(`Session hygiene: force-closing session ${session.id} failed: ${describeError(error)}`);
+                } catch {
+                    // The logger itself failed; there is nowhere left to report.
+                }
+            },
+        );
+    }
+
+    /**
+     * §4.3 — the dead-session and age-rotation checks (issue #283 "Finding 2"
+     * items 2/3), plus the per-peer live-session diagnostic (item 5).
+     *
+     * Poll-driven from `getStatus()`, the same idiom `pollChurn`/`verdict`
+     * already established for recurring session-layer checks — not a new
+     * timer. `get_status` is the plugin's ~15s watchdog tick, comfortably
+     * fine-grained against both {@link DEAD_SESSION_QUIET_MS} (60s) and
+     * {@link SESSION_MAX_AGE_MS} (4h); a few seconds of poll jitter is slop,
+     * not a functional gap. The superseded sweep (item 1) is NOT run from
+     * here — see {@link wireSessionHygiene}.
+     */
+    private pollHygiene(): SessionHygiene {
+        if (this.#hygieneBroken || this.#sessionManager === undefined) {
+            return { checked: false, peers: [], closed: { ...this.#hygieneClosed } };
+        }
+        try {
+            const descriptors: SessionDescriptor[] = [];
+            const byId = new Map<number, NodeSession>();
+            for (const session of this.#sessionManager.sessions) {
+                if (session.isPase) {
+                    continue;
+                }
+                const descriptor = this.describeSession(session);
+                descriptors.push(descriptor);
+                byId.set(descriptor.sessionId, session);
+            }
+            const peers = peerSessionCounts(descriptors);
+            for (const closure of periodicSweep(descriptors, Date.now())) {
+                const session = byId.get(closure.sessionId);
+                if (session !== undefined) {
+                    this.closeSession(session, closure);
+                }
+            }
+            return { checked: true, peers, closed: { ...this.#hygieneClosed } };
+        } catch (error) {
+            this.#hygieneBroken = true;
+            try {
+                this.log(`Session hygiene FAILED and is no longer watching the session layer: ${describeError(error)}`);
+            } catch {
+                // The logger itself failed; there is nowhere left to report.
+            }
+            return { checked: false, peers: [], closed: { ...this.#hygieneClosed } };
+        }
+    }
+
     getStatus(): StatusReport {
         const endpoints = this.#registry?.summaries() ?? [];
         // Before the literal below: this is what raises or clears the §4.3
         // churn notice that `warnings` is about to be read from.
         const subscriptionChurn = this.pollChurn();
+        // Issue #283 "Finding 2": may itself close sessions (dead/rotated) as
+        // a side effect of computing the answer — see `pollHygiene`.
+        const sessionHygiene = this.pollHygiene();
         return {
             commissioned: this.server.lifecycle.isCommissioned,
             fabrics: this.fabrics(),
@@ -1092,6 +1315,7 @@ export class BridgeNode implements BridgeFacade {
             driftChecked: this.#endpointMap.checked,
             warnings: [...this.#warnings.values(), ...this.#endpointMap.warnings],
             subscriptionChurn,
+            sessionHygiene,
         };
     }
 

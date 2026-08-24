@@ -109,6 +109,74 @@ rather than re-explained at every call site.
   `indigo-<Number.MAX_SAFE_INTEGER>~99`, is 26, comfortable, but
   `parsePublishedId`/`parse_published_id` enforce the cap explicitly rather
   than letting a caller discover it as an `AggregateError` mid-attach.
+- **(k) matter.js already caps sessions per peer at 5, but too late to matter
+  (issue #283 "Finding 2").** `SessionManager` (`SessionManager.ts:163`,
+  `MAX_SESSIONS_PER_PEER = 5`) closes a peer's least-recently-active session
+  once it opens a 6th (`#evictExcessSessionsFor`, force-close via
+  `initiateForceClose({cause: new SessionEvictedError()})`, hooked off
+  `#sessions.added`). It does not stop the report-routing defect (Finding 1
+  below): the reference-server recurrence piled only **3** CASE sessions for
+  one Echo peer inside 30 minutes — well under the built-in cap — before the
+  routing defect started dropping reports. `session-hygiene.ts`'s superseded
+  sweep is deliberately the same mechanism at a cap of **1**, not a
+  duplicate of matter.js's own eviction.
+- **(l) `Session`/`NodeSession` expose everything the sweep needs as public
+  API, no matter.js patching required.** `Session.createdAt` (readonly,
+  stamped at construction — `Session.ts:54`), `Session.activeTimestamp`
+  (updated on every received message — `Session.ts:127-133`),
+  `Session.initiateForceClose(context: {cause: Error; keepSubscriptions?:
+  boolean})` (terminates the session and, unless `keepSubscriptions` is set,
+  its subscriptions too, without notifying the peer — `Session.ts:266-287`)
+  and `NodeSession.subscriptions` (a `BasicSet`, `.size` readable — already
+  used by `churn.ts`'s wiring) are all public, all exactly what
+  `SessionManager`'s own internal eviction (k) uses on itself.
+- **(m) The wedge-watchdog signal (Finding 2 item 4) is NOT publicly
+  observable — confirmed, not assumed.** `MessageExchange.onMessageReceived`
+  calls `this.#notifyActivity(true)` (which sets `Session.activeTimestamp`)
+  **unconditionally, before** it branches on `isStandaloneAck`
+  (`MessageExchange.ts:411-432`): a bare MRP acknowledgement of a pushed
+  report advances `activeTimestamp`/`isPeerActive` exactly as a genuine
+  `SubscribeRequest`/`ReadRequest`/`InvokeRequest` would. The one counter
+  that *would* separate "acked" from "consumed",
+  `MessageExchange.#messageReceivedCounter`, is private with no getter, and
+  is scoped to one exchange (a fresh one per IM transaction) rather than
+  accumulated per session — there is no public vantage point from which to
+  ask "how many real IM requests has this peer sent since T", only "when did
+  it last acknowledge anything". This independently corroborates the HAMH
+  maintainer's comment quoted in issue #283 ("an Apple controller can keep
+  MRP-acking pushed reports … while it has stopped consuming data") — and is
+  exactly why item 4 is not built (see `session-hygiene.ts`'s module
+  docstring).
+- **(n) A `ServerSubscription` cannot be rebound to a replacement session —
+  age-based rotation is therefore restricted to subscription-free sessions.**
+  `ServerSubscription.session` (`ServerSubscription.ts:207-209`) returns
+  `this.#context.session`, a `readonly` field (`ServerSubscription.ts:131`)
+  fixed once at construction and never reassigned anywhere in the class.
+  Force-closing the session a live subscription is bound to — even with
+  `keepSubscriptions: true`, which merely stops the *close* from also
+  cancelling the subscription — leaves that subscription pointing at a
+  session that no longer exists; nothing in matter.js re-attaches it to
+  whatever session the peer opens next, so recovery depends entirely on the
+  peer noticing (via its own keepalive/report timeout) and *choosing* to
+  re-subscribe — which is not "clean re-subscribe", it is a self-inflicted
+  instance of the exact staleness pattern #283 exists to fix. No live
+  hardware was available to this probe to confirm what a real controller
+  does when that happens, and the source reading above is sufficient reason
+  not to risk finding out in production: `rotatableSessions` (below) only
+  ever selects sessions with zero live subscriptions.
+- **(o) Finding 1, confirmed directly in this repo's installed 0.17.8 (not
+  taken on the HAMH maintainer's word alone).**
+  `ServerSubscription.ts:830`'s `#sendUpdateMessage` calls
+  `this.#context.initiateExchange(session ?? this.#peerAddress, …)` — a
+  routine send passes no `session`, so routing falls through to
+  `SessionManager.maybeSessionFor(peerAddress)`
+  (`SessionManager.ts:543-559`), whose own comment states the policy
+  outright: *"Prefer the most recently active session (i.e. the one we last
+  heard from the peer on). Older ones may not work with broken peers."* — it
+  picks by `activeTimestamp` recency, not by which session the subscription
+  was actually created on. A peer holding a stale extra session that happens
+  to be more recently *active* (m) than the session its subscription lives
+  on will have reports routed to the session it isn't reading from.
 
 ## 1. Envelope grammar
 
@@ -747,7 +815,8 @@ ecosystem acts. Both are enumerated here in full; there is no other source.
  "drift": [],
  "driftChecked": false,
  "warnings": [],
- "subscriptionChurn": {"checked": true, "active": false, "peers": []}}
+ "subscriptionChurn": {"checked": true, "active": false, "peers": []},
+ "sessionHygiene": {"checked": true, "peers": [], "closed": {"superseded": 0, "dead": 0, "rotated": 0}}}
 ```
 
 `drift` lists any `UniqueID → endpointNumber` mappings that changed since last
@@ -874,6 +943,62 @@ and is still never repaired. Each entry is a `DriftEntry`:
   that reads only the prose channel is still told. Both are cleared together
   when the fabric goes stable — the rolling window drains, or the piled-up
   sessions are reaped.
+
+- `sessionHygiene` — app-level CASE session hygiene against this bridge
+  (issue #283 "Finding 2"). Added in bridge-node 0.17.0 with **no
+  `protocolVersion` bump**, the same additive precedent `subscriptionChurn`
+  set: a client that does not know the field ignores it, and a client that
+  does must tolerate its absence from an older node by defaulting to
+  `{"checked": false, "peers": [], "closed": {"superseded": 0, "dead": 0, "rotated": 0}}`.
+
+  ```json
+  {"checked": true,
+   "peers": [{"peerNodeId": "41869fbd537ef01", "fabricIndex": 2, "liveSessions": 2}],
+   "closed": {"superseded": 4, "dead": 1, "rotated": 0}}
+  ```
+
+  Unlike `subscriptionChurn`, this feature **acts** — it does not merely
+  report — through matter.js's public session-layer API, no dependency
+  patching (§0(k)/(l); see `bridge-node/src/session-hygiene.ts` for the full
+  design and its citations):
+
+  1. **Superseded-session sweep** — the moment a peer opens a new CASE
+     session, its OLDER ones are closed immediately. This is the core
+     mitigation: it removes the pile-up precondition for the still-open
+     matter.js report-routing defect (§0(o)) at a cap of ONE session per
+     peer, well below matter.js's own built-in `MAX_SESSIONS_PER_PEER`
+     eviction of five (§0(k)), which the reference-server recurrence proved
+     too high to prevent the defect from biting.
+  2. **Dead-session force-close** — a CASE session holding zero
+     subscriptions, quiet for 60s, is closed.
+  3. **Age-based rotation** — a subscription-FREE CASE session older than 4h
+     is closed. Deliberately narrower than closing any old session: §0(n)
+     establishes that a `ServerSubscription` is bound for life to the
+     session it was created on, so rotating a session under a live
+     subscription would strand it, not migrate it.
+  4. A fourth mechanism (a "wedge watchdog" for a controller that keeps
+     MRP-acking pushed reports while it has stopped issuing new requests) was
+     assessed and **not built** — §0(m) traces exactly which matter.js
+     internal would need to become public for it to be possible, and it is
+     not, today.
+
+  - `checked` — same discipline as `subscriptionChurn.checked`: `false`
+    means the hygiene machinery could not observe/act on the session layer
+    at all (wiring never attached, or a handler failed and hygiene switched
+    itself off), not "nothing needed closing". No `warnings` entry
+    accompanies a `false` here, unlike churn — nothing hygiene does is a
+    fault a user must act on, only a mitigation that has gone quiet.
+  - `peers` — issue #283's own "diagnostic to run first when staleness
+    recurs" (count live CASE sessions per peer), for EVERY peer holding at
+    least one live CASE session, not only ones over a churn threshold — a
+    standing view of a pile *forming*, complementing
+    `subscriptionChurn.peers`' "act now" view.
+  - `closed` — cumulative sessions this node has force-closed since it
+    started, by reason. Never decreases within a run.
+
+  Every action is logged once (the session that closed, which peer, why, and
+  its age/quiet-time/session-count at the moment of closure) — never
+  silently.
 
 `endpoints[].role` is one of the §4.2 enum; `endpoints[].publishedAs` is
 issues #219/#240's accessory identity (§4.1) — informational here, tolerantly

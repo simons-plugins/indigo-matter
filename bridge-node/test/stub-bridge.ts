@@ -24,6 +24,7 @@ import {
     type RemoveResult,
     type RoleValue,
     type StatusReport,
+    type SessionHygiene,
     type SubscriptionChurn,
     type UpsertResult,
     type WindowClosedReason,
@@ -296,6 +297,11 @@ export class StubBridge implements BridgeFacade {
      * nothing has churned — the churn tests overwrite it.
      */
     subscriptionChurn: SubscriptionChurn = { checked: true, active: false, peers: [] };
+    /**
+     * §4.3 issue #283 "Finding 2". Same reasoning as {@link subscriptionChurn}:
+     * the honest default is a working, quiet detector.
+     */
+    sessionHygiene: SessionHygiene = { checked: true, peers: [], closed: { superseded: 0, dead: 0, rotated: 0 } };
     /** §1.1 — non-undefined puts the double in the refuse-to-start state. */
     refusal?: string;
     /** Calls recorded by the §3.9/§3.10/§3.11 tests. */
@@ -321,6 +327,7 @@ export class StubBridge implements BridgeFacade {
             driftChecked: this.driftChecked,
             warnings: [...this.warnings],
             subscriptionChurn: structuredClone(this.subscriptionChurn),
+            sessionHygiene: structuredClone(this.sessionHygiene),
         };
     }
 
