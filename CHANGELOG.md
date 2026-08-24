@@ -37,6 +37,17 @@ current version is `Info.plist`'s `PluginVersion`.
   which declares the effective bounds on the ColorControl cluster
   (`colorTempPhysicalMinMireds`/`MaxMireds`) when they differ from the
   generic 153-500 mired domain.
+- **New plugin action: "Calibrate Colour-Temperature Bounds"** (issue #293's
+  calibration extension). Passive learning only ever adopts a shortfall
+  against a command the FABRIC sent, so a lamp nobody's paired ecosystem has
+  driven yet has no reference to learn from, however many times its colour
+  temperature changes in Indigo. This action closes that gap on request: it
+  sweeps chosen (or all) exported colour-temperature lights through both
+  extremes via the same dispatch path a real fabric command takes, reads the
+  echo, and persists whatever it measures through the same learner used for
+  passive evidence — no new mechanism, no automatic probing (still rejected
+  as automatic behaviour per ADR-0014 Option C), and no lamp that stays off
+  the whole time ever visibly reacts.
 
 ## 2026.26.2 — adaptive lighting no longer fights warm-limited lamps, and a colour-temperature change no longer dims them
 

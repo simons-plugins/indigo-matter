@@ -190,6 +190,35 @@ class CTBoundsLearner:
             self._observe_locked(entry, int(mireds))
 
     # ------------------------------------------------------------------
+    def adopt_measured(self, entry, side: str, mireds: int, *, reason: str) -> None:
+        """Persist one side's measurement from an EXPLICIT calibration sweep
+        (``ct_calibration.CTCalibrationEngine``, issue #293's ADR-0014 Option
+        C extension — active probing, rejected as an AUTOMATIC mechanism, now
+        shipped as an operator-invoked action that feeds this same store).
+
+        Deliberately thin: it computes the two inputs :meth:`_adopt` needs
+        that :meth:`_observe_locked` would otherwise compute for it
+        (``current_min``/``current_max``) and then funnels straight into
+        :meth:`_adopt` under the SAME lock — so a sweep's measurement gets
+        the identical collapse-refusal guard, re-read-before-write, one INFO
+        log, and republish that passive shortfall/re-widen evidence already
+        gets. No second adoption path is written; that would be exactly the
+        "one fact said twice" this module's own docstring warns against.
+
+        Unlike :meth:`observe`, there is no streak to build and no freshness
+        window to check: the caller (the calibration engine) already knows
+        it commanded ``mireds`` and read the echo back itself, in the same
+        call — the sweep IS its own fresh, single-shot reference, so a
+        second confirmation would only cost time for no better evidence.
+        Role-gated the same way ``observe`` is, for the same reason: a
+        non-CT role has no bounds to learn.
+        """
+        if entry.role not in ct_bounds.CT_ROLES:
+            return
+        with self._lock:
+            current_min, current_max = ct_bounds.effective_ct_bounds(entry.options)
+            self._adopt(entry, side, int(mireds), current_min, current_max, reason=reason)
+
     def _observe_locked(self, entry, mireds: int) -> None:
         device_id = entry.indigo_device_id
         current_min, current_max = ct_bounds.effective_ct_bounds(entry.options)

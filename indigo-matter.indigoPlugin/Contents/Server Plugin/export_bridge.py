@@ -404,6 +404,18 @@ class ExportBridge:
         """PRD §5.5's wholesale export switch, as the config readout reads it."""
         return self._export_enabled()
 
+    @property
+    def ct_learner(self) -> ct_learner.CTBoundsLearner:
+        """The bridge's own bound-scoped learner (issue #293's calibration
+        action, ``ct_calibration.CTCalibrationEngine``, needs it to persist
+        what a sweep measures through the SAME adoption path passive
+        evidence uses). A read-only accessor rather than reaching for the
+        underscored attribute directly: this is the one place outside this
+        class permitted to touch the learner, and a property makes that an
+        explicit, documented seam instead of a convention nobody enforces.
+        """
+        return self._ct_learner
+
     def start(self) -> None:
         """Create and run the client. Idempotent.
 

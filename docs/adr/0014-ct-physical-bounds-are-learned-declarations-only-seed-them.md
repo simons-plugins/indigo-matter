@@ -58,9 +58,29 @@ bounds because claim and hardware share a vendor — ours never do.
   reach and re-widens immediately. Declared/user values only matter before the
   first evidence arrives.
 * **C — active probing** (write both extremes, read the echoes — the method
-  used to build the measured table). Rejected as plugin behaviour: it visibly
-  flashes real lamps, needs an idle window, and the passive evidence in B
-  arrives anyway within one adaptive-lighting cycle.
+  used to build the measured table). Rejected as **automatic** plugin
+  behaviour: it visibly flashes real lamps, needs an idle window, and the
+  passive evidence in B arrives anyway within one adaptive-lighting cycle.
+  Revisited post-acceptance: passive evidence has a real gap B does not
+  close — shortfall adoption requires a *commanded* reference
+  (``ct_learner.CTBoundsLearner.record_commanded``), and that only ever
+  comes from a §5 command the FABRIC sent. A lamp Indigo drives by scene,
+  schedule, or hand — never by a paired ecosystem — has no commanded
+  reference to learn a shortfall against, ever, however many times its
+  colour temperature changes; only the re-widen path (a reading past the
+  CURRENT bounds) can move for it, which cannot narrow a seed that started
+  too wide. C is therefore shipped after all, but not as the rejected
+  automatic mechanism: as an **explicit, operator-invoked action**
+  ("Calibrate Colour-Temperature Bounds", ``ct_calibration.py``) that a user
+  runs deliberately, on their own schedule, against a lamp they have chosen
+  to accept the visible flash on (an OFF lamp does not flash at all — the
+  action defaults to skipping lit ones). The measurements it takes feed the
+  SAME learner and the SAME store B already writes to
+  (``CTBoundsLearner.adopt_measured`` funnels into the existing ``_adopt``)
+  — there is still only one bounds mechanism, B; C is now a second, consented
+  way to hand it evidence, not a second mechanism. Passive evidence remains
+  the core, unattended path for every device the action is never run
+  against.
 
 ## Decision Outcome
 

@@ -394,3 +394,47 @@ def test_adoption_logs_one_clear_info_line_naming_mireds_kelvin_and_reason(
     message = logger.info.call_args[0][0] % logger.info.call_args[0][1:]
     assert "400" in message and "mireds" in message
     assert "2500" in message  # mireds_to_kelvin(400) == 2500K
+
+
+# ---------------------------------------------------------------------------
+# adopt_measured — the calibration action's own path into the SAME adoption
+# machinery (issue #293's ADR-0014 Option C extension, ct_calibration.py)
+# ---------------------------------------------------------------------------
+def test_adopt_measured_persists_through_the_same_adopt_path(learner, store, republish):
+    learner.adopt_measured(_entry(store), "min", 200, reason="calibration sweep")
+    assert store.get(800).options[ct_bounds.OPTION_CT_LEARNED_MIN_MIREDS] == 200
+    republish.assert_called_once_with(800)
+
+
+def test_adopt_measured_ignores_a_non_ct_role(store, republish):
+    learner_mod = ct_learner
+    non_ct_learner = learner_mod.CTBoundsLearner(store, Mock(), republish)
+    entry = _Entry(800, role="onOffLight")
+    non_ct_learner.adopt_measured(entry, "min", 200, reason="calibration sweep")
+    assert store.upserts == []
+    republish.assert_not_called()
+
+
+def test_adopt_measured_needs_no_commanded_reference_or_streak(learner, store, republish):
+    """Unlike ``observe``'s shortfall path, one call is enough — the sweep
+    IS its own single-shot reference (ct_calibration.py's own docstring)."""
+    assert learner._commanded == {}
+    assert learner._pending == {}
+    learner.adopt_measured(_entry(store), "max", 400, reason="calibration sweep")
+    assert store.upserts, "a single adopt_measured call must adopt immediately"
+    assert learner._commanded == {}  # untouched — this path never records one
+    assert learner._pending == {}
+
+
+def test_adopt_measured_collapse_refusal_reuses_adopt_s_own_guard(learner, store, republish):
+    """Same guard ``observe``'s shortfall path already relies on
+    (``test_an_adoption_that_would_collapse_the_range_to_a_point_is_refused``):
+    a measured side that would make ``min >= max`` is refused, warned, and
+    never persisted or republished."""
+    store.upsert(_Entry(800, options={ct_bounds.OPTION_CT_MIN_MIREDS: 200,
+                                      ct_bounds.OPTION_CT_MAX_MIREDS: 400}))
+    store.upserts.clear()
+    learner.adopt_measured(_entry(store), "min", 400, reason="calibration sweep")  # == current max
+    assert store.upserts == []
+    republish.assert_not_called()
+    learner._logger.warning.assert_called_once()
