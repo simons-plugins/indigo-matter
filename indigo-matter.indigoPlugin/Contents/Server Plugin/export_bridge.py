@@ -56,6 +56,8 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Optional
 
 import bridge_protocol
+import ct_bounds
+import ct_learner
 import export_catalog
 import export_handlers
 from bridge_client import TERMINAL_ATTACH_ERRORS, BridgeClient, attach_timeout_for
@@ -379,6 +381,15 @@ class ExportBridge:
         #: the same readout. ``None`` means "nothing has told us yet", which the
         #: readout must not render as "no ecosystems are paired".
         self.fabrics: Optional[list] = None
+        #: Issue #293 — the observed-clamp physical CT bounds learner. One
+        #: per bridge, not per export (it is looked up by device id
+        #: internally); constructed here, not lazily, so `device_updated`/
+        #: `_push_commanded` never have to guard against it being absent.
+        #: `self.upsert` is the republish seam — a bound method reference is
+        #: safe to take here even though `upsert` is defined later in this
+        #: class body, because attribute lookup on `self` happens at CALL
+        #: time, not at this assignment.
+        self._ct_learner = ct_learner.CTBoundsLearner(self._store, self._logger, self.upsert)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -1140,7 +1151,13 @@ class ExportBridge:
             label=entry.label_for(str(getattr(dev, "name", "") or "")),
             reachable=reachable_of(dev),
             states=states,
-            options=dict(entry.options),
+            # Issue #293 — the wire never sees the plugin's own seed/learned
+            # bookkeeping keys, only the EFFECTIVE colour-temperature pair,
+            # and only when it differs from the generic 153/500 domain (see
+            # `ct_bounds.wire_options` for why "differs" is the gate: an
+            # ordinary export must stay byte-identical to before this
+            # existed, which the exact wire-frame round-trip tests pin).
+            options=ct_bounds.wire_options(entry.options),
             # Issues #219/#240 — whatever identity the entry has adopted
             # (a role change or a re-adopt), or today's default derivation
             # for an entry that has never moved off it.
@@ -1207,6 +1224,12 @@ class ExportBridge:
         client = self._live_client("the state update", new_dev.id)
         if client is None:
             return
+        # Issue #293 — every fresh CT reading feeds the learner BEFORE (and
+        # independent of) the tolerance below: `CT_TOLERANCE_MIREDS` is
+        # exactly the shortfall band the learner exists to see, so gating
+        # this on `diff_from`'s own tolerance would hide the evidence from
+        # the one place actually looking for it.
+        self._feed_ct_learner(entry, new_dev, handler)
         # Issue #220 — a device that just STARTED reporting a battery has to be
         # RE-CREATED with PowerSource, not have `batteryLevel` folded into an
         # ordinary `set_state`: the live endpoint was built without it (§4.1's
@@ -1261,6 +1284,26 @@ class ExportBridge:
         if states:
             self._note_pushed(new_dev.id, states, handler)
             self._fire(client.set_state(new_dev.id, states), f"set_state dev {new_dev.id}")
+
+    def _feed_ct_learner(self, entry, new_dev: Any, handler) -> None:
+        """One fresh CT reading to the learner (#293), best-effort.
+
+        A read failure here must not touch the ordinary push path at all —
+        `device_updated`'s own try/except around `diff_from`, a few lines
+        below, already owns reporting a broken device once per streak;
+        duplicating that per-device dedupe for what is a two-line advisory
+        read would be the Wrong Abstraction. `handler.published_states`
+        rather than `states_for` so `entry.options` (needed to read the
+        role's own colour channel correctly) is honoured identically to
+        every other read of this device in this file.
+        """
+        try:
+            mireds = handler.published_states(new_dev, entry.options).get(
+                export_handlers.STATE_COLOR_TEMP_MIREDS)
+        except Exception:  # pylint: disable=broad-except
+            return
+        if isinstance(mireds, int) and not isinstance(mireds, bool):
+            self._ct_learner.observe(entry, mireds)
 
     def _note_pushed(self, device_id: int, states: dict,
                       handler: Optional[export_handlers.ExportHandler] = None) -> None:
@@ -1714,8 +1757,19 @@ class ExportBridge:
         (``windowCovering``'s ``invert`` is the canonical trap — see
         :meth:`_correct`'s warning) must thread ``_entry.options`` through
         first.
+
+        Issue #293 — the ``setColorTemp`` commanded reference is recorded for
+        the learner FIRST, before the live-client gate below: a stale prefs
+        write during a bridge outage is still Indigo-confirmed truth about
+        what was asked, and the freshness window (not the bridge's
+        connectivity) is what should decide whether a later echo still
+        answers it.
         """
         device_id = command.indigo_device_id
+        if command.command == export_handlers.COMMAND_SET_COLOR_TEMP:
+            ct_mireds = commanded.get(export_handlers.STATE_COLOR_TEMP_MIREDS)
+            if isinstance(ct_mireds, int) and not isinstance(ct_mireds, bool):
+                self._ct_learner.record_commanded(device_id, ct_mireds)
         client = self._live_client("the commanded-state push", device_id)
         if client is None:
             return

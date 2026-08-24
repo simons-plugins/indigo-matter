@@ -298,6 +298,60 @@ class TestEndpointProvider:
         h.store.upsert(ExportEntry(102, "dimmableLight", options={"someKey": 1}))
         assert h.bridge.endpoint_specs()[0].options == {"someKey": 1}
 
+    # -- issue #293: the effective CT-bounds wire transform ------------
+    def test_an_ordinary_ct_export_has_no_bounds_on_the_wire(self, bridge_mod, mock_logger,
+                                                             devices):
+        """No seed, nothing learned — the wire options must stay `{}`, byte-
+        identical to an export with no colour-temperature feature at all."""
+        dev = DimmerDevice(800, "CT Lamp", onState=True, brightness=50, whiteTemperature=2700,
+                            supportsWhiteTemperature=True)
+        devices.add(dev)
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(800, "colorTemperatureLight")])
+        assert h.bridge.endpoint_specs()[0].options == {}
+
+    def test_a_seeded_range_reaches_the_wire_as_the_effective_pair(
+            self, bridge_mod, mock_logger, devices):
+        dev = DimmerDevice(800, "CT Lamp", onState=True, brightness=50, whiteTemperature=2700,
+                            supportsWhiteTemperature=True)
+        devices.add(dev)
+        h = Harness(bridge_mod, mock_logger, devices, [
+            ExportEntry(800, "colorTemperatureLight",
+                       options={"ctMinMireds": 200, "ctMaxMireds": 400})])
+        assert h.bridge.endpoint_specs()[0].options == {"ctMinMireds": 200, "ctMaxMireds": 400}
+
+    def test_learned_keys_never_reach_the_wire_only_the_effective_pair_does(
+            self, bridge_mod, mock_logger, devices):
+        dev = DimmerDevice(800, "CT Lamp", onState=True, brightness=50, whiteTemperature=2700,
+                            supportsWhiteTemperature=True)
+        devices.add(dev)
+        h = Harness(bridge_mod, mock_logger, devices, [
+            ExportEntry(800, "colorTemperatureLight",
+                       options={"ctMinMireds": 200, "ctMaxMireds": 400,
+                                "ctLearnedMaxMireds": 390})])
+        options = h.bridge.endpoint_specs()[0].options
+        assert options == {"ctMinMireds": 200, "ctMaxMireds": 390}
+        assert "ctLearnedMaxMireds" not in options
+        assert "ctLearnedMinMireds" not in options
+
+    def test_a_seed_equal_to_generic_produces_no_wire_options(
+            self, bridge_mod, mock_logger, devices):
+        dev = DimmerDevice(800, "CT Lamp", onState=True, brightness=50, whiteTemperature=2700,
+                            supportsWhiteTemperature=True)
+        devices.add(dev)
+        h = Harness(bridge_mod, mock_logger, devices, [
+            ExportEntry(800, "colorTemperatureLight",
+                       options={"ctMinMireds": 153, "ctMaxMireds": 500})])
+        assert h.bridge.endpoint_specs()[0].options == {}
+
+    def test_ct_bounds_never_leak_into_an_unrelated_roles_wire_options(
+            self, bridge_mod, mock_logger, devices):
+        """Options for a role with no colour temperature carry only what that
+        role's own keys mean — an invert flag rides untouched, and no CT
+        keys are invented from nothing."""
+        h = Harness(bridge_mod, mock_logger, devices, [])
+        h.store.upsert(ExportEntry(102, "windowCovering", options={"invert": True}))
+        assert h.bridge.endpoint_specs()[0].options == {"invert": True}
+
     def test_a_disabled_device_is_unreachable_not_absent(self, bridge_mod, mock_logger, devices):
         """XAC8: greyed out in the ecosystem beats timing out."""
         devices[101].enabled = False
@@ -2326,6 +2380,108 @@ class TestCommandedStatePush:
         assert set(ct_pushes) == {426}, (
             f"the clamped echo must never reach the wire once commanded, got {ct_pushes}")
         assert h.bridge._pushed[800]["colorTempMireds"] == 426
+
+
+class TestCTBoundsLearnerWiring:
+    """Issue #293: the learner is fed from real ``on_command``/``device_
+    updated`` traffic, and a successful adoption republishes the endpoint —
+    the ``ct_learner.py`` unit tests pin the state machine itself; these pin
+    that ``ExportBridge`` actually wires it up.
+    """
+
+    def _ct_lamp(self, dev_id=800, **overrides):
+        kwargs = dict(name="CT Lamp", onState=True, brightness=29, whiteLevel=29,
+                      whiteTemperature=2700, supportsWhiteTemperature=True)
+        kwargs.update(overrides)
+        name = kwargs.pop("name")
+        return DimmerDevice(dev_id, name, **kwargs)
+
+    def test_commanded_push_is_not_clamped_to_the_effective_bounds(
+            self, bridge_mod, mock_logger, devices, mock_indigo_base):
+        """ADR-0013 pin, unchanged by #293: the pushed value is the command,
+        clamped only to the GENERIC 153/500 domain, never to a narrower
+        seeded/learned range — clamping it would stop the fabric from ever
+        asking past the current bounds, which is exactly the overreach the
+        learner needs to see."""
+        dev = self._ct_lamp()
+        devices.add(dev)
+        h = Harness(bridge_mod, mock_logger, devices, [
+            ExportEntry(800, "colorTemperatureLight",
+                       options={"ctMinMireds": 200, "ctMaxMireds": 400})])
+        h.start()
+        h.bridge.on_command(bridge_protocol.BridgeCommand(
+            indigo_device_id=800, command="setColorTemp", args={"colorTempMireds": 450}))
+        assert ("set_state", 800, {"colorTempMireds": 450}) in h.client.calls
+
+    def test_two_consistent_shortfalls_learn_a_bound_and_republish(
+            self, bridge_mod, mock_logger, devices, mock_indigo_base):
+        dev = self._ct_lamp()
+        devices.add(dev)
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(800, "colorTemperatureLight")])
+        h.start()
+        upserts_before = len([c for c in h.client.calls if c[0] == "upsert_endpoint"])
+
+        h.bridge.on_command(bridge_protocol.BridgeCommand(
+            indigo_device_id=800, command="setColorTemp", args={"colorTempMireds": 426}))
+        h.bridge.device_updated(dev, self._ct_lamp(whiteTemperature=2500))   # echo -> 400
+        h.bridge.device_updated(dev, self._ct_lamp(whiteTemperature=2500))   # same echo again
+
+        assert h.store.get(800).options["ctLearnedMaxMireds"] == 400
+        upserts_after = len([c for c in h.client.calls if c[0] == "upsert_endpoint"])
+        assert upserts_after == upserts_before + 1, "a learned bound must republish the endpoint"
+        last_spec = [c for c in h.client.calls if c[0] == "upsert_endpoint"][-1][1]
+        assert last_spec.options["ctMaxMireds"] == 400
+
+    def test_a_single_shortfall_does_not_learn_anything(
+            self, bridge_mod, mock_logger, devices, mock_indigo_base):
+        dev = self._ct_lamp()
+        devices.add(dev)
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(800, "colorTemperatureLight")])
+        h.start()
+        h.bridge.on_command(bridge_protocol.BridgeCommand(
+            indigo_device_id=800, command="setColorTemp", args={"colorTempMireds": 426}))
+        h.bridge.device_updated(dev, self._ct_lamp(whiteTemperature=2500))
+        assert "ctLearnedMaxMireds" not in h.store.get(800).options
+
+    def test_a_stale_commanded_reference_does_not_teach_the_learner(
+            self, bridge_mod, mock_logger, devices, mock_indigo_base):
+        """The degradation-path pin at the wiring level: an echo that matches
+        an old command must not be adopted once the reference has gone
+        stale, however the bridge is driven from the outside."""
+        dev = self._ct_lamp()
+        devices.add(dev)
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(800, "colorTemperatureLight")])
+        h.start()
+        h.bridge.on_command(bridge_protocol.BridgeCommand(
+            indigo_device_id=800, command="setColorTemp", args={"colorTempMireds": 426}))
+        # Simulate the reference going stale (an hour later) without a real
+        # sleep — same discipline as every other latency-sensitive test in
+        # this suite reaching into the harness's internals directly.
+        commanded = h.bridge._ct_learner._commanded[800]
+        h.bridge._ct_learner._commanded[800] = type(commanded)(mireds=commanded.mireds,
+                                                                at=commanded.at - 3600)
+        h.bridge.device_updated(dev, self._ct_lamp(whiteTemperature=2500))
+        h.bridge.device_updated(dev, self._ct_lamp(whiteTemperature=2500))
+        assert "ctLearnedMaxMireds" not in h.store.get(800).options
+
+    def test_a_reading_past_a_wrong_seed_re_widens_and_republishes(
+            self, bridge_mod, mock_logger, devices, mock_indigo_base):
+        """Self-healing: a deliberately-too-narrow seed is corrected the
+        moment the device proves it reaches further, with no command
+        involved at all — a plain ecosystem-independent Indigo-side read."""
+        dev = self._ct_lamp(whiteTemperature=3333)   # -> ~300 mireds, past the seeded 250 ceiling
+        devices.add(dev)
+        h = Harness(bridge_mod, mock_logger, devices, [
+            ExportEntry(800, "colorTemperatureLight", options={"ctMaxMireds": 250,
+                                                                "ctMinMireds": 153})])
+        h.start()
+        upserts_before = len([c for c in h.client.calls if c[0] == "upsert_endpoint"])
+
+        h.bridge.device_updated(dev, dev)   # re-report the same (out-of-bounds) reading
+
+        assert h.store.get(800).options["ctLearnedMaxMireds"] == 300  # kelvin_to_mireds(3333)
+        upserts_after = len([c for c in h.client.calls if c[0] == "upsert_endpoint"])
+        assert upserts_after == upserts_before + 1
 
 
 class TestColorModeCoherence:

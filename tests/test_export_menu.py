@@ -31,7 +31,8 @@ import pytest
 import bridge_protocol
 import export_catalog
 import fakes
-from export_store import OPTION_INVERT, PREF_KEY, ExportEntry, ExportStore
+from export_store import (OPTION_CT_LEARNED_MAX_MIREDS, OPTION_CT_MAX_MIREDS,
+                          OPTION_CT_MIN_MIREDS, OPTION_INVERT, PREF_KEY, ExportEntry, ExportStore)
 from fakes import (
     OTHER_PLUGIN_ID,
     DimmerDevice,
@@ -88,7 +89,8 @@ def plug(plugin_mod, devices):  # noqa: ARG001 - devices installs indigo.devices
 def _values(**kwargs):
     base = {"exportFilter": "", "exportDevice": "0", "exportRole": "",
             "exportName": "", "exportInvert": False, "exportStatus": "",
-            "exportNeedsMapping": "false", "exportStateKey": "", "exportStateInvert": False}
+            "exportNeedsMapping": "false", "exportStateKey": "", "exportStateInvert": False,
+            "exportCtWarmestK": "", "exportCtCoolestK": ""}
     base.update(kwargs)
     return base
 
@@ -159,6 +161,40 @@ def test_status_field_is_readonly():
     status = [f for f in _menu_item().findall("./ConfigUI/Field")
               if f.get("id") == "exportStatus"][0]
     assert status.get("readonly") == "true"
+
+
+# ---------------------------------------------------------------------------
+# Colour-temperature bounds fields (issue #293)
+# ---------------------------------------------------------------------------
+def _ct_field(field_id):
+    fields = [f for f in _menu_item().findall("./ConfigUI/Field") if f.get("id") == field_id]
+    assert fields, f"{field_id} field missing from manageMatterExports"
+    return fields[0]
+
+
+@pytest.mark.parametrize("field_id", ["exportCtWarmestK", "exportCtCoolestK"])
+def test_ct_bounds_fields_are_textfields_visible_only_for_ct_roles(field_id):
+    field = _ct_field(field_id)
+    assert field.get("type") == "textfield"
+    assert field.get("visibleBindingId") == "exportRole"
+    xml_roles = set(field.get("visibleBindingValue").split(","))
+    assert xml_roles == {"colorTemperatureLight", "extendedColorLight"}
+    assert field.get("alwaysUseInDialogHeightCalc") == "true"
+
+
+@pytest.mark.parametrize("field_id", ["exportCtWarmestK", "exportCtCoolestK"])
+def test_ct_bounds_fields_have_no_callback(field_id):
+    """Plain textfields, matching `exportFilter`/`exportName` — nothing needs
+    to react while the user is typing a Kelvin value."""
+    assert _ct_field(field_id).findtext("CallbackMethod") is None
+
+
+def test_ct_bounds_fields_carry_the_reciprocal_kelvin_direction_in_their_labels():
+    """Not just present — labelled the RIGHT way round: get warmest/coolest
+    backwards in the XML and a user reading the dialog would seed an
+    inverted range with no code able to catch the mistake."""
+    assert "Warmest" in _ct_field("exportCtWarmestK").findtext("Label")
+    assert "Coolest" in _ct_field("exportCtCoolestK").findtext("Label")
 
 
 # ---------------------------------------------------------------------------
@@ -669,6 +705,59 @@ def test_device_changed_handles_a_deleted_device(plug):
 
 
 # ---------------------------------------------------------------------------
+# Colour-temperature bounds — dialog round trip (issue #293)
+# ---------------------------------------------------------------------------
+def _ct_device(devices, device_id=106, name="CT Lamp", **kwargs):
+    devices.add(DimmerDevice(device_id, name, supportsWhiteTemperature=True,
+                             whiteTemperature=2700, **kwargs))
+    return device_id
+
+
+def test_device_changed_loads_the_saved_seed_as_kelvin_the_reciprocal_way(plug, devices):
+    device_id = _ct_device(devices)
+    plug.exports.upsert(ExportEntry(device_id, "colorTemperatureLight",
+                                    options={OPTION_CT_MIN_MIREDS: 200,
+                                             OPTION_CT_MAX_MIREDS: 400}))
+    values = plug.exportDeviceChanged(_values(exportDevice=str(device_id)), "manageMatterExports")
+    # 200 mireds (the COOLEST bound) is the HIGHER Kelvin (5000K); 400 mireds
+    # (the WARMEST bound) is the LOWER Kelvin (2500K) — get this backwards
+    # and a user reading their own saved seed would see it inverted.
+    assert values["exportCtCoolestK"] == "5000"
+    assert values["exportCtWarmestK"] == "2500"
+
+
+def test_device_changed_seeds_blank_ct_fields_for_a_new_export(plug, devices):
+    device_id = _ct_device(devices)
+    values = plug.exportDeviceChanged(_values(exportDevice=str(device_id)), "manageMatterExports")
+    assert values["exportCtWarmestK"] == ""
+    assert values["exportCtCoolestK"] == ""
+
+
+def test_device_changed_leaves_ct_fields_blank_when_only_a_learned_value_exists(plug, devices):
+    """The learner's own record is never shown or edited in the dialog — only
+    the SEED round-trips through these two fields."""
+    device_id = _ct_device(devices)
+    plug.exports.upsert(ExportEntry(device_id, "colorTemperatureLight",
+                                    options={OPTION_CT_LEARNED_MAX_MIREDS: 400}))
+    values = plug.exportDeviceChanged(_values(exportDevice=str(device_id)), "manageMatterExports")
+    assert values["exportCtWarmestK"] == ""
+    assert values["exportCtCoolestK"] == ""
+
+
+def test_device_changed_clears_ct_fields_for_an_excluded_pick(plug, devices):
+    device_id = _ct_device(devices)
+    plug.exports.upsert(ExportEntry(device_id, "colorTemperatureLight",
+                                    options={OPTION_CT_MIN_MIREDS: 200,
+                                             OPTION_CT_MAX_MIREDS: 400}))
+    devices.add(HostilePluginIdDevice(556, "Flaky Plug"))
+    values = plug.exportDeviceChanged(
+        _values(exportDevice="556", exportCtWarmestK="2500", exportCtCoolestK="5000"),
+        "manageMatterExports")
+    assert values["exportCtWarmestK"] == ""
+    assert values["exportCtCoolestK"] == ""
+
+
+# ---------------------------------------------------------------------------
 # Add / update
 # ---------------------------------------------------------------------------
 def test_add_persists_the_entry_and_reports_it(plug):
@@ -763,6 +852,110 @@ def test_add_before_startup_says_so(plug):
     values = plug.exportAddOrUpdate(
         _values(exportDevice="101", exportRole="onOffLight"), "manageMatterExports")
     assert "still starting" in values["exportStatus"]
+
+
+# ---------------------------------------------------------------------------
+# Colour-temperature bounds — Add/update (issue #293)
+# ---------------------------------------------------------------------------
+def test_add_stores_the_seed_from_kelvin_fields_the_reciprocal_way(plug, devices):
+    device_id = _ct_device(devices)
+    plug.exportAddOrUpdate(
+        _values(exportDevice=str(device_id), exportRole="colorTemperatureLight",
+               exportCtWarmestK="2500", exportCtCoolestK="5000"),
+        "manageMatterExports")
+    assert plug.exports.get(device_id).options == {
+        OPTION_CT_MIN_MIREDS: 200, OPTION_CT_MAX_MIREDS: 400}
+
+
+def test_add_leaves_no_seed_when_both_kelvin_fields_are_blank(plug, devices):
+    device_id = _ct_device(devices)
+    plug.exportAddOrUpdate(
+        _values(exportDevice=str(device_id), exportRole="colorTemperatureLight"),
+        "manageMatterExports")
+    assert plug.exports.get(device_id).options == {}
+
+
+def test_add_rejects_an_incomplete_kelvin_pair(plug, devices):
+    device_id = _ct_device(devices)
+    values = plug.exportAddOrUpdate(
+        _values(exportDevice=str(device_id), exportRole="colorTemperatureLight",
+               exportCtWarmestK="2500"),
+        "manageMatterExports")
+    assert "both" in values["exportStatus"].lower()
+    assert device_id not in plug.exports
+
+
+def test_add_rejects_kelvin_out_of_range(plug, devices):
+    device_id = _ct_device(devices)
+    values = plug.exportAddOrUpdate(
+        _values(exportDevice=str(device_id), exportRole="colorTemperatureLight",
+               exportCtWarmestK="1000", exportCtCoolestK="5000"),
+        "manageMatterExports")
+    assert "2000" in values["exportStatus"] and "6535" in values["exportStatus"]
+    assert device_id not in plug.exports
+
+
+def test_add_rejects_a_warmest_that_is_not_lower_than_the_coolest(plug, devices):
+    """The reciprocal check: WARMEST must be the LOWER Kelvin value."""
+    device_id = _ct_device(devices)
+    values = plug.exportAddOrUpdate(
+        _values(exportDevice=str(device_id), exportRole="colorTemperatureLight",
+               exportCtWarmestK="5000", exportCtCoolestK="3000"),
+        "manageMatterExports")
+    assert "warmest" in values["exportStatus"].lower()
+    assert device_id not in plug.exports
+
+
+def test_add_rejects_non_numeric_kelvin(plug, devices):
+    device_id = _ct_device(devices)
+    values = plug.exportAddOrUpdate(
+        _values(exportDevice=str(device_id), exportRole="colorTemperatureLight",
+               exportCtWarmestK="warm", exportCtCoolestK="5000"),
+        "manageMatterExports")
+    assert "whole numbers" in values["exportStatus"]
+    assert device_id not in plug.exports
+
+
+def test_add_records_ct_bounds_only_for_ct_roles(plug, devices):
+    device_id = _ct_device(devices)
+    plug.exportAddOrUpdate(
+        _values(exportDevice=str(device_id), exportRole="colorTemperatureLight",
+               exportCtWarmestK="2500", exportCtCoolestK="5000"),
+        "manageMatterExports")
+    assert OPTION_CT_MIN_MIREDS in plug.exports.get(device_id).options
+    plug.exportAddOrUpdate(
+        _values(exportDevice=str(device_id), exportRole="dimmableLight",
+               exportCtWarmestK="2500", exportCtCoolestK="5000"),
+        "manageMatterExports")
+    assert plug.exports.get(device_id).options == {}
+
+
+def test_add_preserves_the_learned_bound_across_an_unrelated_update(plug, devices):
+    """Issue #293's own regression trap: saving the dialog for ANY reason —
+    here, just adding a name override — must not silently wipe the learner's
+    own record, which is never a dialog field a user could re-enter."""
+    device_id = _ct_device(devices)
+    plug.exports.upsert(ExportEntry(device_id, "colorTemperatureLight",
+                                    options={OPTION_CT_LEARNED_MAX_MIREDS: 400}))
+    plug.exportAddOrUpdate(
+        _values(exportDevice=str(device_id), exportRole="colorTemperatureLight",
+               exportName="Renamed"),
+        "manageMatterExports")
+    assert plug.exports.get(device_id).options == {OPTION_CT_LEARNED_MAX_MIREDS: 400}
+    assert plug.exports.get(device_id).name_override == "Renamed"
+
+
+def test_add_preserves_the_learned_bound_alongside_a_new_seed(plug, devices):
+    device_id = _ct_device(devices)
+    plug.exports.upsert(ExportEntry(device_id, "colorTemperatureLight",
+                                    options={OPTION_CT_LEARNED_MAX_MIREDS: 400}))
+    plug.exportAddOrUpdate(
+        _values(exportDevice=str(device_id), exportRole="colorTemperatureLight",
+               exportCtWarmestK="2500", exportCtCoolestK="5000"),
+        "manageMatterExports")
+    assert plug.exports.get(device_id).options == {
+        OPTION_CT_MIN_MIREDS: 200, OPTION_CT_MAX_MIREDS: 400,
+        OPTION_CT_LEARNED_MAX_MIREDS: 400}
 
 
 # ---------------------------------------------------------------------------

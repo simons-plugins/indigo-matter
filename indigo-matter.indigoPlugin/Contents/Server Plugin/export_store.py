@@ -45,6 +45,7 @@ import threading
 from dataclasses import dataclass, field
 from typing import Callable, Iterable, Optional
 
+import ct_bounds
 import export_catalog
 from bridge_protocol import ROLES, parse_published_id
 
@@ -88,6 +89,22 @@ MAPPABLE_ROLES = tuple(export_catalog.BINARY_SENSOR_ROLES)
 #: concept (§5.2); on any other role it is either a hand-edit or a stale write,
 #: and honouring it would silently invert a lock or a plug.
 INVERTIBLE_ROLES = ("windowCovering",)
+
+#: ``options`` keys carrying physical colour-temperature bounds (issue #293).
+#: ``OPTION_CT_MIN/MAX_MIREDS`` is the user's SEED from the export dialog;
+#: ``OPTION_CT_LEARNED_MIN/MAX_MIREDS`` is the observed-clamp learner's own
+#: record — see ``ct_bounds.py``, which owns all four names and the roles
+#: they mean anything on, for the reasoning.
+OPTION_CT_MIN_MIREDS = ct_bounds.OPTION_CT_MIN_MIREDS
+OPTION_CT_MAX_MIREDS = ct_bounds.OPTION_CT_MAX_MIREDS
+OPTION_CT_LEARNED_MIN_MIREDS = ct_bounds.OPTION_CT_LEARNED_MIN_MIREDS
+OPTION_CT_LEARNED_MAX_MIREDS = ct_bounds.OPTION_CT_LEARNED_MAX_MIREDS
+
+#: Roles for which the four CT-bounds keys above mean anything. A colour-
+#: temperature bound on any other role is either a hand-edit or a stale
+#: write, and honouring it would publish a physical range for a role with no
+#: colour temperature to bound.
+CT_BOUNDS_ROLES = tuple(ct_bounds.CT_ROLES)
 
 #: The message the dialog shows when the whole blob was unreadable (S3). The
 #: store must never let the UI say "nothing is exported yet" after this.
@@ -137,6 +154,70 @@ def _validate_options(options: dict, role: str, device_id: int) -> None:
             raise ValueError(
                 f"export entry has the {OPTION_STATE_INVERT!r} option on role {role!r}, "
                 f"which reads no boolean state (device {device_id})")
+    _validate_ct_bounds(options, role, device_id)
+
+
+def _validate_ct_bounds(options: dict, role: str, device_id: int) -> None:
+    """Raise ``ValueError`` for the four issue #293 colour-temperature-bounds keys.
+
+    Two independent pairs, each with its own completeness rule:
+
+    * ``ctMinMireds``/``ctMaxMireds`` (the user's SEED) — an INCOMPLETE pair
+      is itself a violation. ``export_dialog_mixin.exportAddOrUpdate`` always
+      writes both keys or neither, so a lone one can only be a hand-edit or a
+      partial write, and honouring it would seed just one side of a range
+      nobody actually declared.
+    * ``ctLearnedMinMireds``/``ctLearnedMaxMireds`` (the learner's own
+      record) — a LONE key is usable on its own: the learner adopts one side
+      at a time (``ct_learner.py``), and a device that has only ever proven
+      its warm limit legitimately has nothing to say about the cool one yet.
+
+    Whichever pair IS complete must satisfy §4.2's declared domain,
+    ``153 <= min < max <= 500`` — a stored range wider than the fabric's own
+    domain, inverted, or collapsed to a point is unusable by construction.
+    """
+    for min_key, max_key, seed_pair in (
+        (OPTION_CT_MIN_MIREDS, OPTION_CT_MAX_MIREDS, True),
+        (OPTION_CT_LEARNED_MIN_MIREDS, OPTION_CT_LEARNED_MAX_MIREDS, False),
+    ):
+        has_min = min_key in options
+        has_max = max_key in options
+        if not (has_min or has_max):
+            continue
+        if role not in CT_BOUNDS_ROLES:
+            raise ValueError(
+                f"export entry has a {min_key!r}/{max_key!r} option on role {role!r}, which "
+                f"has no colour temperature (device {device_id})")
+        for key in (min_key, max_key):
+            if key in options and not (isinstance(options[key], int)
+                                        and not isinstance(options[key], bool)):
+                raise ValueError(
+                    f"export entry {key!r} option is not an integer (device {device_id})")
+        if has_min != has_max:
+            if seed_pair:
+                raise ValueError(
+                    f"export entry has an incomplete {min_key!r}/{max_key!r} pair — both or "
+                    f"neither are required (device {device_id})")
+            # A lone learned side is usable on its own, but it still has to
+            # sit inside §4.2's declared domain: the complete-pair inequality
+            # below never sees it, and without this a hand-edited
+            # ``ctLearnedMaxMireds: 9999`` would load cleanly here and only
+            # be caught by the NODE's own validity warn — leaving the plugin
+            # believing a bound the fabric never adopted.
+            lone_key = min_key if has_min else max_key
+            lone_value = options[lone_key]
+            if not ct_bounds.GENERIC_MIN_MIREDS <= lone_value <= ct_bounds.GENERIC_MAX_MIREDS:
+                raise ValueError(
+                    f"export entry {lone_key!r} option ({lone_value}) is outside the "
+                    f"{ct_bounds.GENERIC_MIN_MIREDS}-{ct_bounds.GENERIC_MAX_MIREDS} mired "
+                    f"domain (device {device_id})")
+            continue  # a lone learned side is usable on its own
+        min_value, max_value = options[min_key], options[max_key]
+        if not (ct_bounds.GENERIC_MIN_MIREDS <= min_value < max_value <= ct_bounds.GENERIC_MAX_MIREDS):
+            raise ValueError(
+                f"export entry {min_key!r}/{max_key!r} pair ({min_value}, {max_value}) does not "
+                f"satisfy {ct_bounds.GENERIC_MIN_MIREDS} <= min < max <= "
+                f"{ct_bounds.GENERIC_MAX_MIREDS} (device {device_id})")
 
 
 @dataclass(frozen=True)
