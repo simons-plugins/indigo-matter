@@ -1,0 +1,114 @@
+name: Tests
+
+# The gate this repo did not have. Until 2026-08-25 CI ran only version-check
+# and create-release, so a six-PR refactor touching 30 files landed verified by
+# nothing but someone running pytest on their laptop. The suite is ~9 seconds;
+# there was never a cost argument for leaving it out.
+#
+# Runs on pull_request AND on push to main: the PR run is the gate, the main
+# run catches whatever a merge itself introduces (a bad conflict resolution
+# passes both parents' checks and neither run tests the result).
+
+on:
+  pull_request:
+    branches:
+      - main
+      - master
+  push:
+    branches:
+      - main
+      - master
+
+# A new push supersedes the previous run on the same ref. Never cancel main —
+# its runs are the record of what landed.
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    name: pytest (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.13 ONLY, for now. 3.11 is the declared floor (`pyproject.toml`
+        # requires-python, and pylint's own py-version) and SHOULD be here, but
+        # four tests in tests/test_bridge_client.py fail on 3.11 today: they
+        # assert on `client.status` straight after `wait_connected()` and pass
+        # on 3.13 purely because its event loop happens to have run the attach
+        # by then. Scheduling order, not logic — and pre-existing, confirmed
+        # failing at 913ad44, well before the refactor that added this file.
+        #
+        # Adding a red leg to a brand-new gate only teaches people to ignore
+        # the gate. Tracked separately; restore "3.11" here once those four
+        # tests await the condition instead of assuming it.
+        python-version: ["3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # pytest is the ONLY third-party import in the suite — the `indigo`
+      # runtime is mocked (tests/conftest.py) and matter-server is mocked at
+      # the WebSocket layer (tests/fakes.py). No requirements file to drift.
+      - name: Install pytest
+        run: python -m pip install --upgrade pip pytest
+
+      - name: Run the suite
+        run: python -m pytest -q
+
+  pylint:
+    name: pylint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # Matches `[tool.pylint.main] py-version` in pyproject.toml, so the
+          # analysis is the one the config describes.
+          python-version: "3.11"
+
+      - name: Install pylint
+        run: python -m pip install --upgrade pip pylint
+
+      # Config lives in pyproject.toml: fail-under = 9.0, max-line-length 120,
+      # tests/ ignored. pylint exits non-zero on its own when the score drops
+      # below fail-under, so no threshold is repeated here — one source of
+      # truth. `import-error` on `indigo` is expected and unavoidable off-box
+      # (the module exists only inside the Indigo runtime); it is why the gate
+      # is a score rather than "zero messages".
+      - name: Run pylint
+        run: python -m pylint "indigo-matter.indigoPlugin/Contents/Server Plugin"
+
+  bridge-node:
+    name: bridge-node (TypeScript)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          # bridge-node/package.json pins engines.node >= 22.13.0.
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: bridge-node/package-lock.json
+
+      - name: Install
+        working-directory: bridge-node
+        run: npm ci
+
+      # `npm test` builds, then copies tests/fixtures/bridge_protocol into the
+      # test build — the ONE shared golden-frame fixture (BRIDGE_PROTOCOL §7),
+      # read by the Python suite directly and by this one via that copy. Change
+      # a frame and both suites must agree, by design. That is exactly why this
+      # job has to run alongside pytest rather than instead of it.
+      - name: Build and test
+        working-directory: bridge-node
+        run: npm test
