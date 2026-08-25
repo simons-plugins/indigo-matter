@@ -102,6 +102,13 @@ ON_TIME_RETIRED_PREF = "matterOnTimeStateRetired"
 #: startup loads it, MatterServerMenuMixin saves it (the "Recreate Matter node
 #: devices…" menu item is where a tombstone is cleared).
 NODE_TOMBSTONES_PREF = "matterNodeDeviceTombstones"
+#: pluginPrefs key holding ``getDeviceStateList``'s "last reported removed-set"
+#: log (issue #312) — one JSON object keyed by Indigo device id, valued by a
+#: fingerprint of the removed state keys, so the state-removal INFO logs once
+#: per distinct answer rather than on every rebuild. Same prefs discipline as
+#: SURVEY_LOG_PREF: plugin.startup loads it, plugin.py saves it, and
+#: plugin.deviceDeleted forgets a deleted device's entry.
+REMOVED_STATE_LOG_PREF = "matterRemovedStateLog"
 #: How long the "Recreate Matter node devices…" menu action may block the
 #: Indigo UI thread on a full reconcile (get_nodes + get_node per node, not
 #: just one round trip like SURVEY_READ_TIMEOUT) — generous for the same

@@ -25,8 +25,10 @@ A live read happens in one place only: verifying a write actually landed.
 from __future__ import annotations
 
 import asyncio
+import json
+import threading
 from dataclasses import dataclass
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 from matter_client import ATTRIBUTE_TIMEOUT
 from matter_handlers.settings import (
@@ -45,6 +47,7 @@ __all__ = [
     "OfferedSetting", "PlannedWrite", "MARKER_YES", "MARKER_NO",
     "offered_settings", "unimplemented_states", "config_ui_values",
     "validate_settings", "planned_writes", "apply_setting",
+    "RemovedStateLog",
 ]
 
 #: Marker values for the ``hasX`` hidden ConfigUI fields that drive
@@ -405,3 +408,100 @@ async def apply_setting(client: Any, node_id: int, endpoint: int,
         # really happened, that is self-defeating.
         reason = f"{reason} (read-back failed: {read_error})"
     return False, reason
+
+
+class RemovedStateLog:
+    """Which device's state-removal ANSWER was last reported (issue #312).
+
+    ``getDeviceStateList`` (``plugin.py``) filters a device's declared states
+    down to what its AttributeList says it implements, and it is right to do
+    that on EVERY rebuild — Indigo calls it as a filter each time, and the
+    cache the answer is drawn from can have changed. Only the LOGGING should
+    happen once per distinct answer, not once per evaluation: the first time a
+    device's removed-set is seen, and again only if that set later changes.
+
+    Same pluginPrefs-blob shape as ``settings_report.SurveyLog`` and
+    ``device_sync.NodeDeviceTombstones`` (deliberately not unified with them —
+    assessed and rejected in the 2026-08-25 refactor; see those two classes'
+    docstrings). Keyed on the Indigo device id rather than a node/endpoint
+    pair: ``getDeviceStateList`` is handed the Indigo device, and a device
+    whose backing node/endpoint is reassigned is a new question anyway.
+
+    **Keyed on the ANSWER, not just the device.** The stored value is a
+    fingerprint of the removed-set (:meth:`fingerprint`), not a boolean
+    "already logged" flag — so a device that later loses a DIFFERENT state
+    still logs, exactly as a device losing its first state does.
+
+    A blob that will not parse starts empty rather than raising — the cost of
+    being wrong is one duplicate INFO line on the next rebuild, not a device
+    that fails to build its state list.
+    """
+
+    def __init__(self, save: Optional[Callable[[str], None]] = None) -> None:
+        self._last: dict[str, str] = {}
+        self._save = save
+        self._lock = threading.RLock()
+
+    def load(self, blob: Any) -> None:
+        """Replace the log from a stored JSON string (or anything unusable)."""
+        parsed: dict[str, str] = {}
+        if isinstance(blob, str) and blob.strip():
+            try:
+                raw = json.loads(blob)
+                if isinstance(raw, dict):
+                    parsed = {str(k): str(v) for k, v in raw.items()}
+            except (TypeError, ValueError):
+                parsed = {}
+        with self._lock:
+            self._last = parsed
+
+    def to_json(self) -> str:
+        with self._lock:
+            return json.dumps(self._last, separators=(",", ":"), sort_keys=True)
+
+    @staticmethod
+    def fingerprint(removed: Iterable[str]) -> str:
+        """A stable, order-independent answer for a removed-key set."""
+        return ",".join(sorted(set(removed)))
+
+    def should_log(self, dev_id: Any, fingerprint: str) -> bool:
+        """Has this device's removed-set changed since it was last logged?
+
+        True the first time a device is asked about (nothing recorded yet),
+        matching the issue #312 requirement that the first occurrence always
+        logs.
+        """
+        with self._lock:
+            return self._last.get(str(int(dev_id))) != fingerprint
+
+    def record(self, dev_id: Any, fingerprint: str) -> None:
+        """Remember that this answer has been logged, and persist."""
+        with self._lock:
+            self._last[str(int(dev_id))] = fingerprint
+        self._persist()
+
+    def forget(self, dev_id: Any) -> None:
+        """Drop a deleted device, so it cannot leak an entry forever.
+
+        Indigo device ids are not reused the way Matter node ids are, but
+        without this every deleted device's entry would sit in ``pluginPrefs``
+        forever — unbounded growth for bookkeeping about a device that no
+        longer exists. Wired to ``plugin.deviceDeleted``.
+        """
+        with self._lock:
+            existed = self._last.pop(str(int(dev_id)), None) is not None
+        if existed:
+            self._persist()
+
+    def _persist(self) -> None:
+        if self._save is None:
+            return
+        try:
+            self._save(self.to_json())
+        except Exception:  # noqa: BLE001 - bookkeeping must never sink a device rebuild
+            # Deliberately silent here, same reasoning as SurveyLog._persist
+            # (issue #308): the caller supplies the save hook and logs there.
+            # A failed save costs one repeated INFO line on the next rebuild,
+            # which is a strictly better outcome than an exception escaping
+            # into getDeviceStateList.
+            pass

@@ -67,9 +67,21 @@ class DiagnosticsMenuMixin:
         mapping: Indigo rebinds it when the PluginConfig dialog is saved, and a
         held reference would write into an orphan. ``savePluginPrefs`` is the
         commit — without it the value survives only until the plugin stops.
+
+        Caught and logged rather than left to escape into
+        ``SurveyLog._persist`` (issue #308): that method is deliberately
+        silent on the assumption that "the caller supplies the save hook and
+        logs there if it wants to" — this is that logging. A failure here is
+        cosmetic (the affected device(s) are simply re-reported on the next
+        start), which is why WARNING rather than anything louder.
         """
-        self.pluginPrefs[SURVEY_LOG_PREF] = blob
-        indigo.server.savePluginPrefs()
+        try:
+            self.pluginPrefs[SURVEY_LOG_PREF] = blob
+            indigo.server.savePluginPrefs()
+        except Exception as exc:  # noqa: BLE001 - bookkeeping must never sink a reconcile
+            self.logger.warning(
+                "Matter: could not save the settable-attribute survey log (%s) — "
+                "the affected device(s) will be re-reported on the next start.", exc)
 
     # ------------------------------------------------------------------
     # Pickers
