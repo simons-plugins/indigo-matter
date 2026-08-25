@@ -630,7 +630,9 @@ def test_current_exports_shows_a_measured_full_range(plug, devices):
                                     options={OPTION_CT_LEARNED_MIN_MIREDS: 153,
                                              OPTION_CT_LEARNED_MAX_MIREDS: 500}))
     label = _labels(plug.getCurrentExports())[str(device_id)]
-    assert "2000-6536K" in label
+    # 6535K, not the raw 6536K conversion: the same clamp the dialog fields
+    # use, so one lamp never shows two different numbers in one dialog.
+    assert "2000-6535K" in label
     assert "measured" in label
 
 

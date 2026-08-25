@@ -479,8 +479,8 @@ class ExportDialogMixin:
             self.logger.exception(exc)
             return [LIST_ERROR_OPTION]
 
-    @staticmethod
-    def _ct_bounds_row_note(entry) -> str:
+    @classmethod
+    def _ct_bounds_row_note(cls, entry) -> str:
         """One export row's colour-temperature range, or ``""``.
 
         Shown in the list so the answer to "did the calibration take?" does
@@ -499,7 +499,9 @@ class ExportDialogMixin:
         if entry.role not in CT_BOUNDS_ROLES or not wire_options(entry.options):
             return ""
         eff_min, eff_max = effective_ct_bounds(entry.options)
-        note = f" · {mireds_to_kelvin(eff_max)}-{mireds_to_kelvin(eff_min)}K"
+        # Through the same clamp the dialog fields use, so one lamp never
+        # reads 6536K in the list and 6535K in the field above it.
+        note = f" · {cls._kelvin_shown(eff_max)}-{cls._kelvin_shown(eff_min)}K"
         if SOURCE_LEARNED in effective_ct_sources(entry.options):
             note += " measured"
         return note
