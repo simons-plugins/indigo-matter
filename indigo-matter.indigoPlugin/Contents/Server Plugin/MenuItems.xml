@@ -276,11 +276,28 @@ A Matter pairing code is not durable: once used, or once the window expires (up 
                    alwaysUseInDialogHeightCalc="true">
                 <Label>Coolest white (K):</Label>
             </Field>
+            <!-- Shadow copies of what the two fields above were PRE-FILLED
+                 with (issue #293 follow-up). export_dialog_mixin.
+                 _ct_seed_from_values compares against these so a bound the
+                 plugin merely DISPLAYED (a learned one) is never re-saved as
+                 a user-declared seed. -->
+            <Field id="exportCtWarmestKShown" type="textfield" hidden="true"/>
+            <Field id="exportCtCoolestKShown" type="textfield" hidden="true"/>
+            <!-- A readonly textfield, not a label: Indigo labels are STATIC
+                 (see this dialog's header comment), and this line has to say
+                 which of the two numbers above was measured and which was
+                 typed — the same reason `exportStatus` is a textfield. -->
+            <Field id="exportCtBoundsSource" type="textfield" readonly="true"
+                   visibleBindingId="exportRole"
+                   visibleBindingValue="colorTemperatureLight,extendedColorLight"
+                   alwaysUseInDialogHeightCalc="true">
+                <Label>Range shown:</Label>
+            </Field>
             <Field id="exportCtBoundsHelp" type="label" fontColor="darkgray"
                    visibleBindingId="exportRole"
                    visibleBindingValue="colorTemperatureLight,extendedColorLight"
                    alwaysUseInDialogHeightCalc="true">
-                <Label>Optional, 2000-6535K. Declares the bulb's real warm/cool limits so paired ecosystems never ask for a colour it cannot reach. Leave both empty for the generic range. The plugin also learns this automatically from what the device actually does — this is only a starting point.</Label>
+                <Label>Optional, 2000-6535K. Declares the bulb's real warm/cool limits so paired ecosystems never ask for a colour it cannot reach — a starting point only: the plugin also learns this automatically from what the device actually does, and a measured side always takes priority over a typed value there. Clearing both removes what you typed; a side the plugin has already measured stays published at its measured value, not the generic range.</Label>
             </Field>
             <Field id="exportName" type="textfield">
                 <Label>Name in ecosystems:</Label>

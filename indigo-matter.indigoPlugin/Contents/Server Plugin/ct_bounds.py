@@ -65,7 +65,7 @@ _STORED_KEYS = (OPTION_CT_MIN_MIREDS, OPTION_CT_MAX_MIREDS,
                 OPTION_CT_LEARNED_MIN_MIREDS, OPTION_CT_LEARNED_MAX_MIREDS)
 
 
-def _is_ct_int(value: object) -> bool:
+def is_valid_ct_bound(value: object) -> bool:
     """A stored bound is a plain ``int`` — a ``bool`` is not one (Python
     quirk: ``isinstance(True, int)`` is ``True``), and neither is anything
     that merely looks numeric. ``export_store._validate_options`` is what
@@ -73,6 +73,12 @@ def _is_ct_int(value: object) -> bool:
     a value store validation has (almost always) already let through — a
     hand-edited ``.indiPref`` is the one path that can still reach this
     without ever passing through the store's own guard.
+
+    Public (issue #293 review): ``ct_learner._adopt``'s ``only_if_unclaimed``
+    guard needs the exact same "is this a real stored bound, not a stray
+    truthy value" test to decide whether a side is already claimed, and a
+    second, drifting copy of this check is exactly the kind of "one fact
+    said twice" this module's own docstring warns against.
     """
     return isinstance(value, int) and not isinstance(value, bool)
 
@@ -81,7 +87,7 @@ def _side(options: dict, learned_key: str, seed_key: str, generic: int) -> int:
     """One side's effective bound: learned, else seed, else generic."""
     for key in (learned_key, seed_key):
         value = options.get(key)
-        if _is_ct_int(value):
+        if is_valid_ct_bound(value):
             return value
     return generic
 
@@ -105,6 +111,64 @@ def effective_ct_bounds(options: Optional[dict]) -> tuple[int, int]:
         _side(options, OPTION_CT_LEARNED_MIN_MIREDS, OPTION_CT_MIN_MIREDS, GENERIC_MIN_MIREDS),
         _side(options, OPTION_CT_LEARNED_MAX_MIREDS, OPTION_CT_MAX_MIREDS, GENERIC_MAX_MIREDS),
     )
+
+
+#: What :func:`effective_ct_sources` reports for one side. Strings rather
+#: than an enum: they are read only by the export dialog, which has to put
+#: one of them in front of a user, and a plain word is what it puts there.
+SOURCE_LEARNED = "learned"
+SOURCE_SEED = "seed"
+SOURCE_GENERIC = "generic"
+
+
+def _side_source(options: dict, learned_key: str, seed_key: str) -> str:
+    """Which of the three sources :func:`_side` would have taken this side from."""
+    if is_valid_ct_bound(options.get(learned_key)):
+        return SOURCE_LEARNED
+    if is_valid_ct_bound(options.get(seed_key)):
+        return SOURCE_SEED
+    return SOURCE_GENERIC
+
+
+def effective_ct_sources(options: Optional[dict]) -> tuple[str, str]:
+    """(min_source, max_source) for the pair :func:`effective_ct_bounds` returns.
+
+    The dialog needs this to answer a question the two numbers alone cannot:
+    a 454-mired warm bound the LEARNER measured and one the user TYPED look
+    identical on screen, but only the second is a declaration the user may
+    edit back out — and re-saving the first as if it were a seed would turn
+    evidence into a declaration behind their back (``export_dialog_mixin.
+    _ct_seed_from_values``, which writes a seed only for a value the user
+    actually changed).
+
+    Deliberately a second walk of the same precedence rather than a richer
+    return from :func:`effective_ct_bounds`: every other caller wants only
+    the numbers, and widening that return would make all of them unpack a
+    provenance they have no use for.
+    """
+    options = options or {}
+    return (
+        _side_source(options, OPTION_CT_LEARNED_MIN_MIREDS, OPTION_CT_MIN_MIREDS),
+        _side_source(options, OPTION_CT_LEARNED_MAX_MIREDS, OPTION_CT_MAX_MIREDS),
+    )
+
+
+def has_stored_ct_bounds(options: Optional[dict]) -> bool:
+    """True if ``options`` carries ANY of the four keys this module owns —
+    seed or learned, either side — regardless of whether the value stored is
+    even valid (that is :func:`is_valid_ct_bound`'s question, not this one).
+
+    This is the "is any bound recorded here at all" test :func:`wire_options`
+    already used inline to decide whether the effective pair reaches the
+    wire; exported (issue #293 review) so ``export_dialog_mixin``'s row note
+    can ask the identical question instead of standing in for it with
+    ``wire_options(...)`` truthiness, which is also true for an entry that
+    merely has an unrelated, non-CT option and no CT bound at all — a stand-
+    in that made an un-swept device's row announce a range nothing recorded.
+    Keeping the one test here, used by both, is what stops the two from
+    drifting apart again.
+    """
+    return any(key in (options or {}) for key in _STORED_KEYS)
 
 
 def wire_options(options: Optional[dict]) -> dict:
@@ -137,7 +201,7 @@ def wire_options(options: Optional[dict]) -> dict:
       exact round-trip tests pin this).
     """
     result = {key: value for key, value in (options or {}).items() if key not in _STORED_KEYS}
-    if any(key in (options or {}) for key in _STORED_KEYS):
+    if has_stored_ct_bounds(options):
         min_mireds, max_mireds = effective_ct_bounds(options)
         result[OPTION_CT_MIN_MIREDS] = min_mireds
         result[OPTION_CT_MAX_MIREDS] = max_mireds

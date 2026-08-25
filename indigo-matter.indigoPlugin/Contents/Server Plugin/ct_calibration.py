@@ -40,10 +40,12 @@ construction — see :func:`_is_lit` — so nothing visibly happens), and
 ``ExportBridge._feed_ct_learner`` may independently adopt the very same
 values through the RE-WIDEN path before this module's own
 :meth:`ct_learner.CTBoundsLearner.adopt_measured` call gets there. That race
-is benign: :meth:`ct_learner.CTBoundsLearner._adopt` is idempotent — adopting
-a candidate equal to the already-effective value is a deliberate no-op (see
-its own "already the effective value — nothing to say twice" guard) — so the
-two paths cannot fight over the same measurement, only agree on it.
+is benign: :meth:`ct_learner.CTBoundsLearner._adopt` refuses to re-write a
+candidate that already equals the STORED learned bound for that side (see
+its own "Already RECORDED as learned — nothing to say twice" guard, which
+deliberately compares against the stored learned key rather than the
+effective bounds) — so the two paths cannot fight over the same
+measurement, only agree on it.
 
 **Threading.** :meth:`CTCalibrationEngine.start` is called from the plugin's
 Actions.xml callback (``plugin.Plugin.actionCalibrateCtBounds``) and returns
@@ -321,8 +323,35 @@ class CTCalibrationEngine:
                         reason=(f"a calibration sweep asked {extreme} mireds and the device "
                                 f"echoed back {echo}"))
                 else:
-                    side_results[side] = ("no clamp observed — echo matched the ask; the driver "
-                                          "may confirm optimistically")
+                    # No clamp: the echo landed fewer than
+                    # `ct_learner.SHORTFALL_THRESHOLD_MIREDS` mireds (that is,
+                    # 9 mireds or closer) from what was asked, so the device
+                    # reached it — the EXTREME is the measurement (not the
+                    # echo, which can still sit a few mireds off within that
+                    # band and would then record a narrower range than the
+                    # lamp actually reached).
+                    #
+                    # This is WEAK evidence, not a clamp (2026-08-25 review):
+                    # reaching an ask proves the lamp goes at least that far,
+                    # not that it would have stopped there — a driver can
+                    # confirm optimistically, which is the original reason
+                    # this result used to be discarded outright, leaving a
+                    # swept lamp that clamped nowhere indistinguishable from
+                    # one never swept. Recorded now, but ONLY where nothing
+                    # else already claims this side (`only_if_unclaimed`,
+                    # enforced by `ct_learner._adopt`, not pre-checked here —
+                    # see its docstring for why a pre-check in this module
+                    # would reintroduce the staleness bug its fresh re-read
+                    # exists to close): a stronger claim, a user's declared
+                    # seed or an earlier genuine measurement, always wins, so
+                    # this can never widen a range the user set or overwrite
+                    # a clamp a previous sweep actually measured.
+                    side_results[side] = extreme
+                    self._learner.adopt_measured(
+                        entry, side, extreme,
+                        reason=(f"a calibration sweep asked {extreme} mireds and the device "
+                                "reached it — no clamp on this side"),
+                        only_if_unclaimed=True)
         except Exception as exc:  # pylint: disable=broad-except
             self._logger.error(
                 "Matter export: the calibration sweep for device %s failed partway through — %s. "

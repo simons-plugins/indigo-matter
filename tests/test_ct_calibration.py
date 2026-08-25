@@ -165,10 +165,21 @@ def test_off_lamp_both_clamps_learned_republished_and_restored(
 
 
 # ---------------------------------------------------------------------------
-# 2. Ask == echo -> no evidence, existing learned value left untouched
+# 2. Ask == echo -> the full reach IS the measurement, and is recorded
 # ---------------------------------------------------------------------------
-def test_echo_matching_the_ask_adopts_nothing_and_leaves_existing_bound_untouched(
+def test_echo_matching_the_ask_records_the_full_reach(
         calibration_mod, ct_learner_mod, mock_indigo_base, logger, republish):  # noqa: ARG001
+    """A lamp that clamps nowhere used to store nothing, leaving it identical
+    to one nobody ever swept (2026-08-25). Recording it is now guarded by
+    `only_if_unclaimed` (issue #293 review): a no-clamp reach is weak
+    evidence — the device merely reached what was asked, which a driver can
+    confirm optimistically — so it is only ever recorded on a side nothing
+    else already claims.
+
+    The pre-existing 180-mired floor is therefore left ALONE: an existing
+    measurement already claims the min side, so the no-clamp 153 candidate is
+    refused there. The max side has no prior claim, so its no-clamp reach
+    (500) IS recorded — the display win this feature exists for."""
     import ct_bounds
     entry = _Entry(800, options={ct_bounds.OPTION_CT_LEARNED_MIN_MIREDS: 180})
     store = FakeStore([entry])
@@ -183,13 +194,93 @@ def test_echo_matching_the_ask_adopts_nothing_and_leaves_existing_bound_untouche
 
     assert engine.start(device_ids=[800], skip_lit=True) is True
 
-    assert store.upserts == []  # nothing new persisted
-    assert store.get(800).options[ct_bounds.OPTION_CT_LEARNED_MIN_MIREDS] == 180  # untouched
-    republish.assert_not_called()
+    options = store.get(800).options
+    assert options[ct_bounds.OPTION_CT_LEARNED_MIN_MIREDS] == 180
+    assert options[ct_bounds.OPTION_CT_LEARNED_MAX_MIREDS] == 500
+    assert ct_bounds.effective_ct_sources(options) == (ct_bounds.SOURCE_LEARNED,
+                                                       ct_bounds.SOURCE_LEARNED)
+    republish.assert_called()
     messages = [c.args[0] % c.args[1:] for c in logger.info.call_args_list]
     device_line = next(m for m in messages if "device 800 calibrated" in m)
-    assert "no clamp observed" in device_line
-    assert "echo matched the ask" in device_line
+    assert "153 mireds" in device_line and "500 mireds" in device_line
+
+
+def test_a_no_clamp_sweep_never_overwrites_a_users_seed(
+        calibration_mod, ct_learner_mod, mock_indigo_base, logger, republish):  # noqa: ARG001
+    """The regression this whole fix exists for: on main, a no-clamp reach
+    overwrote a user's declared seed (a real export with `{ctMinMireds: 200,
+    ctMaxMireds: 400}` published `{200, 400}` on main and `{153, 500}` after
+    an unclamped sweep). The min side is seeded here and must be left alone;
+    the max side has no claim and records normally — and, critically, the
+    WIRE still publishes the user's seeded 200, not the sweep's 153."""
+    import ct_bounds
+    entry = _Entry(800, options={ct_bounds.OPTION_CT_MIN_MIREDS: 200})
+    store = FakeStore([entry])
+    learner = ct_learner_mod.CTBoundsLearner(store, logger, republish)
+    devices = ScriptedDevices()
+    devices.add(
+        DimmerDevice(dev_id=800, name="Test Lamp", onState=False, brightness=0,
+                     whiteLevel=60, whiteTemperature=_mireds_to_kelvin(300)),
+        # Both echoes match exactly what was asked — no shortfall either side.
+        echoes_kelvin=[_mireds_to_kelvin(153), _mireds_to_kelvin(500)])
+    engine = _engine(calibration_mod, store, devices, learner, logger)
+
+    assert engine.start(device_ids=[800], skip_lit=True) is True
+
+    options = store.get(800).options
+    assert ct_bounds.OPTION_CT_LEARNED_MIN_MIREDS not in options
+    assert options[ct_bounds.OPTION_CT_MIN_MIREDS] == 200
+    assert options[ct_bounds.OPTION_CT_LEARNED_MAX_MIREDS] == 500
+    assert ct_bounds.wire_options(options) == {ct_bounds.OPTION_CT_MIN_MIREDS: 200,
+                                               ct_bounds.OPTION_CT_MAX_MIREDS: 500}
+
+
+def test_a_no_clamp_sweep_on_an_unclaimed_device_records_both_sides(
+        calibration_mod, ct_learner_mod, mock_indigo_base, logger, republish):  # noqa: ARG001
+    """No seed, no prior learned value: the display win this feature exists
+    for — a freshly exported, never-swept lamp that clamps nowhere gets both
+    sides recorded, not silently discarded."""
+    import ct_bounds
+    entry = _Entry(800)
+    store = FakeStore([entry])
+    learner = ct_learner_mod.CTBoundsLearner(store, logger, republish)
+    devices = ScriptedDevices()
+    devices.add(
+        DimmerDevice(dev_id=800, name="Test Lamp", onState=False, brightness=0,
+                     whiteLevel=60, whiteTemperature=_mireds_to_kelvin(300)),
+        echoes_kelvin=[_mireds_to_kelvin(153), _mireds_to_kelvin(500)])
+    engine = _engine(calibration_mod, store, devices, learner, logger)
+
+    assert engine.start(device_ids=[800], skip_lit=True) is True
+
+    options = store.get(800).options
+    assert options[ct_bounds.OPTION_CT_LEARNED_MIN_MIREDS] == 153
+    assert options[ct_bounds.OPTION_CT_LEARNED_MAX_MIREDS] == 500
+    assert ct_bounds.effective_ct_sources(options) == (ct_bounds.SOURCE_LEARNED,
+                                                       ct_bounds.SOURCE_LEARNED)
+
+
+def test_a_second_sweep_of_an_unclamped_lamp_persists_nothing_new(
+        calibration_mod, ct_learner_mod, mock_indigo_base, logger, republish):  # noqa: ARG001
+    """The guard that keeps the recording from becoming write churn: once the
+    full reach is stored, re-sweeping says the same thing and must not
+    re-persist or re-publish it."""
+    import ct_bounds
+    entry = _Entry(800, options={ct_bounds.OPTION_CT_LEARNED_MIN_MIREDS: 153,
+                                 ct_bounds.OPTION_CT_LEARNED_MAX_MIREDS: 500})
+    store = FakeStore([entry])
+    learner = ct_learner_mod.CTBoundsLearner(store, logger, republish)
+    devices = ScriptedDevices()
+    devices.add(
+        DimmerDevice(dev_id=800, name="Test Lamp", onState=False, brightness=0,
+                     whiteLevel=60, whiteTemperature=_mireds_to_kelvin(300)),
+        echoes_kelvin=[_mireds_to_kelvin(153), _mireds_to_kelvin(500)])
+    engine = _engine(calibration_mod, store, devices, learner, logger)
+
+    assert engine.start(device_ids=[800], skip_lit=True) is True
+
+    assert store.upserts == []
+    republish.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

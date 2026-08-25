@@ -245,7 +245,8 @@ class CTBoundsLearner:
             self._observe_locked(entry, int(mireds))
 
     # ------------------------------------------------------------------
-    def adopt_measured(self, entry, side: str, mireds: int, *, reason: str) -> None:
+    def adopt_measured(self, entry, side: str, mireds: int, *, reason: str,
+                       only_if_unclaimed: bool = False) -> None:
         """Persist one side's measurement from an EXPLICIT calibration sweep
         (``ct_calibration.CTCalibrationEngine``, issue #293's ADR-0014 Option
         C extension — active probing, rejected as an AUTOMATIC mechanism, now
@@ -272,11 +273,21 @@ class CTBoundsLearner:
         second confirmation would only cost time for no better evidence.
         Role-gated the same way ``observe`` is, for the same reason: a
         non-CT role has no bounds to learn.
+
+        ``only_if_unclaimed`` (issue #293 review): a NO-CLAMP reach — the
+        device simply reached what a sweep asked for, proving nothing about
+        where it would have stopped had it kept going — is too weak a
+        candidate to move a side anyone already has a claim on. Passed
+        through unchanged to :meth:`_adopt`, which re-reads the store fresh
+        and is therefore the only place that can check "unclaimed" against
+        what is ACTUALLY stored right now, not a snapshot this caller might
+        be holding stale.
         """
         if entry.role not in ct_bounds.CT_ROLES:
             return
         with self._lock:
-            self._adopt(entry, side, int(mireds), reason=reason)
+            self._adopt(entry, side, int(mireds), reason=reason,
+                       only_if_unclaimed=only_if_unclaimed)
 
     def _observe_locked(self, entry, mireds: int) -> None:
         device_id = entry.indigo_device_id
@@ -366,7 +377,8 @@ class CTBoundsLearner:
         self._pending[device_id] = _Pending(side=side, mireds=mireds, commanded_at=commanded.at,
                                             started_at=self._now())
 
-    def _adopt(self, entry, side: str, candidate: int, *, reason: str) -> None:
+    def _adopt(self, entry, side: str, candidate: int, *, reason: str,
+              only_if_unclaimed: bool = False) -> None:
         """Persist ``candidate`` as the learned bound for ``side``, if it says anything new.
 
         Re-reads the store FIRST and derives the current effective bounds
@@ -392,6 +404,18 @@ class CTBoundsLearner:
         Recomputing from a fresh re-read, right here, closes both gaps at
         once: no caller's bounds are trusted for the write decision, and the
         guard and the write always agree on what they are guarding.
+
+        ``only_if_unclaimed`` (issue #293 review) is for a NO-CLAMP sweep
+        candidate — the calibration engine asked for an extreme and the
+        device simply reached it, which proves the lamp goes at least that
+        far but says nothing about where it would have stopped had it been
+        asked to go further. That is real but WEAK evidence, too weak to
+        overwrite a claim anyone else already has on this side: a user's
+        SEEDED value (a declaration, not a guess) or an EXISTING learned
+        value (a stronger measurement — a genuine clamp, or an earlier
+        no-clamp reach already recorded). Checked against the fresh re-read
+        below, same as everything else in this method, for the identical
+        staleness reason.
         """
         device_id = entry.indigo_device_id
         fresh = self._store.get(device_id)
@@ -407,15 +431,46 @@ class CTBoundsLearner:
             return
         current_min, current_max = ct_bounds.effective_ct_bounds(fresh.options)
         if side == "min":
-            if candidate == current_min:
-                return  # already the effective value — nothing to say twice
             new_min, new_max = candidate, current_max
             learned_key = ct_bounds.OPTION_CT_LEARNED_MIN_MIREDS
+            seed_key = ct_bounds.OPTION_CT_MIN_MIREDS
         else:
-            if candidate == current_max:
-                return
             new_min, new_max = current_min, candidate
             learned_key = ct_bounds.OPTION_CT_LEARNED_MAX_MIREDS
+            seed_key = ct_bounds.OPTION_CT_MAX_MIREDS
+        if only_if_unclaimed and (ct_bounds.is_valid_ct_bound(fresh.options.get(learned_key))
+                                  or ct_bounds.is_valid_ct_bound(fresh.options.get(seed_key))):
+            # Named after whichever key actually claims the side — learned
+            # checked first, matching the learned-beats-seed precedence
+            # `ct_bounds._side` itself uses, so this message never credits a
+            # typed value for a side the learner already measured.
+            claimant = "an existing measurement" if ct_bounds.is_valid_ct_bound(
+                fresh.options.get(learned_key)) else "a user declaration"
+            self._logger.debug(
+                "Matter export: device %s's %s-side no-clamp calibration candidate (%s mireds) "
+                "discarded — %s already claims this side.", device_id, side, candidate, claimant)
+            return
+        if fresh.options.get(learned_key) == candidate:
+            # Already RECORDED as learned — nothing to say twice. Compared
+            # against the stored learned key, not the effective bounds
+            # (2026-08-25): those two differ for a device whose measurement
+            # happens to land on the generic edge, and the effective test
+            # made that measurement unrecordable. A sweep that asks 153
+            # mireds and gets 153 back has learned something real — the lamp
+            # reaches the full range — but "153 == the generic floor it would
+            # have used anyway" made it indistinguishable from a lamp nobody
+            # ever swept.
+            #
+            # NOT "storing it changes no published bound" (issue #293
+            # review — that was this method's own earlier claim, and it was
+            # wrong): a learned key OUTRANKS a seed key (`ct_bounds._side`),
+            # so writing 153 here would silently discard a user's seeded
+            # value on this side, were one present. What actually prevents
+            # that is the no-clamp caller's `only_if_unclaimed` guard above,
+            # which refuses to reach this far when a seed (or an earlier
+            # measurement) already claims the side — not any property of
+            # 153/500 happening to equal the generic pair.
+            return
         if new_min >= new_max:
             # Bounds sanity (#293's own requirement): an adoption must never
             # collapse or invert the range. Refused rather than silently

@@ -129,3 +129,33 @@ def test_un_trapdoor_a_bound_re_widened_back_to_generic_still_reaches_the_wire()
 
 def test_ct_roles_are_the_two_colour_temperature_roles():
     assert set(ct_bounds.CT_ROLES) == {"colorTemperatureLight", "extendedColorLight"}
+
+
+# ---------------------------------------------------------------------------
+# Provenance (2026-08-25 — the dialog has to say which side was measured)
+# ---------------------------------------------------------------------------
+def test_sources_follow_the_same_precedence_as_the_values():
+    """Two walks of one rule is a drift risk, so this pins them together: the
+    source reported for a side must be the source the value came from."""
+    options = {ct_bounds.OPTION_CT_LEARNED_MAX_MIREDS: 400,
+               ct_bounds.OPTION_CT_MIN_MIREDS: 200,
+               ct_bounds.OPTION_CT_MAX_MIREDS: 450}
+    assert ct_bounds.effective_ct_bounds(options) == (200, 400)
+    assert ct_bounds.effective_ct_sources(options) == (ct_bounds.SOURCE_SEED,
+                                                       ct_bounds.SOURCE_LEARNED)
+
+
+def test_sources_are_generic_when_nothing_is_stored():
+    assert ct_bounds.effective_ct_sources({}) == (ct_bounds.SOURCE_GENERIC,
+                                                  ct_bounds.SOURCE_GENERIC)
+    assert ct_bounds.effective_ct_sources(None) == (ct_bounds.SOURCE_GENERIC,
+                                                    ct_bounds.SOURCE_GENERIC)
+
+
+def test_a_hand_edited_non_integer_bound_is_not_reported_as_its_source():
+    """`is_valid_ct_bound` is what the VALUE walk uses to skip a hand-edited
+    ``.indiPref`` entry; the source walk has to skip the same one, or the
+    dialog would credit the learner for a value it is not publishing."""
+    options = {ct_bounds.OPTION_CT_LEARNED_MAX_MIREDS: "400"}
+    assert ct_bounds.effective_ct_bounds(options)[1] == ct_bounds.GENERIC_MAX_MIREDS
+    assert ct_bounds.effective_ct_sources(options)[1] == ct_bounds.SOURCE_GENERIC

@@ -644,6 +644,70 @@ def test_adopt_measured_collapse_refusal_reuses_adopt_s_own_guard(learner, store
 
 
 # ---------------------------------------------------------------------------
+# only_if_unclaimed — the calibration engine's no-clamp guard (issue #293
+# review: a no-clamp reach is weak evidence and must never overwrite a
+# stronger claim — a user's declared seed, or an existing measurement).
+# ---------------------------------------------------------------------------
+def test_only_if_unclaimed_refuses_a_seeded_side(learner, store, republish):
+    """The regression this guard exists for: a user's declared
+    ``ctMinMireds`` seed must survive a no-clamp sweep untouched."""
+    store.upsert(_Entry(800, options={ct_bounds.OPTION_CT_MIN_MIREDS: 200}))
+    store.upserts.clear()
+    learner.adopt_measured(_entry(store), "min", 153, reason="no clamp",
+                          only_if_unclaimed=True)
+    assert store.upserts == []
+    republish.assert_not_called()
+    assert store.get(800).options == {ct_bounds.OPTION_CT_MIN_MIREDS: 200}
+
+
+def test_only_if_unclaimed_refuses_an_already_learned_side(learner, store, republish):
+    """A side an earlier measurement already claims is not overwritten by a
+    later, weaker no-clamp candidate for the same side."""
+    store.upsert(_Entry(800, options={ct_bounds.OPTION_CT_LEARNED_MAX_MIREDS: 420}))
+    store.upserts.clear()
+    learner.adopt_measured(_entry(store), "max", 500, reason="no clamp",
+                          only_if_unclaimed=True)
+    assert store.upserts == []
+    republish.assert_not_called()
+    assert store.get(800).options == {ct_bounds.OPTION_CT_LEARNED_MAX_MIREDS: 420}
+
+
+def test_only_if_unclaimed_writes_when_nothing_claims_the_side(learner, store, republish):
+    """No seed, no prior learned value: the candidate is adopted normally —
+    the display win this guard must not cost."""
+    learner.adopt_measured(_entry(store), "min", 153, reason="no clamp",
+                          only_if_unclaimed=True)
+    assert store.get(800).options[ct_bounds.OPTION_CT_LEARNED_MIN_MIREDS] == 153
+    republish.assert_called_once_with(800)
+
+
+def test_only_if_unclaimed_is_false_by_default_and_can_overwrite_a_seed(
+        learner, store, republish):
+    """Backward compatibility: every OTHER caller (the shortfall/re-widen
+    paths through ``observe``, and a clamp reading from the calibration
+    engine) never passes ``only_if_unclaimed`` and must keep today's
+    behaviour — a genuine measurement outranks a seed, exactly as before."""
+    store.upsert(_Entry(800, options={ct_bounds.OPTION_CT_MIN_MIREDS: 200}))
+    store.upserts.clear()
+    learner.adopt_measured(_entry(store), "min", 180, reason="a real clamp")
+    assert store.get(800).options[ct_bounds.OPTION_CT_LEARNED_MIN_MIREDS] == 180
+    republish.assert_called_once_with(800)
+
+
+def test_only_if_unclaimed_refusal_is_logged_at_debug_naming_the_reason(
+        learner, store, republish):  # noqa: ARG001
+    store.upsert(_Entry(800, options={ct_bounds.OPTION_CT_MIN_MIREDS: 200}))
+    store.upserts.clear()
+    learner.adopt_measured(_entry(store), "min", 153, reason="no clamp",
+                          only_if_unclaimed=True)
+    learner._logger.debug.assert_called_once()
+    args = learner._logger.debug.call_args.args
+    message = args[0] % args[1:]
+    assert "800" in message and "min" in message and "153" in message
+    assert "already claims this side" in message
+
+
+# ---------------------------------------------------------------------------
 # The 2026-08-24 15:39 incident — a stale caller snapshot must never gate
 # the write. `_adopt` re-reads the store itself for its guard; the `entry`
 # a caller passes in is used only for `indigo_device_id`/role, never trusted

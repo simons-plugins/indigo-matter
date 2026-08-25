@@ -3,6 +3,48 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
+## 2026.28.1 — learned colour-temperature bounds are now visible in the UI
+
+Issue #293 shipped the learner and the calibration sweep, but nothing in the
+plugin's UI ever displayed what they found: the export dialog's two Kelvin
+fields read only the user's SEED, so a lamp whose real range had been
+measured showed two empty boxes — indistinguishable from a lamp that had
+never been calibrated. Six exports on the live server were in exactly that
+state.
+
+- **The two Kelvin fields now show the EFFECTIVE bounds** (learned, else
+  seed, else generic per side), with a new read-only "Range shown:" line
+  saying, per side, whether the number was measured from the device or typed
+  by the user.
+- **An unedited field is no longer saved as a declaration.** The dialog
+  records what it put on screen, and writes `ctMinMireds`/`ctMaxMireds` only
+  for a value that actually changed — so pressing "Add / update export" for
+  an unrelated reason (a rename) can no longer copy the learner's evidence
+  into a seed that would outlive it. Editing a value still declares it, and
+  clearing both still returns the device to the generic range.
+- **The "Currently exported" list carries the range** (e.g.
+  `Cats Lamp → Colour-temperature light · 2203-5000K measured`), so whether
+  a calibration took can be read for every lamp at once. Silent for the
+  generic range, which every un-calibrated export would otherwise repeat
+  identically.
+- **A sweep that finds no clamp now records the full range instead of
+  discarding it — but only where nothing else already claims that side.**
+  A lamp measured as reaching the whole 153-500 mired range used to store
+  nothing at all, leaving it indistinguishable from one nobody ever swept.
+  It can now store `ctLearnedMinMireds: 153`/`ctLearnedMaxMireds: 500`,
+  letting the plugin say the range was measured — but a no-clamp reach is
+  weak evidence (the device merely reached what was asked, which a driver
+  can confirm optimistically), so it is recorded only on a side nothing
+  else already claims: a user's declared seed, or an earlier measurement,
+  always wins. It can therefore never widen a range the user set, and never
+  overwrite a clamp a previous sweep actually measured. The learner's
+  "nothing new to say" guard moved with it, from "equals the effective
+  bounds" to "equals the stored learned key", which is what made a
+  measurement landing on the generic edge unrecordable.
+- A displayed bound is clamped to what the fields accept: 153 mireds is
+  6536K, one Kelvin above the 6535K ceiling, and editing the other field
+  would have bounced the save over a number the plugin itself supplied.
+
 ## 2026.28.0 — app-level session hygiene against the matter.js report-routing defect (issue #283 "Finding 2")
 
 - **New: the bridge node now closes stale CASE sessions on its own**, ahead
