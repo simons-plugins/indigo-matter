@@ -91,7 +91,14 @@ def _values(**kwargs):
     base = {"exportFilter": "", "exportDevice": "0", "exportRole": "",
             "exportName": "", "exportInvert": False, "exportStatus": "",
             "exportNeedsMapping": "false", "exportStateKey": "", "exportStateInvert": False,
-            "exportCtWarmestK": "", "exportCtCoolestK": ""}
+            "exportCtWarmestK": "", "exportCtCoolestK": "",
+            # Present but empty, not absent: matches a real dialog session,
+            # where `exportDeviceChanged` has always already run by the time
+            # a save reaches the plugin and sets these to "" for a device
+            # with nothing shown yet (`_apply_ct_bounds_fields`). A test that
+            # needs the genuinely ABSENT case (no prior `exportDeviceChanged`
+            # at all) deletes these keys explicitly.
+            "exportCtWarmestKShown": "", "exportCtCoolestKShown": ""}
     base.update(kwargs)
     return base
 
@@ -196,6 +203,24 @@ def test_ct_bounds_fields_carry_the_reciprocal_kelvin_direction_in_their_labels(
     inverted range with no code able to catch the mistake."""
     assert "Warmest" in _ct_field("exportCtWarmestK").findtext("Label")
     assert "Coolest" in _ct_field("exportCtCoolestK").findtext("Label")
+
+
+@pytest.mark.parametrize("field_id", ["exportCtWarmestKShown", "exportCtCoolestKShown"])
+def test_ct_bounds_shadow_fields_are_hidden(field_id):
+    """The shadow fields must never be visible on screen — they only carry
+    what was last PUT there, for `_ct_seed_from_values` to compare against."""
+    assert _ct_field(field_id).get("hidden") == "true"
+
+
+def test_ct_bounds_source_field_is_readonly_and_role_bound():
+    """A readonly textfield, not a label (the dialog header's own reason:
+    Indigo labels are static, and this line has to say which side was
+    measured and which was typed)."""
+    field = _ct_field("exportCtBoundsSource")
+    assert field.get("readonly") == "true"
+    assert field.get("visibleBindingId") == "exportRole"
+    xml_roles = set(field.get("visibleBindingValue").split(","))
+    assert xml_roles == {"colorTemperatureLight", "extendedColorLight"}
 
 
 # ---------------------------------------------------------------------------
@@ -645,6 +670,25 @@ def test_current_exports_says_nothing_for_the_generic_ct_range(plug, devices):
     assert "K" not in _labels(plug.getCurrentExports())[str(device_id)].split("→")[1]
 
 
+def test_current_exports_stays_silent_for_an_unrelated_option_with_no_ct_bound(
+        plug, devices):
+    """Issue #293 review: the row note used to gate on `wire_options(entry.
+    options)` truthiness, which is ALSO true for an unrelated, non-CT option
+    — making a lamp with no CT bound at all announce the generic
+    2000-6535K as though it had been measured. Every option key
+    `_validate_options` actually recognises is role-exclusive with the CT
+    roles (an `invert`/`stateKey` pair on a `colorTemperatureLight` is
+    refused outright), so this uses an option key outside that recognised
+    set entirely — the shape a hand-edited `.indiPref` or a newer plugin
+    version's not-yet-validated key would take — bypassing `upsert`'s own
+    validation (which does not reject unknown keys) to reach the store
+    directly, the same way a restored backup would."""
+    device_id = _ct_device(devices)
+    entry = ExportEntry(device_id, "colorTemperatureLight", options={"someFutureOption": True})
+    plug.exports._entries[device_id] = entry  # pylint: disable=protected-access
+    assert "K" not in _labels(plug.getCurrentExports())[str(device_id)].split("→")[1]
+
+
 def test_current_exports_says_nothing_about_bounds_for_a_non_ct_role(plug, devices):
     device_id = _ct_device(devices)
     plug.exports.upsert(ExportEntry(device_id, "dimmableLight"))
@@ -812,6 +856,32 @@ def test_device_changed_says_which_side_was_measured_and_which_was_typed(plug, d
     source = values["exportCtBoundsSource"]
     assert "2500K (measured from the device)" in source
     assert "5000K (as you set it)" in source
+
+
+def test_device_changed_warns_a_measured_side_wont_take_a_typed_override(plug, devices):
+    """Issue #293 review: with a side LEARNED, neither half of the seed/
+    generic-only trailer holds — editing writes a seed that loses to the
+    learned bound, and clearing both leaves the learned side exactly where
+    it was. The line must say something true instead."""
+    device_id = _ct_device(devices)
+    plug.exports.upsert(ExportEntry(device_id, "colorTemperatureLight",
+                                    options={OPTION_CT_LEARNED_MAX_MIREDS: 400}))
+    values = plug.exportDeviceChanged(_values(exportDevice=str(device_id)), "manageMatterExports")
+    source = values["exportCtBoundsSource"]
+    assert "clear both for the generic range" not in source
+    assert "measured value is what the plugin publishes" in source
+
+
+def test_device_changed_keeps_the_override_hint_for_a_seed_only_range(plug, devices):
+    """The seed/generic-only trailer stays exactly as it was when NEITHER
+    side has been measured — nothing false about it in that case."""
+    device_id = _ct_device(devices)
+    plug.exports.upsert(ExportEntry(device_id, "colorTemperatureLight",
+                                    options={OPTION_CT_MIN_MIREDS: 200,
+                                             OPTION_CT_MAX_MIREDS: 450}))
+    values = plug.exportDeviceChanged(_values(exportDevice=str(device_id)), "manageMatterExports")
+    source = values["exportCtBoundsSource"]
+    assert "Change a value to override it; clear both for the generic range." in source
 
 
 def test_device_changed_explains_the_generic_range_rather_than_pre_filling_it(plug, devices):
@@ -1112,6 +1182,47 @@ def test_clearing_both_shown_fields_still_deletes_the_seed(plug, devices):
         _reopen(plug, device_id, exportCtWarmestK="", exportCtCoolestK=""),
         "manageMatterExports")
     assert plug.exports.get(device_id).options == {}
+
+
+def test_add_with_shadow_keys_entirely_absent_leaves_the_existing_seed_untouched(
+        plug, devices):
+    """Issue #293 review: absent shadow keys give `_ct_seed_from_values`
+    nothing to compare the fields against, so the save must fail SAFE as
+    UNEDITED rather than inferring an edit from a comparison it cannot make
+    — the regression this guards: on main, prefilled fields + absent shadows
+    compared unequal, so the plugin wrote its OWN displayed value back as if
+    the user had typed it. A device with a DIFFERENT existing seed than what
+    the typed fields would produce makes that failure visible: without the
+    fix, this save would silently replace 420/180 with 400/200."""
+    device_id = _ct_device(devices)
+    plug.exports.upsert(ExportEntry(device_id, "colorTemperatureLight",
+                                    options={OPTION_CT_MIN_MIREDS: 180,
+                                             OPTION_CT_MAX_MIREDS: 420}))
+    values = _values(exportDevice=str(device_id), exportRole="colorTemperatureLight",
+                     exportCtWarmestK="2500", exportCtCoolestK="5000")
+    del values["exportCtWarmestKShown"]
+    del values["exportCtCoolestKShown"]
+    plug.exportAddOrUpdate(values, "manageMatterExports")
+    assert plug.exports.get(device_id).options == {OPTION_CT_MIN_MIREDS: 180,
+                                                   OPTION_CT_MAX_MIREDS: 420}
+
+
+def test_ct_seed_present_but_empty_shadow_keeps_exact_comparison_semantics(plug):
+    """A present-but-empty shadow is a REAL, DISTINCT state from an absent
+    one (issue #293 review) — both boxes were genuinely blank when last
+    shown — and must keep the exact tuple comparison rather than being swept
+    into the absent-shadow fail-safe above. Proven with the SAME typed
+    fields and existing seed as the absent-shadow test: an absent shadow has
+    nothing to compare against and falls back to carrying the seed forward
+    untouched; a present, genuinely-blank shadow instead runs the real
+    comparison, sees the typed values do not match what was shown (blank),
+    and correctly reads them as a fresh declaration."""
+    previous = {OPTION_CT_MIN_MIREDS: 180, OPTION_CT_MAX_MIREDS: 420}
+    values = {"exportCtWarmestK": "2500", "exportCtCoolestK": "5000",
+             "exportCtWarmestKShown": "", "exportCtCoolestKShown": ""}
+    options, error = plug._ct_seed_from_values(values, previous)
+    assert error is None
+    assert options == {OPTION_CT_MIN_MIREDS: 200, OPTION_CT_MAX_MIREDS: 400}
 
 
 def test_add_preserves_the_learned_bound_alongside_a_new_seed(plug, devices):

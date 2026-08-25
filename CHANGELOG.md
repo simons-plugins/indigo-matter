@@ -28,15 +28,19 @@ state.
   generic range, which every un-calibrated export would otherwise repeat
   identically.
 - **A sweep that finds no clamp now records the full range instead of
-  discarding it.** A lamp measured as reaching the whole 153-500 mired range
-  used to store nothing at all, leaving it indistinguishable from one nobody
-  ever swept. It stores `ctLearnedMinMireds: 153`/`ctLearnedMaxMireds: 500`
-  now — the same pair the generic range publishes, so nothing on the wire
-  changes and no ecosystem sees a different bound; the only difference is
-  that the plugin can say the range was measured. The learner's "nothing new
-  to say" guard moved with it, from "equals the effective bounds" to "equals
-  the stored learned key", which is what made a measurement landing on the
-  generic edge unrecordable.
+  discarding it — but only where nothing else already claims that side.**
+  A lamp measured as reaching the whole 153-500 mired range used to store
+  nothing at all, leaving it indistinguishable from one nobody ever swept.
+  It can now store `ctLearnedMinMireds: 153`/`ctLearnedMaxMireds: 500`,
+  letting the plugin say the range was measured — but a no-clamp reach is
+  weak evidence (the device merely reached what was asked, which a driver
+  can confirm optimistically), so it is recorded only on a side nothing
+  else already claims: a user's declared seed, or an earlier measurement,
+  always wins. It can therefore never widen a range the user set, and never
+  overwrite a clamp a previous sweep actually measured. The learner's
+  "nothing new to say" guard moved with it, from "equals the effective
+  bounds" to "equals the stored learned key", which is what made a
+  measurement landing on the generic edge unrecordable.
 - A displayed bound is clamped to what the fields accept: 153 mireds is
   6536K, one Kelvin above the 6535K ceiling, and editing the other field
   would have bounced the save over a number the plugin itself supplied.

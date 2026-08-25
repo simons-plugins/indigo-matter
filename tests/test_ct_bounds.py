@@ -153,7 +153,7 @@ def test_sources_are_generic_when_nothing_is_stored():
 
 
 def test_a_hand_edited_non_integer_bound_is_not_reported_as_its_source():
-    """`_is_ct_int` is what the VALUE walk uses to skip a hand-edited
+    """`is_valid_ct_bound` is what the VALUE walk uses to skip a hand-edited
     ``.indiPref`` entry; the source walk has to skip the same one, or the
     dialog would credit the learner for a value it is not publishing."""
     options = {ct_bounds.OPTION_CT_LEARNED_MAX_MIREDS: "400"}

@@ -17,7 +17,7 @@ from export_store import (CT_BOUNDS_ROLES, ExportEntry, MAPPABLE_ROLES, OPTION_C
                           OPTION_INVERT, OPTION_STATE_INVERT, OPTION_STATE_KEY)
 from ct_bounds import (GENERIC_MAX_MIREDS, GENERIC_MIN_MIREDS, SOURCE_GENERIC,
                        SOURCE_LEARNED, SOURCE_SEED, effective_ct_bounds,
-                       effective_ct_sources, wire_options)
+                       effective_ct_sources, has_stored_ct_bounds)
 from matter_handlers.color_control import kelvin_to_mireds, mireds_to_kelvin
 from plugin_constants import (
     EXCLUDED_OPTION_PREFIX, EXPORT_PICKER_LIMIT, LIST_ERROR_OPTION,
@@ -488,15 +488,25 @@ class ExportDialogMixin:
         this (2026-08-25: six devices on the live server had learned bounds
         that nothing in the UI displayed).
 
-        Silent only when NOTHING is stored — the same "is any bound recorded
-        here" test :func:`ct_bounds.wire_options` uses to decide what reaches
-        the wire, deliberately not "does the pair differ from generic". A lamp
-        the calibration sweep measured as reaching the full 153-500 stores
+        Silent only when NOTHING is stored — :func:`ct_bounds.
+        has_stored_ct_bounds`, the same "is any bound recorded here" test
+        :func:`ct_bounds.wire_options` uses to decide what reaches the wire,
+        deliberately not "does the pair differ from generic". A lamp the
+        calibration sweep measured as reaching the full 153-500 stores
         exactly the generic pair, and that row has something to say: the range
         was measured. An un-swept lamp stores nothing and stays silent, so the
         rows still differ where it matters.
+
+        Deliberately NOT ``wire_options(entry.options)`` truthiness (issue
+        #293 review): that dict carries every non-CT option too, so it is
+        also truthy for an entry with an unrelated option and no CT bound at
+        all, which made that row announce the generic 2000-6535K as if it
+        had been measured. ``has_stored_ct_bounds`` is exported from
+        ``ct_bounds`` specifically so this check and :func:`wire_options`'s
+        own gate share the one test rather than risking the two drifting
+        apart again.
         """
-        if entry.role not in CT_BOUNDS_ROLES or not wire_options(entry.options):
+        if entry.role not in CT_BOUNDS_ROLES or not has_stored_ct_bounds(entry.options):
             return ""
         eff_min, eff_max = effective_ct_bounds(entry.options)
         # Through the same clamp the dialog fields use, so one lamp never
@@ -579,7 +589,24 @@ class ExportDialogMixin:
         cool_raw = str(values.get("exportCtCoolestK", "") or "").strip()
         shown_warm = str(values.get("exportCtWarmestKShown", "") or "").strip()
         shown_cool = str(values.get("exportCtCoolestKShown", "") or "").strip()
-        if (warm_raw, cool_raw) == (shown_warm, shown_cool):
+        # Absent shadow keys (issue #293 review) mean this call has nothing
+        # to compare the fields against — fail SAFE by treating the save as
+        # UNEDITED rather than inferring an edit from a comparison it cannot
+        # make. Both directions of the bug this avoids are real: prefilled
+        # fields + absent shadows used to compare unequal, silently writing
+        # the learner's own DISPLAYED value back as a user seed — precisely
+        # what this whole shadow mechanism exists to prevent; and cleared
+        # fields + absent shadows made ("", "") == ("", "") true by
+        # accident, turning the documented "clear both deletes the seed"
+        # gesture into a silent no-op.
+        #
+        # A shadow key PRESENT but EMPTY is a different, meaningful state —
+        # both boxes were genuinely blank the last time the dialog showed
+        # them — and keeps comparing exactly as before; only the TOTAL
+        # absence of both keys is ambiguous enough to fail safe on.
+        shadows_absent = ("exportCtWarmestKShown" not in values
+                          and "exportCtCoolestKShown" not in values)
+        if shadows_absent or (warm_raw, cool_raw) == (shown_warm, shown_cool):
             stored = previous_options or {}
             return ({key: stored[key]
                      for key in (OPTION_CT_MIN_MIREDS, OPTION_CT_MAX_MIREDS)
@@ -881,10 +908,20 @@ class ExportDialogMixin:
         values["exportCtCoolestK"] = cool
         values["exportCtWarmestKShown"] = warm
         values["exportCtCoolestKShown"] = cool
+        if SOURCE_LEARNED in (min_source, max_source):
+            # Neither half of the seed/generic-only trailer holds once a
+            # side is measured (issue #293 review): editing that side writes
+            # a seed, which LOSES to the learned bound (`ct_bounds._side`),
+            # so the field would silently revert on reopen; and clearing
+            # both deletes only the seed key, so a learned side stays
+            # published at its measured value, not the generic range.
+            trailer = ("A measured value is what the plugin publishes; typing over it only "
+                      "takes effect on a side that has not been measured yet.")
+        else:
+            trailer = "Change a value to override it; clear both for the generic range."
         values["exportCtBoundsSource"] = (
             f"Warmest {warm}K ({self._CT_SOURCE_PHRASE[max_source]}), "
-            f"coolest {cool}K ({self._CT_SOURCE_PHRASE[min_source]}). "
-            "Change a value to override it; clear both for the generic range.")
+            f"coolest {cool}K ({self._CT_SOURCE_PHRASE[min_source]}). {trailer}")
 
     @classmethod
     def _kelvin_shown(cls, mireds: int) -> str:

@@ -297,7 +297,7 @@ A Matter pairing code is not durable: once used, or once the window expires (up 
                    visibleBindingId="exportRole"
                    visibleBindingValue="colorTemperatureLight,extendedColorLight"
                    alwaysUseInDialogHeightCalc="true">
-                <Label>Optional, 2000-6535K. Declares the bulb's real warm/cool limits so paired ecosystems never ask for a colour it cannot reach. Leave both empty for the generic range. The plugin also learns this automatically from what the device actually does — this is only a starting point.</Label>
+                <Label>Optional, 2000-6535K. Declares the bulb's real warm/cool limits so paired ecosystems never ask for a colour it cannot reach — a starting point only: the plugin also learns this automatically from what the device actually does, and a measured side always takes priority over a typed value there. Clearing both removes what you typed; a side the plugin has already measured stays published at its measured value, not the generic range.</Label>
             </Field>
             <Field id="exportName" type="textfield">
                 <Label>Name in ecosystems:</Label>
