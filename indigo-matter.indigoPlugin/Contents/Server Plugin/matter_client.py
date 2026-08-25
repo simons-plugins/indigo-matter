@@ -260,7 +260,7 @@ class MatterClient(WsJsonClient):
         own RPC deadline (a sleepy Thread node) can still answer after this
         plugin gives up waiting; without a context, that answer's code dies
         in :meth:`WsJsonClient._log_unmatched` as a payload-free debug line.
-        ``ServerMenuMixin._note_late_share_response`` is the consumer.
+        ``MatterServerMenuMixin._note_late_share_response`` is the consumer.
         """
         args = {protocol.ARG_NODE_ID: node_id}
         if duration is not None:

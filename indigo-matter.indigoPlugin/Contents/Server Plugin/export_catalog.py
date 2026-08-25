@@ -487,7 +487,7 @@ def excluded_row(verdict: Excluded, device_id, name: str, mark: str,
     """The picker row for an :class:`Excluded` verdict (XAC9) — shared,
     byte-for-byte, by every device picker that lists exclusions with their
     reason (``ExportDialogMixin._candidate_row``,
-    ``ServerMenuMixin._readopt_device_row``).
+    ``ExportRecoveryMenuMixin._readopt_device_row``).
 
     Returns ``None`` for the loop guard: XAC6 requires that row ABSENT, not
     merely unpickable, so the caller must omit it rather than show it

@@ -1258,7 +1258,7 @@ class TestReattach:
         """Composition check for the #246 migrate commit, with the REAL
         ``ExportBridge.reattach`` against a ``FakeBridgeClient`` rather than a
         mock: ``ExportStore.replace_all`` moves an entry's DEVICE while
-        KEEPING its identity (``server_menu_mixin._migrate_commit``'s one
+        KEEPING its identity (``export_recovery_menu_mixin._migrate_commit``'s one
         atomic write), and the resulting attach frame's endpoint spec has to
         carry exactly that — the TARGET device id, publishing the MIGRATED
         identity — with nothing in between building or mocking the spec.

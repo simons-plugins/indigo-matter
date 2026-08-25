@@ -271,7 +271,7 @@ class LaunchAgent:
         **Why (a) is validated at all** (issue #101). The pin used to be trusted
         on an npx-EXISTS check alone, and the install menu re-writes it from
         ``resolved_bin_dir`` after every successful install (the write is in
-        ``ServerMenuMixin._install_matter_server``, not in ``install()`` itself)
+        ``MatterServerMenuMixin._install_matter_server``, not in ``install()`` itself)
         — so once a pin existed it was self-perpetuating. A user whose pin pointed at a leftover
         ``/usr/local/bin/node`` (an old Node.js ``.pkg``, or Intel Homebrew on an
         Apple-Silicon Mac) got the obvious remedy — install a current node, retry
@@ -1638,7 +1638,7 @@ class LaunchAgent:
         """Carry a pending #187 verification over from the instance THIS one replaces.
 
         The armed deadline lives on the instance, not anywhere prefs-durable, and
-        ``server_menu_mixin.py`` rebuilds a fresh agent on every call (ports and
+        ``bridge_agent_menu_mixin.py`` rebuilds a fresh agent on every call (ports and
         the mDNS interface are prefs, which may have changed since the last one).
         A rebuild whose own ``ensure_installed()`` takes the digest-match "leave
         alone" path — no fresh bootstrap on THIS instance — would otherwise

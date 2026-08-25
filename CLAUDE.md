@@ -46,7 +46,7 @@ Two directions, sharing almost nothing:
   matter.js is imported (workspace ADR-0006).
 
 `plugin.py` is lifecycle glue and the device/action bridge; everything Indigo
-reaches by XML-named callback lives in one of five mixins, because Indigo resolves
+reaches by XML-named callback lives in one of seven mixins, because Indigo resolves
 those names as attributes on the `Plugin` class (issue #146).
 
 **→ Per-module detail is in [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md).**

@@ -3098,7 +3098,7 @@ class TestMenuMigrateExportSuccess:
 
     def test_a_deleted_source_device_still_commits_with_a_placeholder_label(self, plug, devices):
         """The allow-list entry is the legitimate migrate source even once its
-        Indigo device is gone (:meth:`ServerMenuMixin.getMigrateSources`'s own
+        Indigo device is gone (:meth:`ExportRecoveryMenuMixin.getMigrateSources`'s own
         contract) — the commit must not depend on a live source device, and
         the confirmation has to fall back to `_migrate_source_display_name`'s
         "device <id>" placeholder rather than raising."""
@@ -3384,7 +3384,7 @@ def test_migrate_drops_a_mapping_the_new_device_cannot_honour(plug, devices):
 def test_migrate_still_carries_non_mapping_options_from_the_source():
     """Window-covering polarity and anything else still follows the accessory —
     only the state mapping is device-scoped."""
-    from server_menu_mixin import _migrated_options
+    from export_recovery_menu_mixin import _migrated_options
     carried = _migrated_options({"invert": True, "stateKey": "old"},
                                 {"stateKey": "status", "stateInvert": True})
     assert carried == {"invert": True, "stateKey": "status", "stateInvert": True}
