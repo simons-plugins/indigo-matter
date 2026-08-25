@@ -305,6 +305,12 @@ class TestCommands:
         assert self._exchange(mock_logger, lambda c: c.remove_endpoint(123456789),
                               "remove_endpoint", EXCHANGES) is True
 
+    def test_remove_endpoint_permanent(self, mock_logger):
+        # Issue #274 — the confirmed-gone declaration reaches the wire.
+        assert self._exchange(
+            mock_logger, lambda c: c.remove_endpoint(123456789, permanent=True),
+            "remove_endpoint_permanent", EXCHANGES) is True
+
     def test_remove_endpoint_absent_is_not_an_error(self, mock_logger):
         # §3.3: idempotent — removing what is not there succeeds with removed=false.
         async def scenario():

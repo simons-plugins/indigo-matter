@@ -177,6 +177,31 @@ export function parsePreserveEndpointNumbers(value: unknown): boolean {
     return value;
 }
 
+/**
+ * §3.3: whether a `remove_endpoint` is a PERMANENT departure — the driving
+ * Indigo device is confirmed gone (deleted, or deliberately un-exported) —
+ * rather than the removal half of a role-change/re-adopt `replace()`, which
+ * the plugin always follows with an `upsert_endpoint` for the same identity
+ * (issue #274).
+ *
+ * Absent means `false`, matching every `remove_endpoint` call before this
+ * flag existed: the two-command supersede/re-adopt sequence
+ * (`export_bridge.replace()`) must keep getting the ORIGINAL soft removal —
+ * orphaned, not destroyed — so the second command's `upsert_endpoint` still
+ * has an entry to retroactively mark `supersededBy`, or to hand back to the
+ * re-adopt picker. Only a caller that KNOWS the device will never come back
+ * opts in explicitly.
+ */
+export function parsePermanentRemoval(value: unknown): boolean {
+    if (value === undefined) {
+        return false;
+    }
+    if (typeof value !== "boolean") {
+        throw new ProtocolError(ErrorCode.malformedArgs, "permanent must be a boolean");
+    }
+    return value;
+}
+
 /** §3.1: the opt-in that makes emptying the endpoint set deliberate. */
 export function parseReplaceAll(intent: unknown): boolean {
     if (intent === undefined) {

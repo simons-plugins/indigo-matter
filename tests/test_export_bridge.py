@@ -1138,6 +1138,77 @@ class TestIncrementalCrud:
 
 
 # ---------------------------------------------------------------------------
+# Issue #274: a device deleted while the plugin was DOWN is destroyed, not
+# orphaned, at the next classify pass — closing the gap `deviceDeleted`
+# cannot, because nothing fired it.
+# ---------------------------------------------------------------------------
+def _attached_status():
+    return bridge_protocol.parse_status({
+        "commissioned": True, "fabrics": [], "endpointCount": 0,
+        "endpoints": [], "drift": [], "driftChecked": True,
+    })
+
+
+class TestConfirmedDeletedSweep:
+    def test_a_device_missing_at_classify_time_is_removed_from_the_allow_list_and_destroyed(
+            self, bridge_mod, mock_logger, devices):
+        # 999 is not in the `devices` fixture at all — exactly "the Indigo
+        # device no longer exists" per `_spec_for`.
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(999, "onOffLight")])
+        h.start()  # endpoint_specs() runs here; 999 is skipped, never sent
+
+        assert h.store.get(999) is not None, "not yet — only _on_attached acts on it"
+        assert h.client.names() == [], "too early to send remove_endpoint: not attached yet"
+
+        h.bridge._on_attached(_attached_status())
+
+        assert h.store.get(999) is None, "confirmed-gone entries leave the allow-list"
+        assert h.client.only("remove_endpoint") == ("remove_endpoint", 999, "permanent")
+
+    def test_a_device_that_still_exists_but_fails_classify_is_left_alone(
+            self, bridge_mod, mock_logger, devices, unbridgeable_role):
+        # 101 IS in the `devices` fixture — classify fails for an unrelated
+        # reason (no handler for its role), which must NOT be treated the
+        # same as "the device is gone".
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(101, unbridgeable_role)])
+        h.start()
+
+        h.bridge._on_attached(_attached_status())
+
+        assert h.store.get(101) is not None, "still exists — must not be dropped from the allow-list"
+        assert "remove_endpoint" not in h.client.names(), "must not be destroyed for a classify failure"
+
+    def test_draining_is_one_shot_per_discovery(self, bridge_mod, mock_logger, devices):
+        """A second `_on_attached` with nothing newly discovered sends nothing
+        more — the set is drained, not merely read."""
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(999, "onOffLight")])
+        h.start()
+        h.bridge._on_attached(_attached_status())
+        assert h.client.names().count("remove_endpoint") == 1
+
+        h.bridge._on_attached(_attached_status())
+
+        assert h.client.names().count("remove_endpoint") == 1, "nothing left queued to re-send"
+
+    def test_a_store_write_failure_still_reports_but_does_not_crash_the_attach(
+            self, bridge_mod, mock_logger, devices, monkeypatch):
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(999, "onOffLight")])
+        h.start()
+
+        def _fail_remove(device_id):
+            raise RuntimeError("prefs are read-only")
+
+        monkeypatch.setattr(h.store, "remove", _fail_remove)
+
+        h.bridge._on_attached(_attached_status())  # must not raise
+
+        assert h.logger.error.called
+        # The wire is still told, even though the store write failed — the
+        # device is gone either way (mirrors `deviceDeleted`'s own ordering).
+        assert h.client.only("remove_endpoint") == ("remove_endpoint", 999, "permanent")
+
+
+# ---------------------------------------------------------------------------
 # The migrate nudge — a full mid-session attach (issue #246)
 # ---------------------------------------------------------------------------
 def _migrate_status(endpoint_count=1):

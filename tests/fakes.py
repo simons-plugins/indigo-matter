@@ -297,8 +297,13 @@ class FakeBridgeClient:
     async def upsert_endpoint(self, spec, timeout=None):
         return self._record("upsert_endpoint", spec)
 
-    async def remove_endpoint(self, device_id, timeout=None):
-        return self._record("remove_endpoint", device_id)
+    async def remove_endpoint(self, device_id, *, permanent=False, timeout=None):
+        # Issue #274 — mirrors the wire's own "omit unless True" convention
+        # (`bridge_protocol.build_remove_endpoint`): every call recorded
+        # before this flag existed still matches `("remove_endpoint",
+        # device_id)` exactly, and only a caller that opted into `permanent`
+        # sees the extra element.
+        return self._record("remove_endpoint", device_id, *(("permanent",) if permanent else ()))
 
     async def set_state(self, device_id, states):
         return self._record("set_state", device_id, dict(states))

@@ -33,6 +33,7 @@ import {
     parseEndpointSpec,
     parseEndpointSpecs,
     parseFabricIndex,
+    parsePermanentRemoval,
     parsePreserveEndpointNumbers,
     parseReplaceAll,
 } from "./reconcile.js";
@@ -89,7 +90,7 @@ export class BridgeWsServer {
             this.options.bridge.upsertEndpoint(parseEndpointSpec(args.endpoint)),
         );
         this.#handlers.set("remove_endpoint", async args =>
-            this.options.bridge.removeEndpoint(parseDeviceId(args.indigoDeviceId)),
+            this.options.bridge.removeEndpoint(parseDeviceId(args.indigoDeviceId), parsePermanentRemoval(args.permanent)),
         );
         this.#handlers.set("set_state", async args => this.handleSetState(args));
         this.#handlers.set("set_reachable", async args => this.handleSetReachable(args));

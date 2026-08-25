@@ -87,7 +87,8 @@ def _build(proto: BridgeProtocol, request: dict):
     if command == bridge_protocol.CMD_UPSERT_ENDPOINT:
         return proto.build_upsert_endpoint(EndpointSpec.from_wire(args["endpoint"]), mid)
     if command == bridge_protocol.CMD_REMOVE_ENDPOINT:
-        return proto.build_remove_endpoint(args["indigoDeviceId"], mid)
+        return proto.build_remove_endpoint(
+            args["indigoDeviceId"], mid, permanent=args.get(bridge_protocol.ARG_PERMANENT, False))
     if command == bridge_protocol.CMD_SET_STATE:
         return proto.build_set_state(args["indigoDeviceId"], args["states"], mid)
     if command == bridge_protocol.CMD_SET_REACHABLE:
@@ -138,6 +139,16 @@ class TestRequests:
         # §3.10: a reset must not scramble identities unless asked to.
         frame = BridgeProtocol().build_factory_reset(message_id="x")
         assert frame["args"][bridge_protocol.ARG_PRESERVE_ENDPOINT_NUMBERS] is True
+
+    def test_remove_endpoint_permanent_is_absent_unless_true(self):
+        # Issue #274 — every pre-#274 call, and `replace()`'s two-command
+        # supersede/re-adopt half, must keep getting the exact frame they
+        # always have: no destructive opt-in by default.
+        plain = BridgeProtocol().build_remove_endpoint(123456789, message_id="x")
+        assert bridge_protocol.ARG_PERMANENT not in plain["args"]
+        deliberate = BridgeProtocol().build_remove_endpoint(123456789, permanent=True, message_id="x")
+        assert deliberate["args"][bridge_protocol.ARG_PERMANENT] is True
+        assert deliberate == BY_NAME["remove_endpoint_permanent"]["request"] | {"message_id": "x"}
 
 
 class TestResponses:

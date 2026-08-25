@@ -242,6 +242,14 @@ class ExportBridge:
         #: Last reason each device was skipped by the provider, so a permanent
         #: skip (an unbridgeable role) logs once, not on every reconnect.
         self._skipped: dict[int, str] = {}
+        #: Issue #274 — device ids `_spec_for` found with NO Indigo device
+        #: behind them, queued here because the discovery happens inside
+        #: `endpoint_specs()`, which runs before the attach that is about to
+        #: carry them has completed — too early for an explicit
+        #: `remove_endpoint` to land (`_live_client` refuses it). Drained by
+        #: :meth:`_on_attached`, the first later moment the socket can
+        #: actually carry the command.
+        self._confirmed_deleted: set[int] = set()
         #: The reason set behind the last "NONE of them can be bridged" warning,
         #: so that state — which since #141 costs every accessory in every paired
         #: ecosystem — is announced once per cause rather than per reconnect.
@@ -1062,6 +1070,20 @@ class ExportBridge:
         device_id = entry.indigo_device_id
         dev = self._device_getter(device_id)
         if dev is None:
+            # Issue #274: this is the ONE unambiguous case — the Indigo
+            # device itself does not exist any more. Every OTHER reason this
+            # method returns `None` below (excluded, re-typed, unknown role,
+            # a states_for that raised) means the device still exists, so it
+            # must NOT be destroyed — only "leave it out of this attach's
+            # desired set", exactly as before this issue. Queued rather than
+            # removed here: `endpoint_specs()` runs before `attach` completes
+            # (often the very FIRST attach of a reconnect, before the client
+            # is marked attached at all), and an explicit `remove_endpoint`
+            # sent this early is refused with `not_attached` and silently
+            # dropped (`_live_client`'s documented no-op) — the confirmed
+            # fact would be lost. `_on_attached` drains this set once the
+            # socket can actually carry the command.
+            self._confirmed_deleted.add(device_id)
             return self._skip(device_id, "the Indigo device no longer exists")
         # The entry's OPTIONS are part of the question (ADR-0012): a custom
         # device is exportable BECAUSE the user declared which state is its
@@ -1395,8 +1417,21 @@ class ExportBridge:
             return
         self._fire(client.upsert_endpoint(spec), f"upsert_endpoint dev {device_id}")
 
-    def remove(self, device_id: int) -> None:
-        """Drop one endpoint (§3.3). Fire-and-forget; idempotent on the node."""
+    def remove(self, device_id: int, *, permanent: bool = False) -> None:
+        """Drop one endpoint (§3.3). Fire-and-forget; idempotent on the node.
+
+        ``permanent`` (issue #274) is passed straight through to the wire —
+        see ``bridge_client.BridgeClient.remove_endpoint`` and
+        ``bridge_protocol.BridgeProtocol.build_remove_endpoint``. Every
+        caller of THIS method (``deviceDeleted``, the export dialog's
+        "Remove", and the confirmed-deleted sweep in :meth:`_on_attached`)
+        knows unambiguously that the device is not coming back, so they pass
+        ``True``. `replace()`'s two-command supersede/re-adopt sequence does
+        NOT go through this method — it calls ``client.remove_endpoint``
+        directly, at the default ``permanent=False``, because its removal is
+        deliberately followed by an ``upsert_endpoint`` for the same or a
+        related identity and must stay soft.
+        """
         self._skipped.pop(device_id, None)
         self._update_failed.discard(device_id)
         self._stopped_keys.pop(device_id, None)
@@ -1411,7 +1446,7 @@ class ExportBridge:
         client = self._live_client("remove_endpoint", device_id)
         if client is None:
             return
-        self._fire(client.remove_endpoint(device_id), f"remove_endpoint dev {device_id}")
+        self._fire(client.remove_endpoint(device_id, permanent=permanent), f"remove_endpoint dev {device_id}")
 
     def replace(self, device_id: int) -> None:
         """Remove one endpoint and add it back, because its **published
@@ -1749,6 +1784,42 @@ class ExportBridge:
         self._fire(client.set_state(device_id, commanded),
                    f"commanded set_state dev {device_id}")
 
+    def _purge_confirmed_deleted(self) -> None:
+        """Close the #274 gap: a device deleted while the plugin was DOWN.
+
+        `deviceDeleted` already handles a live deletion — it removes the
+        allow-list entry and calls :meth:`remove` with ``permanent=True`` the
+        moment Indigo reports the deletion. The gap is a deletion Indigo
+        reported to nobody, because the plugin was not running to hear it:
+        the entry sits in the allow-list until the next attach's
+        `endpoint_specs()` re-classifies it and `_spec_for` finds no device
+        behind it. This is that discovery's other half — called from
+        :meth:`_on_attached`, the first moment after that attach the wire can
+        actually carry a `remove_endpoint` (see `_spec_for`'s comment for why
+        it cannot be sent any earlier).
+
+        Mirrors `deviceDeleted` exactly: drop the allow-list entry, THEN tell
+        the bridge node, permanently. A store write failing here costs a
+        retry at the NEXT attach (the entry simply gets re-classified and
+        re-queued) rather than a silently lost removal.
+        """
+        if not self._confirmed_deleted:
+            return
+        device_ids, self._confirmed_deleted = self._confirmed_deleted, set()
+        for device_id in sorted(device_ids):
+            try:
+                self._store.remove(device_id)
+            except Exception as exc:  # pylint: disable=broad-except
+                self._logger.error(
+                    "Matter bridge: removing device %s (deleted while the plugin was not running) "
+                    "from the export list FAILED — %s", device_id, exc)
+                self._logger.exception(exc)
+            self._logger.info(
+                "Matter bridge: device %s no longer exists in Indigo — removing its Matter "
+                "accessory permanently (it was deleted while the plugin was not running)",
+                device_id)
+            self.remove(device_id, permanent=True)
+
     # ------------------------------------------------------------------
     # Client callbacks
     # ------------------------------------------------------------------
@@ -1764,6 +1835,7 @@ class ExportBridge:
         line asserting an un-export that never happened. The accessories stay in
         every ecosystem, and nothing is left that knows they should not.
         """
+        self._purge_confirmed_deleted()
         self._disconnect_ticks = 0
         self._poll_fail_ticks = 0
         self._unreachable_reported = False

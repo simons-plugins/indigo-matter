@@ -1011,6 +1011,53 @@ export class EndpointMapStore {
     }
 
     /**
+     * A device is CONFIRMED GONE FOR GOOD — deleted from Indigo, or
+     * deliberately un-exported — so its record is dropped ENTIRELY rather
+     * than kept as an orphan (issue #274).
+     *
+     * **This is the one place a record's `number` is thrown away**, unlike
+     * every other mutation here ({@link forget}, {@link voidNumbers}), all of
+     * which keep it forever precisely so a retired number is never handed to
+     * a different accessory (ADR-0010). That guarantee still holds after this
+     * call: matter.js's OWN persisted allocation for the retired
+     * `Endpoint.id` — a separate store this file never touches — is what
+     * actually prevents reissue, and it is untouched by deleting our own
+     * witness of it. What is lost is re-adopt: {@link restorable} and
+     * {@link orphans} can only offer what is still in `#endpoints`, so a
+     * destroyed identity is gone from both — no re-adopt picker entry, no
+     * pre-attach rebuild, ever again.
+     *
+     * **Only a caller certain the device will never come back may call
+     * this.** {@link EndpointMapStore.forget}'s doc comment explains why an
+     * ORDINARY un-export (an `attach` reconcile that simply does not mention
+     * an identity this pass) must stay soft: the node cannot tell a
+     * deliberate departure from a device that merely failed classification
+     * this one time (issue #274 constraint 2). `node.ts`'s `removeEndpoint`
+     * is the only caller, and only when the plugin's `remove_endpoint`
+     * carried `permanent: true`.
+     *
+     * Returns how many entries actually existed and were removed, so a call
+     * over an already-forgotten or never-recorded `uniqueId` costs no disk
+     * write — the same idempotency `remove_endpoint` itself promises
+     * (§3.3: `{removed: false}` for an absent endpoint).
+     */
+    destroy(uniqueIds: readonly string[]): number {
+        let removed = 0;
+        for (const uniqueId of uniqueIds) {
+            if (this.#endpoints.delete(uniqueId)) {
+                removed += 1;
+            }
+        }
+        if (removed > 0) {
+            this.persist(
+                `destroyed ${removed} endpoint map record(s): the driving device is gone for good, so ` +
+                    "neither the number nor the role/label is retained for re-adopt",
+            );
+        }
+        return removed;
+    }
+
+    /**
      * Compare the live endpoint numbers against the map (PRD §4.3).
      *
      * Endpoints the map has never seen are *recorded*; endpoints whose number

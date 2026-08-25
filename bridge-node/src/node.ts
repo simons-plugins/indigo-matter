@@ -1464,8 +1464,21 @@ export class BridgeNode implements BridgeFacade {
      * then `upsert_endpoint` as two SEPARATE commands (§3 steps 3/5), so the
      * create half of that supersession has not happened yet when THIS command
      * finishes — {@link upsertEndpoint} is what closes the gap when it does.
+     *
+     * **`options.hard` (issue #274) destroys rather than orphans the
+     * `ordinary` bucket.** Only {@link removeEndpoint} ever passes it, and
+     * only when the plugin has declared the removal PERMANENT — the driving
+     * device is deleted, or deliberately un-exported. `attach`'s reconcile
+     * (`reconcile()`) never does: a full reconcile cannot tell "the plugin
+     * dropped this on purpose" from "this device exists but failed
+     * classification this pass" (issue #274 constraint 2), so its ordinary
+     * removals stay soft — orphaned, kept, restorable — exactly as before
+     * this issue. A hard removal is also never eligible for the supersede
+     * pairing above (a deleted device gets no later create to pair with) or
+     * for {@link #lastRemoved} (nothing should retroactively mark a
+     * DESTROYED entry `supersededBy`).
      */
-    private forgetRemoved(before: ReadonlyMap<string, number>): void {
+    private forgetRemoved(before: ReadonlyMap<string, number>, options: { hard?: boolean } = {}): void {
         const after = this.livePublishedIdentities();
         const removed = [...before.keys()].filter(uniqueId => !after.has(uniqueId));
         if (removed.length === 0) {
@@ -1481,12 +1494,12 @@ export class BridgeNode implements BridgeFacade {
         for (const uniqueId of removed) {
             const deviceId = before.get(uniqueId)!;
             const created = createdDeviceIds.get(deviceId);
-            if (created !== undefined && supersedes(uniqueId, created)) {
+            if (!options.hard && created !== undefined && supersedes(uniqueId, created)) {
                 forgotten += this.#endpointMap.forget([uniqueId], { supersededBy: created });
                 continue;
             }
             ordinary.push(uniqueId);
-            if (created === undefined) {
+            if (!options.hard && created === undefined) {
                 // Only when NO identity for this device appeared in this
                 // mutation: a create that already landed and was NOT a
                 // supersession (a re-adopt, PR5 design E2/E5) has settled the
@@ -1494,6 +1507,17 @@ export class BridgeNode implements BridgeFacade {
                 // how a much later, unrelated create would mispair.
                 this.#lastRemoved.set(deviceId, uniqueId);
             }
+        }
+        if (options.hard) {
+            forgotten += this.#endpointMap.destroy(ordinary);
+            if (forgotten > 0) {
+                this.log(
+                    `${forgotten} endpoint map record(s) destroyed — the driving device is gone for good ` +
+                        "(deleted or un-exported); no re-adopt is offered for them and their numbers are not " +
+                        "retained (issue #274)",
+                );
+            }
+            return;
         }
         forgotten += this.#endpointMap.forget(ordinary);
         if (forgotten > 0) {
@@ -1647,12 +1671,12 @@ export class BridgeNode implements BridgeFacade {
      * only one that never looked would have made that invisible until the next
      * upsert happened to notice.
      */
-    async removeEndpoint(indigoDeviceId: number): Promise<RemoveResult> {
+    async removeEndpoint(indigoDeviceId: number, permanent = false): Promise<RemoveResult> {
         const before = this.livePublishedIdentities();
         try {
             return await this.registry.remove(indigoDeviceId);
         } finally {
-            this.forgetRemoved(before);
+            this.forgetRemoved(before, { hard: permanent });
             this.checkDrift();
         }
     }
