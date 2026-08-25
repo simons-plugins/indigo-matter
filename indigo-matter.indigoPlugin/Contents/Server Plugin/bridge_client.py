@@ -230,6 +230,7 @@ class BridgeClient(WsJsonClient):
         #: The last StatusReport the node returned (attach / get_status).
         self.status: Optional[StatusReport] = None
         self._attached = False
+        self._attached_event = asyncio.Event()
         #: True while the node refused the attach with ``endpoint_map_invalid``
         #: and we are holding the connection open for the §1.1 recovery trio.
         self.recovery = False
@@ -245,8 +246,27 @@ class BridgeClient(WsJsonClient):
         """
         return self._attached and self.connected
 
+    async def wait_attached(self, timeout: float = 30.0) -> None:
+        """Block until an ``attach`` the node accepted has landed.
+
+        :meth:`wait_connected` only proves the transport is up — the socket
+        exists the moment the handshake starts, but ``self.status`` and
+        ``self._attached`` are not populated until the attach that follows
+        it completes, on the run loop, some time later. A caller that reads
+        ``status`` or relies on ``set_state`` being deliverable right after
+        ``wait_connected`` returns is trusting that the node is already
+        serving its endpoint set — which is exactly the assumption that is
+        NOT guaranteed: the attach might still be in flight, or might have
+        been refused (§1.1's ``endpoint_map_invalid``), leaving a live socket
+        that is connected but not attached. Wait on this instead of
+        ``wait_connected`` whenever what you need is the node actually
+        serving your endpoints, not merely a live socket to it.
+        """
+        await asyncio.wait_for(self._attached_event.wait(), timeout)
+
     def _mark_disconnected(self) -> None:
         self._attached = False
+        self._attached_event.clear()
         self.recovery = False
         super()._mark_disconnected()
 
@@ -293,6 +313,7 @@ class BridgeClient(WsJsonClient):
             self._handle_attach_refused(exc)
             return
         self._attached = True
+        self._attached_event.set()
         self.recovery = False
         self._notify(self._on_attached, status, replace_all)
 
@@ -437,6 +458,7 @@ class BridgeClient(WsJsonClient):
             "rather than halting", owed)
         status = await self._attach(None, replace_all=True, timeout=None, inline=True)
         self._attached = True
+        self._attached_event.set()
         self.recovery = False
         self._notify(self._on_attached, status, True)
         return True
@@ -596,6 +618,7 @@ class BridgeClient(WsJsonClient):
         else:
             result = await self._request_frame(frame, timeout)
             self._attached = True
+            self._attached_event.set()
             self.recovery = False
         self.status = bridge_protocol.parse_status(result)
         return self.status

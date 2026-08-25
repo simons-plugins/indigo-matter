@@ -39,6 +39,7 @@ from matter_handlers.generic_switch import (
     switch_features,
 )
 from matter_handlers.registry import HandlerRegistry
+from indigo_fakes import FakeDev, FakeDeviceFactory, FakeDevices, FakeFolderFactory
 
 
 # ---------------------------------------------------------------------------
@@ -162,85 +163,6 @@ def test_parse_node_event_missing_fields():
 
 def test_evt_node_event_constant_value():
     assert protocol.EVT_NODE_EVENT == "node_event"
-
-
-# ---------------------------------------------------------------------------
-# Helpers shared with DeviceSync tests
-# ---------------------------------------------------------------------------
-
-class FakeDev:
-    def __init__(self, dev_id, name, device_type_id, props, initial_states=None):
-        self.id = dev_id
-        self.name = name
-        self.deviceTypeId = device_type_id
-        self.pluginProps = props
-        self.states = dict(initial_states or {})
-        self.error = None
-        self.errorState = ""
-        self.folderId = 0
-
-    def updateStatesOnServer(self, kvlist):
-        for kv in kvlist:
-            self.states[kv["key"]] = kv["value"]
-
-    def setErrorStateOnServer(self, value):
-        self.error = value
-        self.errorState = value
-
-    def replaceOnServer(self):
-        self.replaced = True
-
-
-class FakeDevices:
-    def __init__(self):
-        self._by_id = {}
-        self._counter = 2000
-        self._folders = {}
-
-    def next_id(self):
-        self._counter += 1
-        return self._counter
-
-    def add(self, dev):
-        self._by_id[dev.id] = dev
-
-    @property
-    def folders(self):
-        return list(self._folders.values())
-
-    def __iter__(self):
-        return iter(list(self._by_id.values()))
-
-    def __getitem__(self, dev_id):
-        return self._by_id[dev_id]
-
-    def iter(self, _filter=None):
-        return list(self._by_id.values())
-
-
-class FakeDeviceFactory:
-    def __init__(self, devices):
-        self.devices = devices
-        self.created = []
-
-    def create(self, protocol=None, deviceTypeId="", name="", props=None, folder=0, **kwargs):
-        from test_generic_switch import FakeDev  # local import to avoid circular ref
-        dev = FakeDev(self.devices.next_id(), name, deviceTypeId, dict(props or {}))
-        self.devices.add(dev)
-        self.created.append(dev)
-        return dev
-
-    def moveToFolder(self, dev_or_id, value=None):
-        pass
-
-
-class FakeFolderFactory:
-    def __init__(self, devices):
-        self.devices = devices
-
-    def create(self, name):
-        from test_generic_switch import FakeDev  # noqa
-        raise RuntimeError("no folder creation in generic switch tests")
 
 
 @pytest.fixture

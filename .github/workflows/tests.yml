@@ -35,18 +35,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 3.13 ONLY, for now. 3.11 is the declared floor (`pyproject.toml`
-        # requires-python, and pylint's own py-version) and SHOULD be here, but
-        # four tests in tests/test_bridge_client.py fail on 3.11 today: they
-        # assert on `client.status` straight after `wait_connected()` and pass
-        # on 3.13 purely because its event loop happens to have run the attach
-        # by then. Scheduling order, not logic — and pre-existing, confirmed
-        # failing at 913ad44, well before the refactor that added this file.
-        #
-        # Adding a red leg to a brand-new gate only teaches people to ignore
-        # the gate. Tracked separately; restore "3.11" here once those four
-        # tests await the condition instead of assuming it.
-        python-version: ["3.13"]
+        # 3.11 is the declared floor (`pyproject.toml` requires-python, and
+        # pylint's own py-version); 3.13 is what jarvis actually runs. Both
+        # legs are cheap (~1s each), so both run on every push.
+        python-version: ["3.11", "3.13"]
     steps:
       - uses: actions/checkout@v4
 

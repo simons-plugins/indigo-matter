@@ -20,7 +20,7 @@ from http_handlers import HttpApi
 
 from fakes import FakeWebSocket, returns, scripted_responder
 from test_handlers import RELAY_NODE
-from test_device_sync import FakeDev, FakeDeviceFactory, FakeDevices
+from indigo_fakes import FakeDev, FakeDeviceFactory, FakeDevices
 
 
 @pytest.fixture
