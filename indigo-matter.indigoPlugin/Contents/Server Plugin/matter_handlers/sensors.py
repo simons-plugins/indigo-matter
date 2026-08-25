@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from .base import ClusterHandler, IndigoDeviceSpec, MatterCommand
+from .base import ClusterHandler, IndigoDeviceSpec, MatterCommand, base_props
 from .settings import ATTR_HOLD_TIME
 
 ATTR_MEASURED_VALUE = 0x0000
@@ -61,13 +61,7 @@ class _SensorHandler(ClusterHandler):
             IndigoDeviceSpec(
                 device_type_id=self.device_type_id,
                 name=name,
-                props={
-                    "nodeId": str(node.node_id),
-                    "endpointId": str(endpoint.endpoint_id),
-                    "vendorName": node.vendor_name,
-                    "productName": node.product_name,
-                    **self.display_props,
-                },
+                props={**base_props(node, endpoint), **self.display_props},
                 initial_states={self.state_key: 0},
             )
         ]

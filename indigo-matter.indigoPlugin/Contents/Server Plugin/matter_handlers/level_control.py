@@ -11,8 +11,15 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from .base import ENDPOINT_OWNER_CLUSTERS, ClusterHandler, IndigoDeviceSpec, MatterCommand
-from .electrical import CLUSTER_ELECTRICAL_ENERGY, CLUSTER_ELECTRICAL_POWER
+from .base import (
+    ENDPOINT_OWNER_CLUSTERS,
+    ClusterHandler,
+    IndigoDeviceSpec,
+    MatterCommand,
+    base_props,
+    node_endpoint,
+)
+from .electrical import meter_props
 
 CLUSTER_ON_OFF = 0x0006
 CLUSTER_LEVEL_CONTROL = 0x0008
@@ -47,21 +54,9 @@ class LevelControlHandler(ClusterHandler):
         if not self.is_primary_for(node, endpoint):
             return []
         name = node.suggested_name or node.product_name or f"Matter {node.node_id}"
-        props: dict = {
-            "nodeId": str(node.node_id),
-            "endpointId": str(endpoint.endpoint_id),
-            "vendorName": node.vendor_name,
-            "productName": node.product_name,
-        }
-        # Energy support must be set as device props at creation: Indigo does not
-        # apply static <Supports*> Devices.xml elements to API-created devices
-        # (same lesson as colour support; issue #56). When these
-        # props are True, Indigo automatically adds curEnergyLevel / accumEnergyTotal
-        # states that ElectricalPowerHandler / ElectricalEnergyHandler then update.
-        if endpoint.has(CLUSTER_ELECTRICAL_POWER):
-            props["SupportsPowerMeter"] = True
-        if endpoint.has(CLUSTER_ELECTRICAL_ENERGY):
-            props["SupportsEnergyMeter"] = True
+        props: dict = base_props(node, endpoint)
+        # See electrical.meter_props for why these must be set at creation.
+        props.update(meter_props(endpoint))
         return [
             IndigoDeviceSpec(
                 device_type_id=self.device_type_id,
@@ -81,8 +76,7 @@ class LevelControlHandler(ClusterHandler):
 
     def handle_indigo_action(self, indigo_dev: Any, action: Any) -> Optional[MatterCommand]:
         import indigo  # provided by the Indigo runtime (and the test mock)
-        node_id = int(indigo_dev.pluginProps["nodeId"])
-        endpoint_id = int(indigo_dev.pluginProps["endpointId"])
+        node_id, endpoint_id = node_endpoint(indigo_dev)
         device_action = action.deviceAction
 
         # On/off route through the OnOff cluster.

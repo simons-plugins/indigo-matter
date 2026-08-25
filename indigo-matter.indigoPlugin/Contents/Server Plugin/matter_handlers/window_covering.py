@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from .base import ClusterHandler, IndigoDeviceSpec, MatterCommand
+from .base import ClusterHandler, IndigoDeviceSpec, MatterCommand, base_props, node_endpoint
 
 CLUSTER_WINDOW_COVERING = 0x0102
 
@@ -58,12 +58,7 @@ class WindowCoveringHandler(ClusterHandler):
             IndigoDeviceSpec(
                 device_type_id=self.device_type_id,
                 name=name,
-                props={
-                    "nodeId": str(node.node_id),
-                    "endpointId": str(endpoint.endpoint_id),
-                    "vendorName": node.vendor_name,
-                    "productName": node.product_name,
-                },
+                props=base_props(node, endpoint),
                 initial_states={},
             )
         ]
@@ -81,8 +76,7 @@ class WindowCoveringHandler(ClusterHandler):
 
     def handle_indigo_action(self, indigo_dev: Any, action: Any) -> Optional[MatterCommand]:
         import indigo  # provided by the Indigo runtime (and the test mock)
-        node_id = int(indigo_dev.pluginProps["nodeId"])
-        endpoint_id = int(indigo_dev.pluginProps["endpointId"])
+        node_id, endpoint_id = node_endpoint(indigo_dev)
         device_action = action.deviceAction
 
         if device_action == indigo.kDeviceAction.TurnOn:

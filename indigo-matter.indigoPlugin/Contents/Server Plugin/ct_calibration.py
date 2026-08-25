@@ -79,7 +79,7 @@ from typing import Any, Callable, Iterable, Optional, Union
 import ct_bounds
 import ct_learner
 import export_handlers
-from matter_handlers.color_control import mireds_to_kelvin
+from mired_units import mireds_to_kelvin
 
 #: How long to wait after asking for an extreme before re-reading the echo.
 #: Not a network round trip like ``ct_learner.FRESHNESS_WINDOW_SECONDS`` —

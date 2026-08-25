@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from .base import ClusterHandler, IndigoDeviceSpec, MatterAction, MatterWrite
+from .base import ClusterHandler, IndigoDeviceSpec, MatterAction, MatterWrite, base_props, node_endpoint
 
 CLUSTER_THERMOSTAT = 0x0201
 CLUSTER_FAN_CONTROL = 0x0202
@@ -65,10 +65,7 @@ class ThermostatHandler(ClusterHandler):
                 device_type_id=self.device_type_id,
                 name=name,
                 props={
-                    "nodeId": str(node.node_id),
-                    "endpointId": str(endpoint.endpoint_id),
-                    "vendorName": node.vendor_name,
-                    "productName": node.product_name,
+                    **base_props(node, endpoint),
                     "NumTemperatureInputs": "1",
                     "NumHumidityInputs": "0",
                     "SupportsHeatSetpoint": "true",
@@ -103,8 +100,7 @@ class ThermostatHandler(ClusterHandler):
 
     def handle_indigo_action(self, indigo_dev: Any, action: Any) -> Optional[MatterAction]:
         import indigo  # provided by the Indigo runtime (and the test mock)
-        node_id = int(indigo_dev.pluginProps["nodeId"])
-        endpoint_id = int(indigo_dev.pluginProps["endpointId"])
+        node_id, endpoint_id = node_endpoint(indigo_dev)
         ta = action.thermostatAction
         act = indigo.kThermostatAction
 
@@ -208,12 +204,7 @@ class FanControlHandler(ClusterHandler):
             IndigoDeviceSpec(
                 device_type_id=self.device_type_id,
                 name=name,
-                props={
-                    "nodeId": str(node.node_id),
-                    "endpointId": str(endpoint.endpoint_id),
-                    "vendorName": node.vendor_name,
-                    "productName": node.product_name,
-                },
+                props=base_props(node, endpoint),
                 initial_states={"onOffState": False, "brightnessLevel": 0},
             )
         ]
@@ -304,8 +295,7 @@ class FanControlHandler(ClusterHandler):
 
         # Standalone matterFan: dimmer-style actions, attribute-write controlled.
         import indigo  # provided by the Indigo runtime (and the test mock)
-        node_id = int(indigo_dev.pluginProps["nodeId"])
-        endpoint_id = int(indigo_dev.pluginProps["endpointId"])
+        node_id, endpoint_id = node_endpoint(indigo_dev)
         device_action = action.deviceAction
 
         if device_action == indigo.kDeviceAction.TurnOn:

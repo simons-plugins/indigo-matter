@@ -21,8 +21,9 @@ from __future__ import annotations
 import colorsys
 from typing import Any, Optional
 
-from .base import IndigoDeviceSpec, MatterCommand
-from .electrical import CLUSTER_ELECTRICAL_ENERGY, CLUSTER_ELECTRICAL_POWER
+from mired_units import kelvin_to_mireds, mireds_to_kelvin
+from .base import IndigoDeviceSpec, MatterCommand, base_props, node_endpoint
+from .electrical import meter_props
 from .level_control import LevelControlHandler
 
 CLUSTER_COLOR_CONTROL = 0x0300
@@ -102,14 +103,6 @@ def matter_xy_to_rgb(raw_x: int, raw_y: int, brightness: float = 1.0) -> tuple[i
     )
 
 
-def mireds_to_kelvin(mireds: int) -> int:
-    return round(1_000_000 / mireds) if mireds else 0
-
-
-def kelvin_to_mireds(kelvin: float) -> int:
-    return round(1_000_000 / kelvin) if kelvin else 0
-
-
 class ColorControlHandler(LevelControlHandler):
     cluster_id = 0x0300
     cluster_name = "ColorControl"
@@ -128,17 +121,14 @@ class ColorControlHandler(LevelControlHandler):
 
     def create_indigo_devices(self, node: Any, endpoint: Any) -> list[IndigoDeviceSpec]:
         name = node.suggested_name or node.product_name or f"Matter {node.node_id}"
-        props: dict = {
-            "nodeId": str(node.node_id),
-            "endpointId": str(endpoint.endpoint_id),
-            "vendorName": node.vendor_name,
-            "productName": node.product_name,
-            # Color support must be set as device props at creation: Indigo
-            # does not apply the static <Supports*> Devices.xml elements to
-            # API-created devices, so without these the device has no real
-            # white-temperature support and rejects 'whiteTemperature' as an
-            # invalid color level key. (Matches the Indigo SDK's
-            # Relay-and-Dimmer example, which sets these via device props.)
+        props: dict = base_props(node, endpoint)
+        # Color support must be set as device props at creation: Indigo
+        # does not apply the static <Supports*> Devices.xml elements to
+        # API-created devices, so without these the device has no real
+        # white-temperature support and rejects 'whiteTemperature' as an
+        # invalid color level key. (Matches the Indigo SDK's
+        # Relay-and-Dimmer example, which sets these via device props.)
+        props.update({
             "SupportsColor": True,
             "SupportsRGB": True,
             "SupportsWhite": True,
@@ -146,16 +136,9 @@ class ColorControlHandler(LevelControlHandler):
             "SupportsRGBandWhiteSimultaneously": False,
             "WhiteTemperatureMin": 2000,
             "WhiteTemperatureMax": 6500,
-        }
-        # Energy support must be set as device props at creation: Indigo does not
-        # apply static <Supports*> Devices.xml elements to API-created devices
-        # (same lesson as colour support; issue #56). When these
-        # props are True, Indigo automatically adds curEnergyLevel / accumEnergyTotal
-        # states that ElectricalPowerHandler / ElectricalEnergyHandler then update.
-        if endpoint.has(CLUSTER_ELECTRICAL_POWER):
-            props["SupportsPowerMeter"] = True
-        if endpoint.has(CLUSTER_ELECTRICAL_ENERGY):
-            props["SupportsEnergyMeter"] = True
+        })
+        # See electrical.meter_props for why these must be set at creation.
+        props.update(meter_props(endpoint))
         return [
             IndigoDeviceSpec(
                 device_type_id=self.device_type_id,
@@ -251,8 +234,7 @@ class ColorControlHandler(LevelControlHandler):
             pass
 
     def _set_color(self, indigo_dev: Any, values: dict):
-        node_id = int(indigo_dev.pluginProps["nodeId"])
-        endpoint_id = int(indigo_dev.pluginProps["endpointId"])
+        node_id, endpoint_id = node_endpoint(indigo_dev)
         states = getattr(indigo_dev, "states", {}) or {}
         white_temp = values.get("whiteTemperature")
         white_level = values.get("whiteLevel")

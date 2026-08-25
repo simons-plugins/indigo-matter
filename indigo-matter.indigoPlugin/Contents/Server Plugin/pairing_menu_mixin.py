@@ -15,8 +15,8 @@ import bridge_protocol
 import export_bridge          # export_bridge.describe_fabric
 import fabric_backup
 from plugin_constants import (
-    LIST_ERROR_OPTION, NO_SELECTION_ID, PAIRING_READ_TIMEOUT,
-    UNPAIR_TIMEOUT, WINDOW_OPEN_TIMEOUT,
+    NO_SELECTION_ID, PAIRING_READ_TIMEOUT,
+    UNPAIR_TIMEOUT, WINDOW_OPEN_TIMEOUT, degrades_to_list_error,
 )
 from server_process import ServerProcess
 
@@ -188,6 +188,7 @@ class PairingMenuMixin:
             self.logger.debug("could not resolve the Indigo web server URL (%s)", exc)
         return f"{base}/message/{self._export_plugin_id()}/pairing/"  # pylint: disable=no-member  # ExportDialogMixin
 
+    @degrades_to_list_error
     def getBridgeFabrics(self, filter="", valuesDict=None, typeId="", targetId=0):  # noqa: N802, A002
         # pylint: disable=redefined-builtin, unused-argument
         """Picker rows for the unpair menu: one per commissioned ecosystem.
@@ -207,21 +208,17 @@ class PairingMenuMixin:
         this plugin (device, node, backup) leads with a no-selection row for
         exactly this reason, and the one destructive picker did not.
         """
-        try:
-            bridge = self.export_bridge
-            fabrics = bridge.fabrics if bridge is not None else None
-            if not fabrics:
-                # None and [] are different facts, and both are un-pickable, but
-                # only one of them should read as "you are not paired".
-                return [(NO_SELECTION_ID,
-                         "(no paired ecosystems)" if fabrics == []
-                         else "(not connected to the bridge node)")]
-            return [(NO_SELECTION_ID, "(select an ecosystem)")] + [
-                (str(fabric.fabric_index), export_bridge.describe_fabric(fabric))
-                for fabric in fabrics]
-        except Exception as exc:  # pylint: disable=broad-except
-            self.logger.exception(exc)
-            return [LIST_ERROR_OPTION]
+        bridge = self.export_bridge
+        fabrics = bridge.fabrics if bridge is not None else None
+        if not fabrics:
+            # None and [] are different facts, and both are un-pickable, but
+            # only one of them should read as "you are not paired".
+            return [(NO_SELECTION_ID,
+                     "(no paired ecosystems)" if fabrics == []
+                     else "(not connected to the bridge node)")]
+        return [(NO_SELECTION_ID, "(select an ecosystem)")] + [
+            (str(fabric.fabric_index), export_bridge.describe_fabric(fabric))
+            for fabric in fabrics]
 
     def menuUnpairEcosystem(self, valuesDict, menuId=""):  # noqa: N802, ARG002
         """§3.9 — remove one ecosystem's fabric from the bridge.

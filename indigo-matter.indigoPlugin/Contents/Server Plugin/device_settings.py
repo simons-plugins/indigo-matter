@@ -239,6 +239,25 @@ def _marker_field(setting: DeviceSetting) -> str:
     return "has" + setting.key[0].upper() + setting.key[1:]
 
 
+def _is_editing(setting, values: dict) -> bool:
+    """Whether *values* carries a value for *setting* the caller should act on.
+
+    False for a field the dialog never rendered, and false for a BLANK one —
+    a blank means "leave this alone", never "you must fill this in".
+    :func:`config_ui_values` deliberately seeds blank when the device has not
+    reported the value yet, so rejecting blank made the Edit Device dialog
+    unsavable on a freshly adopted device: the user could not even rename it,
+    and the error blamed them for a value the plugin does not know either.
+
+    Shared by :func:`validate_settings` and :func:`planned_writes` because the
+    two must agree — a setting one of them skips and the other does not is
+    either a value validated and never sent, or one sent and never validated.
+    """
+    if setting.key not in values:
+        return False
+    return bool(str(values.get(setting.key, "")).strip())
+
+
 def validate_settings(device_type_id: str, values: dict, limits: LimitsLookup,
                       attribute_list: Optional[Callable] = None,
                       device_known: bool = True) -> dict:
@@ -252,15 +271,7 @@ def validate_settings(device_type_id: str, values: dict, limits: LimitsLookup,
     errors: dict = {}
     for offer in offered_settings(device_type_id, limits, attribute_list, device_known):
         setting = offer.setting
-        if setting.key not in values:
-            continue
-        # A BLANK field means "leave this alone", never "you must fill this in".
-        # config_ui_values deliberately seeds blank when the device has not
-        # reported the value yet, so rejecting blank made the Edit Device dialog
-        # unsavable on a freshly adopted device — the user could not even rename
-        # it, and the error blamed them for a value the plugin does not know
-        # either. planned_writes skips blanks for the same reason.
-        if not str(values.get(setting.key, "")).strip():
+        if not _is_editing(setting, values):
             continue
         value, reason = coerce_value(setting, values.get(setting.key), offer.bounds)
         if value is None:
@@ -282,15 +293,7 @@ def planned_writes(device_type_id: str, values: dict, states: dict,
     planned: list[PlannedWrite] = []
     for offer in offered_settings(device_type_id, limits, attribute_list, device_known):
         setting = offer.setting
-        if setting.key not in values:
-            continue
-        # A BLANK field means "leave this alone", never "you must fill this in".
-        # config_ui_values deliberately seeds blank when the device has not
-        # reported the value yet, so rejecting blank made the Edit Device dialog
-        # unsavable on a freshly adopted device — the user could not even rename
-        # it, and the error blamed them for a value the plugin does not know
-        # either. planned_writes skips blanks for the same reason.
-        if not str(values.get(setting.key, "")).strip():
+        if not _is_editing(setting, values):
             continue
         value, _reason = coerce_value(setting, values.get(setting.key), offer.bounds)
         if value is None:

@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from .base import ClusterHandler, IndigoDeviceSpec, MatterCommand
+from .base import ClusterHandler, IndigoDeviceSpec, MatterCommand, base_props, node_endpoint
 
 CLUSTER_DOOR_LOCK = 0x0101
 
@@ -47,10 +47,7 @@ class DoorLockHandler(ClusterHandler):
                 device_type_id=self.device_type_id,
                 name=name,
                 props={
-                    "nodeId": str(node.node_id),
-                    "endpointId": str(endpoint.endpoint_id),
-                    "vendorName": node.vendor_name,
-                    "productName": node.product_name,
+                    **base_props(node, endpoint),
                     # Indigo does not apply static Devices.xml <IsLockSubType> to
                     # API-created devices; set it here so the device gets the lock
                     # UI (Lock/Unlock buttons, triggers, control-page) instead of
@@ -93,8 +90,7 @@ class DoorLockHandler(ClusterHandler):
 
     def handle_indigo_action(self, indigo_dev: Any, action: Any) -> Optional[MatterCommand]:
         import indigo  # provided by the Indigo runtime (and the test mock)
-        node_id = int(indigo_dev.pluginProps["nodeId"])
-        endpoint_id = int(indigo_dev.pluginProps["endpointId"])
+        node_id, endpoint_id = node_endpoint(indigo_dev)
         device_action = action.deviceAction
 
         if device_action == indigo.kDeviceAction.Lock:

@@ -36,7 +36,7 @@ from matter_model import (
     node_id_to_str,
     parse_node,
 )
-from matter_handlers.base import IndigoDeviceSpec
+from matter_handlers.base import IndigoDeviceSpec, base_props
 from matter_handlers.basic_information import (
     ATTR_NODE_LABEL,
     ATTR_SW_VERSION_STRING,
@@ -56,6 +56,7 @@ from matter_handlers.electrical import (
     CLUSTER_POWER_TOPOLOGY,
     FEATURE_DYNAMIC_POWER_FLOW,
     FEATURE_SET_TOPOLOGY,
+    meter_props,
 )
 from matter_handlers.generic_switch import (
     CLUSTER_SWITCH,
@@ -1147,10 +1148,8 @@ class DeviceSync:
                             src_endpoint = self._endpoint_by_id(node, src_eid)
                             if src_endpoint is None:
                                 continue
-                            if src_endpoint.has(CLUSTER_ELECTRICAL_POWER):
-                                spec.props.setdefault("SupportsPowerMeter", True)
-                            if src_endpoint.has(CLUSTER_ELECTRICAL_ENERGY):
-                                spec.props.setdefault("SupportsEnergyMeter", True)
+                            for key, value in meter_props(src_endpoint).items():
+                                spec.props.setdefault(key, value)
                     plan.append((endpoint, spec))
 
             if not plan:
@@ -1494,13 +1493,7 @@ class DeviceSync:
         return IndigoDeviceSpec(
             device_type_id="matterUnknown",
             name=name,
-            props={
-                "nodeId": str(node.node_id),
-                "endpointId": str(endpoint.endpoint_id),
-                "vendorName": node.vendor_name,
-                "productName": node.product_name,
-                "supportedClusters": supported,
-            },
+            props={**base_props(node, endpoint), "supportedClusters": supported},
             initial_states={"reachable": True},
         )
 
@@ -1521,12 +1514,7 @@ class DeviceSync:
         return IndigoDeviceSpec(
             device_type_id="matterEnergyMeter",
             name=name,
-            props={
-                "nodeId": str(node.node_id),
-                "endpointId": str(endpoint.endpoint_id),
-                "vendorName": node.vendor_name,
-                "productName": node.product_name,
-            },
+            props=base_props(node, endpoint),
             initial_states={"curEnergyLevel": 0.0, "accumEnergyTotal": 0.0, "reachable": True},
         )
 
@@ -3053,10 +3041,7 @@ class DeviceSync:
         whose energy actually lives on a sibling endpoint.
         """
         props: dict = {}
-        if endpoint.has(CLUSTER_ELECTRICAL_POWER):
-            props["SupportsPowerMeter"] = True
-        if endpoint.has(CLUSTER_ELECTRICAL_ENERGY):
-            props["SupportsEnergyMeter"] = True
+        props.update(meter_props(endpoint))
         with self._lock:
             linked_sources = self._reverse_links.get(
                 (int(node.node_id), int(endpoint.endpoint_id)), set()
@@ -3065,10 +3050,7 @@ class DeviceSync:
             src_endpoint = self._endpoint_by_id(node, src_eid)
             if src_endpoint is None:
                 continue
-            if src_endpoint.has(CLUSTER_ELECTRICAL_POWER):
-                props["SupportsPowerMeter"] = True
-            if src_endpoint.has(CLUSTER_ELECTRICAL_ENERGY):
-                props["SupportsEnergyMeter"] = True
+            props.update(meter_props(src_endpoint))
         if int(endpoint.endpoint_id) in self._battery_endpoints(node.node_id):
             props["SupportsBatteryLevel"] = True
         if endpoint.has(CLUSTER_SWITCH):

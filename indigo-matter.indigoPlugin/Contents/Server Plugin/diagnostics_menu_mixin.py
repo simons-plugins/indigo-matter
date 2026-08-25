@@ -41,10 +41,10 @@ from matter_handlers.writable_attributes import MODEL_VERSION
 from matter_model import node_id_to_str, parse_node
 from plugin_constants import (
     ALL_OPTION_ID,
-    LIST_ERROR_OPTION,
     NO_SELECTION_ID,
     SURVEY_LOG_PREF,
     SURVEY_READ_TIMEOUT,
+    degrades_to_list_error,
 )
 
 
@@ -92,18 +92,15 @@ class DiagnosticsMenuMixin:
         options = self._matter_node_options()
         return options or [(NO_SELECTION_ID, "(no Matter devices — none commissioned yet)")]
 
+    @degrades_to_list_error
     def _matter_node_options(self) -> list:
         if self.device_sync is None:
             return []
-        try:
-            return [
-                (str(node_id), f"{', '.join(names) if names else '(no Indigo devices)'} "
-                               f"— node {node_id_to_str(node_id)}")
-                for node_id, names in self.device_sync.list_nodes()
-            ]
-        except Exception as exc:  # noqa: BLE001 - never break a dialog
-            self.logger.exception(exc)
-            return [LIST_ERROR_OPTION]
+        return [
+            (str(node_id), f"{', '.join(names) if names else '(no Indigo devices)'} "
+                           f"— node {node_id_to_str(node_id)}")
+            for node_id, names in self.device_sync.list_nodes()
+        ]
 
     def exploreNodeChanged(self, valuesDict=None, typeId="", devId=0):  # noqa: N802, ARG002
         """No-op callback on the explorer's node menu.
