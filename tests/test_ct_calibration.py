@@ -165,10 +165,18 @@ def test_off_lamp_both_clamps_learned_republished_and_restored(
 
 
 # ---------------------------------------------------------------------------
-# 2. Ask == echo -> no evidence, existing learned value left untouched
+# 2. Ask == echo -> the full reach IS the measurement, and is recorded
 # ---------------------------------------------------------------------------
-def test_echo_matching_the_ask_adopts_nothing_and_leaves_existing_bound_untouched(
+def test_echo_matching_the_ask_records_the_full_reach(
         calibration_mod, ct_learner_mod, mock_indigo_base, logger, republish):  # noqa: ARG001
+    """A lamp that clamps nowhere used to store nothing, leaving it identical
+    to one nobody ever swept (2026-08-25). It publishes the same bounds either
+    way — 153/500 IS the generic pair — so recording it costs nothing on the
+    wire and is the only way the plugin can say the range was measured.
+
+    The pre-existing 180-mired floor is correctly overwritten: the lamp just
+    reached 153 when asked, which is the same proof-of-reach the re-widen rule
+    already acts on."""
     import ct_bounds
     entry = _Entry(800, options={ct_bounds.OPTION_CT_LEARNED_MIN_MIREDS: 180})
     store = FakeStore([entry])
@@ -183,13 +191,38 @@ def test_echo_matching_the_ask_adopts_nothing_and_leaves_existing_bound_untouche
 
     assert engine.start(device_ids=[800], skip_lit=True) is True
 
-    assert store.upserts == []  # nothing new persisted
-    assert store.get(800).options[ct_bounds.OPTION_CT_LEARNED_MIN_MIREDS] == 180  # untouched
-    republish.assert_not_called()
+    options = store.get(800).options
+    assert options[ct_bounds.OPTION_CT_LEARNED_MIN_MIREDS] == 153
+    assert options[ct_bounds.OPTION_CT_LEARNED_MAX_MIREDS] == 500
+    assert ct_bounds.effective_ct_sources(options) == (ct_bounds.SOURCE_LEARNED,
+                                                       ct_bounds.SOURCE_LEARNED)
+    republish.assert_called()
     messages = [c.args[0] % c.args[1:] for c in logger.info.call_args_list]
     device_line = next(m for m in messages if "device 800 calibrated" in m)
-    assert "no clamp observed" in device_line
-    assert "echo matched the ask" in device_line
+    assert "153 mireds" in device_line and "500 mireds" in device_line
+
+
+def test_a_second_sweep_of_an_unclamped_lamp_persists_nothing_new(
+        calibration_mod, ct_learner_mod, mock_indigo_base, logger, republish):  # noqa: ARG001
+    """The guard that keeps the recording from becoming write churn: once the
+    full reach is stored, re-sweeping says the same thing and must not
+    re-persist or re-publish it."""
+    import ct_bounds
+    entry = _Entry(800, options={ct_bounds.OPTION_CT_LEARNED_MIN_MIREDS: 153,
+                                 ct_bounds.OPTION_CT_LEARNED_MAX_MIREDS: 500})
+    store = FakeStore([entry])
+    learner = ct_learner_mod.CTBoundsLearner(store, logger, republish)
+    devices = ScriptedDevices()
+    devices.add(
+        DimmerDevice(dev_id=800, name="Test Lamp", onState=False, brightness=0,
+                     whiteLevel=60, whiteTemperature=_mireds_to_kelvin(300)),
+        echoes_kelvin=[_mireds_to_kelvin(153), _mireds_to_kelvin(500)])
+    engine = _engine(calibration_mod, store, devices, learner, logger)
+
+    assert engine.start(device_ids=[800], skip_lit=True) is True
+
+    assert store.upserts == []
+    republish.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

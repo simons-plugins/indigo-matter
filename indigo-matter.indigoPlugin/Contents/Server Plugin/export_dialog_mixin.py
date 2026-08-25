@@ -17,7 +17,7 @@ from export_store import (CT_BOUNDS_ROLES, ExportEntry, MAPPABLE_ROLES, OPTION_C
                           OPTION_INVERT, OPTION_STATE_INVERT, OPTION_STATE_KEY)
 from ct_bounds import (GENERIC_MAX_MIREDS, GENERIC_MIN_MIREDS, SOURCE_GENERIC,
                        SOURCE_LEARNED, SOURCE_SEED, effective_ct_bounds,
-                       effective_ct_sources)
+                       effective_ct_sources, wire_options)
 from matter_handlers.color_control import kelvin_to_mireds, mireds_to_kelvin
 from plugin_constants import (
     EXCLUDED_OPTION_PREFIX, EXPORT_PICKER_LIMIT, LIST_ERROR_OPTION,
@@ -488,16 +488,17 @@ class ExportDialogMixin:
         this (2026-08-25: six devices on the live server had learned bounds
         that nothing in the UI displayed).
 
-        Silent for the generic range on purpose: every un-calibrated CT export
-        would otherwise carry an identical "2000-6535K" that says only that
-        nothing is known, and a row that reads the same for every device
-        cannot be scanned for the ones that differ.
+        Silent only when NOTHING is stored — the same "is any bound recorded
+        here" test :func:`ct_bounds.wire_options` uses to decide what reaches
+        the wire, deliberately not "does the pair differ from generic". A lamp
+        the calibration sweep measured as reaching the full 153-500 stores
+        exactly the generic pair, and that row has something to say: the range
+        was measured. An un-swept lamp stores nothing and stays silent, so the
+        rows still differ where it matters.
         """
-        if entry.role not in CT_BOUNDS_ROLES:
+        if entry.role not in CT_BOUNDS_ROLES or not wire_options(entry.options):
             return ""
         eff_min, eff_max = effective_ct_bounds(entry.options)
-        if (eff_min, eff_max) == (GENERIC_MIN_MIREDS, GENERIC_MAX_MIREDS):
-            return ""
         note = f" · {mireds_to_kelvin(eff_max)}-{mireds_to_kelvin(eff_min)}K"
         if SOURCE_LEARNED in effective_ct_sources(entry.options):
             note += " measured"

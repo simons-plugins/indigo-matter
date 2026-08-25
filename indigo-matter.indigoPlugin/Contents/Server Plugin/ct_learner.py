@@ -407,15 +407,25 @@ class CTBoundsLearner:
             return
         current_min, current_max = ct_bounds.effective_ct_bounds(fresh.options)
         if side == "min":
-            if candidate == current_min:
-                return  # already the effective value — nothing to say twice
             new_min, new_max = candidate, current_max
             learned_key = ct_bounds.OPTION_CT_LEARNED_MIN_MIREDS
         else:
-            if candidate == current_max:
-                return
             new_min, new_max = current_min, candidate
             learned_key = ct_bounds.OPTION_CT_LEARNED_MAX_MIREDS
+        if fresh.options.get(learned_key) == candidate:
+            # Already RECORDED as learned — nothing to say twice. Compared
+            # against the stored learned key, not the effective bounds
+            # (2026-08-25): those two differ for a device whose measurement
+            # happens to land on the generic edge, and the effective test
+            # made that measurement unrecordable. A sweep that asks 153
+            # mireds and gets 153 back has learned something real — the lamp
+            # reaches the full range — but "153 == the generic floor it would
+            # have used anyway" made it indistinguishable from a lamp nobody
+            # ever swept. Storing it changes no published bound (153/500 IS
+            # the generic pair, and the §4.1 un-trapdoor already carries a
+            # stored pair equal to generic onto the wire); it changes only
+            # whether the plugin can say the range was measured.
+            return
         if new_min >= new_max:
             # Bounds sanity (#293's own requirement): an adoption must never
             # collapse or invert the range. Refused rather than silently

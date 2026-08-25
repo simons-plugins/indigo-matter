@@ -321,8 +321,21 @@ class CTCalibrationEngine:
                         reason=(f"a calibration sweep asked {extreme} mireds and the device "
                                 f"echoed back {echo}"))
                 else:
-                    side_results[side] = ("no clamp observed — echo matched the ask; the driver "
-                                          "may confirm optimistically")
+                    # No clamp: the device reached what was asked, so the
+                    # EXTREME is the measurement (not the echo, which may sit
+                    # a mired or two off through rounding and would then
+                    # record a narrower range than the lamp actually reached).
+                    # Recorded rather than discarded (2026-08-25): a swept
+                    # lamp that clamps nowhere used to store nothing at all,
+                    # leaving it identical to one never swept. It publishes
+                    # the same bounds either way — 153/500 is the generic
+                    # pair — so the only thing this changes is that the
+                    # plugin can now say the range was measured.
+                    side_results[side] = extreme
+                    self._learner.adopt_measured(
+                        entry, side, extreme,
+                        reason=(f"a calibration sweep asked {extreme} mireds and the device "
+                                "reached it — no clamp on this side"))
         except Exception as exc:  # pylint: disable=broad-except
             self._logger.error(
                 "Matter export: the calibration sweep for device %s failed partway through — %s. "

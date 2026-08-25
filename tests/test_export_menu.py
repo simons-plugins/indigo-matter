@@ -620,9 +620,24 @@ def test_current_exports_shows_a_measured_ct_range_without_opening_the_device(pl
     assert "measured" in label
 
 
+def test_current_exports_shows_a_measured_full_range(plug, devices):
+    """The 2026-08-25 change: a lamp the sweep measured as reaching the whole
+    153-500 range stores exactly the generic pair, and its row must still say
+    so — otherwise "measured, no clamp anywhere" is indistinguishable from
+    "never swept", which is the gap that prompted this."""
+    device_id = _ct_device(devices)
+    plug.exports.upsert(ExportEntry(device_id, "colorTemperatureLight",
+                                    options={OPTION_CT_LEARNED_MIN_MIREDS: 153,
+                                             OPTION_CT_LEARNED_MAX_MIREDS: 500}))
+    label = _labels(plug.getCurrentExports())[str(device_id)]
+    assert "2000-6536K" in label
+    assert "measured" in label
+
+
 def test_current_exports_says_nothing_for_the_generic_ct_range(plug, devices):
-    """A note every un-calibrated lamp carries identically is one nobody can
-    scan past — silence is what makes the calibrated rows visible."""
+    """An UNSWEPT lamp stores nothing and stays silent — silence is what makes
+    the measured rows visible. (A lamp measured AS the full range does store
+    keys, and does speak: see the test above.)"""
     device_id = _ct_device(devices)
     plug.exports.upsert(ExportEntry(device_id, "colorTemperatureLight"))
     assert "K" not in _labels(plug.getCurrentExports())[str(device_id)].split("→")[1]
