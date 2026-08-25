@@ -12,6 +12,8 @@ from pathlib import Path
 
 import pytest
 
+import device_settings
+
 BUNDLE = (
     Path(__file__).parent.parent
     / "indigo-matter.indigoPlugin"
@@ -2086,6 +2088,7 @@ def _state_list_plugin(plugin_cls, mock_indigo_base, mock_logger, attr_lists):
     plugin.device_sync = device_sync
     plugin.base_state_lists = {"matterRelay": _relay_states(),
                                "matterMotionSensor": _motion_states()}
+    plugin.removed_state_log = device_settings.RemovedStateLog()
     return plugin
 
 
@@ -2252,3 +2255,109 @@ def test_a_device_type_with_no_settings_is_passed_straight_through(
     dev = SimpleNamespace(id=9, name="Hall Temp", deviceTypeId="matterTemperatureSensor",
                           pluginProps={"nodeId": "52", "endpointId": "1"})
     assert [s["Key"] for s in plugin.getDeviceStateList(dev)] == ["sensorValue"]
+
+
+# ===========================================================================
+# issue #312 — the removed-state INFO logs once per distinct answer, not once
+# per evaluation. The filtering itself does not change (proven above); only
+# how often it is announced.
+# ===========================================================================
+
+def test_the_first_evaluation_logs(plugin_cls, mock_indigo_base, mock_logger):
+    """No prior fingerprint recorded — the answer is new, so it must log."""
+    plugin = _state_list_plugin(plugin_cls, mock_indigo_base, mock_logger, _PLAIN_PLUG_LISTS)
+    plugin.getDeviceStateList(_relay_dev())
+    assert mock_logger.info.call_count == 1
+
+
+def test_an_identical_re_evaluation_does_not_log_again(
+        plugin_cls, mock_indigo_base, mock_logger):
+    """The bug in #312: Indigo rebuilds a device's state list on every dialog
+    dismiss and every plugin start, and the filter is right to re-run every
+    time — but re-announcing the SAME answer is the noise being fixed."""
+    plugin = _state_list_plugin(plugin_cls, mock_indigo_base, mock_logger, _PLAIN_PLUG_LISTS)
+    plugin.getDeviceStateList(_relay_dev())
+    plugin.getDeviceStateList(_relay_dev())
+    plugin.getDeviceStateList(_relay_dev())
+    assert mock_logger.info.call_count == 1
+
+
+def test_a_changed_removed_set_logs_again(plugin_cls, mock_indigo_base, mock_logger):
+    """Keyed on the ANSWER, not just the device: a device that first drops one
+    state and later drops a DIFFERENT one must log the second time too — a
+    boolean "already logged this device" latch would wrongly suppress it."""
+    plugin = _state_list_plugin(plugin_cls, mock_indigo_base, mock_logger, {
+        0x0406: [0, 65528, 65529, 65531, 65532, 65533],   # no HoldTime
+        0x0080: [0, 65528, 65529, 65531, 65532, 65533],   # HAS sensitivityLevel
+    })
+    plugin.getDeviceStateList(_motion_dev())  # drops holdTime only
+    plugin.device_sync.attribute_list.side_effect = lambda node, ep, cluster: {
+        0x0406: [0, 65528, 65529, 65531, 65532, 65533],   # still no HoldTime
+        0x0080: [65528, 65529, 65531, 65532, 65533],      # NOW also loses sensitivityLevel
+    }.get(cluster)
+    plugin.getDeviceStateList(_motion_dev())  # drops holdTime AND sensitivityLevel
+    assert mock_logger.info.call_count == 2
+    second = str(mock_logger.info.call_args_list[1])
+    assert "sensitivityLevel" in second
+
+
+def test_the_same_answer_on_two_different_devices_logs_for_each(
+        plugin_cls, mock_indigo_base, mock_logger):
+    """The fingerprint is keyed per device id — two devices dropping the exact
+    same state must not be treated as the same "already logged" answer."""
+    plugin = _state_list_plugin(plugin_cls, mock_indigo_base, mock_logger, _PLAIN_PLUG_LISTS)
+    plugin.getDeviceStateList(_relay_dev(dev_id=7, node="52"))
+    plugin.getDeviceStateList(_relay_dev(dev_id=8, name="Second plug", node="53"))
+    assert mock_logger.info.call_count == 2
+
+
+def test_a_save_failure_does_not_raise_into_getDeviceStateList(
+        plugin_cls, mock_indigo_base, mock_logger):
+    """To assert the swallow lives in RemovedStateLog._persist and not in
+    getDeviceStateList's own exception handling, make the save hook fatal and
+    confirm the state list still builds — if this needed the OUTER handler to
+    catch it, `.exception` would fire, which the assertion below rules out."""
+    plugin = _state_list_plugin(plugin_cls, mock_indigo_base, mock_logger, _PLAIN_PLUG_LISTS)
+
+    def boom(_blob):
+        raise OSError("prefs are gone")
+
+    plugin.removed_state_log = device_settings.RemovedStateLog(save=boom)
+    keys = [state["Key"] for state in plugin.getDeviceStateList(_relay_dev())]
+    assert keys == ["onOffState"]
+    assert not mock_logger.exception.called
+
+
+def test_a_device_with_no_removed_state_log_wired_fails_open_to_logging_every_time(
+        plugin_cls, mock_indigo_base, mock_logger):
+    """Defensive fallback for the (only theoretical) case getDeviceStateList
+    runs before startup wires removed_state_log: better to over-log than to
+    raise or silently drop the #190 warning altogether."""
+    plugin = _state_list_plugin(plugin_cls, mock_indigo_base, mock_logger, _PLAIN_PLUG_LISTS)
+    del plugin.removed_state_log
+    plugin.getDeviceStateList(_relay_dev())
+    plugin.getDeviceStateList(_relay_dev())
+    assert mock_logger.info.call_count == 2
+
+
+def test_a_deleted_device_is_forgotten_by_the_removed_state_log(
+        plugin_cls, mock_indigo_base, mock_logger):
+    """Wired to plugin.deviceDeleted (issue #312): otherwise a deleted device's
+    fingerprint entry sits in pluginPrefs forever, unbounded, for a device that
+    no longer exists — and if the id were ever reused, a new device could
+    silently inherit a stale "already logged" answer."""
+    import plugin as plugin_module
+    plugin = plugin_module.Plugin.__new__(plugin_module.Plugin)
+    plugin.logger = mock_logger
+    plugin.removed_state_log = device_settings.RemovedStateLog()
+    plugin.removed_state_log.record(7, "startUpOnOff")
+    assert not plugin.removed_state_log.should_log(7, "startUpOnOff")
+
+    dev = _relay_dev(dev_id=7)
+    dev.pluginProps = {}  # not a matterNode, no export bookkeeping to touch
+    plugin._exported_ids = set()
+    plugin.exports = None
+    plugin.device_sync = None
+    plugin.deviceDeleted(dev)
+
+    assert plugin.removed_state_log.should_log(7, "startUpOnOff")

@@ -64,8 +64,8 @@ from server_process import ServerProcess
 
 from plugin_constants import (
     COMMAND_TIMEOUT, MAX_RESUBSCRIBE_ATTEMPTS, NODE_TOMBSTONES_PREF, ON_TIME_RETIRED_PREF,
-    PLUGIN_NAME, PORT_CONFLICT_CHECK_INTERVAL, RESUBSCRIBE_TICKS, SURVEY_LOG_PREF,
-    sanitize_host, server_location,
+    PLUGIN_NAME, PORT_CONFLICT_CHECK_INTERVAL, REMOVED_STATE_LOG_PREF, RESUBSCRIBE_TICKS,
+    SURVEY_LOG_PREF, sanitize_host, server_location,
 )
 import settings_report
 
@@ -240,6 +240,11 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
         self.node_tombstones = NodeDeviceTombstones(save=self._save_node_tombstones, logger=self.logger)
         self.node_tombstones.load(self.pluginPrefs.get(NODE_TOMBSTONES_PREF, ""))
         self.device_sync.node_tombstones = self.node_tombstones
+
+        # getDeviceStateList's "last reported removed-set" per device (issue
+        # #312) — same prefs discipline as survey_log above.
+        self.removed_state_log = device_settings.RemovedStateLog(save=self._save_removed_state_log)
+        self.removed_state_log.load(self.pluginPrefs.get(REMOVED_STATE_LOG_PREF, ""))
 
         self._announce_retired_on_time_state()
 
@@ -547,6 +552,15 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
                     self.device_sync.note_node_device_deleted(int(node_id), dev.id)
             except Exception as exc:  # noqa: BLE001 - a deletion must always complete
                 self.logger.exception(exc)
+        # Every device type can carry a removed_state_log entry (issue #312),
+        # not just matterNode — unlike the tombstone above this is unconditional
+        # and unrelated to exports, so it runs before the early return below.
+        try:
+            log = getattr(self, "removed_state_log", None)
+            if log is not None:
+                log.forget(dev.id)
+        except Exception as exc:  # noqa: BLE001 - a deletion must always complete
+            self.logger.exception(exc)
         if dev.id not in self._exported_ids or self.exports is None:
             return
         try:
@@ -1157,6 +1171,30 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
 
         return lookup
 
+    def _save_removed_state_log(self, blob: str) -> None:
+        """Persist ``removed_state_log`` (issue #312).
+
+        Same discipline as ``DiagnosticsMenuMixin._save_survey_log``: written
+        through ``self.pluginPrefs`` at call time rather than a captured
+        mapping, because Indigo rebinds it when the PluginConfig dialog is
+        saved, and committed via ``savePluginPrefs`` without which it survives
+        only until the plugin stops.
+
+        Caught and logged rather than left to escape into
+        ``RemovedStateLog._persist``, which is deliberately silent for the same
+        reason ``SurveyLog._persist`` is (issue #308: the caller supplies the
+        save hook and logs there). A failure here is cosmetic — the affected
+        device(s) simply reprint their removed-state INFO once more on the
+        next rebuild — which is why WARNING rather than anything louder.
+        """
+        try:
+            self.pluginPrefs[REMOVED_STATE_LOG_PREF] = blob
+            indigo.server.savePluginPrefs()
+        except Exception as exc:  # noqa: BLE001 - bookkeeping must never sink a device rebuild
+            self.logger.warning(
+                "Matter: could not save the removed-state log (%s) — the affected "
+                "device(s) will reprint their state-removal notice on the next rebuild.", exc)
+
     def getDeviceStateList(self, dev):  # noqa: N802
         """Build this device's states from what the DEVICE says it implements.
 
@@ -1225,24 +1263,41 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
                 'device "%s": %d of %d state entries could not be read, so the Matter '
                 "capability filter was not applied to them", dev.name, unreadable, total)
         if removed:
-            # INFO, and worth it: a state disappearing silently breaks any
-            # trigger or control page bound to it, with nothing in the log to
-            # connect the two. One line per device rather than per state.
-            #
-            # Frequency: NOT at device start — deviceStartComm forces a rebuild
-            # before the first reconcile has run, so the cache is cold, every
-            # answer is unknown and nothing is removed. The line comes from the
-            # first _refresh_state_lists after that reconcile, and thereafter
-            # when a node's AttributeLists change OR the pass created a device
-            # (the refresh covers the whole node, so a new sibling reprints this
-            # for the devices already filtered). Indigo also rebuilds when an
-            # Edit Device dialog is dismissed, so editing one reprints it.
-            self.logger.info(
-                'device "%s": removed the state(s) %s — this unit\'s AttributeList says it '
-                "does not implement %s, so the values shown were Indigo's defaults rather "
-                "than anything the device reported",
-                dev.name, ", ".join(f'"{key}"' for key in removed),
-                ", ".join(f"0x{drop[key].attribute:04X}" for key in removed))
+            # Logged once per distinct ANSWER, not once per evaluation (issue
+            # #312). The filtering above is correct to re-run on every rebuild
+            # — Indigo calls this as a filter each time, and the cache the
+            # answer is drawn from can have changed — but reprinting the same
+            # removed-set on every rebuild was pure noise: ~3 lines/device on
+            # every plugin start, forever, for an answer that essentially never
+            # changes within a session. removed_state_log persists a
+            # fingerprint per device so a genuinely NEW or CHANGED answer still
+            # logs (including the very first time) while an unchanged repeat
+            # does not. `None` (not wired — only possible if getDeviceStateList
+            # runs before startup finishes) fails open to the old behaviour
+            # rather than silently going quiet.
+            log = getattr(self, "removed_state_log", None)
+            fingerprint = device_settings.RemovedStateLog.fingerprint(removed)
+            if log is None or log.should_log(dev.id, fingerprint):
+                # INFO, and worth it: a state disappearing silently breaks any
+                # trigger or control page bound to it, with nothing in the log to
+                # connect the two. One line per device rather than per state.
+                #
+                # Frequency: NOT at device start — deviceStartComm forces a rebuild
+                # before the first reconcile has run, so the cache is cold, every
+                # answer is unknown and nothing is removed. The line comes from the
+                # first _refresh_state_lists after that reconcile, and thereafter
+                # when a node's AttributeLists change OR the pass created a device
+                # (the refresh covers the whole node, so a new sibling reprints this
+                # for the devices already filtered). Indigo also rebuilds when an
+                # Edit Device dialog is dismissed, so editing one reprints it.
+                self.logger.info(
+                    'device "%s": removed the state(s) %s — this unit\'s AttributeList says it '
+                    "does not implement %s, so the values shown were Indigo's defaults rather "
+                    "than anything the device reported",
+                    dev.name, ", ".join(f'"{key}"' for key in removed),
+                    ", ".join(f"0x{drop[key].attribute:04X}" for key in removed))
+                if log is not None:
+                    log.record(dev.id, fingerprint)
         return kept
 
     def getDeviceConfigUiValues(self, pluginProps, typeId, devId):  # noqa: N802

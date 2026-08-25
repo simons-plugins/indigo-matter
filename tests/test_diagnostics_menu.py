@@ -299,6 +299,34 @@ def test_saving_the_log_commits_through_indigo(mixin):
     assert sys.modules["indigo"].server.savePluginPrefs.called
 
 
+def test_a_failed_save_is_logged_not_swallowed(mixin):
+    """Issue #308: ``SurveyLog._persist`` is deliberately silent on the
+    assumption that its caller logs — this pins that the caller actually
+    does, so the documented contract is not just a comment nobody honours.
+    """
+    _module, obj = mixin
+    sys.modules["indigo"].server.savePluginPrefs.side_effect = OSError("prefs are gone")
+
+    obj._save_survey_log('{"52": "fp"}')  # must not raise
+
+    assert obj.logger.warning.called
+    warning_args = obj.logger.warning.call_args[0]
+    assert "survey log" in warning_args[0]
+
+
+def test_a_failed_save_logs_exactly_once(mixin):
+    """To assert the swallow in ``SurveyLog._persist`` is never what does the
+    logging, make the *caller's* own logging the only thing capable of firing:
+    if this fired twice, something upstream (``_persist`` itself) would have
+    to have logged too — which the #308 fix explicitly says it must not."""
+    _module, obj = mixin
+    sys.modules["indigo"].server.savePluginPrefs.side_effect = OSError("prefs are gone")
+
+    obj._save_survey_log('{"52": "fp"}')
+
+    assert obj.logger.warning.call_count == 1
+
+
 # ---------------------------------------------------------------------------
 # The invariant
 # ---------------------------------------------------------------------------
