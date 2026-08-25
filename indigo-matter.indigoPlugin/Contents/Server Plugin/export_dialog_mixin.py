@@ -982,6 +982,102 @@ class ExportDialogMixin:
             identity = next_generation(identity)
         return identity
 
+    def _resolve_published_identity(self, dev, previous, role_changed) -> Optional[str]:
+        """The `published_as` an add/update should store, or ``None`` for the default.
+
+        Extracted from :meth:`exportAddOrUpdate` unchanged. It is one of that
+        method's six jobs and the only one that reasons about accessory
+        IDENTITY, which is what makes it worth a name: every branch below is a
+        separate issue-#240/#246 ruling about when an identity may move, and
+        they are easier to check against those rulings in isolation than
+        interleaved with option-building and validation.
+
+        ``None`` means "publish the default derivation" — deliberately not the
+        derivation itself, so the store keeps recording that this export never
+        needed an explicit identity.
+        """
+        device_id = dev.id
+        if role_changed:
+            # Issue #246 review finding 1 — the bump can ALSO land on a
+            # generation another entry already claims (that entry was
+            # re-exported while this one sat un-role-changed), so this walks
+            # past every claimed generation rather than trying the immediate
+            # next one and trusting it is free.
+            bumped = next_generation(previous.published_as or published_id_for(device_id))
+            published_as = self._first_unclaimed_identity(bumped, device_id)
+        elif previous is not None:
+            published_as = previous.published_as
+        else:
+            # Issue #246 review finding 1 — a device whose DEFAULT identity
+            # was migrated onto another device's entry must not silently
+            # publish it again: `None` here means "publish the default
+            # derivation", and that derivation may now belong to someone
+            # else. Only claimed defaults pay the walk; the common case (never
+            # migrated) is untouched and still stores `None`.
+            default_identity = published_id_for(device_id)
+            resolved = self._first_unclaimed_identity(default_identity, device_id)
+            if resolved == default_identity:
+                published_as = None
+            else:
+                published_as = resolved
+                self.logger.info(
+                    "Matter export: %s's original accessory identity (%s) was migrated to "
+                    "another device, so this export becomes a NEW accessory under %s — it does "
+                    "not steal back the migrated one.",
+                    dev.name, default_identity, resolved)
+        return published_as
+
+    def _carry_forward_ct_bounds(self, device_id: int, options: dict, role: str) -> str:
+        """Carry the learner's own record onto *options*, and return any user note.
+
+        Extracted from :meth:`exportAddOrUpdate` unchanged. Mutates *options* in
+        place, as the inline code did, and returns the sentence the dialog
+        appends to its status when a conflicting learned bound had to be
+        dropped — "" when nothing was dropped.
+
+        Worth its own name because it guards a race found in production on
+        2026-08-24 and the re-read below is the whole point of it: see the
+        comment on `fresh_previous`.
+        """
+        ct_coherence_note = ""
+        if role not in CT_BOUNDS_ROLES:
+            return ct_coherence_note
+        # Issue #293 review — the learner's own record is carried
+        # forward from a RE-READ taken here, immediately before the
+        # write, not from the caller's `previous`: that may be a
+        # snapshot from moments ago, and a learner adoption
+        # (`ct_learner.CTBoundsLearner._adopt`, which runs on Indigo's
+        # device thread, not this dialog callback's thread) landing on
+        # THIS device in between must not be silently clobbered by a
+        # carry-forward built from the stale copy. Mirrors `_adopt`'s
+        # own re-read-immediately-before-write, for the identical
+        # reason.
+        fresh_previous = self.exports.get(device_id)
+        for learned_key in (OPTION_CT_LEARNED_MIN_MIREDS, OPTION_CT_LEARNED_MAX_MIREDS):
+            options.pop(learned_key, None)
+            if fresh_previous is not None and learned_key in fresh_previous.options:
+                options[learned_key] = fresh_previous.options[learned_key]
+        # Coherence guard — a carried-forward learned bound can now
+        # conflict with the FRESH seed the caller just built into
+        # `options` (e.g. a stale
+        # learned min of 250 mireds against a new seed max of 200): the
+        # seed is the newer intent, so the conflicting learned key(s)
+        # are dropped rather than saving an entry whose
+        # `ct_bounds.effective_ct_bounds` would come out inverted or
+        # collapsed — the learner simply re-earns the evidence from the
+        # device again.
+        eff_min, eff_max = effective_ct_bounds(options)
+        if eff_min >= eff_max:
+            dropped_any = False
+            for learned_key in (OPTION_CT_LEARNED_MIN_MIREDS, OPTION_CT_LEARNED_MAX_MIREDS):
+                if options.pop(learned_key, None) is not None:
+                    dropped_any = True
+            if dropped_any:
+                ct_coherence_note = (
+                    " A previously learned colour-temperature bound conflicted with this "
+                    "seed and was dropped; the learner will re-confirm it from the device.")
+        return ct_coherence_note
+
     def exportAddOrUpdate(self, valuesDict, typeId="", devId=0):
         # pylint: disable=unused-argument
         """Add or update one export. Validates the role against the catalog.
@@ -1062,69 +1158,8 @@ class ExportDialogMixin:
         # in-place device-type mutation; anything else carries the identity
         # through unchanged — an ordinary update must never move it on its
         # own (PR5 design §1.3).
-        if role_changed:
-            # Issue #246 review finding 1 — the bump can ALSO land on a
-            # generation another entry already claims (that entry was
-            # re-exported while this one sat un-role-changed), so this walks
-            # past every claimed generation rather than trying the immediate
-            # next one and trusting it is free.
-            bumped = next_generation(previous.published_as or published_id_for(device_id))
-            published_as = self._first_unclaimed_identity(bumped, device_id)
-        elif existed:
-            published_as = previous.published_as
-        else:
-            # Issue #246 review finding 1 — a device whose DEFAULT identity
-            # was migrated onto another device's entry must not silently
-            # publish it again: `None` here means "publish the default
-            # derivation", and that derivation may now belong to someone
-            # else. Only claimed defaults pay the walk; the common case (never
-            # migrated) is untouched and still stores `None`.
-            default_identity = published_id_for(device_id)
-            resolved = self._first_unclaimed_identity(default_identity, device_id)
-            if resolved == default_identity:
-                published_as = None
-            else:
-                published_as = resolved
-                self.logger.info(
-                    "Matter export: %s's original accessory identity (%s) was migrated to "
-                    "another device, so this export becomes a NEW accessory under %s — it does "
-                    "not steal back the migrated one.",
-                    dev.name, default_identity, resolved)
-        ct_coherence_note = ""
-        if role in CT_BOUNDS_ROLES:
-            # Issue #293 review — the learner's own record is carried
-            # forward from a RE-READ taken here, immediately before the
-            # write, not from `previous` above: `previous` may be a
-            # snapshot from moments ago, and a learner adoption
-            # (`ct_learner.CTBoundsLearner._adopt`, which runs on Indigo's
-            # device thread, not this dialog callback's thread) landing on
-            # THIS device in between must not be silently clobbered by a
-            # carry-forward built from the stale copy. Mirrors `_adopt`'s
-            # own re-read-immediately-before-write, for the identical
-            # reason.
-            fresh_previous = self.exports.get(device_id)
-            for learned_key in (OPTION_CT_LEARNED_MIN_MIREDS, OPTION_CT_LEARNED_MAX_MIREDS):
-                options.pop(learned_key, None)
-                if fresh_previous is not None and learned_key in fresh_previous.options:
-                    options[learned_key] = fresh_previous.options[learned_key]
-            # Coherence guard — a carried-forward learned bound can now
-            # conflict with the FRESH seed just entered above (e.g. a stale
-            # learned min of 250 mireds against a new seed max of 200): the
-            # seed is the newer intent, so the conflicting learned key(s)
-            # are dropped rather than saving an entry whose
-            # `ct_bounds.effective_ct_bounds` would come out inverted or
-            # collapsed — the learner simply re-earns the evidence from the
-            # device again.
-            eff_min, eff_max = effective_ct_bounds(options)
-            if eff_min >= eff_max:
-                dropped_any = False
-                for learned_key in (OPTION_CT_LEARNED_MIN_MIREDS, OPTION_CT_LEARNED_MAX_MIREDS):
-                    if options.pop(learned_key, None) is not None:
-                        dropped_any = True
-                if dropped_any:
-                    ct_coherence_note = (
-                        " A previously learned colour-temperature bound conflicted with this "
-                        "seed and was dropped; the learner will re-confirm it from the device.")
+        published_as = self._resolve_published_identity(dev, previous, role_changed)
+        ct_coherence_note = self._carry_forward_ct_bounds(device_id, options, role)
         try:
             self.exports.upsert(ExportEntry(
                 indigo_device_id=device_id, role=role,
