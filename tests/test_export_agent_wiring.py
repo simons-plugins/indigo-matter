@@ -420,7 +420,7 @@ class TestPairingEvents:
         h = self._started(bridge_mod, mock_logger, devices)
         fabrics = bridge_protocol.parse_fabrics(
             [{"fabricIndex": 1, "label": "", "vendorId": 0x1349}])
-        h.bridge._on_fabrics_changed(fabrics, "added")
+        h.bridge._health._on_fabrics_changed(fabrics, "added")
         assert "Apple" in infos_of(mock_logger)
         assert h.bridge.fabrics == fabrics
 

@@ -346,7 +346,8 @@ def test_bridge_health_device_exists_as_custom_type():
 
 def test_bridge_health_states_match_what_export_bridge_actually_writes():
     """review finding 6b (extended by issue #288's fabric slots):
-    `export_bridge._write_health_state`'s ``updateStatesOnServer`` call writes
+    `bridge_health.BridgeHealthReporter._write_health_state`'s
+    ``updateStatesOnServer`` call writes
     exactly `subscriptionHealth`/`churnDetail` plus the ten
     `fabric<N>Name`/`fabric<N>Health` slot keys — Devices.xml must declare
     exactly those twelve, no more (ADR-0007: a shipped state is permanent)
