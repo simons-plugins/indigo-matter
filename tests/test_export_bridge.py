@@ -3682,7 +3682,7 @@ class TestFabricSlotFinderThrottle:
         h = self._harness(bridge_mod, mock_logger, devices)
 
         h.bridge.health_tick()          # no client at all -- the one scan, finds nothing
-        assert h.bridge._health_state == (bridge_mod.HEALTH_UNKNOWN, "", None, None)
+        assert h.bridge._health._health_state == (bridge_mod.HEALTH_UNKNOWN, "", None, None)
         assert h.health_devices == []
 
         # A device now exists (out of band) -- persisted "healthy", vacant slots.
@@ -3696,7 +3696,7 @@ class TestFabricSlotFinderThrottle:
 
         h.bridge.health_tick()          # the one-scan throttle means this is NOT found
 
-        assert h.bridge._health_state == (bridge_mod.HEALTH_UNKNOWN, "", None, None), (
+        assert h.bridge._health._health_state == (bridge_mod.HEALTH_UNKNOWN, "", None, None), (
             "the sentinel must not be confused with (or replaced by) a real all-vacant reading")
         assert late.writes == [], "an out-of-band device the throttled path never found stays untouched"
         assert late.states["subscriptionHealth"] == "healthy", "left exactly as found -- not corrected"
@@ -3765,7 +3765,7 @@ class TestStalePersistedHealthAcrossARestart:
             "subscriptionChurn": {"checked": True, "active": False, "peers": []},
         }), False)                                     # creates it, healthy
         assert len(h.health_devices) == 1
-        h.devices.drop(h.bridge._health_device_id)
+        h.devices.drop(h.bridge._health._health_device_id)
         h.health_devices.clear()                        # the user deleted it out-of-band
         h.client.halted = True
 

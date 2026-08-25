@@ -42,6 +42,7 @@ from ct_calibration import CTCalibrationEngine
 import device_settings
 from device_sync import DeviceSync, NodeDeviceTombstones
 from diagnostics_menu_mixin import DiagnosticsMenuMixin, MatterUnavailable
+import bridge_health
 import export_bridge
 from export_bridge import ExportBridge
 import export_dialog_mixin      # noqa: F401 (tests patch EXPORT_PICKER_LIMIT)  # pylint: disable=unused-import
@@ -914,7 +915,7 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
         fabrics = bridge.fabrics
         if fabrics is None:
             return f"{exported} device(s) exported; not yet connected to the bridge node."
-        paired = ", ".join(export_bridge.describe_fabric(f) for f in fabrics) or "nothing yet"
+        paired = ", ".join(bridge_health.describe_fabric(f) for f in fabrics) or "nothing yet"
         # Said as "last reported" because it is: this list is the one the last
         # attach or §5 event left behind, deliberately not a WS round trip (this
         # runs while the dialog is opening). An ecosystem that dropped us a

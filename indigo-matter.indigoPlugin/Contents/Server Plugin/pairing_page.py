@@ -8,7 +8,7 @@ from __future__ import annotations
 from typing import Any
 from urllib.parse import quote
 
-import export_bridge          # for export_bridge.describe_fabric
+import bridge_health          # for bridge_health.describe_fabric
 
 #: Where the raw ``MT:`` payload can be rendered as a scannable QR code. The
 #: CHIP project's own tool, which is the reference implementation of the payload
@@ -43,7 +43,7 @@ def _pairing_html(pairing, message: str) -> str:
     qr_payload = _escape(getattr(pairing, "qr_pairing_code", None))
     expires = _escape(getattr(pairing, "window_expires_at", None))
     fabrics = list(getattr(pairing, "fabrics", ()) or [])
-    paired = ", ".join(_escape(export_bridge.describe_fabric(f)) for f in fabrics) or "none yet"
+    paired = ", ".join(_escape(bridge_health.describe_fabric(f)) for f in fabrics) or "none yet"
     banner = f'<p class="msg">{_escape(message)}</p>' if message else ""
     codes = ""
     if manual:

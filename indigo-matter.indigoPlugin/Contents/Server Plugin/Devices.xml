@@ -1069,8 +1069,9 @@
          this device exists so "churning" and "recovered" are ordinary,
          trigger-able Indigo states.
          allowUserCreation="false" for the same reason matterNode is: only
-         export_bridge._ensure_health_device creates this type, never the New
-         Device dialog — a user-created one would have no bridge behind it.
+         bridge_health.BridgeHealthReporter._ensure_health_device creates this
+         type, never the New Device dialog — a user-created one would have no
+         bridge behind it.
          States are deliberately minimal (ADR-0007: a shipped state is
          permanent) — `subscriptionHealth` is what a trigger binds to;
          `churnDetail` is read-along context, naming the peer(s), never
@@ -1081,7 +1082,7 @@
          is churning when a house has several, only THAT one is. Five fixed
          POSITIONAL slots (ADR-0007 again — the count is a one-time choice,
          not a config knob): slots are filled in `fabric_index` order by
-         export_bridge._fabric_slot_plan and repack whenever a fabric leaves,
+         bridge_health._fabric_slot_plan and repack whenever a fabric leaves,
          they are not tied to any specific fabric's index. An unused slot is
          the empty string on BOTH its Name and Health — never a placeholder
          value a trigger could mistake for a real (if idle) fabric. -->

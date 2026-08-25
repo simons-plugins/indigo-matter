@@ -12,7 +12,7 @@ import indigo  # provided by the Indigo runtime
 
 import bridge_agent
 import bridge_protocol
-import export_bridge          # export_bridge.describe_fabric
+import bridge_health          # bridge_health.describe_fabric
 import fabric_backup
 from plugin_constants import (
     NO_SELECTION_ID, PAIRING_READ_TIMEOUT,
@@ -217,7 +217,7 @@ class PairingMenuMixin:
                      "(no paired ecosystems)" if fabrics == []
                      else "(not connected to the bridge node)")]
         return [(NO_SELECTION_ID, "(select an ecosystem)")] + [
-            (str(fabric.fabric_index), export_bridge.describe_fabric(fabric))
+            (str(fabric.fabric_index), bridge_health.describe_fabric(fabric))
             for fabric in fabrics]
 
     def menuUnpairEcosystem(self, valuesDict, menuId=""):  # noqa: N802, ARG002
