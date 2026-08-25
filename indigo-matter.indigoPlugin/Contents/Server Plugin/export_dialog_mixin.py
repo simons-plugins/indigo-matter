@@ -15,7 +15,9 @@ from bridge_protocol import next_generation, published_id_for
 from export_store import (CT_BOUNDS_ROLES, ExportEntry, MAPPABLE_ROLES, OPTION_CT_LEARNED_MAX_MIREDS,
                           OPTION_CT_LEARNED_MIN_MIREDS, OPTION_CT_MAX_MIREDS, OPTION_CT_MIN_MIREDS,
                           OPTION_INVERT, OPTION_STATE_INVERT, OPTION_STATE_KEY)
-from ct_bounds import GENERIC_MAX_MIREDS, GENERIC_MIN_MIREDS, effective_ct_bounds
+from ct_bounds import (GENERIC_MAX_MIREDS, GENERIC_MIN_MIREDS, SOURCE_GENERIC,
+                       SOURCE_LEARNED, SOURCE_SEED, effective_ct_bounds,
+                       effective_ct_sources)
 from matter_handlers.color_control import kelvin_to_mireds, mireds_to_kelvin
 from plugin_constants import (
     EXCLUDED_OPTION_PREFIX, EXPORT_PICKER_LIMIT, LIST_ERROR_OPTION,
@@ -282,6 +284,9 @@ class ExportDialogMixin:
         values["exportInvert"] = False
         values["exportCtWarmestK"] = ""
         values["exportCtCoolestK"] = ""
+        values["exportCtWarmestKShown"] = ""
+        values["exportCtCoolestKShown"] = ""
+        values["exportCtBoundsSource"] = ""
         values["exportStatus"] = self._export_summary()
         return values
 
@@ -462,6 +467,7 @@ class ExportDialogMixin:
                         label += f' · shown as "{entry.name_override}"'
                     if entry.options.get(OPTION_INVERT):
                         label += " · inverted"
+                    label += self._ct_bounds_row_note(entry)
                     options.append((str(entry.indigo_device_id), label))
                 except Exception as exc:  # pylint: disable=broad-except
                     self._log_row_failure(exc, first=not failures)
@@ -472,6 +478,30 @@ class ExportDialogMixin:
         except Exception as exc:  # pylint: disable=broad-except
             self.logger.exception(exc)
             return [LIST_ERROR_OPTION]
+
+    @staticmethod
+    def _ct_bounds_row_note(entry) -> str:
+        """One export row's colour-temperature range, or ``""``.
+
+        Shown in the list so the answer to "did the calibration take?" does
+        not require opening each device in turn — the question that surfaced
+        this (2026-08-25: six devices on the live server had learned bounds
+        that nothing in the UI displayed).
+
+        Silent for the generic range on purpose: every un-calibrated CT export
+        would otherwise carry an identical "2000-6535K" that says only that
+        nothing is known, and a row that reads the same for every device
+        cannot be scanned for the ones that differ.
+        """
+        if entry.role not in CT_BOUNDS_ROLES:
+            return ""
+        eff_min, eff_max = effective_ct_bounds(entry.options)
+        if (eff_min, eff_max) == (GENERIC_MIN_MIREDS, GENERIC_MAX_MIREDS):
+            return ""
+        note = f" · {mireds_to_kelvin(eff_max)}-{mireds_to_kelvin(eff_min)}K"
+        if SOURCE_LEARNED in effective_ct_sources(entry.options):
+            note += " measured"
+        return note
 
     # ----------------------------------------------------------------
     # Custom-state mapping (ADR-0012, issue #252)
@@ -512,7 +542,8 @@ class ExportDialogMixin:
     _CT_SEED_KELVIN_MIN = 2000
     _CT_SEED_KELVIN_MAX = 6535
 
-    def _ct_seed_from_values(self, values: dict) -> tuple[dict, Optional[str]]:
+    def _ct_seed_from_values(self, values: dict,
+                             previous_options: Optional[dict] = None) -> tuple[dict, Optional[str]]:
         """The ``ctMinMireds``/``ctMaxMireds`` seed pair the dialog fields describe.
 
         Returns ``(options, None)`` on success — ``options`` is ``{}`` when
@@ -520,6 +551,17 @@ class ExportDialogMixin:
         DELETED, since :meth:`exportDeviceChanged` pre-fills these fields
         from any saved one) or the two-key pair when both are filled — or
         ``({}, reason)`` when what is on screen cannot become a seed at all.
+
+        **A value the user did not touch is not a declaration.** The fields
+        are pre-filled with the EFFECTIVE bounds
+        (:meth:`_apply_ct_bounds_fields`), which for a calibrated device are
+        the LEARNER's, so an unedited save would otherwise copy measured
+        evidence into ``ctMinMireds``/``ctMaxMireds`` and leave it there after
+        the learner re-widened or forgot the bound it came from. When both
+        fields still hold exactly what was put on screen, this therefore
+        carries ``previous_options``' own seed keys forward untouched — no
+        seed where there was none, the same seed where there was one — and
+        only a genuinely EDITED pair is read as the user declaring a range.
 
         **Reciprocal by design.** The WARMEST Kelvin the user can name is the
         HIGHEST mireds value (§4.2's ``colorTempMireds`` runs cool-to-warm as
@@ -532,6 +574,13 @@ class ExportDialogMixin:
         """
         warm_raw = str(values.get("exportCtWarmestK", "") or "").strip()
         cool_raw = str(values.get("exportCtCoolestK", "") or "").strip()
+        shown_warm = str(values.get("exportCtWarmestKShown", "") or "").strip()
+        shown_cool = str(values.get("exportCtCoolestKShown", "") or "").strip()
+        if (warm_raw, cool_raw) == (shown_warm, shown_cool):
+            stored = previous_options or {}
+            return ({key: stored[key]
+                     for key in (OPTION_CT_MIN_MIREDS, OPTION_CT_MAX_MIREDS)
+                     if key in stored}, None)
         if not warm_raw and not cool_raw:
             return {}, None
         if not warm_raw or not cool_raw:
@@ -770,32 +819,85 @@ class ExportDialogMixin:
             values["exportRole"] = entry.role
             values["exportName"] = entry.name_override or ""
             values["exportInvert"] = bool(entry.options.get(OPTION_INVERT, False))
-            values["exportCtWarmestK"] = self._kelvin_field(entry.options.get(OPTION_CT_MAX_MIREDS))
-            values["exportCtCoolestK"] = self._kelvin_field(entry.options.get(OPTION_CT_MIN_MIREDS))
+            self._apply_ct_bounds_fields(values, entry.options)
             values["exportStatus"] = f"{dev.name} is exported as {export_catalog.role_label(entry.role)}."
         else:
             values["exportRole"] = verdict.default_role
             values["exportStateInvert"] = export_catalog.default_invert_for(verdict.default_role)
             values["exportName"] = ""
             values["exportInvert"] = False
-            values["exportCtWarmestK"] = ""
-            values["exportCtCoolestK"] = ""
+            self._apply_ct_bounds_fields(values, None)
             values["exportStatus"] = f"{dev.name} is not exported yet."
         return values
 
-    @staticmethod
-    def _kelvin_field(mireds: object) -> str:
-        """One Kelvin dialog field's text for a stored seed mireds value.
+    #: One phrase per :func:`ct_bounds.effective_ct_sources` verdict, for the
+    #: read-only line under the two Kelvin fields. A learned bound and a typed
+    #: one are the same number on screen; only this says which is which.
+    _CT_SOURCE_PHRASE = {
+        SOURCE_LEARNED: "measured from the device",
+        SOURCE_SEED: "as you set it",
+        SOURCE_GENERIC: "generic limit",
+    }
 
-        ``""`` for anything not a usable stored mireds value (absent, the
-        wrong type, a hand-edited non-int) — the same "absent means no seed"
-        reading :meth:`_ct_seed_from_values` uses on the way back in, so a
-        round trip through the dialog cannot silently invent a seed that was
-        never actually saved.
+    def _apply_ct_bounds_fields(self, values: dict, options: Optional[dict]) -> None:
+        """Fill the two Kelvin fields, their shadow copies, and the source line.
+
+        The fields show the EFFECTIVE bounds (``ct_bounds.effective_ct_bounds``
+        — learned, else seed, else generic per side), not just the user's seed:
+        issue #293 shipped the learner writing its own keys, and a calibrated
+        lamp with no seed therefore showed two empty boxes, which reads as "the
+        calibration did nothing" when six devices on the live server had in
+        fact learned their range.
+
+        The shadow fields (``…KShown``) are what makes that safe. They record
+        what was PUT on screen, so :meth:`_ct_seed_from_values` can tell a
+        value the user typed from one the plugin displayed, and decline to
+        re-save a measured bound as a declared seed. Without them, opening a
+        calibrated device and pressing "Add / update export" — for any reason,
+        such as renaming it — would silently convert the learner's evidence
+        into a seed that outlives the evidence.
+
+        Both boxes stay EMPTY when neither side has a bound, because empty is
+        also how the dialog DELETES a seed (:meth:`_ct_seed_from_values`), and
+        pre-filling the generic limits would make "no range set" indis-
+        tinguishable from "the generic range, declared".
         """
-        if not isinstance(mireds, int) or isinstance(mireds, bool):
-            return ""
-        return str(mireds_to_kelvin(mireds))
+        min_source, max_source = effective_ct_sources(options)
+        if options is None or (min_source == SOURCE_GENERIC and max_source == SOURCE_GENERIC):
+            values["exportCtWarmestK"] = ""
+            values["exportCtCoolestK"] = ""
+            values["exportCtWarmestKShown"] = ""
+            values["exportCtCoolestKShown"] = ""
+            values["exportCtBoundsSource"] = "" if options is None else (
+                "No range set — the generic 2000-6535K limits are published. The plugin fills "
+                "this in on its own once it sees what the device can actually reach.")
+            return
+        eff_min, eff_max = effective_ct_bounds(options)
+        warm, cool = self._kelvin_shown(eff_max), self._kelvin_shown(eff_min)
+        values["exportCtWarmestK"] = warm
+        values["exportCtCoolestK"] = cool
+        values["exportCtWarmestKShown"] = warm
+        values["exportCtCoolestKShown"] = cool
+        values["exportCtBoundsSource"] = (
+            f"Warmest {warm}K ({self._CT_SOURCE_PHRASE[max_source]}), "
+            f"coolest {cool}K ({self._CT_SOURCE_PHRASE[min_source]}). "
+            "Change a value to override it; clear both for the generic range.")
+
+    @classmethod
+    def _kelvin_shown(cls, mireds: int) -> str:
+        """One effective mireds bound as Kelvin the two fields will ACCEPT back.
+
+        Clamped to the fields' own range, because the mired domain is very
+        slightly wider at the cool end: 153 mireds — the fabric's floor, and
+        what an un-seeded cool side resolves to — is 6536K, one Kelvin above
+        the 6535K ceiling :meth:`_ct_seed_from_values` enforces. Displayed
+        raw, editing the OTHER field would then bounce the save with "must be
+        between 2000K and 6535K" about a number the plugin itself put there.
+        6535K converts straight back to 153 mireds, so the clamp costs
+        nothing.
+        """
+        return str(min(max(mireds_to_kelvin(mireds), cls._CT_SEED_KELVIN_MIN),
+                       cls._CT_SEED_KELVIN_MAX))
 
     @staticmethod
     def _clear_export_detail(values: dict) -> None:
@@ -814,6 +916,9 @@ class ExportDialogMixin:
         values["exportStateInvert"] = False
         values["exportCtWarmestK"] = ""
         values["exportCtCoolestK"] = ""
+        values["exportCtWarmestKShown"] = ""
+        values["exportCtCoolestKShown"] = ""
+        values["exportCtBoundsSource"] = ""
 
     def _first_unclaimed_identity(self, identity: str, device_id: int) -> str:
         """Walk :func:`next_generation` from ``identity`` until no OTHER
@@ -908,7 +1013,8 @@ class ExportDialogMixin:
             options[OPTION_INVERT] = True
         previous = self.exports.get(device_id)
         if role in CT_BOUNDS_ROLES:
-            ct_seed, ct_error = self._ct_seed_from_values(values)
+            ct_seed, ct_error = self._ct_seed_from_values(
+                values, previous.options if previous is not None else None)
             if ct_error:
                 values["exportStatus"] = ct_error
                 return values

@@ -107,6 +107,46 @@ def effective_ct_bounds(options: Optional[dict]) -> tuple[int, int]:
     )
 
 
+#: What :func:`effective_ct_sources` reports for one side. Strings rather
+#: than an enum: they are read only by the export dialog, which has to put
+#: one of them in front of a user, and a plain word is what it puts there.
+SOURCE_LEARNED = "learned"
+SOURCE_SEED = "seed"
+SOURCE_GENERIC = "generic"
+
+
+def _side_source(options: dict, learned_key: str, seed_key: str) -> str:
+    """Which of the three sources :func:`_side` would have taken this side from."""
+    if _is_ct_int(options.get(learned_key)):
+        return SOURCE_LEARNED
+    if _is_ct_int(options.get(seed_key)):
+        return SOURCE_SEED
+    return SOURCE_GENERIC
+
+
+def effective_ct_sources(options: Optional[dict]) -> tuple[str, str]:
+    """(min_source, max_source) for the pair :func:`effective_ct_bounds` returns.
+
+    The dialog needs this to answer a question the two numbers alone cannot:
+    a 454-mired warm bound the LEARNER measured and one the user TYPED look
+    identical on screen, but only the second is a declaration the user may
+    edit back out — and re-saving the first as if it were a seed would turn
+    evidence into a declaration behind their back (``export_dialog_mixin.
+    _ct_seed_from_values``, which writes a seed only for a value the user
+    actually changed).
+
+    Deliberately a second walk of the same precedence rather than a richer
+    return from :func:`effective_ct_bounds`: every other caller wants only
+    the numbers, and widening that return would make all of them unpack a
+    provenance they have no use for.
+    """
+    options = options or {}
+    return (
+        _side_source(options, OPTION_CT_LEARNED_MIN_MIREDS, OPTION_CT_MIN_MIREDS),
+        _side_source(options, OPTION_CT_LEARNED_MAX_MIREDS, OPTION_CT_MAX_MIREDS),
+    )
+
+
 def wire_options(options: Optional[dict]) -> dict:
     """The §4.1 ``options`` an export actually SENDS, derived from its stored ones.
 

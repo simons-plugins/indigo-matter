@@ -608,6 +608,42 @@ def test_current_exports_summarises_role_name_and_polarity(plug):
     assert "inverted" in label
 
 
+def test_current_exports_shows_a_measured_ct_range_without_opening_the_device(plug, devices):
+    """The whole point of the row note: "did the calibration take?" answered
+    for every lamp at once, rather than by opening each in turn."""
+    device_id = _ct_device(devices)
+    plug.exports.upsert(ExportEntry(device_id, "colorTemperatureLight",
+                                    options={OPTION_CT_LEARNED_MIN_MIREDS: 200,
+                                             OPTION_CT_LEARNED_MAX_MIREDS: 454}))
+    label = _labels(plug.getCurrentExports())[str(device_id)]
+    assert "2203-5000K" in label
+    assert "measured" in label
+
+
+def test_current_exports_says_nothing_for_the_generic_ct_range(plug, devices):
+    """A note every un-calibrated lamp carries identically is one nobody can
+    scan past — silence is what makes the calibrated rows visible."""
+    device_id = _ct_device(devices)
+    plug.exports.upsert(ExportEntry(device_id, "colorTemperatureLight"))
+    assert "K" not in _labels(plug.getCurrentExports())[str(device_id)].split("→")[1]
+
+
+def test_current_exports_says_nothing_about_bounds_for_a_non_ct_role(plug, devices):
+    device_id = _ct_device(devices)
+    plug.exports.upsert(ExportEntry(device_id, "dimmableLight"))
+    assert "K" not in _labels(plug.getCurrentExports())[str(device_id)].split("→")[1]
+
+
+def test_current_exports_marks_a_seeded_range_without_calling_it_measured(plug, devices):
+    device_id = _ct_device(devices)
+    plug.exports.upsert(ExportEntry(device_id, "colorTemperatureLight",
+                                    options={OPTION_CT_MIN_MIREDS: 200,
+                                             OPTION_CT_MAX_MIREDS: 454}))
+    label = _labels(plug.getCurrentExports())[str(device_id)]
+    assert "2203-5000K" in label
+    assert "measured" not in label
+
+
 def test_current_exports_names_a_device_that_has_been_deleted(plug):
     plug.exports.upsert(ExportEntry(999999, "onOffLight"))
     assert "deleted device 999999" in _labels(plug.getCurrentExports())["999999"]
@@ -734,15 +770,59 @@ def test_device_changed_seeds_blank_ct_fields_for_a_new_export(plug, devices):
     assert values["exportCtCoolestK"] == ""
 
 
-def test_device_changed_leaves_ct_fields_blank_when_only_a_learned_value_exists(plug, devices):
-    """The learner's own record is never shown or edited in the dialog — only
-    the SEED round-trips through these two fields."""
+def test_device_changed_shows_a_learned_bound_in_the_kelvin_fields(plug, devices):
+    """What six live devices needed and did not get: a calibrated lamp with no
+    seed used to show two empty boxes, which reads as "the calibration did
+    nothing" when the plugin had in fact learned the range."""
     device_id = _ct_device(devices)
     plug.exports.upsert(ExportEntry(device_id, "colorTemperatureLight",
                                     options={OPTION_CT_LEARNED_MAX_MIREDS: 400}))
     values = plug.exportDeviceChanged(_values(exportDevice=str(device_id)), "manageMatterExports")
+    assert values["exportCtWarmestK"] == "2500"
+    # The cool side has no evidence, so it shows the generic floor.
+    assert values["exportCtCoolestK"] == "6535"
+
+
+def test_device_changed_says_which_side_was_measured_and_which_was_typed(plug, devices):
+    """The two numbers alone cannot answer it — 400 mireds looks identical
+    whether the learner measured it or the user typed it."""
+    device_id = _ct_device(devices)
+    plug.exports.upsert(ExportEntry(device_id, "colorTemperatureLight",
+                                    options={OPTION_CT_LEARNED_MAX_MIREDS: 400,
+                                             OPTION_CT_MIN_MIREDS: 200,
+                                             OPTION_CT_MAX_MIREDS: 450}))
+    values = plug.exportDeviceChanged(_values(exportDevice=str(device_id)), "manageMatterExports")
+    source = values["exportCtBoundsSource"]
+    assert "2500K (measured from the device)" in source
+    assert "5000K (as you set it)" in source
+
+
+def test_device_changed_explains_the_generic_range_rather_than_pre_filling_it(plug, devices):
+    """Empty is also how a seed is DELETED, so "nothing known" must not be
+    dressed up as a declared 2000-6535K range."""
+    device_id = _ct_device(devices)
+    plug.exports.upsert(ExportEntry(device_id, "colorTemperatureLight"))
+    values = plug.exportDeviceChanged(_values(exportDevice=str(device_id)), "manageMatterExports")
     assert values["exportCtWarmestK"] == ""
     assert values["exportCtCoolestK"] == ""
+    assert "No range set" in values["exportCtBoundsSource"]
+
+
+def test_device_changed_never_shows_a_kelvin_the_fields_would_refuse(plug, devices):
+    """153 mireds is 6536K — one Kelvin above what `_ct_seed_from_values`
+    accepts. Shown raw, editing the OTHER field would bounce the save with a
+    complaint about a number the plugin itself put on screen."""
+    device_id = _ct_device(devices)
+    plug.exports.upsert(ExportEntry(device_id, "colorTemperatureLight",
+                                    options={OPTION_CT_LEARNED_MAX_MIREDS: 400}))
+    values = plug.exportDeviceChanged(_values(exportDevice=str(device_id)), "manageMatterExports")
+    plug.exportAddOrUpdate(
+        _values(exportDevice=str(device_id), exportRole="colorTemperatureLight",
+                exportCtWarmestK="2700", exportCtCoolestK=values["exportCtCoolestK"],
+                exportCtWarmestKShown=values["exportCtWarmestKShown"],
+                exportCtCoolestKShown=values["exportCtCoolestKShown"]),
+        "manageMatterExports")
+    assert plug.exports.get(device_id).options[OPTION_CT_MIN_MIREDS] == 153
 
 
 def test_device_changed_clears_ct_fields_for_an_excluded_pick(plug, devices):
@@ -944,6 +1024,77 @@ def test_add_preserves_the_learned_bound_across_an_unrelated_update(plug, device
         "manageMatterExports")
     assert plug.exports.get(device_id).options == {OPTION_CT_LEARNED_MAX_MIREDS: 400}
     assert plug.exports.get(device_id).name_override == "Renamed"
+
+
+def _reopen(plug, device_id, **overrides):
+    """The values a real save carries: whatever the dialog PUT on screen when
+    the device was picked, plus whatever the user then changed.
+
+    Tests that hand-build these two fields prove nothing about the round trip
+    — it is the pre-filled pair that decides whether a save is an edit.
+    """
+    shown = plug.exportDeviceChanged(_values(exportDevice=str(device_id)), "manageMatterExports")
+    values = _values(exportDevice=str(device_id), exportRole=shown["exportRole"],
+                     exportCtWarmestK=shown["exportCtWarmestK"],
+                     exportCtCoolestK=shown["exportCtCoolestK"],
+                     exportCtWarmestKShown=shown["exportCtWarmestKShown"],
+                     exportCtCoolestKShown=shown["exportCtCoolestKShown"])
+    values.update(overrides)
+    return values
+
+
+def test_add_does_not_turn_a_measured_bound_into_a_seed(plug, devices):
+    """The trap the pre-fill creates: the fields now SHOW the learner's own
+    value, so saving the dialog for an unrelated reason (a rename) would copy
+    evidence into a declaration — and a seed outlives the learner re-widening
+    or forgetting the bound it was copied from."""
+    device_id = _ct_device(devices)
+    plug.exports.upsert(ExportEntry(device_id, "colorTemperatureLight",
+                                    options={OPTION_CT_LEARNED_MAX_MIREDS: 400}))
+    plug.exportAddOrUpdate(_reopen(plug, device_id, exportName="Renamed"),
+                           "manageMatterExports")
+    assert plug.exports.get(device_id).options == {OPTION_CT_LEARNED_MAX_MIREDS: 400}
+    assert plug.exports.get(device_id).name_override == "Renamed"
+
+
+def test_add_writes_a_seed_when_a_shown_value_is_actually_edited(plug, devices):
+    """The other half: an edit IS a declaration, and must be stored as one."""
+    device_id = _ct_device(devices)
+    plug.exports.upsert(ExportEntry(device_id, "colorTemperatureLight",
+                                    options={OPTION_CT_LEARNED_MAX_MIREDS: 400}))
+    plug.exportAddOrUpdate(
+        _reopen(plug, device_id, exportCtWarmestK="2200", exportCtCoolestK="5000"),
+        "manageMatterExports")
+    options = plug.exports.get(device_id).options
+    assert options[OPTION_CT_MAX_MIREDS] == 455  # 2200K
+    assert options[OPTION_CT_MIN_MIREDS] == 200
+    assert options[OPTION_CT_LEARNED_MAX_MIREDS] == 400  # evidence survives the seed
+
+
+def test_add_keeps_an_existing_seed_when_nothing_was_edited(plug, devices):
+    """"Untouched" must not mean "deleted" either — the same two empty-vs-
+    unchanged fields decide both."""
+    device_id = _ct_device(devices)
+    plug.exports.upsert(ExportEntry(device_id, "colorTemperatureLight",
+                                    options={OPTION_CT_MIN_MIREDS: 200,
+                                             OPTION_CT_MAX_MIREDS: 400}))
+    plug.exportAddOrUpdate(_reopen(plug, device_id, exportName="Renamed"),
+                           "manageMatterExports")
+    assert plug.exports.get(device_id).options == {OPTION_CT_MIN_MIREDS: 200,
+                                                   OPTION_CT_MAX_MIREDS: 400}
+
+
+def test_clearing_both_shown_fields_still_deletes_the_seed(plug, devices):
+    """Clearing is an edit, not an absence — the documented way to go back to
+    the generic range."""
+    device_id = _ct_device(devices)
+    plug.exports.upsert(ExportEntry(device_id, "colorTemperatureLight",
+                                    options={OPTION_CT_MIN_MIREDS: 200,
+                                             OPTION_CT_MAX_MIREDS: 400}))
+    plug.exportAddOrUpdate(
+        _reopen(plug, device_id, exportCtWarmestK="", exportCtCoolestK=""),
+        "manageMatterExports")
+    assert plug.exports.get(device_id).options == {}
 
 
 def test_add_preserves_the_learned_bound_alongside_a_new_seed(plug, devices):
