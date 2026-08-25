@@ -18,11 +18,12 @@ from export_store import (CT_BOUNDS_ROLES, ExportEntry, MAPPABLE_ROLES, OPTION_C
 from ct_bounds import (GENERIC_MAX_MIREDS, GENERIC_MIN_MIREDS, SOURCE_GENERIC,
                        SOURCE_LEARNED, SOURCE_SEED, effective_ct_bounds,
                        effective_ct_sources, has_stored_ct_bounds)
-from matter_handlers.color_control import kelvin_to_mireds, mireds_to_kelvin
+from mired_units import kelvin_to_mireds, mireds_to_kelvin
 from plugin_constants import (
-    EXCLUDED_OPTION_PREFIX, EXPORT_PICKER_LIMIT, LIST_ERROR_OPTION,
+    EXCLUDED_OPTION_PREFIX, EXPORT_PICKER_LIMIT,
     MENU_MANAGE_EXPORTS, MENU_MIGRATE_EXPORT, MENU_READOPT_EXPORT, MENU_UNPAIR_ECOSYSTEM,
     NO_MATCH_OPTION, NO_SELECTION_ID, NO_SELECTION_LABEL, ROW_ERROR_LABEL, TRUNCATED_OPTION,
+    degrades_to_list_error,
 )
 
 
@@ -143,20 +144,24 @@ class ExportDialogMixin:
                         "'Manage Matter Exports…'.",
                         entry.indigo_device_id, entry.role)
                     continue
-                verdict = export_catalog.classify(dev, plugin_id, entry.options)
-                if not isinstance(verdict, export_catalog.EligibleDevice):
-                    self.logger.warning(
-                        "Matter export allow-list: %s (id %s) is exported as %s but is no longer "
-                        "exportable: %s. It will not be bridged.",
-                        getattr(dev, "name", ""), entry.indigo_device_id, entry.role,
-                        getattr(verdict, "reason", "unknown"))
-                elif entry.role not in verdict.eligible_roles:
-                    self.logger.warning(
-                        "Matter export allow-list: %s (id %s) is exported as %s, which this "
-                        "device no longer offers (%s). Re-pick its role in "
-                        "'Manage Matter Exports…'.",
-                        getattr(dev, "name", ""), entry.indigo_device_id, entry.role,
-                        ", ".join(verdict.eligible_roles))
+                # eligible_target is the same classify-then-check-role dance
+                # the migrate/re-adopt pickers need (export_catalog.py); this
+                # site's own wording is a log line, not a dialog refusal.
+                result = export_catalog.eligible_target(dev, plugin_id, entry.options, entry.role)
+                if isinstance(result, export_catalog.TargetRefusal):
+                    if result.role_mismatch:
+                        self.logger.warning(
+                            "Matter export allow-list: %s (id %s) is exported as %s, which this "
+                            "device no longer offers (%s). Re-pick its role in "
+                            "'Manage Matter Exports…'.",
+                            getattr(dev, "name", ""), entry.indigo_device_id, entry.role,
+                            ", ".join(result.verdict.eligible_roles))
+                    else:
+                        self.logger.warning(
+                            "Matter export allow-list: %s (id %s) is exported as %s but is no longer "
+                            "exportable: %s. It will not be bridged.",
+                            getattr(dev, "name", ""), entry.indigo_device_id, entry.role,
+                            getattr(result.verdict, "reason", "unknown"))
         except Exception as exc:  # pylint: disable=broad-except
             # A diagnostic sweep must never be the thing that fails startup.
             self.logger.exception(exc)
@@ -325,10 +330,11 @@ class ExportDialogMixin:
         # waiting to be set up.
         verdict = export_catalog.classify(dev, plugin_id, self._saved_options(device_id))
         if isinstance(verdict, export_catalog.Excluded):
-            if verdict.reason == export_catalog.REASON_LOOP_GUARD:
-                return None
-            return (f"{EXCLUDED_OPTION_PREFIX}{device_id}",
-                    f"{mark}{name} — not exportable: {verdict.reason}")
+            # export_catalog.excluded_row is the same loop-guard-omit (XAC6) /
+            # not-exportable-reason row ServerMenuMixin._readopt_device_row
+            # builds — shared because the two pickers word this one outcome
+            # identically.
+            return export_catalog.excluded_row(verdict, device_id, name, mark, EXCLUDED_OPTION_PREFIX)
         if isinstance(verdict, export_catalog.MappableDevice):
             # Selectable, unlike an exclusion: the whole point is that the user
             # CAN export it, once they say which state is the reading. Marked
@@ -337,6 +343,7 @@ class ExportDialogMixin:
             return (str(device_id), f"{mark}{name} — {verdict.reason}")
         return (str(device_id), f"{mark}{name}")
 
+    @degrades_to_list_error
     def getExportCandidates(self, filter="", valuesDict=None, typeId="", targetId=0):
         # pylint: disable=redefined-builtin, unused-argument, too-many-locals
         """Picker rows: every Indigo device, exportable or not (XAC9).
@@ -363,57 +370,54 @@ class ExportDialogMixin:
         rows are therefore classified and kept unconditionally, and the cap is
         applied only to the rest, at the end, once the exported count is known.
         """
-        try:
-            text = str((valuesDict or {}).get("exportFilter", "") or "").strip().lower()
-            exported = self.exports.ids() if self.exports is not None else frozenset()
-            plugin_id = self._export_plugin_id()
-            # Always a real row for the seeded value, and always first.
-            options: list[tuple[str, str]] = [(NO_SELECTION_ID, NO_SELECTION_LABEL)]
-            # One pass, two row lists: exported rows are never truncated (see
-            # docstring), so the cap is applied only to `other_rows`, after the
-            # loop, once `len(exported_rows)` is known.
-            exported_rows: list[tuple[str, str]] = []
-            other_rows: list[tuple[str, str]] = []
-            truncated = 0
-            failures = 0
-            for dev in indigo.devices:
-                try:
-                    name = str(getattr(dev, "name", "") or "")
-                    if text and text not in name.lower():
-                        continue
-                    is_exported = dev.id in exported
-                    if not is_exported and len(other_rows) >= EXPORT_PICKER_LIMIT:
-                        # Upper bound on what the cap below could ever keep —
-                        # exported rows only shrink that allowance, never
-                        # raise it — so it's safe to stop building rows here.
-                        # Still counted, so the tail stays honest.
-                        truncated += 1
-                        continue
-                    row = self._candidate_row(dev, name, plugin_id, exported)
-                    if row is None:               # loop guard: absent, not excluded (XAC6)
-                        continue
-                    (exported_rows if is_exported else other_rows).append(row)
-                except Exception as exc:  # pylint: disable=broad-except
-                    self._log_row_failure(exc, first=not failures)
-                    failures += 1
-                    # `dev.id` may be exactly what failed to read, so an
-                    # unreadable device can't be safely tested for membership
-                    # in `exported` — it always lands with the others.
-                    other_rows.append((f"{EXCLUDED_OPTION_PREFIX}err{failures}",
-                                       f"— {ROW_ERROR_LABEL}"))
-            allowance = max(EXPORT_PICKER_LIMIT - len(exported_rows), 0)
-            truncated += max(len(other_rows) - allowance, 0)
-            options.extend(exported_rows)
-            options.extend(other_rows[:allowance])
-            if truncated:
-                options.append(TRUNCATED_OPTION)
-            if len(options) == 1:
-                options.append(NO_MATCH_OPTION)
-            return options
-        except Exception as exc:  # pylint: disable=broad-except
-            self.logger.exception(exc)
-            return [LIST_ERROR_OPTION]
+        text = str((valuesDict or {}).get("exportFilter", "") or "").strip().lower()
+        exported = self.exports.ids() if self.exports is not None else frozenset()
+        plugin_id = self._export_plugin_id()
+        # Always a real row for the seeded value, and always first.
+        options: list[tuple[str, str]] = [(NO_SELECTION_ID, NO_SELECTION_LABEL)]
+        # One pass, two row lists: exported rows are never truncated (see
+        # docstring), so the cap is applied only to `other_rows`, after the
+        # loop, once `len(exported_rows)` is known.
+        exported_rows: list[tuple[str, str]] = []
+        other_rows: list[tuple[str, str]] = []
+        truncated = 0
+        failures = 0
+        for dev in indigo.devices:
+            try:
+                name = str(getattr(dev, "name", "") or "")
+                if text and text not in name.lower():
+                    continue
+                is_exported = dev.id in exported
+                if not is_exported and len(other_rows) >= EXPORT_PICKER_LIMIT:
+                    # Upper bound on what the cap below could ever keep —
+                    # exported rows only shrink that allowance, never
+                    # raise it — so it's safe to stop building rows here.
+                    # Still counted, so the tail stays honest.
+                    truncated += 1
+                    continue
+                row = self._candidate_row(dev, name, plugin_id, exported)
+                if row is None:               # loop guard: absent, not excluded (XAC6)
+                    continue
+                (exported_rows if is_exported else other_rows).append(row)
+            except Exception as exc:  # pylint: disable=broad-except
+                self._log_row_failure(exc, first=not failures)
+                failures += 1
+                # `dev.id` may be exactly what failed to read, so an
+                # unreadable device can't be safely tested for membership
+                # in `exported` — it always lands with the others.
+                other_rows.append((f"{EXCLUDED_OPTION_PREFIX}err{failures}",
+                                   f"— {ROW_ERROR_LABEL}"))
+        allowance = max(EXPORT_PICKER_LIMIT - len(exported_rows), 0)
+        truncated += max(len(other_rows) - allowance, 0)
+        options.extend(exported_rows)
+        options.extend(other_rows[:allowance])
+        if truncated:
+            options.append(TRUNCATED_OPTION)
+        if len(options) == 1:
+            options.append(NO_MATCH_OPTION)
+        return options
 
+    @degrades_to_list_error
     def getExportRoles(self, filter="", valuesDict=None, typeId="", targetId=0):
         # pylint: disable=redefined-builtin, unused-argument
         """Roles the picked device may legitimately be exported as (§5.2).
@@ -423,61 +427,54 @@ class ExportDialogMixin:
         failure is NOT empty: it says so, so the user does not read a broken
         callback as "this device offers no roles".
         """
-        try:
-            kind, device_id = self._export_selection(valuesDict)
-            if kind != "device":
-                return []
-            dev = self._indigo_device(device_id)
-            if dev is None:
-                return []
-            # The mapping being composed in the dialog is part of the
-            # question (ADR-0012): a custom device offers no roles until its
-            # state is chosen, and offers all the binary ones the moment it is.
-            verdict = export_catalog.classify(dev, self._export_plugin_id(),
-                                              self._mapping_from_values(valuesDict or {}))
-            if not isinstance(verdict, export_catalog.EligibleDevice):
-                return []
-            options = []
-            for role in verdict.eligible_roles:
-                try:
-                    options.append((role, export_catalog.role_label(role)))
-                except Exception as exc:  # pylint: disable=broad-except
-                    self._log_row_failure(exc, first=not options)
-            return options
-        except Exception as exc:  # pylint: disable=broad-except
-            self.logger.exception(exc)
-            return [LIST_ERROR_OPTION]
+        kind, device_id = self._export_selection(valuesDict)
+        if kind != "device":
+            return []
+        dev = self._indigo_device(device_id)
+        if dev is None:
+            return []
+        # The mapping being composed in the dialog is part of the
+        # question (ADR-0012): a custom device offers no roles until its
+        # state is chosen, and offers all the binary ones the moment it is.
+        verdict = export_catalog.classify(dev, self._export_plugin_id(),
+                                          self._mapping_from_values(valuesDict or {}))
+        if not isinstance(verdict, export_catalog.EligibleDevice):
+            return []
+        options = []
+        for role in verdict.eligible_roles:
+            try:
+                options.append((role, export_catalog.role_label(role)))
+            except Exception as exc:  # pylint: disable=broad-except
+                self._log_row_failure(exc, first=not options)
+        return options
 
+    @degrades_to_list_error
     def getCurrentExports(self, filter="", valuesDict=None, typeId="", targetId=0):
         # pylint: disable=redefined-builtin, unused-argument
         """Read-only summary of the allow-list (one row per export)."""
-        try:
-            if self.exports is None:
-                return [(NO_SELECTION_ID, "(plugin still starting)")]
-            options = []
-            failures = 0
-            for entry in self.exports.all():
-                try:
-                    dev = self._indigo_device(entry.indigo_device_id)
-                    name = str(getattr(dev, "name", "") or "") if dev is not None else ""
-                    if not name:
-                        name = f"(deleted device {entry.indigo_device_id})"
-                    label = f"{name} → {export_catalog.role_label(entry.role)}"
-                    if entry.name_override:
-                        label += f' · shown as "{entry.name_override}"'
-                    if entry.options.get(OPTION_INVERT):
-                        label += " · inverted"
-                    label += self._ct_bounds_row_note(entry)
-                    options.append((str(entry.indigo_device_id), label))
-                except Exception as exc:  # pylint: disable=broad-except
-                    self._log_row_failure(exc, first=not failures)
-                    failures += 1
-                    options.append((f"{EXCLUDED_OPTION_PREFIX}err{len(options)}",
-                                    f"— {ROW_ERROR_LABEL}"))
-            return options or [(NO_SELECTION_ID, "(nothing exported yet)")]
-        except Exception as exc:  # pylint: disable=broad-except
-            self.logger.exception(exc)
-            return [LIST_ERROR_OPTION]
+        if self.exports is None:
+            return [(NO_SELECTION_ID, "(plugin still starting)")]
+        options = []
+        failures = 0
+        for entry in self.exports.all():
+            try:
+                dev = self._indigo_device(entry.indigo_device_id)
+                name = str(getattr(dev, "name", "") or "") if dev is not None else ""
+                if not name:
+                    name = f"(deleted device {entry.indigo_device_id})"
+                label = f"{name} → {export_catalog.role_label(entry.role)}"
+                if entry.name_override:
+                    label += f' · shown as "{entry.name_override}"'
+                if entry.options.get(OPTION_INVERT):
+                    label += " · inverted"
+                label += self._ct_bounds_row_note(entry)
+                options.append((str(entry.indigo_device_id), label))
+            except Exception as exc:  # pylint: disable=broad-except
+                self._log_row_failure(exc, first=not failures)
+                failures += 1
+                options.append((f"{EXCLUDED_OPTION_PREFIX}err{len(options)}",
+                                f"— {ROW_ERROR_LABEL}"))
+        return options or [(NO_SELECTION_ID, "(nothing exported yet)")]
 
     @classmethod
     def _ct_bounds_row_note(cls, entry) -> str:
@@ -673,6 +670,7 @@ class ExportDialogMixin:
             self.logger.debug("Matter export: could not derive a fleet state key — %s", exc)
         return None
 
+    @degrades_to_list_error
     def getExportStateKeys(self, filter="", valuesDict=None, typeId="", targetId=0):
         # pylint: disable=redefined-builtin, unused-argument
         """The boolean states the selected device offers as a mapping.
@@ -681,17 +679,13 @@ class ExportDialogMixin:
         keeps the field hidden — the XML binds its visibility to
         ``exportNeedsMapping``, set by :meth:`exportDeviceChanged`.
         """
-        try:
-            kind, device_id = self._export_selection(valuesDict or {})
-            if kind != "device":
-                return []
-            dev = self._indigo_device(device_id)
-            if dev is None:
-                return []
-            return [(key, key) for key in export_catalog.binary_state_keys(dev)]
-        except Exception as exc:  # pylint: disable=broad-except
-            self.logger.exception(exc)
-            return [LIST_ERROR_OPTION]
+        kind, device_id = self._export_selection(valuesDict or {})
+        if kind != "device":
+            return []
+        dev = self._indigo_device(device_id)
+        if dev is None:
+            return []
+        return [(key, key) for key in export_catalog.binary_state_keys(dev)]
 
     def exportRoleChanged(self, valuesDict, typeId="", devId=0):
         # pylint: disable=unused-argument

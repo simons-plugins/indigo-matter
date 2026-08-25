@@ -19,7 +19,7 @@ from protocol import MatterCommand, MatterWrite  # re-exported for handlers/test
 
 __all__ = [
     "IndigoDeviceSpec", "MatterCommand", "MatterWrite", "ClusterHandler",
-    "MatterAction", "ENDPOINT_OWNER_CLUSTERS",
+    "MatterAction", "ENDPOINT_OWNER_CLUSTERS", "base_props", "node_endpoint",
 ]
 
 #: A handler action is either a cluster-command invoke or an attribute write.
@@ -47,6 +47,36 @@ class IndigoDeviceSpec:
     name: str
     props: dict
     initial_states: dict = field(default_factory=dict)
+
+
+def base_props(node: Any, endpoint: Any) -> dict:
+    """The identity props every handler stamps on a newly created device.
+
+    ``nodeId``/``endpointId`` are how device_sync and action dispatch find
+    the Matter endpoint a device represents again later; ``vendorName``/
+    ``productName`` are display-only, carried through from the node's
+    interview. Every ``create_indigo_devices`` starts its ``props`` dict
+    with exactly this shape before adding cluster-specific capability props.
+    """
+    return {
+        "nodeId": str(node.node_id),
+        "endpointId": str(endpoint.endpoint_id),
+        "vendorName": node.vendor_name,
+        "productName": node.product_name,
+    }
+
+
+def node_endpoint(indigo_dev: Any) -> tuple[int, int]:
+    """(node_id, endpoint_id) an Indigo device represents, from its props.
+
+    Every action-dispatch handler needs this pair to address the Matter
+    command/write at the right node and endpoint; ``pluginProps`` is where
+    :func:`base_props` put them at creation. Indigo-free like the rest of
+    this module — it only reads ``pluginProps``, never touches ``indigo``.
+    """
+    node_id = int(indigo_dev.pluginProps["nodeId"])
+    endpoint_id = int(indigo_dev.pluginProps["endpointId"])
+    return node_id, endpoint_id
 
 
 class ClusterHandler(ABC):

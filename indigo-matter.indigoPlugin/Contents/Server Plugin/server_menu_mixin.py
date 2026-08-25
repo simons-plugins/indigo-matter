@@ -30,6 +30,7 @@ from plugin_constants import (
     EXPORT_PICKER_LIMIT,
     FACTORY_RESET_TIMEOUT,
     LIST_ERROR_OPTION,
+    degrades_to_list_error,
     NODE_TOMBSTONES_PREF,
     NO_SELECTION_ID,
     NO_SELECTION_LABEL,
@@ -492,6 +493,7 @@ class ServerMenuMixin:
     # ------------------------------------------------------------------
     # Share a Matter device with another ecosystem (issue #210)
     # ------------------------------------------------------------------
+    @degrades_to_list_error
     def getShareableNodes(self, filter="", valuesDict=None, typeId="", targetId=0):  # noqa: N802, A002, ARG002
         """Node picker for "Share a Matter device with another ecosystem…".
 
@@ -512,30 +514,26 @@ class ServerMenuMixin:
         drawn (pairing_menu_mixin.py:196-202); ``device_sync.list_nodes()``
         is a local reconciliation-state read, not a round trip.
 
-        The row-building loop is INSIDE the same try as the ``list_nodes()``
-        call: a malformed entry (e.g. ``node_id_to_str`` choking on a bad id)
-        used to raise past the try/except and take the whole dialog down with
-        it — degrading to :data:`~plugin_constants.LIST_ERROR_OPTION` is the
-        same contract every other picker in this file already gives a bad row.
+        A malformed entry (e.g. ``node_id_to_str`` choking on a bad id) used
+        to raise past this method's own try/except and take the whole dialog
+        down with it — :func:`~plugin_constants.degrades_to_list_error` is
+        the same contract every other picker in this file already gives a
+        bad row.
         """
         if self.device_sync is None:
             # Distinct from "zero nodes": a picker rendered before startup
             # finished has no way to know whether anything is commissioned.
             return [(NO_SELECTION_ID, "(plugin still starting)")]
-        try:
-            nodes = list(self.device_sync.list_nodes())
-            if not nodes:
-                return [(NO_SELECTION_ID, "(no Matter devices — none commissioned yet)")]
-            options = [(NO_SELECTION_ID, NO_SELECTION_LABEL)]
-            options.extend(
-                (str(node_id), f"{', '.join(names) if names else '(no Indigo devices)'} "
-                              f"— node {node_id_to_str(node_id)}")
-                for node_id, names in nodes
-            )
-            return options
-        except Exception as exc:  # noqa: BLE001 - never break the dialog; degrade to an error row
-            self.logger.exception(exc)
-            return [LIST_ERROR_OPTION]
+        nodes = list(self.device_sync.list_nodes())
+        if not nodes:
+            return [(NO_SELECTION_ID, "(no Matter devices — none commissioned yet)")]
+        options = [(NO_SELECTION_ID, NO_SELECTION_LABEL)]
+        options.extend(
+            (str(node_id), f"{', '.join(names) if names else '(no Indigo devices)'} "
+                          f"— node {node_id_to_str(node_id)}")
+            for node_id, names in nodes
+        )
+        return options
 
     def menuShareMatterNode(self, valuesDict, menuId=""):  # noqa: N802, ARG002
         """Open a commissioning window on an ALREADY-commissioned node so a
@@ -896,6 +894,7 @@ class ServerMenuMixin:
     # ------------------------------------------------------------------
     # Migrate an exported accessory… (#246 design §3, issue #246)
     # ------------------------------------------------------------------
+    @degrades_to_list_error  # #246 finding 4 — sibling pickers' discipline
     def getMigrateSources(self, filter="", valuesDict=None, typeId="", targetId=0):  # noqa: N802, A002, ARG002
         """Source picker for "Migrate an exported accessory…" (#246 design §3.2).
 
@@ -916,30 +915,26 @@ class ServerMenuMixin:
         exists)" in place of the device's name, since there is nothing else
         to call it.
         """
-        try:
-            if self.exports is None:
-                return [(NO_SELECTION_ID,
-                         "(plugin still starting — re-open this dialog in a moment)")]
-            entries = self.exports.all()
-            if not entries:
-                return [(NO_SELECTION_ID, "(nothing is currently exported — nothing to migrate)")]
-            bridge = self.export_bridge
-            client = bridge.client if bridge is not None else None
-            options = []
-            for entry in entries:
-                identity = entry.published_as or published_id_for(entry.indigo_device_id)
-                dev = self._indigo_device(entry.indigo_device_id)  # pylint: disable=no-member  # ExportDialogMixin
-                name = dev.name if dev is not None \
-                    else f"(device {entry.indigo_device_id} no longer exists)"
-                number = self._previous_accessory_number(client, entry.indigo_device_id)
-                suffix = f" (accessory #{number})" if number is not None else ""
-                options.append((str(entry.indigo_device_id),
-                                f"{name} — {export_catalog.role_label(entry.role)} — "
-                                f"accessory {identity}{suffix}"))
-            return options
-        except Exception as exc:  # pylint: disable=broad-except  # #246 finding 4 — sibling pickers' discipline
-            self.logger.exception(exc)
-            return [LIST_ERROR_OPTION]
+        if self.exports is None:
+            return [(NO_SELECTION_ID,
+                     "(plugin still starting — re-open this dialog in a moment)")]
+        entries = self.exports.all()
+        if not entries:
+            return [(NO_SELECTION_ID, "(nothing is currently exported — nothing to migrate)")]
+        bridge = self.export_bridge
+        client = bridge.client if bridge is not None else None
+        options = []
+        for entry in entries:
+            identity = entry.published_as or published_id_for(entry.indigo_device_id)
+            dev = self._indigo_device(entry.indigo_device_id)  # pylint: disable=no-member  # ExportDialogMixin
+            name = dev.name if dev is not None \
+                else f"(device {entry.indigo_device_id} no longer exists)"
+            number = self._previous_accessory_number(client, entry.indigo_device_id)
+            suffix = f" (accessory #{number})" if number is not None else ""
+            options.append((str(entry.indigo_device_id),
+                            f"{name} — {export_catalog.role_label(entry.role)} — "
+                            f"accessory {identity}{suffix}"))
+        return options
 
     def migrateSourceChanged(self, valuesDict, typeId="", devId=0):  # noqa: N802, ARG002
         """No-op callback on the source menu (#246 design §3.2) — see
@@ -947,6 +942,7 @@ class ServerMenuMixin:
         ``getMigrateDevices`` below it."""
         return valuesDict
 
+    @degrades_to_list_error
     def getMigrateDevices(self, filter="", valuesDict=None, typeId="", targetId=0):  # noqa: N802, A002, ARG002
         # pylint: disable=too-many-locals  # same two-list shape as getExportCandidates
         """Device picker for "Migrate an exported accessory…" (#246 design §3.2).
@@ -963,48 +959,44 @@ class ServerMenuMixin:
         absent from the list, not merely excluded-with-a-reason — it is the
         row directly above in the dialog, not a target for itself.
         """
+        if self.exports is None:
+            return [(NO_SELECTION_ID,
+                     "(plugin still starting — re-open this dialog in a moment)")]
+        selected = str((valuesDict or {}).get("migrateSource", "") or "")
+        if not selected or selected == NO_SELECTION_ID:
+            return []
         try:
-            if self.exports is None:
-                return [(NO_SELECTION_ID,
-                         "(plugin still starting — re-open this dialog in a moment)")]
-            selected = str((valuesDict or {}).get("migrateSource", "") or "")
-            if not selected or selected == NO_SELECTION_ID:
-                return []
+            source_id = int(selected)
+        except (TypeError, ValueError):
+            return []
+        source_entry = self.exports.get(source_id)
+        if source_entry is None:
+            return []
+        source_identity = _MigrateSourceIdentity(
+            role=source_entry.role,
+            unique_id=source_entry.published_as or published_id_for(source_id))
+        exported = self.exports.ids()
+        plugin_id = self._export_plugin_id()  # pylint: disable=no-member  # ExportDialogMixin
+        eligible: list = []
+        explained: list = []
+        failures = 0
+        for dev in indigo.devices:
+            if dev.id == source_id:
+                continue                     # the row above, not a target for itself
             try:
-                source_id = int(selected)
-            except (TypeError, ValueError):
-                return []
-            source_entry = self.exports.get(source_id)
-            if source_entry is None:
-                return []
-            source_identity = _MigrateSourceIdentity(
-                role=source_entry.role,
-                unique_id=source_entry.published_as or published_id_for(source_id))
-            exported = self.exports.ids()
-            plugin_id = self._export_plugin_id()  # pylint: disable=no-member  # ExportDialogMixin
-            eligible: list = []
-            explained: list = []
-            failures = 0
-            for dev in indigo.devices:
-                if dev.id == source_id:
-                    continue                     # the row above, not a target for itself
-                try:
-                    row = self._readopt_device_row(dev, source_identity, plugin_id, exported)
-                    if row is None:
-                        continue
-                    (explained if row[0].startswith(EXCLUDED_OPTION_PREFIX)
-                     else eligible).append((str(getattr(dev, "name", "") or "").lower(), row))
-                except Exception as exc:  # pylint: disable=broad-except
-                    self._log_row_failure(exc, first=not failures)  # pylint: disable=no-member
-                    failures += 1
-            options = (self._sorted_device_rows(eligible)
-                       + self._sorted_device_rows(explained)[:EXPORT_PICKER_LIMIT])
-            if len(explained) > EXPORT_PICKER_LIMIT:
-                options.append(TRUNCATED_OPTION)
-            return options
-        except Exception as exc:  # pylint: disable=broad-except
-            self.logger.exception(exc)
-            return [LIST_ERROR_OPTION]
+                row = self._readopt_device_row(dev, source_identity, plugin_id, exported)
+                if row is None:
+                    continue
+                (explained if row[0].startswith(EXCLUDED_OPTION_PREFIX)
+                 else eligible).append((str(getattr(dev, "name", "") or "").lower(), row))
+            except Exception as exc:  # pylint: disable=broad-except
+                self._log_row_failure(exc, first=not failures)  # pylint: disable=no-member
+                failures += 1
+        options = (self._sorted_device_rows(eligible)
+                   + self._sorted_device_rows(explained)[:EXPORT_PICKER_LIMIT])
+        if len(explained) > EXPORT_PICKER_LIMIT:
+            options.append(TRUNCATED_OPTION)
+        return options
 
     def _migrate_refuse(self, errors, field: str, msg: str) -> None:
         """One #246 design §3.2 SUBSTANTIVE refusal — see :meth:`_readopt_refuse`'s
@@ -1073,23 +1065,27 @@ class ServerMenuMixin:
                                  "That device no longer exists — refresh the list.")
             return None
         own = self.exports.get(dev.id)
-        verdict = export_catalog.classify(dev, self._export_plugin_id(),  # pylint: disable=no-member
-                                          own.options if own else None)
-        if not isinstance(verdict, export_catalog.EligibleDevice):  # ADR-0012 — see _readopt_device_row
+        # ADR-0012 — see _readopt_device_row. eligible_target (export_catalog.py)
+        # is the classify-then-check-role dance this and _readopt_pick_device
+        # both need; the refusal wording stays here because migrate and
+        # re-adopt word it differently on purpose.
+        result = export_catalog.eligible_target(  # pylint: disable=no-member
+            dev, self._export_plugin_id(), own.options if own else None, source_entry.role)
+        if isinstance(result, export_catalog.TargetRefusal):
+            if result.role_mismatch:
+                self._migrate_refuse(
+                    errors, "migrateDevice",
+                    f'"{dev.name}" cannot appear as a {export_catalog.role_label(source_entry.role)}. '
+                    "Migrating only works when the replacement device can take the same role as "
+                    "the accessory it is inheriting; export it normally instead, and it becomes a "
+                    "new accessory.")
+                return None
             self._migrate_refuse(
                 errors, "migrateDevice",
                 f"{dev.name} needs a state mapping before anything can be migrated onto it — "
                 "export it directly first, which is where that is asked."
-                if isinstance(verdict, export_catalog.MappableDevice)
-                else f"{dev.name} cannot be exported: {getattr(verdict, 'reason', 'not exportable')}")
-            return None
-        if source_entry.role not in verdict.eligible_roles:
-            self._migrate_refuse(
-                errors, "migrateDevice",
-                f'"{dev.name}" cannot appear as a {export_catalog.role_label(source_entry.role)}. '
-                "Migrating only works when the replacement device can take the same role as "
-                "the accessory it is inheriting; export it normally instead, and it becomes a "
-                "new accessory.")
+                if isinstance(result.verdict, export_catalog.MappableDevice)
+                else f"{dev.name} cannot be exported: {getattr(result.verdict, 'reason', 'not exportable')}")
             return None
         # 5. target != source — defensive against a stale/hand-crafted
         # selection; the picker itself never offers this row (it is absent,
@@ -1404,21 +1400,20 @@ class ServerMenuMixin:
         # below and raised, which the caller turns into a DROPPED ROW. Every
         # such device vanished from both device pickers with no reason given:
         # the one outcome this method's whole docstring exists to prevent.
-        if not isinstance(verdict, export_catalog.EligibleDevice):
-            reason = getattr(verdict, "reason", "not exportable")
-            if reason == export_catalog.REASON_LOOP_GUARD:
-                return None                      # XAC6: absent, not excluded
-            if isinstance(verdict, export_catalog.MappableDevice):
-                # Shown, not selectable. Inheriting an accessory does not ask
-                # which state is the reading, so an entry retargeted onto an
-                # unmapped device would publish nothing — the accessory would
-                # go dark rather than move. Export it directly first (which
-                # does ask), then it is an ordinary target.
-                return (f"{EXCLUDED_OPTION_PREFIX}{dev.id}",
-                        f"{mark}{dev.name} — needs a state mapping first; "
-                        f"export it directly, then retry")
+        if isinstance(verdict, export_catalog.Excluded):
+            # export_catalog.excluded_row is the loop-guard-omit (XAC6) /
+            # not-exportable-reason row `_candidate_row` builds too — shared
+            # because the two pickers word this one outcome identically.
+            return export_catalog.excluded_row(verdict, dev.id, dev.name, mark, EXCLUDED_OPTION_PREFIX)
+        if isinstance(verdict, export_catalog.MappableDevice):
+            # Shown, not selectable. Inheriting an accessory does not ask
+            # which state is the reading, so an entry retargeted onto an
+            # unmapped device would publish nothing — the accessory would
+            # go dark rather than move. Export it directly first (which
+            # does ask), then it is an ordinary target.
             return (f"{EXCLUDED_OPTION_PREFIX}{dev.id}",
-                    f"{mark}{dev.name} — not exportable: {reason}")
+                    f"{mark}{dev.name} — needs a state mapping first; "
+                    f"export it directly, then retry")
         if orphan.role not in verdict.eligible_roles:
             return (f"{EXCLUDED_OPTION_PREFIX}{dev.id}",
                     f"{mark}{dev.name} — cannot appear as a "
@@ -1501,6 +1496,7 @@ class ServerMenuMixin:
         """
         return [row for _key, row in sorted(rows, key=lambda pair: pair[0])]
 
+    @degrades_to_list_error
     def getReadoptDevices(self, filter="", valuesDict=None, typeId="", targetId=0):  # noqa: N802, A002, ARG002
         # pylint: disable=too-many-locals  # same two-list shape as getExportCandidates
         """Device picker for "Re-adopt a Matter accessory…" (§4.3) — see
@@ -1521,53 +1517,49 @@ class ServerMenuMixin:
         #247) — the alphabet alone is scannable but says nothing about which
         row is the answer.
         """
+        if self.exports is None:
+            return [(NO_SELECTION_ID,
+                     "(plugin still starting — re-open this dialog in a moment)")]
+        selected = str((valuesDict or {}).get("readoptOrphan", "") or "")
+        if not selected or selected == NO_SELECTION_ID:
+            return []
         try:
-            if self.exports is None:
-                return [(NO_SELECTION_ID,
-                         "(plugin still starting — re-open this dialog in a moment)")]
-            selected = str((valuesDict or {}).get("readoptOrphan", "") or "")
-            if not selected or selected == NO_SELECTION_ID:
-                return []
-            try:
-                orphans = self._live_readopt_orphans() or []
-            except ReadoptOrphansUnavailable:
-                # Same row the orphan picker above it is showing, for the same
-                # read: a list that could not be built must not look like a
-                # list of no eligible devices.
-                return [LIST_ERROR_OPTION]
-            orphan = next((o for o in orphans if o.unique_id == selected), None)
-            if orphan is None or not orphan.role:
-                return []
-            exported = self.exports.ids()
-            plugin_id = self._export_plugin_id()  # pylint: disable=no-member  # ExportDialogMixin
-            eligible: list = []
-            explained: list = []
-            failures = 0
-            for dev in indigo.devices:
-                try:
-                    row = self._readopt_device_row(dev, orphan, plugin_id, exported)
-                    if row is None:
-                        continue
-                    name_key = str(getattr(dev, "name", "") or "").lower()
-                    if row[0].startswith(EXCLUDED_OPTION_PREFIX):
-                        explained.append((name_key, row))
-                    else:
-                        # Selectable rows lead with the strongest candidates
-                        # (issue #247); the explained tail stays plain A→Z,
-                        # having no candidacy to rank.
-                        eligible.append(
-                            (self._readopt_relevance(dev, orphan, exported) + (name_key,), row))
-                except Exception as exc:  # pylint: disable=broad-except
-                    self._log_row_failure(exc, first=not failures)  # pylint: disable=no-member
-                    failures += 1
-            options = (self._sorted_device_rows(eligible)
-                       + self._sorted_device_rows(explained)[:EXPORT_PICKER_LIMIT])
-            if len(explained) > EXPORT_PICKER_LIMIT:
-                options.append(TRUNCATED_OPTION)
-            return options
-        except Exception as exc:  # pylint: disable=broad-except
-            self.logger.exception(exc)
+            orphans = self._live_readopt_orphans() or []
+        except ReadoptOrphansUnavailable:
+            # Same row the orphan picker above it is showing, for the same
+            # read: a list that could not be built must not look like a
+            # list of no eligible devices.
             return [LIST_ERROR_OPTION]
+        orphan = next((o for o in orphans if o.unique_id == selected), None)
+        if orphan is None or not orphan.role:
+            return []
+        exported = self.exports.ids()
+        plugin_id = self._export_plugin_id()  # pylint: disable=no-member  # ExportDialogMixin
+        eligible: list = []
+        explained: list = []
+        failures = 0
+        for dev in indigo.devices:
+            try:
+                row = self._readopt_device_row(dev, orphan, plugin_id, exported)
+                if row is None:
+                    continue
+                name_key = str(getattr(dev, "name", "") or "").lower()
+                if row[0].startswith(EXCLUDED_OPTION_PREFIX):
+                    explained.append((name_key, row))
+                else:
+                    # Selectable rows lead with the strongest candidates
+                    # (issue #247); the explained tail stays plain A→Z,
+                    # having no candidacy to rank.
+                    eligible.append(
+                        (self._readopt_relevance(dev, orphan, exported) + (name_key,), row))
+            except Exception as exc:  # pylint: disable=broad-except
+                self._log_row_failure(exc, first=not failures)  # pylint: disable=no-member
+                failures += 1
+        options = (self._sorted_device_rows(eligible)
+                   + self._sorted_device_rows(explained)[:EXPORT_PICKER_LIMIT])
+        if len(explained) > EXPORT_PICKER_LIMIT:
+            options.append(TRUNCATED_OPTION)
+        return options
 
     @staticmethod
     def _previous_accessory_number(client, device_id: int) -> Optional[int]:
@@ -1783,23 +1775,27 @@ class ServerMenuMixin:
                                  "That device no longer exists — refresh the list.")
             return None
         own = self.exports.get(dev.id)
-        verdict = export_catalog.classify(dev, self._export_plugin_id(),  # pylint: disable=no-member
-                                          own.options if own else None)
-        if not isinstance(verdict, export_catalog.EligibleDevice):  # ADR-0012 — see _readopt_device_row
+        # ADR-0012 — see _readopt_device_row. eligible_target (export_catalog.py)
+        # is the classify-then-check-role dance this and _migrate_pick_device
+        # both need; the refusal wording stays here because re-adopt and
+        # migrate word it differently on purpose.
+        result = export_catalog.eligible_target(  # pylint: disable=no-member
+            dev, self._export_plugin_id(), own.options if own else None, orphan.role)
+        if isinstance(result, export_catalog.TargetRefusal):
+            if result.role_mismatch:
+                self._readopt_refuse(
+                    errors, "readoptDevice",
+                    f'"{dev.name}" cannot appear as a {export_catalog.role_label(orphan.role)}. '
+                    "Re-adopting only works when the replacement device can take the same role as "
+                    "the accessory it is inheriting; export it normally instead, and it becomes a "
+                    "new accessory.")
+                return None
             self._readopt_refuse(
                 errors, "readoptDevice",
                 f"{dev.name} needs a state mapping before an accessory can be re-adopted onto "
                 "it — export it directly first, which is where that is asked."
-                if isinstance(verdict, export_catalog.MappableDevice)
-                else f"{dev.name} cannot be exported: {getattr(verdict, 'reason', 'not exportable')}")
-            return None
-        if orphan.role not in verdict.eligible_roles:
-            self._readopt_refuse(
-                errors, "readoptDevice",
-                f'"{dev.name}" cannot appear as a {export_catalog.role_label(orphan.role)}. '
-                "Re-adopting only works when the replacement device can take the same role as "
-                "the accessory it is inheriting; export it normally instead, and it becomes a "
-                "new accessory.")
+                if isinstance(result.verdict, export_catalog.MappableDevice)
+                else f"{dev.name} cannot be exported: {getattr(result.verdict, 'reason', 'not exportable')}")
             return None
         return dev
 

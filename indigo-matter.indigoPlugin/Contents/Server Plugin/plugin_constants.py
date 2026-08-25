@@ -3,6 +3,8 @@ the four mixin modules it composes. See issue #146.
 """
 from __future__ import annotations
 
+import functools
+
 PLUGIN_NAME = "indigo-matter"
 COMMAND_TIMEOUT = 5.0
 DECOMMISSION_TIMEOUT = 15.0
@@ -143,6 +145,35 @@ ALL_OPTION_ID = "all"
 #: `get_pairing`, not one of the "real work happens behind it" deadlines
 #: above, so it gets the same number rather than a longer one.
 READOPT_ORPHANS_TIMEOUT = 15.0
+
+
+def degrades_to_list_error(func):
+    """Wrap an Indigo dynamic-list callback (``<List class="self"
+    method="...">``) so any exception degrades to :data:`LIST_ERROR_OPTION`
+    instead of taking the whole dialog down.
+
+    This is the tail every such callback used to write out by hand: log the
+    exception, then return the one-row "something went wrong" option — an
+    empty list would render as a popup the user cannot tell from "nothing to
+    choose" (see :data:`LIST_ERROR_OPTION`). Some list callbacks degrade
+    differently ON PURPOSE (a generic fallback list rather than an error row,
+    or a narrower ``except``) and are NOT wrapped with this — see their own
+    docstrings.
+
+    ``functools.wraps`` keeps the wrapped method's ``__name__``: Indigo
+    resolves every ``<List method="...">`` by name as an attribute on the
+    ``Plugin`` class (issue #146), and ``tests/test_plugin_module.py``'s
+    XML-callback-existence check reads that name too, so a decorator that
+    lost it would break both silently.
+    """
+    @functools.wraps(func)
+    def wrapper(self, *args, **kwargs):
+        try:
+            return func(self, *args, **kwargs)
+        except Exception as exc:  # pylint: disable=broad-except
+            self.logger.exception(exc)
+            return [LIST_ERROR_OPTION]
+    return wrapper
 
 
 def server_location(prefs: dict) -> str:

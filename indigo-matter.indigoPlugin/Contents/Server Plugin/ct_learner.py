@@ -76,7 +76,7 @@ import time
 from typing import Callable, Optional
 
 import ct_bounds
-from matter_handlers.color_control import mireds_to_kelvin
+from mired_units import mireds_to_kelvin
 
 #: How stale a commanded reference may be and still count as "this echo is
 #: answering that command". Live-measured design constraint (issue #293

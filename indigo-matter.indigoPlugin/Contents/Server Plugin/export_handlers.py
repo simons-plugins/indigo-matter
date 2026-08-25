@@ -83,7 +83,7 @@ from typing import Any, Callable, NamedTuple, Optional, Union
 import indigo  # provided by the Indigo runtime
 
 import export_catalog
-from matter_handlers.color_control import kelvin_to_mireds, mireds_to_kelvin
+from mired_units import kelvin_to_mireds, mireds_to_kelvin
 
 #: Handlers are stateless singletons in :data:`HANDLERS` with no plugin logger
 #: injected, so the one line they need to say goes to the module logger — the

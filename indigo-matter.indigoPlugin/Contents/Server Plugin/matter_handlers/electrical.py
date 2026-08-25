@@ -44,6 +44,29 @@ ATTR_AVAILABLE_ENDPOINTS = 0x0000
 ATTR_ACTIVE_ENDPOINTS = 0x0001
 
 
+def meter_props(endpoint: Any) -> dict:
+    """Capability props implied by *endpoint*'s electrical clusters.
+
+    Energy support must be set as device props at creation: Indigo does not
+    apply static ``<Supports*>`` Devices.xml elements to API-created devices
+    (same lesson as colour support; issue #56). When these props are True,
+    Indigo automatically adds ``curEnergyLevel`` / ``accumEnergyTotal`` states
+    that :class:`ElectricalPowerHandler` / :class:`ElectricalEnergyHandler`
+    then update.
+
+    Returns only the keys the endpoint earns — never a False — so callers can
+    ``props.update(...)`` (direct assignment) or apply each key via
+    ``setdefault`` (don't clobber an answer another pass already earned)
+    without the helper caring which.
+    """
+    props: dict = {}
+    if endpoint.has(CLUSTER_ELECTRICAL_POWER):
+        props["SupportsPowerMeter"] = True
+    if endpoint.has(CLUSTER_ELECTRICAL_ENERGY):
+        props["SupportsEnergyMeter"] = True
+    return props
+
+
 # ---------------------------------------------------------------------------
 # ElectricalPowerMeasurement helpers
 # ---------------------------------------------------------------------------
