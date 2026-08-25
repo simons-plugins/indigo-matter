@@ -429,7 +429,7 @@ class TestSetState:
                 {bridge_protocol.CMD_SET_STATE: EXCHANGES["set_state_unknown_device"]["response"]}))
             client = _client(mock_logger, fake)
             task = asyncio.create_task(client.run())
-            await client.wait_connected(timeout=2)
+            await client.wait_attached(timeout=2)
 
             await client.set_state(123456791, {"onOff": True})
             await settle(lambda: mock_logger.warning.called)
@@ -978,7 +978,7 @@ class TestSetStateFailurePaths:
             fake = DyingSocket(responder=golden_responder(), handshake=HELLO)
             client = _client(mock_logger, fake)
             task = asyncio.create_task(client.run())
-            await client.wait_connected(timeout=2)
+            await client.wait_attached(timeout=2)
             mock_logger.debug.reset_mock()
 
             await client.set_state(123456789, {"onOff": True})   # must not raise
@@ -1015,7 +1015,7 @@ class TestSetStateFailurePaths:
                 {bridge_protocol.CMD_SET_STATE: EXCHANGES["set_state_unknown_device"]["response"]}))
             client = _client(mock_logger, fake)
             task = asyncio.create_task(client.run())
-            await client.wait_connected(timeout=2)
+            await client.wait_attached(timeout=2)
 
             await client.set_state(123456791, {"onOff": True})
             await settle(lambda: mock_logger.warning.called)
@@ -1119,7 +1119,7 @@ class TestReattach:
             fake = _fake(responder=responder)
             client = _client(mock_logger, fake)
             task = asyncio.create_task(client.run())
-            await client.wait_connected(timeout=2)
+            await client.wait_attached(timeout=2)
             assert client.status.endpoint_count == 0
 
             # The node now serves the two-endpoint set.

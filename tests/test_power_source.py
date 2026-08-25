@@ -229,13 +229,11 @@ def test_no_power_sources_covers_nothing():
 
 # ---------------------------------------------------------------------------
 # device_sync integration tests
-# (reuse helpers from test_device_sync.py via conftest + local FakeDev copies)
+# (reuse the shared Indigo fakes from indigo_fakes.py)
 # ---------------------------------------------------------------------------
 
-# Import fakes from test_device_sync (they're not importable as a module but we
-# can replicate the minimal subset we need here, or import the symbols directly).
 # Since pytest adds tests/ to sys.path via conftest, import directly.
-from test_device_sync import FakeDev, FakeDeviceFactory, FakeDevices, FakeFolderFactory  # noqa: E402
+from indigo_fakes import FakeDev, FakeDeviceFactory, FakeDevices, FakeFolderFactory  # noqa: E402
 
 
 # A sensor node with PowerSource on endpoint 0 and a temperature sensor on endpoint 1.
