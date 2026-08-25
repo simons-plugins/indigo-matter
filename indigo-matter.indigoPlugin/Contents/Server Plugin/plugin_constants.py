@@ -99,7 +99,7 @@ ON_TIME_RETIRED_PREF = "matterOnTimeStateRetired"
 #: — one JSON array of node ids whose synthetic matterNode device the user
 #: deliberately deleted, so create_devices does not recreate it on the next
 #: reconcile. Same prefs discipline as SURVEY_LOG_PREF/matterExports: plugin.
-#: startup loads it, ServerMenuMixin saves it (the "Recreate Matter node
+#: startup loads it, MatterServerMenuMixin saves it (the "Recreate Matter node
 #: devices…" menu item is where a tombstone is cleared).
 NODE_TOMBSTONES_PREF = "matterNodeDeviceTombstones"
 #: How long the "Recreate Matter node devices…" menu action may block the

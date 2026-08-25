@@ -974,7 +974,7 @@ def _share_dev(node_id="45"):
 
 
 def test_action_share_matter_node_delegates_to_share_node(plugin_cls, mock_logger):
-    """The device-targeted twin of ServerMenuMixin.menuShareMatterNode — same
+    """The device-targeted twin of MatterServerMenuMixin.menuShareMatterNode — same
     _window_duration/_share_node core, scoped to the node this device names.
 
     Validation only, deliberately: the actual _share_node work now runs on a
@@ -1180,7 +1180,7 @@ def test_action_share_matter_node_defaults_duration_via_the_real_validator_when_
 
 # ---------------------------------------------------------------------------
 # issue #210 — _on_late_matter_response fans out to BOTH late-response
-# consumers (commission RPC via CommissionJobs, share RPC via ServerMenuMixin)
+# consumers (commission RPC via CommissionJobs, share RPC via MatterServerMenuMixin)
 # ---------------------------------------------------------------------------
 
 def test_on_late_matter_response_routes_to_both_consumers(plugin_cls, mock_logger):

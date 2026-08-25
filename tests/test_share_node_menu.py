@@ -1,8 +1,8 @@
-"""ServerMenuMixin's "Share a Matter device with another ecosystem…" (issue
+"""MatterServerMenuMixin's "Share a Matter device with another ecosystem…" (issue
 #210) — the reverse of the share model: Indigo already holds admin 1 on this
 node, and this opens a commissioning window so a SECOND ecosystem can join.
 
-Composes ``ServerMenuMixin`` with the two sibling mixins it reuses via MRO
+Composes ``MatterServerMenuMixin`` with the two sibling mixins it reuses via MRO
 (``DiagnosticsMenuMixin._fetch_node``, ``PairingMenuMixin._window_duration``)
 — the same composition ``Plugin`` itself does — rather than mocking those
 methods away, so the cross-mixin reuse is actually exercised, not merely
@@ -112,16 +112,16 @@ def _submitter(get_node_result=None, get_node_raises=None,
 
 @pytest.fixture
 def mixin(mock_indigo_base, mock_logger):  # noqa: ARG001
-    """A ServerMenuMixin composed with the two sibling mixins it borrows
+    """A MatterServerMenuMixin composed with the two sibling mixins it borrows
     methods from via MRO — mirroring Plugin's own composition, not a mock of
     the borrowed methods."""
-    for name in ("server_menu_mixin", "diagnostics_menu_mixin", "pairing_menu_mixin"):
+    for name in ("matter_server_menu_mixin", "diagnostics_menu_mixin", "pairing_menu_mixin"):
         sys.modules.pop(name, None)
-    server_menu_mixin = importlib.import_module("server_menu_mixin")
+    matter_server_menu_mixin = importlib.import_module("matter_server_menu_mixin")
     diagnostics_menu_mixin = importlib.import_module("diagnostics_menu_mixin")
     pairing_menu_mixin = importlib.import_module("pairing_menu_mixin")
 
-    class _Composed(server_menu_mixin.ServerMenuMixin,
+    class _Composed(matter_server_menu_mixin.MatterServerMenuMixin,
                     diagnostics_menu_mixin.DiagnosticsMenuMixin,
                     pairing_menu_mixin.PairingMenuMixin):
         pass
@@ -137,7 +137,7 @@ def mixin(mock_indigo_base, mock_logger):  # noqa: ARG001
     obj.device_sync.list_nodes.return_value = [(NODE_ID, ["Grillplats socket"])]
     obj.runtime.submit.side_effect = _submitter(
         get_node_result=RAW_NODE, open_window_result=COMMISSIONING_WINDOW_RESULT)
-    return server_menu_mixin, obj
+    return matter_server_menu_mixin, obj
 
 
 # ---------------------------------------------------------------------------
@@ -435,7 +435,7 @@ def test_happy_path_opens_the_window_with_the_chosen_duration_and_logs_the_codes
     # context is our own ShareWindowRequest — the correlation key a LATE
     # answer (issue #210) is matched back against. Built from the fixture's
     # OWN freshly-imported module, not a top-level import of this test file
-    # — the fixture reloads server_menu_mixin per test, and a dataclass's
+    # — the fixture reloads matter_server_menu_mixin per test, and a dataclass's
     # generated __eq__ compares __class__ identity, not just field values.
     assert obj.matter.open_commissioning_window.call_args == (
         (NODE_ID,), {"duration": 300, "context": module.ShareWindowRequest(NODE_ID, 300)})

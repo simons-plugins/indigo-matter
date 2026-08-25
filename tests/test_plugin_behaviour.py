@@ -1465,7 +1465,7 @@ def test_install_handler_pins_node_and_reinstalls(plug, plugin_mod, monkeypatch)
     plug._stopping = False
     plug._restart_expected_until = 0.0
     reinstalled = SimpleNamespace(ensure_installed=Mock(), restart=Mock())
-    monkeypatch.setattr(plugin_mod.server_menu_mixin, "ServerProcess", lambda *a, **k: reinstalled)
+    monkeypatch.setattr(plugin_mod.matter_server_menu_mixin, "ServerProcess", lambda *a, **k: reinstalled)
     plug._install_matter_server()
     # the node used for install is pinned so the LaunchAgent runs the same one
     assert plug.pluginPrefs["nodeBinDir"] == "/opt/homebrew/bin"
@@ -1482,7 +1482,7 @@ def test_install_handler_aborts_and_logs_when_install_fails(plug, plugin_mod, mo
     plug.pluginPrefs = {"serverLocation": "local"}
     plug._stopping = False
     reinstalled = SimpleNamespace(ensure_installed=Mock())
-    monkeypatch.setattr(plugin_mod.server_menu_mixin, "ServerProcess", lambda *a, **k: reinstalled)
+    monkeypatch.setattr(plugin_mod.matter_server_menu_mixin, "ServerProcess", lambda *a, **k: reinstalled)
     plug._install_matter_server()
     assert "nodeBinDir" not in plug.pluginPrefs        # no pin on failure
     reinstalled.ensure_installed.assert_not_called()   # no reinstall on failure
@@ -1493,7 +1493,7 @@ def test_install_handler_skips_state_mutation_when_stopping(plug, plugin_mod, mo
     plug.server_process = SimpleNamespace(install=lambda: True, resolved_bin_dir="/x")
     plug.pluginPrefs = {"serverLocation": "local"}
     plug._stopping = True                              # plugin tearing down
-    monkeypatch.setattr(plugin_mod.server_menu_mixin, "ServerProcess",
+    monkeypatch.setattr(plugin_mod.matter_server_menu_mixin, "ServerProcess",
                         lambda *a, **k: SimpleNamespace(ensure_installed=Mock()))
     plug._install_matter_server()
     assert "nodeBinDir" not in plug.pluginPrefs        # no pin/rewrite against teardown
@@ -1542,7 +1542,7 @@ def test_install_handler_clean_removes_package_before_reinstall(plug, plugin_mod
     plug._stopping = False
     plug._restart_expected_until = 0.0
     reinstalled = SimpleNamespace(ensure_installed=Mock(), restart=Mock(return_value=True))
-    monkeypatch.setattr(plugin_mod.server_menu_mixin, "ServerProcess", lambda *a, **k: reinstalled)
+    monkeypatch.setattr(plugin_mod.matter_server_menu_mixin, "ServerProcess", lambda *a, **k: reinstalled)
     plug._install_matter_server(clean=True)
     assert order == ["remove", "install"]             # package deleted BEFORE reinstalling
     reinstalled.restart.assert_called_once()
@@ -1579,7 +1579,7 @@ def test_install_handler_default_does_not_remove_package(plug, plugin_mod, monke
     plug.pluginPrefs = {"serverLocation": "local"}
     plug._stopping = False
     plug._restart_expected_until = 0.0
-    monkeypatch.setattr(plugin_mod.server_menu_mixin, "ServerProcess",
+    monkeypatch.setattr(plugin_mod.matter_server_menu_mixin, "ServerProcess",
                         lambda *a, **k: SimpleNamespace(ensure_installed=Mock(),
                                                         restart=Mock(return_value=True)))
     plug._install_matter_server()                     # clean defaults to False
@@ -1666,7 +1666,7 @@ def test_install_handler_logs_when_restart_fails(plug, plugin_mod, monkeypatch):
     plug._restart_expected_until = 0.0
     plug._restart_notice_shown = False
     reinstalled = SimpleNamespace(ensure_installed=Mock(), restart=Mock(return_value=False))
-    monkeypatch.setattr(plugin_mod.server_menu_mixin, "ServerProcess", lambda *a, **k: reinstalled)
+    monkeypatch.setattr(plugin_mod.matter_server_menu_mixin, "ServerProcess", lambda *a, **k: reinstalled)
     plug._install_matter_server()
     plug.logger.error.assert_called()            # restart failure surfaced, not silent success
     assert plug._restart_expected_until == 0.0   # window cleared so the crash diagnostic works
@@ -1678,7 +1678,7 @@ def test_menu_restart_sets_window_on_success(plug, plugin_mod, monkeypatch):
     # ensure_installed can delete the developer's live LaunchAgent plist).
     rebuilt = SimpleNamespace(ensure_installed=Mock(return_value=False),
                               restart=Mock(return_value=True))
-    monkeypatch.setattr(plugin_mod.server_menu_mixin, "ServerProcess", lambda *a, **k: rebuilt)
+    monkeypatch.setattr(plugin_mod.matter_server_menu_mixin, "ServerProcess", lambda *a, **k: rebuilt)
     plug.server_process = SimpleNamespace(restart=Mock(return_value=True))
     plug.pluginPrefs = {"serverLocation": "local"}
     plug._restart_expected_until = 0.0
@@ -1691,7 +1691,7 @@ def test_menu_restart_sets_window_on_success(plug, plugin_mod, monkeypatch):
 def test_menu_restart_clears_window_on_failure(plug, plugin_mod, monkeypatch):
     rebuilt = SimpleNamespace(ensure_installed=Mock(return_value=False),
                               restart=Mock(return_value=False))
-    monkeypatch.setattr(plugin_mod.server_menu_mixin, "ServerProcess", lambda *a, **k: rebuilt)
+    monkeypatch.setattr(plugin_mod.matter_server_menu_mixin, "ServerProcess", lambda *a, **k: rebuilt)
     plug.server_process = SimpleNamespace(restart=Mock(return_value=False))
     plug.pluginPrefs = {"serverLocation": "local"}
     plug._restart_expected_until = 0.0
@@ -1719,7 +1719,7 @@ def test_menu_restart_applies_prefs_changed_since_startup(plug, plugin_mod, monk
         seen.update(prefs)
         return rebuilt
 
-    monkeypatch.setattr(plugin_mod.server_menu_mixin, "ServerProcess", _factory)
+    monkeypatch.setattr(plugin_mod.matter_server_menu_mixin, "ServerProcess", _factory)
     stale = SimpleNamespace(restart=Mock(return_value=True))
     plug.server_process = stale
     plug.pluginPrefs = {"serverLocation": "local", "enableTestNetDcl": True}
@@ -1739,7 +1739,7 @@ def test_menu_restart_does_not_double_restart_when_prefs_changed(plug, plugin_mo
     parent = Mock()
     parent.ensure_installed.return_value = True
     rebuilt = SimpleNamespace(ensure_installed=parent.ensure_installed, restart=parent.restart)
-    monkeypatch.setattr(plugin_mod.server_menu_mixin, "ServerProcess", lambda *a, **k: rebuilt)
+    monkeypatch.setattr(plugin_mod.matter_server_menu_mixin, "ServerProcess", lambda *a, **k: rebuilt)
     plug.server_process = SimpleNamespace(restart=Mock())  # non-None: management is on
     plug.pluginPrefs = {"serverLocation": "local"}
     plug._restart_expected_until = 0.0
@@ -1756,7 +1756,7 @@ def test_menu_restart_stops_when_preflight_tore_the_plist_down(plug, plugin_mod,
     parent = Mock()
     parent.ensure_installed.return_value = None
     rebuilt = SimpleNamespace(ensure_installed=parent.ensure_installed, restart=parent.restart)
-    monkeypatch.setattr(plugin_mod.server_menu_mixin, "ServerProcess", lambda *a, **k: rebuilt)
+    monkeypatch.setattr(plugin_mod.matter_server_menu_mixin, "ServerProcess", lambda *a, **k: rebuilt)
     plug.server_process = SimpleNamespace(restart=Mock())  # non-None: management is on
     plug.pluginPrefs = {"serverLocation": "local"}
     plug._restart_expected_until = 0.0
@@ -1773,7 +1773,7 @@ def test_menu_restart_clears_window_when_ensure_installed_raises(plug, plugin_mo
     # is suppressed for 30s while the server is down.
     rebuilt = SimpleNamespace(ensure_installed=Mock(side_effect=OSError("boom")),
                               restart=Mock(return_value=True))
-    monkeypatch.setattr(plugin_mod.server_menu_mixin, "ServerProcess", lambda *a, **k: rebuilt)
+    monkeypatch.setattr(plugin_mod.matter_server_menu_mixin, "ServerProcess", lambda *a, **k: rebuilt)
     plug.server_process = SimpleNamespace(restart=Mock())  # non-None: management is on
     plug.pluginPrefs = {"serverLocation": "local"}
     plug._restart_expected_until = 0.0

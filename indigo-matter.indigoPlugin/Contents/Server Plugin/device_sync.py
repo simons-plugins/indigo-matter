@@ -831,7 +831,7 @@ class DeviceSync:
         next reconcile runs, and tombstones the node so ``create_devices``
         does not recreate it out from under the user on the next reconnect.
         The "Recreate Matter node devices…" menu item
-        (``ServerMenuMixin.menuRecreateNodeDevices``) is the only way back.
+        (``MatterServerMenuMixin.menuRecreateNodeDevices``) is the only way back.
 
         Endpoint devices deliberately do NOT get this treatment: they are
         cluster-derived, so deleting one is corrected by the next reconcile
@@ -912,7 +912,7 @@ class DeviceSync:
 
         Every node matter-server has reported is listed, INCLUDING one that
         produced no Indigo devices — its entry carries an empty name list, which
-        ``ServerMenuMixin.getMatterNodes`` renders as "(no Indigo devices)".
+        ``MatterServerMenuMixin.getMatterNodes`` renders as "(no Indigo devices)".
         See ``_known_nodes`` for why ``_index`` alone could not do this.
 
         Sorted by node id; device names resolved outside the lock so a slow

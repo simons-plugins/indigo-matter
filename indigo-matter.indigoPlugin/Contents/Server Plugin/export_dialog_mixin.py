@@ -62,9 +62,10 @@ class ExportDialogMixin:
     def _truthy(value) -> bool:
         """Indigo checkboxes arrive as bools or as "true"/"false" strings.
 
-        Cross-band helper: also called from ``PairingMenuMixin`` and
-        ``ServerMenuMixin`` via MRO — its home here is correct only because
-        ``ExportDialogMixin`` is always composed into ``Plugin`` (issue #146).
+        Cross-band helper: also called from ``PairingMenuMixin``,
+        ``ExportRecoveryMenuMixin``, and ``BridgeAgentMenuMixin`` via MRO —
+        its home here is correct only because ``ExportDialogMixin`` is always
+        composed into ``Plugin`` (issue #146).
         """
         if isinstance(value, str):
             return value.strip().lower() in ("true", "yes", "1")
@@ -331,7 +332,7 @@ class ExportDialogMixin:
         verdict = export_catalog.classify(dev, plugin_id, self._saved_options(device_id))
         if isinstance(verdict, export_catalog.Excluded):
             # export_catalog.excluded_row is the same loop-guard-omit (XAC6) /
-            # not-exportable-reason row ServerMenuMixin._readopt_device_row
+            # not-exportable-reason row ExportRecoveryMenuMixin._readopt_device_row
             # builds — shared because the two pickers word this one outcome
             # identically.
             return export_catalog.excluded_row(verdict, device_id, name, mark, EXCLUDED_OPTION_PREFIX)
@@ -958,20 +959,21 @@ class ExportDialogMixin:
         """Walk :func:`next_generation` from ``identity`` until no OTHER
         ``ExportStore`` entry effectively claims it (issue #246 review finding 1).
 
-        "Migrate an exported accessory…" (``server_menu_mixin.ServerMenuMixin.
-        menuMigrateExport``) moves a device's accessory identity onto ANOTHER
-        device's entry. Re-exporting the original device afterwards through
-        this ordinary dialog must not try to publish that same identity again
-        — the node refuses a duplicate ``publishedAs`` for the WHOLE attach
-        (``parseEndpointSpecs``, ``malformed_args``), which takes every export
-        offline, not just the new one. The same collision can recur one
-        generation later (a role change bumping past a generation someone else
-        has since taken), so this keeps walking rather than trying
-        :func:`next_generation` exactly once.
+        "Migrate an exported accessory…" (``export_recovery_menu_mixin.
+        ExportRecoveryMenuMixin.menuMigrateExport``) moves a device's accessory
+        identity onto ANOTHER device's entry. Re-exporting the original device
+        afterwards through this ordinary dialog must not try to publish that
+        same identity again — the node refuses a duplicate ``publishedAs`` for
+        the WHOLE attach (``parseEndpointSpecs``, ``malformed_args``), which
+        takes every export offline, not just the new one. The same collision
+        can recur one generation later (a role change bumping past a
+        generation someone else has since taken), so this keeps walking
+        rather than trying :func:`next_generation` exactly once.
 
-        Reuses :meth:`server_menu_mixin.ServerMenuMixin._readopt_identity_claimant`
-        for the EFFECTIVE-identity comparison it already makes for the same
-        reason (``published_as`` where an entry has one, otherwise the default
+        Reuses :meth:`export_recovery_menu_mixin.ExportRecoveryMenuMixin.
+        _readopt_identity_claimant` for the EFFECTIVE-identity comparison it
+        already makes for the same reason (``published_as`` where an entry
+        has one, otherwise the default
         derivation it publishes under) — ``device_id``'s OWN entry never counts
         as a claimant, so an unchanged existing entry stays free to keep
         publishing the identity it already holds.

@@ -10,10 +10,14 @@ matter-server/bridge-node menus — has moved to mixins (issue #146), except
 the Set Sensitivity Level custom action (``actionSetSensitivityLevel`` and
 its ``getSensitivityLevels`` picker), which stays with the action bridge:
 :class:`HttpApiMixin`, :class:`ExportDialogMixin`, :class:`PairingMenuMixin`,
-:class:`ServerMenuMixin`, :class:`DiagnosticsMenuMixin`.
+:class:`MatterServerMenuMixin`, :class:`ExportRecoveryMenuMixin`,
+:class:`BridgeAgentMenuMixin`, :class:`DiagnosticsMenuMixin` — the last three
+split from one former ``server_menu_mixin.py`` (issue #146: mixins are
+required so callbacks resolve as flat attributes; nothing requires them to
+share a file).
 ``plugin_constants.py`` holds the shared constants and prefs helpers;
 ``pairing_page.py`` holds the pairing IWS page template. ``Plugin`` composes all
-five mixins so every callback still resolves as a plain attribute on the
+seven mixins so every callback still resolves as a plain attribute on the
 ``Plugin`` class, which is how Indigo looks them up.
 
 See ``docs/PRD-indigo-matter-plugin.md``, ``docs/IMPLEMENTATION.md`` (protocol +
@@ -31,6 +35,7 @@ from datetime import datetime, timezone
 import indigo  # provided by the Indigo runtime
 
 from async_runtime import AsyncRuntime
+from bridge_agent_menu_mixin import BridgeAgentMenuMixin
 from commission_jobs import CommissionJobs
 import ct_bounds
 from ct_calibration import CTCalibrationEngine
@@ -41,6 +46,7 @@ import export_bridge
 from export_bridge import ExportBridge
 import export_dialog_mixin      # noqa: F401 (tests patch EXPORT_PICKER_LIMIT)  # pylint: disable=unused-import
 from export_dialog_mixin import ExportDialogMixin
+from export_recovery_menu_mixin import ExportRecoveryMenuMixin
 from export_store import ExportStore
 from http_api_mixin import HttpApiMixin
 from http_handlers import HttpApi
@@ -48,11 +54,11 @@ from launch_agent import STARTUP_GRACE_SECONDS, VERDICT_CONFLICT_FREE, VERDICT_D
 from matter_client import MatterClient
 from matter_handlers.registry import HandlerRegistry
 from matter_handlers.settings import settings_for_type
+import matter_server_menu_mixin  # noqa: F401 (tests patch ServerProcess)  # pylint: disable=unused-import
+from matter_server_menu_mixin import MatterServerMenuMixin
 from pairing_menu_mixin import PairingMenuMixin
 import protocol
 from protocol import MatterWrite, Protocol
-import server_menu_mixin        # noqa: F401 (tests patch ServerProcess)  # pylint: disable=unused-import
-from server_menu_mixin import ServerMenuMixin
 from server_process import ServerProcess
 
 from plugin_constants import (
@@ -86,7 +92,8 @@ _SENSITIVITY_SETTING = next(
     s for s in settings_for_type("matterMotionSensor") if s.key == "sensitivityLevel")
 
 
-class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, ServerMenuMixin,
+class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenuMixin,
+             ExportRecoveryMenuMixin, BridgeAgentMenuMixin,
              DiagnosticsMenuMixin, indigo.PluginBase):
     """Matter plugin entry point."""
 
@@ -1789,7 +1796,7 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, ServerMenuMixin,
     def actionShareMatterNode(self, action, dev):  # noqa: N802
         """Device-targeted twin of "Share a Matter device with another
         ecosystem…" (issue #210): the same ``_share_node`` core
-        ``ServerMenuMixin.menuShareMatterNode`` uses, scoped to the one node
+        ``MatterServerMenuMixin.menuShareMatterNode`` uses, scoped to the one node
         ``dev`` (a matterNode) names — reachable from a control page,
         trigger, or action group, and the seam a future Domio "share this
         device" endpoint would call instead of the menu. There is no dialog
@@ -1843,7 +1850,8 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, ServerMenuMixin,
         safe to call from any thread, so there is nothing about running it
         inline in a test that changes its behaviour.
         """
-        ok, message = self._share_node(node_id, duration)  # pylint: disable=no-member  # ServerMenuMixin (issue #146)
+        # pylint: disable-next=no-member  # MatterServerMenuMixin (issue #146)
+        ok, message = self._share_node(node_id, duration)
         if not ok:
             self.logger.error('"%s": share failed — %s', dev_name, message)
 
@@ -1931,5 +1939,5 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, ServerMenuMixin,
         # anything else; this claims a ShareWindowRequest the same way. Both
         # run unconditionally — a late answer names at most one of them via
         # isinstance, never both, so there is no double-handling to guard.
-        self._note_late_share_response(late)  # pylint: disable=no-member  # ServerMenuMixin (issue #146)
+        self._note_late_share_response(late)  # pylint: disable=no-member  # MatterServerMenuMixin (issue #146)
 

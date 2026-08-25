@@ -227,7 +227,7 @@ def options_lawful_for_role(options: dict, role: str) -> dict:
     :data:`INVERTIBLE_ROLES`, :data:`MAPPABLE_ROLES`, :data:`CT_BOUNDS_ROLES` —
     rather than a hand-copied key list that can drift out of step with them.
 
-    For ``server_menu_mixin._readopt_commit`` (issue #293 review): re-adopting
+    For ``export_recovery_menu_mixin._readopt_commit`` (issue #293 review): re-adopting
     an orphaned accessory onto a device carries that device's OWN previous
     export options forward, and the orphan's role need not match the role
     those options were validated against (``export_catalog``'s dimmer rule
@@ -469,7 +469,7 @@ class ExportStore:
         """Replace the whole allow-list in one persisted write.
 
         Validated the same way :meth:`upsert` is (issue #294 review) and for
-        the same reason: ``_migrate_commit`` (``server_menu_mixin.py``) is
+        the same reason: ``_migrate_commit`` (``export_recovery_menu_mixin.py``) is
         this method's one production caller, and it already wraps the call
         in a try/except reporting "FAILED to save the export list" — exactly
         the failure mode a raised ``ValueError`` here produces. Validated

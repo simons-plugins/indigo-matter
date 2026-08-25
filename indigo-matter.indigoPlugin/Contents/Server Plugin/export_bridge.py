@@ -980,7 +980,7 @@ class ExportBridge:
     def reattach(self) -> bool:
         """Full mid-session §3.1 ``attach`` — the #246 migrate nudge.
 
-        A migrate (``server_menu_mixin.ServerMenuMixin.menuMigrateExport``)
+        A migrate (``export_recovery_menu_mixin.ExportRecoveryMenuMixin.menuMigrateExport``)
         retargets the allow-list, but §3.1's reconcile is what a *rekey* is —
         the store write alone means nothing to the node until an attach
         carries it (ADR-0011). This is that attach, callable outside the
@@ -994,7 +994,7 @@ class ExportBridge:
         a change, and that is only true once this attach has actually landed —
         so the caller needs a real told/not-told answer before it can decide
         which message to show, the same reason
-        ``ServerMenuMixin.menuRebuildEndpointMap`` blocks on
+        ``ExportRecoveryMenuMixin.menuRebuildEndpointMap`` blocks on
         ``rebuild_endpoint_map()`` rather than firing it.
 
         **Routes the result through ``_on_attached`` explicitly, like
@@ -1008,7 +1008,7 @@ class ExportBridge:
 
         Requires an attached client — the caller
         (``menuMigrateExport`` step 2) has already verified one via
-        ``ServerMenuMixin._recovery_client(require_attached=True)``, the same
+        ``ExportRecoveryMenuMixin._recovery_client(require_attached=True)``, the same
         precondition re-adopt's execute path demands (PR5 design E1).
 
         **Three failure classes, three honest messages (issue #246 review
@@ -1037,7 +1037,7 @@ class ExportBridge:
         """
         client = self.client
         if client is None:
-            # The dialog's own error says "see Event Log" (server_menu_mixin's
+            # The dialog's own error says "see Event Log" (export_recovery_menu_mixin's
             # "Saved, but the bridge node was not told") — this is that line,
             # for the mid-dialog-disconnect race that reaches here with no
             # client left to nudge at all.

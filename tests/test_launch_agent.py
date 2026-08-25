@@ -728,7 +728,7 @@ def test_verdict_is_pending_when_the_pids_age_is_unknowable(tmp_path, mock_logge
 # ---------------------------------------------------------------------------
 # adopt_pending_bootstrap_verification() — a rebuild whose own ensure_installed()
 # left a healthy job alone must not silently drop the replaced instance's
-# still-pending #187 verification (server_menu_mixin.py's _start_bridge_agent).
+# still-pending #187 verification (bridge_agent_menu_mixin.py's _start_bridge_agent).
 # ---------------------------------------------------------------------------
 
 def test_adopt_carries_over_a_pending_verification(tmp_path, mock_logger):

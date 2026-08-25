@@ -127,7 +127,8 @@ class _IndigoPluginBaseStub:
 #: Eviction uses raising=False, so a typo'd entry would no-op silently —
 #: test_plugin_module.py pins each entry to a real Server Plugin file.
 _PLUGIN_MODULES = ("plugin", "plugin_constants", "pairing_page", "http_api_mixin",
-                   "export_dialog_mixin", "pairing_menu_mixin", "server_menu_mixin",
+                   "export_dialog_mixin", "pairing_menu_mixin", "matter_server_menu_mixin",
+                   "export_recovery_menu_mixin", "bridge_agent_menu_mixin",
                    "diagnostics_menu_mixin")
 
 
