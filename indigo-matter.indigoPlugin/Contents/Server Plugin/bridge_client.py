@@ -639,9 +639,18 @@ class BridgeClient(WsJsonClient):
                 f"upsert_endpoint result carried no endpointNumber: {result!r}")
         return int(data["endpointNumber"])
 
-    async def remove_endpoint(self, indigo_device_id: int, timeout: float = DEFAULT_TIMEOUT) -> bool:
-        """Remove one endpoint (§3.3). ``False`` means it was already absent."""
-        result = await self._request_frame(self.proto.build_remove_endpoint(indigo_device_id), timeout)
+    async def remove_endpoint(self, indigo_device_id: int, *, permanent: bool = False,
+                              timeout: float = DEFAULT_TIMEOUT) -> bool:
+        """Remove one endpoint (§3.3). ``False`` means it was already absent.
+
+        ``permanent`` (issue #274) is the confirmed-gone declaration — see
+        ``bridge_protocol.BridgeProtocol.build_remove_endpoint``. Defaults to
+        ``False`` so `replace()`'s two-command supersede/re-adopt sequence,
+        which calls this directly rather than through `ExportBridge.remove`,
+        is unaffected.
+        """
+        result = await self._request_frame(
+            self.proto.build_remove_endpoint(indigo_device_id, permanent=permanent), timeout)
         return bool((result or {}).get("removed", False))
 
     async def set_state(self, indigo_device_id: int, states: dict) -> None:

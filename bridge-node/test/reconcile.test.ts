@@ -12,6 +12,7 @@ import {
     parseDeviceId,
     parseEndpointSpec,
     parseEndpointSpecs,
+    parsePermanentRemoval,
     parseReplaceAll,
     planReconcile,
 } from "../src/reconcile.js";
@@ -146,6 +147,22 @@ describe("parseEndpointSpecs / parseReplaceAll (§3.1)", () => {
         ]));
         assert.equal(error.code, ErrorCode.malformedArgs);
         assert.match(error.message, /publishedAs indigo-99 twice/);
+    });
+});
+
+describe("parsePermanentRemoval (§3.3, issue #274)", () => {
+    it("defaults to false — every remove_endpoint call before this flag existed keeps the soft (orphan) behaviour", () => {
+        assert.equal(parsePermanentRemoval(undefined), false);
+    });
+
+    it("honours an explicit true or false", () => {
+        assert.equal(parsePermanentRemoval(true), true);
+        assert.equal(parsePermanentRemoval(false), false);
+    });
+
+    it("rejects a non-boolean", () => {
+        assert.equal(refusal(() => parsePermanentRemoval("true")).code, ErrorCode.malformedArgs);
+        assert.equal(refusal(() => parsePermanentRemoval(1)).code, ErrorCode.malformedArgs);
     });
 });
 

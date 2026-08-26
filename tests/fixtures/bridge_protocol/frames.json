@@ -639,6 +639,22 @@
       }
     }
   },
+  "remove_endpoint_permanent": {
+    "request": {
+      "message_id": "m78",
+      "command": "remove_endpoint",
+      "args": {
+        "indigoDeviceId": 123456789,
+        "permanent": true
+      }
+    },
+    "response": {
+      "message_id": "m78",
+      "result": {
+        "removed": true
+      }
+    }
+  },
   "set_state": {
     "request": {
       "message_id": "m17",

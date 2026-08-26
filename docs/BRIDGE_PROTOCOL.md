@@ -388,11 +388,45 @@ caller to guess why an apparently ordinary upsert failed.
 {"command": "remove_endpoint", "args": {"indigoDeviceId": 123456789}}
 ```
 
-Removes the child endpoint (`endpoint.close()`); the persisted endpoint-number
-allocation is **retained** so re-adding the same device restores the same
-number. Idempotent — removing an absent endpoint succeeds with
-`{"removed": false}`; a live removal returns `{"removed": true}`. Bulk
-removals are paced ~100ms apart by the node.
+Removes the child endpoint (`endpoint.close()`). Idempotent — removing an
+absent endpoint succeeds with `{"removed": false}`; a live removal returns
+`{"removed": true}`. Bulk removals are paced ~100ms apart by the node.
+
+**`permanent` (issue #274, default `false`) decides what happens to the
+endpoint-map record, not just the live endpoint.** Omitted or `false` keeps
+the behaviour every caller had before this flag existed: the persisted
+endpoint-number allocation is **retained** and the entry is marked
+`orphaned` (§4.3's `endpoint-map.json` subsection) — re-adding the same
+device, or re-adopting the identity onto a different one, restores the same
+number. `true` is the confirmed-gone declaration: the Indigo device has been
+deleted, or the user has deliberately un-exported it. The node then
+**destroys** the endpoint-map record outright — no number kept, no
+`orphaned` entry, nothing offered to `list_orphans` — because ADR-0015
+retired the premise that a departed accessory is worth holding open for a
+re-adopt that will never come, once the driving device itself is gone.
+
+Only a caller certain the device is not coming back may pass `true`. The
+plugin passes it from exactly three places: `deviceDeleted` (a live
+deletion), the export dialog's "Remove" (a deliberate un-export), and a
+sweep in `_on_attached` that closes the one gap those two cannot — a device
+deleted from Indigo while the plugin was not running to hear about it (§3.1
+above already re-classifies every allow-list entry on each attach; a device
+missing there is exactly this case, `export_bridge.py`'s `_spec_for`). The
+plugin's own two-command role-change/re-adopt sequence (`replace()`, which
+sends this `remove_endpoint` and a paired `upsert_endpoint` for the same or
+a related identity) never passes `true` — that removal is deliberately soft,
+because the very next command may retroactively mark it `supersededBy`
+(§3.1's supersede accounting) or the map may still offer it as an ordinary
+re-adopt candidate.
+
+**`attach`'s own reconcile never destroys.** A full reconcile (§3.1) cannot
+tell "the plugin dropped this on purpose" from "this device exists but
+failed classification this one pass" — a dependent plugin not yet started,
+a role this build does not know — so any identity that merely falls out of
+an `attach`'s desired set keeps the pre-#274 soft/orphan treatment
+regardless of `permanent`. Destroying is only ever a `remove_endpoint`
+decision, made with the device's existence already confirmed on the plugin
+side.
 
 ### 3.4 `set_state`
 
@@ -600,6 +634,15 @@ recorded, not necessarily newest-orphan-first):
   new identity) is never in this list: re-adopting one would resurrect an
   old-role accessory under a number every paired ecosystem has already
   processed a removal for.
+
+**Since issue #274 (ADR-0015), an ordinary departure no longer lands here at
+all.** A device deletion or a deliberate un-export now goes through
+`remove_endpoint`'s `permanent: true` (§3.3), which destroys the record
+instead of orphaning it — see the `endpoint-map.json` subsection above. Only
+a device that fell out of an `attach`'s desired set without the plugin ever
+confirming why (§3.1's own reconcile never destroys) still produces an
+ordinary orphan, so a healthy bridge's `list_orphans` is expected to answer
+empty far more often than before this issue.
 
 **Not a recovery command.** `list_orphans` requires an ordinary `attach` first,
 same as any other §3 command — it is deliberately absent from §1.1's recovery
@@ -1188,6 +1231,23 @@ entry out of restore-on-start. `orphaned` is cleared the moment the same
 removal marks an entry: absence from the live set proves nothing (a node that
 never attached has an empty one), so a factory reset, a seed and an entry this
 build cannot rebuild all leave the map alone.
+
+**Destroying an entry (issue #274, ADR-0015) is the alternative to
+orphaning it — number, role, label and every other field, gone.** A
+`remove_endpoint` carrying `permanent: true` (§3.3) — the driving device is
+confirmed deleted, or deliberately un-exported — deletes the record from
+`endpoints` outright rather than marking it `orphaned`. Unlike every mutation
+above, this is the one place a record's `number` is not kept: the guarantee
+that a retired number is never reissued (ADR-0010, `numberVoid`'s and
+`orphaned`'s own comments above) still holds, because it was never this file
+that enforced it — matter.js's own persisted allocation for the retired
+`Endpoint.id`, a separate store this file never touches, is what actually
+prevents reuse, and it is untouched by deleting this witness of it. What is
+lost is re-adopt: a destroyed identity is invisible to both `restorable()`
+and `orphans()`/§3.12 from the moment it is destroyed — there is nothing left
+to rebuild or to offer the picker. `attach`'s own reconcile never destroys
+(see §3.1 and §3.3 above); only an explicit `remove_endpoint` with
+`permanent: true` does.
 
 `drift` is populated by every operation that can change the live endpoint set —
 `attach`/`reconcile`, `upsert_endpoint` and `remove_endpoint` — and **on the

@@ -753,6 +753,65 @@ describe("EndpointMapStore.forget — un-export without losing the number (issue
     });
 });
 
+describe("EndpointMapStore.destroy — a confirmed-gone device loses its record entirely (issue #274)", () => {
+    it("deletes the entry outright: no number, no role/label, not restorable, not offered for re-adopt", () => {
+        const dir = storage();
+        const store = new EndpointMapStore(dir);
+        store.load();
+        store.check([
+            { uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Lamp" },
+            { uniqueId: "indigo-2", endpointNumber: 3, role: "dimmableLight", label: "Other" },
+        ]);
+
+        assert.equal(store.destroy(["indigo-1"]), 1);
+
+        assert.equal(store.numberFor("indigo-1"), undefined, "the number itself is gone, unlike forget()");
+        assert.deepEqual(store.restorable(), [
+            { uniqueId: "indigo-2", endpointNumber: 3, indigoDeviceId: 2, role: "dimmableLight", label: "Other" },
+        ]);
+        assert.deepEqual(store.orphans(), [], "destroyed, not orphaned — nothing left to offer the re-adopt picker");
+        assert.deepEqual(mapFileIn(dir).endpoints, {
+            "indigo-2": { number: 3, role: "dimmableLight", label: "Other" },
+        });
+    });
+
+    it("also destroys an entry that was already orphaned (an un-export later confirmed as a deletion)", () => {
+        const dir = storage();
+        const store = new EndpointMapStore(dir);
+        store.load();
+        store.check([{ uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Lamp" }]);
+        store.forget(["indigo-1"]);
+        assert.deepEqual(store.orphans().map(orphan => orphan.uniqueId), ["indigo-1"]);
+
+        assert.equal(store.destroy(["indigo-1"]), 1);
+
+        assert.deepEqual(store.orphans(), []);
+        assert.equal(mapFileIn(dir).endpoints["indigo-1"], undefined);
+    });
+
+    it("costs no disk write when there was nothing to destroy — unknown ids are a no-op, like forget()", () => {
+        const dir = storage();
+        const store = new EndpointMapStore(dir);
+        store.load();
+        store.check([{ uniqueId: "indigo-1", endpointNumber: 2 }]);
+        const before = readFileSync(join(dir, ENDPOINT_MAP_FILE), "utf8");
+
+        assert.equal(store.destroy(["indigo-nope"]), 0);
+
+        assert.equal(readFileSync(join(dir, ENDPOINT_MAP_FILE), "utf8"), before);
+    });
+
+    it("is idempotent — destroying an already-destroyed (i.e. absent) entry is a no-op", () => {
+        const dir = storage();
+        const store = new EndpointMapStore(dir);
+        store.load();
+        store.check([{ uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Lamp" }]);
+        assert.equal(store.destroy(["indigo-1"]), 1);
+
+        assert.equal(store.destroy(["indigo-1"]), 0);
+    });
+});
+
 describe("EndpointMapStore.seed replaces the whole map", () => {
     it("refuses to seed fewer numbers than the baseline already holds", () => {
         // ⊗ `seed` is a full replace, and nothing said so. Its one caller

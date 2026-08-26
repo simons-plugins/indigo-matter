@@ -709,6 +709,119 @@ describe("issue #141: an un-exported device stops being restored", () => {
     });
 });
 
+/** `remove_endpoint`, optionally with the issue #274 `permanent` flag, awaited. */
+async function removeOne(
+    client: TestClient,
+    messageId: string,
+    indigoDeviceId: number,
+    permanent?: boolean,
+): Promise<{ removed: boolean }> {
+    client.send({
+        message_id: messageId,
+        command: "remove_endpoint",
+        args: { indigoDeviceId, ...(permanent === undefined ? {} : { permanent }) },
+    });
+    for (;;) {
+        const frame = await client.next(10_000);
+        if (frame.message_id === messageId) {
+            assert.equal(frame.error_code, undefined, JSON.stringify(frame));
+            return frame.result as { removed: boolean };
+        }
+    }
+}
+
+describe("issue #274: remove_endpoint's permanent flag destroys rather than orphans", () => {
+    it("drops the map entry entirely — no number, not restorable, not offered for re-adopt", async () => {
+        const storagePath = storage();
+        const numbers = await seedTwoAccessories(storagePath);
+
+        const session = await boot(storagePath);
+        try {
+            // §2: a fresh connection must attach before any CRUD command —
+            // with the SAME set already live, so this is a pure update and
+            // does not itself touch LOUNGE.
+            await attach(session.client, "a1", BOTH);
+            const result = await removeOne(session.client, "r1", LOUNGE, true);
+            assert.equal(result.removed, true);
+
+            assert.deepEqual(readMap(storagePath).endpoints[uniqueIdFor(LOUNGE)], undefined,
+                "the entry is gone, not orphaned");
+            assert.deepEqual(session.bridge.listOrphans(), [],
+                "nothing is left to offer the re-adopt picker");
+            assert.equal(
+                childOf(session.bridge.server, LOUNGE), undefined,
+                "the live accessory is gone from the aggregator too",
+            );
+        } finally {
+            await session.close();
+        }
+
+        // A later restart does not bring it back — there is nothing left to
+        // restore it FROM.
+        const second = await boot(storagePath);
+        try {
+            assert.deepEqual(
+                second.bridge.getStatus().endpoints.map(endpoint => endpoint.indigoDeviceId),
+                [KITCHEN],
+                "only the still-exported device is restored",
+            );
+            assert.deepEqual(numbersOf(second.bridge), { [KITCHEN]: numbers[KITCHEN] });
+        } finally {
+            await second.close();
+        }
+    });
+
+    it("without the flag, keeps today's soft (orphan) behaviour — the default is unchanged", async () => {
+        const storagePath = storage();
+        await seedTwoAccessories(storagePath);
+
+        const session = await boot(storagePath);
+        try {
+            await attach(session.client, "a1", BOTH);
+            await removeOne(session.client, "r1", LOUNGE);
+
+            const record = readMap(storagePath).endpoints[uniqueIdFor(LOUNGE)];
+            assert.equal(record?.orphaned, true, "the pre-#274 orphan behaviour is untouched by default");
+            assert.deepEqual(
+                session.bridge.listOrphans().map(orphan => orphan.uniqueId),
+                [uniqueIdFor(LOUNGE)],
+                "still offered for re-adopt, exactly as before this issue",
+            );
+        } finally {
+            await session.close();
+        }
+    });
+
+    it("is idempotent on an already-absent endpoint, exactly like a non-permanent remove", async () => {
+        const storagePath = storage();
+        const session = await boot(storagePath);
+        try {
+            await attach(session.client, "a1", []);
+            const result = await removeOne(session.client, "r1", 999999999, true);
+            assert.deepEqual(result, { removed: false });
+        } finally {
+            await session.close();
+        }
+    });
+
+    it("rejects a non-boolean permanent with malformed_args", async () => {
+        const storagePath = storage();
+        const session = await boot(storagePath);
+        try {
+            await attach(session.client, "a1", []);
+            session.client.send({
+                message_id: "r1",
+                command: "remove_endpoint",
+                args: { indigoDeviceId: KITCHEN, permanent: "yes" },
+            });
+            const frame = await session.client.next(10_000);
+            assert.equal(frame.error_code, ErrorCode.malformedArgs);
+        } finally {
+            await session.close();
+        }
+    });
+});
+
 describe("issue #141: what a restored endpoint actually publishes", () => {
     it("comes up under its own recorded name, before any attach", async () => {
         // ⊗ T1. `label: entry.label` was pinned by nothing: mutate it to a

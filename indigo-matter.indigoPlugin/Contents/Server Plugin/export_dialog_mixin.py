@@ -1265,7 +1265,11 @@ class ExportDialogMixin:
         # allow-list stops the client out from under it.
         if self.export_bridge is not None:
             try:
-                self.export_bridge.remove(device_id)
+                # Issue #274: a deliberate un-export is as final as a device
+                # deletion — destroy the accessory rather than orphaning it
+                # for a re-adopt. Keeping it accessible only through
+                # "Migrate an exported accessory…" is the point.
+                self.export_bridge.remove(device_id, permanent=True)
             except Exception as exc:  # pylint: disable=broad-except
                 self.logger.exception(exc)
         self._exports_changed()  # pylint: disable=no-member  # lifecycle, stays in plugin.py

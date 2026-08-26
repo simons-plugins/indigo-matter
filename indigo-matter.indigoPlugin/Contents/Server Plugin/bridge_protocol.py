@@ -88,6 +88,12 @@ ARG_ENDPOINT = "endpoint"
 ARG_INDIGO_DEVICE_ID = "indigoDeviceId"
 #: Issues #219/#240 — the accessory identity this device publishes as (§4.1).
 ARG_PUBLISHED_AS = "publishedAs"
+#: Issue #274 — §3.3 opt-in: the driving device is confirmed gone for good
+#: (deleted, or deliberately un-exported), so the node should DESTROY the
+#: endpoint-map record rather than orphan it. Absent/``False`` is the
+#: pre-#274 default every caller keeps unless it says otherwise — see
+#: ``build_remove_endpoint``.
+ARG_PERMANENT = "permanent"
 ARG_STATES = "states"
 ARG_REACHABLE = "reachable"
 ARG_DURATION_SECONDS = "durationSeconds"
@@ -938,9 +944,25 @@ class BridgeProtocol:
         """§3.2 — create or update one endpoint. Idempotent."""
         return self.build_request(CMD_UPSERT_ENDPOINT, {ARG_ENDPOINT: _endpoint_wire(spec)}, message_id)
 
-    def build_remove_endpoint(self, indigo_device_id: int, message_id: Optional[str] = None) -> dict:
-        """§3.3 — remove one endpoint; the number allocation is retained."""
-        return self.build_request(CMD_REMOVE_ENDPOINT, {ARG_INDIGO_DEVICE_ID: int(indigo_device_id)}, message_id)
+    def build_remove_endpoint(self, indigo_device_id: int, message_id: Optional[str] = None, *,
+                              permanent: bool = False) -> dict:
+        """§3.3 — remove one endpoint.
+
+        ``permanent`` (issue #274) is omitted unless ``True`` — the same
+        "absent means not asking for the destructive thing" convention
+        ``build_attach``'s ``intent`` uses — so every pre-#274 call, and the
+        two-command supersede/re-adopt half `export_bridge.replace()` sends,
+        keeps getting the SOFT removal: the number allocation is retained and
+        the entry stays orphaned (re-adopt evidence), exactly as before this
+        issue. Only a caller certain the device will never come back — a
+        confirmed Indigo device deletion, or a deliberate un-export — passes
+        ``True``, which tells the node to destroy the endpoint-map record
+        along with the live endpoint.
+        """
+        args: dict = {ARG_INDIGO_DEVICE_ID: int(indigo_device_id)}
+        if permanent:
+            args[ARG_PERMANENT] = True
+        return self.build_request(CMD_REMOVE_ENDPOINT, args, message_id)
 
     def build_set_state(self, indigo_device_id: int, states: dict,
                         message_id: Optional[str] = None) -> dict:

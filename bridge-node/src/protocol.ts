@@ -584,8 +584,20 @@ export interface BridgeFacade {
     reconcile(endpoints: readonly EndpointSpec[], replaceAll: boolean): Promise<StatusReport>;
     /** §3.2 — create-or-update. Rejects a role change with `role_change` (§4.1). */
     upsertEndpoint(spec: EndpointSpec): Promise<UpsertResult>;
-    /** §3.3 — idempotent; `{removed: false}` for a device with no live endpoint. */
-    removeEndpoint(indigoDeviceId: number): Promise<RemoveResult>;
+    /**
+     * §3.3 — idempotent; `{removed: false}` for a device with no live endpoint.
+     *
+     * `permanent` (issue #274, default `false`) is the confirmed-gone
+     * declaration: `true` destroys the endpoint-map record along with the
+     * live endpoint (no orphan, no re-adopt), for a device that has been
+     * deleted or deliberately un-exported. `false` — the default, and what
+     * every pre-#274 caller still gets — keeps the pre-existing orphan
+     * behaviour, which the two-command supersede/re-adopt sequence
+     * (`export_bridge.replace()`) depends on: its `upsert_endpoint` half
+     * still needs an orphaned entry to mark `supersededBy`, or to hand to
+     * the re-adopt picker.
+     */
+    removeEndpoint(indigoDeviceId: number, permanent?: boolean): Promise<RemoveResult>;
     /** §3.4 — local (offline-context) writes, so they do not echo as `command`. */
     setState(indigoDeviceId: number, states: Record<string, unknown>): Promise<void>;
     /** §3.5 — Bridged Device Basic Information `Reachable`. */

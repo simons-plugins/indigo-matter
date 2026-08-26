@@ -577,7 +577,10 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
         self._export_callback_failed.discard(dev.id)
         try:
             if self.export_bridge is not None:
-                self.export_bridge.remove(dev.id)
+                # Issue #274: the device is confirmed gone — destroy the
+                # accessory outright rather than orphaning it for a re-adopt
+                # that no longer exists.
+                self.export_bridge.remove(dev.id, permanent=True)
         except Exception as exc:  # noqa: BLE001
             self.logger.exception(exc)
         finally:
