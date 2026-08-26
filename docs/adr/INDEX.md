@@ -31,6 +31,7 @@ chosen), see [`../ARCHITECTURE.md`](../ARCHITECTURE.md).
 * [ADR-0012](0012-export-eligibility-can-be-a-user-declaration.md) - ADR-0012: For a device Indigo does not type, export eligibility is a user declaration (accepted; narrows ADR-0003)
 * [ADR-0013](0013-a-confirmed-commanded-colour-temperature-is-pushed-as-state.md) - ADR-0013: A confirmed, commanded colour-temperature is pushed as state (accepted)
 * [ADR-0014](0014-ct-physical-bounds-are-learned-declarations-only-seed-them.md) - ADR-0014: Colour-temperature physical bounds are learned from clamped echoes; declarations only seed them (accepted)
-* [ADR-0015](0015-a-confirmed-deletion-destroys-the-accessory-no-retention.md) - ADR-0015: A confirmed device deletion destroys the accessory — no orphan retention, no re-adopt (accepted; supersedes in part ADR-0010)
+* [ADR-0015](0015-a-confirmed-deletion-destroys-the-accessory-no-retention.md) - ADR-0015: A confirmed device deletion destroys the accessory — no orphan retention, no re-adopt (accepted; supersedes in part ADR-0010; its **mechanism** — the opt-in `permanent` flag — is **superseded by ADR-0016**, its ruling stands)
+* [ADR-0016](0016-destruction-is-unconditional-there-is-no-soft-removal.md) - ADR-0016: Endpoint removal is unconditionally destructive — there is no soft removal to opt out of (accepted; supersedes ADR-0015's mechanism)
 
 <!-- adrlogstop -->

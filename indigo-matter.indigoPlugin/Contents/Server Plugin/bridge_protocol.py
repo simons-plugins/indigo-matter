@@ -66,13 +66,12 @@ CMD_OPEN_WINDOW = "open_commissioning_window"
 CMD_REMOVE_FABRIC = "remove_fabric"
 CMD_FACTORY_RESET = "factory_reset"
 CMD_REBUILD_ENDPOINT_MAP = "rebuild_endpoint_map"
-CMD_LIST_ORPHANS = "list_orphans"
 
 #: The complete §3 command domain. Anything else gets ``unknown_command``.
 COMMANDS = frozenset({
     CMD_ATTACH, CMD_UPSERT_ENDPOINT, CMD_REMOVE_ENDPOINT, CMD_SET_STATE, CMD_SET_REACHABLE,
     CMD_GET_STATUS, CMD_GET_PAIRING, CMD_OPEN_WINDOW, CMD_REMOVE_FABRIC, CMD_FACTORY_RESET,
-    CMD_REBUILD_ENDPOINT_MAP, CMD_LIST_ORPHANS,
+    CMD_REBUILD_ENDPOINT_MAP,
 })
 
 # attach args (§3.1)
@@ -88,12 +87,6 @@ ARG_ENDPOINT = "endpoint"
 ARG_INDIGO_DEVICE_ID = "indigoDeviceId"
 #: Issues #219/#240 — the accessory identity this device publishes as (§4.1).
 ARG_PUBLISHED_AS = "publishedAs"
-#: Issue #274 — §3.3 opt-in: the driving device is confirmed gone for good
-#: (deleted, or deliberately un-exported), so the node should DESTROY the
-#: endpoint-map record rather than orphan it. Absent/``False`` is the
-#: pre-#274 default every caller keeps unless it says otherwise — see
-#: ``build_remove_endpoint``.
-ARG_PERMANENT = "permanent"
 ARG_STATES = "states"
 ARG_REACHABLE = "reachable"
 ARG_DURATION_SECONDS = "durationSeconds"
@@ -428,28 +421,6 @@ class DriftEntry:
     unique_id: str
     expected: int
     actual: int
-
-
-@dataclass
-class OrphanRecord:
-    """One left-behind accessory identity (§3.12, issues #219/#240) — the
-    re-adopt picker's data. Mirrors `bridge-node/src/protocol.ts`'s
-    ``OrphanRecord`` field-for-field. ``role``/``label`` absent together is
-    the pre-2026.16.2 bare orphan (PR5 design §4.2's third picker row, E4) —
-    a plugin that old deleted them on un-export, so there is nothing left to
-    match a replacement device against and the record can never be
-    re-adopted, only shown so the user can see its number is spoken for.
-    """
-    unique_id: str
-    number: int
-    role: Optional[str] = None
-    label: Optional[str] = None
-    #: ISO-8601, or ``None`` for a pre-PR5 orphan — the picker renders that
-    #: as "date unknown" (§4.2).
-    orphaned_at: Optional[str] = None
-    #: The Indigo device that drove this identity before it was un-exported,
-    #: if the node recorded one (issue #219).
-    device_id: Optional[int] = None
 
 
 @dataclass
@@ -816,22 +787,6 @@ def parse_session_hygiene(data: Any) -> SessionHygiene:
     )
 
 
-def parse_orphans(result: Any) -> list:
-    """Normalise a §3.12 ``list_orphans`` payload into :class:`OrphanRecord`."""
-    orphans = []
-    for item in (result or []):
-        raw_device_id = item.get("deviceId")
-        orphans.append(OrphanRecord(
-            unique_id=str(item.get("uniqueId", "")),
-            number=int(item.get("number", 0)),
-            role=item.get("role"),
-            label=item.get("label"),
-            orphaned_at=item.get("orphanedAt"),
-            device_id=int(raw_device_id) if raw_device_id is not None else None,
-        ))
-    return orphans
-
-
 def parse_pairing(result: Any) -> PairingReport:
     """Normalise a ``get_pairing`` payload (§3.7)."""
     data = result or {}
@@ -944,25 +899,12 @@ class BridgeProtocol:
         """§3.2 — create or update one endpoint. Idempotent."""
         return self.build_request(CMD_UPSERT_ENDPOINT, {ARG_ENDPOINT: _endpoint_wire(spec)}, message_id)
 
-    def build_remove_endpoint(self, indigo_device_id: int, message_id: Optional[str] = None, *,
-                              permanent: bool = False) -> dict:
-        """§3.3 — remove one endpoint.
-
-        ``permanent`` (issue #274) is omitted unless ``True`` — the same
-        "absent means not asking for the destructive thing" convention
-        ``build_attach``'s ``intent`` uses — so every pre-#274 call, and the
-        two-command supersede/re-adopt half `export_bridge.replace()` sends,
-        keeps getting the SOFT removal: the number allocation is retained and
-        the entry stays orphaned (re-adopt evidence), exactly as before this
-        issue. Only a caller certain the device will never come back — a
-        confirmed Indigo device deletion, or a deliberate un-export — passes
-        ``True``, which tells the node to destroy the endpoint-map record
-        along with the live endpoint.
-        """
-        args: dict = {ARG_INDIGO_DEVICE_ID: int(indigo_device_id)}
-        if permanent:
-            args[ARG_PERMANENT] = True
-        return self.build_request(CMD_REMOVE_ENDPOINT, args, message_id)
+    def build_remove_endpoint(self, indigo_device_id: int, message_id: Optional[str] = None) -> dict:
+        """§3.3 — remove one endpoint. Destroys the endpoint-map record along
+        with the live endpoint (issue #274) — the driving device is not
+        coming back."""
+        return self.build_request(
+            CMD_REMOVE_ENDPOINT, {ARG_INDIGO_DEVICE_ID: int(indigo_device_id)}, message_id)
 
     def build_set_state(self, indigo_device_id: int, states: dict,
                         message_id: Optional[str] = None) -> dict:
@@ -1013,10 +955,6 @@ class BridgeProtocol:
     def build_rebuild_endpoint_map(self, message_id: Optional[str] = None) -> dict:
         """§3.11 — adopt the live endpoint numbers as the new persisted map."""
         return self.build_request(CMD_REBUILD_ENDPOINT_MAP, None, message_id)
-
-    def build_list_orphans(self, message_id: Optional[str] = None) -> dict:
-        """§3.12 — every left-behind accessory identity the re-adopt picker could offer."""
-        return self.build_request(CMD_LIST_ORPHANS, None, message_id)
 
     # ------------------------------------------------------------------
     # Inbound classification

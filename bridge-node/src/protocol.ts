@@ -201,12 +201,12 @@ export function parsePublishedId(value: string): { deviceId: number; generation:
  *
  * The narrow question, deliberately, because it is the only removal-plus-create
  * pair that retires an identity for good. A removal and a create for the same
- * `indigoDeviceId` is NOT enough on its own: a re-adopt onto an
- * already-exported device (PR5 design E2/E5) is also one removal plus one create for
- * one device, and the identity it leaves behind is an ordinary orphan the
- * re-adopt picker must go on offering — PR5 design E5 says so in as many words. Only a
- * generation bump means "this identity has been replaced and its number is
- * retired"; everything else means "this identity is simply not live right now".
+ * `indigoDeviceId` is NOT enough on its own: migrating an accessory onto an
+ * already-exported device (issue #246) is also one removal plus one create
+ * for one device, and the identity it leaves behind is an ordinary orphan,
+ * not a retired one. Only a generation bump means "this identity has been
+ * replaced and its number is retired"; everything else means "this identity
+ * is simply not live right now".
  */
 export function supersedes(oldPublishedAs: string, newPublishedAs: string): boolean {
     const before = parsePublishedId(oldPublishedAs);
@@ -524,26 +524,6 @@ export interface DriftEntry {
     actual: number;
 }
 
-/**
- * §3.12 `list_orphans` (issue #219) — one left-behind accessory identity the
- * re-adopt picker could offer. Defined here rather than in `endpoint-map.ts`
- * (which is where {@link EndpointMapStore.orphans} actually builds these) so
- * `BridgeFacade.listOrphans()` — landing alongside the `list_orphans` command
- * itself — can be declared without `endpoint-map.ts` reaching back into a
- * module that already imports FROM it: the existing direction is
- * `endpoint-map.ts` → `protocol.ts`, never the reverse.
- */
-export interface OrphanRecord {
-    uniqueId: string;
-    number: number;
-    role?: string;
-    label?: string;
-    /** ISO-8601, or absent for a pre-PR5 orphan — the picker renders that as "date unknown". */
-    orphanedAt?: string;
-    /** The device that drove this identity before it was un-exported, if recorded. */
-    deviceId?: number;
-}
-
 /** §3.7 */
 export interface PairingReport {
     commissioned: boolean;
@@ -587,17 +567,11 @@ export interface BridgeFacade {
     /**
      * §3.3 — idempotent; `{removed: false}` for a device with no live endpoint.
      *
-     * `permanent` (issue #274, default `false`) is the confirmed-gone
-     * declaration: `true` destroys the endpoint-map record along with the
-     * live endpoint (no orphan, no re-adopt), for a device that has been
-     * deleted or deliberately un-exported. `false` — the default, and what
-     * every pre-#274 caller still gets — keeps the pre-existing orphan
-     * behaviour, which the two-command supersede/re-adopt sequence
-     * (`export_bridge.replace()`) depends on: its `upsert_endpoint` half
-     * still needs an orphaned entry to mark `supersededBy`, or to hand to
-     * the re-adopt picker.
+     * Destroys the endpoint-map record along with the live endpoint (issue
+     * #274): the driving device has been deleted or deliberately un-exported,
+     * and is not coming back.
      */
-    removeEndpoint(indigoDeviceId: number, permanent?: boolean): Promise<RemoveResult>;
+    removeEndpoint(indigoDeviceId: number): Promise<RemoveResult>;
     /** §3.4 — local (offline-context) writes, so they do not echo as `command`. */
     setState(indigoDeviceId: number, states: Record<string, unknown>): Promise<void>;
     /** §3.5 — Bridged Device Basic Information `Reachable`. */
@@ -638,11 +612,6 @@ export interface BridgeFacade {
     factoryReset(preserveEndpointNumbers: boolean): Promise<void>;
     /** §3.11 — adopt the live endpoint numbers as the new persisted map. */
     rebuildEndpointMap(): Promise<StatusReport>;
-    /**
-     * §3.12 — every left-behind accessory identity the re-adopt picker (#219)
-     * could offer. Read-only: nothing about listing orphans changes the map.
-     */
-    listOrphans(): OrphanRecord[];
 }
 
 /** A protocol-level failure a command handler can throw to shape its response. */

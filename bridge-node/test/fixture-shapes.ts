@@ -20,7 +20,6 @@ import type {
     EventFrame,
     FabricInfo,
     HandshakeFrame,
-    OrphanRecord,
     PairingReport,
     RemoveResult,
     SessionHygiene,
@@ -378,25 +377,3 @@ export const endpointMapInvalid = {
     error_code: "endpoint_map_invalid",
     details: "endpoint map is unreadable; only get_status, get_pairing and rebuild_endpoint_map are accepted",
 } satisfies ErrorFrame;
-
-/**
- * §3.12's answer (issue #219) — three left-behind identities: one with a full
- * date, one "date unknown" (`orphanedAt` absent, a pre-PR5 orphan), and one
- * bare `{uniqueId, number}` entry (PR5 design E4) — a pre-2026.16.2 orphan with no
- * role/label, listed but unmatchable.
- */
-export const orphanList = [
-    {
-        uniqueId: "indigo-223456791",
-        number: 7,
-        role: "dimmableLight",
-        label: "Kitchen Lamp",
-        orphanedAt: "2026-08-12T09:15:00Z",
-        deviceId: 223456791,
-    },
-    { uniqueId: "indigo-223456792", number: 4, role: "onOffLight", label: "Porch Light" },
-    { uniqueId: "indigo-223456793", number: 9 },
-] satisfies OrphanRecord[];
-
-/** The same command over a map with nothing orphaned. */
-export const orphanListEmpty = [] satisfies OrphanRecord[];

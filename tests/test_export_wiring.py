@@ -335,9 +335,9 @@ class TestDeviceDeleted:
         plug._exports_changed()
         plug.deviceDeleted(RelayDevice(101, "Study Plug"))
         assert plug.exports.ids() == frozenset()
-        # Issue #274 — a deletion is confirmed and permanent: no orphan, no
-        # re-adopt.
-        plug.export_bridge.remove.assert_called_once_with(101, permanent=True)
+        # Issue #274 — a deletion is confirmed and permanent: the accessory
+        # is destroyed outright.
+        plug.export_bridge.remove.assert_called_once_with(101)
         assert plug._exported_ids == frozenset()
 
     def test_a_failed_store_write_still_removes_the_endpoint(self, plug, monkeypatch):
@@ -347,7 +347,7 @@ class TestDeviceDeleted:
         monkeypatch.setattr(plug.exports, "remove",
                             Mock(side_effect=RuntimeError("prefs are read-only")))
         plug.deviceDeleted(RelayDevice(101, "Study Plug"))
-        plug.export_bridge.remove.assert_called_once_with(101, permanent=True)
+        plug.export_bridge.remove.assert_called_once_with(101)
         assert plug.logger.error.called
 
     def test_a_raising_endpoint_removal_still_refreshes_the_cache(self, plug):
@@ -457,7 +457,7 @@ class TestDialogNudges:
         plug.export_bridge.reset_mock()
         plug.exportRemove(_values(exportDevice="101"), "manageMatterExports")
         # Issue #274 — a deliberate un-export is as final as a deletion.
-        plug.export_bridge.remove.assert_called_once_with(101, permanent=True)
+        plug.export_bridge.remove.assert_called_once_with(101)
         assert plug._exported_ids == frozenset()
 
     def test_removing_something_unexported_nudges_nothing(self, plug):

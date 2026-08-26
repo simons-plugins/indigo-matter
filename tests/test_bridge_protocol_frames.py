@@ -87,8 +87,7 @@ def _build(proto: BridgeProtocol, request: dict):
     if command == bridge_protocol.CMD_UPSERT_ENDPOINT:
         return proto.build_upsert_endpoint(EndpointSpec.from_wire(args["endpoint"]), mid)
     if command == bridge_protocol.CMD_REMOVE_ENDPOINT:
-        return proto.build_remove_endpoint(
-            args["indigoDeviceId"], mid, permanent=args.get(bridge_protocol.ARG_PERMANENT, False))
+        return proto.build_remove_endpoint(args["indigoDeviceId"], mid)
     if command == bridge_protocol.CMD_SET_STATE:
         return proto.build_set_state(args["indigoDeviceId"], args["states"], mid)
     if command == bridge_protocol.CMD_SET_REACHABLE:
@@ -105,8 +104,6 @@ def _build(proto: BridgeProtocol, request: dict):
         return proto.build_factory_reset(args["preserveEndpointNumbers"], mid)
     if command == bridge_protocol.CMD_REBUILD_ENDPOINT_MAP:
         return proto.build_rebuild_endpoint_map(mid)
-    if command == bridge_protocol.CMD_LIST_ORPHANS:
-        return proto.build_list_orphans(mid)
     raise AssertionError(f"no builder for command {command!r}")
 
 
@@ -139,17 +136,6 @@ class TestRequests:
         # §3.10: a reset must not scramble identities unless asked to.
         frame = BridgeProtocol().build_factory_reset(message_id="x")
         assert frame["args"][bridge_protocol.ARG_PRESERVE_ENDPOINT_NUMBERS] is True
-
-    def test_remove_endpoint_permanent_is_absent_unless_true(self):
-        # Issue #274 — every pre-#274 call, and `replace()`'s two-command
-        # supersede/re-adopt half, must keep getting the exact frame they
-        # always have: no destructive opt-in by default.
-        plain = BridgeProtocol().build_remove_endpoint(123456789, message_id="x")
-        assert bridge_protocol.ARG_PERMANENT not in plain["args"]
-        deliberate = BridgeProtocol().build_remove_endpoint(123456789, permanent=True, message_id="x")
-        assert deliberate["args"][bridge_protocol.ARG_PERMANENT] is True
-        assert deliberate == BY_NAME["remove_endpoint_permanent"]["request"] | {"message_id": "x"}
-
 
 class TestResponses:
     """Every golden response parses into the normalised dataclasses."""
@@ -375,23 +361,6 @@ class TestResponses:
         assert (reopened.commissioned, reopened.window_open) == (True, True)
         assert reopened.window_expires_at is not None
         assert reopened.manual_pairing_code
-
-    def test_orphan_records_are_normalised(self):
-        orphans = bridge_protocol.parse_orphans(FRAMES["list_orphans"]["response"]["result"])
-        assert len(orphans) == 3
-        full, partial, bare = orphans
-        assert (full.unique_id, full.number) == ("indigo-223456791", 7)
-        assert full.role == "dimmableLight"
-        assert full.label == "Kitchen Lamp"
-        assert full.orphaned_at == "2026-08-12T09:15:00Z"
-        assert full.device_id == 223456791
-        assert partial.orphaned_at is None and partial.device_id is None
-        # PR5 design E4 — the pre-2026.16.2 bare orphan: nothing beyond number/uniqueId.
-        assert bare.role is None and bare.label is None and bare.device_id is None
-
-    def test_empty_orphan_list_normalises_to_empty(self):
-        assert bridge_protocol.parse_orphans(
-            FRAMES["list_orphans_empty"]["response"]["result"]) == []
 
     def test_commissioning_window(self):
         window = bridge_protocol.parse_window(
@@ -665,7 +634,7 @@ class TestCoverage:
         assert "publishedAs" not in spec.to_wire()
 
     def test_endpoint_spec_round_trips_a_non_default_published_as(self):
-        """A role-changed or re-adopted export sends its identity on the wire,
+        """A role-changed or migrated export sends its identity on the wire,
         and it survives a round trip untouched."""
         wire = dict(BY_NAME["upsert_endpoint"]["request"]["args"]["endpoint"])
         wire["publishedAs"] = "indigo-123456789~2"
@@ -674,10 +643,10 @@ class TestCoverage:
         assert spec.to_wire() == wire
 
     def test_a_golden_frame_carries_a_non_default_published_as(self):
-        """Issues #219/#240 — the hand-built round trip above proves the
-        plugin agrees with ITSELF. Only a GOLDEN frame makes both languages
-        agree, and every frame in this file was default-identity until
-        `upsert_endpoint_published_as` was added: the one field a re-adopt or
+        """Issue #240 — the hand-built round trip above proves the plugin
+        agrees with ITSELF. Only a GOLDEN frame makes both languages agree,
+        and every frame in this file was default-identity until
+        `upsert_endpoint_published_as` was added: the one field a migrate or
         a role change puts on the wire had no cross-language fixture at all.
         The node asserts the same exchange in
         `bridge-node/test/protocol.test.ts`.

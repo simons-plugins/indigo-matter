@@ -302,13 +302,13 @@ with `error_code: "mass_removal_refused"` unless the args carry
 ecosystem must be deliberate (the §5.1 allow-list being emptied), never the
 side effect of a stale or buggy client attaching with a default state.
 
-**The guard counts DEPARTURES, not removals** (issues #219/#240). A removed
+**The guard counts DEPARTURES, not removals** (issue #240). A removed
 `publishedAs` whose `indigoDeviceId` also appears among the identities being
 created is one device changing which accessory identity it publishes — a
-role-change supersession, or a re-adopt — and the device stays exported
-throughout, so it is not a departure and does not count towards emptying the
-live set. Without that carve-out, changing the role of the only exported
-device on a bridge would be refused as a mass removal. Note this is
+role-change supersession, or an ordinary retarget — and the device stays
+exported throughout, so it is not a departure and does not count towards
+emptying the live set. Without that carve-out, changing the role of the only
+exported device on a bridge would be refused as a mass removal. Note this is
 deliberately the BROAD "one removal plus one create for the same device"
 rule, not the narrow generation test `supersededBy` uses: both shapes keep
 the device exported, which is the only question the guard is asking.
@@ -343,12 +343,13 @@ ecosystem, not every change the rekey carries. This is the mechanism behind
 the plugin's "Migrate an exported accessory…" menu action — a live device
 replaced by another one, or a module
 moved to new hardware, while both Indigo devices exist at once — and it is why
-migrate can honestly promise room/name/scene survival where the `list_orphans`
-re-adopt path (whose identity DID lapse) cannot. A retarget combined with a
-role change or a battery gain cannot be represented this way — a live cluster
-set cannot be reshaped without being rebuilt — and falls back to the ordinary
-`recreate` outcome above, wire activity and all; the plugin refuses cross-role
-migrate at the dialog before it ever reaches here (#219/#240 reasoning).
+migrate can honestly promise room/name/scene survival: the identity never
+lapses, so no ecosystem ever processes a removal of it. A retarget combined
+with a role change or a battery gain cannot be represented this way — a live
+cluster set cannot be reshaped without being rebuilt — and falls back to the
+ordinary `recreate` outcome above, wire activity and all; the plugin refuses
+cross-role migrate at the dialog before it ever reaches here (issue #240
+reasoning).
 
 ### 3.2 `upsert_endpoint`
 
@@ -364,9 +365,9 @@ neither can be done to a live endpoint in place:
 
 - a `role` different from the live endpoint's (§4.1: ecosystems cache the
   Matter device type per endpoint);
-- a `publishedAs` different from the live endpoint's (issues #219/#240).
-  That is a supersession or a re-adopt, and the only path allowed to do it is
-  the plugin's remove-then-add, which sends the two mutations as two separate
+- a `publishedAs` different from the live endpoint's (issue #240). That is a
+  role-change supersession, and the only path allowed to do it is the
+  plugin's remove-then-add, which sends the two mutations as two separate
   commands rather than asking this one to move a live endpoint out from under
   itself.
 
@@ -392,41 +393,28 @@ Removes the child endpoint (`endpoint.close()`). Idempotent — removing an
 absent endpoint succeeds with `{"removed": false}`; a live removal returns
 `{"removed": true}`. Bulk removals are paced ~100ms apart by the node.
 
-**`permanent` (issue #274, default `false`) decides what happens to the
-endpoint-map record, not just the live endpoint.** Omitted or `false` keeps
-the behaviour every caller had before this flag existed: the persisted
-endpoint-number allocation is **retained** and the entry is marked
-`orphaned` (§4.3's `endpoint-map.json` subsection) — re-adding the same
-device, or re-adopting the identity onto a different one, restores the same
-number. `true` is the confirmed-gone declaration: the Indigo device has been
-deleted, or the user has deliberately un-exported it. The node then
-**destroys** the endpoint-map record outright — no number kept, no
-`orphaned` entry, nothing offered to `list_orphans` — because ADR-0015
-retired the premise that a departed accessory is worth holding open for a
-re-adopt that will never come, once the driving device itself is gone.
-
-Only a caller certain the device is not coming back may pass `true`. The
-plugin passes it from exactly three places: `deviceDeleted` (a live
+**Destroys the endpoint-map record along with the live endpoint (issue
+#274).** No number kept, no `orphaned` entry — because ADR-0015 retired the
+premise that a departed accessory is worth holding open for a re-adopt that
+will never come, once the driving device itself is gone. Every caller of
+this command is confirming the driving device is not coming back: the
+plugin sends it from exactly three places — `deviceDeleted` (a live
 deletion), the export dialog's "Remove" (a deliberate un-export), and a
 sweep in `_on_attached` that closes the one gap those two cannot — a device
 deleted from Indigo while the plugin was not running to hear about it (§3.1
 above already re-classifies every allow-list entry on each attach; a device
-missing there is exactly this case, `export_bridge.py`'s `_spec_for`). The
-plugin's own two-command role-change/re-adopt sequence (`replace()`, which
-sends this `remove_endpoint` and a paired `upsert_endpoint` for the same or
-a related identity) never passes `true` — that removal is deliberately soft,
-because the very next command may retroactively mark it `supersededBy`
-(§3.1's supersede accounting) or the map may still offer it as an ordinary
-re-adopt candidate.
+missing there is exactly this case, `export_bridge.py`'s `_spec_for`) —
+plus the plugin's two-command role-change sequence (`replace()`, which
+sends this `remove_endpoint` and a paired `upsert_endpoint` for a new
+identity on the same device).
 
 **`attach`'s own reconcile never destroys.** A full reconcile (§3.1) cannot
 tell "the plugin dropped this on purpose" from "this device exists but
 failed classification this one pass" — a dependent plugin not yet started,
 a role this build does not know — so any identity that merely falls out of
 an `attach`'s desired set keeps the pre-#274 soft/orphan treatment
-regardless of `permanent`. Destroying is only ever a `remove_endpoint`
-decision, made with the device's existence already confirmed on the plugin
-side.
+regardless. Destroying is only ever a `remove_endpoint` decision, made with
+the device's existence already confirmed on the plugin side.
 
 ### 3.4 `set_state`
 
@@ -605,50 +593,6 @@ The name is timestamped for the same reason `identity.json.unreadable-<stamp>`
 is: a fixed name means the second quarantine silently destroys the first, and
 the first is the one nearest the original truth.
 
-### 3.12 `list_orphans`
-
-```json
-{"command": "list_orphans", "args": {}}
-```
-
-Read-only, no arguments: every left-behind accessory identity the endpoint map
-still remembers — issue #219's re-adopt picker is built from this. Result is a
-bare array, `[<OrphanRecord>, …]`, in map order (the order numbers were first
-recorded, not necessarily newest-orphan-first):
-
-```json
-[{"uniqueId": "indigo-123456789", "number": 7, "role": "dimmableLight",
-  "label": "Kitchen Lamp", "orphanedAt": "2026-08-12T09:15:00Z", "deviceId": 123456789},
- {"uniqueId": "indigo-123456790", "number": 4}]
-```
-
-- `role`/`label` are absent for a pre-2026.16.2 orphan (that plugin version
-  deleted them on un-export instead of recording them) — the picker lists it
-  anyway, with nothing to match a replacement device against, and refuses to
-  re-adopt it.
-- `orphanedAt` is absent for an orphan recorded before this field existed — the
-  picker renders that as "date unknown".
-- `deviceId` is the Indigo device that drove the identity before it was
-  un-exported, when recorded.
-- A **superseded** identity (issue #240 — a role change moved its device to a
-  new identity) is never in this list: re-adopting one would resurrect an
-  old-role accessory under a number every paired ecosystem has already
-  processed a removal for.
-
-**Since issue #274 (ADR-0015), an ordinary departure no longer lands here at
-all.** A device deletion or a deliberate un-export now goes through
-`remove_endpoint`'s `permanent: true` (§3.3), which destroys the record
-instead of orphaning it — see the `endpoint-map.json` subsection above. Only
-a device that fell out of an `attach`'s desired set without the plugin ever
-confirming why (§3.1's own reconcile never destroys) still produces an
-ordinary orphan, so a healthy bridge's `list_orphans` is expected to answer
-empty far more often than before this issue.
-
-**Not a recovery command.** `list_orphans` requires an ordinary `attach` first,
-same as any other §3 command — it is deliberately absent from §1.1's recovery
-trio (`get_status`, `get_pairing`, `rebuild_endpoint_map`): a node refusing
-over an unreadable map has no orphans it can vouch for.
-
 ## 4. Shapes
 
 ### 4.1 `EndpointSpec`
@@ -665,10 +609,10 @@ over an unreadable map has no orphans it can vouch for.
 - `indigoDeviceId` — the immutable Indigo device ID: the device this
   accessory is **driven by** — every §5 command is addressed to it and every
   §3.4 state push arrives keyed on it. It is no longer the accessory's
-  identity (ADR-0010, issues #219/#240): `publishedAs` below is what
+  identity (ADR-0010, issue #240): `publishedAs` below is what
   `Endpoint.id`/`UniqueID`/`SerialNumber` are derived from, and it defaults to
   `indigo-<indigoDeviceId>` — which is why an ordinary export looks exactly as
-  it always has, and why a re-adopted one has the two deliberately disagree.
+  it always has, and why a migrated one has the two deliberately disagree.
 - `role` — one of the v1 role enum (§4.2). A role change for an existing
   endpoint is **rejected** (`error_code: "role_change"`); the plugin must
   remove and re-add, because ecosystems cache device types per endpoint.
@@ -702,13 +646,13 @@ over an unreadable map has no orphans it can vouch for.
   them. The plugin never sends its own SEED/LEARNED bookkeeping keys on the
   wire, only this effective pair, and only when it differs from the generic
   153/500 domain — see `ct_bounds.wire_options` in the plugin source.
-- `publishedAs` — issues #219/#240. The accessory identity this device
+- `publishedAs` — issue #240. The accessory identity this device
   publishes as (`Endpoint.id`/`UniqueID`/`SerialNumber`) — **the plugin owns
   and persists it; the node owns only the number that identity gets** (§0
   (e)-(j), invariant 3). **Omitted (or equal to `indigo-<indigoDeviceId>`)
   means "use today's default derivation"** — every export that has never
   changed role sends no key at all, so this field is invisible on the wire
-  until a role change or a re-adopt moves an accessory off its default
+  until a role change or a migrate moves an accessory off its default
   identity. **Validation:** must match `indigo-<safeInt>[~<generation≥2>]`
   and be ≤32 characters (§0 (j)); anything else is refused with
   `malformed_args`. **Duplicate refusal:** `attach` rejects, also with
@@ -903,11 +847,12 @@ and is still never repaired. Each entry is a `DriftEntry`:
 - `warnings` — faults the node has hit and cannot fix on its own, in prose. Most
   are persistence failures: the endpoint map could not be written or deleted,
   the commissioning witness could not be cleared, `identity.json` could not be
-  saved. Since bridge-node 0.15.0 the channel also carries two things that are
-  not writes at all — the issues #219/#240 re-adopt notices, and the issue #286
-  subscription-churn notice described below — because they are the same kind of
-  thing: a fault a human has to act on that appears nowhere else. Empty is the
-  normal state, and entries are **current, not historical** — a warning
+  saved. Since bridge-node 0.15.0 the channel also carries things that are not
+  writes at all — a driving-device-change confirmation (issue #240), an
+  unrebuildable-entry skip, and the issue #286 subscription-churn notice
+  described below — because they are the same kind of thing: a fault or
+  notable event a human has to know about that appears nowhere else. Empty is
+  the normal state, and entries are **current, not historical** — a warning
   disappears the moment the condition it describes ends.
 
   This exists because the node's only other channel is stdout, and while the
@@ -1121,32 +1066,23 @@ version 2** since bridge-node 0.6.0:
   start — a visible cluster-set change in every paired ecosystem, which
   self-heals the moment a newer bridge (or the plugin's next `attach`)
   recreates the endpoint with `battery: true` again.
-- `deviceId` — issues #219/#240, the Indigo device *currently driving* this
+- `deviceId` — issue #240, the Indigo device *currently driving* this
   published identity. Absent means "the key's own derivation" — every
-  pre-`publishedAs` record, and every entry that has never been re-adopted.
-  **Unlike `battery`, this is replace-on-change, not add-only** — a re-adopt
-  is precisely a change of driving device, and add-only-forever would pin
-  the deleted device's id in the record permanently. `restorable()` resolves
-  an entry's device id from this field first, falling back to parsing it out
-  of the `publishedAs` key itself (§4.1) — without it, a restore-on-start
-  after a re-adopt would rebuild the accessory bound to the OLD, deleted
-  device rather than the new one. Same inert-extra-key parse tolerance as
-  the keys above. **Rollback caveat:** an older bridge drops the key on its
-  next write and falls back to deriving the device id from the key itself —
-  which is the *previous* driving device, not the re-adopted one — so a
-  re-adopted accessory restored by a rolled-back bridge rebuilds bound to
-  whichever device the key's own `indigo-<id>` names, self-healing the next
-  time a `publishedAs`-aware plugin attaches and records the real driver.
-- `orphanedAt` — issues #219/#240, an ISO-8601 stamp written by an un-export
-  alongside `orphaned`, from the node's own injected clock. Purely
-  informational — the re-adopt picker's "un-exported on …" column; absent on
-  every orphan recorded before this field existed, which the picker renders
-  as "date unknown" rather than guessing. Same inert-extra-key parse
-  tolerance. **Rollback caveat:** an older bridge drops the key on its next
-  write; the orphan is unaffected (still re-adoptable, still keeps its
-  number), it simply reads as "date unknown" in the picker from then on —
-  there is no self-heal because there is nothing to heal, the date was never
-  load-bearing.
+  pre-`publishedAs` record, and every entry that has never been retargeted
+  by a migrate. **Unlike `battery`, this is replace-on-change, not add-only**
+  — migrating an accessory (issue #246) is precisely a change of driving
+  device for an identity that stays live throughout, and add-only-forever
+  would pin the OLD device's id in the record permanently. `restorable()`
+  resolves an entry's device id from this field first, falling back to
+  parsing it out of the `publishedAs` key itself (§4.1) — without it, a
+  restore-on-start after a migrate would rebuild the accessory bound to the
+  wrong device. Same inert-extra-key parse tolerance as the keys above.
+  **Rollback caveat:** an older bridge drops the key on its next write and
+  falls back to deriving the device id from the key itself — which is the
+  *previous* driving device, not the migrated one — so a migrated accessory
+  restored by a rolled-back bridge rebuilds bound to whichever device the
+  key's own `indigo-<id>` names, self-healing the next time a
+  `publishedAs`-aware plugin attaches and records the real driver.
 - `supersededBy` — issue #240, the published identity that replaced this one
   on a role change. Set when the node observes a removal paired with a create
   of a **later generation of that same identity**
@@ -1154,25 +1090,23 @@ version 2** since bridge-node 0.6.0:
   (`forgetRemoved`'s pairing logic) or arrive as separate commands from the
   plugin's `replace()` (`noteSupersessionIfPaired`'s, called by
   `upsertEndpoint` once a create has landed). The generation test is the whole
-  test, deliberately: a **re-adopt** onto an already-exported device is also
-  one removal plus one create for one device, and the identity it leaves
-  behind is an ORDINARY orphan that stays re-adoptable — only a generation
-  bump retires an identity. A superseded record is `orphaned` too (it
-  is not live) but is **excluded from both `restorable()` and
-  `orphans()`/§3.12** — restoring it would resurrect an old-role accessory
-  under a number every paired ecosystem has already processed a removal for,
-  and re-adopting it would do the same thing by hand. Same inert-extra-key
-  parse tolerance. **Rollback caveat:** an older bridge build drops the key
-  on its next write, and the superseded record becomes an ordinary orphan —
-  visible in `list_orphans` and re-adoptable, which would resurrect the
-  retired role under its retired number if acted on. Reaching this state at
-  all needs an out-of-band swap (a hand-installed older bridge-node build
-  pointed at storage a newer one already wrote to) rather than an ordinary
-  reconnect: invariant 5's fail-closed already refuses any *live* pairing
-  whose `protocolVersion`s disagree, and the ordinary install/reinstall menus
-  always fetch the pinned version. Documented here rather than defended
-  against in code, for the same reason `numberVoid`'s and `orphaned`'s own
-  rollback paths are not.
+  test, deliberately: migrating an accessory onto an already-exported device
+  (issue #246) is also one removal plus one create for one device, and the
+  identity it leaves behind is an ORDINARY orphan, not a retired one — only a
+  generation bump retires an identity. A superseded record is `orphaned` too
+  (it is not live) but is **excluded from `restorable()`** — restoring it
+  would resurrect an old-role accessory under a number every paired ecosystem
+  has already processed a removal for. Same inert-extra-key parse tolerance.
+  **Rollback caveat:** an older bridge build drops the key on its next write,
+  and the superseded record becomes an ordinary, rebuildable orphan again —
+  which would resurrect the retired role under its retired number at the next
+  restart if left that way. Reaching this state at all needs an out-of-band
+  swap (a hand-installed older bridge-node build pointed at storage a newer
+  one already wrote to) rather than an ordinary reconnect: invariant 5's
+  fail-closed already refuses any *live* pairing whose `protocolVersion`s
+  disagree, and the ordinary install/reinstall menus always fetch the pinned
+  version. Documented here rather than defended against in code, for the same
+  reason `numberVoid`'s and `orphaned`'s own rollback paths are not.
 
 **Version 1 files are read, migrated in place, and never treated as corrupt.**
 A v1 entry is a bare number; it keeps that number, is simply not restorable
@@ -1211,43 +1145,41 @@ subscribed to see any of it, and the alternative (deferring the restore until
 after the refusal decision) reopens the online-and-empty window for every
 healthy start, which is the bug itself.
 
-**Un-exporting marks an entry orphaned, and (since issue #219) keeps its
-restoration half.** When a reconcile or a `remove_endpoint` actually takes an
-endpoint away, its entry is marked `orphaned` (see above) while `role`,
-`label` **and** `number` are all kept. Before #219, `role`/`label` were
-dropped instead — which also excluded the entry from restore-on-start, but
-threw away the only evidence a future re-adopt UI could match a *recreated*
-device (a factory-reset accessory that comes back with a new `UniqueID`)
-against the endpoint it used to occupy. Without either mechanism, `check`'s
-add-and-refresh-only behaviour would leave an un-exported device restorable
-for ever: it would be rebuilt before every `server.start()` and removed again
-by the next attach — the same appear-then-vanish churn, aimed at devices the
-user had already removed — and each ghost would also cost a removal-pacing
-slot on every attach. Keeping the number is §3.3's retained allocation, so a
-re-export returns the *same* accessory rather than a new one; keeping
-`role`/`label` costs nothing extra, since `orphaned` alone already keeps the
-entry out of restore-on-start. `orphaned` is cleared the moment the same
-`UniqueID` is live again, so a plain re-export is unaffected. Only a measured
-removal marks an entry: absence from the live set proves nothing (a node that
-never attached has an empty one), so a factory reset, a seed and an entry this
-build cannot rebuild all leave the map alone.
+**An `attach` reconcile's un-export marks an entry orphaned, keeping its
+restoration half.** When a reconcile takes an endpoint away because it
+simply falls out of the desired set, its entry is marked `orphaned` (see
+above) while `role`, `label` **and** `number` are all kept — a full reconcile
+can never tell "the plugin dropped this on purpose" from "this device exists
+but failed classification this one pass" (issue #274 constraint), so it must
+stay reversible. Without this, `check`'s add-and-refresh-only behaviour would
+leave an un-exported device restorable for ever: it would be rebuilt before
+every `server.start()` and removed again by the next attach — the same
+appear-then-vanish churn, aimed at devices the user had already removed —
+and each ghost would also cost a removal-pacing slot on every attach. Keeping
+the number is §3.3's retained allocation, so a re-export returns the *same*
+accessory rather than a new one; keeping `role`/`label` costs nothing extra,
+since `orphaned` alone already keeps the entry out of restore-on-start.
+`orphaned` is cleared the moment the same `UniqueID` is live again, so a
+plain re-export is unaffected. Only a measured removal marks an entry:
+absence from the live set proves nothing (a node that never attached has an
+empty one), so a factory reset, a seed and an entry this build cannot
+rebuild all leave the map alone.
 
-**Destroying an entry (issue #274, ADR-0015) is the alternative to
-orphaning it — number, role, label and every other field, gone.** A
-`remove_endpoint` carrying `permanent: true` (§3.3) — the driving device is
-confirmed deleted, or deliberately un-exported — deletes the record from
-`endpoints` outright rather than marking it `orphaned`. Unlike every mutation
-above, this is the one place a record's `number` is not kept: the guarantee
-that a retired number is never reissued (ADR-0010, `numberVoid`'s and
-`orphaned`'s own comments above) still holds, because it was never this file
-that enforced it — matter.js's own persisted allocation for the retired
-`Endpoint.id`, a separate store this file never touches, is what actually
-prevents reuse, and it is untouched by deleting this witness of it. What is
-lost is re-adopt: a destroyed identity is invisible to both `restorable()`
-and `orphans()`/§3.12 from the moment it is destroyed — there is nothing left
-to rebuild or to offer the picker. `attach`'s own reconcile never destroys
-(see §3.1 and §3.3 above); only an explicit `remove_endpoint` with
-`permanent: true` does.
+**An explicit `remove_endpoint` destroys instead (issue #274, ADR-0015) —
+number, role, label and every other field, gone.** Every `remove_endpoint`
+command (§3.3) is the plugin confirming the driving device is gone for good
+— deleted, or deliberately un-exported — so the node deletes the record from
+`endpoints` outright rather than marking it `orphaned`. Unlike every
+reconcile-driven mutation above, this is the one place a record's `number`
+is not kept: the guarantee that a retired number is never reissued
+(ADR-0010, `numberVoid`'s and `orphaned`'s own comments above) still holds,
+because it was never this file that enforced it — matter.js's own persisted
+allocation for the retired `Endpoint.id`, a separate store this file never
+touches, is what actually prevents reuse, and it is untouched by deleting
+this witness of it. What is lost is `restorable()`: a destroyed identity is
+gone from it the moment it is destroyed — there is nothing left to rebuild.
+`attach`'s own reconcile never destroys (see §3.1 and §3.3 above); only an
+explicit `remove_endpoint` does.
 
 `drift` is populated by every operation that can change the live endpoint set —
 `attach`/`reconcile`, `upsert_endpoint` and `remove_endpoint` — and **on the
@@ -1288,7 +1220,7 @@ is already gone).
    (issues #219/#240) — a narrowing of the earlier
    `indigoDeviceId` → `Endpoint.id` → number statement, not a reversal:
    nothing is still ever keyed on list position or label, and every export
-   that has never role-changed or been re-adopted publishes under exactly
+   that has never role-changed or been migrated publishes under exactly
    today's derivation.
 4. **State pushes are echo-guarded** in the node (`ctx.offline`); the plugin
    never receives a `command` event for a change it pushed.

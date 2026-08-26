@@ -220,49 +220,16 @@ def _validate_ct_bounds(options: dict, role: str, device_id: int) -> None:
                 f"{ct_bounds.GENERIC_MAX_MIREDS} (device {device_id})")
 
 
-def options_lawful_for_role(options: dict, role: str) -> dict:
-    """The subset of ``options`` that :func:`_validate_options` accepts for ``role``.
-
-    Driven by the SAME per-role tables ``_validate_options`` checks against —
-    :data:`INVERTIBLE_ROLES`, :data:`MAPPABLE_ROLES`, :data:`CT_BOUNDS_ROLES` —
-    rather than a hand-copied key list that can drift out of step with them.
-
-    For ``export_recovery_menu_mixin._readopt_commit`` (issue #293 review): re-adopting
-    an orphaned accessory onto a device carries that device's OWN previous
-    export options forward, and the orphan's role need not match the role
-    those options were validated against (``export_catalog``'s dimmer rule
-    makes one device eligible for both a light role and ``windowCovering``,
-    for instance). Filtering here before the entry is built keeps
-    ``ExportStore.upsert``'s options validation from hard-failing the
-    re-adopt outright. Dropping the unlawful keys is correct, not a
-    compromise: they described the OLD role's semantics, not this one's, and
-    the learner/dialog re-earn or re-seed whatever the new role needs.
-    """
-    lawful = {}
-    if OPTION_INVERT in options and role in INVERTIBLE_ROLES:
-        lawful[OPTION_INVERT] = options[OPTION_INVERT]
-    if role in MAPPABLE_ROLES:
-        for key in (OPTION_STATE_KEY, OPTION_STATE_INVERT):
-            if key in options:
-                lawful[key] = options[key]
-    if role in CT_BOUNDS_ROLES:
-        for key in (OPTION_CT_MIN_MIREDS, OPTION_CT_MAX_MIREDS,
-                    OPTION_CT_LEARNED_MIN_MIREDS, OPTION_CT_LEARNED_MAX_MIREDS):
-            if key in options:
-                lawful[key] = options[key]
-    return lawful
-
-
 @dataclass(frozen=True)
 class ExportEntry:
     """One allow-listed device and the metadata Indigo cannot supply.
 
     ``indigo_device_id`` is this store's key, and the device the accessory is
     DRIVEN by — never re-keyed on name or list position. It is no longer the
-    accessory's identity (ADR-0010, issues #219/#240): ``published_as`` is,
-    both on the wire (§4.1 ``publishedAs``) and in the node's endpoint map
+    accessory's identity (ADR-0010, issue #240): ``published_as`` is, both
+    on the wire (§4.1 ``publishedAs``) and in the node's endpoint map
     (PRD §4.3), and it defaults to ``indigo-<indigo_device_id>``. The two
-    agree for every ordinary export and deliberately disagree for a re-adopted
+    agree for every ordinary export and deliberately disagree for a migrated
     one, which is the whole point of separating them.
     """
 
@@ -319,11 +286,11 @@ class ExportEntry:
                 raise ValueError(
                     f"export entry {KEY_PUBLISHED_AS!r} is not a string (device {device_id})")
             # Lawfulness is the ONLY check: the identity deliberately need
-            # NOT embed this entry's own device id. A re-adopt (issue #219) is
-            # exactly `indigo-<OLD device>` driven by a NEW one, so demanding
-            # the two agree would drop every re-adopted export the next time
+            # NOT embed this entry's own device id. A migrate (issue #246) is
+            # exactly `indigo-<OTHER device>` driven by this one, so demanding
+            # the two agree would drop every migrated export the next time
             # the allow-list was loaded — silently un-exporting the accessory
-            # the re-adopt existed to keep.
+            # the migrate existed to keep.
             if parse_published_id(published_as) is None:
                 raise ValueError(
                     f"export entry {KEY_PUBLISHED_AS!r} {published_as!r} is not a lawful "

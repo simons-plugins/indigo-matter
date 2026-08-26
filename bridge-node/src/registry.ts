@@ -59,10 +59,10 @@ interface LiveEndpoint {
      */
     battery: boolean;
     /**
-     * Issues #219/#240 — the accessory identity this live endpoint was built
-     * with (`Endpoint.id`/`UniqueID`/`SerialNumber`). Held here rather than
-     * re-derived because a re-adopted identity is no longer a pure function of
-     * `indigoDeviceId` — see {@link EndpointSpec.publishedAs}.
+     * Issue #240 — the accessory identity this live endpoint was built with
+     * (`Endpoint.id`/`UniqueID`/`SerialNumber`). Held here rather than
+     * re-derived because a role-changed or migrated identity is no longer a
+     * pure function of `indigoDeviceId` — see {@link EndpointSpec.publishedAs}.
      */
     publishedAs: string;
     /** Reassigned when a failed close forces the listeners to be restored. */
@@ -300,7 +300,7 @@ export class EndpointRegistry {
         const live = this.liveComposition();
         const plan = planReconcile(live, desired, replaceAll);
 
-        // Issues #219/#240 — a removed identity whose `indigoDeviceId` also
+        // Issue #240 — a removed identity whose `indigoDeviceId` also
         // appears in `plan.create` is one device changing which identity it
         // publishes, planned as removal+create rather than an in-place recreate
         // (`reconcile.ts`'s `planReconcile`). Logged before anything mutates so
@@ -309,12 +309,10 @@ export class EndpointRegistry {
         // TWO different things have that shape, and they must not share a
         // sentence. `supersedes()` is the same narrow test `node.ts` uses to
         // decide whether to write `supersededBy`: only a LATER GENERATION of
-        // the same identity retires the old one for good. A re-adopt (PR5
-        // design E2/E5) is also one removal plus one create for one device, and
-        // the identity it leaves behind is an ORDINARY orphan the map goes on
-        // offering to the re-adopt picker — so saying "retired … never reused"
-        // about it was flatly wrong, and its "role X → X" made the line read
-        // as a role change that had not happened.
+        // the same identity retires the old one for good. Anything else with
+        // this shape leaves an ORDINARY orphan behind — so saying "retired …
+        // never reused" about it would be flatly wrong, and its "role X → X"
+        // would make the line read as a role change that had not happened.
         const createdByDeviceId = new Map(plan.create.map(spec => [spec.indigoDeviceId, spec]));
         for (const oldPublishedAs of plan.remove) {
             const old = live.get(oldPublishedAs);
@@ -336,8 +334,7 @@ export class EndpointRegistry {
                     `Endpoint ${old.indigoDeviceId} is moving from accessory identity ${oldPublishedAs} ` +
                         `(number ${number}) to ${created.publishedAs}: controllers process a removal and an ` +
                         "addition. This is NOT a supersession — the identity it is leaving is an ordinary " +
-                        "left-behind accessory that stays re-adoptable, and its number is kept for it " +
-                        "(issue #219 re-adopt).",
+                        "left-behind accessory, and its number is kept for it.",
                 );
             }
         }

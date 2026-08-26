@@ -27,7 +27,6 @@ from export_store import (
     SCHEMA_VERSION,
     ExportEntry,
     ExportStore,
-    options_lawful_for_role,
 )
 
 
@@ -366,10 +365,11 @@ def test_entry_from_dict_rejects_malformed_published_as():
             {"indigoDeviceId": 1, "role": "onOffLight", "publishedAs": "not-lawful"})
 
 
-def test_entry_from_dict_accepts_a_re_adopted_published_as():
-    """Issue #219 — a re-adopted entry publishes as the identity of the OLD,
-    deleted device while being driven by a NEW one. The two deliberately do
-    NOT agree, and demanding they did dropped the entry on the next load."""
+def test_entry_from_dict_accepts_a_migrated_published_as():
+    """Issue #246 — a migrated entry publishes as the identity of the
+    device it moved FROM while being driven by a different one. The two
+    deliberately do NOT agree, and demanding they did would drop the entry
+    on the next load."""
     entry = ExportEntry.from_dict(
         {"indigoDeviceId": 1, "role": "onOffLight", "publishedAs": "indigo-2"})
     assert entry.published_as == "indigo-2"
@@ -387,12 +387,11 @@ def test_published_as_round_trips_through_a_second_store(prefs, mock_logger):
     assert second.get(7).published_as == "indigo-7~2"
 
 
-def test_a_re_adopted_entry_round_trips_through_a_second_store(prefs, mock_logger):
-    """Issue #219, end to end through the persistence the menu action uses:
-    `menuReadoptExport` writes exactly this shape (a NEW device publishing as
-    the OLD device's identity), so it has to survive a plugin restart — a
-    dropped entry here silently un-exports the accessory the re-adopt existed
-    to preserve."""
+def test_an_entry_publishing_a_different_devices_identity_round_trips_through_a_second_store(
+        prefs, mock_logger):
+    """`menuMigrateExport` writes exactly this shape (a NEW device publishing
+    as another device's identity), so it has to survive a plugin restart — a
+    dropped entry here silently un-exports the accessory migrate moved."""
     first = ExportStore(lambda: prefs, mock_logger)
     first.upsert(_entry(987654321, "onOffLight", published_as="indigo-123456789"))
     second = ExportStore(lambda: prefs, mock_logger)
@@ -413,9 +412,9 @@ def test_upsert_refuses_an_unlawful_published_as_at_WRITE_time(prefs, mock_logge
     assert PREF_KEY not in prefs or "indigo-1e3" not in prefs[PREF_KEY]
 
 
-def test_upsert_still_accepts_a_re_adopted_published_as(prefs, mock_logger):
+def test_upsert_still_accepts_a_migrated_published_as(prefs, mock_logger):
     """The write-time check is LAWFULNESS only, exactly like `from_dict`'s —
-    a re-adopt is a NEW device publishing the OLD device's identity, so the
+    a migrate is a device publishing a DIFFERENT device's identity, so the
     two deliberately do not agree."""
     store = ExportStore(lambda: prefs, mock_logger)
     store.upsert(_entry(1, "onOffLight", published_as="indigo-2"))
@@ -838,49 +837,3 @@ def test_a_non_boolean_inversion_is_refused():
     with pytest.raises(ValueError):
         ExportEntry.from_dict(_mapped(**{OPTION_STATE_KEY: "status",
                                          OPTION_STATE_INVERT: "yes"}))
-
-
-# ---------------------------------------------------------------------------
-# options_lawful_for_role (issue #293 review) — the readopt cross-role guard
-# ---------------------------------------------------------------------------
-def test_options_lawful_for_role_keeps_everything_on_a_same_role_carry():
-    options = {OPTION_STATE_KEY: "status", OPTION_STATE_INVERT: True}
-    assert options_lawful_for_role(options, "occupancySensor") == options
-
-
-def test_options_lawful_for_role_drops_invert_for_a_non_covering_role():
-    filtered = options_lawful_for_role({OPTION_INVERT: True}, "onOffLight")
-    assert filtered == {}
-
-
-def test_options_lawful_for_role_keeps_invert_for_window_covering():
-    options = {OPTION_INVERT: True}
-    assert options_lawful_for_role(options, "windowCovering") == options
-
-
-def test_options_lawful_for_role_drops_a_mapping_for_a_non_mappable_role():
-    filtered = options_lawful_for_role(
-        {OPTION_STATE_KEY: "status", OPTION_STATE_INVERT: True}, "onOffPlugInUnit")
-    assert filtered == {}
-
-
-def test_options_lawful_for_role_drops_ct_bounds_for_a_role_with_no_colour_temperature():
-    options = {OPTION_CT_MIN_MIREDS: 153, OPTION_CT_MAX_MIREDS: 400,
-              OPTION_CT_LEARNED_MIN_MIREDS: 200, OPTION_CT_LEARNED_MAX_MIREDS: 350}
-    assert options_lawful_for_role(options, "windowCovering") == {}
-
-
-def test_options_lawful_for_role_keeps_ct_bounds_for_a_ct_role():
-    options = {OPTION_CT_MIN_MIREDS: 153, OPTION_CT_MAX_MIREDS: 400}
-    assert options_lawful_for_role(options, "colorTemperatureLight") == options
-
-
-def test_options_lawful_for_role_result_is_lawful_input_to_upsert(prefs, mock_logger):
-    """The point of the helper: whatever it returns must itself pass
-    `_validate_options` for the target role, so `upsert` never re-rejects it."""
-    store = ExportStore(lambda: prefs, mock_logger)
-    filtered = options_lawful_for_role(
-        {OPTION_CT_LEARNED_MIN_MIREDS: 153, OPTION_CT_LEARNED_MAX_MIREDS: 370,
-         OPTION_INVERT: True}, "windowCovering")
-    entry = store.upsert(ExportEntry(101, "windowCovering", options=filtered))
-    assert entry.options == {OPTION_INVERT: True}

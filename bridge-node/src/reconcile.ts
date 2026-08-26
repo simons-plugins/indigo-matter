@@ -177,31 +177,6 @@ export function parsePreserveEndpointNumbers(value: unknown): boolean {
     return value;
 }
 
-/**
- * §3.3: whether a `remove_endpoint` is a PERMANENT departure — the driving
- * Indigo device is confirmed gone (deleted, or deliberately un-exported) —
- * rather than the removal half of a role-change/re-adopt `replace()`, which
- * the plugin always follows with an `upsert_endpoint` for the same identity
- * (issue #274).
- *
- * Absent means `false`, matching every `remove_endpoint` call before this
- * flag existed: the two-command supersede/re-adopt sequence
- * (`export_bridge.replace()`) must keep getting the ORIGINAL soft removal —
- * orphaned, not destroyed — so the second command's `upsert_endpoint` still
- * has an entry to retroactively mark `supersededBy`, or to hand back to the
- * re-adopt picker. Only a caller that KNOWS the device will never come back
- * opts in explicitly.
- */
-export function parsePermanentRemoval(value: unknown): boolean {
-    if (value === undefined) {
-        return false;
-    }
-    if (typeof value !== "boolean") {
-        throw new ProtocolError(ErrorCode.malformedArgs, "permanent must be a boolean");
-    }
-    return value;
-}
-
 /** §3.1: the opt-in that makes emptying the endpoint set deliberate. */
 export function parseReplaceAll(intent: unknown): boolean {
     if (intent === undefined) {
@@ -368,11 +343,11 @@ export function planReconcile(
     //
     // **Deliberately the BROAD rule, unlike `supersedes()`.** The narrow
     // generation test is right for `supersededBy`, which answers "is this
-    // identity retired for good?" — a re-adopt's is not. The guard asks a
-    // different question: "does this device still have an accessory
-    // afterwards?" A re-adopt and a supersession both answer yes, so both
-    // belong here, and `stillExportedCount` is named for what it counts
-    // rather than for one of the two things that produce it.
+    // identity retired for good?" The guard asks a different question:
+    // "does this device still have an accessory afterwards?" — true for any
+    // remove-plus-create pair on the same device, supersession or not, so
+    // `stillExportedCount` is named for what it counts rather than for the
+    // one thing that usually produces it.
     const createdDeviceIds = new Set(plan.create.map(spec => spec.indigoDeviceId));
     const stillExportedCount = plan.remove.filter(publishedAs => {
         const removedDeviceId = live.get(publishedAs)?.indigoDeviceId;

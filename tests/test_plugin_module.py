@@ -140,7 +140,6 @@ MENU_SECTIONS = [
      "Restore a fabric backup…",
      "Rebuild Matter Endpoint Map…",
      "Migrate an exported accessory…",
-     "Re-adopt a Matter accessory…",
      "Recreate Matter node devices…",
      "Reset Matter Bridge Pairings…"],
 ]

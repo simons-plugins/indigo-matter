@@ -1266,20 +1266,20 @@ describe("endpoint-number stability (PRD §4.3 / XAC5)", () => {
     });
 });
 
-/** A re-adopt's replacement device: drives identity `indigo-1`, is not 1. */
+/** A migrated identity's new driving device: drives identity `indigo-1`, is not 1. */
 const REPLACEMENT_DEVICE = 700_000_001;
 
-describe("supersede & published identity (issues #219/#240)", () => {
-    it("publishes the OLD UniqueID and SerialNumber for a re-adopted identity", async () => {
-        // The PR5 design F7/F8 pin, and the whole of #219 in one assertion: the only
-        // identity a controller can see is the endpoint number plus the
-        // bridged Basic Information attributes, and matter.js does NOT
-        // persist `uniqueId`/`serialNumber` — whatever is declared at
-        // construction is what is published. A re-adopted accessory is
-        // therefore only "the same accessory" to Apple Home if BOTH are
-        // derived from `publishedAs` rather than from the device now driving
-        // it; derive either from `indigoDeviceId` and every paired ecosystem
-        // sees a brand-new accessory, room and scenes gone.
+describe("supersede & published identity (issue #240)", () => {
+    it("publishes the OLD UniqueID and SerialNumber for a migrated identity", async () => {
+        // The PR5 design F7/F8 pin: the only identity a controller can see is
+        // the endpoint number plus the bridged Basic Information attributes,
+        // and matter.js does NOT persist `uniqueId`/`serialNumber` —
+        // whatever is declared at construction is what is published. A
+        // migrated accessory is therefore only "the same accessory" to Apple
+        // Home if BOTH are derived from `publishedAs` rather than from the
+        // device now driving it; derive either from `indigoDeviceId` and
+        // every paired ecosystem sees a brand-new accessory, room and scenes
+        // gone.
         const h = await harness();
         try {
             await h.registry.reconcile(
@@ -1297,11 +1297,11 @@ describe("supersede & published identity (issues #219/#240)", () => {
         }
     });
 
-    it("routes a command from a re-adopted accessory to the NEW Indigo device", async () => {
+    it("routes a command from a migrated accessory to the NEW Indigo device", async () => {
         // The COMMAND_SINKS indirection (owner decision 2). The sink is keyed
         // on `Endpoint.id` — which IS `publishedAs` — while the value carries
         // the driving `indigoDeviceId`. Key it on `indigo-<indigoDeviceId>`
-        // instead and an ecosystem-originated command on a re-adopted
+        // instead and an ecosystem-originated command on a migrated
         // accessory finds no sink at all: Apple Home says the accessory did
         // not respond, for ever, and nothing in Indigo moves.
         const h = await harness();
@@ -1359,38 +1359,38 @@ describe("supersede & published identity (issues #219/#240)", () => {
         }
     });
 
-    it("does not call a re-adopt a supersession, or print role X → X (comment-analyzer C2)", async () => {
-        // The PR5 design E2/E5 shape: ONE device, ONE removal, ONE create, and the
-        // identity left behind is an ORDINARY orphan `orphans()`/§3.12 must
-        // go on offering. The broad "removal + create for the same device"
-        // rule logged "identity … is being retired … never reused" about it —
-        // the opposite of what the map does — and printed "role onOffLight →
-        // onOffLight", which reads as a role change nobody asked for.
+    it("does not call this shape a supersession, or print role X → X (comment-analyzer C2)", async () => {
+        // ONE device, ONE removal, ONE create, and the identity left behind
+        // is an ORDINARY orphan. The broad "removal + create for the same
+        // device" rule logged "identity … is being retired … never reused"
+        // about it — the opposite of what the map does — and printed "role
+        // onOffLight → onOffLight", which reads as a role change nobody
+        // asked for.
         const h = await harness();
         try {
             await h.registry.reconcile([spec(1, Role.onOffLight)], false);
             h.logs.length = 0;
 
             // Device 1 stops publishing indigo-1 and starts publishing
-            // indigo-99 — a re-adopt onto an already-exported device.
+            // indigo-99 — not a generation bump of its own identity.
             await h.registry.reconcile(
                 [spec(1, Role.onOffLight, { publishedAs: uniqueIdFor(99) })], false,
             );
 
             assert.ok(
                 !h.logs.some(line => line.startsWith("Superseding endpoint")),
-                `a re-adopt is not a supersession: ${h.logs.join("\n")}`,
+                `not a supersession: ${h.logs.join("\n")}`,
             );
             assert.ok(
                 !h.logs.some(line => line.includes("The retired number is never reused.")),
-                `the old identity stays re-adoptable and keeps its number: ${h.logs.join("\n")}`,
+                `the old identity stays an ordinary orphan and keeps its number: ${h.logs.join("\n")}`,
             );
             assert.ok(
                 h.logs.some(
                     line =>
                         line.includes(`moving from accessory identity ${uniqueIdFor(1)}`) &&
                         line.includes(`to ${uniqueIdFor(99)}`) &&
-                        line.includes("stays re-adoptable"),
+                        line.includes("ordinary left-behind accessory"),
                 ),
                 `expected the identity-move line, got ${h.logs.join("\n")}`,
             );

@@ -441,16 +441,16 @@ def role_label(role: str) -> str:
 
 @dataclass(frozen=True)
 class TargetRefusal:
-    """Why :func:`eligible_target` refused ``dev`` as a migrate/re-adopt
-    target, or why an already-saved export no longer holds up.
+    """Why :func:`eligible_target` refused ``dev`` as a migrate target, or
+    why an already-saved export no longer holds up.
 
     Always carries the :func:`classify` verdict this came from — including an
     :class:`EligibleDevice` one, on a role mismatch — so a caller that needs
     more than the bare reason (e.g. the device's CURRENT ``eligible_roles``,
     to name what it offers instead) can still read it off ``.verdict``. This
     stays plain data on purpose: the callers that raise it word a refusal
-    differently from each other (migrate vs re-adopt vs the startup
-    reconcile's log line), so the message itself is never built here.
+    differently from each other (migrate vs the startup reconcile's log
+    line), so the message itself is never built here.
     """
 
     verdict: Verdict
@@ -462,12 +462,12 @@ class TargetRefusal:
 
 def eligible_target(dev, plugin_id: str, saved_options: Optional[dict],
                     required_role: str) -> Union[EligibleDevice, TargetRefusal]:
-    """Classify ``dev`` for reuse as a migrate/re-adopt/reconcile target that
-    must be able to take ``required_role``.
+    """Classify ``dev`` for reuse as a migrate/reconcile target that must be
+    able to take ``required_role``.
 
     This is the ~10-line dance that used to be hand-written at every call
-    site that needs it (issue #246's migrate and re-adopt pickers, plus the
-    startup export reconcile): call :func:`classify` with the device's own
+    site that needs it (issue #246's migrate picker, plus the startup export
+    reconcile): call :func:`classify` with the device's own
     saved options, refuse anything that is not an :class:`EligibleDevice`,
     then refuse again if the role it is being asked to carry is not one of
     the roles offered. Returns the :class:`EligibleDevice` verdict on
@@ -487,7 +487,7 @@ def excluded_row(verdict: Excluded, device_id, name: str, mark: str,
     """The picker row for an :class:`Excluded` verdict (XAC9) — shared,
     byte-for-byte, by every device picker that lists exclusions with their
     reason (``ExportDialogMixin._candidate_row``,
-    ``ExportRecoveryMenuMixin._readopt_device_row``).
+    ``ExportRecoveryMenuMixin._migrate_device_row``).
 
     Returns ``None`` for the loop guard: XAC6 requires that row ABSENT, not
     merely unpickable, so the caller must omit it rather than show it

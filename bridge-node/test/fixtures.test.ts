@@ -84,8 +84,6 @@ describe("golden fixtures match their typed mirror", () => {
             shapes.factoryResetResult],
         ["rebuild_endpoint_map result", golden.rebuild_endpoint_map.response.result, shapes.rebuiltStatus],
         ["endpoint_map_invalid", golden.endpoint_map_invalid.response, shapes.endpointMapInvalid],
-        ["list_orphans result", golden.list_orphans.response.result, shapes.orphanList],
-        ["list_orphans_empty result", golden.list_orphans_empty.response.result, shapes.orphanListEmpty],
     ];
 
     for (const [name, actual, expected] of cases) {

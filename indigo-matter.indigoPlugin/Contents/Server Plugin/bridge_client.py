@@ -639,18 +639,15 @@ class BridgeClient(WsJsonClient):
                 f"upsert_endpoint result carried no endpointNumber: {result!r}")
         return int(data["endpointNumber"])
 
-    async def remove_endpoint(self, indigo_device_id: int, *, permanent: bool = False,
+    async def remove_endpoint(self, indigo_device_id: int, *,
                               timeout: float = DEFAULT_TIMEOUT) -> bool:
         """Remove one endpoint (§3.3). ``False`` means it was already absent.
 
-        ``permanent`` (issue #274) is the confirmed-gone declaration — see
-        ``bridge_protocol.BridgeProtocol.build_remove_endpoint``. Defaults to
-        ``False`` so `replace()`'s two-command supersede/re-adopt sequence,
-        which calls this directly rather than through `ExportBridge.remove`,
-        is unaffected.
+        Destroys the endpoint-map record along with the live endpoint (issue
+        #274) — see ``bridge_protocol.BridgeProtocol.build_remove_endpoint``.
         """
         result = await self._request_frame(
-            self.proto.build_remove_endpoint(indigo_device_id, permanent=permanent), timeout)
+            self.proto.build_remove_endpoint(indigo_device_id), timeout)
         return bool((result or {}).get("removed", False))
 
     async def set_state(self, indigo_device_id: int, states: dict) -> None:
@@ -836,11 +833,3 @@ class BridgeClient(WsJsonClient):
             self.logger.warning(
                 "the endpoint map was rebuilt, but re-attaching was refused (%s); the ordinary "
                 "reconnect will try again", failed)
-
-    async def list_orphans(self, timeout: float = DEFAULT_TIMEOUT) -> list:
-        """§3.12 — every left-behind accessory identity the re-adopt picker
-        (issue #219) could offer. Read-only: no argument, no state change on
-        the node — the same "local and quick" cost class as :meth:`get_status`.
-        """
-        result = await self._request_frame(self.proto.build_list_orphans(), timeout)
-        return bridge_protocol.parse_orphans(result)
