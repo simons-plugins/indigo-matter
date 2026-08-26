@@ -79,9 +79,9 @@ import export_handlers         # noqa: F401
 from pairing_page import _escape, _pairing_html   # noqa: F401
 from plugin_constants import (  # noqa: F401
     ALL_OPTION_ID, DECOMMISSION_TIMEOUT, EXCLUDED_OPTION_PREFIX, EXPORT_PICKER_LIMIT,
-    FACTORY_RESET_TIMEOUT, LIST_ERROR_OPTION, MENU_MANAGE_EXPORTS, MENU_READOPT_EXPORT,
+    FACTORY_RESET_TIMEOUT, LIST_ERROR_OPTION, MENU_MANAGE_EXPORTS,
     MENU_UNPAIR_ECOSYSTEM, NO_MATCH_OPTION, NO_SELECTION_ID, NO_SELECTION_LABEL,
-    PAIRING_READ_TIMEOUT, READOPT_ORPHANS_TIMEOUT, ROW_ERROR_LABEL, SURVEY_READ_TIMEOUT,
+    PAIRING_READ_TIMEOUT, ROW_ERROR_LABEL, SURVEY_READ_TIMEOUT,
     TRUNCATED_OPTION, UNPAIR_TIMEOUT, WINDOW_OPEN_TIMEOUT,
 )
 
@@ -578,9 +578,8 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
         try:
             if self.export_bridge is not None:
                 # Issue #274: the device is confirmed gone — destroy the
-                # accessory outright rather than orphaning it for a re-adopt
-                # that no longer exists.
-                self.export_bridge.remove(dev.id, permanent=True)
+                # accessory outright.
+                self.export_bridge.remove(dev.id)
         except Exception as exc:  # noqa: BLE001
             self.logger.exception(exc)
         finally:

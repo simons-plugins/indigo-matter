@@ -33,7 +33,6 @@ import {
     parseEndpointSpec,
     parseEndpointSpecs,
     parseFabricIndex,
-    parsePermanentRemoval,
     parsePreserveEndpointNumbers,
     parseReplaceAll,
 } from "./reconcile.js";
@@ -90,7 +89,7 @@ export class BridgeWsServer {
             this.options.bridge.upsertEndpoint(parseEndpointSpec(args.endpoint)),
         );
         this.#handlers.set("remove_endpoint", async args =>
-            this.options.bridge.removeEndpoint(parseDeviceId(args.indigoDeviceId), parsePermanentRemoval(args.permanent)),
+            this.options.bridge.removeEndpoint(parseDeviceId(args.indigoDeviceId)),
         );
         this.#handlers.set("set_state", async args => this.handleSetState(args));
         this.#handlers.set("set_reachable", async args => this.handleSetReachable(args));
@@ -105,7 +104,6 @@ export class BridgeWsServer {
             return {};
         });
         this.#handlers.set("rebuild_endpoint_map", async () => this.options.bridge.rebuildEndpointMap());
-        this.#handlers.set("list_orphans", async () => this.options.bridge.listOrphans());
         options.bridge.onWindowClosed(reason => this.sendEvent(EventName.windowClosed, { reason }));
         options.bridge.onCommand(data => this.sendEvent(EventName.command, data));
         options.bridge.onDriftDetected(drift => this.sendEvent(EventName.driftDetected, { drift }));

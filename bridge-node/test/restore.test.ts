@@ -172,17 +172,6 @@ function readMap(storagePath: string): EndpointMapFile {
     return JSON.parse(readFileSync(join(storagePath, ENDPOINT_MAP_FILE), "utf8")) as EndpointMapFile;
 }
 
-/**
- * Strip `forget()`'s non-deterministic `orphanedAt` stamp (issue #219) so the
- * rest of a persisted record can still be `deepEqual`ed exactly; its own
- * stamping is pinned in `endpoint-map.test.ts`, so these integration tests
- * only need to know it is THERE, not what it says.
- */
-function withoutOrphanedAt<T extends { orphanedAt?: string }>(record: T): Omit<T, "orphanedAt"> {
-    const { orphanedAt, ...rest } = record;
-    return rest;
-}
-
 /** `upsert_endpoint` for one freshly-specced onOffLight accessory, awaited. */
 async function upsertOne(client: TestClient, messageId: string, indigoDeviceId: number): Promise<void> {
     client.send({
@@ -510,9 +499,8 @@ describe("issue #141: an un-exported device stops being restored", () => {
         // `forgetRemoved` call in `node.reconcile` and the third boot below
         // restores 2 and the attach removes one of them again.
         //
-        // Since issue #219, `forget` keeps role/label (re-adopt evidence for a
-        // future recreated-device UI) rather than deleting them — `orphaned` is
-        // what now keeps the entry out of `restorable`.
+        // `forget` keeps role/label rather than deleting them — `orphaned` is
+        // what keeps the entry out of `restorable`.
         const storagePath = storage();
         const numbers = await seedTwoAccessories(storagePath);
 
@@ -526,11 +514,10 @@ describe("issue #141: an un-exported device stops being restored", () => {
 
         const afterRemoval = readMap(storagePath);
         assert.deepEqual(
-            withoutOrphanedAt(afterRemoval.endpoints[uniqueIdFor(LOUNGE)]!),
+            afterRemoval.endpoints[uniqueIdFor(LOUNGE)]!,
             { number: numbers[LOUNGE], role: "dimmableLight", label: "Lounge Lamp", orphaned: true, deviceId: LOUNGE },
-            "the number AND role/label survive (§3.3, #219) so a re-export returns the SAME " +
-                "accessory and the entry remains re-adopt evidence, but `orphaned` keeps it " +
-                "out of the pre-attach rebuild",
+            "the number AND role/label survive (§3.3) so a re-export returns the SAME accessory, " +
+                "but `orphaned` keeps it out of the pre-attach rebuild",
         );
         assert.deepEqual(
             afterRemoval.endpoints[uniqueIdFor(KITCHEN)],
@@ -614,11 +601,13 @@ describe("issue #141: an un-exported device stops being restored", () => {
         }
     });
 
-    it("forgets one removed through remove_endpoint too, not just through attach", async () => {
+    it("destroys one removed through remove_endpoint too, not just through attach", async () => {
         // ⊗ §3.3's own removal path is the other way a device leaves the live
-        // set, and a fix wired only into `attach` would leave it making ghosts.
+        // set. Every `remove_endpoint` command is the plugin confirming the
+        // driving device is gone for good (issue #274), so this is a destroy,
+        // not an orphan.
         const storagePath = storage();
-        const numbers = await seedTwoAccessories(storagePath);
+        await seedTwoAccessories(storagePath);
 
         const session = await boot(storagePath);
         try {
@@ -639,13 +628,7 @@ describe("issue #141: an un-exported device stops being restored", () => {
             await session.close();
         }
 
-        assert.deepEqual(withoutOrphanedAt(readMap(storagePath).endpoints[uniqueIdFor(LOUNGE)]!), {
-            number: numbers[LOUNGE],
-            role: "dimmableLight",
-            label: "Lounge Lamp",
-            orphaned: true,
-            deviceId: LOUNGE,
-        });
+        assert.equal(readMap(storagePath).endpoints[uniqueIdFor(LOUNGE)], undefined);
     });
 
     it("forgets only what it watched go, never merely what is absent", async () => {
@@ -709,17 +692,16 @@ describe("issue #141: an un-exported device stops being restored", () => {
     });
 });
 
-/** `remove_endpoint`, optionally with the issue #274 `permanent` flag, awaited. */
+/** `remove_endpoint`, awaited. */
 async function removeOne(
     client: TestClient,
     messageId: string,
     indigoDeviceId: number,
-    permanent?: boolean,
 ): Promise<{ removed: boolean }> {
     client.send({
         message_id: messageId,
         command: "remove_endpoint",
-        args: { indigoDeviceId, ...(permanent === undefined ? {} : { permanent }) },
+        args: { indigoDeviceId },
     });
     for (;;) {
         const frame = await client.next(10_000);
@@ -730,8 +712,8 @@ async function removeOne(
     }
 }
 
-describe("issue #274: remove_endpoint's permanent flag destroys rather than orphans", () => {
-    it("drops the map entry entirely — no number, not restorable, not offered for re-adopt", async () => {
+describe("issue #274: remove_endpoint destroys rather than orphans", () => {
+    it("drops the map entry entirely — no number, not restorable", async () => {
         const storagePath = storage();
         const numbers = await seedTwoAccessories(storagePath);
 
@@ -741,13 +723,11 @@ describe("issue #274: remove_endpoint's permanent flag destroys rather than orph
             // with the SAME set already live, so this is a pure update and
             // does not itself touch LOUNGE.
             await attach(session.client, "a1", BOTH);
-            const result = await removeOne(session.client, "r1", LOUNGE, true);
+            const result = await removeOne(session.client, "r1", LOUNGE);
             assert.equal(result.removed, true);
 
             assert.deepEqual(readMap(storagePath).endpoints[uniqueIdFor(LOUNGE)], undefined,
                 "the entry is gone, not orphaned");
-            assert.deepEqual(session.bridge.listOrphans(), [],
-                "nothing is left to offer the re-adopt picker");
             assert.equal(
                 childOf(session.bridge.server, LOUNGE), undefined,
                 "the live accessory is gone from the aggregator too",
@@ -771,51 +751,13 @@ describe("issue #274: remove_endpoint's permanent flag destroys rather than orph
         }
     });
 
-    it("without the flag, keeps today's soft (orphan) behaviour — the default is unchanged", async () => {
-        const storagePath = storage();
-        await seedTwoAccessories(storagePath);
-
-        const session = await boot(storagePath);
-        try {
-            await attach(session.client, "a1", BOTH);
-            await removeOne(session.client, "r1", LOUNGE);
-
-            const record = readMap(storagePath).endpoints[uniqueIdFor(LOUNGE)];
-            assert.equal(record?.orphaned, true, "the pre-#274 orphan behaviour is untouched by default");
-            assert.deepEqual(
-                session.bridge.listOrphans().map(orphan => orphan.uniqueId),
-                [uniqueIdFor(LOUNGE)],
-                "still offered for re-adopt, exactly as before this issue",
-            );
-        } finally {
-            await session.close();
-        }
-    });
-
-    it("is idempotent on an already-absent endpoint, exactly like a non-permanent remove", async () => {
+    it("is idempotent on an already-absent endpoint", async () => {
         const storagePath = storage();
         const session = await boot(storagePath);
         try {
             await attach(session.client, "a1", []);
-            const result = await removeOne(session.client, "r1", 999999999, true);
+            const result = await removeOne(session.client, "r1", 999999999);
             assert.deepEqual(result, { removed: false });
-        } finally {
-            await session.close();
-        }
-    });
-
-    it("rejects a non-boolean permanent with malformed_args", async () => {
-        const storagePath = storage();
-        const session = await boot(storagePath);
-        try {
-            await attach(session.client, "a1", []);
-            session.client.send({
-                message_id: "r1",
-                command: "remove_endpoint",
-                args: { indigoDeviceId: KITCHEN, permanent: "yes" },
-            });
-            const frame = await session.client.next(10_000);
-            assert.equal(frame.error_code, ErrorCode.malformedArgs);
         } finally {
             await session.close();
         }
@@ -1039,9 +981,9 @@ describe("issue #141: one unusable map entry costs only itself", () => {
         // key — so that collision can no longer happen BY CONSTRUCTION: every
         // restored spec gets a distinct `Endpoint.id` for free. What can still
         // fail on its way into the Matter tree is an entry whose KEY is not a
-        // legal one: `deviceId` makes it resolvable (issue #219 — a re-adopted
-        // or hand-edited entry need not have a key `parsePublishedId` accepts)
-        // while the key itself violates PR5 design F9's "no `.` in an `Endpoint.id`" —
+        // legal one: `deviceId` makes it resolvable (a migrated or hand-edited
+        // entry need not have a key `parsePublishedId` accepts) while the key
+        // itself violates PR5 design F9's "no `.` in an `Endpoint.id`" —
         // exactly the kind of corrupted-but-resolvable entry `restore()`'s
         // per-spec try/catch exists to survive.
         const storagePath = storage();
@@ -1450,12 +1392,17 @@ describe("issue #220: a battery survives a restart", () => {
     });
 });
 
-describe("issues #219/#240 at node level: re-adopt and the two-command supersede", () => {
-    it("logs the re-adopt line and rebinds deviceId when a different device claims the same identity", async () => {
-        // #219: a device is deleted, its export is un-exported (`remove_endpoint`),
-        // and a REPLACEMENT device claims the same published identity by name —
-        // exactly what the (future) Re-adopt menu action sends. Nothing on the
-        // wire should move: same `Endpoint.id`, same number (PR5 design F1), same UniqueID.
+describe("issue #274 at node level: remove_endpoint destroys, so a later upsert is a fresh add", () => {
+    it("a device confirmed gone and later re-created gets the SAME matter.js number back, with no memory of the old owner", async () => {
+        // Once `remove_endpoint` destroys rather than orphans, a plugin-side
+        // deletion followed by a later re-export under the same identity (a
+        // different device claiming the same `publishedAs` by name) is
+        // simply a fresh ADD to this file's own witness — there is no
+        // previous record left to compare against, so no "driven by device
+        // X, replacing device Y" notice fires. What still holds is the
+        // number itself: matter.js's OWN persisted allocation for that
+        // `Endpoint.id` is untouched by us destroying our own witness of it
+        // (see `EndpointMapStore.destroy`'s own docstring).
         const storagePath = storage();
         const session = await boot(storagePath);
         try {
@@ -1474,6 +1421,8 @@ describe("issues #219/#240 at node level: re-adopt and the two-command supersede
                     break;
                 }
             }
+            assert.equal(readMap(storagePath).endpoints[uniqueIdFor(KITCHEN)], undefined,
+                "destroyed outright — nothing left in the witness map");
             session.logged.length = 0;
 
             const REPLACEMENT_DEVICE_ID = 700_000_001;
@@ -1504,7 +1453,7 @@ describe("issues #219/#240 at node level: re-adopt and the two-command supersede
             assert.equal(
                 (upsertFrame?.result as { endpointNumber: number } | undefined)?.endpointNumber,
                 numberBefore,
-                "PR5 design F1: the SAME Endpoint.id gets the SAME number back",
+                "the SAME Endpoint.id gets the SAME matter.js number back regardless of our own witness",
             );
 
             assert.deepEqual(
@@ -1513,245 +1462,18 @@ describe("issues #219/#240 at node level: re-adopt and the two-command supersede
             );
             const map = readMap(storagePath);
             assert.equal(map.endpoints[uniqueIdFor(KITCHEN)]?.deviceId, REPLACEMENT_DEVICE_ID);
-            assert.equal(map.endpoints[uniqueIdFor(KITCHEN)]?.orphaned, undefined, "live again, so un-orphaned");
-
-            assert.ok(
-                session.logged.some(
-                    line =>
-                        line.includes(`Accessory ${uniqueIdFor(KITCHEN)}`) &&
-                        line.includes(`is now driven by Indigo device ${REPLACEMENT_DEVICE_ID}`) &&
-                        line.includes(`replacing device ${KITCHEN}`),
-                ),
-                `expected the re-adopt log line, got ${session.logged.join(" | ")}`,
-            );
-        } finally {
-            await session.close();
-        }
-    });
-
-    it("nudges towards Re-adopt when an attach creates a NEW identity matching an orphan's role+label (PR5 design owner ruling 4)", async () => {
-        // Distinct from the re-adopt test above: here the REPLACEMENT device is
-        // exported under its OWN brand-new identity (not the orphan's), the way
-        // an ordinary export naturally would be if the user never knew the old
-        // accessory was still sitting in the map. The node cannot act on this —
-        // only the plugin owns publishedAs — so the best it can do is say so.
-        const storagePath = storage();
-        const session = await boot(storagePath);
-        try {
-            await attach(session.client, "a0", [KITCHEN_SPEC]);
-
-            session.client.send({
-                message_id: "r0",
-                command: "remove_endpoint",
-                args: { indigoDeviceId: KITCHEN },
-            });
-            for (;;) {
-                const frame = await session.client.next(10_000);
-                if (frame.message_id === "r0") {
-                    assert.equal(frame.error_code, undefined, JSON.stringify(frame));
-                    break;
-                }
-            }
-            session.logged.length = 0;
-
-            const REPLACEMENT_DEVICE_ID = 700_000_002;
-            session.client.send({
-                message_id: "u0",
-                command: "upsert_endpoint",
-                args: {
-                    endpoint: {
-                        indigoDeviceId: REPLACEMENT_DEVICE_ID,
-                        // No publishedAs — the default derivation, a BRAND-NEW
-                        // identity distinct from the orphaned KITCHEN one.
-                        role: KITCHEN_SPEC.role,
-                        label: KITCHEN_SPEC.label,
-                        reachable: true,
-                        states: { onOff: false },
-                        options: {},
-                    },
-                },
-            });
-            for (;;) {
-                const frame = await session.client.next(10_000);
-                if (frame.message_id === "u0") {
-                    assert.equal(frame.error_code, undefined, JSON.stringify(frame));
-                    break;
-                }
-            }
-
-            assert.ok(
-                session.logged.some(
-                    line =>
-                        line.includes("Re-adopt a Matter accessory…") &&
-                        line.includes(uniqueIdFor(KITCHEN)) &&
-                        line.includes(uniqueIdFor(REPLACEMENT_DEVICE_ID)),
-                ),
-                `expected the readopt nudge naming both identities, got ${session.logged.join(" | ")}`,
-            );
-            // ...and it has to leave stdout. The node is launched by launchd,
-            // so `session.logged` is a terminal nobody is watching; §4.3
-            // `warnings` is what `export_bridge.py` mirrors into the Indigo
-            // event log, and this nudge is the whole discoverability moment
-            // for `Re-adopt a Matter accessory…`.
-            assert.ok(
-                session.bridge
-                    .getStatus()
-                    .warnings.some(line => line.includes("Re-adopt a Matter accessory…")),
-                `the nudge must ride StatusReport.warnings, got ${JSON.stringify(
-                    session.bridge.getStatus().warnings,
-                )}`,
-            );
-        } finally {
-            await session.close();
-        }
-    });
-
-    it("marks the old identity supersededBy the new one when remove and create arrive as two separate commands", async () => {
-        // #240 §3 steps 3/5: the plugin's future `replace()` sends
-        // `remove_endpoint` then `upsert_endpoint` as two SEPARATE commands, not
-        // one `attach` batch — this is the two-command half of a role change,
-        // and it is the ordinary path a role change actually takes.
-        const storagePath = storage();
-        const session = await boot(storagePath);
-        try {
-            await attach(session.client, "a0", [KITCHEN_SPEC]);
-
-            session.client.send({
-                message_id: "r0",
-                command: "remove_endpoint",
-                args: { indigoDeviceId: KITCHEN },
-            });
-            for (;;) {
-                const frame = await session.client.next(10_000);
-                if (frame.message_id === "r0") break;
-            }
-
-            // No supersededBy yet — the create has not happened (§3 step 3).
-            assert.equal(readMap(storagePath).endpoints[uniqueIdFor(KITCHEN)]?.supersededBy, undefined);
-
-            const newIdentity = `${uniqueIdFor(KITCHEN)}~2`;
-            session.client.send({
-                message_id: "u0",
-                command: "upsert_endpoint",
-                args: {
-                    endpoint: {
-                        indigoDeviceId: KITCHEN,
-                        publishedAs: newIdentity,
-                        role: "dimmableLight",
-                        label: "Kitchen Lamp",
-                        reachable: true,
-                        states: { onOff: false, level: 50 },
-                        options: {},
-                    },
-                },
-            });
-            for (;;) {
-                const frame = await session.client.next(10_000);
-                if (frame.message_id === "u0") {
-                    assert.equal(frame.error_code, undefined, JSON.stringify(frame));
-                    break;
-                }
-            }
-
-            const map = readMap(storagePath);
-            assert.equal(map.endpoints[uniqueIdFor(KITCHEN)]?.orphaned, true);
-            assert.equal(
-                map.endpoints[uniqueIdFor(KITCHEN)]?.supersededBy,
-                newIdentity,
-                "the create half landed as a SEPARATE command, and still paired with the removal",
-            );
-            assert.equal(map.endpoints[newIdentity]?.deviceId, KITCHEN);
-        } finally {
-            await session.close();
-        }
-    });
-
-    it("leaves the interim identity an ORDINARY orphan when a re-adopt replaces it (PR5 design E5)", async () => {
-        // PR5 design E2/E5: the device was recreated and re-exported under its OWN
-        // identity before the user noticed the empty room, so re-adopt has to
-        // remove THAT accessory and publish the orphaned one in its place.
-        // That is one removal plus one create for one device — the same shape
-        // as a supersede — but it is NOT one: the identity left behind was
-        // never replaced by a later generation of itself, its number is not
-        // retired, and PR5 design E5 rules it "itself re-adoptable later, which is
-        // harmless". Marking it superseded would hide it from the picker for
-        // good.
-        const storagePath = storage();
-        const session = await boot(storagePath);
-        const answered = async (messageId: string): Promise<void> => {
-            for (;;) {
-                const frame = await session.client.next(10_000);
-                if (frame.message_id === messageId) {
-                    // `error_code`, not `error` — the refusal frame's own key
-                    // (`ws-server.ts`'s `sendError`).
-                    assert.equal(frame.error_code, undefined, JSON.stringify(frame));
-                    return;
-                }
-            }
-        };
-        try {
-            await attach(session.client, "a0", [KITCHEN_SPEC]);
-
-            // The original accessory is un-exported: its identity is now an
-            // orphan, and its number is held for it (§3.3).
-            session.client.send({
-                message_id: "r0",
-                command: "remove_endpoint",
-                args: { indigoDeviceId: KITCHEN },
-            });
-            await answered("r0");
-
-            // The user recreates the device and exports it normally — a
-            // SECOND, brand-new accessory under its own default identity.
-            const REPLACEMENT_DEVICE_ID = 700_000_004;
-            await upsertOne(session.client, "u0", REPLACEMENT_DEVICE_ID);
-
-            // Then notices the empty room and re-adopts, which
-            // `ExportBridge.replace()` sends as remove-then-upsert.
-            session.client.send({
-                message_id: "r1",
-                command: "remove_endpoint",
-                args: { indigoDeviceId: REPLACEMENT_DEVICE_ID },
-            });
-            await answered("r1");
-            session.client.send({
-                message_id: "u1",
-                command: "upsert_endpoint",
-                args: {
-                    endpoint: {
-                        indigoDeviceId: REPLACEMENT_DEVICE_ID,
-                        publishedAs: uniqueIdFor(KITCHEN),
-                        role: "onOffLight",
-                        label: "Kitchen Lamp (new)",
-                        reachable: true,
-                        states: { onOff: false },
-                        options: {},
-                    },
-                },
-            });
-            await answered("u1");
-
-            const interim = uniqueIdFor(REPLACEMENT_DEVICE_ID);
-            const record = readMap(storagePath).endpoints[interim];
-            assert.equal(record?.orphaned, true, "the interim accessory did leave the ecosystems");
-            assert.equal(
-                record?.supersededBy,
-                undefined,
-                "but nothing SUPERSEDED it — no later generation of it was ever published",
-            );
-            assert.ok(
-                session.bridge.listOrphans().some(orphan => orphan.uniqueId === interim),
-                `§3.12 must go on offering it (PR5 design E5), got ${JSON.stringify(session.bridge.listOrphans())}`,
-            );
+            assert.equal(map.endpoints[uniqueIdFor(KITCHEN)]?.orphaned, undefined, "never orphaned — a fresh add");
         } finally {
             await session.close();
         }
     });
 
     it("does not pair an unrelated upsert against a stale removal of a DIFFERENT device", async () => {
-        // The `#lastRemoved` bookkeeping is keyed per device id — removing
-        // KITCHEN must never taint a plain, unrelated create for some other,
-        // brand-new device.
+        // `#lastRemoved` is only ever populated by a SOFT (reconcile) removal
+        // — `remove_endpoint`'s hard destroy never touches it — but the
+        // guard is keyed per device id regardless: removing KITCHEN must
+        // never taint a plain, unrelated create for some other, brand-new
+        // device.
         const storagePath = storage();
         const session = await boot(storagePath);
         try {
@@ -1772,9 +1494,9 @@ describe("issues #219/#240 at node level: re-adopt and the two-command supersede
 
             assert.equal(readMap(storagePath).endpoints[uniqueIdFor(UNRELATED_DEVICE_ID)]?.supersededBy, undefined);
             assert.equal(
-                readMap(storagePath).endpoints[uniqueIdFor(KITCHEN)]?.supersededBy,
+                readMap(storagePath).endpoints[uniqueIdFor(KITCHEN)],
                 undefined,
-                "KITCHEN's own removal must also stay an ordinary orphan — nothing paired with it",
+                "KITCHEN's own removal destroyed the entry outright — nothing left to pair with",
             );
         } finally {
             await session.close();
@@ -1782,13 +1504,13 @@ describe("issues #219/#240 at node level: re-adopt and the two-command supersede
     });
 });
 
-describe("restore binds to the DRIVING device, and never to a retired identity (issues #219/#240)", () => {
+describe("restore binds to the DRIVING device, and never to a retired identity (issue #240)", () => {
     it("restores an accessory bound to the map's deviceId, not to its key", async () => {
-        // The whole of #219 in the one place nothing else covers: `restore()`
-        // runs BEFORE any attach, from the file alone, so a bug here is a
-        // re-adopted accessory that comes back bound to the DELETED device —
-        // commands routed nowhere and state pushed by nobody, silently, until
-        // the plugin's next attach happens to correct it.
+        // The one place nothing else covers: `restore()` runs BEFORE any
+        // attach, from the file alone, so a bug here is a migrated accessory
+        // that comes back bound to the OLD device — commands routed nowhere
+        // and state pushed by nobody, silently, until the plugin's next
+        // attach happens to correct it.
         const storagePath = storage();
         const numbers = await seedTwoAccessories(storagePath);
         const REPLACEMENT_DEVICE_ID = 700_000_010;
@@ -1826,7 +1548,7 @@ describe("restore binds to the DRIVING device, and never to a retired identity (
 
             // The rest needs an attached client (`set_state` and the §5
             // command event both require one), so attach with exactly what a
-            // re-adopted export sends. It must be an UPDATE of the restored
+            // migrated export sends. It must be an UPDATE of the restored
             // endpoint, not a recreate — the number proves which.
             await attach(session.client, "a0", [{
                 ...KITCHEN_SPEC,
@@ -1913,111 +1635,4 @@ describe("restore binds to the DRIVING device, and never to a retired identity (
         }
     });
 
-    it("still offers an ordinary orphan after a restart when no create ever paired with it (PR5 design E7)", async () => {
-        // E7: the bridge or plugin dies between a supersede's remove and its
-        // add. `#lastRemoved` is in-memory only, so the pairing is lost — and
-        // the ruling is that the survivor must be an ORDINARY orphan, offered
-        // by §3.12 like any other, rather than a speculatively-retired one.
-        const storagePath = storage();
-        const first = await boot(storagePath);
-        try {
-            await attach(first.client, "a0", [KITCHEN_SPEC]);
-            first.client.send({
-                message_id: "r0",
-                command: "remove_endpoint",
-                args: { indigoDeviceId: KITCHEN },
-            });
-            for (;;) {
-                const frame = await first.client.next(10_000);
-                if (frame.message_id === "r0") {
-                    assert.equal(frame.error_code, undefined, JSON.stringify(frame));
-                    break;
-                }
-            }
-        } finally {
-            await first.close();
-        }
-        // The create never happens — the process ends here.
-
-        const second = await boot(storagePath);
-        try {
-            assert.equal(
-                readMap(storagePath).endpoints[uniqueIdFor(KITCHEN)]?.supersededBy,
-                undefined,
-                "a supersession marker must never be written speculatively",
-            );
-            assert.deepEqual(
-                second.bridge.listOrphans().map(orphan => orphan.uniqueId),
-                [uniqueIdFor(KITCHEN)],
-                `§3.12 must go on offering it, got ${JSON.stringify(second.bridge.listOrphans())}`,
-            );
-            assert.equal(
-                childOf(second.bridge.server, KITCHEN),
-                undefined,
-                "offered for re-adoption, but NOT rebuilt — it is orphaned",
-            );
-        } finally {
-            await second.close();
-        }
-    });
-
-    it("supersedes a SECOND time: indigo-N~2 retires when indigo-N~3 arrives", async () => {
-        // The gap a "does the new identity have a suffix?" test would leave:
-        // a role change on an already-role-changed export. Driven through the
-        // two-command path, which is the one a real `replace()` takes.
-        const storagePath = storage();
-        const session = await boot(storagePath);
-        const GEN2 = `${uniqueIdFor(KITCHEN)}~2`;
-        const GEN3 = `${uniqueIdFor(KITCHEN)}~3`;
-        try {
-            await attach(session.client, "a0", [{ ...KITCHEN_SPEC, publishedAs: GEN2 }]);
-
-            session.client.send({
-                message_id: "r0",
-                command: "remove_endpoint",
-                args: { indigoDeviceId: KITCHEN },
-            });
-            for (;;) {
-                const frame = await session.client.next(10_000);
-                if (frame.message_id === "r0") {
-                    assert.equal(frame.error_code, undefined, JSON.stringify(frame));
-                    break;
-                }
-            }
-
-            session.client.send({
-                message_id: "u0",
-                command: "upsert_endpoint",
-                args: {
-                    endpoint: {
-                        indigoDeviceId: KITCHEN,
-                        publishedAs: GEN3,
-                        role: "dimmableLight",
-                        label: "Kitchen Lamp",
-                        reachable: true,
-                        states: { onOff: false, level: 40 },
-                        options: {},
-                    },
-                },
-            });
-            for (;;) {
-                const frame = await session.client.next(10_000);
-                if (frame.message_id === "u0") {
-                    assert.equal(frame.error_code, undefined, JSON.stringify(frame));
-                    break;
-                }
-            }
-
-            const map = readMap(storagePath);
-            assert.equal(map.endpoints[GEN2]?.supersededBy, GEN3);
-            assert.equal(map.endpoints[GEN2]?.orphaned, true);
-            assert.deepEqual(
-                session.bridge.listOrphans().map(orphan => orphan.uniqueId),
-                [],
-                "a retired identity is never offered for re-adoption",
-            );
-        } finally {
-            await session.close();
-        }
-    });
 });

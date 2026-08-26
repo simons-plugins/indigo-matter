@@ -130,9 +130,9 @@ export function indigoDeviceIdFrom(uniqueId: string): number | undefined {
  * or mutated.
  *
  * **It is NOT where a live endpoint's id comes from, and reverting it to that
- * would be silent.** Since issues #219/#240 an `Endpoint.id` is built from
+ * would be silent.** Since issue #240 an `Endpoint.id` is built from
  * `spec.publishedAs` (`createEndpoint`), which merely DEFAULTS to this
- * derivation — a re-adopted or role-changed accessory publishes something
+ * derivation — a migrated or role-changed accessory publishes something
  * else, and rebuilding the id from `indigoDeviceId` here would hand it a
  * different `Endpoint.id`, i.e. a different matter.js endpoint number, i.e. a
  * duplicate accessory in every paired ecosystem. Neither this nor
@@ -146,9 +146,9 @@ export const endpointIdFor = uniqueIdFor;
 /**
  * `SerialNumber` must differ from `UniqueID` (Matter rejects equal values), so
  * the `indigo-` prefix is stripped here and kept there. Takes the *published*
- * identity, not the driving device id (issues #219/#240): a re-adopted
- * accessory keeps publishing the OLD serial number, because §6.3's identity
- * flow now runs through `publishedAs`, not `indigoDeviceId`, directly.
+ * identity, not the driving device id (issue #240): a migrated accessory
+ * keeps publishing the identity it inherited, because §6.3's identity flow
+ * runs through `publishedAs`, not `indigoDeviceId`, directly.
  */
 export function serialNumberFrom(publishedAs: string): string {
     return publishedAs.slice(UNIQUE_ID_PREFIX.length);
@@ -587,8 +587,8 @@ interface CommandSink {
  * roles. This map is that closure, keyed on the one identifier a behaviour can
  * always reach: `this.endpoint.id`, which IS the endpoint's `spec.publishedAs`
  * (see {@link createEndpoint}) — the CommandSink value carries `indigoDeviceId`
- * separately (issues #219/#240) precisely because, under a re-adopted
- * identity, the two are no longer a pure function of one another.
+ * separately (issue #240) precisely because, under a migrated identity, the
+ * two are no longer a pure function of one another.
  *
  * Registration and teardown both live in {@link watchCommands} so the lifetime
  * is identical to the observable listeners': one place removes both, and a
@@ -2639,11 +2639,10 @@ export async function applyStates(
     // gets.
     const { battery, rest } = splitBattery(states);
     if (battery !== undefined && !hasBattery) {
-        // Passed in by the caller (issues #219/#240) rather than derived from
-        // `endpoint.id`: under a re-adopted published identity, `endpoint.id`
+        // Passed in by the caller (issue #240) rather than derived from
+        // `endpoint.id`: under a migrated published identity, `endpoint.id`
         // no longer parses back to the device driving it, and deriving from it
-        // here would name the WRONG device — the old, deleted one — in the
-        // refusal.
+        // here would name the WRONG device in the refusal.
         refuseBatteryLevelWithoutBattery(indigoDeviceId);
     }
     // A consumed `batteryLevel` counts as consumption for refusal purposes
@@ -2938,7 +2937,7 @@ export function watchCommands(
 ): () => void {
     const teardown: (() => void)[] = [];
     // The published identity, not `endpointIdFor(spec.indigoDeviceId)`: under a
-    // re-adopted identity (issue #219) the two differ, and `COMMAND_SINKS` is
+    // migrated identity (issue #240) the two differ, and `COMMAND_SINKS` is
     // keyed on `endpoint.id`/`Endpoint.id`, which IS `spec.publishedAs` (see
     // {@link createEndpoint}) — the sink has to be found under the same key.
     const endpointId = spec.publishedAs;

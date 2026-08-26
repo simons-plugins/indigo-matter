@@ -766,9 +766,9 @@ If the device you migrate onto already has its own exported accessory, THAT
 accessory is removed from every ecosystem and replaced by the migrated one —
 the dialog marks it and warns you before you confirm.
 
-It only works onto a device that can take the accessory's role, for the same
-reason re-adopt below has that limit — export the device normally instead if
-it cannot, and accept that it becomes a new accessory.
+It only works onto a device that can take the accessory's role — export the
+device normally instead if it cannot, and accept that it becomes a new
+accessory.
 
 The old Indigo device is not locked out afterwards — you can export it again
 later — but re-exporting it makes a NEW accessory under a fresh identity; it
@@ -776,40 +776,21 @@ does not steal back the identity you just migrated away.
 
 ### If you delete and recreate an exported device
 
-Deleting an Indigo device that is exported does not touch your ecosystems —
-its accessory keeps sitting in its room, still remembered, just no longer
-driven by anything. Re-creating the device (or restoring it a different way)
-gets you a NEW Indigo device with a NEW id, and Indigo has no way to know it
-is "the same" device you deleted, so exporting it normally builds a SECOND,
-brand-new accessory — the old one is still there, in its old room, doing
-nothing.
+Deleting an Indigo device that is exported removes its accessory from every
+paired ecosystem — this happens as soon as the plugin notices the deletion
+(immediately if it is running, at the next reconnect if it was not). There
+is nothing left behind to manage: the accessory is gone, not merely
+un-driven.
 
-**`Plugin ▸ Re-adopt a Matter accessory…`** is the way back — for when the
-old device is already gone, so migrating (above) is no longer an option.
-Pick the left-behind accessory (it lists what role it was, and when it was
-un-exported), pick the Indigo device that should drive it now, and confirm.
-The accessory returns under its original identity and number, and no
-duplicate is created — but by the time an accessory is left behind at all,
-most ecosystems have already processed the removal: Apple Home purges an
-accessory's room, name and scene associations within moments of noticing it
-is gone. So expect the accessory to come back in the Default Room under a
-default name, with any scene or automation that referenced it needing to be
-rebuilt. Room and name survive intact only when no ecosystem ever gets the
-chance to notice the removal — which is exactly what migrating is for, while
-the old device still exists.
-
-It only works when the replacement device can take the SAME role the
-accessory already has — a plug can be re-adopted onto another plug-like
-device, but not onto a light. If it cannot, export the device normally
-instead and accept that it becomes a new accessory.
-
-**One thing re-adopt cannot fix:** an accessory left behind by a plugin
-version **older than 2026.16.2** has no role or name recorded against it —
-that version deleted the record on un-export instead of keeping it. The
-menu still lists it, so you can see its accessory number is spoken for, but
-there is nothing left to match a replacement device against, so it cannot be
-re-adopted; export the device normally and accept a new accessory. Nothing
-un-exported by 2026.16.2 or later has this problem.
+Re-creating the device (or restoring it a different way) gets you a NEW
+Indigo device with a NEW id, and Indigo has no way to know it is "the same"
+device you deleted — exporting it normally builds a brand-new accessory,
+in the Default Room under a default name, with any scene or automation that
+referenced the old one needing to be rebuilt. If the old device still
+exists at the time you want to move its accessory onto a replacement, use
+**Migrate** (above) instead — it is the only way to carry room, name, scenes
+and automations across, and only works while the old device has not yet
+been deleted.
 
 ### Which ecosystems this actually works with
 

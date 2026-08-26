@@ -106,10 +106,12 @@ describe("supersedes() — only a later generation retires an identity (issue #2
         assert.equal(supersedes("indigo-7~2", "indigo-7~3"), true);
     });
 
-    it("is FALSE for the same generation — the re-adopt shape", () => {
-        // PR5 design E2/E5: one device, one removal, one create, and the
-        // identity left behind is an ordinary orphan the picker must go on
-        // offering. Getting this wrong hides a re-adoptable accessory for ever.
+    it("is FALSE for the same generation, or a different device's identity", () => {
+        // Migrating an accessory onto an already-exported device (issue
+        // #246) is also one removal plus one create for one device, and the
+        // identity left behind must be an ordinary orphan, not a retired
+        // one. Getting this wrong would resurrect an old-role accessory at
+        // the next restart.
         assert.equal(supersedes("indigo-7", "indigo-7"), false);
         assert.equal(supersedes("indigo-7", "indigo-99"), false);
         assert.equal(supersedes("indigo-7~2", "indigo-7~2"), false);

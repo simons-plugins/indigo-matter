@@ -652,15 +652,12 @@ describe("EndpointMapStore.forget — un-export without losing the number (issue
     it("marks the entry orphaned, keeping BOTH the restoration half and the identity half", () => {
         // ⊗ The other half of `restorable`. Without it a device the user
         // un-exported stayed restorable for ever and was rebuilt-then-removed on
-        // every boot. Deleting role/label (the pre-#219 behaviour) worked too but
-        // threw away the only evidence a future re-adopt UI could match a
-        // recreated device against — so #219 marks `orphaned` instead of erasing
-        // anything. Deleting the ENTRY instead would also be wrong: §3.3 retains
-        // the allocation so a re-export comes back as the same accessory rather
-        // than a new one in every paired ecosystem.
+        // every boot. #219 marks `orphaned` rather than erasing role/label — they
+        // cost nothing to keep. Deleting the ENTRY instead would also be wrong:
+        // §3.3 retains the allocation so a re-export comes back as the same
+        // accessory rather than a new one in every paired ecosystem.
         const dir = storage();
-        const now = new Date("2026-08-18T07:21:04.000Z");
-        const store = new EndpointMapStore(dir, undefined, () => now);
+        const store = new EndpointMapStore(dir);
         store.load();
         store.check([
             { uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Lamp" },
@@ -679,7 +676,6 @@ describe("EndpointMapStore.forget — un-export without losing the number (issue
                 role: "onOffLight",
                 label: "Lamp",
                 orphaned: true,
-                orphanedAt: now.toISOString(),
             },
             "indigo-2": { number: 3, role: "dimmableLight", label: "Other" },
         });
@@ -697,9 +693,6 @@ describe("EndpointMapStore.forget — un-export without losing the number (issue
         assert.deepEqual(store.restorable(), [
             { uniqueId: "indigo-1", endpointNumber: 2, indigoDeviceId: 1, role: "onOffLight", label: "Lamp" },
         ]);
-        // `orphanedAt` is dropped along with `orphaned` itself: a live device
-        // is not orphaned, so a stamp saying when it WAS would be stale
-        // evidence masquerading as current.
         assert.deepEqual(mapFileIn(dir).endpoints, {
             "indigo-1": { number: 2, role: "onOffLight", label: "Lamp" },
         });
@@ -754,7 +747,7 @@ describe("EndpointMapStore.forget — un-export without losing the number (issue
 });
 
 describe("EndpointMapStore.destroy — a confirmed-gone device loses its record entirely (issue #274)", () => {
-    it("deletes the entry outright: no number, no role/label, not restorable, not offered for re-adopt", () => {
+    it("deletes the entry outright: no number, no role/label, not restorable", () => {
         const dir = storage();
         const store = new EndpointMapStore(dir);
         store.load();
@@ -769,7 +762,6 @@ describe("EndpointMapStore.destroy — a confirmed-gone device loses its record 
         assert.deepEqual(store.restorable(), [
             { uniqueId: "indigo-2", endpointNumber: 3, indigoDeviceId: 2, role: "dimmableLight", label: "Other" },
         ]);
-        assert.deepEqual(store.orphans(), [], "destroyed, not orphaned — nothing left to offer the re-adopt picker");
         assert.deepEqual(mapFileIn(dir).endpoints, {
             "indigo-2": { number: 3, role: "dimmableLight", label: "Other" },
         });
@@ -781,11 +773,10 @@ describe("EndpointMapStore.destroy — a confirmed-gone device loses its record 
         store.load();
         store.check([{ uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Lamp" }]);
         store.forget(["indigo-1"]);
-        assert.deepEqual(store.orphans().map(orphan => orphan.uniqueId), ["indigo-1"]);
+        assert.equal(mapFileIn(dir).endpoints["indigo-1"]?.orphaned, true);
 
         assert.equal(store.destroy(["indigo-1"]), 1);
 
-        assert.deepEqual(store.orphans(), []);
         assert.equal(mapFileIn(dir).endpoints["indigo-1"], undefined);
     });
 
@@ -1322,7 +1313,7 @@ describe("battery (issue #220)", () => {
     });
 });
 
-describe("the driving device, the orphan date and supersession (issues #219/#240)", () => {
+describe("the driving device and supersession (issue #240)", () => {
     it("records deviceId for a live entry and REPLACES it when the driver changes", () => {
         const dir = storage();
         const store = new EndpointMapStore(dir);
@@ -1335,9 +1326,8 @@ describe("the driving device, the orphan date and supersession (issues #219/#240
             "indigo-1": { number: 2, role: "onOffLight", label: "Lamp", deviceId: 100 },
         });
 
-        // A driver change with no orphan step first — a #246 migrate's shape
-        // (a #219 re-adopt would have seen forget() in between): the SAME
-        // identity, now driven by a DIFFERENT device.
+        // A driver change with no orphan step first — a #246 migrate's shape:
+        // the SAME identity, now driven by a DIFFERENT device.
         store.check([
             { uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Lamp", deviceId: 200 },
         ]);
@@ -1358,7 +1348,7 @@ describe("the driving device, the orphan date and supersession (issues #219/#240
                 endpoints: {
                     "indigo-1": { number: 2, role: "onOffLight", label: "Kitchen Lamp" },
                     // The KEY alone would parse to device id 2 — `deviceId` must win.
-                    "indigo-2": { number: 3, role: "dimmableLight", label: "Re-adopted", deviceId: 999 },
+                    "indigo-2": { number: 3, role: "dimmableLight", label: "Migrated", deviceId: 999 },
                 },
             }),
         );
@@ -1372,7 +1362,7 @@ describe("the driving device, the orphan date and supersession (issues #219/#240
                 endpointNumber: 3,
                 indigoDeviceId: 999,
                 role: "dimmableLight",
-                label: "Re-adopted",
+                label: "Migrated",
             },
         ]);
     });
@@ -1391,24 +1381,6 @@ describe("the driving device, the orphan date and supersession (issues #219/#240
             ["indigo-1~2"],
             "the superseded identity must never come back — its number is retired for good",
         );
-    });
-
-    it("stamps orphanedAt from the injected clock when forget() marks an entry", () => {
-        const dir = storage();
-        const now = new Date("2026-08-18T07:21:04.000Z");
-        const store = new EndpointMapStore(dir, undefined, () => now);
-        store.load();
-        store.check([{ uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Lamp" }]);
-
-        store.forget(["indigo-1"]);
-
-        assert.deepEqual(mapFileIn(dir).endpoints["indigo-1"], {
-            number: 2,
-            role: "onOffLight",
-            label: "Lamp",
-            orphaned: true,
-            orphanedAt: now.toISOString(),
-        });
     });
 
     it("marks supersededBy only when the caller says the removal was a supersession", () => {
@@ -1431,58 +1403,7 @@ describe("the driving device, the orphan date and supersession (issues #219/#240
         assert.equal(mapFileIn(dir).endpoints["indigo-2"]?.supersededBy, "indigo-2~2");
     });
 
-    it("orphans() omits superseded entries but includes bare no-role/label ones (PR5 design E4)", () => {
-        const dir = storage();
-        writeFileSync(
-            join(dir, ENDPOINT_MAP_FILE),
-            JSON.stringify({
-                version: 2,
-                endpoints: {
-                    "indigo-1": {
-                        number: 2,
-                        role: "onOffLight",
-                        label: "Kitchen Lamp",
-                        orphaned: true,
-                        orphanedAt: "2026-08-01T00:00:00.000Z",
-                    },
-                    "indigo-2": {
-                        number: 3,
-                        role: "dimmableLight",
-                        label: "Lounge Lamp",
-                        orphaned: true,
-                        supersededBy: "indigo-2~2",
-                    },
-                    // Pre-2026.16.2: an older plugin's forget() deleted role/label.
-                    "indigo-9": { number: 7, orphaned: true },
-                    // Live — not orphaned at all.
-                    "indigo-4": { number: 8, role: "onOffLight", label: "Live One" },
-                },
-            }),
-        );
-        const store = new EndpointMapStore(dir);
-        store.load();
-
-        // Superseded "indigo-2" is excluded (not re-adoptable); the live
-        // "indigo-4" is excluded (not orphaned); the bare "indigo-9" IS
-        // included, per PR5 design E4 — shown so the picker can tell the user its
-        // number is reserved and why it cannot be re-adopted, rather than
-        // hiding it.
-        assert.deepEqual(store.orphans(), [
-            {
-                uniqueId: "indigo-1",
-                number: 2,
-                role: "onOffLight",
-                label: "Kitchen Lamp",
-                orphanedAt: "2026-08-01T00:00:00.000Z",
-            },
-            {
-                uniqueId: "indigo-9",
-                number: 7,
-            },
-        ]);
-    });
-
-    it("clears orphaned and adopts the new deviceId the first time a re-adopted identity is live", () => {
+    it("clears orphaned and adopts the new deviceId the first time a retargeted identity is live", () => {
         const dir = storage();
         const logged: string[] = [];
         const store = new EndpointMapStore(dir, message => logged.push(message));
@@ -1500,75 +1421,11 @@ describe("the driving device, the orphan date and supersession (issues #219/#240
         assert.deepEqual(
             mapFileIn(dir).endpoints["indigo-1"],
             { number: 2, role: "onOffLight", label: "Lamp", deviceId: 200 },
-            "orphaned AND orphanedAt are gone, and the device id is the NEW driver",
+            "orphaned is gone, and the device id is the NEW driver",
         );
         assert.ok(
             logged.some(line => line.includes("is now driven by Indigo device 200, replacing device 100")),
-            `expected the re-adopt log line, got ${JSON.stringify(logged)}`,
-        );
-    });
-
-    it("nudges towards Re-adopt when a NEW identity's role+label match an existing orphan (PR5 design owner ruling 4)", () => {
-        const dir = storage();
-        const logged: string[] = [];
-        const store = new EndpointMapStore(dir, message => logged.push(message));
-        store.load();
-        store.check([
-            { uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Kitchen Lamp", deviceId: 100 },
-        ]);
-        store.forget(["indigo-1"]);
-        logged.length = 0;
-
-        // A DIFFERENT device, exported under a BRAND-NEW identity, with the
-        // same role and the same name — the "deleted, recreated, re-exported"
-        // case #219 exists for.
-        store.check([
-            { uniqueId: "indigo-2", endpointNumber: 5, role: "onOffLight", label: "Kitchen Lamp", deviceId: 200 },
-        ]);
-
-        assert.ok(
-            logged.some(line => line.includes("Re-adopt a Matter accessory…") && line.includes("indigo-1")),
-            `expected the readopt nudge, got ${JSON.stringify(logged)}`,
-        );
-    });
-
-    it("does not nudge for an UPDATE to an existing identity", () => {
-        const dir = storage();
-        const logged: string[] = [];
-        const store = new EndpointMapStore(dir, message => logged.push(message));
-        store.load();
-        store.check([{ uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Kitchen Lamp" }]);
-        store.forget(["indigo-1"]);
-        logged.length = 0;
-
-        // Re-adding the SAME identity — an ordinary re-export, not a new one.
-        store.check([{ uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Kitchen Lamp" }]);
-
-        assert.ok(
-            !logged.some(line => line.includes("Re-adopt a Matter accessory…")),
-            `did not expect a nudge for an existing identity, got ${JSON.stringify(logged)}`,
-        );
-    });
-
-    it("does not nudge against a SUPERSEDED orphan", () => {
-        const dir = storage();
-        const logged: string[] = [];
-        const store = new EndpointMapStore(dir, message => logged.push(message));
-        store.load();
-        store.check([{ uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Lamp" }]);
-        store.check([{ uniqueId: "indigo-1~2", endpointNumber: 5, role: "dimmableLight", label: "Lamp" }]);
-        store.forget(["indigo-1"], { supersededBy: "indigo-1~2" });
-        logged.length = 0;
-
-        // Same role+label as the SUPERSEDED indigo-1 — must not nudge towards
-        // resurrecting a retired role under its retired number.
-        store.check([
-            { uniqueId: "indigo-9", endpointNumber: 9, role: "onOffLight", label: "Lamp", deviceId: 900 },
-        ]);
-
-        assert.ok(
-            !logged.some(line => line.includes("Re-adopt a Matter accessory…")),
-            `did not expect a nudge against a superseded record, got ${JSON.stringify(logged)}`,
+            `expected the driver-change log line, got ${JSON.stringify(logged)}`,
         );
     });
 
@@ -1577,8 +1434,8 @@ describe("the driving device, the orphan date and supersession (issues #219/#240
         // the default `indigo-<deviceId>` the supersession retired, so the
         // identity is LIVE again and the marker saying another one replaced
         // it is now false. Left behind, it would hide this record from
-        // `orphans()` the NEXT time it was un-exported — an ordinary orphan
-        // that could never be re-adopted.
+        // `restorable()` the NEXT time it was un-exported — an ordinary
+        // orphan that could never be rebuilt.
         const dir = storage();
         const store = new EndpointMapStore(dir);
         store.load();
@@ -1600,10 +1457,10 @@ describe("the driving device, the orphan date and supersession (issues #219/#240
         );
 
         store.forget(["indigo-1"]);
-        assert.deepEqual(
-            store.orphans().map(orphan => orphan.uniqueId),
-            ["indigo-1"],
-            "un-exported again, it is an ORDINARY orphan the re-adopt picker can offer",
+        assert.equal(
+            mapFileIn(dir).endpoints["indigo-1"]?.supersededBy,
+            undefined,
+            "un-exported again, it is an ORDINARY orphan, not a superseded one",
         );
     });
 
@@ -1665,57 +1522,13 @@ describe("the driving device, the orphan date and supersession (issues #219/#240
     });
 });
 
-describe("re-adopt notices reach the client, not just stdout (PR5 design §4.5, issues #219/#240)", () => {
+describe("endpoint-map notices reach the client, not just stdout (issue #240)", () => {
     // `this.log` is stdout and the node is launched by launchd, so a line
-    // written only there is a line no user will ever see. Each of these three
-    // was stdout-only; `StatusReport.warnings` is the one channel
+    // written only there is a line no user will ever see. Each of these was
+    // stdout-only; `StatusReport.warnings` is the one channel
     // `export_bridge.py` mirrors into the Indigo event log.
 
-    it("puts the Re-adopt nudge on the warnings channel", () => {
-        const store = new EndpointMapStore(storage());
-        store.load();
-        store.check([
-            { uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Kitchen Lamp", deviceId: 100 },
-        ]);
-        store.forget(["indigo-1"]);
-
-        store.check([
-            { uniqueId: "indigo-2", endpointNumber: 5, role: "onOffLight", label: "Kitchen Lamp", deviceId: 200 },
-        ]);
-
-        assert.ok(
-            store.warnings.some(line => line.includes("Re-adopt a Matter accessory…")),
-            `the nudge must ride StatusReport.warnings, got ${JSON.stringify(store.warnings)}`,
-        );
-    });
-
-    it("says the nudge once, however many attaches follow", () => {
-        const store = new EndpointMapStore(storage());
-        store.load();
-        store.check([
-            { uniqueId: "indigo-1", endpointNumber: 2, role: "onOffLight", label: "Kitchen Lamp", deviceId: 100 },
-        ]);
-        store.forget(["indigo-1"]);
-        store.check([
-            { uniqueId: "indigo-2", endpointNumber: 5, role: "onOffLight", label: "Kitchen Lamp", deviceId: 200 },
-        ]);
-        store.forget(["indigo-2"]);
-        // A second brand-new identity matching the SAME orphan: the nudge
-        // names indigo-1 again, and the channel must not accumulate a copy
-        // per attach — a warning set that grows re-logs plugin-side every
-        // time it changes (`_report_node_warnings` latches on the SET).
-        store.check([
-            { uniqueId: "indigo-3", endpointNumber: 6, role: "onOffLight", label: "Kitchen Lamp", deviceId: 300 },
-        ]);
-
-        assert.equal(
-            store.warnings.filter(line => line.includes("Re-adopt a Matter accessory…")).length,
-            2,
-            `one notice per NEW identity, never a repeat: ${JSON.stringify(store.warnings)}`,
-        );
-    });
-
-    it("puts the landed-re-adopt confirmation on the warnings channel", () => {
+    it("puts the driven-by-a-different-device confirmation on the warnings channel", () => {
         const store = new EndpointMapStore(storage());
         store.load();
         store.check([
@@ -1774,45 +1587,12 @@ describe("re-adopt notices reach the client, not just stdout (PR5 design §4.5, 
 });
 
 describe("a map entry that cannot be trusted is named, never silently used (PR5 design E11/E12)", () => {
-    it("does not offer an orphan whose key parsePublishedId refuses", () => {
-        // The picker writes the row's key into the plugin's ExportStore as a
-        // `publishedAs`, and the node refuses an unlawful one at the NEXT
-        // attach with `malformed_args` — which stops every export, not just
-        // this one. `restorable()` already declines such an entry (PR5 design E11); the
-        // list feeding a user's choice must too.
-        const dir = storage();
-        writeFileSync(
-            join(dir, ENDPOINT_MAP_FILE),
-            JSON.stringify({
-                version: ENDPOINT_MAP_VERSION,
-                endpoints: {
-                    "indigo-1": { number: 2, role: "onOffLight", label: "Lamp", orphaned: true },
-                    // `Number("indigo-1e3")` would coerce; `parsePublishedId` refuses.
-                    "indigo-1e3": { number: 3, role: "onOffLight", label: "Not Ours", orphaned: true },
-                    "made-up-key": { number: 4, role: "onOffLight", label: "Mystery", orphaned: true },
-                },
-            }),
-        );
-        const store = new EndpointMapStore(dir);
-        store.load();
-
-        assert.deepEqual(
-            store.orphans().map(orphan => orphan.uniqueId),
-            ["indigo-1"],
-        );
-        for (const key of ["indigo-1e3", "made-up-key"]) {
-            assert.ok(
-                store.warnings.some(line => line.includes(JSON.stringify(key))),
-                `${key} must be named, not merely dropped: ${JSON.stringify(store.warnings)}`,
-            );
-        }
-    });
-
     it("says so when a present-but-unusable supersededBy is discarded", () => {
-        // The marker's LOSS re-arms a retired identity as an ordinary re-adopt
-        // candidate, and re-adopting it resurrects an old-role accessory under
-        // a number every paired ecosystem has already processed a removal for.
-        // Tolerating the field is right; losing it in silence is not.
+        // The marker's LOSS re-arms a retired identity as an ordinary,
+        // rebuildable one, and rebuilding it resurrects an old-role accessory
+        // under a number every paired ecosystem has already processed a
+        // removal for. Tolerating the field is right; losing it in silence
+        // is not.
         const dir = storage();
         writeFileSync(
             join(dir, ENDPOINT_MAP_FILE),
@@ -1832,7 +1612,6 @@ describe("a map entry that cannot be trusted is named, never silently used (PR5 
         const store = new EndpointMapStore(dir);
         store.load();
 
-        assert.equal(store.orphans().length, 1, "it IS re-adoptable again — that is the point");
         assert.ok(
             store.warnings.some(
                 line => line.includes("unusable supersededBy") && line.includes("indigo-1"),
@@ -1851,7 +1630,7 @@ describe("a map entry that cannot be trusted is named, never silently used (PR5 
         const reloaded = new EndpointMapStore(dir);
         reloaded.load();
 
-        assert.equal(reloaded.orphans().length, 1);
+        assert.equal(mapFileIn(dir).endpoints["indigo-1"]?.orphaned, true);
         assert.deepEqual(reloaded.warnings, [], "an ordinary orphan is not an oddity");
     });
 });

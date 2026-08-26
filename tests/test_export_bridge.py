@@ -289,7 +289,7 @@ class TestEndpointProvider:
         assert spec.published_as == "indigo-102"
 
     def test_a_spec_carries_the_stored_published_identity(self, bridge_mod, mock_logger, devices):
-        """A re-adopted or role-changed entry's identity rides along verbatim."""
+        """A migrated or role-changed entry's identity rides along verbatim."""
         h = Harness(bridge_mod, mock_logger, devices,
                     [ExportEntry(102, "dimmableLight", published_as="indigo-102~2")])
         (spec,) = h.bridge.endpoint_specs()
@@ -1163,7 +1163,7 @@ class TestConfirmedDeletedSweep:
         h.bridge._on_attached(_attached_status())
 
         assert h.store.get(999) is None, "confirmed-gone entries leave the allow-list"
-        assert h.client.only("remove_endpoint") == ("remove_endpoint", 999, "permanent")
+        assert h.client.only("remove_endpoint") == ("remove_endpoint", 999)
 
     def test_a_device_that_still_exists_but_fails_classify_is_left_alone(
             self, bridge_mod, mock_logger, devices, unbridgeable_role):
@@ -1205,7 +1205,7 @@ class TestConfirmedDeletedSweep:
         assert h.logger.error.called
         # The wire is still told, even though the store write failed — the
         # device is gone either way (mirrors `deviceDeleted`'s own ordering).
-        assert h.client.only("remove_endpoint") == ("remove_endpoint", 999, "permanent")
+        assert h.client.only("remove_endpoint") == ("remove_endpoint", 999)
 
 
 # ---------------------------------------------------------------------------

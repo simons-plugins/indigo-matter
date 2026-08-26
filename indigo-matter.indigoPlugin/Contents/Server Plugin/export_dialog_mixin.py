@@ -21,7 +21,7 @@ from ct_bounds import (GENERIC_MAX_MIREDS, GENERIC_MIN_MIREDS, SOURCE_GENERIC,
 from mired_units import kelvin_to_mireds, mireds_to_kelvin
 from plugin_constants import (
     EXCLUDED_OPTION_PREFIX, EXPORT_PICKER_LIMIT,
-    MENU_MANAGE_EXPORTS, MENU_MIGRATE_EXPORT, MENU_READOPT_EXPORT, MENU_UNPAIR_ECOSYSTEM,
+    MENU_MANAGE_EXPORTS, MENU_MIGRATE_EXPORT, MENU_UNPAIR_ECOSYSTEM,
     NO_MATCH_OPTION, NO_SELECTION_ID, NO_SELECTION_LABEL, ROW_ERROR_LABEL, TRUNCATED_OPTION,
     degrades_to_list_error,
 )
@@ -146,8 +146,8 @@ class ExportDialogMixin:
                         entry.indigo_device_id, entry.role)
                     continue
                 # eligible_target is the same classify-then-check-role dance
-                # the migrate/re-adopt pickers need (export_catalog.py); this
-                # site's own wording is a log line, not a dialog refusal.
+                # the migrate picker needs (export_catalog.py); this site's
+                # own wording is a log line, not a dialog refusal.
                 result = export_catalog.eligible_target(dev, plugin_id, entry.options, entry.role)
                 if isinstance(result, export_catalog.TargetRefusal):
                     if result.role_mismatch:
@@ -231,12 +231,11 @@ class ExportDialogMixin:
         the log at the moment it happened and nowhere at all afterwards. This
         dialog is where somebody goes when an accessory is behaving oddly.
 
-        Since issues #219/#240 the §4.3 ``warnings`` channel also carries the
-        node's one-shot NOTICES (``EndpointMapStore``'s ``#notices``: a
-        re-adoptable orphan spotted, a re-adopt landed, an entry this bridge
-        version cannot rebuild), so the wording below says "reports" rather
-        than naming them all persistence problems — several of them are not
-        problems at all.
+        Since issue #240 the §4.3 ``warnings`` channel also carries the
+        node's one-shot NOTICES (``EndpointMapStore``'s ``#notices`` — e.g. an
+        entry this bridge version cannot rebuild), so the wording below says
+        "reports" rather than naming them all persistence problems — several
+        of them are not problems at all.
         """
         if status is None:
             return ""
@@ -266,13 +265,6 @@ class ExportDialogMixin:
             # first item and the user is one click from unpairing whatever
             # happens to be second.
             values["fabric"] = NO_SELECTION_ID
-            return values
-        if menu_id == MENU_READOPT_EXPORT:
-            # Same reasoning as the unpair dialog above: both pickers lead
-            # with a no-selection row, so both fields are seeded to match it.
-            values["readoptOrphan"] = NO_SELECTION_ID
-            values["readoptDevice"] = NO_SELECTION_ID
-            values["readoptConfirm"] = False
             return values
         if menu_id == MENU_MIGRATE_EXPORT:
             # Issue #246 — same reasoning again: both pickers lead with a
@@ -332,7 +324,7 @@ class ExportDialogMixin:
         verdict = export_catalog.classify(dev, plugin_id, self._saved_options(device_id))
         if isinstance(verdict, export_catalog.Excluded):
             # export_catalog.excluded_row is the same loop-guard-omit (XAC6) /
-            # not-exportable-reason row ExportRecoveryMenuMixin._readopt_device_row
+            # not-exportable-reason row ExportRecoveryMenuMixin._migrate_device_row
             # builds — shared because the two pickers word this one outcome
             # identically.
             return export_catalog.excluded_row(verdict, device_id, name, mark, EXCLUDED_OPTION_PREFIX)
@@ -971,14 +963,14 @@ class ExportDialogMixin:
         rather than trying :func:`next_generation` exactly once.
 
         Reuses :meth:`export_recovery_menu_mixin.ExportRecoveryMenuMixin.
-        _readopt_identity_claimant` for the EFFECTIVE-identity comparison it
-        already makes for the same reason (``published_as`` where an entry
-        has one, otherwise the default
-        derivation it publishes under) — ``device_id``'s OWN entry never counts
-        as a claimant, so an unchanged existing entry stays free to keep
-        publishing the identity it already holds.
+        _identity_claimant` for the EFFECTIVE-identity comparison it already
+        makes for the same reason (``published_as`` where an entry has one,
+        otherwise the default derivation it publishes under) —
+        ``device_id``'s OWN entry never counts as a claimant, so an unchanged
+        existing entry stays free to keep publishing the identity it already
+        holds.
         """
-        while self._readopt_identity_claimant(identity, device_id) is not None:  # pylint: disable=no-member
+        while self._identity_claimant(identity, device_id) is not None:  # pylint: disable=no-member
             identity = next_generation(identity)
         return identity
 
@@ -1210,10 +1202,10 @@ class ExportDialogMixin:
         **Returns whether the bridge was actually told**, because this is only
         the second of two halves and they can land independently: the store
         write has already happened by the time anyone calls this, so a caller
-        that reports an outcome to the user (the re-adopt confirmation,
-        PR5 design §4.5) has to be able to report "saved, but not yet applied"
-        rather than announce both. The existing export-dialog caller ignores
-        it: its ``exportStatus`` line already says only what it saved.
+        that reports an outcome to the user has to be able to report "saved,
+        but not yet applied" rather than announce both. The existing
+        export-dialog caller ignores it: its ``exportStatus`` line already
+        says only what it saved.
         """
         self._exports_changed()  # pylint: disable=no-member  # lifecycle, stays in plugin.py
         bridge = self.export_bridge
@@ -1266,10 +1258,8 @@ class ExportDialogMixin:
         if self.export_bridge is not None:
             try:
                 # Issue #274: a deliberate un-export is as final as a device
-                # deletion — destroy the accessory rather than orphaning it
-                # for a re-adopt. Keeping it accessible only through
-                # "Migrate an exported accessory…" is the point.
-                self.export_bridge.remove(device_id, permanent=True)
+                # deletion — destroy the accessory outright.
+                self.export_bridge.remove(device_id)
             except Exception as exc:  # pylint: disable=broad-except
                 self.logger.exception(exc)
         self._exports_changed()  # pylint: disable=no-member  # lifecycle, stays in plugin.py

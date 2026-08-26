@@ -71,7 +71,7 @@
 import { copyFileSync, readFileSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 
-import { describeError, type DriftEntry, type OrphanRecord, parsePublishedId, RefuseReason } from "./protocol.js";
+import { describeError, type DriftEntry, parsePublishedId, RefuseReason } from "./protocol.js";
 import { writeJsonAtomic } from "./storage.js";
 
 /** What the PRD §7 refuse-to-start decision is taken from. */
@@ -186,17 +186,16 @@ export interface EndpointRecord {
      */
     numberVoid?: true;
     /**
-     * Set by {@link EndpointMapStore.forget} (issue #219): the device was
-     * un-exported,
-     * so the entry must not be rebuilt by {@link EndpointMapStore.restorable}
-     * — but unlike the pre-#219 behaviour, `role`/`label` are KEPT rather
-     * than deleted, because they are the only evidence a future re-adopt UI
-     * could match a recreated device against. Cleared the moment
-     * {@link EndpointMapStore.check} sees the same `UniqueID` live again
-     * (`noteRestorable`) — a live device is by
-     * definition not orphaned, and re-exporting the same accessory must not
-     * leave it permanently excluded from the next boot's pre-seeding. Absent
-     * on every ordinary entry, same convention as `numberVoid`.
+     * Set by {@link EndpointMapStore.forget}: the device was un-exported, so
+     * the entry must not be rebuilt by {@link EndpointMapStore.restorable} —
+     * the actual fix for issue #141's appear-then-vanish churn.
+     * `role`/`label` are KEPT rather than deleted alongside it (they cost two
+     * strings, and nothing here has a reason to clear them). Cleared the
+     * moment {@link EndpointMapStore.check} sees the same `UniqueID` live
+     * again (`noteRestorable`) — a live device is by definition not
+     * orphaned, and re-exporting the same accessory must not leave it
+     * permanently excluded from the next boot's pre-seeding. Absent on every
+     * ordinary entry, same convention as `numberVoid`.
      */
     orphaned?: true;
     /**
@@ -211,27 +210,19 @@ export interface EndpointRecord {
      */
     battery?: true;
     /**
-     * Set by {@link recordFor}/{@link noteRestorable} (issue #219 re-adopt):
-     * the Indigo device CURRENTLY driving this published identity. Absent
-     * means "the key's own derivation" — every pre-PR5 record, and every
-     * un-re-adopted one, for which `parsePublishedId(uniqueId)?.deviceId` is
-     * still the right answer (see {@link RestorableEndpoint.indigoDeviceId}).
+     * Set by {@link recordFor}/{@link noteRestorable}: the Indigo device
+     * CURRENTLY driving this published identity. Absent means "the key's own
+     * derivation" — every record whose identity has never been retargeted
+     * onto a different device, for which `parsePublishedId(uniqueId)?.deviceId`
+     * is still the right answer (see {@link RestorableEndpoint.indigoDeviceId}).
      *
      * **Replace-on-change, unlike {@link numberVoid}/{@link orphaned}/
-     * {@link battery}'s add-only convention.** A re-adopt IS a change of
-     * driving device — pinning the FIRST (now-deleted) device id forever
-     * would make restore-on-start rebuild the accessory bound to a device
-     * that no longer exists, which is the whole failure #219 exists to fix.
+     * {@link battery}'s add-only convention.** Migrating an accessory (issue
+     * #246) IS a change of driving device for an identity that stays LIVE the
+     * whole time — pinning the first device id forever would make
+     * restore-on-start rebuild the accessory bound to the wrong one.
      */
     deviceId?: number;
-    /**
-     * Set by {@link EndpointMapStore.forget} (issue #219) the moment an entry
-     * is FIRST orphaned — an ISO-8601 stamp from the store's injected clock,
-     * purely for the re-adopt picker's "un-exported on …" column. Absent on
-     * every pre-PR5 orphan; the picker renders that as "date unknown" rather
-     * than treating it as a fault (§4.2).
-     */
-    orphanedAt?: string;
     /**
      * Set by {@link EndpointMapStore.forget} when the caller has decided this
      * identity was RETIRED, not merely un-exported (issue #240): the published
@@ -239,19 +230,21 @@ export interface EndpointRecord {
      *
      * **The narrow rule, and it is narrow on purpose.** Only a LATER
      * GENERATION of the same identity — `indigo-7` → `indigo-7~2`, which is
-     * what `protocol.ts`'s `supersedes()` tests — counts. A **re-adopt** is
-     * the same shape at a glance (one removal plus one create, for one device)
-     * and is deliberately NOT one: the identity a re-adopt leaves behind is an
-     * ordinary orphan the picker must go on offering, PR5 design E5 in as many
-     * words. Both node-side writers apply `supersedes()` before setting this,
-     * whether the pair lands in one mutation (`node.ts`'s `forgetRemoved`) or
-     * as two commands (`noteSupersessionIfPaired`).
+     * what `protocol.ts`'s `supersedes()` tests — counts. Migrating an
+     * accessory onto an already-exported device (issue #246, the ● case) is
+     * the same shape at a glance (one removal plus one create, for one
+     * device) and is deliberately NOT one: the target's own old identity and
+     * the newly-inherited one are unrelated strings, so it is left an
+     * ORDINARY orphan instead. Both node-side writers apply `supersedes()`
+     * before setting this, whether the pair lands in one mutation
+     * (`node.ts`'s `forgetRemoved`) or as two commands
+     * (`noteSupersessionIfPaired`).
      *
-     * A superseded entry is {@link orphaned} too (it is not live), but it is
-     * NOT a re-adopt candidate — {@link EndpointMapStore.restorable} and
-     * {@link EndpointMapStore.orphans} both exclude it, because re-adopting it
-     * would resurrect the OLD-role accessory under a number every paired
-     * ecosystem has already processed a removal for.
+     * A superseded entry is {@link orphaned} too (it is not live), but it
+     * must never be REBUILT at the next restart —
+     * {@link EndpointMapStore.restorable} excludes it, because that would
+     * resurrect the OLD-role accessory under a number every paired ecosystem
+     * has already processed a removal for.
      */
     supersededBy?: string;
 }
@@ -309,13 +302,13 @@ export interface RestorableEndpoint {
     /** Issue #220 — `true` only when the persisted entry has ever seen one. */
     battery?: true;
     /**
-     * Issue #219 — the device `node.ts`'s restore-on-start builds the spec
-     * for. Resolved by {@link EndpointMapStore.restorable} from
-     * {@link EndpointRecord.deviceId} where a re-adopt has set it, falling
+     * The device `node.ts`'s restore-on-start builds the spec for. Resolved
+     * by {@link EndpointMapStore.restorable} from
+     * {@link EndpointRecord.deviceId} where a migrate has set it, falling
      * back to the published identity's own derivation
-     * (`parsePublishedId(uniqueId)?.deviceId`) for every pre-PR5 and
-     * un-re-adopted entry — an entry that resolves to neither is not
-     * restorable at all, so this is never `undefined` here.
+     * (`parsePublishedId(uniqueId)?.deviceId`) for every entry that has never
+     * been retargeted — an entry that resolves to neither is not restorable
+     * at all, so this is never `undefined` here.
      */
     indigoDeviceId: number;
 }
@@ -329,14 +322,14 @@ export interface EndpointMapLoad {
     problem?: string;
     /**
      * Entry-level oddities tolerated during the read, for the caller to put on
-     * the §4.3 channel (issues #219/#240).
+     * the §4.3 channel (issue #240).
      *
      * `readRecord` is deliberately forgiving — a bad field costs the field, not
      * the file (see its own comment) — but "tolerated" is not the same as
-     * "unremarkable", and a DISCARDED `supersededBy` re-arms a retired identity
-     * as an ordinary re-adopt candidate. That is a decision about the user's
-     * accessories, taken from a value we could not read, and it must not be
-     * taken in silence.
+     * "unremarkable", and a DISCARDED `supersededBy` re-arms a retired
+     * identity as an ordinary, rebuildable one. That is a decision about the
+     * user's accessories, taken from a value we could not read, and it must
+     * not be taken in silence.
      */
     notes?: string[];
 }
@@ -395,27 +388,23 @@ function readRecord(value: unknown, uniqueId: string, notes: string[]): Endpoint
     if (typeof candidate.deviceId === "number" && Number.isInteger(candidate.deviceId)) {
         record.deviceId = candidate.deviceId;
     }
-    // Same tolerance: a stamp that is not a non-empty string is simply
-    // absent — the picker already renders that as "date unknown" (§4.2).
-    if (isNonEmptyString(candidate.orphanedAt)) {
-        record.orphanedAt = candidate.orphanedAt;
-    }
     // Same tolerance: anything other than a non-empty string is simply not a
     // supersession marker — but unlike the others, LOSING this one changes
     // what the node offers the user. A superseded identity is excluded from
-    // `restorable()` and `orphans()`; without the marker it becomes an
-    // ordinary re-adopt candidate again, and re-adopting it resurrects an
-    // old-role accessory under a number every paired ecosystem has already
-    // processed a removal for. Present-but-unusable is therefore said out
-    // loud; absent (every ordinary record) is not.
+    // `restorable()`; without the marker it becomes eligible to be REBUILT
+    // again at the next restart, resurrecting an old-role accessory under a
+    // number every paired ecosystem has already processed a removal for.
+    // Present-but-unusable is therefore said out loud; absent (every
+    // ordinary record) is not.
     if (isNonEmptyString(candidate.supersededBy)) {
         record.supersededBy = candidate.supersededBy;
     } else if (candidate.supersededBy !== undefined) {
         notes.push(
             `Endpoint map entry ${uniqueId} has an unusable supersededBy ` +
                 `(${JSON.stringify(candidate.supersededBy)}); it was discarded, so this retired ` +
-                "accessory identity is a re-adopt candidate again. Re-adopting it would resurrect " +
-                "an old-role accessory under a retired number — check it before you do.",
+                "accessory identity is eligible to be rebuilt again at the next restart — that " +
+                "would resurrect an old-role accessory under a retired number — check it before " +
+                "the bridge next restarts.",
         );
     }
     return record;
@@ -541,11 +530,11 @@ function recordFor(entry: LiveEndpointNumber): EndpointRecord {
  * un-exported.
  *
  * **Also adopts a CHANGED `deviceId`, replacing rather than adding (issue
- * #219 re-adopt).** A re-adopt IS a change of driving device — pinning the
- * first device id forever, `battery`'s convention, would make the next
- * restore-on-start rebuild the accessory bound to a device that no longer
- * exists. {@link EndpointMapStore.check} reads the record's OLD device id
- * before calling this, so it can still tell a re-adopt from a first sighting
+ * #246).** Migrating an accessory IS a change of driving device — pinning
+ * the first device id forever, `battery`'s convention, would make the next
+ * restore-on-start rebuild the accessory bound to the wrong one.
+ * {@link EndpointMapStore.check} reads the record's OLD device id before
+ * calling this, so it can still tell the change apart from a first sighting
  * once this has overwritten it — see that method's own doc comment.
  */
 function noteRestorable(record: EndpointRecord, entry: LiveEndpointNumber): boolean {
@@ -573,24 +562,17 @@ function noteRestorable(record: EndpointRecord, entry: LiveEndpointNumber): bool
     }
     if (record.orphaned) {
         delete record.orphaned;
-        // `orphanedAt` goes with it (issue #219): a live device is not
-        // orphaned, so a stamp saying when it WAS would be stale evidence
-        // sitting next to a marker that no longer agrees with it. Harmless
-        // either way — {@link forget} only ever reads it when re-orphaning,
-        // and stamps a fresh one then — but a raw read of the file should
-        // never see the two disagree.
-        delete record.orphanedAt;
         changed = true;
     }
     if (record.supersededBy !== undefined) {
-        // And so does `supersededBy`: this identity is LIVE again, so the
+        // `supersededBy` goes too: this identity is LIVE again, so the
         // marker saying another one replaced it is now simply false. It gets
         // here when an identity that was once superseded is published again
         // — un-export a role-changed export, re-export it, and the plugin
         // sends the default `indigo-<deviceId>` the supersession retired.
         // Left in place it would outlive the resurrection and hide the entry
-        // from `orphans()` (§3.12) the NEXT time it was un-exported, making a
-        // perfectly ordinary orphan permanently un-re-adoptable.
+        // from `restorable()` the NEXT time it was un-exported, making a
+        // perfectly ordinary orphan permanently unrebuildable.
         delete record.supersededBy;
         changed = true;
     }
@@ -638,14 +620,13 @@ export class EndpointMapStore {
     /** Persistence failures worth putting in `StatusReport.warnings` (§4.3). */
     #warnings = new Map<string, string>();
     /**
-     * One-shot NOTICES that ride the same §4.3 channel (issues #219/#240).
+     * One-shot NOTICES that ride the same §4.3 channel (issue #240).
      *
      * `this.log` is stdout, and the node is started by launchd — so a line
-     * written only there is a line no user will ever see. Three of this file's
-     * most consequential statements were stdout-only: the re-adopt nudge (the
-     * whole discoverability moment for `Re-adopt a Matter accessory…`), the
-     * "this entry cannot be rebuilt by this bridge version" skip, and the
-     * confirmation that a re-adopt actually landed. {@link warnings} therefore
+     * written only there is a line no user will ever see. Two of this file's
+     * most consequential statements were stdout-only: the "this entry cannot
+     * be rebuilt by this bridge version" skip, and the confirmation that a
+     * device's driving identity actually changed. {@link warnings} therefore
      * carries these too, which is the one channel `export_bridge.py` already
      * mirrors into the Indigo event log.
      *
@@ -785,11 +766,10 @@ export class EndpointMapStore {
      * whatever number came back. Excluding void entries here would only widen
      * the online-and-empty window issue #141 already closed, for no benefit.
      *
-     * **`orphaned` IS part of this filter (issue #219).** A {@link forget}en
-     * entry now keeps its `role`/`label` as re-adopt evidence rather than
-     * losing them, so the orphan marker is what still keeps it out of the
-     * pre-attach rebuild — exactly the churn {@link forget}'s own doc comment
-     * exists to prevent, unaffected by role/label now surviving alongside it.
+     * **`orphaned` IS part of this filter (issue #141).** A {@link forget}en
+     * entry keeps its `role`/`label` (they cost nothing to keep), so the
+     * orphan marker is what actually keeps it out of the pre-attach rebuild —
+     * exactly the churn {@link forget}'s own doc comment exists to prevent.
      *
      * **So is `supersededBy` (issue #240), checked in its own right rather
      * than left to ride on `orphaned`.** The two are written together, but a
@@ -800,15 +780,15 @@ export class EndpointMapStore {
      * four conditions, not three: no `role`, no `label`, `orphaned`, or
      * `supersededBy`.
      *
-     * **Resolves `indigoDeviceId` — and skips what it cannot (issue #219).**
-     * `record.deviceId` wins where a re-adopt has set it; otherwise it falls
+     * **Resolves `indigoDeviceId` — and skips what it cannot.**
+     * `record.deviceId` wins where a migrate has set it; otherwise it falls
      * back to the published identity's own derivation
-     * (`parsePublishedId(uniqueId)?.deviceId`), which is every pre-PR5 and
-     * un-re-adopted entry. An entry with a `role`/`label` but neither source
-     * of a device id — a map written by a NEWER node, or hand-edited — is
-     * skipped and named on the §4.3 {@link warnings} channel (so it reaches
-     * the user's Indigo log, not just stdout), in the same "cannot be rebuilt
-     * by this bridge version" words `node.ts`'s own loop uses for an
+     * (`parsePublishedId(uniqueId)?.deviceId`), which is every entry that has
+     * never been retargeted. An entry with a `role`/`label` but neither
+     * source of a device id — a map written by a NEWER node, or hand-edited —
+     * is skipped and named on the §4.3 {@link warnings} channel (so it
+     * reaches the user's Indigo log, not just stdout), in the same "cannot be
+     * rebuilt by this bridge version" words `node.ts`'s own loop uses for an
      * unsupported `role`: this is the only place that ever sees such an entry,
      * since a skipped one never reaches that loop at all.
      */
@@ -849,63 +829,6 @@ export class EndpointMapStore {
     }
 
     /**
-     * §3.12's answer (issue #219) — every left-behind accessory identity the
-     * re-adopt picker could plausibly offer, in map order (the order numbers
-     * were first recorded).
-     *
-     * **Excludes `supersededBy` records (issue #240).** Those are orphaned
-     * too, but re-adopting one would resurrect the OLD-role accessory under a
-     * number every paired ecosystem has already processed a removal for —
-     * see {@link EndpointRecord.supersededBy}.
-     *
-     * **Includes entries with no `role`/`label` (PR5 design E4, §4.2), unlike
-     * {@link restorable}'s filter.** A pre-2026.16.2 bare `{number}` orphan —
-     * from a plugin old enough to have deleted them on un-export — carries
-     * nothing a replacement device could be matched against, so it can never
-     * be re-adopted, but the ruling (PR5 design §5 E4) is to show it anyway: "the number
-     * is reserved and the user is entitled to see why", as the picker's
-     * "no role recorded, cannot be re-adopted" row (§4.2's third row). Callers
-     * that need to tell the two shapes apart check `role`/`label` for
-     * `undefined`, which {@link restorable}'s own skip-and-log already treats
-     * as unrebuildable for the SAME entries.
-     *
-     * **Skips a key `parsePublishedId` refuses — PR5 design E11's `restorable()`
-     * treatment, applied here for a sharper reason.** This list feeds the
-     * re-adopt picker, and picking a row writes its key into the plugin's
-     * `ExportStore` as a `publishedAs`, which the node then refuses at the
-     * next attach with `malformed_args` — and an attach refusal takes EVERY
-     * export offline, not just that one. So a hand-edited or newer-node key is
-     * named once on the §4.3 channel and left out, rather than offered as a
-     * route into a whole-bridge outage.
-     */
-    orphans(): OrphanRecord[] {
-        const orphans: OrphanRecord[] = [];
-        for (const [uniqueId, record] of this.#endpoints) {
-            if (!record.orphaned || record.supersededBy !== undefined) {
-                continue;
-            }
-            if (parsePublishedId(uniqueId) === undefined) {
-                this.notice(
-                    `unofferable:${uniqueId}`,
-                    `Endpoint map key ${JSON.stringify(uniqueId)} is not a published accessory identity ` +
-                        "this bridge version understands, so it is not offered for re-adoption; a re-adopt " +
-                        "onto it would be refused at the next attach and stop every export.",
-                );
-                continue;
-            }
-            orphans.push({
-                uniqueId,
-                number: record.number,
-                ...(record.role !== undefined ? { role: record.role } : {}),
-                ...(record.label !== undefined ? { label: record.label } : {}),
-                ...(record.orphanedAt !== undefined ? { orphanedAt: record.orphanedAt } : {}),
-                ...(record.deviceId !== undefined ? { deviceId: record.deviceId } : {}),
-            });
-        }
-        return orphans;
-    }
-
-    /**
      * True when the map is non-empty and EVERY entry in it is
      * {@link EndpointRecord.orphaned} — issue #222's distinction for
      * `node.ts`'s `restoreEndpoints()`: a map in this state is the *correct*
@@ -932,18 +855,15 @@ export class EndpointMapStore {
      * devices the user had already told us to stop exporting, and it regresses
      * XAC7's "un-exported accessories are gone".
      *
-     * **The number AND the role/label stay (issue #219).** §3.3 already retained
-     * the number on purpose, so re-adding the same device gets the same endpoint
+     * **The number AND the role/label stay.** §3.3 already retained the
+     * number on purpose, so re-adding the same device gets the same endpoint
      * number back and paired ecosystems see the accessory they already know
-     * rather than a new one. Deleting `role`/`label` too — the pre-#219
-     * behaviour — threw away the only evidence a future re-adopt UI could match
-     * a *recreated* device (a factory-reset accessory that comes back with a new
-     * `UniqueID`) against the endpoint it used to occupy. Instead the entry is
-     * marked {@link EndpointRecord.orphaned}, which is what keeps it out of
-     * {@link restorable}'s pre-attach rebuild — the actual thing #141 needed —
-     * without destroying anything. `check`'s `noteRestorable` clears the marker
-     * the moment the same `UniqueID` is live again, so a plain re-export is
-     * unaffected.
+     * rather than a new one; `role`/`label` are simply never cleared alongside
+     * it. The entry is marked {@link EndpointRecord.orphaned}, which is what
+     * keeps it out of {@link restorable}'s pre-attach rebuild — the actual
+     * thing #141 needed — without destroying anything. `check`'s
+     * `noteRestorable` clears the marker the moment the same `UniqueID` is
+     * live again, so a plain re-export is unaffected.
      *
      * **Only a caller that watched a specific endpoint go may call this.** An
      * empty live set is not evidence of anything: a node that has never attached
@@ -955,22 +875,19 @@ export class EndpointMapStore {
      * nothing and the plugin's re-attach re-creates the same set.
      *
      * **`options.supersededBy` marks a role-change supersession (issue
-     * #240) instead of an ordinary un-export**, and `orphanedAt` is stamped
-     * from the store's injected `now()` the moment an entry is FIRST
-     * orphaned — never re-stamped on a later call, so it always reads the
-     * time the accessory actually left, not the time a supersession was
-     * confirmed.
+     * #240) instead of an ordinary un-export.**
      *
-     * **This is also how a TWO-COMMAND supersede gets its `supersededBy`
-     * (§3 of the design: `replace()` sends `remove_endpoint` then
-     * `upsert_endpoint` as separate commands).** The first call orphans the
-     * entry with no `supersededBy` yet — the create has not happened. The
-     * SECOND call, once the create lands, passes the SAME `uniqueId` again
-     * with `{supersededBy}` — the guard below therefore does not stop at
+     * **This is also how a CROSS-COMMAND supersede gets its `supersededBy`**
+     * (a device un-exported by an `attach` reconcile, then later re-exported
+     * under a later generation of its identity as a SEPARATE
+     * `upsert_endpoint` — see `node.ts`'s `forgetRemoved`/
+     * `noteSupersessionIfPaired` pair). The first call orphans the entry
+     * with no `supersededBy` yet — the create has not happened. The SECOND
+     * call, once the create lands, passes the SAME `uniqueId` again with
+     * `{supersededBy}` — the guard below therefore does not stop at
      * "already orphaned" the way it does for a caller with nothing new to
      * say; a second call that has a `supersededBy` this record does not yet
-     * carry still counts as a change, and only `orphanedAt` is protected
-     * from being re-stamped.
+     * carry still counts as a change.
      *
      * Returns how many entries CHANGED — newly orphaned, newly given a
      * `supersededBy`, or both — so a no-op (no record at all, nothing worth
@@ -990,9 +907,6 @@ export class EndpointMapStore {
                 continue;
             }
             record.orphaned = true;
-            if (newlyOrphaned) {
-                record.orphanedAt = this.now().toISOString();
-            }
             if (newlySuperseded) {
                 record.supersededBy = options.supersededBy;
             }
@@ -1003,8 +917,8 @@ export class EndpointMapStore {
                 options.supersededBy !== undefined
                     ? `marked ${changed} superseded accessory identity(ies) retired, keeping their numbers ` +
                           "so they can never be handed to another accessory"
-                    : `marked ${changed} un-exported endpoint(s) orphaned, keeping their role/label ` +
-                          "as re-adopt evidence and their numbers so a re-export returns the same accessory",
+                    : `marked ${changed} un-exported endpoint(s) orphaned, keeping their numbers so a ` +
+                          "re-export returns the same accessory",
             );
         }
         return changed;
@@ -1022,9 +936,8 @@ export class EndpointMapStore {
      * call: matter.js's OWN persisted allocation for the retired
      * `Endpoint.id` — a separate store this file never touches — is what
      * actually prevents reissue, and it is untouched by deleting our own
-     * witness of it. What is lost is re-adopt: {@link restorable} and
-     * {@link orphans} can only offer what is still in `#endpoints`, so a
-     * destroyed identity is gone from both — no re-adopt picker entry, no
+     * witness of it. What is lost is {@link restorable}: it can only offer
+     * what is still in `#endpoints`, so a destroyed identity is gone — no
      * pre-attach rebuild, ever again.
      *
      * **Only a caller certain the device will never come back may call
@@ -1033,8 +946,8 @@ export class EndpointMapStore {
      * an identity this pass) must stay soft: the node cannot tell a
      * deliberate departure from a device that merely failed classification
      * this one time (issue #274 constraint 2). `node.ts`'s `removeEndpoint`
-     * is the only caller, and only when the plugin's `remove_endpoint`
-     * carried `permanent: true`.
+     * is the only caller, and it always does — every `remove_endpoint`
+     * command is the plugin confirming the driving device is gone for good.
      *
      * Returns how many entries actually existed and were removed, so a call
      * over an already-forgotten or never-recorded `uniqueId` costs no disk
@@ -1051,7 +964,7 @@ export class EndpointMapStore {
         if (removed > 0) {
             this.persist(
                 `destroyed ${removed} endpoint map record(s): the driving device is gone for good, so ` +
-                    "neither the number nor the role/label is retained for re-adopt",
+                    "neither the number nor the role/label is retained",
             );
         }
         return removed;
@@ -1077,17 +990,17 @@ export class EndpointMapStore {
      * what has to stop being true, not just the mismatch it was guarding
      * against.
      *
-     * **A changed `deviceId` on an EXISTING record is logged as a re-adopt
-     * (issue #219).** The record's device id is read before
-     * {@link noteRestorable} overwrites it, so a real change (both sides
-     * defined, and different) can still be told apart from a first sighting
-     * (`added`, above — nothing to compare against) and from this build
-     * simply filling in a field a pre-PR5 record never had (`record.deviceId`
-     * was `undefined`, not merely different). Reported directly here, the same
-     * place the `numberVoid` adoption above logs itself, because — like that
-     * one — only `check` ever sees both the old and the new value at once; and
-     * on the §4.3 {@link warnings} channel rather than stdout, because it is
-     * the confirmation that the user's re-adopt actually landed.
+     * **A changed `deviceId` on an EXISTING record is logged.** The record's
+     * device id is read before {@link noteRestorable} overwrites it, so a
+     * real change (both sides defined, and different) can still be told
+     * apart from a first sighting (`added`, above — nothing to compare
+     * against) and from this build simply filling in a field the record never
+     * had (`record.deviceId` was `undefined`, not merely different). Reported
+     * directly here, the same place the `numberVoid` adoption above logs
+     * itself, because — like that one — only `check` ever sees both the old
+     * and the new value at once; and on the §4.3 {@link warnings} channel
+     * rather than stdout, because it is the confirmation that the change
+     * actually landed.
      */
     check(live: readonly LiveEndpointNumber[]): DriftEntry[] {
         const drift: DriftEntry[] = [];
@@ -1097,17 +1010,16 @@ export class EndpointMapStore {
         for (const entry of live) {
             const record = this.#endpoints.get(entry.uniqueId);
             if (record === undefined) {
-                this.noteReadoptableMatch(entry);
                 this.#endpoints.set(entry.uniqueId, recordFor(entry));
                 added += 1;
                 continue;
             }
             const previousDeviceId = record.deviceId;
             // Read before `noteRestorable` un-orphans the record below — this
-            // is the only way left to tell a MIGRATE (issue #246: the
-            // identity stayed live the whole time, a rekey moved it) from a
-            // RE-ADOPT (issue #219: `forget()` marked it orphaned when it was
-            // un-exported, and this is the first live sighting since).
+            // is what tells a MIGRATE (issue #246: the identity stayed live
+            // the whole time, a rekey moved it) from an identity that was
+            // orphaned (`forget()` marked it so when it was un-exported) and
+            // is only now live again under a different device.
             const wasOrphaned = record.orphaned === true;
             // The restoration half is refreshed even when the number drifted:
             // a renamed accessory whose number also moved must still come back
@@ -1122,19 +1034,17 @@ export class EndpointMapStore {
                 // only the promise after the dash differs, because the two
                 // paths earn different ones. A migrate's identity NEVER
                 // lapsed (issue #246: this PR's own rekey), so room/name/
-                // scenes provably survive. A re-adopt's identity DID lapse
-                // (it was orphaned first), and this PR corrected that exact
-                // promise elsewhere as measured-false: an ecosystem that
-                // already processed the removal has purged room/name context
-                // within moments, so only identity and number are restored.
+                // scenes provably survive. An identity that was orphaned
+                // first DID lapse, so an ecosystem that already processed the
+                // removal has purged room/name context within moments,
+                // meaning only identity and number are restored.
                 this.notice(
-                    `readopted:${entry.uniqueId}`,
+                    `redriven:${entry.uniqueId}`,
                     wasOrphaned
                         ? `Accessory ${entry.uniqueId} (number ${record.number}) is now driven by Indigo device ` +
                               `${entry.deviceId}, replacing device ${previousDeviceId}. Its identity and number ` +
                               "are restored, but an ecosystem that already processed its removal may already " +
-                              "have purged its room and name — this identity was orphaned first (issue #219 " +
-                              "re-adopt)."
+                              "have purged its room and name — this identity was orphaned first."
                         : `Accessory ${entry.uniqueId} (number ${record.number}) is now driven by Indigo device ` +
                               `${entry.deviceId}, replacing device ${previousDeviceId} — nothing on the wire ` +
                               "changed, so every paired ecosystem keeps the room, name, scenes and automations " +
@@ -1177,50 +1087,6 @@ export class EndpointMapStore {
             this.#checked = true;
         }
         return drift;
-    }
-
-    /**
-     * Owner ruling 4 (issue #219) — a cheap nudge, not a decision. Called
-     * from {@link check}'s `added` branch, before the brand-new record is
-     * inserted: when the identity `check` is about to record for the FIRST
-     * time has a `role` AND `label` that exactly match an existing
-     * ORPHANED, non-superseded record, say so once — on the §4.3
-     * {@link warnings} channel, because a nudge nobody reads is not a nudge —
-     * naming the `Re-adopt a Matter accessory…` menu action. This is exactly the
-     * motivating case for #219 — a device deleted, recreated and
-     * re-exported under a brand-new identity, with the room now empty in
-     * every ecosystem and no obvious reason why — offered before the user
-     * has to notice and go looking for it.
-     *
-     * Deliberately does nothing else: it changes no state, blocks nothing,
-     * and never fires for an update to an EXISTING identity (an ordinary
-     * re-export, or a role-change supersede) — those are not the
-     * "orphaned accessory nobody re-adopted yet" case this exists to
-     * surface. An ambiguous match (more than one orphan with the same
-     * role/label) logs against the first one found, in map order — good
-     * enough for a nudge that only ever points a user at the menu, never
-     * acts on their behalf.
-     */
-    private noteReadoptableMatch(entry: LiveEndpointNumber): void {
-        if (entry.role === undefined || entry.label === undefined) {
-            return;
-        }
-        for (const [uniqueId, record] of this.#endpoints) {
-            if (!record.orphaned || record.supersededBy !== undefined) {
-                continue;
-            }
-            if (record.role === entry.role && record.label === entry.label) {
-                this.notice(
-                    `readoptable:${entry.uniqueId}`,
-                    `"${entry.label}" was just exported as a NEW accessory (${entry.uniqueId}), but a ` +
-                        `left-behind accessory with the same role and name (${uniqueId}, number ` +
-                        `${record.number}) is still in the endpoint map. If this is the same device, ` +
-                        "'Re-adopt a Matter accessory…' in the plugin menu keeps its room, name, scenes " +
-                        "and automations instead of leaving this one to start from scratch (issue #219).",
-                );
-                return;
-            }
-        }
     }
 
     /**

@@ -125,10 +125,8 @@ REVIVABLE_HALT_REASONS = frozenset({"version_skew", bridge_protocol.ERR_VERSION_
 #: :func:`bridge_client.attach_timeout_for` deadline before giving up on the
 #: ``Future`` that carries it, so the OUTER wait is never the tighter of the
 #: two deadlines — the same headroom reasoning as
-#: :data:`bridge_client.REBUILD_TIMEOUT_HEADROOM`, and the same 5.0 margin
-#: :data:`plugin_constants.READOPT_ORPHANS_TIMEOUT` (15.0) keeps over
-#: ``bridge_client.DEFAULT_TIMEOUT`` (10.0) — a fixed headroom, not a ratio
-#: (a ratio reading would prescribe 1.5x here, not +5.0).
+#: :data:`bridge_client.REBUILD_TIMEOUT_HEADROOM` — a fixed headroom, not a
+#: ratio (a ratio reading would prescribe 1.5x here, not +5.0).
 REATTACH_RESULT_HEADROOM = 5.0
 
 #: PRD §5.5's wholesale export switch. **Absent means ON**, because it arrived in
@@ -946,8 +944,7 @@ class ExportBridge:
 
         Requires an attached client — the caller
         (``menuMigrateExport`` step 2) has already verified one via
-        ``ExportRecoveryMenuMixin._recovery_client(require_attached=True)``, the same
-        precondition re-adopt's execute path demands (PR5 design E1).
+        ``ExportRecoveryMenuMixin._recovery_client(require_attached=True)``.
 
         **Three failure classes, three honest messages (issue #246 review
         finding 2).** A single broad ``except`` used to give every one of them
@@ -1134,8 +1131,8 @@ class ExportBridge:
             # ordinary export must stay byte-identical to before this
             # existed, which the exact wire-frame round-trip tests pin).
             options=ct_bounds.wire_options(entry.options),
-            # Issues #219/#240 — whatever identity the entry has adopted
-            # (a role change or a re-adopt), or today's default derivation
+            # Issue #240/#246 — whatever identity the entry has adopted
+            # (a role change or a migrate), or today's default derivation
             # for an entry that has never moved off it.
             published_as=entry.published_as or published_id_for(device_id),
             # §4.1 issue #220 — evidence, not opinion. `is not None` (INCLUDING
@@ -1417,20 +1414,18 @@ class ExportBridge:
             return
         self._fire(client.upsert_endpoint(spec), f"upsert_endpoint dev {device_id}")
 
-    def remove(self, device_id: int, *, permanent: bool = False) -> None:
+    def remove(self, device_id: int) -> None:
         """Drop one endpoint (§3.3). Fire-and-forget; idempotent on the node.
 
-        ``permanent`` (issue #274) is passed straight through to the wire —
-        see ``bridge_client.BridgeClient.remove_endpoint`` and
-        ``bridge_protocol.BridgeProtocol.build_remove_endpoint``. Every
-        caller of THIS method (``deviceDeleted``, the export dialog's
+        Every caller of THIS method (``deviceDeleted``, the export dialog's
         "Remove", and the confirmed-deleted sweep in :meth:`_on_attached`)
-        knows unambiguously that the device is not coming back, so they pass
-        ``True``. `replace()`'s two-command supersede/re-adopt sequence does
-        NOT go through this method — it calls ``client.remove_endpoint``
-        directly, at the default ``permanent=False``, because its removal is
-        deliberately followed by an ``upsert_endpoint`` for the same or a
-        related identity and must stay soft.
+        knows unambiguously that the device is not coming back, so the node
+        destroys the endpoint-map record along with the live endpoint
+        (issue #274) — see ``bridge_client.BridgeClient.remove_endpoint`` and
+        ``bridge_protocol.BridgeProtocol.build_remove_endpoint``. `replace()`'s
+        two-command role-change sequence does NOT go through this method — it
+        calls ``client.remove_endpoint`` directly, because its removal is
+        deliberately followed by an ``upsert_endpoint`` for a related identity.
         """
         self._skipped.pop(device_id, None)
         self._update_failed.discard(device_id)
@@ -1446,30 +1441,23 @@ class ExportBridge:
         client = self._live_client("remove_endpoint", device_id)
         if client is None:
             return
-        self._fire(client.remove_endpoint(device_id, permanent=permanent), f"remove_endpoint dev {device_id}")
+        self._fire(client.remove_endpoint(device_id), f"remove_endpoint dev {device_id}")
 
     def replace(self, device_id: int) -> None:
         """Remove one endpoint and add it back, because its **published
         identity** changed.
 
-        Two callers, one shape. A **role change** is the original one: §4.1
-        rejects a role change on an existing endpoint (``role_change``) —
-        ecosystems cache the Matter device type per endpoint — so the only way
-        through is remove-then-add, and the accessory is genuinely new to every
-        paired ecosystem afterwards: it loses its name and room assignment
-        there, which is why the dialog says so out loud rather than letting the
-        user discover it in the Home app. A **re-adopt** (issue #219, PR5
-        design §4.4) is the other: the role does not move at all, the device
-        simply starts publishing an identity that already exists in the
-        ecosystems, and the lost-name-and-room sentence above does NOT apply to
-        it — keeping that room is the entire point of the feature. What the two
-        share is that the identity on the wire changes, which §3.2 refuses to
-        do in place either way.
+        A **role change** is the reason: §4.1 rejects a role change on an
+        existing endpoint (``role_change``) — ecosystems cache the Matter
+        device type per endpoint — so the only way through is remove-then-add,
+        and the accessory is genuinely new to every paired ecosystem
+        afterwards: it loses its name and room assignment there, which is why
+        the dialog says so out loud rather than letting the user discover it
+        in the Home app.
 
-        Whichever it is, the remove lands FIRST and unconditionally: if the
-        add half cannot be built the accessory is already gone from every
-        ecosystem, so both bail-outs below say so rather than returning in
-        silence.
+        The remove lands FIRST and unconditionally: if the add half cannot be
+        built the accessory is already gone from every ecosystem, so both
+        bail-outs below say so rather than returning in silence.
         """
         client = self._live_client("the identity change", device_id)
         if client is None:
@@ -1788,8 +1776,8 @@ class ExportBridge:
         """Close the #274 gap: a device deleted while the plugin was DOWN.
 
         `deviceDeleted` already handles a live deletion — it removes the
-        allow-list entry and calls :meth:`remove` with ``permanent=True`` the
-        moment Indigo reports the deletion. The gap is a deletion Indigo
+        allow-list entry and calls :meth:`remove` the moment Indigo reports
+        the deletion. The gap is a deletion Indigo
         reported to nobody, because the plugin was not running to hear it:
         the entry sits in the allow-list until the next attach's
         `endpoint_specs()` re-classifies it and `_spec_for` finds no device
@@ -1799,9 +1787,9 @@ class ExportBridge:
         it cannot be sent any earlier).
 
         Mirrors `deviceDeleted` exactly: drop the allow-list entry, THEN tell
-        the bridge node, permanently. A store write failing here costs a
-        retry at the NEXT attach (the entry simply gets re-classified and
-        re-queued) rather than a silently lost removal.
+        the bridge node to destroy the accessory. A store write failing here
+        costs a retry at the NEXT attach (the entry simply gets re-classified
+        and re-queued) rather than a silently lost removal.
         """
         if not self._confirmed_deleted:
             return
@@ -1818,7 +1806,7 @@ class ExportBridge:
                 "Matter bridge: device %s no longer exists in Indigo — removing its Matter "
                 "accessory permanently (it was deleted while the plugin was not running)",
                 device_id)
-            self.remove(device_id, permanent=True)
+            self.remove(device_id)
 
     # ------------------------------------------------------------------
     # Client callbacks
