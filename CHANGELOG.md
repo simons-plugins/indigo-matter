@@ -3,6 +3,26 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
+## 2026.29.9 — a raising rollback restart is now covered by a test, and four more modules are reviewed
+
+Mostly internal (issue #310). The six broad exception handlers in
+`device_settings.py`, `settings_report.py`, `fabric_backup.py` and
+`color_control.py` were read with their commits, issues and tests, and each now
+states what it absorbs and why that is safe.
+
+**One real gap closed.** `fabric_backup`'s rollback path — the worst case a
+restore can reach, where the original fabric is back on disk but matter-server
+is down — has a handler catching a raising restart so that the CRITICAL
+manual-recovery message, and the bridge restart with it, still run. No test
+could reach it: the test double could make that restart *return False*, but
+nothing could make it *raise*, and the two arrive by different routes. The
+double gained the missing mode and the path now has a test, verified to fail
+when the handler stops catching.
+
+Nothing was narrowed. The two write paths in `device_settings.py` cannot report
+a swallowed failure as success — success is only ever declared by a read-back —
+and `color_control`'s echo guard fails to an absent value, never a wrong one.
+
 ## 2026.29.8 — internal: every broad exception handler in plugin.py is now a reviewed one
 
 No user-visible change. All 34 `except Exception` handlers in `plugin.py` were

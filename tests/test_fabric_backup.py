@@ -44,6 +44,9 @@ class FakeControl:
     makes only the first start() RETURN False (the rollback start succeeds) —
     exercising the bool-False path. ``rollback_start_fails`` makes the SECOND
     (rollback) start() return False — exercising the loud manual-recovery path.
+    ``rollback_start_raises`` makes the SECOND (rollback) start() RAISE — the
+    only path into fabric_backup's rollback except, which no other mode could
+    reach (issue #310 audit).
     ``start_always_false`` makes EVERY start() return False — a never-installed
     bridge, whose ``start()`` fails by design and must not abort a good restore.
     ``alive`` is what ``is_alive()`` reports; ``name``/``log`` let a bridge and a
@@ -57,6 +60,7 @@ class FakeControl:
         stop_returns: bool = True,
         start_returns_false: bool = False,
         rollback_start_fails: bool = False,
+        rollback_start_raises: bool = False,
         start_always_false: bool = False,
         alive: bool = True,
         name: str = "",
@@ -67,6 +71,7 @@ class FakeControl:
         self._stop_returns = stop_returns
         self._start_returns_false = start_returns_false
         self._rollback_start_fails = rollback_start_fails
+        self._rollback_start_raises = rollback_start_raises
         self._start_always_false = start_always_false
         self._alive = alive
         self._name = name
@@ -93,6 +98,8 @@ class FakeControl:
             raise RuntimeError("boom on start")
         if is_first and self._start_returns_false:
             return False
+        if not is_first and self._rollback_start_raises:
+            raise RuntimeError("boom on rollback start")
         if not is_first and self._rollback_start_fails:
             return False
         return True
@@ -421,6 +428,36 @@ def test_restore_rollback_start_failure_logs_manual_recovery(tmp_path):
     assert "CRITICAL" in err
     assert "DOWN" in err
     assert storage in err  # original fabric location named for manual recovery
+
+
+def test_restore_rollback_start_that_RAISES_still_reaches_manual_recovery(tmp_path):
+    """The rollback restart raising, not merely returning False.
+
+    Same worst case as the test above — original fabric back on disk, server
+    down — reached the other way. It matters because the two arrive by
+    different routes: a False return falls straight into the `if not started`
+    block, while a raise has to be CAUGHT first or it escapes past both the
+    CRITICAL line and the bridge restart, leaving the user with a traceback
+    and no idea where their fabric is. No FakeControl mode could reach that
+    except until now (issue #310 audit).
+    """
+    storage = _make_storage(tmp_path)
+    archive = fabric_backup.create_backup(storage, now=_NOW)
+    (tmp_path / "appsupport" / "matter-server" / "config").write_text("ORIGINAL-LIVE")
+    logger = FakeLogger()
+    control = FakeControl(start_returns_false=True, rollback_start_raises=True)
+
+    with pytest.raises(RuntimeError, match="rolled back"):
+        fabric_backup.restore_backup(archive, storage, control, now=_NOW, logger=logger)
+
+    assert (tmp_path / "appsupport" / "matter-server" / "config").read_text() == "ORIGINAL-LIVE"
+    err = logger.text("error")
+    # Two CRITICALs, not one: the raise is named, AND the manual-recovery
+    # guidance still fires. Either alone would leave the user short.
+    assert "failed to restart after restore rollback" in err
+    assert "boom on rollback start" in err, "the caught exception must be named, not just counted"
+    assert "DOWN" in err
+    assert storage in err
 
 
 # ----------------------------------------------------------------------
