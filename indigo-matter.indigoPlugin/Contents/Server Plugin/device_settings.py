@@ -354,7 +354,16 @@ async def apply_setting(client: Any, node_id: int, endpoint: int,
             await client.write(write, timeout=timeout)
             last_error = None
             break
-        except Exception as exc:  # retried below, reported if final
+        except Exception as exc:  # pylint: disable=broad-except
+            # retried below, reported if final
+            #
+            # Absorbing: any transport or timeout failure of the SEND. Safe —
+            # structurally, not by luck — because a send error is not evidence
+            # about device state (a timeout can land after the device accepted
+            # the write), so it is kept in `last_error` and disclosed in the
+            # final verdict, and success is only ever declared by the
+            # read-back below. A swallowed write failure therefore cannot be
+            # reported as applied.
             last_error = exc
             if attempt == 1:
                 await sleep(retry_delay)
@@ -375,7 +384,15 @@ async def apply_setting(client: Any, node_id: int, endpoint: int,
                                           timeout=timeout)
             read_error = None
             break
-        except Exception as exc:  # an unreadable verify is a failure, below
+        except Exception as exc:  # pylint: disable=broad-except
+            # an unreadable verify is a failure, below
+            #
+            # Absorbing: any failure of the verification READ. Safe because it
+            # is stored in `read_error` and reported as an unconfirmed failure
+            # naming it, while `read_back` stays the NO_ANSWER sentinel so
+            # nothing downstream can mistake the absence for a value. An
+            # unproven write reported as applied is the one outcome that would
+            # make the whole verification pointless.
             read_back = NO_ANSWER
             read_error = exc
             if attempt == 1:
@@ -498,7 +515,8 @@ class RemovedStateLog:
             return
         try:
             self._save(self.to_json())
-        except Exception:  # bookkeeping must never sink a device rebuild
+        except Exception:  # pylint: disable=broad-except
+            # bookkeeping must never sink a device rebuild
             # Deliberately silent here, same reasoning as SurveyLog._persist
             # (issue #308): the caller supplies the save hook and logs there.
             # A failed save costs one repeated INFO line on the next rebuild,

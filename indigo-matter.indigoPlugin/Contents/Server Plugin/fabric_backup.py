@@ -899,7 +899,15 @@ def _rollback(
     # Bring the server back up on the rolled-back (original) fabric.
     try:
         started = server_control.start()
-    except Exception as start_exc:
+    except Exception as start_exc:  # pylint: disable=broad-except
+        # Absorbing: a raising server_control.start() after the rollback has
+        # already succeeded. It must be caught for the same reason the sibling
+        # at the restore leg is: the CRITICAL manual-recovery message below,
+        # and the bridge restart with it, are what the user actually needs —
+        # a bare traceback out of here would hide both. The raise is not
+        # swallowed: it is named in the CRITICAL logged here, and `started =
+        # False` then fires the loudest recovery message too, so this path
+        # produces two CRITICALs and never silence.
         started = False
         log.error(
             "CRITICAL: matter-server failed to restart after restore rollback (%s).", start_exc

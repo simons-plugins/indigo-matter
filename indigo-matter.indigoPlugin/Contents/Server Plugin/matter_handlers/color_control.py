@@ -230,7 +230,14 @@ class ColorControlHandler(LevelControlHandler):
             return
         try:
             updater([{"key": key, "value": value} for key, value in states.items()])
-        except Exception:  # cosmetic echo only
+        except Exception:  # pylint: disable=broad-except
+            # cosmetic echo only
+            #
+            # Absorbing: any updateStatesOnServer failure on a UI echo for
+            # channels no device report will ever correct. Safe because every
+            # conversion happens BEFORE the try and the Matter command has
+            # already been issued — a failure here yields an ABSENT echo (the
+            # pre-#60 slider snap-back), never a fabricated value.
             pass
 
     def _set_color(self, indigo_dev: Any, values: dict):
