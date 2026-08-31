@@ -1594,10 +1594,44 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
         """
         try:
             existing_ui = str(indigo.devices[dev.id].states.get("curEnergyLevel.ui", ""))
-            if existing_ui not in ("", "<no meter>"):
-                return  # a real reading is already on the device — leave it alone
-        except Exception:  # a failed read must not block priming
-            pass
+        except KeyError:
+            # The device is not in indigo.devices at all, so it cannot be
+            # holding a real reading for the guard to protect — and if it is
+            # genuinely gone the apply_states below lands on nothing. Falls
+            # through to the unconditional prime deliberately: the state must
+            # not be left at Indigo's plausible-looking bare 0 (#190) just
+            # because a device was mid-creation when startComm ran. Pinned by
+            # test_prime_absent_node_energy_state_primes_when_the_evidence_read_fails.
+            existing_ui = ""
+        except Exception as exc:  # pylint: disable=broad-except
+            # A DIFFERENT failure, and the distinction is the whole fix. This
+            # is not "no such device" — it is the lookup itself failing, which
+            # means the device most likely still exists and may well be
+            # holding a real reading. The guard could not be EVALUATED, so do
+            # not prime.
+            #
+            # Priming is the destructive half of this method — the docstring
+            # above records that an unguarded prime clobbers a real ep-0
+            # reading mid-session, and that accumEnergyTotal in particular then
+            # makes SQL Logger log a huge negative delta immediately followed
+            # by an equally huge positive one. This guard is the only thing
+            # standing between that and every deviceStartComm, and startComm
+            # re-fires on EVERY prop change.
+            #
+            # Skipping a prime costs a bare "0" in the display until
+            # device_sync's own _prime_states pass runs on the next connect.
+            # Skipping the GUARD costs logged data that was real. The previous
+            # handler collapsed both failures into one and chose priming for
+            # both ("a failed read must not block priming"), which let a
+            # transient read failure — precisely when the server is least
+            # trustworthy and the device most likely still there — do the
+            # damage the guard exists to prevent.
+            self.logger.warning(
+                "could not read the current energy reading of device %s (%s) — not flagging it "
+                "as meterless, because that could overwrite a real reading", dev.id, exc)
+            return
+        if existing_ui not in ("", "<no meter>"):
+            return  # a real reading is already on the device — leave it alone
         try:
             self.device_sync.apply_states(
                 dev.id,
