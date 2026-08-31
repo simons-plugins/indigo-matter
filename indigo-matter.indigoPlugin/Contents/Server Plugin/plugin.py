@@ -255,7 +255,15 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
             try:
                 self.server_process = ServerProcess(prefs, self.logger)
                 self.server_process.ensure_installed()
-            except Exception as exc:
+            except Exception as exc:  # pylint: disable=broad-except
+                # Absorbing: anything ServerProcess's constructor or ensure_installed()
+                # raises. Safe because the matter-server agent is optional and gated off by
+                # default: startup continues to build the MatterClient either way, and the
+                # `self.server_process` guard on the next line is written for exactly this
+                # post-failure state. NOTE (#310): this does collapse two outcomes — a
+                # ctor failure leaves server_process None, while an ensure_installed()
+                # failure leaves it SET but possibly not installed. Nothing distinguishes
+                # them today; the traceback is the only evidence.
                 self.logger.exception(exc)
 
         # Only in managed/local mode can we read the server's own error log; in remote
@@ -374,7 +382,8 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
             # stops — so every reload would re-announce (diagnostics_menu_mixin.py
             # records the same trap for the survey log).
             self._save_plugin_prefs()
-        except Exception as exc:  # a notice must never break startup
+        except Exception as exc:  # pylint: disable=broad-except
+            # a notice must never break startup
             self.logger.exception(exc)
 
     # ------------------------------------------------------------------
@@ -432,7 +441,11 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
         """The bare call, without the once-only guard. True if it did not raise."""
         try:
             indigo.devices.subscribeToChanges()
-        except Exception as exc:
+        except Exception as exc:  # pylint: disable=broad-except
+            # Absorbing: any failure of indigo.devices.subscribeToChanges(), an
+            # undocumented, unacknowledged, one-way call. Safe because the consequence
+            # is named at ERROR and _resubscribe_tick's bounded watchdog is the retry.
+            # Pinned by test_a_failed_subscription_is_loud_and_not_fatal.
             self.logger.error("Matter bridge: could not subscribe to Indigo device changes — "
                               "exported accessories will not follow Indigo state. %s", exc)
             self.logger.exception(exc)
@@ -522,7 +535,8 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
             return
         try:
             self.export_bridge.device_updated(origDev, newDev)
-        except Exception as exc:  # never let export break Indigo's callback
+        except Exception as exc:  # pylint: disable=broad-except
+            # never let export break Indigo's callback
             # Named and rate-limited: a bare traceback here says a device broke
             # but not which one, and this callback fires often enough that a
             # stuck device would bury the rest of the event log.
@@ -550,7 +564,8 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
                 node_id = dev.pluginProps.get("nodeId")
                 if node_id not in (None, ""):
                     self.device_sync.note_node_device_deleted(int(node_id), dev.id)
-            except Exception as exc:  # a deletion must always complete
+            except Exception as exc:  # pylint: disable=broad-except
+                # a deletion must always complete
                 self.logger.exception(exc)
         # Every device type can carry a removed_state_log entry (issue #312),
         # not just matterNode — unlike the tombstone above this is unconditional
@@ -559,7 +574,8 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
             log = getattr(self, "removed_state_log", None)
             if log is not None:
                 log.forget(dev.id)
-        except Exception as exc:  # a deletion must always complete
+        except Exception as exc:  # pylint: disable=broad-except
+            # a deletion must always complete
             self.logger.exception(exc)
         if dev.id not in self._exported_ids or self.exports is None:
             return
@@ -567,7 +583,7 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
             self.exports.remove(dev.id)
             self.logger.info("Removed Matter export for %s (id %s) — the Indigo device was deleted",
                              getattr(dev, "name", ""), dev.id)
-        except Exception as exc:
+        except Exception as exc:  # pylint: disable=broad-except
             # The store rolled back, so the entry survives; the endpoint removal
             # below is still right (the device is gone either way) and the
             # startup sweep will report the orphan.
@@ -580,7 +596,12 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
                 # Issue #274: the device is confirmed gone — destroy the
                 # accessory outright.
                 self.export_bridge.remove(dev.id)
-        except Exception as exc:
+        except Exception as exc:  # pylint: disable=broad-except
+            # Absorbing: anything export_bridge.remove() raises — the socket is the
+            # bridge's, not ours, so this is an expected raise path (see the finally
+            # below, which exists because of it). Safe because the deletion has already
+            # happened in Indigo and the startup sweep reports any surviving export.
+            # Pinned by test_a_raising_endpoint_removal_still_refreshes_the_cache.
             self.logger.exception(exc)
         finally:
             # In a finally because the endpoint removal above can raise (the
@@ -590,7 +611,12 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
             # and deviceDeleted will never fire for it again.
             try:
                 self._exports_changed()
-            except Exception as exc:
+            except Exception as exc:  # pylint: disable=broad-except
+                # Absorbing: anything _exports_changed() raises. This one is inside the
+                # finally, which is why it must not be removed: an exception raised from a
+                # finally REPLACES whatever was in flight and would escape into Indigo's
+                # deviceDeleted callback, turning a bookkeeping failure into a broken
+                # delete. No test drives this arm (#310 audit).
                 self.logger.exception(exc)
 
     def shutdown(self) -> None:
@@ -604,7 +630,13 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
         if self.runtime is not None and self.runtime.is_running and self.matter is not None:
             try:
                 self.runtime.submit(self.matter.close()).result(timeout=4)
-            except Exception as exc:
+            except Exception as exc:  # pylint: disable=broad-except
+                # Absorbing: anything closing the matter-server connection raises during
+                # shutdown, on a future already capped at 4s. Safe, and deliberately quiet,
+                # because the connection is being abandoned anyway and shutdown must reach
+                # the bridge-stop below; a failure to close something we are discarding is
+                # teardown noise, not news. NOTE (#310): this level was never argued for in
+                # a commit or pinned by a test — it is day-one code.
                 self.logger.debug("matter close error: %s", exc)
         # Same ordering rule as the controller client: close the socket while the
         # loop still exists to close it on. The bridge *agent* is deliberately
@@ -634,7 +666,12 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
                 return
             await self.matter.set_default_fabric_label(desired)
             self.logger.info('fabric label set to "%s" (was %s)', desired, current or "server default")
-        except Exception as exc:
+        except Exception as exc:  # pylint: disable=broad-except
+            # Absorbing: a matter-server too old to know set_default_fabric_label.
+            # Safe because the label is cosmetic and this runs BEFORE _resync's own
+            # try — raising here would mean no reconcile at all. Level chosen
+            # deliberately in d91573e ("Cosmetic: failure logs at debug, never blocks
+            # reconcile") and pinned by test_fabric_label_failure_does_not_block_reconcile.
             self.logger.debug("could not set fabric label (older matter-server?): %s", exc)
 
     async def _resync(self) -> None:
@@ -656,7 +693,7 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
                     detailed.append(await self.matter.get_node(node_id))
             self.device_sync.reconcile_all(detailed)
             self.logger.info("reconciled %d Matter node(s)", len(detailed))
-        except Exception as exc:
+        except Exception as exc:  # pylint: disable=broad-except
             # _resync is the sole reconcile path (first connect + every reconnect);
             # keep the traceback so a first-connect failure (user sees no devices)
             # is debuggable. On failure nothing is cleared (reconcile_all never ran).
@@ -828,7 +865,8 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
         setattr(self, next_attr, now + PORT_CONFLICT_CHECK_INTERVAL)
         try:
             conflict = agent.port_conflict_report()
-        except Exception as exc:  # a diagnostic must never kill the watchdog
+        except Exception as exc:  # pylint: disable=broad-except
+            # a diagnostic must never kill the watchdog
             self.logger.debug("port conflict check failed: %s", exc)
             return  # leave any pending #187 verification armed; the next tick retries
         if due_token is not None:
@@ -998,7 +1036,7 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
             return
         try:
             self.export_bridge.exports_changed()
-        except Exception as exc:
+        except Exception as exc:  # pylint: disable=broad-except
             # A bare traceback here reads as a crash in "save settings". Say what
             # did not happen and what to do instead — the prefs ARE saved.
             self.logger.error(
@@ -1143,7 +1181,8 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
             try:
                 return self.device_sync.setting_limits(
                     int(node_id), int(endpoint_id), cluster, attribute)
-            except Exception as exc:  # a broken lookup hides the field, never breaks the dialog
+            except Exception as exc:  # pylint: disable=broad-except
+                # a broken lookup hides the field, never breaks the dialog
                 self.logger.debug("setting-limits lookup failed for node %s/%s: %s",
                                   node_id, endpoint_id, exc)
                 return None
@@ -1166,7 +1205,8 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
         def lookup(cluster):
             try:
                 return self.device_sync.attribute_list(int(node_id), int(endpoint_id), cluster)
-            except Exception as exc:  # unknown, never "absent"
+            except Exception as exc:  # pylint: disable=broad-except
+                # unknown, never "absent"
                 self.logger.debug("attribute-list lookup failed for node %s/%s: %s",
                                   node_id, endpoint_id, exc)
                 return None
@@ -1192,7 +1232,8 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
         try:
             self.pluginPrefs[REMOVED_STATE_LOG_PREF] = blob
             indigo.server.savePluginPrefs()
-        except Exception as exc:  # bookkeeping must never sink a device rebuild
+        except Exception as exc:  # pylint: disable=broad-except
+            # bookkeeping must never sink a device rebuild
             self.logger.warning(
                 "Matter: could not save the removed-state log (%s) — the affected "
                 "device(s) will reprint their state-removal notice on the next rebuild.", exc)
@@ -1229,7 +1270,8 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
             absent = device_settings.unimplemented_states(
                 dev.deviceTypeId,
                 self._setting_attribute_list_lookup(dict(dev.pluginProps)))
-        except Exception as exc:  # never break a device's state list
+        except Exception as exc:  # pylint: disable=broad-except
+            # never break a device's state list
             # .exception, not .debug: nothing expected can reach here. The gate
             # is a comprehension over a module constant plus `implements`, which
             # is total, and the attribute-list lookup swallows its own failures.
@@ -1247,7 +1289,8 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
         for state in states:
             try:
                 key = state["Key"]
-            except Exception:  # an entry we cannot read is an entry we keep
+            except Exception:  # pylint: disable=broad-except
+                # an entry we cannot read is an entry we keep
                 unreadable += 1
                 kept.append(state)
                 continue
@@ -1338,7 +1381,8 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
                 # nothing at all — the #186 failure mode the comment on that
                 # return already documents.
                 values["lastSurveySummary"] = self._survey_summary_for(values)
-        except Exception as exc:  # never block the dialog over the settings section
+        except Exception as exc:  # pylint: disable=broad-except
+            # never block the dialog over the settings section
             self.logger.exception("could not build device settings for %s: %s", devId, exc)
         # MUST be indigo.Dict, not a plain dict — the same shape
         # getPrefsConfigUiValues returns. Returning a plain dict fails INSIDE
@@ -1389,7 +1433,8 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
             dev = indigo.devices[targetId]
             props.setdefault("nodeId", dev.pluginProps.get("nodeId"))
             props.setdefault("endpointId", dev.pluginProps.get("endpointId"))
-        except Exception as exc:  # fall back to whatever the dialog carries
+        except Exception as exc:  # pylint: disable=broad-except
+            # fall back to whatever the dialog carries
             self.logger.debug("getSettingOptions: no device %r: %s", targetId, exc)
         wanted = str(filter or "").strip()
         for offer in device_settings.offered_settings(
@@ -1426,7 +1471,13 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
                 self._setting_limits_lookup(valuesDict),
                 self._setting_attribute_list_lookup(valuesDict),
                 self._has_matter_node(valuesDict))
-        except Exception as exc:
+        except Exception as exc:  # pylint: disable=broad-except
+            # Absorbing: anything planned_writes() raises while working out what the
+            # dialog changed. Safe because it aborts having submitted NOTHING, which is
+            # the only correct direction for a write path: an unknown plan must never
+            # become a burst of writes to a possibly battery-powered device (the
+            # failure _device_states' docstring describes). No test drives this arm
+            # (#310 audit).
             self.logger.exception("could not work out device setting changes: %s", exc)
             return
         if not plans:
@@ -1465,7 +1516,8 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
         except KeyError:
             self.logger.debug("device %s has no states (new or deleted mid-dialog)", dev_id)
             return {}
-        except Exception as exc:  # unexpected, and it changes what we write
+        except Exception as exc:  # pylint: disable=broad-except
+            # unexpected, and it changes what we write
             self.logger.warning(
                 "could not read states for device %s (%s) — every setting will look "
                 "changed, so only settings you actually edited should be saved", dev_id, exc)
@@ -1487,7 +1539,8 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
             ok, message = await device_settings.apply_setting(
                 self.matter, node_id, endpoint_id, plan,
                 on_observed=observed.append)
-        except Exception as exc:  # a crash here must not kill the loop
+        except Exception as exc:  # pylint: disable=broad-except
+            # a crash here must not kill the loop
             self.logger.exception('"%s" could not be applied: %s', label, exc)
             return
         if ok:
@@ -1511,7 +1564,15 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
             if actual is not None:
                 self.device_sync.apply_states(
                     dev_id, [{"key": plan.setting.key, "value": actual}])
-        except Exception as exc:
+        except Exception as exc:  # pylint: disable=broad-except
+            # Absorbing: the device being gone (routine — the dialog closed seconds ago
+            # and this runs later on the loop) AND a failed errorState/apply_states
+            # write on a device that still exists. Those are not the same thing, and
+            # the second silently defeats what the comment above promises: the dialog
+            # re-seeds from state, so without the honest value it shows a setting the
+            # device never adopted. Flagged in the #310 audit as the file's one real
+            # narrow candidate; left as-is here because narrowing it is a behaviour
+            # change and belongs in its own commit with a test.
             self.logger.debug("could not flag failed setting on device %s: %s", dev_id, exc)
 
     def deviceStartComm(self, dev):  # noqa: N802
@@ -1521,7 +1582,8 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
         # fielded devices and every update logs an Indigo error.
         try:
             dev.stateListOrDisplayStateIdChanged()
-        except Exception as exc:  # refresh failure must not block startComm
+        except Exception as exc:  # pylint: disable=broad-except
+            # refresh failure must not block startComm
             # WARNING, not debug (issue #288 review finding E): since #288 a
             # failure here can mean ten of matterBridgeHealth's twelve states
             # are missing — Indigo silently discards a write to an undeclared
@@ -1637,7 +1699,16 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
                 dev.id,
                 [{"key": "curEnergyLevel", "value": 0, "uiValue": "<no meter>"},
                  {"key": "accumEnergyTotal", "value": 0, "uiValue": "<no meter>"}])
-        except Exception as exc:  # cosmetic, must not break device start
+        except Exception as exc:  # pylint: disable=broad-except
+            # cosmetic, must not break device start
+            #
+            # Absorbing: any failure of the placeholder write itself. Safe —
+            # and note this is the ONE half of this method that is genuinely
+            # cosmetic. The guard above is not: its failure can destroy a real
+            # reading, which is why it no longer swallows (2026.29.7). Here the
+            # write has already been cleared as safe by that guard, so losing
+            # it costs a bare 0 in the display until device_sync's own
+            # _prime_states pass runs on the next connect.
             self.logger.debug("could not flag absent node energy state for %s: %s", dev.id, exc)
 
     def _prime_retired_on_time_state(self, dev) -> None:
@@ -1663,7 +1734,8 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
         try:
             self.device_sync.apply_states(
                 dev.id, [{"key": "onTime", "value": 0, "uiValue": "<unused>"}])
-        except Exception as exc:  # cosmetic, must not break device start
+        except Exception as exc:  # pylint: disable=broad-except
+            # cosmetic, must not break device start
             self.logger.debug("could not flag retired onTime state for %s: %s", dev.id, exc)
 
     def deviceStopComm(self, dev):  # noqa: N802
@@ -1734,7 +1806,8 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
             endpoint_id = dev.pluginProps.get("endpointId")
             if node_id and endpoint_id not in (None, ""):
                 known = self.device_sync.sensitivity_levels_supported(int(node_id), int(endpoint_id))
-        except Exception as exc:  # never break the dialog; degrade to the generic fallback
+        except Exception as exc:  # pylint: disable=broad-except
+            # never break the dialog; degrade to the generic fallback
             self.logger.debug("getSensitivityLevels: could not resolve device %r: %s", targetId, exc)
         if known and known > 0:
             labels = ["Low (0)", "Standard (1)", "High (2)"] if known == 3 else [f"Level {i}" for i in range(known)]
@@ -1765,7 +1838,8 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
                 name = str(getattr(dev, "name", "") or "") if dev is not None else \
                     f"(deleted device {entry.indigo_device_id})"
                 options.append((str(entry.indigo_device_id), name))
-        except Exception as exc:  # a broken picker must still offer "all"
+        except Exception as exc:  # pylint: disable=broad-except
+            # a broken picker must still offer "all"
             self.logger.debug("getCtCalibrationScope: could not list CT exports: %s", exc)
         return options
 
@@ -1973,7 +2047,13 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
         except FuturesTimeoutError:
             self.logger.error('refresh of "%s" timed out', dev.name)
             dev.setErrorStateOnServer("timeout")
-        except Exception as exc:
+        except Exception as exc:  # pylint: disable=broad-except
+            # Absorbing: any non-timeout failure of interview_node — matter-server
+            # down, node unreachable, or the node refusing. Safe because the user gets
+            # an ERROR naming the device plus a visible errorState, and the two-value
+            # vocabulary ("timeout" vs "cmd failed") is a deliberate UI contract pinned
+            # by test_action_universal_refresh_timeout_logs_and_sets_error and its
+            # failure twin.
             self.logger.error('refresh of "%s" failed: %s', dev.name, exc)
             dev.setErrorStateOnServer("cmd failed")
 
@@ -1991,7 +2071,13 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
             self.logger.error("Matter command to %s timed out", dev.name)
             dev.setErrorStateOnServer("timeout")
             return False
-        except Exception as exc:
+        except Exception as exc:  # pylint: disable=broad-except
+            # Absorbing: any non-timeout failure of a Matter command — the server being
+            # down, or the device rejecting the cluster command (a CT-only light sent
+            # MoveToHueAndSaturation, the live case behind af8540b). Safe because both
+            # are reported at ERROR with the device named and both leave a visible
+            # errorState; a downed server also marks devices unreachable independently
+            # via _on_disconnected, so the shared "cmd failed" state is short-lived.
             self.logger.error("Matter command to %s failed: %s", dev.name, exc)
             dev.setErrorStateOnServer("cmd failed")
             return False
@@ -2005,7 +2091,14 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
         # (it runs its own device-create pass), so it always gets its shot.
         try:
             self.device_sync.handle_event(evt)
-        except Exception as exc:
+        except Exception as exc:  # pylint: disable=broad-except
+            # Absorbing: anything device_sync.handle_event() raises for one event.
+            # This is STAGE ISOLATION, not loop survival — the loop is already
+            # protected two layers up (matter_client._handle_event, then
+            # ws_json_client._handle_frame, each with its own reason). Without it a
+            # device_sync failure would starve jobs.reconcile_node_added below, which
+            # can still recover the commission on its own device-create pass. Pinned
+            # by test_device_sync_failure_does_not_starve_reconcile.
             self.logger.exception(exc)
         # A node that arrives AFTER its commission job timed out is matter-server
         # finishing the join in the background (issue #16): device_sync has just

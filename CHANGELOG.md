@@ -3,6 +3,20 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
+## 2026.29.8 — internal: every broad exception handler in plugin.py is now a reviewed one
+
+No user-visible change. All 34 `except Exception` handlers in `plugin.py` were
+read — with their comments, their originating commits, the issues and ADRs they
+cite, and whether any test actually pins the decision — and each now carries a
+`# pylint: disable=broad-except` and a stated reason (issue #310, step 3).
+
+With `device_sync.py` (2026.29.6) and the energy guard (2026.29.7) now merged,
+the two big files are finished and the plugin-wide `broad-exception-caught`
+count falls **120 → 46**, all of it now in twelve smaller modules.
+
+Nothing was narrowed here. The audit found one genuine candidate
+(`_apply_setting`'s device flag) and it is recorded at the site rather than
+changed, because narrowing it is a behaviour change and belongs with a test.
 ## 2026.29.7 — a node's energy reading can no longer be overwritten because Indigo was briefly unreadable
 
 `_prime_absent_node_energy_state` flags a node device's `curEnergyLevel` /
