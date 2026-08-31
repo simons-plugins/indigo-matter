@@ -3,6 +3,17 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
+## 2026.29.6 — internal: every broad exception handler in device_sync.py is now a reviewed one
+
+No user-visible change. All 40 `except Exception` handlers in `device_sync.py`
+were read and each now carries a `# pylint: disable=broad-except` **and** a
+stated reason — what it absorbs, and why absorbing it is safe. The plugin-wide
+`broad-exception-caught` count falls 120 → 80; the remainder are other modules,
+`plugin.py` holding 34 of them (issue #310, step 3).
+
+The suppression is the point: it is only added where someone has read the
+handler, so the count that remains is an honest backlog rather than noise.
+
 ## 2026.29.3 – 2026.29.5 — a failed device lookup is no longer mistaken for a deleted device
 
 `indigo.devices[dev_id]` raises `KeyError` for "no such device" and anything
