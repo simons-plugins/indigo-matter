@@ -2665,6 +2665,95 @@ describe("onOff commands (§4.2, §7, #143, #201)", () => {
     });
 });
 
+describe("a countdown across a node restart (issue #203)", () => {
+    it("REPRODUCTION: a node restart drops a running countdown, leaving the device on", async () => {
+        // #203 confirmed, and its mechanism corrected. The issue predicted
+        // that neither the timer NOR `OnTime` would survive; measured, only
+        // the timer dies. `OnTime` comes back persisted at its remaining
+        // value while the in-memory `timedOnTimer` — a lazily created
+        // `Time.getPeriodicTimer` (`OnOffServer.js:151`) — does not, and
+        // nothing rearms it. The failure is one-directional: it can only
+        // ever leave something ON that was asked to go off.
+        //
+        // Deliberately driven through a real restart — close the node, reopen
+        // the SAME storage path — because the claim under test is about what
+        // matter.js persists, which a double cannot answer.
+        const storagePath = mkdtempSync(join(SCRATCH_ROOT, "indigo-matter-203-"));
+        scratchRoots.push(storagePath);
+
+        const COUNTDOWN_DECISECONDS = 30; // 3s — long enough to restart inside
+
+        const first = await harness({ storagePath });
+        try {
+            await first.registry.reconcile([spec(1, Role.onOffLight)], false);
+            const endpoint = only(first);
+            await first.registry.setState(1, { onOff: true });
+            first.commands.length = 0;
+
+            await endpoint.act(agent =>
+                agent.get(OnOffLighting).onWithTimedOff({
+                    onOffControl: { acceptOnlyWhenOn: false },
+                    onTime: COUNTDOWN_DECISECONDS,
+                    offWaitTime: 0,
+                }),
+            );
+            assert.deepEqual(
+                first.commands,
+                [{ indigoDeviceId: 1, command: "onOff", args: { value: true } }],
+                "the countdown's ON must reach Indigo",
+            );
+            assert.ok(
+                ((endpoint.stateOf("onOff") as Record<string, number>).onTime ?? 0) > 0,
+                "precondition: a countdown must actually be running before the restart",
+            );
+        } finally {
+            await first.close(); // the restart
+        }
+
+        const second = await harness({ storagePath });
+        try {
+            await second.registry.reconcile([spec(1, Role.onOffLight)], false);
+            const endpoint = only(second);
+            // The plugin's own attach push. Indigo still has the device ON,
+            // correctly — it was turned on and nothing has turned it off.
+            await second.registry.setState(1, { onOff: true });
+            second.commands.length = 0;
+
+            // The mechanism, and NOT the one #203 modelled: `OnTime` survives
+            // the restart intact — matter.js persists the attribute — while
+            // `timedOnTimer` does not, because it is an in-memory
+            // `Time.getPeriodicTimer` nothing rearms on start
+            // (`OnOffServer.js:151`). So the endpoint comes back openly
+            // stating that 3.0s of countdown were left, and no clock is
+            // running against it.
+            //
+            // That is the useful half of this reproduction: the evidence a
+            // fix needs is already on disk. A fix does not have to persist
+            // anything new — only to READ this at attach.
+            assert.equal(
+                (endpoint.stateOf("onOff") as Record<string, unknown>).onTime,
+                COUNTDOWN_DECISECONDS,
+                "OnTime is persisted verbatim — the in-flight countdown is still legible after the restart",
+            );
+
+            // Well past the original 3s deadline.
+            await waitFor(() => second.commands.length > 0, 4500);
+            assert.deepEqual(
+                second.commands,
+                [],
+                "#203 REPRODUCED: no off ever reaches Indigo, so the device stays on indefinitely",
+            );
+            assert.equal(
+                (endpoint.stateOf("onOff") as Record<string, unknown>).onOff,
+                true,
+                "and the attribute agrees with Indigo that it is still on",
+            );
+        } finally {
+            await second.close();
+        }
+    });
+});
+
 describe("LevelControl command conversion (§4.2, #143)", () => {
     /**
      * One row per LevelControl command variant. `run` performs the real
