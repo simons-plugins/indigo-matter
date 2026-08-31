@@ -78,7 +78,7 @@ class DiagnosticsMenuMixin:
         try:
             self.pluginPrefs[SURVEY_LOG_PREF] = blob
             indigo.server.savePluginPrefs()
-        except Exception as exc:  # noqa: BLE001 - bookkeeping must never sink a reconcile
+        except Exception as exc:  # bookkeeping must never sink a reconcile
             self.logger.warning(
                 "Matter: could not save the settable-attribute survey log (%s) — "
                 "the affected device(s) will be re-reported on the next start.", exc)
@@ -150,7 +150,7 @@ class DiagnosticsMenuMixin:
             dev_id = self.device_sync.lookup(node.node_id, endpoint.endpoint_id)
             if dev_id:
                 return f"{indigo.devices[dev_id].name} (endpoint {endpoint.endpoint_id})"
-        except Exception as exc:  # noqa: BLE001 - a label must never break the picker
+        except Exception as exc:  # a label must never break the picker
             self.logger.debug("explore: label for endpoint %s failed: %s",
                               endpoint.endpoint_id, exc)
         label = endpoint.node_label or endpoint.product_name
@@ -298,7 +298,7 @@ class DiagnosticsMenuMixin:
             errors["attribute"] = ("No answer within the timeout. A battery/Thread device "
                                    "may simply have been asleep — try again.")
             return (False, valuesDict, errors)
-        except Exception as exc:  # noqa: BLE001 - surfaced to the dialog below
+        except Exception as exc:  # surfaced to the dialog below
             self.logger.warning("live read of %s on node %s failed: %s",
                                 settings_report.attribute_label(cluster, attribute),
                                 node_id_to_str(node_id), exc)
@@ -353,13 +353,13 @@ class DiagnosticsMenuMixin:
                 self.matter.get_node(int(node_id))).result(timeout=SURVEY_READ_TIMEOUT)
         except FuturesTimeoutError as exc:
             raise MatterUnavailable("matter-server did not answer in time") from exc
-        except Exception as exc:  # noqa: BLE001 - reported to the caller as unavailable
+        except Exception as exc:  # reported to the caller as unavailable
             raise MatterUnavailable(str(exc)) from exc
         if not raw:
             return None
         try:
             return parse_node(raw)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             raise MatterUnavailable(f"the node's details could not be parsed: {exc}") from exc
 
 

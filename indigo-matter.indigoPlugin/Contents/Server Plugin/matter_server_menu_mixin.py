@@ -202,7 +202,7 @@ class MatterServerMenuMixin:
                 "matter-server installed, pinned to node at %s, and restarting onto the "
                 "new version — it reconnects automatically.", sp.resolved_bin_dir,
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             # npm may have succeeded and only the pin/activate step failed — say so, so
             # the user doesn't reinstall in circles chasing a downstream problem.
             self.logger.exception(exc)
@@ -265,7 +265,7 @@ class MatterServerMenuMixin:
             restarted = True if reloaded else (
                 False if reloaded is None else self.server_process.restart()
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             # Unguarded, this would escape with the expected-restart window still armed,
             # suppressing the crash diagnostic for 30s while the server is down.
             self._restart_expected_until = 0.0
@@ -342,7 +342,7 @@ class MatterServerMenuMixin:
         try:
             for folder in indigo.devices.folders:
                 options.append((str(folder.id), folder.name))
-        except Exception as exc:  # noqa: BLE001 - never break the dialog; degrade to no-folder only
+        except Exception as exc:  # never break the dialog; degrade to no-folder only
             self.logger.exception(exc)
         return options
 
@@ -362,7 +362,7 @@ class MatterServerMenuMixin:
             # picker rendering and submit. Benign (device lands at root), but leave
             # a trail rather than silently dropping the selection.
             self.logger.debug("folder id %r not found, commissioning at root", folder_id)
-        except Exception as exc:  # noqa: BLE001 - degrade to no folder, never fail the commission
+        except Exception as exc:  # degrade to no folder, never fail the commission
             self.logger.warning("folder id %r not resolvable, commissioning without a folder: %s", folder_id, exc)
         return None
 
@@ -376,7 +376,7 @@ class MatterServerMenuMixin:
                 label = ", ".join(names) if names else "(no Indigo devices)"
                 options.append((str(node_id), f"{label} — node {node_id_to_str(node_id)}"))
             return options
-        except Exception as exc:  # noqa: BLE001 - never break the dialog; degrade to an empty picker
+        except Exception as exc:  # never break the dialog; degrade to an empty picker
             self.logger.exception(exc)
             return []
 
@@ -556,7 +556,7 @@ class MatterServerMenuMixin:
         """
         try:
             node = self._fetch_node(node_id)  # pylint: disable=no-member  # DiagnosticsMenuMixin (issue #146)
-        except Exception as exc:  # noqa: BLE001 - _fetch_node only ever raises its own
+        except Exception as exc:  # _fetch_node only ever raises its own
             # MatterUnavailable (diagnostics_menu_mixin.py), caught by base class here
             # rather than importing that mixin's exception type — a mixin importing a
             # sibling mixin's name is exactly the back-import issue #146 removed
@@ -619,7 +619,7 @@ class MatterServerMenuMixin:
                 f"matter-server refused this (error {exc.code}) — a window may already be "
                 "open on this device; wait up to 15 minutes and try again. The previous "
                 "window's code cannot be recovered. See the log.")
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             self.logger.error("share: opening a commissioning window on node %s FAILED — %s",
                               node_id_to_str(node_id), exc)
             self.logger.exception(exc)
@@ -780,7 +780,7 @@ class MatterServerMenuMixin:
         try:
             # pylint: disable=no-member  # Plugin._resync (issue #146)
             self.runtime.submit(self._resync()).result(timeout=RECONCILE_TIMEOUT)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             self.logger.error(
                 "Matter: cleared %d node-device tombstone(s), but the reconcile that "
                 "recreates them FAILED — %s. They will be recreated on the next successful "

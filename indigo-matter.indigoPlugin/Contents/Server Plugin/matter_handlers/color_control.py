@@ -230,7 +230,7 @@ class ColorControlHandler(LevelControlHandler):
             return
         try:
             updater([{"key": key, "value": value} for key, value in states.items()])
-        except Exception:  # noqa: BLE001 - cosmetic echo only
+        except Exception:  # cosmetic echo only
             pass
 
     def _set_color(self, indigo_dev: Any, values: dict):

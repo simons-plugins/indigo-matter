@@ -384,7 +384,7 @@ class BridgeAgentMenuMixin:
                 else:
                     self.logger.info("Matter bridge installed and restarted onto the new "
                                      "version — reload the plugin to reconnect.")
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             self.logger.exception(exc)
             self.logger.error(
                 "Install of the Matter bridge did not complete after the npm step — the "

@@ -95,7 +95,7 @@ class PairingMenuMixin:
             return (False, valuesDict, errors)
         try:
             pairing = self.runtime.submit(client.get_pairing()).result(timeout=PAIRING_READ_TIMEOUT)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             self.logger.error("Matter bridge: could not read the bridge node's pairing state — %s. "
                               "No pairing window was opened.", exc)
             self.logger.exception(exc)
@@ -114,7 +114,7 @@ class PairingMenuMixin:
         try:
             window = self.runtime.submit(
                 client.open_commissioning_window(duration)).result(timeout=WINDOW_OPEN_TIMEOUT)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             self.logger.error(
                 "Matter bridge: opening a pairing window FAILED — %s. Nothing was changed and "
                 "existing pairings are untouched. If the bridge says a window is already open, "
@@ -184,7 +184,7 @@ class PairingMenuMixin:
         base = "http://localhost:8176"
         try:
             base = str(indigo.server.getWebServerURL() or base)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             self.logger.debug("could not resolve the Indigo web server URL (%s)", exc)
         return f"{base}/message/{self._export_plugin_id()}/pairing/"  # pylint: disable=no-member  # ExportDialogMixin
 
@@ -252,7 +252,7 @@ class PairingMenuMixin:
         try:
             removal = self.runtime.submit(
                 client.remove_fabric(fabric_index)).result(timeout=UNPAIR_TIMEOUT)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             self.logger.error("Matter bridge: unpairing ecosystem %s FAILED — %s. Pairings are "
                               "unchanged.", fabric_index, exc)
             self.logger.exception(exc)
@@ -310,7 +310,7 @@ class PairingMenuMixin:
         try:
             pairing = self.runtime.submit(client.get_pairing()).result(timeout=PAIRING_READ_TIMEOUT)
             bridge.note_fabrics(pairing.fabrics)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             # The removal itself already succeeded or was already true; failing
             # to re-read the list afterwards is not worth reporting as a failure.
             self.logger.debug("Matter bridge: could not refresh the ecosystem list (%s)", exc)
@@ -418,7 +418,7 @@ class PairingMenuMixin:
             self.logger.error(
                 "Fabric backup FAILED — no fabric to back up, nothing was written: %s", exc,
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             self.logger.error("Fabric backup FAILED — nothing was written: %s", exc)
             self.logger.exception(exc)
 
@@ -426,7 +426,7 @@ class PairingMenuMixin:
         """List-callback populating the restore picker (newest first)."""
         try:
             storage_path = self._resolve_storage_path()
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             self.logger.exception(exc)
             return []
         options = []
@@ -507,7 +507,7 @@ class PairingMenuMixin:
                         "drift in the log and renumbers nothing.", preserved,
                         " and the node has been restarted" if result["bridge_started"] else "")
             return (True, valuesDict)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             # restore_backup rolled back and preserved the original fabric (or
             # aborted before touching it). Surface the failure in the UI dialog —
             # never report success when the underlying op failed.

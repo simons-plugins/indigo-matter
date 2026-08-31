@@ -702,7 +702,7 @@ class SurveyLog:
             return
         try:
             self._save(self.to_json())
-        except Exception:  # noqa: BLE001 - bookkeeping must never sink a reconcile
+        except Exception:  # bookkeeping must never sink a reconcile
             # Deliberately silent here: the caller supplies the save hook and
             # logs there (DiagnosticsMenuMixin._save_survey_log does, per
             # issue #308). A failed save costs one repeated INFO on the next
