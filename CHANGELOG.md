@@ -3,6 +3,109 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
+## 2026.29.2 — the bridge node for permanent removal
+
+- Pins the bundled bridge node to **0.17.1**, which is where 2026.29.0's and
+  2026.29.1's wire changes actually live. 0.17.0 had already been published
+  when those landed, so the repo was holding the new plugin against the old
+  published node — a combination that fails quietly rather than loudly:
+  `protocolVersion` is still 2 on both sides, the handshake passes, nothing
+  refuses, and removals simply go on orphaning. The deletion behaviour below
+  would have been inert on any install that had not rebuilt the node by hand.
+
+## 2026.29.1 — "Re-adopt a Matter accessory…" is gone
+
+With a confirmed deletion now destroying the accessory (2026.29.0), nothing
+can leave an orphan behind, so the whole concept comes out — 14 methods, the
+`list_orphans` wire command, the `orphanedAt` field and the menu item itself.
+
+- **The plugin menu loses "Re-adopt a Matter accessory…".** There is no
+  longer anything for it to list. If you want to keep an accessory's identity
+  and number while changing which Indigo device drives it, that is what
+  **"Migrate an exported accessory…"** does, and it is unaffected.
+- **Migrate is verified end to end against the new mechanism.** Its two-command
+  sequence now destroys and re-adds rather than superseding in place; the
+  accessory number comes from matter.js's own persisted allocation, so both the
+  number and the identity still move correctly.
+- **A role change's old accessory was never re-adoptable** and still is not —
+  that number is retired on purpose (issue #240).
+- `mass_removal_refused` is untouched, and matters more now than it did: it is
+  the single guard between a plugin bug that sends a short list and a wiped
+  fabric.
+
+ADR-0016 supersedes ADR-0015's mechanism; ADR-0015's ruling stands. Closes #274.
+
+## 2026.29.0 — a deleted Indigo device destroys its Matter accessory
+
+**Behaviour change.** Deleting an Indigo device now removes the Matter
+accessory it exported, in every paired ecosystem. Previously the accessory was
+kept as an "orphan" so it could be handed to another device later.
+
+The reason for the change is what an orphan actually costs. Issue #273 measured
+it on the reference rig: **nine live published endpoints** whose Indigo devices
+no longer existed — duplicate names, dead accessories and inflated endpoint
+counts in Apple Home and Alexa. An orphan is not free; it is an accessory every
+controller still sees.
+
+- **If you want to keep an accessory, migrate it before you delete the device**
+  — "Migrate an exported accessory…" moves the identity and the number across.
+  Delete first and you re-pair in Apple/Alexa, which takes a few minutes.
+- **A deletion the plugin was not running for is now caught too.** Indigo told
+  nobody, so on the next attach an endpoint whose device is gone is destroyed
+  rather than retained.
+- **Existence is the whole rule, and it is deliberately narrow.** A device is
+  gone when it is not in `indigo.devices` — nothing else. A device whose owning
+  plugin is disabled, restarting or still loading STILL EXISTS, so none of those
+  is ever read as a deletion. There is no grace period because none is needed.
+
+## 2026.28.9 — a failed save now says so, and a state-removal notice stops repeating
+
+- **A survey-log save that fails is now logged.** `_save_survey_log` had no
+  error handling at all, so a raising `savePluginPrefs()` was swallowed further
+  down and nobody said anything — the comment describing "the caller logs there
+  if it wants to" pointed at a contract nothing honoured. It now warns, naming
+  the failure and its consequence (issue #308).
+- **The state-removal INFO logs on change, not on every rebuild.** Indigo
+  rebuilds the state list on each plugin start, and the notice reprinted its
+  unchanged answer every time — around three lines per start, measured across a
+  week of jarvis logs. It now prints the first time a device loses a set of
+  states, and again if a device later loses a *different* one (issue #312).
+
+## 2026.28.7 – 2026.28.8 — internal: the repo gets a test gate
+
+No user-visible change.
+
+- **CI now runs pytest, pylint and the bridge-node suite** on every PR and on
+  every push to main. Until now it ran only version-check and create-release,
+  so the refactor below was verified by nothing but someone running pytest on a
+  laptop. The bridge-node run matters because `frames.json` is the one golden
+  fixture both suites read — a frame change has to satisfy both.
+- **Python 3.11 is back in the matrix.** Four bridge-client tests read
+  `client.status` immediately after `wait_connected()` and passed on 3.13 only
+  because its event loop happened to have run the attach by then; they now wait
+  for the attach itself (issue #304). Pre-existing, and invisible for exactly as
+  long as no CI ran the suite.
+- A drifted duplicate of the inbound Indigo test fakes was unified into
+  `tests/indigo_fakes.py` (issue #306).
+
+## 2026.28.2 – 2026.28.6 — internal: five refactor passes, no behaviour change
+
+No user-visible change; recorded so the version numbers are not a blank.
+
+- **Six re-derived decisions collapsed into single helpers** — the
+  `SupportsPowerMeter`/`SupportsEnergyMeter` derivation alone had been written
+  out at six places, the same class of defect already fixed once for batteries.
+- **`server_menu_mixin` split into three mixins** (2325 lines, six unrelated
+  bands), **`BridgeHealthReporter` extracted from `ExportBridge`** (2888 → 2192
+  lines) and **`NodeResolver` extracted from `LaunchAgent`** — all pure moves,
+  no method renamed, added or dropped.
+- **`exportAddOrUpdate` 165 → 104 lines**, with accessory-identity resolution
+  and the colour-temperature carry-forward given their own names.
+- The `LaunchAgent` split stopped well short of what the plan called for:
+  measured, the code has 48 cross-band calls, most of them mutual, in exactly
+  the paths hardened against #182 and #187. Composing those would have produced
+  a worse file than the one we started with.
+
 ## 2026.28.1 — learned colour-temperature bounds are now visible in the UI
 
 Issue #293 shipped the learner and the calibration sweep, but nothing in the

@@ -24,3 +24,6 @@ docs/research/
 
 # local secrets (npm publish token)
 .env
+
+# npm pack output — build artefact, never committed
+bridge-node/*.tgz

@@ -534,32 +534,23 @@ If the bridge node is NOT refusing, this does nothing useful and is refused: the
         Migrate an exported accessory… (issue #246). Moves a LIVE exported
         accessory's identity to a different Indigo device — replaced
         hardware, a module moved to new gear, a device rebuilt under a new
-        id, with the OLD Indigo device still present. Placed immediately
-        BEFORE "Re-adopt a Matter accessory…", and the two are a matched
-        pair, not a duplicate:
+        id, with the OLD Indigo device still present.
 
-        * Migrate is the LIVE-source path. The identity never lapses, so no
-          paired ecosystem ever processes a removal, and room, name, scenes
-          and automations survive BY CONSTRUCTION — the 2026-08-18 jarvis
-          measurement behind ADR-0011.
-        * Re-adopt is the recovery fallback for an identity that has
-          ALREADY been left behind — the old device is gone, or stopped
-          exporting, before anyone reached for a menu. By the time it is
-          reachable, most ecosystems (Apple Home within moments) have
-          already purged the room/name/scene context re-adopt cannot get
-          back.
+        This is the LIVE-source path, and since issue #274 it is the ONLY
+        path: a deleted Indigo device destroys its accessory, so an identity
+        left behind is no longer recoverable and the re-adopt fallback that
+        used to sit below this entry is gone. Migrate BEFORE deleting the
+        old device. The identity never lapses, so no paired ecosystem ever
+        processes a removal, and room, name, scenes and automations survive
+        BY CONSTRUCTION — the 2026-08-18 jarvis measurement behind ADR-0011.
 
-        Reach for migrate FIRST, while the old device still exists; re-adopt
-        is what is left once it does not. Declarative under the hood
-        (ADR-0011): the store retargets the entry in one atomic
-        `replace_all`, and a full mid-session `attach`
+        Declarative under the hood (ADR-0011): the store retargets the entry
+        in one atomic `replace_all`, and a full mid-session `attach`
         (`ExportBridge.reattach()`) carries it to the bridge node, which
-        reconciles it as an in-place REKEY — zero wire activity, same
-        `Endpoint.id`, same accessory number. No dedicated protocol command,
-        for the same reason ADR-0010 rejected one for re-adopt.
+        reconciles it as an in-place REKEY — same `Endpoint.id`, same
+        accessory number.
 
-        Master-detail shape, same reasoning as "Re-adopt a Matter
-        accessory…" below: `migrateSource` gets a CallbackMethod
+        Master-detail shape: `migrateSource` gets a CallbackMethod
         (`migrateSourceChanged`) purely to make Indigo round-trip and re-run
         `migrateDevice`'s own dynamicReload list, filtered to devices that
         can take the picked source's role.
