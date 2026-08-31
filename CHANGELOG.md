@@ -10,12 +10,49 @@ read — with their comments, their originating commits, the issues and ADRs the
 cite, and whether any test actually pins the decision — and each now carries a
 `# pylint: disable=broad-except` and a stated reason (issue #310, step 3).
 
-Two are left for PR #323, which owns that function. The plugin-wide count falls
-to 88 on this branch; `device_sync.py`'s 40 clear separately.
+With `device_sync.py` (2026.29.6) and the energy guard (2026.29.7) now merged,
+the two big files are finished and the plugin-wide `broad-exception-caught`
+count falls **120 → 46**, all of it now in twelve smaller modules.
 
 Nothing was narrowed here. The audit found one genuine candidate
 (`_apply_setting`'s device flag) and it is recorded at the site rather than
 changed, because narrowing it is a behaviour change and belongs with a test.
+## 2026.29.7 — a node's energy reading can no longer be overwritten because Indigo was briefly unreadable
+
+`_prime_absent_node_energy_state` flags a node device's `curEnergyLevel` /
+`accumEnergyTotal` as `<no meter>` so a node without an endpoint-0 meter does
+not display a bare `0` that reads as a real "0 W". It is guarded: before
+writing, it reads what the device currently shows and does nothing if a real
+reading is already there. `deviceStartComm` re-fires on **every** prop change,
+so that guard runs constantly.
+
+The guard's own failure was swallowed, and priming went ahead anyway. A read
+that failed for a transient reason — the very moment Indigo is least
+trustworthy — therefore let the placeholder overwrite a real reading.
+`accumEnergyTotal` moves slowly enough that SQL Logger would record a large
+negative delta immediately followed by an equally large positive one.
+
+**The two failures are now told apart**, which is the whole fix:
+
+- **The device is absent** (`KeyError`) — it cannot be holding a reading worth
+  protecting, so the prime still happens. Leaving the state at Indigo's bare
+  `0` would be the plausible-looking-value mistake this method exists to
+  avoid. Unchanged behaviour, and the existing test that pins it still passes
+  untouched.
+- **The lookup itself failed** — the device most likely still exists, so the
+  prime is skipped and the reason is logged. The display shows a bare `0`
+  until `device_sync`'s own priming pass runs on the next connect; nothing is
+  destroyed.
+## 2026.29.6 — internal: every broad exception handler in device_sync.py is now a reviewed one
+
+No user-visible change. All 40 `except Exception` handlers in `device_sync.py`
+were read and each now carries a `# pylint: disable=broad-except` **and** a
+stated reason — what it absorbs, and why absorbing it is safe. The plugin-wide
+`broad-exception-caught` count falls 120 → 80; the remainder are other modules,
+`plugin.py` holding 34 of them (issue #310, step 3).
+
+The suppression is the point: it is only added where someone has read the
+handler, so the count that remains is an honest backlog rather than noise.
 
 ## 2026.29.3 – 2026.29.5 — a failed device lookup is no longer mistaken for a deleted device
 

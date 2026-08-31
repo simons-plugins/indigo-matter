@@ -2360,3 +2360,61 @@ def test_a_deleted_device_is_forgotten_by_the_removed_state_log(
     plugin.deviceDeleted(dev)
 
     assert plugin.removed_state_log.should_log(7, "startUpOnOff")
+
+
+class _UnreadableDevices:
+    """An ``indigo.devices`` whose subscript fails the way a sick server fails.
+
+    A dict already raises ``KeyError`` for "no such device"; this is the OTHER
+    failure, the one that used to be indistinguishable from it.
+    """
+
+    def __init__(self, exc=None):
+        self._exc = exc or RuntimeError("the Indigo server is not answering")
+
+    def __getitem__(self, _dev_id):
+        raise self._exc
+
+
+def test_an_unreadable_energy_reading_does_not_prime_over_it(plugin_cls, mock_indigo_base):
+    """The guard is the only thing between an unguarded prime and a real ep-0
+    reading, and deviceStartComm re-fires on every prop change. If the guard
+    cannot be EVALUATED, priming anyway is the one outcome that can destroy
+    data — accumEnergyTotal moves slowly enough that SQL Logger would log a
+    huge negative delta and then an equally huge positive one. Not priming
+    costs a bare 0 in the display until _prime_states runs on the next
+    connect."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    mock_indigo_base.devices = _UnreadableDevices()
+    stub = SimpleNamespace(logger=MagicMock(), device_sync=MagicMock())
+    plugin_cls._prime_absent_node_energy_state(stub, SimpleNamespace(id=42))
+
+    stub.device_sync.apply_states.assert_not_called()
+    assert any("could not overwrite a real reading" in str(call.args)
+               or "overwrite a real reading" in str(call.args)
+               for call in stub.logger.warning.call_args_list), \
+        "a skipped prime must say why, or it looks like the state was simply never flagged"
+
+
+def test_the_two_read_failures_are_not_treated_the_same(plugin_cls, mock_indigo_base):
+    """The distinction this fix exists for, asserted as a pair so neither half
+    can be changed without noticing the other.
+
+    A device ABSENT from indigo.devices (KeyError) cannot be holding a reading
+    the guard would protect, so it still primes — leaving the state at
+    Indigo's plausible-looking bare 0 is the #190 mistake. A lookup that FAILS
+    means the device most likely still exists, so it must not.
+    """
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    absent = SimpleNamespace(logger=MagicMock(), device_sync=MagicMock())
+    mock_indigo_base.devices = {}          # a real dict: a real KeyError
+    plugin_cls._prime_absent_node_energy_state(absent, SimpleNamespace(id=42))
+    absent.device_sync.apply_states.assert_called_once()
+
+    unreadable = SimpleNamespace(logger=MagicMock(), device_sync=MagicMock())
+    mock_indigo_base.devices = _UnreadableDevices()
+    plugin_cls._prime_absent_node_energy_state(unreadable, SimpleNamespace(id=42))
+    unreadable.device_sync.apply_states.assert_not_called()
