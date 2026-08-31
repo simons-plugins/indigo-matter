@@ -798,7 +798,16 @@ class DeviceSync:
             for dev_id in candidates:
                 try:
                     indigo.device.ungroupDevice(indigo.devices[dev_id])
+                except KeyError:
+                    self.logger.debug("could not ungroup Indigo device %s: it is gone", dev_id)
                 except Exception as exc:
+                    # Deliberately debug, and NOT escalated with the rest of
+                    # this pass's lookups. An open device dialog refuses the
+                    # ungroup routinely; the delete below is still attempted,
+                    # usually succeeds, and when it does not THAT failure
+                    # warns. Pinned by
+                    # test_a_refused_ungroup_still_lets_delete_node_delete_what_it_can,
+                    # which asserts this exact level.
                     self.logger.debug("could not ungroup Indigo device %s: %s", dev_id, exc)
             deleted = []
             for dev_id in candidates:
@@ -1361,8 +1370,18 @@ class DeviceSync:
                 # id costs one device rather than the rest of the node's sweep
                 # (fix F).
                 indigo.devices[int(dev_id)]
-            except Exception as exc:
+            except (KeyError, ValueError) as exc:
+                # Gone, or an id that will not coerce — either way there is no
+                # device to group and the next pass will not find one.
                 self.logger.debug("not grouping device %s: %s", dev_id, exc)
+                continue
+            except Exception as exc:
+                # NOT gone: the lookup failed, so a device that exists is left
+                # ungrouped and nothing else reports it.
+                self._group_warn(
+                    int(dev_id) if str(dev_id).lstrip("-").isdigit() else 0, "group-lookup",
+                    "could not read device %s to group it (%s) — it is left ungrouped",
+                    dev_id, exc)
                 continue
             try:
                 self._ensure_grouped(dev_id, group_with, family)
@@ -1809,8 +1828,19 @@ class DeviceSync:
         """
         try:
             dev = indigo.devices[dev_id]
+        except KeyError:
+            # Gone — deleted out of band between the index read and here.
+            # Nothing to true up, and reconcile heals the index.
+            self.logger.debug("name true-up: device %s is gone", dev_id)
+            return
         except Exception as exc:
-            self.logger.debug("name true-up: device %s unavailable: %s", dev_id, exc)
+            # NOT gone: the lookup itself failed, so a device that very likely
+            # still exists silently keeps whatever name it has. Deduped —
+            # this path runs on every reconcile pass.
+            self._group_warn(
+                dev_id, "trueup-name-lookup",
+                "could not read device %s to true up its name (%s) — its name is left as it is",
+                dev_id, exc)
             return
         current = getattr(dev, "name", "")
         if current == target:
@@ -1874,8 +1904,16 @@ class DeviceSync:
         """
         try:
             dev = indigo.devices[dev_id]
+        except KeyError:
+            self.logger.debug("node-device true-up: device %s is gone", dev_id)
+            return
         except Exception as exc:
-            self.logger.debug("node-device true-up: device %s unavailable: %s", dev_id, exc)
+            # NOT gone — see _true_up_endpoint_name. The whole true-up (folder
+            # adoption and the nodeBaseName restamp below) is skipped.
+            self._group_warn(
+                dev_id, "trueup-node-lookup",
+                "could not read node device %s to true up its folder and name (%s) — "
+                "both are left as they are", dev_id, exc)
             return
         # Folder first, and independently of any name evidence: an orphaned
         # node device in the root folder is worth healing even for a node whose
@@ -2507,8 +2545,18 @@ class DeviceSync:
         """
         try:
             dev = indigo.devices[dev_id]
+        except KeyError:
+            self.logger.debug("apply_identity: device %s is gone", dev_id)
+            return False
         except Exception as exc:
-            self.logger.debug("apply_identity: device %s unavailable: %s", dev_id, exc)
+            # NOT gone. The False returned below is read by the true-up callers
+            # as "the rename did not land" (fix B), which is the safe answer
+            # either way — but a caller must not be told that in silence when
+            # the cause was a failed lookup rather than a failed rename.
+            self._group_warn(
+                dev_id, "identity-lookup",
+                "could not read device %s to apply its commissioned name and folder (%s)",
+                dev_id, exc)
             return False
         renamed = False
         try:
@@ -3507,16 +3555,30 @@ class DeviceSync:
     def _safe_unreachable(self, dev_id: int) -> None:
         try:
             indigo.devices[dev_id].setErrorStateOnServer("unreachable")
+        except KeyError:
+            self.logger.debug("could not mark %s unreachable: it is gone", dev_id)
         except Exception as exc:
-            self.logger.debug("could not mark %s unreachable: %s", dev_id, exc)
+            # NOT gone: the device stays on screen with no error state while
+            # the node behind it is unreachable — the failure mode that looks
+            # exactly like a healthy device.
+            self._group_warn(
+                dev_id, "unreachable-write",
+                "could not mark device %s unreachable (%s) — it will keep showing as normal "
+                "while its Matter node is not responding", dev_id, exc)
 
     def _clear_error(self, dev_id: int) -> None:
         try:
             dev = indigo.devices[dev_id]
             if getattr(dev, "errorState", ""):
                 dev.setErrorStateOnServer("")
+        except KeyError:
+            self.logger.debug("could not clear error on %s: it is gone", dev_id)
         except Exception as exc:
-            self.logger.debug("could not clear error on %s: %s", dev_id, exc)
+            # NOT gone: a recovered device keeps a stale "unreachable" badge.
+            self._group_warn(
+                dev_id, "clear-error",
+                "could not clear the error state on device %s (%s) — it may still show as "
+                "unreachable after its node has recovered", dev_id, exc)
 
     def _write_node_reachable(self, node_id: Any, reachable: bool) -> None:
         """Write matterNode's own ``reachable`` state directly (issue #204).
@@ -3542,9 +3604,20 @@ class DeviceSync:
             return
         try:
             indigo.devices[dev_id].updateStatesOnServer([_reachable_kv(reachable)])
-        except Exception as exc:
+        except KeyError:
             self.logger.debug(
-                "could not write matterNode reachable state for node %s: %s", node_id, exc)
+                "could not write matterNode reachable state for node %s: the device is gone",
+                node_id)
+        except Exception as exc:
+            # NOT gone, and the most consequential of these: `reachable` is a
+            # state triggers and schedules are written against, so a failed
+            # write leaves automations reading a value that has stopped
+            # tracking the node while nothing anywhere says so.
+            self._group_warn(
+                dev_id, "reachable-write",
+                "could not write the reachable state for Matter node %s (%s) — any trigger or "
+                "schedule using it is reading a value that is no longer being updated",
+                node_id, exc)
 
     # ------------------------------------------------------------------
     # Inbound events (asyncio thread) → Indigo state

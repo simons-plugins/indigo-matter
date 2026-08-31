@@ -5659,3 +5659,182 @@ def test_ungroup_then_user_delete_still_tombstones_the_node(ds, indigo_env):
 
     assert ds.node_tombstones.is_tombstoned(42)
     assert ds.create_from_raw(evidenced, "Office Plug")["nodeDeviceId"] is None
+
+
+# ----------------------------------------------------------------------
+# Lookup failures are not deletions (issue #310)
+#
+# `indigo.devices[dev_id]` raises KeyError for "no such device" and anything
+# else for "the lookup itself failed". Collapsing those into one handler is
+# the failure the workspace degradation-path standard names by hand: a sick
+# Indigo server becomes indistinguishable from a device the user deleted, and
+# the work these methods exist to do is skipped in silence.
+#
+# Each test below drives BOTH halves of one site: a non-KeyError failure must
+# warn and say what was skipped, and a genuinely absent device must stay quiet.
+# The absent half uses an id that was never created, so it raises the real
+# KeyError from the real fake rather than a simulated one.
+# ----------------------------------------------------------------------
+
+GONE_DEVICE_ID = 999_999
+
+
+class _BrokenLookup:
+    """An ``indigo.devices`` whose subscript fails the way a sick server fails.
+
+    Only ``__getitem__`` changes, and only for ``dev_id``; everything else
+    delegates to the real fake. That keeps each test's single variable single
+    — a test that also broke iteration or creation could pass for the wrong
+    reason.
+    """
+
+    def __init__(self, real, dev_id, exc=None):
+        self._real = real
+        self._dev_id = int(dev_id)
+        self._exc = exc or RuntimeError("the Indigo server is not answering")
+
+    def __getitem__(self, dev_id):
+        if int(dev_id) == self._dev_id:
+            raise self._exc
+        return self._real[dev_id]
+
+    def __iter__(self):
+        return iter(self._real)
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+def _warnings(mock_logger):
+    return [str(call.args) for call in mock_logger.warning.call_args_list]
+
+
+def _a_device(ds, indigo_env):
+    """One created endpoint device. RELAY_NODE's node id is 42."""
+    _indigo, devices = indigo_env
+    result = ds.create_from_raw(RELAY_NODE, "Office Plug")
+    return result["primaryDeviceId"], devices
+
+
+def test_a_failed_lookup_when_marking_unreachable_warns_rather_than_vanishing(
+        ds, indigo_env, mock_logger):
+    """The one that looks exactly like health. If the error state cannot be
+    written, the device keeps showing as normal while its node is dead — so
+    the failure has to be said out loud, not filed at debug next to the
+    device-was-deleted case."""
+    _indigo, devices = indigo_env
+    dev_id, _ = _a_device(ds, indigo_env)
+
+    _indigo.devices = _BrokenLookup(devices, dev_id)
+    ds._safe_unreachable(dev_id)
+    assert any("could not mark device" in w and "keep showing as normal" in w
+               for w in _warnings(mock_logger)), \
+        "a failed unreachable-write must name what the user will now see instead"
+
+    # ...and a device that is genuinely gone stays quiet: there is nothing to
+    # mark and nothing wrong.
+    _indigo.devices = devices
+    mock_logger.warning.reset_mock()
+    ds._safe_unreachable(GONE_DEVICE_ID)
+    assert _warnings(mock_logger) == []
+
+
+def test_a_failed_lookup_when_clearing_an_error_warns(ds, indigo_env, mock_logger):
+    """The mirror: a recovered device that keeps a stale 'unreachable' badge."""
+    _indigo, devices = indigo_env
+    dev_id, _ = _a_device(ds, indigo_env)
+
+    _indigo.devices = _BrokenLookup(devices, dev_id)
+    ds._clear_error(dev_id)
+    assert any("could not clear the error state" in w for w in _warnings(mock_logger))
+
+    _indigo.devices = devices
+    mock_logger.warning.reset_mock()
+    ds._clear_error(GONE_DEVICE_ID)
+    assert _warnings(mock_logger) == []
+
+
+def test_a_failed_reachable_write_says_automations_are_reading_a_stale_value(
+        ds, indigo_env, mock_logger):
+    """`reachable` is a state triggers and schedules are written against. A
+    write that fails leaves those automations reading a value that has stopped
+    tracking the node, which nothing else anywhere reports."""
+    _indigo, devices = indigo_env
+    node_dev_id = ds.create_from_raw(
+        _with_node_evidence(RELAY_NODE), "Office Plug")["nodeDeviceId"]
+
+    _indigo.devices = _BrokenLookup(devices, node_dev_id)
+    ds._write_node_reachable(42, True)
+    assert any("no longer being updated" in w for w in _warnings(mock_logger)), \
+        "the warning must say what the stale value costs, not just that a write failed"
+
+
+def test_a_failed_lookup_in_apply_identity_warns_as_well_as_returning_false(
+        ds, indigo_env, mock_logger):
+    """False already means 'the rename did not land', which is the safe answer
+    either way — but a caller must not be told that in silence when the cause
+    was a failed lookup rather than a failed rename."""
+    _indigo, devices = indigo_env
+    dev_id, _ = _a_device(ds, indigo_env)
+
+    _indigo.devices = _BrokenLookup(devices, dev_id)
+    assert ds._apply_identity(dev_id, "Office Plug", 0) is False
+    assert any("to apply its commissioned name and folder" in w
+               for w in _warnings(mock_logger))
+
+    _indigo.devices = devices
+    mock_logger.warning.reset_mock()
+    assert ds._apply_identity(GONE_DEVICE_ID, "Office Plug", 0) is False
+    assert _warnings(mock_logger) == []
+
+
+def test_a_failed_lookup_in_the_name_true_up_warns(ds, indigo_env, mock_logger):
+    """The true-up runs every pass; a device whose name is wrong stays wrong,
+    and used to say so only at debug."""
+    _indigo, devices = indigo_env
+    dev_id, _ = _a_device(ds, indigo_env)
+
+    _indigo.devices = _BrokenLookup(devices, dev_id)
+    # The lookup is the first statement, so the remaining arguments are never
+    # reached. They are deliberately unusable: if this ever stops failing at
+    # the lookup, the test breaks loudly instead of passing for a new reason.
+    ds._true_up_endpoint_name(dev_id, None, None, None, None)
+    assert any("to true up its name" in w for w in _warnings(mock_logger))
+
+    _indigo.devices = devices
+    mock_logger.warning.reset_mock()
+    ds._true_up_endpoint_name(GONE_DEVICE_ID, None, None, None, None)
+    assert _warnings(mock_logger) == []
+
+
+def test_a_failed_lookup_in_the_node_device_true_up_warns(ds, indigo_env, mock_logger):
+    """Same shape, and it costs two things rather than one: the folder
+    adoption and the nodeBaseName restamp both live behind this lookup."""
+    _indigo, devices = indigo_env
+    node_dev_id = ds.create_from_raw(
+        _with_node_evidence(RELAY_NODE), "Office Plug")["nodeDeviceId"]
+
+    _indigo.devices = _BrokenLookup(devices, node_dev_id)
+    ds._true_up_node_device(node_dev_id, None, None, 0)
+    assert any("to true up its folder and name" in w for w in _warnings(mock_logger))
+
+    _indigo.devices = devices
+    mock_logger.warning.reset_mock()
+    ds._true_up_node_device(GONE_DEVICE_ID, None, None, 0)
+    assert _warnings(mock_logger) == []
+
+
+def test_one_warning_per_device_per_kind_even_though_these_paths_run_every_pass(
+        ds, indigo_env, mock_logger):
+    """The reason these escalate to WARNING at all is that they are silent
+    today — but the true-up paths run on EVERY reconcile, so an escalation
+    without dedup would trade silence for a warning per device per pass. The
+    _group_warn dedupe is what makes the level affordable."""
+    _indigo, devices = indigo_env
+    dev_id, _ = _a_device(ds, indigo_env)
+    _indigo.devices = _BrokenLookup(devices, dev_id)
+
+    for _ in range(5):
+        ds._safe_unreachable(dev_id)
+
+    assert len([w for w in _warnings(mock_logger) if "could not mark device" in w]) == 1

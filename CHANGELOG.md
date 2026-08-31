@@ -3,6 +3,49 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
+## 2026.29.3 – 2026.29.5 — a failed device lookup is no longer mistaken for a deleted device
+
+`indigo.devices[dev_id]` raises `KeyError` for "no such device" and anything
+else — a busy server, a dropped connection — for "the lookup itself failed".
+`device_sync.py` collapsed both into one handler at eight places, so a sick
+Indigo server was indistinguishable from a device the user had deleted, and
+the work behind the lookup was skipped with a debug line nobody reads.
+
+Seven of the eight now say so, once per device per kind of failure (the
+true-up paths run on every reconcile, so an undeduped warning would nag
+forever):
+
+- **Marking a device unreachable** — the one that looks exactly like health.
+  If the error state cannot be written, the device carries on showing as
+  normal while its Matter node is not responding.
+- **Clearing an error state** — the mirror: a recovered device keeps a stale
+  "unreachable" badge.
+- **Writing a node's `reachable` state** — the most consequential, because
+  `reachable` is a state triggers and schedules are written against. A failed
+  write leaves those automations reading a value that has stopped tracking the
+  node, and until now nothing anywhere said so.
+- **Applying a commissioned name and folder**, and **both name true-ups** —
+  each returns "it didn't land", which was already the safe answer, but a
+  caller should not be told that in silence when the cause was a failed lookup
+  rather than a failed rename.
+- **Grouping a newly created device** — it is left ungrouped and nothing else
+  reports it.
+
+The eighth is deliberately unchanged: a refused **ungroup during a
+decommission** stays at debug, because an open device dialog refuses it
+routinely, the delete that follows is still attempted, and when *that* fails
+it already warns. A test pins that level, and it caught the first version of
+this change trying to escalate it.
+
+A device that is genuinely gone still says nothing — that is not a failure,
+and reconcile heals the index on the next pass.
+
+Also in these versions, both internal: a reproduction test for issue #203 (a
+bridge-node restart drops a running `OnWithTimedOff` countdown, leaving the
+device on — confirmed, not yet fixed), and the deletion of 116 `# noqa: BLE001`
+comments that suppressed nothing because ruff is not a dependency of this
+repo (issue #310, step 1).
+
 ## 2026.29.2 — the bridge node for permanent removal
 
 - Pins the bundled bridge node to **0.17.1**, which is where 2026.29.0's and
