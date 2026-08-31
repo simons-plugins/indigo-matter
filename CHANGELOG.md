@@ -29,6 +29,16 @@ negative delta immediately followed by an equally large positive one.
   prime is skipped and the reason is logged. The display shows a bare `0`
   until `device_sync`'s own priming pass runs on the next connect; nothing is
   destroyed.
+## 2026.29.6 — internal: every broad exception handler in device_sync.py is now a reviewed one
+
+No user-visible change. All 40 `except Exception` handlers in `device_sync.py`
+were read and each now carries a `# pylint: disable=broad-except` **and** a
+stated reason — what it absorbs, and why absorbing it is safe. The plugin-wide
+`broad-exception-caught` count falls 120 → 80; the remainder are other modules,
+`plugin.py` holding 34 of them (issue #310, step 3).
+
+The suppression is the point: it is only added where someone has read the
+handler, so the count that remains is an honest backlog rather than noise.
 
 ## 2026.29.3 – 2026.29.5 — a failed device lookup is no longer mistaken for a deleted device
 
