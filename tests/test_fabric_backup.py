@@ -122,7 +122,7 @@ class FakeLogger:
     def _record(self, level, msg, *args):
         try:
             self.records[level].append(msg % args if args else msg)
-        except Exception:  # noqa: BLE001 — never let logging break a test
+        except Exception:  # never let logging break a test
             self.records[level].append(str(msg))
 
     def info(self, msg, *args):

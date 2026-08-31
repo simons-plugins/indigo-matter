@@ -369,7 +369,7 @@ class NodeDeviceTombstones:
             return
         try:
             self._save(self.to_json())
-        except Exception as exc:  # noqa: BLE001 - bookkeeping must never sink a reconcile
+        except Exception as exc:  # bookkeeping must never sink a reconcile
             # Unlike SurveyLog's failed save (cosmetic — the digest is just
             # stale until the next successful write), a failed tombstone save
             # is not cosmetic (issue #204 review, fix C): if the plugin
@@ -612,7 +612,7 @@ class DeviceSync:
                 if not getattr(dev, "configured", True)
                 and (dev.pluginProps or {}).get("createdTypeId")
             ]
-        except Exception as exc:  # noqa: BLE001 - a diagnostic must never sink reconcile
+        except Exception as exc:  # a diagnostic must never sink reconcile
             self.logger.debug("could not scan for unconfigured devices: %s", exc)
             return
         for dev in strays:
@@ -798,14 +798,14 @@ class DeviceSync:
             for dev_id in candidates:
                 try:
                     indigo.device.ungroupDevice(indigo.devices[dev_id])
-                except Exception as exc:  # noqa: BLE001
+                except Exception as exc:
                     self.logger.debug("could not ungroup Indigo device %s: %s", dev_id, exc)
             deleted = []
             for dev_id in candidates:
                 try:
                     indigo.device.delete(indigo.devices[dev_id])
                     deleted.append(dev_id)
-                except Exception as exc:  # noqa: BLE001
+                except Exception as exc:
                     if dev_id == node_dev_id:
                         self._self_deleted_ids.discard(dev_id)
                     self.logger.warning("could not delete Indigo device %s: %s", dev_id, exc)
@@ -931,7 +931,7 @@ class DeviceSync:
                 except KeyError:
                     # deleted out-of-band mid-iteration; reconcile will heal the index
                     names.append(f"device {dev_id}")
-                except Exception as exc:  # noqa: BLE001 - UI label only; never break the picker
+                except Exception as exc:  # UI label only; never break the picker
                     self.logger.debug("list_nodes: name lookup for device %s failed: %s", dev_id, exc)
                     names.append(f"device {dev_id}")
             out.append((nid, names))
@@ -1077,7 +1077,7 @@ class DeviceSync:
                                 self._redundant_meter_logged.add(ep_key)
                                 try:
                                     meter_name = indigo.devices[meter_dev_id].name
-                                except Exception as exc:  # noqa: BLE001 - name lookup only; log fires either way
+                                except Exception as exc:  # name lookup only; log fires either way
                                     self.logger.debug(
                                         "redundant meter: device %s name lookup failed: %s",
                                         meter_dev_id, exc,
@@ -1361,12 +1361,12 @@ class DeviceSync:
                 # id costs one device rather than the rest of the node's sweep
                 # (fix F).
                 indigo.devices[int(dev_id)]
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 self.logger.debug("not grouping device %s: %s", dev_id, exc)
                 continue
             try:
                 self._ensure_grouped(dev_id, group_with, family)
-            except Exception as exc:  # noqa: BLE001 - per-device independence (fix F)
+            except Exception as exc:  # per-device independence (fix F)
                 self.logger.debug(
                     "grouping device %s with %s failed: %s", dev_id, group_with, exc)
         if new_ids:
@@ -1769,7 +1769,7 @@ class DeviceSync:
         for dev_id, type_id in entries:
             try:
                 name = indigo.devices[dev_id].name
-            except Exception as exc:  # noqa: BLE001 - deleted out of band; it just doesn't vote
+            except Exception as exc:  # deleted out of band; it just doesn't vote
                 self.logger.debug("family base: device %s unreadable: %s", dev_id, exc)
                 continue
             base = _generated_base(name, _ROLE_LABELS.get(type_id, ""))
@@ -1809,7 +1809,7 @@ class DeviceSync:
         """
         try:
             dev = indigo.devices[dev_id]
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             self.logger.debug("name true-up: device %s unavailable: %s", dev_id, exc)
             return
         current = getattr(dev, "name", "")
@@ -1874,7 +1874,7 @@ class DeviceSync:
         """
         try:
             dev = indigo.devices[dev_id]
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             self.logger.debug("node-device true-up: device %s unavailable: %s", dev_id, exc)
             return
         # Folder first, and independently of any name evidence: an orphaned
@@ -1886,7 +1886,7 @@ class DeviceSync:
                 if target_folder:
                     # dedup: this runs every pass until it succeeds (fix E).
                     self._move_to_folder(dev_id, target_folder, dedup=True)
-        except Exception as exc:  # noqa: BLE001 - a folder must never sink a pass
+        except Exception as exc:  # a folder must never sink a pass
             self.logger.debug("node-device folder adoption for %s failed: %s", dev_id, exc)
         if not derived_base:
             return
@@ -1917,7 +1917,7 @@ class DeviceSync:
             props["nodeBaseName"] = derived_base
             try:
                 dev.replacePluginPropsOnServer(props)
-            except Exception as exc:  # noqa: BLE001 - deduped for the same reason
+            except Exception as exc:  # deduped for the same reason
                 # the rename and folder failures above are (fix E): a props
                 # write Indigo keeps refusing is retried on every pass.
                 self._group_warn(
@@ -1946,7 +1946,7 @@ class DeviceSync:
         and the membership read-back are identical either way."""
         try:
             indigo.device.groupWithDevice(first, second)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             self._group_warn(
                 dev_id, "group",
                 "could not group device %s with Matter node device %s: %s — if a device "
@@ -1955,7 +1955,7 @@ class DeviceSync:
             return
         try:
             after = [int(member) for member in indigo.device.getGroupList(dev_id)]
-        except Exception as exc:  # noqa: BLE001 - the group was made; only the check failed
+        except Exception as exc:  # the group was made; only the check failed
             self.logger.debug("could not verify the group of device %s: %s", dev_id, exc)
             return
         if int(node_dev_id) not in after:
@@ -2011,7 +2011,7 @@ class DeviceSync:
             return
         try:
             group = [int(member) for member in indigo.device.getGroupList(dev_id)]
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             # Debug, not a warning (issue #204 review, fix D): by far the most
             # likely cause is an endpoint device the user deleted by hand —
             # plugin.deviceDeleted only prunes matterNode ids, so a dead
@@ -2056,7 +2056,7 @@ class DeviceSync:
                 try:
                     node_group = [
                         int(member) for member in indigo.device.getGroupList(node_dev_id)]
-                except Exception as exc:  # noqa: BLE001
+                except Exception as exc:
                     self.logger.debug(
                         "could not read the device group of node device %s: %s",
                         node_dev_id, exc)
@@ -2372,7 +2372,7 @@ class DeviceSync:
                     "(currently %s) will not update further.",
                     node_id_to_str(node.node_id), eid, dev_id, getattr(dev, "name", "?"), battery,
                 )
-        except Exception as exc:  # noqa: BLE001 - a diagnostic must not sink reconcile
+        except Exception as exc:  # a diagnostic must not sink reconcile
             self.logger.debug(
                 "battery-exclusion warning for node %s failed: %s",
                 node_id_to_str(getattr(node, "node_id", "?")), exc,
@@ -2392,7 +2392,7 @@ class DeviceSync:
                 props=spec.props,
                 folder=folder_id,
             )
-        except ValueError as exc:  # noqa: BLE001 - surface but don't abort the batch
+        except ValueError as exc:  # surface but don't abort the batch
             if "NameNotUnique" in str(exc):
                 # A device with this name exists but was invisible to both the
                 # index and _unique_name — live evidence (issue #62): a device
@@ -2410,7 +2410,7 @@ class DeviceSync:
             else:
                 self.logger.exception(exc)
             return None
-        except Exception as exc:  # noqa: BLE001 - surface but don't abort the batch
+        except Exception as exc:  # surface but don't abort the batch
             self.logger.exception(exc)
             return None
         if model:
@@ -2419,12 +2419,12 @@ class DeviceSync:
             try:
                 dev.model = model
                 dev.replaceOnServer()
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 self.logger.debug("could not set model on device %s: %s", dev.id, exc)
         if spec.initial_states:
             try:
                 dev.updateStatesOnServer(_kvlist(spec.initial_states))
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 self.logger.debug("initial state set failed: %s", exc)
             if "reachable" in spec.initial_states:
                 # Second write, uiValue-bearing (display column UX, see
@@ -2457,7 +2457,7 @@ class DeviceSync:
                 if folder.name == name:
                     return folder.id
             return indigo.devices.folder.create(name).id
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             self.logger.warning("could not resolve/create device folder %r: %s", name, exc)
             return 0
 
@@ -2467,7 +2467,7 @@ class DeviceSync:
                 indigo.device.moveToFolder(dev_id, value=folder_id)
             except TypeError:  # older positional signature
                 indigo.device.moveToFolder(dev_id, folder_id)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             # `dedup` is for the true-up callers only — see _apply_identity.
             self._warn_once_if(dedup, dev_id, "folder",
                                "could not move device %s to folder %s: %s",
@@ -2507,7 +2507,7 @@ class DeviceSync:
         """
         try:
             dev = indigo.devices[dev_id]
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             self.logger.debug("apply_identity: device %s unavailable: %s", dev_id, exc)
             return False
         renamed = False
@@ -2519,7 +2519,7 @@ class DeviceSync:
             # Only AFTER replaceOnServer returns: `dev.name` was already
             # mutated in memory above, so it is not evidence on its own.
             renamed = target == name
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             self._warn_once_if(dedup, dev_id, "rename",
                                "could not rename device %s to %r: %s", dev_id, name, exc)
         if folder_id and getattr(dev, "folderId", 0) != folder_id:
@@ -2642,7 +2642,7 @@ class DeviceSync:
                 update = handler.on_attribute_update(dev, attribute, value)
                 if update:
                     kv.extend(handler.format_kv(update))
-            except Exception as exc:  # noqa: BLE001 - one bad attr must not abort priming
+            except Exception as exc:  # one bad attr must not abort priming
                 self.logger.warning("prime %s attr %s/%s failed: %s", dev_id, cluster, attribute, exc)
         if kv:
             self.apply_states(dev_id, kv)
@@ -2752,7 +2752,7 @@ class DeviceSync:
                 names.append(indigo.devices[dev_id].name)
             except KeyError:
                 continue  # deleted between the index read and here; nothing to name
-            except Exception as exc:  # noqa: BLE001 - a label must never break the report
+            except Exception as exc:  # a label must never break the report
                 self.logger.debug("survey: name lookup for device %s failed: %s", dev_id, exc)
         return names
 
@@ -2805,7 +2805,7 @@ class DeviceSync:
             for line in lines:
                 self.logger.info("%s", line)
             return True
-        except Exception as exc:  # noqa: BLE001 - a diagnostic must not sink reconcile
+        except Exception as exc:  # a diagnostic must not sink reconcile
             self.logger.warning("settable-attribute report for node %s failed: %s",
                                 node_id_to_str(getattr(node, "node_id", "?")), exc)
             return False
@@ -2932,7 +2932,7 @@ class DeviceSync:
                 # Deleted between the index read and here — the same deletion
                 # race the rest of this class tolerates. Nothing to retry for.
                 self.logger.debug("device %s vanished before its state list could rebuild", dev_id)
-            except Exception as exc:  # noqa: BLE001 - a device that will not rebuild keeps its states
+            except Exception as exc:  # a device that will not rebuild keeps its states
                 # NOT debug: this workspace's field notes record that this call
                 # rejects a bad state id with an error naming no key, and it is
                 # a plugin defect rather than anything the user did. Silence here
@@ -3196,7 +3196,7 @@ class DeviceSync:
                         # the meter/battery heal for the next device).
                         try:
                             self._warn_stale_display_state(dev, type_id, display_props)
-                        except Exception as exc:  # noqa: BLE001
+                        except Exception as exc:
                             self.logger.warning(
                                 "stale-display check failed on device %s: %s", dev_id, exc,
                             )
@@ -3233,7 +3233,7 @@ class DeviceSync:
                             list(missing.keys()), dev_id, type_id,
                             node_id_to_str(node.node_id),
                         )
-                except Exception as exc:  # noqa: BLE001 - props failure must not sink reconcile
+                except Exception as exc:  # props failure must not sink reconcile
                     self.logger.warning(
                         "could not re-assert capability props on device %s: %s",
                         dev_id, exc,
@@ -3295,7 +3295,7 @@ class DeviceSync:
             # one malformed node must not sink reconciliation for the rest
             try:
                 node = parse_node(raw)
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 # Keep the node offered for decommission if its id is salvageable.
                 # Parse failure is a property of the node's SHAPE, so it recurs on
                 # every pass — dropping it would make a malformed node permanently
@@ -3333,7 +3333,7 @@ class DeviceSync:
                 # (it may have changed while we were away) and clear any stale
                 # 'unreachable'; for one matter-server reports offline, mark it.
                 self._apply_reachability(node)
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 self.logger.warning("reconcile of node %s failed: %s", node.node_id, exc)
         with self._lock:
             # raw_nodes is matter-server's authoritative list, so a node absent
@@ -3507,7 +3507,7 @@ class DeviceSync:
     def _safe_unreachable(self, dev_id: int) -> None:
         try:
             indigo.devices[dev_id].setErrorStateOnServer("unreachable")
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             self.logger.debug("could not mark %s unreachable: %s", dev_id, exc)
 
     def _clear_error(self, dev_id: int) -> None:
@@ -3515,7 +3515,7 @@ class DeviceSync:
             dev = indigo.devices[dev_id]
             if getattr(dev, "errorState", ""):
                 dev.setErrorStateOnServer("")
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             self.logger.debug("could not clear error on %s: %s", dev_id, exc)
 
     def _write_node_reachable(self, node_id: Any, reachable: bool) -> None:
@@ -3542,7 +3542,7 @@ class DeviceSync:
             return
         try:
             indigo.devices[dev_id].updateStatesOnServer([_reachable_kv(reachable)])
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             self.logger.debug(
                 "could not write matterNode reachable state for node %s: %s", node_id, exc)
 
@@ -3598,7 +3598,7 @@ class DeviceSync:
             return
         try:
             node = parse_node(data)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             self.logger.warning("node_added parse failed: %s", exc)
             return
         self.create_devices(node)
@@ -3643,7 +3643,7 @@ class DeviceSync:
             return
         try:
             states = handler.on_node_event(dev, evt.event_id, evt.event_data)
-        except Exception as exc:  # noqa: BLE001 - one bad event must not silently freeze the device
+        except Exception as exc:  # one bad event must not silently freeze the device
             self.logger.warning(
                 "bad node_event for device %s (ep%s cl%s evt%s): %s",
                 dev_id, evt.endpoint, evt.cluster, evt.event_id, exc,
@@ -3727,7 +3727,7 @@ class DeviceSync:
                     states = handler.on_attribute_update(dev, evt.attribute, evt.value)
                     if states:
                         self.apply_states(dev_id, handler.format_kv(states))
-                except Exception as exc:  # noqa: BLE001 - one bad value must not silently freeze the device
+                except Exception as exc:  # one bad value must not silently freeze the device
                     self.logger.warning(
                         "bad update for device %s (ep%s cl%s attr%s value=%r): %s",
                         dev_id, evt.endpoint, evt.cluster, evt.attribute, evt.value, exc,
@@ -3754,7 +3754,7 @@ class DeviceSync:
             return
         try:
             states = handler.on_attribute_update(dev, evt.attribute, evt.value)
-        except Exception as exc:  # noqa: BLE001 - one bad value must not silently freeze the device
+        except Exception as exc:  # one bad value must not silently freeze the device
             self.logger.warning(
                 "bad update for device %s (ep%s cl%s attr%s value=%r): %s",
                 dev_id, evt.endpoint, evt.cluster, evt.attribute, evt.value, exc,

@@ -354,7 +354,7 @@ async def apply_setting(client: Any, node_id: int, endpoint: int,
             await client.write(write, timeout=timeout)
             last_error = None
             break
-        except Exception as exc:  # noqa: BLE001 - retried below, reported if final
+        except Exception as exc:  # retried below, reported if final
             last_error = exc
             if attempt == 1:
                 await sleep(retry_delay)
@@ -375,7 +375,7 @@ async def apply_setting(client: Any, node_id: int, endpoint: int,
                                           timeout=timeout)
             read_error = None
             break
-        except Exception as exc:  # noqa: BLE001 - an unreadable verify is a failure, below
+        except Exception as exc:  # an unreadable verify is a failure, below
             read_back = NO_ANSWER
             read_error = exc
             if attempt == 1:
@@ -498,7 +498,7 @@ class RemovedStateLog:
             return
         try:
             self._save(self.to_json())
-        except Exception:  # noqa: BLE001 - bookkeeping must never sink a device rebuild
+        except Exception:  # bookkeeping must never sink a device rebuild
             # Deliberately silent here, same reasoning as SurveyLog._persist
             # (issue #308): the caller supplies the save hook and logs there.
             # A failed save costs one repeated INFO line on the next rebuild,

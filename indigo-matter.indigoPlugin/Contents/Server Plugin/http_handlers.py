@@ -88,7 +88,7 @@ class HttpApi:
             result = self._decommission(node_id)
         except MatterUnavailable as exc:
             return 503, {"error": "matter_server_unreachable", "message": str(exc)}
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             self.logger.exception(exc)
             return 500, {"error": "internal_error", "message": str(exc)}
         if result is None:
@@ -111,7 +111,7 @@ class HttpApi:
             result = self._diagnostics(node_id)
         except MatterUnavailable as exc:
             return 503, {"error": "matter_server_unreachable", "message": str(exc)}
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             self.logger.exception(exc)
             return 500, {"error": "internal_error", "message": str(exc)}
         if result is None:

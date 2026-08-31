@@ -180,7 +180,7 @@ class ExportRecoveryMenuMixin:
             len(self.exports) if self.exports is not None else 0)
         try:
             status = self.runtime.submit(client.rebuild_endpoint_map()).result(timeout=deadline)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             # Never report success over a rebuild that did not persist: the node
             # answers with an error rather than a StatusReport when the new map
             # could not be written, and the refusal is still in force.
@@ -731,7 +731,7 @@ class ExportRecoveryMenuMixin:
             # same ecosystems should not also lose accessory identity. The
             # "the map itself is corrupt" path is the rebuild above.
             self.runtime.submit(client.factory_reset(True)).result(timeout=FACTORY_RESET_TIMEOUT)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             self.logger.error("Matter bridge: resetting the bridge pairings FAILED — %s. "
                               "Pairings are unchanged.", exc)
             self.logger.exception(exc)

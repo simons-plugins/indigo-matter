@@ -776,7 +776,7 @@ def restore_backup(
         # a failure that must trigger rollback exactly like an exception would.
         if not server_control.start():
             raise RuntimeError("matter-server failed to start after restore")
-    except BaseException as exc:  # noqa: BLE001 — re-raised after rollback
+    except BaseException as exc:  # re-raised after rollback
         _rollback(storage_path, moved_aside_to, server_control, now=now, log=log, bridge=plan)
         raise RuntimeError(
             f"Fabric restore from {archive_path} failed and was rolled back "
@@ -899,7 +899,7 @@ def _rollback(
     # Bring the server back up on the rolled-back (original) fabric.
     try:
         started = server_control.start()
-    except Exception as start_exc:  # noqa: BLE001
+    except Exception as start_exc:
         started = False
         log.error(
             "CRITICAL: matter-server failed to restart after restore rollback (%s).", start_exc

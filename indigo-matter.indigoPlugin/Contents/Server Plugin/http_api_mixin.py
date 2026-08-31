@@ -139,7 +139,7 @@ class HttpApiMixin:
         fabric_already_absent = False
         try:
             await self.matter.remove_node(node_id)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             if is_node_not_exists(exc):
                 fabric_already_absent = True
                 # matter-server has no such node, so there is no fabric entry left to
@@ -191,7 +191,7 @@ class HttpApiMixin:
             raw = await self.matter.get_node(node_id)
         except ConnectionError as exc:
             raise MatterUnavailable(str(exc)) from exc
-        except Exception as exc:  # noqa: BLE001 - protocol/timeout error reading the node
+        except Exception as exc:  # protocol/timeout error reading the node
             self.logger.warning("diagnostics get_node(%s) failed: %s", node_id, exc)
             raise MatterUnavailable(str(exc)) from exc
         if not raw:
@@ -252,7 +252,7 @@ class HttpApiMixin:
                                        "Export at least one device, then reload this page.")
         try:
             pairing = self.runtime.submit(client.get_pairing()).result(timeout=PAIRING_READ_TIMEOUT)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             self.logger.exception(exc)
             return _pairing_html(None, f"Could not read the bridge node's pairing state: {exc}")
         if not pairing.manual_pairing_code:
