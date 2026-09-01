@@ -3,6 +3,47 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
+## 2026.29.15 — the bridge-node suite stops hiding tests it did not run
+
+Fixes #330. `npm test` reported `# fail 0` and `# skipped 0` on runs where it
+had silently not executed whole suites. Counts alternated between two values —
+144 suites or 141, never anything else — and the missing block was always the
+same: `planReconcile (§3.1)` with its `battery composition (issue #220)` and
+`driving-device rekey (issue #246/ADR-0011)` children. Eight tests of real
+regression coverage could vanish from a green run with nothing to say so.
+
+The proximate cause was `--test-force-exit`, which terminates the runner while a
+concurrently-forked file is still streaming TAP. But that flag was load-bearing:
+without it the suite hung indefinitely. Two leaks were holding the loop open.
+
+**Every interface, not just loopback.** matter.js advertises mDNS on every
+interface the host has, VPN tunnels included, and a send queued against a tunnel
+that is not carrying traffic never completes — leaving UDP 5353 sockets and
+pending `SendWrap` requests behind (`UdpMulticastServer utun8: UDP send
+timeout`). `main.test.ts` already pinned its spawned children to loopback; the
+four in-process files that stand up real `ServerNode`s did not. They now share
+`test/loopback.ts`, which also replaces `main.test.ts`'s private copy.
+
+**A responder nothing owned.** `MdnsService` is a service on the *Environment* —
+`Environment.default`, a process-wide singleton — not on any node, so it outlives
+the last node closed and keeps four UDP sockets open. Verified directly: 50
+nodes started, 50 closed, sockets still held. `closeSharedMdns()` disposes it in
+an `after()` hook.
+
+With the flag gone, a **pre-existing failure it had been hiding** appeared:
+`persistence.test.ts` reported 47 tests / 0 fail with the flag and 48 tests /
+1 fail without. `VolatileEventStore.add()` issues
+`storage.set("lastEventNumber", …)` without awaiting it, so a write can still be
+in flight after `ServerNode.close()` resolves; deleting the scratch directory in
+that window fails `ENOENT` and surfaces as an `unhandledRejection` attributed to
+whichever test ran last. Cleanup now settles first, and stays tolerant, because
+only matter.js awaiting its own write could close the race properly.
+
+Three consecutive runs now give **676 tests / 144 suites / 0 fail**, exit 0, with
+`planReconcile` and both its children present every time. 676 is the highest
+count ever observed under the old flag — the 144-suite mode was always the
+complete set, and every lower number was truncation.
+
 ## 2026.29.13 — ships the SIGTERM fix: bridge node pinned to 0.17.2
 
 Release of the work banked in 2026.29.12, which changed only `bridge-node` and

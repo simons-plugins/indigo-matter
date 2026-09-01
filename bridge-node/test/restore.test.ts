@@ -42,6 +42,7 @@ import { BridgeNode, ENDPOINT_COUNT_ADVISORY, ENDPOINT_COUNT_WARNING, matterJsVe
 import { ErrorCode, PROTOCOL_VERSION, RefuseReason } from "../src/protocol.js";
 import { BridgeWsServer } from "../src/ws-server.js";
 import { TestClient } from "./client.js";
+import { closeSharedMdns, LOOPBACK, settleMatterWrites } from "./loopback.js";
 
 /** The On/Off cluster as `endpoints.ts` builds it for a light. */
 const OnOffLighting = OnOffServer.with("Lighting");
@@ -56,6 +57,11 @@ Logger.level = "fatal";
 const SCRATCH_ROOT = process.env.INDIGO_MATTER_TEST_SCRATCH ?? tmpdir();
 mkdirSync(SCRATCH_ROOT, { recursive: true });
 const scratch: string[] = [];
+
+// #330: the mDNS responder is a service on the shared Environment, so no
+// node close disposes it — without this the runner cannot exit.
+after(closeSharedMdns);
+after(settleMatterWrites);
 
 after(() => {
     for (const dir of scratch) {
@@ -110,7 +116,7 @@ async function boot(storagePath: string, options: { commissionedAt?: string; ref
     const logged: string[] = [];
     const bridge = new BridgeNode(
         // Ephemeral on both ports, so a parallel run cannot collide.
-        { storagePath, matterPort: 0, wsPort: 0 },
+        { storagePath, matterPort: 0, wsPort: 0, mdnsInterface: LOOPBACK },
         options.commissionedAt === undefined
             ? { ...IDENTITY }
             : { ...IDENTITY, commissionedAt: options.commissionedAt },

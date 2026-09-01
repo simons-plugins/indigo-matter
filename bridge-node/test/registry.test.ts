@@ -57,6 +57,7 @@ import {
     type RoleValue,
 } from "../src/protocol.js";
 import { EndpointRegistry } from "../src/registry.js";
+import { closeSharedMdns, LOOPBACK, settleMatterWrites } from "./loopback.js";
 
 const PRODUCT_NAME = "Indigo Matter Bridge";
 
@@ -94,6 +95,11 @@ mkdirSync(SCRATCH_ROOT, { recursive: true });
 // TAP output. Fatal keeps a genuine stack visible without the narration.
 Logger.level = "fatal";
 
+// #330: the mDNS responder is a service on the shared Environment, so no
+// node close disposes it — without this the runner cannot exit.
+after(closeSharedMdns);
+after(settleMatterWrites);
+
 after(() => {
     for (const root of scratchRoots) {
         rmSync(root, { recursive: true, force: true });
@@ -127,6 +133,10 @@ async function harness(
     const environment = new Environment("test", Environment.default);
     environment.vars.set("storage.path", storagePath);
     environment.vars.set("runtime.signals", false);
+    // #330: keep the responder off every other interface — see loopback.ts.
+    if (LOOPBACK !== undefined) {
+        environment.vars.set("mdns.networkInterface", LOOPBACK);
+    }
 
     const node = await ServerNode.create({
         id: "indigo-matter-bridge",

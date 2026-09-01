@@ -38,6 +38,7 @@ import { PROTOCOL_VERSION } from "../src/protocol.js";
 import { BridgeWsServer } from "../src/ws-server.js";
 import { TestClient } from "./client.js";
 import { golden } from "./stub-bridge.js";
+import { closeSharedMdns, LOOPBACK, settleMatterWrites } from "./loopback.js";
 
 const BRIDGE_VERSION = "0.1.0-test";
 const KITCHEN = 123456789;
@@ -48,6 +49,11 @@ Logger.level = "fatal";
 const SCRATCH_ROOT = process.env.INDIGO_MATTER_TEST_SCRATCH ?? tmpdir();
 mkdirSync(SCRATCH_ROOT, { recursive: true });
 const storagePath = mkdtempSync(join(SCRATCH_ROOT, "indigo-matter-integration-"));
+
+// #330: the mDNS responder is a service on the shared Environment, so no
+// node close disposes it — without this the runner cannot exit.
+after(closeSharedMdns);
+after(settleMatterWrites);
 
 after(() => rmSync(storagePath, { recursive: true, force: true }));
 
@@ -74,7 +80,7 @@ describe("plugin ⇄ node, end to end", () => {
         const bridge = new BridgeNode(
             // Port 0 on both: matter.js and `ws` each bind an ephemeral port, so
             // a parallel run cannot collide with this one.
-            { storagePath, matterPort: 0, wsPort: 0 },
+            { storagePath, matterPort: 0, wsPort: 0, mdnsInterface: LOOPBACK },
             { installId: "integration0001", passcode: 20202021, discriminator: 3840 },
             BRIDGE_VERSION,
             () => {},
@@ -258,7 +264,7 @@ describe("driving-device rekey via attach (issue #246/ADR-0011)", () => {
         const DEVICE_B = 223344552;
         const rekeyStoragePath = mkdtempSync(join(SCRATCH_ROOT, "indigo-matter-rekey-"));
         const bridge = new BridgeNode(
-            { storagePath: rekeyStoragePath, matterPort: 0, wsPort: 0 },
+            { storagePath: rekeyStoragePath, matterPort: 0, wsPort: 0, mdnsInterface: LOOPBACK },
             { installId: "integration0003", passcode: 20202021, discriminator: 3840 },
             BRIDGE_VERSION,
             () => {},
@@ -374,7 +380,7 @@ describe("the whole §4.2 role table, from the golden frames", () => {
         // count, the roles, the ordering, and `{}` for every set_state — is
         // asserted instead.
         const bridge = new BridgeNode(
-            { storagePath: mkdtempSync(join(SCRATCH_ROOT, "indigo-matter-roles-")), matterPort: 0, wsPort: 0 },
+            { storagePath: mkdtempSync(join(SCRATCH_ROOT, "indigo-matter-roles-")), matterPort: 0, wsPort: 0, mdnsInterface: LOOPBACK },
             { installId: "integration0002", passcode: 20202021, discriminator: 3840 },
             BRIDGE_VERSION,
             () => {},
