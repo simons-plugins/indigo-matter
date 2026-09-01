@@ -756,8 +756,16 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
 
     def _expect_restart(self) -> None:
         """Open the ~30s window during which a client outage is treated as an expected
-        restart (see :meth:`_on_server_unreachable`), not a crash."""
-        self._restart_expected_until = time.time() + 30
+        restart (see :meth:`_on_server_unreachable`), not a crash.
+
+        MONOTONIC (#340 review), like the bridge twin and like the WS client's
+        own backoff clock: the deadline is never compared against anything
+        persisted, and on a wall clock a backwards NTP step — macOS *steps* a
+        large offset rather than slewing it, which is what a Mac waking with RTC
+        drift does — would extend the window by the size of the step. A 5-minute
+        correction would turn 30s of quieting into 5.5 minutes of it.
+        """
+        self._restart_expected_until = time.monotonic() + 30
         self._restart_notice_shown = False
 
     def _restart_expected(self) -> bool:
@@ -769,7 +777,7 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
         its ``outage_expected`` seam. Every path that disarms the window still
         does so by zeroing the deadline, so both consumers go loud together.
         """
-        return time.time() < self._restart_expected_until
+        return time.monotonic() < self._restart_expected_until
 
     def runConcurrentThread(self) -> None:
         """Watchdog only — no I/O. Surfaces connectivity; reconnect is owned by

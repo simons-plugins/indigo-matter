@@ -21,7 +21,7 @@ import protocol
 from bridge_client import BridgeClient
 from matter_client import MatterClient
 from protocol import Protocol
-from ws_json_client import WsJsonClient
+from ws_json_client import HandshakeFailed, WsJsonClient
 
 from fakes import NO_HANDSHAKE, FakeWebSocket, returns
 
@@ -864,12 +864,103 @@ class TestExpectedOutage:
         # disarm the supervisor's diagnostic: the supervisor is the side that
         # knows when its window closes, and it can only report a restart that
         # never came back if this hook keeps firing underneath the quiet.
+        #
+        # Asserted as "keeps firing", not "fired once": a single firing is also
+        # what a permanently-latched hook produces, and that is the shape of the
+        # bug — a supervisor that defers is relying on being asked AGAIN.
         calls = []
-        run(self._two_failures(mock_logger, peer,
-                               outage_expected=lambda: True,
-                               on_repeated_failure=calls.append))
-        assert calls, ("the repeated-failure hook must fire inside the window — without it "
-                       "a node that never returns is silent for the whole streak")
+
+        async def scenario():
+            delays = []
+
+            def rearming_supervisor(attempt):
+                calls.append(attempt)
+                client.rearm_failure_diagnostic()   # what a deferring supervisor does
+
+            async def fake_sleep(delay):
+                delays.append(delay)
+                if len(delays) >= 4:
+                    await client.close()
+                await asyncio.sleep(0)
+
+            client = CLIENTS[peer](mock_logger, None, connect=self._boom_connect(),
+                                   sleep=fake_sleep, outage_expected=lambda: True,
+                                   on_repeated_failure=rearming_supervisor)
+            await asyncio.wait_for(client.run(), timeout=5)
+        run(scenario())
+        assert len(calls) >= 2, (
+            "the hook must keep firing underneath the quiet — a deferred diagnostic is "
+            f"only deferred if it is asked again: {calls}")
+
+    @pytest.mark.parametrize("peer", sorted(CLIENTS))
+    def test_a_timeout_inside_the_window_is_quieted_too(self, mock_logger, monkeypatch, peer):
+        # The TimeoutError branch is separately routed (from 3.11 it IS an
+        # OSError, so it is caught before WS_ERRORS on purpose) and would
+        # otherwise be the one connect failure that stayed loud through a
+        # restart for no stated reason.
+        monkeypatch.setattr(WsJsonClient, "HELLO_TIMEOUT", 0.01)
+
+        async def scenario():
+            delays = []
+
+            async def fake_sleep(delay):
+                delays.append(delay)
+                if len(delays) >= 2:
+                    await client.close()
+                await asyncio.sleep(0)
+
+            client = CLIENTS[peer](mock_logger, FakeWebSocket(handshake=NO_HANDSHAKE),
+                                   sleep=fake_sleep, outage_expected=lambda: True)
+            await asyncio.wait_for(client.run(), timeout=5)
+        run(scenario())
+        assert "no handshake frame within" not in logged(mock_logger, "warning")
+        assert "no handshake frame within" in logged(mock_logger, "debug")
+
+    def test_a_handshake_the_peer_ANSWERED_is_never_quieted(self, mock_logger):
+        # ⊗ The demotion originally covered this branch too, and it is the one
+        # place it is wrong. On the bridge, HandshakeFailed reaches the run loop
+        # only after the node has already refused an attach — so it is proof the
+        # peer is UP, the exact opposite of the premise a restart window rests
+        # on. An update that produced an INCOMPATIBLE node must not be quieter
+        # than one that produced no node at all.
+        async def scenario():
+            delays = []
+
+            def connect(_uri):
+                return returns(FakeWebSocket(handshake={"hello": True}))
+
+            async def refuse(_frame):
+                raise HandshakeFailed("bridge node refused attach: ERR_NOPE (details)")
+
+            async def fake_sleep(delay):
+                delays.append(delay)
+                if len(delays) >= 2:
+                    await client.close()
+                await asyncio.sleep(0)
+
+            client = bridge_client(mock_logger, None, connect=connect, sleep=fake_sleep,
+                                   outage_expected=lambda: True)
+            client._handshake = refuse
+            await asyncio.wait_for(client.run(), timeout=5)
+        run(scenario())
+        assert "handshake failed" in logged(mock_logger, "warning"), (
+            "a peer that answered must be reported even mid-restart")
+
+    @pytest.mark.parametrize("peer", sorted(CLIENTS))
+    def test_a_broken_window_check_is_reported_once_per_streak(self, mock_logger, peer):
+        # Failing to the loud side is only half of it. This is the ONLY place a
+        # broken supervisor predicate is ever mentioned, and at debug — off by
+        # default in Indigo — the defect would be invisible forever while
+        # quieting stayed silently disabled. Latched like _diag_fired, because
+        # the check runs on every attempt.
+        def boom():
+            raise RuntimeError("supervisor predicate is broken")
+
+        run(self._two_failures(mock_logger, peer, outage_expected=boom))
+        said = logged(mock_logger, "warning")
+        assert said.count("expected-outage check raised") == 1, (
+            f"once per streak — not per attempt, and not never: {said}")
+        assert "restart quieting is OFF" in said
 
     @pytest.mark.parametrize("peer", sorted(CLIENTS))
     def test_the_window_closing_makes_the_next_attempt_loud_again(self, mock_logger, peer):

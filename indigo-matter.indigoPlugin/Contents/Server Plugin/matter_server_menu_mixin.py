@@ -177,6 +177,15 @@ class MatterServerMenuMixin:
             self.pluginPrefs["nodeBinDir"] = sp.resolved_bin_dir
             indigo.server.savePluginPrefs()
             self.server_process = ServerProcess(self._server_prefs(), self.logger)  # pylint: disable=no-member
+            # #340 review: armed BEFORE ensure_installed(), not before restart()
+            # below. `ensure_installed` bootouts and re-bootstraps launchd, so
+            # the plist rewrite is itself what drops the socket — the same
+            # ordering the bridge's install path was corrected to, and the same
+            # one `menuRestartMatterServer` already uses. Armed only here, the
+            # first connect failure is immediate and the second (1s later) fires
+            # the full "appears to be crashing" report with a stderr tail, for a
+            # restart this menu ordered.
+            self._expect_restart()  # pylint: disable=no-member
             self.server_process.ensure_installed()
             # #187 review: no adopt_pending_bootstrap_verification() needed here —
             # unlike _start_bridge_agent's automatic, high-frequency rebuilds, the
@@ -187,7 +196,6 @@ class MatterServerMenuMixin:
             # newly-installed package sits on disk while the OLD process keeps running
             # (a running LaunchAgent doesn't pick up new files). This is what makes the
             # menu action a one-click, no-CLI update.
-            self._expect_restart()  # pylint: disable=no-member
             if not self.server_process.restart():
                 # Don't claim success: the new version may not be running.
                 self._restart_expected_until = 0.0  # let the crash diagnostic work
