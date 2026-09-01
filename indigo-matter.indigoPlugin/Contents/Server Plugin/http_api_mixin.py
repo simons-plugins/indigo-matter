@@ -257,10 +257,17 @@ class HttpApiMixin:
         """
         method, _path_args, _query = self._parse_request(action)
         if method.upper() != "GET":
-            return self._reply(405, {"error": "method_not_allowed"})
+            # Cache-Control: no-store — mirrors http_thread_page's fix below (#334,
+            # 2026-09-01): this page carries a LIVE pairing code, an even stronger
+            # case never to let a browser re-serve a cached authenticated GET.
+            reply = indigo.Dict()
+            reply["status"] = 405
+            reply["headers"] = indigo.Dict({"Content-Type": "application/json", "Cache-Control": "no-store"})
+            reply["content"] = json.dumps({"error": "method_not_allowed"})
+            return reply
         reply = indigo.Dict()
         reply["status"] = 200
-        reply["headers"] = indigo.Dict({"Content-Type": "text/html; charset=utf-8"})
+        reply["headers"] = indigo.Dict({"Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store"})
         reply["content"] = self._pairing_page()
         return reply
 
@@ -324,7 +331,14 @@ class HttpApiMixin:
         """
         method, _path_args, query = self._parse_request(action)
         if method.upper() != "GET":
-            return self._reply(405, {"error": "method_not_allowed"})
+            # Cache-Control: no-store — Safari re-served a cached ?live=1 render of
+            # this page after a promotion, so a "Refresh (live)" click showed stale,
+            # pre-promotion data (#334, 2026-09-01). Content-Type alone isn't enough.
+            reply = indigo.Dict()
+            reply["status"] = 405
+            reply["headers"] = indigo.Dict({"Content-Type": "application/json", "Cache-Control": "no-store"})
+            reply["content"] = json.dumps({"error": "method_not_allowed"})
+            return reply
         live = str(query.get("live", "")) == "1"
         mesh, diags, error = self._thread_mesh_snapshot(live_sleepy=live)
         generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -335,7 +349,7 @@ class HttpApiMixin:
         )
         reply = indigo.Dict()
         reply["status"] = 200
-        reply["headers"] = indigo.Dict({"Content-Type": "text/html; charset=utf-8"})
+        reply["headers"] = indigo.Dict({"Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store"})
         reply["content"] = content
         return reply
 

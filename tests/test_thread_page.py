@@ -200,12 +200,15 @@ def test_it_serves_html_200(plug, monkeypatch):
     reply = plug.http_thread_page(_action())
     assert reply["status"] == 200
     assert reply["headers"]["Content-Type"].startswith("text/html")
+    assert reply["headers"]["Cache-Control"] == "no-store"
     assert "<!DOCTYPE html>" in reply["content"]
     assert "GRILLPLATS Plug" in reply["content"]
 
 
 def test_only_GET_is_served(plug):
-    assert plug.http_thread_page(_action("POST"))["status"] == 405
+    reply = plug.http_thread_page(_action("POST"))
+    assert reply["status"] == 405
+    assert reply["headers"]["Cache-Control"] == "no-store"
 
 
 def test_live_1_calls_run_survey_with_live_sleepy_true(plug, monkeypatch):
