@@ -3,6 +3,48 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
+## 2026.29.12 — the bridge node answers SIGTERM from its first line, not its last
+
+**bridge-node 0.17.2** (not yet published; the `DEFAULT_INSTALL_SPEC` pin still
+points at 0.17.1 and moves when it is).
+
+`main.ts` installed its `SIGTERM`/`SIGINT` handlers as the **last** statement of
+`main()`. Everything before them — reading and writing `identity.json`, the
+whole of `bridge.start()`, `ws.listen()` — therefore ran on node's default
+signal disposition: a stop arriving in that window killed the process outright,
+with no `close()` of the Matter node or the protocol socket and an exit code of
+`null` rather than a number.
+
+The visible symptom was an intermittent CI failure (#328): `main.test.ts`
+resolves the moment it reads `Protocol WebSocket listening`, which
+`ws-server.ts` logs from *inside* `listen()`, a few ticks before the old
+`process.on` was reached — so on a loaded runner the test's own SIGTERM
+sometimes landed in the gap. Twice, on PRs touching no TypeScript at all.
+
+The handlers now live at module scope, in place before `main()` runs a line.
+`shutdown` closes whatever is genuinely up: the protocol server is published to
+it before `listen()` (its `close()` is guarded on its own handle, so it is safe
+on a server that never bound — and that is precisely the window the flake lived
+in), while the Matter node is published only once `start()` has **resolved**,
+because closing a node that is still starting is how a clean stop becomes a
+stalled one, and a stall is the escape hatch's exit 1. A signal that arrives
+before either exists closes nothing and exits 0 — a stop that early is still a
+clean stop.
+
+The identity file was never at risk: `storage.ts` writes it through a temp file
+and `rename`, so a death by signal leaves either the old file or the new one.
+
+Two things this does *not* change. `launchctl bootout` — how the plugin
+actually stops the agent — removes the job, so `KeepAlive {SuccessfulExit:
+false}` was never consulted on that path and no respawn was ever triggered by
+this; and matter.js installs no signal handlers of its own
+(`runtime.signals: false`), so being registered earlier races nothing.
+
+Covered by a new test that SIGTERMs the child on its version banner, seconds of
+`bridge.start()` before readiness — it fails by construction against the old
+code (exit `null`) and asserts the signal really did land pre-readiness rather
+than passing quietly when startup wins.
+
 ## 2026.29.11 — one unreadable device no longer empties the migrate picker, and a broken matter-server answer is a 500
 
 **API change (API.md v1.5).** The `diagnostics` endpoint returned 503

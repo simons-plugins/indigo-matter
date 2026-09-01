@@ -111,6 +111,42 @@ async function stopAndWait(child: ChildProcessWithoutNullStreams, timeoutMs = 20
 }
 
 /**
+ * Spawn the entry point and SIGTERM it the moment `marker` appears, instead of
+ * waiting for readiness — the only way to put the signal *inside* startup.
+ *
+ * `start()` cannot do this: it resolves on the readiness line, by which point
+ * the window this exercises has closed.
+ */
+async function killOn(
+    args: string[],
+    marker: string,
+    timeoutMs = 30_000,
+): Promise<{ code: number | null; output: string }> {
+    const child = spawn(process.execPath, [ENTRY, ...args], { stdio: "pipe" });
+    let output = "";
+    let signalled = false;
+    return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+            child.kill("SIGKILL");
+            reject(new Error(`Bridge did not exit in ${timeoutMs}ms. Output:\n${output}`));
+        }, timeoutMs);
+        const onData = (chunk: Buffer): void => {
+            output += chunk.toString();
+            if (!signalled && output.includes(marker)) {
+                signalled = true;
+                child.kill("SIGTERM");
+            }
+        };
+        child.stdout.on("data", onData);
+        child.stderr.on("data", onData);
+        child.once("exit", code => {
+            clearTimeout(timer);
+            resolve({ code, output });
+        });
+    });
+}
+
+/**
  * This host's loopback interface, resolved rather than hardcoded — `lo0` on
  * macOS, `lo` on Linux, and `--mdns-interface` is validated against the real
  * interface list, so a guess that is wrong for the platform fails the spawn
@@ -153,6 +189,33 @@ describe("main.ts as a process", { skip: existsSync(ENTRY) ? false : "run `npm r
         // Not the escape hatch: that path is a forced exit(1), and telling it
         // apart from a genuine clean stop is the entire point of the number.
         assert.doesNotMatch(output(), /Shutdown stalled/);
+    });
+
+    it("exits 0 on a SIGTERM that lands mid-startup, before anything is serving", async () => {
+        // ⊗ #328. The handlers used to be installed on the LAST line of
+        // `main()`, so every step before them — the identity read and write,
+        // and the whole of `bridge.start()` — ran on node's *default* SIGTERM
+        // disposition: death by signal, mid-write, with no `bridge.close()`.
+        // The CI flake was the narrow end of it (the test's readiness line is
+        // logged inside `ws.listen()`, a few ticks before the old `process.on`
+        // was reached); this is the wide end, and it is the one that can
+        // truncate `identity.json`.
+        //
+        // The signal is sent on the version banner, which `main()` logs before
+        // it touches storage — so the child still has all of `bridge.start()`
+        // ahead of it, seconds against the parent's sub-millisecond turnaround.
+        const dir = storage();
+        const { code, output } = await killOn(["--storage-path", dir, ...ports(7)], "indigo-matter-bridge ");
+
+        assert.doesNotMatch(
+            output,
+            /Protocol WebSocket listening/,
+            `startup outran the signal, so this run exercised nothing — the marker needs to be earlier. Output:\n${output}`,
+        );
+        // `null` is the tell: that is what node reports for death by signal,
+        // and it is what launchd would see instead of a number.
+        assert.equal(code, 0, `a stop during startup must still be a clean exit. Output:\n${output}`);
+        assert.match(output, /Received SIGTERM/);
     });
 
     it("writes an identity on first run and reuses it on the second", async () => {
