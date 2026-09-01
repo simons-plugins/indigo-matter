@@ -19,18 +19,40 @@ RouteTable, LeaderRouterId and ParentChangeCount together (the last gated, per
 ADR-0003, on the cluster's own AttributeList). But ``on_attribute_update`` — like
 every handler's, by device_sync's own contract — is called with exactly ONE changed
 attribute at a time, whether that call comes from a live ``attribute_updated`` event
-or from ``_prime_states`` replaying a node's cached snapshot one key at a time. So
-this handler holds a small per-node cache of the cluster's own last-seen attribute
-values (``{node_id: {attribute_id: value}}``, rebuilt from whatever priming/live
-traffic has arrived so far, never persisted across a reload — the same throwaway-cache
-discipline as ``device_sync``'s own ``_power_coverage``/``_forward_links``), and on
-every update re-parses the WHOLE cluster through :func:`thread_mesh.parse_node_diag`
-before computing :func:`thread_mesh.summary_states`. Never raises on malformed data:
-a value ``thread_mesh`` cannot make sense of degrades to no neighbours/no role/no
-flags there already (its own module docstring), and this handler wraps the parse in
-a broad ``except`` besides, logging at debug and returning ``{}`` — the same
-"one bad value must not freeze the device" posture as ``device_sync._on_attribute``'s
-own try/except around every handler call, just one layer closer to the data.
+or from ``_prime_states`` replaying a node's cached snapshot one key at a time (in
+cache-dict iteration order — device_sync does not control or guarantee which
+attribute arrives first). So this handler holds a small per-node cache of the
+cluster's own last-seen attribute values (``{node_id: {attribute_id: value}}``,
+rebuilt from whatever priming/live traffic has arrived so far, never persisted
+across a reload — the same throwaway-cache discipline as ``device_sync``'s own
+``_power_coverage``/``_forward_links``), and on every update re-parses the WHOLE
+cluster through :func:`thread_mesh.parse_node_diag` before computing
+:func:`thread_mesh.summary_states`.
+
+**The priming-order gate (#334 post-review, B2.8).** Because priming replays one
+cached attribute at a time, the FIRST attribute to arrive (RoutingRole, say) would
+otherwise compute a diag whose NeighborTable has not arrived yet — genuinely
+``neighbours_known=False`` (:mod:`thread_mesh`'s own absent-vs-unknown distinction,
+B2.1), but for a reason that has nothing to do with the device: the rest of the
+snapshot simply has not been replayed yet. That transient "unknown" would land in
+the exact same batched Indigo state update as the real numbers a moment later,
+which is a false transient a trigger could catch. So this handler withholds every
+result — returns ``{}`` — until BOTH RoutingRole and NeighborTable have been SEEN
+at least once (their KEY present in the per-node cache, not their VALUE: a live
+NeighborTable reading of ``None`` still counts as "seen", exactly like B2.1's own
+rule for what "known" means).
+
+Malformed data itself is never this handler's problem to catch: a value
+``thread_mesh`` cannot make sense of degrades to no neighbours/no role/no flags
+there already (its own module docstring), and this handler relies on
+``device_sync``'s own try/except around every handler call (``_prime_states``'s and
+``_on_attribute``'s, both wrapping ``handler.on_attribute_update`` individually) for
+the "one bad value must not freeze the device" guarantee — which is also where the
+warning actually reaches an operator, naming the device and the failing attribute,
+something a handler-local logger reaching no configured handler in production could
+never do (#334 post-review, B2.6 — this module used to carry its own
+``logging.getLogger(__name__)`` and a second, redundant broad ``except`` around the
+parse; both are gone, on purpose, not an oversight).
 
 **Which attributes are subscribed.** Only what the four states actually consume,
 per ``thread_mesh.health_flags``: RoutingRole (role_name, detached, is_router,
@@ -51,7 +73,6 @@ its target ``matterNode`` device, so ordinary same-endpoint dispatch
 """
 from __future__ import annotations
 
-import logging
 from typing import Any, Optional
 
 from thread_mesh import (
@@ -67,12 +88,6 @@ from thread_mesh import (
 )
 
 from .base import ClusterHandler, IndigoDeviceSpec, MatterAction, node_endpoint
-
-#: ``logging.getLogger(__name__)`` reaches no handler in production (same note as
-#: export_catalog.py's ``_LOG``) — fine here, since "never raise" only asks for a
-#: debug-level breadcrumb, not a guaranteed Event Log line (this is diagnostics
-#: data with no write path, so nothing downstream is actually acting on silence).
-_LOG = logging.getLogger(__name__)
 
 #: Everything ``thread_mesh.summary_states``/``health_flags`` read on this cluster —
 #: see the module docstring for what each one feeds. Not every ThreadNetworkDiagnostics
@@ -106,6 +121,19 @@ class ThreadNetworkDiagnosticsHandler(ClusterHandler):
         # node_id -> {attribute_id: last-seen raw value}. See the module
         # docstring: on_attribute_update only ever sees one changed attribute,
         # so the whole-cluster parse needs this to reassemble the rest.
+        #
+        # Never evicted (#334 post-review, B2.11): there is no per-node-removal
+        # hook a ClusterHandler can register for (searched device_sync.py and
+        # matter_handlers/base.py — device_sync evicts its OWN caches, e.g.
+        # `_forward_links`/`_reverse_links`, from inside `delete_node`/
+        # `node_removed`, but never calls back into a handler instance to do
+        # the same). Growth is bounded by the number of DISTINCT Thread node
+        # ids this Indigo install has ever seen — decommissioning and
+        # recommissioning the same node id simply overwrites its entry, and a
+        # genuinely new node id adds one small dict entry, not an unbounded
+        # leak. Inventing a hook for this alone was judged not worth adding a
+        # new handler-lifecycle mechanism that nothing else in this package
+        # needs yet.
         self._node_attrs: dict[int, dict[int, Any]] = {}
 
     def is_primary_for(self, node: Any, endpoint: Any) -> bool:
@@ -125,38 +153,40 @@ class ThreadNetworkDiagnosticsHandler(ClusterHandler):
         except (KeyError, TypeError, ValueError):
             # A device with no (or unparsable) nodeId/endpointId props — should
             # not happen for a real matterNode device, but degrade rather than
-            # assume the props are shaped as expected.
-            _LOG.debug("thread diag update for a device with no usable nodeId/endpointId props")
+            # assume the props are shaped as expected. This narrow except is
+            # NOT the broad one B2.6 removed below: it is a shape problem with
+            # the DEVICE's own props, not a parse problem with Thread data, and
+            # node_endpoint's own contract already names exactly these three
+            # exception types.
             return {}
 
         node_attrs = self._node_attrs.setdefault(node_id, {})
         node_attrs[attribute_id] = value
 
-        try:
-            diag = parse_node_diag(
-                node_id=node_id,
-                name=getattr(indigo_dev, "name", "") or "",
-                # "reachable" is device_sync's own BridgedDeviceBasicInformation-
-                # derived liveness state (already declared on matterNode) — the
-                # closest thing to "is this node currently available" this
-                # handler has, without threading a second signal through.
-                available=bool(getattr(indigo_dev, "states", {}).get("reachable", True)),
-                attributes={
-                    (0, CLUSTER_THREAD_DIAG, attr): raw
-                    for attr, raw in node_attrs.items()
-                },
-            )
-            if diag is None:
-                return {}
-            states = summary_states(diag)
-        except Exception as exc:  # pylint: disable=broad-except
-            # Never raise on malformed data: thread_mesh already tolerates most
-            # of it internally (see its own module docstring), this is the outer
-            # belt for whatever it doesn't — one bad value must not freeze the
-            # device's Thread states, same posture as device_sync's own
-            # try/except around every handler call, just closer to the data.
-            _LOG.debug("could not parse Thread diagnostics for node %s: %s", node_id, exc)
+        # #334 post-review, B2.8: withhold every result until BOTH RoutingRole
+        # and NeighborTable have been SEEN at least once (see the module
+        # docstring's "priming-order gate" section) — a KEY check, not a value
+        # check, so a live NeighborTable reading of None still counts as seen.
+        if ATTR_ROUTING_ROLE not in node_attrs or ATTR_NEIGHBOR_TABLE not in node_attrs:
             return {}
+
+        diag = parse_node_diag(
+            node_id=node_id,
+            name=getattr(indigo_dev, "name", "") or "",
+            # "reachable" is device_sync's own liveness state
+            # (`_write_node_reachable`), derived from matter-server's node-level
+            # `available` flag — NOT from BridgedDeviceBasicInformation, which
+            # this node (endpoint 0 of a directly-commissioned node, not a
+            # bridged child) does not even carry.
+            available=bool(getattr(indigo_dev, "states", {}).get("reachable", True)),
+            attributes={
+                (0, CLUSTER_THREAD_DIAG, attr): raw
+                for attr, raw in node_attrs.items()
+            },
+        )
+        if diag is None:
+            return {}
+        states = summary_states(diag)
 
         existing = getattr(indigo_dev, "states", {})
         return {key: state_value for key, state_value in states.items() if key in existing}

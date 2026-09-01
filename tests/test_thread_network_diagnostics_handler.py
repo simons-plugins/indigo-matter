@@ -20,6 +20,7 @@ import importlib
 import json
 import os
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -140,36 +141,44 @@ def test_unsubscribed_attribute_is_a_noop():
     assert h.on_attribute_update(_Dev(), 0x0000, 25) == {}  # Channel — not subscribed
 
 
-def test_malformed_value_before_any_role_yields_role_only_without_raising():
+def test_malformed_value_before_any_role_yields_empty_without_raising():
     """A garbage NeighborTable/RouteTable/counter value must never raise, even
     before RoutingRole itself has ever been cached.
 
-    #334 post-review (B2.3): a cluster-0x35 key IS present here (NeighborTable,
-    then RouteTable, then ParentChangeCount), so ``parse_node_diag`` no longer
-    returns ``None`` the way a genuine Wi-Fi node correctly does — it returns an
-    "unreadable" diag (role Unspecified), and ``summary_states`` degrades that
-    (via B2.1's ``neighbours_known`` gate, since the NeighborTable value itself
-    is malformed) to ``threadRole`` alone. B2.8 (handler-level priming gate,
-    Step 3 of #334's post-review) narrows this further — this pins today's
-    behaviour at the ``thread_mesh``/``summary_states`` layer, independent of
-    that handler-level gate.
+    #334 post-review, B2.8: RoutingRole is never fed in this test, so the
+    priming-order gate (both RoutingRole AND NeighborTable must have been SEEN
+    at least once) withholds every result — {} — regardless of what garbage
+    the other attributes carry. Without that gate, the first of these calls
+    would compute an "unreadable" diag (B2.3: a cluster-0x35 key IS present)
+    and report threadRole="Unspecified" before RoutingRole itself ever
+    arrives — a priming-order artefact, not a real reading.
     """
     h = ThreadNetworkDiagnosticsHandler()
     dev = _Dev()
-    assert h.on_attribute_update(dev, ATTR_NEIGHBOR_TABLE, "not-a-list-of-structs") == {"threadRole": "Unspecified"}
-    assert h.on_attribute_update(dev, ATTR_ROUTE_TABLE, object()) == {"threadRole": "Unspecified"}
-    assert h.on_attribute_update(dev, ATTR_PARENT_CHANGE_COUNT, {"unexpected": "shape"}) == {"threadRole": "Unspecified"}
+    assert h.on_attribute_update(dev, ATTR_NEIGHBOR_TABLE, "not-a-list-of-structs") == {}
+    assert h.on_attribute_update(dev, ATTR_ROUTE_TABLE, object()) == {}
+    assert h.on_attribute_update(dev, ATTR_PARENT_CHANGE_COUNT, {"unexpected": "shape"}) == {}
 
 
-def test_malformed_value_after_role_established_degrades_not_raises():
+def test_malformed_value_after_role_established_writes_role_only_not_a_blessed_swallow():
     """Once RoutingRole is known, a malformed NeighborTable must not raise —
-    thread_mesh already skips malformed structs internally; this pins the
-    outer handler never surfaces an exception either way."""
+    thread_mesh already skips/flags malformed structs internally (see
+    tests/test_thread_mesh.py's TestNeighboursKnown) — but must ALSO not
+    silently invent health/neighbour states from data it cannot read.
+
+    #334 post-review, B2.1: the old assertion here (`set(result) <=
+    _THREAD_STATE_KEYS`) passes on `{}` too, which is exactly the "swallow"
+    this test is supposed to catch and instead blessed as intended behaviour.
+    Pinned here as the SPECIFIC result: only threadRole, nothing else.
+    """
     h = ThreadNetworkDiagnosticsHandler()
     dev = _Dev(node_id=0x34)
-    h.on_attribute_update(dev, ATTR_ROUTING_ROLE, 5)  # Router
+    h.on_attribute_update(dev, ATTR_ROUTING_ROLE, 5)  # Router — gate not yet satisfied, {}
     result = h.on_attribute_update(dev, ATTR_NEIGHBOR_TABLE, "garbage")
-    assert set(result) <= _THREAD_STATE_KEYS  # degrades to a valid (if empty-ish) result
+    assert result == {"threadRole": "Router"}
+    assert "threadHealth" not in result
+    assert "threadNeighbourCount" not in result
+    assert "threadLinkRssi" not in result
 
 
 def test_unparsable_node_id_props_returns_empty_without_raising():
@@ -311,7 +320,12 @@ def test_priming_a_node_without_thread_cluster_leaves_states_blank(ds, indigo_en
     node_dev_id = result["nodeDeviceId"]
     assert node_dev_id is not None
     dev = devices[node_dev_id]
-    assert dev.states.get("threadRole") == 0  # Devices.xml default, never written
+    # #334 post-review, B3.11: 0 is FakeDev's own static-state seed convention
+    # (indigo_fakes.py's `self.states.setdefault(state_key, 0)`), not a real
+    # Indigo default for a String state (which is "") — asserted here as the
+    # SEEDED value this test actually pins: the handler never wrote to it, so
+    # it never left the seed FakeDev gave it at creation.
+    assert dev.states.get("threadRole") == 0
 
 
 def test_live_attribute_event_updates_the_node_device_via_plain_dispatch(ds, indigo_env):
@@ -346,3 +360,81 @@ def test_live_attribute_event_updates_the_node_device_via_plain_dispatch(ds, ind
 
     assert dev.states.get("threadNeighbourCount") == 2
     assert dev.states.get("threadHealth") == "ok"
+
+
+# ---------------------------------------------------------------------------
+# #334 post-review — B2.6: device_sync's own warning path is what protects
+# a raising handler now (this handler no longer catches its own exceptions,
+# and no longer logs to a module logger that reaches nothing in production)
+# ---------------------------------------------------------------------------
+
+def test_a_raising_handler_is_reported_by_device_syncs_warning_path(ds, indigo_env, mock_logger, monkeypatch):
+    """Same pattern as test_device_sync.py's
+    test_node_scoped_handler_keyerror_still_bad_update_warning (PowerSource):
+    the handler's OWN broad except and module logger are gone (B2.6) — a bug
+    inside on_attribute_update must still be caught and reported, and now it
+    can only be device_sync's own try/except (`_on_attribute`) doing it,
+    which is also the only place the warning reaches an operator at all.
+    """
+    import protocol  # pylint: disable=import-outside-toplevel
+    from protocol import MatterEvent  # pylint: disable=import-outside-toplevel
+
+    _indigo, devices = indigo_env
+    raw = _thread_node_raw(0x34)
+    result = ds.create_from_raw(raw, "Router Node")
+    node_dev_id = result["nodeDeviceId"]
+    assert node_dev_id is not None
+    handler = ds.registry.handler_for_cluster(CLUSTER_THREAD_DIAG)
+    monkeypatch.setattr(handler, "on_attribute_update", Mock(side_effect=RuntimeError("boom")))
+
+    ds.handle_event(MatterEvent(
+        kind=protocol.EVT_ATTRIBUTE_UPDATED,
+        node_id=0x34, endpoint=0, cluster=CLUSTER_THREAD_DIAG,
+        attribute=ATTR_ROUTING_ROLE, value=5,
+    ))  # must not raise
+
+    warn_msgs = [c[0][0] % tuple(c[0][1:]) for c in mock_logger.warning.call_args_list]
+    assert any("bad update" in m for m in warn_msgs)
+    devices[node_dev_id]  # still there — the device was not corrupted by the raise
+
+
+# ---------------------------------------------------------------------------
+# #334 post-review — B2.8: the priming-order gate
+# ---------------------------------------------------------------------------
+
+def test_neither_attribute_seen_yet_yields_empty():
+    h = ThreadNetworkDiagnosticsHandler()
+    dev = _Dev(node_id=0x34)
+    assert h.on_attribute_update(dev, ATTR_LEADER_ROUTER_ID, 14) == {}
+
+
+def test_role_alone_yields_empty_until_neighbor_table_is_also_seen():
+    h = ThreadNetworkDiagnosticsHandler()
+    dev = _Dev(node_id=0x34)
+    assert h.on_attribute_update(dev, ATTR_ROUTING_ROLE, 5) == {}
+    # a NeighborTable of None still counts as "seen" (B2.1's own key-vs-value
+    # rule) — the gate opens even though the reading itself is unknown.
+    result = h.on_attribute_update(dev, ATTR_NEIGHBOR_TABLE, None)
+    assert result == {"threadRole": "Router"}
+
+
+def test_neighbor_table_alone_yields_empty_until_role_is_also_seen():
+    h = ThreadNetworkDiagnosticsHandler()
+    dev = _Dev(node_id=0x34)
+    assert h.on_attribute_update(dev, ATTR_NEIGHBOR_TABLE, []) == {}
+    result = h.on_attribute_update(dev, ATTR_ROUTING_ROLE, 5)
+    assert result["threadRole"] == "Router"
+    assert "threadHealth" in result  # both known now — the full state set
+
+
+# ---------------------------------------------------------------------------
+# #334 post-review — B3.9: reachable == False -> detached -> "bad"
+# ---------------------------------------------------------------------------
+
+def test_unreachable_device_reports_bad_health():
+    h = ThreadNetworkDiagnosticsHandler()
+    dev = _Dev(node_id=0x2E)
+    dev.states["reachable"] = False
+    h.on_attribute_update(dev, ATTR_ROUTING_ROLE, 2)  # SleepyEndDevice
+    result = h.on_attribute_update(dev, ATTR_NEIGHBOR_TABLE, [])
+    assert result["threadHealth"] == "bad"
