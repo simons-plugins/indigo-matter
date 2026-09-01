@@ -44,6 +44,7 @@ import { ErrorCode, PROTOCOL_VERSION, RefuseReason } from "../src/protocol.js";
 import { DEAD_SESSION_QUIET_MS, SESSION_MAX_AGE_MS } from "../src/session-hygiene.js";
 import { BridgeWsServer } from "../src/ws-server.js";
 import { TestClient } from "./client.js";
+import { closeSharedMdns, LOOPBACK, settleMatterWrites } from "./loopback.js";
 
 const BRIDGE_VERSION = "0.1.0-test";
 const KITCHEN = 123456789;
@@ -54,6 +55,11 @@ Logger.level = "fatal";
 const SCRATCH_ROOT = process.env.INDIGO_MATTER_TEST_SCRATCH ?? tmpdir();
 mkdirSync(SCRATCH_ROOT, { recursive: true });
 const scratch: string[] = [];
+
+// #330: the mDNS responder is a service on the shared Environment, so no
+// node close disposes it — without this the runner cannot exit.
+after(closeSharedMdns);
+after(settleMatterWrites);
 
 after(() => {
     for (const dir of scratch) {
@@ -196,7 +202,7 @@ async function bootPosed(
 ): Promise<PosedSession> {
     const logged: string[] = [];
     const bridge = new PosedNode(
-        { storagePath, matterPort: 0, wsPort: 0 },
+        { storagePath, matterPort: 0, wsPort: 0, mdnsInterface: LOOPBACK },
         options.commissionedAt === undefined
             ? { ...IDENTITY }
             : { ...IDENTITY, commissionedAt: options.commissionedAt },
@@ -223,7 +229,7 @@ interface Session {
 async function boot(storagePath: string, commissionedAt?: string): Promise<Session> {
     const bridge = new BridgeNode(
         // Ephemeral on both ports, so a parallel run cannot collide.
-        { storagePath, matterPort: 0, wsPort: 0 },
+        { storagePath, matterPort: 0, wsPort: 0, mdnsInterface: LOOPBACK },
         commissionedAt === undefined ? { ...IDENTITY } : { ...IDENTITY, commissionedAt },
         BRIDGE_VERSION,
         () => {},
@@ -577,7 +583,7 @@ describe("factory_reset (preserve: true) voids the map instead of drift-checking
         const storagePath = storage();
         const logged: string[] = [];
         const bridge = new BridgeNode(
-            { storagePath, matterPort: 0, wsPort: 0 },
+            { storagePath, matterPort: 0, wsPort: 0, mdnsInterface: LOOPBACK },
             { ...IDENTITY },
             BRIDGE_VERSION,
             message => logged.push(message),
@@ -626,7 +632,7 @@ describe("factory_reset (preserve: true) voids the map instead of drift-checking
         const storagePath = storage();
         const logged: string[] = [];
         const bridge = new BridgeNode(
-            { storagePath, matterPort: 0, wsPort: 0 },
+            { storagePath, matterPort: 0, wsPort: 0, mdnsInterface: LOOPBACK },
             { ...IDENTITY },
             BRIDGE_VERSION,
             message => logged.push(message),
@@ -676,7 +682,7 @@ describe("noteLastFabricGone voids the endpoint map too (issue #140)", () => {
         );
         const witness = "2026-08-01T00:00:00.000Z";
         const bridge = new BridgeNode(
-            { storagePath, matterPort: 0, wsPort: 0 },
+            { storagePath, matterPort: 0, wsPort: 0, mdnsInterface: LOOPBACK },
             { ...IDENTITY, commissionedAt: witness },
             BRIDGE_VERSION,
             () => {},
@@ -990,7 +996,7 @@ describe("refusing for an unusable identity is a different refusal (E5 R4)", () 
     function refusalLineFor(reason: string): string {
         const logged: string[] = [];
         const bridge = new BridgeNode(
-            { storagePath: storage(), matterPort: 0, wsPort: 0 },
+            { storagePath: storage(), matterPort: 0, wsPort: 0, mdnsInterface: LOOPBACK },
             { ...IDENTITY },
             BRIDGE_VERSION,
             message => logged.push(message),
@@ -1036,7 +1042,7 @@ describe("refusing for an unusable identity is a different refusal (E5 R4)", () 
         const storagePath = storage();
         const logged: string[] = [];
         const bridge = new BridgeNode(
-            { storagePath, matterPort: 0, wsPort: 0 },
+            { storagePath, matterPort: 0, wsPort: 0, mdnsInterface: LOOPBACK },
             { ...IDENTITY },
             BRIDGE_VERSION,
             message => logged.push(message),
@@ -1137,7 +1143,7 @@ describe("factory_reset tells the truth about what it could not do (§3.10)", ()
         const storagePath = storage();
         const logged: string[] = [];
         const bridge = new BridgeNode(
-            { storagePath, matterPort: 0, wsPort: 0 },
+            { storagePath, matterPort: 0, wsPort: 0, mdnsInterface: LOOPBACK },
             { ...IDENTITY },
             BRIDGE_VERSION,
             message => logged.push(message),
@@ -1183,7 +1189,7 @@ describe("noteFabrics never swallows the read it depends on (E5 S2)", () => {
         // what the teardown paths hand it.
         const logged: string[] = [];
         const bridge = new BridgeNode(
-            { storagePath: storage(), matterPort: 0, wsPort: 0 },
+            { storagePath: storage(), matterPort: 0, wsPort: 0, mdnsInterface: LOOPBACK },
             { ...IDENTITY },
             BRIDGE_VERSION,
             message => logged.push(message),
@@ -1439,7 +1445,7 @@ describe("subscription-churn detection reaches get_status (issue #286)", () => {
     it("reports checked:false — not a quiet all-clear — when the wiring fails", async () => {
         const logged: string[] = [];
         const bridge = new ChurnBlindNode(
-            { storagePath: storage(), matterPort: 0, wsPort: 0 },
+            { storagePath: storage(), matterPort: 0, wsPort: 0, mdnsInterface: LOOPBACK },
             { ...IDENTITY },
             BRIDGE_VERSION,
             message => logged.push(message),
@@ -1667,7 +1673,7 @@ describe("the wired session-hygiene periodic sweep (issue #283 items 2/3)", () =
     it("reports checked:false — not a quiet all-clear — when the wiring fails", async () => {
         const logged: string[] = [];
         const bridge = new ChurnBlindNode(
-            { storagePath: storage(), matterPort: 0, wsPort: 0 },
+            { storagePath: storage(), matterPort: 0, wsPort: 0, mdnsInterface: LOOPBACK },
             { ...IDENTITY },
             BRIDGE_VERSION,
             message => logged.push(message),
@@ -1693,7 +1699,7 @@ describe("closeSession's async-outcome discipline (issue #283 review, Finding 2)
     it("does not count a rejected force-close, logs the failure once, and a later poll does not re-select or re-log it", async () => {
         const logged: string[] = [];
         const bridge = new BridgeNode(
-            { storagePath: storage(), matterPort: 0, wsPort: 0 },
+            { storagePath: storage(), matterPort: 0, wsPort: 0, mdnsInterface: LOOPBACK },
             { ...IDENTITY },
             BRIDGE_VERSION,
             message => logged.push(message),

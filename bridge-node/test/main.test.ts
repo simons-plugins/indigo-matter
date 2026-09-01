@@ -33,13 +33,14 @@
 import assert from "node:assert/strict";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { networkInterfaces, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { after, describe, it } from "node:test";
 
 import { ErrorCode, PROTOCOL_VERSION } from "../src/protocol.js";
 import { TestClient } from "./client.js";
+import { LOOPBACK } from "./loopback.js";
 
 /**
  * `.test-build/test/` at run time, so the compiled entry point is two levels up
@@ -155,16 +156,6 @@ async function killOn(
     });
 }
 
-/**
- * This host's loopback interface, resolved rather than hardcoded — `lo0` on
- * macOS, `lo` on Linux, and `--mdns-interface` is validated against the real
- * interface list, so a guess that is wrong for the platform fails the spawn
- * outright. `undefined` if there is somehow no internal interface, in which case
- * the flag is simply omitted and the child behaves exactly as it did before.
- */
-const LOOPBACK = Object.entries(networkInterfaces()).find(
-    ([, addresses]) => addresses?.some(address => address.internal),
-)?.[0];
 
 /**
  * Two ephemeral-ish ports derived from the PID, so parallel files do not clash,
