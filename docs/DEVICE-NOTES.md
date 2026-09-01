@@ -161,3 +161,31 @@ lighting every ~3 seconds, forever (issue #281) — the plugin's fix (a
 commanded-value push plus `CT_TOLERANCE_MIREDS`, ADR-0013) converges the
 fabric on the commanded value and tolerates exactly this gap; it is not a
 fix to the bulb's own reporting.
+
+## Thread mesh (observed 2026-09-01)
+
+**IKEA rev-2 vs rev-3 ThreadNetworkDiagnostics firmware differ in what they
+report, not just in values.** Rev-2 firmware (ALPSTUGA, TIMMERFLOTTE) reports
+FeatureMap 0 and a 22-entry AttributeList — the MLECNT-gated counters
+(DetachedRoleCount, ChildRoleCount, RouterRoleCount, LeaderRoleCount,
+AttachAttemptCount, PartitionIdChangeCount, ParentChangeCount) are absent
+entirely, not zero. Rev-3 firmware (GRILLPLATS, BILRESA, Aqara FP300) reports
+FeatureMap 15 and carries the full counter set. Always check the
+AttributeList before reading a counter — do not assume it exists because the
+cluster does.
+
+**None of the IKEA/Aqara nodes seen implements the provisional ExtAddress
+(0x3F) / Rloc16 (0x40) attributes.** A router's own identity therefore has to
+come from its route table's self entry — the row with NextHop 63, PathCost 0,
+and Allocated set — rather than from those attributes directly.
+
+**Ext-address values arrive precision-lossy through matter-server's JSON**:
+uint64 is serialised as a JS Number, so anything above 2^53 loses low bits.
+Never use ext address as an identity key — key routers by RLOC16 (exact)
+instead.
+
+**matter-server's cache goes stale for sleepy devices.** Cached
+PartitionId/LeaderRouterId values were hours old on two nodes and looked like
+a partition split; a live read of the same nodes showed a single partition.
+Treat a cached partition/leader disagreement as a staleness signal to
+re-verify, not as evidence of an actual split.
