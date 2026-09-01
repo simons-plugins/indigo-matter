@@ -44,6 +44,7 @@ import asyncio
 import functools
 from concurrent.futures import CancelledError as FuturesCancelledError
 from concurrent.futures import TimeoutError as FuturesTimeoutError
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 import indigo  # provided by the Indigo runtime
@@ -442,6 +443,10 @@ class DiagnosticsMenuMixin:
 
         # R8 — eager, Indigo-thread resolution (see docstring above).
         node_names = self._thread_node_names()  # B5.4 — same names the page uses
+        # #344: same eager-capture pattern as node_names/page_url just above —
+        # the survey coroutine runs on the asyncio loop thread and must not
+        # touch self.device_sync itself.
+        event_stamps = self.device_sync.thread_event_stamps() if self.device_sync is not None else {}
         try:
             page_url = self._iws_page_url("thread")  # pylint: disable=no-member  # HttpApiMixin
         except Exception:  # pylint: disable=broad-except
@@ -461,6 +466,7 @@ class DiagnosticsMenuMixin:
             return await asyncio.wait_for(
                 thread_survey.survey_thread_nodes(
                     self.matter, live_sleepy=live_sleepy, node_names=node_names,
+                    event_stamps=event_stamps,
                 ),
                 timeout=total_timeout,
             )
@@ -622,8 +628,12 @@ class DiagnosticsMenuMixin:
             self.logger.info("Matter: no Thread devices are commissioned yet.")
             return
 
-        mesh = thread_mesh.build_mesh(survey.diags)
-        for line in thread_mesh.render_report(mesh, survey.diags, page_url=page_url):
+        # #344: ages are computed at RENDER time, not survey time — `now` is
+        # resolved once here so the report's "stale" flags and its per-node
+        # "cache: interviewed … ago" lines agree with each other.
+        now = datetime.now(timezone.utc)
+        mesh = thread_mesh.build_mesh(survey.diags, now)
+        for line in thread_mesh.render_report(mesh, survey.diags, page_url=page_url, now=now):
             self.logger.info("%s", line)
 
         if mesh.unreadable:

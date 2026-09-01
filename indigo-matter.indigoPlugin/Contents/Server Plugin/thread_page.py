@@ -19,11 +19,18 @@ Indigo device names — is treated as hostile input and passed through
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any, Optional
 
-from thread_mesh import RSSI_BAD, RSSI_WEAK, partition_header_text
+from thread_mesh import RSSI_BAD, RSSI_WEAK, freshness_text, humanise_age, partition_header_text
 
 __all__ = ["render_thread_page"]
+
+#: #344 UX (Simon's call, 2026-09-02): CACHED stays the page's default — old
+#: data is HIGHLIGHTED, not hidden. An interview baseline older than this is
+#: "stale enough to flag": the per-node cell gets the amber chip, and (when
+#: it is the oldest such baseline on the page) the header/banner note it.
+_STALE_AGE_SECONDS = 3600.0
 
 # RSSI colour bands (#334 finding B4.7): these ARE thread_mesh's own
 # RSSI_WEAK/RSSI_BAD thresholds, imported rather than duplicated as plain
@@ -399,6 +406,35 @@ def _render_flags(mesh) -> str:
     return f'<ul class="flags">{rows}</ul>'
 
 
+def _interview_age_seconds(diag, now: datetime) -> Optional[float]:
+    if diag.last_interview is None:
+        return None
+    return (now - diag.last_interview).total_seconds()
+
+
+def _oldest_interview_age(diags: list, now: datetime) -> Optional[float]:
+    """The MAX interview age across every diag with a known ``last_interview``
+    (#344) — ``None`` when none is known at all. Used for the header's
+    "oldest node baseline" note and the stale banner's threshold."""
+    ages = [age for age in (_interview_age_seconds(d, now) for d in diags) if age is not None]
+    return max(ages) if ages else None
+
+
+def _freshness_cell(diag, now: datetime) -> str:
+    """The Nodes table's freshness cell (#344): ``"cached · interviewed 6d
+    ago · last 0x35 update 2h ago"`` / ``"live · interviewed 6d ago"`` — the
+    source word plus :func:`freshness_text`, escaped, and wrapped in an amber
+    ``chip-stale`` span when this is CACHED data whose interview baseline is
+    older than an hour (Simon's UX call — cached stays the page default; old
+    data is highlighted, not hidden)."""
+    source_word = "live" if diag.source == "live" else "cached"
+    text = _escape(f"{source_word} · {freshness_text(diag, now)}")
+    age = _interview_age_seconds(diag, now)
+    if diag.source != "live" and age is not None and age > _STALE_AGE_SECONDS:
+        return f'<span class="chip-stale">{text}</span>'
+    return text
+
+
 def _best_link_text(diag) -> str:
     if diag.is_router:
         rssi = diag.best_rssi
@@ -408,7 +444,7 @@ def _best_link_text(diag) -> str:
     return _fmt_opt(rssi, suffix=" dBm")
 
 
-def _render_table(diags: list) -> str:
+def _render_table(diags: list, now: datetime) -> str:
     if not diags:
         return '<p class="msg">No Thread devices are commissioned.</p>'
     rows = []
@@ -423,7 +459,7 @@ def _render_table(diags: list) -> str:
             f"<td>{_escape(diag.role_name)}</td>"
             f"<td>{_escape(router_bits)}</td>"
             f"<td>{_escape(_fmt_opt(diag.partition_id))}</td>"
-            f"<td>{_escape(diag.source)}</td>"
+            f"<td>{_freshness_cell(diag, now)}</td>"
             f"<td>{len(diag.neighbours)}</td>"
             f"<td>{_escape(_best_link_text(diag))}</td>"
             f"<td>{_escape(counters)}</td>"
@@ -464,9 +500,10 @@ def _render_unreadable(mesh) -> str:
 
 
 def render_thread_page(mesh, diags: list, *, generated_at: str, live: bool,  # pylint: disable=too-many-locals
-                        plugin_id: str, error: Optional[str] = None) -> str:
-    """The Thread mesh page (#334). Self-contained: no scripts, no external
-    assets. ``mesh``/``diags`` come from
+                        plugin_id: str, error: Optional[str] = None,
+                        now: Optional[datetime] = None) -> str:
+    """The Thread mesh page (#334; cache-age display added #344). Self-contained:
+    no scripts, no external assets. ``mesh``/``diags`` come from
     :func:`thread_mesh.build_mesh`/:func:`thread_survey.run_survey`; when
     ``error`` is set (matter-server unreachable, ``get_nodes()`` failing, or
     both a live AND a cache-fallback read failing) both are expected to be
@@ -475,11 +512,34 @@ def render_thread_page(mesh, diags: list, *, generated_at: str, live: bool,  # p
     degradation-path convention). A live-only timeout does NOT reach this
     banner path any more (#334 finding B3.2): it falls back to a cached
     render with ``error`` naming the live timeout instead.
+
+    ``now`` (#344) is resolved once, here, and threaded to every age
+    computed on this render — the caller (``HttpApiMixin.http_thread_page``)
+    passes the SAME value it derived ``generated_at`` from, so the header's
+    timestamp and every cache age on the page agree with each other.
     """
+    resolved_now = now or datetime.now(timezone.utc)
     live_url = f"/message/{_escape(plugin_id)}/thread?live=1"
     cached_url = f"/message/{_escape(plugin_id)}/thread"
     badge = "LIVE" if live else "CACHED"
     badge_class = "badge-live" if live else "badge-cached"
+
+    # #344 UX (Simon's call): CACHED stays the default view; a header note and
+    # a banner point at "Refresh (live)" only when the data is actually old
+    # enough to matter — never on a live render, and never when no diag's
+    # interview age is even known yet.
+    oldest_age = None if live else _oldest_interview_age(diags, resolved_now)
+    badge_note = ""
+    stale_banner = ""
+    if oldest_age is not None:
+        badge_note = f' <span class="badge-note">oldest node baseline: {_escape(humanise_age(oldest_age))}</span>'
+        if oldest_age > _STALE_AGE_SECONDS:
+            stale_banner = (
+                f'<p class="msg">Some of this data is matter-server\'s cache — oldest node baseline '
+                f'{_escape(humanise_age(oldest_age))} ago. Baselines are a lower bound: a value may be '
+                f'staler than its interview. Use <a href="{live_url}">Refresh (live)</a> to re-read '
+                f'sleepy devices.</p>'
+            )
 
     header = f"""
 <h1>Thread mesh</h1>
@@ -487,13 +547,14 @@ def render_thread_page(mesh, diags: list, *, generated_at: str, live: bool,  # p
 <tr><th>Network</th><td>{_escape(mesh.network_name or "unknown")}</td></tr>
 <tr><th>Channel</th><td>{_escape(_fmt_opt(mesh.channel))}</td></tr>
 <tr><th>PAN</th><td>{_escape(f"0x{mesh.pan_id:04X}") if mesh.pan_id is not None else "unknown"}</td></tr>
-<tr><th>Generated</th><td>{_escape(generated_at)} <span class="badge {badge_class}">{badge}</span></td></tr>
+<tr><th>Generated</th><td>{_escape(generated_at)} <span class="badge {badge_class}">{badge}</span>{badge_note}</td></tr>
 </table>
 <p class="partition-summary">{_escape(partition_header_text(mesh, diags))}</p>
 <p class="links">
 <a href="{live_url}">Refresh (live)</a> &middot;
 <a href="{cached_url}">Cached (fast)</a>
-</p>"""
+</p>
+{stale_banner}"""
 
     if error:
         banner = f'<p class="warn"><strong>Could not read the Thread mesh:</strong> {_escape(error)}</p>'
@@ -510,7 +571,7 @@ def render_thread_page(mesh, diags: list, *, generated_at: str, live: bool,  # p
 <h2>Flags</h2>
 {_render_flags(mesh)}
 <h2>Nodes</h2>
-{_render_table(diags)}
+{_render_table(diags, resolved_now)}
 {_render_unreadable(mesh)}"""
         return _document(body)
 
@@ -519,7 +580,7 @@ def render_thread_page(mesh, diags: list, *, generated_at: str, live: bool,  # p
 <h2>Flags</h2>
 {_render_flags(mesh)}
 <h2>Nodes</h2>
-{_render_table(diags)}
+{_render_table(diags, resolved_now)}
 {_render_unreadable(mesh)}"""
     return _document(body)
 
@@ -535,12 +596,14 @@ def _document(body: str) -> str:
    --box-owned-fill: #eaf3ea; --box-owned-stroke: #2e8b45;
    --box-foreign-fill: #f2f2f2; --box-foreign-stroke: #888;
    --box-child-fill: #f6f6f6; --box-child-stroke: #aaa;
+   --chip-stale-bg: #fff3cd; --chip-stale-fg: #7a5b00;
  }}
  @media (prefers-color-scheme: dark) {{
    :root {{
      --fg: #e6e6e6; --muted: #aaa; --bg: #16171a; --border: #333;
      --box-owned-fill: #1e2d20; --box-owned-stroke: #4caf6b;
      --box-foreign-fill: #26272b; --box-foreign-stroke: #888;
+     --chip-stale-bg: #4a3b00; --chip-stale-fg: #e8c76a;
      --box-child-fill: #202124; --box-child-stroke: #666;
    }}
  }}
@@ -555,6 +618,9 @@ def _document(body: str) -> str:
           font-weight: 700; letter-spacing: .04em; }}
  .badge-live {{ background: #d6f5df; color: #1e6b34; }}
  .badge-cached {{ background: #eee; color: #555; }}
+ .badge-note {{ margin-left: .5rem; font-size: .75rem; color: var(--muted); }}
+ .chip-stale {{ background: var(--chip-stale-bg); color: var(--chip-stale-fg);
+               padding: .05rem .4rem; border-radius: .3rem; font-weight: 600; }}
  .links a {{ margin-right: 1rem; }}
  .msg {{ background: #fff6d6; border: 1px solid #e8d48a; padding: .7rem; border-radius: .4rem; }}
  .warn {{ background: #fdeaea; border: 1px solid #d99; padding: .7rem; border-radius: .4rem; }}

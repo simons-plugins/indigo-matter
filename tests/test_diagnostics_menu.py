@@ -101,6 +101,7 @@ def mixin(mock_indigo_base, mock_logger):
     obj.device_sync = Mock()
     obj.device_sync.list_nodes.return_value = [(0x34, ["Grillplats socket"])]
     obj.device_sync.lookup.return_value = 0
+    obj.device_sync.thread_event_stamps.return_value = {}  # #344
     obj.runtime.submit.return_value = _Future(RELAY_NODE)
     obj._iws_page_url = Mock(  # pylint: disable=protected-access
         side_effect=lambda action_id: f"http://localhost:8176/message/ours/{action_id}/")
