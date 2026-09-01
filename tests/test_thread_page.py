@@ -594,7 +594,10 @@ def test_a_plain_cached_request_timing_out_does_not_retry(plug, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# #334 post-review — B5.5: the page's live path uses its own (shorter) timeout
+# #334 post-review — B5.5: the page's live path uses its own per-node timeout
+# (field correction #334, 2026-09-01: now pinned to the menu's budget,
+# ATTRIBUTE_TIMEOUT, not a shorter one — a napping SED answers at its next
+# poll, which a shorter budget structurally misses)
 # ---------------------------------------------------------------------------
 
 def test_live_path_uses_the_pages_own_per_node_timeout(plug, monkeypatch):
@@ -608,4 +611,5 @@ def test_live_path_uses_the_pages_own_per_node_timeout(plug, monkeypatch):
     monkeypatch.setattr("http_api_mixin.thread_survey.run_survey", _fake_run_survey)
     plug.http_thread_page(_action(query={"live": "1"}))
     assert captured["per_node_timeout"] == http_api_mixin._PAGE_LIVE_PER_NODE_TIMEOUT  # pylint: disable=protected-access
-    assert http_api_mixin._PAGE_LIVE_PER_NODE_TIMEOUT < http_api_mixin.ATTRIBUTE_TIMEOUT  # pylint: disable=protected-access
+    # Semantic pin, not numeric: the live path matches the menu's budget.
+    assert http_api_mixin._PAGE_LIVE_PER_NODE_TIMEOUT == http_api_mixin.ATTRIBUTE_TIMEOUT  # pylint: disable=protected-access

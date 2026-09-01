@@ -23,15 +23,22 @@ from plugin_constants import DECOMMISSION_TIMEOUT, PAIRING_READ_TIMEOUT, SURVEY_
 from protocol import is_node_not_exists
 from thread_page import render_thread_page
 
-#: #334 finding B5.5: the page's ``?live=1`` path runs on a SYNCHRONOUS IWS
-#: handler blocking the calling thread — the menu's ATTRIBUTE_TIMEOUT (30 s)
-#: per non-router node would mean a worst case near 50 s (30 +
-#: SURVEY_READ_TIMEOUT) with a browser tab sitting on it. Observed real SED
-#: live reads take 2.7-6.9 s; 12 s is generous headroom without repeating the
-#: menu's budget. The menu itself keeps ATTRIBUTE_TIMEOUT (a background
+#: #334 finding B5.5 set this to 12 s (below the menu's ATTRIBUTE_TIMEOUT,
+#: 30 s) on 2.7-6.9 s observed single reads, reasoning the synchronous IWS
+#: handler shouldn't repeat the menu's 30 s budget with a browser tab sitting
+#: on it. Field correction (#334, 2026-09-01): a real ``?live=1`` refresh hit
+#: 12-s timeouts on 3 of 4 sleepy nodes — a sleepy end device answers a read
+#: only at its next poll, which can approach a minute (this rig's Aqara
+#: FP300 subscribes at 67 s), so 12 s structurally misses a napping device.
+#: Now matches ATTRIBUTE_TIMEOUT (30 s), the menu's own budget, which covers
+#: a typical poll; a node napping longer still degrades honestly into the
+#: page's "Unreadable / stale" section rather than blocking forever. Reads
+#: run concurrently (``_live_refresh`` via ``asyncio.gather``, thread_survey.py),
+#: so the worst case stays ~30 s + SURVEY_READ_TIMEOUT for the whole page, not
+#: summed per node. The menu itself keeps ATTRIBUTE_TIMEOUT (a background
 #: dialog result, not a page a person is staring at). No result cache: every
 #: request re-surveys, live or cached.
-_PAGE_LIVE_PER_NODE_TIMEOUT = 12.0
+_PAGE_LIVE_PER_NODE_TIMEOUT = 30.0
 
 
 class HttpApiMixin:
