@@ -187,6 +187,7 @@ class BridgeClient(WsJsonClient):
         on_connect: Optional[Callable[[], Awaitable]] = None,
         on_disconnect: Optional[Callable[[], None]] = None,
         on_repeated_failure: Optional[Callable[[int], None]] = None,
+        outage_expected: Optional[Callable[[], bool]] = None,
         now: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], Awaitable] = asyncio.sleep,
     ) -> None:
@@ -197,7 +198,8 @@ class BridgeClient(WsJsonClient):
         super().__init__(
             f"ws://127.0.0.1:{port}/", logger,
             connect=connect, on_connect=on_connect, on_disconnect=on_disconnect,
-            on_repeated_failure=on_repeated_failure, now=now, sleep=sleep,
+            on_repeated_failure=on_repeated_failure, outage_expected=outage_expected,
+            now=now, sleep=sleep,
         )
         self.plugin_version = plugin_version
         self._endpoint_provider = endpoint_provider or (lambda: [])

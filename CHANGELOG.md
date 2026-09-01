@@ -3,6 +3,48 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
+## 2026.30.2 — A bridge update is no longer logged as a bridge crash (#340)
+
+Updating the bridge node takes it down for ~16 seconds, and the plugin
+reported that outage as though the node had fallen over: five per-attempt
+`connection lost` warnings, plus "the bridge node is not responding" with a
+tail of `bridge-node.err.log` attached as evidence — a file that is appended
+to and never truncated, so in the reported case its newest line was eight
+days old.
+
+The controller side has solved this since its own install menu shipped:
+`plugin._expect_restart()` opens a ~30s window, and inside it the crash
+diagnostic is replaced by one line and **deferred** — the client's
+failure latch is re-armed so a server that never comes back still surfaces
+its real error on a later cycle. The bridge was simply never wired to it.
+
+- **The bridge gets the same window.** `ExportBridge.expect_restart()` /
+  `cancel_expected_restart()`, armed by the install path **before
+  `ensure_installed()`** — rewriting the LaunchAgent is itself what drops the
+  socket, 1.1s before the first warning and 2s before any `restart()` runs, so
+  a window armed around the restart alone starts too late. Closed early by a
+  successful attach, and withdrawn by every failure branch: no plist written,
+  a failed restart, a poke nothing accepted, a shutdown racing the install, and
+  the broad handler. A window left armed over a bridge that never came back is
+  the one way this could cost a user a real diagnosis.
+- **The shared transport quiets its own reconnect warnings.** Those five lines
+  come from `ws_json_client`, which both peers use — so a *controller* restart
+  was equally noisy, just without the stderr dump. The client now takes an
+  `outage_expected` seam and drops per-attempt connect failures to DEBUG while
+  the supervisor's window is open. It keeps no copy of the window: a supervisor
+  that disarms it goes loud again on the very next attempt.
+- **Quieting is not swallowing.** The repeated-failure hook still fires on the
+  same schedule inside the window, the `logger.exception` branch (an unexpected
+  teardown, not a refused connect) still gets its traceback, an attach refusal
+  is never suppressed — the node answering "no" is not a restart in progress —
+  and a supervisor predicate that raises is treated as no window at all.
+
+Not covered: the fabric-restore path (`fabric_backup.py`) also restarts the
+bridge deliberately, through a different control seam and over a much longer
+outage than this window is sized for. And the `reap_orphan_servers` warning
+during a planned bounce is factually correct — whether it should be quieter is
+a separate call.
+
 ## 2026.30.0 — Thread mesh diagnostics: states, a report, and a read-only map (#334)
 
 Thread devices commissioned through Indigo/Domio are invisible to Apple's own

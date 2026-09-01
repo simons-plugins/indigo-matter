@@ -153,6 +153,7 @@ class WsJsonClient:  # pylint: disable=too-many-instance-attributes
         on_disconnect: Optional[Callable[[], None]] = None,
         on_repeated_failure: Optional[Callable[[int], None]] = None,
         on_late_response: Optional[Callable[[LateResponse], None]] = None,
+        outage_expected: Optional[Callable[[], bool]] = None,
         now: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], Awaitable] = asyncio.sleep,
     ) -> None:
@@ -172,6 +173,13 @@ class WsJsonClient:  # pylint: disable=too-many-instance-attributes
         # missed its own deadline (issue #23) — the transport stays agnostic
         # about what a late answer MEANS; that is the caller's call to make.
         self._on_late_response = on_late_response
+        # outage_expected: sync, asked before every failed-connection log line —
+        # "did the supervisor take this peer down on purpose?" (issue #340). The
+        # window it reports is OWNED by the supervisor, which is the only side
+        # that knows it ordered a restart and the only side with the failure
+        # branches that must disarm it; this client keeps no copy, so a window
+        # the supervisor closes early goes loud again immediately.
+        self._outage_expected = outage_expected
         self._diag_fired = False
         self._sleep = sleep
         self._now = now
@@ -248,18 +256,20 @@ class WsJsonClient:  # pylint: disable=too-many-instance-attributes
             except HandshakeFailed as exc:
                 # The peer answered and said why; retry, but do not pretend this
                 # was a dropped socket and do not dump a traceback for it.
-                self.logger.warning("%s handshake failed (%s): %s — retrying", self.PEER, self.uri, exc)
+                self._report_connect_failure(
+                    "%s handshake failed (%s): %s — retrying", self.PEER, self.uri, exc)
                 self._maybe_report_repeated_failure(attempt)
             except asyncio.TimeoutError as exc:
                 # Caught BEFORE WS_ERRORS on purpose: from 3.11 asyncio.TimeoutError
                 # IS the builtin TimeoutError, which is an OSError — so it would
                 # otherwise land in the branch below and log "connection lost: "
                 # with an empty reason, the least useful line we could emit.
-                self.logger.warning("%s timed out (%s): %s", self.PEER, self.uri,
-                                    str(exc) or "no detail given")
+                self._report_connect_failure("%s timed out (%s): %s", self.PEER, self.uri,
+                                             str(exc) or "no detail given")
                 self._maybe_report_repeated_failure(attempt)
             except WS_ERRORS as exc:
-                self.logger.warning("%s connection lost (%s): %s", self.PEER, self.uri, exc)
+                self._report_connect_failure(
+                    "%s connection lost (%s): %s", self.PEER, self.uri, exc)
                 self._maybe_report_repeated_failure(attempt)
             except Exception as exc:  # pylint: disable=broad-except
                 # defensive: never let the run loop die
@@ -296,6 +306,58 @@ class WsJsonClient:  # pylint: disable=too-many-instance-attributes
                 # is exactly when the user needs the reason re-surfaced, and a
                 # streak that already fired would otherwise stay latched silent.
                 self.rearm_failure_diagnostic()
+
+    def _report_connect_failure(self, message: str, *args: Any) -> None:
+        """Log a failed connection attempt at the level the situation deserves.
+
+        A reconnect that fails because the supervisor is *mid-restart* of this
+        peer is not news — it is the restart working. Issue #340: updating the
+        bridge node put five ``connection lost`` warnings and a stale stderr
+        dump in the Indigo log for a 16-second outage the plugin had itself
+        ordered, which then recovered cleanly.
+
+        Inside the supervisor's window these go to DEBUG. What does NOT change
+        is whether the failure is *counted*: :meth:`_maybe_report_repeated_failure`
+        still fires on the same schedule, so the supervisor's own diagnostic —
+        which knows about the window and DEFERS rather than drops (see
+        :meth:`rearm_failure_diagnostic`) — remains the thing that decides
+        whether a restart that never came back gets reported. Quieting the
+        per-attempt line is not the same as deciding nothing is wrong, and the
+        window is short and supervisor-disarmed precisely so it cannot become
+        that.
+
+        The ``logger.exception`` branch in :meth:`_run_loop` deliberately does
+        not route through here: an unexpected teardown is a bug in this client,
+        not a refused connect, and a restart in progress is no reason to hide a
+        traceback.
+        """
+        if self._outage_is_expected():
+            self.logger.debug(message, *args)
+            return
+        self.logger.warning(message, *args)
+
+    def _outage_is_expected(self) -> bool:
+        """Ask the supervisor whether it took this peer down on purpose.
+
+        Absent seam (remote mode, tests, any client with no supervisor) means
+        NO: an unmanaged peer's outage is never expected, and defaulting the
+        other way would make silence the fallback for the one client that can
+        never explain itself. A raising seam means no as well — the answer is
+        only ever used to make a log line quieter, so the failure mode of the
+        question must be the loud one.
+        """
+        if self._outage_expected is None:
+            return False
+        try:
+            return bool(self._outage_expected())
+        except Exception:  # pylint: disable=broad-except
+            # Absorbing: a supervisor predicate that raises. Load-bearing: this
+            # is called from inside the run loop's failure handling, where an
+            # escape would end reconnection for the life of the process — the
+            # same reason _maybe_report_repeated_failure guards its own hook.
+            self.logger.debug("%s: the expected-outage check raised; treating the "
+                              "failure as unexpected", self.PEER, exc_info=True)
+            return False
 
     def _maybe_report_repeated_failure(self, attempt: int) -> None:
         """Fire ``on_repeated_failure`` once per streak, after ≥2 consecutive fails.

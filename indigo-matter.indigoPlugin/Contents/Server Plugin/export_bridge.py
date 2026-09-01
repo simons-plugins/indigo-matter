@@ -52,6 +52,7 @@ Four disciplines worth knowing before editing:
 from __future__ import annotations
 
 import asyncio
+import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Optional
 
@@ -257,6 +258,17 @@ class ExportBridge:
         #: Set once the "the node is not running" line has been said for this
         #: outage, so a manually-started-later node does not fill the log first.
         self._unreachable_reported = False
+        #: Issue #340 — while WE are restarting the node (an install/update),
+        #: an outage is the restart working, not the node failing. Until this
+        #: deadline :meth:`_on_unreachable` says one line and DEFERS its
+        #: diagnostic instead of dumping the node's error log, and the client's
+        #: own per-attempt reconnect warnings drop to debug. The controller
+        #: side has had this since its own install menu shipped
+        #: (``plugin._expect_restart``); the bridge was never wired to it, so a
+        #: bridge update read in the log exactly like a bridge crash.
+        self._restart_expected_until = 0.0
+        #: Dedups the one "restarting…" line to once per window.
+        self._restart_notice_shown = False
         #: Same latch shape, one per condition that persists until a human or a
         #: reconnect changes it. Each is cleared by :meth:`_on_attached`, which
         #: is the only event that means "whatever that was, it is over".
@@ -411,6 +423,7 @@ class ExportBridge:
             on_decommissioned=self._on_decommissioned,
             on_window_closed=self._on_window_closed,
             on_repeated_failure=self._on_unreachable,
+            outage_expected=self._restart_expected,
         )
         self._unreachable_reported = False
         self._disconnect_ticks = 0
@@ -1827,6 +1840,12 @@ class ExportBridge:
         self._disconnect_ticks = 0
         self._poll_fail_ticks = 0
         self._unreachable_reported = False
+        # The restart we were waiting out has landed, so close its window early
+        # (#340). Left to expire on its own, a node that came back and then died
+        # for real inside the remaining seconds would be reported as "still
+        # restarting" — the window must mean "we are waiting for THIS bounce",
+        # not "the last 30 seconds were forgiven".
+        self._restart_expected_until = 0.0
         self._halted_reported = False
         self._recovery_reported = False
         self._refusal_reported = None
@@ -2045,6 +2064,43 @@ class ExportBridge:
         """
         self._health.note_fabrics(fabrics)
 
+    def expect_restart(self, seconds: float = 30.0) -> None:
+        """Open the window during which an outage is a restart, not a failure (#340).
+
+        Called by the install/update path **before the plist is rewritten**, not
+        merely before ``restart()``: rewriting the LaunchAgent is itself what
+        drops the socket (in the issue's log, 1.1s before the first warning), so
+        a window opened around the restart alone starts one warning too late.
+
+        ``seconds`` is generous on purpose — the observed bounce is ~16s from
+        plist write to a completed attach — because the cost of a window that is
+        slightly too long is one deferred diagnostic, while the cost of one too
+        short is the noise this exists to remove. :meth:`_on_attached` closes it
+        the moment the node is actually back.
+        """
+        self._restart_expected_until = time.time() + seconds
+        self._restart_notice_shown = False
+
+    def cancel_expected_restart(self) -> None:
+        """Close the window early, because the restart did NOT happen.
+
+        Every failure branch of the install path calls this. A window left armed
+        over a bridge that never came back is the one way this feature could
+        cost a user a real diagnosis: it would buy the dead node 30 seconds of
+        silence at exactly the moment the error log has something to say.
+        """
+        self._restart_expected_until = 0.0
+        self._restart_notice_shown = False
+
+    def _restart_expected(self) -> bool:
+        """Whether a restart we ordered is still expected to be in progress.
+
+        Also handed to the client as its ``outage_expected`` seam, so the
+        per-attempt reconnect warnings and this class's diagnostic answer to one
+        window rather than two copies of it.
+        """
+        return time.time() < self._restart_expected_until
+
     def _on_unreachable(self, attempts: int) -> None:
         """The node is not answering — and since E7 the agent is asked why.
 
@@ -2055,7 +2111,29 @@ class ExportBridge:
         installed. All three present identically at the socket as "connection
         refused". The seam returns the agent's own error-log tail; a failure
         inside it is contained there and costs only the extra sentence.
+
+        **Unless we are the reason it is quiet** (#340). Inside the window
+        :meth:`expect_restart` opens, this says one line and DEFERS — the
+        controller-side wording is deliberate and this is its twin: the client's
+        latch is re-armed so a node that never comes back still surfaces its
+        real error on a later cycle, past the window. Dropping the diagnostic
+        instead would mean an update that broke the node reported nothing at
+        all, which is strictly worse than the noise being fixed here.
+
+        The error-log tail is the specific thing worth not printing during a
+        planned bounce: it is appended to and never truncated, so what it offers
+        as evidence of "the node is down right now" can be — and in the issue's
+        log was — a crash-loop from eight days earlier.
         """
+        if self._restart_expected():
+            if not self._restart_notice_shown:
+                self._restart_notice_shown = True
+                self._logger.info(
+                    "Matter bridge: the bridge node is restarting; reconnecting…")
+            client = self.client
+            if client is not None:
+                client.rearm_failure_diagnostic()
+            return
         if self._unreachable_reported:
             return
         self._unreachable_reported = True

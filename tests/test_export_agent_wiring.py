@@ -606,3 +606,115 @@ def test_an_unknown_vendor_is_rendered_as_hex_never_guessed(bridge_mod):
     is an answer they will act on."""
     unknown = bridge_protocol.FabricInfo(fabric_index=4, label="", vendor_id=0x1075)
     assert bridge_mod.describe_fabric(unknown) == "vendor 0x1075 (index 4)"
+
+
+# ---------------------------------------------------------------------------
+# #340 — an outage WE ordered is a restart, not a failure
+# ---------------------------------------------------------------------------
+
+class TestExpectedRestartWindow:
+    """Updating the bridge node logged like a bridge crash: five reconnect
+    warnings and a tail of an error log whose newest line was eight days old,
+    for a 16-second outage the plugin itself caused and which then recovered.
+
+    The controller side has had this window since its own install menu shipped;
+    these tests pin the bridge's twin — and, more importantly, pin the ways the
+    window could hide something real.
+    """
+
+    def _armed(self, bridge_mod, mock_logger, devices):
+        h = AgentHarness(bridge_mod, mock_logger, devices, [ExportEntry(101, "onOffLight")])
+        h.bridge.exports_changed()
+        h.diagnosis = "Recent bridge node errors:\nlisten EADDRINUSE 5540"
+        return h
+
+    def _status(self):
+        return bridge_protocol.parse_status({
+            "commissioned": True, "endpointCount": 1, "endpoints": [], "drift": [],
+            "driftChecked": True, "warnings": [], "fabrics": [],
+        })
+
+    def test_inside_the_window_the_error_log_tail_is_not_dumped(self, bridge_mod,
+                                                               mock_logger, devices):
+        h = self._armed(bridge_mod, mock_logger, devices)
+        h.bridge.expect_restart()
+        h.bridge._on_unreachable(2)
+        assert "EADDRINUSE" not in warnings_of(mock_logger), (
+            "the tail is appended to and never truncated — during a planned bounce its "
+            "'evidence' can be, and was, a crash-loop from days earlier")
+        assert "restarting" in infos_of(mock_logger)
+
+    def test_inside_the_window_the_diagnostic_is_DEFERRED_not_dropped(self, bridge_mod,
+                                                                     mock_logger, devices):
+        # The test this feature lives or dies by. Quieting the report is only
+        # safe because the client's latch is re-armed underneath it: without
+        # this call, an update that killed the node for good would go silent for
+        # the entire failure streak and never say why.
+        h = self._armed(bridge_mod, mock_logger, devices)
+        h.bridge.expect_restart()
+        h.bridge._on_unreachable(2)
+        assert "rearm_failure_diagnostic" in h.client.names(), (
+            "mutation check: dropping the rearm turns a deferred diagnostic into a "
+            "swallowed one, and nothing would ever report a node that never came back")
+
+    def test_a_node_that_never_comes_back_is_reported_once_the_window_passes(
+            self, bridge_mod, mock_logger, devices):
+        h = self._armed(bridge_mod, mock_logger, devices)
+        h.bridge.expect_restart()
+        h.bridge._on_unreachable(2)                     # quiet: the restart is in flight
+        h.bridge._restart_expected_until = 0.0          # ...and the window runs out
+        h.bridge._on_unreachable(3)
+        assert "not responding" in warnings_of(mock_logger)
+        assert "EADDRINUSE" in warnings_of(mock_logger), (
+            "past the window the full diagnosis must arrive — the deferral only buys "
+            "the restart the seconds it was given")
+
+    def test_the_restarting_line_is_said_once_per_window_not_per_attempt(
+            self, bridge_mod, mock_logger, devices):
+        h = self._armed(bridge_mod, mock_logger, devices)
+        h.bridge.expect_restart()
+        for attempt in (2, 3, 4):
+            h.bridge._on_unreachable(attempt)
+        assert infos_of(mock_logger).count("is restarting") == 1
+
+    def test_a_successful_attach_closes_the_window_early(self, bridge_mod, mock_logger,
+                                                         devices):
+        # A window left to expire on its own forgives the whole 30 seconds: a
+        # node that came back and then died for real inside the remainder would
+        # be reported as "still restarting".
+        h = self._armed(bridge_mod, mock_logger, devices)
+        h.bridge.expect_restart()
+        h.bridge._on_attached(self._status(), False)
+        h.bridge._on_unreachable(2)
+        assert "not responding" in warnings_of(mock_logger), (
+            "the bounce is over — the next outage is a new, unexplained one")
+
+    def test_cancelling_the_window_restores_the_full_report_immediately(
+            self, bridge_mod, mock_logger, devices):
+        h = self._armed(bridge_mod, mock_logger, devices)
+        h.bridge.expect_restart()
+        h.bridge.cancel_expected_restart()
+        h.bridge._on_unreachable(2)
+        assert "EADDRINUSE" in warnings_of(mock_logger)
+
+    def test_the_window_is_the_clients_own_outage_seam(self, bridge_mod, mock_logger,
+                                                       devices):
+        # The client is handed the predicate, not a copy of the deadline, so
+        # `cancel_expected_restart` reaches its per-attempt logging too — the
+        # half of #340 that produced five of the six warning lines.
+        h = self._armed(bridge_mod, mock_logger, devices)
+        seam = h.client.kwargs["outage_expected"]
+        assert seam() is False
+        h.bridge.expect_restart()
+        assert seam() is True
+        h.bridge.cancel_expected_restart()
+        assert seam() is False
+
+    def test_the_window_never_suppresses_an_attach_refusal(self, bridge_mod, mock_logger,
+                                                           devices):
+        # A refusal is the node ANSWERING — it is up, and it is saying no. That
+        # is never the restart working, whatever window is open.
+        h = self._armed(bridge_mod, mock_logger, devices)
+        h.bridge.expect_restart()
+        h.bridge._on_attach_refused("ERR_SOMETHING", "the node said no")
+        assert "refused the connection" in errors_of(mock_logger)

@@ -808,3 +808,127 @@ class TestLateResponse:
             await client.close()
             task.cancel()
         run(scenario())
+
+
+class TestExpectedOutage:
+    """#340: a peer WE took down must not be reported as a peer that fell over.
+
+    The risk this class exists to pin is not the quiet — it is what the quiet
+    could swallow. Every test below asks "when could this go silent and be
+    wrong?" rather than "does it go silent?".
+    """
+
+    def _boom_connect(self):
+        def connect(_uri):
+            async def boom():
+                raise ConnectionError("node not there yet")
+            return boom()
+        return connect
+
+    async def _two_failures(self, mock_logger, peer, **kw):
+        """Drive two failed connection attempts, then stop. Returns the client."""
+        delays = []
+
+        async def fake_sleep(delay):
+            delays.append(delay)
+            if len(delays) >= 2:
+                await client.close()
+            await asyncio.sleep(0)
+
+        client = CLIENTS[peer](mock_logger, None, connect=self._boom_connect(),
+                               sleep=fake_sleep, **kw)
+        await asyncio.wait_for(client.run(), timeout=5)
+        assert len(delays) >= 2, delays
+        return client
+
+    @pytest.mark.parametrize("peer", sorted(CLIENTS))
+    def test_reconnect_failures_are_warnings_when_nobody_ordered_the_outage(
+            self, mock_logger, peer):
+        # The baseline, and the half that must NOT change: with no supervisor
+        # window (remote mode, or a peer that simply died), a refused connect is
+        # still news at WARNING.
+        run(self._two_failures(mock_logger, peer))
+        assert "connection lost" in logged(mock_logger, "warning")
+
+    @pytest.mark.parametrize("peer", sorted(CLIENTS))
+    def test_reconnect_failures_drop_to_debug_inside_the_window(self, mock_logger, peer):
+        run(self._two_failures(mock_logger, peer, outage_expected=lambda: True))
+        assert "connection lost" not in logged(mock_logger, "warning"), (
+            "an outage the supervisor ordered must not be reported as a failure")
+        assert "connection lost" in logged(mock_logger, "debug"), (
+            "quieted is not deleted — the attempts must still be traceable at debug")
+
+    @pytest.mark.parametrize("peer", sorted(CLIENTS))
+    def test_the_failure_is_still_COUNTED_inside_the_window(self, mock_logger, peer):
+        # The one that matters. Demoting the per-attempt line must not also
+        # disarm the supervisor's diagnostic: the supervisor is the side that
+        # knows when its window closes, and it can only report a restart that
+        # never came back if this hook keeps firing underneath the quiet.
+        calls = []
+        run(self._two_failures(mock_logger, peer,
+                               outage_expected=lambda: True,
+                               on_repeated_failure=calls.append))
+        assert calls, ("the repeated-failure hook must fire inside the window — without it "
+                       "a node that never returns is silent for the whole streak")
+
+    @pytest.mark.parametrize("peer", sorted(CLIENTS))
+    def test_the_window_closing_makes_the_next_attempt_loud_again(self, mock_logger, peer):
+        # The window is a live question, not a snapshot taken when the client
+        # was built: a supervisor that disarms it (its restart failed) must get
+        # the warnings back on the very next attempt, with no reconnection of
+        # any kind in between.
+        open_window = [True]
+
+        async def scenario():
+            delays = []
+
+            async def fake_sleep(delay):
+                delays.append(delay)
+                open_window[0] = False        # the supervisor gives up mid-streak
+                if len(delays) >= 2:
+                    await client.close()
+                await asyncio.sleep(0)
+
+            client = CLIENTS[peer](mock_logger, None, connect=self._boom_connect(),
+                                   sleep=fake_sleep,
+                                   outage_expected=lambda: open_window[0])
+            await asyncio.wait_for(client.run(), timeout=5)
+        run(scenario())
+        assert "connection lost" in logged(mock_logger, "warning")
+
+    @pytest.mark.parametrize("peer", sorted(CLIENTS))
+    def test_a_raising_window_check_is_treated_as_no_window(self, mock_logger, peer):
+        # Fail loud, not quiet. A predicate that raises is a broken supervisor,
+        # and the wrong way to fail is the one where the log goes silent —
+        # nothing would ever surface the broken predicate either.
+        def boom():
+            raise RuntimeError("supervisor predicate is broken")
+
+        run(self._two_failures(mock_logger, peer, outage_expected=boom))
+        assert "connection lost" in logged(mock_logger, "warning")
+
+    def test_an_unexpected_teardown_still_gets_its_traceback_inside_the_window(
+            self, mock_logger):
+        # The `logger.exception` branch is deliberately NOT routed through the
+        # demotion: it means this client hit something it does not understand,
+        # which a restart in progress is no reason to hide. Pinned by handing it
+        # a failure the WS_ERRORS branch cannot catch.
+        async def scenario():
+            delays = []
+
+            def connect(_uri):
+                async def boom():
+                    raise ValueError("not a socket error at all")
+                return boom()
+
+            async def fake_sleep(delay):
+                delays.append(delay)
+                await client.close()
+                await asyncio.sleep(0)
+
+            client = bridge_client(mock_logger, None, connect=connect, sleep=fake_sleep,
+                                   outage_expected=lambda: True)
+            await asyncio.wait_for(client.run(), timeout=5)
+        run(scenario())
+        assert mock_logger.exception.call_args_list, (
+            "an unexpected teardown must keep its traceback even mid-restart")

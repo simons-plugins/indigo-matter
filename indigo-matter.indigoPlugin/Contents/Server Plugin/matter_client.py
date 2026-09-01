@@ -74,6 +74,7 @@ class MatterClient(WsJsonClient):
         on_disconnect: Optional[Callable[[], None]] = None,
         on_repeated_failure: Optional[Callable[[int], None]] = None,
         on_late_response: Optional[Callable[[Any], None]] = None,
+        outage_expected: Optional[Callable[[], bool]] = None,
         now: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], Awaitable] = asyncio.sleep,
     ) -> None:
@@ -91,7 +92,7 @@ class MatterClient(WsJsonClient):
             uri, logger,
             connect=connect, on_connect=on_connect, on_disconnect=on_disconnect,
             on_repeated_failure=on_repeated_failure, on_late_response=on_late_response,
-            now=now, sleep=sleep,
+            outage_expected=outage_expected, now=now, sleep=sleep,
         )
         self._on_event = on_event
         self.server_info: Optional[dict] = None
