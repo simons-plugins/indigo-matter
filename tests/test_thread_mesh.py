@@ -18,6 +18,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import re
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -41,7 +42,9 @@ from thread_mesh import (
     Route,
     build_mesh,
     format_ext_address,
+    freshness_text,
     health_flags,
+    humanise_age,
     parse_node_diag,
     partition_header_text,
     render_report,
@@ -1063,3 +1066,119 @@ def test_better_partition_attach_attempt_count_is_captured():
     # that it is in _COUNTER_ATTRS, not silently dropped.
     diag = _parse_fixture(0x2E)
     assert diag.counters.get("better_partition_attach_attempts") == 0
+
+
+# ---------------------------------------------------------------------------
+# #344 — humanise_age
+# ---------------------------------------------------------------------------
+
+class TestHumaniseAge:
+    def test_under_a_minute_is_just_now(self):
+        assert humanise_age(30) == "just now"
+
+    def test_negative_is_just_now(self):
+        # Clock skew must never render as a fake age.
+        assert humanise_age(-5) == "just now"
+
+    def test_minutes(self):
+        assert humanise_age(45 * 60) == "45m"
+
+    def test_hours(self):
+        assert humanise_age(2 * 3600) == "2h"
+
+    def test_days(self):
+        assert humanise_age(6 * 86400) == "6d"
+
+    def test_largest_single_unit_not_compound(self):
+        # 25 hours is "1d", never "1d 1h" — a diagnostic glance, not a
+        # duration formatter (see the function's own docstring).
+        assert humanise_age(25 * 3600) == "1d"
+
+
+# ---------------------------------------------------------------------------
+# #344 — freshness_text
+# ---------------------------------------------------------------------------
+
+def _diag_with_freshness(*, last_interview=None, last_event_seen=None):
+    return NodeDiag(
+        node_id=1, name="x", available=True, role=5, channel=None,
+        network_name="", pan_id=None, ext_pan_id=None, partition_id=None,
+        leader_router_id=None, neighbours=[], routes=[], counters={},
+        last_interview=last_interview, last_event_seen=last_event_seen,
+    )
+
+
+class TestFreshnessText:
+    NOW = datetime(2026, 9, 2, tzinfo=timezone.utc)
+
+    def test_both_known(self):
+        diag = _diag_with_freshness(
+            last_interview=self.NOW - timedelta(days=6),
+            last_event_seen=(self.NOW - timedelta(hours=2)).timestamp(),
+        )
+        assert freshness_text(diag, self.NOW) == "interviewed 6d ago · last 0x35 update 2h ago"
+
+    def test_interview_unknown(self):
+        diag = _diag_with_freshness(last_event_seen=(self.NOW - timedelta(hours=2)).timestamp())
+        assert freshness_text(diag, self.NOW) == "interviewed — · last 0x35 update 2h ago"
+
+    def test_event_unknown(self):
+        diag = _diag_with_freshness(last_interview=self.NOW - timedelta(days=6))
+        assert freshness_text(diag, self.NOW) == "interviewed 6d ago · last 0x35 update —"
+
+    def test_both_unknown(self):
+        diag = _diag_with_freshness()
+        assert freshness_text(diag, self.NOW) == "interviewed — · last 0x35 update —"
+
+
+# ---------------------------------------------------------------------------
+# #344 — the stale flag's message gains an age when the interview is known
+# ---------------------------------------------------------------------------
+
+class TestStaleFlagWithInterviewAge:
+    NOW = datetime(2026, 9, 2, tzinfo=timezone.utc)
+
+    def test_stale_message_includes_the_age_when_known(self):
+        diag = _parse_fixture(0x2F)  # cached SED, gets the "stale" info flag
+        diag.last_interview = self.NOW - timedelta(days=6)
+        stale = next(f for f in health_flags(diag, self.NOW) if f.code == "stale")
+        assert "baseline interview 6d ago" in stale.message
+        assert "matter-server's cache can be hours stale" in stale.message
+
+    def test_stale_message_keeps_the_old_wording_when_interview_is_unknown(self):
+        diag = _parse_fixture(0x2F)
+        stale = next(f for f in health_flags(diag, self.NOW) if f.code == "stale")
+        assert "baseline interview" not in stale.message
+        assert stale.message == f"{diag.name}: cached — matter-server's cache can be hours stale for sleepy devices"
+
+    def test_now_defaults_to_the_real_clock_without_raising(self):
+        # health_flags(diag) with no `now` at all must still work — every
+        # existing caller/test in this file relies on that default.
+        diag = _parse_fixture(0x2F)
+        diag.last_interview = self.NOW - timedelta(days=1)
+        stale = next(f for f in health_flags(diag) if f.code == "stale")
+        assert "baseline interview" in stale.message
+
+
+# ---------------------------------------------------------------------------
+# #344 — render_report's per-node cache-age line
+# ---------------------------------------------------------------------------
+
+class TestRenderReportCacheLine:
+    NOW = datetime(2026, 9, 2, tzinfo=timezone.utc)
+
+    def test_node_block_contains_the_cache_freshness_line(self):
+        diags = _all_diags()
+        mesh = build_mesh(diags, self.NOW)
+        lines = render_report(mesh, diags, now=self.NOW)
+        assert any(line.strip().startswith("cache: interviewed") for line in lines)
+        for line in lines:
+            assert len(line) <= 120
+
+    def test_freshness_line_reflects_a_known_interview_age(self):
+        diags = _all_diags()
+        diags[0].last_interview = self.NOW - timedelta(days=6)
+        mesh = build_mesh(diags, self.NOW)
+        lines = render_report(mesh, diags, now=self.NOW)
+        text = "\n".join(lines)
+        assert "cache: interviewed 6d ago" in text
