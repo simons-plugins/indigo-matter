@@ -287,6 +287,24 @@ class BridgeAgentMenuMixin:
             self.export_bridge.note_agent_stopped()
         return (True, valuesDict)
 
+    def _expect_bridge_restart(self) -> None:
+        """Tell the export bridge that the coming outage is one we ordered (#340).
+
+        The ``None`` guard covers exactly two states, and neither is the obvious
+        guess: ``plugin.py`` builds the ``ExportBridge`` **unconditionally**
+        (started only if the allow-list is non-empty), so it is None only before
+        ``startup`` has built it and after ``shutdown`` has torn it down. An
+        install with export switched off, or with nothing exported, still has a
+        bridge object — the latter returns above this call, before arming.
+        """
+        if self.export_bridge is not None:
+            self.export_bridge.expect_restart()
+
+    def _cancel_bridge_restart(self) -> None:
+        """Withdraw that promise: the restart did not happen, or we cannot say it did."""
+        if self.export_bridge is not None:
+            self.export_bridge.cancel_expected_restart()
+
     def _install_bridge_node(self, clean: bool = False) -> None:
         """npm-install the bridge package, then restart it if anything is exported.
 
@@ -306,7 +324,19 @@ class BridgeAgentMenuMixin:
         followed by "the restart FAILED — the old version may still be running"
         (nothing was running). Two wrong messages, no bridge, and the only real
         remedy — write the plist now that the package exists — never attempted.
+
+        **The #340 window's withdrawal is structural, not per-branch.**
+        ``unclaimed_window`` means "we opened a window and nobody has taken
+        responsibility for it yet"; the two success terminals clear it by handing
+        it to a reconnect that is genuinely in flight, and the ``finally`` closes
+        whatever is left. That covers a ``BaseException`` the ``except
+        Exception`` below cannot see — this runs on a daemon thread, so
+        ``SystemExit`` at Indigo shutdown is the realistic one. Written per
+        branch first, it was correct in all five; a sixth added later would have
+        had to remember, over a failure whose whole cost is 30 seconds of
+        silence at the moment the error log finally has something to say.
         """
+        unclaimed_window = False
         try:
             agent = bridge_agent.BridgeProcess(dict(self.pluginPrefs), self.logger)
             if clean and not agent.remove_package():
@@ -330,6 +360,14 @@ class BridgeAgentMenuMixin:
                     "yet, and the bridge only runs while the export list is non-empty. Add a "
                     "device in 'Manage Matter Exports…' and it will start itself.")
                 return
+            # #340: from here on the node is going down because WE said so.
+            # ARMED BEFORE ensure_installed(), not before restart(): rewriting
+            # the plist is itself what launchd acts on, and in the reported log
+            # the socket dropped 1.1s after the plist was written and 2s before
+            # any restart() could have run. `armed` hands the withdrawal to the
+            # `finally` below, so no branch added later can forget it.
+            self._expect_bridge_restart()
+            unclaimed_window = True
             # Write (or refresh) the plist first. On the first-run path there is
             # none — this is where it comes from — and `ensure_installed` returning
             # True means launchd has already bootstrapped the NEW files, so there
@@ -366,6 +404,7 @@ class BridgeAgentMenuMixin:
             # that reason — see `revive_after_install`'s own reason gate.
             revived = self.export_bridge is not None and self.export_bridge.revive_after_install()
             if revived:
+                unclaimed_window = False
                 self.logger.info("Matter bridge installed and restarted onto the new "
                                  "version — the halted connection has been replaced; "
                                  "reconnecting now.")
@@ -379,9 +418,13 @@ class BridgeAgentMenuMixin:
                 # claim it is reconnecting.
                 poked = self.export_bridge is not None and self.export_bridge.retry_now()
                 if poked:
+                    unclaimed_window = False
                     self.logger.info("Matter bridge installed and restarted onto the new "
                                      "version — reconnecting now.")
                 else:
+                    # No run loop took the poke, so no reconnect is in flight for
+                    # the window to cover — and the user has been told to reload.
+                    # Leaving it armed would only mute the next 30s.
                     self.logger.info("Matter bridge installed and restarted onto the new "
                                      "version — reload the plugin to reconnect.")
         except Exception as exc:  # pylint: disable=broad-except
@@ -398,3 +441,9 @@ class BridgeAgentMenuMixin:
                 "Install of the Matter bridge did not complete after the npm step — the "
                 "package may be installed but the agent was not restarted. See the trace above, "
                 "then retry Plugins ▸ Matter ▸ Install/update the Matter bridge.")
+        finally:
+            # Still unclaimed: nothing above could promise a reconnect is coming,
+            # so withdraw. The two success terminals are the only states where a
+            # bounce genuinely is.
+            if unclaimed_window:
+                self._cancel_bridge_restart()

@@ -445,10 +445,13 @@ Changes from v1.2 (v1.3, all clarifications/additive, no transport change):
 
 Changes from v1.1 (v1.2): decommission's `nodeId` moved from a path component to a `?nodeId=` query param (the path form never worked — IWS drops trailing path components on POST); diagnostics additionally accepts `?nodeId=`; the local base URL is HTTPS, not HTTP. v1.1 itself was a transport change from v1.0 (semantics unchanged). Breaking changes require a version bump and a transition period where both versions are supported. Additive changes (new optional params, new handlers) do not require a version bump.
 
-Domio includes `X-Matter-API-Version: 1.4` in every request. The plugin does not
-currently validate the header; 1.3 and 1.4 clients are wire-compatible (a client
-not yet mirroring this v1.4 update sends `1.3`, which every v1.4 change above is
-backward-compatible with — see the note above).
+Domio includes `X-Matter-API-Version: 1.4` in every request — it has not been
+bumped to `1.5`, and does not need to be. The plugin does not validate the
+header, and 1.3, 1.4 and 1.5 clients are all wire-compatible: every v1.4 change
+is additive (a client still sending `1.3` simply ignores the new optional
+field), and v1.5 changes no payload at all — only which status code §3.5
+`diagnostics` uses for a fault it was already reporting. A client that has not
+mirrored v1.5 is not broken by it; it just retries a 500 it need not retry.
 
 ## 8. Future Endpoints (Not in v1)
 

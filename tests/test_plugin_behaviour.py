@@ -566,6 +566,62 @@ def test_startup_wires_connect_and_disconnect_callbacks(plugin_mod, monkeypatch)
     assert captured["on_late_response"] == p._on_late_matter_response
 
 
+def test_startup_hands_the_matter_client_the_plugins_own_restart_window(plugin_mod,
+                                                                        monkeypatch):
+    # #340. The bridge half of this feature has a seam test; the controller half
+    # is the one every user meets when they update matter-server, and dropping
+    # the kwarg here silently reverts it — five reconnect warnings per update,
+    # with nothing else in the suite noticing.
+    #
+    # Asserted as live behaviour rather than identity: what matters is that the
+    # client can SEE the window open and close, not which callable carries it.
+    captured = {}
+
+    class FakeMatter:
+        def __init__(self, proto, logger, prefs, **kw):
+            captured.update(kw)
+
+        def run(self):
+            return None
+
+    class FakeRuntimeObj:
+        is_running = True
+
+        def start(self):
+            pass
+
+        def submit(self, coro):
+            if hasattr(coro, "close"):
+                coro.close()
+            return Mock()
+
+    monkeypatch.setattr(plugin_mod, "MatterClient", FakeMatter)
+    monkeypatch.setattr(plugin_mod, "AsyncRuntime", lambda logger: FakeRuntimeObj())
+    monkeypatch.setattr(plugin_mod, "CommissionJobs", lambda *a, **k: Mock())
+    monkeypatch.setattr(plugin_mod, "HttpApi", lambda *a, **k: Mock())
+    monkeypatch.setattr(plugin_mod, "ServerProcess", lambda *a, **k: Mock())
+
+    p = plugin_mod.Plugin.__new__(plugin_mod.Plugin)
+    p.logger = Mock()
+    p._version = "2026.0.1"
+    p._subscribed_to_devices = False
+    p.pluginPrefs = {}
+    p.proto = object()
+    p.registry = object()
+    p.device_sync = Mock()
+    p.runtime = None
+    p.server_process = None
+    p._restart_expected_until = 0.0    # __init__ is skipped by Plugin.__new__ above
+
+    p.startup()
+    seam = captured["outage_expected"]
+    assert seam() is False, "cold: nothing has ordered a restart"
+    p._expect_restart()
+    assert seam() is True
+    p._restart_expected_until = 0.0          # every disarm path zeroes the deadline
+    assert seam() is False
+
+
 def test_startup_wires_knows_node_into_commission_jobs(plugin_mod, monkeypatch):
     # #24: _remove_orphaned_node's "did anything ever adopt this node" check
     # needs device_sync's real knows_node — dropping this wiring would leave

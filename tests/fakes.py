@@ -324,6 +324,12 @@ class FakeBridgeClient:
         self._record("retry_now")
         return True  # mirrors a real WsJsonClient accepting the poke
 
+    def rearm_failure_diagnostic(self):
+        # Recorded because #340's whole safety argument rests on it: the
+        # expected-restart window DEFERS the unreachable diagnostic, and the
+        # only difference between deferring and dropping is this call.
+        self._record("rearm_failure_diagnostic")
+
     # -- introspection ---------------------------------------------------
     def _record(self, name, *args):
         self.calls.append((name, *args))

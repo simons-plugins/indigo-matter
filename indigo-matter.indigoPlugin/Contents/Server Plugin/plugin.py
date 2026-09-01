@@ -276,6 +276,11 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
             on_disconnect=self._on_disconnected,
             on_repeated_failure=on_repeated_failure,
             on_late_response=self._on_late_matter_response,
+            # #340: the client's per-attempt "connection lost" warnings are the
+            # bulk of a restart's log noise, and they are emitted where nothing
+            # knows the outage was ordered. Hand it the same window the
+            # diagnostic below reads, rather than a second copy of the state.
+            outage_expected=self._restart_expected,
         )
         self.jobs = CommissionJobs(
             self.matter, self.device_sync.create_from_raw, self.logger,
@@ -714,7 +719,7 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
         sp = self.server_process
         if sp is None:
             return
-        if time.time() < self._restart_expected_until:
+        if self._restart_expected():
             # We deliberately restarted it — this outage is expected, not a crash. But
             # DEFER, don't drop: re-arm the client so if the server never comes back the
             # real error still surfaces on a later cycle (past the window). _resync
@@ -751,9 +756,28 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
 
     def _expect_restart(self) -> None:
         """Open the ~30s window during which a client outage is treated as an expected
-        restart (see :meth:`_on_server_unreachable`), not a crash."""
-        self._restart_expected_until = time.time() + 30
+        restart (see :meth:`_on_server_unreachable`), not a crash.
+
+        MONOTONIC (#340 review), like the bridge twin and like the WS client's
+        own backoff clock: the deadline is never compared against anything
+        persisted, and on a wall clock a backwards NTP step — macOS *steps* a
+        large offset rather than slewing it, which is what a Mac waking with RTC
+        drift does — would extend the window by the size of the step. A 5-minute
+        correction would turn 30s of quieting into 5.5 minutes of it.
+        """
+        self._restart_expected_until = time.monotonic() + 30
         self._restart_notice_shown = False
+
+    def _restart_expected(self) -> bool:
+        """Whether we are inside the window :meth:`_expect_restart` opened.
+
+        The single reader of ``_restart_expected_until``, because it now has two
+        consumers — this class's own crash diagnostic and (issue #340) the WS
+        client's per-attempt reconnect logging, which is handed this method as
+        its ``outage_expected`` seam. Every path that disarms the window still
+        does so by zeroing the deadline, so both consumers go loud together.
+        """
+        return time.monotonic() < self._restart_expected_until
 
     def runConcurrentThread(self) -> None:
         """Watchdog only — no I/O. Surfaces connectivity; reconnect is owned by

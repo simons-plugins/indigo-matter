@@ -28,7 +28,7 @@ import os
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 import pytest
 
@@ -1572,3 +1572,213 @@ class TestUiThreadDeadlines:
                      "FACTORY_RESET_TIMEOUT"):
             value = getattr(plugin_mod, name)
             assert isinstance(value, (int, float)) and value > 0, name
+
+
+# ---------------------------------------------------------------------------
+# #340 — the install path's expected-restart window
+# ---------------------------------------------------------------------------
+
+class _WindowSpy:
+    """A stand-in export bridge that actually HOLDS the window state.
+
+    A `Mock` records that `expect_restart()` was called but stays permanently
+    "not armed", so no dependency can be made to refuse on the basis of it —
+    which is what the degradation convention asks for when the thing under test
+    is an ordering.
+    """
+
+    def __init__(self):
+        self.armed = False
+        self.arms = 0
+        self.cancels = 0
+
+    def expect_restart(self):
+        self.arms += 1
+        self.armed = True
+
+    def cancel_expected_restart(self):
+        self.cancels += 1
+        self.armed = False
+
+    def revive_after_install(self):
+        return False
+
+    def retry_now(self):
+        return True
+
+
+class TestInstallExpectedRestartWindow:
+    """The install/update menu takes the bridge node down on purpose. Whether it
+    SAYS so decides whether the next 30 seconds of log are a diagnosis or noise
+    — and, if the install went wrong, whether they are a diagnosis or silence.
+
+    Every test here is about the second half. A window is a promise that
+    something is coming back; each branch that cannot keep that promise has to
+    withdraw it.
+    """
+
+    def _agent(self, monkeypatch, plugin_mod, **kw):
+        kw.setdefault("install", Mock(return_value=True))
+        kw.setdefault("restart", Mock(return_value=True))
+        kw.setdefault("ensure_installed", Mock(return_value=False))
+        # A real string, because the restart-failure branch os.path.join()s it —
+        # a Mock there raises TypeError, and the failure would be reported by the
+        # broad handler instead of by the branch under test.
+        kw.setdefault("log_dir", "/tmp/indigo-matter-logs")
+        agent = Mock(**kw)
+        monkeypatch.setattr(plugin_mod.bridge_agent, "BridgeProcess", lambda *_a, **_k: agent)
+        return agent
+
+    def _bridge(self, plug, **kw):
+        kw.setdefault("revive_after_install", Mock(return_value=False))
+        kw.setdefault("retry_now", Mock(return_value=True))
+        plug.export_bridge = Mock(**kw)
+        return plug.export_bridge
+
+    def test_the_window_opens_BEFORE_the_plist_is_rewritten(self, plug, plugin_mod,
+                                                            monkeypatch):
+        """⊗ The ordering the reported log settles. The socket dropped 1.1s after
+        the plist was written and 2s before any `restart()` could have run — so a
+        window armed around the restart alone starts one warning too late, and
+        the first "connection lost" is still reported as a failure.
+
+        Both edges are made FATAL rather than checked against a recorded call
+        list. A recorded order pins only the calls it records: slip a
+        `_cancel_bridge_restart()` in between and the list still reads
+        ``["expect", "plist", "restart"]`` while the feature is dead. Here the
+        dependencies themselves refuse — `install()` raises if the window is
+        already open (armed before a minutes-long npm run, so it expires during
+        it), `ensure_installed()` raises if it is not (armed too late).
+        """
+        spy = _WindowSpy()
+        plug.export_bridge = spy
+        violations: list[str] = []
+
+        def npm():
+            if spy.armed:
+                violations.append("armed before the npm step — it would expire during it")
+            return True
+
+        def write_plist():
+            if not spy.armed:
+                violations.append("the plist was rewritten with no window open")
+            return False
+
+        self._agent(monkeypatch, plugin_mod,
+                    install=Mock(side_effect=npm),
+                    ensure_installed=Mock(side_effect=write_plist))
+        plug._install_bridge_node()
+        assert violations == [], violations
+        assert spy.armed, "a successful install hands the window to the reconnect"
+        assert "restarted onto the new version" in _logged(plug.logger), (
+            "the success terminal must actually have been reached")
+
+    def test_the_window_is_opened_at_its_declared_length(self, plug, plugin_mod,
+                                                         monkeypatch):
+        """`expect_restart()` takes no arguments, and the install path must not
+        start passing one. A window of zero is a feature that silently does
+        nothing in production while every "was it armed?" assertion still
+        passes."""
+        self._agent(monkeypatch, plugin_mod)
+        bridge = self._bridge(plug)
+        plug._install_bridge_node()
+        assert bridge.expect_restart.call_args == call()
+
+    def test_a_bootstrap_that_needed_no_restart_still_leaves_the_window_open(
+            self, plug, plugin_mod, monkeypatch):
+        """`ensure_installed` returning True means launchd already loaded the new
+        files, so `restart()` is deliberately skipped — but the node still went
+        down and is still coming back. This is the first-run path, and it was the
+        only install terminal with no window test of its own."""
+        agent = self._agent(monkeypatch, plugin_mod,
+                            ensure_installed=Mock(return_value=True))
+        bridge = self._bridge(plug)
+        plug._install_bridge_node()
+        agent.restart.assert_not_called()
+        bridge.expect_restart.assert_called_once()
+        bridge.cancel_expected_restart.assert_not_called()
+
+    def test_a_successful_install_LEAVES_the_window_open(self, plug, plugin_mod,
+                                                         monkeypatch):
+        self._agent(monkeypatch, plugin_mod)
+        bridge = self._bridge(plug)
+        plug._install_bridge_node()
+        bridge.expect_restart.assert_called_once()
+        bridge.cancel_expected_restart.assert_not_called()
+
+    def test_a_plist_that_could_not_be_written_withdraws_the_window(self, plug, plugin_mod,
+                                                                    monkeypatch):
+        self._agent(monkeypatch, plugin_mod, ensure_installed=Mock(return_value=None))
+        bridge = self._bridge(plug)
+        plug._install_bridge_node()
+        bridge.cancel_expected_restart.assert_called_once()
+
+    def test_a_FAILED_restart_withdraws_the_window(self, plug, plugin_mod, monkeypatch):
+        """The old version may still be running, or nothing may be. Either way
+        this is the moment the error log is worth reading, and a window left
+        armed would buy the failure 30 seconds of quiet."""
+        self._agent(monkeypatch, plugin_mod, restart=Mock(return_value=False))
+        bridge = self._bridge(plug)
+        plug._install_bridge_node()
+        bridge.cancel_expected_restart.assert_called_once()
+        assert "FAILED" in _logged(plug.logger)
+
+    def test_a_poke_nothing_accepted_withdraws_the_window(self, plug, plugin_mod,
+                                                          monkeypatch):
+        """No run loop took the poke, so no reconnect is in flight for the window
+        to cover — and the user has just been told to reload the plugin."""
+        self._agent(monkeypatch, plugin_mod)
+        bridge = self._bridge(plug, retry_now=Mock(return_value=False))
+        plug._install_bridge_node()
+        bridge.cancel_expected_restart.assert_called_once()
+        assert "reload the plugin to reconnect" in _logged(plug.logger)
+
+    def test_a_raising_install_step_withdraws_the_window(self, plug, plugin_mod,
+                                                         monkeypatch):
+        """The broad handler's own failure mode. Unguarded, this escapes with the
+        window armed over a bridge whose restart we can no longer vouch for."""
+        self._agent(monkeypatch, plugin_mod,
+                    ensure_installed=Mock(side_effect=RuntimeError("launchctl exploded")))
+        bridge = self._bridge(plug)
+        plug._install_bridge_node()
+        bridge.cancel_expected_restart.assert_called_once()
+        assert "did not complete after the npm step" in _logged(plug.logger)
+
+    def test_a_shutdown_racing_the_install_withdraws_the_window(self, plug, plugin_mod,
+                                                                monkeypatch):
+        """`ensure_installed`/`restart` are subprocess work that can outlast
+        shutdown's thread join — the plugin is leaving, and nothing is going to
+        attach and close the window."""
+        bridge = self._bridge(plug)
+
+        def _stop_mid_install():
+            plug._stopping = True
+            return False
+
+        self._agent(monkeypatch, plugin_mod,
+                    ensure_installed=Mock(side_effect=_stop_mid_install))
+        plug._install_bridge_node()
+        bridge.cancel_expected_restart.assert_called_once()
+
+    def test_an_install_with_no_export_bridge_at_all_does_not_crash(self, plug, plugin_mod,
+                                                                    monkeypatch):
+        """`export_bridge` is None only before startup has built it and after
+        shutdown has torn it down — `plugin.py` builds it unconditionally. (An
+        install with nothing exported is a DIFFERENT case, with a live bridge
+        object; see the next test.) The window seams must be no-ops here."""
+        self._agent(monkeypatch, plugin_mod)
+        plug.export_bridge = None
+        plug._install_bridge_node()
+        assert "restarted onto the new version" in _logged(plug.logger)
+
+    def test_an_install_with_nothing_exported_never_arms_a_window(self, plug, plugin_mod,
+                                                                  monkeypatch):
+        """XG5: this install does not start the bridge, so it takes nothing down
+        — and a window armed here would mute an unrelated outage."""
+        agent = self._agent(monkeypatch, plugin_mod)
+        bridge = self._bridge(plug)
+        plug.pluginPrefs.clear()
+        plug.exports = ExportStore(lambda: plug.pluginPrefs, plug.logger)
+        plug._install_bridge_node()
+        agent.ensure_installed.assert_not_called()
+        bridge.expect_restart.assert_not_called()
