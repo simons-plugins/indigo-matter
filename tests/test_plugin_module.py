@@ -121,7 +121,8 @@ MENU_SECTIONS = [
      "Share a Matter device with another ecosystem…",
      "Decommission Matter device…",
      "Report settable Matter settings…",
-     "Explore Matter attributes (advanced)…"],
+     "Explore Matter attributes (advanced)…",
+     "Report Thread mesh…"],
     # 2 · Matter devices Indigo publishes
     ["Manage Matter Exports…",
      "Pair Matter Bridge…",

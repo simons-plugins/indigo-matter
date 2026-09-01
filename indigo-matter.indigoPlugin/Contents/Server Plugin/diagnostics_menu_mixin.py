@@ -1,7 +1,7 @@
-"""The Matter menu's read-only diagnostics (issue #191).
+"""The Matter menu's read-only diagnostics (issue #191; #334 for the third item).
 
-Two menu items, both of which answer "what does this device actually expose?"
-without touching it:
+Three menu items, all of which answer a question about a device without
+touching it:
 
 * **Report settable Matter settings…** — the on-demand half of the automatic
   settable-attribute report. Devices commissioned before that report shipped
@@ -11,6 +11,12 @@ without touching it:
 * **Explore Matter attributes…** — a labelled dump of a chosen
   node/endpoint/cluster, plus a single live attribute read for confirming one
   value. Power-user surface; deliberately unfiltered.
+* **Report Thread mesh…** — roles, neighbour/route links (RSSI/LQI/frame-error),
+  the leader, foreign routers and health flags for every Thread node, parsed by
+  :mod:`thread_mesh` from matter-server's ThreadNetworkDiagnostics cache and
+  optionally live-refreshed first for the sleepy devices via the shared
+  :func:`thread_survey.run_survey` (the same coroutine the IWS Thread page uses,
+  so the live-read policy lives in one place).
 
 **Neither writes anything, now or ever** (decided 2026-08-11 — see
 :mod:`settings_report` for the three reasons). If a write is needed the answer
@@ -36,6 +42,8 @@ from typing import Any, Optional
 import indigo  # provided by the Indigo runtime
 
 import settings_report
+import thread_mesh
+import thread_survey
 from matter_client import ATTRIBUTE_TIMEOUT
 from matter_handlers.writable_attributes import MODEL_VERSION
 from matter_model import node_id_to_str, parse_node
@@ -332,6 +340,57 @@ class DiagnosticsMenuMixin:
             settings_report.cluster_label(cluster),
             settings_report.attribute_label(cluster, attribute),
             settings_report.render_value(value))
+        return (True, valuesDict)
+
+    # ------------------------------------------------------------------
+    # Deliverable C — the Thread mesh report (#334)
+    # ------------------------------------------------------------------
+    def menuReportThreadMesh(self, valuesDict, menuId=""):  # noqa: N802, ARG002
+        """Log the Thread mesh: roles, links, the leader, foreign routers and
+        health flags, from :func:`thread_survey.run_survey` + :mod:`thread_mesh`.
+
+        ``liveReadSleepy`` (default on) live-refreshes every non-router node
+        first — the same coroutine the IWS Thread page will use, so the
+        cache-vs-live policy is not duplicated. A ``get_nodes()`` failure is a
+        failed call (routed through the same "matter-server unavailable" shape
+        as every other diagnostic here), never printed as an empty mesh.
+        """
+        errors = indigo.Dict()
+        if self.runtime is None or self.matter is None:
+            errors["liveReadSleepy"] = "The plugin is not connected to matter-server yet."
+            return (False, valuesDict, errors)
+
+        live_sleepy = bool(valuesDict.get("liveReadSleepy", True))
+        try:
+            diags = thread_survey.run_survey(self.runtime, self.matter, live_sleepy=live_sleepy)
+        except FuturesTimeoutError:
+            errors["liveReadSleepy"] = "matter-server did not answer in time — see the Event Log."
+            return (False, valuesDict, errors)
+        except Exception as exc:  # pylint: disable=broad-except
+            # get_nodes() failing outright is a failed call, not an empty mesh
+            # (root workspace CLAUDE.md degradation-path convention) — surfaced
+            # as a dialog error rather than printed as "no Thread devices".
+            self.logger.warning("Matter: could not read the Thread mesh: %s", exc)
+            errors["liveReadSleepy"] = f"matter-server could not be read: {exc}"
+            return (False, valuesDict, errors)
+
+        if not diags:
+            self.logger.info("Matter: no Thread devices are commissioned yet.")
+            return (True, valuesDict)
+
+        mesh = thread_mesh.build_mesh(diags)
+        for line in thread_mesh.render_report(mesh, diags):
+            self.logger.info("%s", line)
+
+        if mesh.unreadable:
+            # Partial failure, same convention as menuReportSettings: still
+            # print everything (the cached values above), then say so — a
+            # diagnostic that looks complete when it is not is the failure
+            # mode a diagnostic can least afford.
+            errors["liveReadSleepy"] = (
+                f"{len(mesh.unreadable)} node(s) could not be live-read — cached values "
+                f"shown; see the Event Log.")
+            return (False, valuesDict, errors)
         return (True, valuesDict)
 
     # ------------------------------------------------------------------
