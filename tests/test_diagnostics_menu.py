@@ -20,7 +20,9 @@ import asyncio
 import importlib
 import json
 import sys
+import threading
 import xml.etree.ElementTree as ET
+from concurrent.futures import CancelledError as FuturesCancelledError
 from concurrent.futures import Future, TimeoutError as FuturesTimeoutError
 from pathlib import Path
 from types import SimpleNamespace
@@ -54,16 +56,25 @@ RELAY_NODE = {
 class _Future:
     """A concurrent.futures stand-in: ``submit(...).result(timeout=…)``."""
 
-    def __init__(self, value=None, raises=None):
-        self._value, self._raises = value, raises
+    def __init__(self, value=None, raises=None, cancelled=False):
+        self._value, self._raises, self._cancelled = value, raises, cancelled
 
     def result(self, timeout=None):  # noqa: ARG002
+        if self._cancelled:
+            # What a REAL concurrent.futures.Future does once cancel()
+            # actually took: raises its own CancelledError, whose str() is
+            # empty (#339 review, R1-CORRECTION) — this is what used to fall
+            # into the generic handler and log a cause-less warning.
+            raise FuturesCancelledError()
         if self._raises is not None:
             raise self._raises
         return self._value
 
     def cancel(self):  # run_survey calls this on a timeout (#334 post-review, B2.7)
         return True
+
+    def cancelled(self):  # #339 review, R1-CORRECTION
+        return self._cancelled
 
 
 @pytest.fixture
@@ -398,7 +409,7 @@ def _warn_body(obj) -> str:
     return "\n".join(_fmt(call) for call in obj.logger.warning.call_args_list)
 
 
-def test_menu_returns_immediately_leaving_the_survey_running_in_the_background(mixin):
+def test_menu_returns_immediately_leaving_the_survey_running_in_the_background(mixin, monkeypatch):
     """The whole point of #339: a real dialog timed out waiting up to ~50 s
     for a sleepy-device survey, so the menu must return long before the
     survey — real or fake — has finished, let alone reported anything.
@@ -410,8 +421,15 @@ def test_menu_returns_immediately_leaving_the_survey_running_in_the_background(m
     real, and completing an already-resolved ``concurrent.futures.Future``'s
     callback fires it immediately in the calling thread, so the assertions
     below are ordered exactly as they would run in production.
+
+    #339 review, R6: the timeout constants are monkeypatched down (like
+    ``test_the_total_budget_is_enforced_by_the_coroutine_itself`` below) so
+    that a future regression that made the menu block again fails this test
+    in well under a second, not after the real ~50 s budget.
     """
-    _module, obj = mixin
+    module, obj = mixin
+    monkeypatch.setattr(module, "ATTRIBUTE_TIMEOUT", 0.05)
+    monkeypatch.setattr(module, "SURVEY_READ_TIMEOUT", 0.0)
     nodes = json.loads(THREAD_FIXTURE_PATH.read_text(encoding="utf-8"))
     obj.matter = _ThreadFakeMatter(nodes)
     pending: Future = Future()
@@ -507,6 +525,51 @@ def test_no_url_footer_when_page_url_is_none(mixin):
     assert "Visual map" not in _log_body(obj)
 
 
+def test_a_broken_page_url_resolution_does_not_cost_the_whole_report(mixin):
+    """R3/R8 (#339 review): ``page_url`` is now resolved eagerly inside
+    ``menuReportThreadMesh`` behind its own try/except — a failure there must
+    not trade the WHOLE successful report for the footer line (root workspace
+    CLAUDE.md isolation clause)."""
+    nodes = json.loads(THREAD_FIXTURE_PATH.read_text(encoding="utf-8"))
+    _module, obj = _thread_mesh_mixin(mixin, _ThreadFakeMatter(nodes))
+    obj._iws_page_url = Mock(side_effect=RuntimeError("getWebServerURL blew up"))  # pylint: disable=protected-access
+    ok, _values = obj.menuReportThreadMesh({"liveReadSleepy": False})[:2]
+    assert ok
+    body = _log_body(obj)
+    assert "single_neighbour:" in body, "the mesh report itself must still print"
+    assert "Visual map" not in body
+
+
+def test_node_names_and_page_url_are_resolved_eagerly_before_the_coroutine_runs(mixin):
+    """R8 (#339 review): both are resolved on the Indigo thread, before the
+    survey coroutine is even submitted, and closed over as plain values — not
+    re-resolved lazily inside the coroutine on the loop thread. Pinned by
+    checking neither collaborator is called again once the (captured,
+    initially undriven) coroutine actually runs.
+    """
+    _module, obj = mixin
+    nodes = json.loads(THREAD_FIXTURE_PATH.read_text(encoding="utf-8"))
+    obj.matter = _ThreadFakeMatter(nodes)
+    pending: Future = Future()
+    captured = {}
+    obj.runtime = Mock()
+    obj.runtime.submit.side_effect = lambda coro: (captured.__setitem__("coro", coro), pending)[1]
+
+    ok, _values = obj.menuReportThreadMesh({"liveReadSleepy": False})[:2]
+
+    assert ok is True
+    assert not pending.done(), "the coroutine has not run yet"
+    obj._iws_page_url.assert_called_once_with("thread")  # pylint: disable=protected-access
+    assert obj.device_sync.list_nodes.call_count == 1
+
+    result = asyncio.run(captured["coro"])
+    pending.set_result(result)
+
+    # Driving the coroutine must not have re-resolved either value.
+    obj._iws_page_url.assert_called_once_with("thread")  # pylint: disable=protected-access
+    assert obj.device_sync.list_nodes.call_count == 1
+
+
 def test_a_timed_out_live_read_is_reported_to_the_event_log_AND_the_node_still_appears_cached(mixin):
     nodes = json.loads(THREAD_FIXTURE_PATH.read_text(encoding="utf-8"))
     matter = _ThreadFakeMatter(nodes, timeout_nodes={0x2E})
@@ -594,6 +657,11 @@ def test_matter_server_unavailable_is_reported_not_printed_as_an_empty_mesh(mixi
     assert ok
     assert "could not read the Thread mesh" in _warn_body(obj)
     assert "no Thread devices" not in _log_body(obj)
+    # #339 review, R2: the warning above keeps its plain wording (this branch
+    # is open-ended EXPECTED network failures, not unknown bugs), but a DEBUG
+    # companion must still carry the traceback for the times it turns out not
+    # to be routine.
+    assert any(c.kwargs.get("exc_info") is True for c in obj.logger.debug.call_args_list)
 
 
 def test_the_report_refuses_before_the_connection_is_up(mixin):
@@ -657,20 +725,168 @@ def test_a_timeout_logs_to_the_event_log_once_the_backgrounded_survey_gives_up(m
     assert "live=True" in warn_body
 
 
+# ---------------------------------------------------------------------------
+# R1/R1-CORRECTION (#339 review): shutdown/restart cancellation is logged,
+# not silently swallowed or mislabelled as a generic read failure
+# ---------------------------------------------------------------------------
+
+def test_a_cancelled_fake_future_is_logged_info_not_warning(mixin):
+    """Unit-level companion to the real-loop test below: a future whose
+    ``cancelled()`` reports True must produce the INFO cancellation line,
+    never the generic "could not read the Thread mesh" warning — the failure
+    mode before this fix, since a cancelled concurrent.futures.Future's
+    ``result()`` raises its OWN CancelledError with an EMPTY ``str()``."""
+    _module, obj = mixin
+    obj._log_thread_mesh_survey_result(  # pylint: disable=protected-access
+        False, "http://localhost:8176/message/ours/thread/", _Future(cancelled=True))
+    assert not obj.logger.warning.called
+    info_msgs = [str(c) for c in obj.logger.info.call_args_list]
+    assert any("cancelled" in m.lower() for m in info_msgs)
+
+
+def test_a_real_loop_cancellation_is_logged_info_not_warning(mixin):
+    """R1-CORRECTION, real end-to-end: spin the ACTUAL ``AsyncRuntime``,
+    submit a hanging survey coroutine, then stop the runtime the way plugin
+    shutdown does. ``AsyncRuntime._drain_and_close`` cancels every pending
+    task, which drives the REAL ``concurrent.futures.Future`` done-callback
+    with a REAL cancellation — not a hand-rolled stand-in — and this also
+    pins that the R5 in-flight guard clears on this path too.
+    """
+    import async_runtime  # local: only this test needs the real runtime
+
+    _module, obj = mixin
+    runtime = async_runtime.AsyncRuntime(logger=Mock())
+    runtime.start()
+    started = threading.Event()
+
+    class _HangingMatter:
+        connected = True
+
+        async def get_nodes(self):
+            started.set()
+            await asyncio.sleep(100)
+            return []
+
+    obj.runtime = runtime
+    obj.matter = _HangingMatter()
+
+    try:
+        ok, _values = obj.menuReportThreadMesh({"liveReadSleepy": False})[:2]
+        assert ok is True
+        assert started.wait(timeout=2), "the survey coroutine never started running"
+    finally:
+        runtime.stop()  # cancels every pending task, same as plugin shutdown
+
+    # stop() joins the loop thread, and _drain_and_close's task.cancel() +
+    # run_until_complete(gather(...)) runs — and fires the done-callback —
+    # on that same thread, so it has already happened by the time stop()
+    # returns.
+    assert not obj.logger.warning.called
+    info_msgs = [str(c) for c in obj.logger.info.call_args_list]
+    assert any("cancelled" in m.lower() for m in info_msgs)
+    assert obj._thread_mesh_survey_pending is None, (  # pylint: disable=protected-access
+        "R5: the in-flight guard must clear on cancellation too")
+
+
+# ---------------------------------------------------------------------------
+# R5 (#339 review): a second click while a survey is pending is refused
+# politely, and the guard clears on every completion path
+# ---------------------------------------------------------------------------
+
+def test_a_second_click_is_refused_while_one_is_pending(mixin):
+    _module, obj = mixin
+    nodes = json.loads(THREAD_FIXTURE_PATH.read_text(encoding="utf-8"))
+    obj.matter = _ThreadFakeMatter(nodes)
+    pending: Future = Future()
+    captured = {}
+    obj.runtime = Mock()
+    # Capture (and later close) the real coroutine rather than letting a bare
+    # Mock swallow it uncalled — an unclosed coroutine is a ResourceWarning
+    # nuisance, not a real leak here, but there is no reason to leave one.
+    obj.runtime.submit.side_effect = lambda coro: (captured.__setitem__("coro", coro), pending)[1]
+
+    ok1, _values = obj.menuReportThreadMesh({"liveReadSleepy": False})[:2]
+    assert ok1 is True
+
+    ok2, _values2, errors2 = obj.menuReportThreadMesh({"liveReadSleepy": False})
+    assert ok2 is False
+    assert "already running" in errors2["liveReadSleepy"]
+    assert obj.runtime.submit.call_count == 1, "a refused click must not start a second survey"
+
+    captured["coro"].close()
+
+
+def test_allowed_again_once_the_survey_completes(mixin):
+    nodes = json.loads(THREAD_FIXTURE_PATH.read_text(encoding="utf-8"))
+    # _thread_mesh_mixin installs _RecordingRuntime, which runs the
+    # coroutine to completion synchronously, so the flag is already cleared
+    # by the time menuReportThreadMesh returns.
+    _module, obj = _thread_mesh_mixin(mixin, _ThreadFakeMatter(nodes))
+    ok1, _values = obj.menuReportThreadMesh({"liveReadSleepy": False})[:2]
+    assert ok1 is True
+    assert obj._thread_mesh_survey_pending is None  # pylint: disable=protected-access
+
+    ok2, _values2 = obj.menuReportThreadMesh({"liveReadSleepy": False})[:2]
+    assert ok2 is True, "a second survey must be allowed once the first has completed"
+
+
+def test_allowed_again_once_the_survey_fails(mixin):
+    matter = _ThreadFakeMatter([], get_nodes_error=ConnectionError("matter-server down"))
+    _module, obj = _thread_mesh_mixin(mixin, matter)
+    ok1, _values = obj.menuReportThreadMesh({"liveReadSleepy": False})[:2]
+    assert ok1 is True
+    assert obj._thread_mesh_survey_pending is None  # pylint: disable=protected-access
+
+    ok2, _values2 = obj.menuReportThreadMesh({"liveReadSleepy": False})[:2]
+    assert ok2 is True, "a second survey must be allowed once the first has failed"
+
+
+# ---------------------------------------------------------------------------
+# R4/R7 (#339 review): a stopped/unavailable runtime is a dialog error, not
+# an unhandled RuntimeError plus an un-awaited coroutine warning
+# ---------------------------------------------------------------------------
+
+def test_a_stopped_runtime_is_a_dialog_error_not_an_unhandled_exception(mixin):
+    """Every other ``self.runtime.submit(...)`` call site in these mixins is
+    guarded; this was the only bare one (#339 review, R4/R7) — a stopped loop
+    (e.g. shutdown mid-menu-click) raised RuntimeError straight into Indigo's
+    menu machinery instead of the same "not connected yet" dialog-error
+    family every other precondition failure here uses."""
+    _module, obj = mixin
+    nodes = json.loads(THREAD_FIXTURE_PATH.read_text(encoding="utf-8"))
+    obj.matter = _ThreadFakeMatter(nodes)
+    obj.runtime = Mock()
+    obj.runtime.submit.side_effect = RuntimeError("asyncio runtime is not running")
+
+    ok, _values, errors = obj.menuReportThreadMesh({"liveReadSleepy": False})
+
+    assert ok is False
+    assert "not connected" in errors["liveReadSleepy"]
+    assert obj._thread_mesh_survey_pending is None, (  # pylint: disable=protected-access
+        "a submit() that never produced a future must not leave the guard set")
+
+
 def test_a_done_callback_that_somehow_raises_is_logged_not_lost(mixin, monkeypatch):
     """A done-callback that raises is swallowed by asyncio's own default
     exception handler, never Indigo's Event Log — the one thing this menu
     just told the user to go watch. Forcing ``thread_mesh.build_mesh`` to
     blow up makes the "make it fatal" point concrete: nothing may propagate
-    out of the callback silently."""
+    out of the callback silently.
+
+    #339 review, R2: this last-resort guard exists for UNKNOWN bugs, so it
+    must use ``logger.exception`` (traceback kept), not ``logger.warning``
+    (traceback discarded) — pinned here via ``exception.call_args_list``
+    rather than ``warning``.
+    """
     nodes = json.loads(THREAD_FIXTURE_PATH.read_text(encoding="utf-8"))
     module, obj = _thread_mesh_mixin(mixin, _ThreadFakeMatter(nodes))
     boom = RuntimeError("build_mesh exploded")
     monkeypatch.setattr(module.thread_mesh, "build_mesh", Mock(side_effect=boom))
     ok, _values = obj.menuReportThreadMesh({"liveReadSleepy": False})[:2]
     assert ok
-    warn_msgs = [str(c) for c in obj.logger.warning.call_args_list]
-    assert any("report failed unexpectedly" in m and "build_mesh exploded" in m for m in warn_msgs)
+    assert not obj.logger.warning.called, "an unknown bug must not be logged as a routine warning"
+    exc_msgs = [str(c) for c in obj.logger.exception.call_args_list]
+    assert any("report failed unexpectedly" in m and "build_mesh exploded" in m for m in exc_msgs)
 
 
 # ---------------------------------------------------------------------------

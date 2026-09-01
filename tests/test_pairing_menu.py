@@ -1496,6 +1496,14 @@ class TestIwsPageUrl:
         exactly what ``_iws_page_url("pairing")`` would."""
         assert plug._pairing_page_url() == plug._iws_page_url("pairing")
 
+    def test_a_trailing_slash_on_the_resolved_base_is_not_doubled(self, plug, plugin_mod):
+        """#339 review, R6: a reflector/Bonjour URL ending in "/" used to leave
+        the resolved page URL reading "…8176//message/…"."""
+        plugin_mod.indigo.server.getWebServerURL.return_value = "http://jarvis.local:8176/"
+        url = plug._iws_page_url("thread")
+        assert "//message" not in url
+        assert url == f"http://jarvis.local:8176/message/{OURS}/thread/"
+
 
 class TestEscaping:
     def test_none_becomes_empty_not_the_word_None(self, plugin_mod):

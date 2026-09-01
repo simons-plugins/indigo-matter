@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+from concurrent.futures import CancelledError as FuturesCancelledError
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from typing import Any, Optional
 
@@ -84,6 +85,14 @@ def _truthy(value) -> bool:
 
 class DiagnosticsMenuMixin:
     """Read-only Matter diagnostics: the settable-attribute report and explorer."""
+
+    #: R5 in-flight guard for the backgrounded Thread mesh survey (#339 review):
+    #: the pending survey's ``concurrent.futures.Future``, or ``None``. A
+    #: class-level default rather than something set in ``__init__`` — this
+    #: mixin defines no ``__init__`` (see module docstring, issue #146) —
+    #: assigning ``self._thread_mesh_survey_pending = ...`` always creates a
+    #: same-named INSTANCE attribute, it never mutates this one.
+    _thread_mesh_survey_pending: Optional[Any] = None
 
     # ------------------------------------------------------------------
     # Prefs
@@ -387,11 +396,24 @@ class DiagnosticsMenuMixin:
         :meth:`_log_thread_mesh_survey_result`), because the dialog is already
         closed by the time any of them could fire — a timeout, a
         ``get_nodes()`` failure, an unaddressable fabric, a genuinely empty
-        (Wi-Fi-only) fabric, and a partial live-read failure all keep the
-        exact wording they had as dialog errors; only the destination changed.
-        The one thing that stays a dialog error is the precondition below,
-        which is still checked, and still refused, before anything is ever
-        submitted.
+        (Wi-Fi-only) fabric, a partial live-read failure, and a shutdown-time
+        cancellation all keep the exact wording they had as dialog errors (or,
+        for cancellation, the wording the equivalent dialog error would have
+        had); only the destination changed. The things that stay dialog
+        errors are the two precondition checks below — not connected yet, and
+        a survey already running — both still checked, and still refused,
+        before anything is ever submitted.
+
+        **``node_names`` and ``page_url`` are resolved HERE, on the Indigo
+        thread, eagerly** (#339 review, R8) — not inside the coroutine, and
+        not inside the done-callback. Three reasons: it restores
+        ``list_nodes()``'s documented "names resolved off the dispatch
+        thread" intent (resolving them inside the coroutine would move that
+        work onto the loop thread instead); it keeps the plugin's first
+        ``indigo.server.*`` RPC (``getWebServerURL``, inside
+        ``_iws_page_url``) off the loop thread; and it means the done-callback
+        touches nothing but ``self.logger`` and these two captured, already-
+        resolved values — see :meth:`_on_thread_mesh_survey_done`.
         """
         errors = indigo.Dict()
         # Same guard, same wording, as HttpApiMixin._thread_mesh_snapshot
@@ -402,11 +424,33 @@ class DiagnosticsMenuMixin:
             errors["liveReadSleepy"] = "The plugin is not connected to matter-server yet."
             return (False, valuesDict, errors)
 
+        # R5 (#339 review): refuse a second concurrent survey politely rather
+        # than starting one — duplicate radio traffic to sleepy battery
+        # devices and a doubled report are real costs, and the guard is six
+        # lines. Cleared in _on_thread_mesh_survey_done's outer `finally`, so
+        # completion, failure, AND cancellation all release it.
+        if self._thread_mesh_survey_pending is not None:
+            errors["liveReadSleepy"] = ("A Thread mesh survey is already running — its "
+                                        "report will appear in the Event Log shortly.")
+            return (False, valuesDict, errors)
+
         # #334 post-review, B3.1: Indigo delivers a checkbox as the STRING
         # "true"/"false", and bool("false") is True — this used to always
         # live-read regardless of the checkbox, silently ignoring "off".
         live_sleepy = _truthy(valuesDict.get("liveReadSleepy", True))
         total_timeout = ATTRIBUTE_TIMEOUT + SURVEY_READ_TIMEOUT
+
+        # R8 — eager, Indigo-thread resolution (see docstring above).
+        node_names = self._thread_node_names()  # B5.4 — same names the page uses
+        try:
+            page_url = self._iws_page_url("thread")  # pylint: disable=no-member  # HttpApiMixin
+        except Exception:  # pylint: disable=broad-except
+            # R3/R8 (#339 review): a broken URL resolution must not cost the
+            # WHOLE completed report (root workspace CLAUDE.md isolation
+            # clause) — _log_thread_mesh_survey_result already treats
+            # page_url=None as "omit the footer line", the same contract
+            # render_report uses when _iws_page_url itself returns None.
+            page_url = None
 
         async def _survey_within_budget():
             # thread_survey.run_survey enforces its budget with
@@ -416,55 +460,130 @@ class DiagnosticsMenuMixin:
             # instead, via asyncio.wait_for (#339).
             return await asyncio.wait_for(
                 thread_survey.survey_thread_nodes(
-                    self.matter, live_sleepy=live_sleepy,
-                    node_names=self._thread_node_names(),  # B5.4 — same names the page uses
+                    self.matter, live_sleepy=live_sleepy, node_names=node_names,
                 ),
                 timeout=total_timeout,
             )
 
-        future = self.runtime.submit(_survey_within_budget())
-        future.add_done_callback(functools.partial(self._on_thread_mesh_survey_done, live_sleepy))
+        coro = _survey_within_budget()
+        try:
+            future = self.runtime.submit(coro)
+        except RuntimeError:
+            # R7/R4 (#339 review): every other submit() call site in these
+            # mixins is guarded; this was the only bare one. A stopped loop
+            # (shutdown mid-menu-click) raised this straight into Indigo's
+            # menu machinery instead of the dialog-error family every other
+            # "not connected yet" path uses.
+            coro.close()  # avoid a "coroutine was never awaited" warning
+            errors["liveReadSleepy"] = "The plugin is not connected to matter-server yet."
+            return (False, valuesDict, errors)
+
+        # Set BEFORE add_done_callback: an already-done future (as every test
+        # using a synchronous fake runtime produces) invokes its done-callback
+        # synchronously, inline, from inside add_done_callback() itself — the
+        # pending flag has to already be in place for that callback's own
+        # `finally` to have something to clear.
+        self._thread_mesh_survey_pending = future
+        future.add_done_callback(
+            functools.partial(self._on_thread_mesh_survey_done, live_sleepy, page_url))
 
         self.logger.info(
             "Matter: Thread mesh survey started (live-read sleepy: %s) — the report will "
             "follow in the Event Log within about a minute.", "yes" if live_sleepy else "no")
         return (True, valuesDict)
 
-    def _on_thread_mesh_survey_done(self, live_sleepy: bool, future) -> None:
+    def _on_thread_mesh_survey_done(self, live_sleepy: bool, page_url: Optional[str],
+                                     future) -> None:
         """Done-callback for the backgrounded Thread mesh survey (#339).
 
-        Runs on the asyncio LOOP thread, never Indigo's: a
-        ``concurrent.futures.Future`` fires its done-callbacks wherever
-        ``set_result``/``set_exception`` was called, and for a future
-        returned by :meth:`AsyncRuntime.submit <async_runtime.AsyncRuntime.submit>`
-        that is always the loop thread. ``self.logger`` and pure code only —
-        no Indigo device writes belong here.
+        Usually runs on the asyncio LOOP thread: a ``concurrent.futures.Future``
+        fires its done-callbacks wherever ``set_result``/``set_exception``/
+        ``cancel`` was called, and for a future returned by
+        :meth:`AsyncRuntime.submit <async_runtime.AsyncRuntime.submit>` that is
+        ordinarily the loop thread. **But not always** (#339 review, R6/R8):
+        if the future is *already done* by the time
+        ``menuReportThreadMesh`` calls ``add_done_callback`` on it, this fires
+        synchronously, inline, on whatever thread made that call — Indigo's,
+        in production; the test thread, for every test that uses a
+        synchronous fake runtime.
+
+        That uncertainty is exactly why the body below, and
+        :meth:`_log_thread_mesh_survey_result`, touch nothing but
+        ``self.logger`` and the two values captured here — ``live_sleepy`` and
+        ``page_url``, both resolved eagerly on the Indigo thread by the caller
+        (R8) — plus pure computation over ``future.result()``. No Indigo
+        device writes, and no fresh Indigo RPCs, belong here: there is no
+        thread this method can safely assume it is on.
 
         The whole body sits behind this one try/except, which only logs:
         asyncio swallows an exception raised out of a done-callback into its
         own default exception handler, never Indigo's Event Log, so a bug in
         the reporting logic below would otherwise vanish silently — exactly
         the "the report will follow in the Event Log" promise the synchronous
-        half of this menu item just made, broken with no trace.
+        half of this menu item just made, broken with no trace. The catch is
+        deliberately ``(Exception, asyncio.CancelledError)``, not a bare
+        ``BaseException`` — the latter is not this handler's job to widen to
+        (``asyncio.CancelledError`` is listed explicitly only because it is a
+        ``BaseException`` subclass that can legitimately arrive here via the
+        synchronous already-done path above; see R1-CORRECTION).
         """
         try:
-            self._log_thread_mesh_survey_result(live_sleepy, future)
-        except Exception as exc:  # pylint: disable=broad-except
+            self._log_thread_mesh_survey_result(live_sleepy, page_url, future)
+        except (Exception, asyncio.CancelledError) as exc:  # pylint: disable=broad-except
             # Absorbing: anything the reporting logic below could raise — see
             # this method's docstring for why nothing may escape a
-            # done-callback here.
-            self.logger.warning("Matter: Thread mesh survey report failed unexpectedly: %s", exc)
+            # done-callback here. logger.exception (not .warning): this catch
+            # exists for UNKNOWN bugs, and the traceback is the entire
+            # diagnostic value of that (workspace CLAUDE.md standard).
+            self.logger.exception(
+                "Matter: Thread mesh survey report failed unexpectedly: %s", exc)
+        finally:
+            # R5: release the in-flight guard on every path out of the
+            # survey — completion, failure, AND cancellation alike.
+            self._thread_mesh_survey_pending = None
 
-    def _log_thread_mesh_survey_result(self, live_sleepy: bool, future) -> None:
+    def _log_thread_mesh_survey_result(self, live_sleepy: bool, page_url: Optional[str],
+                                        future) -> None:
         """The post-survey handling ``menuReportThreadMesh`` used to do
         synchronously and report as a dialog error (#334) — now run from
         :meth:`_on_thread_mesh_survey_done` once the backgrounded survey
         actually finishes, and reported to the Event Log instead, because the
         dialog is long gone by then (#339). Every branch keeps the exact
         wording it had as a dialog error; only the destination changed.
+
+        ``page_url`` arrives already resolved by the caller (R3/R8) — this
+        method never calls ``_iws_page_url`` itself, and treats ``None`` as
+        "omit the footer", the same contract :func:`thread_mesh.render_report`
+        already has for it.
         """
+        if future.cancelled():
+            # R1-CORRECTION: a survey cancelled by plugin shutdown/restart
+            # (AsyncRuntime._drain_and_close cancels every pending task) is
+            # expected, not a fault — info, not a warning. Checked before
+            # calling .result(): that call would raise
+            # concurrent.futures.CancelledError, whose str() is EMPTY, which
+            # is what used to make this fall into the generic handler below
+            # and log a cause-less "could not read the Thread mesh: ".
+            self.logger.info(
+                "Matter: Thread mesh survey cancelled before it finished (the "
+                "plugin is stopping or restarting) — no report will follow; "
+                "run it again.")
+            return
         try:
             survey = future.result()
+        except (asyncio.CancelledError, FuturesCancelledError):
+            # Belt-and-braces (R1-CORRECTION): the future.cancelled() check
+            # above is the normal path for a cancelled
+            # concurrent.futures.Future; this covers the same event surfacing
+            # as one of these two exceptions from result() directly —
+            # ``asyncio.CancelledError`` is the BaseException spelling that
+            # can arrive via the synchronous already-done callback path (see
+            # this method's caller's docstring).
+            self.logger.info(
+                "Matter: Thread mesh survey cancelled before it finished (the "
+                "plugin is stopping or restarting) — no report will follow; "
+                "run it again.")
+            return
         except (asyncio.TimeoutError, FuturesTimeoutError):
             # #334 post-review, B2.7's reasoning still applies: name the
             # timeout on the Event Log rather than leaving the promised
@@ -477,7 +596,14 @@ class DiagnosticsMenuMixin:
             # get_nodes() failing outright is a failed call, not an empty mesh
             # (root workspace CLAUDE.md degradation-path convention) — reported
             # to the Event Log rather than printed as "no Thread devices".
+            # This branch exists for OPEN-ENDED, expected network failures
+            # (matter-server dropping, a protocol refusal) — full
+            # logger.exception() would be noisy for those, so the warning
+            # keeps its plain wording and a DEBUG companion carries the
+            # traceback for the times it turns out not to be routine.
             self.logger.warning("Matter: could not read the Thread mesh: %s", exc)
+            self.logger.debug(
+                "Matter: Thread mesh survey read failure, full traceback", exc_info=True)
             return
 
         # #334 post-review, B2.4: three genuinely different "nothing to show"
@@ -497,7 +623,6 @@ class DiagnosticsMenuMixin:
             return
 
         mesh = thread_mesh.build_mesh(survey.diags)
-        page_url = self._iws_page_url("thread")  # pylint: disable=no-member  # HttpApiMixin
         for line in thread_mesh.render_report(mesh, survey.diags, page_url=page_url):
             self.logger.info("%s", line)
 

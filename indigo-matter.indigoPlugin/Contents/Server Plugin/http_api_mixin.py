@@ -281,6 +281,7 @@ class HttpApiMixin:
             # URL. Safe because a wrong-host URL the user can edit beats no URL at
             # all — hence DEBUG.
             self.logger.debug("could not resolve the Indigo web server URL (%s)", exc)
+        base = base.rstrip("/")  # #339 review, R6: a trailing slash doubled to "…8176//message"
         return f"{base}/message/{self._export_plugin_id()}/{action_id}/"  # pylint: disable=no-member  # ExportDialogMixin
 
     # ------------------------------------------------------------------
