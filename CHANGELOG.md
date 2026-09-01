@@ -3,7 +3,19 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
-## 2026.29.11 — one unreadable device no longer empties the migrate picker
+## 2026.29.11 — one unreadable device no longer empties the migrate picker, and a broken matter-server answer is a 500
+
+**API change (API.md v1.5).** The `diagnostics` endpoint returned 503
+`matter_server_unreachable` for *any* failure reading a node — including
+matter-server answering with a protocol error, or a fault in the plugin. Since
+API.md tells the client to prompt the user to retry on a 503, that sent Domio
+away to try again against a server that was up and answering, over a fault that
+would recur every time. 503 is now reserved for the two conditions that really
+mean "no answer" — the socket being down and the read timing out — and
+everything else surfaces as 500 `internal_error`, which should not be
+auto-retried. `TimeoutError` is named explicitly alongside `ConnectionError`
+because it is a sibling of it under `OSError`, not a subclass; catching only
+`ConnectionError` would have turned every timeout into a 500.
 
 The shortcomings #310's review recorded, now fixed — and writing the test for
 one of them found a defect nobody had recorded.

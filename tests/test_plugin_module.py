@@ -2458,3 +2458,66 @@ def test_the_two_read_failures_are_not_treated_the_same(plugin_cls, mock_indigo_
     mock_indigo_base.devices = _UnreadableDevices()
     plugin_cls._prime_absent_node_energy_state(unreadable, SimpleNamespace(id=42))
     unreadable.device_sync.apply_states.assert_not_called()
+
+
+# ----------------------------------------------------------------------
+# diagnostics: 503 means "no answer", not "any failure" (issue #310)
+# ----------------------------------------------------------------------
+
+def _diagnostics_stub(mock_logger, get_node):
+    from types import SimpleNamespace
+    return SimpleNamespace(matter=SimpleNamespace(get_node=get_node), logger=mock_logger)
+
+
+def _run_diagnostics(plugin_cls, stub, node_id=42):
+    import asyncio
+    return asyncio.run(plugin_cls._diagnostics(stub, node_id))
+
+
+def test_a_dead_socket_is_still_unreachable(plugin_cls, mock_logger):
+    """503 is right here: the server did not answer, and API.md tells the
+    client to prompt a retry — which will work once the socket is back."""
+    from http_api_mixin import MatterUnavailable
+
+    async def dead(_node_id):
+        raise ConnectionError("matter-server not connected")
+
+    with pytest.raises(MatterUnavailable):
+        _run_diagnostics(plugin_cls, _diagnostics_stub(mock_logger, dead))
+
+
+def test_a_timed_out_read_is_still_unreachable(plugin_cls, mock_logger):
+    """And the one a narrower catch would have broken. TimeoutError is a
+    SIBLING of ConnectionError under OSError, not a subclass, so catching
+    ConnectionError alone would silently turn every timeout into a 500."""
+    from http_api_mixin import MatterUnavailable
+
+    async def slow(_node_id):
+        raise TimeoutError("no response in 10s")
+
+    with pytest.raises(MatterUnavailable):
+        _run_diagnostics(plugin_cls, _diagnostics_stub(mock_logger, slow))
+
+
+def test_a_protocol_error_is_NOT_reported_as_unreachable(plugin_cls, mock_logger):
+    """The change (#310). matter-server answered — it just answered with an
+    error — so telling the client to retry sent it back against a server that
+    was up, over a fault that would recur every attempt. It now propagates to
+    the handler's 500, which API.md says not to auto-retry."""
+    import protocol
+    from http_api_mixin import MatterUnavailable
+
+    async def refused(_node_id):
+        raise protocol.ProtocolError(7, "unsupported")
+
+    with pytest.raises(protocol.ProtocolError):
+        _run_diagnostics(plugin_cls, _diagnostics_stub(mock_logger, refused))
+
+    # ...and specifically NOT as the unreachable exception, which is the whole
+    # point: MatterUnavailable is what the handler turns into a 503.
+    try:
+        _run_diagnostics(plugin_cls, _diagnostics_stub(mock_logger, refused))
+    except MatterUnavailable:  # pragma: no cover - only on regression
+        raise AssertionError("a protocol error must not be reported as unreachable")
+    except protocol.ProtocolError:
+        pass

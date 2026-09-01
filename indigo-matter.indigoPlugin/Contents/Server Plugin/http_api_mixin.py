@@ -195,10 +195,20 @@ class HttpApiMixin:
         from matter_model import parse_node
         try:
             raw = await self.matter.get_node(node_id)
-        except ConnectionError as exc:
-            raise MatterUnavailable(str(exc)) from exc
-        except Exception as exc:  # protocol/timeout error reading the node
-            self.logger.warning("diagnostics get_node(%s) failed: %s", node_id, exc)
+        except (ConnectionError, TimeoutError) as exc:
+            # 503 matter_server_unreachable — and ONLY these two (issue #310).
+            # Both mean the server did not answer: the socket is down, or the
+            # request timed out. API.md tells the client to prompt the user to
+            # retry on a 503, and for these that is honest advice.
+            #
+            # Everything else — a ProtocolError, a bug in here — is now left to
+            # propagate into the 500 the handler already has. It used to be
+            # caught and reported as "unreachable" too, which sent the client
+            # away to retry against a server that was up and answering, over a
+            # fault that would recur every time. `TimeoutError` is named
+            # explicitly because it is a SIBLING of ConnectionError under
+            # OSError, not a subclass — catching ConnectionError alone would
+            # silently turn every timeout into a 500.
             raise MatterUnavailable(str(exc)) from exc
         if not raw:
             return None  # genuine unknown node → 404
