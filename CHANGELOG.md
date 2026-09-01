@@ -3,6 +3,27 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
+## 2026.29.13 — ships the SIGTERM fix: bridge node pinned to 0.17.2
+
+Release of the work banked in 2026.29.12, which changed only `bridge-node` and
+so could not reach anyone until the node was published and the pin moved.
+
+- `bridge-node` **0.17.2** published to npm.
+- `DEFAULT_INSTALL_SPEC` moves to `indigo-matter-bridge@0.17.2` — the one line a
+  release bumps, in step with `bridge-node/package.json`'s `version`.
+
+What that carries, in full detail under 2026.29.12: the bridge node's
+`SIGTERM`/`SIGINT` handlers now sit at module scope rather than on the last line
+of `main()`, so a stop arriving during startup is a clean exit 0 with an ordered
+shutdown instead of death by signal with nothing closed. A Matter node that came
+online during the stop is closed and named in the log; the `main().catch`
+shutdown guard logs rather than swallowing, keeping the `EADDRINUSE` marker the
+plugin greps for out of the dark.
+
+Existing installs pick the new node up on the next install/upgrade pass;
+`launch_agent.py` warns when a running job's arguments have drifted from the
+plist, so a stale node is visible rather than silent.
+
 ## 2026.29.12 — the bridge node answers SIGTERM from its first line, not its last
 
 **bridge-node 0.17.2** (not yet published; the `DEFAULT_INSTALL_SPEC` pin still
