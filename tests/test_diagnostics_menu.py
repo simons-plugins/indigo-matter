@@ -366,6 +366,94 @@ def _log_body(obj) -> str:
     return "\n".join(str(call) for call in obj.logger.info.call_args_list)
 
 
+def _fmt(call) -> str:
+    """A logger call's actual text, %-substituted like the real Event Log
+    would show it. Needed for the new (#339) warning-based assertions below,
+    which use ``logger.warning("...%d...", count)`` — a bare ``str(call)``
+    shows the un-substituted template plus a repr'd args tuple, not the text
+    a human reads, unlike the ``"%s"`` + already-formatted-string idiom the
+    report-body lines above use (where the substring already sits inside the
+    single arg, so raw ``str(call)`` happens to contain it)."""
+    args = call.args
+    if len(args) > 1:
+        return str(args[0]) % args[1:]
+    return str(args[0]) if args else ""
+
+
+def _warn_body(obj) -> str:
+    return "\n".join(_fmt(call) for call in obj.logger.warning.call_args_list)
+
+
+def test_menu_returns_immediately_leaving_the_survey_running_in_the_background(mixin):
+    """The whole point of #339: a real dialog timed out waiting up to ~50 s
+    for a sleepy-device survey, so the menu must return long before the
+    survey — real or fake — has finished, let alone reported anything.
+
+    Drives the ACTUAL coroutine ``menuReportThreadMesh`` submitted (captured
+    from the fake runtime, per the root CLAUDE.md degradation-path
+    convention: run real code, don't just assert against a mock), then
+    completes the future by hand — this is what the loop thread does for
+    real, and completing an already-resolved ``concurrent.futures.Future``'s
+    callback fires it immediately in the calling thread, so the assertions
+    below are ordered exactly as they would run in production.
+    """
+    _module, obj = mixin
+    nodes = json.loads(THREAD_FIXTURE_PATH.read_text(encoding="utf-8"))
+    obj.matter = _ThreadFakeMatter(nodes)
+    pending: Future = Future()
+    captured = {}
+    obj.runtime = Mock()
+    obj.runtime.submit.side_effect = lambda coro: (captured.__setitem__("coro", coro), pending)[1]
+
+    ok, values = obj.menuReportThreadMesh({"liveReadSleepy": False})[:2]
+
+    assert ok is True
+    assert values == {"liveReadSleepy": False}
+    assert not pending.done(), "the menu must not have waited for a result"
+    assert not obj.logger.warning.called
+    started = [str(c) for c in obj.logger.info.call_args_list]
+    assert any("survey started" in m and "Event Log" in m for m in started)
+
+    result = asyncio.run(captured["coro"])
+    pending.set_result(result)
+
+    body = _log_body(obj)
+    assert "single_neighbour:" in body
+
+
+def test_the_total_budget_is_enforced_by_the_coroutine_itself(mixin, monkeypatch):
+    """Backgrounded, there is no Indigo thread left blocked on ``.result(timeout=…)``
+    to enforce the old budget — this pins that ``asyncio.wait_for`` inside the
+    submitted coroutine now does that job for real, not merely that a
+    TimeoutError-shaped exception is handled if one shows up."""
+    module, obj = mixin
+    monkeypatch.setattr(module, "ATTRIBUTE_TIMEOUT", 0.01)
+    monkeypatch.setattr(module, "SURVEY_READ_TIMEOUT", 0.0)
+
+    class _HangingMatter:
+        connected = True
+
+        async def get_nodes(self):
+            await asyncio.sleep(5)
+            return []
+
+    obj.matter = _HangingMatter()
+    captured = {}
+
+    def fake_submit(coro):
+        captured["coro"] = coro
+        return Future()
+
+    obj.runtime = Mock()
+    obj.runtime.submit.side_effect = fake_submit
+
+    ok, _values = obj.menuReportThreadMesh({"liveReadSleepy": True})[:2]
+    assert ok is True
+
+    with pytest.raises(asyncio.TimeoutError):
+        asyncio.run(captured["coro"])
+
+
 def test_the_report_prints_the_fixtures_health_flags(mixin):
     nodes = json.loads(THREAD_FIXTURE_PATH.read_text(encoding="utf-8"))
     _module, obj = _thread_mesh_mixin(mixin, _ThreadFakeMatter(nodes))
@@ -378,14 +466,15 @@ def test_the_report_prints_the_fixtures_health_flags(mixin):
     assert "far_from_leader:" in body
 
 
-def test_a_timed_out_live_read_is_reported_in_the_dialog_AND_the_node_still_appears_cached(mixin):
+def test_a_timed_out_live_read_is_reported_to_the_event_log_AND_the_node_still_appears_cached(mixin):
     nodes = json.loads(THREAD_FIXTURE_PATH.read_text(encoding="utf-8"))
     matter = _ThreadFakeMatter(nodes, timeout_nodes={0x2E})
     _module, obj = _thread_mesh_mixin(mixin, matter)
-    ok, _values, errors = obj.menuReportThreadMesh({"liveReadSleepy": True})
-    assert not ok
-    assert "1 node(s) could not be live-read" in errors["liveReadSleepy"]
-    assert "cached values" in errors["liveReadSleepy"]
+    ok, _values = obj.menuReportThreadMesh({"liveReadSleepy": True})[:2]
+    assert ok, "the dialog itself is long gone by the time this is known"
+    warn_body = _warn_body(obj)
+    assert "1 node(s) could not be live-read" in warn_body
+    assert "cached values" in warn_body
     body = _log_body(obj)
     assert "BILRESA scroll wheel" in body, "the timed-out node must still be printed, from cache"
 
@@ -427,16 +516,19 @@ def test_wifi_only_fabric_is_a_friendly_success_not_an_error(mixin):
     ok, _values = obj.menuReportThreadMesh({"liveReadSleepy": True})[:2]
     assert ok
     assert "no Thread devices" in _log_body(obj)
+    assert not obj.logger.warning.called
 
 
 def test_zero_raw_nodes_is_an_error_not_a_friendly_empty_mesh(mixin):
     # #334 post-review, B2.4: raw_count == 0 — matter-server itself reports no
     # commissioned nodes at all, which is a different (and worth flagging)
-    # situation from "some nodes exist and none of them are Thread".
+    # situation from "some nodes exist and none of them are Thread". #339:
+    # this is now a WARNING on the Event Log, not a dialog error — the
+    # dialog closed the moment the survey was submitted.
     _module, obj = _thread_mesh_mixin(mixin, _ThreadFakeMatter([]))
-    ok, _values, errors = obj.menuReportThreadMesh({"liveReadSleepy": True})
-    assert not ok
-    assert "no commissioned nodes at all" in errors["liveReadSleepy"]
+    ok, _values = obj.menuReportThreadMesh({"liveReadSleepy": True})[:2]
+    assert ok
+    assert "no commissioned nodes at all" in _warn_body(obj)
 
 
 def test_raw_nodes_all_unaddressable_is_an_error_listing_the_skip_reasons(mixin):
@@ -445,10 +537,11 @@ def test_raw_nodes_all_unaddressable_is_an_error_listing_the_skip_reasons(mixin)
     # not even address, which is a real failure, not an empty mesh.
     unaddressable = [{"attributes": {"0/53/1": 5}}]  # no node_id at all
     _module, obj = _thread_mesh_mixin(mixin, _ThreadFakeMatter(unaddressable))
-    ok, _values, errors = obj.menuReportThreadMesh({"liveReadSleepy": True})
-    assert not ok
-    assert "could not be read" in errors["liveReadSleepy"]
-    assert "no node_id" in errors["liveReadSleepy"]
+    ok, _values = obj.menuReportThreadMesh({"liveReadSleepy": True})[:2]
+    assert ok
+    warn_body = _warn_body(obj)
+    assert "could not be read" in warn_body
+    assert "no node_id" in warn_body
 
 
 def test_matter_server_unavailable_is_reported_not_printed_as_an_empty_mesh(mixin):
@@ -456,9 +549,9 @@ def test_matter_server_unavailable_is_reported_not_printed_as_an_empty_mesh(mixi
     degradation-path convention) — must not read as "no Thread devices"."""
     matter = _ThreadFakeMatter([], get_nodes_error=ConnectionError("matter-server down"))
     _module, obj = _thread_mesh_mixin(mixin, matter)
-    ok, _values, errors = obj.menuReportThreadMesh({"liveReadSleepy": False})
-    assert not ok
-    assert "matter-server could not be read" in errors["liveReadSleepy"]
+    ok, _values = obj.menuReportThreadMesh({"liveReadSleepy": False})[:2]
+    assert ok
+    assert "could not read the Thread mesh" in _warn_body(obj)
     assert "no Thread devices" not in _log_body(obj)
 
 
@@ -510,21 +603,33 @@ def test_falls_back_to_endpoint_join_with_no_matternode_device(mixin):
     assert names[0x34] == "FP300 Motion, FP300 Illuminance"
 
 
-def test_a_timeout_logs_before_reporting_it_in_the_dialog(mixin):
-    # #334 post-review, B2.7: the dialog told the user to "see the Event Log"
-    # for detail that was never actually written there.
+def test_a_timeout_logs_to_the_event_log_once_the_backgrounded_survey_gives_up(mixin):
+    # #334 post-review, B2.7's reasoning still applies, just relocated (#339):
+    # the report must actually say the survey timed out, not vanish silently.
     nodes = json.loads(THREAD_FIXTURE_PATH.read_text(encoding="utf-8"))
-    _module, obj = mixin
-    obj.matter = Mock(connected=True)
-    obj.runtime = Mock()
-    # close() the real coroutine run_survey builds — Mock().submit() never runs
-    # it, and an unawaited coroutine otherwise warns at garbage-collection time.
-    obj.runtime.submit.side_effect = lambda coro: (coro.close(), _Future(raises=FuturesTimeoutError()))[1]
-    ok, _values, errors = obj.menuReportThreadMesh({"liveReadSleepy": True})
-    assert not ok
-    assert "see the Event Log" in errors["liveReadSleepy"]
+    matter = _ThreadFakeMatter(nodes, get_nodes_error=asyncio.TimeoutError())
+    _module, obj = _thread_mesh_mixin(mixin, matter)
+    ok, _values = obj.menuReportThreadMesh({"liveReadSleepy": True})[:2]
+    assert ok
+    warn_body = _warn_body(obj)
+    assert "timed out" in warn_body
+    assert "live=True" in warn_body
+
+
+def test_a_done_callback_that_somehow_raises_is_logged_not_lost(mixin, monkeypatch):
+    """A done-callback that raises is swallowed by asyncio's own default
+    exception handler, never Indigo's Event Log — the one thing this menu
+    just told the user to go watch. Forcing ``thread_mesh.build_mesh`` to
+    blow up makes the "make it fatal" point concrete: nothing may propagate
+    out of the callback silently."""
+    nodes = json.loads(THREAD_FIXTURE_PATH.read_text(encoding="utf-8"))
+    module, obj = _thread_mesh_mixin(mixin, _ThreadFakeMatter(nodes))
+    boom = RuntimeError("build_mesh exploded")
+    monkeypatch.setattr(module.thread_mesh, "build_mesh", Mock(side_effect=boom))
+    ok, _values = obj.menuReportThreadMesh({"liveReadSleepy": False})[:2]
+    assert ok
     warn_msgs = [str(c) for c in obj.logger.warning.call_args_list]
-    assert any("timed out" in m for m in warn_msgs)
+    assert any("report failed unexpectedly" in m and "build_mesh exploded" in m for m in warn_msgs)
 
 
 # ---------------------------------------------------------------------------

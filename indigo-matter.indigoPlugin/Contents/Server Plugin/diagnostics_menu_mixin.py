@@ -15,8 +15,12 @@ touching it:
   the leader, foreign routers and health flags for every Thread node, parsed by
   :mod:`thread_mesh` from matter-server's ThreadNetworkDiagnostics cache and
   optionally live-refreshed first for the sleepy devices via the shared
-  :func:`thread_survey.run_survey` (the same coroutine the IWS Thread page uses,
-  so the live-read policy lives in one place).
+  :func:`thread_survey.survey_thread_nodes` (the same coroutine the IWS Thread
+  page's :func:`thread_survey.run_survey` uses, so the live-read policy lives
+  in one place). **Runs in the background** (#339): a live-read survey can
+  take up to ~50 s, which is too long to block a menu dialog on (field-reported
+  against v2026.30.0), so the menu returns immediately and the report follows
+  in the Event Log via the submitted coroutine's done-callback.
 
 **None of them writes anything, now or ever** (decided 2026-08-11 — see
 :mod:`settings_report` for the three reasons). If a write is needed the answer
@@ -36,6 +40,8 @@ have to be class members (issue #146). Like its siblings this module defines no
 """
 from __future__ import annotations
 
+import asyncio
+import functools
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from typing import Any, Optional
 
@@ -359,18 +365,33 @@ class DiagnosticsMenuMixin:
     # ------------------------------------------------------------------
     # Deliverable C — the Thread mesh report (#334)
     # ------------------------------------------------------------------
-    def menuReportThreadMesh(self, valuesDict, menuId=""):  # noqa: N802, ARG002  pylint: disable=too-many-return-statements
-        """Log the Thread mesh: roles, links, the leader, foreign routers and
-        health flags, from :func:`thread_survey.run_survey` + :mod:`thread_mesh`.
+    def menuReportThreadMesh(self, valuesDict, menuId=""):  # noqa: N802, ARG002
+        """Start the Thread mesh survey in the BACKGROUND and return at once.
 
-        ``liveReadSleepy`` (default on) live-refreshes every non-router node
-        first — the same coroutine the IWS Thread page uses, so the
-        cache-vs-live policy is not duplicated. A ``get_nodes()`` failure is a
-        failed call (routed through the same "matter-server unavailable" shape
-        as every other diagnostic here), never printed as an empty mesh — and
-        (#334 post-review, B2.4) neither is a fabric that reported raw nodes
-        this module could not even address (``Survey.skipped``): only a fabric
-        that genuinely has no Thread devices gets the friendly answer.
+        Used to run :func:`thread_survey.run_survey` synchronously and block
+        the dialog on it. A real dialog timeout was field-reported against
+        v2026.30.0 on 2026-09-01: with ``liveReadSleepy`` on, the survey can
+        legitimately take up to ``ATTRIBUTE_TIMEOUT + SURVEY_READ_TIMEOUT``
+        (~50 s, one ``per_node_timeout`` budget for the slowest sleepy node
+        plus the ``get_nodes()``/marshalling margin) — and an Indigo menu
+        dialog must not block anywhere near that long. The fix moves the wait
+        off the calling (Indigo) thread entirely: the survey coroutine is
+        submitted to the async runtime with :meth:`AsyncRuntime.submit
+        <async_runtime.AsyncRuntime.submit>` and this method returns
+        immediately; :meth:`_on_thread_mesh_survey_done`, attached as the
+        submitted future's done-callback, does the reporting once the survey
+        actually finishes.
+
+        **Every failure that used to come back as a dialog error now reports
+        to the Event Log instead** (via ``_on_thread_mesh_survey_done`` ->
+        :meth:`_log_thread_mesh_survey_result`), because the dialog is already
+        closed by the time any of them could fire — a timeout, a
+        ``get_nodes()`` failure, an unaddressable fabric, a genuinely empty
+        (Wi-Fi-only) fabric, and a partial live-read failure all keep the
+        exact wording they had as dialog errors; only the destination changed.
+        The one thing that stays a dialog error is the precondition below,
+        which is still checked, and still refused, before anything is ever
+        submitted.
         """
         errors = indigo.Dict()
         # Same guard, same wording, as HttpApiMixin._thread_mesh_snapshot
@@ -385,42 +406,95 @@ class DiagnosticsMenuMixin:
         # "true"/"false", and bool("false") is True — this used to always
         # live-read regardless of the checkbox, silently ignoring "off".
         live_sleepy = _truthy(valuesDict.get("liveReadSleepy", True))
-        try:
-            survey = thread_survey.run_survey(
-                self.runtime, self.matter, live_sleepy=live_sleepy,
-                node_names=self._thread_node_names(),  # B5.4 — same names the page uses
+        total_timeout = ATTRIBUTE_TIMEOUT + SURVEY_READ_TIMEOUT
+
+        async def _survey_within_budget():
+            # thread_survey.run_survey enforces its budget with
+            # future.result(timeout=...) on the calling (Indigo) thread —
+            # there is no such thread left blocked on this call any more, so
+            # the same total budget is enforced from INSIDE the coroutine
+            # instead, via asyncio.wait_for (#339).
+            return await asyncio.wait_for(
+                thread_survey.survey_thread_nodes(
+                    self.matter, live_sleepy=live_sleepy,
+                    node_names=self._thread_node_names(),  # B5.4 — same names the page uses
+                ),
+                timeout=total_timeout,
             )
-        except FuturesTimeoutError:
-            # #334 post-review, B2.7: name the timeout on the Event Log — the
-            # dialog error alone told the user to "see the Event Log" for
-            # detail that was never actually written there.
+
+        future = self.runtime.submit(_survey_within_budget())
+        future.add_done_callback(functools.partial(self._on_thread_mesh_survey_done, live_sleepy))
+
+        self.logger.info(
+            "Matter: Thread mesh survey started (live-read sleepy: %s) — the report will "
+            "follow in the Event Log within about a minute.", "yes" if live_sleepy else "no")
+        return (True, valuesDict)
+
+    def _on_thread_mesh_survey_done(self, live_sleepy: bool, future) -> None:
+        """Done-callback for the backgrounded Thread mesh survey (#339).
+
+        Runs on the asyncio LOOP thread, never Indigo's: a
+        ``concurrent.futures.Future`` fires its done-callbacks wherever
+        ``set_result``/``set_exception`` was called, and for a future
+        returned by :meth:`AsyncRuntime.submit <async_runtime.AsyncRuntime.submit>`
+        that is always the loop thread. ``self.logger`` and pure code only —
+        no Indigo device writes belong here.
+
+        The whole body sits behind this one try/except, which only logs:
+        asyncio swallows an exception raised out of a done-callback into its
+        own default exception handler, never Indigo's Event Log, so a bug in
+        the reporting logic below would otherwise vanish silently — exactly
+        the "the report will follow in the Event Log" promise the synchronous
+        half of this menu item just made, broken with no trace.
+        """
+        try:
+            self._log_thread_mesh_survey_result(live_sleepy, future)
+        except Exception as exc:  # pylint: disable=broad-except
+            # Absorbing: anything the reporting logic below could raise — see
+            # this method's docstring for why nothing may escape a
+            # done-callback here.
+            self.logger.warning("Matter: Thread mesh survey report failed unexpectedly: %s", exc)
+
+    def _log_thread_mesh_survey_result(self, live_sleepy: bool, future) -> None:
+        """The post-survey handling ``menuReportThreadMesh`` used to do
+        synchronously and report as a dialog error (#334) — now run from
+        :meth:`_on_thread_mesh_survey_done` once the backgrounded survey
+        actually finishes, and reported to the Event Log instead, because the
+        dialog is long gone by then (#339). Every branch keeps the exact
+        wording it had as a dialog error; only the destination changed.
+        """
+        try:
+            survey = future.result()
+        except (asyncio.TimeoutError, FuturesTimeoutError):
+            # #334 post-review, B2.7's reasoning still applies: name the
+            # timeout on the Event Log rather than leaving the promised
+            # report to simply never show up.
             self.logger.warning(
                 "Matter: Thread mesh survey timed out after %.0f s (live=%s)",
                 ATTRIBUTE_TIMEOUT + SURVEY_READ_TIMEOUT, live_sleepy)
-            errors["liveReadSleepy"] = "matter-server did not answer in time — see the Event Log."
-            return (False, valuesDict, errors)
+            return
         except Exception as exc:  # pylint: disable=broad-except
             # get_nodes() failing outright is a failed call, not an empty mesh
-            # (root workspace CLAUDE.md degradation-path convention) — surfaced
-            # as a dialog error rather than printed as "no Thread devices".
+            # (root workspace CLAUDE.md degradation-path convention) — reported
+            # to the Event Log rather than printed as "no Thread devices".
             self.logger.warning("Matter: could not read the Thread mesh: %s", exc)
-            errors["liveReadSleepy"] = f"matter-server could not be read: {exc}"
-            return (False, valuesDict, errors)
+            return
 
         # #334 post-review, B2.4: three genuinely different "nothing to show"
         # situations, told apart rather than all printed as one friendly
         # empty mesh (root workspace CLAUDE.md degradation-path convention —
         # an unusable precondition is a failed call, not an empty result).
         if survey.raw_count == 0:
-            errors["liveReadSleepy"] = "matter-server reports no commissioned nodes at all."
-            return (False, valuesDict, errors)
+            self.logger.warning("Matter: matter-server reports no commissioned nodes at all.")
+            return
         if not survey.diags and survey.skipped:
-            errors["liveReadSleepy"] = (
-                f"{len(survey.skipped)} raw node(s) could not be read: {'; '.join(survey.skipped)}")
-            return (False, valuesDict, errors)
+            self.logger.warning(
+                "Matter: %d raw node(s) could not be read: %s",
+                len(survey.skipped), "; ".join(survey.skipped))
+            return
         if not survey.diags:
             self.logger.info("Matter: no Thread devices are commissioned yet.")
-            return (True, valuesDict)
+            return
 
         mesh = thread_mesh.build_mesh(survey.diags)
         for line in thread_mesh.render_report(mesh, survey.diags):
@@ -431,11 +505,9 @@ class DiagnosticsMenuMixin:
             # print everything (the cached values above), then say so — a
             # diagnostic that looks complete when it is not is the failure
             # mode a diagnostic can least afford.
-            errors["liveReadSleepy"] = (
-                f"{len(mesh.unreadable)} node(s) could not be live-read — cached values "
-                f"shown; see the Event Log.")
-            return (False, valuesDict, errors)
-        return (True, valuesDict)
+            self.logger.warning(
+                "Matter: %d node(s) could not be live-read — cached values shown above.",
+                len(mesh.unreadable))
 
     def _thread_node_names(self) -> dict:
         """``node_id -> the single name a human would use for it``, shared by
