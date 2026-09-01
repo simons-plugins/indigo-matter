@@ -546,6 +546,24 @@ class TestRenderReport:
         assert isinstance(lines, list)
         assert any("Flags" in line for line in lines)
 
+    def test_a_page_url_appends_a_visual_map_footer(self):
+        """#339: discoverability — the report links the mesh page when the
+        caller supplies one."""
+        diags = _all_diags()
+        mesh = build_mesh(diags)
+        lines = render_report(mesh, diags, page_url="http://jarvis.local:8176/message/ours/thread/")
+        text = "\n".join(lines)
+        assert "Visual map: http://jarvis.local:8176/message/ours/thread/" in text
+
+    def test_no_page_url_means_no_footer(self):
+        """This module stays pure — it never resolves a URL itself, and a
+        caller with nothing to pass (or the IWS page, which never calls this
+        function at all) must not get a broken "Visual map: None" line."""
+        diags = _all_diags()
+        mesh = build_mesh(diags)
+        assert "Visual map" not in "\n".join(render_report(mesh, diags))
+        assert "Visual map" not in "\n".join(render_report(mesh, diags, page_url=None))
+
 
 # ---------------------------------------------------------------------------
 # Constants sanity

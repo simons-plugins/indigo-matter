@@ -1055,9 +1055,19 @@ def _node_lines(diag: NodeDiag, mesh: Mesh) -> list[str]:
     return lines
 
 
-def render_report(mesh: Mesh, diags: list[NodeDiag]) -> list[str]:
+def render_report(mesh: Mesh, diags: list[NodeDiag], *, page_url: Optional[str] = None) -> list[str]:
     """Event-log lines: header, one block per owned node, foreign routers, then
-    FLAGS, then UNREADABLE. Fixed-width, no colour, kept to <=120 chars/line."""
+    FLAGS, then UNREADABLE, then (#339) an optional footer linking the visual
+    map. Fixed-width, no colour, kept to <=120 chars/line.
+
+    ``page_url`` is passed in rather than resolved here, keeping this module
+    pure (no ``indigo`` import, no I/O — its own module docstring's whole
+    point). The only caller is ``diagnostics_menu_mixin.menuReportThreadMesh``
+    (via ``HttpApiMixin._iws_page_url``); the IWS Thread page never calls this
+    function at all — it renders its own HTML (``thread_page.py``) — so
+    omitting ``page_url`` (``None``, the default) is what every other test of
+    this function already does, and simply omits the footer line.
+    """
     lines = [
         f"Thread mesh: {mesh.network_name or 'unknown'}  "
         f"channel {mesh.channel if mesh.channel is not None else '?'}  "
@@ -1095,5 +1105,9 @@ def render_report(mesh: Mesh, diags: list[NodeDiag]) -> list[str]:
         lines.append("-- Unreadable --")
         for node_id, reason in mesh.unreadable:
             lines.append(f"   0x{node_id:X}: {reason}")
+
+    if page_url:
+        lines.append("")
+        lines.append(f"Visual map: {page_url}  (add ?live=1 for a live refresh)")
 
     return lines

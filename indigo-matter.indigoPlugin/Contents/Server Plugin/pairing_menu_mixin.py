@@ -182,21 +182,15 @@ class PairingMenuMixin:
     def _pairing_page_url(self) -> str:
         """The IWS URL of the QR page (Actions.xml ``pairing``).
 
-        ``getWebServerURL`` picks the reflector, then the Bonjour name, then
-        localhost — so this is reachable from the phone the user is holding
-        whenever a reflector or a ``.local`` name exists, which is the case the
-        page is FOR. A failure falls back to the loopback default rather than
-        omitting the line: a wrong-host URL a user can edit beats no URL.
+        One-line delegate to :meth:`HttpApiMixin._iws_page_url
+        <http_api_mixin.HttpApiMixin._iws_page_url>` (#339), which
+        generalised this method's original resolution logic (reflector, then
+        Bonjour, then localhost) to any hidden-action page. Kept as its own
+        method rather than inlined at every call site: existing callers and
+        tests name it directly, and ``self._iws_page_url("pairing")`` reads
+        one layer further from what those call sites actually mean.
         """
-        base = "http://localhost:8176"
-        try:
-            base = str(indigo.server.getWebServerURL() or base)
-        except Exception as exc:  # pylint: disable=broad-except
-            # Absorbing: any failure of the Indigo server RPC behind a display-only
-            # URL. Safe because a wrong-host URL the user can edit beats no URL at
-            # all, and the pairing codes themselves are unaffected — hence DEBUG.
-            self.logger.debug("could not resolve the Indigo web server URL (%s)", exc)
-        return f"{base}/message/{self._export_plugin_id()}/pairing/"  # pylint: disable=no-member  # ExportDialogMixin
+        return self._iws_page_url("pairing")  # pylint: disable=no-member  # HttpApiMixin
 
     @degrades_to_list_error
     def getBridgeFabrics(self, filter="", valuesDict=None, typeId="", targetId=0):  # noqa: N802, A002
