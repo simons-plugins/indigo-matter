@@ -1466,6 +1466,37 @@ class TestPairingPageUrl:
         assert plug._pairing_page_url().endswith(f"/message/{OURS}/pairing/")
 
 
+class TestIwsPageUrl:
+    """``HttpApiMixin._iws_page_url`` (#339) — the generalisation
+    ``_pairing_page_url`` above now delegates to. Same three shapes, pinned
+    the same way, plus that the ``action_id`` argument actually varies the
+    handler the URL points at (``_pairing_page_url`` only ever asks for one)."""
+
+    def test_it_uses_the_INDIGO_web_server_url_not_localhost(self, plug, plugin_mod):
+        url = plug._iws_page_url("thread")
+        plugin_mod.indigo.server.getWebServerURL.assert_called()
+        assert url.startswith("http://jarvis.local:8176/")
+        assert "localhost" not in url
+
+    def test_a_failure_falls_back_to_loopback_rather_than_no_url(self, plug, plugin_mod):
+        """A wrong-host URL a user can edit beats no URL at all."""
+        plugin_mod.indigo.server.getWebServerURL.side_effect = RuntimeError("no reflector")
+        try:
+            assert plug._iws_page_url("thread").startswith("http://localhost:8176/")
+        finally:
+            plugin_mod.indigo.server.getWebServerURL.side_effect = None
+
+    def test_it_points_at_the_requested_action(self, plug):
+        assert plug._iws_page_url("thread").endswith(f"/message/{OURS}/thread/")
+        assert plug._iws_page_url("pairing").endswith(f"/message/{OURS}/pairing/")
+
+    def test_pairing_page_url_still_delegates_to_it(self, plug):
+        """``_pairing_page_url`` is kept as a one-line delegate (#339) — its
+        own callers/tests name it directly — but it must still resolve to
+        exactly what ``_iws_page_url("pairing")`` would."""
+        assert plug._pairing_page_url() == plug._iws_page_url("pairing")
+
+
 class TestEscaping:
     def test_none_becomes_empty_not_the_word_None(self, plugin_mod):
         """⊗ The reason `_escape` is hand-rolled rather than `html.escape`, named

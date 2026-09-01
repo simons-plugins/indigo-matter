@@ -20,6 +20,7 @@ import asyncio
 import importlib
 import json
 import sys
+import xml.etree.ElementTree as ET
 from concurrent.futures import Future, TimeoutError as FuturesTimeoutError
 from pathlib import Path
 from types import SimpleNamespace
@@ -29,6 +30,7 @@ import pytest
 
 SERVER_PLUGIN = (Path(__file__).parent.parent / "indigo-matter.indigoPlugin"
                  / "Contents" / "Server Plugin")
+MENU_ITEMS_XML = SERVER_PLUGIN / "MenuItems.xml"
 
 THREAD_FIXTURE_PATH = Path(__file__).parent / "fixtures" / "thread_mesh" / "nodes.json"
 THREAD_ROUTER_IDS = {0x27, 0x34, 0x3F}
@@ -66,7 +68,17 @@ class _Future:
 
 @pytest.fixture
 def mixin(mock_indigo_base, mock_logger):
-    """A bare DiagnosticsMenuMixin with the collaborators it reaches for."""
+    """A bare DiagnosticsMenuMixin with the collaborators it reaches for.
+
+    ``_iws_page_url`` is stubbed rather than left to raise: it is defined on
+    ``HttpApiMixin``, not this class, and only ``Plugin`` composes both
+    (issue #146's established cross-mixin pattern — same as ``self._export_plugin_id()``
+    calls elsewhere). Its own resolution logic (``getWebServerURL`` ->
+    reflector/Bonjour/localhost fallback) is pinned against the real,
+    fully-composed ``Plugin`` in ``tests/test_pairing_menu.py::TestIwsPageUrl``
+    instead — that is where ``_pairing_page_url`` (the method this generalises,
+    #339) is already tested the same way.
+    """
     for name in ("settings_report", "diagnostics_menu_mixin"):
         sys.modules.pop(name, None)
     module = importlib.import_module("diagnostics_menu_mixin")
@@ -79,6 +91,8 @@ def mixin(mock_indigo_base, mock_logger):
     obj.device_sync.list_nodes.return_value = [(0x34, ["Grillplats socket"])]
     obj.device_sync.lookup.return_value = 0
     obj.runtime.submit.return_value = _Future(RELAY_NODE)
+    obj._iws_page_url = Mock(  # pylint: disable=protected-access
+        side_effect=lambda action_id: f"http://localhost:8176/message/ours/{action_id}/")
     return module, obj
 
 
@@ -466,6 +480,33 @@ def test_the_report_prints_the_fixtures_health_flags(mixin):
     assert "far_from_leader:" in body
 
 
+def test_the_report_ends_with_the_visual_map_url(mixin):
+    """#339: discoverability — the Event Log report now links the mesh page,
+    since the menu that used to be the only way to see this data no longer
+    shows anything itself. ``_iws_page_url`` itself (the ``getWebServerURL``
+    resolution) is pinned separately against the real, fully-composed
+    ``Plugin`` in ``test_pairing_menu.py::TestIwsPageUrl`` — this only pins
+    that the report asks for the "thread" page and prints what it gets back."""
+    nodes = json.loads(THREAD_FIXTURE_PATH.read_text(encoding="utf-8"))
+    _module, obj = _thread_mesh_mixin(mixin, _ThreadFakeMatter(nodes))
+    ok, _values = obj.menuReportThreadMesh({"liveReadSleepy": False})[:2]
+    assert ok
+    obj._iws_page_url.assert_called_with("thread")  # pylint: disable=protected-access
+    body = _log_body(obj)
+    assert "Visual map: http://localhost:8176/message/ours/thread/" in body
+
+
+def test_no_url_footer_when_page_url_is_none(mixin):
+    """render_report's own contract (#339): omitting page_url omits the
+    footer line entirely, rather than printing a broken "Visual map: None"."""
+    nodes = json.loads(THREAD_FIXTURE_PATH.read_text(encoding="utf-8"))
+    _module, obj = _thread_mesh_mixin(mixin, _ThreadFakeMatter(nodes))
+    obj._iws_page_url = Mock(return_value=None)  # pylint: disable=protected-access
+    ok, _values = obj.menuReportThreadMesh({"liveReadSleepy": False})[:2]
+    assert ok
+    assert "Visual map" not in _log_body(obj)
+
+
 def test_a_timed_out_live_read_is_reported_to_the_event_log_AND_the_node_still_appears_cached(mixin):
     nodes = json.loads(THREAD_FIXTURE_PATH.read_text(encoding="utf-8"))
     matter = _ThreadFakeMatter(nodes, timeout_nodes={0x2E})
@@ -630,6 +671,34 @@ def test_a_done_callback_that_somehow_raises_is_logged_not_lost(mixin, monkeypat
     assert ok
     warn_msgs = [str(c) for c in obj.logger.warning.call_args_list]
     assert any("report failed unexpectedly" in m and "build_mesh exploded" in m for m in warn_msgs)
+
+
+# ---------------------------------------------------------------------------
+# The reportThreadMesh dialog text fits (#339)
+# ---------------------------------------------------------------------------
+
+def test_the_dialog_text_is_never_wider_than_the_dialog():
+    """Field report against v2026.30.0 (2026-09-01): the dialog's intro text
+    rendered wider than the dialog itself. A ``type="label"`` field is
+    documented to span the dialog and wrap ("Label" canonical doc,
+    indigo-claude-plugin), but a checkbox's own ``Label``/``Description`` sit
+    beside the control with no such wrap — so every field here, of either
+    kind, must stay short enough that overflow cannot quietly return.
+    """
+    item = None
+    for candidate in ET.parse(MENU_ITEMS_XML).getroot().findall("MenuItem"):
+        if candidate.get("id") == "reportThreadMesh":
+            item = candidate
+            break
+    assert item is not None, "reportThreadMesh menu item missing"
+    for field in item.find("ConfigUI").findall("Field"):
+        for tag in ("Label", "Description"):
+            text = field.findtext(tag)
+            if text is None:
+                continue
+            assert len(text) <= 90, (
+                f"reportThreadMesh field {field.get('id')!r} <{tag}> is {len(text)} "
+                f"chars — over the 90-char budget that keeps it inside the dialog: {text!r}")
 
 
 # ---------------------------------------------------------------------------

@@ -497,7 +497,8 @@ class DiagnosticsMenuMixin:
             return
 
         mesh = thread_mesh.build_mesh(survey.diags)
-        for line in thread_mesh.render_report(mesh, survey.diags):
+        page_url = self._iws_page_url("thread")  # pylint: disable=no-member  # HttpApiMixin
+        for line in thread_mesh.render_report(mesh, survey.diags, page_url=page_url):
             self.logger.info("%s", line)
 
         if mesh.unreadable:

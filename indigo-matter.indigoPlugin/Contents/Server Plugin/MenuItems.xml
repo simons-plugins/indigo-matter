@@ -171,11 +171,22 @@ A Matter pairing code is not durable: once used, or once the window expires (up 
         <CallbackMethod>menuReportThreadMesh</CallbackMethod>
         <ConfigUI>
             <Field id="threadMeshIntro" type="label">
-                <Label>Logs the Thread mesh to the Event Log: roles, links (RSSI/LQI/frame-error), the leader, foreign routers and health flags, read from matter-server's ThreadNetworkDiagnostics cache. Read-only — nothing is ever written to a device (#334).</Label>
+                <Label>Prints the Thread mesh to the Event Log: roles, links and health flags.</Label>
+            </Field>
+            <Field id="threadMeshReadOnly" type="label">
+                <Label>Read-only — nothing is ever written to any device.</Label>
             </Field>
             <Field id="liveReadSleepy" type="checkbox" defaultValue="true">
-                <Label>Live-read sleepy devices first (slower, accurate):</Label>
-                <Description>matter-server's cache can be hours stale for battery/Thread devices — a cached partition reading has been proven wrong by a live read before. Leave this on unless you specifically want the raw cache.</Description>
+                <Label>Live-read sleepy devices first:</Label>
+            </Field>
+            <Field id="liveReadSleepyHelp" type="label" fontColor="darkgray">
+                <Label>Slower but accurate — the cache can be hours stale for battery devices.</Label>
+            </Field>
+            <Field id="threadMeshFooter" type="label">
+                <Label>The report ends with a link to the visual mesh map page.</Label>
+            </Field>
+            <Field id="threadMeshBackground" type="label">
+                <Label>This dialog closes right away; the report follows in the Event Log.</Label>
             </Field>
         </ConfigUI>
     </MenuItem>

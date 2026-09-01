@@ -254,6 +254,36 @@ class HttpApiMixin:
         }
 
     # ------------------------------------------------------------------
+    # Shared: the IWS URL of one of this plugin's hidden-action pages (#339)
+    # ------------------------------------------------------------------
+    def _iws_page_url(self, action_id: str) -> str:
+        """The IWS URL of a hidden-action page (an ``Actions.xml`` entry with
+        ``uiPath="hidden"`` — e.g. ``"pairing"``, ``"thread"``).
+
+        ``getWebServerURL`` picks the reflector, then the Bonjour name, then
+        localhost — so this is reachable from the phone the user is holding
+        whenever a reflector or a ``.local`` name exists, which is the case a
+        page link is FOR. A failure falls back to the loopback default rather
+        than omitting the line: a wrong-host URL a user can edit beats no URL.
+        The RPC failure itself is DEBUG-absorbed because nothing downstream
+        gates on this — it feeds a display-only URL, never a decision.
+
+        Generalised (#339) from ``PairingMenuMixin._pairing_page_url``, which
+        is now a one-line delegate to this method kept for its own
+        callers/tests — this lives on ``HttpApiMixin`` because that is where
+        every IWS page handler and its ``Actions.xml`` entry actually is.
+        """
+        base = "http://localhost:8176"
+        try:
+            base = str(indigo.server.getWebServerURL() or base)
+        except Exception as exc:  # pylint: disable=broad-except
+            # Absorbing: any failure of the Indigo server RPC behind a display-only
+            # URL. Safe because a wrong-host URL the user can edit beats no URL at
+            # all — hence DEBUG.
+            self.logger.debug("could not resolve the Indigo web server URL (%s)", exc)
+        return f"{base}/message/{self._export_plugin_id()}/{action_id}/"  # pylint: disable=no-member  # ExportDialogMixin
+
+    # ------------------------------------------------------------------
     # The QR page (IWS hidden action — PRD §6 "display mechanism")
     # ------------------------------------------------------------------
     def http_pairing(self, action, dev=None, caller_waiting_for_result=None):  # noqa: N802, ARG002

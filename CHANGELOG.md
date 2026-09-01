@@ -3,6 +3,27 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
+## 2026.30.1 — Report Thread mesh… runs in the background; dialog text fits (#339)
+
+Field report against v2026.30.0: the "Report Thread mesh…" dialog's intro
+text rendered wider than the dialog, and with live-read on, the survey (up
+to ~50 s) timed out inside the dialog itself.
+
+- **Backgrounded**: the menu now submits the survey to the async runtime and
+  closes immediately — "the report will follow in the Event Log within about
+  a minute." Every failure that used to come back as a dialog error (a
+  timeout, matter-server unreachable, an unaddressable fabric, a partial
+  live-read failure) now logs to the Event Log instead, keeping its exact
+  former wording; only the destination changed, because the dialog is
+  already closed by the time any of them could fire.
+- **Dialog text fits**: the intro, checkbox label/help and footer were
+  rewritten as short, separate `label` fields (which wrap) instead of long
+  text crammed beside the checkbox (which does not).
+- **Discoverable**: the report now ends with a link to the visual Thread mesh
+  map page. `_pairing_page_url`'s URL-resolution logic was generalised into a
+  shared `HttpApiMixin._iws_page_url(action_id)` so both the pairing QR page
+  and this report can build a page URL the same way.
+
 ## 2026.30.0 — Thread mesh diagnostics: states, a report, and a read-only map (#334)
 
 Thread devices commissioned through Indigo/Domio are invisible to Apple's own
