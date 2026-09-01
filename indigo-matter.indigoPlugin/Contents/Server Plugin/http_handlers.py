@@ -88,7 +88,12 @@ class HttpApi:
             result = self._decommission(node_id)
         except MatterUnavailable as exc:
             return 503, {"error": "matter_server_unreachable", "message": str(exc)}
-        except Exception as exc:
+        except Exception as exc:  # pylint: disable=broad-except
+            # Absorbing: any decommission failure the providers did not classify. The
+            # bottom rung of a deliberate ladder — 405 method, 400 bad nodeId, 503
+            # MatterUnavailable, 404 unknown node all sit above it — so this is the
+            # 500 case, not a collapse. An escape would blow the IWS action callback
+            # and give the HTTP caller nothing at all.
             self.logger.exception(exc)
             return 500, {"error": "internal_error", "message": str(exc)}
         if result is None:
@@ -111,7 +116,12 @@ class HttpApi:
             result = self._diagnostics(node_id)
         except MatterUnavailable as exc:
             return 503, {"error": "matter_server_unreachable", "message": str(exc)}
-        except Exception as exc:
+        except Exception as exc:  # pylint: disable=broad-except
+            # Absorbing: any diagnostics failure the providers did not classify. The
+            # bottom rung of a deliberate ladder — 405 method, 400 bad nodeId, 503
+            # MatterUnavailable, 404 unknown node all sit above it — so this is the
+            # 500 case, not a collapse. An escape would blow the IWS action callback
+            # and give the HTTP caller nothing at all.
             self.logger.exception(exc)
             return 500, {"error": "internal_error", "message": str(exc)}
         if result is None:

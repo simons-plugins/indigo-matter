@@ -139,7 +139,13 @@ class HttpApiMixin:
         fabric_already_absent = False
         try:
             await self.matter.remove_node(node_id)
-        except Exception as exc:
+        except Exception as exc:  # pylint: disable=broad-except
+            # Absorbing: deliberately every error type, so is_node_not_exists can
+            # inspect it — the discrimination happens INSIDE, not in the except
+            # clause. 'Already absent' completes the decommission (#111/#182);
+            # anything else degrades to fabricRemoved:false with the node kept for
+            # retry. An escape would abandon the Indigo-side bookkeeping this
+            # endpoint owes either way.
             if is_node_not_exists(exc):
                 fabric_already_absent = True
                 # matter-server has no such node, so there is no fabric entry left to
@@ -252,7 +258,12 @@ class HttpApiMixin:
                                        "Export at least one device, then reload this page.")
         try:
             pairing = self.runtime.submit(client.get_pairing()).result(timeout=PAIRING_READ_TIMEOUT)
-        except Exception as exc:
+        except Exception as exc:  # pylint: disable=broad-except
+            # Absorbing: any failure reading pairing state — timeout, dead runtime,
+            # protocol error. Safe because this handler returns HTML to a human at a
+            # browser: the failure becomes a readable error page carrying the reason,
+            # which is the contract its test names — a failed get_pairing becomes a
+            # page, not a 500.
             self.logger.exception(exc)
             return _pairing_html(None, f"Could not read the bridge node's pairing state: {exc}")
         if not pairing.manual_pairing_code:

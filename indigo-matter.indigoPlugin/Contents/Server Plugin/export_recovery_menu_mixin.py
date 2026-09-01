@@ -180,7 +180,12 @@ class ExportRecoveryMenuMixin:
             len(self.exports) if self.exports is not None else 0)
         try:
             status = self.runtime.submit(client.rebuild_endpoint_map()).result(timeout=deadline)
-        except Exception as exc:
+        except Exception as exc:  # pylint: disable=broad-except
+            # Absorbing: any failure of the rebuild round trip (node error,
+            # timeout, transport). Safe because all of them mean the same thing:
+            # the persisted map is unchanged and the node's refusal still stands,
+            # which is exactly what the ERROR and errorsDict say. Never report
+            # success over a rebuild that did not reach disk.
             # Never report success over a rebuild that did not persist: the node
             # answers with an error rather than a StatusReport when the new map
             # could not be written, and the refusal is still in force.
@@ -731,7 +736,11 @@ class ExportRecoveryMenuMixin:
             # same ecosystems should not also lose accessory identity. The
             # "the map itself is corrupt" path is the rebuild above.
             self.runtime.submit(client.factory_reset(True)).result(timeout=FACTORY_RESET_TIMEOUT)
-        except Exception as exc:
+        except Exception as exc:  # pylint: disable=broad-except
+            # Absorbing: any failure of the factory_reset round trip. Safe because
+            # the node verifies its own witness file before reporting completion,
+            # so a node-side failure arrives here as an error rather than as a
+            # false success — and the ERROR says pairings are unchanged.
             self.logger.error("Matter bridge: resetting the bridge pairings FAILED — %s. "
                               "Pairings are unchanged.", exc)
             self.logger.exception(exc)

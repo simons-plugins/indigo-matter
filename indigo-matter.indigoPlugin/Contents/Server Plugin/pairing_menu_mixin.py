@@ -95,7 +95,10 @@ class PairingMenuMixin:
             return (False, valuesDict, errors)
         try:
             pairing = self.runtime.submit(client.get_pairing()).result(timeout=PAIRING_READ_TIMEOUT)
-        except Exception as exc:
+        except Exception as exc:  # pylint: disable=broad-except
+            # Absorbing: any failure of the get_pairing round trip. Safe because
+            # the refusal is explicit ('No pairing window was opened') and nothing
+            # was changed; an escape would be a raw Indigo traceback dialog.
             self.logger.error("Matter bridge: could not read the bridge node's pairing state — %s. "
                               "No pairing window was opened.", exc)
             self.logger.exception(exc)
@@ -114,7 +117,11 @@ class PairingMenuMixin:
         try:
             window = self.runtime.submit(
                 client.open_commissioning_window(duration)).result(timeout=WINDOW_OPEN_TIMEOUT)
-        except Exception as exc:
+        except Exception as exc:  # pylint: disable=broad-except
+            # Absorbing: any failure of open_commissioning_window. Safe because the
+            # handler never reports success over a window that did not open — the
+            # user would otherwise stand in front of the Home app waiting for a
+            # code that does not exist. §3.8's assertClosed refusal arrives here.
             self.logger.error(
                 "Matter bridge: opening a pairing window FAILED — %s. Nothing was changed and "
                 "existing pairings are untouched. If the bridge says a window is already open, "
@@ -184,7 +191,10 @@ class PairingMenuMixin:
         base = "http://localhost:8176"
         try:
             base = str(indigo.server.getWebServerURL() or base)
-        except Exception as exc:
+        except Exception as exc:  # pylint: disable=broad-except
+            # Absorbing: any failure of the Indigo server RPC behind a display-only
+            # URL. Safe because a wrong-host URL the user can edit beats no URL at
+            # all, and the pairing codes themselves are unaffected — hence DEBUG.
             self.logger.debug("could not resolve the Indigo web server URL (%s)", exc)
         return f"{base}/message/{self._export_plugin_id()}/pairing/"  # pylint: disable=no-member  # ExportDialogMixin
 
@@ -252,7 +262,12 @@ class PairingMenuMixin:
         try:
             removal = self.runtime.submit(
                 client.remove_fabric(fabric_index)).result(timeout=UNPAIR_TIMEOUT)
-        except Exception as exc:
+        except Exception as exc:  # pylint: disable=broad-except
+            # Absorbing: any failure of the remove_fabric round trip — transport,
+            # timeout, protocol all mean the same thing: the node did not answer.
+            # Safe because a destructive action refusing loudly with 'pairings are
+            # unchanged' is the only honest report, and an escape would be a raw
+            # traceback dialog.
             self.logger.error("Matter bridge: unpairing ecosystem %s FAILED — %s. Pairings are "
                               "unchanged.", fabric_index, exc)
             self.logger.exception(exc)
@@ -310,7 +325,11 @@ class PairingMenuMixin:
         try:
             pairing = self.runtime.submit(client.get_pairing()).result(timeout=PAIRING_READ_TIMEOUT)
             bridge.note_fabrics(pairing.fabrics)
-        except Exception as exc:
+        except Exception as exc:  # pylint: disable=broad-except
+            # Absorbing: a failed post-unpair cache refresh. Safe because the
+            # destructive operation already landed; the cache degrades to stale,
+            # which every consumer is documented to tolerate, and reporting this
+            # as a failure would misdescribe an unpair that succeeded.
             # The removal itself already succeeded or was already true; failing
             # to re-read the list afterwards is not worth reporting as a failure.
             self.logger.debug("Matter bridge: could not refresh the ecosystem list (%s)", exc)
@@ -418,7 +437,12 @@ class PairingMenuMixin:
             self.logger.error(
                 "Fabric backup FAILED — no fabric to back up, nothing was written: %s", exc,
             )
-        except Exception as exc:
+        except Exception as exc:  # pylint: disable=broad-except
+            # Absorbing: any create_backup failure beyond the FileNotFoundError
+            # handled above (I/O, zip validation). Safe because C3 guarantees no
+            # partial archive can exist, so 'nothing was written' is true — and a
+            # menuItem callback has no errorsDict channel at all, so an ERROR plus
+            # the traceback is the loudest outcome available.
             self.logger.error("Fabric backup FAILED — nothing was written: %s", exc)
             self.logger.exception(exc)
 
@@ -426,7 +450,16 @@ class PairingMenuMixin:
         """List-callback populating the restore picker (newest first)."""
         try:
             storage_path = self._resolve_storage_path()
-        except Exception as exc:
+        except Exception as exc:  # pylint: disable=broad-except
+            # Absorbing: any failure resolving the backup storage path. KNOWN
+            # SHORTCOMING (#310 audit): this renders a failed lookup identically to
+            # 'you have no backups' — the empty-result-over-failure shape the
+            # workspace degradation-path standard names. The house fix already
+            # exists (`degrades_to_list_error`, used by getBridgeFabrics above and
+            # pinned by test_a_broken_picker_says_so_rather_than_rendering_empty),
+            # and the Tier A refactor deliberately left this callback out because
+            # converting it CHANGES BEHAVIOUR. Recorded here rather than changed:
+            # it belongs in its own commit with a test.
             self.logger.exception(exc)
             return []
         options = []
@@ -507,7 +540,11 @@ class PairingMenuMixin:
                         "drift in the log and renumbers nothing.", preserved,
                         " and the node has been restarted" if result["bridge_started"] else "")
             return (True, valuesDict)
-        except Exception as exc:
+        except Exception as exc:  # pylint: disable=broad-except
+            # Absorbing: any restore_backup failure. Safe because the callee's
+            # contract (PR #30 review, C1/C2) is roll-back-then-reraise, so by the
+            # time this catches, the ORIGINAL fabric is already preserved on disk
+            # and the only remaining job is honest reporting into the errorsDict.
             # restore_backup rolled back and preserved the original fabric (or
             # aborted before touching it). Surface the failure in the UI dialog —
             # never report success when the underlying op failed.

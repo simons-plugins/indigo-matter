@@ -499,7 +499,12 @@ class BridgeClient(WsJsonClient):
             return
         try:
             handler(data)
-        except Exception as exc:  # a bad frame must not kill the loop
+        except Exception as exc:  # pylint: disable=broad-except
+            # Absorbing: anything an event callback raises. The transport's frame
+            # catch would contain it anyway — what this adds is that THIS is the
+            # one place that still knows which event and which payload were in
+            # flight (_deliver's contract says so explicitly), so it trades a
+            # generic 'frame dropped' for an actionable traceback.
             # Name the event and its payload: a bare traceback out of a callback
             # tells you a dict was wrong somewhere, which is not a lead.
             self.logger.exception("bridge node event %s failed on %r: %s", name, data, exc)
@@ -542,7 +547,14 @@ class BridgeClient(WsJsonClient):
             return
         try:
             callback(*args)
-        except Exception as exc:  # callbacks must not kill the run loop
+        except Exception as exc:  # pylint: disable=broad-except
+            # callbacks must not kill the run loop
+            #
+            # Absorbing: a raising handshake-side callback (on_attached,
+            # on_version_skew, on_attach_refused). Load-bearing: these fire from
+            # the handshake path where there is no frame handler to contain them,
+            # so a raising callback would abort the connection and then do it
+            # again on every reconnect.
             self.logger.exception("bridge node callback %r failed: %s",
                                   getattr(callback, "__name__", callback), exc)
 
