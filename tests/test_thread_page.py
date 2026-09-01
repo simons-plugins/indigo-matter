@@ -475,6 +475,11 @@ def test_live_timeout_falls_back_to_cache_and_says_so(plug, monkeypatch):
     assert "showing cached data" in reply["content"]
     assert "GRILLPLATS Plug" in reply["content"]  # real data still rendered
     assert "<svg" in reply["content"]
+    # #334 post-review, B2.7/B3.6: the page path logs the timeout too, same
+    # as the menu's own FuturesTimeoutError branch — "showing cached data" in
+    # the page is not the only place this fact should be recorded.
+    warn_msgs = [str(c) for c in plug.logger.warning.call_args_list]
+    assert any("timed out" in m for m in warn_msgs)
 
 
 def test_live_timeout_then_cache_failure_falls_back_to_the_bare_banner(plug, monkeypatch):
