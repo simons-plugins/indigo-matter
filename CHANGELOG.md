@@ -3,6 +3,48 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
+## 2026.29.11 — one unreadable device no longer empties the migrate picker, and a broken matter-server answer is a 500
+
+**API change (API.md v1.5).** The `diagnostics` endpoint returned 503
+`matter_server_unreachable` for *any* failure reading a node — including
+matter-server answering with a protocol error, or a fault in the plugin. Since
+API.md tells the client to prompt the user to retry on a 503, that sent Domio
+away to try again against a server that was up and answering, over a fault that
+would recur every time. 503 is now reserved for the two conditions that really
+mean "no answer" — the socket being down and the read timing out — and
+everything else surfaces as 500 `internal_error`, which should not be
+auto-retried. `TimeoutError` is named explicitly alongside `ConnectionError`
+because it is a sibling of it under `OSError`, not a subclass; catching only
+`ConnectionError` would have turned every timeout into a 500.
+
+The shortcomings #310's review recorded, now fixed — and writing the test for
+one of them found a defect nobody had recorded.
+
+- **One unreadable device used to empty the whole "Migrate an exported
+  accessory…" target picker.** The per-row guard that exists to stop exactly
+  that read the device's id one line ABOVE its own `try`, so a device being
+  deleted underneath the dialog escaped containment and the picker degraded to
+  a single "(error building list)" row — every legitimate target lost. Its
+  sibling picker reads the id inside the try; these two loops describe
+  themselves as the same rule and had drifted. Found by writing the missing
+  test, not by reading the code.
+- **The restore picker now says when it is broken.** A failed storage-path
+  resolution rendered identically to "you have no backups" — the one answer a
+  user acts on, by concluding there is nothing to restore. It shows the error
+  row instead, and the listing itself is now covered too (its failure used to
+  escape and take the dialog down).
+- **A failed setting whose failure could not be recorded now warns.** The write
+  failure was always reported; what was silent was the follow-up write that
+  keeps the dialog honest. Without it the settings dialog re-seeds from state
+  and shows a value the device never adopted — the divergence that write exists
+  to prevent. A device deleted mid-flight stays quiet, as before.
+
+Three test gaps closed with it: `matter_client`'s raising event handler (its
+`bridge_client` twin has been tested for months), the migrate picker's hostile
+row, and `_previous_accessory_number`'s guarantee that a malformed status
+report cannot fail a migrate that has already committed — a pin deleted along
+with the re-adopt suite in #274b, leaving the decision unwatched.
+
 ## 2026.29.10 — every broad exception handler in the plugin has now been read
 
 No user-visible change, and the end of issue #310's triage. The last 40 broad

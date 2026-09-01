@@ -1564,16 +1564,20 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
             if actual is not None:
                 self.device_sync.apply_states(
                     dev_id, [{"key": plan.setting.key, "value": actual}])
+        except KeyError:
+            # The device was deleted between the dialog closing and this
+            # running on the loop — routine, and there is nothing left to
+            # flag or to keep honest.
+            self.logger.debug("could not flag failed setting: device %s is gone", dev_id)
         except Exception as exc:  # pylint: disable=broad-except
-            # Absorbing: the device being gone (routine — the dialog closed seconds ago
-            # and this runs later on the loop) AND a failed errorState/apply_states
-            # write on a device that still exists. Those are not the same thing, and
-            # the second silently defeats what the comment above promises: the dialog
-            # re-seeds from state, so without the honest value it shows a setting the
-            # device never adopted. Flagged in the #310 audit as the file's one real
-            # narrow candidate; left as-is here because narrowing it is a behaviour
-            # change and belongs in its own commit with a test.
-            self.logger.debug("could not flag failed setting on device %s: %s", dev_id, exc)
+            # NOT gone: the device exists and the flag/state write failed, so
+            # the dialog will re-seed from state and show a setting the device
+            # never adopted — the exact divergence the comment above says this
+            # write exists to prevent. The write failure was already reported
+            # to the user at ERROR; this says the record of it did not stick.
+            self.logger.warning(
+                "the setting failure on device %s could not be recorded (%s) — the device's "
+                "settings dialog may show a value the device never adopted", dev_id, exc)
 
     def deviceStartComm(self, dev):  # noqa: N802
         # Indigo builds a device's state list at creation and does NOT re-read

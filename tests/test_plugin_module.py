@@ -1819,6 +1819,46 @@ def test_a_lying_device_leaves_the_state_alone_and_flags_the_device(plugin_cls, 
         5, [{"key": "holdTime", "value": 10}])
 
 
+def test_a_failed_flag_on_a_LIVE_device_warns_rather_than_going_quiet(
+        plugin_cls, mock_indigo_base, mock_logger):
+    """The write failure is already reported at ERROR; this is about the RECORD
+    of it not sticking.
+
+    The dialog re-seeds from state, so if the honest read-back value cannot be
+    written the user is shown a setting the device never adopted — the exact
+    divergence the write exists to prevent. That must not be a debug line
+    indistinguishable from 'the device was deleted' (issue #310).
+    """
+    from unittest.mock import MagicMock
+    dev = _fp300_dev()
+    dev.setErrorStateOnServer = MagicMock(side_effect=RuntimeError("server not answering"))
+    mock_indigo_base.devices = {5: dev}
+    stub = _settings_stub(plugin_cls, mock_logger, matter=MagicMock())
+    stub.matter.write = _async_none
+    stub.matter.read = _async_value(10)          # ACKed the write, kept the old value
+    _run_apply(plugin_cls, stub, _hold_time_plan())
+
+    assert any("may show a value the device never adopted" in str(call.args)
+               for call in mock_logger.warning.call_args_list), \
+        "a failed record of a failed setting must say what the user will now see"
+
+
+def test_a_device_deleted_mid_flight_is_not_warned_about(
+        plugin_cls, mock_indigo_base, mock_logger):
+    """The other half. _apply_setting runs on the loop seconds after the dialog
+    closed, so the user deleting the device in between is routine — there is
+    nothing left to flag and nothing to keep honest."""
+    from unittest.mock import MagicMock
+    mock_indigo_base.devices = {}                # a real dict: a real KeyError
+    stub = _settings_stub(plugin_cls, mock_logger, matter=MagicMock())
+    stub.matter.write = _async_none
+    stub.matter.read = _async_value(10)
+    _run_apply(plugin_cls, stub, _hold_time_plan())
+
+    assert not any("may show a value the device never adopted" in str(call.args)
+                   for call in mock_logger.warning.call_args_list)
+
+
 def test_a_crash_in_the_write_path_never_kills_the_loop(plugin_cls, mock_indigo_base,
                                                         mock_logger, monkeypatch):
     import functools
@@ -2418,3 +2458,66 @@ def test_the_two_read_failures_are_not_treated_the_same(plugin_cls, mock_indigo_
     mock_indigo_base.devices = _UnreadableDevices()
     plugin_cls._prime_absent_node_energy_state(unreadable, SimpleNamespace(id=42))
     unreadable.device_sync.apply_states.assert_not_called()
+
+
+# ----------------------------------------------------------------------
+# diagnostics: 503 means "no answer", not "any failure" (issue #310)
+# ----------------------------------------------------------------------
+
+def _diagnostics_stub(mock_logger, get_node):
+    from types import SimpleNamespace
+    return SimpleNamespace(matter=SimpleNamespace(get_node=get_node), logger=mock_logger)
+
+
+def _run_diagnostics(plugin_cls, stub, node_id=42):
+    import asyncio
+    return asyncio.run(plugin_cls._diagnostics(stub, node_id))
+
+
+def test_a_dead_socket_is_still_unreachable(plugin_cls, mock_logger):
+    """503 is right here: the server did not answer, and API.md tells the
+    client to prompt a retry — which will work once the socket is back."""
+    from http_api_mixin import MatterUnavailable
+
+    async def dead(_node_id):
+        raise ConnectionError("matter-server not connected")
+
+    with pytest.raises(MatterUnavailable):
+        _run_diagnostics(plugin_cls, _diagnostics_stub(mock_logger, dead))
+
+
+def test_a_timed_out_read_is_still_unreachable(plugin_cls, mock_logger):
+    """And the one a narrower catch would have broken. TimeoutError is a
+    SIBLING of ConnectionError under OSError, not a subclass, so catching
+    ConnectionError alone would silently turn every timeout into a 500."""
+    from http_api_mixin import MatterUnavailable
+
+    async def slow(_node_id):
+        raise TimeoutError("no response in 10s")
+
+    with pytest.raises(MatterUnavailable):
+        _run_diagnostics(plugin_cls, _diagnostics_stub(mock_logger, slow))
+
+
+def test_a_protocol_error_is_NOT_reported_as_unreachable(plugin_cls, mock_logger):
+    """The change (#310). matter-server answered — it just answered with an
+    error — so telling the client to retry sent it back against a server that
+    was up, over a fault that would recur every attempt. It now propagates to
+    the handler's 500, which API.md says not to auto-retry."""
+    import protocol
+    from http_api_mixin import MatterUnavailable
+
+    async def refused(_node_id):
+        raise protocol.ProtocolError(7, "unsupported")
+
+    with pytest.raises(protocol.ProtocolError):
+        _run_diagnostics(plugin_cls, _diagnostics_stub(mock_logger, refused))
+
+    # ...and specifically NOT as the unreachable exception, which is the whole
+    # point: MatterUnavailable is what the handler turns into a 503.
+    try:
+        _run_diagnostics(plugin_cls, _diagnostics_stub(mock_logger, refused))
+    except MatterUnavailable:  # pragma: no cover - only on regression
+        raise AssertionError("a protocol error must not be reported as unreachable")
+    except protocol.ProtocolError:
+        pass

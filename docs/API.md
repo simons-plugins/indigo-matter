@@ -1,7 +1,7 @@
 # Matter API Contract — Domio ↔ Indigo Plugin
 
 **Status:** Authoritative for v1
-**Version:** 1.4
+**Version:** 1.5
 **Last updated:** 2026-08-09
 
 This document is the single source of truth for the HTTP API between Domio (iOS) and the `indigo-matter` plugin running on the Indigo Server. Both Domio and the plugin implementations MUST conform to this spec. Any change requires a co-ordinated update on both sides — treat as a versioned interface, not an implementation detail.
@@ -380,6 +380,20 @@ Diagnostic snapshot for a single device. `nodeId` is the trailing path component
 
 For Thread devices, `network.type` is `"thread"` with fields `routerId`, `linkQualityIn`, `linkQualityOut`, `borderRouter`.
 
+**Response 404:** the node is genuinely unknown to matter-server.
+
+**Response 503 `matter_server_unreachable`** (v1.5): the socket to matter-server
+is down, or the read timed out. These are the only two conditions that produce
+a 503 here — both mean "the server did not answer", so Domio's retry prompt is
+the right response.
+
+**Response 500 `internal_error`** (v1.5): matter-server answered but the answer
+could not be used — a protocol error, or a fault in the plugin. Previously
+these were also reported as 503, which sent Domio away to retry against a
+server that was up and answering, over a fault that would recur on every
+attempt. **A 500 here should not be retried automatically**; the plugin's event
+log names the cause.
+
 ## 4. Polling Semantics
 
 - Domio SHOULD poll at 1s intervals during active commissioning.
@@ -413,6 +427,14 @@ case where a job's fields change after going terminal *while it stays* `failed`
   device (ADR-0008), nullable for the same reasons `primaryDeviceId` is (see the
   nullability paragraph below the sample). Additive, no version bump per §7's own
   rule for new optional fields.
+
+Changes from v1.4 (v1.5, one behaviour change, no transport change):
+
+- §3.5: `diagnostics` now returns **500 `internal_error`** where it used to
+  return 503 for a matter-server protocol error or a plugin fault. 503 is
+  reserved for the two conditions that genuinely mean "no answer" — the socket
+  being down, and the read timing out. Domio should keep prompting a retry on
+  503 and should NOT auto-retry a 500.
 
 Changes from v1.2 (v1.3, all clarifications/additive, no transport change):
 
