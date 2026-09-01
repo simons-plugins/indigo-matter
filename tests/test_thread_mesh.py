@@ -146,14 +146,20 @@ class TestRealFacts:
         owned_router_ids = {d.router_id for d in diags if d.router_id is not None}
         assert 49 not in owned_router_ids
 
-    def test_0x38_parent_is_foreign_router_62(self):
-        diag = _parse_fixture(0x38)
-        parent = diag.parent
+    def test_0x38_parent_is_router_62_which_is_owned_node_0x34(self):
+        # Follow-up correction: the self-entry rule is role-gated and requires
+        # LinkEstablished == False, which resolves 0x34 to router 62 (0xF800) —
+        # so 0x38's parent is NOT foreign after all, it is 0x34 itself.
+        diag_38 = _parse_fixture(0x38)
+        diag_34 = _parse_fixture(0x34)
+        parent = diag_38.parent
         assert parent is not None
         assert parent.router_id == 62
-        diags = _all_diags()
-        owned_router_ids = {d.router_id for d in diags if d.router_id is not None}
-        assert 62 not in owned_router_ids
+        assert diag_34.router_id == 62
+        mesh = build_mesh(_all_diags())
+        link = next(link for link in mesh.links if link.a == "node:0x38")
+        assert link.kind == "parent"
+        assert link.b == "node:0x34"
 
     def test_0x40_is_a_reed(self):
         diag = _parse_fixture(0x40)
@@ -161,15 +167,45 @@ class TestRealFacts:
         assert diag.is_router is False
         assert diag.router_id is None
 
-    def test_self_entry_ambiguity_is_reported_not_guessed(self):
-        # 0x34's RouteTable has two rows shaped like a self-entry (its own, and a
-        # directly-linked neighbour router recorded the same way) — genuinely
-        # ambiguous in the real data. We must not silently pick one: a wrong guess
-        # would collide with 0x3F's real router_id 23 in build_mesh.
+    def test_0x34_self_entry_resolves_to_router_62(self):
+        # Follow-up correction: verified against the fixture that a node is never
+        # its own radio neighbour, so the self-entry is the NextHop==63/PathCost==0/
+        # Allocated row with LinkEstablished == False — 0x34's other candidate
+        # (0x5C00 / router 23) is its neighbour 0x3F, which has LinkEstablished True.
         diag = _parse_fixture(0x34)
         assert diag.role_name == "Router"
+        assert diag.router_id == 62
+        assert diag.rloc16 == 0xF800
+        assert diag.parse_warnings == []
+
+    def test_synthetic_self_entry_still_genuinely_ambiguous_returns_none(self):
+        # A Router role with two RouteTable rows that BOTH satisfy the full
+        # self-entry shape (including LinkEstablished == False) and disagree on
+        # router id — a node cannot be two routers at once, so this must degrade
+        # to None with a recorded warning rather than pick one arbitrarily.
+        attrs = {
+            "0/53/1": 5,  # Router
+            "0/53/8": [
+                {"0": 1, "1": 1024, "2": 1, "3": 63, "4": 0, "5": 0, "6": 0, "7": 0,
+                 "8": True, "9": False},
+                {"0": 2, "1": 2048, "2": 2, "3": 63, "4": 0, "5": 0, "6": 0, "7": 0,
+                 "8": True, "9": False},
+            ],
+        }
+        diag = parse_node_diag(99, "ambiguous router", True, attrs)
+        assert diag is not None
         assert diag.router_id is None
         assert diag.rloc16 is None
+        assert any("self-entry ambiguous" in warning for warning in diag.parse_warnings)
+
+    def test_reed_route_row_shaped_like_a_self_entry_is_not_mistaken_for_one(self):
+        # 0x40 (REED, role 4) has a RouteTable row (router 23, NextHop 63, PathCost
+        # 0, Allocated, LinkEstablished False) that is shaped exactly like a
+        # self-entry but describes 0x3F, not itself — the role gate is why REED
+        # never gets a router_id at all, regardless of what its routes contain.
+        diag = _parse_fixture(0x40)
+        assert diag.role_name == "Reed"
+        assert diag.router_id is None
 
     def test_stale_cached_partitions_are_disagreements_not_a_split(self):
         diags = _all_diags()
@@ -195,10 +231,35 @@ class TestHealthFlags:
         assert ("single_neighbour", "warn") in codes
 
     def test_0x2e_weak_link_bad_and_unstable_parent(self):
+        # weak_link judges the WORSE of avg/last (0x2E: avg -21, last -95) and
+        # names which one tripped it — here last_rssi, per the coordinator's
+        # follow-up. Neighbour.rssi (display) stays last-preferred separately.
         diag = _parse_fixture(0x2E)
-        codes = {(f.code, f.severity) for f in health_flags(diag)}
+        flags = health_flags(diag)
+        codes = {(f.code, f.severity) for f in flags}
         assert ("weak_link", "bad") in codes
         assert ("unstable_parent", "warn") in codes
+        weak_link = next(f for f in flags if f.code == "weak_link")
+        assert "-95" in weak_link.message
+        assert "lastRssi" in weak_link.message
+
+    def test_weak_link_names_avg_when_avg_is_the_worse_reading(self):
+        # Synthetic: avg worse than last — the flag must name "avgRssi", proving
+        # the check picks the worse field rather than always preferring last.
+        attrs = {
+            "0/53/1": 2,  # SleepyEndDevice
+            "0/53/7": [{
+                "0": 1, "1": 1, "2": 4096, "3": 1, "4": 1, "5": 1,
+                "6": -95, "7": -21, "8": 0, "9": 0, "10": True, "11": True, "13": False,
+            }],
+        }
+        diag = parse_node_diag(50, "synthetic sed", True, attrs)
+        assert diag is not None
+        flags = health_flags(diag)
+        weak_link = next(f for f in flags if f.code == "weak_link")
+        assert weak_link.severity == "bad"
+        assert "-95" in weak_link.message
+        assert "avgRssi" in weak_link.message
 
     def test_0x27_far_from_leader(self):
         diag = _parse_fixture(0x27)
@@ -284,6 +345,28 @@ class TestBuildMesh:
         # are both peer routers (is_child False), so there is nothing to spawn.
         mesh = build_mesh(_all_diags())
         assert not any(link.kind == "child" and link.b == "node:0x27" for link in mesh.links)
+
+    def test_foreign_routers_are_exactly_12_14_49(self):
+        # Follow-up correction: router 62 is owned (node:0x34), so it is no longer
+        # in the foreign set — only 12 (0x3000), 14 (leader, 0x3800) and 49
+        # (0xC400) remain foreign anywhere in the fixture.
+        mesh = build_mesh(_all_diags())
+        foreign_ids = {n.router_id for n in mesh.nodes if n.foreign}
+        assert foreign_ids == {12, 14, 49}
+        foreign_by_id = {n.router_id: n for n in mesh.nodes if n.foreign}
+        assert foreign_by_id[14].rloc16 == 0x3800
+        assert foreign_by_id[14].is_leader is True
+        assert foreign_by_id[12].rloc16 == 0x3000
+        assert foreign_by_id[49].rloc16 == 0xC400
+
+    def test_0x3f_neighbour_router_62_links_to_owned_node_0x34(self):
+        mesh = build_mesh(_all_diags())
+        link = next(
+            link for link in mesh.links
+            if link.kind == "router" and link.a == "node:0x3F" and link.b == "node:0x34"
+        )
+        assert link.avg_rssi == -77
+        assert link.frame_error_pct == 58
 
     def test_flags_aggregate_across_all_nodes(self):
         mesh = build_mesh(_all_diags())

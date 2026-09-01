@@ -30,16 +30,28 @@ nodes):
    ``stale`` note for any cached sleepy-device reading — never a conclusion.
 
 Two more things worth stating because they are not obvious from re-reading the code
-later: a router's own self-entry in its RouteTable is identified as the row with
-``NextHop == INVALID_ROUTER_ID and PathCost == 0 and Allocated`` — but real data
-(0x34 in the fixture) can have *two* rows matching that shape (its own entry and a
-directly-linked neighbour router recorded with the same shape); when more than one
-distinct router id matches, :attr:`NodeDiag.router_id` returns ``None`` rather than
-guess, because a wrong guess would silently merge two different routers under one
-key in :func:`build_mesh`. And the "representative" RSSI used for health checks
-(:attr:`Neighbour.rssi`) prefers ``LastRssi`` over the smoothed ``AverageRssi``: a
-real parent link in the fixture averages -21 dBm but last read -95 dBm, and it is the
--95 an operator needs surfaced, not the average that hides it.
+later. First, a router's own self-entry in its RouteTable is the row with
+``NextHop == INVALID_ROUTER_ID and PathCost == 0 and Allocated and not LinkEstablished``
+— a node is never its own radio neighbour, so its self-entry is the one candidate
+*without* an established link, and this only makes sense for a Router/Leader (role
+gate): a REED's RouteTable can otherwise contain a row shaped exactly like a
+self-entry that actually describes a neighbouring router. 0x34 in the fixture has
+two rows shaped like ``NextHop==63, PathCost==0, Allocated`` before that last
+condition — its own entry (router 62, LinkEstablished False) and its neighbour 0x3F's
+entry (router 23, LinkEstablished True) — and only the LinkEstablished check tells
+them apart. :attr:`NodeDiag.router_id` still returns ``None`` (with a note in
+``parse_warnings``) on the — now theoretical — case where more than one candidate
+remains even after both the role gate and the link check, because a wrong guess would
+silently merge two different routers under one key in :func:`build_mesh`.
+
+Second, the "representative" RSSI used for the ``weak_link`` health check is the
+WORSE of AverageRssi and LastRssi (either may be null), and the flag message names
+which one tripped it — a real parent link in the fixture averages -21 dBm but last
+read -95 dBm, and a check that only looked at one of the two could miss it depending
+on which. :attr:`Neighbour.rssi`, used for *display* (``summary_states``'
+``threadLinkRssi``), stays LastRssi-preferred: the most recent reading is what an
+operator watching the state wants, whereas the health check's job is to catch
+whichever reading is worse.
 """
 from __future__ import annotations
 
@@ -200,7 +212,17 @@ class Route:
 
     @property
     def is_self(self) -> bool:
-        return self.next_hop == INVALID_ROUTER_ID and self.path_cost == 0 and self.allocated
+        """Shaped like the reader's own RouteTable entry: no next hop needed, no
+        path cost, allocated — AND not an established link, because a node is
+        never its own radio neighbour. That last condition is what disambiguates
+        it from a directly-linked neighbour router recorded with the same shape
+        (verified against 0x34 in the fixture; see the module docstring)."""
+        return (
+            self.next_hop == INVALID_ROUTER_ID
+            and self.path_cost == 0
+            and self.allocated
+            and not self.link_established
+        )
 
     @property
     def reachable(self) -> bool:
@@ -291,16 +313,19 @@ class NodeDiag:
     def router_id(self) -> Optional[int]:
         """This node's own router id, from its RouteTable self-entry.
 
-        Only meaningful for a Router/Leader — a SED/ED/REED has no self-entry.
-        Real data can have more than one row shaped like a self-entry (0x34 in the
-        fixture: its own row, and a directly-linked neighbour router recorded the
-        same way) — when the candidates disagree, this returns ``None`` rather than
-        guess, because a wrong guess would merge two different routers under one
-        key in :func:`build_mesh`.
+        Only meaningful for a Router/Leader — a SED/ED/REED has no self-entry, and
+        (verified against 0x40 in the fixture, a REED) its RouteTable can otherwise
+        contain a row shaped exactly like one, describing a NEIGHBOUR router, not
+        itself — hence the role gate. ``Route.is_self`` already requires
+        ``not link_established`` (a node is never its own radio neighbour), which
+        resolves the one genuine ambiguity seen live (0x34: two rows matched before
+        that condition, one of them its own). If candidates still disagree after
+        both, this returns ``None`` rather than guess, because a wrong guess would
+        merge two different routers under one key in :func:`build_mesh`.
         """
         if not self.is_router:
             return None
-        candidates = {route.router_id for route in self.routes if route.is_self}
+        candidates = _self_entry_router_ids(self.routes)
         return candidates.pop() if len(candidates) == 1 else None
 
     @property
@@ -340,6 +365,13 @@ def _path_cost_to_leader(diag: NodeDiag) -> Optional[int]:
     return None
 
 
+def _self_entry_router_ids(routes: list[Route]) -> set[int]:
+    """Router ids whose RouteTable row is shaped like a self-entry
+    (:attr:`Route.is_self`). Shared between :attr:`NodeDiag.router_id` and
+    :func:`parse_node_diag`'s ambiguity warning so the two never disagree."""
+    return {route.router_id for route in routes if route.is_self}
+
+
 def parse_node_diag(node_id: int, name: str, available: bool, attributes: Mapping) -> Optional[NodeDiag]:
     """Parse one node's ThreadNetworkDiagnostics attributes into a :class:`NodeDiag`.
 
@@ -366,6 +398,14 @@ def parse_node_diag(node_id: int, name: str, available: bool, attributes: Mappin
                 value = _opt_int(_attr(attributes, attr_id))
                 if value is not None:
                     counters[counter_name] = value
+
+    if role in (ROLE_ROUTER, ROLE_LEADER):
+        self_candidates = _self_entry_router_ids(routes)
+        if len(self_candidates) > 1:
+            warnings.append(
+                f"self-entry ambiguous: router ids {sorted(self_candidates)} all match "
+                "NextHop=invalid/PathCost=0/Allocated/LinkEstablished=False"
+            )
 
     return NodeDiag(
         node_id=int(node_id),
@@ -399,6 +439,34 @@ def _mesh_key(diag: NodeDiag) -> str:
     return f"node:0x{diag.node_id:X}"
 
 
+def _worst_reading(neighbour: Neighbour) -> tuple[Optional[int], Optional[str]]:
+    """The worse (more negative, i.e. weaker) of a neighbour's AverageRssi and
+    LastRssi, and which field it came from — used only by the ``weak_link`` health
+    check, which needs to catch whichever of the two readings is bad. Either may be
+    null; both null returns ``(None, None)``. See the module docstring: this is
+    deliberately NOT the same convention as :attr:`Neighbour.rssi` (display)."""
+    avg, last = neighbour.avg_rssi, neighbour.last_rssi
+    if avg is None and last is None:
+        return None, None
+    if avg is None:
+        return last, "last"
+    if last is None:
+        return avg, "avg"
+    return (last, "last") if last <= avg else (avg, "avg")
+
+
+def _worst_link_reading(diag: NodeDiag) -> tuple[Optional[int], Optional[str]]:
+    """The rssi (and which field) the ``weak_link`` check should judge: the best
+    neighbour's worst reading for a router (any one decent link is fine), the
+    parent's worst reading for a non-router."""
+    if diag.is_router:
+        readings = [_worst_reading(n) for n in diag.neighbours]
+        readings = [r for r in readings if r[0] is not None]
+        return max(readings, key=lambda r: r[0]) if readings else (None, None)
+    parent = diag.parent
+    return _worst_reading(parent) if parent is not None else (None, None)
+
+
 def health_flags(diag: NodeDiag) -> list[HealthFlag]:  # pylint: disable=too-many-branches
     """Derive health flags for one node. Never raises: every check degrades to
     "no data, no flag" rather than assuming the worst or the best."""
@@ -411,12 +479,13 @@ def health_flags(diag: NodeDiag) -> list[HealthFlag]:  # pylint: disable=too-man
             f"{diag.name}: detached (role={diag.role_name}, available={diag.available})",
         ))
 
-    rssi = diag.best_rssi if diag.is_router else (diag.parent.rssi if diag.parent else None)
+    rssi, which = _worst_link_reading(diag)
     if rssi is not None:
+        label = f"{which}Rssi" if which else "rssi"
         if rssi < RSSI_BAD:
-            flags.append(HealthFlag(key, "bad", "weak_link", f"{diag.name}: link at {rssi} dBm"))
+            flags.append(HealthFlag(key, "bad", "weak_link", f"{diag.name}: link at {rssi} dBm ({label})"))
         elif rssi < RSSI_WEAK:
-            flags.append(HealthFlag(key, "warn", "weak_link", f"{diag.name}: link at {rssi} dBm"))
+            flags.append(HealthFlag(key, "warn", "weak_link", f"{diag.name}: link at {rssi} dBm ({label})"))
 
     for neighbour in diag.neighbours:
         if neighbour.frame_error_pct > FRAME_ERROR_HIGH:
