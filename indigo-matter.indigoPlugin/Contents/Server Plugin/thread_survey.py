@@ -36,6 +36,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 from concurrent.futures import TimeoutError as FuturesTimeoutError
+from datetime import datetime, timezone
 from typing import Any, Mapping, Optional
 
 from matter_client import ATTRIBUTE_TIMEOUT
@@ -66,6 +67,35 @@ __all__ = ["Survey", "survey_thread_nodes", "run_survey"]
 _LIVE_ATTR_IDS = (ATTR_ROUTING_ROLE, ATTR_NEIGHBOR_TABLE, ATTR_ROUTE_TABLE, ATTR_PARTITION_ID, ATTR_LEADER_ROUTER_ID)
 
 
+def _parse_timestamp(value: Any) -> Optional[datetime]:
+    """Best-effort parse of matter-server's ``date_commissioned``/
+    ``last_interview`` raw-node fields (#344): a ``datetime`` passes through
+    (naive assumed UTC), an ISO-8601 ``str`` is parsed tolerating a trailing
+    "Z" and no timezone (assumed UTC), an ``int``/``float`` is epoch seconds.
+    Anything else — or a string ``datetime.fromisoformat`` can't make sense
+    of — degrades to ``None``, never raises: the shipped fixture
+    (``tests/fixtures/thread_mesh/nodes.json``) has neither key at all, and
+    absence must be the boring case, not a crash (root workspace CLAUDE.md
+    degradation-path convention)."""
+    if isinstance(value, datetime):
+        return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, str):
+        text = value.strip()
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            return None
+        return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(value, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+    return None
+
+
 @dataclasses.dataclass(frozen=True)
 class Survey:
     """The result of one survey pass (#334 post-review, B2.4).
@@ -94,6 +124,7 @@ async def survey_thread_nodes(  # pylint: disable=too-many-locals
     live_sleepy: bool,
     per_node_timeout: float = ATTRIBUTE_TIMEOUT,
     node_names: Optional[Mapping[int, str]] = None,
+    event_stamps: Optional[Mapping[int, float]] = None,
 ) -> Survey:
     """Parse every Thread node matter-server knows about, optionally live-refreshed.
 
@@ -111,6 +142,16 @@ async def survey_thread_nodes(  # pylint: disable=too-many-locals
     mains-powered and polled continuously already, so its cache is not the stale
     one. A live-read failure or timeout never drops the node: the cached
     :class:`~thread_mesh.NodeDiag` stands, with ``read_error`` set to say why.
+
+    **#344 cache-age fields are applied AFTER live-refresh, not before.**
+    ``date_commissioned``/``last_interview`` (from the raw node's own top-level
+    keys) and ``last_event_seen`` (from ``event_stamps``) are captured during the
+    raw loop below but only WRITTEN onto each diag once the live-refresh block
+    has finished. ``_live_refresh`` field-copies every ``dataclasses.fields
+    (NodeDiag)`` from its own freshly-parsed live diag (which never sets these
+    three — only :mod:`thread_survey` does) onto the cached one it is
+    refreshing; applying them earlier would have a successful live read wipe
+    them straight back to ``None`` on exactly the node whose refresh worked.
     """
     raw_nodes = await matter.get_nodes()  # a failure here is a failed call — let it raise
     raw_nodes = raw_nodes or []
@@ -118,6 +159,7 @@ async def survey_thread_nodes(  # pylint: disable=too-many-locals
     diags: list[NodeDiag] = []
     skipped: list[str] = []
     raw_attributes_by_node: dict[int, Mapping] = {}
+    raw_timestamps_by_node: dict[int, tuple[Optional[datetime], Optional[datetime]]] = {}
     for index, raw in enumerate(raw_nodes):
         if not isinstance(raw, Mapping):
             skipped.append(f"raw node[{index}]: not a mapping ({type(raw).__name__})")
@@ -134,6 +176,10 @@ async def survey_thread_nodes(  # pylint: disable=too-many-locals
             continue  # not a Thread node — correct exclusion, not a skip
         diags.append(diag)
         raw_attributes_by_node[node_id] = attributes
+        raw_timestamps_by_node[node_id] = (
+            _parse_timestamp(raw.get("date_commissioned")),
+            _parse_timestamp(raw.get("last_interview")),
+        )
 
     if live_sleepy:
         targets = [diag for diag in diags if not diag.is_router]
@@ -153,6 +199,16 @@ async def survey_thread_nodes(  # pylint: disable=too-many-locals
             for diag, result in zip(targets, results):
                 if isinstance(result, BaseException):
                     diag.read_error = f"live refresh failed: {result!r}"
+
+    # #344 decision 2 (see this function's own docstring): applied HERE, after
+    # every live refresh above has already run its per-field copy, so a
+    # successful live read cannot wipe these back to None.
+    stamps = event_stamps or {}
+    for diag in diags:
+        date_commissioned, last_interview = raw_timestamps_by_node.get(diag.node_id, (None, None))
+        diag.date_commissioned = date_commissioned
+        diag.last_interview = last_interview
+        diag.last_event_seen = stamps.get(diag.node_id)
 
     return Survey(diags=diags, raw_count=len(raw_nodes), skipped=skipped)
 
@@ -239,6 +295,7 @@ def run_survey(
     live_sleepy: bool,
     per_node_timeout: float = ATTRIBUTE_TIMEOUT,
     node_names: Optional[Mapping[int, str]] = None,
+    event_stamps: Optional[Mapping[int, float]] = None,
 ) -> Survey:
     """Indigo-thread bridge for :func:`survey_thread_nodes` (Indigo -> asyncio,
     see ``async_runtime``'s module docstring). Blocks the calling Indigo thread.
@@ -257,7 +314,7 @@ def run_survey(
     """
     future = runtime.submit(
         survey_thread_nodes(matter, live_sleepy=live_sleepy, per_node_timeout=per_node_timeout,
-                            node_names=node_names)
+                            node_names=node_names, event_stamps=event_stamps)
     )
     try:
         return future.result(timeout=per_node_timeout + SURVEY_READ_TIMEOUT)
