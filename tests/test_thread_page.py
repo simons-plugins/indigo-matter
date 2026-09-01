@@ -21,6 +21,7 @@ import pytest
 
 from thread_mesh import build_mesh, parse_node_diag
 from thread_page import render_thread_page
+from thread_survey import Survey
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "thread_mesh" / "nodes.json"
 PLUGIN_ID = "com.simons-plugins.indigo-matter"
@@ -191,8 +192,11 @@ def _action(method="GET", query=None):
 
 
 def test_it_serves_html_200(plug, monkeypatch):
+    # NOTE: minimal compatibility patch for #334 post-review Step 2
+    # (thread_survey.run_survey now returns a Survey, not a bare list — B2.4).
     mesh, diags = _fixture_mesh()
-    monkeypatch.setattr("http_api_mixin.thread_survey.run_survey", lambda *a, **k: diags)
+    monkeypatch.setattr("http_api_mixin.thread_survey.run_survey",
+                        lambda *a, **k: Survey(diags=diags, raw_count=len(diags), skipped=[]))
     reply = plug.http_thread_page(_action())
     assert reply["status"] == 200
     assert reply["headers"]["Content-Type"].startswith("text/html")

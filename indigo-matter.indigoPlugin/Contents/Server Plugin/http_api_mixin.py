@@ -333,10 +333,13 @@ class HttpApiMixin:
         if self.runtime is None or self.matter is None or not self.matter.connected:
             return thread_mesh.build_mesh([]), [], "The plugin is not connected to matter-server yet."
         try:
+            # NOTE: minimal compatibility patch for #334 post-review Step 2
+            # (thread_survey.run_survey now returns a Survey, not a bare list —
+            # B2.4). The raw_count/skipped-aware wiring lands in Step 5.
             diags = thread_survey.run_survey(
                 self.runtime, self.matter, live_sleepy=live_sleepy,
                 node_names=self._thread_node_names(),
-            )
+            ).diags
         except FuturesTimeoutError:
             return thread_mesh.build_mesh([]), [], "matter-server did not answer in time."
         except Exception as exc:  # pylint: disable=broad-except

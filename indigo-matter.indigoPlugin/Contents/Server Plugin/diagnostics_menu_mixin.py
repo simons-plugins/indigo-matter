@@ -362,7 +362,10 @@ class DiagnosticsMenuMixin:
 
         live_sleepy = bool(valuesDict.get("liveReadSleepy", True))
         try:
-            diags = thread_survey.run_survey(self.runtime, self.matter, live_sleepy=live_sleepy)
+            # NOTE: minimal compatibility patch for #334 post-review Step 2
+            # (thread_survey.run_survey now returns a Survey, not a bare list —
+            # B2.4). The raw_count/skipped-aware wiring lands in Step 4.
+            diags = thread_survey.run_survey(self.runtime, self.matter, live_sleepy=live_sleepy).diags
         except FuturesTimeoutError:
             errors["liveReadSleepy"] = "matter-server did not answer in time — see the Event Log."
             return (False, valuesDict, errors)
