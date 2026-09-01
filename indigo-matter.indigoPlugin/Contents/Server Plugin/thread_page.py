@@ -6,12 +6,12 @@ import. Mirrors :mod:`pairing_page`'s shape: the only caller is
 
 Self-contained HTML + CSS + an inline SVG map computed entirely in Python — no
 JS, no external assets, so it renders in Safari on a phone over the Reflector.
-The map is a simple layered layout: the fabric's leader (owned or foreign) on
-its own row, every other router in a row beneath it, and every non-router
-placed under whichever router it links to (its parent, for a SED/ED/REED; the
-router it is an anonymous child of, for a "child:0x.." node) — never geometry
-computed anywhere but here, and never a write of any kind (ADR-0004: this page
-only ever reads).
+The map is a layered layout (:func:`_layout`): the fabric's leader (owned or
+foreign) on its own row, every other router in a row beneath it, and every
+non-router placed under whichever router it links to (its parent, for a
+SED/ED/REED; the router it is an anonymous child of, for a "child:0x.." node)
+— never geometry computed anywhere but here, and never a write of any kind
+(ADR-0004: this page only ever reads).
 
 Everything rendered here — node names above all, which come straight from
 Indigo device names — is treated as hostile input and passed through
@@ -21,17 +21,18 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
+from thread_mesh import RSSI_BAD, RSSI_WEAK, partition_header_text
+
 __all__ = ["render_thread_page"]
 
-# RSSI colour bands (ground truth, SPEC "Ground truth" section / thread_mesh's
-# own RSSI_WEAK/RSSI_BAD constants — duplicated as plain numbers here rather
-# than imported, because this module must stay import-free of thread_mesh's
-# *logic*, only its *data shapes*; the bands are a presentation choice, not a
-# health-flag decision, and the two are allowed to diverge without either
-# breaking the other).
-_RSSI_GOOD = -70
-_RSSI_WEAK = -80
-
+# RSSI colour bands (#334 finding B4.7): these ARE thread_mesh's own
+# RSSI_WEAK/RSSI_BAD thresholds, imported rather than duplicated as plain
+# numbers — a page that used its own bands (previously -70/-80, diverging
+# from thread_mesh's -80/-90) could show a green edge for a link
+# health_flags had already called "warn", which is exactly the kind of
+# disagreement a diagnostic must not have with itself. One source of truth:
+# a red edge on this page always corresponds to a "bad" weak_link flag, and
+# an amber edge to a "warn" one.
 _COLOR_GOOD = "#2e8b45"
 _COLOR_WEAK = "#b8860b"
 _COLOR_BAD = "#c0392b"
@@ -42,6 +43,10 @@ _BOX_H = 56
 _GAP_X = 26
 _GAP_Y = 92
 _MARGIN = 28
+#: How far above a same-layer link's row its arc's control point sits (#334
+#: finding A4) — same-layer links (router <-> router) drawn as straight lines
+#: at the same y used to disappear behind whichever box sat between them.
+_ARC_HEIGHT = 36
 
 
 def _escape(text: Any) -> str:
@@ -61,9 +66,9 @@ def _fmt_opt(value: Any, *, suffix: str = "") -> str:
 def _edge_color(rssi: Optional[int]) -> str:
     if rssi is None:
         return _COLOR_UNKNOWN
-    if rssi >= _RSSI_GOOD:
+    if rssi >= RSSI_WEAK:
         return _COLOR_GOOD
-    if rssi >= _RSSI_WEAK:
+    if rssi >= RSSI_BAD:
         return _COLOR_WEAK
     return _COLOR_BAD
 
@@ -76,7 +81,7 @@ def _severity_rank(severity: str) -> int:
 # Link merging — a link between two routers is reported from BOTH sides
 # (build_mesh adds one MeshLink per reporting node), so the page shows ONE
 # edge per pair, using the worse of the two sides' readings for colour and
-# both readings in the label when they disagree (SPEC #334 §4).
+# both readings in the label when they disagree (#334).
 # ---------------------------------------------------------------------------
 
 def _link_worst_reading(avg_rssi: Optional[int], last_rssi: Optional[int]) -> Optional[int]:
@@ -128,28 +133,57 @@ def _link_label(link: dict) -> str:
 
 # ---------------------------------------------------------------------------
 # Layout — leader on its own row, every other router beneath it, every
-# non-router placed under whichever router it links to.
+# non-router placed under whichever router it links to. Pure function: takes
+# a Mesh, returns box geometry, computes nothing else (#334 finding A4).
 # ---------------------------------------------------------------------------
 
 def _is_router_node(node) -> bool:
     return node.foreign or node.role_name in ("Router", "Leader")
 
 
-def _layout(mesh) -> tuple[dict[str, tuple[float, float]], float, float]:  # pylint: disable=too-many-locals
+def _claim_slot(used_xs: list[float], preferred_x: float) -> float:
+    """Nudge ``preferred_x`` right, in ``_BOX_W + _GAP_X`` steps, until it does
+    not collide with any already-claimed x in the same row (#334 finding A4).
+
+    Before this, two independently-computed non-router boxes — each simply
+    "centred under its own parent" — could land on the exact same x when two
+    different parents happened to be at the same x themselves (e.g. two
+    single-child parents both placing their child at slot 0 relative to
+    themselves): one box silently hid the other, and the hidden node's edge
+    read as though it belonged to the visible one.
+    """
+    step = _BOX_W + _GAP_X
+    x = preferred_x
+    while any(abs(x - used) < step - 1e-6 for used in used_xs):
+        x += step
+    return x
+
+
+def _layout(mesh) -> dict[str, tuple[float, float, float, float]]:  # pylint: disable=too-many-locals
+    """``MeshNode.key -> (left, top, width, height)`` in SVG user units.
+
+    A pure function of ``mesh`` alone — no I/O, no randomness — so a caller
+    (or a test) can assert two boxes never overlap purely from this dict,
+    without rendering any SVG at all.
+    """
     nodes = list(mesh.nodes)
     leader = next((n for n in nodes if n.is_leader), None)
     routers = [n for n in nodes if _is_router_node(n) and n is not leader]
     non_routers = [n for n in nodes if not _is_router_node(n)]
 
-    positions: dict[str, tuple[float, float]] = {}
+    centers: dict[str, tuple[float, float]] = {}
+
     y_leader = _MARGIN
     if leader is not None:
-        positions[leader.key] = (_MARGIN + _BOX_W / 2, y_leader + _BOX_H / 2)
+        centers[leader.key] = (_MARGIN + _BOX_W / 2, y_leader + _BOX_H / 2)
 
     y_routers = y_leader + (_BOX_H + _GAP_Y if leader is not None else 0)
+    router_row_xs: list[float] = []
     for index, node in enumerate(sorted(routers, key=lambda n: (n.foreign, n.name))):
-        x = _MARGIN + index * (_BOX_W + _GAP_X) + _BOX_W / 2
-        positions[node.key] = (x, y_routers + _BOX_H / 2)
+        preferred = _MARGIN + index * (_BOX_W + _GAP_X) + _BOX_W / 2
+        x = _claim_slot(router_row_xs, preferred)
+        router_row_xs.append(x)
+        centers[node.key] = (x, y_routers + _BOX_H / 2)
 
     # Every non-router keyed by whichever router-layer node its own link (kind
     # "parent" or "child") points at — never a phantom parent guess: a
@@ -160,37 +194,37 @@ def _layout(mesh) -> tuple[dict[str, tuple[float, float]], float, float]:  # pyl
         if link.kind in ("parent", "child") and link.a in {n.key for n in non_routers}:
             linked_parent[link.a] = link.b
 
-    by_parent: dict[str, list] = {}
-    orphans = []
-    for node in non_routers:
-        parent_key = linked_parent.get(node.key)
-        if parent_key is not None and parent_key in positions:
-            by_parent.setdefault(parent_key, []).append(node)
-        else:
-            orphans.append(node)
-
     y_children = y_routers + (_BOX_H + _GAP_Y if routers or leader is not None else 0)
-    for parent_key in sorted(by_parent, key=lambda k: positions[k][0]):
-        children = sorted(by_parent[parent_key], key=lambda n: n.name)
-        parent_x, _parent_y = positions[parent_key]
-        start_x = parent_x - ((len(children) - 1) * (_BOX_W + _GAP_X)) / 2
-        for index, child in enumerate(children):
-            positions[child.key] = (start_x + index * (_BOX_W + _GAP_X), y_children + _BOX_H / 2)
+    child_row_xs: list[float] = []
 
-    next_x = max((x + _BOX_W / 2 + _GAP_X for x, _y in positions.values()), default=_MARGIN)
-    for node in sorted(orphans, key=lambda n: n.name):
-        positions[node.key] = (next_x + _BOX_W / 2, y_children + _BOX_H / 2)
-        next_x += _BOX_W + _GAP_X
+    def _placement_key(node):
+        parent_key = linked_parent.get(node.key)
+        placeable = parent_key is not None and parent_key in centers
+        return (0 if placeable else 1, node.name)
 
-    xs = [x for x, _y in positions.values()] or [_MARGIN + _BOX_W / 2]
-    ys = [y for _x, y in positions.values()] or [_MARGIN + _BOX_H / 2]
-    width = max(xs) + _BOX_W / 2 + _MARGIN
-    height = max(ys) + _BOX_H / 2 + _MARGIN
-    return positions, width, height
+    for node in sorted(non_routers, key=_placement_key):
+        parent_key = linked_parent.get(node.key)
+        if parent_key is not None and parent_key in centers:
+            preferred = centers[parent_key][0]
+        elif child_row_xs:
+            preferred = max(child_row_xs) + _BOX_W + _GAP_X
+        else:
+            preferred = _MARGIN + _BOX_W / 2
+        x = _claim_slot(child_row_xs, preferred)
+        child_row_xs.append(x)
+        centers[node.key] = (x, y_children + _BOX_H / 2)
+
+    return {key: (x - _BOX_W / 2, y - _BOX_H / 2, _BOX_W, _BOX_H) for key, (x, y) in centers.items()}
 
 
-def _node_box_svg(node, x: float, y: float) -> str:
-    left, top = x - _BOX_W / 2, y - _BOX_H / 2
+def _box_center(box: tuple[float, float, float, float]) -> tuple[float, float]:
+    left, top, width, height = box
+    return left + width / 2, top + height / 2
+
+
+def _node_box_svg(node, box: tuple[float, float, float, float]) -> str:
+    left, top, width, height = box
+    x, y = _box_center(box)
     if node.foreign:
         css_class = "box-foreign"
         title = f"Router {_escape(node.router_id)}"
@@ -213,20 +247,37 @@ def _node_box_svg(node, x: float, y: float) -> str:
     )
     return (
         f'<g class="node {css_class}">'
-        f'<rect x="{left:.1f}" y="{top:.1f}" width="{_BOX_W}" height="{_BOX_H}" rx="8"/>'
+        f'<rect x="{left:.1f}" y="{top:.1f}" width="{width}" height="{height}" rx="8"/>'
         f'<text x="{x:.1f}" y="{y - (len(lines) - 1) * 8:.1f}" text-anchor="middle">{text_lines}</text>'
         f'</g>'
     )
 
 
-def _link_svg(link: dict, positions: dict[str, tuple[float, float]]) -> str:
-    if link["a"] not in positions or link["b"] not in positions:
+def _link_svg(link: dict, boxes: dict[str, tuple[float, float, float, float]]) -> str:
+    if link["a"] not in boxes or link["b"] not in boxes:
         return ""
-    ax, ay = positions[link["a"]]
-    bx, by = positions[link["b"]]
+    ax, ay = _box_center(boxes[link["a"]])
+    bx, by = _box_center(boxes[link["b"]])
     color = _edge_color(link["overall_rssi"])
-    mid_x, mid_y = (ax + bx) / 2, (ay + by) / 2
     label = _escape(_link_label(link))
+
+    # Same-layer links (router <-> router, e.g. two routers in the same row)
+    # drawn as a straight line sat exactly on top of any box between them and
+    # were effectively invisible (#334 finding A4) — an arc above the row
+    # keeps the edge visible regardless of what sits between its endpoints.
+    if abs(ay - by) < 1e-6:
+        mid_x = (ax + bx) / 2
+        control_y = ay - _ARC_HEIGHT
+        apex_x, apex_y = mid_x, ay - _ARC_HEIGHT / 2
+        return (
+            f'<g class="edge edge-arc">'
+            f'<path d="M {ax:.1f} {ay:.1f} Q {mid_x:.1f} {control_y:.1f} {bx:.1f} {by:.1f}" '
+            f'stroke="{color}" stroke-width="2" fill="none"/>'
+            f'<text x="{apex_x:.1f}" y="{apex_y:.1f}" text-anchor="middle" class="edge-label">{label}</text>'
+            f'</g>'
+        )
+
+    mid_x, mid_y = (ax + bx) / 2, (ay + by) / 2
     return (
         f'<g class="edge">'
         f'<line x1="{ax:.1f}" y1="{ay:.1f}" x2="{bx:.1f}" y2="{by:.1f}" stroke="{color}" stroke-width="2"/>'
@@ -237,9 +288,9 @@ def _link_svg(link: dict, positions: dict[str, tuple[float, float]]) -> str:
 
 def _legend_svg(x: float, y: float) -> str:
     rows = [
-        (_COLOR_GOOD, f"≥ {_RSSI_GOOD} dBm"),
-        (_COLOR_WEAK, f"{_RSSI_WEAK}…{_RSSI_GOOD} dBm"),
-        (_COLOR_BAD, f"< {_RSSI_WEAK} dBm"),
+        (_COLOR_GOOD, f"≥ {RSSI_WEAK} dBm"),
+        (_COLOR_WEAK, f"{RSSI_BAD}…{RSSI_WEAK} dBm"),
+        (_COLOR_BAD, f"< {RSSI_BAD} dBm"),
         (_COLOR_UNKNOWN, "unknown"),
     ]
     parts = [f'<text x="{x}" y="{y - 8}" class="legend-title">Link RSSI</text>']
@@ -255,13 +306,16 @@ def _legend_svg(x: float, y: float) -> str:
 def _render_map(mesh) -> str:
     if not mesh.nodes:
         return '<p class="msg">No Thread nodes to draw.</p>'
-    positions, width, height = _layout(mesh)
+    boxes = _layout(mesh)
+    right = max((left + width for left, _top, width, _height in boxes.values()), default=_MARGIN)
+    bottom = max((top + height for _left, top, _width, height in boxes.values()), default=_MARGIN)
+    width = right + _MARGIN
+    height = bottom + _MARGIN
     legend_height = 100
     total_height = height + legend_height
 
-    edges_svg = "".join(_link_svg(link, positions) for link in _merged_links(mesh.links))
-    nodes_svg = "".join(_node_box_svg(node, *positions[node.key])
-                        for node in mesh.nodes if node.key in positions)
+    edges_svg = "".join(_link_svg(link, boxes) for link in _merged_links(mesh.links))
+    nodes_svg = "".join(_node_box_svg(node, boxes[node.key]) for node in mesh.nodes if node.key in boxes)
     legend_svg = _legend_svg(_MARGIN, height + 24)
 
     return (
@@ -276,7 +330,12 @@ def _render_map(mesh) -> str:
         f'.box-foreign text {{ fill: var(--muted); }}'
         f'.box-child rect {{ fill: var(--box-child-fill); stroke: var(--box-child-stroke); }}'
         f'.box-child text {{ fill: var(--muted); font-size: 10px; }}'
-        f'.edge-label {{ font: 10px ui-monospace, Menlo, monospace; fill: var(--muted); }}'
+        # Text halo (#334 finding A4) — an edge label painted directly over its
+        # line/arc with no background was often unreadable; paint-order: stroke
+        # draws the (thick, background-coloured) stroke BEHIND the glyph fill,
+        # which reads as a halo without needing a separate background rect.
+        f'.edge-label {{ font: 10px ui-monospace, Menlo, monospace; fill: var(--muted); '
+        f'paint-order: stroke; stroke: var(--bg); stroke-width: 4px; }}'
         f'.legend-title {{ font: 700 12px -apple-system, sans-serif; fill: var(--fg); }}'
         f'.legend-label {{ font: 11px -apple-system, sans-serif; fill: var(--fg); }}'
         f'</style>'
@@ -343,22 +402,21 @@ def _render_table(diags: list) -> str:
     )
 
 
-def _render_unreadable(mesh, diags: list) -> str:
-    # mesh.unreadable is BUILT from the same diags' read_error fields
-    # (thread_mesh.build_mesh), so the two lists are normally identical — both
-    # are listed anyway (SPEC #334 §4) so this section stays correct even if a
-    # future caller ever builds the mesh from a different diags list than the
-    # one it renders here.
-    seen: set[int] = set()
-    items = []
-    for node_id, reason in mesh.unreadable:
-        seen.add(node_id)
-        items.append(f'<li>0x{node_id:X}: {_escape(reason)}</li>')
-    for diag in diags:
-        if diag.read_error and diag.node_id not in seen:
-            items.append(f'<li>{_escape(diag.name)} (0x{diag.node_id:X}): {_escape(diag.read_error)}</li>')
-    for disagreement in mesh.disagreements:
-        items.append(f'<li>{_escape(disagreement)}</li>')
+def _render_unreadable(mesh) -> str:
+    """The "Unreadable / stale" section: ``mesh.unreadable`` (per-node
+    read_error), ``mesh.disagreements`` (partition disagreements), and
+    ``mesh.warnings`` (#334 finding B2.5 — parse warnings plus mesh-level
+    notes like an unattributed-children group, B5.2).
+
+    No re-derivation from ``diags`` (#334 finding B1.6): ``mesh.unreadable``
+    is built from those same diags' ``read_error`` fields inside
+    :func:`thread_mesh.build_mesh`, so the two lists are the SAME list, not
+    two that could drift — walking ``diags`` a second time here bought
+    nothing but the appearance of a second source of truth.
+    """
+    items = [f'<li>0x{node_id:X}: {_escape(reason)}</li>' for node_id, reason in mesh.unreadable]
+    items.extend(f'<li>{_escape(disagreement)}</li>' for disagreement in mesh.disagreements)
+    items.extend(f'<li>0x{node_id:X}: {_escape(note)}</li>' for node_id, note in mesh.warnings)
     if not items:
         return ""
     return (
@@ -369,27 +427,21 @@ def _render_unreadable(mesh, diags: list) -> str:
 
 def render_thread_page(mesh, diags: list, *, generated_at: str, live: bool,  # pylint: disable=too-many-locals
                         plugin_id: str, error: Optional[str] = None) -> str:
-    """The Thread mesh page (SPEC #334 §4). Self-contained: no scripts, no
-    external assets. ``mesh``/``diags`` come from
+    """The Thread mesh page (#334). Self-contained: no scripts, no external
+    assets. ``mesh``/``diags`` come from
     :func:`thread_mesh.build_mesh`/:func:`thread_survey.run_survey`; when
-    ``error`` is set (matter-server unreachable, ``get_nodes()`` failing, or the
-    live-read round trip timing out) both are expected to be empty and the page
-    shows the banner instead of a map — an unusable read must never look like a
-    real but empty mesh (root workspace CLAUDE.md degradation-path convention).
+    ``error`` is set (matter-server unreachable, ``get_nodes()`` failing, or
+    both a live AND a cache-fallback read failing) both are expected to be
+    empty and the page shows the banner instead of a map — an unusable read
+    must never look like a real but empty mesh (root workspace CLAUDE.md
+    degradation-path convention). A live-only timeout does NOT reach this
+    banner path any more (#334 finding B3.2): it falls back to a cached
+    render with ``error`` naming the live timeout instead.
     """
     live_url = f"/message/{_escape(plugin_id)}/thread?live=1"
     cached_url = f"/message/{_escape(plugin_id)}/thread"
     badge = "LIVE" if live else "CACHED"
     badge_class = "badge-live" if live else "badge-cached"
-
-    # NOTE: minimal compatibility patch for #334 post-review Step 1
-    # (thread_mesh.Mesh.partitions -> partition_ids/majority_partition/
-    # majority_leader, B1.3) — this whole header block is rewritten properly
-    # in Step 5 (A1: partition_header_text, majority + leader inline).
-    partitions = mesh.partition_ids
-    partition_text = ", ".join(str(p) for p in partitions) if partitions else "unknown"
-    leader = next((n for n in mesh.nodes if n.is_leader), None)
-    leader_text = _fmt_opt(leader.router_id) if leader is not None else "unknown"
 
     header = f"""
 <h1>Thread mesh</h1>
@@ -397,10 +449,9 @@ def render_thread_page(mesh, diags: list, *, generated_at: str, live: bool,  # p
 <tr><th>Network</th><td>{_escape(mesh.network_name or "unknown")}</td></tr>
 <tr><th>Channel</th><td>{_escape(_fmt_opt(mesh.channel))}</td></tr>
 <tr><th>PAN</th><td>{_escape(f"0x{mesh.pan_id:04X}") if mesh.pan_id is not None else "unknown"}</td></tr>
-<tr><th>Partition(s)</th><td>{_escape(partition_text)}</td></tr>
-<tr><th>Leader router id</th><td>{_escape(leader_text)}</td></tr>
 <tr><th>Generated</th><td>{_escape(generated_at)} <span class="badge {badge_class}">{badge}</span></td></tr>
 </table>
+<p class="partition-summary">{_escape(partition_header_text(mesh, diags))}</p>
 <p class="links">
 <a href="{live_url}">Refresh (live)</a> &middot;
 <a href="{cached_url}">Cached (fast)</a>
@@ -409,15 +460,33 @@ def render_thread_page(mesh, diags: list, *, generated_at: str, live: bool,  # p
     if error:
         banner = f'<p class="warn"><strong>Could not read the Thread mesh:</strong> {_escape(error)}</p>'
         body = f"{header}{banner}"
-    else:
-        body = f"""{header}
+        if not mesh.nodes:
+            # A hard failure (matter-server unreachable, get_nodes() failing,
+            # or a cache-fallback ALSO failing): no map, same as before.
+            return _document(body)
+        # #334 finding B3.2: a live timeout that fell back to a cache-only
+        # render still has real data — show it, banner and all, rather than
+        # discarding it the way a hard failure has to.
+        body += f"""
 {_render_map(mesh)}
 <h2>Flags</h2>
 {_render_flags(mesh)}
 <h2>Nodes</h2>
 {_render_table(diags)}
-{_render_unreadable(mesh, diags)}"""
+{_render_unreadable(mesh)}"""
+        return _document(body)
 
+    body = f"""{header}
+{_render_map(mesh)}
+<h2>Flags</h2>
+{_render_flags(mesh)}
+<h2>Nodes</h2>
+{_render_table(diags)}
+{_render_unreadable(mesh)}"""
+    return _document(body)
+
+
+def _document(body: str) -> str:
     return f"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -443,6 +512,7 @@ def render_thread_page(mesh, diags: list, *, generated_at: str, live: bool,  # p
  .header-facts {{ border-collapse: collapse; margin: .5rem 0; }}
  .header-facts th {{ text-align: left; color: var(--muted); font-weight: 400; padding: .1rem .8rem .1rem 0; }}
  .header-facts td {{ padding: .1rem 0; }}
+ .partition-summary {{ margin: .3rem 0 .8rem; }}
  .badge {{ display: inline-block; padding: .1rem .5rem; border-radius: .3rem; font-size: .75rem;
           font-weight: 700; letter-spacing: .04em; }}
  .badge-live {{ background: #d6f5df; color: #1e6b34; }}
@@ -466,6 +536,7 @@ def render_thread_page(mesh, diags: list, *, generated_at: str, live: bool,  # p
 <footer>This page is read-only — no Matter attribute is ever written from it (ADR-0004).
 An ext(ended) address shown elsewhere in these diagnostics is flagged "≈" when
 matter-server's JSON serialisation has lost precision (values ≥ 2⁵³) and should
-not be treated as exact; this page keys every node by its router id / RLOC16 instead,
-which is not lossy.</footer>
+not be treated as exact. Owned nodes are keyed by their Matter node id; only
+foreign routers and unattributed children are keyed by router id / RLOC16
+instead, which is not lossy.</footer>
 </body></html>"""

@@ -452,6 +452,13 @@ class DiagnosticsMenuMixin:
         that comma-joined list for a node with no ``matterNode`` device yet
         (ADR-0008's AttributeList gate not cleared) — same as before this
         change for that case, just no longer the first choice.
+
+        A node with no Indigo devices at all (neither a ``matterNode`` device
+        nor any endpoint device) is simply absent from this returned dict
+        (#334 finding B4.15) — :func:`thread_survey._node_name` then supplies
+        its own fallback ("<vendor> <product>" from BasicInformation, or
+        "node 0x.." with neither), which this function has no need to
+        duplicate.
         """
         if self.device_sync is None:
             return {}
