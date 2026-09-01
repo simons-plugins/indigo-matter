@@ -18,7 +18,7 @@ touching it:
   :func:`thread_survey.run_survey` (the same coroutine the IWS Thread page uses,
   so the live-read policy lives in one place).
 
-**Neither writes anything, now or ever** (decided 2026-08-11 — see
+**None of them writes anything, now or ever** (decided 2026-08-11 — see
 :mod:`settings_report` for the three reasons). If a write is needed the answer
 is a new ``DeviceSetting`` declaration, which is bounds-checked and verified by
 read-back; not a generic writer, which is neither.
@@ -60,6 +60,20 @@ class MatterUnavailable(Exception):
     """matter-server could not answer. Re-declared rather than imported from
     ``http_api_mixin`` — a mixin importing a sibling mixin is the back-import
     issue #146 removed, and ``Plugin`` composes both anyway."""
+
+
+def _truthy(value) -> bool:
+    """Indigo checkboxes arrive as bools or as "true"/"false" strings — ``bool("false")``
+    is ``True``, which is the bug this exists to avoid (#334 post-review, B3.1).
+
+    Same idiom as ``ExportDialogMixin._truthy`` (``export_dialog_mixin.py`` ~L62-71),
+    replicated here rather than imported: this bare mixin has no guarantee
+    ``ExportDialogMixin`` is anywhere in its MRO when instantiated on its own, which
+    is exactly how ``tests/test_diagnostics_menu.py``'s ``mixin`` fixture builds it.
+    """
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "yes", "1")
+    return bool(value)
 
 
 class DiagnosticsMenuMixin:
@@ -345,28 +359,44 @@ class DiagnosticsMenuMixin:
     # ------------------------------------------------------------------
     # Deliverable C — the Thread mesh report (#334)
     # ------------------------------------------------------------------
-    def menuReportThreadMesh(self, valuesDict, menuId=""):  # noqa: N802, ARG002
+    def menuReportThreadMesh(self, valuesDict, menuId=""):  # noqa: N802, ARG002  pylint: disable=too-many-return-statements
         """Log the Thread mesh: roles, links, the leader, foreign routers and
         health flags, from :func:`thread_survey.run_survey` + :mod:`thread_mesh`.
 
         ``liveReadSleepy`` (default on) live-refreshes every non-router node
-        first — the same coroutine the IWS Thread page will use, so the
+        first — the same coroutine the IWS Thread page uses, so the
         cache-vs-live policy is not duplicated. A ``get_nodes()`` failure is a
         failed call (routed through the same "matter-server unavailable" shape
-        as every other diagnostic here), never printed as an empty mesh.
+        as every other diagnostic here), never printed as an empty mesh — and
+        (#334 post-review, B2.4) neither is a fabric that reported raw nodes
+        this module could not even address (``Survey.skipped``): only a fabric
+        that genuinely has no Thread devices gets the friendly answer.
         """
         errors = indigo.Dict()
-        if self.runtime is None or self.matter is None:
+        # Same guard, same wording, as HttpApiMixin._thread_mesh_snapshot
+        # (#334 post-review, B5.6) — this menu used to skip the `.connected`
+        # check and could hang against a runtime that exists but is not
+        # actually talking to matter-server yet.
+        if self.runtime is None or self.matter is None or not self.matter.connected:
             errors["liveReadSleepy"] = "The plugin is not connected to matter-server yet."
             return (False, valuesDict, errors)
 
-        live_sleepy = bool(valuesDict.get("liveReadSleepy", True))
+        # #334 post-review, B3.1: Indigo delivers a checkbox as the STRING
+        # "true"/"false", and bool("false") is True — this used to always
+        # live-read regardless of the checkbox, silently ignoring "off".
+        live_sleepy = _truthy(valuesDict.get("liveReadSleepy", True))
         try:
-            # NOTE: minimal compatibility patch for #334 post-review Step 2
-            # (thread_survey.run_survey now returns a Survey, not a bare list —
-            # B2.4). The raw_count/skipped-aware wiring lands in Step 4.
-            diags = thread_survey.run_survey(self.runtime, self.matter, live_sleepy=live_sleepy).diags
+            survey = thread_survey.run_survey(
+                self.runtime, self.matter, live_sleepy=live_sleepy,
+                node_names=self._thread_node_names(),  # B5.4 — same names the page uses
+            )
         except FuturesTimeoutError:
+            # #334 post-review, B2.7: name the timeout on the Event Log — the
+            # dialog error alone told the user to "see the Event Log" for
+            # detail that was never actually written there.
+            self.logger.warning(
+                "Matter: Thread mesh survey timed out after %.0f s (live=%s)",
+                ATTRIBUTE_TIMEOUT + SURVEY_READ_TIMEOUT, live_sleepy)
             errors["liveReadSleepy"] = "matter-server did not answer in time — see the Event Log."
             return (False, valuesDict, errors)
         except Exception as exc:  # pylint: disable=broad-except
@@ -377,12 +407,23 @@ class DiagnosticsMenuMixin:
             errors["liveReadSleepy"] = f"matter-server could not be read: {exc}"
             return (False, valuesDict, errors)
 
-        if not diags:
+        # #334 post-review, B2.4: three genuinely different "nothing to show"
+        # situations, told apart rather than all printed as one friendly
+        # empty mesh (root workspace CLAUDE.md degradation-path convention —
+        # an unusable precondition is a failed call, not an empty result).
+        if survey.raw_count == 0:
+            errors["liveReadSleepy"] = "matter-server reports no commissioned nodes at all."
+            return (False, valuesDict, errors)
+        if not survey.diags and survey.skipped:
+            errors["liveReadSleepy"] = (
+                f"{len(survey.skipped)} raw node(s) could not be read: {'; '.join(survey.skipped)}")
+            return (False, valuesDict, errors)
+        if not survey.diags:
             self.logger.info("Matter: no Thread devices are commissioned yet.")
             return (True, valuesDict)
 
-        mesh = thread_mesh.build_mesh(diags)
-        for line in thread_mesh.render_report(mesh, diags):
+        mesh = thread_mesh.build_mesh(survey.diags)
+        for line in thread_mesh.render_report(mesh, survey.diags):
             self.logger.info("%s", line)
 
         if mesh.unreadable:
@@ -395,6 +436,44 @@ class DiagnosticsMenuMixin:
                 f"shown; see the Event Log.")
             return (False, valuesDict, errors)
         return (True, valuesDict)
+
+    def _thread_node_names(self) -> dict:
+        """``node_id -> the single name a human would use for it``, shared by
+        this menu and :meth:`http_api_mixin.HttpApiMixin.http_thread_page`
+        (cross-mixin ``self.`` call, the established pattern issue #146 set —
+        ``Plugin`` composes both) so a node's name can never disagree between
+        the two surfaces (#334 post-review, B5.4).
+
+        Prefers the ``matterNode`` device's own name (ADR-0008: one Indigo
+        device per node) over :meth:`device_sync.DeviceSync.list_nodes`'s
+        comma-joined list of EVERY endpoint device's name — a 4-endpoint FP300
+        used to show up as "FP300 Motion, FP300 Illuminance, FP300
+        Temperature, FP300 Humidity" instead of just "FP300". Falls back to
+        that comma-joined list for a node with no ``matterNode`` device yet
+        (ADR-0008's AttributeList gate not cleared) — same as before this
+        change for that case, just no longer the first choice.
+        """
+        if self.device_sync is None:
+            return {}
+        try:
+            names: dict[int, str] = {}
+            for node_id, endpoint_names in self.device_sync.list_nodes():
+                node_dev_id = self.device_sync.lookup(node_id, 0, device_type_id="matterNode")
+                if node_dev_id is not None:
+                    try:
+                        names[node_id] = indigo.devices[node_dev_id].name
+                        continue
+                    except Exception:  # pylint: disable=broad-except
+                        pass  # fall through to the endpoint-name join below
+                if endpoint_names:
+                    names[node_id] = ", ".join(endpoint_names)
+            return names
+        except Exception as exc:  # pylint: disable=broad-except
+            # Absorbing: this is cosmetic naming only, never worth failing the
+            # report/page over — thread_survey degrades a missing name to
+            # "<vendor> <product>" or "node 0x.." on its own.
+            self.logger.debug("thread node names: could not resolve (%s)", exc)
+            return {}
 
     # ------------------------------------------------------------------
     # Shared

@@ -350,22 +350,7 @@ class HttpApiMixin:
             return thread_mesh.build_mesh([]), [], f"matter-server could not be read: {exc}"
         return thread_mesh.build_mesh(diags), diags, None
 
-    def _thread_node_names(self) -> dict:
-        """``node_id -> Indigo device name(s)``, for ``thread_survey``'s naming
-        fallback ("<vendor> <product>", else "node 0x..").
-
-        Same source :meth:`DiagnosticsMenuMixin._matter_node_options` reads
-        (``device_sync.list_nodes()``) — reused rather than re-derived, so a
-        node's name here and in the diagnostics pickers can never disagree. A
-        node with no Indigo devices is simply left out of the map.
-        """
-        if self.device_sync is None:
-            return {}
-        try:
-            return {node_id: ", ".join(names) for node_id, names in self.device_sync.list_nodes() if names}
-        except Exception as exc:  # pylint: disable=broad-except
-            # Absorbing: this is cosmetic naming only, never worth failing the
-            # whole page over — thread_survey degrades a missing name to
-            # "<vendor> <product>" or "node 0x.." on its own.
-            self.logger.debug("thread page: could not resolve node names (%s)", exc)
-            return {}
+    # ``_thread_node_names`` lives on DiagnosticsMenuMixin (#334 post-review,
+    # B5.4) — cross-mixin ``self.`` call, the established pattern issue #146
+    # set, so this page and the "Report Thread mesh…" menu item can never name
+    # a node differently. See that module for the method itself.

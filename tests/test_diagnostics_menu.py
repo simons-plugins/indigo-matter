@@ -60,6 +60,9 @@ class _Future:
             raise self._raises
         return self._value
 
+    def cancel(self):  # run_survey calls this on a timeout (#334 post-review, B2.7)
+        return True
+
 
 @pytest.fixture
 def mixin(mock_indigo_base, mock_logger):
@@ -309,6 +312,7 @@ class _ThreadFakeMatter:
 
     def __init__(self, nodes, *, timeout_nodes=(), forbidden_nodes=(), get_nodes_error=None):
         self.nodes = nodes
+        self.connected = True  # B5.6 — menuReportThreadMesh now checks this
         self.read_calls: list[int] = []
         self._timeout_nodes = set(timeout_nodes)
         self._forbidden_nodes = set(forbidden_nodes)
@@ -386,13 +390,20 @@ def test_a_timed_out_live_read_is_reported_in_the_dialog_AND_the_node_still_appe
     assert "BILRESA scroll wheel" in body, "the timed-out node must still be printed, from cache"
 
 
-def test_live_read_sleepy_off_performs_no_read_calls(mixin):
+@pytest.mark.parametrize("off_value", [False, "false", "False", 0])
+def test_live_read_sleepy_off_performs_no_read_calls(mixin, off_value):
     """"Make it fatal" (root CLAUDE.md): every node id is in the forbidden set,
-    so any read() call — a broken liveReadSleepy guard — fails loudly."""
+    so any read() call — a broken liveReadSleepy guard — fails loudly.
+
+    #334 post-review, B3.1: Indigo delivers a checkbox as the STRING
+    "true"/"false" — ``bool("false")`` is ``True``, so before the ``_truthy``
+    fix every one of these OFF values except the literal ``False`` still
+    live-read (this parametrisation is what caught it).
+    """
     nodes = json.loads(THREAD_FIXTURE_PATH.read_text(encoding="utf-8"))
     matter = _ThreadFakeMatter(nodes, forbidden_nodes=THREAD_ROUTER_IDS | THREAD_NON_ROUTER_IDS)
     _module, obj = _thread_mesh_mixin(mixin, matter)
-    ok, _values = obj.menuReportThreadMesh({"liveReadSleepy": False})[:2]
+    ok, _values = obj.menuReportThreadMesh({"liveReadSleepy": off_value})[:2]
     assert ok
     assert matter.read_calls == []
 
@@ -407,11 +418,37 @@ def test_routers_are_never_live_read(mixin):
     assert not (set(matter.read_calls) & THREAD_ROUTER_IDS)
 
 
-def test_zero_thread_nodes_is_a_friendly_success_not_an_error(mixin):
-    _module, obj = _thread_mesh_mixin(mixin, _ThreadFakeMatter([]))
+def test_wifi_only_fabric_is_a_friendly_success_not_an_error(mixin):
+    # #334 post-review, B2.4: raw_count > 0 (matter-server DID report nodes),
+    # diags is empty, and skipped is empty (every raw node parsed fine, none
+    # of them is a Thread node) — the friendly answer, not an error.
+    wifi_only = [{"node_id": 1, "available": True, "attributes": {"0/40/1": "Vendor"}}]
+    _module, obj = _thread_mesh_mixin(mixin, _ThreadFakeMatter(wifi_only))
     ok, _values = obj.menuReportThreadMesh({"liveReadSleepy": True})[:2]
     assert ok
     assert "no Thread devices" in _log_body(obj)
+
+
+def test_zero_raw_nodes_is_an_error_not_a_friendly_empty_mesh(mixin):
+    # #334 post-review, B2.4: raw_count == 0 — matter-server itself reports no
+    # commissioned nodes at all, which is a different (and worth flagging)
+    # situation from "some nodes exist and none of them are Thread".
+    _module, obj = _thread_mesh_mixin(mixin, _ThreadFakeMatter([]))
+    ok, _values, errors = obj.menuReportThreadMesh({"liveReadSleepy": True})
+    assert not ok
+    assert "no commissioned nodes at all" in errors["liveReadSleepy"]
+
+
+def test_raw_nodes_all_unaddressable_is_an_error_listing_the_skip_reasons(mixin):
+    # #334 post-review, B2.4: raw_count > 0, diags empty, skipped non-empty —
+    # every raw node matter-server returned was something this module could
+    # not even address, which is a real failure, not an empty mesh.
+    unaddressable = [{"attributes": {"0/53/1": 5}}]  # no node_id at all
+    _module, obj = _thread_mesh_mixin(mixin, _ThreadFakeMatter(unaddressable))
+    ok, _values, errors = obj.menuReportThreadMesh({"liveReadSleepy": True})
+    assert not ok
+    assert "could not be read" in errors["liveReadSleepy"]
+    assert "no node_id" in errors["liveReadSleepy"]
 
 
 def test_matter_server_unavailable_is_reported_not_printed_as_an_empty_mesh(mixin):
@@ -430,6 +467,64 @@ def test_the_report_refuses_before_the_connection_is_up(mixin):
     obj.matter = None
     ok, _values, errors = obj.menuReportThreadMesh({"liveReadSleepy": True})
     assert not ok and "not connected" in errors["liveReadSleepy"]
+
+
+def test_the_report_refuses_when_matter_is_not_connected(mixin):
+    # #334 post-review, B5.6: same guard, same wording, as
+    # HttpApiMixin._thread_mesh_snapshot — obj.matter EXISTS here but is not
+    # actually talking to matter-server yet.
+    _module, obj = mixin
+    obj.matter = Mock(connected=False)
+    ok, _values, errors = obj.menuReportThreadMesh({"liveReadSleepy": True})
+    assert not ok and "not connected to matter-server" in errors["liveReadSleepy"]
+
+
+def test_menu_passes_the_shared_node_names_to_the_survey(mixin):
+    # #334 post-review, B5.4: the menu used to omit node_names= entirely,
+    # so a live-refreshed diag's name could disagree with the page's.
+    nodes = json.loads(THREAD_FIXTURE_PATH.read_text(encoding="utf-8"))
+    _module, obj = _thread_mesh_mixin(mixin, _ThreadFakeMatter(nodes))
+    obj.device_sync.list_nodes.return_value = [(0x34, ["Grillplats socket"])]
+    obj.device_sync.lookup.return_value = None  # no matterNode device yet — falls back
+    ok, _values = obj.menuReportThreadMesh({"liveReadSleepy": False})[:2]
+    assert ok
+    assert "Grillplats socket" in _log_body(obj)
+
+
+def test_prefers_the_matternode_devices_own_name_over_the_endpoint_join(mixin):
+    # #334 post-review, B5.4: a multi-endpoint node's matterNode device name
+    # wins over device_sync.list_nodes()'s comma-joined endpoint device names.
+    _module, obj = mixin
+    obj.device_sync.list_nodes.return_value = [(0x34, ["FP300 Motion", "FP300 Illuminance"])]
+    obj.device_sync.lookup.return_value = 991
+    sys.modules["indigo"].devices = {991: SimpleNamespace(name="FP300")}
+    names = obj._thread_node_names()  # pylint: disable=protected-access
+    assert names[0x34] == "FP300"
+
+
+def test_falls_back_to_endpoint_join_with_no_matternode_device(mixin):
+    _module, obj = mixin
+    obj.device_sync.list_nodes.return_value = [(0x34, ["FP300 Motion", "FP300 Illuminance"])]
+    obj.device_sync.lookup.return_value = None
+    names = obj._thread_node_names()  # pylint: disable=protected-access
+    assert names[0x34] == "FP300 Motion, FP300 Illuminance"
+
+
+def test_a_timeout_logs_before_reporting_it_in_the_dialog(mixin):
+    # #334 post-review, B2.7: the dialog told the user to "see the Event Log"
+    # for detail that was never actually written there.
+    nodes = json.loads(THREAD_FIXTURE_PATH.read_text(encoding="utf-8"))
+    _module, obj = mixin
+    obj.matter = Mock(connected=True)
+    obj.runtime = Mock()
+    # close() the real coroutine run_survey builds — Mock().submit() never runs
+    # it, and an unawaited coroutine otherwise warns at garbage-collection time.
+    obj.runtime.submit.side_effect = lambda coro: (coro.close(), _Future(raises=FuturesTimeoutError()))[1]
+    ok, _values, errors = obj.menuReportThreadMesh({"liveReadSleepy": True})
+    assert not ok
+    assert "see the Event Log" in errors["liveReadSleepy"]
+    warn_msgs = [str(c) for c in obj.logger.warning.call_args_list]
+    assert any("timed out" in m for m in warn_msgs)
 
 
 # ---------------------------------------------------------------------------

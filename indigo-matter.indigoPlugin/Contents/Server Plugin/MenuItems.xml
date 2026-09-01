@@ -108,7 +108,7 @@ A Matter pairing code is not durable: once used, or once the window expires (up 
         list's OPTIONS — so a menu dialog physically cannot display an answer.
         Same constraint and same resolution as the pairing codes in section 3.
 
-        NEITHER WRITES ANYTHING, and that is settled (2026-08-11), not an
+        NONE OF THEM WRITES ANYTHING, and that is settled (2026-08-11), not an
         omission awaiting a follow-up: a generic attribute writer is
         unvalidated by construction, is device-global on devices joined to
         several ecosystems, and adds nothing over declaring another
