@@ -1053,27 +1053,15 @@
                  nodes, by the ThreadNetworkDiagnostics handler (cluster
                  0x0035) reading matter-server's cache of that node's own
                  endpoint-0 attributes. Wi-Fi nodes never see an update on
-                 this cluster, so these seven states simply stay blank there
-                 — that is correct, not a gap. -->
+                 this cluster, so these states simply stay blank there —
+                 that is correct, not a gap. Deliberately only the four a
+                 trigger would bind to (ADR-0008: a shipped state is
+                 permanent); channel, network name and partition id live on
+                 the mesh report/page instead. -->
             <State id="threadRole">
                 <ValueType>String</ValueType>
                 <TriggerLabel>Thread Role</TriggerLabel>
                 <ControlPageLabel>Thread Role</ControlPageLabel>
-            </State>
-            <State id="threadChannel">
-                <ValueType>Integer</ValueType>
-                <TriggerLabel>Thread Channel</TriggerLabel>
-                <ControlPageLabel>Thread Channel</ControlPageLabel>
-            </State>
-            <State id="threadNetworkName">
-                <ValueType>String</ValueType>
-                <TriggerLabel>Thread Network</TriggerLabel>
-                <ControlPageLabel>Thread Network</ControlPageLabel>
-            </State>
-            <State id="threadPartitionId">
-                <ValueType>String</ValueType>
-                <TriggerLabel>Thread Partition</TriggerLabel>
-                <ControlPageLabel>Thread Partition</ControlPageLabel>
             </State>
             <State id="threadNeighbourCount">
                 <ValueType>Integer</ValueType>

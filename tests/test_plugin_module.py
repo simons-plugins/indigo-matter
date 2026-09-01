@@ -290,10 +290,17 @@ def test_matter_node_states_are_the_deliberately_short_list():
     are declared — vendorName/productName are NOT here (props only).
     curEnergyLevel/accumEnergyTotal joined once ep-0 energy attribution
     shipped (issue #204's final stage) — same ids matterEnergyMeter already
-    declares, deliberately permanent for the same reason."""
+    declares, deliberately permanent for the same reason. The four Thread
+    states (issue #334) are the trigger-worthy subset of ThreadNetworkDiagnostics
+    — role, link RSSI, neighbour count, health verdict. Channel, network name
+    and partition id were deliberately NOT declared: they belong on the mesh
+    report/page, and the partition id in particular is the value matter-server's
+    cache reported stale for sleepy devices, so a state would invite triggers on
+    a wrong number. Written only for Thread nodes; blank on Wi-Fi nodes."""
     assert _device_state_ids("matterNode") == {
         "nodeLabel", "softwareVersion", "batteryLevel", "reachable",
         "curEnergyLevel", "accumEnergyTotal",
+        "threadRole", "threadLinkRssi", "threadNeighbourCount", "threadHealth",
     }
 
 
