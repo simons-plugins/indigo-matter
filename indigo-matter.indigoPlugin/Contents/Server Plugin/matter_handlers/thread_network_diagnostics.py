@@ -44,18 +44,10 @@ ParentChangeCount behind it (ADR-0003): without the AttributeList cached, a node
 counters dict stays empty forever regardless of how many times attribute 21 itself
 arrives, and ``unstable_parent`` could never fire.
 
-**Why ``node_scoped = True`` despite the cluster living on the SAME endpoint (0) as
-its target device** — unlike PowerSource's genuine cross-endpoint case, which is
-what ``node_scoped`` was built for. ``_on_attribute``'s node-scoped fan-out routes
-through ``_battery_targets``, PowerSource's own coverage cache, which has no
-special knowledge of Thread at all — but that fan-out's target set is guaranteed to
-always include the event's own endpoint (``_battery_targets`` either returns
-``None``, meaning node-wide, or a set built by unioning in the queried endpoint
-itself), so this cluster's ep-0 events always still reach the ep-0 ``matterNode``
-device, on every node shape (no PowerSource, one, or several). The cost is a few
-harmless extra dispatch calls to sibling devices on a battery-covered node, each
-dropped immediately by the ``key in indigo_dev.states`` guard below — cheaper than
-adding a second fan-out seam to device_sync for one handler.
+**``node_scoped = False``**: same-endpoint like BasicInformation, unlike
+PowerSource — ThreadNetworkDiagnostics lives on endpoint 0, the SAME endpoint as
+its target ``matterNode`` device, so ordinary same-endpoint dispatch
+(``_lookup_for_cluster``) is exactly right and no cross-endpoint fan-out is needed.
 """
 from __future__ import annotations
 
@@ -98,16 +90,17 @@ _SUBSCRIBED_ATTRS: frozenset = frozenset({
 class ThreadNetworkDiagnosticsHandler(ClusterHandler):
     """ThreadNetworkDiagnostics (0x0035) → the ``matterNode`` device's Thread states.
 
-    Non-primary (``device_sync`` owns ``matterNode`` creation) and node-scoped —
-    see the module docstring for why that flag is set despite the cluster sharing
-    its target device's own endpoint. Read-only: ``handle_indigo_action`` always
-    returns ``None`` (ADR-0004).
+    Non-primary (``device_sync`` owns ``matterNode`` creation) and NOT node-scoped:
+    this cluster lives on the same endpoint (0) as the device it describes, same
+    as ``basic_information.py`` — ordinary same-endpoint dispatch is exactly right,
+    unlike ``PowerSourceHandler``'s genuine cross-endpoint case. Read-only:
+    ``handle_indigo_action`` always returns ``None`` (ADR-0004).
     """
 
     cluster_id = CLUSTER_THREAD_DIAG
     cluster_name = "ThreadNetworkDiagnostics"
     device_type_id = "matterNode"
-    node_scoped = True
+    node_scoped = False
 
     def __init__(self) -> None:
         # node_id -> {attribute_id: last-seen raw value}. See the module
@@ -131,9 +124,8 @@ class ThreadNetworkDiagnosticsHandler(ClusterHandler):
             node_id, _endpoint_id = node_endpoint(indigo_dev)
         except (KeyError, TypeError, ValueError):
             # A device with no (or unparsable) nodeId/endpointId props — should
-            # not happen for a real matterNode device, but this handler can be
-            # reached (via node_scoped fan-out) against ANY device on the node,
-            # so degrade rather than assume the props are shaped as expected.
+            # not happen for a real matterNode device, but degrade rather than
+            # assume the props are shaped as expected.
             _LOG.debug("thread diag update for a device with no usable nodeId/endpointId props")
             return {}
 

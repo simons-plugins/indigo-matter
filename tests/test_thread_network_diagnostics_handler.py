@@ -179,8 +179,10 @@ def test_creates_no_devices():
 
 
 def test_node_scoped_flag():
+    """Same-endpoint like BasicInformation, unlike PowerSource: this cluster
+    lives on endpoint 0, same as its target matterNode device."""
     h = ThreadNetworkDiagnosticsHandler()
-    assert h.node_scoped is True
+    assert h.node_scoped is False
 
 
 def test_handle_action_always_returns_none():
@@ -299,3 +301,37 @@ def test_priming_a_node_without_thread_cluster_leaves_states_blank(ds, indigo_en
     assert node_dev_id is not None
     dev = devices[node_dev_id]
     assert dev.states.get("threadRole") == 0  # Devices.xml default, never written
+
+
+def test_live_attribute_event_updates_the_node_device_via_plain_dispatch(ds, indigo_env):
+    """node_scoped = False (same-endpoint like BasicInformation): a live
+    attribute_updated event on cluster 0x35/endpoint 0 must reach the
+    matterNode device through _on_attribute's ORDINARY _lookup_for_cluster
+    path, not the PowerSource-style node-scoped fan-out. Primes 0x34 (1
+    neighbour → warn), then a live NeighborTable update adding a second,
+    healthy neighbour must clear single_neighbour and flip threadHealth to
+    "ok" — observable proof the live event actually reached the device."""
+    import protocol
+    from protocol import MatterEvent
+
+    _indigo, devices = indigo_env
+    raw = _thread_node_raw(0x34)
+    result = ds.create_from_raw(raw, "Router Node")
+    node_dev_id = result["nodeDeviceId"]
+    assert node_dev_id is not None
+    dev = devices[node_dev_id]
+    assert dev.states.get("threadHealth") == "warn"  # single_neighbour, primed
+
+    two_neighbours = _thread_attrs(_load_fixture_node(0x34))[ATTR_NEIGHBOR_TABLE] + [{
+        "0": 1, "1": 5, "2": 4096, "3": 500, "4": 8, "5": 3,
+        "6": -50, "7": -50, "8": 0, "9": 0,
+        "10": True, "11": True, "12": True, "13": False,
+    }]
+    ds.handle_event(MatterEvent(
+        kind=protocol.EVT_ATTRIBUTE_UPDATED,
+        node_id=0x34, endpoint=0, cluster=CLUSTER_THREAD_DIAG,
+        attribute=ATTR_NEIGHBOR_TABLE, value=two_neighbours,
+    ))
+
+    assert dev.states.get("threadNeighbourCount") == 2
+    assert dev.states.get("threadHealth") == "ok"
