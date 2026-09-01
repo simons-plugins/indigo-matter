@@ -93,6 +93,53 @@ def test_send_command_invokes_device_command(mock_logger):
     run(scenario())
 
 
+def test_a_raising_event_handler_does_not_kill_the_connection(mock_logger):
+    """The twin `test_bridge_client.py` has had for months and this file has
+    not (issue #310 audit).
+
+    `on_event` fans into the whole DeviceSync update path, so it can raise
+    anything. The catch around it is not loop protection — the transport's own
+    frame catch provides that — it is there so the failure is reported while
+    still naming WHICH event broke, and so one bad event costs one event rather
+    than the connection.
+    """
+    async def scenario():
+        seen = []
+
+        def boom(evt):
+            seen.append(evt)
+            raise RuntimeError("device sync exploded")
+
+        fake = FakeWebSocket()
+        client = MatterClient(Protocol(), mock_logger, {},
+                              connect=lambda uri: returns(fake),
+                              on_event=boom)
+        task = asyncio.create_task(client.run())
+        await client.wait_connected(timeout=2)
+
+        await fake.push_event("attribute_updated", [42, "1/6/0", True])
+        for _ in range(20):
+            if mock_logger.exception.called:
+                break
+            await asyncio.sleep(0.01)
+
+        assert seen, "the handler was never called"
+        mock_logger.exception.assert_called()
+        assert client.connected, "one raising handler must not cost the connection"
+
+        # ...and the client is still delivering: the next event still lands.
+        await fake.push_event("attribute_updated", [42, "1/6/0", False])
+        for _ in range(20):
+            if len(seen) > 1:
+                break
+            await asyncio.sleep(0.01)
+        assert len(seen) > 1, "the dispatcher stopped after the first failure"
+
+        await client.close()
+        task.cancel()
+    run(scenario())
+
+
 def test_events_are_dispatched_to_callback(mock_logger):
     async def scenario():
         received = []

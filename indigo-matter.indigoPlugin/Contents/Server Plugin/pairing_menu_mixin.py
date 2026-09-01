@@ -446,22 +446,21 @@ class PairingMenuMixin:
             self.logger.error("Fabric backup FAILED — nothing was written: %s", exc)
             self.logger.exception(exc)
 
+    @degrades_to_list_error
     def getFabricBackups(self, filter="", valuesDict=None, typeId="", targetId=0):  # noqa: N802, A002
-        """List-callback populating the restore picker (newest first)."""
-        try:
-            storage_path = self._resolve_storage_path()
-        except Exception as exc:  # pylint: disable=broad-except
-            # Absorbing: any failure resolving the backup storage path. KNOWN
-            # SHORTCOMING (#310 audit): this renders a failed lookup identically to
-            # 'you have no backups' — the empty-result-over-failure shape the
-            # workspace degradation-path standard names. The house fix already
-            # exists (`degrades_to_list_error`, used by getBridgeFabrics above and
-            # pinned by test_a_broken_picker_says_so_rather_than_rendering_empty),
-            # and the Tier A refactor deliberately left this callback out because
-            # converting it CHANGES BEHAVIOUR. Recorded here rather than changed:
-            # it belongs in its own commit with a test.
-            self.logger.exception(exc)
-            return []
+        """List-callback populating the restore picker (newest first).
+
+        Degrades to ``LIST_ERROR_OPTION``, not to an empty list (issue #310).
+        A failed storage-path resolution used to render EXACTLY like "you have
+        no backups" — and that is the one answer a user acts on, by concluding
+        there is nothing to restore and going looking for a fabric they in fact
+        still have. The row says the list is broken instead.
+
+        The decorator also covers ``list_backups`` and the formatting loop,
+        whose failures previously escaped this method entirely and took the
+        whole dialog down with a raw traceback.
+        """
+        storage_path = self._resolve_storage_path()
         options = []
         for entry in fabric_backup.list_backups(storage_path):
             when = datetime.fromtimestamp(entry["mtime"], timezone.utc).strftime("%Y-%m-%d %H:%M UTC")

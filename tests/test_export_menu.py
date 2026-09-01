@@ -2021,6 +2021,44 @@ class TestGetMigrateDevices:
         assert options == [(plugin_mod.NO_SELECTION_ID,
                             "(plugin still starting — re-open this dialog in a moment)")]
 
+    def test_one_unreadable_device_costs_one_row_here_too(self, plug, devices, plugin_mod):
+        """The migrate picker holds its OWN copy of the per-row loop, and its
+        containment was pinned only by getExportCandidates' identical test
+        (issue #310 audit). Two copies of a rule with one test between them is
+        how the copies drift — and they HAD: this loop read `dev.id` one line
+        ABOVE its own try, so a device being deleted underneath us escaped the
+        per-row containment entirely and `degrades_to_list_error` replaced the
+        WHOLE picker with the error row. Every legitimate row was lost to one
+        unreadable device — the exact outcome the per-row try exists to
+        prevent, and which `_migrate_device_row`'s docstring claimed it did
+        prevent ("the caller contains it, matching _candidate_row").
+
+        What is pinned here is the containment that matters: one hostile device
+        costs one device, not the dialog, and the failure is logged.
+
+        The DIVERGENCE is pinned too, deliberately, so it is a decision rather
+        than a surprise: `getExportCandidates` keeps an error ROW for the
+        unreadable device (ROW_ERROR_LABEL, "so the count is honest"), while
+        this picker drops it silently. Arguably right — you cannot migrate onto
+        a device that cannot be read, so an unselectable row would only be
+        noise — but the two loops describe themselves as the same rule
+        (`_migrate_device_row`: "the caller contains it, matching
+        ExportDialogMixin._candidate_row") and they are not. If they are ever
+        reconciled, this assertion is the one that should fail first.
+        """
+        plug.exports.upsert(ExportEntry(101, "onOffPlugInUnit"))
+        before = _labels(plug.getMigrateDevices(valuesDict={"migrateSource": "101"}))
+        assert before, "precondition: the picker offers something to begin with"
+
+        devices.add(HostileDevice())
+        labels = _labels(plug.getMigrateDevices(valuesDict={"migrateSource": "101"}))
+
+        assert labels == before, \
+            "one hostile device must cost only itself — every other row is unchanged"
+        plug.logger.exception.assert_called()
+        assert not [l for l in labels.values() if plugin_mod.ROW_ERROR_LABEL in l], \
+            "migrate drops the row where getExportCandidates keeps it — see the docstring"
+
     def test_a_vanished_source_yields_no_devices(self, plug):
         assert plug.getMigrateDevices(valuesDict={"migrateSource": "999999"}) == []
 
@@ -2274,6 +2312,42 @@ class TestMenuMigrateExportSuccess:
         said = _said(plug.logger.warning.call_args_list)
         assert '"Garage Plug"\'s own previous accessory (number 11) has been removed ' \
             "from your ecosystems." in said
+
+    def test_a_raising_status_report_never_unwinds_a_committed_migrate(self, plug, devices):
+        """Resurrects the pin deleted with the re-adopt suite in #274b.
+
+        `_previous_accessory_number` promises never to raise "over a cosmetic
+        omission", and catches every exception on purpose — a summary object
+        with a raising property would defeat a narrower catch. By the time it
+        runs, the store write and the bridge nudge have BOTH already landed,
+        so an exception here would fail the REPORT of a migrate that is not
+        itself undone: the user would see an error over a change that
+        happened.
+
+        #274b removed the test that held this (it lived in the re-adopt
+        suite), leaving the decision unwatched even though the helper still
+        serves migrate. This is the migrate-flow equivalent.
+        """
+        devices.add(RelayDevice(106, "Garage Plug"))
+        plug.exports.upsert(ExportEntry(101, "onOffPlugInUnit"))
+        plug.exports.upsert(ExportEntry(106, "onOffPlugInUnit"))
+        client = _bridge_with(plug, attached=True)
+
+        class _HostileStatus:
+            @property
+            def endpoints(self):
+                raise RuntimeError("status report is malformed")
+
+        client.status = _HostileStatus()
+        plug.export_bridge.reattach = Mock(return_value=True)
+
+        ok, _values_out = plug.menuMigrateExport(
+            {"migrateConfirm": True, "migrateSource": "101", "migrateDevice": "106"})
+
+        assert ok is True, "a cosmetic read must not fail a migrate that already committed"
+        said = _said(plug.logger.warning.call_args_list)
+        assert "has been removed from your ecosystems." in said
+        assert "(number" not in said, "an unreadable status must omit the number, not guess one"
 
     def test_confirmation_removal_sentence_survives_an_unknown_number(self, plug, devices):
         """Issue #246 review finding 3 — gated on whether the target's own

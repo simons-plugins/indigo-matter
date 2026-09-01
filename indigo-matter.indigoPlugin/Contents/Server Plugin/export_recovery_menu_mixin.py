@@ -300,9 +300,15 @@ class ExportRecoveryMenuMixin:
         explained: list = []
         failures = 0
         for dev in indigo.devices:
-            if dev.id == source_id:
-                continue                     # the row above, not a target for itself
             try:
+                # INSIDE the try, like getExportCandidates' identical loop
+                # (issue #310): `dev.id` on a device being deleted underneath
+                # us raises, and read one line earlier that raise escaped the
+                # per-row containment entirely — degrades_to_list_error then
+                # replaced the WHOLE picker with the error row, which is the
+                # one outcome this loop exists to prevent.
+                if dev.id == source_id:
+                    continue                 # the row above, not a target for itself
                 row = self._migrate_device_row(dev, source_identity, plugin_id, exported)
                 if row is None:
                     continue

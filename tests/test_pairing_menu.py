@@ -476,6 +476,28 @@ class TestFabricPicker:
         assert "error building list" in list(rows.values())[0]
 
 
+class TestFabricBackupPicker:
+    def test_a_broken_backup_picker_says_so_rather_than_looking_empty(self, plug):
+        """An empty picker and a broken picker used to render identically here,
+        and "you have no backups" is the one answer a user ACTS on — by
+        concluding there is nothing to restore and going looking for a fabric
+        they in fact still have (issue #310)."""
+        plug._resolve_storage_path = Mock(side_effect=RuntimeError("prefs unreadable"))
+        rows = dict(plug.getFabricBackups())
+        assert "error building list" in list(rows.values())[0]
+
+    def test_a_failure_LISTING_the_backups_no_longer_takes_the_dialog_down(self, plug, monkeypatch):
+        """The storage path resolving fine and the listing then failing used to
+        escape this callback entirely — a raw traceback instead of a dialog.
+        The decorator covers the whole body now, not just the path lookup."""
+        import fabric_backup
+        plug._resolve_storage_path = Mock(return_value="/tmp/does-not-matter")
+        monkeypatch.setattr(fabric_backup, "list_backups",
+                            Mock(side_effect=RuntimeError("unreadable directory")))
+        rows = dict(plug.getFabricBackups())
+        assert "error building list" in list(rows.values())[0]
+
+
 class TestUnpairMenu:
     def test_neither_tick_removes_nothing(self, plug):
         """⊗ Asserted against THE CLIENT, with a live client present."""

@@ -1819,6 +1819,46 @@ def test_a_lying_device_leaves_the_state_alone_and_flags_the_device(plugin_cls, 
         5, [{"key": "holdTime", "value": 10}])
 
 
+def test_a_failed_flag_on_a_LIVE_device_warns_rather_than_going_quiet(
+        plugin_cls, mock_indigo_base, mock_logger):
+    """The write failure is already reported at ERROR; this is about the RECORD
+    of it not sticking.
+
+    The dialog re-seeds from state, so if the honest read-back value cannot be
+    written the user is shown a setting the device never adopted — the exact
+    divergence the write exists to prevent. That must not be a debug line
+    indistinguishable from 'the device was deleted' (issue #310).
+    """
+    from unittest.mock import MagicMock
+    dev = _fp300_dev()
+    dev.setErrorStateOnServer = MagicMock(side_effect=RuntimeError("server not answering"))
+    mock_indigo_base.devices = {5: dev}
+    stub = _settings_stub(plugin_cls, mock_logger, matter=MagicMock())
+    stub.matter.write = _async_none
+    stub.matter.read = _async_value(10)          # ACKed the write, kept the old value
+    _run_apply(plugin_cls, stub, _hold_time_plan())
+
+    assert any("may show a value the device never adopted" in str(call.args)
+               for call in mock_logger.warning.call_args_list), \
+        "a failed record of a failed setting must say what the user will now see"
+
+
+def test_a_device_deleted_mid_flight_is_not_warned_about(
+        plugin_cls, mock_indigo_base, mock_logger):
+    """The other half. _apply_setting runs on the loop seconds after the dialog
+    closed, so the user deleting the device in between is routine — there is
+    nothing left to flag and nothing to keep honest."""
+    from unittest.mock import MagicMock
+    mock_indigo_base.devices = {}                # a real dict: a real KeyError
+    stub = _settings_stub(plugin_cls, mock_logger, matter=MagicMock())
+    stub.matter.write = _async_none
+    stub.matter.read = _async_value(10)
+    _run_apply(plugin_cls, stub, _hold_time_plan())
+
+    assert not any("may show a value the device never adopted" in str(call.args)
+                   for call in mock_logger.warning.call_args_list)
+
+
 def test_a_crash_in_the_write_path_never_kills_the_loop(plugin_cls, mock_indigo_base,
                                                         mock_logger, monkeypatch):
     import functools
