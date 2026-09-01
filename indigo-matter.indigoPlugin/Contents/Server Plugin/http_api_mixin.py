@@ -8,15 +8,19 @@ from __future__ import annotations
 import json
 import time
 from concurrent.futures import TimeoutError as FuturesTimeoutError
+from datetime import datetime, timezone
 from typing import Any
 
 import indigo  # provided by the Indigo runtime
 
+import thread_mesh
+import thread_survey
 from commission_jobs import node_id_to_str
 from http_handlers import MatterUnavailable
 from pairing_page import _pairing_html
 from plugin_constants import DECOMMISSION_TIMEOUT, PAIRING_READ_TIMEOUT
 from protocol import is_node_not_exists
+from thread_page import render_thread_page
 
 
 class HttpApiMixin:
@@ -282,3 +286,83 @@ class HttpApiMixin:
                 "No pairing window is open, so there is no code to show. Open one with "
                 "Plugins ▸ Matter ▸ Pair Matter Bridge… in Indigo.")
         return _pairing_html(pairing, "")
+
+    # ------------------------------------------------------------------
+    # The read-only Thread mesh page (IWS hidden action — #334, ADR-0004)
+    # ------------------------------------------------------------------
+    def http_thread_page(self, action, dev=None, caller_waiting_for_result=None):  # noqa: N802, ARG002
+        """Serve the Thread mesh page. GET only, mirroring ``http_pairing``.
+
+        ``?live=1`` live-refreshes every sleepy (non-router) node first, via
+        the exact same :func:`thread_survey.run_survey` the "Report Thread
+        mesh…" menu diagnostic uses — the cache-vs-live policy lives in one
+        place, not two drifting call sites. Always 200: a matter-server
+        failure renders as the page's own error banner (ADR-0004 has no write
+        path to fall back to, and a broken read must never look like a real
+        but empty mesh — root workspace CLAUDE.md degradation-path
+        convention).
+        """
+        method, _path_args, query = self._parse_request(action)
+        if method.upper() != "GET":
+            return self._reply(405, {"error": "method_not_allowed"})
+        live = str(query.get("live", "")) == "1"
+        mesh, diags, error = self._thread_mesh_snapshot(live_sleepy=live)
+        generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        content = render_thread_page(
+            mesh, diags, generated_at=generated_at, live=live,
+            plugin_id=self._export_plugin_id(),  # pylint: disable=no-member  # ExportDialogMixin
+            error=error,
+        )
+        reply = indigo.Dict()
+        reply["status"] = 200
+        reply["headers"] = indigo.Dict({"Content-Type": "text/html; charset=utf-8"})
+        reply["content"] = content
+        return reply
+
+    def _thread_mesh_snapshot(self, *, live_sleepy: bool):
+        """``(mesh, diags, error)`` for the Thread page.
+
+        Mirrors ``DiagnosticsMenuMixin.menuReportThreadMesh``'s failure
+        handling (same two failure shapes: not connected, and
+        ``run_survey``/``get_nodes()`` failing outright) but reports an HTML
+        banner instead of a dialog error. A per-node live-read timeout is NOT
+        one of these — that degrades to ``NodeDiag.read_error`` inside
+        ``thread_survey`` and is shown in the page's own "Unreadable" section,
+        same as the menu report prints it from cache rather than failing.
+        """
+        if self.runtime is None or self.matter is None or not self.matter.connected:
+            return thread_mesh.build_mesh([]), [], "The plugin is not connected to matter-server yet."
+        try:
+            diags = thread_survey.run_survey(
+                self.runtime, self.matter, live_sleepy=live_sleepy,
+                node_names=self._thread_node_names(),
+            )
+        except FuturesTimeoutError:
+            return thread_mesh.build_mesh([]), [], "matter-server did not answer in time."
+        except Exception as exc:  # pylint: disable=broad-except
+            # Absorbing: get_nodes() failing is a failed call (thread_survey's own
+            # contract), not an empty mesh — surfaced as the page's error banner
+            # rather than a silently "no Thread devices" map.
+            self.logger.warning("Matter: could not read the Thread mesh for the IWS page: %s", exc)
+            return thread_mesh.build_mesh([]), [], f"matter-server could not be read: {exc}"
+        return thread_mesh.build_mesh(diags), diags, None
+
+    def _thread_node_names(self) -> dict:
+        """``node_id -> Indigo device name(s)``, for ``thread_survey``'s naming
+        fallback ("<vendor> <product>", else "node 0x..").
+
+        Same source :meth:`DiagnosticsMenuMixin._matter_node_options` reads
+        (``device_sync.list_nodes()``) — reused rather than re-derived, so a
+        node's name here and in the diagnostics pickers can never disagree. A
+        node with no Indigo devices is simply left out of the map.
+        """
+        if self.device_sync is None:
+            return {}
+        try:
+            return {node_id: ", ".join(names) for node_id, names in self.device_sync.list_nodes() if names}
+        except Exception as exc:  # pylint: disable=broad-except
+            # Absorbing: this is cosmetic naming only, never worth failing the
+            # whole page over — thread_survey degrades a missing name to
+            # "<vendor> <product>" or "node 0x.." on its own.
+            self.logger.debug("thread page: could not resolve node names (%s)", exc)
+            return {}

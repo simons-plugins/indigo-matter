@@ -3,6 +3,46 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
+## 2026.30.0 — Thread mesh diagnostics: states, a report, and a read-only map (#334)
+
+Thread devices commissioned through Indigo/Domio are invisible to Apple's own
+Thread tooling (Thread Doctor only lists HomeKit accessories), even though
+matter-server already caches every node's ThreadNetworkDiagnostics cluster
+(0x0035). This release turns that cache into three surfaces, all read-only
+(ADR-0004 — nothing here writes to a device, now or ever) and all built on one
+shared model (`thread_mesh.py`) and one shared survey coroutine
+(`thread_survey.py`), so the cache-vs-live policy lives in exactly one place:
+
+- **Four new `matterNode` states**: `threadRole`, `threadNeighbourCount`,
+  `threadLinkRssi` and `threadHealth` ("ok"/"warn"/"bad"), kept deliberately
+  short (ADR-0008) — only what a trigger would plausibly bind to. Channel,
+  network name and partition are **not** states: they are report- and
+  page-only, by design, because a cached reading of them for a sleepy device
+  can be hours stale and a state that looks live but silently isn't is worse
+  than no state at all.
+- **"Report Thread mesh…"** — a new read-only menu diagnostic alongside the
+  existing settable-attribute report and attribute explorer. Prints roles,
+  neighbour/route links (RSSI/LQI/frame-error), the leader, foreign routers and
+  health flags to the event log, with an option to live-read every sleepy
+  (non-router) node first for accuracy — routers are never live-read; they are
+  mains-powered and polled continuously already, so their cache is not the
+  stale one. A live-read timeout on one node still prints everything else
+  (from cache) and says so, rather than silently thinning the report.
+- **A read-only Thread mesh page**, served over the Indigo Web Server at
+  `/message/com.simons-plugins.indigo-matter/thread` — the same report as a
+  self-contained HTML page with an inline SVG map (no JS, no external assets,
+  readable on a phone over the Reflector): the leader, every other router, and
+  every non-router placed under whichever router it links to, edges coloured
+  by RSSI and labelled with LQI/frame-error, plus the flags list and a
+  per-node table. `?live=1` runs the same live-read pass as the menu item. A
+  matter-server failure renders as the page's own error banner, never a
+  silently empty map.
+- **Foreign routers are shown but not named** — a router referenced by an
+  owned node's tables that no Indigo device claims is drawn as "Router N",
+  the fabric's leader captioned "probably your border router" when it is one
+  of them. Naming them (via mDNS `_meshcop._udp` discovery of a border
+  router's own ext address) is a separate concern, tracked as #335.
+
 ## 2026.29.15 — the bridge-node suite stops hiding tests it did not run
 
 Fixes #330. `npm test` reported `# fail 0` and `# skipped 0` on runs where it
