@@ -64,6 +64,57 @@ Inherits workspace standards from [root CLAUDE.md](../CLAUDE.md#common-standards
 - **Architecture decisions**: repo-local ones live in [`docs/adr/`](./docs/adr/INDEX.md) (MADR 4.0.0). **Read that index before changing writable settings, capability detection, or the diagnostics surface.** Cross-repo concerns go in the workspace `docs/adr/` instead. Numbering is independent and collides, so always qualify a reference as "workspace ADR-NNNN". ADRs are immutable once accepted — supersede, never edit.
 - **Device quirks**: hardware behaviours that surprised us are in [`docs/DEVICE-NOTES.md`](./docs/DEVICE-NOTES.md).
 
+## Releasing the bridge node (read this BEFORE `npm publish`)
+
+`bridge-node` ships as an **exact-pinned npm package**, not as part of the
+plugin bundle. A change to `bridge-node/src/` reaches nobody until *both* of
+these happen — merging it does nothing on its own:
+
+1. `npm publish` the new `bridge-node/package.json` `version`, and
+2. move `DEFAULT_INSTALL_SPEC` in `Contents/Server Plugin/bridge_agent.py` to
+   that version. That is "the one line a release bumps", as its own docstring
+   says.
+
+Order matters: **publish first**. If the pin reaches `main` before the version
+is on npm, every install resolving it fails.
+
+### The npm token lives in `.env`, and must be passed explicitly
+
+The publish credential is `npmjs-token` in this repo's **`.env`** (gitignored,
+untracked — keep it that way). There is deliberately no ambient npm credential:
+`~/.npmrc` holds no token, so a bare `npm publish` fails outright rather than
+half-working under the wrong identity.
+
+```sh
+cd bridge-node
+TOKEN=$(grep -i 'npmjs-token' ../.env | cut -d= -f2- | xargs)
+npm publish "--//registry.npmjs.org/:_authToken=$TOKEN"
+```
+
+**Why this is written down.** `npm login` writes a token of its own into
+`~/.npmrc`, and npm prefers it silently. When that happened here, a publish with
+the correct `.env` token in hand still failed — and npm reports an
+unauthorised write as `404 Not Found - PUT`, never `403`, so it reads as "no
+such package" rather than "wrong credential". That combination cost a long
+debugging detour. If you see that 404, suspect the credential, not the package,
+and check for a token in `~/.npmrc` first.
+
+Do not run `npm login`, and do not store the token anywhere but `.env`.
+
+### Verifying and shipping
+
+`npm view` serves cached metadata and will lie to you immediately after a
+publish. Check the registry directly:
+
+```sh
+curl -sS https://registry.npmjs.org/indigo-matter-bridge \
+  | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['dist-tags']['latest'])"
+```
+
+Then open the pin-bump PR with **`[release]` in the title** (releases are
+opt-in). Note `version-check` runs on *every* PR to `main` with no path filter,
+so even a docs-only PR needs a `PluginVersion` bump.
+
 ## Status
 
 Both directions are built, released, and field-validated against real hardware:
