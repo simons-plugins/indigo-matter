@@ -34,6 +34,7 @@ from .smoke_co import SmokeCOAlarmHandler
 from .thermostat import FanControlHandler, ThermostatHandler
 from .air_quality import AirQualityHandler, CO2Handler, PM25Handler, TVOCHandler
 from .power_source import PowerSourceHandler
+from .thread_network_diagnostics import ThreadNetworkDiagnosticsHandler
 from .valve import ValveHandler
 from .window_covering import WindowCoveringHandler
 
@@ -52,7 +53,10 @@ def default_handlers() -> list[ClusterHandler]:
     BasicInformation is non-primary too — device_sync owns matterNode
     creation, like the device_sync-owned _unknown_spec/_energy_meter_spec
     fallback specs (issue #204, ADR-0008) — and order-independent for the
-    same reason PowerSource is, so it sits alongside it at the end."""
+    same reason PowerSource is, so it sits alongside it at the end.
+    ThreadNetworkDiagnostics (issue #334) is the same shape as
+    BasicInformation for a second matterNode-targeting cluster — non-primary,
+    node-scoped, order-independent — so it sits next to it."""
     return [
         ColorControlHandler(),
         LevelControlHandler(),
@@ -80,6 +84,7 @@ def default_handlers() -> list[ClusterHandler]:
         BooleanStateConfigHandler(),
         PowerSourceHandler(),
         BasicInformationHandler(),
+        ThreadNetworkDiagnosticsHandler(),
     ]
 
 

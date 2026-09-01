@@ -51,9 +51,12 @@ _STATIC_DEVICE_TYPE_STATES = {
     # matterEnergyMeter/matterUnknown's `reachable`. curEnergyLevel/
     # accumEnergyTotal joined the list once ep-0 energy attribution shipped
     # (issue #204's final stage) — same ids matterEnergyMeter already
-    # declares, also unconditionally.
+    # declares, also unconditionally. threadRole/threadNeighbourCount/
+    # threadLinkRssi/threadHealth joined the same way once #334 shipped —
+    # written only for Thread nodes, blank (this default) on Wi-Fi ones.
     "matterNode": {"nodeLabel", "softwareVersion", "batteryLevel", "reachable",
-                   "curEnergyLevel", "accumEnergyTotal"},
+                   "curEnergyLevel", "accumEnergyTotal",
+                   "threadRole", "threadNeighbourCount", "threadLinkRssi", "threadHealth"},
 }
 
 
