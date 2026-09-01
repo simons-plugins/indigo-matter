@@ -56,7 +56,8 @@ def default_handlers() -> list[ClusterHandler]:
     same reason PowerSource is, so it sits alongside it at the end.
     ThreadNetworkDiagnostics (issue #334) is the same shape as
     BasicInformation for a second matterNode-targeting cluster — non-primary,
-    node-scoped, order-independent — so it sits next to it."""
+    same-endpoint (`node_scoped = False`), order-independent — so it sits
+    next to it."""
     return [
         ColorControlHandler(),
         LevelControlHandler(),

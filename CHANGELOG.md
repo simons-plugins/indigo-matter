@@ -9,17 +9,27 @@ Thread devices commissioned through Indigo/Domio are invisible to Apple's own
 Thread tooling (Thread Doctor only lists HomeKit accessories), even though
 matter-server already caches every node's ThreadNetworkDiagnostics cluster
 (0x0035). This release turns that cache into three surfaces, all read-only
-(ADR-0004 — nothing here writes to a device, now or ever) and all built on one
-shared model (`thread_mesh.py`) and one shared survey coroutine
-(`thread_survey.py`), so the cache-vs-live policy lives in exactly one place:
+(ADR-0004 — nothing here writes to a device, now or ever) and all built on
+one shared model (`thread_mesh.py`). Two of the three — the menu report and
+the IWS page — also share one survey coroutine (`thread_survey.py`), so the
+cache-vs-live policy lives in exactly one place; the four `matterNode`
+states are different — they are fed directly by `device_sync`'s existing
+per-attribute dispatch (one changed attribute at a time, live or replayed
+from the cache at device creation) straight into `thread_mesh`, and never
+call `thread_survey` at all:
 
 - **Four new `matterNode` states**: `threadRole`, `threadNeighbourCount`,
   `threadLinkRssi` and `threadHealth` ("ok"/"warn"/"bad"), kept deliberately
   short (ADR-0008) — only what a trigger would plausibly bind to. Channel,
-  network name and partition are **not** states: they are report- and
-  page-only, by design, because a cached reading of them for a sleepy device
-  can be hours stale and a state that looks live but silently isn't is worse
-  than no state at all.
+  network name and partition are **not** states: the reason is ADR-0008
+  itself (a shipped state is permanent, so the bar is "would a trigger
+  plausibly bind to this"), not staleness — all four shipped states come
+  from exactly the same cache and are equally stale for a sleepy device.
+  Channel/network/partition simply are not the kind of thing an automation
+  binds to; they live in the report and page instead, where `threadLinkRssi`
+  is also never written as a `-128` sentinel when unknown (it is left
+  untouched, alongside the other three states, until the neighbour table
+  itself is known).
 - **"Report Thread mesh…"** — a new read-only menu diagnostic alongside the
   existing settable-attribute report and attribute explorer. Prints roles,
   neighbour/route links (RSSI/LQI/frame-error), the leader, foreign routers and
@@ -34,14 +44,27 @@ shared model (`thread_mesh.py`) and one shared survey coroutine
   readable on a phone over the Reflector): the leader, every other router, and
   every non-router placed under whichever router it links to, edges coloured
   by RSSI and labelled with LQI/frame-error, plus the flags list and a
-  per-node table. `?live=1` runs the same live-read pass as the menu item. A
-  matter-server failure renders as the page's own error banner, never a
-  silently empty map.
+  per-node table. `?live=1` runs the same live-read pass as the menu item,
+  with its own shorter per-node timeout (12 s vs. the menu's 30 s — a
+  synchronous IWS handler's worst case would otherwise near 50 s) and a
+  cache-only fallback when the live pass times out outright, rather than
+  giving up entirely. A matter-server failure renders as the page's own
+  error banner, never a silently empty map.
 - **Foreign routers are shown but not named** — a router referenced by an
   owned node's tables that no Indigo device claims is drawn as "Router N",
   the fabric's leader captioned "probably your border router" when it is one
   of them. Naming them (via mDNS `_meshcop._udp` discovery of a border
   router's own ext address) is a separate concern, tracked as #335.
+- **A non-router with no parent is unhealthy, not silently "ok"** — a
+  SED/ED/REED whose neighbour table is known but has no usable parent link
+  now gets a `bad` `no_parent` health flag; this check used to live only
+  inside the router branch, so a detached leaf node reported clean.
+- **A router's children that can only be partly matched to Indigo devices
+  are no longer individually mislabelled** — which specific RLOC becomes
+  which "child:0x.." box was a NeighborTable-iteration-order coin flip once
+  some (not all) of a router's children were already attributed to an owned
+  device; the unmatched remainder now collapses into one order-independent
+  "N unattributed child(ren)" box instead.
 
 ## 2026.29.15 — the bridge-node suite stops hiding tests it did not run
 

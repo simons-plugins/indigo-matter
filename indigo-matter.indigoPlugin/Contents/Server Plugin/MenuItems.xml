@@ -175,7 +175,7 @@ A Matter pairing code is not durable: once used, or once the window expires (up 
             </Field>
             <Field id="liveReadSleepy" type="checkbox" defaultValue="true">
                 <Label>Live-read sleepy devices first (slower, accurate):</Label>
-                <Description>matter-server's cache can be hours stale for battery/Thread devices — a cached partition or parent link has been proven wrong by a live read before. Leave this on unless you specifically want the raw cache.</Description>
+                <Description>matter-server's cache can be hours stale for battery/Thread devices — a cached partition reading has been proven wrong by a live read before. Leave this on unless you specifically want the raw cache.</Description>
             </Field>
         </ConfigUI>
     </MenuItem>
