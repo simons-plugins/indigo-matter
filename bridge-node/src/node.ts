@@ -402,10 +402,18 @@ export class BridgeNode implements BridgeFacade {
             environment.vars.set("mdns.networkInterface", this.config.mdnsInterface);
         }
         // We own SIGTERM/SIGINT outright. matter.js's ProcessManager installs its
-        // own interrupt handlers when the runtime starts, and being registered
-        // first they run first — tearing the ServerNode down concurrently with
-        // main.ts's ordered shutdown. `runtime.signals` is the documented opt-out
-        // (`ProcessManager.hasSignalSupport` reads it).
+        // own interrupt handlers when the runtime starts, which would tear the
+        // ServerNode down concurrently with main.ts's ordered shutdown.
+        // `runtime.signals` is the documented opt-out
+        // (`ProcessManager.hasSignalSupport` reads it, defaulting to TRUE — so
+        // this line is what makes main.ts the only signal handler in the
+        // process, and deleting it re-enables matter.js's).
+        //
+        // Ordering is no longer part of the argument: since #328, main.ts
+        // registers at module scope, before this method is ever called, so
+        // matter.js's would now run second rather than first. Concurrent
+        // teardown is wrong in either order, hence opting out rather than
+        // relying on the sequence.
         environment.vars.set("runtime.signals", false);
 
         const server = await ServerNode.create({

@@ -47,12 +47,15 @@ async function phase<T>(name: string, run: () => Promise<T> | T): Promise<T> {
 }
 
 /**
- * What is actually up, and therefore what a stop has to close. Both are
- * `undefined` until the thing they name is genuinely closeable — see the
- * publication points in {@link main}.
+ * What is up and must come down. `shutdown` walks this in REVERSE, so each
+ * entry is registered at the point the thing it names becomes real.
+ *
+ * A registry rather than two `let`s because the registration *point* is the
+ * load-bearing part — see the two call sites in {@link main}, which register
+ * for opposite-looking reasons — and two variables encoded that only in
+ * prose, plus a second time, silently, in the escape hatch's `pending` label.
  */
-let bridge: BridgeNode | undefined;
-let ws: BridgeWsServer | undefined;
+const closers: Array<{ what: string; close: () => Promise<void> }> = [];
 let shuttingDown = false;
 
 const shutdown = (signal: string): void => {
@@ -62,12 +65,10 @@ const shutdown = (signal: string): void => {
     shuttingDown = true;
     log(`Received ${signal}, shutting down`);
 
-    // Armed before the awaits, so a close that never resolves is still
-    // caught. Unref'd: it must not itself hold the loop open. A forced exit
-    // is not a clean shutdown, hence exit code 1 — launchd should see the
-    // difference. BridgeNode.start() sets `runtime.signals: false`, so
-    // matter.js's ProcessManager is not racing us for these signals.
-    let pending = "protocol WS close";
+    // Armed before the awaits, so a close that never resolves is still caught.
+    // Unref'd: it must not itself hold the loop open. A forced exit is not a
+    // clean shutdown, hence exit code 1 — launchd should see the difference.
+    let pending = "shutdown start";
     const escapeHatch = setTimeout(() => {
         log(`Shutdown stalled at: ${pending}; forcing exit`);
         process.exit(1);
@@ -75,31 +76,43 @@ const shutdown = (signal: string): void => {
     escapeHatch.unref();
 
     void (async () => {
-        // Separate try blocks: a failing WS close must not skip the Matter
-        // close, which is what releases the storage lock. Both are optional
-        // because a stop can arrive before either exists — closing nothing
-        // and exiting 0 is the correct handling of a stop that early.
-        try {
-            await ws?.close();
-        } catch (error) {
-            log(`Error closing protocol WS: ${describeErrorWithStack(error)}`);
-        }
-        pending = "Matter node close";
-        try {
-            await bridge?.close();
-        } catch (error) {
-            log(`Error closing Matter node: ${describeErrorWithStack(error)}`);
+        const closed: string[] = [];
+        const failed: string[] = [];
+        // Drained, not snapshotted. `main()` keeps running while this awaits —
+        // a stop during the Matter start lets startup finish, and the protocol
+        // WS registers *after* this loop began. A `[...closers].reverse()` copy
+        // taken up front misses it and leaves a bound socket unclosed; popping
+        // picks up whatever startup added in the meantime and still closes
+        // innermost-first.
+        //
+        // One try per entry: a failing close must not skip the next, which is
+        // what releases the storage lock.
+        while (closers.length > 0) {
+            const entry = closers.pop() as { what: string; close: () => Promise<void> };
+            pending = `${entry.what} close`;
+            try {
+                await entry.close();
+                closed.push(entry.what);
+            } catch (error) {
+                failed.push(entry.what);
+                log(`Error closing ${entry.what}: ${describeErrorWithStack(error)}`);
+            }
         }
         clearTimeout(escapeHatch);
-        log("Shutdown complete");
-        // Both closes returned, in order, so everything that is ours is
-        // down — and what is left on the loop is not ours to wait for.
-        // matter.js 0.17.8's `ServerNode.erase()` (§3.10) leaves a ref'd
-        // timer behind that `close()` does not clear, measured at 0.17.8:
-        // without this, a perfectly clean shutdown *after a factory reset*
-        // would sit until the escape hatch fired and then exit 1, telling
-        // launchd a successful stop was a crash. Exit 0 here; the escape
-        // hatch still owns every path where a close does NOT return.
+        // Say what actually came down. A bare "Shutdown complete" certified
+        // three different outcomes — everything closed, NOTHING closed because
+        // the stop beat startup, and every close throwing — and nothing outside
+        // the process could tell them apart, which is exactly the shape the
+        // workspace's degradation-path rule warns about.
+        const detail = closed.length > 0 ? `closed: ${closed.join(", ")}` : "closed: nothing was up yet";
+        log(`Shutdown complete (${detail}${failed.length > 0 ? `; FAILED: ${failed.join(", ")}` : ""})`);
+        // Everything that is ours is down, and what is left on the loop is not
+        // ours to wait for. matter.js 0.17.8's `ServerNode.erase()` (§3.10)
+        // leaves a ref'd timer behind that `close()` does not clear, measured
+        // at 0.17.8: without this, a perfectly clean shutdown *after a factory
+        // reset* would sit until the escape hatch fired and then exit 1,
+        // telling launchd a successful stop was a crash. Exit 0 here; the
+        // escape hatch still owns every path where a close does NOT return.
         process.exit(0);
     })();
 };
@@ -111,8 +124,13 @@ const shutdown = (signal: string): void => {
 // `null`, no `close()` of anything. The narrow end of that window was an
 // intermittent CI failure (readiness is logged inside `ws.listen()`, a few
 // ticks before the old `process.on` was reached); the wide end was every
-// second of startup. There is no ordering hazard in being early: matter.js
-// installs no signal handlers of its own (`runtime.signals: false`, node.ts).
+// millisecond of startup, ~90ms of it measured on an idle Mac.
+//
+// Registering this early is safe, but NOT because matter.js has no handlers of
+// its own: its `ProcessManager` installs SIGINT/SIGTERM/SIGABRT handlers when
+// its runtime starts, gated on `runtime.signals`, which DEFAULTS TO TRUE. It
+// installs none here only because `BridgeNode.start()` sets that var false
+// (node.ts). Delete that line and this comment stops being true.
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("SIGINT", () => shutdown("SIGINT"));
 
@@ -175,14 +193,33 @@ async function main(): Promise<void> {
         log,
         identityFault === undefined ? undefined : RefuseReason.identityUnreadable,
     );
-    await phase(`Matter node start failed (matter port ${config.matterPort}, storage ${config.storagePath})`, () =>
-        node.start(),
+    // Registered BEFORE `start()` resolves, because `start()` returns long
+    // after the node is live: `server.start()` brings it online — mDNS
+    // advertising, accepting sessions, storage lock held — and only then does
+    // `start()` wire churn detection, session hygiene and the endpoint-identity
+    // assertion (node.ts). Registering on the RETURN would walk a stop straight
+    // past a running node, and the log would be indistinguishable from a stop
+    // that arrived before anything existed.
+    //
+    // The closer sequences itself behind the in-flight start rather than racing
+    // it: `#server` is assigned before `server.start()` (node.ts), so closing
+    // mid-start would race matter.js's own bring-up. The escape hatch bounds
+    // how long that wait can take — a start wedged past it is a forced exit 1,
+    // which for a wedged bridge is the right answer.
+    const starting = phase(
+        `Matter node start failed (matter port ${config.matterPort}, storage ${config.storagePath})`,
+        () => node.start(),
     );
-    // Published only once `start()` has RESOLVED. `close()` on a node that is
-    // still starting is how a clean stop becomes a stalled one, and the escape
-    // hatch reports a stall as exit 1 — the outcome this file exists to avoid.
-    // A signal arriving mid-`start()` therefore closes nothing and exits 0.
-    bridge = node;
+    closers.push({
+        what: "Matter node",
+        close: async () => {
+            // A start that FAILED left nothing of ours up; its error is
+            // `main()`'s to report, not this closer's to rethrow.
+            await starting.catch(() => undefined);
+            await node.close();
+        },
+    });
+    await starting;
 
     const server = new BridgeWsServer({
         port: config.wsPort,
@@ -191,11 +228,13 @@ async function main(): Promise<void> {
         matterJsVersion,
         log,
     });
-    // Published BEFORE `listen()`, unlike the node above: `close()` is guarded
-    // on its own server handle, so it is safe on a server that never bound —
-    // and this is the window the CI flake lived in, where the socket is
-    // already accepting connections but `listen()` has not yet returned.
-    ws = server;
+    // Registered before `listen()`, and unlike the node above no sequencing is
+    // needed: `close()` reads its own `#wss` handle (ws-server.ts), which
+    // `listen()` assigns synchronously, so a close is either a guarded no-op or
+    // an ordinary close of a live server. The CI flake's own window is the
+    // latter — bound and accepting, readiness already logged, `listen()` not
+    // yet returned to us.
+    closers.push({ what: "protocol WS", close: () => server.close() });
     await phase(`protocol WS listen failed (port ${config.wsPort})`, () => server.listen());
 }
 
@@ -216,7 +255,16 @@ main().catch((error: unknown) => {
     // step interrupted that way can reject on its way out. That rejection is a
     // consequence of the shutdown, not a startup failure, and letting it exit 1
     // here would hand launchd the crash code for what was a clean stop.
+    //
+    // It must still be RECORDED. The window is reachable with a real fault in
+    // it — a SIGTERM landing while `listen()` rejects EADDRINUSE — and the
+    // `console.error` below is this program's ONLY writer to launchd's
+    // StandardErrorPath, which the plugin greps for exactly that marker
+    // (`_err_log_mentions_port_conflict`, launch_agent.py). Returning silently
+    // would hide the one startup fault the plugin knows how to diagnose.
     if (shuttingDown) {
+        log(`Startup abandoned by shutdown: ${describeErrorWithStack(error)}`);
+        console.error(`[bridge] startup abandoned by shutdown: ${describeErrorWithStack(error)}`);
         return;
     }
     log(`Fatal: ${describeErrorWithStack(error)}`);

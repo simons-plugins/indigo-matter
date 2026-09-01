@@ -21,29 +21,64 @@ resolves the moment it reads `Protocol WebSocket listening`, which
 `process.on` was reached — so on a loaded runner the test's own SIGTERM
 sometimes landed in the gap. Twice, on PRs touching no TypeScript at all.
 
-The handlers now live at module scope, in place before `main()` runs a line.
-`shutdown` closes whatever is genuinely up: the protocol server is published to
-it before `listen()` (its `close()` is guarded on its own handle, so it is safe
-on a server that never bound — and that is precisely the window the flake lived
-in), while the Matter node is published only once `start()` has **resolved**,
-because closing a node that is still starting is how a clean stop becomes a
-stalled one, and a stall is the escape hatch's exit 1. A signal that arrives
-before either exists closes nothing and exits 0 — a stop that early is still a
-clean stop.
+Handlers now live at module scope, in place before `main()` runs a line, and
+what has to come down lives in a small registry that `shutdown` **drains**
+(rather than a pair of variables it snapshots — `main()` keeps running during a
+shutdown, so the protocol WS can register after the drain has already begun,
+and a snapshot left that socket unclosed).
 
-The identity file was never at risk: `storage.ts` writes it through a temp file
-and `rename`, so a death by signal leaves either the old file or the new one.
+The registration *point* is the load-bearing part:
 
-Two things this does *not* change. `launchctl bootout` — how the plugin
-actually stops the agent — removes the job, so `KeepAlive {SuccessfulExit:
-false}` was never consulted on that path and no respawn was ever triggered by
-this; and matter.js installs no signal handlers of its own
-(`runtime.signals: false`), so being registered earlier races nothing.
+- The **Matter node** registers *before* `start()` resolves, because `start()`
+  returns long after `server.start()` has brought the node online — mDNS
+  advertising, sessions accepted, storage lock held — and only then wires churn
+  detection, session hygiene and the endpoint-identity assertion. Registering on
+  the return walked a stop straight past a running node. Its closer sequences
+  itself behind the in-flight start rather than racing it, since `#server` is
+  assigned before `server.start()`; the escape hatch bounds that wait, so a
+  start wedged past it is a forced exit 1, which for a wedged bridge is right.
+- The **protocol WS** registers before `listen()` and needs no sequencing:
+  `close()` reads its own handle, so it is either a guarded no-op or an ordinary
+  close of a live server.
 
-Covered by a new test that SIGTERMs the child on its version banner, seconds of
-`bridge.start()` before readiness — it fails by construction against the old
-code (exit `null`) and asserts the signal really did land pre-readiness rather
-than passing quietly when startup wins.
+`Shutdown complete` now names what it closed. A bare line certified three
+different outcomes — everything closed, *nothing* closed because the stop beat
+startup, and every close throwing — and nothing outside the process could tell
+them apart, which is the shape the workspace's degradation-path rule warns
+about.
+
+`main().catch` defers to an in-progress shutdown so a step that rejects on its
+way out cannot turn a clean stop into exit 1 — but it **logs** rather than
+returning silently. That window is reachable with a real fault in it (a SIGTERM
+landing while `listen()` rejects `EADDRINUSE`, confirmed against `ws`), and the
+`console.error` there is this program's only writer to launchd's
+`StandardErrorPath` — the file `_err_log_mentions_port_conflict` greps for
+exactly that marker. Swallowing it would have hidden the one startup fault the
+plugin knows how to diagnose.
+
+Two claims worth recording as **false**, since both were believed while writing
+this. The identity file was never at risk: `storage.ts` writes it through a temp
+file and `rename`, so a death by signal leaves either the old file or the new
+one. And launchd never read this as a crash on the plugin's own stop path:
+`launchctl bootout` *removes* the job, so `KeepAlive {SuccessfulExit: false}` is
+not consulted and no respawn was ever caused by this. The real cost was always
+the unclean shutdown itself. Relatedly, `node.ts`'s comment that matter.js's
+signal handlers "being registered first they run first" was made stale by this
+change and has been corrected — matter.js's `ProcessManager` does install
+handlers, gated on a `runtime.signals` var that defaults to **true**, and is
+silent here only because `BridgeNode.start()` sets it false.
+
+Covered by a test that SIGTERMs the child on its version banner, ~90 ms before
+readiness (measured — an earlier draft of this entry claimed "seconds", which
+was wrong by about 20×). Startup then completes alongside the shutdown, so the
+guard is the *order* of the two log lines rather than the absence of one, and
+the test asserts the node that came up during the stop was closed and named —
+it fails against both the pre-#328 code (exit `null`) and against the first cut
+of the fix (bare `Shutdown complete`). A restart on the same storage directory
+pins that an interrupted start leaves a startable box and no temp-file debris,
+SIGINT gets its own case, and `start()`'s timeout path now kills the child it
+used to leak — an orphan holding mDNS 5353 for the rest of the run, which can
+only have worsened the contention its own file header warns about.
 
 ## 2026.29.11 — one unreadable device no longer empties the migrate picker, and a broken matter-server answer is a 500
 
