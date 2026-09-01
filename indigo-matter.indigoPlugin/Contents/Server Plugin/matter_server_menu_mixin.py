@@ -202,7 +202,13 @@ class MatterServerMenuMixin:
                 "matter-server installed, pinned to node at %s, and restarting onto the "
                 "new version — it reconnects automatically.", sp.resolved_bin_dir,
             )
-        except Exception as exc:
+        except Exception as exc:  # pylint: disable=broad-except
+            # Absorbing: anything after npm returns — the prefs save, the
+            # ServerProcess rebuild, the restart. Safe because this runs on a
+            # BACKGROUND INSTALL THREAD, where an escape dies with no log at
+            # all; converting it into a trace plus the half-success message is
+            # strictly more than the user would otherwise get.
+            #
             # npm may have succeeded and only the pin/activate step failed — say so, so
             # the user doesn't reinstall in circles chasing a downstream problem.
             self.logger.exception(exc)
@@ -265,7 +271,12 @@ class MatterServerMenuMixin:
             restarted = True if reloaded else (
                 False if reloaded is None else self.server_process.restart()
             )
-        except Exception as exc:
+        except Exception as exc:  # pylint: disable=broad-except
+            # Absorbing: any ensure_installed/restart failure in a menu
+            # callback. Safe because the handler disarms the window before
+            # reporting — and an escape would ALSO show Indigo's raw traceback
+            # dialog. Pinned by test_menu_restart_clears_window_when_ensure_installed_raises.
+            #
             # Unguarded, this would escape with the expected-restart window still armed,
             # suppressing the crash diagnostic for 30s while the server is down.
             self._restart_expected_until = 0.0
@@ -342,7 +353,13 @@ class MatterServerMenuMixin:
         try:
             for folder in indigo.devices.folders:
                 options.append((str(folder.id), folder.name))
-        except Exception as exc:  # never break the dialog; degrade to no-folder only
+        except Exception as exc:  # pylint: disable=broad-except
+            # never break the dialog; degrade to no-folder only
+            #
+            # Absorbing: any failure enumerating indigo.devices.folders while
+            # the dialog is being drawn. Safe because a raising LIST CALLBACK
+            # takes the whole dialog down — degrading to the "(no folder)" row
+            # keeps commissioning usable.
             self.logger.exception(exc)
         return options
 
@@ -362,7 +379,13 @@ class MatterServerMenuMixin:
             # picker rendering and submit. Benign (device lands at root), but leave
             # a trail rather than silently dropping the selection.
             self.logger.debug("folder id %r not found, commissioning at root", folder_id)
-        except Exception as exc:  # degrade to no folder, never fail the commission
+        except Exception as exc:  # pylint: disable=broad-except
+            # degrade to no folder, never fail the commission
+            #
+            # Absorbing: a stale or unresolvable picker selection (the folder
+            # deleted between render and submit is the routine case). Safe
+            # because the cost is "the device lands at the device-list root",
+            # never a refused commission; the WARNING below names it.
             self.logger.warning("folder id %r not resolvable, commissioning without a folder: %s", folder_id, exc)
         return None
 
@@ -376,7 +399,12 @@ class MatterServerMenuMixin:
                 label = ", ".join(names) if names else "(no Indigo devices)"
                 options.append((str(node_id), f"{label} — node {node_id_to_str(node_id)}"))
             return options
-        except Exception as exc:  # never break the dialog; degrade to an empty picker
+        except Exception as exc:  # pylint: disable=broad-except
+            # never break the dialog; degrade to an empty picker
+            #
+            # Absorbing: any list or format failure on the UI thread. Safe
+            # because the exception log keeps the evidence while the dialog
+            # still opens; an escape is a raw traceback dialog.
             self.logger.exception(exc)
             return []
 
@@ -411,7 +439,14 @@ class MatterServerMenuMixin:
             errors["node"] = ("matter-server did not respond — see the log. The removal may "
                               "still complete in the background; check the device before retrying.")
             return (False, valuesDict, errors)
-        except (Exception, FuturesCancelledError) as exc:  # CancelledError is BaseException on 3.10+
+        except (Exception, FuturesCancelledError) as exc:  # pylint: disable=broad-except
+            # CancelledError is BaseException on 3.10+ — hence the tuple, not
+            # a bare Exception, which would miss it.
+            #
+            # Absorbing: whatever _decommission_sync's documented "other →
+            # caller handles" contract hands back. Safe because the caller IS
+            # this handler: it converts the failure into a logged dialog error
+            # rather than a raw traceback on Indigo's UI thread.
             self.logger.error("decommission %s failed: %s", node_id_to_str(node_id), exc)
             self.logger.exception(exc)
             errors["node"] = "Decommission failed — see the Indigo event log."
@@ -556,7 +591,13 @@ class MatterServerMenuMixin:
         """
         try:
             node = self._fetch_node(node_id)  # pylint: disable=no-member  # DiagnosticsMenuMixin (issue #146)
-        except Exception as exc:  # _fetch_node only ever raises its own
+        except Exception as exc:  # pylint: disable=broad-except
+            # Absorbing: broad ON PURPOSE as a name-avoidance device, not as a
+            # net — the body immediately re-splits by type name, so connectivity
+            # stays at debug and a genuine code bug still gets a traceback. The
+            # distinction a narrow catch would give is preserved inside.
+            #
+            # _fetch_node only ever raises its own
             # MatterUnavailable (diagnostics_menu_mixin.py), caught by base class here
             # rather than importing that mixin's exception type — a mixin importing a
             # sibling mixin's name is exactly the back-import issue #146 removed
@@ -619,7 +660,12 @@ class MatterServerMenuMixin:
                 f"matter-server refused this (error {exc.code}) — a window may already be "
                 "open on this device; wait up to 15 minutes and try again. The previous "
                 "window's code cannot be recovered. See the log.")
-        except Exception as exc:
+        except Exception as exc:  # pylint: disable=broad-except
+            # Absorbing: anything the named rungs above (timeout, connection,
+            # protocol) did not claim — the last rung of issue #210's error
+            # ladder. Safe because a menu callback must return a dialog error
+            # rather than a raw traceback, and the half-opened-window warning
+            # below still has to reach the user.
             self.logger.error("share: opening a commissioning window on node %s FAILED — %s",
                               node_id_to_str(node_id), exc)
             self.logger.exception(exc)
@@ -780,7 +826,13 @@ class MatterServerMenuMixin:
         try:
             # pylint: disable=no-member  # Plugin._resync (issue #146)
             self.runtime.submit(self._resync()).result(timeout=RECONCILE_TIMEOUT)
-        except Exception as exc:
+        except Exception as exc:  # pylint: disable=broad-except
+            # Absorbing: submit/result plumbing failures ONLY. _resync swallows
+            # every real reconcile error itself and logs "resync incomplete"
+            # (issue #204 review, fix B), so nothing reaching here is a
+            # reconcile failure. Safe because the tombstones were already
+            # cleared, which is what makes "recreated on the next reconnect"
+            # honest rather than a claim this handler cannot verify.
             self.logger.error(
                 "Matter: cleared %d node-device tombstone(s), but the reconcile that "
                 "recreates them FAILED — %s. They will be recreated on the next successful "

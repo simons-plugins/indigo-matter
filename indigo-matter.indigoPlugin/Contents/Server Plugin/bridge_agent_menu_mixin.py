@@ -384,7 +384,15 @@ class BridgeAgentMenuMixin:
                 else:
                     self.logger.info("Matter bridge installed and restarted onto the new "
                                      "version — reload the plugin to reconnect.")
-        except Exception as exc:
+        except Exception as exc:  # pylint: disable=broad-except
+            # Absorbing: anything after npm returns — the plist write, the
+            # restart, the revive/poke. Safe for the same reason as its
+            # controller-side twin in matter_server_menu_mixin: this runs on a
+            # BACKGROUND INSTALL THREAD where an escape vanishes without a log,
+            # leaving a possibly-installed package with a stale agent still
+            # running and nothing said. The message below names that exact
+            # half-success so the user retries rather than reinstalling in
+            # circles.
             self.logger.exception(exc)
             self.logger.error(
                 "Install of the Matter bridge did not complete after the npm step — the "

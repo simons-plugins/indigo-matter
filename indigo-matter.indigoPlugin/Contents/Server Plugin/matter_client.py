@@ -140,7 +140,12 @@ class MatterClient(WsJsonClient):
             return
         try:
             self._on_event(evt)
-        except Exception as exc:  # handler must not kill the loop
+        except Exception as exc:  # pylint: disable=broad-except
+            # Absorbing: anything on_event raises — it fans into the whole DeviceSync
+            # update path, so the failure modes are open-ended. Loop protection here
+            # is redundant with ws_json_client's frame catch; the reason this exists
+            # is that only this frame still knows WHICH event and payload broke, and a
+            # bare traceback from a callback taking every event kind cannot say.
             # Name the event and its data: which event broke the handler is the
             # whole question, and a bare traceback from inside a callback that
             # takes every event kind cannot answer it.

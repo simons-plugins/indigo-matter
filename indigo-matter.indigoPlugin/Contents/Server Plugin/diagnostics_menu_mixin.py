@@ -78,7 +78,13 @@ class DiagnosticsMenuMixin:
         try:
             self.pluginPrefs[SURVEY_LOG_PREF] = blob
             indigo.server.savePluginPrefs()
-        except Exception as exc:  # bookkeeping must never sink a reconcile
+        except Exception as exc:  # pylint: disable=broad-except
+            # bookkeeping must never sink a reconcile
+            #
+            # Absorbing: any prefs-write failure. Safe because a failed survey
+            # save costs one repeated report next start — and this hook IS the
+            # logging half of SurveyLog._persist's deliberately silent
+            # contract (issue #308), so the silence there is answered here.
             self.logger.warning(
                 "Matter: could not save the settable-attribute survey log (%s) — "
                 "the affected device(s) will be re-reported on the next start.", exc)
@@ -150,7 +156,15 @@ class DiagnosticsMenuMixin:
             dev_id = self.device_sync.lookup(node.node_id, endpoint.endpoint_id)
             if dev_id:
                 return f"{indigo.devices[dev_id].name} (endpoint {endpoint.endpoint_id})"
-        except Exception as exc:  # a label must never break the picker
+        except Exception as exc:  # pylint: disable=broad-except
+            # a label must never break the picker
+            #
+            # Absorbing: any device-name lookup failure. A MISSING device is
+            # the routine case here (deleted out of band while its endpoint
+            # mapping lingers), and unlike device_sync's lookups this one
+            # gates NOTHING — it degrades a display label to the bridged-child
+            # identity or the bare endpoint number. Raising would take the
+            # dialog down, which is the only real risk on this path.
             self.logger.debug("explore: label for endpoint %s failed: %s",
                               endpoint.endpoint_id, exc)
         label = endpoint.node_label or endpoint.product_name
@@ -298,7 +312,15 @@ class DiagnosticsMenuMixin:
             errors["attribute"] = ("No answer within the timeout. A battery/Thread device "
                                    "may simply have been asleep — try again.")
             return (False, valuesDict, errors)
-        except Exception as exc:  # surfaced to the dialog below
+        except Exception as exc:  # pylint: disable=broad-except
+            # surfaced to the dialog below
+            #
+            # Absorbing: any failure of a live device read — matter.read's
+            # failure modes are open-ended (protocol refusals, a connection
+            # dropping mid-await). Not swallowed: the warning names
+            # cluster/attribute/node and the exception text goes into the
+            # dialog's error field. Best-effort by design (ADR-0004) and
+            # nothing downstream gates on it.
             self.logger.warning("live read of %s on node %s failed: %s",
                                 settings_report.attribute_label(cluster, attribute),
                                 node_id_to_str(node_id), exc)

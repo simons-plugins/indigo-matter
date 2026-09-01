@@ -3,6 +3,30 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
+## 2026.29.10 — every broad exception handler in the plugin has now been read
+
+No user-visible change, and the end of issue #310's triage. The last 40 broad
+`except Exception` handlers — across the menu mixins, commissioning, the
+WebSocket clients and the HTTP API — were each read with their comment, their
+originating commit, the issues and ADRs they cite, and whether a test actually
+pins the decision. Every one now states what it absorbs and why that is safe.
+
+**Plugin-wide `broad-exception-caught`: 120 → 0**, pylint 9.48 → 9.59, across
+2026.29.4 – 2026.29.10. Not one handler was suppressed unread.
+
+Three comments were found to be **wrong** and are corrected here. The frame
+catches in `ws_json_client`, `bridge_client` and `matter_client` each said
+"must not kill the loop"; the loop is already protected by the run-loop catch
+above them, and what they actually buy is "drop one frame and keep the
+connection" rather than a teardown that would reconnect, re-attach and very
+likely be handed the same bad frame again. The distinction matters the next
+time someone decides whether one of them is removable.
+
+Two handlers are recorded as known shortcomings rather than changed, because
+fixing them alters behaviour and belongs with a test: `_apply_setting`'s device
+flag (2026.29.8) and `getFabricBackups`, which renders a failed storage-path
+lookup identically to "you have no backups".
+
 ## 2026.29.9 — a raising rollback restart is now covered by a test, and four more modules are reviewed
 
 Mostly internal (issue #310). The six broad exception handlers in

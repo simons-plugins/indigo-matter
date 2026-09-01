@@ -613,7 +613,12 @@ class CommissionJobs:
                 "(completed after the commission request timed out).",
                 job.suggested_name, node_id_to_str(node_id), _device_count(created),
             )
-        except Exception as exc:  # the job must reach a terminal state
+        except Exception as exc:  # pylint: disable=broad-except
+            # the job must reach a terminal state
+            #
+            # Absorbing: any create_devices failure during a late-join reconcile.
+            # Same fire-and-forget argument as _run_job: an escape is invisible
+            # and a non-terminal job locks its setup code forever.
             self.logger.exception(exc)
             job.error = {"code": "internal_error", "message": _exc_message(exc)}
             self._advance(job, FAILED, job.progress, "")
@@ -824,7 +829,14 @@ class CommissionJobs:
             # bug, so report it as such rather than internal_error.
             await self._fail(job, "commissioning_failed", str(exc), node_id,
                              opt_int(getattr(exc, "code", None)))
-        except Exception as exc:  # last-resort, mapped to internal_error
+        except Exception as exc:  # pylint: disable=broad-except
+            # last-resort, mapped to internal_error
+            #
+            # Absorbing: whatever the five narrower clauses above did not claim.
+            # Load-bearing, not decorative: _run_job is fire-and-forget via
+            # run_coroutine_threadsafe, whose Future nobody awaits — an escape
+            # vanishes silently, and a job left non-terminal is never reaped and
+            # 409-locks its setup code for the life of the process.
             self.logger.exception(exc)
             await self._fail(job, "internal_error", _exc_message(exc), node_id)
 
@@ -838,7 +850,13 @@ class CommissionJobs:
         if node_id is not None and not self._node_held_by_other_job(job, node_id):
             try:
                 await self.matter.remove_node(node_id)  # best-effort cleanup
-            except Exception as exc:  # A7: loud, cleanup is still best-effort
+            except Exception as exc:  # pylint: disable=broad-except
+                # A7: loud, cleanup is still best-effort
+                #
+                # Absorbing: a failed best-effort node removal inside a failure path
+                # that must still land the job FAILED. Safe because the primary
+                # failure is already being reported, the leaked-slot consequence is
+                # WARNed with a remedy, and the finally still clears the A2 marker.
                 self.logger.warning(
                     "commission job %s: commissioning failed, and the "
                     "best-effort cleanup removing node %s from the fabric "
@@ -967,7 +985,12 @@ class CommissionJobs:
                     "in pairing mode and retry.",
                     job.job_id, RECONCILE_WINDOW.total_seconds() / 60,
                 )
-        except Exception as exc:  # A1: nothing else can ever see this raise
+        except Exception as exc:  # pylint: disable=broad-except
+            # A1: nothing else can ever see this raise
+            #
+            # Absorbing: everything, because nothing else can see it — see the
+            # docstring above. This coroutine is fire-and-forget on the loop and
+            # no caller ever calls .result(), so a raise would vanish in silence.
             self.logger.exception(exc)
 
     async def _remove_orphaned_node(self, job: Job, node_id: Any) -> None:
@@ -1032,7 +1055,12 @@ class CommissionJobs:
                         "could not be checked for this id",
                         job.job_id, node_id_to_str(node_id),
                     )
-            except Exception as exc:  # A5: loud, cleanup is still best-effort
+            except Exception as exc:  # pylint: disable=broad-except
+                # A5: loud, cleanup is still best-effort
+                #
+                # Absorbing: a failed best-effort fabric cleanup for an orphaned node.
+                # Safe because the WARNING names the leaked-slot consequence AND its
+                # remedy; the removal was never the operation's promise.
                 self.logger.warning(
                     "commission job %s: could not remove orphaned node %s "
                     "(%s); it remains on the fabric and may occupy a fabric "

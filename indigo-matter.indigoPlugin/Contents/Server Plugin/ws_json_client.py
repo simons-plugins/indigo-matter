@@ -261,7 +261,14 @@ class WsJsonClient:  # pylint: disable=too-many-instance-attributes
             except WS_ERRORS as exc:
                 self.logger.warning("%s connection lost (%s): %s", self.PEER, self.uri, exc)
                 self._maybe_report_repeated_failure(attempt)
-            except Exception as exc:  # defensive: never let the run loop die
+            except Exception as exc:  # pylint: disable=broad-except
+                # defensive: never let the run loop die
+                #
+                # Absorbing: everything the connection attempt can raise. The genuine
+                # last line of defence — nothing outside _run_loop catches, so an
+                # escape here ends reconnection for the life of the process. The
+                # finally closes the socket (a leak here once turned the 1s backoff
+                # into a connect/attach hammer) and the backoff continues.
                 self.logger.exception(
                     "%s (%s): unexpected failure, tearing down the connection: %s",
                     self.PEER, self.uri, exc)
@@ -302,7 +309,13 @@ class WsJsonClient:  # pylint: disable=too-many-instance-attributes
         self._diag_fired = True
         try:
             self._on_repeated_failure(attempt + 1)
-        except Exception:  # pragma: no cover - diagnostics must not kill the run loop
+        except Exception:  # pylint: disable=broad-except  # pragma: no cover
+            # diagnostics must not kill the run loop
+            #
+            # Absorbing: an injected supervisor diagnostic raising. Load-bearing:
+            # it is called from inside the run loop's own failure handling, so an
+            # escape leaves the except clause and ends _run_loop permanently. A
+            # broken diagnostic must cost a log line, not the transport.
             self.logger.exception("on_repeated_failure hook raised")
 
     def rearm_failure_diagnostic(self) -> None:
@@ -477,7 +490,12 @@ class WsJsonClient:  # pylint: disable=too-many-instance-attributes
             return
         try:
             self._dispatch(frame)
-        except Exception as exc:  # a bad frame must not kill the listen loop
+        except Exception as exc:  # pylint: disable=broad-except
+            # Absorbing: anything the frame dispatch raises. NOT loop protection,
+            # despite how it reads — the run-loop catch already provides that. What
+            # this chooses is 'drop one frame, keep the connection' over teardown,
+            # which would reconnect, re-attach, and very likely be handed the same
+            # bad frame again.
             self.logger.warning("%s: frame dropped, dispatch raised (%s): %s",
                                 self.PEER, exc, _truncate(frame))
 
@@ -502,7 +520,13 @@ class WsJsonClient:  # pylint: disable=too-many-instance-attributes
         if not fut.done():
             try:
                 fut.set_result(self._parse_result(frame))
-            except Exception as exc:  # protocol-level failure → surface to the caller
+            except Exception as exc:  # pylint: disable=broad-except
+                # protocol-level failure → surface to the caller
+                #
+                # Absorbing: whatever _parse_result — a subclass hook — raises. This
+                # swallows NOTHING: the exception is re-routed onto the waiting
+                # caller's future, so the caller sees the real protocol error instead
+                # of the generic ConnectionError a teardown would produce.
                 fut.set_exception(exc)
 
     def _log_unmatched(self, frame: dict, mid: Optional[str]) -> None:
@@ -599,7 +623,13 @@ class WsJsonClient:  # pylint: disable=too-many-instance-attributes
         if was_connected and not self._closing and self._on_disconnect is not None:
             try:
                 self._on_disconnect()
-            except Exception as exc:  # pragma: no cover - callback must not kill the loop
+            except Exception as exc:  # pylint: disable=broad-except  # pragma: no cover
+                # callback must not kill the loop
+                #
+                # Absorbing: an injected on_disconnect callback raising. Genuinely
+                # load-bearing: this runs inside run()'s per-iteration FINALLY, and an
+                # exception from a finally escapes the iteration entirely and ends
+                # _run_loop — no reconnect, ever.
                 self.logger.exception(exc)
 
     # ------------------------------------------------------------------
