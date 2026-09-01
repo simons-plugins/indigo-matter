@@ -43,10 +43,24 @@ _BOX_H = 56
 _GAP_X = 26
 _GAP_Y = 92
 _MARGIN = 28
-#: How far above a same-layer link's row its arc's control point sits (#334
-#: finding A4) — same-layer links (router <-> router) drawn as straight lines
-#: at the same y used to disappear behind whichever box sat between them.
-_ARC_HEIGHT = 36
+#: Same-layer link (router <-> router) arc geometry (#334 finding 1, post-A4
+#: follow-up). A quadratic Bezier with both endpoints at the same y and a
+#: control point ``control_offset`` above them peaks at HALF that offset —
+#: ``B(0.5) = 0.5*ay + 0.5*control_y`` — not at the control point itself. The
+#: original A4 fix set the control offset to a flat 36px and used that same
+#: 36px as if it were the apex height too, so the curve's REAL apex was only
+#: 18px above the row — less than a box's own half-height (``_BOX_H / 2`` =
+#: 28px) — so the arc dipped back below the tops of whatever boxes sat
+#: between its endpoints and still read as a line crushed behind them. Every
+#: computation below is in terms of the apex height actually wanted (at
+#: least clear of a box top, with margin); the control point is derived from
+#: it (``2 *`` the apex), never the other way around.
+_ARC_MIN_APEX = 40.0
+#: Longer same-layer links bow higher, so an arc spanning several boxes
+#: clears all of them rather than skimming the row just above the nearest
+#: one; adjacent pairs (one box-step apart) fall under the floor above and
+#: are what the floor exists for.
+_ARC_APEX_RATIO = 0.15
 
 
 def _escape(text: Any) -> str:
@@ -177,22 +191,41 @@ def _layout(mesh) -> dict[str, tuple[float, float, float, float]]:  # pylint: di
     if leader is not None:
         centers[leader.key] = (_MARGIN + _BOX_W / 2, y_leader + _BOX_H / 2)
 
-    y_routers = y_leader + (_BOX_H + _GAP_Y if leader is not None else 0)
-    router_row_xs: list[float] = []
-    for index, node in enumerate(sorted(routers, key=lambda n: (n.foreign, n.name))):
-        preferred = _MARGIN + index * (_BOX_W + _GAP_X) + _BOX_W / 2
-        x = _claim_slot(router_row_xs, preferred)
-        router_row_xs.append(x)
-        centers[node.key] = (x, y_routers + _BOX_H / 2)
-
     # Every non-router keyed by whichever router-layer node its own link (kind
     # "parent" or "child") points at — never a phantom parent guess: a
     # non-router with no such link (a detached node, or a link to a node this
     # page could not place) becomes an orphan, laid out after the rest.
+    # Computed before the router row below because that row now also seats
+    # leader children (next paragraph), which needs it too.
     linked_parent: dict[str, str] = {}
     for link in mesh.links:
         if link.kind in ("parent", "child") and link.a in {n.key for n in non_routers}:
             linked_parent[link.a] = link.b
+
+    # A non-router whose parent IS the leader (a REED/SED one hop off the
+    # leader, same as a router is) belongs in the router row beside the
+    # routers, not the row below (#334 finding 2) — placed a full row down,
+    # directly under the leader, its edge to the leader ran straight through
+    # whichever router happened to sit at the leader's x. One hop is one hop
+    # regardless of whether the far end is a router or not, so putting it in
+    # the router row means no edge ever has to skip a layer. It is seated in
+    # the SAME index-ordered pass as the routers below (not appended
+    # afterward and pinned to the leader's x): appended-and-pinned pushed it
+    # past every already-placed router to the first free slot at the far end
+    # of the row, and the long, shallow edge back to the leader from there
+    # grazed whichever router boxes sat between — the same shape of defect
+    # this fix exists to remove, just relocated.
+    leader_children = [n for n in non_routers if leader is not None and linked_parent.get(n.key) == leader.key]
+    leader_child_keys = {n.key for n in leader_children}
+
+    y_routers = y_leader + (_BOX_H + _GAP_Y if leader is not None else 0)
+    router_row_xs: list[float] = []
+    router_row_nodes = routers + leader_children
+    for index, node in enumerate(sorted(router_row_nodes, key=lambda n: (n.foreign, n.name))):
+        preferred = _MARGIN + index * (_BOX_W + _GAP_X) + _BOX_W / 2
+        x = _claim_slot(router_row_xs, preferred)
+        router_row_xs.append(x)
+        centers[node.key] = (x, y_routers + _BOX_H / 2)
 
     y_children = y_routers + (_BOX_H + _GAP_Y if routers or leader is not None else 0)
     child_row_xs: list[float] = []
@@ -202,7 +235,8 @@ def _layout(mesh) -> dict[str, tuple[float, float, float, float]]:  # pylint: di
         placeable = parent_key is not None and parent_key in centers
         return (0 if placeable else 1, node.name)
 
-    for node in sorted(non_routers, key=_placement_key):
+    remaining_non_routers = [n for n in non_routers if n.key not in leader_child_keys]
+    for node in sorted(remaining_non_routers, key=_placement_key):
         parent_key = linked_parent.get(node.key)
         if parent_key is not None and parent_key in centers:
             preferred = centers[parent_key][0]
@@ -267,8 +301,12 @@ def _link_svg(link: dict, boxes: dict[str, tuple[float, float, float, float]]) -
     # keeps the edge visible regardless of what sits between its endpoints.
     if abs(ay - by) < 1e-6:
         mid_x = (ax + bx) / 2
-        control_y = ay - _ARC_HEIGHT
-        apex_x, apex_y = mid_x, ay - _ARC_HEIGHT / 2
+        apex_height = max(_ARC_MIN_APEX, abs(bx - ax) * _ARC_APEX_RATIO)
+        # The control point sits at TWICE the wanted apex height, because a
+        # quadratic Bezier with both endpoints at the same y peaks at only
+        # half its control point's offset (see the constants' docstring).
+        control_y = ay - 2 * apex_height
+        apex_x, apex_y = mid_x, ay - apex_height
         return (
             f'<g class="edge edge-arc">'
             f'<path d="M {ax:.1f} {ay:.1f} Q {mid_x:.1f} {control_y:.1f} {bx:.1f} {by:.1f}" '

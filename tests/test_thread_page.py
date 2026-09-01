@@ -302,6 +302,83 @@ def test_same_layer_link_is_drawn_as_an_arc_not_a_straight_line():
     assert 'class="edge edge-arc"' in html
 
 
+# ---------------------------------------------------------------------------
+# #334 finding 1 — a real browser render showed the 0x27 -> rid:12 arc (three
+# box-steps apart, with 0x34 and 0x3F sitting between the endpoints) still
+# read as a straight line: the arc's control point was 36px above the row,
+# but a quadratic Bezier with both endpoints at the same y only reaches HALF
+# its control point's offset above that y — an 18px real apex, less than a
+# box's own half-height (28px), so the curve dipped back under the tops of
+# the intervening boxes. Fixed by deriving the control offset from the apex
+# height actually wanted, not the other way around (see the arc constants'
+# docstring in thread_page.py).
+# ---------------------------------------------------------------------------
+
+def test_the_0x27_to_rid12_link_is_an_arc_not_a_line_behind_other_boxes():
+    from thread_page import _layout, _link_svg, _merged_links  # pylint: disable=import-outside-toplevel
+    mesh, diags = _fixture_mesh()
+    boxes = _layout(mesh)
+    assert boxes["node:0x27"][1] == boxes["rid:12"][1]  # same y = same layer
+
+    html = render_thread_page(mesh, diags, generated_at="t", live=False, plugin_id=PLUGIN_ID)
+    assert '<path d="M' in html
+    assert ' Q ' in html
+
+    # No same-layer pair, anywhere in the real fixture, is ever drawn as a
+    # straight <line> — the arc rule keys on "same y", not on adjacency.
+    for link in _merged_links(mesh.links):
+        if link["a"] not in boxes or link["b"] not in boxes:
+            continue
+        ay, by = boxes[link["a"]][1], boxes[link["b"]][1]
+        svg = _link_svg(link, boxes)
+        if abs(ay - by) < 1e-6:
+            assert "<path" in svg and " Q " in svg
+            assert "<line" not in svg
+
+
+def test_synthetic_adjacent_routers_arc_apex_is_at_least_40px_above_the_layer():
+    import re  # pylint: disable=import-outside-toplevel
+    from thread_mesh import Mesh, MeshLink, MeshNode  # pylint: disable=import-outside-toplevel
+    from thread_page import _layout, _link_svg, _merged_links  # pylint: disable=import-outside-toplevel
+
+    node_a = MeshNode(key="node:0x1", node_id=1, name="A", role_name="Router", router_id=1,
+                      rloc16=0x0400, foreign=False, is_leader=False, partition_id=None, children_count=0)
+    node_b = MeshNode(key="node:0x2", node_id=2, name="B", role_name="Router", router_id=2,
+                      rloc16=0x0800, foreign=False, is_leader=False, partition_id=None, children_count=0)
+    link = MeshLink(a="node:0x1", b="node:0x2", kind="router", avg_rssi=-50, last_rssi=-50,
+                    lqi=3, frame_error_pct=0, seen_from="node:0x1")
+    mesh = Mesh(network_name="net", channel=None, pan_id=None, partition_ids=[],
+               majority_partition=None, majority_leader=None, nodes=[node_a, node_b],
+               links=[link], flags=[], unreadable=[], disagreements=[], warnings=[])
+
+    boxes = _layout(mesh)
+    assert boxes["node:0x1"][1] == boxes["node:0x2"][1]  # adjacent, same layer
+    ay = boxes["node:0x1"][1] + boxes["node:0x1"][3] / 2
+
+    svg = _link_svg(_merged_links(mesh.links)[0], boxes)
+    match = re.search(r'<text x="[\d.]+" y="([\d.]+)"', svg)
+    assert match is not None
+    apex_y = float(match.group(1))
+    assert ay - apex_y >= 40 - 1e-6
+
+
+# ---------------------------------------------------------------------------
+# #334 finding 2 — node:0x40 (ALPSTUGA new, a REED whose parent is the leader
+# rid:14) was laid out a full row below the router row, directly under the
+# leader, so its edge to the leader ran straight through whichever router
+# happened to share the leader's x. One hop off the leader is one hop
+# regardless of whether the far end is a router or not.
+# ---------------------------------------------------------------------------
+
+def test_a_leader_child_is_placed_in_the_router_layer_not_a_row_below():
+    from thread_page import _layout  # pylint: disable=import-outside-toplevel
+    mesh, _diags = _fixture_mesh()
+    boxes = _layout(mesh)
+    router_ys = {boxes[key][1] for key in ("node:0x27", "node:0x34", "node:0x3F")}
+    assert len(router_ys) == 1
+    assert boxes["node:0x40"][1] == next(iter(router_ys))
+
+
 def test_viewbox_grows_to_fit_the_widest_row():
     from thread_page import _layout  # pylint: disable=import-outside-toplevel
     mesh, _diags = _fixture_mesh()
