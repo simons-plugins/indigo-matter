@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import re
 import threading
+import time
 from typing import Any, Callable, Optional
 
 import indigo
@@ -36,6 +37,7 @@ from matter_model import (
     node_id_to_str,
     parse_node,
 )
+from thread_mesh import CLUSTER_THREAD_DIAG
 from matter_handlers.base import IndigoDeviceSpec, base_props
 from matter_handlers.basic_information import (
     ATTR_NODE_LABEL,
@@ -430,6 +432,15 @@ class DeviceSync:
         # fan-out — collapsed into. Issue #82's cross-contamination bug was a
         # bug in one of those copies.
         self._power_coverage: dict[int, dict[int, frozenset[int]]] = {}
+        # node_id -> last LIVE ThreadNetworkDiagnostics (cluster 0x35)
+        # attribute_updated event time, unix epoch seconds (#344). Stamped only
+        # from _on_attribute, never from _prime_states' cache replay — see that
+        # method's own comment for why. Never evicted, same no-eviction stance
+        # as ThreadNetworkDiagnosticsHandler's own _node_attrs cache
+        # (matter_handlers/thread_network_diagnostics.py): growth is bounded by
+        # the number of distinct Thread node ids this Indigo install has ever
+        # seen, not by anything unbounded. In-memory only, never persisted.
+        self._thread_event_seen: dict[int, float] = {}
         # The raw LIMITS attribute behind every setting that declares
         # FromAttribute bounds (most take theirs from the spec and cache nothing
         # here — matter_handlers.settings.SETTINGS), keyed
@@ -922,6 +933,15 @@ class DeviceSync:
         # commissioned empty bridge in the /status payload's nodeCount.
         with self._lock:
             return len(self._known_nodes | {nid for (nid, _eid) in self._index})
+
+    def thread_event_stamps(self) -> dict[int, float]:
+        """Shallow copy of ``node_id -> last live ThreadNetworkDiagnostics
+        (cluster 0x35) attribute_updated event time`` (#344), for
+        :mod:`thread_survey`'s ``event_stamps`` — a copy so a caller mutating
+        the result cannot corrupt ``_thread_event_seen`` out from under
+        ``_on_attribute``."""
+        with self._lock:
+            return dict(self._thread_event_seen)
 
     def list_nodes(self) -> list:
         """Per-node summary for UI pickers: ``[(node_id, [device names])]``.
@@ -3784,13 +3804,32 @@ class DeviceSync:
         if states:
             self.apply_states(dev_id, handler.format_kv(states))
 
-    def _on_attribute(self, evt: protocol.MatterEvent) -> None:
+    def _on_attribute(self, evt: protocol.MatterEvent) -> None:  # pylint: disable=too-many-statements
+        # #344's cluster-0x35 event stamp (below) pushed this already-large
+        # method one statement past pylint's default threshold; not otherwise
+        # restructured here — see the method's existing R0911/R0912 debt,
+        # tolerated the same way everywhere else in this file.
         if evt.node_id is None or evt.endpoint is None or evt.cluster is None:
             # a malformed attribute_updated frame (e.g. a truncated "ep/cl/at"
             # path) — surface it rather than dropping silently; protocol.py is the
             # rename firewall and a wire-shape change should be visible here.
             self.logger.warning("ignoring malformed attribute event: %r", evt.raw)
             return
+        if evt.cluster == CLUSTER_THREAD_DIAG:
+            # #344: stamp when this node last delivered a LIVE
+            # ThreadNetworkDiagnostics event — BEFORE any handler/device
+            # resolution below, so a node with no matterNode device yet (or
+            # one whose device has since vanished) still gets a stamp.
+            # Deliberately NOT in ThreadNetworkDiagnosticsHandler.on_attribute_
+            # update (matter_handlers/thread_network_diagnostics.py, untouched
+            # by #344): that method also runs during _prime_states' replay of
+            # matter-server's CACHED snapshot one attribute at a time — stamping
+            # there would mark stale cache "just now" on every plugin restart,
+            # exactly the lie #344 exists to remove. This path only ever runs
+            # for a genuine live ``attribute_updated`` event (see handle_event);
+            # _prime_states calls handlers directly and never reaches here.
+            with self._lock:
+                self._thread_event_seen[int(evt.node_id)] = time.time()
         # BridgedDeviceBasicInformation (0x0039) Reachable (0x0011): per-endpoint
         # liveness.  Handle BEFORE handler dispatch because device_sync owns
         # reachability state; handlers return state dicts and must not set error
