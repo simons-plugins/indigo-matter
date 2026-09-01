@@ -75,10 +75,14 @@ async function start(args: string[], timeoutMs = 30_000): Promise<Started> {
     const child = spawn(process.execPath, [ENTRY, ...args], { stdio: "pipe" });
     let output = "";
     const started = new Promise<void>((resolve, reject) => {
-        const timer = setTimeout(
-            () => reject(new Error(`Bridge did not start in ${timeoutMs}ms. Output:\n${output}`)),
-            timeoutMs,
-        );
+        const timer = setTimeout(() => {
+            // Kill before rejecting. A timed-out child left alive holds the
+            // Matter port, the protocol port AND the mDNS responder on 5353 for
+            // the rest of the run — the header's contention warning, made worse
+            // by the very failure that reports it.
+            child.kill("SIGKILL");
+            reject(new Error(`Bridge did not start in ${timeoutMs}ms. Output:\n${output}`));
+        }, timeoutMs);
         const onData = (chunk: Buffer): void => {
             output += chunk.toString();
             if (output.includes("Protocol WebSocket listening")) {
@@ -108,6 +112,47 @@ async function stopAndWait(child: ChildProcessWithoutNullStreams, timeoutMs = 20
     });
     child.kill("SIGTERM");
     return exited;
+}
+
+/**
+ * Spawn the entry point and signal it the moment `marker` appears, instead of
+ * waiting for readiness — the only way to put a signal *inside* startup.
+ *
+ * `start()` cannot do this: it resolves on the readiness line, by which point
+ * the window these tests exercise has closed.
+ *
+ * If `marker` never appears the child is SIGKILLed and this rejects on the
+ * timeout, which is the intended failure for a marker that has drifted (the
+ * matter.js-sourced ones below can move between releases).
+ */
+async function killOn(
+    args: string[],
+    marker: string,
+    signal: NodeJS.Signals = "SIGTERM",
+    timeoutMs = 30_000,
+): Promise<{ code: number | null; output: string }> {
+    const child = spawn(process.execPath, [ENTRY, ...args], { stdio: "pipe" });
+    let output = "";
+    let signalled = false;
+    return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+            child.kill("SIGKILL");
+            reject(new Error(`Bridge did not exit in ${timeoutMs}ms. Output:\n${output}`));
+        }, timeoutMs);
+        const onData = (chunk: Buffer): void => {
+            output += chunk.toString();
+            if (!signalled && output.includes(marker)) {
+                signalled = true;
+                child.kill(signal);
+            }
+        };
+        child.stdout.on("data", onData);
+        child.stderr.on("data", onData);
+        child.once("exit", code => {
+            clearTimeout(timer);
+            resolve({ code, output });
+        });
+    });
 }
 
 /**
@@ -149,10 +194,90 @@ describe("main.ts as a process", { skip: existsSync(ENTRY) ? false : "run `npm r
         const code = await stopAndWait(child);
 
         assert.equal(code, 0, `expected a clean exit. Output:\n${output()}`);
-        assert.match(output(), /Shutdown complete/);
+        // Names both, innermost-first — a shutdown that quietly skipped one
+        // still logged a bare "Shutdown complete" before #328's review.
+        assert.match(output(), /Shutdown complete \(closed: protocol WS, Matter node\)/);
         // Not the escape hatch: that path is a forced exit(1), and telling it
         // apart from a genuine clean stop is the entire point of the number.
         assert.doesNotMatch(output(), /Shutdown stalled/);
+    });
+
+    it("exits 0 on a SIGTERM that lands mid-startup, and still closes what came up", async () => {
+        // ⊗ #328, both halves.
+        //
+        // (1) The handlers used to be installed on the LAST line of `main()`,
+        // so every step before them — the identity read and the whole of
+        // `bridge.start()` — ran on node's *default* SIGTERM disposition: death
+        // by signal, no `close()` of anything, and an exit code of `null` where
+        // launchd wants a number.
+        //
+        // (2) The first cut of the fix then published the Matter node only once
+        // `start()` had RESOLVED — but `start()` returns long after
+        // `server.start()` brings the node online, so a stop in that tail
+        // walked past a live, advertising node and closed nothing.
+        //
+        // The signal goes on the version banner, ~90ms before readiness
+        // (measured, idle Mac; less on a loaded runner). Startup then runs to
+        // completion *alongside* the shutdown — that is expected, the closers
+        // are drained rather than snapshotted — so the guard is the ORDER of
+        // the two log lines, not the absence of one.
+        const dir = storage();
+        const { code, output } = await killOn(["--storage-path", dir, ...ports(7)], "indigo-matter-bridge ");
+
+        const signalledAt = output.indexOf("Received SIGTERM");
+        const readyAt = output.indexOf("Protocol WebSocket listening");
+        assert.ok(signalledAt >= 0, `the signal never reached a handler. Output:\n${output}`);
+        assert.ok(
+            readyAt === -1 || signalledAt < readyAt,
+            `the signal landed AFTER readiness, so this run exercised nothing — it must arrive during startup. Output:\n${output}`,
+        );
+        // `null` is the tell for the old behaviour: that is what node reports
+        // for death by signal. launchd sees the signal termination, which under
+        // `KeepAlive { SuccessfulExit: false }` is not a successful exit.
+        assert.equal(code, 0, `a stop during startup must still be a clean exit. Output:\n${output}`);
+        // The node came online *after* the signal, so it must be closed and the
+        // log must name it. Exit code alone cannot tell this apart from having
+        // abandoned a live node — which is exactly what the first cut did.
+        assert.match(
+            output,
+            /Shutdown complete \(closed: [^)]*Matter node/,
+            `a Matter node that came up during the stop must be closed. Output:\n${output}`,
+        );
+        assert.doesNotMatch(output, /Shutdown stalled/);
+
+        // And the box is still startable. This is the promise behind #328 that
+        // an exit code does not express: launchd stopped us mid-startup, so the
+        // next start must come up. It also pins that the interrupted
+        // `loadOrCreateIdentity` left no debris — it writes through a temp file
+        // and `rename` (storage.ts), so the real file is either the old one or
+        // the new one, never a truncated one.
+        const restarted = await start(["--storage-path", dir, ...ports(7)]);
+        const restartCode = await stopAndWait(restarted.child);
+        assert.equal(
+            restartCode,
+            0,
+            `the restart after an interrupted start must be clean. Output:\n${restarted.output()}`,
+        );
+        assert.deepEqual(
+            readdirSync(dir).filter(name => name.startsWith("identity.json.")),
+            [],
+            "an interrupted start must leave no identity temp file behind",
+        );
+    });
+
+    it("exits 0 on SIGINT too, so an interactive stop is not a crash either", async () => {
+        // SIGINT shares `shutdown` with SIGTERM, so this pins the registration
+        // line, not the path — hence only the exit code and the acknowledgement
+        // are asserted here; the close behaviour is the SIGTERM test's job.
+        const dir = storage();
+        const { code, output } = await killOn(
+            ["--storage-path", dir, ...ports(9)],
+            "indigo-matter-bridge ",
+            "SIGINT",
+        );
+
+        assert.equal(code, 0, `SIGINT must be a clean exit. Output:\n${output}`);
+        assert.match(output, /Received SIGINT/);
     });
 
     it("writes an identity on first run and reuses it on the second", async () => {
@@ -305,7 +430,9 @@ describe("main.ts as a process", { skip: existsSync(ENTRY) ? false : "run `npm r
         const code = await stopAndWait(child);
 
         assert.equal(code, 0, `a clean stop after a reset must exit 0. Output:\n${output()}`);
-        assert.match(output(), /Shutdown complete/);
+        // Names both, innermost-first — a shutdown that quietly skipped one
+        // still logged a bare "Shutdown complete" before #328's review.
+        assert.match(output(), /Shutdown complete \(closed: protocol WS, Matter node\)/);
         // The escape hatch is a forced exit(1); leaving it armed turns a clean
         // stop into a 10-second stall and then a lie to launchd.
         assert.doesNotMatch(output(), /Shutdown stalled/);
