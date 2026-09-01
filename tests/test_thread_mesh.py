@@ -15,7 +15,9 @@ never a crash.
 """
 from __future__ import annotations
 
+import dataclasses
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -29,6 +31,7 @@ from thread_mesh import (
     ATTR_ROUTING_ROLE,
     CLUSTER_THREAD_DIAG,
     INVALID_ROUTER_ID,
+    ROLE_UNSPECIFIED,
     HealthFlag,
     Mesh,
     MeshLink,
@@ -40,7 +43,9 @@ from thread_mesh import (
     format_ext_address,
     health_flags,
     parse_node_diag,
+    partition_header_text,
     render_report,
+    rloc_label,
     summary_states,
 )
 
@@ -101,14 +106,16 @@ class TestRealFacts:
     def test_majority_partition_and_foreign_leader(self):
         diags = _all_diags()
         mesh = build_mesh(diags)
-        assert 1388375940 in mesh.partitions.values()
+        assert 1388375940 in mesh.partition_ids
+        assert mesh.majority_partition == 1388375940
+        assert mesh.majority_leader == 14
         leader = next(n for n in mesh.nodes if n.is_leader)
         assert leader.foreign is True
         assert leader.router_id == 14
         assert leader.rloc16 == 0x3800
         assert "leader" in leader.name.lower()
 
-    def test_0x3f_is_router_51_wait_router_23_with_one_child_and_three_neighbours(self):
+    def test_0x3f_is_router_23_with_one_child_and_three_neighbours(self):
         # 0x3F (node 63): self-entry router_id 23, one child 0x5C04, three neighbours.
         diag = _parse_fixture(0x3F)
         assert diag.router_id == 23
@@ -311,13 +318,21 @@ class TestSummaryStates:
         diag = _parse_fixture(0x2E)
         assert summary_states(diag)["threadHealth"] == "bad"
 
-    def test_unknown_rssi_reports_minus_128(self):
+    def test_unknown_rssi_is_not_written_at_all(self):
+        # B2.9: a -128 sentinel used to be written for "no rssi reading" and
+        # trips numeric triggers exactly like a real bad reading would — the
+        # fix is to omit the key, leaving the Indigo state untouched, not to
+        # pick a different fake number.
         diag = NodeDiag(
             node_id=1, name="lonely router", available=True, role=5, channel=None,
             network_name="", pan_id=None, ext_pan_id=None, partition_id=None,
             leader_router_id=None, neighbours=[], routes=[], counters={},
         )
-        assert summary_states(diag)["threadLinkRssi"] == -128
+        states = summary_states(diag)
+        assert "threadLinkRssi" not in states
+        # the router still gets health/neighbour states — only the rssi is unknown
+        assert states["threadNeighbourCount"] == 0
+        assert "threadHealth" in states
 
 
 # ---------------------------------------------------------------------------
@@ -417,9 +432,14 @@ class TestDegradation:
         assert diag is not None
         assert diag.routes == []
         assert diag.router_id is None
-        # Still degrades to a flag, not a crash: 0 neighbours -> bad single_neighbour.
+        # B2.1: NeighborTable was never cached either (absent, not empty) — this
+        # must NOT be read as "0 neighbours" (which used to fire a false BAD
+        # single_neighbour flag); it degrades to an info "not yet available"
+        # flag instead, and single_neighbour must not fire on unknown data.
+        assert diag.neighbours_known is False
         codes = {f.code for f in health_flags(diag)}
-        assert "single_neighbour" in codes
+        assert "single_neighbour" not in codes
+        assert "neighbours_unknown" in codes
 
     def test_empty_neighbor_table(self):
         attrs = {"0/53/1": 2, "0/53/7": []}
@@ -459,8 +479,10 @@ class TestDegradation:
         assert diag is not None
         assert len(diag.neighbours) == 1
         assert diag.neighbours[0].ext_address == 999
-        assert len(diag.parse_warnings) == 1
-        assert "neighbour[0]" in diag.parse_warnings[0]
+        # Plus a "RouteTable absent" warning (B2.1 extended the same absent-vs-
+        # malformed distinction to RouteTable) — this attrs dict has no "0/53/8"
+        # key at all, which is unrelated to the neighbour-struct warning below.
+        assert any("neighbour[0]" in w for w in diag.parse_warnings)
 
     def test_malformed_route_struct_is_skipped_and_warned(self):
         attrs = {
@@ -550,3 +572,476 @@ def test_every_fixture_node_parses_without_raising(node_id):
     # HealthFlag/dataclass smoke — never raises for any real fixture node.
     health_flags(diag)
     summary_states(diag)
+
+
+# ---------------------------------------------------------------------------
+# #334 post-review — B2.1: neighbours_known ("absent" is not "empty")
+# ---------------------------------------------------------------------------
+
+class TestNeighboursKnown:
+    def test_none_neighbor_table_is_absent_not_empty(self):
+        attrs = {"0/53/1": 5}  # RoutingRole only — NeighborTable never cached
+        diag = parse_node_diag(10, "router", True, attrs)
+        assert diag is not None
+        assert diag.neighbours == []
+        assert diag.neighbours_known is False
+        assert any("NeighborTable absent" in w for w in diag.parse_warnings)
+
+    def test_non_list_neighbor_table_is_malformed_not_empty(self):
+        attrs = {"0/53/1": 5, "0/53/7": "garbage"}
+        diag = parse_node_diag(11, "router", True, attrs)
+        assert diag is not None
+        assert diag.neighbours_known is False
+        assert any("NeighborTable malformed" in w for w in diag.parse_warnings)
+
+    def test_empty_list_neighbor_table_is_known(self):
+        attrs = {"0/53/1": 5, "0/53/7": []}
+        diag = parse_node_diag(12, "router", True, attrs)
+        assert diag is not None
+        assert diag.neighbours_known is True
+
+    def test_unknown_table_suppresses_single_neighbour_and_weak_link(self):
+        # Adversarial: "when could this return a false BAD and be wrong?" — a
+        # router whose NeighborTable was never cached used to read exactly like
+        # one with zero neighbours (bad single_neighbour) before this fix.
+        attrs = {"0/53/1": 5}
+        diag = parse_node_diag(13, "router", True, attrs)
+        flags = health_flags(diag)
+        codes = {f.code for f in flags}
+        assert "single_neighbour" not in codes
+        assert "weak_link" not in codes
+        info_flag = next(f for f in flags if f.code == "neighbours_unknown")
+        assert info_flag.severity == "info"
+
+    def test_unknown_table_writes_only_thread_role(self):
+        attrs = {"0/53/1": 5}
+        diag = parse_node_diag(14, "router", True, attrs)
+        assert set(summary_states(diag)) == {"threadRole"}
+
+
+# ---------------------------------------------------------------------------
+# #334 post-review — B5.1 CRITICAL: non-router with no parent must be "bad"
+# ---------------------------------------------------------------------------
+
+class TestNoParent:
+    def test_non_router_with_known_empty_neighbour_table_is_bad_not_ok(self):
+        # Adversarial: "when could this return ok and be wrong?" — a SED with a
+        # KNOWN-empty NeighborTable (not absent — an actual empty list) has no
+        # parent and cannot reach the mesh at all. Before this fix the
+        # zero-neighbour check lived only inside `if diag.is_router`, so a
+        # detached non-router reported clean.
+        attrs = {"0/53/1": 2, "0/53/7": []}  # SleepyEndDevice, known-empty table
+        diag = parse_node_diag(15, "orphan sed", True, attrs)
+        assert diag is not None
+        assert diag.neighbours_known is True
+        assert diag.parent is None
+        codes = {(f.code, f.severity) for f in health_flags(diag)}
+        assert ("no_parent", "bad") in codes
+
+    def test_router_never_gets_no_parent(self):
+        attrs = {"0/53/1": 5, "0/53/7": []}
+        diag = parse_node_diag(16, "lonely router", True, attrs)
+        codes = {f.code for f in health_flags(diag)}
+        assert "no_parent" not in codes
+        assert "single_neighbour" in codes
+
+
+# ---------------------------------------------------------------------------
+# #334 post-review — B1.2/B2.2: router_id_unknown
+# ---------------------------------------------------------------------------
+
+class TestRouterIdUnknown:
+    def test_ambiguous_self_entry_gets_router_id_unknown_warning(self):
+        attrs = {
+            "0/53/1": 5,
+            "0/53/8": [
+                {"0": 1, "1": 1024, "2": 1, "3": 63, "4": 0, "5": 0, "6": 0, "7": 0,
+                 "8": True, "9": False},
+                {"0": 2, "1": 2048, "2": 2, "3": 63, "4": 0, "5": 0, "6": 0, "7": 0,
+                 "8": True, "9": False},
+            ],
+        }
+        diag = parse_node_diag(20, "ambiguous router", True, attrs)
+        codes = {(f.code, f.severity) for f in health_flags(diag)}
+        assert ("router_id_unknown", "warn") in codes
+
+    def test_two_owned_nodes_one_with_unresolved_router_id_documents_the_duplicate(self):
+        # Pin the ACCEPTED consequence (B1.2) rather than hide it: a router
+        # whose own router_id cannot be resolved is absent from
+        # owned_key_by_router_id, so a sibling node's reference to that router
+        # id creates a phantom foreign "rid:N" box even though it is really
+        # this device — the flag is what makes that non-silent.
+        ambiguous_attrs = {
+            "0/53/1": 5,
+            "0/53/8": [
+                {"0": 1, "1": 1024, "2": 30, "3": 63, "4": 0, "5": 0, "6": 0, "7": 0,
+                 "8": True, "9": False},
+                {"0": 2, "1": 2048, "2": 31, "3": 63, "4": 0, "5": 0, "6": 0, "7": 0,
+                 "8": True, "9": False},
+            ],
+        }
+        sed_attrs = {
+            "0/53/1": 2,
+            "0/53/7": [{"0": 1, "1": 5, "2": 30 << 10, "5": 3, "6": -50, "7": -50,
+                        "8": 0, "9": 0, "10": True, "11": True, "13": False}],
+        }
+        ambiguous = parse_node_diag(21, "ambiguous router", True, ambiguous_attrs)
+        sed = parse_node_diag(22, "sed pointing at router 30", True, sed_attrs)
+        mesh = build_mesh([ambiguous, sed])
+        assert any(n.foreign and n.router_id == 30 for n in mesh.nodes), "the accepted phantom duplicate"
+        assert any(f.code == "router_id_unknown" for f in mesh.flags)
+
+
+# ---------------------------------------------------------------------------
+# #334 post-review — B2.3: an unparseable RoutingRole must not drop the node
+# ---------------------------------------------------------------------------
+
+class TestUnreadableRoutingRole:
+    def test_unparseable_routing_role_with_other_cluster_keys_still_appears(self):
+        # Ground truth 2026-09-01: a real fixture-shaped node whose RoutingRole
+        # came back as the STRING "Router" (matter-server's own serialisation
+        # garbling it) must not vanish the way a genuine Wi-Fi node correctly
+        # does — it still has other cluster-0x35 keys, so it is a Thread node.
+        attrs = {"0/53/1": "Router", "0/53/0": 25}
+        diag = parse_node_diag(30, "garbled role", True, attrs)
+        assert diag is not None
+        assert diag.role == ROLE_UNSPECIFIED
+        assert diag.read_error == "RoutingRole unreadable"
+        mesh = build_mesh([diag])
+        assert (30, "RoutingRole unreadable") in mesh.unreadable
+
+    def test_wifi_node_with_no_thread_cluster_at_all_still_returns_none(self):
+        attrs = {"0/40/1": "Some Vendor"}  # BasicInformation only — no 0x35 key at all
+        assert parse_node_diag(31, "wifi plug", True, attrs) is None
+
+
+# ---------------------------------------------------------------------------
+# #334 post-review — B3.5a / B3.4: majority computation
+# ---------------------------------------------------------------------------
+
+def _bare_diag(node_id, *, partition_id, source="cache", role=5, leader_router_id=None):
+    return NodeDiag(
+        node_id=node_id, name=f"n{node_id}", available=True, role=role, channel=None,
+        network_name="", pan_id=None, ext_pan_id=None, partition_id=partition_id,
+        leader_router_id=leader_router_id, neighbours=[], routes=[], counters={}, source=source,
+    )
+
+
+class TestMajorityFromLivePool:
+    def test_majority_partition_uses_only_the_live_pool_when_any_diag_is_live(self):
+        # Two CACHED diags agree on partition 1, one LIVE diag alone reports
+        # partition 2 — if the majority pool included the cached diags too, 1
+        # would win 2-to-1; it must not, because a live read is exactly what
+        # disproved a stale-cache "majority" on 2026-09-01.
+        cached_a = _bare_diag(1, partition_id=1, source="cache")
+        cached_b = _bare_diag(2, partition_id=1, source="cache")
+        live_c = _bare_diag(3, partition_id=2, source="live", role=2)
+        mesh = build_mesh([cached_a, cached_b, live_c])
+        assert mesh.majority_partition == 2
+
+
+class TestPartitionTie:
+    def test_two_node_tie_reversed_order_has_no_majority(self):
+        diag_a = _bare_diag(1, partition_id=100, source="live")
+        diag_b = _bare_diag(2, partition_id=200, source="live")
+        mesh_forward = build_mesh([diag_a, diag_b])
+        mesh_reversed = build_mesh([diag_b, diag_a])
+        assert mesh_forward.majority_partition is None
+        assert mesh_reversed.majority_partition is None
+        assert len(mesh_forward.disagreements) == 2
+        assert len(mesh_reversed.disagreements) == 2
+
+    def test_tie_header_says_no_majority_and_split(self):
+        diag_a = _bare_diag(1, partition_id=100, source="live")
+        diag_b = _bare_diag(2, partition_id=200, source="live")
+        mesh = build_mesh([diag_a, diag_b])
+        text = partition_header_text(mesh, [diag_a, diag_b])
+        assert "no majority" in text
+        assert "100" in text and "200" in text
+        assert "split" in text
+
+
+# ---------------------------------------------------------------------------
+# #334 post-review — A1: partition header presentation
+# ---------------------------------------------------------------------------
+
+class TestPartitionHeaderText:
+    def test_majority_with_disagreement_matches_the_documented_example(self):
+        diags = _all_diags()
+        mesh = build_mesh(diags)
+        text = partition_header_text(mesh, diags)
+        assert text == (
+            'Partition 1388375940 (leader router 14) — 2 cached node(s) report a '
+            'different partition, see "Unreadable / stale"'
+        )
+
+    def test_no_disagreement_omits_the_trailing_clause(self):
+        diag = _bare_diag(1, partition_id=42, leader_router_id=7)
+        mesh = build_mesh([diag])
+        text = partition_header_text(mesh, [diag])
+        assert text == "Partition 42 (leader router 7)"
+        assert "cached node" not in text
+
+    def test_two_plus_live_partitions_says_split_even_with_a_majority(self):
+        live_a = _bare_diag(1, partition_id=1, source="live")
+        live_b = _bare_diag(2, partition_id=1, source="live")
+        live_c = _bare_diag(3, partition_id=2, source="live", role=2)
+        mesh = build_mesh([live_a, live_b, live_c])
+        assert mesh.majority_partition == 1  # a real majority exists...
+        text = partition_header_text(mesh, [live_a, live_b, live_c])
+        assert "split" in text  # ...but 2+ LIVE nodes still disagree, so say so
+
+    def test_report_render_uses_the_same_text(self):
+        diags = _all_diags()
+        mesh = build_mesh(diags)
+        lines = render_report(mesh, diags)
+        assert lines[1] == partition_header_text(mesh, diags)
+
+
+# ---------------------------------------------------------------------------
+# #334 post-review — A2: RLOC -> name resolution
+# ---------------------------------------------------------------------------
+
+class TestRlocResolution:
+    def test_high_frame_error_message_names_the_target(self):
+        diags = _all_diags()
+        mesh = build_mesh(diags)
+        flag = next(f for f in mesh.flags if f.code == "high_frame_error")
+        assert re.search(r"to .+ \(0x[0-9A-Fa-f]{4}\)", flag.message)
+
+    def test_report_neighbour_lines_name_the_target(self):
+        diags = _all_diags()
+        mesh = build_mesh(diags)
+        text = "\n".join(render_report(mesh, diags))
+        # 0x3F's neighbour router 62 is owned node 0x34, named "GRILLPLATS Plug".
+        assert "GRILLPLATS Plug (0xF800)" in text
+
+    def test_unresolved_rloc_falls_back_to_none(self):
+        assert rloc_label(build_mesh([]), 0x1234) is None
+
+
+# ---------------------------------------------------------------------------
+# #334 post-review — A3/B4.2/B5.7: stale wording and REED coverage
+# ---------------------------------------------------------------------------
+
+class TestStaleWording:
+    def test_reed_source_cache_gets_stale_info_flag(self):
+        # B5.7: "sleepy/live-read candidate" is defined once (NodeDiag.is_router)
+        # — a REED must get the same staleness note a SED/ED does; it used to be
+        # silently skipped.
+        diag = _parse_fixture(0x40)  # REED, source defaults "cache"
+        assert diag.role_name == "Reed"
+        assert any(f.code == "stale" and f.severity == "info" for f in health_flags(diag))
+
+    def test_matter_server_cache_wording(self):
+        diag = _parse_fixture(0x2F)
+        stale = next(f for f in health_flags(diag) if f.code == "stale")
+        assert "matter-server's cache" in stale.message
+        assert "Thread's own cache" not in stale.message
+
+
+# ---------------------------------------------------------------------------
+# #334 post-review — B3.12: synthetic cases the fixture alone can't cover
+# ---------------------------------------------------------------------------
+
+class TestSyntheticCases:
+    def test_owned_leader_role_6_is_leader_and_not_foreign(self):
+        attrs = {
+            "0/53/1": 6,  # Leader
+            "0/53/13": 5,
+            "0/53/8": [{"0": 1, "1": 5 << 10, "2": 5, "3": 63, "4": 0, "5": 0, "6": 0,
+                        "7": 0, "8": True, "9": False}],
+        }
+        diag = parse_node_diag(50, "owned leader", True, attrs)
+        assert diag is not None
+        assert diag.role_name == "Leader"
+        mesh = build_mesh([diag])
+        node = mesh.nodes[0]
+        assert node.is_leader is True
+        assert node.foreign is False
+
+    def test_parent_prefers_non_child_then_best_average_rssi(self):
+        attrs = {
+            "0/53/1": 2,  # SED
+            "0/53/7": [
+                # shaped like a candidate parent but IS our child — must be skipped
+                {"0": 1, "1": 5, "2": 1024, "5": 3, "6": -10, "7": -10,
+                 "8": 0, "9": 0, "10": True, "11": True, "13": True},
+                # two genuine non-child candidates — the better average wins
+                {"0": 2, "1": 5, "2": 2048, "5": 3, "6": -70, "7": -70,
+                 "8": 0, "9": 0, "10": True, "11": True, "13": False},
+                {"0": 3, "1": 5, "2": 3072, "5": 3, "6": -30, "7": -30,
+                 "8": 0, "9": 0, "10": True, "11": True, "13": False},
+            ],
+        }
+        diag = parse_node_diag(51, "picky sed", True, attrs)
+        assert diag is not None
+        parent = diag.parent
+        assert parent is not None
+        assert parent.rloc16 == 3072  # the non-child with the best (-30) average
+        assert not parent.is_child
+
+    def test_two_owned_seds_fully_identify_a_routers_children_zero_anonymous(self):
+        router_attrs = {
+            "0/53/1": 5,
+            "0/53/8": [{"0": 1, "1": 5 << 10, "2": 5, "3": 63, "4": 0, "5": 0, "6": 0,
+                        "7": 0, "8": True, "9": False}],
+            "0/53/7": [
+                {"0": 10, "1": 5, "2": 5 << 10 | 1, "5": 3, "6": -50, "7": -50,
+                 "8": 0, "9": 0, "10": True, "11": True, "13": True},
+                {"0": 11, "1": 5, "2": 5 << 10 | 2, "5": 3, "6": -50, "7": -50,
+                 "8": 0, "9": 0, "10": True, "11": True, "13": True},
+            ],
+        }
+        router = parse_node_diag(52, "router with 2 children", True, router_attrs)
+
+        def _sed(node_id, parent_rloc16):
+            return parse_node_diag(node_id, f"sed {node_id}", True, {
+                "0/53/1": 2,
+                "0/53/7": [{"0": node_id, "1": 5, "2": parent_rloc16, "5": 3, "6": -50, "7": -50,
+                            "8": 0, "9": 0, "10": True, "11": True, "13": False}],
+            })
+
+        sed_a = _sed(60, 5 << 10 | 1)
+        sed_b = _sed(61, 5 << 10 | 2)
+        mesh = build_mesh([router, sed_a, sed_b])
+        assert not any(n.key.startswith("child:") for n in mesh.nodes)
+
+    def test_far_from_leader_boundary(self):
+        def _diag_with_path_cost(cost):
+            return NodeDiag(
+                node_id=1, name="x", available=True, role=5, channel=None,
+                network_name="", pan_id=None, ext_pan_id=None, partition_id=None,
+                leader_router_id=9, neighbours=[],
+                routes=[Route(ext_address=1, rloc16=9 << 10, router_id=9, next_hop=1,
+                               path_cost=cost, lqi_in=0, lqi_out=0, age_s=0,
+                               allocated=True, link_established=True)],
+                counters={},
+            )
+        assert not any(f.code == "far_from_leader" for f in health_flags(_diag_with_path_cost(2)))
+        assert any(f.code == "far_from_leader" for f in health_flags(_diag_with_path_cost(3)))
+
+
+# ---------------------------------------------------------------------------
+# #334 post-review — B3.7: high_frame_error / RSSI boundary edges
+# ---------------------------------------------------------------------------
+
+def _diag_with_neighbour(*, frame_error_pct=0, avg_rssi=None, last_rssi=None, role=5):
+    return NodeDiag(
+        node_id=1, name="x", available=True, role=role, channel=None,
+        network_name="", pan_id=None, ext_pan_id=None, partition_id=None,
+        leader_router_id=None,
+        neighbours=[Neighbour(
+            ext_address=1, age_s=0, rloc16=1024, lqi=0, avg_rssi=avg_rssi, last_rssi=last_rssi,
+            frame_error_pct=frame_error_pct, message_error_pct=0,
+            rx_on_when_idle=True, full_thread_device=True, is_child=False,
+        )],
+        routes=[], counters={},
+    )
+
+
+class TestFrameErrorAndRssiBoundaries:
+    def test_frame_error_20_is_no_flag_21_is_warn(self):
+        assert not any(f.code == "high_frame_error" for f in health_flags(_diag_with_neighbour(frame_error_pct=20)))
+        assert any(f.code == "high_frame_error" for f in health_flags(_diag_with_neighbour(frame_error_pct=21)))
+
+    @pytest.mark.parametrize("rssi,expected", [
+        (-80, None), (-81, "warn"), (-90, "warn"), (-91, "bad"),
+    ])
+    def test_rssi_band_edges(self, rssi, expected):
+        flags = health_flags(_diag_with_neighbour(avg_rssi=rssi, last_rssi=rssi))
+        weak_link = next((f for f in flags if f.code == "weak_link"), None)
+        if expected is None:
+            assert weak_link is None
+        else:
+            assert weak_link is not None and weak_link.severity == expected
+
+
+# ---------------------------------------------------------------------------
+# #334 post-review — B2.5 / B5.2: Mesh.warnings
+# ---------------------------------------------------------------------------
+
+class TestMeshWarnings:
+    def test_parse_warnings_aggregate_into_mesh_warnings(self):
+        attrs = {
+            "0/53/1": 5,
+            "0/53/7": [{"0": 1, "1": 2, "2": 3}],  # malformed neighbour entry
+        }
+        diag = parse_node_diag(70, "half-malformed", True, attrs)
+        mesh = build_mesh([diag])
+        assert (70, diag.parse_warnings[0]) in mesh.warnings
+
+    def test_unattributed_children_note_is_order_independent(self):
+        def _mesh_for(child_order):
+            router_attrs = {
+                "0/53/1": 5,
+                "0/53/8": [{"0": 1, "1": 5 << 10, "2": 5, "3": 63, "4": 0, "5": 0, "6": 0,
+                            "7": 0, "8": True, "9": False}],
+                "0/53/7": child_order,
+            }
+            router = parse_node_diag(71, "router", True, router_attrs)
+            sed = parse_node_diag(72, "sed", True, {
+                "0/53/1": 2,
+                "0/53/7": [{"0": 72, "1": 5, "2": 5 << 10 | 1, "5": 3, "6": -50, "7": -50,
+                            "8": 0, "9": 0, "10": True, "11": True, "13": False}],
+            })
+            return build_mesh([router, sed])
+
+        child1 = {"0": 10, "1": 5, "2": 5 << 10 | 1, "5": 3, "6": -50, "7": -50,
+                  "8": 0, "9": 0, "10": True, "11": True, "13": True}
+        child2 = {"0": 11, "1": 5, "2": 5 << 10 | 2, "5": 3, "6": -60, "7": -60,
+                  "8": 0, "9": 0, "10": True, "11": True, "13": True}
+        mesh_a = _mesh_for([child1, child2])
+        mesh_b = _mesh_for([child2, child1])
+
+        for mesh in (mesh_a, mesh_b):
+            unattributed = [n for n in mesh.nodes if n.key.endswith("#unattributed")]
+            assert len(unattributed) == 1
+            assert unattributed[0].name == "1 unattributed child(ren)"
+            assert any("could not be matched to an Indigo device" in msg for _nid, msg in mesh.warnings)
+
+        assert set(mesh_a.nodes) == set(mesh_b.nodes)
+        assert set(mesh_a.links) == set(mesh_b.links)
+
+    def test_identified_zero_keeps_individual_rloc_labels(self):
+        # When NONE of a router's children are attributed yet, individual
+        # "child:0x.." labels are still safe (nothing to collide with).
+        router_attrs = {
+            "0/53/1": 5,
+            "0/53/8": [{"0": 1, "1": 5 << 10, "2": 5, "3": 63, "4": 0, "5": 0, "6": 0,
+                        "7": 0, "8": True, "9": False}],
+            "0/53/7": [{"0": 10, "1": 5, "2": 5 << 10 | 1, "5": 3, "6": -50, "7": -50,
+                        "8": 0, "9": 0, "10": True, "11": True, "13": True}],
+        }
+        router = parse_node_diag(73, "router", True, router_attrs)
+        mesh = build_mesh([router])
+        assert any(n.key == "child:0x1401" for n in mesh.nodes)
+        assert not any(n.key.endswith("#unattributed") for n in mesh.nodes)
+
+
+# ---------------------------------------------------------------------------
+# #334 post-review — B1.4 / B1.5: key constructors, Literal typing, frozen Mesh
+# ---------------------------------------------------------------------------
+
+def test_router_and_child_key_constructors():
+    from thread_mesh import _child_key, _router_key  # pylint: disable=import-outside-toplevel
+    assert _router_key(14) == "rid:14"
+    assert _child_key(0xF804) == "child:0xF804"
+
+
+def test_mesh_is_frozen():
+    mesh = build_mesh([])
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        mesh.channel = 99
+
+
+# ---------------------------------------------------------------------------
+# #334 post-review — B4.14: counter 20 (BetterPartitionAttachAttemptCount)
+# ---------------------------------------------------------------------------
+
+def test_better_partition_attach_attempt_count_is_captured():
+    # BILRESA (0x2E) is rev-3 firmware and its AttributeList carries attribute
+    # 20 (verified in the fixture) — the counter must actually be captured now
+    # that it is in _COUNTER_ATTRS, not silently dropped.
+    diag = _parse_fixture(0x2E)
+    assert diag.counters.get("better_partition_attach_attempts") == 0

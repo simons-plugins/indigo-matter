@@ -140,14 +140,25 @@ def test_unsubscribed_attribute_is_a_noop():
     assert h.on_attribute_update(_Dev(), 0x0000, 25) == {}  # Channel — not subscribed
 
 
-def test_malformed_value_before_any_role_yields_empty_without_raising():
-    """No RoutingRole ever cached ⇒ parse_node_diag returns None ⇒ {} — and a
-    garbage NeighborTable value must not raise getting there."""
+def test_malformed_value_before_any_role_yields_role_only_without_raising():
+    """A garbage NeighborTable/RouteTable/counter value must never raise, even
+    before RoutingRole itself has ever been cached.
+
+    #334 post-review (B2.3): a cluster-0x35 key IS present here (NeighborTable,
+    then RouteTable, then ParentChangeCount), so ``parse_node_diag`` no longer
+    returns ``None`` the way a genuine Wi-Fi node correctly does — it returns an
+    "unreadable" diag (role Unspecified), and ``summary_states`` degrades that
+    (via B2.1's ``neighbours_known`` gate, since the NeighborTable value itself
+    is malformed) to ``threadRole`` alone. B2.8 (handler-level priming gate,
+    Step 3 of #334's post-review) narrows this further — this pins today's
+    behaviour at the ``thread_mesh``/``summary_states`` layer, independent of
+    that handler-level gate.
+    """
     h = ThreadNetworkDiagnosticsHandler()
     dev = _Dev()
-    assert h.on_attribute_update(dev, ATTR_NEIGHBOR_TABLE, "not-a-list-of-structs") == {}
-    assert h.on_attribute_update(dev, ATTR_ROUTE_TABLE, object()) == {}
-    assert h.on_attribute_update(dev, ATTR_PARENT_CHANGE_COUNT, {"unexpected": "shape"}) == {}
+    assert h.on_attribute_update(dev, ATTR_NEIGHBOR_TABLE, "not-a-list-of-structs") == {"threadRole": "Unspecified"}
+    assert h.on_attribute_update(dev, ATTR_ROUTE_TABLE, object()) == {"threadRole": "Unspecified"}
+    assert h.on_attribute_update(dev, ATTR_PARENT_CHANGE_COUNT, {"unexpected": "shape"}) == {"threadRole": "Unspecified"}
 
 
 def test_malformed_value_after_role_established_degrades_not_raises():

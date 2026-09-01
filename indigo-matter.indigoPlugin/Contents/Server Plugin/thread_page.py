@@ -382,7 +382,11 @@ def render_thread_page(mesh, diags: list, *, generated_at: str, live: bool,  # p
     badge = "LIVE" if live else "CACHED"
     badge_class = "badge-live" if live else "badge-cached"
 
-    partitions = sorted({p for p in mesh.partitions.values() if p is not None})
+    # NOTE: minimal compatibility patch for #334 post-review Step 1
+    # (thread_mesh.Mesh.partitions -> partition_ids/majority_partition/
+    # majority_leader, B1.3) — this whole header block is rewritten properly
+    # in Step 5 (A1: partition_header_text, majority + leader inline).
+    partitions = mesh.partition_ids
     partition_text = ", ".join(str(p) for p in partitions) if partitions else "unknown"
     leader = next((n for n in mesh.nodes if n.is_leader), None)
     leader_text = _fmt_opt(leader.router_id) if leader is not None else "unknown"
