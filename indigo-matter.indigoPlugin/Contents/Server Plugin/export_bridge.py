@@ -52,6 +52,7 @@ Four disciplines worth knowing before editing:
 from __future__ import annotations
 
 import asyncio
+import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Optional
 
@@ -85,6 +86,14 @@ from bridge_protocol import EndpointSpec, published_id_for
 #: performed anyway. Short enough that a genuinely wedged worker is named while
 #: the user is still looking at the log.
 COMMAND_TIMEOUT = 30.0
+
+#: How long an outage stays "the restart we ordered" (issue #340). Generous
+#: against the ~16s a real bounce took from plist write to completed attach,
+#: because the two directions cost differently: too long is one deferred
+#: diagnostic, too short is the log noise this exists to remove. Bounded by a
+#: MONOTONIC deadline, and closed early by an attach, a refusal or a stop —
+#: the expiry is the backstop, not the mechanism.
+EXPECTED_RESTART_WINDOW = 30.0
 
 #: How many dispatches may be outstanding before the watchdog says so. The
 #: worker is single-threaded, so anything above a couple means work is stacking
@@ -206,10 +215,20 @@ class ExportBridge:
                  agent_stop: Optional[Callable[[], None]] = None,
                  agent_diagnose: Optional[Callable[[], Optional[str]]] = None,
                  health_device_finder: Optional[Callable[[], Any]] = None,
-                 health_device_factory: Optional[Callable[[], Any]] = None) -> None:
+                 health_device_factory: Optional[Callable[[], Any]] = None,
+                 now: Callable[[], float] = time.monotonic) -> None:
         self._store = store
         self._runtime = runtime
         self._logger = logger
+        #: Clock for the expected-restart deadline only. MONOTONIC, matching
+        #: `WsJsonClient`'s own `now=`: the deadline is never compared against
+        #: anything persisted, and with a wall clock a backwards NTP step (macOS
+        #: STEPS rather than slews a large offset, which is what a Mac waking
+        #: with RTC drift does) would extend the window by the size of the step —
+        #: turning a 30s quiet into a multi-minute one on both peers at once.
+        #: Injectable so the expiry can be tested by moving time rather than by
+        #: poking the deadline, which is what let a never-expiring window pass.
+        self._now = now
         self._prefs_getter = prefs_getter
         self._plugin_version = plugin_version
         self._plugin_id = plugin_id
@@ -269,6 +288,17 @@ class ExportBridge:
         #: which reconnects on the normal backoff and refuses again — is said
         #: once per streak rather than once per cycle.
         self._refusal_reported: Optional[str] = None
+        #: Issue #340 — while WE are restarting the node (an install/update), an
+        #: outage is the restart working, not the node failing. Until this
+        #: monotonic deadline :meth:`_on_unreachable` says one line and DEFERS
+        #: its diagnostic instead of dumping the node's error log, and the
+        #: client's per-attempt reconnect warnings drop to debug. NOT one of the
+        #: latches above: those are cleared only by an attach, while this is
+        #: also closed by a refusal, by a stop, and by its own expiry — because
+        #: each of those is separately evidence the bounce is not in flight.
+        self._restart_expected_until = 0.0
+        #: Dedups the one "restarting…" line to once per window.
+        self._restart_notice_shown = False
         #: Device ids whose ``device_updated`` is currently failing, so a stuck
         #: device does not write a traceback per state change.
         self._update_failed: set[int] = set()
@@ -411,6 +441,7 @@ class ExportBridge:
             on_decommissioned=self._on_decommissioned,
             on_window_closed=self._on_window_closed,
             on_repeated_failure=self._on_unreachable,
+            outage_expected=self._restart_expected,
         )
         self._unreachable_reported = False
         self._disconnect_ticks = 0
@@ -432,6 +463,12 @@ class ExportBridge:
 
     def stop(self, timeout: float = 4.0) -> None:
         """Close the client. Idempotent; never raises at shutdown."""
+        # #340 review: the window belongs to the client being closed here. Left
+        # standing it outlives it — switch export off mid-install and back on
+        # 20s later, and `start()` wires a BRAND-NEW client to a seam that still
+        # says True, so its first genuine failures are demoted and its first
+        # `_on_unreachable` announces a restart nobody ordered any more.
+        self.cancel_expected_restart()
         self._stopped = True
         client, self.client = self.client, None
         executor, self._executor = self._executor, None
@@ -1827,6 +1864,13 @@ class ExportBridge:
         self._disconnect_ticks = 0
         self._poll_fail_ticks = 0
         self._unreachable_reported = False
+        # The restart we were waiting out has landed, so close its window early
+        # (#340). Left to expire on its own, a node that came back and then died
+        # for real inside the remaining seconds would be reported as "still
+        # restarting" — the window must mean "we are waiting for THIS bounce",
+        # not "the last 30 seconds were forgiven". Through the named closer, so
+        # there is exactly one body that knows what closing involves.
+        self.cancel_expected_restart()
         self._halted_reported = False
         self._recovery_reported = False
         self._refusal_reported = None
@@ -1900,7 +1944,17 @@ class ExportBridge:
         refuse again in ~30s, forever — so those get the same once-per-streak
         latch as ``_on_unreachable``, cleared by the attach that eventually
         succeeds.
+
+        **Closes the expected-restart window first, on every path** (#340
+        review). Reaching here means the node opened the socket and said no —
+        it is UP. An open window would then have the plugin logging "the bridge
+        node is restarting; reconnecting…" over a node that is running and
+        refusing, with the per-attempt reasons demoted to debug, for the rest of
+        the window. A peer that answers is the opposite of the premise the
+        window rests on, and a failed *update* is exactly when a refusal is most
+        likely to be the thing the user needs to read.
         """
+        self.cancel_expected_restart()
         if code == bridge_protocol.ERR_ENDPOINT_MAP_INVALID:
             # One code, two opposite remedies — see REFUSE_IDENTITY_UNREADABLE.
             # This branch used to hard-code the map wording for both, so a user
@@ -2045,6 +2099,44 @@ class ExportBridge:
         """
         self._health.note_fabrics(fabrics)
 
+    def expect_restart(self) -> None:
+        """Open the window during which an outage is a restart, not a failure (#340).
+
+        Called by the install/update path **before the plist is rewritten**, not
+        merely before ``restart()`` — see :meth:`bridge_agent_menu_mixin.
+        BridgeAgentMenuMixin._install_bridge_node` for the measurement that
+        settles the ordering. Length and clock choice: see
+        :data:`EXPECTED_RESTART_WINDOW`.
+
+        The window is a claim that a bounce is in flight, so anything that
+        disproves the claim closes it: an attach (:meth:`_on_attached`), a
+        refusal (:meth:`_on_attach_refused` — a node that answers is up), a stop
+        (:meth:`stop`), and the install path's own failure branches. Expiry is
+        the backstop for none of those happening at all.
+        """
+        self._restart_expected_until = self._now() + EXPECTED_RESTART_WINDOW
+        self._restart_notice_shown = False
+
+    def cancel_expected_restart(self) -> None:
+        """Close the window early, because the restart did NOT happen.
+
+        Every failure branch of the install path calls this. A window left armed
+        over a bridge that never came back is the one way this feature could
+        cost a user a real diagnosis: it would buy the dead node 30 seconds of
+        silence at exactly the moment the error log has something to say.
+        """
+        self._restart_expected_until = 0.0
+        self._restart_notice_shown = False
+
+    def _restart_expected(self) -> bool:  # noqa: D401
+        """Whether a restart we ordered is still expected to be in progress.
+
+        Also handed to the client as its ``outage_expected`` seam, so the
+        per-attempt reconnect warnings and this class's diagnostic answer to one
+        window rather than two copies of it.
+        """
+        return self._now() < self._restart_expected_until
+
     def _on_unreachable(self, attempts: int) -> None:
         """The node is not answering — and since E7 the agent is asked why.
 
@@ -2055,7 +2147,48 @@ class ExportBridge:
         installed. All three present identically at the socket as "connection
         refused". The seam returns the agent's own error-log tail; a failure
         inside it is contained there and costs only the extra sentence.
+
+        **Unless we are the reason it is quiet** (#340). Inside the window
+        :meth:`expect_restart` opens, this says one line and DEFERS — the
+        controller-side wording is deliberate and this is its twin: the client's
+        latch is re-armed (when there is a client to re-arm — this fires from a
+        client's own failure path, so in practice there always is) so a node
+        that never comes back still surfaces its real error on a later cycle,
+        past the window. Dropping the diagnostic
+        instead would mean an update that broke the node reported nothing at
+        all, which is strictly worse than the noise being fixed here.
+
+        The error-log tail is the specific thing worth not printing during a
+        planned bounce: it is appended to and never truncated, so what it offers
+        as evidence of "the node is down right now" can be — and in the issue's
+        log was — a crash-loop from eight days earlier.
         """
+        if self._restart_expected():
+            if not self._restart_notice_shown:
+                self._restart_notice_shown = True
+                # "expecting … to restart", not "is restarting": on the
+                # fresh-bootstrap path the install never called restart() at all
+                # — it handed launchd a new plist — so nothing here has
+                # confirmed anything came up. Claiming it did would be the same
+                # class of unverified assertion the poke messages avoid.
+                self._logger.info(
+                    "Matter bridge: expecting the bridge node to restart; reconnecting…")
+            client = self.client
+            if client is not None:
+                client.rearm_failure_diagnostic()
+            else:
+                # The deferral leg, skipped. Safe TODAY only because every path
+                # that nulls `self.client` (stop, _stop_soon,
+                # _replace_all_then_stop, revive_after_install) also discards
+                # that client, so the un-rearmed latch dies with it — but the
+                # invariant is nowhere else written down, and a future "park the
+                # client without discarding it" would turn this into the silent
+                # 30s swallow the rearm exists to prevent. Said out loud so it
+                # is a traceable skip rather than an invisible one.
+                self._logger.debug(
+                    "Matter bridge: expected-restart deferral had no client to re-arm; "
+                    "the diagnostic for this streak is lost with the client that raised it")
+            return
         if self._unreachable_reported:
             return
         self._unreachable_reported = True
