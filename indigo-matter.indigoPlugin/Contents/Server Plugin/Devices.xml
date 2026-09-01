@@ -1049,6 +1049,40 @@
                 <TriggerLabel>Reachable</TriggerLabel>
                 <ControlPageLabel>Reachable</ControlPageLabel>
             </State>
+            <!-- Thread mesh diagnostics (issue #334): written only for Thread
+                 nodes, by the ThreadNetworkDiagnostics handler (cluster
+                 0x0035). The handler does NOT read matter-server's cache
+                 itself — device_sync feeds it one attribute at a time,
+                 exactly as it feeds every handler: a cache replay when the
+                 device is first created, then live attribute_updated events
+                 after. Wi-Fi nodes never see an update on this cluster, so
+                 these states simply stay blank there — that is correct, not
+                 a gap. Deliberately only the four a trigger would bind to
+                 (ADR-0008: a shipped state is permanent); channel, network
+                 name and partition id live on the mesh report/page instead.
+                 threadLinkRssi/threadNeighbourCount/threadHealth are left
+                 UNTOUCHED (not written at all, never a sentinel) while the
+                 neighbour table itself is unknown — only threadRole is. -->
+            <State id="threadRole">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Thread Role</TriggerLabel>
+                <ControlPageLabel>Thread Role</ControlPageLabel>
+            </State>
+            <State id="threadNeighbourCount">
+                <ValueType>Integer</ValueType>
+                <TriggerLabel>Thread Neighbours</TriggerLabel>
+                <ControlPageLabel>Thread Neighbours</ControlPageLabel>
+            </State>
+            <State id="threadLinkRssi">
+                <ValueType>Integer</ValueType>
+                <TriggerLabel>Thread Link RSSI (dBm)</TriggerLabel>
+                <ControlPageLabel>Thread Link RSSI (dBm)</ControlPageLabel>
+            </State>
+            <State id="threadHealth">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Thread Health</TriggerLabel>
+                <ControlPageLabel>Thread Health</ControlPageLabel>
+            </State>
         </States>
         <UiDisplayStateId>reachable</UiDisplayStateId>
     </Device>

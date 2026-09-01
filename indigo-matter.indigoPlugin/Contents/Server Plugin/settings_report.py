@@ -140,6 +140,8 @@ INFRASTRUCTURE_CLUSTERS: frozenset = frozenset({
     0x0030,  # GeneralCommissioning — Breadcrumb
     0x0031,  # NetworkCommissioning — InterfaceEnabled
     0x0453,  # ThreadNetworkDirectory — PreferredExtendedPanId
+    0x0035,  # ThreadNetworkDiagnostics — read-only mesh diagnostics (#334); no
+             # writable attribute at all (absent from WRITABLE_ATTRIBUTES)
     # --- recovered by #197's parser fix; all fabric-owned, none a user setting -
     0x001E,  # Binding — the binding table; device-to-device wiring
     0x001F,  # AccessControl — Acl/Extension, who may talk to this node

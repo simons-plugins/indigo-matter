@@ -97,17 +97,18 @@ A Matter pairing code is not durable: once used, or once the window expires (up 
     </MenuItem>
 
     <!--
-        Read-only diagnostics (issue #191). Deliberately in section 1, beside
-        the devices they describe, rather than with the plumbing in sections
-        3-5: these answer questions about a DEVICE.
+        Read-only diagnostics (issue #191; Report Thread mesh… added by #334).
+        Deliberately in section 1, beside the devices they describe, rather
+        than with the plumbing in sections 3-5: these answer questions about a
+        DEVICE.
 
-        Both report into the EVENT LOG, and that is forced rather than chosen.
-        Indigo's ConfigUI has no per-field change callback — the only dynamic
-        mechanism is <List dynamicReload="true">, which regenerates a list's
-        OPTIONS — so a menu dialog physically cannot display an answer. Same
-        constraint and same resolution as the pairing codes in section 3.
+        All three report into the EVENT LOG, and that is forced rather than
+        chosen. Indigo's ConfigUI has no per-field change callback — the only
+        dynamic mechanism is <List dynamicReload="true">, which regenerates a
+        list's OPTIONS — so a menu dialog physically cannot display an answer.
+        Same constraint and same resolution as the pairing codes in section 3.
 
-        NEITHER WRITES ANYTHING, and that is settled (2026-08-11), not an
+        NONE OF THEM WRITES ANYTHING, and that is settled (2026-08-11), not an
         omission awaiting a follow-up: a generic attribute writer is
         unvalidated by construction, is device-global on devices joined to
         several ecosystems, and adds nothing over declaring another
@@ -162,6 +163,19 @@ A Matter pairing code is not durable: once used, or once the window expires (up 
             </Field>
             <Field id="attributeHelp" type="label" fontColor="darkgray">
                 <Label>Leave empty for a full dump from the cached snapshot — complete and instant, but an unsubscribed value can be stale. To confirm one value against the device itself, choose an exact endpoint and cluster and enter an attribute id here (e.g. 0x4003). A battery or Thread device can take several seconds to answer.</Label>
+            </Field>
+        </ConfigUI>
+    </MenuItem>
+    <MenuItem id="reportThreadMesh">
+        <Name>Report Thread mesh…</Name>
+        <CallbackMethod>menuReportThreadMesh</CallbackMethod>
+        <ConfigUI>
+            <Field id="threadMeshIntro" type="label">
+                <Label>Logs the Thread mesh to the Event Log: roles, links (RSSI/LQI/frame-error), the leader, foreign routers and health flags, read from matter-server's ThreadNetworkDiagnostics cache. Read-only — nothing is ever written to a device (#334).</Label>
+            </Field>
+            <Field id="liveReadSleepy" type="checkbox" defaultValue="true">
+                <Label>Live-read sleepy devices first (slower, accurate):</Label>
+                <Description>matter-server's cache can be hours stale for battery/Thread devices — a cached partition reading has been proven wrong by a live read before. Leave this on unless you specifically want the raw cache.</Description>
             </Field>
         </ConfigUI>
     </MenuItem>

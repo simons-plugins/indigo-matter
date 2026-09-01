@@ -8,15 +8,37 @@ from __future__ import annotations
 import json
 import time
 from concurrent.futures import TimeoutError as FuturesTimeoutError
+from datetime import datetime, timezone
 from typing import Any
 
 import indigo  # provided by the Indigo runtime
 
+import thread_mesh
+import thread_survey
 from commission_jobs import node_id_to_str
 from http_handlers import MatterUnavailable
+from matter_client import ATTRIBUTE_TIMEOUT
 from pairing_page import _pairing_html
-from plugin_constants import DECOMMISSION_TIMEOUT, PAIRING_READ_TIMEOUT
+from plugin_constants import DECOMMISSION_TIMEOUT, PAIRING_READ_TIMEOUT, SURVEY_READ_TIMEOUT
 from protocol import is_node_not_exists
+from thread_page import render_thread_page
+
+#: #334 finding B5.5 set this to 12 s (below the menu's ATTRIBUTE_TIMEOUT,
+#: 30 s) on 2.7-6.9 s observed single reads, reasoning the synchronous IWS
+#: handler shouldn't repeat the menu's 30 s budget with a browser tab sitting
+#: on it. Field correction (#334, 2026-09-01): a real ``?live=1`` refresh hit
+#: 12-s timeouts on 3 of 4 sleepy nodes — a sleepy end device answers a read
+#: only at its next poll, which can approach a minute (this rig's Aqara
+#: FP300 subscribes at 67 s), so 12 s structurally misses a napping device.
+#: Now matches ATTRIBUTE_TIMEOUT (30 s), the menu's own budget, which covers
+#: a typical poll; a node napping longer still degrades honestly into the
+#: page's "Unreadable / stale" section rather than blocking forever. Reads
+#: run concurrently (``_live_refresh`` via ``asyncio.gather``, thread_survey.py),
+#: so the worst case stays ~30 s + SURVEY_READ_TIMEOUT for the whole page, not
+#: summed per node. The menu itself keeps ATTRIBUTE_TIMEOUT (a background
+#: dialog result, not a page a person is staring at). No result cache: every
+#: request re-surveys, live or cached.
+_PAGE_LIVE_PER_NODE_TIMEOUT = 30.0
 
 
 class HttpApiMixin:
@@ -242,10 +264,17 @@ class HttpApiMixin:
         """
         method, _path_args, _query = self._parse_request(action)
         if method.upper() != "GET":
-            return self._reply(405, {"error": "method_not_allowed"})
+            # Cache-Control: no-store — mirrors http_thread_page's fix below (#334,
+            # 2026-09-01): this page carries a LIVE pairing code, an even stronger
+            # case never to let a browser re-serve a cached authenticated GET.
+            reply = indigo.Dict()
+            reply["status"] = 405
+            reply["headers"] = indigo.Dict({"Content-Type": "application/json", "Cache-Control": "no-store"})
+            reply["content"] = json.dumps({"error": "method_not_allowed"})
+            return reply
         reply = indigo.Dict()
         reply["status"] = 200
-        reply["headers"] = indigo.Dict({"Content-Type": "text/html; charset=utf-8"})
+        reply["headers"] = indigo.Dict({"Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store"})
         reply["content"] = self._pairing_page()
         return reply
 
@@ -282,3 +311,121 @@ class HttpApiMixin:
                 "No pairing window is open, so there is no code to show. Open one with "
                 "Plugins ▸ Matter ▸ Pair Matter Bridge… in Indigo.")
         return _pairing_html(pairing, "")
+
+    # ------------------------------------------------------------------
+    # The read-only Thread mesh page (IWS hidden action — #334, ADR-0004)
+    # ------------------------------------------------------------------
+    def http_thread_page(self, action, dev=None, caller_waiting_for_result=None):  # noqa: N802, ARG002
+        """Serve the Thread mesh page. GET only, mirroring ``http_pairing``.
+
+        ``?live=1`` live-refreshes every sleepy (non-router) node first, via
+        the exact same :func:`thread_survey.run_survey` the "Report Thread
+        mesh…" menu diagnostic uses — the cache-vs-live policy lives in one
+        place, not two drifting call sites. Always 200 for a GET: a
+        matter-server failure renders as the page's own error banner
+        (ADR-0004 has no write path to fall back to, and a broken read must
+        never look like a real but empty mesh — root workspace CLAUDE.md
+        degradation-path convention).
+
+        This handler and :meth:`_thread_mesh_snapshot` are read-only by
+        DISCIPLINE, not by a source-level guard: ADR-0004's own test
+        (``test_the_diagnostics_never_write_to_a_device``) only ever covered
+        ``diagnostics_menu_mixin.py`` and ``thread_survey.py``, and cannot be
+        extended to this whole module — ``http_api_mixin.py`` legitimately
+        holds the commission/decommission write paths (#334 post-review,
+        B5.9). ``tests/test_thread_page.py`` pins this handler's OWN source
+        instead, narrower than the module-wide guard would be.
+        """
+        method, _path_args, query = self._parse_request(action)
+        if method.upper() != "GET":
+            # Cache-Control: no-store — Safari re-served a cached ?live=1 render of
+            # this page after a promotion, so a "Refresh (live)" click showed stale,
+            # pre-promotion data (#334, 2026-09-01). Content-Type alone isn't enough.
+            reply = indigo.Dict()
+            reply["status"] = 405
+            reply["headers"] = indigo.Dict({"Content-Type": "application/json", "Cache-Control": "no-store"})
+            reply["content"] = json.dumps({"error": "method_not_allowed"})
+            return reply
+        live = str(query.get("live", "")) == "1"
+        mesh, diags, error = self._thread_mesh_snapshot(live_sleepy=live)
+        generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        content = render_thread_page(
+            mesh, diags, generated_at=generated_at, live=live,
+            plugin_id=self._export_plugin_id(),  # pylint: disable=no-member  # ExportDialogMixin
+            error=error,
+        )
+        reply = indigo.Dict()
+        reply["status"] = 200
+        reply["headers"] = indigo.Dict({"Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store"})
+        reply["content"] = content
+        return reply
+
+    def _thread_mesh_snapshot(self, *, live_sleepy: bool):  # pylint: disable=too-many-return-statements
+        """``(mesh, diags, error)`` for the Thread page.
+
+        Mirrors ``DiagnosticsMenuMixin.menuReportThreadMesh``'s failure
+        handling (not connected; ``run_survey``/``get_nodes()`` failing
+        outright; the three :class:`~thread_survey.Survey` shapes, #334
+        finding B2.4) but reports an HTML banner instead of a dialog error.
+        A per-node live-read timeout is NOT one of these — that degrades to
+        ``NodeDiag.read_error`` inside ``thread_survey`` and is shown in the
+        page's own "Unreadable" section, same as the menu report prints it
+        from cache rather than failing.
+
+        A ``?live=1`` request that times out OUTRIGHT (the whole survey, not
+        one node) falls back to a cache-only survey instead of the bare
+        banner (#334 finding B3.2) — the page still has real, useful data to
+        show, with ``error`` naming the live timeout so nobody mistakes it
+        for a genuinely fresh read. Only when the cache-only fallback ALSO
+        fails does this reach the banner-only path.
+        """
+        if self.runtime is None or self.matter is None or not self.matter.connected:
+            return thread_mesh.build_mesh([]), [], "The plugin is not connected to matter-server yet."
+
+        def _survey(live: bool):
+            return thread_survey.run_survey(
+                self.runtime, self.matter, live_sleepy=live,
+                per_node_timeout=_PAGE_LIVE_PER_NODE_TIMEOUT if live else ATTRIBUTE_TIMEOUT,
+                node_names=self._thread_node_names(),
+            )
+
+        try:
+            survey = _survey(live_sleepy)
+        except FuturesTimeoutError:
+            if not live_sleepy:
+                return thread_mesh.build_mesh([]), [], "matter-server did not answer in time."
+            self.logger.warning(
+                "Matter: Thread mesh survey timed out after %.0f s (live=%s) — falling back to cache.",
+                _PAGE_LIVE_PER_NODE_TIMEOUT + SURVEY_READ_TIMEOUT, live_sleepy)
+            try:
+                survey = _survey(False)
+            except FuturesTimeoutError:
+                return thread_mesh.build_mesh([]), [], "matter-server did not answer in time."
+            except Exception as exc:  # pylint: disable=broad-except
+                self.logger.warning("Matter: could not read the Thread mesh (cache fallback): %s", exc)
+                return thread_mesh.build_mesh([]), [], f"matter-server could not be read: {exc}"
+            mesh = thread_mesh.build_mesh(survey.diags)
+            return mesh, survey.diags, (
+                f"Live refresh timed out after {_PAGE_LIVE_PER_NODE_TIMEOUT:.0f} s — showing cached data.")
+        except Exception as exc:  # pylint: disable=broad-except
+            # Absorbing: get_nodes() failing is a failed call (thread_survey's own
+            # contract), not an empty mesh — surfaced as the page's error banner
+            # rather than a silently "no Thread devices" map.
+            self.logger.warning("Matter: could not read the Thread mesh for the IWS page: %s", exc)
+            return thread_mesh.build_mesh([]), [], f"matter-server could not be read: {exc}"
+
+        # #334 finding B2.4: raw_count == 0 (nothing commissioned at all) and
+        # "every raw node was unaddressable" (skipped, non-empty) are both
+        # real failures, distinct from the friendly "no Thread devices"
+        # success (raw_count > 0, diags empty, skipped empty).
+        if survey.raw_count == 0:
+            return thread_mesh.build_mesh([]), [], "matter-server reports no commissioned nodes at all."
+        if not survey.diags and survey.skipped:
+            return thread_mesh.build_mesh([]), [], (
+                f"{len(survey.skipped)} raw node(s) could not be read: {'; '.join(survey.skipped)}")
+        return thread_mesh.build_mesh(survey.diags), survey.diags, None
+
+    # ``_thread_node_names`` lives on DiagnosticsMenuMixin (#334 post-review,
+    # B5.4) — cross-mixin ``self.`` call, the established pattern issue #146
+    # set, so this page and the "Report Thread mesh…" menu item can never name
+    # a node differently. See that module for the method itself.

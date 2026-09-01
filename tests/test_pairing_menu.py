@@ -678,6 +678,7 @@ class TestPairingPage:
         reply = plug.http_pairing(self._action())
         assert reply["status"] == 200
         assert reply["headers"]["Content-Type"].startswith("text/html")
+        assert reply["headers"]["Cache-Control"] == "no-store"
         body = reply["content"]
         assert "1234-567-8901" in body and "MT:Y.K90" in body
         assert "<!DOCTYPE html>" in body
@@ -746,7 +747,9 @@ class TestPairingPage:
 
     def test_only_GET_is_served(self, plug):
         _bridge_with(plug)
-        assert plug.http_pairing(self._action("POST"))["status"] == 405
+        reply = plug.http_pairing(self._action("POST"))
+        assert reply["status"] == 405
+        assert reply["headers"]["Cache-Control"] == "no-store"
 
     def test_the_page_escapes_what_it_renders(self, plugin_mod):
         """Everything on the page comes from the node or from an exception

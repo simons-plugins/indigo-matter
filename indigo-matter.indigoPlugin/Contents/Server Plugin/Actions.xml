@@ -115,4 +115,14 @@
         <Name>matter export pairing page</Name>
         <CallbackMethod>http_pairing</CallbackMethod>
     </Action>
+    <!-- The read-only Thread mesh map (#334, ADR-0004). Another handler that
+         returns HTML rather than JSON, for the same reason as the pairing
+         page: the event log can carry the same report as text
+         ("Report Thread mesh…" on the menu) but not the SVG map. Same IWS
+         auth as the Domio handlers above; `?live=1` live-refreshes the sleepy
+         nodes first via the shared thread_survey.run_survey. -->
+    <Action id="thread" uiPath="hidden">
+        <Name>matter Thread mesh page</Name>
+        <CallbackMethod>http_thread_page</CallbackMethod>
+    </Action>
 </Actions>

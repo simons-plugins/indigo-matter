@@ -161,3 +161,47 @@ lighting every ~3 seconds, forever (issue #281) — the plugin's fix (a
 commanded-value push plus `CT_TOLERANCE_MIREDS`, ADR-0013) converges the
 fabric on the commanded value and tolerates exactly this gap; it is not a
 fix to the bulb's own reporting.
+
+## Thread mesh (observed 2026-09-01)
+
+**IKEA rev-2 vs rev-3 ThreadNetworkDiagnostics firmware differ in what they
+report, not just in values.** Rev-2 firmware (ALPSTUGA, TIMMERFLOTTE) reports
+FeatureMap 0 and a 22-entry AttributeList — the MLECNT-gated counters
+(DetachedRoleCount, ChildRoleCount, RouterRoleCount, LeaderRoleCount,
+AttachAttemptCount, PartitionIdChangeCount, ParentChangeCount) are absent
+entirely, not zero. Rev-3 IKEA firmware (GRILLPLATS, BILRESA) reports
+FeatureMap 15 and carries the full counter set. **The FeatureMap bit is not
+the authority — the AttributeList is (ADR-0003):** Aqara's Presence
+Multi-Sensor FP300 also reports FeatureMap 15, but its own AttributeList
+omits 14–21 entirely, so it reports NONE of the counters despite the same
+FeatureMap value the rev-3 IKEA devices carry. Always check the
+AttributeList before reading a counter — do not assume it exists because the
+cluster does, and do not assume it exists because FeatureMap says so either.
+
+**None of the IKEA/Aqara nodes seen implements the provisional ExtAddress
+(0x3F) / Rloc16 (0x40) attributes.** A router's own identity therefore has to
+come from its route table's self entry — the row with NextHop 63, PathCost 0,
+Allocated set, **and LinkEstablished clear** (a node is never its own radio
+neighbour, so its self-entry is the one candidate WITHOUT an established
+link) — rather than from those attributes directly. This check is gated to
+Router/Leader roles only: a REED's RouteTable can otherwise contain a row
+shaped exactly like a self-entry that actually describes a neighbouring
+router, not itself. Verified against the 2026-09-01 fixture: 0x34 has two
+RouteTable rows matching `NextHop==63, PathCost==0, Allocated` — its own
+entry (router 62, LinkEstablished False) and its neighbour 0x3F's entry
+(router 23, LinkEstablished True) — where only the LinkEstablished check
+tells them apart; 0x40 (a REED) has a row shaped exactly like a self-entry
+(router 23, `NextHop==63, PathCost==0, Allocated, LinkEstablished False`)
+that actually describes 0x3F, which the role gate alone is what keeps 0x40
+from being misread as router 23.
+
+**Ext-address values arrive precision-lossy through matter-server's JSON**:
+uint64 is serialised as a JS Number, so anything above 2^53 loses low bits.
+Never use ext address as an identity key — key routers by RLOC16 (exact)
+instead.
+
+**matter-server's cache goes stale for sleepy devices.** Cached
+PartitionId/LeaderRouterId values were hours old on two nodes and looked like
+a partition split; a live read of the same nodes showed a single partition.
+Treat a cached partition/leader disagreement as a staleness signal to
+re-verify, not as evidence of an actual split.
