@@ -3805,13 +3805,9 @@ class DeviceSync:
             self.apply_states(dev_id, handler.format_kv(states))
 
     def _on_attribute(self, evt: protocol.MatterEvent) -> None:  # pylint: disable=too-many-statements
-        # #344 review, B1: kept — measured 51/50 statements with the pragma
-        # removed (`pylint "Server Plugin"`, this repo's pinned config), not
-        # the 49/50 the fix spec's review claimed, so removing this DOES fire
-        # a new R0915 (verified directly, not assumed — see the PR/commit
-        # note). Leaving it in place is the deviation from finding B1; see
-        # the R0911/R0912 debt below, tolerated the same way everywhere else
-        # in this file.
+        # 51/50 statements since #344's cluster-0x35 stamp below (measured with
+        # the repo's pinned pylint config) — suppressed rather than restructured,
+        # the same tolerance this method's unsuppressed R0911/R0912 debt gets.
         if evt.node_id is None or evt.endpoint is None or evt.cluster is None:
             # a malformed attribute_updated frame (e.g. a truncated "ep/cl/at"
             # path) — surface it rather than dropping silently; protocol.py is the
