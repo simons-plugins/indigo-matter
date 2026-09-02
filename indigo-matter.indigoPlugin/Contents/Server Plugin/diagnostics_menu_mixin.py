@@ -44,6 +44,7 @@ import asyncio
 import functools
 from concurrent.futures import CancelledError as FuturesCancelledError
 from concurrent.futures import TimeoutError as FuturesTimeoutError
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 import indigo  # provided by the Indigo runtime
@@ -404,16 +405,20 @@ class DiagnosticsMenuMixin:
         a survey already running — both still checked, and still refused,
         before anything is ever submitted.
 
-        **``node_names`` and ``page_url`` are resolved HERE, on the Indigo
-        thread, eagerly** (#339 review, R8) — not inside the coroutine, and
-        not inside the done-callback. Three reasons: it restores
-        ``list_nodes()``'s documented "names resolved off the dispatch
-        thread" intent (resolving them inside the coroutine would move that
-        work onto the loop thread instead); it keeps the plugin's first
+        **``node_names``, ``event_stamps`` (#344) and ``page_url`` are
+        resolved HERE, on the Indigo thread, eagerly** (#339 review, R8) —
+        not inside the coroutine, and not inside the done-callback. Three
+        reasons: it restores ``list_nodes()``'s documented "names resolved
+        off the dispatch thread" intent (resolving them inside the coroutine
+        would move that work onto the loop thread instead — the same reason
+        ``event_stamps`` is captured here rather than the coroutine reaching
+        for ``self.device_sync`` itself); it keeps the plugin's first
         ``indigo.server.*`` RPC (``getWebServerURL``, inside
         ``_iws_page_url``) off the loop thread; and it means the done-callback
-        touches nothing but ``self.logger`` and these two captured, already-
-        resolved values — see :meth:`_on_thread_mesh_survey_done`.
+        touches nothing but ``self.logger`` and its own two captured,
+        already-resolved values (``live_sleepy``/``page_url`` — see
+        :meth:`_on_thread_mesh_survey_done`) — ``node_names``/``event_stamps``
+        flow into the SURVEY coroutine instead, never the done-callback.
         """
         errors = indigo.Dict()
         # Same guard, same wording, as HttpApiMixin._thread_mesh_snapshot
@@ -442,6 +447,10 @@ class DiagnosticsMenuMixin:
 
         # R8 — eager, Indigo-thread resolution (see docstring above).
         node_names = self._thread_node_names()  # B5.4 — same names the page uses
+        # #344: same eager-capture pattern as node_names above and page_url
+        # below — the survey coroutine runs on the asyncio loop thread and
+        # must not touch self.device_sync itself.
+        event_stamps = self.device_sync.thread_event_stamps() if self.device_sync is not None else {}
         try:
             page_url = self._iws_page_url("thread")  # pylint: disable=no-member  # HttpApiMixin
         except Exception:  # pylint: disable=broad-except
@@ -461,6 +470,7 @@ class DiagnosticsMenuMixin:
             return await asyncio.wait_for(
                 thread_survey.survey_thread_nodes(
                     self.matter, live_sleepy=live_sleepy, node_names=node_names,
+                    event_stamps=event_stamps,
                 ),
                 timeout=total_timeout,
             )
@@ -622,8 +632,12 @@ class DiagnosticsMenuMixin:
             self.logger.info("Matter: no Thread devices are commissioned yet.")
             return
 
-        mesh = thread_mesh.build_mesh(survey.diags)
-        for line in thread_mesh.render_report(mesh, survey.diags, page_url=page_url):
+        # #344: ages are computed at RENDER time, not survey time — `now` is
+        # resolved once here so the report's "stale" flags and its per-node
+        # "freshness: … · interviewed … ago" lines agree with each other.
+        now = datetime.now(timezone.utc)
+        mesh = thread_mesh.build_mesh(survey.diags, now)
+        for line in thread_mesh.render_report(mesh, survey.diags, page_url=page_url, now=now):
             self.logger.info("%s", line)
 
         if mesh.unreadable:

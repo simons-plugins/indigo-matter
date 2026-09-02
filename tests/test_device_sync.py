@@ -13,6 +13,7 @@ from unittest.mock import Mock
 import pytest
 
 import protocol
+import thread_mesh
 from protocol import MatterEvent
 
 from test_handlers import RELAY_NODE
@@ -5838,3 +5839,58 @@ def test_one_warning_per_device_per_kind_even_though_these_paths_run_every_pass(
         ds._safe_unreachable(dev_id)
 
     assert len([w for w in _warnings(mock_logger) if "could not mark device" in w]) == 1
+
+
+# ===========================================================================
+# #344 — DeviceSync._thread_event_seen: the last-LIVE-0x35-event stamp
+#
+# Deliberately stamped in _on_attribute (live attribute_updated events only),
+# NOT in ThreadNetworkDiagnosticsHandler.on_attribute_update
+# (matter_handlers/thread_network_diagnostics.py, untouched by #344) — that
+# handler method is ALSO invoked by _prime_states while replaying a node's
+# CACHED snapshot one attribute at a time, so stamping there would mark stale
+# cache "just now" on every plugin restart, exactly the lie #344 removes.
+# ===========================================================================
+
+def test_a_live_thread_attribute_event_stamps_the_node_id(ds):
+    ds.handle_event(MatterEvent(
+        kind=protocol.EVT_ATTRIBUTE_UPDATED,
+        node_id=99, endpoint=0, cluster=thread_mesh.CLUSTER_THREAD_DIAG, attribute=1, value=5,
+    ))
+    assert 99 in ds.thread_event_stamps()
+
+
+def test_a_non_thread_attribute_event_does_not_stamp(ds):
+    ds.handle_event(MatterEvent(
+        kind=protocol.EVT_ATTRIBUTE_UPDATED,
+        node_id=99, endpoint=1, cluster=0x0006, attribute=0, value=True,
+    ))
+    assert ds.thread_event_stamps() == {}
+
+
+def test_thread_event_stamps_returns_a_copy_not_the_live_dict(ds):
+    ds.handle_event(MatterEvent(
+        kind=protocol.EVT_ATTRIBUTE_UPDATED,
+        node_id=99, endpoint=0, cluster=thread_mesh.CLUSTER_THREAD_DIAG, attribute=1, value=5,
+    ))
+    stamps = ds.thread_event_stamps()
+    stamps[123] = 0.0  # mutate the caller's copy
+    assert 123 not in ds.thread_event_stamps()
+
+
+def test_priming_a_thread_nodes_cached_snapshot_does_not_stamp_anything(ds, indigo_env):
+    """The decision-1 pin: a node whose commissioning/reconcile pass primes a
+    matterNode device from CACHED cluster-0x35 attributes (RoutingRole,
+    NeighborTable — both on the same endpoint 0 as the matterNode device
+    itself) must leave ``_thread_event_seen`` untouched. ``_prime_states``
+    calls ``handler.on_attribute_update`` directly; it never goes anywhere
+    near ``_on_attribute``, which is the only place this plugin stamps."""
+    _indigo, _devices = indigo_env
+    node = _with_node_evidence(RELAY_NODE)
+    node["attributes"]["0/53/1"] = 2  # RoutingRole = SleepyEndDevice
+    node["attributes"]["0/53/7"] = []  # NeighborTable, known-empty
+
+    result = ds.create_from_raw(node, "Office Plug")
+
+    assert result["nodeDeviceId"] is not None, "sanity: the matterNode device was actually created"
+    assert ds.thread_event_stamps() == {}

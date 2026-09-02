@@ -17,12 +17,13 @@ from __future__ import annotations
 import asyncio
 import json
 from concurrent.futures import TimeoutError as FuturesTimeoutError
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
 from thread_mesh import ATTR_PARTITION_ID, build_mesh, parse_node_diag
-from thread_survey import Survey, run_survey, survey_thread_nodes
+from thread_survey import Survey, _parse_timestamp, run_survey, survey_thread_nodes
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "thread_mesh" / "nodes.json"
 ROUTER_IDS = {0x27, 0x34, 0x3F}
@@ -442,3 +443,156 @@ def test_run_survey_cancels_the_underlying_future_on_timeout(monkeypatch):
     with pytest.raises(FuturesTimeoutError):
         run_survey(runtime, matter, live_sleepy=False, per_node_timeout=0.0)
     assert runtime.future.cancelled is True
+
+
+# ---------------------------------------------------------------------------
+# #344 — _parse_timestamp
+# ---------------------------------------------------------------------------
+
+class TestParseTimestamp:
+    def test_iso_with_trailing_z(self):
+        parsed = _parse_timestamp("2026-08-27T10:00:00Z")
+        assert parsed is not None
+        assert parsed.year == 2026 and parsed.month == 8 and parsed.day == 27
+        assert parsed.tzinfo is not None
+
+    def test_iso_naive_assumes_utc(self):
+        parsed = _parse_timestamp("2026-08-27T10:00:00")
+        assert parsed is not None
+        assert parsed.tzinfo == timezone.utc
+
+    def test_epoch_int(self):
+        parsed = _parse_timestamp(1_800_000_000)
+        assert parsed is not None
+        assert parsed.tzinfo is not None
+
+    def test_epoch_float(self):
+        parsed = _parse_timestamp(1_800_000_000.5)
+        assert parsed is not None
+
+    def test_datetime_passthrough_naive_assumes_utc(self):
+        naive = datetime(2026, 1, 1)
+        parsed = _parse_timestamp(naive)
+        assert parsed == naive.replace(tzinfo=timezone.utc)
+
+    def test_datetime_passthrough_aware_is_untouched(self):
+        aware = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        assert _parse_timestamp(aware) is aware
+
+    def test_garbage_string_is_none(self):
+        assert _parse_timestamp("not a date") is None
+
+    def test_none_is_none(self):
+        assert _parse_timestamp(None) is None
+
+    def test_dict_is_none(self):
+        # Adversarial: "when could this raise and be wrong?" — matter-server
+        # handing back an unexpected shape for these fields must degrade to
+        # None, never crash the whole survey (root workspace CLAUDE.md
+        # degradation-path convention).
+        assert _parse_timestamp({"not": "a timestamp"}) is None
+
+    def test_never_raises_for_any_of_the_above(self):
+        for value in ("2026-08-27T10:00:00Z", "2026-08-27T10:00:00", 1_800_000_000,
+                      1_800_000_000.5, datetime(2026, 1, 1), "garbage", None, {"a": 1}, [], object()):
+            _parse_timestamp(value)  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# #344 — raw date_commissioned/last_interview land on the diag; absence is None
+# ---------------------------------------------------------------------------
+
+class TestCacheAgeFields:
+    def test_fixture_nodes_carry_no_timestamps_and_diags_get_none(self):
+        # The shipped fixture has neither key at all — absence must be the
+        # boring case, proven by running it through completely unchanged.
+        # #344 review, A1: absence must ALSO stay silent — no parse_warning.
+        matter = FakeMatter()
+        survey = _run(survey_thread_nodes(matter, live_sleepy=False))
+        assert survey.diags  # sanity: the fixture actually parsed
+        for diag in survey.diags:
+            assert diag.date_commissioned is None
+            assert diag.last_interview is None
+            assert diag.last_event_seen is None
+            assert not any("unparseable" in w for w in diag.parse_warnings)
+
+    def test_a_present_but_unparseable_last_interview_records_a_parse_warning(self):
+        # #344 review, A1 (silent-failure M1): a PRESENT raw value that
+        # _parse_timestamp cannot make sense of — matter-server's wire shape
+        # changing — must be visible, unlike the boring "absent" case above.
+        nodes = _fixture_nodes()
+        for raw in nodes:
+            if raw["node_id"] == 0x34:
+                raw["last_interview"] = "garbage"
+        matter = FakeMatter(nodes=nodes)
+        survey = _run(survey_thread_nodes(matter, live_sleepy=False))
+        diag = next(d for d in survey.diags if d.node_id == 0x34)
+        assert diag.last_interview is None
+        assert any("last_interview unparseable: 'garbage'" in w for w in diag.parse_warnings)
+        # And it must actually reach an operator via build_mesh's warnings —
+        # not just sit unused on the diag.
+        mesh = build_mesh(survey.diags)
+        assert any(
+            node_id == 0x34 and "last_interview unparseable" in msg for node_id, msg in mesh.warnings
+        )
+
+    def test_a_present_but_unparseable_date_commissioned_records_a_parse_warning(self):
+        nodes = _fixture_nodes()
+        for raw in nodes:
+            if raw["node_id"] == 0x34:
+                raw["date_commissioned"] = {"not": "a timestamp"}
+        matter = FakeMatter(nodes=nodes)
+        survey = _run(survey_thread_nodes(matter, live_sleepy=False))
+        diag = next(d for d in survey.diags if d.node_id == 0x34)
+        assert diag.date_commissioned is None
+        assert any("date_commissioned unparseable" in w for w in diag.parse_warnings)
+
+    def test_raw_date_commissioned_and_last_interview_land_on_the_diag(self):
+        nodes = _fixture_nodes()
+        for raw in nodes:
+            if raw["node_id"] == 0x34:
+                raw["date_commissioned"] = "2026-08-01T00:00:00Z"
+                raw["last_interview"] = 1_800_000_000
+        matter = FakeMatter(nodes=nodes)
+        survey = _run(survey_thread_nodes(matter, live_sleepy=False))
+        diag = next(d for d in survey.diags if d.node_id == 0x34)
+        assert diag.date_commissioned is not None and diag.date_commissioned.year == 2026
+        assert diag.last_interview is not None
+        # A sibling node with neither raw key present is unaffected.
+        other = next(d for d in survey.diags if d.node_id == 0x3F)
+        assert other.date_commissioned is None and other.last_interview is None
+
+    def test_event_stamps_mapping_is_applied_missing_node_id_is_none(self):
+        matter = FakeMatter()
+        survey = _run(survey_thread_nodes(matter, live_sleepy=False, event_stamps={0x27: 123.0}))
+        by_id = {d.node_id: d for d in survey.diags}
+        assert by_id[0x27].last_event_seen == 123.0
+        assert by_id[0x2E].last_event_seen is None
+
+    def test_run_survey_forwards_event_stamps(self):
+        runtime = _RecordingRuntime()
+        matter = FakeMatter()
+        survey = run_survey(runtime, matter, live_sleepy=False, event_stamps={0x27: 42.0})
+        by_id = {d.node_id: d for d in survey.diags}
+        assert by_id[0x27].last_event_seen == 42.0
+
+
+# ---------------------------------------------------------------------------
+# #344 decision 2 — the trap: a live refresh's per-field copy from a freshly-
+# parsed live diag (which never sets these three fields itself) must not wipe
+# out an interview/event stamp applied BEFORE the live-refresh block runs.
+# survey_thread_nodes applies them AFTER instead — this pins that ordering.
+# ---------------------------------------------------------------------------
+
+def test_live_refresh_success_does_not_wipe_the_interview_and_event_stamps():
+    nodes = _fixture_nodes()
+    for raw in nodes:
+        if raw["node_id"] == 0x2E:  # BILRESA — non-router, gets live-read
+            raw["last_interview"] = "2026-08-27T10:00:00Z"
+    matter = FakeMatter(nodes=nodes)
+    survey = _run(survey_thread_nodes(
+        matter, live_sleepy=True, event_stamps={0x2E: 1_800_000_000.0}))
+    diag = next(d for d in survey.diags if d.node_id == 0x2E)
+    assert diag.source == "live", "sanity: the live refresh must actually have succeeded"
+    assert diag.last_interview is not None and diag.last_interview.year == 2026
+    assert diag.last_event_seen == 1_800_000_000.0

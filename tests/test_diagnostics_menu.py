@@ -101,6 +101,7 @@ def mixin(mock_indigo_base, mock_logger):
     obj.device_sync = Mock()
     obj.device_sync.list_nodes.return_value = [(0x34, ["Grillplats socket"])]
     obj.device_sync.lookup.return_value = 0
+    obj.device_sync.thread_event_stamps.return_value = {}  # #344
     obj.runtime.submit.return_value = _Future(RELAY_NODE)
     obj._iws_page_url = Mock(  # pylint: disable=protected-access
         side_effect=lambda action_id: f"http://localhost:8176/message/ours/{action_id}/")
@@ -691,6 +692,27 @@ def test_menu_passes_the_shared_node_names_to_the_survey(mixin):
     ok, _values = obj.menuReportThreadMesh({"liveReadSleepy": False})[:2]
     assert ok
     assert "Grillplats socket" in _log_body(obj)
+
+
+def test_menu_forwards_event_stamps_to_survey_thread_nodes(mixin, monkeypatch):
+    # #344 review, A4 (test-review #1): event_stamps must actually reach
+    # thread_survey.survey_thread_nodes, not just be resolved and dropped.
+    module, obj = mixin
+    nodes = json.loads(THREAD_FIXTURE_PATH.read_text(encoding="utf-8"))
+    obj.matter = _ThreadFakeMatter(nodes)
+    obj.runtime = _RecordingRuntime()
+    obj.device_sync.thread_event_stamps.return_value = {0x34: 123.0}
+    captured = {}
+    real_survey_thread_nodes = module.thread_survey.survey_thread_nodes
+
+    async def _capture(matter, **kwargs):
+        captured.update(kwargs)
+        return await real_survey_thread_nodes(matter, **kwargs)
+
+    monkeypatch.setattr(module.thread_survey, "survey_thread_nodes", _capture)
+    ok, _values = obj.menuReportThreadMesh({"liveReadSleepy": False})[:2]
+    assert ok
+    assert captured["event_stamps"] == {0x34: 123.0}
 
 
 def test_prefers_the_matternode_devices_own_name_over_the_endpoint_join(mixin):

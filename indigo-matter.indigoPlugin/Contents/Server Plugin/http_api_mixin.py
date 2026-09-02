@@ -378,12 +378,17 @@ class HttpApiMixin:
             reply["content"] = json.dumps({"error": "method_not_allowed"})
             return reply
         live = str(query.get("live", "")) == "1"
-        mesh, diags, error = self._thread_mesh_snapshot(live_sleepy=live)
-        generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        # #344: ONE `now`, computed here and threaded through both the mesh
+        # build (its "stale" flag ages) and the page render (its header badge,
+        # per-node freshness cells, and `generated_at`) — so every cache-age
+        # figure on one render of this page agrees with every other.
+        now = datetime.now(timezone.utc)
+        mesh, diags, error = self._thread_mesh_snapshot(live_sleepy=live, now=now)
+        generated_at = now.strftime("%Y-%m-%dT%H:%M:%SZ")
         content = render_thread_page(
             mesh, diags, generated_at=generated_at, live=live,
             plugin_id=self._export_plugin_id(),  # pylint: disable=no-member  # ExportDialogMixin
-            error=error,
+            error=error, now=now,
         )
         reply = indigo.Dict()
         reply["status"] = 200
@@ -391,7 +396,7 @@ class HttpApiMixin:
         reply["content"] = content
         return reply
 
-    def _thread_mesh_snapshot(self, *, live_sleepy: bool):  # pylint: disable=too-many-return-statements
+    def _thread_mesh_snapshot(self, *, live_sleepy: bool, now=None):  # pylint: disable=too-many-return-statements
         """``(mesh, diags, error)`` for the Thread page.
 
         Mirrors ``DiagnosticsMenuMixin.menuReportThreadMesh``'s failure
@@ -409,33 +414,56 @@ class HttpApiMixin:
         show, with ``error`` naming the live timeout so nobody mistakes it
         for a genuinely fresh read. Only when the cache-only fallback ALSO
         fails does this reach the banner-only path.
+
+        ``now`` (#344) is threaded into every :func:`thread_mesh.build_mesh`
+        call below so its "stale" flag ages agree with the caller's own
+        ``generated_at``/page render — the caller (``http_thread_page``)
+        computes it once and passes the SAME value here and to
+        ``render_thread_page``.
         """
         if self.runtime is None or self.matter is None or not self.matter.connected:
-            return thread_mesh.build_mesh([]), [], "The plugin is not connected to matter-server yet."
+            return thread_mesh.build_mesh([], now), [], "The plugin is not connected to matter-server yet."
+
+        # #344: captured ONCE, on this (Indigo) thread, and forwarded into
+        # every survey below — the same eager-capture pattern node_names/
+        # page_url already use elsewhere in these mixins (#339 R3/R8), because
+        # thread_survey's coroutine runs on the asyncio loop thread and must
+        # not touch self.device_sync itself.
+        #
+        # #344 review, C2: these stamps (and `now`, above in http_thread_page)
+        # are captured BEFORE a live survey runs, on purpose — thread-safety
+        # (device_sync's lock must not be reached for from the loop thread)
+        # and so every age on one render shares a single coherent `now`. The
+        # cost: a LIVE row's own "last 0x35 update" can understate its true
+        # freshness by however long the survey took, because an event that
+        # arrives DURING the survey is not in this snapshot. Understating is
+        # the safe direction — do not "fix" this by stamping later; that
+        # would let a page describe a read as fresher than it actually was.
+        stamps = self.device_sync.thread_event_stamps() if self.device_sync is not None else {}
 
         def _survey(live: bool):
             return thread_survey.run_survey(
                 self.runtime, self.matter, live_sleepy=live,
                 per_node_timeout=_PAGE_LIVE_PER_NODE_TIMEOUT if live else ATTRIBUTE_TIMEOUT,
-                node_names=self._thread_node_names(),
+                node_names=self._thread_node_names(), event_stamps=stamps,
             )
 
         try:
             survey = _survey(live_sleepy)
         except FuturesTimeoutError:
             if not live_sleepy:
-                return thread_mesh.build_mesh([]), [], "matter-server did not answer in time."
+                return thread_mesh.build_mesh([], now), [], "matter-server did not answer in time."
             self.logger.warning(
                 "Matter: Thread mesh survey timed out after %.0f s (live=%s) — falling back to cache.",
                 _PAGE_LIVE_PER_NODE_TIMEOUT + SURVEY_READ_TIMEOUT, live_sleepy)
             try:
                 survey = _survey(False)
             except FuturesTimeoutError:
-                return thread_mesh.build_mesh([]), [], "matter-server did not answer in time."
+                return thread_mesh.build_mesh([], now), [], "matter-server did not answer in time."
             except Exception as exc:  # pylint: disable=broad-except
                 self.logger.warning("Matter: could not read the Thread mesh (cache fallback): %s", exc)
-                return thread_mesh.build_mesh([]), [], f"matter-server could not be read: {exc}"
-            mesh = thread_mesh.build_mesh(survey.diags)
+                return thread_mesh.build_mesh([], now), [], f"matter-server could not be read: {exc}"
+            mesh = thread_mesh.build_mesh(survey.diags, now)
             return mesh, survey.diags, (
                 f"Live refresh timed out after {_PAGE_LIVE_PER_NODE_TIMEOUT:.0f} s — showing cached data.")
         except Exception as exc:  # pylint: disable=broad-except
@@ -443,18 +471,18 @@ class HttpApiMixin:
             # contract), not an empty mesh — surfaced as the page's error banner
             # rather than a silently "no Thread devices" map.
             self.logger.warning("Matter: could not read the Thread mesh for the IWS page: %s", exc)
-            return thread_mesh.build_mesh([]), [], f"matter-server could not be read: {exc}"
+            return thread_mesh.build_mesh([], now), [], f"matter-server could not be read: {exc}"
 
         # #334 finding B2.4: raw_count == 0 (nothing commissioned at all) and
         # "every raw node was unaddressable" (skipped, non-empty) are both
         # real failures, distinct from the friendly "no Thread devices"
         # success (raw_count > 0, diags empty, skipped empty).
         if survey.raw_count == 0:
-            return thread_mesh.build_mesh([]), [], "matter-server reports no commissioned nodes at all."
+            return thread_mesh.build_mesh([], now), [], "matter-server reports no commissioned nodes at all."
         if not survey.diags and survey.skipped:
-            return thread_mesh.build_mesh([]), [], (
+            return thread_mesh.build_mesh([], now), [], (
                 f"{len(survey.skipped)} raw node(s) could not be read: {'; '.join(survey.skipped)}")
-        return thread_mesh.build_mesh(survey.diags), survey.diags, None
+        return thread_mesh.build_mesh(survey.diags, now), survey.diags, None
 
     # ``_thread_node_names`` lives on DiagnosticsMenuMixin (#334 post-review,
     # B5.4) — cross-mixin ``self.`` call, the established pattern issue #146

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import importlib
 import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -182,6 +183,7 @@ def plug(plugin_mod):
     p.matter = Mock(connected=True)
     p.device_sync = Mock()
     p.device_sync.list_nodes.return_value = []
+    p.device_sync.thread_event_stamps.return_value = {}  # #344
     p.export_bridge = None
     return p
 
@@ -613,3 +615,136 @@ def test_live_path_uses_the_pages_own_per_node_timeout(plug, monkeypatch):
     assert captured["per_node_timeout"] == http_api_mixin._PAGE_LIVE_PER_NODE_TIMEOUT  # pylint: disable=protected-access
     # Semantic pin, not numeric: the live path matches the menu's budget.
     assert http_api_mixin._PAGE_LIVE_PER_NODE_TIMEOUT == http_api_mixin.ATTRIBUTE_TIMEOUT  # pylint: disable=protected-access
+
+
+# ---------------------------------------------------------------------------
+# #344 review — A4: event_stamps actually reaches run_survey (test-review #1)
+# ---------------------------------------------------------------------------
+
+def test_event_stamps_are_forwarded_to_run_survey(plug, monkeypatch):
+    plug.device_sync.thread_event_stamps.return_value = {0x34: 555.0}
+    captured = {}
+
+    def _fake_run_survey(runtime, matter, *, live_sleepy, event_stamps=None, node_names=None, **kwargs):
+        captured["event_stamps"] = event_stamps
+        return Survey(diags=[], raw_count=0, skipped=[])
+
+    monkeypatch.setattr("http_api_mixin.thread_survey.run_survey", _fake_run_survey)
+    plug.http_thread_page(_action())
+    assert captured["event_stamps"] == {0x34: 555.0}
+
+
+# ---------------------------------------------------------------------------
+# #344 — per-node cache age: stale chip, badge note, and the amber banner
+# ---------------------------------------------------------------------------
+
+NOW = datetime(2026, 9, 2, tzinfo=timezone.utc)
+
+
+def test_cached_node_older_than_an_hour_gets_the_stale_chip_and_banner():
+    mesh, diags = _fixture_mesh()
+    diags[0].last_interview = NOW - timedelta(hours=6)
+    html = render_thread_page(mesh, diags, generated_at="t", live=False, plugin_id=PLUGIN_ID, now=NOW)
+    assert 'class="chip-stale"' in html
+    assert "oldest node baseline: 6h" in html
+    assert "Some of this data is matter-server" in html
+    assert 'href="/message/com.simons-plugins.indigo-matter/thread?live=1"' in html
+    assert "Refresh (live)" in html
+
+
+def test_cached_node_under_an_hour_old_gets_neither_chip_nor_banner():
+    mesh, diags = _fixture_mesh()
+    for diag in diags:
+        diag.last_interview = NOW - timedelta(minutes=10)
+    html = render_thread_page(mesh, diags, generated_at="t", live=False, plugin_id=PLUGIN_ID, now=NOW)
+    assert 'class="chip-stale"' not in html
+    assert "Some of this data is matter-server" not in html
+    # A known-but-fresh baseline still earns the header note (age is known).
+    assert "oldest node baseline: 10m" in html
+
+
+def test_live_render_shows_neither_banner_nor_oldest_baseline_note():
+    # NOTE: a per-node stale CHIP is keyed to that diag's own `source` (a live
+    # survey never live-reads routers, so a router can stay cache-sourced on
+    # an otherwise-"live" page) — only the page-wide badge note and banner are
+    # gated on the `live` flag itself, which is what this pins.
+    mesh, diags = _fixture_mesh()
+    for diag in diags:
+        diag.last_interview = NOW - timedelta(days=6)
+    html = render_thread_page(mesh, diags, generated_at="t", live=True, plugin_id=PLUGIN_ID, now=NOW)
+    assert "oldest node baseline" not in html
+    assert "Some of this data is matter-server" not in html
+
+
+def test_unknown_interview_age_renders_an_em_dash_and_no_chip():
+    mesh, diags = _fixture_mesh()  # fixture diags carry no last_interview at all
+    html = render_thread_page(mesh, diags, generated_at="t", live=False, plugin_id=PLUGIN_ID, now=NOW)
+    assert "interviewed — ·" in html
+    assert 'class="chip-stale"' not in html
+    assert "oldest node baseline" not in html
+
+
+# ---------------------------------------------------------------------------
+# #344 review — A3: "oldest node baseline" must not hide unknown baselines
+# ---------------------------------------------------------------------------
+
+def test_mixed_known_and_unknown_baselines_names_the_unknown_count():
+    mesh, diags = _fixture_mesh()
+    diags[0].last_interview = NOW - timedelta(minutes=10)
+    diags[1].last_interview = NOW - timedelta(hours=6)
+    # diags[2:] keep last_interview=None — genuinely unknown.
+    unknown_count = len(diags) - 2
+    html = render_thread_page(mesh, diags, generated_at="t", live=False, plugin_id=PLUGIN_ID, now=NOW)
+    # This also kills the max-vs-min mutant: the OLDEST known age (6h) must
+    # win, not the freshest (10m).
+    assert f"oldest node baseline: 6h ({unknown_count} unknown)" in html
+    assert "oldest node baseline: 10m" not in html
+    assert f"{unknown_count} node(s) have no interview baseline at all." in html
+    # Named BEFORE the "Use Refresh (live)" sentence (A3's ordering call).
+    banner_start = html.index("Some of this data is matter-server")
+    unknown_at = html.index(f"{unknown_count} node(s) have no interview baseline at all.")
+    use_refresh_at = html.index("Use <a href=", banner_start)
+    assert banner_start < unknown_at < use_refresh_at
+
+
+def test_all_known_baselines_wording_is_unchanged():
+    # A3: no "(N unknown)" suffix at all when every diag's baseline is known.
+    mesh, diags = _fixture_mesh()
+    for diag in diags:
+        diag.last_interview = NOW - timedelta(hours=2)
+    html = render_thread_page(mesh, diags, generated_at="t", live=False, plugin_id=PLUGIN_ID, now=NOW)
+    assert "oldest node baseline: 2h</span>" in html
+    assert "unknown)" not in html
+    assert "have no interview baseline at all" not in html
+
+
+# ---------------------------------------------------------------------------
+# #344 review — C3: a live-sourced diag's own stale chip is keyed to ITS
+# `source`, never the page-wide `live` flag
+# ---------------------------------------------------------------------------
+
+def test_live_sourced_diag_with_old_interview_gets_no_stale_chip():
+    mesh, diags = _fixture_mesh()
+    diags[0].source = "live"
+    diags[0].last_interview = NOW - timedelta(hours=6)
+    html = render_thread_page(mesh, diags, generated_at="t", live=False, plugin_id=PLUGIN_ID, now=NOW)
+    assert 'class="chip-stale"' not in html
+    assert "live · interviewed 6h ago" in html
+
+
+def test_hostile_node_name_is_still_escaped_alongside_the_new_freshness_cell():
+    attrs = {
+        "0/53/1": 2,  # SleepyEndDevice
+        "0/53/2": "net", "0/53/3": 1, "0/53/4": 1,
+        "0/53/7": [{"0": 1, "1": 5, "2": 0x2800, "5": 3, "6": -60, "7": -60,
+                    "8": 0, "9": 0, "10": True, "11": True, "13": False}],
+    }
+    diag = parse_node_diag(1, "<script>alert(1)</script>", True, attrs)
+    diag.last_interview = NOW - timedelta(hours=6)
+    mesh = build_mesh([diag])
+    html = render_thread_page(mesh, [diag], generated_at="t", live=False, plugin_id=PLUGIN_ID, now=NOW)
+    assert "<script>alert(1)</script>" not in html
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in html
+    # The stale chip fires alongside it — proves the escaping survives the
+    # new cell's own wrapping, not just the unrelated name column.
+    assert 'class="chip-stale"' in html
