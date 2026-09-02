@@ -3,6 +3,40 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
+## 2026.31.0 — the Thread mesh report and page now show the cache's age (#344)
+
+The Thread page/report already labelled data `CACHED` vs `LIVE`, but gave no
+age — the badge's timestamp is when the page rendered, not when the data was
+true. matter-server's `get_nodes` carries per-node `date_commissioned` and
+`last_interview` — the cache's baseline (observed spread on real hardware:
+hours to six days) — and this release surfaces it, per node, everywhere the
+mesh is shown.
+
+- **Per-node cache age**: the menu report, the IWS page, and the page's Nodes
+  table all now show an interview baseline (`interviewed 6d ago`) and, when
+  this plugin has itself seen a live cluster-0x35 event for that node since
+  it last started, a `last 0x35 update 2h ago` alongside it. **The baseline
+  is a LOWER bound, never "accurate as of"** — a stale `PartitionId` has been
+  observed to survive a later interview, so this names when the interview
+  happened, not how fresh the data actually is.
+- **Cached stays the page's default; old data is highlighted, not hidden**
+  (Simon's UX call): a per-node interview baseline older than an hour gets an
+  amber `chip-stale` cell, and the header gains an `oldest node baseline`
+  note plus an amber banner pointing at the existing "Refresh (live)" link —
+  the note also says how many nodes have NO baseline at all, so a handful of
+  fresh readings can never read as though the whole fabric were freshly
+  surveyed. Never shown on a live render, and never invented when no node's
+  baseline is known at all.
+- **The live-0x35-event stamp lives in `device_sync`, not the cluster
+  handler** — the handler is also invoked while priming a device from
+  matter-server's cached snapshot at plugin startup, and stamping there
+  would mark stale cache "just now" on every restart, exactly the lie this
+  feature exists to remove. Only a genuine live `attribute_updated` event
+  stamps a node; the stamp is in-memory only, never persisted.
+- A future-dated timestamp (clock skew) never reads as maximum freshness —
+  it degrades to unknown (`—`), the same as an absent field, rather than
+  "just now" or worse "just now ago".
+
 ## 2026.30.3 — Report Thread mesh… runs in the background; dialog text fits (#339)
 
 Field report against v2026.30.0: the "Report Thread mesh…" dialog's intro
