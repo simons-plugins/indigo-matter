@@ -398,9 +398,10 @@ def _order_ring1(members: list, chords: list[tuple[str, str]], has_orphans: bool
 
 def _layout_full(mesh):  # pylint: disable=too-many-locals
     """The real work behind :func:`_layout` — also returns each ring-2 node's
-    angle (needed to place its name radially, #346 §2) and the viewBox side,
-    computed once here so :func:`_render_map` never re-derives ring
-    membership and risks disagreeing with the positions actually drawn.
+    angle (needed to place its name radially, #346 §2), each ring-1 node's
+    above/below label side (#346 fix A2), and the viewBox side, computed
+    once here so :func:`_render_map` never re-derives ring membership and
+    risks disagreeing with the positions actually drawn.
 
     The viewBox (#346 fix 3) is sized from the mesh's ACTUAL extents — every
     glyph's circle/square AND its estimated label box — never a flat
@@ -420,7 +421,7 @@ def _layout_full(mesh):  # pylint: disable=too-many-locals
     drifting apart.)
     """
     if not mesh.nodes:
-        return {}, {}, 0.0
+        return {}, {}, {}, 0.0
 
     leader, ring1_members, ring2, linked_parent = _ring1_and_ring2(mesh)
     ring1_keys = {n.key for n in ring1_members}
@@ -480,23 +481,32 @@ def _layout_full(mesh):  # pylint: disable=too-many-locals
         theta = ring2_angle[node.key]
         relative[node.key] = (r2 * math.sin(theta), -r2 * math.cos(theta), _glyph_r(node), theta)
 
+    # A ring-1 node's label goes ABOVE the glyph when the node is in the top
+    # half of the ring (#346 fix A2) -- exactly the nodes whose relative y
+    # (leader/centre at the origin) is on the "up" side, `y <= 0`, since
+    # `y = -r1 * cos(theta)` and cos(theta) >= 0 there. Ring-2 and the centre
+    # itself are unaffected (radial / always-below respectively), so this is
+    # only ever consulted for a ring-1 key.
+    ring1_above = {node.key: relative[node.key][1] <= 0 for node in ring1}
+
     nodes_by_key = {node.key: node for node in mesh.nodes}
     half_extent = 0.0
     for key, (x, y, r, angle) in relative.items():
-        half_extent = max(half_extent, _half_extent(x, y, r, _display_name(nodes_by_key[key]), angle))
+        above = ring1_above.get(key, False)
+        half_extent = max(half_extent, _half_extent(x, y, r, _display_name(nodes_by_key[key]), angle, above=above))
 
     center = half_extent + _MARGIN
     side = 2 * center
     positions = {key: (x + center, y + center, r) for key, (x, y, r, _angle) in relative.items()}
 
-    return positions, ring2_angle, side
+    return positions, ring2_angle, ring1_above, side
 
 
 def _layout(mesh) -> dict[str, tuple[float, float, float]]:
     """``MeshNode.key -> (cx, cy, r)`` in SVG user units — a pure function of
     ``mesh`` alone (no I/O, no randomness), so a caller (or a test) can assert
     layout properties purely from this dict, without rendering any SVG."""
-    positions, _ring2_angle, _side = _layout_full(mesh)
+    positions, _ring2_angle, _ring1_above, _side = _layout_full(mesh)
     return positions
 
 
@@ -583,34 +593,62 @@ def _text_anchor_for_angle(angle: float) -> str:
     return "start" if deg < 180 else "end"
 
 
-def _label_anchor_point(cx: float, cy: float, r: float,
-                         outward_angle: Optional[float]) -> tuple[str, float, float]:
+#: #346 fix A2: glyph edge -> the label line nearest it (both above/below
+#: cases); plus a second reserved gap, ABOVE only, for the role line that
+#: sits farther out than the name there (the below case already has its
+#: second line grow further away via `dy`, so it needs no extra reservation).
+_LABEL_GAP = 14.0
+_LABEL_ABOVE_STACK = 14.0
+
+
+def _label_anchor_point(cx: float, cy: float, r: float, outward_angle: Optional[float],
+                         above: bool = False) -> tuple[str, float, float]:
     """The (text-anchor, x, y) a node's name/role labels are drawn at (#346
     §2) — shared between :func:`_label_svg` (rendering) and :func:`_label_box`
     (viewBox sizing, #346 fix 3) so the two can never disagree about where a
-    label actually sits."""
+    label actually sits.
+
+    ``above`` (#346 fix A2) only applies to a ring-1/centre node
+    (``outward_angle is None``): a ring-1 node in the top half of the ring
+    gets its label ABOVE the glyph instead of below, so a spoke or chord
+    running below it — where the label used to sit — can never cross it.
+    The y returned is always the FIRST (topmost, when above) line's
+    baseline; :func:`_label_svg` reserves room below it for a second line."""
     if outward_angle is None:
-        return "middle", cx, cy + r + 14
+        if above:
+            return "middle", cx, cy - r - _LABEL_GAP - _LABEL_ABOVE_STACK
+        return "middle", cx, cy + r + _LABEL_GAP
     anchor = _text_anchor_for_angle(outward_angle)
     pad = r + 10
     return anchor, cx + pad * math.sin(outward_angle), cy - pad * math.cos(outward_angle)
 
 
-def _label_svg(cx: float, cy: float, r: float, lines: list[str], outward_angle: Optional[float]) -> str:
-    anchor, x, y = _label_anchor_point(cx, cy, r, outward_angle)
-    tspans = f'<tspan x="{x:.1f}">{_escape(lines[0])}</tspan>'
-    if len(lines) > 1:
-        tspans += f'<tspan x="{x:.1f}" dy="1.15em" class="role">{_escape(lines[1])}</tspan>'
+def _label_svg(cx: float, cy: float, r: float, lines: list[str], outward_angle: Optional[float],
+               *, above: bool = False) -> str:
+    anchor, x, y = _label_anchor_point(cx, cy, r, outward_angle, above)
+    if outward_angle is None and above and len(lines) > 1:
+        # Ring-1 top half (#346 fix A2): the stack reads role (farthest from
+        # the glyph, drawn first/topmost) then name (closest to the glyph,
+        # second) — name stays the line nearest the glyph either way.
+        tspans = f'<tspan x="{x:.1f}" class="role">{_escape(lines[1])}</tspan>'
+        tspans += f'<tspan x="{x:.1f}" dy="1.15em">{_escape(lines[0])}</tspan>'
+    else:
+        tspans = f'<tspan x="{x:.1f}">{_escape(lines[0])}</tspan>'
+        if len(lines) > 1:
+            tspans += f'<tspan x="{x:.1f}" dy="1.15em" class="role">{_escape(lines[1])}</tspan>'
     return f'<text x="{x:.1f}" y="{y:.1f}" text-anchor="{anchor}" class="node-name">{tspans}</text>'
 
 
-def _label_box(cx: float, cy: float, r: float, name: str,
-               outward_angle: Optional[float]) -> tuple[float, float, float, float]:
+def _label_box(cx: float, cy: float, r: float, name: str, outward_angle: Optional[float],
+               *, above: bool = False) -> tuple[float, float, float, float]:
     """Estimated ``(x0, y0, x1, y1)`` bounding box of a node's drawn name
     label (#346 fix 3) — sized from the ACTUAL (truncated) name, anchored the
     same way :func:`_label_svg` draws it, so the viewBox this feeds never
-    clips a label the way a flat ``label_room`` guess did."""
-    anchor, x, y = _label_anchor_point(cx, cy, r, outward_angle)
+    clips a label the way a flat ``label_room`` guess did. The SAME generous
+    above/below margins cover both label directions: :func:`_label_svg`'s
+    tspans always stack DOWNWARD from the anchor y regardless of ``above``,
+    only the anchor y's own position moves."""
+    anchor, x, y = _label_anchor_point(cx, cy, r, outward_angle, above)
     width = _LABEL_CHAR_WIDTH * len(_truncate(name))
     if anchor == "start":
         x0, x1 = x, x + width
@@ -621,13 +659,14 @@ def _label_box(cx: float, cy: float, r: float, name: str,
     return x0, y - _LABEL_BOX_ABOVE, x1, y + _LABEL_BOX_BELOW
 
 
-def _half_extent(x: float, y: float, r: float, name: str, outward_angle: Optional[float]) -> float:
+def _half_extent(x: float, y: float, r: float, name: str, outward_angle: Optional[float],
+                 *, above: bool = False) -> float:
     """The largest ``|x|`` or ``|y|`` reached by this node's glyph OR its
     label box, in the mesh-centred frame (leader/centre at the origin) —
     what the viewBox's symmetric half-side must be at least as big as
     (#346 fix 3)."""
     extent = max(abs(x) + r, abs(y) + r)
-    x0, y0, x1, y1 = _label_box(x, y, r, name, outward_angle)
+    x0, y0, x1, y1 = _label_box(x, y, r, name, outward_angle, above=above)
     for corner_x, corner_y in ((x0, y0), (x1, y0), (x0, y1), (x1, y1)):
         extent = max(extent, abs(corner_x), abs(corner_y))
     return extent
@@ -642,9 +681,33 @@ def _worst_flag_severity(flags_for_node: list) -> Optional[str]:
     return None
 
 
-def _badge_svg(cx: float, cy: float, r: float, severity: str) -> str:
+def _badge_corner_signs(outward_angle: Optional[float], above: bool) -> tuple[float, float]:
+    """Which corner of the glyph the warning badge sits in, as ``(sign_x,
+    sign_y)`` multipliers on ``r * 0.8`` — always the corner OPPOSITE the
+    label, so the badge and the label text can never sit on top of each
+    other (#346 fix B): label above -> badge bottom-right; label below ->
+    top-right; label to the right (ring-2, text-anchor start) -> top-left;
+    label to the left (text-anchor end) -> top-right. A near-vertical ring-2
+    label (text-anchor middle) follows the same above/below rule as the
+    centre/ring-1 case, using its own angle to tell which."""
+    if outward_angle is None:
+        return (1.0, 1.0) if above else (1.0, -1.0)
+    anchor = _text_anchor_for_angle(outward_angle)
+    if anchor == "start":
+        return -1.0, -1.0
+    if anchor == "end":
+        return 1.0, -1.0
+    deg = math.degrees(outward_angle) % 360
+    is_up = deg <= 15 or deg >= 345
+    return (1.0, 1.0) if is_up else (1.0, -1.0)
+
+
+def _badge_svg(circle: tuple[float, float, float], severity: str,
+               outward_angle: Optional[float], above: bool) -> str:
+    cx, cy, r = circle
     color = "var(--badge-bad)" if severity == "bad" else "var(--badge-warn)"
-    bx, by = cx + r * 0.8, cy - r * 0.8
+    sign_x, sign_y = _badge_corner_signs(outward_angle, above)
+    bx, by = cx + r * 0.8 * sign_x, cy + r * 0.8 * sign_y
     points = f"{bx:.1f},{by - 8:.1f} {bx - 7:.1f},{by + 6:.1f} {bx + 7:.1f},{by + 6:.1f}"
     return f'<polygon class="badge-flag" points="{points}" fill="{color}"/>'
 
@@ -690,29 +753,38 @@ def _glyph_shape_svg(kind: str, cx: float, cy: float, r: float) -> str:
     return f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="{r:.1f}" fill="{_GLYPH_FILL_VAR[kind]}"/>'
 
 
+def _inner_text_svg(circle: tuple[float, float, float], node) -> str:
+    """The RLOC16 (or ``R{router_id}`` fallback) text inside a glyph, or ""
+    when the glyph is too small for it (#346 §2: r <= 12 gets no inner
+    text) or the node has neither."""
+    cx, cy, r = circle
+    text = _inner_text(node)
+    if not text or r <= 12:
+        return ""
+    return (f'<text x="{cx:.1f}" y="{cy:.1f}" text-anchor="middle" dominant-baseline="central" '
+            f'class="glyph-text">{_escape(text)}</text>')
+
+
 def _node_glyph_svg(node, circle: tuple[float, float, float], flags_for_node: list,
-                     *, outward_angle: Optional[float] = None) -> str:
+                     *, outward_angle: Optional[float] = None, label_above: bool = False) -> str:
     """One node's glyph, inner RLOC16, name/role labels and warning badge.
 
-    ``outward_angle`` is ``None`` for the centre/ring-1 nodes (name centred
-    below the glyph) and the node's own angle for a ring-2 node (name drawn
-    radially outward, #346 §2) — threaded in rather than re-derived here so
-    ring membership has exactly one source of truth (:func:`_layout_full`).
+    ``outward_angle`` is ``None`` for the centre/ring-1 nodes and the
+    node's own angle for a ring-2 node (name drawn radially outward, #346
+    §2). ``label_above`` (#346 fix A2) only matters when ``outward_angle``
+    is ``None``: the centre always stays below (default), a ring-1 node
+    goes above or below by its own half of the ring. Both are threaded in
+    rather than re-derived here so ring membership has exactly one source
+    of truth (:func:`_layout_full`).
     """
     cx, cy, r = circle
     kind = _glyph_kind(node)
     shape_svg = _glyph_shape_svg(kind, cx, cy, r)
-
-    inner_svg = ""
-    inner = _inner_text(node)
-    if inner and r > 12:
-        inner_svg = (f'<text x="{cx:.1f}" y="{cy:.1f}" text-anchor="middle" dominant-baseline="central" '
-                     f'class="glyph-text">{_escape(inner)}</text>')
-
-    label_svg = _label_svg(cx, cy, r, _name_and_role_lines(node), outward_angle)
+    inner_svg = _inner_text_svg(circle, node)
+    label_svg = _label_svg(cx, cy, r, _name_and_role_lines(node), outward_angle, above=label_above)
 
     severity = _worst_flag_severity(flags_for_node)
-    badge_svg = _badge_svg(cx, cy, r, severity) if severity else ""
+    badge_svg = _badge_svg(circle, severity, outward_angle, label_above) if severity else ""
 
     title = "\n".join(_escape(t) for t in (node.name, *(f.message for f in flags_for_node)))
 
@@ -775,9 +847,15 @@ def _link_svg(link: dict, positions: dict, nodes_by_key: dict) -> str:
 #: 430px makes the old 12px name font render at ~7px) — name/role/RLOC16 all
 #: sized up; the map-wrap/min-width pairing in `_render_map` is the other
 #: half of this fix.
+#: #346 fix A1: the SAME halo the old edge labels had (paint-order draws the
+#: background-coloured stroke BEHIND the glyph fill), on every node text
+#: class EXCEPT the inner RLOC16 (`.glyph-text`, always on a solid glyph
+#: fill, never over a line) — a chord or spoke passing behind a label now
+#: reads as interrupted instead of striking through the text.
+_LABEL_HALO = "paint-order: stroke; stroke: var(--bg); stroke-width: 4px;"
 _MAP_CSS = (
-    '.node-name { font: 14px -apple-system, sans-serif; fill: var(--fg); }'
-    '.role { font-size: 11px; fill: var(--muted); }'
+    f'.node-name {{ font: 14px -apple-system, sans-serif; fill: var(--fg); {_LABEL_HALO} }}'
+    f'.role {{ font-size: 11px; fill: var(--muted); {_LABEL_HALO} }}'
     '.glyph-text { font: 700 12px ui-monospace, Menlo, monospace; fill: #fff; }'
     '.badge-flag { stroke: var(--bg); stroke-width: 1; }'
 )
@@ -860,16 +938,20 @@ def _render_legend() -> str:
 def _render_map(mesh) -> str:
     if not mesh.nodes:
         return '<p class="msg">No Thread nodes to draw.</p>'
-    positions, ring2_angle, side = _layout_full(mesh)
+    positions, ring2_angle, ring1_above, side = _layout_full(mesh)
     nodes_by_key = {node.key: node for node in mesh.nodes if node.key in positions}
     flags_by_node: dict[str, list] = {}
     for flag in mesh.flags:
         flags_by_node.setdefault(flag.node_key, []).append(flag)
 
+    # Nodes are drawn AFTER edges (kept, #346 fix A1) — a chord/spoke sits
+    # behind every glyph and label; the label halo above is what keeps the
+    # TEXT itself readable where a line still runs behind it.
     edges_svg = "".join(_link_svg(link, positions, nodes_by_key) for link in _merged_links(mesh.links))
     nodes_svg = "".join(
         _node_glyph_svg(node, positions[node.key], flags_by_node.get(node.key, []),
-                        outward_angle=ring2_angle.get(node.key))
+                        outward_angle=ring2_angle.get(node.key),
+                        label_above=ring1_above.get(node.key, False))
         for node in mesh.nodes if node.key in positions
     )
 
