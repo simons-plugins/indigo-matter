@@ -437,13 +437,14 @@ def test_every_label_box_lies_inside_the_viewbox_on_the_fixture():
     # fix's own required test.
     from thread_page import _display_name, _label_box, _layout_full  # pylint: disable=import-outside-toplevel
     mesh, _diags = _fixture_mesh()
-    circles, ring2_angle, side = _layout_full(mesh)
+    circles, ring2_angle, ring1_above, side = _layout_full(mesh)
     for node in mesh.nodes:
         if node.key not in circles:
             continue
         x, y, r = circles[node.key]
         angle = ring2_angle.get(node.key)
-        x0, y0, x1, y1 = _label_box(x, y, r, _display_name(node), angle)
+        above = ring1_above.get(node.key, False)
+        x0, y0, x1, y1 = _label_box(x, y, r, _display_name(node), angle, above=above)
         assert x0 >= -1e-6 and x1 <= side + 1e-6, f"{node.key} label x out of the viewBox"
         assert y0 >= -1e-6 and y1 <= side + 1e-6, f"{node.key} label y out of the viewBox"
 
@@ -472,7 +473,7 @@ def test_viewbox_fits_a_22_char_name_far_left_and_far_right():
                majority_partition=None, majority_leader=None, nodes=[router, left, right], links=links,
                flags=[], unreadable=[], disagreements=[], warnings=[])
 
-    circles, ring2_angle, side = _layout_full(mesh)
+    circles, ring2_angle, ring1_above, side = _layout_full(mesh)
     # A single ring-1 node's sector spans the whole circle, so its two
     # children land at exactly +/-90 degrees from its own angle (0) —
     # "L..." (sorts first) on the left, "R..." on the right.
@@ -482,7 +483,8 @@ def test_viewbox_fits_a_22_char_name_far_left_and_far_right():
     for node in (router, left, right):
         x, y, r = circles[node.key]
         angle = ring2_angle.get(node.key)
-        x0, y0, x1, y1 = _label_box(x, y, r, node.name, angle)
+        above = ring1_above.get(node.key, False)
+        x0, y0, x1, y1 = _label_box(x, y, r, node.name, angle, above=above)
         assert x0 >= -1e-6 and x1 <= side + 1e-6, f"{node.key} label clipped horizontally"
         assert y0 >= -1e-6 and y1 <= side + 1e-6, f"{node.key} label clipped vertically"
 
@@ -857,7 +859,7 @@ def test_hostile_node_name_is_still_escaped_alongside_the_new_freshness_cell():
 def test_leader_is_at_the_viewbox_centre_and_every_ring1_node_is_equidistant():
     from thread_page import _layout_full, _ring1_and_ring2  # pylint: disable=import-outside-toplevel
     mesh, _diags = _fixture_mesh()
-    circles, _ring2_angle, side = _layout_full(mesh)
+    circles, _ring2_angle, _ring1_above, side = _layout_full(mesh)
     leader, ring1_members, _ring2, _linked_parent = _ring1_and_ring2(mesh)
     center = side / 2
     lx, ly, _lr = circles[leader.key]
@@ -873,7 +875,7 @@ def test_each_ring2_nodes_angle_is_closer_to_its_own_parent_than_any_other_ring1
     import math  # pylint: disable=import-outside-toplevel
     from thread_page import _layout_full, _ring1_and_ring2  # pylint: disable=import-outside-toplevel
     mesh, _diags = _fixture_mesh()
-    circles, ring2_angle, side = _layout_full(mesh)
+    circles, ring2_angle, _ring1_above, side = _layout_full(mesh)
     center = side / 2
     _leader, ring1_members, _ring2, linked_parent = _ring1_and_ring2(mesh)
 
@@ -1130,3 +1132,133 @@ def test_role_sub_line_display_mapping_does_not_change_the_table_or_flags():
     html = render_thread_page(mesh, diags, generated_at="t", live=False, plugin_id=PLUGIN_ID)
     assert "SleepyEndDevice" in html  # still literal in the Nodes table
     assert "Reed" in html  # thread_mesh's own role_name spelling, in the table
+
+
+# ---------------------------------------------------------------------------
+# #346 fix A — node labels vs lines: a halo on every node-text class (except
+# the inner RLOC16), and a ring-1 label placed on the OUTWARD vertical side
+# (above at the top of the ring, below at the bottom) so a spoke/chord
+# running inward can never cross it.
+# ---------------------------------------------------------------------------
+
+def test_ring1_label_is_above_the_glyph_at_the_top_and_below_at_the_bottom():
+    from thread_mesh import Mesh, MeshNode  # pylint: disable=import-outside-toplevel
+    from thread_page import _layout_full, _node_glyph_svg  # pylint: disable=import-outside-toplevel
+    import re  # pylint: disable=import-outside-toplevel
+
+    node_a = MeshNode(key="node:0x1", node_id=1, name="A router", role_name="Router", router_id=1,
+                      rloc16=0x0400, foreign=False, is_leader=False, partition_id=None, children_count=0)
+    node_b = MeshNode(key="node:0x2", node_id=2, name="B router", role_name="Router", router_id=2,
+                      rloc16=0x0800, foreign=False, is_leader=False, partition_id=None, children_count=0)
+    mesh = Mesh(network_name="net", channel=None, pan_id=None, partition_ids=[],
+               majority_partition=None, majority_leader=None, nodes=[node_a, node_b], links=[],
+               flags=[], unreadable=[], disagreements=[], warnings=[])
+    circles, _ring2_angle, ring1_above, _side = _layout_full(mesh)
+    # Two ring-1 nodes (sector width 180 deg): exactly one lands in the top
+    # half and one in the bottom -- the property isn't vacuously true.
+    assert sorted(ring1_above.values()) == [False, True]
+
+    for node in (node_a, node_b):
+        cx, cy, _r = circles[node.key]
+        svg = _node_glyph_svg(node, circles[node.key], [], label_above=ring1_above[node.key])
+        # `<text ... class="node-name">` specifically -- the glyph's own
+        # inner RLOC16 text is also a <text> element, at y == cy exactly,
+        # and would match a looser regex first.
+        match = re.search(r'<text x="[\d.]+" y="([\d.-]+)" text-anchor="[a-z]+" class="node-name"', svg)
+        assert match is not None
+        y = float(match.group(1))
+        if ring1_above[node.key]:
+            assert y < cy, f"{node.key}: label above should have text y < glyph cy"
+        else:
+            assert y > cy, f"{node.key}: label below should have text y > glyph cy"
+
+
+def test_ring1_top_label_keeps_the_name_nearest_the_glyph():
+    # #346 fix A2: stacked ABOVE, the order reads role (farthest) then name
+    # (closest to the glyph) -- the name is always the line nearest the
+    # glyph, whichever side the label ends up on.
+    from thread_mesh import MeshNode  # pylint: disable=import-outside-toplevel
+    from thread_page import _node_glyph_svg  # pylint: disable=import-outside-toplevel
+    import re  # pylint: disable=import-outside-toplevel
+
+    node = MeshNode(key="node:0x1", node_id=1, name="Top router", role_name="Router", router_id=7,
+                    rloc16=0x1C00, foreign=False, is_leader=False, partition_id=None, children_count=0)
+    above_svg = _node_glyph_svg(node, (300.0, 300.0, 26.0), [], label_above=True)
+    below_svg = _node_glyph_svg(node, (300.0, 300.0, 26.0), [], label_above=False)
+    above_tspans = re.findall(r"<tspan[^>]*>([^<]*)</tspan>", above_svg)
+    below_tspans = re.findall(r"<tspan[^>]*>([^<]*)</tspan>", below_svg)
+    assert below_tspans == ["Top router", "Router · router 7"]  # below: name first (nearest), then role
+    assert above_tspans == ["Router · router 7", "Top router"]  # above: role first, name LAST (still nearest)
+
+
+def test_node_label_text_has_the_same_halo_the_old_edge_labels_had():
+    # The page has TWO <style> blocks -- the document's own (in <head>) and
+    # the map's (inside the <svg>, where .node-name/.role/.glyph-text
+    # actually live) -- so every block is searched, not just the first.
+    import re  # pylint: disable=import-outside-toplevel
+    mesh, diags = _fixture_mesh()
+    html = render_thread_page(mesh, diags, generated_at="t", live=False, plugin_id=PLUGIN_ID)
+    style = "".join(re.findall(r"<style>(.*?)</style>", html, re.S))
+    assert style
+    for selector in (".node-name", ".role"):
+        rule_match = re.search(re.escape(selector) + r"\s*\{([^}]*)\}", style)
+        assert rule_match is not None, f"no {selector} rule found"
+        rule = rule_match.group(1)
+        assert "paint-order: stroke" in rule
+        assert "stroke: var(--bg)" in rule
+        assert "stroke-width: 4px" in rule
+    # The inner RLOC16 text is explicitly excluded from the halo.
+    glyph_text_match = re.search(r"\.glyph-text\s*\{([^}]*)\}", style)
+    assert glyph_text_match is not None
+    assert "paint-order" not in glyph_text_match.group(1)
+
+
+# ---------------------------------------------------------------------------
+# #346 fix B — the warning badge goes on the side OPPOSITE the label, so it
+# never sits over the label's own text: above -> bottom-right; below ->
+# top-right; label to the right (text-anchor start) -> top-left; label to
+# the left (text-anchor end) -> top-right.
+# ---------------------------------------------------------------------------
+
+def _badge_bbox(points_attr: str):
+    pts = [tuple(map(float, p.split(","))) for p in points_attr.split()]
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def _boxes_intersect(box_a, box_b) -> bool:
+    ax0, ay0, ax1, ay1 = box_a
+    bx0, by0, bx1, by1 = box_b
+    return not (ax1 < bx0 or ax0 > bx1 or ay1 < by0 or ay0 > by1)
+
+
+def test_warning_badge_never_intersects_its_own_label_box_in_any_position():
+    import math  # pylint: disable=import-outside-toplevel
+    import re  # pylint: disable=import-outside-toplevel
+    from thread_page import _badge_svg, _label_box  # pylint: disable=import-outside-toplevel
+
+    cx, cy, r = 200.0, 200.0, 16.0
+    name = "Some Device Name"
+    scenarios = [
+        ("below (ring1/centre)", None, False),
+        ("above (ring1 top half)", None, True),
+        ("right (ring2 start anchor)", math.pi / 2, False),
+        ("left (ring2 end anchor)", 3 * math.pi / 2, False),
+    ]
+    for label_desc, outward_angle, above in scenarios:
+        label_box = _label_box(cx, cy, r, name, outward_angle, above=above)
+        badge_svg = _badge_svg((cx, cy, r), "bad", outward_angle, above)
+        match = re.search(r'points="([^"]+)"', badge_svg)
+        assert match is not None
+        badge_box = _badge_bbox(match.group(1))
+        assert not _boxes_intersect(badge_box, label_box), f"{label_desc}: badge overlaps its own label box"
+
+
+def test_badge_corner_matches_the_documented_rule():
+    from thread_page import _badge_corner_signs  # pylint: disable=import-outside-toplevel
+    import math  # pylint: disable=import-outside-toplevel
+    assert _badge_corner_signs(None, False) == (1.0, -1.0)  # below -> top-right
+    assert _badge_corner_signs(None, True) == (1.0, 1.0)  # above -> bottom-right
+    assert _badge_corner_signs(math.pi / 2, False) == (-1.0, -1.0)  # right (start) -> top-left
+    assert _badge_corner_signs(3 * math.pi / 2, False) == (1.0, -1.0)  # left (end) -> top-right
