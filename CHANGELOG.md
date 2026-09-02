@@ -29,9 +29,11 @@ ring beside whichever ring-1 node it links to.
 - **Quiet edges**: straight lines now (no more arcs — a chord between two
   ring-1 nodes never has to dodge a third node the arcs existed to avoid),
   shortened to each glyph's own edge so lines start and end AT the glyphs,
-  not behind them. No visible label by default — every edge carries its
-  RSSI/LQI/frame-error reading in a hover/long-press tooltip, and only a
-  "poor" link (see below) draws its label on the map.
+  not behind them. No visible label on any edge, including a "poor" one
+  (a short spoke gave a label nowhere to go without colliding with the far
+  node's own name) — the colour, the node's warning badge, the flags
+  list, and every edge's own hover/long-press tooltip already carry the
+  RSSI/LQI/frame-error reading.
 - **Four display bands, not the health thresholds**: excellent (≥ -65 dBm),
   good (-77…-66), fair (-87…-78), poor (≤ -88) — the map's OWN thresholds,
   deliberately separate from `thread_mesh`'s `RSSI_WEAK`/`RSSI_BAD` (still
