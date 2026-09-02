@@ -152,6 +152,14 @@ async def survey_thread_nodes(  # pylint: disable=too-many-locals
     three — only :mod:`thread_survey` does) onto the cached one it is
     refreshing; applying them earlier would have a successful live read wipe
     them straight back to ``None`` on exactly the node whose refresh worked.
+
+    **A present-but-unparseable timestamp is visible, not silent** (#344
+    review, finding A1): when the raw node carries a ``date_commissioned``/
+    ``last_interview`` key that :func:`_parse_timestamp` could not make sense
+    of, that lands in the diag's own ``parse_warnings`` — distinguishing
+    "matter-server omits this" (the shipped fixture's own case, and boring)
+    from "the wire shape changed" (worth an operator's attention). An absent
+    key stays silent either way.
     """
     raw_nodes = await matter.get_nodes()  # a failure here is a failed call — let it raise
     raw_nodes = raw_nodes or []
@@ -160,6 +168,15 @@ async def survey_thread_nodes(  # pylint: disable=too-many-locals
     skipped: list[str] = []
     raw_attributes_by_node: dict[int, Mapping] = {}
     raw_timestamps_by_node: dict[int, tuple[Optional[datetime], Optional[datetime]]] = {}
+    # #344 review, A1: the RAW (pre-parse) values alongside the parsed ones —
+    # a key that IS present but that _parse_timestamp could not make sense of
+    # (matter-server's wire shape changing) must be visible, the same
+    # principle as _on_attribute's malformed-frame warning; a key that is
+    # simply ABSENT (the shipped fixture's own case) stays silent. Applied as
+    # a parse_warning in the final loop below, alongside the fields
+    # themselves, so it inherits the same after-live-refresh timing (decision
+    # 2's own ordering) rather than needing a second one.
+    raw_stamp_values_by_node: dict[int, tuple[Any, Any]] = {}
     for index, raw in enumerate(raw_nodes):
         if not isinstance(raw, Mapping):
             skipped.append(f"raw node[{index}]: not a mapping ({type(raw).__name__})")
@@ -176,10 +193,13 @@ async def survey_thread_nodes(  # pylint: disable=too-many-locals
             continue  # not a Thread node — correct exclusion, not a skip
         diags.append(diag)
         raw_attributes_by_node[node_id] = attributes
+        raw_date_commissioned = raw.get("date_commissioned")
+        raw_last_interview = raw.get("last_interview")
         raw_timestamps_by_node[node_id] = (
-            _parse_timestamp(raw.get("date_commissioned")),
-            _parse_timestamp(raw.get("last_interview")),
+            _parse_timestamp(raw_date_commissioned),
+            _parse_timestamp(raw_last_interview),
         )
+        raw_stamp_values_by_node[node_id] = (raw_date_commissioned, raw_last_interview)
 
     if live_sleepy:
         targets = [diag for diag in diags if not diag.is_router]
@@ -200,15 +220,26 @@ async def survey_thread_nodes(  # pylint: disable=too-many-locals
                 if isinstance(result, BaseException):
                     diag.read_error = f"live refresh failed: {result!r}"
 
-    # #344 decision 2 (see this function's own docstring): applied HERE, after
-    # every live refresh above has already run its per-field copy, so a
-    # successful live read cannot wipe these back to None.
+    # #344's apply-after-refresh rule (see this function's docstring):
+    # applied HERE, after every live refresh above has already run its
+    # per-field copy, so a successful live read cannot wipe these back to
+    # None.
     stamps = event_stamps or {}
     for diag in diags:
         date_commissioned, last_interview = raw_timestamps_by_node.get(diag.node_id, (None, None))
         diag.date_commissioned = date_commissioned
         diag.last_interview = last_interview
         diag.last_event_seen = stamps.get(diag.node_id)
+        # #344 review, A1: a raw value that WAS present but did not survive
+        # _parse_timestamp is a wire-shape change worth surfacing — this is
+        # the only place it is safe to mutate parse_warnings (a mutable
+        # list), because this loop runs after _live_refresh's own per-field
+        # copy has already finished for every targeted diag.
+        raw_date_commissioned, raw_last_interview = raw_stamp_values_by_node.get(diag.node_id, (None, None))
+        if raw_date_commissioned is not None and date_commissioned is None:
+            diag.parse_warnings.append(f"date_commissioned unparseable: {raw_date_commissioned!r}")
+        if raw_last_interview is not None and last_interview is None:
+            diag.parse_warnings.append(f"last_interview unparseable: {raw_last_interview!r}")
 
     return Survey(diags=diags, raw_count=len(raw_nodes), skipped=skipped)
 

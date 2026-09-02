@@ -506,6 +506,7 @@ class TestCacheAgeFields:
     def test_fixture_nodes_carry_no_timestamps_and_diags_get_none(self):
         # The shipped fixture has neither key at all — absence must be the
         # boring case, proven by running it through completely unchanged.
+        # #344 review, A1: absence must ALSO stay silent — no parse_warning.
         matter = FakeMatter()
         survey = _run(survey_thread_nodes(matter, live_sleepy=False))
         assert survey.diags  # sanity: the fixture actually parsed
@@ -513,6 +514,38 @@ class TestCacheAgeFields:
             assert diag.date_commissioned is None
             assert diag.last_interview is None
             assert diag.last_event_seen is None
+            assert not any("unparseable" in w for w in diag.parse_warnings)
+
+    def test_a_present_but_unparseable_last_interview_records_a_parse_warning(self):
+        # #344 review, A1 (silent-failure M1): a PRESENT raw value that
+        # _parse_timestamp cannot make sense of — matter-server's wire shape
+        # changing — must be visible, unlike the boring "absent" case above.
+        nodes = _fixture_nodes()
+        for raw in nodes:
+            if raw["node_id"] == 0x34:
+                raw["last_interview"] = "garbage"
+        matter = FakeMatter(nodes=nodes)
+        survey = _run(survey_thread_nodes(matter, live_sleepy=False))
+        diag = next(d for d in survey.diags if d.node_id == 0x34)
+        assert diag.last_interview is None
+        assert any("last_interview unparseable: 'garbage'" in w for w in diag.parse_warnings)
+        # And it must actually reach an operator via build_mesh's warnings —
+        # not just sit unused on the diag.
+        mesh = build_mesh(survey.diags)
+        assert any(
+            node_id == 0x34 and "last_interview unparseable" in msg for node_id, msg in mesh.warnings
+        )
+
+    def test_a_present_but_unparseable_date_commissioned_records_a_parse_warning(self):
+        nodes = _fixture_nodes()
+        for raw in nodes:
+            if raw["node_id"] == 0x34:
+                raw["date_commissioned"] = {"not": "a timestamp"}
+        matter = FakeMatter(nodes=nodes)
+        survey = _run(survey_thread_nodes(matter, live_sleepy=False))
+        diag = next(d for d in survey.diags if d.node_id == 0x34)
+        assert diag.date_commissioned is None
+        assert any("date_commissioned unparseable" in w for w in diag.parse_warnings)
 
     def test_raw_date_commissioned_and_last_interview_land_on_the_diag(self):
         nodes = _fixture_nodes()

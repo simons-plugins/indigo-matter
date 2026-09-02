@@ -165,11 +165,17 @@ def format_ext_address(ext_address: Optional[int]) -> str:
 
 def humanise_age(seconds: float) -> str:
     """The largest single unit an age fits in — ``"6d"``, ``"2h"``, ``"45m"`` —
-    for the #344 cache-age display. Under a minute (and negative, i.e. clock
-    skew) is ``"just now"`` rather than ``"0m"``: no caller of this needs
-    sub-minute precision, and a negative age is never something to show as if
-    it meant anything. Deliberately a single unit, never a compound one like
-    "1d 2h" — this is a diagnostic glance, not a duration formatter."""
+    for the #344 cache-age display. Under a minute is ``"just now"`` rather
+    than ``"0m"``: no caller of this needs sub-minute precision. A negative
+    input also maps to ``"just now"`` here — that part of the function's
+    behaviour is unchanged — but #344 review found that on its own this let a
+    MATERIALLY future timestamp (clock skew worth caring about, not sub-
+    minute jitter) render as "just now ago": the most-fresh possible wording
+    for data that is actually unknown. Deciding THAT is not this function's
+    job any more — see :func:`_age_phrase`, the gate every display caller
+    goes through before ever reaching here. Deliberately a single unit, never
+    a compound one like "1d 2h" — this is a diagnostic glance, not a duration
+    formatter."""
     if seconds < 60:
         return "just now"
     minutes = seconds / 60
@@ -181,17 +187,54 @@ def humanise_age(seconds: float) -> str:
     return f"{int(hours / 24)}d"
 
 
+def _aware(value: datetime) -> datetime:
+    """Normalise a naive ``datetime`` to UTC-aware (#344 review, C4).
+
+    :mod:`thread_survey`'s ``_parse_timestamp`` is the only PRODUCTION writer
+    of :attr:`NodeDiag.date_commissioned`/``last_interview`` and always hands
+    back an aware datetime already — this exists for DIRECT writers (tests
+    setting ``diag.last_interview = datetime(...)`` with no ``tzinfo``),
+    where a naive-vs-aware subtraction would raise ``TypeError`` instead of
+    degrading to a sensible age, breaking :func:`health_flags`' own "never
+    raises" contract."""
+    return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+
+
+def _age_phrase(seconds: float) -> Optional[str]:
+    """The single place that decides how a possibly-negative age reads to a
+    person (#344 review, finding A2 / comment-review #7) — ``humanise_age``
+    itself no longer is it.
+
+    * ``seconds < -120`` — materially in the future (clock skew past ordinary
+      jitter): the timestamp cannot be trusted as an age at all, so this
+      returns ``None`` (the same "unknown" callers already render as ``—``),
+      rather than let ``humanise_age`` turn it into "just now ago" — the
+      most-fresh possible wording for data that is actually unreadable.
+    * ``-120 <= seconds < 60`` — ordinary jitter (a live event racing the
+      ``now`` this was computed against) or a genuinely tiny positive age:
+      ``"just now"``, with no trailing "ago" — "just now ago" is not English.
+    * otherwise — :func:`humanise_age` plus ``" ago"``, the wording every
+      caller used before this helper existed.
+    """
+    if seconds < -120:
+        return None
+    if seconds < 60:
+        return "just now"
+    return f"{humanise_age(seconds)} ago"
+
+
 def freshness_text(diag: "NodeDiag", now: datetime) -> str:
     """The cache-age line shared by the event-log report and the IWS page
     (#344): ``"interviewed 6d ago · last 0x35 update 2h ago"``, with an em
-    dash for whichever half is unknown — never a fake age. One function, one
-    wording, so the report and the page can never say this differently."""
+    dash for whichever half is unknown OR unreadable (a materially future
+    timestamp — see :func:`_age_phrase`) — never a fake age. One function,
+    one wording, so the report and the page can never say this differently."""
     if diag.last_interview is not None:
-        interviewed = f"{humanise_age((now - diag.last_interview).total_seconds())} ago"
+        interviewed = _age_phrase((now - _aware(diag.last_interview)).total_seconds()) or "—"
     else:
         interviewed = "—"
     if diag.last_event_seen is not None:
-        event = f"{humanise_age(now.timestamp() - diag.last_event_seen)} ago"
+        event = _age_phrase(now.timestamp() - diag.last_event_seen) or "—"
     else:
         event = "—"
     return f"interviewed {interviewed} · last 0x35 update {event}"
@@ -398,9 +441,15 @@ class NodeDiag:
     #: the cache's baseline age. Defaulted so every existing constructor call
     #: (including the handler's) is untouched; populated by
     #: :mod:`thread_survey` from the raw node's own top-level keys, AFTER its
-    #: live-refresh pass (see that module's docstring for why the order
-    #: matters: a per-field copy from a freshly-parsed live diag would
-    #: otherwise wipe these back to ``None``).
+    #: live-refresh pass (see :func:`thread_survey.survey_thread_nodes`'s
+    #: docstring for why the order matters: a per-field copy from a
+    #: freshly-parsed live diag would otherwise wipe these back to ``None``).
+    #: ``thread_survey._parse_timestamp`` is the only PRODUCTION writer and
+    #: always returns an aware datetime; :func:`_aware` exists only for
+    #: direct writers (tests) that might hand this a naive one (#344 review,
+    #: C4). ``date_commissioned`` itself stays parsed-but-unrendered
+    #: (issue #344's own scope said "parse both") — deliberate groundwork,
+    #: not an oversight.
     date_commissioned: Optional[datetime] = None
     last_interview: Optional[datetime] = None
     #: Unix epoch seconds of the last LIVE (never a priming replay — see
@@ -606,9 +655,12 @@ def health_flags(  # pylint: disable=too-many-branches
     "no data, no flag" rather than assuming the worst or the best.
 
     ``now`` (#344) only feeds the ``stale`` flag's age — resolved to the real
-    wall clock when omitted (every OTHER caller of this function already
-    threads ``now`` through explicitly; see :func:`build_mesh`), never
-    guessed at write time.
+    wall clock when omitted (never guessed at write time). :func:`build_mesh`
+    threads ``now`` through explicitly; :func:`summary_states` omits it, but
+    that is safe only because it then filters out every ``info``-level flag
+    (``stale`` is one), so the wall-clock default is never actually
+    observable through it — if ``summary_states`` ever stops filtering info
+    flags, it must start passing ``now`` too (#344 review, B2).
 
     Two gates worth calling out (#334 post-review):
 
@@ -687,14 +739,20 @@ def health_flags(  # pylint: disable=too-many-branches
     # SED/ED, so it must get the same staleness note a cached reading deserves
     # (#334 finding B5.7; this used to name only SED/ED and silently skip REEDs).
     if diag.source == "cache" and not diag.is_router:
+        phrase = None
         if diag.last_interview is not None:
-            # #344: the baseline is a LOWER bound, never "accurate as of" — a
-            # stale PartitionId has been observed to survive a later interview
-            # (see the module docstring's decision 2), so this names when the
-            # interview happened, not how fresh the data actually is.
-            age = humanise_age(((now or datetime.now(timezone.utc)) - diag.last_interview).total_seconds())
+            # #344 (issue body): the baseline is a LOWER bound, never
+            # "accurate as of" — a stale PartitionId has been observed to
+            # survive a later interview, so this names when the interview
+            # happened, not how fresh the data actually is.
+            seconds = ((now or datetime.now(timezone.utc)) - _aware(diag.last_interview)).total_seconds()
+            # #344 review, A2: a materially FUTURE interview (clock skew) is
+            # unreadable as an age — _age_phrase returns None for it — so this
+            # falls back to the no-age wording below rather than claim one.
+            phrase = _age_phrase(seconds)
+        if phrase is not None:
             message = (
-                f"{diag.name}: cached — baseline interview {age} ago; matter-server's cache can be "
+                f"{diag.name}: cached — baseline interview {phrase}; matter-server's cache can be "
                 "hours stale for sleepy devices"
             )
         else:
@@ -1103,7 +1161,13 @@ def partition_header_text(mesh: Mesh, diags: Iterable[NodeDiag]) -> str:
 
 def _node_lines(diag: NodeDiag, mesh: Mesh, now: datetime) -> list[str]:
     lines = [f"-- {diag.name} (0x{diag.node_id:X}) -- role={diag.role_name} available={diag.available}"]
-    lines.append(f"   cache: {freshness_text(diag, now)}")
+    # #344 review, B5: named "freshness", not "cache" — the line applies to a
+    # LIVE diag too (a live-refreshed non-router still shows its interview
+    # baseline), so a bare "cache:" label was wrong for exactly the rows a
+    # reader most wants to trust. Same source-word convention as the page's
+    # own freshness cell (thread_page._freshness_cell).
+    source_word = "live" if diag.source == "live" else "cached"
+    lines.append(f"   freshness: {source_word} · {freshness_text(diag, now)}")
     if diag.router_id is not None:
         lines.append(f"   router_id={diag.router_id} rloc16=0x{diag.rloc16:04X}")
     lines.append(f"   partition={diag.partition_id} leader_router_id={diag.leader_router_id}")

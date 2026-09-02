@@ -22,7 +22,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from thread_mesh import RSSI_BAD, RSSI_WEAK, freshness_text, humanise_age, partition_header_text
+from thread_mesh import RSSI_BAD, RSSI_WEAK, _aware, freshness_text, humanise_age, partition_header_text
 
 __all__ = ["render_thread_page"]
 
@@ -409,15 +409,30 @@ def _render_flags(mesh) -> str:
 def _interview_age_seconds(diag, now: datetime) -> Optional[float]:
     if diag.last_interview is None:
         return None
-    return (now - diag.last_interview).total_seconds()
+    # #344 review, C4: _aware normalises a naive last_interview (a direct
+    # test-writer, never thread_survey._parse_timestamp itself — see
+    # NodeDiag's own field comment) so this subtraction never raises.
+    return (now - _aware(diag.last_interview)).total_seconds()
 
 
-def _oldest_interview_age(diags: list, now: datetime) -> Optional[float]:
-    """The MAX interview age across every diag with a known ``last_interview``
-    (#344) — ``None`` when none is known at all. Used for the header's
-    "oldest node baseline" note and the stale banner's threshold."""
-    ages = [age for age in (_interview_age_seconds(d, now) for d in diags) if age is not None]
-    return max(ages) if ages else None
+def _oldest_interview_age(diags: list, now: datetime) -> tuple[Optional[float], int]:
+    """``(oldest_age, unknown_count)`` (#344; unknown_count added #344 review,
+    A3): the MAX interview age across every diag with a known
+    ``last_interview``, ``None`` when none is known at all, alongside how
+    many diags have NO baseline at all. Used for the header's "oldest node
+    baseline" note and the stale banner's threshold — before A3, that note
+    silently said nothing about the unknown diags, which could make "oldest
+    node baseline: 10m" read as though the whole fabric were freshly
+    surveyed when most of it was actually unread."""
+    ages: list[float] = []
+    unknown_count = 0
+    for diag in diags:
+        age = _interview_age_seconds(diag, now)
+        if age is None:
+            unknown_count += 1
+        else:
+            ages.append(age)
+    return (max(ages) if ages else None), unknown_count
 
 
 def _freshness_cell(diag, now: datetime) -> str:
@@ -467,7 +482,10 @@ def _render_table(diags: list, now: datetime) -> str:
         )
     header = (
         "<tr><th>Name</th><th>Role</th><th>Router id (rloc16)</th><th>Partition</th>"
-        "<th>Source</th><th>Neighbours</th><th>Best link</th><th>Counters present</th></tr>"
+        # #344 review, C1: "· cache age" — the column already carries the
+        # freshness cell (source word + interview/event ages); the bare
+        # "Source" header undersold what it actually shows.
+        "<th>Source · cache age</th><th>Neighbours</th><th>Best link</th><th>Counters present</th></tr>"
     )
     return (
         '<div class="table-wrap"><table class="nodes">'
@@ -524,21 +542,39 @@ def render_thread_page(mesh, diags: list, *, generated_at: str, live: bool,  # p
     badge = "LIVE" if live else "CACHED"
     badge_class = "badge-live" if live else "badge-cached"
 
-    # #344 UX (Simon's call): CACHED stays the default view; a header note and
-    # a banner point at "Refresh (live)" only when the data is actually old
-    # enough to matter — never on a live render, and never when no diag's
-    # interview age is even known yet.
-    oldest_age = None if live else _oldest_interview_age(diags, resolved_now)
+    # #344 UX (Simon's call), rewritten #344 review B3 to match A3: the
+    # header note is purely informational and appears on any CACHED render
+    # where at least one diag's interview baseline is known — now also
+    # naming how many diags have NO baseline at all (A3), rather than
+    # silently implying the whole fabric is that fresh. The BANNER — the
+    # thing pointing at "Refresh (live)" — is gated separately, on the
+    # oldest KNOWN baseline actually being stale (> 1 h). Neither ever
+    # appears on a live render.
+    oldest_age, unknown_baseline_count = (None, 0) if live else _oldest_interview_age(diags, resolved_now)
     badge_note = ""
     stale_banner = ""
     if oldest_age is not None:
-        badge_note = f' <span class="badge-note">oldest node baseline: {_escape(humanise_age(oldest_age))}</span>'
+        # #344 review, A3: "(N unknown)" only when there IS an unknown diag —
+        # wording is unchanged when every diag's baseline is known.
+        unknown_note = f" ({unknown_baseline_count} unknown)" if unknown_baseline_count else ""
+        badge_note = (
+            f' <span class="badge-note">oldest node baseline: '
+            f'{_escape(humanise_age(oldest_age))}{unknown_note}</span>'
+        )
         if oldest_age > _STALE_AGE_SECONDS:
+            # #344 review, A3: named BEFORE the "Use Refresh (live)" sentence
+            # — a reader deciding whether to bother re-reading needs to know
+            # some nodes have no baseline to trust at all before being told
+            # how to fix the ones that do.
+            unknown_sentence = (
+                f' {unknown_baseline_count} node(s) have no interview baseline at all.'
+                if unknown_baseline_count else ""
+            )
             stale_banner = (
                 f'<p class="msg">Some of this data is matter-server\'s cache — oldest node baseline '
                 f'{_escape(humanise_age(oldest_age))} ago. Baselines are a lower bound: a value may be '
-                f'staler than its interview. Use <a href="{live_url}">Refresh (live)</a> to re-read '
-                f'sleepy devices.</p>'
+                f'staler than its interview.{unknown_sentence} Use <a href="{live_url}">Refresh (live)</a> '
+                f'to re-read sleepy devices.</p>'
             )
 
     header = f"""
@@ -642,5 +678,7 @@ An ext(ended) address shown elsewhere in these diagnostics is flagged "≈" when
 matter-server's JSON serialisation has lost precision (values ≥ 2⁵³) and should
 not be treated as exact. Owned nodes are keyed by their Matter node id; only
 foreign routers and unattributed children are keyed by router id / RLOC16
-instead, which is not lossy.</footer>
+instead, which is not lossy. "Last 0x35 update" counts only live
+ThreadNetworkDiagnostics events seen since the plugin last started — after a
+restart it reads "—" until the next event arrives.</footer>
 </body></html>"""

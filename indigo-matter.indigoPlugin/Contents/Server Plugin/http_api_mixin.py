@@ -429,6 +429,16 @@ class HttpApiMixin:
         # page_url already use elsewhere in these mixins (#339 R3/R8), because
         # thread_survey's coroutine runs on the asyncio loop thread and must
         # not touch self.device_sync itself.
+        #
+        # #344 review, C2: these stamps (and `now`, above in http_thread_page)
+        # are captured BEFORE a live survey runs, on purpose — thread-safety
+        # (device_sync's lock must not be reached for from the loop thread)
+        # and so every age on one render shares a single coherent `now`. The
+        # cost: a LIVE row's own "last 0x35 update" can understate its true
+        # freshness by however long the survey took, because an event that
+        # arrives DURING the survey is not in this snapshot. Understating is
+        # the safe direction — do not "fix" this by stamping later; that
+        # would let a page describe a read as fresher than it actually was.
         stamps = self.device_sync.thread_event_stamps() if self.device_sync is not None else {}
 
         def _survey(live: bool):

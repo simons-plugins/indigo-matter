@@ -618,6 +618,23 @@ def test_live_path_uses_the_pages_own_per_node_timeout(plug, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# #344 review — A4: event_stamps actually reaches run_survey (test-review #1)
+# ---------------------------------------------------------------------------
+
+def test_event_stamps_are_forwarded_to_run_survey(plug, monkeypatch):
+    plug.device_sync.thread_event_stamps.return_value = {0x34: 555.0}
+    captured = {}
+
+    def _fake_run_survey(runtime, matter, *, live_sleepy, event_stamps=None, node_names=None, **kwargs):
+        captured["event_stamps"] = event_stamps
+        return Survey(diags=[], raw_count=0, skipped=[])
+
+    monkeypatch.setattr("http_api_mixin.thread_survey.run_survey", _fake_run_survey)
+    plug.http_thread_page(_action())
+    assert captured["event_stamps"] == {0x34: 555.0}
+
+
+# ---------------------------------------------------------------------------
 # #344 — per-node cache age: stale chip, badge note, and the amber banner
 # ---------------------------------------------------------------------------
 
@@ -665,6 +682,54 @@ def test_unknown_interview_age_renders_an_em_dash_and_no_chip():
     assert "interviewed — ·" in html
     assert 'class="chip-stale"' not in html
     assert "oldest node baseline" not in html
+
+
+# ---------------------------------------------------------------------------
+# #344 review — A3: "oldest node baseline" must not hide unknown baselines
+# ---------------------------------------------------------------------------
+
+def test_mixed_known_and_unknown_baselines_names_the_unknown_count():
+    mesh, diags = _fixture_mesh()
+    diags[0].last_interview = NOW - timedelta(minutes=10)
+    diags[1].last_interview = NOW - timedelta(hours=6)
+    # diags[2:] keep last_interview=None — genuinely unknown.
+    unknown_count = len(diags) - 2
+    html = render_thread_page(mesh, diags, generated_at="t", live=False, plugin_id=PLUGIN_ID, now=NOW)
+    # This also kills the max-vs-min mutant: the OLDEST known age (6h) must
+    # win, not the freshest (10m).
+    assert f"oldest node baseline: 6h ({unknown_count} unknown)" in html
+    assert "oldest node baseline: 10m" not in html
+    assert f"{unknown_count} node(s) have no interview baseline at all." in html
+    # Named BEFORE the "Use Refresh (live)" sentence (A3's ordering call).
+    banner_start = html.index("Some of this data is matter-server")
+    unknown_at = html.index(f"{unknown_count} node(s) have no interview baseline at all.")
+    use_refresh_at = html.index("Use <a href=", banner_start)
+    assert banner_start < unknown_at < use_refresh_at
+
+
+def test_all_known_baselines_wording_is_unchanged():
+    # A3: no "(N unknown)" suffix at all when every diag's baseline is known.
+    mesh, diags = _fixture_mesh()
+    for diag in diags:
+        diag.last_interview = NOW - timedelta(hours=2)
+    html = render_thread_page(mesh, diags, generated_at="t", live=False, plugin_id=PLUGIN_ID, now=NOW)
+    assert "oldest node baseline: 2h</span>" in html
+    assert "unknown)" not in html
+    assert "have no interview baseline at all" not in html
+
+
+# ---------------------------------------------------------------------------
+# #344 review — C3: a live-sourced diag's own stale chip is keyed to ITS
+# `source`, never the page-wide `live` flag
+# ---------------------------------------------------------------------------
+
+def test_live_sourced_diag_with_old_interview_gets_no_stale_chip():
+    mesh, diags = _fixture_mesh()
+    diags[0].source = "live"
+    diags[0].last_interview = NOW - timedelta(hours=6)
+    html = render_thread_page(mesh, diags, generated_at="t", live=False, plugin_id=PLUGIN_ID, now=NOW)
+    assert 'class="chip-stale"' not in html
+    assert "live · interviewed 6h ago" in html
 
 
 def test_hostile_node_name_is_still_escaped_alongside_the_new_freshness_cell():
