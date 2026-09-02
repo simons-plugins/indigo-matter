@@ -56,7 +56,7 @@ a power-user explorer for dumping any node/endpoint/cluster from the cache, and
 (RSSI/LQI/frame-error), the leader, foreign routers and health flags to the
 event log — with an option to live-read the sleepy devices first for accuracy.
 The same picture is also a page: `http://<indigo-host>:8176/message/com.simons-plugins.indigo-matter/thread`
-renders it as a self-contained HTML page with an inline map, readable on a
+renders it as a self-contained HTML page with an inline radial map, readable on a
 phone over the Reflector, with `?live=1` for the same live-read pass. Thread
 devices commissioned through Indigo are invisible to Apple's own Thread
 tooling, so this is the only place to see their mesh at all.
