@@ -36,14 +36,39 @@ __all__ = ["render_thread_page"]
 _STALE_AGE_SECONDS = 3600.0
 
 _MARGIN = 28
-#: Extra room left outside ring 2 for its nodes' outward-drawn names (#346).
-_LABEL_ROOM = 140.0
-_RING1_MIN_R = 150.0
-_RING1_TO_RING2_GAP = 130.0
+#: Ring radii (#346 fix 5: tightened a little for phone-width legibility —
+#: same leader/router/end-device glyph sizes, just less empty space between
+#: rings). Leader/router/end-device radii are unchanged.
+_RING1_MIN_R = 120.0
+_RING1_TO_RING2_GAP = 105.0
 #: The "2r + 8" spacing floor from the layout spec — the extra 8 units is
 #: pure breathing room between two adjacent glyphs' edges, on top of the
 #: `+4` the overlap test itself demands (#346).
 _MIN_GLYPH_GAP = 8.0
+
+#: #346 fix 1: a chord whose perpendicular distance from the centre falls
+#: inside this radius visually cuts through the centre node's own two label
+#: lines (name + role/caption) below it. `_GLYPH_R_LEADER` (30) is used even
+#: when there is no actual leader glyph at the centre — the label ZONE is
+#: what matters, not whether a leader happens to occupy it.
+_LABEL_ZONE_MARGIN = 70.0
+
+#: #346 fix 3: a node's drawn label is sized from its ACTUAL (truncated)
+#: name, not a flat guess — the constant that broke was `label_room`, a
+#: single fixed number that clipped any name long enough to need more than
+#: it. `_LABEL_CHAR_WIDTH` is units per character at the name font size —
+#: measured against the real fixture's rendered text (`getComputedTextLength`
+#: in a browser, 14px -apple-system), NOT the fix's own suggested 6.8: an
+#: upper-case-heavy name ("TIMMERFLOTTE...") averages ~8.6, and 6.8
+#: under-estimated it enough to reproduce the exact clipping bug this
+#: constant exists to fix — an SVG clips content outside its own viewBox by
+#: default, so under-estimating a label's width silently re-clips it.
+#: `_LABEL_BOX_ABOVE`/`_LABEL_BOX_BELOW` are the (deliberately generous)
+#: vertical reach above/below a label's anchor point — below covers both
+#: label lines ("two lines tall").
+_LABEL_CHAR_WIDTH = 8.7
+_LABEL_BOX_ABOVE = 12.0
+_LABEL_BOX_BELOW = 30.0
 
 #: Glyph sizes (#346 §2) — radius for a circle, half-side for a square. This
 #: IS the ``r`` a :func:`_layout` caller gets back, used both for edge
@@ -55,6 +80,9 @@ _GLYPH_R_REED = 16.0
 _GLYPH_R_ED = 12.0
 _GLYPH_R_CHILD = 10.0
 _GLYPH_R_UNKNOWN = 12.0
+
+#: #346 fix 1 — see `_LABEL_ZONE_MARGIN`'s own comment above.
+_LABEL_ZONE_R = _GLYPH_R_LEADER + _LABEL_ZONE_MARGIN
 
 #: Ring-1 ordering (#346 §1): exhaustive permutation search below this many
 #: nodes (<= 5040 permutations with the first node fixed), a greedy walk
@@ -289,25 +317,6 @@ def _greedy_ring1_order(canonical: list, chords: list[tuple[str, str]]) -> list:
     return order
 
 
-def _order_ring1(members: list, chords: list[tuple[str, str]]) -> list:
-    """Deterministic ring-1 order minimising chord crossings (#346 §1). Same
-    mesh, same chords, always yields the same order — no randomness anywhere."""
-    if len(members) <= 1:
-        return list(members)
-    canonical = sorted(members, key=lambda n: (n.foreign, n.name))
-    if len(canonical) > _EXHAUSTIVE_RING1_LIMIT:
-        return _greedy_ring1_order(canonical, chords)
-
-    first, rest = canonical[0], canonical[1:]
-    best_order, best_crossings = None, None
-    for perm in itertools.permutations(rest):
-        order = [first, *perm]
-        crossings = _count_crossings(order, chords)
-        if best_crossings is None or crossings < best_crossings:
-            best_crossings, best_order = crossings, order
-    return best_order
-
-
 def _required_ring_radius(triples: list[tuple[float, float, float]], floor: float) -> float:
     """The smallest radius at which every ``(r_i, r_j, angular_gap)`` triple's
     chord is at least ``r_i + r_j + _MIN_GLYPH_GAP`` apart, never less than
@@ -321,14 +330,89 @@ def _required_ring_radius(triples: list[tuple[float, float, float]], floor: floa
     return needed
 
 
+def _ring1_radius(order: list, has_orphans: bool, sector_width: float) -> float:
+    """The ring-1 radius THIS order needs so adjacent glyphs clear the
+    "2r+8" spacing floor (#346 §1) — a function of order because which
+    specific glyph radii end up adjacent depends on it. Also used by the
+    ordering objective itself (#346 fix 1), so the label-zone check there
+    matches the geometry that order would actually draw."""
+    r1 = _RING1_MIN_R
+    if len(order) >= 2:
+        pairs = list(zip(order, order[1:]))
+        if not has_orphans:
+            pairs.append((order[-1], order[0]))
+        r1 = _required_ring_radius([(_glyph_r(a), _glyph_r(b), sector_width) for a, b in pairs], r1)
+    return r1
+
+
+def _chord_angle(position: dict, sector_width: float, chord: tuple[str, str]) -> float:
+    """The (<= pi) angle actually subtended at the ring's centre by this
+    chord, from its two endpoints' INDEX positions in a candidate order."""
+    i, j = position[chord[0]], position[chord[1]]
+    raw = (abs(i - j) * sector_width) % (2 * math.pi)
+    return min(raw, 2 * math.pi - raw)
+
+
+def _ring1_order_score(order: list, chords: list[tuple[str, str]], has_orphans: bool,
+                        sector_width: float) -> tuple[int, int, float]:
+    """Lexicographic ring-1 ordering objective (#346 fix 1 — a previous
+    version counted only chord-chord crossings, which a real fixture showed
+    is not enough: two zero-crossing orders can still differ in whether a
+    chord cuts through the centre's own label). In order: (a) chord-chord
+    crossings, (b) how many chords fall inside the centre's label zone
+    (`_LABEL_ZONE_R` of it), (c) the total angular separation of every chord
+    (shorter chords read tidier). The `(foreign, name)` tie-break (d) is the
+    permutation SEARCH order itself — see :func:`_order_ring1`."""
+    position = {node.key: i for i, node in enumerate(order)}
+    crossings = _count_crossings(order, chords)
+    r1 = _ring1_radius(order, has_orphans, sector_width)
+    intrusions = 0
+    angle_sum = 0.0
+    for chord in chords:
+        theta = _chord_angle(position, sector_width, chord)
+        angle_sum += theta
+        if r1 * math.cos(theta / 2) < _LABEL_ZONE_R:
+            intrusions += 1
+    return crossings, intrusions, angle_sum
+
+
+def _order_ring1(members: list, chords: list[tuple[str, str]], has_orphans: bool, sector_width: float) -> list:
+    """Deterministic ring-1 order minimising :func:`_ring1_order_score`
+    (#346 §1, fix 1). Same mesh, same chords, always yields the same order —
+    no randomness anywhere."""
+    if len(members) <= 1:
+        return list(members)
+    canonical = sorted(members, key=lambda n: (n.foreign, n.name))
+    if len(canonical) > _EXHAUSTIVE_RING1_LIMIT:
+        return _greedy_ring1_order(canonical, chords)
+
+    first, rest = canonical[0], canonical[1:]
+    best_order, best_score = None, None
+    for perm in itertools.permutations(rest):
+        order = [first, *perm]
+        score = _ring1_order_score(order, chords, has_orphans, sector_width)
+        if best_score is None or score < best_score:
+            best_score, best_order = score, order
+    return best_order
+
+
 def _layout_full(mesh):  # pylint: disable=too-many-locals
     """The real work behind :func:`_layout` — also returns each ring-2 node's
     angle (needed to place its name radially, #346 §2) and the viewBox side,
     computed once here so :func:`_render_map` never re-derives ring
     membership and risks disagreeing with the positions actually drawn.
 
+    The viewBox (#346 fix 3) is sized from the mesh's ACTUAL extents — every
+    glyph's circle/square AND its estimated label box — never a flat
+    ``label_room`` guess that clipped any name long enough to outgrow it.
+    Computed as a SQUARE centred on the leader (or the empty centre, if
+    none): the half-side is the largest distance any glyph or label corner
+    reaches from that centre, so the leader-is-at-the-centre / ring-1-is-
+    equidistant properties (deliberately kept, not asked to change) hold
+    regardless of which names happen to be long.
+
     (measured: `pylint --rcfile pyproject.toml ".../thread_page.py"` flags
-    this at 33/15 locals — genuine, not a shortcut: ring 1's sector width,
+    this at >15 locals — genuine, not a shortcut: ring 1's sector width,
     ring 2's per-parent grouping, and both rings' radius growth are one
     coherent computation that must see each other's results; splitting it
     into helpers would only turn these into more function-call arguments,
@@ -340,26 +424,22 @@ def _layout_full(mesh):  # pylint: disable=too-many-locals
 
     leader, ring1_members, ring2, linked_parent = _ring1_and_ring2(mesh)
     ring1_keys = {n.key for n in ring1_members}
-    ring1 = _order_ring1(ring1_members, _chord_pairs(ring1_keys, mesh.links))
-    ring1_index = {node.key: i for i, node in enumerate(ring1)}
 
     # Orphans: a ring-2 node whose link points nowhere placeable on ring 1
     # (no link at all, or a link to a ring-2/unplaced node) — one trailing
     # sector for all of them, rather than a phantom parent guess (#346 §1).
-    has_orphans = any(ring1_index.get(linked_parent.get(n.key)) is None for n in ring2)
-
-    n_sectors = len(ring1) + (1 if has_orphans else 0)
+    # Membership-only, so this (and the sector width it drives) does not
+    # depend on ring 1's ORDER and can be computed before it.
+    has_orphans = any(linked_parent.get(n.key) not in ring1_keys for n in ring2)
+    n_sectors = len(ring1_members) + (1 if has_orphans else 0)
     sector_width = (2 * math.pi / n_sectors) if n_sectors else 0.0
+
+    chords = _chord_pairs(ring1_keys, mesh.links)
+    ring1 = _order_ring1(ring1_members, chords, has_orphans, sector_width)
+    ring1_index = {node.key: i for i, node in enumerate(ring1)}
     ring1_angle = {node.key: i * sector_width for i, node in enumerate(ring1)}
     orphan_angle = len(ring1) * sector_width if has_orphans else None
-
-    r1 = _RING1_MIN_R
-    if len(ring1) >= 2:
-        pairs = list(zip(ring1, ring1[1:]))
-        if not has_orphans:
-            pairs.append((ring1[-1], ring1[0]))
-        r1 = _required_ring_radius(
-            [(_glyph_r(a), _glyph_r(b), sector_width) for a, b in pairs], r1)
+    r1 = _ring1_radius(ring1, has_orphans, sector_width)
 
     # Ring-2: each ring-1 node's children spread evenly inside its own
     # sector (a single child sits on the parent's own angle); orphans spread
@@ -388,18 +468,26 @@ def _layout_full(mesh):  # pylint: disable=too-many-locals
         triples.append((_glyph_r(ordered_ring2[-1]), _glyph_r(ordered_ring2[0]), wrap_delta))
         r2 = _required_ring_radius(triples, r2)
 
-    side = 2 * r2 + 2 * _MARGIN + _LABEL_ROOM
-    center = side / 2
-
-    positions: dict[str, tuple[float, float, float]] = {}
+    # Positions relative to the mesh's own centre (the leader sits at the
+    # origin) — kept relative until the viewBox half-side is known, below.
+    relative: dict[str, tuple[float, float, float, Optional[float]]] = {}
     if leader is not None:
-        positions[leader.key] = (center, center, _glyph_r(leader))
+        relative[leader.key] = (0.0, 0.0, _glyph_r(leader), None)
     for node in ring1:
         theta = ring1_angle[node.key]
-        positions[node.key] = (center + r1 * math.sin(theta), center - r1 * math.cos(theta), _glyph_r(node))
+        relative[node.key] = (r1 * math.sin(theta), -r1 * math.cos(theta), _glyph_r(node), None)
     for node in ring2:
         theta = ring2_angle[node.key]
-        positions[node.key] = (center + r2 * math.sin(theta), center - r2 * math.cos(theta), _glyph_r(node))
+        relative[node.key] = (r2 * math.sin(theta), -r2 * math.cos(theta), _glyph_r(node), theta)
+
+    nodes_by_key = {node.key: node for node in mesh.nodes}
+    half_extent = 0.0
+    for key, (x, y, r, angle) in relative.items():
+        half_extent = max(half_extent, _half_extent(x, y, r, _display_name(nodes_by_key[key]), angle))
+
+    center = half_extent + _MARGIN
+    side = 2 * center
+    positions = {key: (x + center, y + center, r) for key, (x, y, r, _angle) in relative.items()}
 
     return positions, ring2_angle, side
 
@@ -416,8 +504,20 @@ def _layout(mesh) -> dict[str, tuple[float, float, float]]:
 # Node glyphs (#346 §2) — vocabulary mirrors Apple's Thread Doctor app.
 # ---------------------------------------------------------------------------
 
-def _truncate(name: str, limit: int = 18) -> str:
-    return name if len(name) <= limit else f"{name[:limit - 1]}…"
+#: #346 fix 4: the old 18-char limit truncated names that would have fit —
+#: e.g. "Router 14 (leader…" cut mid-caption. 22 is the visible-text length
+#: budget; truncation only triggers once a name actually exceeds 24 (so a
+#: name of 19-24 chars, which fits, is left alone rather than shaved for no
+#: reason), and never keeps fewer than 3 real characters before the ellipsis.
+_TRUNCATE_LIMIT = 22
+_TRUNCATE_THRESHOLD = 24
+
+
+def _truncate(name: str, limit: int = _TRUNCATE_LIMIT, threshold: int = _TRUNCATE_THRESHOLD) -> str:
+    if len(name) <= threshold:
+        return name
+    keep = max(limit - 1, 3)
+    return f"{name[:keep]}…"
 
 
 def _inner_text(node) -> str:
@@ -432,12 +532,37 @@ def _inner_text(node) -> str:
     return ""
 
 
+#: #346 fix 6: the role sub-line reads plain words, not the raw role_name
+#: ("SleepyEndDevice") — display only; role_name itself stays untouched
+#: everywhere else (the Nodes table, the flags list, thread_mesh).
+_ROLE_DISPLAY = {
+    "Leader": "Leader", "Router": "Router", "Reed": "REED", "EndDevice": "End device",
+    "SleepyEndDevice": "Sleepy end device", "Child": "Child",
+}
+
+
+def _display_role(role_name: str) -> str:
+    return _ROLE_DISPLAY.get(role_name, role_name)
+
+
+def _display_name(node) -> str:
+    """The raw (untruncated) text shown as a node's name line. A foreign
+    node's is `Router N`, never its full ``node.name`` (#346 fix 4 found the
+    bug: build_mesh gives a foreign LEADER a `node.name` like "Router 14
+    (leader — probably your border router)" — the long descriptive suffix
+    exists for the menu report's plain-text output, not this glyph's own
+    name line, which already draws that same fact as a separate caption)."""
+    if node.foreign:
+        return f"Router {node.router_id}" if node.router_id is not None else node.name
+    return node.name
+
+
 def _name_and_role_lines(node) -> list[str]:
     """Name (truncated) plus, for an owned non-child node, a second line with
     the role (and router id) — the same information the old box rendering
     showed. A foreign node's second line is only ever the border-router
     caption; an anonymous child gets no second line at all."""
-    name = _truncate(node.name)
+    name = _truncate(_display_name(node))
     if node.foreign:
         lines = [name]
         if node.is_leader:
@@ -445,7 +570,7 @@ def _name_and_role_lines(node) -> list[str]:
         return lines
     if node.role_name == "Child":
         return [name]
-    role_bits = [node.role_name]
+    role_bits = [_display_role(node.role_name)]
     if node.router_id is not None:
         role_bits.append(f"router {node.router_id}")
     return [name, " · ".join(role_bits)]
@@ -458,18 +583,54 @@ def _text_anchor_for_angle(angle: float) -> str:
     return "start" if deg < 180 else "end"
 
 
-def _label_svg(cx: float, cy: float, r: float, lines: list[str], outward_angle: Optional[float]) -> str:
+def _label_anchor_point(cx: float, cy: float, r: float,
+                         outward_angle: Optional[float]) -> tuple[str, float, float]:
+    """The (text-anchor, x, y) a node's name/role labels are drawn at (#346
+    §2) — shared between :func:`_label_svg` (rendering) and :func:`_label_box`
+    (viewBox sizing, #346 fix 3) so the two can never disagree about where a
+    label actually sits."""
     if outward_angle is None:
-        anchor, x, y = "middle", cx, cy + r + 14
-    else:
-        anchor = _text_anchor_for_angle(outward_angle)
-        pad = r + 10
-        x = cx + pad * math.sin(outward_angle)
-        y = cy - pad * math.cos(outward_angle)
+        return "middle", cx, cy + r + 14
+    anchor = _text_anchor_for_angle(outward_angle)
+    pad = r + 10
+    return anchor, cx + pad * math.sin(outward_angle), cy - pad * math.cos(outward_angle)
+
+
+def _label_svg(cx: float, cy: float, r: float, lines: list[str], outward_angle: Optional[float]) -> str:
+    anchor, x, y = _label_anchor_point(cx, cy, r, outward_angle)
     tspans = f'<tspan x="{x:.1f}">{_escape(lines[0])}</tspan>'
     if len(lines) > 1:
         tspans += f'<tspan x="{x:.1f}" dy="1.15em" class="role">{_escape(lines[1])}</tspan>'
     return f'<text x="{x:.1f}" y="{y:.1f}" text-anchor="{anchor}" class="node-name">{tspans}</text>'
+
+
+def _label_box(cx: float, cy: float, r: float, name: str,
+               outward_angle: Optional[float]) -> tuple[float, float, float, float]:
+    """Estimated ``(x0, y0, x1, y1)`` bounding box of a node's drawn name
+    label (#346 fix 3) — sized from the ACTUAL (truncated) name, anchored the
+    same way :func:`_label_svg` draws it, so the viewBox this feeds never
+    clips a label the way a flat ``label_room`` guess did."""
+    anchor, x, y = _label_anchor_point(cx, cy, r, outward_angle)
+    width = _LABEL_CHAR_WIDTH * len(_truncate(name))
+    if anchor == "start":
+        x0, x1 = x, x + width
+    elif anchor == "end":
+        x0, x1 = x - width, x
+    else:
+        x0, x1 = x - width / 2, x + width / 2
+    return x0, y - _LABEL_BOX_ABOVE, x1, y + _LABEL_BOX_BELOW
+
+
+def _half_extent(x: float, y: float, r: float, name: str, outward_angle: Optional[float]) -> float:
+    """The largest ``|x|`` or ``|y|`` reached by this node's glyph OR its
+    label box, in the mesh-centred frame (leader/centre at the origin) —
+    what the viewBox's symmetric half-side must be at least as big as
+    (#346 fix 3)."""
+    extent = max(abs(x) + r, abs(y) + r)
+    x0, y0, x1, y1 = _label_box(x, y, r, name, outward_angle)
+    for corner_x, corner_y in ((x0, y0), (x1, y0), (x0, y1), (x1, y1)):
+        extent = max(extent, abs(corner_x), abs(corner_y))
+    return extent
 
 
 def _worst_flag_severity(flags_for_node: list) -> Optional[str]:
@@ -585,17 +746,12 @@ def _shorten_to_glyph_edges(circle_a: tuple[float, float, float],
     return ax + ux * ar, ay + uy * ar, bx - ux * br, by - uy * br
 
 
-def _poor_edge_label(link: dict, segment: tuple[float, float, float, float], label_text: str) -> str:
-    """A visible label is drawn only on a "poor" edge (#346 §3) — every other
-    band's reading lives in the edge's ``<title>`` only."""
-    if _rssi_band(link["overall_rssi"]) != "poor":
-        return ""
-    sx, sy, ex, ey = segment
-    mid_x, mid_y = (sx + ex) / 2, (sy + ey) / 2
-    return f'<text x="{mid_x:.1f}" y="{mid_y:.1f}" text-anchor="middle" class="edge-label">{_escape(label_text)}</text>'
-
-
 def _link_svg(link: dict, positions: dict, nodes_by_key: dict) -> str:
+    """No visible label on ANY edge, not even a "poor" one (#346 fix 2 — a
+    poor spoke is often short, and its label collided with the far node's
+    own name/role text); the colour, the node's warning badge, the flags
+    list, and this edge's own ``<title>`` tooltip already say the same
+    thing, so the reading is never actually lost, just quieter."""
     if link["a"] not in positions or link["b"] not in positions:
         return ""
     shortened = _shorten_to_glyph_edges(positions[link["a"]], positions[link["b"]])
@@ -604,30 +760,26 @@ def _link_svg(link: dict, positions: dict, nodes_by_key: dict) -> str:
     sx, sy, ex, ey = shortened
 
     color = _edge_color(link["overall_rssi"])
-    label_text = _link_label(link)
     title = (f'{_escape(nodes_by_key[link["a"]].name)} ↔ {_escape(nodes_by_key[link["b"]].name)}: '
-             f'{_escape(label_text)}')
-    visible_label = _poor_edge_label(link, shortened, label_text)
+             f'{_escape(_link_label(link))}')
 
     return (
         f'<g class="edge">'
         f'<title>{title}</title>'
         f'<line x1="{sx:.1f}" y1="{sy:.1f}" x2="{ex:.1f}" y2="{ey:.1f}" stroke="{color}" stroke-width="3"/>'
-        f'{visible_label}'
         f'</g>'
     )
 
 
+#: #346 fix 5: readable at phone width (a 756-unit viewBox squeezed to
+#: 430px makes the old 12px name font render at ~7px) — name/role/RLOC16 all
+#: sized up; the map-wrap/min-width pairing in `_render_map` is the other
+#: half of this fix.
 _MAP_CSS = (
-    '.node-name { font: 12px -apple-system, sans-serif; fill: var(--fg); }'
-    '.role { font-size: 10px; fill: var(--muted); }'
-    '.glyph-text { font: 700 11px ui-monospace, Menlo, monospace; fill: #fff; }'
+    '.node-name { font: 14px -apple-system, sans-serif; fill: var(--fg); }'
+    '.role { font-size: 11px; fill: var(--muted); }'
+    '.glyph-text { font: 700 12px ui-monospace, Menlo, monospace; fill: #fff; }'
     '.badge-flag { stroke: var(--bg); stroke-width: 1; }'
-    # Text halo (#334 finding A4, kept): paint-order draws the background-
-    # coloured stroke BEHIND the glyph fill so a label over a line reads
-    # without needing a separate background rect.
-    '.edge-label { font: 10px ui-monospace, Menlo, monospace; fill: var(--muted); '
-    'paint-order: stroke; stroke: var(--bg); stroke-width: 4px; }'
 )
 
 
@@ -722,13 +874,19 @@ def _render_map(mesh) -> str:
     )
 
     svg = (
-        f'<svg viewBox="0 0 {side:.0f} {side:.0f}" style="width:100%;height:auto" '
+        f'<svg viewBox="0 0 {side:.0f} {side:.0f}" '
+        f'style="width:100%;height:auto;min-width:560px" '
         f'role="img" aria-label="Thread mesh map">'
         f'<style>{_MAP_CSS}</style>'
         f'{edges_svg}{nodes_svg}'
         f'</svg>'
     )
-    return svg + _render_legend()
+    # #346 fix 5: on a phone the viewBox is squeezed into a narrow screen no
+    # matter the font size; `min-width` keeps the map at a size where the
+    # now-larger text is actually readable, and `map-wrap`'s horizontal
+    # scroll (rather than the SVG itself overflowing the page) is what makes
+    # a wider-than-viewport map still usable there — pan it, don't shrink it.
+    return f'<div class="map-wrap">{svg}</div>' + _render_legend()
 
 
 # ---------------------------------------------------------------------------
@@ -1019,6 +1177,7 @@ def _document(body: str) -> str:
  .flag-warn .sev {{ color: #b8860b; font-weight: 700; }}
  .flag-info .sev {{ color: var(--muted); font-weight: 700; }}
  .flags .code {{ font: .8rem ui-monospace, Menlo, monospace; color: var(--muted); }}
+ .map-wrap {{ overflow-x: auto; }}
  .table-wrap {{ overflow-x: auto; }}
  table.nodes {{ border-collapse: collapse; width: 100%; font-size: .9rem; }}
  table.nodes th, table.nodes td {{ text-align: left; padding: .3rem .6rem; border-bottom: 1px solid var(--border); }}
