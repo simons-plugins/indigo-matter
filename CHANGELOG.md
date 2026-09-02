@@ -10,29 +10,35 @@ child row) with same-layer links bowed into arcs to stay visible. It now
 draws radially, styled after Apple's Thread Doctor app (Simon's own
 reference, approved): the leader at the centre, every other router-layer
 node on a ring around it, and every remaining device clustered on an outer
-ring beside whichever ring-1 node it links to.
+ring beside whichever ring-1 node it links to. A four-reviewer pass on the
+first draft is folded into every bullet below, not called out separately.
 
 - **Radial layout**: ring 1 (owned routers, foreign routers, and any
-  non-router one hop off the leader) is ordered to minimise how many of its
-  own router-to-router links cross each other — exhaustive search for up to
-  8 nodes, a greedy walk above that — so the map is deterministic (same
-  mesh, same picture) but no longer just alphabetical. Ring 2 clusters each
-  device beside its own parent's position on ring 1; a device with no
-  placeable parent gets its own trailing sector rather than a phantom guess.
+  non-router one hop off the leader) is ordered by a three-part objective —
+  fewest router-to-router links crossing each other, then fewest chords
+  passing through the centre's own label, then the shortest chords overall
+  — exhaustive search for up to 8 nodes, a greedy walk above that, so the
+  map is deterministic (same mesh, same picture) but no longer just
+  alphabetical. Ring 2 clusters each device beside its own parent's
+  position on ring 1; a device with no placeable parent gets its own
+  trailing sector rather than a phantom guess.
 - **A glyph vocabulary, not boxes**: filled circles for the leader/router/
   end device, a hollow ring for a REED, a rounded square for a router this
   plugin doesn't own, and a square split blue/purple when that foreign
-  router is also the leader ("probably your border router"). Each glyph
-  carries its own RLOC16 (the same 4-hex-digit id a neighbour table uses)
-  inside it, and a red or amber triangle badge when it has a bad/warn health
-  flag — the flag text is in the glyph's tooltip.
-- **Quiet edges**: straight lines now (no more arcs — a chord between two
-  ring-1 nodes never has to dodge a third node the arcs existed to avoid),
-  shortened to each glyph's own edge so lines start and end AT the glyphs,
-  not behind them. No visible label on any edge, including a "poor" one
-  (a short spoke gave a label nowhere to go without colliding with the far
-  node's own name) — the colour, the node's warning badge, the flags
-  list, and every edge's own hover/long-press tooltip already carry the
+  router is also the leader ("probably your border router"). The larger
+  glyphs (leader, router, REED, unidentified router) carry their own RLOC16
+  (the same 4-hex-digit id a neighbour table uses) inside them; an end
+  device's glyph is too small for that, so its RLOC16 — like every glyph's
+  — lives in its tooltip instead, alongside a red or amber triangle badge
+  when it has a bad/warn health flag.
+- **Quiet edges**: straight lines now (no more arcs — each is shortened to
+  start and end AT its own two glyphs, not behind them; keeping a chord
+  clear of a THIRD node is the ring-1 ordering objective's job, above, not
+  this). No visible label on any edge, including a "poor" one (a short
+  spoke gave a label nowhere to go without colliding with the far node's
+  own name) — the colour, the node's warning badge, the flags list, and
+  every edge's own tooltip (a hover on desktop; on a phone, rely on the
+  colour, the badge and the flags list instead) already carry the
   RSSI/LQI/frame-error reading.
 - **Four display bands, not the health thresholds**: excellent (≥ -65 dBm),
   good (-77…-66), fair (-87…-78), poor (≤ -88) — the map's OWN thresholds,
@@ -41,9 +47,28 @@ ring beside whichever ring-1 node it links to.
   dBm link is still "good" for health but reads "fair" on the map — the two
   scales answer different questions and are allowed to disagree.
 - **A collapsible legend**, moved out of the SVG into a `<details>` block
-  under the map (collapsed by default): every glyph's meaning, the five
-  bands, RLOC16/Partition/Frame-error definitions, and the leader-failover
-  and unowned-router notes Thread Doctor's own legend carries.
+  under the map (collapsed by default, and now with its own background —
+  it was unreadable in dark mode, sat on a hard-coded light-amber box with
+  no dark override): every glyph's meaning — including a role this plugin
+  hasn't resolved yet, and a minority-partition leader, which now draws (and
+  sizes) as a router instead of falling through to that same "role
+  unknown" glyph — the four bands plus Unknown (signal not reported),
+  RLOC16/Partition/Frame-error definitions, and the leader-failover and
+  unowned-router notes Thread Doctor's own legend carries.
+- **A phone-width pass**: a 560px minimum width inside a sideways-
+  scrollable wrapper, and name/role/RLOC16 fonts up to 14/11/12px, so a
+  phone pans a readable map instead of shrinking an unreadable one. Node
+  text carries the same halo edge labels used to, so a line running behind
+  it reads as interrupted rather than struck through; a ring-1 (or
+  straight-up ring-2) label now draws on the OUTWARD side of the ring
+  instead of always below, and the warning badge always sits on the glyph
+  corner OPPOSITE the label, so neither a line nor a badge ever sits on top
+  of label text. A name up to 24 characters is shown whole; longer ones are
+  cut to 22 visible characters. The role sub-line reads plain English
+  ("Sleepy end device"), not the raw internal role name. The viewBox is
+  sized from the ACTUAL drawn label lines — name AND role, each at its own
+  font size — rather than a flat guess, so a short name with a long role
+  line can no longer clip past the edge.
 
 ## 2026.31.0 — the Thread mesh report and page now show the cache's age (#344)
 
