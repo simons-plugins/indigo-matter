@@ -454,19 +454,44 @@ def test_a_leader_child_is_on_ring_1_same_distance_from_the_centre_as_the_router
     assert _dist("node:0x40") == next(iter(router_dist))
 
 
-def test_viewbox_is_square_and_contains_every_glyph():
-    from thread_page import _layout  # pylint: disable=import-outside-toplevel
-    mesh, diags = _fixture_mesh()
-    circles = _layout(mesh)
-    html = render_thread_page(mesh, diags, generated_at="t", live=False, plugin_id=PLUGIN_ID)
+def test_viewbox_is_tight_and_contains_every_glyph_and_label():
+    # UAT (Simon): "a lot of white space around the mesh map" -- a SQUARE
+    # viewBox centred on the leader padded empty bands around the fixture's
+    # asymmetric content (867x867 for content nowhere near that tall). The
+    # viewBox is now a TIGHT bounding box: not square, not centred on the
+    # leader -- this pins both "every glyph/label still fits" AND "the
+    # viewBox isn't padded past 2*_MARGIN beyond the content's own extent",
+    # the actual regression this test exists to catch.
     import re  # pylint: disable=import-outside-toplevel
+    from thread_page import (  # pylint: disable=import-outside-toplevel
+        _MARGIN, _label_box, _layout_full, _name_and_role_lines,
+    )
+    mesh, diags = _fixture_mesh()
+    circles, ring2_angle, ring1_above, width, height = _layout_full(mesh)
+    html = render_thread_page(mesh, diags, generated_at="t", live=False, plugin_id=PLUGIN_ID)
     match = re.search(r'viewBox="0 0 (\d+) (\d+)"', html)
     assert match is not None
-    side = int(match.group(1))
-    assert side == int(match.group(2))  # square, still centred on the leader
-    for x, y, r in circles.values():
-        assert x - r >= 0 and x + r <= side
-        assert y - r >= 0 and y + r <= side
+    rendered_width, rendered_height = int(match.group(1)), int(match.group(2))
+
+    min_x = min_y = float("inf")
+    max_x = max_y = float("-inf")
+    for node in mesh.nodes:
+        if node.key not in circles:
+            continue
+        x, y, r = circles[node.key]
+        angle = ring2_angle.get(node.key)
+        above = ring1_above.get(node.key, False)
+        x0, y0, x1, y1 = _label_box(x, y, r, _name_and_role_lines(node), angle, above=above)
+        assert x - r >= -1e-6 and x + r <= rendered_width + 1e-6, f"{node.key} glyph x out of the viewBox"
+        assert y - r >= -1e-6 and y + r <= rendered_height + 1e-6, f"{node.key} glyph y out of the viewBox"
+        assert x0 >= -1e-6 and x1 <= rendered_width + 1e-6, f"{node.key} label x out of the viewBox"
+        assert y0 >= -1e-6 and y1 <= rendered_height + 1e-6, f"{node.key} label y out of the viewBox"
+        min_x, max_x = min(min_x, x - r, x0), max(max_x, x + r, x1)
+        min_y, max_y = min(min_y, y - r, y0), max(max_y, y + r, y1)
+
+    content_width, content_height = max_x - min_x, max_y - min_y
+    assert rendered_width <= content_width + 2 * _MARGIN + 1
+    assert rendered_height <= content_height + 2 * _MARGIN + 1
 
 
 def test_every_label_box_lies_inside_the_viewbox_on_the_fixture():
@@ -478,7 +503,7 @@ def test_every_label_box_lies_inside_the_viewbox_on_the_fixture():
     # checks against an INDEPENDENT estimate instead.)
     from thread_page import _label_box, _layout_full, _name_and_role_lines  # pylint: disable=import-outside-toplevel
     mesh, _diags = _fixture_mesh()
-    circles, ring2_angle, ring1_above, side = _layout_full(mesh)
+    circles, ring2_angle, ring1_above, width, height = _layout_full(mesh)
     for node in mesh.nodes:
         if node.key not in circles:
             continue
@@ -486,8 +511,8 @@ def test_every_label_box_lies_inside_the_viewbox_on_the_fixture():
         angle = ring2_angle.get(node.key)
         above = ring1_above.get(node.key, False)
         x0, y0, x1, y1 = _label_box(x, y, r, _name_and_role_lines(node), angle, above=above)
-        assert x0 >= -1e-6 and x1 <= side + 1e-6, f"{node.key} label x out of the viewBox"
-        assert y0 >= -1e-6 and y1 <= side + 1e-6, f"{node.key} label y out of the viewBox"
+        assert x0 >= -1e-6 and x1 <= width + 1e-6, f"{node.key} label x out of the viewBox"
+        assert y0 >= -1e-6 and y1 <= height + 1e-6, f"{node.key} label y out of the viewBox"
 
 
 def test_viewbox_fits_a_22_char_name_far_left_and_far_right():
@@ -514,7 +539,7 @@ def test_viewbox_fits_a_22_char_name_far_left_and_far_right():
                majority_partition=None, majority_leader=None, nodes=[router, left, right], links=links,
                flags=[], unreadable=[], disagreements=[], warnings=[])
 
-    circles, ring2_angle, ring1_above, side = _layout_full(mesh)
+    circles, ring2_angle, ring1_above, width, height = _layout_full(mesh)
     # A single ring-1 node's sector spans the whole circle, so its two
     # children land at exactly +/-90 degrees from its own angle (0) —
     # "L..." (sorts first) on the left, "R..." on the right.
@@ -526,8 +551,8 @@ def test_viewbox_fits_a_22_char_name_far_left_and_far_right():
         angle = ring2_angle.get(node.key)
         above = ring1_above.get(node.key, False)
         x0, y0, x1, y1 = _label_box(x, y, r, _name_and_role_lines(node), angle, above=above)
-        assert x0 >= -1e-6 and x1 <= side + 1e-6, f"{node.key} label clipped horizontally"
-        assert y0 >= -1e-6 and y1 <= side + 1e-6, f"{node.key} label clipped vertically"
+        assert x0 >= -1e-6 and x1 <= width + 1e-6, f"{node.key} label clipped horizontally"
+        assert y0 >= -1e-6 and y1 <= height + 1e-6, f"{node.key} label clipped vertically"
 
 
 # ---------------------------------------------------------------------------
@@ -897,15 +922,16 @@ def test_hostile_node_name_is_still_escaped_alongside_the_new_freshness_cell():
 # glyphs (RLOC16, truncation, warning badges), and the legend.
 # ---------------------------------------------------------------------------
 
-def test_leader_is_at_the_viewbox_centre_and_every_ring1_node_is_equidistant():
+def test_leader_is_at_the_layout_centre_and_every_ring1_node_is_equidistant():
+    # UAT fix: the viewBox is a tight bounding box now, no longer centred
+    # on the leader (that was the source of the reported white space), so
+    # this only pins the LAYOUT property -- every ring-1 node is the same
+    # distance from the leader's own position -- not a viewBox-geometry one.
     from thread_page import _layout_full, _ring1_and_ring2  # pylint: disable=import-outside-toplevel
     mesh, _diags = _fixture_mesh()
-    circles, _ring2_angle, _ring1_above, side = _layout_full(mesh)
+    circles, _ring2_angle, _ring1_above, _width, _height = _layout_full(mesh)
     leader, ring1_members, _ring2, _linked_parent = _ring1_and_ring2(mesh)
-    center = side / 2
     lx, ly, _lr = circles[leader.key]
-    assert abs(lx - center) < 1e-6
-    assert abs(ly - center) < 1e-6
 
     distances = {round(((circles[n.key][0] - lx) ** 2 + (circles[n.key][1] - ly) ** 2) ** 0.5, 6)
                  for n in ring1_members}
@@ -916,14 +942,16 @@ def test_each_ring2_nodes_angle_is_closer_to_its_own_parent_than_any_other_ring1
     import math  # pylint: disable=import-outside-toplevel
     from thread_page import _layout_full, _ring1_and_ring2  # pylint: disable=import-outside-toplevel
     mesh, _diags = _fixture_mesh()
-    circles, ring2_angle, _ring1_above, side = _layout_full(mesh)
-    center = side / 2
-    _leader, ring1_members, _ring2, linked_parent = _ring1_and_ring2(mesh)
+    circles, ring2_angle, _ring1_above, _width, _height = _layout_full(mesh)
+    leader, ring1_members, _ring2, linked_parent = _ring1_and_ring2(mesh)
+    # The leader's own position is the ring's centre now (the viewBox is no
+    # longer centred on it, post-UAT tight-viewBox fix).
+    center_x, center_y, _lr = circles[leader.key]
 
     ring1_angle = {}
     for node in ring1_members:
         x, y, _r = circles[node.key]
-        ring1_angle[node.key] = math.atan2(x - center, -(y - center))
+        ring1_angle[node.key] = math.atan2(x - center_x, -(y - center_y))
 
     def _angular_gap(a, b):
         diff = abs(a - b) % (2 * math.pi)
@@ -1132,9 +1160,11 @@ def test_owned_leader_glyph_is_at_the_centre_with_the_leader_role_line():
                majority_partition=None, majority_leader=3, nodes=[leader, router], links=[link],
                flags=[], unreadable=[], disagreements=[], warnings=[])
 
-    circles, _ring2_angle, _ring1_above, side = _layout_full(mesh)
-    lx, ly, lr = circles[leader.key]
-    assert (lx, ly) == (side / 2, side / 2)
+    # The viewBox is a tight bounding box now (UAT fix), not centred on the
+    # leader -- position is covered by the layout-centre/equidistance test
+    # instead; this pins the glyph's own kind/size/labels.
+    circles, _ring2_angle, _ring1_above, _width, _height = _layout_full(mesh)
+    _lx, _ly, lr = circles[leader.key]
     assert lr == _glyph_r(leader) == 30.0
 
     html = render_thread_page(mesh, [], generated_at="t", live=False, plugin_id=PLUGIN_ID)
@@ -1204,7 +1234,7 @@ def test_hostile_name_on_a_ring1_top_node_is_escaped():
     mesh = Mesh(network_name="net", channel=None, pan_id=None, partition_ids=[],
                majority_partition=None, majority_leader=None, nodes=[hostile], links=[],
                flags=[], unreadable=[], disagreements=[], warnings=[])
-    _circles, _ring2_angle, ring1_above, _side = _layout_full(mesh)
+    _circles, _ring2_angle, ring1_above, _width, _height = _layout_full(mesh)
     assert ring1_above[hostile.key] is True  # the only ring-1 node: lands at angle 0, the top
 
     html = render_thread_page(mesh, [], generated_at="t", live=False, plugin_id=PLUGIN_ID)
@@ -1410,12 +1440,14 @@ def test_orphans_land_outside_every_ring1_sector_and_are_still_drawn():
                majority_partition=None, majority_leader=1, nodes=[leader, router, child, orphan_a, orphan_b],
                links=links, flags=[], unreadable=[], disagreements=[], warnings=[])
 
-    circles, ring2_angle, _ring1_above, side = _layout_full(mesh)
+    circles, ring2_angle, _ring1_above, _width, _height = _layout_full(mesh)
     assert {"node:0x4", "node:0x5"} <= set(circles)  # both orphans drawn
 
-    _leader, ring1_members, _ring2, _linked_parent = _ring1_and_ring2(mesh)
-    center = side / 2
-    ring1_angle = {n.key: math.atan2(circles[n.key][0] - center, -(circles[n.key][1] - center))
+    leader, ring1_members, _ring2, _linked_parent = _ring1_and_ring2(mesh)
+    # The leader's own position is the ring's centre now (the viewBox is no
+    # longer centred on it, post-UAT tight-viewBox fix).
+    center_x, center_y, _lr = circles[leader.key]
+    ring1_angle = {n.key: math.atan2(circles[n.key][0] - center_x, -(circles[n.key][1] - center_y))
                    for n in ring1_members}
     n_sectors = len(ring1_members) + 1  # orphans get their own trailing sector
     sector_half_width = math.pi / n_sectors
@@ -1494,7 +1526,7 @@ def test_ring1_label_is_above_the_glyph_at_the_top_and_below_at_the_bottom():
     mesh = Mesh(network_name="net", channel=None, pan_id=None, partition_ids=[],
                majority_partition=None, majority_leader=None, nodes=[node_a, node_b], links=[],
                flags=[], unreadable=[], disagreements=[], warnings=[])
-    circles, _ring2_angle, ring1_above, _side = _layout_full(mesh)
+    circles, _ring2_angle, ring1_above, _width, _height = _layout_full(mesh)
     # Two ring-1 nodes (sector width 180 deg): exactly one lands in the top
     # half and one in the bottom -- the property isn't vacuously true.
     assert sorted(ring1_above.values()) == [False, True]

@@ -65,10 +65,14 @@ first draft is folded into every bullet below, not called out separately.
   corner OPPOSITE the label, so neither a line nor a badge ever sits on top
   of label text. A name up to 24 characters is shown whole; longer ones are
   cut to 22 visible characters. The role sub-line reads plain English
-  ("Sleepy end device"), not the raw internal role name. The viewBox is
-  sized from the ACTUAL drawn label lines — name AND role, each at its own
-  font size — rather than a flat guess, so a short name with a long role
-  line can no longer clip past the edge.
+  ("Sleepy end device"), not the raw internal role name. The viewBox is a
+  TIGHT bounding box around the drawn glyphs and labels (no square padding)
+  — sized from the ACTUAL drawn label lines, name AND role each at its own
+  font size, so a short name with a long role line can no longer clip past
+  the edge, and UAT feedback that a square viewBox centred on the leader
+  padded empty bands around the map's (usually asymmetric) content is
+  fixed the same way: not square, not centred, just as big as the content
+  plus a margin.
 
 ## 2026.31.0 — the Thread mesh report and page now show the cache's age (#344)
 

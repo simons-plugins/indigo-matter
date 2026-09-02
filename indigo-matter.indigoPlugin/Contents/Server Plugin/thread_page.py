@@ -413,19 +413,21 @@ def _order_ring1(members: list, chords: list[tuple[str, str]], has_orphans: bool
 def _layout_full(mesh):  # pylint: disable=too-many-locals
     """The real work behind :func:`_layout` — also returns each ring-2 node's
     angle (needed to place its name radially, #346 §2), each ring-1 node's
-    above/below label side (#346 fix A2), and the viewBox side, computed
-    once here so :func:`_render_map` never re-derives ring membership and
-    risks disagreeing with the positions actually drawn.
+    above/below label side (#346 fix A2), and the viewBox (width, height),
+    computed once here so :func:`_render_map` never re-derives ring
+    membership and risks disagreeing with the positions actually drawn.
 
-    The viewBox (#346 fix 3) is sized from the mesh's ACTUAL extents — every
-    glyph's circle/square AND its estimated label box, sized from the actual
-    drawn label lines (review A2: name AND role) — because an SVG silently
-    clips anything outside its own viewBox. Computed as a SQUARE centred on
-    the leader (or the empty centre, if none): the half-side is the largest
-    distance any glyph or label corner reaches from that centre, so the
-    leader-is-at-the-centre / ring-1-is-equidistant properties (deliberately
-    kept, not asked to change) hold regardless of which names happen to be
-    long.
+    The viewBox is a TIGHT bounding box (UAT: Simon reported "a lot of white
+    space around the mesh map" — a SQUARE viewBox centred on the leader
+    padded empty bands around the fixture's asymmetric content, 867×867 for
+    content nowhere near that tall). Every glyph's circle/square AND its
+    estimated label box (sized from the actual drawn label lines, review
+    A2: name and role) are unioned into one min/max extent per axis,
+    independently — not square, not centred on the leader — then
+    `_MARGIN` is added on every side. The RING LAYOUT itself (angles,
+    radii) is unchanged; only this framing step is. The leader-at-a-fixed-
+    point / ring-1-equidistant properties still hold (they are a property
+    of the ring maths, not of how the result is framed).
 
     (measured: `pylint --rcfile pyproject.toml ".../thread_page.py"` flags
     this at >15 locals — genuine, not a shortcut: ring 1's sector width,
@@ -436,7 +438,7 @@ def _layout_full(mesh):  # pylint: disable=too-many-locals
     drifting apart.)
     """
     if not mesh.nodes:
-        return {}, {}, {}, 0.0
+        return {}, {}, {}, 0.0, 0.0
 
     leader, ring1_members, ring2, linked_parent = _ring1_and_ring2(mesh)
     ring1_keys = {n.key for n in ring1_members}
@@ -505,24 +507,28 @@ def _layout_full(mesh):  # pylint: disable=too-many-locals
     ring1_above = {node.key: relative[node.key][1] <= 0 for node in ring1}
 
     nodes_by_key = {node.key: node for node in mesh.nodes}
-    half_extent = 0.0
+    min_x = min_y = math.inf
+    max_x = max_y = -math.inf
     for key, (x, y, r, angle) in relative.items():
         above = ring1_above.get(key, False)
         lines = _name_and_role_lines(nodes_by_key[key])
-        half_extent = max(half_extent, _half_extent(x, y, r, lines, angle, above=above))
+        x0, y0, x1, y1 = _content_bounds(x, y, r, lines, angle, above=above)
+        min_x, min_y = min(min_x, x0), min(min_y, y0)
+        max_x, max_y = max(max_x, x1), max(max_y, y1)
 
-    center = half_extent + _MARGIN
-    side = 2 * center
-    positions = {key: (x + center, y + center, r) for key, (x, y, r, _angle) in relative.items()}
+    offset_x, offset_y = _MARGIN - min_x, _MARGIN - min_y
+    width = (max_x - min_x) + 2 * _MARGIN
+    height = (max_y - min_y) + 2 * _MARGIN
+    positions = {key: (x + offset_x, y + offset_y, r) for key, (x, y, r, _angle) in relative.items()}
 
-    return positions, ring2_angle, ring1_above, side
+    return positions, ring2_angle, ring1_above, width, height
 
 
 def _layout(mesh) -> dict[str, tuple[float, float, float]]:
     """``MeshNode.key -> (cx, cy, r)`` in SVG user units — a pure function of
     ``mesh`` alone (no I/O, no randomness), so a caller (or a test) can assert
     layout properties purely from this dict, without rendering any SVG."""
-    positions, _ring2_angle, _ring1_above, _side = _layout_full(mesh)
+    positions, _ring2_angle, _ring1_above, _width, _height = _layout_full(mesh)
     return positions
 
 
@@ -704,17 +710,15 @@ def _label_box(cx: float, cy: float, r: float, lines: list[str], outward_angle: 
     return x0, y - _LABEL_BOX_ABOVE, x1, y + _LABEL_BOX_BELOW
 
 
-def _half_extent(x: float, y: float, r: float, lines: list[str], outward_angle: Optional[float],
-                 *, above: bool = False) -> float:
-    """The largest ``|x|`` or ``|y|`` reached by this node's glyph OR its
-    label box, in the mesh-centred frame (leader/centre at the origin) —
-    what the viewBox's symmetric half-side must be at least as big as
-    (#346 fix 3)."""
-    extent = max(abs(x) + r, abs(y) + r)
-    x0, y0, x1, y1 = _label_box(x, y, r, lines, outward_angle, above=above)
-    for corner_x, corner_y in ((x0, y0), (x1, y0), (x0, y1), (x1, y1)):
-        extent = max(extent, abs(corner_x), abs(corner_y))
-    return extent
+def _content_bounds(x: float, y: float, r: float, lines: list[str], outward_angle: Optional[float],
+                    *, above: bool = False) -> tuple[float, float, float, float]:
+    """The bounding box ``(x0, y0, x1, y1)`` of a node's glyph AND its label
+    box combined, in whatever frame ``x``/``y`` are given — the tight
+    viewBox is the union of every node's own box like this, per axis
+    independently (#346 UAT: a square viewBox centred on the leader padded
+    empty bands around asymmetric content)."""
+    label_x0, label_y0, label_x1, label_y1 = _label_box(x, y, r, lines, outward_angle, above=above)
+    return min(x - r, label_x0), min(y - r, label_y0), max(x + r, label_x1), max(y + r, label_y1)
 
 
 def _worst_flag_severity(flags_for_node: list) -> Optional[str]:
@@ -1036,7 +1040,7 @@ def _render_legend() -> str:
 def _render_map(mesh) -> str:
     if not mesh.nodes:
         return '<p class="msg">No Thread nodes to draw.</p>'
-    positions, ring2_angle, ring1_above, side = _layout_full(mesh)
+    positions, ring2_angle, ring1_above, width, height = _layout_full(mesh)
     # `if node.key in positions` here and below: defensive, same reasoning
     # as `_link_svg`'s own guard (review C12) — `_layout_full` places every
     # node in `mesh.nodes`, so this never actually filters anything out.
@@ -1057,7 +1061,7 @@ def _render_map(mesh) -> str:
     )
 
     svg = (
-        f'<svg viewBox="0 0 {side:.0f} {side:.0f}" '
+        f'<svg viewBox="0 0 {width:.0f} {height:.0f}" '
         f'style="width:100%;height:auto;min-width:560px" '
         f'role="img" aria-label="Thread mesh map">'
         f'<style>{_MAP_CSS}</style>'
