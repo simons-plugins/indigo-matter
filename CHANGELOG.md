@@ -3,6 +3,46 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
+## 2026.32.0 — the Thread mesh page is drawn radially with role glyphs (#346)
+
+The Thread mesh page's map was a three-row layout (leader row, router row,
+child row) with same-layer links bowed into arcs to stay visible. It now
+draws radially, styled after Apple's Thread Doctor app (Simon's own
+reference, approved): the leader at the centre, every other router-layer
+node on a ring around it, and every remaining device clustered on an outer
+ring beside whichever ring-1 node it links to.
+
+- **Radial layout**: ring 1 (owned routers, foreign routers, and any
+  non-router one hop off the leader) is ordered to minimise how many of its
+  own router-to-router links cross each other — exhaustive search for up to
+  8 nodes, a greedy walk above that — so the map is deterministic (same
+  mesh, same picture) but no longer just alphabetical. Ring 2 clusters each
+  device beside its own parent's position on ring 1; a device with no
+  placeable parent gets its own trailing sector rather than a phantom guess.
+- **A glyph vocabulary, not boxes**: filled circles for the leader/router/
+  end device, a hollow ring for a REED, a rounded square for a router this
+  plugin doesn't own, and a square split blue/purple when that foreign
+  router is also the leader ("probably your border router"). Each glyph
+  carries its own RLOC16 (the same 4-hex-digit id a neighbour table uses)
+  inside it, and a red or amber triangle badge when it has a bad/warn health
+  flag — the flag text is in the glyph's tooltip.
+- **Quiet edges**: straight lines now (no more arcs — a chord between two
+  ring-1 nodes never has to dodge a third node the arcs existed to avoid),
+  shortened to each glyph's own edge so lines start and end AT the glyphs,
+  not behind them. No visible label by default — every edge carries its
+  RSSI/LQI/frame-error reading in a hover/long-press tooltip, and only a
+  "poor" link (see below) draws its label on the map.
+- **Four display bands, not the health thresholds**: excellent (≥ -65 dBm),
+  good (-77…-66), fair (-87…-78), poor (≤ -88) — the map's OWN thresholds,
+  deliberately separate from `thread_mesh`'s `RSSI_WEAK`/`RSSI_BAD` (still
+  -80/-90), which still drive the health flags a node actually gets. A -78
+  dBm link is still "good" for health but reads "fair" on the map — the two
+  scales answer different questions and are allowed to disagree.
+- **A collapsible legend**, moved out of the SVG into a `<details>` block
+  under the map (collapsed by default): every glyph's meaning, the five
+  bands, RLOC16/Partition/Frame-error definitions, and the leader-failover
+  and unowned-router notes Thread Doctor's own legend carries.
+
 ## 2026.31.0 — the Thread mesh report and page now show the cache's age (#344)
 
 The Thread page/report already labelled data `CACHED` vs `LIVE`, but gave no
