@@ -1,4 +1,4 @@
-"""Tests for the Thread mesh IWS page — #334.
+"""Tests for the Thread mesh IWS page — #334; radial map #346.
 
 Two halves, mirroring ``test_pairing_menu.py``'s split for the pairing page:
 
@@ -65,6 +65,26 @@ def test_it_names_the_foreign_leader_as_the_probable_border_router():
     html = render_thread_page(mesh, diags, generated_at="t", live=False, plugin_id=PLUGIN_ID)
     assert "Router 14" in html
     assert "probably your border router" in html
+
+
+def test_foreign_leader_display_name_is_router_n_not_the_raw_node_name():
+    # review E1: the node-foreign_leader glyph's two drawn lines, extracted
+    # directly from the SVG -- "Router 14" (never the long node.name
+    # build_mesh gives a foreign LEADER), then the border-router caption.
+    import re  # pylint: disable=import-outside-toplevel
+    from thread_mesh import MeshNode  # pylint: disable=import-outside-toplevel
+    from thread_page import _display_name  # pylint: disable=import-outside-toplevel
+    mesh, diags = _fixture_mesh()
+    html = render_thread_page(mesh, diags, generated_at="t", live=False, plugin_id=PLUGIN_ID)
+    group_match = re.search(r'<g class="node node-foreign_leader">.*?</g>', html, re.S)
+    assert group_match is not None
+    tspans = re.findall(r"<tspan[^>]*>([^<]*)</tspan>", group_match.group(0))
+    assert tspans == ["Router 14", "probably your border router"]
+
+    unrouted = MeshNode(key="rid:5", node_id=None, name="Router 5", role_name="Router",
+                        router_id=None, rloc16=None, foreign=True, is_leader=False,
+                        partition_id=None, children_count=0)
+    assert _display_name(unrouted) == "Router 5"  # falls back to node.name with no router_id
 
 
 def test_it_carries_the_0x34_single_neighbour_flag():
@@ -268,7 +288,8 @@ def test_get_nodes_failure_renders_the_banner_not_an_empty_mesh(plug, monkeypatc
 
 
 # ---------------------------------------------------------------------------
-# #334 post-review — A4: layout (no-overlap, same-layer arcs, viewBox growth)
+# #334 post-review — A4: layout (no-overlap, viewBox growth); arcs are gone
+# under the radial map (#346) — see test_no_edge_passes_through_a_third_glyph.
 # ---------------------------------------------------------------------------
 
 def test_layout_glyphs_never_overlap():
@@ -283,7 +304,18 @@ def test_layout_glyphs_never_overlap():
             assert dist >= ra + rb + 4, f"{key_a} overlaps {key_b}"
 
 
-def test_a_detached_sed_still_gets_a_box():
+def test_layout_is_identical_when_the_diags_arrive_in_a_different_order():
+    # Review A1: all four (n.foreign, n.name) tie-breaks used to collide on
+    # the fixture's duplicate names (two "GRILLPLATS Plug", two "ALPSTUGA
+    # air quality monitor"), so reversing the diags swapped 0x34/0x3F and
+    # dragged their children along -- a layout that silently depended on
+    # dict/list iteration order, not on the mesh's own content.
+    diags = _fixture_diags()
+    from thread_page import _layout  # pylint: disable=import-outside-toplevel
+    assert _layout(build_mesh(diags)) == _layout(build_mesh(list(reversed(diags))))
+
+
+def test_a_detached_sed_still_gets_a_glyph():
     # #334 post-review, B3.10: a node with no parent link at all (a detached
     # SED, B5.1's own no_parent case) must not silently vanish from the
     # layout because it has nowhere obvious to be placed under.
@@ -291,8 +323,8 @@ def test_a_detached_sed_still_gets_a_box():
     attrs = {"0/53/1": 2}  # SED, no NeighborTable at all -> no parent
     diag = parse_node_diag(99, "detached sed", True, attrs)
     mesh = build_mesh([diag])
-    boxes = _layout(mesh)
-    assert mesh.nodes[0].key in boxes
+    circles = _layout(mesh)
+    assert mesh.nodes[0].key in circles
 
 
 def _point_segment_distance(px, py, ax, ay, bx, by):
@@ -334,9 +366,14 @@ def test_no_edge_passes_through_a_third_glyph():
     # than that glyph's own radius. The CENTRE node's excluded region is
     # bigger than its bare glyph (#346 fix 1): its own two label lines sit
     # just below it, so a chord that clears the glyph circle but still cuts
-    # through "Router 14 (leader…" / "probably your border router" is still
-    # a real defect the plain circle check couldn't see.
-    from thread_page import _layout, _merged_links, _ring1_and_ring2  # pylint: disable=import-outside-toplevel
+    # through "Router 14" / "probably your border router" is still a real
+    # defect the plain circle check couldn't see. Review C11: the excluded
+    # region is the code's OWN estimate (_label_box, on the leader's ACTUAL
+    # drawn lines) rather than a second, hand-rolled 3.5-per-char guess that
+    # could silently drift from what _label_box itself considers safe.
+    from thread_page import (  # pylint: disable=import-outside-toplevel
+        _label_box, _layout, _merged_links, _name_and_role_lines, _ring1_and_ring2,
+    )
     mesh, _diags = _fixture_mesh()
     circles = _layout(mesh)
 
@@ -344,8 +381,9 @@ def test_no_edge_passes_through_a_third_glyph():
     centre_label_rect = None
     if leader is not None:
         cx, cy, cr = circles[leader.key]
-        half_w = 3.5 * min(len(leader.name), 22)
-        centre_label_rect = (cx - half_w, cy + cr, cx + half_w, cy + cr + 34)
+        # The centre never stacks "above" (#346 fix A4's own rule) -- its
+        # label is always below the glyph.
+        centre_label_rect = _label_box(cx, cy, cr, _name_and_role_lines(leader), None, above=False)
 
     for link in _merged_links(mesh.links):
         if link["a"] not in circles or link["b"] not in circles:
@@ -416,7 +454,7 @@ def test_a_leader_child_is_on_ring_1_same_distance_from_the_centre_as_the_router
     assert _dist("node:0x40") == next(iter(router_dist))
 
 
-def test_viewbox_contains_every_glyph_plus_its_label_room():
+def test_viewbox_is_square_and_contains_every_glyph():
     from thread_page import _layout  # pylint: disable=import-outside-toplevel
     mesh, diags = _fixture_mesh()
     circles = _layout(mesh)
@@ -432,10 +470,13 @@ def test_viewbox_contains_every_glyph_plus_its_label_room():
 
 
 def test_every_label_box_lies_inside_the_viewbox_on_the_fixture():
-    # #346 fix 3: the viewBox is computed from ACTUAL glyph + label extents,
-    # not a flat label_room guess — this is the fixture-side half of that
-    # fix's own required test.
-    from thread_page import _display_name, _label_box, _layout_full  # pylint: disable=import-outside-toplevel
+    # #346 fix 3: the viewBox is sized from the ACTUAL drawn label lines,
+    # because an SVG silently clips anything outside its own viewBox — this
+    # is the fixture-side half of that fix's own required test. (Circular in
+    # the sense that it uses _label_box's own estimate to size against
+    # itself; test_widest_drawn_role_line_fits_inside_the_viewbox below
+    # checks against an INDEPENDENT estimate instead.)
+    from thread_page import _label_box, _layout_full, _name_and_role_lines  # pylint: disable=import-outside-toplevel
     mesh, _diags = _fixture_mesh()
     circles, ring2_angle, ring1_above, side = _layout_full(mesh)
     for node in mesh.nodes:
@@ -444,7 +485,7 @@ def test_every_label_box_lies_inside_the_viewbox_on_the_fixture():
         x, y, r = circles[node.key]
         angle = ring2_angle.get(node.key)
         above = ring1_above.get(node.key, False)
-        x0, y0, x1, y1 = _label_box(x, y, r, _display_name(node), angle, above=above)
+        x0, y0, x1, y1 = _label_box(x, y, r, _name_and_role_lines(node), angle, above=above)
         assert x0 >= -1e-6 and x1 <= side + 1e-6, f"{node.key} label x out of the viewBox"
         assert y0 >= -1e-6 and y1 <= side + 1e-6, f"{node.key} label y out of the viewBox"
 
@@ -455,7 +496,7 @@ def test_viewbox_fits_a_22_char_name_far_left_and_far_right():
     # well into the left half (text-anchor end, extends further left) — both
     # 22 characters, both must still fit inside the computed viewBox.
     from thread_mesh import Mesh, MeshLink, MeshNode  # pylint: disable=import-outside-toplevel
-    from thread_page import _label_box, _layout_full  # pylint: disable=import-outside-toplevel
+    from thread_page import _label_box, _layout_full, _name_and_role_lines  # pylint: disable=import-outside-toplevel
 
     router = MeshNode(key="node:0x1", node_id=1, name="Router A", role_name="Router", router_id=1,
                       rloc16=0x0400, foreign=False, is_leader=False, partition_id=None, children_count=0)
@@ -484,7 +525,7 @@ def test_viewbox_fits_a_22_char_name_far_left_and_far_right():
         x, y, r = circles[node.key]
         angle = ring2_angle.get(node.key)
         above = ring1_above.get(node.key, False)
-        x0, y0, x1, y1 = _label_box(x, y, r, node.name, angle, above=above)
+        x0, y0, x1, y1 = _label_box(x, y, r, _name_and_role_lines(node), angle, above=above)
         assert x0 >= -1e-6 and x1 <= side + 1e-6, f"{node.key} label clipped horizontally"
         assert y0 >= -1e-6 and y1 <= side + 1e-6, f"{node.key} label clipped vertically"
 
@@ -902,6 +943,42 @@ def test_each_ring2_nodes_angle_is_closer_to_its_own_parent_than_any_other_ring1
     assert checked > 0
 
 
+def test_greedy_ring1_order_places_all_ten_nodes_of_a_large_ring():
+    # review E3: a ring-1 bigger than _EXHAUSTIVE_RING1_LIMIT (8) takes the
+    # untested-until-now greedy path (_greedy_ring1_order) instead of the
+    # exhaustive permutation search.
+    from thread_mesh import Mesh, MeshLink, MeshNode  # pylint: disable=import-outside-toplevel
+    from thread_page import _layout  # pylint: disable=import-outside-toplevel
+
+    routers = [
+        MeshNode(key=f"node:0x{i:x}", node_id=i, name=f"Router {i}", role_name="Router", router_id=i,
+                 rloc16=i << 10, foreign=False, is_leader=False, partition_id=None, children_count=0)
+        for i in range(10)
+    ]
+    links = [
+        MeshLink(a=routers[i].key, b=routers[(i + 1) % 10].key, kind="router", avg_rssi=-50, last_rssi=-50,
+                 lqi=3, frame_error_pct=0, seen_from=routers[i].key)
+        for i in range(10)
+    ]
+    mesh = Mesh(network_name="net", channel=None, pan_id=None, partition_ids=[],
+               majority_partition=None, majority_leader=None, nodes=routers, links=links,
+               flags=[], unreadable=[], disagreements=[], warnings=[])
+
+    circles_1 = _layout(mesh)
+    circles_2 = _layout(mesh)
+    assert len(circles_1) == 10  # every node placed
+    assert circles_1 == circles_2  # deterministic: identical across two calls
+
+    items = list(circles_1.items())
+    for i, (key_a, (xa, ya, ra)) in enumerate(items):
+        for key_b, (xb, yb, rb) in items[i + 1:]:
+            dist = ((xa - xb) ** 2 + (ya - yb) ** 2) ** 0.5
+            assert dist >= ra + rb + 4, f"{key_a} overlaps {key_b}"
+
+    html = render_thread_page(mesh, [], generated_at="t", live=False, plugin_id=PLUGIN_ID)
+    assert "<svg" in html
+
+
 def test_crossing_minimisation_places_the_diagonal_non_adjacent_and_is_deterministic():
     # Synthetic 4-router ring: A-B, B-C, C-D, D-A (the ring itself) plus the
     # A-C diagonal. The only zero-crossing arrangement puts A and C OPPOSITE
@@ -1005,6 +1082,26 @@ def test_bad_flag_renders_the_red_badge_info_only_renders_none():
     assert "var(--badge-warn)" not in svg_info
 
 
+def test_small_glyph_carries_its_rloc16_in_the_tooltip_not_inside_it():
+    # review B3: an end device's glyph is too small for inner text (#346
+    # §2: r <= 12 gets none), so its RLOC16 -- when known -- has to live
+    # somewhere; the legend now says "carry it in their tooltip", so this
+    # pins that the tooltip actually does.
+    from thread_mesh import MeshNode  # pylint: disable=import-outside-toplevel
+    from thread_page import _node_glyph_svg  # pylint: disable=import-outside-toplevel
+    small = MeshNode(key="node:0x2E", node_id=0x2E, name="Small device", role_name="SleepyEndDevice",
+                     router_id=None, rloc16=0x2E00, foreign=False, is_leader=False,
+                     partition_id=None, children_count=0)
+    svg = _node_glyph_svg(small, (100.0, 100.0, 12.0), [])
+    assert ">2E00<" not in svg  # too small for inner text
+    assert "RLOC16 0x2E00" in svg  # but it's in the tooltip
+
+    no_rloc = MeshNode(key="node:0x2F", node_id=0x2F, name="No RLOC yet", role_name="SleepyEndDevice",
+                       router_id=None, rloc16=None, foreign=False, is_leader=False,
+                       partition_id=None, children_count=0)
+    assert "RLOC16" not in _node_glyph_svg(no_rloc, (100.0, 100.0, 12.0), [])
+
+
 def test_rloc16_appears_inside_the_glyph_r_style_fallback_for_a_foreign_router():
     from thread_mesh import MeshNode  # pylint: disable=import-outside-toplevel
     from thread_page import _node_glyph_svg  # pylint: disable=import-outside-toplevel
@@ -1017,6 +1114,102 @@ def test_rloc16_appears_inside_the_glyph_r_style_fallback_for_a_foreign_router()
                                router_id=12, rloc16=None, foreign=True, is_leader=False,
                                partition_id=None, children_count=0)
     assert ">R12<" in _node_glyph_svg(foreign_no_rloc, (100.0, 100.0, 24.0), [])
+
+
+def test_owned_leader_glyph_is_at_the_centre_with_the_leader_role_line():
+    # review E2: an OWNED leader (is_leader=True, not foreign) -- the centre
+    # circle glyph, not the split foreign_leader square.
+    import re  # pylint: disable=import-outside-toplevel
+    from thread_mesh import Mesh, MeshLink, MeshNode  # pylint: disable=import-outside-toplevel
+    from thread_page import _glyph_r, _layout_full  # pylint: disable=import-outside-toplevel
+    leader = MeshNode(key="node:0x1", node_id=1, name="My Leader", role_name="Leader", router_id=3,
+                      rloc16=0x0C00, foreign=False, is_leader=True, partition_id=None, children_count=0)
+    router = MeshNode(key="node:0x2", node_id=2, name="A Router", role_name="Router", router_id=7,
+                      rloc16=0x1C00, foreign=False, is_leader=False, partition_id=None, children_count=0)
+    link = MeshLink(a="node:0x2", b="node:0x1", kind="router", avg_rssi=-50, last_rssi=-50,
+                    lqi=3, frame_error_pct=0, seen_from="node:0x2")
+    mesh = Mesh(network_name="net", channel=None, pan_id=None, partition_ids=[],
+               majority_partition=None, majority_leader=3, nodes=[leader, router], links=[link],
+               flags=[], unreadable=[], disagreements=[], warnings=[])
+
+    circles, _ring2_angle, _ring1_above, side = _layout_full(mesh)
+    lx, ly, lr = circles[leader.key]
+    assert (lx, ly) == (side / 2, side / 2)
+    assert lr == _glyph_r(leader) == 30.0
+
+    html = render_thread_page(mesh, [], generated_at="t", live=False, plugin_id=PLUGIN_ID)
+    group_match = re.search(r'<g class="node node-leader">.*?</g>', html, re.S)
+    assert group_match is not None
+    tspans = re.findall(r"<tspan[^>]*>([^<]*)</tspan>", group_match.group(0))
+    assert tspans == ["My Leader", "Leader · router 3"]
+
+
+def test_a_minority_leader_draws_as_a_router_not_unknown():
+    # review A3: role_name == "Leader" but is_leader == False (a minority-
+    # partition leader, or majority_leader is None) used to fall through to
+    # "unknown" -- a dashed r=12 circle with no RLOC16 -- even though it is
+    # exactly as much a router as any other. It now draws (and sizes) as a
+    # router; the role sub-line ("Leader . router 3") is the honest signal.
+    from thread_mesh import MeshNode  # pylint: disable=import-outside-toplevel
+    from thread_page import _glyph_kind, _glyph_r, _node_glyph_svg  # pylint: disable=import-outside-toplevel
+    node = MeshNode(key="node:0x99", node_id=0x99, name="Minority leader", role_name="Leader",
+                    router_id=3, rloc16=0x0C00, foreign=False, is_leader=False,
+                    partition_id=None, children_count=0)
+    assert _glyph_kind(node) == "router"
+    assert _glyph_r(node) == _glyph_r(MeshNode(key="k", node_id=1, name="n", role_name="Router",
+                                               router_id=1, rloc16=0x400, foreign=False, is_leader=False,
+                                               partition_id=None, children_count=0))
+    assert ">0C00<" in _node_glyph_svg(node, (100.0, 100.0, 26.0), [])
+
+
+def test_every_glyph_kind_the_map_can_draw_has_a_legend_row():
+    # review A3: enumerate every _glyph_kind output the map can actually
+    # produce (every ROLE_NAMES value, plus foreign / foreign+leader / an
+    # anonymous child) and confirm each has a legend row -- and that no
+    # legend row describes a kind _glyph_kind can never return ("warn" is
+    # the one legitimate exception: it documents the badge overlay, not a
+    # glyph shape).
+    from thread_mesh import ROLE_NAMES, MeshNode  # pylint: disable=import-outside-toplevel
+    from thread_page import _LEGEND_NODE_ROWS, _glyph_kind  # pylint: disable=import-outside-toplevel
+
+    def _node(role_name, *, foreign=False, is_leader=False):
+        return MeshNode(key="node:0x1", node_id=1, name="n", role_name=role_name, router_id=1,
+                        rloc16=0x0400, foreign=foreign, is_leader=is_leader,
+                        partition_id=None, children_count=0)
+
+    achievable = {_glyph_kind(_node(role_name)) for role_name in ROLE_NAMES.values()}
+    achievable.add(_glyph_kind(_node("Router", foreign=True)))
+    achievable.add(_glyph_kind(_node("Router", foreign=True, is_leader=True)))
+    achievable.add(_glyph_kind(_node("Leader", is_leader=True)))  # an OWNED leader
+    achievable.add(_glyph_kind(_node("Child")))
+
+    row_kinds = {kind for kind, _title, _desc in _LEGEND_NODE_ROWS}
+    documented_non_kind_rows = {"warn"}  # the badge overlay, not a glyph shape
+    for kind in achievable:
+        assert kind in row_kinds, f"_glyph_kind can draw {kind!r} but the legend has no row for it"
+    for kind in row_kinds - documented_non_kind_rows:
+        assert kind in achievable, f"legend row {kind!r} describes a kind _glyph_kind can never return"
+
+
+def test_hostile_name_on_a_ring1_top_node_is_escaped():
+    # review E5: a ring-1 node in the TOP half of the ring takes the
+    # "stacks upward" branch of _label_svg (#346 fix A2/A4) -- a DIFFERENT
+    # code path than the (already-covered) below case, so escaping has to
+    # be pinned there separately.
+    from thread_mesh import Mesh, MeshNode  # pylint: disable=import-outside-toplevel
+    from thread_page import _layout_full  # pylint: disable=import-outside-toplevel
+    hostile = MeshNode(key="node:0x1", node_id=1, name="<script>alert(1)</script>", role_name="Router",
+                       router_id=9, rloc16=0x2400, foreign=False, is_leader=False,
+                       partition_id=None, children_count=0)
+    mesh = Mesh(network_name="net", channel=None, pan_id=None, partition_ids=[],
+               majority_partition=None, majority_leader=None, nodes=[hostile], links=[],
+               flags=[], unreadable=[], disagreements=[], warnings=[])
+    _circles, _ring2_angle, ring1_above, _side = _layout_full(mesh)
+    assert ring1_above[hostile.key] is True  # the only ring-1 node: lands at angle 0, the top
+
+    html = render_thread_page(mesh, [], generated_at="t", live=False, plugin_id=PLUGIN_ID)
+    assert "<script>alert(1)</script>" not in html
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in html
 
 
 def test_long_name_is_truncated_visibly_but_complete_and_escaped_in_the_title():
@@ -1044,6 +1237,79 @@ def test_long_name_is_truncated_visibly_but_complete_and_escaped_in_the_title():
     assert "&lt;script&gt;alert(1)&lt;/script&gt; a very long device name indeed" in title_match.group(1)
 
 
+def test_widest_drawn_role_line_fits_inside_the_viewbox():
+    # review A2: the role sub-line was not part of the viewBox's label-box
+    # estimate, so a short name with a long role line clipped -- measured in
+    # Chromium, a SED named "Lamp" (role "Sleepy end device") at 90 degrees
+    # ran ~53 units past the right edge. This estimates the widest DRAWN
+    # line independently, from the tspan text and the per-font char widths
+    # exposed as constants -- NOT via _label_box -- so it cannot pass by
+    # sharing a bug with the code under test.
+    import math  # pylint: disable=import-outside-toplevel
+    import re  # pylint: disable=import-outside-toplevel
+    from thread_mesh import Mesh, MeshLink, MeshNode  # pylint: disable=import-outside-toplevel
+    from thread_page import (  # pylint: disable=import-outside-toplevel
+        _LABEL_CHAR_WIDTH, _ROLE_CHAR_WIDTH, _chord_pairs, _order_ring1, _ring1_and_ring2,
+    )
+
+    leader = MeshNode(key="node:leader", node_id=0, name="Leader", role_name="Leader", router_id=0,
+                      rloc16=0x0000, foreign=False, is_leader=True, partition_id=None, children_count=0)
+    routers = [
+        MeshNode(key=f"node:r{i}", node_id=i, name="P", role_name="Router", router_id=i,
+                 rloc16=i << 10, foreign=False, is_leader=False, partition_id=None, children_count=0)
+        for i in range(1, 5)
+    ]
+    stub = Mesh(network_name="net", channel=None, pan_id=None, partition_ids=[],
+               majority_partition=None, majority_leader=None, nodes=[leader, *routers], links=[],
+               flags=[], unreadable=[], disagreements=[], warnings=[])
+    _leader, ring1_members, _ring2, _linked_parent = _ring1_and_ring2(stub)
+    ring1_keys = {n.key for n in ring1_members}
+    # 4 ring-1 members, no chords: sector width is 90 degrees, so index 1 in
+    # the deterministic order is "the router at 90 degrees".
+    order = _order_ring1(ring1_members, _chord_pairs(ring1_keys, []), False, math.pi / 2)
+    router_at_90 = order[1]
+
+    lamp = MeshNode(key="node:lamp", node_id=10, name="Lamp", role_name="SleepyEndDevice", router_id=None,
+                    rloc16=None, foreign=False, is_leader=False, partition_id=None, children_count=0)
+    beacon = MeshNode(key="node:beacon", node_id=11, name="B", role_name="EndDevice", router_id=None,
+                      rloc16=None, foreign=False, is_leader=False, partition_id=None, children_count=0)
+    links = [
+        MeshLink(a="node:lamp", b=router_at_90.key, kind="parent", avg_rssi=-50, last_rssi=-50,
+                 lqi=3, frame_error_pct=0, seen_from="node:lamp"),
+        MeshLink(a="node:beacon", b=router_at_90.key, kind="parent", avg_rssi=-50, last_rssi=-50,
+                 lqi=3, frame_error_pct=0, seen_from="node:beacon"),
+    ]
+    mesh = Mesh(network_name="net", channel=None, pan_id=None, partition_ids=[],
+               majority_partition=None, majority_leader=None, nodes=[leader, *routers, lamp, beacon],
+               links=links, flags=[], unreadable=[], disagreements=[], warnings=[])
+
+    html = render_thread_page(mesh, [], generated_at="t", live=False, plugin_id=PLUGIN_ID)
+    match = re.search(r'viewBox="0 0 (\d+) (\d+)"', html)
+    assert match is not None
+    side = int(match.group(1))
+
+    checked = 0
+    for text_match in re.finditer(
+            r'<text x="([\d.]+)" y="[\d.]+" text-anchor="(\w+)" class="node-name">(.*?)</text>',
+            html, re.S):
+        x = float(text_match.group(1))
+        anchor_kind = text_match.group(2)
+        for tspan_match in re.finditer(r'(<tspan[^>]*>)([^<]*)</tspan>', text_match.group(3)):
+            tag, text = tspan_match.groups()
+            char_width = _ROLE_CHAR_WIDTH if 'class="role"' in tag else _LABEL_CHAR_WIDTH
+            width = char_width * len(text)
+            if anchor_kind == "start":
+                x0, x1 = x, x + width
+            elif anchor_kind == "end":
+                x0, x1 = x - width, x
+            else:
+                x0, x1 = x - width / 2, x + width / 2
+            assert x0 >= -1e-6, f"{text!r} runs past the LEFT edge (x0={x0:.1f})"
+            assert x1 <= side + 1e-6, f"{text!r} runs past the RIGHT edge (x1={x1:.1f}, side={side})"
+            checked += 1
+    assert checked > 0
+
+
 def test_truncation_limit_threshold_and_minimum_kept_characters():
     # #346 fix 4: a name that FITS in 22 is left alone even past the old 18
     # limit; only a name over 24 gets shortened, and never to fewer than 3
@@ -1061,15 +1327,30 @@ def test_truncation_limit_threshold_and_minimum_kept_characters():
 
 
 def test_legend_is_a_details_block_naming_every_glyph_and_all_five_bands():
+    # review B4: scoped to the <details>...</details> substring -- "Leader",
+    # "Router", "Good" etc. all appear elsewhere on the page too (the Nodes
+    # table, the map itself), so a bare `in html` check could pass even if
+    # the legend's OWN content were wrong.
+    import re  # pylint: disable=import-outside-toplevel
+    from thread_page import _BAND_EXCELLENT, _BAND_FAIR, _BAND_GOOD  # pylint: disable=import-outside-toplevel
     mesh, diags = _fixture_mesh()
     html = render_thread_page(mesh, diags, generated_at="t", live=False, plugin_id=PLUGIN_ID)
-    assert '<details class="legend msg">' in html
-    assert "What do the colours mean?" in html
-    for title in ("Leader", "Router", "REED", "End device / Sleepy end device", "Border router",
-                  "Unidentified router", "Warning triangle"):
-        assert title in html
+    match = re.search(r"<details.*?</details>", html, re.S)
+    assert match is not None
+    legend = match.group(0)
+    assert legend.startswith('<details class="legend">')  # review A5: no "msg" class any more
+    assert "What do the colours mean?" in legend
+    for title in ("Leader", "Router", "REED", "End device / Sleepy end device", "Child",
+                  "Unidentified router", "Border router + leader", "Role unknown", "Warning triangle"):
+        assert title in legend, f"missing node-glyph legend row: {title}"
     for band in ("Excellent", "Good", "Fair", "Poor", "Unknown"):
-        assert band in html
+        assert band in legend, f"missing band legend row: {band}"
+    # review B4: the dBm range TEXT is derived from _BAND_* -- pin the
+    # actual numbers, not just the band names.
+    assert f"{_BAND_EXCELLENT} dBm or stronger" in legend
+    assert f"{_BAND_GOOD} to {_BAND_EXCELLENT - 1} dBm" in legend
+    assert f"{_BAND_FAIR} to {_BAND_GOOD - 1} dBm" in legend
+    assert f"{_BAND_FAIR - 1} dBm or weaker" in legend
 
 
 def test_layout_of_an_empty_mesh_is_empty():
@@ -1092,6 +1373,66 @@ def test_layout_of_a_leaderless_mesh_still_places_every_node():
                flags=[], unreadable=[], disagreements=[], warnings=[])
     circles = _layout(mesh)
     assert set(circles) == {"node:0x1", "node:0x2"}
+
+
+def test_orphans_land_outside_every_ring1_sector_and_are_still_drawn():
+    # review E4: leader + one router with a real child, plus two SEDs whose
+    # parent link points at a key that doesn't exist in the mesh at all --
+    # orphans (#346 §1), which get one trailing sector rather than a phantom
+    # parent guess. Both must land OUTSIDE every ring-1 node's own sector
+    # (they are not that router's children) and still be drawn.
+    import math  # pylint: disable=import-outside-toplevel
+    from thread_mesh import Mesh, MeshLink, MeshNode  # pylint: disable=import-outside-toplevel
+    from thread_page import _layout, _layout_full, _ring1_and_ring2  # pylint: disable=import-outside-toplevel
+
+    leader = MeshNode(key="node:0x1", node_id=1, name="Leader", role_name="Leader", router_id=1,
+                      rloc16=0x0400, foreign=False, is_leader=True, partition_id=None, children_count=0)
+    router = MeshNode(key="node:0x2", node_id=2, name="Router A", role_name="Router", router_id=2,
+                      rloc16=0x0800, foreign=False, is_leader=False, partition_id=None, children_count=0)
+    child = MeshNode(key="node:0x3", node_id=3, name="Real child", role_name="SleepyEndDevice",
+                     router_id=None, rloc16=None, foreign=False, is_leader=False,
+                     partition_id=None, children_count=0)
+    orphan_a = MeshNode(key="node:0x4", node_id=4, name="Orphan A", role_name="SleepyEndDevice",
+                        router_id=None, rloc16=None, foreign=False, is_leader=False,
+                        partition_id=None, children_count=0)
+    orphan_b = MeshNode(key="node:0x5", node_id=5, name="Orphan B", role_name="SleepyEndDevice",
+                        router_id=None, rloc16=None, foreign=False, is_leader=False,
+                        partition_id=None, children_count=0)
+    links = [
+        MeshLink(a="node:0x3", b="node:0x2", kind="parent", avg_rssi=-50, last_rssi=-50,
+                 lqi=3, frame_error_pct=0, seen_from="node:0x3"),
+        MeshLink(a="node:0x4", b="node:absent", kind="parent", avg_rssi=-50, last_rssi=-50,
+                 lqi=3, frame_error_pct=0, seen_from="node:0x4"),
+        MeshLink(a="node:0x5", b="node:absent", kind="parent", avg_rssi=-50, last_rssi=-50,
+                 lqi=3, frame_error_pct=0, seen_from="node:0x5"),
+    ]
+    mesh = Mesh(network_name="net", channel=None, pan_id=None, partition_ids=[],
+               majority_partition=None, majority_leader=1, nodes=[leader, router, child, orphan_a, orphan_b],
+               links=links, flags=[], unreadable=[], disagreements=[], warnings=[])
+
+    circles, ring2_angle, _ring1_above, side = _layout_full(mesh)
+    assert {"node:0x4", "node:0x5"} <= set(circles)  # both orphans drawn
+
+    _leader, ring1_members, _ring2, _linked_parent = _ring1_and_ring2(mesh)
+    center = side / 2
+    ring1_angle = {n.key: math.atan2(circles[n.key][0] - center, -(circles[n.key][1] - center))
+                   for n in ring1_members}
+    n_sectors = len(ring1_members) + 1  # orphans get their own trailing sector
+    sector_half_width = math.pi / n_sectors
+
+    def _angular_gap(a, b):
+        diff = abs(a - b) % (2 * math.pi)
+        return min(diff, 2 * math.pi - diff)
+
+    for orphan_key in ("node:0x4", "node:0x5"):
+        orphan_angle = ring2_angle[orphan_key]
+        for ring1_key, angle in ring1_angle.items():
+            assert _angular_gap(orphan_angle, angle) > sector_half_width, (
+                f"{orphan_key} at {orphan_angle:.2f} falls inside {ring1_key}'s own sector")
+
+    html = render_thread_page(mesh, [], generated_at="t", live=False, plugin_id=PLUGIN_ID)
+    assert "Orphan A" in html
+    assert "Orphan B" in html
 
 
 # ---------------------------------------------------------------------------
@@ -1213,6 +1554,29 @@ def test_node_label_text_has_the_same_halo_the_old_edge_labels_had():
     assert "paint-order" not in glyph_text_match.group(1)
 
 
+def test_every_css_var_used_is_defined_in_both_light_and_dark_root_blocks():
+    # review A5: cheap insurance for every colour var (not just --panel-*,
+    # the one this review pass happened to add) -- a var used anywhere on
+    # the page (CSS rule or inline SVG `fill="var(--x)"`) but missing from
+    # either :root block would fall back to the browser default, silently,
+    # in exactly one colour scheme.
+    import re  # pylint: disable=import-outside-toplevel
+    mesh, diags = _fixture_mesh()
+    html = render_thread_page(mesh, diags, generated_at="t", live=False, plugin_id=PLUGIN_ID)
+
+    used_vars = set(re.findall(r"var\((--[a-z0-9-]+)\)", html))
+    assert used_vars  # sanity: the page really does use CSS vars
+
+    root_blocks = re.findall(r":root\s*\{([^}]*)\}", html, re.S)
+    assert len(root_blocks) == 2, f"expected exactly 2 :root blocks (light, dark), found {len(root_blocks)}"
+    light_defined = set(re.findall(r"(--[a-z0-9-]+)\s*:", root_blocks[0]))
+    dark_defined = set(re.findall(r"(--[a-z0-9-]+)\s*:", root_blocks[1]))
+
+    for var in used_vars:
+        assert var in light_defined, f"{var} used but not defined in the light :root block"
+        assert var in dark_defined, f"{var} used but not defined in the dark :root block"
+
+
 # ---------------------------------------------------------------------------
 # #346 fix B — the warning badge goes on the side OPPOSITE the label, so it
 # never sits over the label's own text: above -> bottom-right; below ->
@@ -1234,25 +1598,37 @@ def _boxes_intersect(box_a, box_b) -> bool:
 
 
 def test_warning_badge_never_intersects_its_own_label_box_in_any_position():
+    # review A4: two vertical ring-2 scenarios added -- "top" (angle 0,
+    # text-anchor middle) and "bottom" (angle pi) -- alongside the
+    # ring-1/centre above/below and the two horizontal ring-2 cases. Uses a
+    # real two-line `lines` (name + role), not a bare string, so the
+    # role-width-aware box (#346 review A2) is what's actually exercised.
     import math  # pylint: disable=import-outside-toplevel
     import re  # pylint: disable=import-outside-toplevel
     from thread_page import _badge_svg, _label_box  # pylint: disable=import-outside-toplevel
 
     cx, cy, r = 200.0, 200.0, 16.0
-    name = "Some Device Name"
+    lines = ["Some Device Name", "Sleepy end device"]
+    glyph_box = (cx - r, cy - r, cx + r, cy + r)
     scenarios = [
         ("below (ring1/centre)", None, False),
         ("above (ring1 top half)", None, True),
         ("right (ring2 start anchor)", math.pi / 2, False),
         ("left (ring2 end anchor)", 3 * math.pi / 2, False),
+        ("top (ring2 straight up)", 0.0, False),
+        ("bottom (ring2 straight down)", math.pi, False),
     ]
     for label_desc, outward_angle, above in scenarios:
-        label_box = _label_box(cx, cy, r, name, outward_angle, above=above)
+        label_box = _label_box(cx, cy, r, lines, outward_angle, above=above)
         badge_svg = _badge_svg((cx, cy, r), "bad", outward_angle, above)
         match = re.search(r'points="([^"]+)"', badge_svg)
         assert match is not None
         badge_box = _badge_bbox(match.group(1))
         assert not _boxes_intersect(badge_box, label_box), f"{label_desc}: badge overlaps its own label box"
+        if label_desc.startswith("top"):
+            # review A4's own extra check: BILRESA-style straight-up ring-2
+            # label must clear the glyph itself, not just the badge.
+            assert not _boxes_intersect(label_box, glyph_box), f"{label_desc}: label box overlaps the glyph"
 
 
 def test_badge_corner_matches_the_documented_rule():
@@ -1262,3 +1638,21 @@ def test_badge_corner_matches_the_documented_rule():
     assert _badge_corner_signs(None, True) == (1.0, 1.0)  # above -> bottom-right
     assert _badge_corner_signs(math.pi / 2, False) == (-1.0, -1.0)  # right (start) -> top-left
     assert _badge_corner_signs(3 * math.pi / 2, False) == (1.0, -1.0)  # left (end) -> top-right
+
+
+# ---------------------------------------------------------------------------
+# review E6 — tools/render_thread_fixture.py smoke test
+# ---------------------------------------------------------------------------
+
+def test_render_thread_fixture_tool_runs_and_writes_an_svg(tmp_path):
+    import subprocess  # pylint: disable=import-outside-toplevel
+    import sys  # pylint: disable=import-outside-toplevel
+    repo_root = Path(__file__).parent.parent
+    out_path = tmp_path / "fixture.html"
+    result = subprocess.run(
+        [sys.executable, str(repo_root / "tools" / "render_thread_fixture.py"), str(out_path)],
+        cwd=repo_root, capture_output=True, text=True, timeout=30, check=False,
+    )
+    assert result.returncode == 0, f"stderr: {result.stderr}"
+    assert out_path.exists()
+    assert "<svg" in out_path.read_text(encoding="utf-8")
