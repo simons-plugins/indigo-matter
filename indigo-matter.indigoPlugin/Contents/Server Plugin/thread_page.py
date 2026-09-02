@@ -1371,7 +1371,7 @@ def _document(body: str) -> str:
  footer {{ margin-top: 2rem; font-size: .85rem; color: var(--muted); }}
 </style></head><body>
 {body}
-<footer>This page is read-only — no Matter attribute is ever written from it (ADR-0004).
+<footer>This page is read-only — no Matter attribute is ever written from it.
 An ext(ended) address shown elsewhere in these diagnostics is flagged "≈" when
 matter-server's JSON serialisation has lost precision (values ≥ 2⁵³) and should
 not be treated as exact. Owned nodes are keyed by their Matter node id; only
