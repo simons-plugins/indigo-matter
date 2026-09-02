@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).parent.parent
@@ -25,6 +26,11 @@ from thread_page import render_thread_page  # noqa: E402  pylint: disable=wrong-
 
 FIXTURE_PATH = REPO_ROOT / "tests" / "fixtures" / "thread_mesh" / "nodes.json"
 PLUGIN_ID = "com.simons-plugins.indigo-matter"
+#: The SAME instant, in both forms render_thread_page wants (#344 review C2:
+#: the caller passes generated_at and now from the SAME moment, so the
+#: header timestamp and every cache age on the page agree with each other).
+GENERATED_AT = "2026-09-02T12:00:00Z"
+NOW = datetime(2026, 9, 2, 12, tzinfo=timezone.utc)
 
 
 def _fixture_diags() -> list:
@@ -34,20 +40,25 @@ def _fixture_diags() -> list:
         attrs = raw["attributes"]
         name = attrs.get("0/40/3") or attrs.get("0/40/1") or ""
         diag = parse_node_diag(raw["node_id"], name, raw["available"], attrs)
-        assert diag is not None
+        if diag is None:
+            raise SystemExit(f"fixture node {raw['node_id']:#x} did not parse")
         diags.append(diag)
     return diags
 
 
 def main() -> None:
+    """Render the real test fixture through :func:`render_thread_page` and
+    write the HTML to the path given as the sole command-line argument —
+    the fastest way to eyeball a layout/CSS change (open the file in a
+    browser) without a live matter-server or an Indigo install running."""
     if len(sys.argv) != 2:
         print(f"usage: {sys.argv[0]} <out.html>", file=sys.stderr)
         raise SystemExit(2)
 
     diags = _fixture_diags()
     mesh = build_mesh(diags)
-    html = render_thread_page(mesh, diags, generated_at="2026-09-02T12:00:00Z",
-                              live=False, plugin_id=PLUGIN_ID)
+    html = render_thread_page(mesh, diags, generated_at=GENERATED_AT, live=False,
+                              plugin_id=PLUGIN_ID, now=NOW)
 
     out_path = Path(sys.argv[1])
     out_path.write_text(html, encoding="utf-8")

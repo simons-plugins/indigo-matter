@@ -38,7 +38,7 @@ _STALE_AGE_SECONDS = 3600.0
 _MARGIN = 28
 #: Ring radii (#346 fix 5: tightened a little for phone-width legibility —
 #: same leader/router/end-device glyph sizes, just less empty space between
-#: rings). Leader/router/end-device radii are unchanged.
+#: rings).
 _RING1_MIN_R = 120.0
 _RING1_TO_RING2_GAP = 105.0
 #: The "2r + 8" spacing floor from the layout spec — the extra 8 units is
@@ -46,27 +46,34 @@ _RING1_TO_RING2_GAP = 105.0
 #: `+4` the overlap test itself demands (#346).
 _MIN_GLYPH_GAP = 8.0
 
-#: #346 fix 1: a chord whose perpendicular distance from the centre falls
-#: inside this radius visually cuts through the centre node's own two label
-#: lines (name + role/caption) below it. `_GLYPH_R_LEADER` (30) is used even
-#: when there is no actual leader glyph at the centre — the label ZONE is
-#: what matters, not whether a leader happens to occupy it.
+#: #346 fix 1: the margin ADDED to `_GLYPH_R_LEADER` to get `_LABEL_ZONE_R`
+#: below — a chord whose perpendicular distance from the centre falls
+#: inside that combined radius visually cuts through the centre node's own
+#: two label lines (name + role/caption) below it. `_GLYPH_R_LEADER` (30) is
+#: used even when there is no actual leader glyph at the centre — the label
+#: ZONE is what matters, not whether a leader happens to occupy it. The zone
+#: is a full circle (not just the space below the centre) — a deliberate
+#: over-approximation: a chord skimming the TOP of the centre is penalised
+#: too, since a wide glyph or an "above"-placed label (#346 fix A2) can
+#: still reach up into that space.
 _LABEL_ZONE_MARGIN = 70.0
 
-#: #346 fix 3: a node's drawn label is sized from its ACTUAL (truncated)
-#: name, not a flat guess — the constant that broke was `label_room`, a
-#: single fixed number that clipped any name long enough to need more than
-#: it. `_LABEL_CHAR_WIDTH` is units per character at the name font size —
-#: measured against the real fixture's rendered text (`getComputedTextLength`
-#: in a browser, 14px -apple-system), NOT the fix's own suggested 6.8: an
-#: upper-case-heavy name ("TIMMERFLOTTE...") averages ~8.6, and 6.8
-#: under-estimated it enough to reproduce the exact clipping bug this
-#: constant exists to fix — an SVG clips content outside its own viewBox by
-#: default, so under-estimating a label's width silently re-clips it.
-#: `_LABEL_BOX_ABOVE`/`_LABEL_BOX_BELOW` are the (deliberately generous)
-#: vertical reach above/below a label's anchor point — below covers both
-#: label lines ("two lines tall").
+#: #346 fix 3: the viewBox is sized from the ACTUAL drawn label lines (name
+#: AND role, #346 review A2), not a flat guess — an SVG clips anything
+#: outside its own viewBox by default, so under-estimating a label silently
+#: re-clips it. `_LABEL_CHAR_WIDTH` is units per character at the 14px name
+#: font; `_ROLE_CHAR_WIDTH` is the same ratio at the 11px role font
+#: (11/14 of it). Measured, reproducibly: render the fixture
+#: (`python3 tools/render_thread_fixture.py out.html`), open it in a
+#: browser, and read `document.querySelector('tspan').getComputedTextLength()`
+#: on the TIMMERFLOTTE tspan (22 chars, upper-case-heavy — the widest name
+#: in the fixture) divided by its character count: ~8.6 at 14px, rounded up
+#: to 8.7 so the estimate never under-shoots. `_LABEL_BOX_ABOVE`/
+#: `_LABEL_BOX_BELOW` are the (deliberately generous) vertical reach
+#: above/below a label's anchor point — below covers both label lines
+#: ("two lines tall").
 _LABEL_CHAR_WIDTH = 8.7
+_ROLE_CHAR_WIDTH = _LABEL_CHAR_WIDTH * 11 / 14
 _LABEL_BOX_ABOVE = 12.0
 _LABEL_BOX_BELOW = 30.0
 
@@ -84,9 +91,9 @@ _GLYPH_R_UNKNOWN = 12.0
 #: #346 fix 1 — see `_LABEL_ZONE_MARGIN`'s own comment above.
 _LABEL_ZONE_R = _GLYPH_R_LEADER + _LABEL_ZONE_MARGIN
 
-#: Ring-1 ordering (#346 §1): exhaustive permutation search below this many
-#: nodes (<= 5040 permutations with the first node fixed), a greedy walk
-#: above it.
+#: Ring-1 ordering (#346 §1): exhaustive permutation search AT OR BELOW this
+#: many nodes (the first node fixed, so 8 nodes is 7! = 5040 permutations),
+#: a greedy walk above it.
 _EXHAUSTIVE_RING1_LIMIT = 8
 
 # Display bands (#346) — the MAP's own thresholds for colouring an edge line,
@@ -148,7 +155,8 @@ def _severity_rank(severity: str) -> int:
 # Link merging — a link between two routers is reported from BOTH sides
 # (build_mesh adds one MeshLink per reporting node), so the page shows ONE
 # edge per pair, using the worse of the two sides' readings for colour and
-# both readings in the label when they disagree (#334).
+# both readings in the tooltip when they disagree (#334; review C2 — no
+# edge draws a visible label at all any more, #346 fix 2).
 # ---------------------------------------------------------------------------
 
 def _link_worst_reading(avg_rssi: Optional[int], last_rssi: Optional[int]) -> Optional[int]:
@@ -190,7 +198,7 @@ def _merged_links(links) -> list[dict]:
     return merged
 
 
-def _link_label(link: dict) -> str:
+def _link_tooltip_text(link: dict) -> str:
     if link["rssi_values"]:
         rssi_text = "/".join(str(v) for v in link["rssi_values"]) + " dBm"
     else:
@@ -208,9 +216,15 @@ def _is_router_node(node) -> bool:
     return node.foreign or node.role_name in ("Router", "Leader")
 
 
+#: review A3: a node with `role_name == "Leader"` but `is_leader=False`
+#: (a minority-partition leader, or no majority_leader at all) used to fall
+#: through to "unknown" -- a dashed r=12 circle, no RLOC16, no legend row --
+#: even though it is exactly as much a router as any other. "Leader" maps
+#: to the same size/kind as "Router" here; the role sub-line ("Leader ·
+#: router N") is what tells the two apart.
 _ROLE_GLYPH_R = {
-    "Router": _GLYPH_R_ROUTER, "Reed": _GLYPH_R_REED, "EndDevice": _GLYPH_R_ED,
-    "SleepyEndDevice": _GLYPH_R_ED, "Child": _GLYPH_R_CHILD,
+    "Router": _GLYPH_R_ROUTER, "Leader": _GLYPH_R_ROUTER, "Reed": _GLYPH_R_REED,
+    "EndDevice": _GLYPH_R_ED, "SleepyEndDevice": _GLYPH_R_ED, "Child": _GLYPH_R_CHILD,
 }
 
 
@@ -299,7 +313,7 @@ def _greedy_ring1_order(canonical: list, chords: list[tuple[str, str]]) -> list:
     for a, b in chords:
         degree[a] += 1
         degree[b] += 1
-    start = sorted(canonical, key=lambda n: (-degree[n.key], n.foreign, n.name))[0]
+    start = sorted(canonical, key=lambda n: (-degree[n.key], n.foreign, n.name, n.key))[0]
 
     order = [start]
     placed = {start.key}
@@ -308,7 +322,7 @@ def _greedy_ring1_order(canonical: list, chords: list[tuple[str, str]]) -> list:
         def _score(key: str) -> tuple:
             linked = sum(1 for a, b in chords if (a == key and b in placed) or (b == key and a in placed))
             node = by_key[key]
-            return -linked, node.foreign, node.name
+            return -linked, node.foreign, node.name, node.key
 
         remaining.sort(key=_score)
         next_key = remaining.pop(0)
@@ -382,7 +396,7 @@ def _order_ring1(members: list, chords: list[tuple[str, str]], has_orphans: bool
     no randomness anywhere."""
     if len(members) <= 1:
         return list(members)
-    canonical = sorted(members, key=lambda n: (n.foreign, n.name))
+    canonical = sorted(members, key=lambda n: (n.foreign, n.name, n.key))
     if len(canonical) > _EXHAUSTIVE_RING1_LIMIT:
         return _greedy_ring1_order(canonical, chords)
 
@@ -404,13 +418,14 @@ def _layout_full(mesh):  # pylint: disable=too-many-locals
     risks disagreeing with the positions actually drawn.
 
     The viewBox (#346 fix 3) is sized from the mesh's ACTUAL extents — every
-    glyph's circle/square AND its estimated label box — never a flat
-    ``label_room`` guess that clipped any name long enough to outgrow it.
-    Computed as a SQUARE centred on the leader (or the empty centre, if
-    none): the half-side is the largest distance any glyph or label corner
-    reaches from that centre, so the leader-is-at-the-centre / ring-1-is-
-    equidistant properties (deliberately kept, not asked to change) hold
-    regardless of which names happen to be long.
+    glyph's circle/square AND its estimated label box, sized from the actual
+    drawn label lines (review A2: name AND role) — because an SVG silently
+    clips anything outside its own viewBox. Computed as a SQUARE centred on
+    the leader (or the empty centre, if none): the half-side is the largest
+    distance any glyph or label corner reaches from that centre, so the
+    leader-is-at-the-centre / ring-1-is-equidistant properties (deliberately
+    kept, not asked to change) hold regardless of which names happen to be
+    long.
 
     (measured: `pylint --rcfile pyproject.toml ".../thread_page.py"` flags
     this at >15 locals — genuine, not a shortcut: ring 1's sector width,
@@ -452,7 +467,7 @@ def _layout_full(mesh):  # pylint: disable=too-many-locals
     ring2_angle: dict[str, float] = {}
     for index, members in groups.items():
         center_angle = ring1_angle[ring1[index].key] if index is not None else orphan_angle
-        ordered = sorted(members, key=lambda n: (n.foreign, n.name))
+        ordered = sorted(members, key=lambda n: (n.foreign, n.name, n.key))
         count = len(ordered)
         for j, node in enumerate(ordered):
             offset = 0.0 if count == 1 else (j - (count - 1) / 2) * (sector_width / count)
@@ -493,7 +508,8 @@ def _layout_full(mesh):  # pylint: disable=too-many-locals
     half_extent = 0.0
     for key, (x, y, r, angle) in relative.items():
         above = ring1_above.get(key, False)
-        half_extent = max(half_extent, _half_extent(x, y, r, _display_name(nodes_by_key[key]), angle, above=above))
+        lines = _name_and_role_lines(nodes_by_key[key])
+        half_extent = max(half_extent, _half_extent(x, y, r, lines, angle, above=above))
 
     center = half_extent + _MARGIN
     side = 2 * center
@@ -515,10 +531,9 @@ def _layout(mesh) -> dict[str, tuple[float, float, float]]:
 # ---------------------------------------------------------------------------
 
 #: #346 fix 4: the old 18-char limit truncated names that would have fit —
-#: e.g. "Router 14 (leader…" cut mid-caption. 22 is the visible-text length
-#: budget; truncation only triggers once a name actually exceeds 24 (so a
-#: name of 19-24 chars, which fits, is left alone rather than shaved for no
-#: reason), and never keeps fewer than 3 real characters before the ellipsis.
+#: e.g. "Router 14 (leader…" cut mid-caption. Names up to 24 chars are shown
+#: whole; longer ones are cut to 21 + "…" (22 visible). The 3-char floor
+#: only matters for an explicit `limit` shorter than 4.
 _TRUNCATE_LIMIT = 22
 _TRUNCATE_THRESHOLD = 24
 
@@ -597,8 +612,31 @@ def _text_anchor_for_angle(angle: float) -> str:
 #: cases); plus a second reserved gap, ABOVE only, for the role line that
 #: sits farther out than the name there (the below case already has its
 #: second line grow further away via `dy`, so it needs no extra reservation).
+#: 22 (review A4) is not arbitrary: it is the smallest value that keeps
+#: `_LABEL_BOX_BELOW`'s generous downward reach from re-entering the glyph
+#: it is trying to clear, in BOTH the ring-1/centre (needs >= 16) and the
+#: ring-2 straight-up (needs >= 20, independent of r) stacking-upward
+#: formulas below -- `test_warning_badge_never_intersects_its_own_label_box_in_any_position`
+#: pins this against the glyph box directly, not just against the badge.
 _LABEL_GAP = 14.0
-_LABEL_ABOVE_STACK = 14.0
+_LABEL_ABOVE_STACK = 22.0
+
+
+def _label_stacks_upward(outward_angle: Optional[float], above: bool) -> bool:
+    """Whether a label's tspans should stack UPWARD (role farthest, name
+    nearest the glyph) rather than the default downward stack (#346 fix A4
+    — review found a ring-2 node straight above its parent, e.g. BILRESA on
+    the fixture, still stacked downward: its role line landed INSIDE the
+    glyph). True for a ring-1/centre label placed ``above``, and for a
+    ring-2 label whose own angle points close enough to straight up
+    (``text-anchor`` "middle", the same ±15° band :func:`_text_anchor_for_angle`
+    uses) that its whole label sits above the glyph the same way."""
+    if outward_angle is None:
+        return above
+    if _text_anchor_for_angle(outward_angle) != "middle":
+        return False
+    deg = math.degrees(outward_angle) % 360
+    return deg <= 15 or deg >= 345
 
 
 def _label_anchor_point(cx: float, cy: float, r: float, outward_angle: Optional[float],
@@ -608,28 +646,29 @@ def _label_anchor_point(cx: float, cy: float, r: float, outward_angle: Optional[
     (viewBox sizing, #346 fix 3) so the two can never disagree about where a
     label actually sits.
 
-    ``above`` (#346 fix A2) only applies to a ring-1/centre node
-    (``outward_angle is None``): a ring-1 node in the top half of the ring
-    gets its label ABOVE the glyph instead of below, so a spoke or chord
-    running below it — where the label used to sit — can never cross it.
-    The y returned is always the FIRST (topmost, when above) line's
-    baseline; :func:`_label_svg` reserves room below it for a second line."""
+    A label that :func:`_label_stacks_upward` (#346 fix A2, extended by
+    fix A4 to a straight-up ring-2 label too) gets extra clearance
+    reserved beyond the glyph, so its SECOND (nearest-glyph) line still
+    clears the glyph edge — the y/pad returned is always the FIRST
+    (farthest, when stacking upward) line's baseline; :func:`_label_svg`
+    reserves room toward the glyph for the second line."""
+    stack_up = _label_stacks_upward(outward_angle, above)
     if outward_angle is None:
-        if above:
+        if stack_up:
             return "middle", cx, cy - r - _LABEL_GAP - _LABEL_ABOVE_STACK
         return "middle", cx, cy + r + _LABEL_GAP
     anchor = _text_anchor_for_angle(outward_angle)
-    pad = r + 10
+    pad = r + 10 + (_LABEL_ABOVE_STACK if stack_up else 0.0)
     return anchor, cx + pad * math.sin(outward_angle), cy - pad * math.cos(outward_angle)
 
 
 def _label_svg(cx: float, cy: float, r: float, lines: list[str], outward_angle: Optional[float],
                *, above: bool = False) -> str:
     anchor, x, y = _label_anchor_point(cx, cy, r, outward_angle, above)
-    if outward_angle is None and above and len(lines) > 1:
-        # Ring-1 top half (#346 fix A2): the stack reads role (farthest from
-        # the glyph, drawn first/topmost) then name (closest to the glyph,
-        # second) — name stays the line nearest the glyph either way.
+    if _label_stacks_upward(outward_angle, above) and len(lines) > 1:
+        # Stacking upward (#346 fix A2/A4): role (farthest from the glyph,
+        # drawn first/topmost) then name (closest to the glyph, second) —
+        # name stays the line nearest the glyph either way.
         tspans = f'<tspan x="{x:.1f}" class="role">{_escape(lines[1])}</tspan>'
         tspans += f'<tspan x="{x:.1f}" dy="1.15em">{_escape(lines[0])}</tspan>'
     else:
@@ -639,17 +678,23 @@ def _label_svg(cx: float, cy: float, r: float, lines: list[str], outward_angle: 
     return f'<text x="{x:.1f}" y="{y:.1f}" text-anchor="{anchor}" class="node-name">{tspans}</text>'
 
 
-def _label_box(cx: float, cy: float, r: float, name: str, outward_angle: Optional[float],
+def _label_box(cx: float, cy: float, r: float, lines: list[str], outward_angle: Optional[float],
                *, above: bool = False) -> tuple[float, float, float, float]:
-    """Estimated ``(x0, y0, x1, y1)`` bounding box of a node's drawn name
-    label (#346 fix 3) — sized from the ACTUAL (truncated) name, anchored the
-    same way :func:`_label_svg` draws it, so the viewBox this feeds never
-    clips a label the way a flat ``label_room`` guess did. The SAME generous
-    above/below margins cover both label directions: :func:`_label_svg`'s
-    tspans always stack DOWNWARD from the anchor y regardless of ``above``,
-    only the anchor y's own position moves."""
+    """Estimated ``(x0, y0, x1, y1)`` bounding box of a node's drawn label
+    (#346 fix 3; review A2) — sized from the lines ACTUALLY drawn (name AND
+    role, both already truncated/formatted by the caller, typically
+    :func:`_name_and_role_lines`), anchored the same way :func:`_label_svg`
+    draws them, so the viewBox this feeds never clips a label. A short name
+    with a long role line (review A2's own example: SED "Lamp", role
+    "Sleepy end device") is wider by its ROLE line, not its name — the width
+    is the wider of the two, at each line's own font size. The SAME
+    generous above/below margins cover both stacking directions
+    (:func:`_label_svg` stacks tspans toward the glyph either way, #346
+    fix A4) — only the anchor y's own position moves."""
     anchor, x, y = _label_anchor_point(cx, cy, r, outward_angle, above)
-    width = _LABEL_CHAR_WIDTH * len(_truncate(name))
+    width = _LABEL_CHAR_WIDTH * len(lines[0])
+    if len(lines) > 1:
+        width = max(width, _ROLE_CHAR_WIDTH * len(lines[1]))
     if anchor == "start":
         x0, x1 = x, x + width
     elif anchor == "end":
@@ -659,14 +704,14 @@ def _label_box(cx: float, cy: float, r: float, name: str, outward_angle: Optiona
     return x0, y - _LABEL_BOX_ABOVE, x1, y + _LABEL_BOX_BELOW
 
 
-def _half_extent(x: float, y: float, r: float, name: str, outward_angle: Optional[float],
+def _half_extent(x: float, y: float, r: float, lines: list[str], outward_angle: Optional[float],
                  *, above: bool = False) -> float:
     """The largest ``|x|`` or ``|y|`` reached by this node's glyph OR its
     label box, in the mesh-centred frame (leader/centre at the origin) —
     what the viewBox's symmetric half-side must be at least as big as
     (#346 fix 3)."""
     extent = max(abs(x) + r, abs(y) + r)
-    x0, y0, x1, y1 = _label_box(x, y, r, name, outward_angle, above=above)
+    x0, y0, x1, y1 = _label_box(x, y, r, lines, outward_angle, above=above)
     for corner_x, corner_y in ((x0, y0), (x1, y0), (x0, y1), (x1, y1)):
         extent = max(extent, abs(corner_x), abs(corner_y))
     return extent
@@ -689,17 +734,16 @@ def _badge_corner_signs(outward_angle: Optional[float], above: bool) -> tuple[fl
     top-right; label to the right (ring-2, text-anchor start) -> top-left;
     label to the left (text-anchor end) -> top-right. A near-vertical ring-2
     label (text-anchor middle) follows the same above/below rule as the
-    centre/ring-1 case, using its own angle to tell which."""
-    if outward_angle is None:
-        return (1.0, 1.0) if above else (1.0, -1.0)
-    anchor = _text_anchor_for_angle(outward_angle)
-    if anchor == "start":
-        return -1.0, -1.0
-    if anchor == "end":
-        return 1.0, -1.0
-    deg = math.degrees(outward_angle) % 360
-    is_up = deg <= 15 or deg >= 345
-    return (1.0, 1.0) if is_up else (1.0, -1.0)
+    centre/ring-1 case — :func:`_label_stacks_upward` is the SAME test that
+    decides whether that label's own text stacks upward, so the badge and
+    the label can never disagree about which side is "up" here."""
+    if outward_angle is not None:
+        anchor = _text_anchor_for_angle(outward_angle)
+        if anchor == "start":
+            return -1.0, -1.0
+        if anchor == "end":
+            return 1.0, -1.0
+    return (1.0, 1.0) if _label_stacks_upward(outward_angle, above) else (1.0, -1.0)
 
 
 def _badge_svg(circle: tuple[float, float, float], severity: str,
@@ -713,7 +757,8 @@ def _badge_svg(circle: tuple[float, float, float], severity: str,
 
 
 _ROLE_GLYPH_KIND = {
-    "Router": "router", "Reed": "reed", "EndDevice": "ed", "SleepyEndDevice": "ed", "Child": "child",
+    "Router": "router", "Leader": "router", "Reed": "reed", "EndDevice": "ed",
+    "SleepyEndDevice": "ed", "Child": "child",
 }
 
 
@@ -765,6 +810,18 @@ def _inner_text_svg(circle: tuple[float, float, float], node) -> str:
             f'class="glyph-text">{_escape(text)}</text>')
 
 
+def _node_title(node, flags_for_node: list) -> str:
+    """The glyph's ``<title>`` tooltip: the node's name, its RLOC16 when
+    known (review B3 -- the legend now says the inner glyph text is only on
+    the LARGER glyphs, so a small end device's own RLOC16 has to live
+    somewhere; the tooltip already exists for every node regardless of
+    size), then every flag message, one per line."""
+    lines = [node.name]
+    if node.rloc16 is not None:
+        lines.append(f"RLOC16 0x{node.rloc16:04X}")
+    return "\n".join(_escape(t) for t in (*lines, *(f.message for f in flags_for_node)))
+
+
 def _node_glyph_svg(node, circle: tuple[float, float, float], flags_for_node: list,
                      *, outward_angle: Optional[float] = None, label_above: bool = False) -> str:
     """One node's glyph, inner RLOC16, name/role labels and warning badge.
@@ -785,8 +842,7 @@ def _node_glyph_svg(node, circle: tuple[float, float, float], flags_for_node: li
 
     severity = _worst_flag_severity(flags_for_node)
     badge_svg = _badge_svg(circle, severity, outward_angle, label_above) if severity else ""
-
-    title = "\n".join(_escape(t) for t in (node.name, *(f.message for f in flags_for_node)))
+    title = _node_title(node, flags_for_node)
 
     return (
         f'<g class="node node-{kind}">'
@@ -798,16 +854,22 @@ def _node_glyph_svg(node, circle: tuple[float, float, float], flags_for_node: li
 
 # ---------------------------------------------------------------------------
 # Edges (#346 §3) — straight lines, glyph-edge to glyph-edge, quiet by
-# default. A hover/long-press title always carries the reading; a visible
-# label is drawn only on a "poor" edge.
+# default. No band ever draws a visible label (review C1/B5, corrected from
+# an earlier draft that still said "poor" edges did) — the reading lives
+# only in the <title>, which is a hover tooltip on desktop; on a phone rely
+# on the colour, the badge and the flags list.
 # ---------------------------------------------------------------------------
 
 def _shorten_to_glyph_edges(circle_a: tuple[float, float, float],
                              circle_b: tuple[float, float, float]) -> Optional[tuple[float, float, float, float]]:
     """Move each endpoint in from the glyph centre to its own edge (or square
-    half-side) by that glyph's own r — so a chord never overlaps a third
-    node's glyph the way a raw centre-to-centre line would (#346 §3).
-    ``None`` for two coincident points (should not happen; defensive)."""
+    half-side) by that glyph's own r, so a line starts and ends AT the two
+    glyphs it connects rather than under them (#346 §3). Review C3: this
+    function does NOT keep a chord clear of a THIRD node's glyph — that's
+    the ring-1 ordering objective's job (:func:`_ring1_order_score`; on a
+    ring, the only node a chord can otherwise meet is the centre, which the
+    ordering penalises). ``None`` for two coincident points (should not
+    happen; defensive)."""
     ax, ay, ar = circle_a
     bx, by, br = circle_b
     dx, dy = bx - ax, by - ay
@@ -824,6 +886,11 @@ def _link_svg(link: dict, positions: dict, nodes_by_key: dict) -> str:
     own name/role text); the colour, the node's warning badge, the flags
     list, and this edge's own ``<title>`` tooltip already say the same
     thing, so the reading is never actually lost, just quieter."""
+    # Defensive, not a degradation path (review C12): every link's two ends
+    # come from the SAME mesh `_layout` positioned, so both keys are always
+    # present in practice — a dropped one would mean the layout itself
+    # failed to place a real node, a layout bug to fix, not something this
+    # render function should quietly paper over.
     if link["a"] not in positions or link["b"] not in positions:
         return ""
     shortened = _shorten_to_glyph_edges(positions[link["a"]], positions[link["b"]])
@@ -833,7 +900,7 @@ def _link_svg(link: dict, positions: dict, nodes_by_key: dict) -> str:
 
     color = _edge_color(link["overall_rssi"])
     title = (f'{_escape(nodes_by_key[link["a"]].name)} ↔ {_escape(nodes_by_key[link["b"]].name)}: '
-             f'{_escape(_link_label(link))}')
+             f'{_escape(_link_tooltip_text(link))}')
 
     return (
         f'<g class="edge">'
@@ -867,38 +934,59 @@ _MAP_CSS = (
 # ---------------------------------------------------------------------------
 
 def _legend_swatch(kind: str) -> str:
+    # review B1: "foreign_leader" replaces the old "border_router" swatch —
+    # a solid light-blue square the map never actually draws (`_glyph_kind`
+    # has no plain "the leader is unowned but not a BR" case; a foreign
+    # leader is ALWAYS drawn split). "unknown" (review A3) and "child" match
+    # `_glyph_shape_svg`'s own dashed-circle / filled-grey-circle exactly.
     shapes = {
         "leader": '<circle cx="10" cy="10" r="8" fill="var(--glyph-leader)"/>',
         "router": '<circle cx="10" cy="10" r="8" fill="var(--glyph-router)"/>',
         "reed": '<circle cx="10" cy="10" r="7" fill="none" stroke="var(--glyph-ed)" stroke-width="3"/>',
         "ed": '<circle cx="10" cy="10" r="6" fill="var(--glyph-ed)"/>',
-        "border_router": '<rect x="2" y="2" width="16" height="16" rx="4" fill="var(--glyph-br)"/>',
+        "child": '<circle cx="10" cy="10" r="5" fill="var(--glyph-child)"/>',
         "foreign": '<rect x="2" y="2" width="16" height="16" rx="4" fill="var(--glyph-foreign)"/>',
+        "foreign_leader": (
+            '<path d="M2 2h8v16H2z" fill="var(--glyph-br)"/>'
+            '<path d="M10 2h8v16h-8z" fill="var(--glyph-leader)"/>'
+        ),
+        "unknown": ('<circle cx="10" cy="10" r="7" fill="none" stroke="var(--glyph-foreign)" '
+                    'stroke-width="2" stroke-dasharray="3 3"/>'),
         "warn": '<polygon points="10,3 2,17 18,17" fill="var(--badge-warn)"/>',
     }
     return f'<svg width="20" height="20" viewBox="0 0 20 20" aria-hidden="true">{shapes[kind]}</svg>'
 
 
 #: (glyph kind, display name, plain-English one-liner) — Thread Doctor's own
-#: wording as the model (#346 §4).
+#: wording as the model (#346 §4). The `kind` column matches `_glyph_kind`'s
+#: own return values exactly (`test_every_glyph_kind_the_map_can_draw_has_a_legend_row`
+#: pins this both ways: every drawable kind has a row, and "warn" is the
+#: only row that isn't itself a glyph kind — it documents the badge overlay).
 _LEGEND_NODE_ROWS = (
     ("leader", "Leader", "the router currently coordinating the mesh"),
     ("router", "Router", "relays traffic for other devices"),
     ("reed", "REED", "mains-powered, radio always on, but the mesh hasn't promoted it to router"),
     ("ed", "End device / Sleepy end device",
      "non-routing device (plug, bulb, sensor); sleepy ones only wake to report"),
-    ("border_router", "Border router",
-     "HomePod, Apple TV or other gateway (drawn split when it is also the leader)"),
+    ("child", "Child",
+     "an unidentified child of one of your routers — Thread reports it exists, but not which device it is"),
     ("foreign", "Unidentified router",
      "a router this plugin doesn't own; drawn from what your devices report about it"),
+    ("foreign_leader", "Border router + leader",
+     "the leader is a router this plugin doesn't own; almost always your HomePod or Apple TV"),
+    ("unknown", "Role unknown", "the device hasn't reported a Thread role yet, or is detached"),
     ("warn", "Warning triangle", "this device has a warn (amber) or bad (red) finding; see the flags list"),
 )
 
+#: review B4: the range text is DERIVED from the `_BAND_*` constants
+#: (rather than hand-typed, which could silently drift from the boundaries
+#: `_rssi_band` actually uses) — everything here is one dBm off the
+#: adjacent band's own threshold, by construction.
 _LEGEND_BAND_ROWS = (
-    ("excellent", "Excellent", "-65 dBm or stronger"),
-    ("good", "Good", "-77 to -66 dBm"),
-    ("fair", "Fair", "-87 to -78 dBm"),
-    ("poor", "Poor", "-88 dBm or weaker"),
+    ("excellent", "Excellent", f"{_BAND_EXCELLENT} dBm or stronger"),
+    ("good", "Good", f"{_BAND_GOOD} to {_BAND_EXCELLENT - 1} dBm"),
+    ("fair", "Fair", f"{_BAND_FAIR} to {_BAND_GOOD - 1} dBm"),
+    ("poor", "Poor", f"{_BAND_FAIR - 1} dBm or weaker"),
     ("unknown", "Unknown", "signal not reported"),
 )
 
@@ -915,20 +1003,30 @@ def _render_legend() -> str:
         for kind, title, desc in _LEGEND_BAND_ROWS
     )
     return (
-        '<details class="legend msg"><summary>What do the colours mean?</summary>'
+        # review A5: its own container, not `.msg` (a hard-coded light-amber
+        # box with no dark-mode override — unreadable in dark mode).
+        '<details class="legend"><summary>What do the colours mean?</summary>'
         '<h3>Nodes</h3>'
         f'<ul>{node_items}</ul>'
         '<h3>Lines (Thread link signal strength)</h3>'
         f'<ul>{band_items}</ul>'
         '<h3>Terms</h3>'
-        '<p><strong>RLOC16</strong> — the 4-hex-digit address inside each glyph, the id neighbour '
-        'tables use.</p>'
+        # review B3: RLOC16 is only INSIDE the larger glyphs — an end device's
+        # r=12 (or smaller) glyph never carries inner text (#346 §2: "small
+        # glyphs get no inner text"); its RLOC16, when known, is in its own
+        # node's tooltip instead (see _node_glyph_svg's title).
+        '<p><strong>RLOC16</strong> — the 4-hex-digit address inside the larger glyphs (leader, '
+        'router, REED, unidentified router); end devices are too small and carry it in their '
+        'tooltip.</p>'
         '<p><strong>Partition</strong> — the group of routers currently agreeing on one leader; '
         "nodes in different partitions can't reach each other yet.</p>"
         '<p><strong>Frame error</strong> — the percentage of radio frames to a neighbour that failed '
         'to decode.</p>'
-        '<p class="legend-note">If the leader fails, the mesh re-elects one in roughly 30 s; devices '
-        'may briefly stall.</p>'
+        # review B2: "roughly 30 s" was an unsourced, likely-wrong number
+        # (the Thread spec's own re-election timeout is on the order of
+        # minutes) — dropped rather than corrected to an unverified one.
+        '<p class="legend-note">If the leader fails, the routers elect a new one automatically; '
+        'devices may briefly stall.</p>'
         "<p class=\"legend-note\">Border routers and other routers this plugin doesn't own can't be "
         'read directly — the map shows them from what your own devices report.</p>'
         '</details>'
@@ -939,6 +1037,9 @@ def _render_map(mesh) -> str:
     if not mesh.nodes:
         return '<p class="msg">No Thread nodes to draw.</p>'
     positions, ring2_angle, ring1_above, side = _layout_full(mesh)
+    # `if node.key in positions` here and below: defensive, same reasoning
+    # as `_link_svg`'s own guard (review C12) — `_layout_full` places every
+    # node in `mesh.nodes`, so this never actually filters anything out.
     nodes_by_key = {node.key: node for node in mesh.nodes if node.key in positions}
     flags_by_node: dict[str, list] = {}
     for flag in mesh.flags:
@@ -1217,6 +1318,7 @@ def _document(body: str) -> str:
    --edge-excellent: #3fb44f; --edge-good: #e6c229; --edge-fair: #f0932b;
    --edge-poor: #e0443a; --edge-unread: #9a9a9a;
    --badge-warn: #d9a406; --badge-bad: #c0392b;
+   --panel-bg: #fafafa; --panel-border: #ddd;
  }}
  @media (prefers-color-scheme: dark) {{
    :root {{
@@ -1227,6 +1329,7 @@ def _document(body: str) -> str:
      --edge-excellent: #5cc96a; --edge-good: #e8cf57; --edge-fair: #f2a35c;
      --edge-poor: #e56f66; --edge-unread: #b0b0b0;
      --badge-warn: #e0b73a; --badge-bad: #d9695f;
+     --panel-bg: #1e1e1e; --panel-border: #444;
    }}
  }}
  body {{ font: 16px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
@@ -1246,7 +1349,8 @@ def _document(body: str) -> str:
  .links a {{ margin-right: 1rem; }}
  .msg {{ background: #fff6d6; border: 1px solid #e8d48a; padding: .7rem; border-radius: .4rem; }}
  .warn {{ background: #fdeaea; border: 1px solid #d99; padding: .7rem; border-radius: .4rem; }}
- details.legend {{ margin: .8rem 0; }}
+ details.legend {{ margin: .8rem 0; background: var(--panel-bg); border: 1px solid var(--panel-border);
+                  color: var(--fg); padding: .7rem; border-radius: .4rem; }}
  details.legend summary {{ font-weight: 700; cursor: pointer; }}
  details.legend h3 {{ margin: .8rem 0 .3rem; font-size: .85rem; }}
  details.legend ul {{ list-style: none; padding: 0; margin: 0 0 .4rem; }}
