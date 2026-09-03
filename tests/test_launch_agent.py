@@ -114,6 +114,23 @@ def test_controller_keeps_the_legacy_marker_filename(tmp_path, mock_logger):
     assert sp.spec.label == LABEL
 
 
+def test_agent_spec_env_passes_through_but_can_never_override_path(tmp_path, mock_logger):
+    """`env` is merged FIRST and PATH written LAST (2026.32.1).
+
+    A flipped merge order would let a spec's PATH entry strip the resolved node
+    bin dir, and that agent would crash-loop on its next fresh bootstrap with
+    node unable to find its co-located helpers — surfacing only as "connection
+    refused". Extra variables must still pass through untouched.
+    """
+    import dataclasses
+    spec = dataclasses.replace(_spec("com.example.thing", "thing", "/tmp/thing-store"),
+                               env=(("PATH", "/evil"), ("FOO", "bar")))
+    agent = _agent(tmp_path / "home", spec, mock_logger)
+    env = plistlib.loads(agent.build_plist())["EnvironmentVariables"]
+    assert env["PATH"] == f"{os.path.dirname(agent.npx_path)}:/usr/bin:/bin"
+    assert env["FOO"] == "bar"
+
+
 # ---------------------------------------------------------------------------
 # Per-agent stamp isolation (the reason the extraction can't just share one marker)
 # ---------------------------------------------------------------------------

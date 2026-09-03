@@ -329,3 +329,25 @@ def test_uninstall_never_touches_the_storage(tmp_path, mock_logger):
     bridge.uninstall()
     assert not os.path.exists(bridge.plist_path)
     assert os.path.isdir(bridge.storage_path)
+
+
+# ---------------------------------------------------------------------------
+# Log level: the bridge must not inherit matter.js's DEBUG default (2026.32.1)
+# ---------------------------------------------------------------------------
+
+def test_the_bridge_plist_pins_matter_js_to_info_and_the_controller_is_untouched(
+        tmp_path, mock_logger):
+    """launchd never rotates StandardOutPath, so the level IS the size cap.
+
+    The controller agent must NOT gain the variable: any change to its plist
+    bytes re-bootstraps it on the next start and drops every Thread session.
+    """
+    import plistlib
+    bridge = _bridge(tmp_path, mock_logger)
+    env = plistlib.loads(bridge.build_plist())["EnvironmentVariables"]
+    assert env["MATTER_LOG_LEVEL"] == "info"
+    assert env["PATH"].endswith(":/usr/bin:/bin")      # PATH is still the agent's own
+    controller = ServerProcess({}, mock_logger, home=str(tmp_path / "home"),
+                               npx_path=str(tmp_path / "home" / "bin" / "npx"),
+                               runner=FakeRunner())
+    assert "MATTER_LOG_LEVEL" not in plistlib.loads(controller.build_plist())["EnvironmentVariables"]
