@@ -3,6 +3,17 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
+## 2026.32.1 — the bridge node logs at INFO, not matter.js's DEBUG default
+
+- The bridge LaunchAgent now sets `MATTER_LOG_LEVEL=info`. Nothing had ever set
+  a level, so matter.js ran at its DEBUG default and launchd's `StandardOutPath`
+  grew without rotation — 1.4 GB in a fortnight on the reference install, 99.5%
+  of it per-message MRP and subscription chatter. INFO keeps every invoke,
+  subscribe, session and endpoint line. `AgentSpec` gains an optional `env`
+  tuple to carry it; the matter-server agent is unchanged (it already logs at
+  INFO), so only the bridge agent is re-bootstrapped once on the first start
+  after this upgrade.
+
 ## 2026.32.0 — the Thread mesh page is drawn radially with role glyphs (#346)
 
 The Thread mesh page's map was a three-row layout (leader row, router row,

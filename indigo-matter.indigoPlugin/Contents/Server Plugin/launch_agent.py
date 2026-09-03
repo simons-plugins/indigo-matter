@@ -111,6 +111,11 @@ class AgentSpec:
         is the difference between a fixable state and a support thread. Blank
         falls back to the old wording via :attr:`install_menu_name`, which is
         right for an agent that has no menu at all.
+    :param env: extra ``EnvironmentVariables`` for the plist, as ``(name, value)``
+        pairs (a tuple, so the frozen spec stays hashable). ``PATH`` is always set
+        by :meth:`LaunchAgent.build_plist` and cannot be overridden here. Changing
+        a spec's ``env`` changes its plist digest, so the next plugin start
+        bootouts and re-bootstraps THAT agent only — see :meth:`_apply_plist`.
     """
 
     label: str
@@ -127,6 +132,7 @@ class AgentSpec:
     port: Optional[int] = None
     applied_marker: Optional[str] = None
     install_menu: str = ""
+    env: tuple[tuple[str, str], ...] = ()
 
     @property
     def applied_marker_name(self) -> str:
@@ -254,7 +260,7 @@ class LaunchAgent:
             "KeepAlive": {"SuccessfulExit": False, "Crashed": True},
             "StandardOutPath": out_log,
             "StandardErrorPath": err_log,
-            "EnvironmentVariables": {"PATH": f"{npx_dir}:/usr/bin:/bin"},
+            "EnvironmentVariables": {**dict(self.spec.env), "PATH": f"{npx_dir}:/usr/bin:/bin"},
         }
         return plistlib.dumps(spec)
 

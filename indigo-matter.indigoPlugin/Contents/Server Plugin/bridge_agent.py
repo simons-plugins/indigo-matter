@@ -212,6 +212,13 @@ class BridgeProcess(LaunchAgent):
                 # first-class §7 failure, reported by the node at startup.
                 port=int(ws_port),
                 install_menu=BRIDGE_INSTALL_MENU,
+                # matter.js defaults to DEBUG and launchd never rotates
+                # StandardOutPath: on jarvis that was 1.4 GB in a fortnight, of
+                # which 99.5% by bytes was DEBUG (per-message MRP/subscription
+                # chatter). INFO keeps every Invoke, Subscribe, session and
+                # endpoint line — everything a diagnosis has ever needed.
+                # matter.js maps MATTER_LOG_LEVEL onto its `log.level` variable.
+                env=(("MATTER_LOG_LEVEL", "info"),),
             ),
             prefs, logger,
             home=resolved_home, npx_path=npx_path,
