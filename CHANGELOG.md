@@ -9,9 +9,16 @@ current version is `Info.plist`'s `PluginVersion`.
   already-off lamp while its timed-on countdown runs) and the HR-6 no-op line
   (a `stepColor` command dropped because CIE xy steps are not converted) are
   logged at `info` instead of `debug`, so they survive the `MATTER_LOG_LEVEL=info`
-  the LaunchAgent now sets. The per-value "Clamped …" line stays at `debug`: it
-  can fire on every out-of-range colour command and would be noise.
-- `DEFAULT_INSTALL_SPEC` moves to `indigo-matter-bridge@0.17.3`.
+  the LaunchAgent now sets.
+- Deliberately NOT promoted: `clampLogged`'s per-value "Clamped …" line. It
+  sits behind eight call sites (percentages, battery, mireds, hue, thermostat
+  setpoints, humidity, covering position, the CT patch) and fires only when a
+  value was actually clamped — so it is a noise call, not a colour-only one.
+  The cost is real: `endpoints.ts` documents that line as the fingerprint of a
+  plugin-side unit bug (a °F thermostat pushing 68 landing on 50), and at INFO
+  that fingerprint is no longer in the log. Promote it too if that ever bites.
+- `bridge-node` **0.17.3** published to npm; `DEFAULT_INSTALL_SPEC` moves to
+  `indigo-matter-bridge@0.17.3` (publish first, then the pin — CLAUDE.md).
 
 ## 2026.32.1 — the bridge node logs at INFO, not matter.js's DEBUG default
 

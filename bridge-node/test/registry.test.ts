@@ -3448,12 +3448,12 @@ describe("ColorControl command conversion (§4.2, #143)", () => {
         }
     });
 
-    it("stepColor writes nothing — probe-confirmed to write silently in stock, so it is a debug-logged no-op", async () => {
+    it("stepColor writes nothing — probe-confirmed to write silently in stock, so it is an info-logged no-op", async () => {
         // HR-6: stepColorLogic is the one continuous colour command that
         // contradicts the "move*/step* with no target write nothing" pattern
         // (moveColorLogic genuinely writes nothing and is left stock). A
         // silent write nothing here watches is not acceptable, so it is
-        // overridden to no-op + debug log instead of left stock.
+        // overridden to no-op + info log (0.17.3) instead of left stock.
         const h = await harness();
         try {
             await h.registry.reconcile([spec(1, Role.extendedColorLight)], false);

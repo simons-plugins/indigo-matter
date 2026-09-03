@@ -218,9 +218,10 @@ class BridgeProcess(LaunchAgent):
                 # chatter). INFO keeps every inbound Invoke/Subscribe/Read, the
                 # session and endpoint-ready lines. The level is GLOBAL (matter.js
                 # maps MATTER_LOG_LEVEL onto `log.level`, no per-facility knob),
-                # so the node's own two `logger.debug` lines in endpoints.ts (the
-                # HR-6 debug-logged no-op, the #143 ghost-off note) go quiet too —
-                # promote those to `info` in the node if they must survive.
+                # so a node-side `logger.debug` is silenced too. The two that
+                # mattered (the HR-6 no-op, the #143 ghost-off note) were promoted
+                # to `info` in bridge-node 0.17.3; `clampLogged`'s per-value line
+                # is deliberately still `debug` (see the 2026.32.2 changelog).
                 env=(("MATTER_LOG_LEVEL", "info"),),
             ),
             prefs, logger,
