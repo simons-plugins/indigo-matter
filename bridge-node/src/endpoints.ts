@@ -769,8 +769,8 @@ class IndigoOnOffServer extends OnOffServer.with("Lighting") {
      * called any more ({@link IndigoLevelControlServer}'s `transition()`
      * override replaces its whole call site), so the replay case is the
      * *only* remaining explanation for this state, and the branch below is
-     * debug-level bookkeeping rather than a warning about something that
-     * might be wrong. (#203 — a bridge-node *restart* dropping a running
+     * info-level bookkeeping (0.17.3 — the plugin runs the node at INFO)
+     * rather than a warning about something that might be wrong. (#203 — a bridge-node *restart* dropping a running
      * countdown, since the timer is in-memory only — is a separate, still
      * open half of countdown correctness; this guard only concerns the
      * replayed push that follows such a restart.)
@@ -783,7 +783,10 @@ class IndigoOnOffServer extends OnOffServer.with("Lighting") {
             // countdown tests.
             const internal = (this as unknown as { internal?: { timedOnTimer?: { isRunning?: boolean } } }).internal;
             if (!value && internal?.timedOnTimer?.isRunning) {
-                logger.debug(
+                // `info`, not `debug`: the plugin's LaunchAgent runs the node at
+                // MATTER_LOG_LEVEL=info (2026.32.1), and this is the only trace
+                // of a ghost-off that can darken a lamp someone re-lit.
+                logger.info(
                     `Endpoint ${this.endpoint.id}: an off push matched an already-off onOff attribute while a ` +
                         "timed-on countdown is still running — most likely a replayed push racing its own " +
                         "confirmation (harmless; the countdown must survive). Two other reachable causes: a " +
@@ -1015,7 +1018,8 @@ function addWithOverflow(value: number, add: number, min: number, max: number): 
  * (§4.2 P-4 grouped it there) but a probe of this exact matter.js version
  * proved otherwise — it passes `targetValue: currentX + stepX`, which DOES
  * reach `transitionImmediately` and silently move `currentX`/`currentY`
- * (nothing watches them) — so it is overridden to a debug-logged no-op below,
+ * (nothing watches them) — so it is overridden to a logged no-op below (at
+ * `info` since 0.17.3, so it survives the plugin's MATTER_LOG_LEVEL=info),
  * per HR-6, rather than left stock on the strength of the general pattern.
  *
  * `stopMoveStepLogic`/`stopHueAndSaturationMovement`/`stopAllColorMovement`
@@ -1156,8 +1160,10 @@ class IndigoColorControlServer extends ColorControlServer.with("HueSaturation", 
         // (probe-confirmed) — currentX/currentY that nothing watches. Left
         // unconverted in this PR (commit 6 only lands moveToColorLogic); a
         // silent write is not an acceptable alternative (HR-6), so it is a
-        // debug-logged no-op instead.
-        logger.debug(
+        // logged no-op instead — at `info`, because the plugin runs the node at
+        // MATTER_LOG_LEVEL=info (2026.32.1) and a `debug` line would be the
+        // silence HR-6 rejects.
+        logger.info(
             `Endpoint ${this.endpoint.id}: dropped stepColor (stepX=${stepX}, stepY=${stepY}) — CIE xy step ` +
                 "commands are not yet converted to §4.2 (only moveToColor is, #143)",
         );
