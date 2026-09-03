@@ -8,8 +8,12 @@ current version is `Info.plist`'s `PluginVersion`.
 - The bridge LaunchAgent now sets `MATTER_LOG_LEVEL=info`. Nothing had ever set
   a level, so matter.js ran at its DEBUG default and launchd's `StandardOutPath`
   grew without rotation — 1.4 GB in a fortnight on the reference install, 99.5%
-  of it per-message MRP and subscription chatter. INFO keeps every invoke,
-  subscribe, session and endpoint line. `AgentSpec` gains an optional `env`
+  of it per-message MRP and subscription chatter. INFO keeps every inbound
+  invoke, subscribe and read, plus the session and endpoint-ready lines. The
+  level is global, so the node's own two `logger.debug` diagnostics (the HR-6
+  no-op line and the #143 ghost-off note) are silenced as well; promoting them
+  to `info` in the node is the follow-up if they are wanted back.
+  `AgentSpec` gains an optional `env`
   tuple to carry it; the matter-server agent is unchanged (it already logs at
   INFO), so only the bridge agent is re-bootstrapped once on the first start
   after this upgrade.

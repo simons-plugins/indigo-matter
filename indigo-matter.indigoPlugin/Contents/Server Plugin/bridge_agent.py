@@ -215,9 +215,12 @@ class BridgeProcess(LaunchAgent):
                 # matter.js defaults to DEBUG and launchd never rotates
                 # StandardOutPath: on jarvis that was 1.4 GB in a fortnight, of
                 # which 99.5% by bytes was DEBUG (per-message MRP/subscription
-                # chatter). INFO keeps every Invoke, Subscribe, session and
-                # endpoint line — everything a diagnosis has ever needed.
-                # matter.js maps MATTER_LOG_LEVEL onto its `log.level` variable.
+                # chatter). INFO keeps every inbound Invoke/Subscribe/Read, the
+                # session and endpoint-ready lines. The level is GLOBAL (matter.js
+                # maps MATTER_LOG_LEVEL onto `log.level`, no per-facility knob),
+                # so the node's own two `logger.debug` lines in endpoints.ts (the
+                # HR-6 debug-logged no-op, the #143 ghost-off note) go quiet too —
+                # promote those to `info` in the node if they must survive.
                 env=(("MATTER_LOG_LEVEL", "info"),),
             ),
             prefs, logger,
