@@ -783,7 +783,10 @@ class IndigoOnOffServer extends OnOffServer.with("Lighting") {
             // countdown tests.
             const internal = (this as unknown as { internal?: { timedOnTimer?: { isRunning?: boolean } } }).internal;
             if (!value && internal?.timedOnTimer?.isRunning) {
-                logger.debug(
+                // `info`, not `debug`: the plugin's LaunchAgent runs the node at
+                // MATTER_LOG_LEVEL=info (2026.32.1), and this is the only trace
+                // of a ghost-off that can darken a lamp someone re-lit.
+                logger.info(
                     `Endpoint ${this.endpoint.id}: an off push matched an already-off onOff attribute while a ` +
                         "timed-on countdown is still running — most likely a replayed push racing its own " +
                         "confirmation (harmless; the countdown must survive). Two other reachable causes: a " +
@@ -1156,8 +1159,10 @@ class IndigoColorControlServer extends ColorControlServer.with("HueSaturation", 
         // (probe-confirmed) — currentX/currentY that nothing watches. Left
         // unconverted in this PR (commit 6 only lands moveToColorLogic); a
         // silent write is not an acceptable alternative (HR-6), so it is a
-        // debug-logged no-op instead.
-        logger.debug(
+        // logged no-op instead — at `info`, because the plugin runs the node at
+        // MATTER_LOG_LEVEL=info (2026.32.1) and a `debug` line would be the
+        // silence HR-6 rejects.
+        logger.info(
             `Endpoint ${this.endpoint.id}: dropped stepColor (stepX=${stepX}, stepY=${stepY}) — CIE xy step ` +
                 "commands are not yet converted to §4.2 (only moveToColor is, #143)",
         );

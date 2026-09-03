@@ -3,6 +3,16 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
+## 2026.32.2 — the two node diagnostics 2026.32.1 silenced are back: bridge node pinned to 0.17.3
+
+- `bridge-node` **0.17.3**: the #143 ghost-off note (an off push matching an
+  already-off lamp while its timed-on countdown runs) and the HR-6 no-op line
+  (a `stepColor` command dropped because CIE xy steps are not converted) are
+  logged at `info` instead of `debug`, so they survive the `MATTER_LOG_LEVEL=info`
+  the LaunchAgent now sets. The per-value "Clamped …" line stays at `debug`: it
+  can fire on every out-of-range colour command and would be noise.
+- `DEFAULT_INSTALL_SPEC` moves to `indigo-matter-bridge@0.17.3`.
+
 ## 2026.32.1 — the bridge node logs at INFO, not matter.js's DEBUG default
 
 - The bridge LaunchAgent now sets `MATTER_LOG_LEVEL=info`. Nothing had ever set
