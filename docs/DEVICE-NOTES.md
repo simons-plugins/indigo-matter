@@ -162,6 +162,26 @@ commanded-value push plus `CT_TOLERANCE_MIREDS`, ADR-0013) converges the
 fabric on the commanded value and tolerates exactly this gap; it is not a
 fix to the bulb's own reporting.
 
+**One Tuya TS0502B's own round trip is lossy, and closes a feedback loop
+through the hardware.** Sending the combined `{whiteLevel, whiteTemperature}`
+write above (the #281 fix) makes this particular unit re-solve its
+dual-channel duty cycle and echo `dev.brightness` back **one point lower**
+than what was sent. Because the next CT command reads `brightness` fresh,
+the asserted level ratchets down one point per Apple adaptive-lighting tick
+— measured live over three nights: 40 → 39 → 38 → 37 → 36 → 35, only while
+the lamp was lit (an off lamp takes the stored-`whiteLevel` branch instead,
+which this driver does not perturb). Downstream, Lamplighter read each
+uncommanded step as a manual touch and locked the zone out of automation for
+hours. A second, otherwise-identical TS0502B does **not** do this — its
+round trip is lossless — so this is a per-unit firmware/solve quirk, not a
+model-wide one; a 7-day sweep of 13 exported CT-role devices found 59
+coupled changes on the lossy unit and 0-2 coincidental ones (on commanded
+values) on every other device. These devices report no firmware version, so
+the two units cannot be told apart from Indigo. The export now remembers,
+per device, the level it last asserted and re-sends that instead of
+following a ≤1-point drift, while still adopting any larger, genuine change
+(`_debounced_white_level` in `export_handlers.py`).
+
 ## Thread mesh (observed 2026-09-01)
 
 **IKEA rev-2 vs rev-3 ThreadNetworkDiagnostics firmware differ in what they

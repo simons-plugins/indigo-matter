@@ -3,6 +3,28 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
+## 2026.32.3 — a lossy CT bulb's own echo no longer ratchets its brightness down
+
+- Fixed: on a Tuya TS0502B (z2m), the combined `{whiteLevel, whiteTemperature}`
+  write `_set_color_temp` sends on every colour-temperature command (the #281
+  fix) is itself lossy on this driver — the lamp re-solves its dual-channel
+  duty cycle and echoes `dev.brightness` back one point lower than what was
+  sent. The next CT command read that drifted live value straight into its
+  own write, so the level ratcheted down one point per Apple adaptive-
+  lighting tick — measured in production over three nights: 40 → 39 → 38 →
+  37 → 36 → 35, only while the lamp was lit. Downstream, Lamplighter read
+  each uncommanded 1% step as a manual touch and silently locked the zone out
+  of automation for hours. A second, otherwise-identical TS0502B does not
+  round-trip lossy and was unaffected (0-2 coincidental changes across a
+  7-day sweep of 13 CT-role devices, vs 59 on this one).
+- Fix is additive, not subtractive: a level is still always asserted with
+  every write (dropping the key was the exact #281 failure mode and is not
+  reopened). `_debounced_white_level` now remembers, per device, the level
+  this handler last asserted, and re-asserts that instead of following a
+  ≤1-point drift down; any larger step is adopted as a genuine change. See
+  `export_handlers.py`'s `_set_color_temp`/`_debounced_white_level`
+  docstrings and `docs/DEVICE-NOTES.md`.
+
 ## 2026.32.2 — the two node diagnostics 2026.32.1 silenced are back: bridge node pinned to 0.17.3
 
 - `bridge-node` **0.17.3**: the #143 ghost-off note (an off push matching an

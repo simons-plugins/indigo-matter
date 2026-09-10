@@ -566,6 +566,78 @@ class TestColorTemperature:
         assert kwargs["whiteLevel"] == 35
 
 
+class TestColorTempWhiteLevelRatchet:
+    """Production evidence: a Tuya TS0502B (z2m) echoes ``brightness`` back
+    ONE POINT LOWER than the whiteLevel this handler just wrote, and the next
+    CT command reads that drifted live value straight into its own write —
+    40 -> 39 -> 38 -> ..., one step per Apple adaptive-lighting tick, only
+    while the lamp is lit. The loop closes through the hardware, so it only
+    shows up across SEVERAL successive commands on the SAME device id, which
+    is why every test below drives ``dispatch`` more than once.
+    """
+
+    @staticmethod
+    def _dispatch(handlers, mock_indigo_base, dev, mireds=250):
+        handlers.handler_for("colorTemperatureLight").dispatch(
+            "setColorTemp", {"colorTempMireds": mireds}, dev)
+        _args, kwargs = mock_indigo_base.dimmer.setColorLevels.call_args
+        return kwargs["whiteLevel"]
+
+    def test_281_non_regression_a_level_is_still_asserted_when_live_reads_are_absent(
+            self, handlers, mock_indigo_base):
+        """#281's exact starting condition: ``whiteLevel`` stale/absent while
+        the lamp is lit must still send a REAL level, never omit the key —
+        omitting it is the failure mode #281 fixed (a driver reading a
+        missing whiteLevel as 0 and switching the lamp off)."""
+        dev = DimmerDevice(1, "Lamp", onState=True, brightness=29, whiteLevel=0)
+        assert self._dispatch(handlers, mock_indigo_base, dev) == 29
+        kwargs = mock_indigo_base.dimmer.setColorLevels.call_args.kwargs
+        assert "whiteLevel" in kwargs and isinstance(kwargs["whiteLevel"], int)
+
+    def test_a_lossy_device_does_not_ratchet_down_across_successive_commands(
+            self, handlers, mock_indigo_base):
+        """The bug itself. Simulates the TS0502B's lossy round trip: after
+        each write, the device (and so the next read of ``dev.brightness``)
+        reports back exactly one point lower than what was just sent. Without
+        the fix, five successive CT commands walk the asserted level down
+        five points; with it, the level sent stays pinned at the first one."""
+        dev = DimmerDevice(1, "Lamp", onState=True, brightness=40, whiteLevel=40)
+        sent = []
+        for _ in range(5):
+            level = self._dispatch(handlers, mock_indigo_base, dev)
+            sent.append(level)
+            dev.brightness = level - 1  # the lossy device's own echo
+        assert sent == [40, 40, 40, 40, 40]
+
+    def test_a_genuine_level_change_is_adopted_not_suppressed_as_drift(
+            self, handlers, mock_indigo_base):
+        """More than the ratchet tolerance apart must be treated as a real
+        change (an Indigo-side preset, a manual dim) and sent as-is — the
+        anti-drift logic must not eat a level change nobody asked to hide."""
+        dev = DimmerDevice(1, "Lamp", onState=True, brightness=40, whiteLevel=40)
+        assert self._dispatch(handlers, mock_indigo_base, dev) == 40
+        dev.brightness = 70  # a real jump, not one point of drift
+        assert self._dispatch(handlers, mock_indigo_base, dev) == 70
+
+    def test_a_lossless_device_is_unaffected(self, handlers, mock_indigo_base):
+        """The second TS0502B unit, whose round trip does not drift: repeated
+        commands at a genuinely stable brightness must keep sending that same
+        value, not something else the memory invented."""
+        dev = DimmerDevice(1, "Lamp", onState=True, brightness=55, whiteLevel=55)
+        for _ in range(4):
+            assert self._dispatch(handlers, mock_indigo_base, dev) == 55
+
+    def test_the_ratchet_memory_is_per_device(self, handlers, mock_indigo_base):
+        """Two devices drifting independently must not share remembered state."""
+        dev_a = DimmerDevice(1, "Lamp A", onState=True, brightness=40, whiteLevel=40)
+        dev_b = DimmerDevice(2, "Lamp B", onState=True, brightness=90, whiteLevel=90)
+        assert self._dispatch(handlers, mock_indigo_base, dev_a) == 40
+        assert self._dispatch(handlers, mock_indigo_base, dev_b) == 90
+        dev_a.brightness = 39  # A drifts
+        assert self._dispatch(handlers, mock_indigo_base, dev_a) == 40
+        assert self._dispatch(handlers, mock_indigo_base, dev_b) == 90  # B untouched
+
+
 # ---------------------------------------------------------------------------
 # extendedColorLight
 # ---------------------------------------------------------------------------

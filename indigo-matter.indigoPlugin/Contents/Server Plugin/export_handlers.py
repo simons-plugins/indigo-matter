@@ -682,6 +682,52 @@ class DimmableLightExport(OnOffExport):
         indigo.dimmer.setBrightness(dev, value=int(_clamp(round(level), 0, 100)))
 
 
+#: Per-device memory of the whiteLevel :meth:`ColorTemperatureLightExport
+#: ._set_color_temp` last asserted to a LIT lamp. Anti-ratchet for a
+#: production-measured feedback loop: on a Tuya TS0502B (z2m), the combined
+#: ``{whiteLevel, whiteTemperature}`` write this handler must send (see its
+#: docstring, issue #281) re-solves the lamp's dual-channel duty cycle and
+#: echoes ``dev.brightness`` back ONE POINT LOWER than what was sent. The next
+#: CT command reads that drifted live value and writes it again, so the level
+#: ratchets down one point per Apple adaptive-lighting tick (measured: 40 →
+#: 39 → 38 → … over three nights, only while the lamp is lit) — a loop that
+#: closes through the hardware, not through any state this handler held
+#: before. A second, otherwise-identical TS0502B does not do this; the round
+#: trip is lossless there. Module-level for the same reason as
+#: :data:`_overrange_warned`: the handler is a stateless singleton with no
+#: instance to hold it on.
+_LAST_ASSERTED_WHITE_LEVEL: dict[int, float] = {}
+
+#: A step this small, seen between the level just asserted and the live
+#: reading on the next call, is this device's own round-trip rounding, not a
+#: real level change — the measured drift is exactly one point per write. A
+#: bigger step (an Indigo-side preset, a manual dim) is adopted normally.
+_WHITE_LEVEL_RATCHET_TOLERANCE = 1
+
+
+def _debounced_white_level(device_id: int, brightness: float) -> float:
+    """The whiteLevel to assert for a LIT lamp, without following device drift.
+
+    Compares ``brightness`` (the live reading this call would otherwise send
+    verbatim) against the level this handler itself last asserted for
+    ``device_id``. Within :data:`_WHITE_LEVEL_RATCHET_TOLERANCE`, the drift is
+    assumed to be the device's own echo and the REMEMBERED value is
+    re-asserted instead of the drifted one — this is what breaks the ratchet,
+    since the asserted value then stops following the device down. Anything
+    larger is treated as a genuine change and adopted, becoming the new
+    remembered value. Either way a level is always returned and always sent
+    (never omitted) — dropping the key from the write is the exact failure
+    mode issue #281 fixed, and this must not reopen it.
+    """
+    remembered = _LAST_ASSERTED_WHITE_LEVEL.get(device_id)
+    if remembered is not None and abs(brightness - remembered) <= _WHITE_LEVEL_RATCHET_TOLERANCE:
+        level = remembered
+    else:
+        level = brightness
+    _LAST_ASSERTED_WHITE_LEVEL[device_id] = level
+    return level
+
+
 class ColorTemperatureLightExport(DimmableLightExport):
     """``colorTemperatureLight`` — adds ``colorTempMireds`` over Indigo's Kelvin."""
 
@@ -797,6 +843,18 @@ class ColorTemperatureLightExport(DimmableLightExport):
         from which keys arrive, without this handler ever having to touch a
         channel nobody asked it to change. Switching the lamp's own hardware
         mode per write is the bulb/driver's job, and z2m already does it.
+
+        One driver turns this fix into a different bug: on a Tuya TS0502B, the
+        combined write above is itself lossy — the lamp re-solves its
+        dual-channel duty cycle and echoes ``brightness`` back one point
+        lower than what was sent, so reading it straight into the next write
+        ratchets the level down one point per tick, forever, only while the
+        lamp is lit. That loop closes through the hardware, so no amount of
+        care in this handler's own state can see it coming; the fix is
+        :func:`_debounced_white_level`, which remembers what THIS handler
+        last asserted and re-asserts that instead of a same-device drift of
+        one point, while still adopting (and always sending) any larger,
+        genuine change. See its docstring and ``docs/DEVICE-NOTES.md``.
         """
         mireds = args.get(STATE_COLOR_TEMP_MIREDS)
         if not isinstance(mireds, (int, float)) or isinstance(mireds, bool) or not mireds:
@@ -812,7 +870,10 @@ class ColorTemperatureLightExport(DimmableLightExport):
             return ("the Indigo device has no white channel, so there is no colour "
                     "temperature to set")
         brightness = _number(dev, "brightness")
-        level = brightness if brightness is not None and brightness > 0 else white_level
+        if brightness is not None and brightness > 0:
+            level = _debounced_white_level(dev.id, brightness)
+        else:
+            level = white_level
         levels: dict[str, int] = {
             "whiteLevel": int(_clamp(round(level), 0, 100)),
             "whiteTemperature": mireds_to_kelvin(
