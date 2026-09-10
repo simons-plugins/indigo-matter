@@ -147,8 +147,34 @@ temperature write that sends the *stored* `whiteLevel` back to
 `setColorLevels` is therefore not preserving the lamp's current level at
 all — it publishes whatever stale number `whiteLevel` happens to hold, and on
 this driver that number reaches the wire as a literal brightness, switching
-an ON lamp OFF. The export now sources the white level from `brightness`
-itself for any lamp that is actually on ([issue #281](https://github.com/simons-plugins/indigo-matter/issues/281)).
+an ON lamp OFF ([issue #281](https://github.com/simons-plugins/indigo-matter/issues/281)).
+The original fix (2026-08-23) sourced a level from `brightness` instead and
+sent it alongside every colour-temperature write, because `setColorLevels`
+documents `whiteTemperature` as used *in combination with* `whiteLevel` and
+the z2m plugin's colour handler at the time could not take a CT-only write
+without reading a missing `whiteLevel` as 0 and switching the lamp off.
+
+**CT writes are now temperature-only — no level co-write at all.** The z2m
+plugin's colour handler (`plugin_color_control.py`, last modified
+2026-08-26 — after the co-write shipped, at Simon's own request to its
+author) now publishes `{"brightness": N}` and `{"color_temp": mired}` as two
+independent MQTT messages, only when each key is present in the action, so a
+CT-only write no longer risks switching the lamp off. The co-write itself
+had by then turned actively harmful: on one lossy Tuya TS0502B the combined
+write made the lamp echo its brightness back one point lower than commanded,
+which the next CT write read and re-sent, ratcheting the level down roughly
+one point per Apple adaptive-lighting tick while the lamp stayed lit —
+measured 40→39→38→37→36→35 over an evening, three nights running.
+`ColorTemperatureLightExport._set_color_temp` now sends only
+`whiteTemperature`.
+
+**This is a VERSION DEPENDENCY on the z2m plugin, not a one-time fact.**
+Simon hand-re-applies local patches to the z2m Indigo plugin after
+reinstalls. Rolling that plugin back to a build older than 2026-08-26
+reopens the original #281 bug: a CT-only write will again risk a missing
+`whiteLevel` reading as 0 and switching the lamp off. If CT-only writes
+start switching lamps off again, check the z2m plugin's build date before
+re-investigating this file.
 
 **Warm-limit clamping is silent and permanent.** A bulb whose warmest
 setting is 2500K accepts a commanded 2347K without complaint and simply

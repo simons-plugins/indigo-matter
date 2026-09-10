@@ -28,10 +28,11 @@ needed at all, because the ask and the reference are the same call.
 ``handler.dispatch(COMMAND_SET_COLOR_TEMP, ...)``, exactly what
 ``ExportBridge._apply_command`` calls for a real §5 command. That is
 deliberate, not incidental: it means issue #281's off-lamp safety (a CT
-write on an OFF lamp preserves the stored ``whiteLevel`` rather than
-switching the lamp on) and the no-white-channel refusal (a reason string,
-not a raised error) apply to a calibration sweep identically to a real
-ecosystem command, with no second implementation to keep in sync.
+write on an OFF lamp sends colour temperature only, carrying no level, so
+there is nothing in the write that could switch the lamp on) and the
+no-white-channel refusal (a reason string, not a raised error) apply to a
+calibration sweep identically to a real ecosystem command, with no second
+implementation to keep in sync.
 
 **Side effect, and why it is harmless.** Every dispatch here is a real
 Indigo write, so it lands on ``deviceUpdated`` like any other change: the
