@@ -787,10 +787,11 @@ ecosystem acts. Both are enumerated here in full; there is no other source.
   "Indigo's last confirmation" rather than the device's state). Indigo's own
   semantics then apply: brightness-while-off is turn-on-to-that-level, a
   colour write does whatever the device's driver does with one, and a
-  colour-temperature change on a lamp with a white channel is normally
-  stored without turning the lamp on (`_set_color_temp`'s own documented
-  choice; an RGB-only lamp refuses it with a logged reason, and a driver
-  that retains a non-zero `whiteLevel` while off will light up).
+  colour-temperature change on a lamp with a white channel is always
+  stored without turning the lamp on: `_set_color_temp` sends
+  `whiteTemperature` only, carrying no level, so no driver's handling of
+  `whiteLevel` can turn the lamp on (an RGB-only lamp refuses the write
+  entirely, with a logged reason).
 - `batteryLevel: 1-100` (issue #220) is the first **role-independent**
   `set_state` key — valid for `set_state` against ANY role whose endpoint was
   built with `battery: true` (§4.1), not listed against any single role above.

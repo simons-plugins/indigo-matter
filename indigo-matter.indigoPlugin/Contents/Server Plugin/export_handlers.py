@@ -108,9 +108,11 @@ _LOG = logging.getLogger(__name__)
 #: ``logging.getLogger("Plugin")`` — the SDK's own documented way for a
 #: submodule to reach the SAME Event Log handler ``self.logger`` uses,
 #: without ``export_bridge`` threading a logger argument through every
-#: handler for the sake of one line). Reserved for ``DoorLockExport``'s
-#: relay-fallback notice (issue #289 review finding 2) — nothing else in
-#: this module needs to reach a user this way.
+#: handler for the sake of one line). Used by ``DoorLockExport``'s
+#: relay-fallback notice (issue #289 review finding 2) and by
+#: ``ColorTemperatureLightExport``'s non-z2m-ownership notice (issue #352
+#: review finding 6) — the two places in this module where a user must act
+#: on what a debug line through ``_LOG`` would otherwise hide.
 _PLUGIN_LOG = logging.getLogger("Plugin")
 
 # --------------------------------------------------------------------------
@@ -682,6 +684,24 @@ class DimmableLightExport(OnOffExport):
         indigo.dimmer.setBrightness(dev, value=int(_clamp(round(level), 0, 100)))
 
 
+#: The zigbee2mqtt Indigo plugin's bundle id. All 13 CT-role exported devices
+#: are owned by it today (issue #352, verified) — that ownership is WHY a
+#: temperature-only write is safe: this plugin's colour handler treats
+#: ``whiteLevel``/``brightness`` and ``whiteTemperature``/``color_temp`` as
+#: independent MQTT publishes. A device owned by any other plugin has never
+#: had that verified, which is exactly what :data:`_non_z2m_ct_warned` below
+#: exists to surface rather than silently assume — see
+#: ``ColorTemperatureLightExport._set_color_temp``.
+ZIGBEE2MQTT_PLUGIN_ID = "com.autologplugin.indigoplugin.zigbee2mqtt"
+
+#: Devices a CT-role export has already warned about not being owned by
+#: :data:`ZIGBEE2MQTT_PLUGIN_ID`. Once per device, same reasoning as
+#: :data:`_overrange_warned` above — the ownership fact does not change
+#: between dispatches, so a per-call line would just be the loudest thing in
+#: the log for a condition that never changes.
+_non_z2m_ct_warned: set[int] = set()
+
+
 class ColorTemperatureLightExport(DimmableLightExport):
     """``colorTemperatureLight`` — adds ``colorTempMireds`` over Indigo's Kelvin."""
 
@@ -790,6 +810,14 @@ class ColorTemperatureLightExport(DimmableLightExport):
         from which keys arrive, without this handler ever having to touch a
         channel nobody asked it to change. Switching the lamp's own hardware
         mode per write is the bulb/driver's job, and z2m already does it.
+
+        One more thing, a notice rather than a guard: the whole safety case
+        above is a fact about the z2m plugin's colour handler, not about this
+        write. A device exported with this role but owned by a different
+        plugin has never had that fact checked, so the write still goes out
+        exactly as described — it is simply reported once per device, via
+        :data:`_non_z2m_ct_warned`, so the gap is visible rather than
+        assumed.
         """
         mireds = args.get(STATE_COLOR_TEMP_MIREDS)
         if not isinstance(mireds, (int, float)) or isinstance(mireds, bool) or not mireds:
@@ -808,6 +836,19 @@ class ColorTemperatureLightExport(DimmableLightExport):
             "whiteTemperature": mireds_to_kelvin(
                 int(_clamp(round(mireds), MIREDS_MIN, MIREDS_MAX))),
         }
+        if getattr(dev, "pluginId", None) != ZIGBEE2MQTT_PLUGIN_ID \
+                and dev.id not in _non_z2m_ct_warned:
+            _non_z2m_ct_warned.add(dev.id)
+            # `_PLUGIN_LOG`, not `_LOG` — see the module header. This write's
+            # whole safety case (above) rests on z2m ownership, verified for
+            # today's 13 exported devices but not enforced — a device owned
+            # by any OTHER plugin has never had it checked, so the person who
+            # exported it needs to see this, not just a debug line.
+            _PLUGIN_LOG.info(
+                "Matter bridge: device %s (id %s) is exported with a colour-temperature "
+                "role but is not owned by the zigbee2mqtt plugin — its colour-temperature "
+                "write sends whiteTemperature only, with no level co-write; see "
+                "docs/DEVICE-NOTES.md.", getattr(dev, "name", "?"), dev.id)
         indigo.dimmer.setColorLevels(dev, **levels)
         return None
 

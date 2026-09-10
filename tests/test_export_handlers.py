@@ -392,26 +392,42 @@ class TestColorTemperature:
         # The thing the command WAS for still happens.
         assert kwargs["whiteTemperature"] == 4000
 
-    def test_the_no_white_channel_guard_fires_before_brightness_is_ever_read(
+    def test_a_device_with_no_white_channel_is_refused_before_any_write(
             self, handlers, mock_indigo_base):
-        """The ``whiteLevel is None`` tri-state guard must run BEFORE brightness
-        is read at all — a device with no white channel has no colour
-        temperature to set, whatever its brightness is doing."""
+        """The ``whiteLevel is None`` guard must stand between the command
+        and Indigo — a device with no white channel has no colour
+        temperature to set, so ``setColorLevels`` must never be reached for
+        it, whatever the reason string ends up saying."""
+        dev = DimmerDevice(1, "Lamp", whiteLevel=None)
+        outcome = handlers.handler_for("colorTemperatureLight").dispatch(
+            "setColorTemp", {"colorTempMireds": 250}, dev)
+        assert isinstance(outcome, str) and "no white channel" in outcome
+        mock_indigo_base.dimmer.setColorLevels.assert_not_called()
+
+    def test_the_happy_path_completes_even_if_brightness_would_raise(
+            self, handlers, mock_indigo_base):
+        """Separately from the guard above: on a LIT lamp whose ``brightness``
+        property raises, the CT write must still COMPLETE successfully.
+        Making ``brightness`` fatal to touch is the same "assert something
+        did not happen" pattern as the no-white-channel test above, aimed at
+        the happy path instead — it fails the instant anyone re-adds a
+        brightness read to ``_set_color_temp``, rather than waiting for the
+        next lossy driver to surface it."""
 
         class _RaisesIfBrightnessIsRead(DimmerDevice):
             @property
             def brightness(self):
-                raise AssertionError("brightness must not be read")
+                raise AssertionError("brightness must not be read on the CT happy path")
 
             @brightness.setter
             def brightness(self, _value):
                 pass
 
-        dev = _RaisesIfBrightnessIsRead(1, "Lamp", whiteLevel=None)
-        outcome = handlers.handler_for("colorTemperatureLight").dispatch(
-            "setColorTemp", {"colorTempMireds": 250}, dev)
-        assert isinstance(outcome, str) and "no white channel" in outcome
-        mock_indigo_base.dimmer.setColorLevels.assert_not_called()
+        dev = _RaisesIfBrightnessIsRead(1, "Lamp", onState=True, whiteLevel=40)
+        handlers.handler_for("colorTemperatureLight").dispatch(
+            "setColorTemp", {"colorTempMireds": 370}, dev)
+        mock_indigo_base.dimmer.setColorLevels.assert_called_once_with(
+            dev, whiteTemperature=2703)
 
     @pytest.mark.parametrize("mireds,expected_kelvin", [
         (1, 6536),        # → clamped up to MIREDS_MIN 153
@@ -524,6 +540,50 @@ class TestColorTemperature:
         handler.dispatch("setColorTemp", {"colorTempMireds": mireds}, dev)
         _args, kwargs = mock_indigo_base.dimmer.setColorLevels.call_args
         assert handlers.kelvin_to_mireds(kwargs["whiteTemperature"]) == commanded
+
+    def test_a_lit_lamp_dispatch_writes_only_the_ct_command(
+            self, handlers, mock_indigo_base):
+        """The only surviving ``onState=True, brightness=N`` dispatch case on
+        this role — the others were deleted alongside the co-write (#352).
+        Exact kwargs, and no OTHER Indigo call goes out alongside it: the
+        suite otherwise only pins the ABSENCE of a keyword, not the absence
+        of a second command — the guard against the #281 symptom recurring
+        via a different route, such as someone "helpfully" re-asserting the
+        level as a second call.
+        """
+        dev = DimmerDevice(1, "Lamp", onState=True, brightness=60, whiteLevel=40)
+        handlers.handler_for("colorTemperatureLight").dispatch(
+            "setColorTemp", {"colorTempMireds": 370}, dev)
+        mock_indigo_base.dimmer.setColorLevels.assert_called_once_with(
+            dev, whiteTemperature=2703)
+        mock_indigo_base.dimmer.setBrightness.assert_not_called()
+        mock_indigo_base.device.turnOn.assert_not_called()
+        mock_indigo_base.device.turnOff.assert_not_called()
+
+    def test_a_non_z2m_owned_ct_export_warns_once_per_device(self, handlers, caplog):
+        """Issue #352 review finding 6: the CT-only write's safety rests
+        entirely on every CT-role export being owned by the zigbee2mqtt
+        plugin (docs/DEVICE-NOTES.md) — a point-in-time fact nothing
+        enforces. A device owned by any OTHER plugin must say so once,
+        through the real plugin logger — the same shape as DoorLockExport's
+        relay-fallback notice."""
+        dev = DimmerDevice(1, "Lamp", whiteLevel=40)  # default pluginId is not z2m
+        with caplog.at_level("INFO"):
+            handlers.handler_for("colorTemperatureLight").dispatch(
+                "setColorTemp", {"colorTempMireds": 370}, dev)
+            handlers.handler_for("colorTemperatureLight").dispatch(
+                "setColorTemp", {"colorTempMireds": 250}, dev)
+        infos = [r for r in caplog.records if r.levelname == "INFO"]
+        assert len(infos) == 1
+        assert infos[0].name == "Plugin"
+        assert "not owned by the zigbee2mqtt plugin" in infos[0].message
+
+    def test_a_z2m_owned_ct_export_does_not_warn(self, handlers, caplog):
+        dev = DimmerDevice(1, "Lamp", whiteLevel=40, plugin_id=handlers.ZIGBEE2MQTT_PLUGIN_ID)
+        with caplog.at_level("INFO"):
+            handlers.handler_for("colorTemperatureLight").dispatch(
+                "setColorTemp", {"colorTempMireds": 370}, dev)
+        assert [r for r in caplog.records if r.levelname == "INFO"] == []
 
 
 # ---------------------------------------------------------------------------
