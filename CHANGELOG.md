@@ -3,6 +3,28 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
+## 2026.32.3 — colour-temperature writes are temperature-only again
+
+- `ColorTemperatureLightExport._set_color_temp` no longer co-writes
+  `whiteLevel` alongside `whiteTemperature`. The co-write was added in #281
+  (2026-08-23) because the z2m plugin's colour handler at the time could not
+  take a CT-only write without a missing `whiteLevel` reading as 0 and
+  switching the lamp off; the z2m plugin's `plugin_color_control.py` (last
+  modified 2026-08-26, after the workaround shipped) now handles `whiteLevel`
+  and `whiteTemperature` as two independent writes, so the workaround is
+  obsolete. It had also turned actively harmful: on a lossy Tuya TS0502B the
+  combined write made the lamp echo its brightness back one point lower than
+  commanded, which the next CT write re-sent, ratcheting the level down about
+  one point per Apple adaptive-lighting tick — measured 40→39→38→37→36→35
+  over an evening, three nights running.
+- This is a **version dependency** on the z2m plugin build, documented in
+  `docs/DEVICE-NOTES.md` — a rollback older than 2026-08-26 reopens the
+  original #281 off-switch bug for CT-only writes.
+- ADR-0013's commanded-colour-temperature-push machinery
+  (`commanded_states`, `_push_commanded`, `CT_TOLERANCE_MIREDS`) is
+  unaffected; it does not read or write `whiteLevel`.
+- Supersedes PR #351, which is not merging.
+
 ## 2026.32.2 — the two node diagnostics 2026.32.1 silenced are back: bridge node pinned to 0.17.3
 
 - `bridge-node` **0.17.3**: the #143 ghost-off note (an off push matching an

@@ -717,44 +717,39 @@ class ColorTemperatureLightExport(DimmableLightExport):
 
     @staticmethod
     def _set_color_temp(args: dict, dev: Any, _options: dict) -> Optional[str]:
-        """Set white temperature, preserving the white channel's own level.
+        """Set white temperature only — no more level co-write.
 
-        ``setColorLevels`` documents whiteTemperature as used *in combination
-        with* whiteLevel, so sending the temperature alone risks a driver
-        reading whiteLevel as 0 and turning the lamp off — a colour tweak that
-        blacks out the room is a worse bug than a colour tweak that misses.
-        "Preserve the white channel's own level" still stands as the goal, but
-        for a LIT lamp the source of truth for that level is ``brightness``,
-        not the stored ``whiteLevel`` — issue #281 proved live that
-        ``whiteLevel`` does not track brightness on channel-publishing drivers
-        (z2m: ``whiteLevel`` sat at 0.0, then stale at 20, while ``brightness``
-        was actually 29, then 49, then 69). Sending the stored ``whiteLevel``
-        with every colour-temperature write published a literal
-        ``{"brightness": 0}`` on the wire and switched an ON lamp OFF on every
-        single Apple adaptive-lighting tick (~3s). For an OFF lamp
-        (``brightness`` 0 or ``None``) the stored ``whiteLevel`` is still what
-        is sent — the two existing off-lamp test pins (in
-        ``tests/test_export_handlers.py``: a lamp reporting ``whiteLevel`` 0,
-        and one reporting some other stored level) remain the contract for
-        that case; only the LIT branch changed. Gate and
-        source both read ``brightness`` so they cannot disagree with each
-        other: :class:`DimmableLightExport`'s ``states_for`` already treats
-        ``brightness`` as the export-side level, and :func:`_number` keeps the
-        read ``None``-safe, falling back to today's off-lamp behaviour when it
-        is absent. (A future shape banked but out of scope here: matter.js
-        ``executeIfOff`` colour staging, referenced on issue #281, would let a
-        colour-temperature write land on an OFF lamp without touching its
-        on/off state at all — not needed while the write already preserves an
-        off lamp's stored level.)
+        Until 2026-08-23 (issue #281) this sent ``whiteLevel`` alongside
+        ``whiteTemperature`` on every write, because ``setColorLevels``
+        documents them as used *in combination* and the z2m plugin's colour
+        handler at the time could not take a CT-only write without a driver
+        reading the missing ``whiteLevel`` as 0 and switching the lamp off.
+        That upstream limitation is fixed: z2m's ``plugin_color_control.py``
+        (last modified 2026-08-26 — after the workaround shipped here, at
+        Simon's own request to its author) now publishes ``{"brightness": N}``
+        and ``{"color_temp": mired}`` as two independent MQTT messages, each
+        only when its key is actually present in the action. A CT-only
+        ``setColorTemp`` therefore reaches z2m as a CT-only publish and
+        touches nothing else.
 
-        This applies to true RGBW hardware too, deliberately. On an
-        ``extendedColorLight`` a colour-temperature write is a request to
-        render white mode, and the lamp's perceived level in that mode is its
-        ``brightness`` — gating this on ``supportsRGB`` to "protect" a
-        separate white channel would hand RGBW z2m strips (whose stored
-        ``whiteLevel`` is just as stale as a CCT lamp's) exactly the
-        issue-#281 clobber this change removes. ``_set_color`` below stays
-        the counterpart: an RGB write touches no white key at all.
+        The stale co-write had turned actively harmful, not just redundant:
+        on one lossy Tuya TS0502B the combined write made the lamp echo its
+        brightness back one point lower than commanded, which the next
+        colour-temperature write then read and re-sent, ratcheting the level
+        down roughly one point per Apple adaptive-lighting tick while the
+        lamp stayed lit — measured 40→39→38→37→36→35 over an evening, three
+        nights running. Sending temperature alone removes the feedback path:
+        there is no level carried here for a lossy echo to corrupt. All 13
+        CT-role exported devices are owned by the z2m plugin (verified), so
+        there is no other driver's behaviour to weigh against this. This is a
+        **version dependency**, not a one-time fact: rolling the z2m plugin
+        back to a pre-2026-08-26 build reopens the original #281 off-switch
+        bug for a CT-only write — see ``docs/DEVICE-NOTES.md``.
+
+        This applies to true RGBW hardware too, deliberately —
+        :class:`ExtendedColorLightExport` inherits this method unchanged.
+        ``_set_color`` below stays the counterpart: an RGB write touches no
+        white key at all.
 
         Two guards, all about not depending on someone else to be careful:
 
@@ -765,16 +760,14 @@ class ColorTemperatureLightExport(DimmableLightExport):
           arrived from anywhere else. ``round`` rather than ``int`` because
           truncating 369.9 to 369 is a different colour, not a rounding detail.
         * **no white channel means no command.** ``whiteLevel is None`` is real
-          Indigo for "this device has no white channel at all" — inventing 100
-          for it asks its driver to drive something it does not have, so the
-          command is skipped entirely. A whiteLevel of **0** is a different
-          answer to a different question: the channel exists and is currently
-          off, and 0 is the *real* value, so it is sent as 0. The `or 100`
-          default that used to sit here caught it — `0.0` is falsy — and turned
-          "set the colour temperature of a lamp that is off" into "set the
-          colour temperature AND switch the white channel to full", which is a
-          bridge turning a light on that nobody asked it to. Matter keeps
-          colour and on/off orthogonal for exactly this reason: a
+          Indigo for "this device has no white channel at all" — a device that
+          reports no white channel has no colour temperature to set, so the
+          command is skipped entirely rather than driving a channel that does
+          not exist. A whiteLevel of **0** is a different answer to a
+          different question: the channel exists, merely reporting off, so the
+          write still goes out — it no longer forwards any level value at all,
+          only the temperature, so "off" and "lit" behave identically here.
+          Matter keeps colour and on/off orthogonal for exactly this reason: a
           `MoveToColorTemperature` on an off lamp changes its colour, not its
           state.
 
@@ -811,10 +804,7 @@ class ColorTemperatureLightExport(DimmableLightExport):
             # that cannot name the device. The caller latches this per device.
             return ("the Indigo device has no white channel, so there is no colour "
                     "temperature to set")
-        brightness = _number(dev, "brightness")
-        level = brightness if brightness is not None and brightness > 0 else white_level
         levels: dict[str, int] = {
-            "whiteLevel": int(_clamp(round(level), 0, 100)),
             "whiteTemperature": mireds_to_kelvin(
                 int(_clamp(round(mireds), MIREDS_MIN, MIREDS_MAX))),
         }

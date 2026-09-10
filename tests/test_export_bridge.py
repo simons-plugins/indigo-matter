@@ -1387,7 +1387,7 @@ class TestOnCommand:
         self._deliver(h, "command_set_color_temp")
         _args, kwargs = mock_indigo_base.dimmer.setColorLevels.call_args
         assert kwargs["whiteTemperature"] == 3125     # 1e6 / 320 mireds
-        assert kwargs["whiteLevel"] == 70
+        assert "whiteLevel" not in kwargs
 
     def test_a_set_color_command_reaches_the_device(self, bridge_mod, mock_logger, devices,
                                                     mock_indigo_base):

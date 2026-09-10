@@ -310,12 +310,27 @@ class TestColorTemperature:
             assert "colorTempMireds" not in \
                 handlers.handler_for("colorTemperatureLight").states_for(dev)
 
-    def test_dispatch_preserves_the_white_level(self, handlers, mock_indigo_base):
+    def test_dispatch_sends_temperature_only_no_level_co_write(self, handlers, mock_indigo_base):
+        """The z2m plugin's colour handler (``plugin_color_control.py``, last
+        modified 2026-08-26 — after our #281 workaround shipped, at Simon's
+        own request to its author) now handles ``whiteLevel``/``brightness``
+        and ``whiteTemperature``/``color_temp`` as two independent writes, so
+        the combined write this test used to pin is no longer needed — and
+        had turned actively harmful on a lossy Tuya TS0502B, ratcheting
+        brightness down about a point per Apple adaptive-lighting tick
+        (measured 40→39→38→37→36→35 over an evening, three nights running)
+        because the lamp's own imprecise echo of the co-written level was
+        read back and re-sent on the next tick. A CT-only command must now
+        reach Indigo with ONLY ``whiteTemperature`` — no ``whiteLevel`` key
+        at all.
+        """
         dev = DimmerDevice(1, "Lamp", whiteLevel=40)
         handlers.handler_for("colorTemperatureLight").dispatch(
             "setColorTemp", {"colorTempMireds": 370}, dev)
         mock_indigo_base.dimmer.setColorLevels.assert_called_once_with(
-            dev, whiteLevel=40, whiteTemperature=2703)
+            dev, whiteTemperature=2703)
+        _args, kwargs = mock_indigo_base.dimmer.setColorLevels.call_args
+        assert "whiteLevel" not in kwargs
 
     def test_a_1800k_lamp_is_clamped_to_the_declared_maximum(self, handlers):
         """T3: the other end of the domain. 1800K → 556 mireds → clamped to 500.
@@ -362,54 +377,20 @@ class TestColorTemperature:
         assert handlers.handler_for("colorTemperatureLight").dispatch(
             "setColorTemp", {"colorTempMireds": 250}, dev) is True
 
-    def test_a_white_channel_reporting_off_keeps_its_real_level(
+    def test_a_white_channel_reporting_off_still_gets_the_write(
             self, handlers, mock_indigo_base):
-        """E5: `whiteLevel or 100` caught the real 0 — `0.0` is falsy.
-
-        The two zero-ish answers are different facts and need opposite
-        treatment, which is what the truthiness test destroyed. ``None`` means
-        "no white channel exists" and is handled above by skipping the write
-        entirely; **0** means "the channel exists and is currently off", and it
-        is the device's real state. Defaulting it to 100 turned a colour-
-        temperature change into a colour-temperature change *plus* switching the
-        white channel to full — a bridge turning a lamp on that nobody asked it
-        to, in response to a command Matter defines as orthogonal to on/off.
+        """``whiteLevel`` 0 and ``None`` are different facts. ``None`` means
+        "no white channel exists" and is refused above; **0** means "the
+        channel exists and is currently off" — the presence check still lets
+        the write through, it just no longer forwards a level value with it.
         """
         dev = DimmerDevice(1, "Lamp", whiteLevel=0)
         handlers.handler_for("colorTemperatureLight").dispatch(
             "setColorTemp", {"colorTempMireds": 250}, dev)
         _args, kwargs = mock_indigo_base.dimmer.setColorLevels.call_args
-        assert kwargs["whiteLevel"] == 0
+        assert "whiteLevel" not in kwargs
         # The thing the command WAS for still happens.
         assert kwargs["whiteTemperature"] == 4000
-
-    def test_a_lit_lamp_sends_its_brightness_not_the_stale_white_level(
-            self, handlers, mock_indigo_base):
-        """Issue #281, tonight's exact wire case.
-
-        z2m's ``whiteLevel`` does not track ``brightness`` on a channel-
-        publishing driver — it sat at 0.0 while the lamp was actually at
-        brightness 29. Sending the stored ``whiteLevel`` with every colour-
-        temperature write published a literal ``{"brightness": 0}`` and
-        switched an ON lamp OFF on every single adaptive-lighting tick. This
-        kills the stale-whiteLevel-0 off-switcher.
-        """
-        dev = DimmerDevice(1, "Lamp", onState=True, brightness=29, whiteLevel=0)
-        handlers.handler_for("colorTemperatureLight").dispatch(
-            "setColorTemp", {"colorTempMireds": 250}, dev)
-        _args, kwargs = mock_indigo_base.dimmer.setColorLevels.call_args
-        assert kwargs["whiteLevel"] == 29
-        assert kwargs["whiteTemperature"] == 4000
-
-    def test_a_lit_lamp_overrides_a_stale_high_white_level_too(
-            self, handlers, mock_indigo_base):
-        """Not just the zero case: ANY stored ``whiteLevel`` is stale once the
-        lamp is lit, not only the one that happens to switch it off."""
-        dev = DimmerDevice(1, "Lamp", onState=True, brightness=29, whiteLevel=80)
-        handlers.handler_for("colorTemperatureLight").dispatch(
-            "setColorTemp", {"colorTempMireds": 250}, dev)
-        _args, kwargs = mock_indigo_base.dimmer.setColorLevels.call_args
-        assert kwargs["whiteLevel"] == 29
 
     def test_the_no_white_channel_guard_fires_before_brightness_is_ever_read(
             self, handlers, mock_indigo_base):
@@ -431,16 +412,6 @@ class TestColorTemperature:
             "setColorTemp", {"colorTempMireds": 250}, dev)
         assert isinstance(outcome, str) and "no white channel" in outcome
         mock_indigo_base.dimmer.setColorLevels.assert_not_called()
-
-    def test_an_off_lamp_still_sends_its_stored_white_level(self, handlers, mock_indigo_base):
-        """The off-lamp half of the rule: ``brightness`` 0 (the fixture's
-        default, and now the load-bearing fact) means the stored ``whiteLevel``
-        is still what is preserved — only a LIT lamp's write changed."""
-        dev = DimmerDevice(1, "Lamp", whiteLevel=35)
-        handlers.handler_for("colorTemperatureLight").dispatch(
-            "setColorTemp", {"colorTempMireds": 250}, dev)
-        _args, kwargs = mock_indigo_base.dimmer.setColorLevels.call_args
-        assert kwargs["whiteLevel"] == 35
 
     @pytest.mark.parametrize("mireds,expected_kelvin", [
         (1, 6536),        # → clamped up to MIREDS_MIN 153
@@ -484,7 +455,7 @@ class TestColorTemperature:
         handlers.handler_for("colorTemperatureLight").dispatch(
             "setColorTemp", {"colorTempMireds": 370}, dev)
         mock_indigo_base.dimmer.setColorLevels.assert_called_once_with(
-            dev, whiteLevel=40, whiteTemperature=2703)
+            dev, whiteTemperature=2703)
 
     def test_a_sub_tolerance_mireds_wobble_is_not_a_change(self, handlers):
         """Issue #281's literal live gap: Apple wrote 426 mireds (≈2347K), the
@@ -554,36 +525,23 @@ class TestColorTemperature:
         _args, kwargs = mock_indigo_base.dimmer.setColorLevels.call_args
         assert handlers.kelvin_to_mireds(kwargs["whiteTemperature"]) == commanded
 
-    def test_a_lamp_with_no_readable_brightness_falls_back_to_the_stored_white_level(
-            self, handlers, mock_indigo_base):
-        """Pins the docstring's None-safety claim: a device whose ``brightness``
-        attribute is unreadable (``_number`` → None) must fall back to the
-        stored ``whiteLevel``, not raise on the ``> 0`` comparison."""
-        dev = DimmerDevice(1, "Lamp", brightness=None, whiteLevel=35)
-        handlers.handler_for("colorTemperatureLight").dispatch(
-            "setColorTemp", {"colorTempMireds": 250}, dev)
-        _args, kwargs = mock_indigo_base.dimmer.setColorLevels.call_args
-        assert kwargs["whiteLevel"] == 35
-
 
 # ---------------------------------------------------------------------------
 # extendedColorLight
 # ---------------------------------------------------------------------------
 class TestExtendedColor:
-    def test_a_lit_rgbw_lamp_also_sends_brightness_as_the_white_level(
+    def test_a_lit_rgbw_lamp_also_gets_the_temperature_only_write(
             self, handlers, mock_indigo_base):
-        """Deliberate (recorded in ``_set_color_temp``'s docstring): a CT write
-        on RGBW is a request to render white mode at the lamp's perceived
-        level, which is ``brightness``. Gating on ``supportsRGB`` to keep the
-        stored ``whiteLevel`` would hand RGBW z2m strips — whose ``whiteLevel``
-        is just as stale — exactly the issue-#281 off-switch this fix removes.
-        """
+        """:class:`ExtendedColorLightExport` inherits ``_set_color_temp``
+        unchanged, so an RGBW device's CT write carries the same fix as a
+        plain CCT lamp's — no ``whiteLevel`` co-write, regardless of the
+        device's brightness, on/off state, or stored RGB levels."""
         dev = DimmerDevice(1, "Lamp", onState=True, brightness=29, whiteLevel=80,
                            redLevel=100, greenLevel=0, blueLevel=0)
         handlers.handler_for("extendedColorLight").dispatch(
             "setColorTemp", {"colorTempMireds": 250}, dev)
         _args, kwargs = mock_indigo_base.dimmer.setColorLevels.call_args
-        assert kwargs["whiteLevel"] == 29
+        assert "whiteLevel" not in kwargs
 
     def test_rgb_becomes_hue_and_saturation(self, handlers):
         dev = DimmerDevice(1, "Lamp", onState=True, brightness=50,
