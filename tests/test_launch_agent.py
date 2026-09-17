@@ -1026,6 +1026,28 @@ def test_clear_stale_locks_leaves_a_genuinely_live_server_alone(tmp_path, mock_l
     assert os.path.exists(pidf)
 
 
+def test_clear_stale_locks_does_not_accuse_an_owner_the_age_probe_merely_rounded(
+        tmp_path, mock_logger):
+    """MUST NOT FIRE: a live owner that wrote matter.pid within the probe's own error.
+
+    ``ps -o etime=`` prints whole seconds truncated DOWN, and the age is subtracted
+    from a ``time.time()`` read taken after that subprocess returns — both push the
+    computed start time later. So a healthy server that acquired its lock a fraction
+    of a second after exec can compute as "started after matter.pid was written". Here
+    the process reports 1s of age against a pid file written 2s ago: a bare
+    ``started_at > mtime`` test calls that stale and deletes a RUNNING server's lock,
+    corrupting a live fabric. Only a gap no probe error explains may fire.
+    """
+    storage = str(tmp_path / "a-store")
+    runner = ProcRunner(ps_lines=["4242"], proc_etime="00:01")  # unreadable command line
+    agent = _agent(tmp_path / "home", _spec("com.example.a", "pkg-a", storage), mock_logger,
+                   runner=runner)
+    lock, pidf = _write_lock(storage, 4242, mtime=time.time() - 2)
+    assert agent.clear_stale_storage_locks() == 0
+    assert os.path.exists(lock)
+    assert os.path.exists(pidf)
+
+
 def test_clear_stale_locks_leaves_the_lock_when_the_probe_cannot_tell(tmp_path, mock_logger):
     """MUST NOT FIRE: ps itself is unusable, so nothing here is evidence of staleness.
 

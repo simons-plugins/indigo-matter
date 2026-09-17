@@ -64,6 +64,16 @@ EADDRINUSE_MARKER = "EADDRINUSE"
 # LaunchAgent.clear_stale_storage_locks() for why we look in more than one such directory.
 MATTER_LOCK_FILENAME = "matter.lock"
 MATTER_PID_FILENAME = "matter.pid"
+# Slack on the "process started after matter.pid was written" signal, in seconds.
+# The age probe is `ps -o etime=`, which prints WHOLE seconds truncated DOWN, and we
+# subtract that age from a time.time() read taken after the ps subprocess has returned
+# — both errors push the computed start time LATER, by up to a second each. A genuinely
+# live server writes matter.pid well inside that margin (on jarvis matter.js acquires
+# the lock ~30ms after the process's first log line), so a bare `started_at > mtime`
+# comparison can accuse a healthy owner and delete the lock out from under a running
+# fabric. That is a far worse outage than the crash-loop this check exists to end, so
+# the signal only fires when the process is LATER BY A MARGIN no probe error explains.
+START_AFTER_LOCK_SLACK_SECONDS = 5
 # How long a freshly started server is allowed to have no listener before "nothing is
 # listening on our port" counts as a fault. matter-server was observed taking ~9s to
 # reach its bind on jarvis; 120s is generous enough that a slow or loaded Mac never
@@ -1251,7 +1261,9 @@ class LaunchAgent:
         age = self._process_age_seconds(pid)
         if pid_file_mtime is not None and age is not None:
             started_at = time.time() - age
-            if started_at > pid_file_mtime:
+            # The margin is not cosmetic — see START_AFTER_LOCK_SLACK_SECONDS. Without
+            # it the probe's own rounding can make a live owner look too young.
+            if started_at > pid_file_mtime + START_AFTER_LOCK_SLACK_SECONDS:
                 return True, (
                     f"pid {pid} started after matter.pid was last written, so it "
                     f"cannot be the process that wrote that lock"
