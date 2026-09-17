@@ -17,6 +17,7 @@ import dataclasses
 import hashlib
 import os
 import plistlib
+import time
 
 import pytest
 
@@ -932,3 +933,210 @@ def test_port_probe_tries_the_second_absolute_candidate(tmp_path, mock_logger):
     assert agent._port_listener_pids() == [321]
     probes = [c[0] for c in runner.calls if c and os.path.basename(c[0]) == "lsof"]
     assert probes == ["/usr/bin/lsof"]
+
+
+# ---------------------------------------------------------------------------
+# clear_stale_storage_locks — the 2026-09-15 jarvis reboot pid-reuse bug.
+#
+# A stale matter.lock stops a fresh matter-server from EVER starting ("Storage is
+# locked by another process"), and matter.js's own check is defeated by a rebooted
+# Mac recycling the recorded pid onto an unrelated, still-live process. These tests
+# are adversarial on purpose: each one asks "could this clear a lock it must not?"
+# or "could this leave a lock it must clear?" rather than just the happy path.
+# ---------------------------------------------------------------------------
+
+def _write_lock(directory, pid, token="deadbeef", mtime=None):
+    """Write a matter.lock + matter.pid pair as matter.js itself would.
+
+    Returns (lock_path, pid_path). ``mtime``, if given, backdates matter.pid's
+    mtime (epoch seconds) so a test can control the start-time signal precisely.
+    """
+    os.makedirs(directory, exist_ok=True)
+    lock_path = os.path.join(directory, "matter.lock")
+    pid_path = os.path.join(directory, "matter.pid")
+    with open(lock_path, "w", encoding="utf-8") as handle:
+        handle.write("")
+    with open(pid_path, "w", encoding="utf-8") as handle:
+        handle.write(f"{pid} {token}\n")
+    if mtime is not None:
+        os.utime(pid_path, (mtime, mtime))
+    return lock_path, pid_path
+
+
+class NoPsRunner(ProcRunner):
+    """``ps`` cannot be executed at all — models a totally unusable probe.
+
+    Mirrors ``NoLsofRunner`` above: Python raises OSError when subprocess can't
+    find the binary, which ``_ps_map`` must fold into "{}" (could not tell),
+    never into "nothing is running".
+    """
+
+    def __call__(self, cmd, **kwargs):
+        if cmd and cmd[0] == "ps":
+            self.calls.append(cmd)
+            raise OSError(2, "No such file or directory: 'ps'")
+        return super().__call__(cmd, **kwargs)
+
+
+def test_clear_stale_locks_clears_a_reboot_reused_pid(tmp_path, mock_logger):
+    """The real bug: matter.pid names a LIVE pid that is someone else entirely.
+
+    This is pid 1621 on jarvis, 2026-09-15: the pre-reboot matter-server's pid,
+    reassigned by macOS to IndigoPluginHost3 running Home Intelligence.
+    """
+    storage = str(tmp_path / "a-store")
+    runner = ProcRunner(ps_lines=[
+        "1621 /usr/bin/python3 IndigoPluginHost3 -x indigo-home-intelligence",
+    ])
+    agent = _agent(tmp_path / "home", _spec("com.example.a", "pkg-a", storage), mock_logger,
+                   runner=runner)
+    lock, pidf = _write_lock(storage, 1621)
+    assert agent.clear_stale_storage_locks() == 1
+    assert not os.path.exists(lock)
+    assert not os.path.exists(pidf)
+
+
+def test_clear_stale_locks_clears_on_the_reboot_proof_start_time_signal(tmp_path, mock_logger):
+    """Command line is inconclusive (no args at all); start time settles it.
+
+    The live pid started only 5s ago, but matter.pid was last written an hour ago
+    — the pid cannot be the process that wrote that file.
+    """
+    storage = str(tmp_path / "a-store")
+    runner = ProcRunner(ps_lines=["570"], proc_etime="00:05")  # bare pid: unreadable command
+    agent = _agent(tmp_path / "home", _spec("com.example.a", "pkg-a", storage), mock_logger,
+                   runner=runner)
+    lock, pidf = _write_lock(storage, 570, mtime=time.time() - 3600)
+    assert agent.clear_stale_storage_locks() == 1
+    assert not os.path.exists(lock)
+
+
+def test_clear_stale_locks_leaves_a_genuinely_live_server_alone(tmp_path, mock_logger):
+    """MUST NOT FIRE: both signals say this is our own, still-running server."""
+    storage = str(tmp_path / "a-store")
+    agent = _agent(tmp_path / "home", _spec("com.example.a", "pkg-a", storage, port=5580),
+                   mock_logger, runner=ProcRunner())
+    pkg = os.path.join(agent.project_dir, "node_modules", agent.spec.package)
+    cmdline = f"4242 node {pkg}/dist/Main.js --storage-path {agent.storage_path} --port 5580"
+    agent._run = ProcRunner(ps_lines=[cmdline], proc_etime="10:00")  # alive 10 minutes
+    # matter.pid's mtime defaults to "now" — well AFTER the process's start time.
+    lock, pidf = _write_lock(storage, 4242)
+    assert agent.clear_stale_storage_locks() == 0
+    assert os.path.exists(lock)
+    assert os.path.exists(pidf)
+
+
+def test_clear_stale_locks_leaves_the_lock_when_the_probe_cannot_tell(tmp_path, mock_logger):
+    """MUST NOT FIRE: ps itself is unusable, so nothing here is evidence of staleness.
+
+    Deleting a live server's lock corrupts a running fabric — worse than the
+    crash-loop this method exists to fix — so "could not tell" must never read
+    as "safe to clear". The method must also say so, not silently report zero.
+    """
+    storage = str(tmp_path / "a-store")
+    agent = _agent(tmp_path / "home", _spec("com.example.a", "pkg-a", storage), mock_logger,
+                   runner=NoPsRunner())
+    lock, _pidf = _write_lock(storage, 4242)
+    assert agent.clear_stale_storage_locks() == 0
+    assert os.path.exists(lock)
+    warnings = [str(c) for c in mock_logger.warning.call_args_list if "cannot tell" in str(c)]
+    assert warnings
+
+
+def test_clear_stale_locks_clears_a_dead_pid(tmp_path, mock_logger):
+    storage = str(tmp_path / "a-store")
+    # A non-empty, genuinely successful ps snapshot that simply does not list our pid —
+    # not to be confused with an empty/unusable probe (that case has its own test).
+    runner = ProcRunner(ps_lines=["1 /sbin/launchd", "50 /usr/libexec/some-service"])
+    agent = _agent(tmp_path / "home", _spec("com.example.a", "pkg-a", storage), mock_logger,
+                   runner=runner)
+    lock, pidf = _write_lock(storage, 9999)
+    assert agent.clear_stale_storage_locks() == 1
+    assert not os.path.exists(lock)
+
+
+def test_clear_stale_locks_clears_a_garbage_pid_file(tmp_path, mock_logger):
+    storage = str(tmp_path / "a-store")
+    agent = _agent(tmp_path / "home", _spec("com.example.a", "pkg-a", storage), mock_logger,
+                   runner=ProcRunner())
+    os.makedirs(storage, exist_ok=True)
+    lock = os.path.join(storage, "matter.lock")
+    with open(lock, "w", encoding="utf-8") as handle:
+        handle.write("")
+    with open(os.path.join(storage, "matter.pid"), "w", encoding="utf-8") as handle:
+        handle.write("not-a-pid\n")
+    assert agent.clear_stale_storage_locks() == 1
+    assert not os.path.exists(lock)
+
+
+def test_clear_stale_locks_clears_a_missing_pid_file(tmp_path, mock_logger):
+    storage = str(tmp_path / "a-store")
+    agent = _agent(tmp_path / "home", _spec("com.example.a", "pkg-a", storage), mock_logger,
+                   runner=ProcRunner())
+    os.makedirs(storage, exist_ok=True)
+    lock = os.path.join(storage, "matter.lock")
+    with open(lock, "w", encoding="utf-8") as handle:
+        handle.write("")
+    # No matter.pid at all — matter.js itself treats this as stale.
+    assert agent.clear_stale_storage_locks() == 1
+    assert not os.path.exists(lock)
+
+
+def test_clear_stale_locks_walks_immediate_subdirectories_too(tmp_path, mock_logger):
+    """The bridge keeps a lock per subdir (config/, certificates/, …), not at the root."""
+    storage = str(tmp_path / "a-store")
+    runner = ProcRunner(ps_lines=["1 /sbin/launchd"])
+    agent = _agent(tmp_path / "home", _spec("com.example.a", "pkg-a", storage), mock_logger,
+                   runner=runner)
+    lock, _pidf = _write_lock(os.path.join(storage, "certificates"), 9999)
+    assert agent.clear_stale_storage_locks() == 1
+    assert not os.path.exists(lock)
+
+
+def test_clear_stale_locks_no_op_when_nothing_is_locked(tmp_path, mock_logger):
+    storage = str(tmp_path / "a-store")
+    agent = _agent(tmp_path / "home", _spec("com.example.a", "pkg-a", storage), mock_logger,
+                   runner=ProcRunner())
+    os.makedirs(storage, exist_ok=True)   # storage exists, but no matter.lock anywhere
+    assert agent.clear_stale_storage_locks() == 0
+
+
+# ---------------------------------------------------------------------------
+# Ordering: the sweep must run BEFORE bootstrap, or launchd starts a process
+# that immediately loses to a lock nobody living holds.
+# ---------------------------------------------------------------------------
+
+def _agent_with_plist(tmp_path, mock_logger, runner):
+    agent = _agent(tmp_path / "home", _spec("com.example.a", "pkg-a", str(tmp_path / "a-store")),
+                   mock_logger, runner=runner)
+    os.makedirs(os.path.dirname(agent.plist_path), exist_ok=True)
+    with open(agent.plist_path, "wb") as handle:
+        handle.write(agent.build_plist())
+    return agent
+
+
+def _fatal_if_bootstrap_runs_first(order):
+    def _bootstrap_and_record(*_args, **_kwargs):
+        if "clear" not in order:
+            raise AssertionError("bootstrap ran before clear_stale_storage_locks")
+        order.append("bootstrap")
+        return True
+    return _bootstrap_and_record
+
+
+def test_stale_lock_sweep_runs_before_bootstrap_on_start(tmp_path, mock_logger):
+    agent = _agent_with_plist(tmp_path, mock_logger, ProcRunner())
+    order: list[str] = []
+    agent.clear_stale_storage_locks = lambda: order.append("clear") or 0
+    agent._bootstrap_and_record = _fatal_if_bootstrap_runs_first(order)
+    assert agent.start() is True
+    assert order == ["clear", "bootstrap"]
+
+
+def test_stale_lock_sweep_runs_before_bootstrap_on_restart(tmp_path, mock_logger):
+    agent = _agent_with_plist(tmp_path, mock_logger, ProcRunner())
+    order: list[str] = []
+    agent.clear_stale_storage_locks = lambda: order.append("clear") or 0
+    agent._bootstrap_and_record = _fatal_if_bootstrap_runs_first(order)
+    assert agent.restart() is True
+    assert order == ["clear", "bootstrap"]

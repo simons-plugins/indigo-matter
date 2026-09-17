@@ -3,6 +3,36 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
+## 2026.32.4 — a rebooted Mac can no longer wedge a LaunchAgent behind a stale storage lock
+
+- New `LaunchAgent.clear_stale_storage_locks()`, run immediately before
+  bootstrap on `start()`, `restart()`, and the fresh-bootstrap path in
+  `_apply_plist()`. matter.js's own stale-lock check
+  (`@matter/nodejs/src/fs/lock-utils.ts`, `staleReason`) only compares the
+  recorded pid's token against its own; for any other pid it does a bare
+  `process.kill(pid, 0)` and calls the lock live the moment that succeeds.
+  After a reboot, macOS is free to hand that recorded pid to anything —
+  2026-09-15 22:03 on jarvis, pid 1621 (the pre-reboot matter-server) came
+  back as `IndigoPluginHost3` running Home Intelligence, an unrelated,
+  still-live process — so matter.js never cleared the lock and matter-server
+  crash-looped on `"Storage is locked by another process"` for 28 minutes
+  across 155 attempts.
+- The new check walks the agent's storage root and its immediate
+  subdirectories (matter-server keeps its lock at the root; the bridge keeps
+  one per subdir — `config/`, `certificates/`, `vendors/`, `ota/`,
+  `server-1-fff1/`, …) and clears a `matter.lock` only when the recorded pid
+  is dead, or — if it is alive — a readable command line names something
+  other than this agent's package and storage path, or the live process
+  started later than `matter.pid`'s mtime (the reboot-proof signal). Either
+  positive signal clears the lock; when neither probe can tell anything at
+  all (an unusable `ps`, an unreadable command line and an unknowable
+  process age together), the lock is left exactly as found and the plugin
+  says why — matching the workspace's degradation-path convention, since
+  clearing a live server's lock would corrupt a running fabric.
+- matter-server is an upstream package (0.17.9, the current stable, ships a
+  byte-identical `lock-utils.ts`), so this is carried on our side rather
+  than waited on upstream.
+
 ## 2026.32.3 — colour-temperature writes are temperature-only again
 
 - `ColorTemperatureLightExport._set_color_temp` no longer co-writes

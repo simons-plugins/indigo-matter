@@ -58,6 +58,12 @@ LSOF_CANDIDATES = ("/usr/sbin/lsof", "/usr/bin/lsof", "lsof")
 # an ADVISORY signal (see LaunchAgent.port_conflict_report): the err log is append-only
 # across restarts, so a hit may be ancient history.
 EADDRINUSE_MARKER = "EADDRINUSE"
+# Filenames matter.js's own storage lock leaves behind
+# (node_modules/@matter/nodejs/src/fs/lock-utils.ts). matter.pid holds "<pid> <token>";
+# matter.lock is the lock file itself. Both live together in a storage directory — see
+# LaunchAgent.clear_stale_storage_locks() for why we look in more than one such directory.
+MATTER_LOCK_FILENAME = "matter.lock"
+MATTER_PID_FILENAME = "matter.pid"
 # How long a freshly started server is allowed to have no listener before "nothing is
 # listening on our port" counts as a fault. matter-server was observed taking ~9s to
 # reach its bind on jarvis; 120s is generous enough that a slow or loaded Mac never
@@ -523,6 +529,11 @@ class LaunchAgent:
         # released the storage lock. Reap any such straggler so the fresh instance below
         # isn't killed by "Storage is locked by another process".
         self.reap_orphan_servers()
+        # A dead or reassigned pid can leave matter.js's OWN lock behind (see
+        # clear_stale_storage_locks) even when there is no orphan process left to reap —
+        # exactly the post-reboot case. Must run before bootstrap: launchd would otherwise
+        # start a process that immediately loses to a lock nobody living holds.
+        self.clear_stale_storage_locks()
         # bootstrap (modern) with a load fallback for older macOS. The marker records the
         # bytes we just wrote (== on disk), so it always reflects what launchd loaded.
         if self._bootstrap_and_record(desired):
@@ -734,6 +745,7 @@ class LaunchAgent:
         """
         if os.path.exists(self.plist_path):
             self.reap_orphan_servers()  # nothing legit runs after stop(); clear any orphan
+            self.clear_stale_storage_locks()  # …nor holds a lock a dead/reassigned pid left
             return self._bootstrap_and_record()
         self.ensure_installed()
         return self.is_alive()
@@ -766,6 +778,7 @@ class LaunchAgent:
         # earlier LaunchAgent keeps holding the storage lock and would make the fresh
         # instance die with "Storage is locked by another process". Reap it first.
         self.reap_orphan_servers()
+        self.clear_stale_storage_locks()  # …and a lock nobody living holds, e.g. post-reboot
         if self._bootstrap_and_record():  # records the digest of the plist actually loaded
             return True
         # fall back to a full unload/reinstall cycle
@@ -1091,6 +1104,184 @@ class LaunchAgent:
             "it is disabled until this works again.",
             self.spec.package, pid, why, self.spec.port,
         )
+
+    # ------------------------------------------------------------------
+    # Stale storage-lock clearing — a lock can outlive the process that wrote
+    # it, and a reboot defeats matter.js's own staleness check entirely.
+    # ------------------------------------------------------------------
+    def clear_stale_storage_locks(self) -> int:
+        """Delete any matter.lock this agent's own storage still holds that no
+        LIVING process of ours can be holding. Returns how many were cleared.
+
+        matter.js's stale-lock check (node_modules/@matter/nodejs/src/fs/lock-utils.ts,
+        ``staleReason``) reads matter.pid (``"<pid> <token>"``) and only compares the
+        token when the recorded pid equals ITS OWN pid; for any other pid it does a
+        bare ``process.kill(pid, 0)`` and calls the lock live the moment that succeeds.
+        After a reboot, macOS is free to hand a recycled pid to anything, and it did:
+        2026-09-15 22:03, jarvis rebooted, and matter.pid's pid 1621 (the pre-reboot
+        matter-server) came back as IndigoPluginHost3 running Home Intelligence — a
+        live, unrelated, still-running process. matter.js read that as "still mine"
+        and never cleared the lock, so the server crash-looped on "Storage is locked
+        by another process" for 28 minutes across 155 attempts. matter-server is
+        upstream and 0.17.9 ships the byte-identical check, so this is our fix to
+        carry, not theirs to wait for — run immediately before we ask launchd to
+        bootstrap a process that would otherwise lose to a lock nobody living holds.
+
+        Walks ``self.storage_path`` itself AND its immediate subdirectories (one
+        level): matter-server keeps its lock at the storage root, but the bridge's
+        tree keeps one per purpose (``config/``, ``certificates/``, ``vendors/``,
+        ``ota/``, ``server-1-fff1/`` and friends), so there is no single fixed
+        location that covers both agents' layouts.
+
+        For each directory holding a ``matter.lock``, ``matter.pid`` decides it:
+
+        * missing or unparseable → stale (matter.js itself treats "no PID file"
+          as stale, so we do too).
+        * the recorded pid is not currently running → stale.
+        * the recorded pid IS running → judged by TWO independent signals, and
+          only a POSITIVE answer from either counts (see
+          :meth:`_stale_reason_for_live_pid`): a readable command line that does
+          not name our package dir *and* our storage path, or a process that
+          started later than matter.pid's mtime (so it cannot be the process
+          that wrote that file — the reboot-proof signal).
+
+        A probe that cannot tell — ``ps`` unusable, or an unreadable command line
+        *and* an unknowable process age — is never treated as evidence of
+        staleness (the workspace CLAUDE.md degradation-path convention: an
+        unusable precondition must not silently read as "safe to act"). Deleting
+        a live server's lock corrupts a running fabric, which is a strictly
+        worse outage than the crash-loop this method exists to end, so those
+        cases are logged and the lock is left exactly as found.
+        """
+        procs = self._ps_map()
+        ps_usable = bool(procs)
+        cleared = 0
+        for directory in self._lock_candidate_dirs():
+            lock_path = os.path.join(directory, MATTER_LOCK_FILENAME)
+            if not self._exists(lock_path):
+                continue
+            pid = self._read_matter_pid(os.path.join(directory, MATTER_PID_FILENAME))
+            if pid is None:
+                self._clear_lock(directory, "matter.pid is missing or unparseable")
+                cleared += 1
+                continue
+            if not ps_usable:
+                # Cannot even ask "is this pid alive" — say so and stop here rather than
+                # falling through to a start-time check whose age probe (ps -p) would
+                # fail for the exact same reason and could look like a second, unrelated
+                # confirmation of "we don't know".
+                self.logger.warning(
+                    "%s in %s names pid %s, but ps is unusable so this plugin cannot "
+                    "tell whether that process still holds it. Leaving the lock in "
+                    "place — diagnose by hand with: ps -p %s",
+                    MATTER_LOCK_FILENAME, directory, pid, pid,
+                )
+                continue
+            if pid not in procs:
+                self._clear_lock(directory, f"pid {pid} in matter.pid is no longer running")
+                cleared += 1
+                continue
+            stale, reason = self._stale_reason_for_live_pid(directory, pid, procs[pid])
+            if stale:
+                self._clear_lock(directory, reason)
+                cleared += 1
+        return cleared
+
+    def _lock_candidate_dirs(self) -> list[str]:
+        """``self.storage_path`` plus its immediate subdirectories.
+
+        One level deep covers both agents' layouts (see
+        :meth:`clear_stale_storage_locks`) without hardcoding either one's
+        subdirectory names. A storage root that does not exist yet (first run)
+        degrades to just the root itself — nothing to clear, nothing to crash on.
+        """
+        dirs = [self.storage_path]
+        try:
+            entries = os.listdir(self.storage_path)
+        except OSError:
+            return dirs
+        for name in entries:
+            path = os.path.join(self.storage_path, name)
+            if os.path.isdir(path):
+                dirs.append(path)
+        return dirs
+
+    @staticmethod
+    def _read_matter_pid(path: str) -> Optional[int]:
+        """The leading pid from a ``matter.pid`` file (``"<pid> <token>"``).
+
+        None for anything matter.js's own check would also call stale: the file
+        is absent, empty, or its first field is not an integer. Garbage and
+        "missing" are folded into the same outcome deliberately — a caller with
+        a lock file and no trustworthy owner has nothing more to learn here.
+        """
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                content = handle.read()
+        except OSError:
+            return None
+        parts = content.split()
+        if not parts:
+            return None
+        try:
+            return int(parts[0])
+        except ValueError:
+            return None
+
+    def _stale_reason_for_live_pid(self, directory: str, pid: int,
+                                    command: str) -> tuple[bool, str]:
+        """Judge a LIVE pid's lock by the two signals in :meth:`clear_stale_storage_locks`.
+
+        Returns ``(True, reason)`` the moment either signal positively says stale,
+        else ``(False, "")`` — including when both signals are simply inconclusive,
+        which callers must treat as "leave it alone", not "cleared".
+        """
+        pkg_dir = self._package_dir()
+        if command:
+            ours = pkg_dir in command and self.storage_path in command
+            if not ours:
+                return True, (
+                    f"pid {pid} is alive but its command line is not {self.spec.package} "
+                    f"for this storage — the pid was reassigned (reboot pid reuse)"
+                )
+            # A command line that DOES match is a positive "this is genuinely ours" —
+            # not itself grounds to override a positive start-time signal, so fall
+            # through and let that check run too.
+        pid_file_mtime = self._file_mtime(os.path.join(directory, MATTER_PID_FILENAME))
+        age = self._process_age_seconds(pid)
+        if pid_file_mtime is not None and age is not None:
+            started_at = time.time() - age
+            if started_at > pid_file_mtime:
+                return True, (
+                    f"pid {pid} started after matter.pid was last written, so it "
+                    f"cannot be the process that wrote that lock"
+                )
+        return False, ""
+
+    @staticmethod
+    def _file_mtime(path: str) -> Optional[float]:
+        try:
+            return os.stat(path).st_mtime
+        except OSError:
+            return None
+
+    def _clear_lock(self, directory: str, reason: str) -> None:
+        """Remove ``matter.lock`` (and ``matter.pid`` beside it) in ``directory``.
+
+        Best-effort: a removal that fails is logged at debug, same discipline as
+        :meth:`_record_applied_digest` — the caller already committed to "stale"
+        and a permissions hiccup on the delete is a separate, smaller problem.
+        """
+        self.logger.warning(
+            "clearing stale %s in %s (%s) so %s can start.",
+            MATTER_LOCK_FILENAME, directory, reason, self.spec.package,
+        )
+        for name in (MATTER_LOCK_FILENAME, MATTER_PID_FILENAME):
+            path = os.path.join(directory, name)
+            try:
+                os.remove(path)
+            except OSError as exc:
+                self.logger.debug("could not remove %s: %s", path, exc)
 
     def _err_log_mentions_port_conflict(self) -> bool:
         """True if the agent's error log tail mentions an EADDRINUSE fatal.
