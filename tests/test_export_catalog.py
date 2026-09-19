@@ -249,6 +249,21 @@ def test_classification_failure_is_logged_once(caplog):
     assert len([r for r in caplog.records if "could not classify" in r.message]) == 1
 
 
+def test_the_classification_failure_reaches_the_plugin_logger_not_the_module_logger(caplog):
+    """The module logger (``_LOG``) reaches no handler in production — see
+    ``export_handlers``' module header for the full account. This error is the
+    only account of WHY a device was excluded, so it must go through
+    ``_PLUGIN_LOG`` (``logging.getLogger("Plugin")``, the one the Indigo Event
+    Log actually uses), with its traceback intact.
+    """
+    with caplog.at_level("ERROR"):
+        classify(HostileDevice(), OURS)
+    errors = [r for r in caplog.records if "could not classify" in r.message]
+    assert len(errors) == 1
+    assert errors[0].name == "Plugin"
+    assert errors[0].exc_info is not None
+
+
 def test_a_raising_capability_flag_is_excluded_not_fatal():
     class ExplodingSensor(SensorDevice):
         @property
