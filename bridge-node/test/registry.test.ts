@@ -44,6 +44,7 @@ import {
     MIREDS_MIN,
     percentToBatteryRemaining,
     percentToCurrentLevel,
+    rejectedStateKeys,
     SUPPORTED_ROLES,
     uniqueIdFor,
     watchCommands,
@@ -742,10 +743,19 @@ describe("set_state (§3.4)", () => {
         }
     });
 
-    it("writes 0% as currentLevel 1, which reads back as 0%", async () => {
+    it("writes 0% as currentLevel 1 when the device reads ON (#353's conservative pin)", async () => {
+        // This test's premise used to be "level:0 always floors to 1" —
+        // #353 changed that for an OFF device (see the "currentLevel
+        // retention while off" describe block below), so this one now pins
+        // the surviving half: ON stays the case where level:0 really does
+        // mean "the Lighting-feature minimum", since the owner ruled level 0
+        // out as a state Indigo produces while genuinely on.
         const h = await harness();
         try {
-            await h.registry.reconcile([spec(1, Role.dimmableLight, { states: { level: 100 } })], false);
+            await h.registry.reconcile(
+                [spec(1, Role.dimmableLight, { states: { onOff: true, level: 100 } })],
+                false,
+            );
             await h.registry.setState(1, { level: 0 });
             const dim = [...h.aggregator.parts][0];
             assert.equal((dim?.stateOf("levelControl") as Record<string, unknown>).currentLevel, 1);
@@ -917,6 +927,280 @@ describe("set_state (§3.4)", () => {
             await h.close();
         }
     });
+});
+
+/**
+ * #353 — a `level: 0` push must not floor a genuinely-off device's
+ * `currentLevel` to the Lighting-feature minimum; see
+ * {@link retainLevelWhileOff}'s doc in `src/endpoints.ts` for the rule, the
+ * Alexa/HAMH#880 evidence and why reading the OnOff attribute here is not a
+ * #143 violation. Each test below is named for the case it is adversarial
+ * against — "when could this retain/lose the level and be wrong?" — not just
+ * "does retention work".
+ */
+describe("currentLevel retention while off (#353)", () => {
+    it("(a) an on-then-off push in the SAME frame retains the pre-off level, not the minimum", async () => {
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(1, Role.dimmableLight)], false);
+            await h.registry.setState(1, { onOff: true, level: 20 });
+            const dim = only(h);
+            // 20% → round(20 × 254 / 100) = 51.
+            assert.equal((dim.stateOf("levelControl") as Record<string, unknown>).currentLevel, 51);
+
+            await h.registry.setState(1, { onOff: false, level: 0 });
+            assert.equal(
+                (dim.stateOf("levelControl") as Record<string, unknown>).currentLevel,
+                51,
+                "currentLevel must not collapse to the Lighting minimum in the same push that turns the light off",
+            );
+            assert.equal((dim.stateOf("onOff") as Record<string, unknown>).onOff, false);
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("(b) a BARE level:0 (no onOff key) retains the level when the attribute already reads off", async () => {
+        // Off by construction (no onOff in the initial states), pre-seeded at
+        // a known non-minimum level so retention is observable rather than
+        // coincidental.
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(1, Role.dimmableLight, { states: { level: 40 } })], false);
+            const dim = only(h);
+            const before = (dim.stateOf("levelControl") as Record<string, unknown>).currentLevel;
+            assert.notEqual(before, 1, "fixture setup: currentLevel must start non-minimum");
+            assert.equal((dim.stateOf("onOff") as Record<string, unknown>).onOff, false, "fixture setup: must start off");
+
+            await h.registry.setState(1, { level: 0 });
+            assert.equal(
+                (dim.stateOf("levelControl") as Record<string, unknown>).currentLevel,
+                before,
+                "a bare level:0 must fall back to the live OnOff attribute, not assume on",
+            );
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("(d) onOff:true and level:0 in the SAME push still writes the minimum (conservative pin)", async () => {
+        const h = await harness();
+        try {
+            await h.registry.reconcile(
+                [spec(1, Role.dimmableLight, { states: { onOff: true, level: 50 } })],
+                false,
+            );
+            const dim = only(h);
+            await h.registry.setState(1, { onOff: true, level: 0 });
+            assert.equal((dim.stateOf("levelControl") as Record<string, unknown>).currentLevel, 1);
+            assert.equal((dim.stateOf("onOff") as Record<string, unknown>).onOff, true);
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("(e) level:0 is ALWAYS a consumed, successful key — never refused, in any onOff combination", async () => {
+        // The trap this guards: a levelPatch that could answer {} for
+        // level:0 would make rejectedStateKeys call it unconsumed, and
+        // statePatchOrRefuse would then refuse a lawful {onOff:false,
+        // level:0} (or a bare {level:0}) wholesale — discarding a genuine
+        // onOff:false right alongside it.
+        assert.deepEqual(rejectedStateKeys(Role.dimmableLight, { level: 0 }), []);
+
+        const h = await harness();
+        try {
+            await h.registry.reconcile(
+                [spec(1, Role.dimmableLight, { states: { onOff: true, level: 50 } })],
+                false,
+            );
+            // Every onOff/level:0 combination below must SUCCEED (no throw).
+            await h.registry.setState(1, { level: 0 });
+            await h.registry.setState(1, { onOff: true, level: 0 });
+            await h.registry.setState(1, { onOff: false, level: 0 });
+
+            // A wrong-typed level is a different key entirely and must still
+            // be refused exactly as before this change.
+            await rejects(() => h.registry.setState(1, { level: "0" }), ErrorCode.malformedArgs);
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("(f) a later on-push with a real level overwrites a retained value normally", async () => {
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(1, Role.dimmableLight)], false);
+            await h.registry.setState(1, { onOff: true, level: 20 }); // currentLevel 51
+            await h.registry.setState(1, { onOff: false, level: 0 }); // retained at 51
+            await h.registry.setState(1, { onOff: true, level: 35 });
+            const dim = only(h);
+            // 35% → round(35 × 254 / 100) = 89.
+            assert.equal((dim.stateOf("levelControl") as Record<string, unknown>).currentLevel, 89);
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("(g) a replayed full state set (registry.update / re-attach) retains the level, not just a bare setState", async () => {
+        // `registry.ts#update` (reached by reconciling the SAME
+        // indigoDeviceId again with an unchanged role/battery) replays the
+        // FULL spec.states through applyStates on every attach — exactly
+        // what a plugin restart's reconcile does. If retention only worked
+        // for setState's direct path, a restart replay would still zero the
+        // level out from under a light that never actually changed.
+        const h = await harness();
+        try {
+            await h.registry.reconcile(
+                [spec(1, Role.dimmableLight, { states: { onOff: true, level: 20 } })],
+                false,
+            );
+            const dim = only(h);
+            assert.equal((dim.stateOf("levelControl") as Record<string, unknown>).currentLevel, 51);
+
+            await h.registry.reconcile(
+                [spec(1, Role.dimmableLight, { states: { onOff: false, level: 0 } })],
+                false,
+            );
+            assert.equal(
+                (dim.stateOf("levelControl") as Record<string, unknown>).currentLevel,
+                51,
+                "a replayed off+level:0 must retain, not reset, the level",
+            );
+            assert.equal((dim.stateOf("onOff") as Record<string, unknown>).onOff, false);
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("(h) a FRESH endpoint created off with level:0 keeps the Lighting minimum — known limit until its first turn-on", async () => {
+        // No prior on-level exists anywhere to retain: createEndpoint does
+        // not call retainLevelWhileOff (see that function's own "fresh-
+        // endpoint known limit" doc), so LEVEL_CONTROL_INITIAL's default (1)
+        // is what construction keeps. This is the one case #353 does not fix.
+        const h = await harness();
+        try {
+            await h.registry.reconcile(
+                [spec(1, Role.dimmableLight, { states: { onOff: false, level: 0 } })],
+                false,
+            );
+            const dim = only(h);
+            assert.equal((dim.stateOf("levelControl") as Record<string, unknown>).currentLevel, 1);
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("(i) the retention rule holds on every level-bearing role", async () => {
+        for (const role of [Role.dimmableLight, Role.colorTemperatureLight, Role.extendedColorLight] as const) {
+            const h = await harness();
+            try {
+                await h.registry.reconcile([spec(1, role)], false);
+                await h.registry.setState(1, { onOff: true, level: 20 });
+                const dim = only(h);
+                assert.equal((dim.stateOf("levelControl") as Record<string, unknown>).currentLevel, 51, role);
+
+                await h.registry.setState(1, { onOff: false, level: 0 });
+                assert.equal(
+                    (dim.stateOf("levelControl") as Record<string, unknown>).currentLevel,
+                    51,
+                    `${role}: currentLevel must not collapse while off`,
+                );
+            } finally {
+                await h.close();
+            }
+        }
+    });
+
+    it("(j) a level command issued while off computes its target against the RETAINED level, not the minimum", async () => {
+        // Pins the read side of retention: IndigoLevelControlServer's
+        // stepLogic override reads `currentLevel` off the live endpoint, so a
+        // retained 51 (not the old floor-to-1 behaviour) must be what a
+        // step's target is computed from. executeIfOff (LEVEL_CONTROL_INITIAL)
+        // is what lets this plain command reach the override at all while the
+        // attribute reads off — see the executeIfOff tests below for that
+        // half on its own.
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(1, Role.dimmableLight)], false);
+            await h.registry.setState(1, { onOff: true, level: 20 }); // currentLevel 51
+            await h.registry.setState(1, { onOff: false, level: 0 }); // retained at 51
+            const endpoint = only(h);
+            assert.equal((endpoint.stateOf("levelControl") as Record<string, unknown>).currentLevel, 51);
+
+            await endpoint.act(agent =>
+                agent.get(LevelLighting).step({
+                    stepMode: LevelControl.StepMode.Up,
+                    stepSize: 10,
+                    transitionTime: null,
+                    optionsMask: {},
+                    optionsOverride: {},
+                }),
+            );
+            // 51 + 10 = 61 → round(61 × 100 / 254) = 24. A pre-#353 bridge
+            // would have stepped from 1, reporting setLevel 4 instead.
+            assert.deepEqual(h.commands, [{ indigoDeviceId: 1, command: "setLevel", args: { level: 24 } }]);
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("(restart) a bridge restart replays off+level:0 without resetting a persisted currentLevel", async () => {
+        // The degradation path that actually matters: whenever the bridge
+        // node restarts while lights are off, the plugin's attach reconcile
+        // sends each off dimmer's CURRENT states — including level:0 — as
+        // the initial `states` on a re-created Endpoint object for the SAME
+        // persisted endpoint id. If matter.js's own restore or
+        // this fix's construction path lost the retained level here, #353
+        // would resurface on every single restart rather than being fixed.
+        const storagePath = mkdtempSync(join(SCRATCH_ROOT, "indigo-matter-353-restart-"));
+        scratchRoots.push(storagePath);
+
+        const first = await harness({ storagePath });
+        try {
+            await first.registry.reconcile([spec(1, Role.dimmableLight)], false);
+            await first.registry.setState(1, { onOff: true, level: 20 }); // currentLevel 51
+            await first.registry.setState(1, { onOff: false, level: 0 }); // retained at 51
+            assert.equal(
+                (only(first).stateOf("levelControl") as Record<string, unknown>).currentLevel,
+                51,
+            );
+        } finally {
+            await first.close();
+        }
+
+        // A genuinely new node, same storage lock — mirrors the
+        // ConfigurationVersion-restart test above and "gives an id the same
+        // number across a node restart".
+        const second = await harness({ storagePath });
+        try {
+            // What the plugin's attach reconcile really sends for an off
+            // dimmer: its last confirmed states, level:0 included.
+            await second.registry.reconcile(
+                [spec(1, Role.dimmableLight, { states: { onOff: false, level: 0 } })],
+                false,
+            );
+            const dim = only(second);
+            assert.equal(
+                (dim.stateOf("levelControl") as Record<string, unknown>).currentLevel,
+                51,
+                "a restart's attach reconcile must not reset the persisted level to the Lighting minimum",
+            );
+            assert.equal((dim.stateOf("onOff") as Record<string, unknown>).onOff, false);
+            // Same reasoning as the endpoint-number restart test: rebuilding
+            // from persisted state must stay silent on the wire.
+            assert.deepEqual(second.commands, [], "a restart sprayed command events");
+        } finally {
+            await second.close();
+        }
+    });
+
+    // (k), the matter.js scene quirk (a scene recall to exactly the retained
+    // level while off would skip the level half of #applySceneValues's own
+    // equality guard — see IndigoLevelControlServer's class doc) is not
+    // pinned here: it needs a commissioned ScenesManagement fixture this
+    // harness does not otherwise build, and the guard itself is pre-existing,
+    // not introduced by this change. Noted as a known limit in the class doc
+    // instead of sunk into a bespoke harness for one adversarial case.
 });
 
 /** A matter.js `$Changed` observable, as much of it as these tests drive. */

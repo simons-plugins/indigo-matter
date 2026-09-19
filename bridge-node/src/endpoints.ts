@@ -260,6 +260,16 @@ export function percentToBatteryRemaining(percent: number): number {
  * touches the OnOff cluster. Turning a light off at 0% is the plugin's call —
  * it owns the Indigo device's on/off state and sends `onOff` in the same
  * `set_state` when it means it (§4.2 lists them as independent state keys).
+ *
+ * **#353: a `level: 0` push while off no longer reaches `currentLevel`.**
+ * This function still clamps 0→1 exactly as before — `levelPatch` still
+ * converts every numeric level unconditionally, this function included — but
+ * {@link retainLevelWhileOff} strips that particular write back out of the
+ * patch at `applyStates` before it is applied, so the minimum computed here
+ * is not what lands in `currentLevel` for an off device with a prior
+ * confirmed level (a brand-new endpoint's first-ever construction is a known
+ * exception — see that function's doc). See that function's doc for the full
+ * rule and for why it lives there instead of here.
  */
 export function percentToCurrentLevel(percent: number): number {
     return Math.max(1, percentToMatter(percent));
@@ -1556,10 +1566,23 @@ function ctBoundsOverride(
  * writable attribute (an ecosystem could in principle write it back to
  * `false` — pinned as a real test, not just a comment, in "executeIfOff is
  * itself writable…"), and a *plain* `MoveToLevel` (no `WithOnOff`) on a
- * genuinely-off lamp now forwards where it used to be dropped — harmless in
- * practice, since Apple's brightness slider sends `MoveToLevelWithOnOff`,
- * which was never gated in the first place, so the common path is
- * unaffected either way.
+ * genuinely-off lamp now forwards where it used to be dropped. **This used to
+ * be called "harmless in practice" here — that claim is FALSE, and #353 is
+ * exactly its counter-example.** Alexa's own "turn on" sends `onOff.on`
+ * followed, 40-70ms later, by a separate plain `MoveToLevel(254)` — observed
+ * on the wire, not `WithOnOff`. Forwarded straight through this seed, that
+ * command forced every Alexa-driven dimmer to 100% on every Alexa turn-on
+ * (Apple Home was not observed doing this — it uses
+ * `MoveToLevelWithOnOff`), because `currentLevel` sat at the Lighting-feature
+ * minimum while the light was off; WHY Alexa sends it is upstream's inference
+ * (`home-assistant-matter-hub#880`), not something this bridge has verified.
+ * `executeIfOff` stays `true` on purpose regardless — flipping it would also
+ * break "Alexa, set X to 70%" on an off light, which sends the identical
+ * plain-command shape — #353 is fixed at the source instead: see
+ * {@link retainLevelWhileOff}, which stops `currentLevel` from sitting at
+ * that minimum while a device is off (a brand-new endpoint's first-ever
+ * construction is a known exception — see that function's own doc), so there
+ * is nothing for a stray `MoveToLevel` to "restore".
  * `coupleColorTempToLevel: false` is the cluster's own default restated, not
  * a behaviour change — it is here so a reader chasing why `couple()`'s
  * colour-temperature branch (`LevelControlServer.js:400-412`) never fires
@@ -1766,6 +1789,15 @@ function onOffPatch(states: Record<string, unknown>): Record<string, unknown> {
     return typeof states.onOff === "boolean" ? { [ON_OFF]: { onOff: states.onOff } } : {};
 }
 
+/**
+ * Converts every numeric `level` unconditionally, `0` included — deliberately
+ * not endpoint-aware. #353's "keep the last on-level while off" rule lives in
+ * {@link retainLevelWhileOff} instead, which runs at {@link applyStates} (the
+ * call site that actually has a live endpoint to ask "is this device off");
+ * see that function's doc for the rule, for why {@link createEndpoint} does
+ * NOT also call it, and for why the rule cannot live here without breaking
+ * {@link rejectedStateKeys}.
+ */
 function levelPatch(states: Record<string, unknown>): Record<string, unknown> {
     if (typeof states.level !== "number") {
         return {};
@@ -2617,6 +2649,113 @@ export function rejectedStateKeys(role: RoleValue, states: Record<string, unknow
 }
 
 /**
+ * #353 — Indigo reports 0% brightness whenever a dimmer is off, so an
+ * ordinary "the light is off" push carries `{onOff: false, level: 0}`. Passed
+ * through {@link levelPatch} unmodified, `level: 0` becomes `currentLevel: 1`
+ * (the Lighting feature's own MINIMUM — see {@link percentToCurrentLevel}),
+ * which reads back as 0% but is not the same thing as a real bulb's own
+ * memory of its last on-level, which an ecosystem typically still shows on an
+ * off light. Observed on the wire: Alexa's "turn on" sends `onOff.on`, then
+ * 40-70ms later a SEPARATE plain `levelControl.moveToLevel(254)` (not
+ * `WithOnOff`, `transitionTime: 0`, from the Amazon fabric, vendor 4631).
+ * WHY Alexa sends that second command is not something we can see — upstream
+ * `t0bst4r/home-assistant-matter-hub#880` infers, from one A/B there
+ * (advertising a non-minimum level while off made Alexa send On only), that
+ * Alexa treats a light sitting at the Lighting minimum as needing an
+ * explicit level to look genuinely on. Treat that as upstream's inference,
+ * not a fact this bridge has verified. What IS fact: the observed command
+ * forces every Alexa-driven dimmer to 100% on every Alexa turn-on, overriding
+ * the dimmer's own on-level (Apple Home was not observed doing this — it
+ * uses `MoveToLevelWithOnOff`). Same shape and same fix as upstream's
+ * commit `f761edd0`: stop advertising the Lighting minimum while off by
+ * retaining the last confirmed on-level instead, so there is nothing for a
+ * stray restore to act on.
+ *
+ * **The rule.** A pushed `level: 0` does not write `currentLevel` when the
+ * device is off; the attribute keeps the last level Indigo confirmed while
+ * the light was on. "Off" means either this SAME push says `onOff: false`,
+ * or it says nothing about `onOff` at all and the endpoint's `OnOff`
+ * attribute already reads `false`. Reading that attribute here is NOT a #143
+ * violation: #143 (see {@link IndigoOnOffServer}'s and
+ * {@link IndigoLevelControlServer}'s class docs) is about ecosystem COMMANDS
+ * racing ahead of an unconfirmed attribute; this only ever runs from a STATE
+ * PUSH, and {@link IndigoOnOffServer.applyIndigoOnOff} is that attribute's
+ * only writer — so for this direction the attribute IS Indigo-confirmed
+ * truth, not a stale echo. Every other combination (`level: 0` pushed
+ * alongside `onOff: true`, or with no `onOff` key while the attribute already
+ * reads `true`) keeps today's behaviour and writes 1: the owner's call,
+ * treating "level 0 while on" as a state Indigo should not produce rather
+ * than one worth a bespoke meaning of its own.
+ *
+ * **Deliberately not inside {@link levelPatch}.** `rejectedStateKeys` decides
+ * "was this key consumed" by running `statePatch({level: 0})` on that ONE key
+ * alone, with no endpoint in sight (see its own doc). A `levelPatch` that
+ * could return `{}` for `level: 0` would make that lawful key look
+ * unconsumed, and `statePatchOrRefuse`/`applyStates` would then refuse a
+ * lawful `{onOff:false, level:0}` (or a bare `{level:0}`) push wholesale as
+ * `malformed_args` — discarding a genuine `onOff:false` right alongside it.
+ * So `levelPatch` keeps converting `level` unconditionally, including 0, and
+ * this function only ever DELETES a `currentLevel` key it already added —
+ * it never changes what counts as consumed.
+ *
+ * **Fresh-endpoint known limit, and why {@link createEndpoint} does not call
+ * this.** A brand-new endpoint has no confirmed prior level to retain, so a
+ * `level: 0` construction push while off just keeps
+ * {@link LEVEL_CONTROL_INITIAL}'s default `currentLevel: 1` — the bug
+ * persists for such a device until its first turn-on. An EXISTING accessory
+ * is unaffected by this limit across a bridge *restart*, though: matter.js
+ * persists `currentLevel` (it is a nonvolatile Matter attribute) and restores
+ * that value over whatever `createEndpoint` seeds as construction defaults —
+ * pinned live by the "(restart) a bridge restart replays off+level:0..."
+ * test below, the same restart-survival shape
+ * {@link bridgedInfoFor}'s `configurationVersion` comment documents for that
+ * attribute. So `createEndpoint`'s construction patch never needs this
+ * function, and it matters HOW that holds: a restarted node has an empty
+ * live set, so `registry.reconcile()` takes its `create` branch —
+ * `createEndpoint` DOES run again, its patch DOES carry `currentLevel: 1`,
+ * and `applyStates` does NOT run afterwards. The level survives only because
+ * matter.js restores the persisted value over that construction patch. The
+ * restore is not selective: a throwaway probe while fixing #353 showed it
+ * beats a genuinely DIFFERENT attach state too (a dimmer attached as on at
+ * 60% came up off at 20%), which is a separate problem from this one — the
+ * restart test here pins #353's outcome, not that mechanism, so a future fix
+ * that applies attach states after `create` reaches this function through
+ * `applyStates` and the level is retained either way.
+ */
+function retainLevelWhileOff(endpoint: Endpoint, patch: Record<string, unknown>, rest: Record<string, unknown>): void {
+    if (rest.level !== 0) {
+        return;
+    }
+    const levelControl = patch[LEVEL_CONTROL] as { currentLevel?: number } | undefined;
+    if (levelControl?.currentLevel === undefined) {
+        return;
+    }
+    // `endpoint.stateOf(ON_OFF)` is read ONLY here, behind both guards above —
+    // never unconditionally at the top of `applyStates`. A role with no
+    // LevelControl (every E4 sensor, the lock, the covering…) has no OnOff
+    // behaviour either in several cases, and `stateOf` THROWS ("Behavior
+    // \"onOff\" is not present on this endpoint") rather than returning
+    // undefined for a behaviour the endpoint's device type never composed —
+    // measured via the sensor/thermostat/lock/covering suites going from
+    // green to a wall of that exact throw when this read was unconditional.
+    // Every role that CAN reach this point (patch carries a LEVEL_CONTROL
+    // write) is one of the three level-bearing roles, and all three also
+    // compose `IndigoOnOffServer` (see the ROLE_DEFINITIONS class comment),
+    // so the read is safe exactly where it is now guarded to.
+    const off =
+        typeof rest.onOff === "boolean"
+            ? rest.onOff === false
+            : (endpoint.stateOf(ON_OFF) as { onOff?: boolean }).onOff === false;
+    if (!off) {
+        return;
+    }
+    delete levelControl.currentLevel;
+    if (Object.keys(levelControl).length === 0) {
+        delete patch[LEVEL_CONTROL];
+    }
+}
+
+/**
  * Apply a §3.4 `set_state` as a local (offline-context) write.
  *
  * An empty `states` is a lawful no-op and succeeds. Keys the role does not
@@ -2660,6 +2799,13 @@ export async function applyStates(
     // a valid battery reading thrown away alongside the stranger it arrived
     // with. A push with no consumable battery key keeps the ordinary refusal.
     const patch = battery !== undefined ? definitionFor(role).statePatch(rest) : statePatchOrRefuse(role, rest);
+    // #353 — after refusal is decided (so a lawful `level: 0` was already
+    // counted as consumed above), strip the write back out if it would have
+    // floored an off device's currentLevel to the Lighting minimum. Run
+    // BEFORE the onOff `act()` below, so a fallback live-attribute read (see
+    // the function's own doc for when that branch fires) sees this push's
+    // OWN prior confirmation, not a value this same push is about to move.
+    retainLevelWhileOff(endpoint, patch, rest);
     // #293 — `colorPatch()` (inside `statePatch` above) already clamped a
     // `colorTempMireds` write to the generic 153-500 band via `clampMireds`.
     // Re-clamp into whatever THIS endpoint currently advertises as physical
