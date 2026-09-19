@@ -3,6 +3,65 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
+## 2026.32.4 — a rebooted Mac can no longer wedge a LaunchAgent behind a stale storage lock
+
+- New `LaunchAgent.clear_stale_storage_locks()`, run immediately before
+  bootstrap on `start()`, `restart()`, and the fresh-bootstrap path in
+  `_apply_plist()`. matter.js's own stale-lock check
+  (`@matter/nodejs/src/fs/lock-utils.ts`, `staleReason`) only compares the
+  recorded pid's token against its own; for any other pid it does a bare
+  `process.kill(pid, 0)` and calls the lock live the moment that succeeds.
+  After a reboot, macOS is free to hand that recorded pid to anything —
+  2026-09-15 22:03 on jarvis, pid 1621 (the pre-reboot matter-server) came
+  back as `IndigoPluginHost3` running Home Intelligence, an unrelated,
+  still-live process — so matter.js never cleared the lock and matter-server
+  crash-looped on `"Storage is locked by another process"` for 28 minutes
+  across 155 attempts.
+- The new check walks the agent's storage root and its immediate
+  subdirectories, **never following a symlink** out of that tree
+  (matter-server keeps its lock at the root; the bridge keeps one per subdir
+  — `config/`, `certificates/`, `vendors/`, `ota/`, `server-1-fff1/`, …), and
+  clears a `matter.lock` only when the recorded pid is dead, or — if it is
+  alive — an ORDERED judgement of it: a readable command line settles it
+  outright (naming this agent's package and storage path ends the decision
+  as "ours", full stop; naming anything else is stale), and only when the
+  command line is unreadable does a live process having started later than
+  `matter.pid`'s mtime (the reboot-proof signal) get a vote. When nothing can
+  decide either way — an unusable `ps`, an unreadable/missing-but-probe-
+  failed `matter.pid`, or an unreadable command line plus an unknowable
+  process age — the lock is left exactly as found and the plugin says so,
+  naming the pid and which probe failed, rather than silently reporting a
+  clean sweep — matching the workspace's degradation-path convention, since
+  clearing a live server's lock would corrupt a running fabric. A binary or
+  truncated `matter.pid` (what a power cut mid-write leaves) is handled
+  without raising, and a lock the plugin fails to remove (e.g. a read-only
+  directory) is reported as a failure, never as a false "cleared".
+- matter-server is an upstream package (0.17.9, the current stable, ships a
+  byte-identical `lock-utils.ts`), so this is carried on our side rather
+  than waited on upstream.
+- Review fix: `_apply_plist()`'s "healthy and untouched" branch (matching
+  plist digest, a live managed pid, no orphan to reap) used to return
+  *before* ever reaching the sweep. That is exactly what a reboot-reused
+  pid's crash-loop looks like the instant a plugin reload samples it —
+  launchd keeps respawning the doomed process every ~10s, and whichever
+  attempt is alive at that instant has the right digest and nothing for
+  `reap_orphan_servers()` to reap (the reused pid belongs to someone else's
+  legitimate process). "Reload the plugin" is the natural remedy a stuck
+  user reaches for first, so that branch now sweeps too, before returning —
+  still without re-bootstrapping a job that stays launchd's to respawn.
+- Review fix: `reap_orphan_servers()`'s SIGTERM path already polled until
+  the signalled pids left `ps`; the SIGKILL branch signalled and returned
+  immediately. All three sweep call sites run right after it, and a
+  just-KILLed pid stays visible in `ps` — with its full, still-matching
+  command line — for a beat after `kill(2)` returns, so the sweep read it as
+  a live owner (`LIVE_PID_OURS`) and left its lock in place. That was the
+  worst case to miss: a SIGKILLed matter-server never runs matter.js's exit
+  handler, so unlike a clean SIGTERM exit it has definitely *not* released
+  its lock, and the fresh bootstrap that follows would die on the exact
+  `"Storage is locked by another process"` failure this feature exists to
+  end. The SIGKILL branch now waits the same way the SIGTERM branch does,
+  and reports a pid that is still present once that wait is exhausted.
+
 ## 2026.32.3 — colour-temperature writes are temperature-only again
 
 - `ColorTemperatureLightExport._set_color_temp` no longer co-writes

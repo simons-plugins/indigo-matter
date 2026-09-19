@@ -17,6 +17,8 @@ import dataclasses
 import hashlib
 import os
 import plistlib
+import subprocess
+import time
 
 import pytest
 
@@ -343,6 +345,16 @@ def test_remove_package_says_so_when_it_could_NOT_remove_it(tmp_path, mock_logge
 def _infos(logger) -> str:
     return " ".join(str(c.args[0]) % c.args[1:] if len(c.args) > 1 else str(c.args[0])
                     for c in logger.info.call_args_list)
+
+
+def _warnings(logger) -> str:
+    return " ".join(str(c.args[0]) % c.args[1:] if len(c.args) > 1 else str(c.args[0])
+                    for c in logger.warning.call_args_list)
+
+
+def _errors(logger) -> str:
+    return " ".join(str(c.args[0]) % c.args[1:] if len(c.args) > 1 else str(c.args[0])
+                    for c in logger.error.call_args_list)
 
 
 # ---------------------------------------------------------------------------
@@ -932,3 +944,500 @@ def test_port_probe_tries_the_second_absolute_candidate(tmp_path, mock_logger):
     assert agent._port_listener_pids() == [321]
     probes = [c[0] for c in runner.calls if c and os.path.basename(c[0]) == "lsof"]
     assert probes == ["/usr/bin/lsof"]
+
+
+# ---------------------------------------------------------------------------
+# clear_stale_storage_locks — the 2026-09-15 jarvis reboot pid-reuse bug.
+#
+# A stale matter.lock stops a fresh matter-server from EVER starting ("Storage is
+# locked by another process"), and matter.js's own check is defeated by a rebooted
+# Mac recycling the recorded pid onto an unrelated, still-live process. These tests
+# are adversarial on purpose: each one asks "could this clear a lock it must not?"
+# or "could this leave a lock it must clear?" rather than just the happy path.
+# ---------------------------------------------------------------------------
+
+def _write_lock(directory, pid, token="deadbeef", mtime=None):
+    """Write a matter.lock + matter.pid pair as matter.js itself would.
+
+    Returns (lock_path, pid_path). ``mtime``, if given, backdates matter.pid's
+    mtime (epoch seconds) so a test can control the start-time signal precisely.
+    """
+    os.makedirs(directory, exist_ok=True)
+    lock_path = os.path.join(directory, "matter.lock")
+    pid_path = os.path.join(directory, "matter.pid")
+    with open(lock_path, "w", encoding="utf-8") as handle:
+        handle.write("")
+    with open(pid_path, "w", encoding="utf-8") as handle:
+        handle.write(f"{pid} {token}\n")
+    if mtime is not None:
+        os.utime(pid_path, (mtime, mtime))
+    return lock_path, pid_path
+
+
+class NoPsRunner(ProcRunner):
+    """``ps`` cannot be executed at all — models a totally unusable probe.
+
+    Mirrors ``NoLsofRunner`` above: Python raises OSError when subprocess can't
+    find the binary, which ``_ps_map`` must fold into "{}" (could not tell),
+    never into "nothing is running".
+    """
+
+    def __call__(self, cmd, **kwargs):
+        if cmd and cmd[0] == "ps":
+            self.calls.append(cmd)
+            raise OSError(2, "No such file or directory: 'ps'")
+        return super().__call__(cmd, **kwargs)
+
+
+def test_clear_stale_locks_clears_a_reboot_reused_pid(tmp_path, mock_logger):
+    """The real bug: matter.pid names a LIVE pid that is someone else entirely.
+
+    This is pid 1621 on jarvis, 2026-09-15: the pre-reboot matter-server's pid,
+    reassigned by macOS to IndigoPluginHost3 running Home Intelligence.
+    """
+    storage = str(tmp_path / "a-store")
+    runner = ProcRunner(ps_lines=[
+        "1621 /usr/bin/python3 IndigoPluginHost3 -x indigo-home-intelligence",
+    ])
+    agent = _agent(tmp_path / "home", _spec("com.example.a", "pkg-a", storage), mock_logger,
+                   runner=runner)
+    lock, pidf = _write_lock(storage, 1621)
+    assert agent.clear_stale_storage_locks() == 1
+    assert not os.path.exists(lock)
+    assert not os.path.exists(pidf)
+
+
+def test_clear_stale_locks_clears_on_the_reboot_proof_start_time_signal(tmp_path, mock_logger):
+    """Command line is inconclusive (no args at all); start time settles it.
+
+    The live pid started only 5s ago, but matter.pid was last written an hour ago
+    — the pid cannot be the process that wrote that file.
+    """
+    storage = str(tmp_path / "a-store")
+    runner = ProcRunner(ps_lines=["570"], proc_etime="00:05")  # bare pid: unreadable command
+    agent = _agent(tmp_path / "home", _spec("com.example.a", "pkg-a", storage), mock_logger,
+                   runner=runner)
+    lock, pidf = _write_lock(storage, 570, mtime=time.time() - 3600)
+    assert agent.clear_stale_storage_locks() == 1
+    assert not os.path.exists(lock)
+
+
+def test_clear_stale_locks_leaves_a_genuinely_live_server_alone(tmp_path, mock_logger):
+    """MUST NOT FIRE: both signals say this is our own, still-running server."""
+    storage = str(tmp_path / "a-store")
+    agent = _agent(tmp_path / "home", _spec("com.example.a", "pkg-a", storage, port=5580),
+                   mock_logger, runner=ProcRunner())
+    pkg = os.path.join(agent.project_dir, "node_modules", agent.spec.package)
+    cmdline = f"4242 node {pkg}/dist/Main.js --storage-path {agent.storage_path} --port 5580"
+    agent._run = ProcRunner(ps_lines=[cmdline], proc_etime="10:00")  # alive 10 minutes
+    # matter.pid's mtime defaults to "now" — well AFTER the process's start time.
+    lock, pidf = _write_lock(storage, 4242)
+    assert agent.clear_stale_storage_locks() == 0
+    assert os.path.exists(lock)
+    assert os.path.exists(pidf)
+
+
+def test_clear_stale_locks_does_not_accuse_an_owner_the_age_probe_merely_rounded(
+        tmp_path, mock_logger):
+    """MUST NOT FIRE: a live owner that wrote matter.pid within the probe's own error.
+
+    ``ps -o etime=`` prints whole seconds truncated DOWN, and the age is subtracted
+    from a ``time.time()`` read taken after that subprocess returns — both push the
+    computed start time later. So a healthy server that acquired its lock a fraction
+    of a second after exec can compute as "started after matter.pid was written". Here
+    the process reports 1s of age against a pid file written 2s ago: a bare
+    ``started_at > mtime`` test calls that stale and deletes a RUNNING server's lock,
+    corrupting a live fabric. Only a gap no probe error explains may fire.
+    """
+    storage = str(tmp_path / "a-store")
+    runner = ProcRunner(ps_lines=["4242"], proc_etime="00:01")  # unreadable command line
+    agent = _agent(tmp_path / "home", _spec("com.example.a", "pkg-a", storage), mock_logger,
+                   runner=runner)
+    lock, pidf = _write_lock(storage, 4242, mtime=time.time() - 2)
+    assert agent.clear_stale_storage_locks() == 0
+    assert os.path.exists(lock)
+    assert os.path.exists(pidf)
+
+
+def test_clear_stale_locks_leaves_the_lock_when_the_probe_cannot_tell(tmp_path, mock_logger):
+    """MUST NOT FIRE: ps itself is unusable, so nothing here is evidence of staleness.
+
+    Deleting a live server's lock corrupts a running fabric — worse than the
+    crash-loop this method exists to fix — so "could not tell" must never read
+    as "safe to clear". The method must also say so, not silently report zero.
+    """
+    storage = str(tmp_path / "a-store")
+    agent = _agent(tmp_path / "home", _spec("com.example.a", "pkg-a", storage), mock_logger,
+                   runner=NoPsRunner())
+    lock, _pidf = _write_lock(storage, 4242)
+    assert agent.clear_stale_storage_locks() == 0
+    assert os.path.exists(lock)
+    warnings = [str(c) for c in mock_logger.warning.call_args_list if "cannot tell" in str(c)]
+    assert warnings
+
+
+def test_clear_stale_locks_clears_a_dead_pid(tmp_path, mock_logger):
+    storage = str(tmp_path / "a-store")
+    # A non-empty, genuinely successful ps snapshot that simply does not list our pid —
+    # not to be confused with an empty/unusable probe (that case has its own test).
+    runner = ProcRunner(ps_lines=["1 /sbin/launchd", "50 /usr/libexec/some-service"])
+    agent = _agent(tmp_path / "home", _spec("com.example.a", "pkg-a", storage), mock_logger,
+                   runner=runner)
+    lock, pidf = _write_lock(storage, 9999)
+    assert agent.clear_stale_storage_locks() == 1
+    assert not os.path.exists(lock)
+
+
+def test_clear_stale_locks_clears_a_garbage_pid_file(tmp_path, mock_logger):
+    storage = str(tmp_path / "a-store")
+    agent = _agent(tmp_path / "home", _spec("com.example.a", "pkg-a", storage), mock_logger,
+                   runner=ProcRunner())
+    os.makedirs(storage, exist_ok=True)
+    lock = os.path.join(storage, "matter.lock")
+    with open(lock, "w", encoding="utf-8") as handle:
+        handle.write("")
+    with open(os.path.join(storage, "matter.pid"), "w", encoding="utf-8") as handle:
+        handle.write("not-a-pid\n")
+    assert agent.clear_stale_storage_locks() == 1
+    assert not os.path.exists(lock)
+
+
+def test_clear_stale_locks_clears_a_missing_pid_file(tmp_path, mock_logger):
+    storage = str(tmp_path / "a-store")
+    agent = _agent(tmp_path / "home", _spec("com.example.a", "pkg-a", storage), mock_logger,
+                   runner=ProcRunner())
+    os.makedirs(storage, exist_ok=True)
+    lock = os.path.join(storage, "matter.lock")
+    with open(lock, "w", encoding="utf-8") as handle:
+        handle.write("")
+    # No matter.pid at all — matter.js itself treats this as stale.
+    assert agent.clear_stale_storage_locks() == 1
+    assert not os.path.exists(lock)
+
+
+def test_clear_stale_locks_walks_immediate_subdirectories_too(tmp_path, mock_logger):
+    """The bridge keeps a lock per subdir (config/, certificates/, …), not at the root."""
+    storage = str(tmp_path / "a-store")
+    runner = ProcRunner(ps_lines=["1 /sbin/launchd"])
+    agent = _agent(tmp_path / "home", _spec("com.example.a", "pkg-a", storage), mock_logger,
+                   runner=runner)
+    lock, _pidf = _write_lock(os.path.join(storage, "certificates"), 9999)
+    assert agent.clear_stale_storage_locks() == 1
+    assert not os.path.exists(lock)
+
+
+def test_clear_stale_locks_no_op_when_nothing_is_locked(tmp_path, mock_logger):
+    storage = str(tmp_path / "a-store")
+    agent = _agent(tmp_path / "home", _spec("com.example.a", "pkg-a", storage), mock_logger,
+                   runner=ProcRunner())
+    os.makedirs(storage, exist_ok=True)   # storage exists, but no matter.lock anywhere
+    assert agent.clear_stale_storage_locks() == 0
+
+
+def test_clear_stale_locks_leaves_a_positively_identified_owner_even_if_it_looks_young(
+        tmp_path, mock_logger):
+    """Pins the dangerous fall-through: a matching command line must END the
+    decision. Before the fix, a matching command line fell through to the
+    start-time check anyway, so a rounding-inflated age could still accuse a
+    positively-identified, RUNNING server and delete its lock — corrupting a
+    live fabric, the worst outcome this whole method exists to avoid.
+
+    matter.pid's mtime here predates the process's computed start time by far
+    more than the slack margin — exactly the shape that used to fire.
+    """
+    storage = str(tmp_path / "a-store")
+    agent = _agent(tmp_path / "home", _spec("com.example.a", "pkg-a", storage, port=5580),
+                   mock_logger, runner=ProcRunner())
+    pkg = os.path.join(agent.project_dir, "node_modules", agent.spec.package)
+    cmdline = f"4242 node {pkg}/dist/Main.js --storage-path {agent.storage_path} --port 5580"
+    # etime "00:01" => age 1s => started_at ~= now. matter.pid's mtime is set far in
+    # the past, so started_at is WELL past mtime + START_AFTER_LOCK_SLACK_SECONDS —
+    # the exact condition the old code would have called stale.
+    agent._run = ProcRunner(ps_lines=[cmdline], proc_etime="00:01")
+    lock, pidf = _write_lock(storage, 4242, mtime=time.time() - 3600)
+    assert agent.clear_stale_storage_locks() == 0
+    assert os.path.exists(lock)
+    assert os.path.exists(pidf)
+
+
+def test_clear_stale_locks_treats_an_undecodable_pid_file_as_no_owner_without_raising(
+        tmp_path, mock_logger):
+    """A power cut mid-write leaves a binary/truncated matter.pid.
+
+    `open(..., encoding="utf-8").read()` raises UnicodeDecodeError, which is a
+    ValueError — NOT an OSError — so the old bare `except OSError` let it escape
+    clear_stale_storage_locks (and from there start()/restart()/_apply_plist()).
+    The deliberate, chosen behaviour: unreadable CONTENT is folded into "no
+    owner recorded", same as garbage text — nothing more to learn from it.
+    """
+    storage = str(tmp_path / "a-store")
+    agent = _agent(tmp_path / "home", _spec("com.example.a", "pkg-a", storage), mock_logger,
+                   runner=ProcRunner())
+    os.makedirs(storage, exist_ok=True)
+    lock = os.path.join(storage, "matter.lock")
+    with open(lock, "w", encoding="utf-8") as handle:
+        handle.write("")
+    with open(os.path.join(storage, "matter.pid"), "wb") as handle:
+        handle.write(b"\xff\xfe\x00binary-garbage-from-a-power-cut")
+    assert agent.clear_stale_storage_locks() == 1   # did not raise, and cleared it
+    assert not os.path.exists(lock)
+
+
+def test_clear_stale_locks_leaves_an_unreadable_pid_file_and_warns(
+        tmp_path, mock_logger, monkeypatch):
+    """A PROBE FAILURE (e.g. EACCES) reading matter.pid must NOT read as "no
+    owner": the file may still name a live server. Distinct from genuinely
+    missing, which DOES clear (see the "missing_pid_file" test above).
+    """
+    storage = str(tmp_path / "a-store")
+    agent = _agent(tmp_path / "home", _spec("com.example.a", "pkg-a", storage), mock_logger,
+                   runner=ProcRunner())
+    lock, pidf = _write_lock(storage, 4242)
+    real_open = open
+
+    def _fail_on_pid_file(path, *a, **k):
+        if path == pidf:
+            raise PermissionError(13, "Permission denied")
+        return real_open(path, *a, **k)
+
+    monkeypatch.setattr("builtins.open", _fail_on_pid_file)
+    assert agent.clear_stale_storage_locks() == 0
+    assert os.path.exists(lock)
+    assert "could not be read" in _warnings(mock_logger)
+
+
+def test_clear_lock_does_not_report_success_when_os_remove_fails(
+        tmp_path, mock_logger, monkeypatch):
+    """Reviewers reproduced this against a read-only directory: os.remove fails,
+    but the old code logged "clearing stale ..." BEFORE attempting removal and
+    swallowed the failure at DEBUG, so cleared += 1 ran regardless — the caller
+    was told the lock was gone while it was still on disk, and the server kept
+    crash-looping on it. The fix: count only a removal that actually succeeded,
+    and log the failure at ERROR.
+    """
+    storage = str(tmp_path / "a-store")
+    agent = _agent(tmp_path / "home", _spec("com.example.a", "pkg-a", storage), mock_logger,
+                   runner=ProcRunner())
+    os.makedirs(storage, exist_ok=True)
+    lock = os.path.join(storage, "matter.lock")
+    with open(lock, "w", encoding="utf-8") as handle:
+        handle.write("")
+    # No matter.pid -> the "missing or unparseable" path, which calls _clear_lock.
+    real_remove = os.remove
+
+    def _fail_on_lock(path, *a, **k):
+        if path == lock:
+            raise PermissionError(13, "Permission denied")
+        return real_remove(path, *a, **k)
+
+    monkeypatch.setattr(os, "remove", _fail_on_lock)
+    assert agent.clear_stale_storage_locks() == 0
+    assert os.path.exists(lock)
+    errors = _errors(mock_logger)
+    assert "matter.lock" in errors and f"rm {lock}" in errors
+    # And the caller must never have claimed success for a removal that failed.
+    assert "cleared stale" not in _warnings(mock_logger)
+
+
+def test_clear_stale_locks_does_not_follow_a_symlinked_subdirectory(tmp_path, mock_logger):
+    """A symlink inside the storage root must never be swept: os.path.isdir
+    follows symlinks, so without an explicit islink() check a symlink pointing
+    outside the storage tree would have its target's matter.lock DELETED
+    outside the storage root entirely.
+    """
+    storage = str(tmp_path / "a-store")
+    outside = tmp_path / "outside-the-storage-tree"
+    os.makedirs(storage, exist_ok=True)
+    # A dead pid: if this directory were swept, it would be judged stale and cleared.
+    lock, pidf = _write_lock(str(outside), 99999)
+    os.symlink(str(outside), os.path.join(storage, "linked"))
+    runner = ProcRunner(ps_lines=["1 /sbin/launchd"])
+    agent = _agent(tmp_path / "home", _spec("com.example.a", "pkg-a", storage), mock_logger,
+                   runner=runner)
+    assert agent.clear_stale_storage_locks() == 0
+    assert os.path.exists(lock)
+    assert os.path.exists(pidf)
+
+
+def test_clear_stale_locks_warns_instead_of_a_silent_zero_when_listdir_fails(
+        tmp_path, mock_logger, monkeypatch):
+    """os.listdir raising must not silently narrow the sweep to the root: the
+    bridge keeps its locks ONE level down, which is exactly what a failed
+    listdir would skip while still reporting a "clean" 0.
+    """
+    storage = str(tmp_path / "a-store")
+    os.makedirs(storage, exist_ok=True)
+    lock, _pidf = _write_lock(os.path.join(storage, "certificates"), 99999)
+    runner = ProcRunner(ps_lines=["1 /sbin/launchd"])
+    agent = _agent(tmp_path / "home", _spec("com.example.a", "pkg-a", storage), mock_logger,
+                   runner=runner)
+    monkeypatch.setattr(os, "listdir",
+                        lambda *_a, **_k: (_ for _ in ()).throw(PermissionError(13, "denied")))
+    assert agent.clear_stale_storage_locks() == 0
+    assert os.path.exists(lock)   # never even looked at
+    assert storage in _warnings(mock_logger)
+
+
+def test_clear_stale_locks_warns_undecided_instead_of_a_silent_zero(tmp_path, mock_logger):
+    """Kills the `age = age or 0` mutation: an inconclusive command line AND an
+    unparseable etime must leave the lock alone AND say so. Before this test,
+    that mutation made age default to 0 (falsy None), which read as "the
+    process is 0 seconds old" — a real number the started_at comparison could
+    act on — so the case silently resolved to LIVE_PID_OURS with no warning at
+    all, the exact silent-zero the review's mutation testing caught.
+    """
+    storage = str(tmp_path / "a-store")
+    runner = ProcRunner(ps_lines=["4242"], proc_etime=None)  # bare pid + unparseable age
+    agent = _agent(tmp_path / "home", _spec("com.example.a", "pkg-a", storage), mock_logger,
+                   runner=runner)
+    lock, pidf = _write_lock(storage, 4242)
+    assert agent.clear_stale_storage_locks() == 0
+    assert os.path.exists(lock)
+    assert os.path.exists(pidf)
+    warnings = _warnings(mock_logger)
+    assert "4242" in warnings and "process age could not be determined" in warnings
+
+
+# ---------------------------------------------------------------------------
+# Ordering: the sweep must run BEFORE bootstrap, or launchd starts a process
+# that immediately loses to a lock nobody living holds.
+# ---------------------------------------------------------------------------
+
+def _agent_with_plist(tmp_path, mock_logger, runner):
+    agent = _agent(tmp_path / "home", _spec("com.example.a", "pkg-a", str(tmp_path / "a-store")),
+                   mock_logger, runner=runner)
+    os.makedirs(os.path.dirname(agent.plist_path), exist_ok=True)
+    with open(agent.plist_path, "wb") as handle:
+        handle.write(agent.build_plist())
+    return agent
+
+
+def _fatal_if_bootstrap_runs_first(order):
+    def _bootstrap_and_record(*_args, **_kwargs):
+        if "clear" not in order:
+            raise AssertionError("bootstrap ran before clear_stale_storage_locks")
+        order.append("bootstrap")
+        return True
+    return _bootstrap_and_record
+
+
+def test_stale_lock_sweep_runs_before_bootstrap_on_start(tmp_path, mock_logger):
+    agent = _agent_with_plist(tmp_path, mock_logger, ProcRunner())
+    order: list[str] = []
+    agent.clear_stale_storage_locks = lambda: order.append("clear") or 0
+    agent._bootstrap_and_record = _fatal_if_bootstrap_runs_first(order)
+    assert agent.start() is True
+    assert order == ["clear", "bootstrap"]
+
+
+def test_stale_lock_sweep_runs_before_bootstrap_on_restart(tmp_path, mock_logger):
+    agent = _agent_with_plist(tmp_path, mock_logger, ProcRunner())
+    order: list[str] = []
+    agent.clear_stale_storage_locks = lambda: order.append("clear") or 0
+    agent._bootstrap_and_record = _fatal_if_bootstrap_runs_first(order)
+    assert agent.restart() is True
+    assert order == ["clear", "bootstrap"]
+
+
+# ---------------------------------------------------------------------------
+# Finding A (stale-lock review) — the "healthy and untouched" branch of
+# _apply_plist used to return BEFORE ever reaching clear_stale_storage_locks()
+# further down. That branch fires whenever the plist digest matches, the
+# managed job has a live pid, and there is no orphan to reap — exactly what a
+# reboot-reused pid's crash-loop looks like the instant a plugin reload
+# samples it: launchd keeps respawning the job every ~10s, the reused pid
+# belongs to someone else's legitimate process so reap_orphan_servers()
+# correctly does not touch it, and the sweep further below was never reached.
+# That is precisely the remedy ("reload the plugin") a stuck user reaches for
+# first.
+# ---------------------------------------------------------------------------
+
+def test_healthy_untouched_apply_plist_still_reaches_the_sweep(tmp_path, mock_logger):
+    """Fatal-dependency style: if the healthy/unobstructed branch stopped calling
+    clear_stale_storage_locks(), this would return normally instead of raising."""
+    agent = _agent_with_plist(tmp_path, mock_logger, ProcRunner(print_pid=5423))
+    agent._record_applied_digest(agent._digest_of(agent.build_plist()))
+
+    def _boom():
+        raise AssertionError("swept")
+
+    agent.clear_stale_storage_locks = _boom
+    with pytest.raises(AssertionError, match="swept"):
+        agent.ensure_installed()
+
+
+def test_healthy_untouched_apply_plist_still_returns_false(tmp_path, mock_logger):
+    """The sweep must not change the early-return contract: False still means
+    'nothing was re-bootstrapped' — a crash-looping agent stays launchd's to
+    respawn, and a cleared lock just lets the NEXT respawn succeed."""
+    agent = _agent_with_plist(tmp_path, mock_logger, ProcRunner(print_pid=5423))
+    agent._record_applied_digest(agent._digest_of(agent.build_plist()))
+    swept = []
+    agent.clear_stale_storage_locks = lambda: swept.append(1) or 0
+    assert agent.ensure_installed() is False
+    assert swept == [1]
+
+
+# ---------------------------------------------------------------------------
+# Finding B (stale-lock review) — reap_orphan_servers()'s SIGTERM path polls
+# until the signalled pids are gone; the SIGKILL branch used to signal and
+# return immediately. All three sweep call sites run
+# clear_stale_storage_locks() microseconds later, and `ps` still lists a
+# just-KILLed pid, with its full (still-matching) command line, for a beat
+# after kill(2) returns — a dying/zombie process, not a gone one. That made
+# the sweep match it as LIVE_PID_OURS and leave its lock in place: the worst
+# case to miss, because a SIGKILLed matter-server never runs matter.js's exit
+# handler and so has DEFINITELY not released its lock.
+# ---------------------------------------------------------------------------
+
+class KillLingersRunner(ProcRunner):
+    """A SIGKILLed pid stays visible in ``ps`` — with its full, matching command
+    line intact — for ``linger`` more ``ps`` polls after ``kill -KILL`` returns,
+    before the kernel actually reaps it. Models the exact gap Finding B closes:
+    SIGKILL signals and (pre-fix) returned immediately, with nothing waiting for
+    the corpse to actually leave ``ps``.
+    """
+
+    def __init__(self, *args, linger: int = 2, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._linger = linger
+        self._lingering: dict[str, int] = {}
+
+    def __call__(self, cmd, **kwargs):
+        if cmd and cmd[0] == "kill" and cmd[1].lstrip("-") == "KILL":
+            pid = cmd[2]
+            self.calls.append(cmd)
+            self.signals.append(("KILL", pid))
+            self._lingering[pid] = self._linger
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        if cmd and cmd[0] == "ps" and "etime=" not in cmd:
+            self.calls.append(cmd)
+            for pid, remaining in list(self._lingering.items()):
+                if remaining <= 0:
+                    self.ps_lines = [ln for ln in self.ps_lines if ln.split()[0] != pid]
+                    del self._lingering[pid]
+                else:
+                    self._lingering[pid] = remaining - 1
+            return subprocess.CompletedProcess(cmd, 0, stdout="\n".join(self.ps_lines) + "\n", stderr="")
+        return super().__call__(cmd, **kwargs)
+
+
+def test_reap_waits_after_sigkill_so_the_sweep_never_sees_a_corpse_as_live(tmp_path,
+                                                                            mock_logger):
+    storage = str(tmp_path / "a-store")
+    runner = KillLingersRunner(ignore_term=True, linger=2)
+    agent = _agent(tmp_path / "home", _spec("com.example.a", "pkg-a", storage), mock_logger,
+                   runner=runner)
+    # A baseline entry that outlives 545's removal, so an empty `ps` output never
+    # reads as "the probe is unusable" (see e.g. test_clear_stale_locks_clears_a_dead_pid).
+    runner.ps_lines = ["1 /sbin/launchd", _proc_line(agent, 545)]
+    _write_lock(storage, 545)  # the pid we are about to KILL also holds the storage lock
+
+    assert agent.reap_orphan_servers() == 1
+    assert ("TERM", "545") in runner.signals
+    assert ("KILL", "545") in runner.signals
+
+    # By the time reap_orphan_servers() has returned, 545 must actually be gone from
+    # `ps` — proving the wait, not just the signal, happened — so the sweep that every
+    # real call site runs right after can tell the lock is stale and clear it.
+    assert agent.clear_stale_storage_locks() == 1

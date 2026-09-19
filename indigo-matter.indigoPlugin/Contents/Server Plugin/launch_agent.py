@@ -58,6 +58,22 @@ LSOF_CANDIDATES = ("/usr/sbin/lsof", "/usr/bin/lsof", "lsof")
 # an ADVISORY signal (see LaunchAgent.port_conflict_report): the err log is append-only
 # across restarts, so a hit may be ancient history.
 EADDRINUSE_MARKER = "EADDRINUSE"
+# Filenames matter.js's own storage lock leaves behind
+# (node_modules/@matter/nodejs/src/fs/lock-utils.ts). matter.pid holds "<pid> <token>";
+# matter.lock is the lock file itself. Both live together in a storage directory — see
+# LaunchAgent.clear_stale_storage_locks() for why we look in more than one such directory.
+MATTER_LOCK_FILENAME = "matter.lock"
+MATTER_PID_FILENAME = "matter.pid"
+# Slack on the "process started after matter.pid was written" signal, in seconds.
+# The age probe is `ps -o etime=`, which prints WHOLE seconds truncated DOWN, and we
+# subtract that age from a time.time() read taken after the ps subprocess has returned
+# — both errors push the computed start time LATER, by up to a second each. A genuinely
+# live server writes matter.pid well inside that margin (on jarvis matter.js acquires
+# the lock ~30ms after the process's first log line), so a bare `started_at > mtime`
+# comparison can accuse a healthy owner and delete the lock out from under a running
+# fabric. That is a far worse outage than the crash-loop this check exists to end, so
+# the signal only fires when the process is LATER BY A MARGIN no probe error explains.
+START_AFTER_LOCK_SLACK_SECONDS = 5
 # How long a freshly started server is allowed to have no listener before "nothing is
 # listening on our port" counts as a fault. matter-server was observed taking ~9s to
 # reach its bind on jarvis; 120s is generous enough that a slow or loaded Mac never
@@ -72,6 +88,15 @@ STARTUP_GRACE_SECONDS = 120
 VERDICT_DEAD = "dead"
 VERDICT_CONFLICT_FREE = "conflict_free"
 VERDICT_PENDING = "pending"
+
+# LaunchAgent._stale_reason_for_live_pid() outcomes (stale-lock review). Collapsing
+# LIVE_PID_OURS and LIVE_PID_UNDECIDED into the same (False, "") is what let the
+# `age = age or 0` mutation survive the old test suite: both looked identical to the
+# caller, so an unusable probe silently read as "nothing to report" instead of "I
+# could not tell". A live pid must be judged into exactly one of these three.
+LIVE_PID_STALE = "stale"
+LIVE_PID_OURS = "ours"
+LIVE_PID_UNDECIDED = "undecided"
 
 
 @dataclass(frozen=True)
@@ -171,6 +196,14 @@ class LaunchAgent:
         # is cleared by the next successful probe so a later failure is reported again.
         self._port_probe_warned = False
         self._process_age_warned = False
+        # Same discipline for the stale-lock sweep's own probes (stale-lock review):
+        # each latch is cleared the next time the sweep succeeds at the thing it warns
+        # about, so a later, DIFFERENT episode of the same failure is reported again
+        # rather than being silenced by a warning issued weeks (or one directory) ago.
+        self._pid_read_warned = False
+        self._listdir_warned = False
+        self._ps_unusable_for_lock_warned = False
+        self._live_pid_undecided_warned = False
         # Set by _bootstrap_and_record() on a successful fresh bootstrap; cleared once
         # due_for_bootstrap_verification() has been acted on (issue #187). See that
         # method's docstring for why this exists alongside port_conflict_report().
@@ -496,6 +529,22 @@ class LaunchAgent:
                 # Healthy and unobstructed — survive the reload untouched. A matching
                 # digest proves the right plist was WRITTEN, not that the live job is
                 # using it, so check the running args before declaring victory.
+                #
+                # Sweep for a stale storage lock too (stale-lock review, finding A).
+                # A reboot-reused pid can crash-loop THIS managed job while looking
+                # exactly like this branch: launchd respawns it every ~10s (KeepAlive
+                # Crashed:true), and whichever attempt is alive the instant we sample
+                # has the right digest and no orphan to reap — the reused pid belongs
+                # to someone else's legitimate process, so reap_orphan_servers()
+                # correctly leaves it alone; it just never gets reaped either. This
+                # branch is exactly the natural remedy a stuck user reaches for
+                # (reload the plugin), so it must not require the sample to land in
+                # the much narrower window where an orphan or a dead pid line instead
+                # routes through one of the branches below that already fall through
+                # to the bootstrap path's sweep. Must run before we return: this
+                # branch never bootstraps, so nothing else here will sweep before
+                # launchd's own KeepAlive respawns the crash-looping job again.
+                self.clear_stale_storage_locks()
                 self._warn_on_argument_drift(job["arguments"])
                 # …and a pid does not prove the job is REACHABLE (issue #182). A server
                 # that lost the port race stays alive without a WebSocket listener, so
@@ -523,6 +572,11 @@ class LaunchAgent:
         # released the storage lock. Reap any such straggler so the fresh instance below
         # isn't killed by "Storage is locked by another process".
         self.reap_orphan_servers()
+        # A dead or reassigned pid can leave matter.js's OWN lock behind (see
+        # clear_stale_storage_locks) even when there is no orphan process left to reap —
+        # exactly the post-reboot case. Must run before bootstrap: launchd would otherwise
+        # start a process that immediately loses to a lock nobody living holds.
+        self.clear_stale_storage_locks()
         # bootstrap (modern) with a load fallback for older macOS. The marker records the
         # bytes we just wrote (== on disk), so it always reflects what launchd loaded.
         if self._bootstrap_and_record(desired):
@@ -734,6 +788,7 @@ class LaunchAgent:
         """
         if os.path.exists(self.plist_path):
             self.reap_orphan_servers()  # nothing legit runs after stop(); clear any orphan
+            self.clear_stale_storage_locks()  # …nor holds a lock a dead/reassigned pid left
             return self._bootstrap_and_record()
         self.ensure_installed()
         return self.is_alive()
@@ -766,6 +821,7 @@ class LaunchAgent:
         # earlier LaunchAgent keeps holding the storage lock and would make the fresh
         # instance die with "Storage is locked by another process". Reap it first.
         self.reap_orphan_servers()
+        self.clear_stale_storage_locks()  # …and a lock nobody living holds, e.g. post-reboot
         if self._bootstrap_and_record():  # records the digest of the plist actually loaded
             return True
         # fall back to a full unload/reinstall cycle
@@ -844,8 +900,10 @@ class LaunchAgent:
         unrelated node process, another agent, or another user's server, is never
         touched), OR by finding one of our package's processes squatting on our port —
         see :meth:`_running_server_pids` for why the storage-path match alone has a blind
-        spot. Matches are SIGTERMed, we wait briefly, then SIGKILL any that ignore TERM. A
-        port holder we can't identify as ours is never signalled, only warned about.
+        spot. Matches are SIGTERMed, we wait briefly, then SIGKILL any that ignore TERM —
+        and wait once more (stale-lock review, finding B; see the comment at that second
+        wait for why). A port holder we can't identify as ours is never signalled, only
+        warned about.
 
         Pass ``exclude_pid`` (the managed job's pid) to leave a healthy running server
         alone while still clearing an orphan beside it. Returns how many were signalled.
@@ -865,15 +923,48 @@ class LaunchAgent:
         # handler, normally sub-second). Bounded ~1.5s worst case; this blocks the
         # (already synchronous) start/restart path only in the rare orphan-present case —
         # a brief, deliberate stall to un-wedge a server that would otherwise never start.
-        for _ in range(6):
-            self._sleep(0.25)
-            if not self._running_server_pids(exclude_pid=exclude_pid):
-                return len(pids)
-        for pid in self._running_server_pids(exclude_pid=exclude_pid):
+        if self._wait_for_pids_gone(exclude_pid=exclude_pid):
+            return len(pids)
+        stragglers = self._running_server_pids(exclude_pid=exclude_pid)
+        for pid in stragglers:
             self.logger.warning("%s pid %s ignored SIGTERM; sending SIGKILL",
                                 self.spec.package, pid)
             self._signal(pid, "KILL")
+        # SIGKILL never runs matter.js's exit handler — unlike the clean SIGTERM exit
+        # above, a killed process has DEFINITELY not released its storage lock. All
+        # three sweep call sites run clear_stale_storage_locks() microseconds after
+        # this method returns, and _ps_map() still lists a just-KILLed pid, with its
+        # full (still-matching) command line, for a beat after kill(2) returns — a
+        # dying/zombie process, not a gone one. Without waiting here exactly as the
+        # SIGTERM path does above, the sweep would match that corpse as LIVE_PID_OURS
+        # and leave its lock in place: the "Storage is locked by another process"
+        # failure the sweep exists to end, and the worst case to miss, because a
+        # KILLed owner's lock is unambiguously stale, never merely undecided.
+        if not self._wait_for_pids_gone(exclude_pid=exclude_pid):
+            survivors = self._running_server_pids(exclude_pid=exclude_pid)
+            self.logger.warning(
+                "%s pid(s) %s did not exit even after SIGKILL; its storage lock may "
+                "still be held the next time this plugin tries to clear it.",
+                self.spec.package, ", ".join(map(str, survivors)),
+            )
         return len(pids)
+
+    def _wait_for_pids_gone(self, exclude_pid: Optional[int], attempts: int = 6,
+                             interval: float = 0.25) -> bool:
+        """Poll :meth:`_running_server_pids` until none remain, or give up.
+
+        Shared by both the post-SIGTERM and post-SIGKILL waits in
+        :meth:`reap_orphan_servers` — the same idiom, the same injectable
+        ``self._sleep`` (instant in tests), and the same bound, because either
+        signal can leave a corpse visible to ``ps`` for a beat before the kernel
+        actually reaps it. Returns True once ``_running_server_pids`` reports none
+        left; False if ``attempts`` polls all still saw at least one.
+        """
+        for _ in range(attempts):
+            self._sleep(interval)
+            if not self._running_server_pids(exclude_pid=exclude_pid):
+                return True
+        return False
 
     def _ps_map(self) -> dict[int, str]:
         """pid → full command line for every running process ({} if ps is unavailable)."""
@@ -1091,6 +1182,358 @@ class LaunchAgent:
             "it is disabled until this works again.",
             self.spec.package, pid, why, self.spec.port,
         )
+
+    # ------------------------------------------------------------------
+    # Stale storage-lock clearing — a lock can outlive the process that wrote
+    # it, and a reboot defeats matter.js's own staleness check entirely.
+    # ------------------------------------------------------------------
+    def clear_stale_storage_locks(self) -> int:
+        """Delete any matter.lock this agent's own storage still holds that no
+        LIVING process of ours can be holding. Returns how many were cleared.
+
+        matter.js's stale-lock check (node_modules/@matter/nodejs/src/fs/lock-utils.ts,
+        ``staleReason``) reads matter.pid (``"<pid> <token>"``) and only compares the
+        token when the recorded pid equals ITS OWN pid; for any other pid it does a
+        bare ``process.kill(pid, 0)`` and calls the lock live the moment that succeeds.
+        After a reboot, macOS is free to hand a recycled pid to anything, and it did:
+        2026-09-15 22:03, jarvis rebooted, and matter.pid's pid 1621 (the pre-reboot
+        matter-server) came back as IndigoPluginHost3 running Home Intelligence — a
+        live, unrelated, still-running process. matter.js read that as "still mine"
+        and never cleared the lock, so the server crash-looped on "Storage is locked
+        by another process" for 28 minutes across 155 attempts. matter-server is
+        upstream and 0.17.9 ships the byte-identical check, so this is our fix to
+        carry, not theirs to wait for — run immediately before we ask launchd to
+        bootstrap a process that would otherwise lose to a lock nobody living holds.
+
+        Walks ``self.storage_path`` itself AND its immediate subdirectories (one
+        level): matter-server keeps its lock at the storage root, but the bridge's
+        tree keeps one per purpose (``config/``, ``certificates/``, ``vendors/``,
+        ``ota/``, ``server-1-fff1/`` and friends), so there is no single fixed
+        location that covers both agents' layouts.
+
+        For each directory holding a ``matter.lock``, ``matter.pid`` decides it:
+
+        * missing, or a readable file whose first field is not an integer
+          (including undecodable/binary content — a power-cut mid-write leaves
+          exactly this) → stale (matter.js itself treats "no PID file" as
+          stale, so we do too).
+        * present but UNREADABLE for any other reason (permissions, EIO, too
+          many open files — the plugin host runs many plugins) → a PROBE
+          FAILURE, not "no owner". The file may well name a live owner we
+          simply could not see; the lock is left in place and this is warned
+          about, never treated as a licence to delete (see
+          :meth:`_read_matter_pid`).
+        * the recorded pid is not currently running → stale.
+        * the recorded pid IS running → an ORDERED decision, not two
+          independent signals (see :meth:`_stale_reason_for_live_pid`): a
+          readable command line settles it outright, one way or the other,
+          and the start-time signal only gets a vote when the command line is
+          inconclusive (empty/unreadable).
+
+        A probe that cannot tell — ``ps`` unusable, an unreadable ``matter.pid``,
+        or an unreadable command line *and* an unknowable process age — is never
+        treated as evidence of staleness (the workspace CLAUDE.md
+        degradation-path convention: an unusable precondition must not silently
+        read as "safe to act"). Deleting a live server's lock corrupts a
+        running fabric, which is a strictly worse outage than the crash-loop
+        this method exists to end, so those cases are WARNED about and the lock
+        is left exactly as found — a silent zero here is indistinguishable from
+        "nothing was wrong", which is the shape of bug this method exists to end.
+        """
+        procs = self._ps_map()
+        ps_usable = bool(procs)
+        if ps_usable:
+            self._ps_unusable_for_lock_warned = False  # re-arm: see _port_listener_pids
+        cleared = 0
+        for directory in self._lock_candidate_dirs():
+            lock_path = os.path.join(directory, MATTER_LOCK_FILENAME)
+            if not self._exists(lock_path):
+                continue
+            pid, unreadable = self._read_matter_pid(os.path.join(directory, MATTER_PID_FILENAME))
+            if unreadable:
+                self._warn_pid_file_unreadable(directory)
+                continue
+            if pid is None:
+                if self._clear_lock(directory, "matter.pid is missing or unparseable"):
+                    cleared += 1
+                continue
+            if not ps_usable:
+                # Cannot even ask "is this pid alive" — say so and stop here rather than
+                # falling through to a start-time check whose age probe (ps -p) would
+                # fail for the exact same reason and could look like a second, unrelated
+                # confirmation of "we don't know".
+                self._warn_ps_unusable_for_lock(directory, pid)
+                continue
+            if pid not in procs:
+                if self._clear_lock(directory, f"pid {pid} in matter.pid is no longer running"):
+                    cleared += 1
+                continue
+            status, reason = self._stale_reason_for_live_pid(directory, pid, procs[pid])
+            if status == LIVE_PID_STALE:
+                if self._clear_lock(directory, reason):
+                    cleared += 1
+            elif status == LIVE_PID_UNDECIDED:
+                self._warn_live_pid_undecided(directory, pid, reason)
+            # LIVE_PID_OURS: positively identified as our own live server — nothing
+            # to clear, nothing to warn about.
+        return cleared
+
+    def _lock_candidate_dirs(self) -> list[str]:
+        """``self.storage_path`` plus its immediate subdirectories.
+
+        One level deep covers both agents' layouts (see
+        :meth:`clear_stale_storage_locks`) without hardcoding either one's
+        subdirectory names. A storage root that does not exist yet (first run)
+        degrades to just the root itself — nothing to clear, nothing to crash on.
+
+        Symlinked entries are skipped, never descended into: ``os.path.isdir``
+        follows symlinks, so a symlink planted in the storage root would have
+        let ``matter.lock``/``matter.pid`` be deleted OUTSIDE the storage tree
+        entirely — a much larger blast radius than a stale lock.
+        """
+        dirs = [self.storage_path]
+        try:
+            entries = os.listdir(self.storage_path)
+        except FileNotFoundError:
+            return dirs
+        except OSError as exc:
+            # PermissionError/NotADirectoryError/EIO etc — narrows the sweep to the
+            # root only, which is exactly where the bridge keeps NONE of its locks.
+            # Must be warned about, not folded into the quiet first-run case, or a
+            # broken listdir silently reports the same "0 cleared" as a clean sweep.
+            self._warn_listdir_unusable(self.storage_path, exc)
+            return dirs
+        for name in entries:
+            path = os.path.join(self.storage_path, name)
+            if os.path.islink(path):
+                continue
+            if os.path.isdir(path):
+                dirs.append(path)
+        return dirs
+
+    def _warn_listdir_unusable(self, path: str, exc: OSError) -> None:
+        """Say once per degradation that the storage root could not be listed.
+
+        Same latch discipline as :meth:`_warn_port_probe_unusable`: cleared the
+        next time :meth:`_lock_candidate_dirs` succeeds, so a later, separate
+        episode is reported again rather than silenced by this one.
+        """
+        if self._listdir_warned:
+            return
+        self._listdir_warned = True
+        self.logger.warning(
+            "could not list %s (%s), so the stale-lock sweep is checking only the "
+            "storage root — a lock in one of its subdirectories (config/, "
+            "certificates/, …) would be missed entirely. Diagnose by hand with: "
+            "ls -la %s",
+            path, exc, path,
+        )
+
+    def _read_matter_pid(self, path: str) -> tuple[Optional[int], bool]:
+        """Read ``matter.pid``'s leading pid (``"<pid> <token>"``).
+
+        Returns ``(pid, unreadable)`` — THREE outcomes, not two:
+
+        * ``(pid, False)`` — a pid we can trust.
+        * ``(None, False)`` — genuinely no owner recorded, exactly what
+          matter.js's own check also calls stale: the file is absent, empty,
+          or its first field is not an integer. A ``UnicodeDecodeError`` (a
+          binary/truncated file — precisely what a power cut mid-write leaves)
+          is folded into this outcome too: it is unreadable CONTENT, not a
+          probe failure, and a caller with a lock and no trustworthy owner in
+          the file has nothing more to learn from it either way.
+        * ``(None, True)`` — a PROBE FAILURE (permissions, EIO, too many open
+          files — the plugin host runs many plugins): the file may well name a
+          LIVE owner and we simply could not read it. Must never be treated as
+          "no owner" — see :meth:`clear_stale_storage_locks`.
+
+        A successful read (either a pid or a genuine "no owner") re-arms
+        :meth:`_warn_pid_file_unreadable`, same discipline as the port and
+        process-age probes.
+        """
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                content = handle.read()
+        except FileNotFoundError:
+            self._pid_read_warned = False
+            return None, False
+        except UnicodeDecodeError:
+            self._pid_read_warned = False
+            return None, False
+        except OSError:
+            return None, True
+        self._pid_read_warned = False
+        parts = content.split()
+        if not parts:
+            return None, False
+        try:
+            return int(parts[0]), False
+        except ValueError:
+            return None, False
+
+    def _warn_pid_file_unreadable(self, directory: str) -> None:
+        """Say once per degradation that ``matter.pid`` could not be read.
+
+        Distinct from "missing" (which is a genuine, actionable "no owner") —
+        this is a probe failure, and the file may still name a live server
+        whose lock would otherwise be deleted out from under it. Same latch
+        discipline as :meth:`_warn_port_probe_unusable`.
+        """
+        if self._pid_read_warned:
+            return
+        self._pid_read_warned = True
+        pid_path = os.path.join(directory, MATTER_PID_FILENAME)
+        self.logger.warning(
+            "%s exists in %s but %s could not be read, so this plugin cannot tell "
+            "whether a live process still owns it. Leaving the lock in place — "
+            "diagnose by hand with: ls -la %s",
+            MATTER_LOCK_FILENAME, directory, MATTER_PID_FILENAME, pid_path,
+        )
+
+    def _warn_ps_unusable_for_lock(self, directory: str, pid: int) -> None:
+        """Say once per degradation that ``ps`` is unusable for the lock sweep.
+
+        The bridge keeps one lock per subdirectory, so a single dead ``ps``
+        would otherwise repeat this warning once per directory in the SAME
+        sweep. Latched so one outage produces one warning, cleared (in
+        :meth:`clear_stale_storage_locks`) the next time ``ps`` works again.
+        """
+        if self._ps_unusable_for_lock_warned:
+            return
+        self._ps_unusable_for_lock_warned = True
+        self.logger.warning(
+            "%s in %s names pid %s, but ps is unusable so this plugin cannot "
+            "tell whether that process still holds it. Leaving the lock in "
+            "place — diagnose by hand with: ps -p %s",
+            MATTER_LOCK_FILENAME, directory, pid, pid,
+        )
+
+    def _stale_reason_for_live_pid(self, directory: str, pid: int,
+                                    command: str) -> tuple[str, str]:
+        """Judge a LIVE pid's lock — an ORDERED decision, not two independent signals.
+
+        1. A readable command line that does NOT name our package dir and our
+           storage path is positive proof of staleness (reboot pid reuse) —
+           :data:`LIVE_PID_STALE`.
+        2. A readable command line that DOES match is positive proof this is
+           our own running server — :data:`LIVE_PID_OURS`, returned
+           immediately. The decision ENDS here: nothing below may override a
+           positive "this is ours". Falling through used to let a rounding-
+           inflated start-time signal accuse a positively-identified, running
+           server and delete its lock — a worse outage than the crash-loop
+           this method exists to end.
+        3. Only when the command line is INCONCLUSIVE (empty/unreadable) does
+           the start-time signal get a vote: a process that started strictly
+           after matter.pid's mtime (see :data:`START_AFTER_LOCK_SLACK_SECONDS`)
+           cannot be the process that wrote that file — the reboot-proof
+           signal. If that too cannot be evaluated (mtime or age unknowable),
+           the pid is :data:`LIVE_PID_UNDECIDED`.
+
+        Returns ``(status, detail)``. ``detail`` is the reason to log when
+        ``status`` is :data:`LIVE_PID_STALE` or :data:`LIVE_PID_UNDECIDED`;
+        empty for :data:`LIVE_PID_OURS`. Callers must treat
+        :data:`LIVE_PID_UNDECIDED` as "leave it alone" exactly like
+        :data:`LIVE_PID_OURS` — but, unlike ``OURS``, they must also report it:
+        mutation testing proved that collapsing the two into a bare
+        ``(False, "")`` lets a broken probe silently disable this whole check
+        (patching ``age = age or 0`` killed no test and deleted live locks).
+        """
+        pkg_dir = self._package_dir()
+        if command:
+            ours = pkg_dir in command and self.storage_path in command
+            if not ours:
+                return LIVE_PID_STALE, (
+                    f"pid {pid} is alive but its command line is not {self.spec.package} "
+                    f"for this storage — the pid was reassigned (reboot pid reuse)"
+                )
+            return LIVE_PID_OURS, ""
+        pid_file_mtime = self._file_mtime(os.path.join(directory, MATTER_PID_FILENAME))
+        age = self._process_age_seconds(pid)
+        if pid_file_mtime is not None and age is not None:
+            started_at = time.time() - age
+            # The margin is not cosmetic — see START_AFTER_LOCK_SLACK_SECONDS. Without
+            # it the probe's own rounding can make a live owner look too young.
+            if started_at > pid_file_mtime + START_AFTER_LOCK_SLACK_SECONDS:
+                return LIVE_PID_STALE, (
+                    f"pid {pid} started after matter.pid was last written, so it "
+                    f"cannot be the process that wrote that lock"
+                )
+            return LIVE_PID_OURS, ""
+        unknowns = []
+        if pid_file_mtime is None:
+            unknowns.append(f"{MATTER_PID_FILENAME}'s mtime could not be read")
+        if age is None:
+            unknowns.append("its process age could not be determined")
+        return LIVE_PID_UNDECIDED, (
+            f"pid {pid}'s command line is unreadable and " + " and ".join(unknowns)
+        )
+
+    def _warn_live_pid_undecided(self, directory: str, pid: int, why: str) -> None:
+        """Say once per degradation that a live pid's lock could not be judged.
+
+        The lock is correctly left in place either way, but staying silent
+        about WHY is exactly the gap mutation testing found: a sweep that looks
+        at a lock and gives up leaves no operator-visible symptom, so the
+        crash-loop this method exists to end just continues, unexplained. Same
+        latch discipline as :meth:`_warn_port_probe_unusable`.
+        """
+        if self._live_pid_undecided_warned:
+            return
+        self._live_pid_undecided_warned = True
+        self.logger.warning(
+            "%s in %s names pid %s, which is running, but %s. Leaving the lock in "
+            "place — diagnose by hand with: ps -p %s -o command=",
+            MATTER_LOCK_FILENAME, directory, pid, why, pid,
+        )
+
+    @staticmethod
+    def _file_mtime(path: str) -> Optional[float]:
+        try:
+            return os.stat(path).st_mtime
+        except OSError:
+            return None
+
+    def _clear_lock(self, directory: str, reason: str) -> bool:
+        """Remove ``matter.lock`` (and best-effort ``matter.pid``) in ``directory``.
+
+        Returns whether ``matter.lock`` itself is actually gone afterward — the
+        caller's cleared-count and this method's own log line both hinge on
+        that, never on removal merely being ATTEMPTED. This used to log
+        "clearing stale … so <pkg> can start" at WARNING before attempting the
+        removal and swallow a failed ``os.remove`` at DEBUG, so a read-only or
+        permissions failure was reported as a completed clear while the lock
+        was still on disk — the original outage, re-armed, now actively
+        misleading (reviewers reproduced this against a read-only directory).
+
+        ``FileNotFoundError`` on removal counts as success (already gone, e.g.
+        a race with a concurrent clear) — not a failure to report.
+        """
+        lock_path = os.path.join(directory, MATTER_LOCK_FILENAME)
+        try:
+            os.remove(lock_path)
+            removed = True
+        except FileNotFoundError:
+            removed = True
+        except OSError as exc:
+            removed = False
+            self.logger.error(
+                "could not remove stale %s in %s (%s): %s. %s will keep failing to "
+                "start until this is cleared by hand: rm %s",
+                MATTER_LOCK_FILENAME, directory, reason, exc, self.spec.package, lock_path,
+            )
+        if removed:
+            self.logger.warning(
+                "cleared stale %s in %s (%s) so %s can start.",
+                MATTER_LOCK_FILENAME, directory, reason, self.spec.package,
+            )
+        # matter.pid is bookkeeping beside the actual lock — matter.js's own check
+        # only cares about matter.lock — so it stays best-effort at debug, same
+        # discipline as _record_applied_digest.
+        try:
+            os.remove(os.path.join(directory, MATTER_PID_FILENAME))
+        except OSError as exc:
+            self.logger.debug("could not remove %s: %s", os.path.join(directory, MATTER_PID_FILENAME), exc)
+        return removed
 
     def _err_log_mentions_port_conflict(self) -> bool:
         """True if the agent's error log tail mentions an EADDRINUSE fatal.
