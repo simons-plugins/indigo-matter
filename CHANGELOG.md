@@ -18,17 +18,24 @@ current version is `Info.plist`'s `PluginVersion`.
   crash-looped on `"Storage is locked by another process"` for 28 minutes
   across 155 attempts.
 - The new check walks the agent's storage root and its immediate
-  subdirectories (matter-server keeps its lock at the root; the bridge keeps
-  one per subdir — `config/`, `certificates/`, `vendors/`, `ota/`,
-  `server-1-fff1/`, …) and clears a `matter.lock` only when the recorded pid
-  is dead, or — if it is alive — a readable command line names something
-  other than this agent's package and storage path, or the live process
-  started later than `matter.pid`'s mtime (the reboot-proof signal). Either
-  positive signal clears the lock; when neither probe can tell anything at
-  all (an unusable `ps`, an unreadable command line and an unknowable
-  process age together), the lock is left exactly as found and the plugin
-  says why — matching the workspace's degradation-path convention, since
-  clearing a live server's lock would corrupt a running fabric.
+  subdirectories, **never following a symlink** out of that tree
+  (matter-server keeps its lock at the root; the bridge keeps one per subdir
+  — `config/`, `certificates/`, `vendors/`, `ota/`, `server-1-fff1/`, …), and
+  clears a `matter.lock` only when the recorded pid is dead, or — if it is
+  alive — an ORDERED judgement of it: a readable command line settles it
+  outright (naming this agent's package and storage path ends the decision
+  as "ours", full stop; naming anything else is stale), and only when the
+  command line is unreadable does a live process having started later than
+  `matter.pid`'s mtime (the reboot-proof signal) get a vote. When nothing can
+  decide either way — an unusable `ps`, an unreadable/missing-but-probe-
+  failed `matter.pid`, or an unreadable command line plus an unknowable
+  process age — the lock is left exactly as found and the plugin says so,
+  naming the pid and which probe failed, rather than silently reporting a
+  clean sweep — matching the workspace's degradation-path convention, since
+  clearing a live server's lock would corrupt a running fabric. A binary or
+  truncated `matter.pid` (what a power cut mid-write leaves) is handled
+  without raising, and a lock the plugin fails to remove (e.g. a read-only
+  directory) is reported as a failure, never as a false "cleared".
 - matter-server is an upstream package (0.17.9, the current stable, ships a
   byte-identical `lock-utils.ts`), so this is carried on our side rather
   than waited on upstream.

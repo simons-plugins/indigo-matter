@@ -346,6 +346,16 @@ def _infos(logger) -> str:
                     for c in logger.info.call_args_list)
 
 
+def _warnings(logger) -> str:
+    return " ".join(str(c.args[0]) % c.args[1:] if len(c.args) > 1 else str(c.args[0])
+                    for c in logger.warning.call_args_list)
+
+
+def _errors(logger) -> str:
+    return " ".join(str(c.args[0]) % c.args[1:] if len(c.args) > 1 else str(c.args[0])
+                    for c in logger.error.call_args_list)
+
+
 # ---------------------------------------------------------------------------
 # run_state — "loaded" is not "running", and the difference is #104's fault 2
 # ---------------------------------------------------------------------------
@@ -1121,6 +1131,170 @@ def test_clear_stale_locks_no_op_when_nothing_is_locked(tmp_path, mock_logger):
                    runner=ProcRunner())
     os.makedirs(storage, exist_ok=True)   # storage exists, but no matter.lock anywhere
     assert agent.clear_stale_storage_locks() == 0
+
+
+def test_clear_stale_locks_leaves_a_positively_identified_owner_even_if_it_looks_young(
+        tmp_path, mock_logger):
+    """Pins the dangerous fall-through: a matching command line must END the
+    decision. Before the fix, a matching command line fell through to the
+    start-time check anyway, so a rounding-inflated age could still accuse a
+    positively-identified, RUNNING server and delete its lock — corrupting a
+    live fabric, the worst outcome this whole method exists to avoid.
+
+    matter.pid's mtime here predates the process's computed start time by far
+    more than the slack margin — exactly the shape that used to fire.
+    """
+    storage = str(tmp_path / "a-store")
+    agent = _agent(tmp_path / "home", _spec("com.example.a", "pkg-a", storage, port=5580),
+                   mock_logger, runner=ProcRunner())
+    pkg = os.path.join(agent.project_dir, "node_modules", agent.spec.package)
+    cmdline = f"4242 node {pkg}/dist/Main.js --storage-path {agent.storage_path} --port 5580"
+    # etime "00:01" => age 1s => started_at ~= now. matter.pid's mtime is set far in
+    # the past, so started_at is WELL past mtime + START_AFTER_LOCK_SLACK_SECONDS —
+    # the exact condition the old code would have called stale.
+    agent._run = ProcRunner(ps_lines=[cmdline], proc_etime="00:01")
+    lock, pidf = _write_lock(storage, 4242, mtime=time.time() - 3600)
+    assert agent.clear_stale_storage_locks() == 0
+    assert os.path.exists(lock)
+    assert os.path.exists(pidf)
+
+
+def test_clear_stale_locks_treats_an_undecodable_pid_file_as_no_owner_without_raising(
+        tmp_path, mock_logger):
+    """A power cut mid-write leaves a binary/truncated matter.pid.
+
+    `open(..., encoding="utf-8").read()` raises UnicodeDecodeError, which is a
+    ValueError — NOT an OSError — so the old bare `except OSError` let it escape
+    clear_stale_storage_locks (and from there start()/restart()/_apply_plist()).
+    The deliberate, chosen behaviour: unreadable CONTENT is folded into "no
+    owner recorded", same as garbage text — nothing more to learn from it.
+    """
+    storage = str(tmp_path / "a-store")
+    agent = _agent(tmp_path / "home", _spec("com.example.a", "pkg-a", storage), mock_logger,
+                   runner=ProcRunner())
+    os.makedirs(storage, exist_ok=True)
+    lock = os.path.join(storage, "matter.lock")
+    with open(lock, "w", encoding="utf-8") as handle:
+        handle.write("")
+    with open(os.path.join(storage, "matter.pid"), "wb") as handle:
+        handle.write(b"\xff\xfe\x00binary-garbage-from-a-power-cut")
+    assert agent.clear_stale_storage_locks() == 1   # did not raise, and cleared it
+    assert not os.path.exists(lock)
+
+
+def test_clear_stale_locks_leaves_an_unreadable_pid_file_and_warns(
+        tmp_path, mock_logger, monkeypatch):
+    """A PROBE FAILURE (e.g. EACCES) reading matter.pid must NOT read as "no
+    owner": the file may still name a live server. Distinct from genuinely
+    missing, which DOES clear (see the "missing_pid_file" test above).
+    """
+    storage = str(tmp_path / "a-store")
+    agent = _agent(tmp_path / "home", _spec("com.example.a", "pkg-a", storage), mock_logger,
+                   runner=ProcRunner())
+    lock, pidf = _write_lock(storage, 4242)
+    real_open = open
+
+    def _fail_on_pid_file(path, *a, **k):
+        if path == pidf:
+            raise PermissionError(13, "Permission denied")
+        return real_open(path, *a, **k)
+
+    monkeypatch.setattr("builtins.open", _fail_on_pid_file)
+    assert agent.clear_stale_storage_locks() == 0
+    assert os.path.exists(lock)
+    assert "could not be read" in _warnings(mock_logger)
+
+
+def test_clear_lock_does_not_report_success_when_os_remove_fails(
+        tmp_path, mock_logger, monkeypatch):
+    """Reviewers reproduced this against a read-only directory: os.remove fails,
+    but the old code logged "clearing stale ..." BEFORE attempting removal and
+    swallowed the failure at DEBUG, so cleared += 1 ran regardless — the caller
+    was told the lock was gone while it was still on disk, and the server kept
+    crash-looping on it. The fix: count only a removal that actually succeeded,
+    and log the failure at ERROR.
+    """
+    storage = str(tmp_path / "a-store")
+    agent = _agent(tmp_path / "home", _spec("com.example.a", "pkg-a", storage), mock_logger,
+                   runner=ProcRunner())
+    os.makedirs(storage, exist_ok=True)
+    lock = os.path.join(storage, "matter.lock")
+    with open(lock, "w", encoding="utf-8") as handle:
+        handle.write("")
+    # No matter.pid -> the "missing or unparseable" path, which calls _clear_lock.
+    real_remove = os.remove
+
+    def _fail_on_lock(path, *a, **k):
+        if path == lock:
+            raise PermissionError(13, "Permission denied")
+        return real_remove(path, *a, **k)
+
+    monkeypatch.setattr(os, "remove", _fail_on_lock)
+    assert agent.clear_stale_storage_locks() == 0
+    assert os.path.exists(lock)
+    errors = _errors(mock_logger)
+    assert "matter.lock" in errors and f"rm {lock}" in errors
+    # And the caller must never have claimed success for a removal that failed.
+    assert "cleared stale" not in _warnings(mock_logger)
+
+
+def test_clear_stale_locks_does_not_follow_a_symlinked_subdirectory(tmp_path, mock_logger):
+    """A symlink inside the storage root must never be swept: os.path.isdir
+    follows symlinks, so without an explicit islink() check a symlink pointing
+    outside the storage tree would have its target's matter.lock DELETED
+    outside the storage root entirely.
+    """
+    storage = str(tmp_path / "a-store")
+    outside = tmp_path / "outside-the-storage-tree"
+    os.makedirs(storage, exist_ok=True)
+    # A dead pid: if this directory were swept, it would be judged stale and cleared.
+    lock, pidf = _write_lock(str(outside), 99999)
+    os.symlink(str(outside), os.path.join(storage, "linked"))
+    runner = ProcRunner(ps_lines=["1 /sbin/launchd"])
+    agent = _agent(tmp_path / "home", _spec("com.example.a", "pkg-a", storage), mock_logger,
+                   runner=runner)
+    assert agent.clear_stale_storage_locks() == 0
+    assert os.path.exists(lock)
+    assert os.path.exists(pidf)
+
+
+def test_clear_stale_locks_warns_instead_of_a_silent_zero_when_listdir_fails(
+        tmp_path, mock_logger, monkeypatch):
+    """os.listdir raising must not silently narrow the sweep to the root: the
+    bridge keeps its locks ONE level down, which is exactly what a failed
+    listdir would skip while still reporting a "clean" 0.
+    """
+    storage = str(tmp_path / "a-store")
+    os.makedirs(storage, exist_ok=True)
+    lock, _pidf = _write_lock(os.path.join(storage, "certificates"), 99999)
+    runner = ProcRunner(ps_lines=["1 /sbin/launchd"])
+    agent = _agent(tmp_path / "home", _spec("com.example.a", "pkg-a", storage), mock_logger,
+                   runner=runner)
+    monkeypatch.setattr(os, "listdir",
+                        lambda *_a, **_k: (_ for _ in ()).throw(PermissionError(13, "denied")))
+    assert agent.clear_stale_storage_locks() == 0
+    assert os.path.exists(lock)   # never even looked at
+    assert storage in _warnings(mock_logger)
+
+
+def test_clear_stale_locks_warns_undecided_instead_of_a_silent_zero(tmp_path, mock_logger):
+    """Kills the `age = age or 0` mutation: an inconclusive command line AND an
+    unparseable etime must leave the lock alone AND say so. Before this test,
+    that mutation made age default to 0 (falsy None), which read as "the
+    process is 0 seconds old" — a real number the started_at comparison could
+    act on — so the case silently resolved to LIVE_PID_OURS with no warning at
+    all, the exact silent-zero the review's mutation testing caught.
+    """
+    storage = str(tmp_path / "a-store")
+    runner = ProcRunner(ps_lines=["4242"], proc_etime=None)  # bare pid + unparseable age
+    agent = _agent(tmp_path / "home", _spec("com.example.a", "pkg-a", storage), mock_logger,
+                   runner=runner)
+    lock, pidf = _write_lock(storage, 4242)
+    assert agent.clear_stale_storage_locks() == 0
+    assert os.path.exists(lock)
+    assert os.path.exists(pidf)
+    warnings = _warnings(mock_logger)
+    assert "4242" in warnings and "process age could not be determined" in warnings
 
 
 # ---------------------------------------------------------------------------
