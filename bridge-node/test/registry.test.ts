@@ -743,27 +743,6 @@ describe("set_state (§3.4)", () => {
         }
     });
 
-    it("writes 0% as currentLevel 1 when the device reads ON (#353's conservative pin)", async () => {
-        // This test's premise used to be "level:0 always floors to 1" —
-        // #353 changed that for an OFF device (see the "currentLevel
-        // retention while off" describe block below), so this one now pins
-        // the surviving half: ON stays the case where level:0 really does
-        // mean "the Lighting-feature minimum", since the owner ruled level 0
-        // out as a state Indigo produces while genuinely on.
-        const h = await harness();
-        try {
-            await h.registry.reconcile(
-                [spec(1, Role.dimmableLight, { states: { onOff: true, level: 100 } })],
-                false,
-            );
-            await h.registry.setState(1, { level: 0 });
-            const dim = [...h.aggregator.parts][0];
-            assert.equal((dim?.stateOf("levelControl") as Record<string, unknown>).currentLevel, 1);
-        } finally {
-            await h.close();
-        }
-    });
-
     it("refuses a set_state whose keys the role does not speak", async () => {
         // This used to answer success. An onOffLight has no LevelControl, so
         // `{level: 50}` produced an empty patch, `applyStates` returned early
@@ -930,13 +909,15 @@ describe("set_state (§3.4)", () => {
 });
 
 /**
- * #353 — a `level: 0` push must not floor a genuinely-off device's
- * `currentLevel` to the Lighting-feature minimum; see
- * {@link retainLevelWhileOff}'s doc in `src/endpoints.ts` for the rule, the
- * Alexa/HAMH#880 evidence and why reading the OnOff attribute here is not a
- * #143 violation. Each test below is named for the case it is adversarial
- * against — "when could this retain/lose the level and be wrong?" — not just
- * "does retention work".
+ * #353 — a pushed `level: 0` never writes `currentLevel` (ADR-0017's rule
+ * a); see {@link retainLevelWhileOff}'s doc in `src/endpoints.ts` for the
+ * rule and the Alexa/HAMH#880 evidence. There is no on/off test any more —
+ * an earlier rule (b) withheld the write only while the device read off, and
+ * was replaced after it was measured to re-open #353 for a split-frame push
+ * (see ADR-0017's "Rejected variant"); (c) and (d) below pin what changed.
+ * Each test is named for the case it is adversarial against — "when could
+ * this retain/lose the level and be wrong?" — not just "does retention
+ * work".
  */
 describe("currentLevel retention while off (#353)", () => {
     it("(a) an on-then-off push in the SAME frame retains the pre-off level, not the minimum", async () => {
@@ -960,10 +941,12 @@ describe("currentLevel retention while off (#353)", () => {
         }
     });
 
-    it("(b) a BARE level:0 (no onOff key) retains the level when the attribute already reads off", async () => {
+    it("(b) a BARE level:0 (no onOff key) retains the level regardless of what OnOff currently reads", async () => {
         // Off by construction (no onOff in the initial states), pre-seeded at
         // a known non-minimum level so retention is observable rather than
-        // coincidental.
+        // coincidental. Rule a never reads the OnOff attribute at all — this
+        // is retention working from `rest.level === 0` alone, not from any
+        // fallback onto the live attribute.
         const h = await harness();
         try {
             await h.registry.reconcile([spec(1, Role.dimmableLight, { states: { level: 40 } })], false);
@@ -976,19 +959,49 @@ describe("currentLevel retention while off (#353)", () => {
             assert.equal(
                 (dim.stateOf("levelControl") as Record<string, unknown>).currentLevel,
                 before,
-                "a bare level:0 must fall back to the live OnOff attribute, not assume on",
+                "a bare level:0 must retain the prior level unconditionally",
             );
         } finally {
             await h.close();
         }
     });
 
-    // (c) lives outside this describe block: "writes 0% as currentLevel 1
-    // when the device reads ON (#353's conservative pin)", above, in the
-    // preceding describe — it predates #353 and was repurposed as this
-    // rule's ON-side pin rather than duplicated here.
+    it("(c) a bare level:0 retains the prior level even while OnOff still reads ON — rule a never inspects it", async () => {
+        // Under rule b this was "writes 0% as currentLevel 1 when the device
+        // reads ON (#353's conservative pin)" — the owner's deliberate
+        // exception for "level 0 while on", which rule a removes entirely:
+        // there is no on/off test left to except FROM. See (d) below for the
+        // one shape that still floors to the minimum: onOff:true and level:0
+        // arriving together in the SAME push.
+        const h = await harness();
+        try {
+            await h.registry.reconcile(
+                [spec(1, Role.dimmableLight, { states: { onOff: true, level: 100 } })],
+                false,
+            );
+            const dim = only(h);
+            // 100% → round(100 × 254 / 100) = 254.
+            assert.equal((dim.stateOf("levelControl") as Record<string, unknown>).currentLevel, 254);
 
-    it("(d) onOff:true and level:0 in the SAME push still writes the minimum (conservative pin)", async () => {
+            await h.registry.setState(1, { level: 0 });
+            assert.equal(
+                (dim.stateOf("levelControl") as Record<string, unknown>).currentLevel,
+                254,
+                "a bare level:0 must retain the prior level even while the attribute reads ON",
+            );
+            assert.equal((dim.stateOf("onOff") as Record<string, unknown>).onOff, true, "onOff is untouched by a bare level push");
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("(d) onOff:true and level:0 in the SAME push now RETAINS the prior level (accepted cost, ADR-0017)", async () => {
+        // Under rule b this floored to the minimum on the reasoning that "on
+        // at level 0" should still be visible as off-like. Rule a drops that
+        // exception: the owner confirmed Indigo never actually reports on at
+        // brightness 0, so this combination is judged unreachable in
+        // practice, and retaining here costs nothing real — pinned so a
+        // future change to this behaviour is a decision, not an accident.
         const h = await harness();
         try {
             await h.registry.reconcile(
@@ -996,9 +1009,85 @@ describe("currentLevel retention while off (#353)", () => {
                 false,
             );
             const dim = only(h);
+            // 50% → round(50 × 254 / 100) = 127.
+            assert.equal((dim.stateOf("levelControl") as Record<string, unknown>).currentLevel, 127);
+
             await h.registry.setState(1, { onOff: true, level: 0 });
-            assert.equal((dim.stateOf("levelControl") as Record<string, unknown>).currentLevel, 1);
+            assert.equal(
+                (dim.stateOf("levelControl") as Record<string, unknown>).currentLevel,
+                127,
+                "onOff:true and level:0 together now retains, it does not floor to the minimum",
+            );
             assert.equal((dim.stateOf("onOff") as Record<string, unknown>).onOff, true);
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("(R3) a split off-push arriving LEVEL-FIRST retains at every step — the split-frame case rule a exists to fix", async () => {
+        // The Indigo plugin pushes one diff per callback with no coalescing
+        // of its own, so an off can arrive as two frames instead of one, in
+        // either order, depending on which plugin owns the device. Under the
+        // OLD attribute-gated rule (rule b), this EXACT sequence ended at
+        // currentLevel 1: `{level: 0}` arrived while the OnOff attribute
+        // still read on (from the prior frame), so rule b wrote the minimum
+        // right there — before the following `{onOff: false}` frame ever
+        // ran. This is the measured re-opening of #353 recorded in
+        // ADR-0017's "Rejected variant" section. Rule a never inspects onOff
+        // at all, so it retains through both frames regardless of order.
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(1, Role.dimmableLight)], false);
+            await h.registry.setState(1, { onOff: true, level: 20 });
+            const dim = only(h);
+            // 20% → round(20 × 254 / 100) = 51.
+            assert.equal((dim.stateOf("levelControl") as Record<string, unknown>).currentLevel, 51);
+
+            await h.registry.setState(1, { level: 0 });
+            assert.equal(
+                (dim.stateOf("levelControl") as Record<string, unknown>).currentLevel,
+                51,
+                "currentLevel must retain immediately after the level-only frame, before onOff:false ever arrives",
+            );
+
+            await h.registry.setState(1, { onOff: false });
+            assert.equal(
+                (dim.stateOf("levelControl") as Record<string, unknown>).currentLevel,
+                51,
+                "currentLevel must still be retained once the device is confirmed off",
+            );
+            assert.equal((dim.stateOf("onOff") as Record<string, unknown>).onOff, false);
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("(R4) a split off-push arriving ONOFF-FIRST also retains at every step", async () => {
+        // The other frame order. Rule b already handled this order correctly
+        // (by the time `{level: 0}` arrived, the attribute already read
+        // off), so this is not the failing case — it is here so both orders
+        // are pinned side by side and neither can regress independently.
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(1, Role.dimmableLight)], false);
+            await h.registry.setState(1, { onOff: true, level: 20 });
+            const dim = only(h);
+            assert.equal((dim.stateOf("levelControl") as Record<string, unknown>).currentLevel, 51);
+
+            await h.registry.setState(1, { onOff: false });
+            assert.equal(
+                (dim.stateOf("levelControl") as Record<string, unknown>).currentLevel,
+                51,
+                "currentLevel must be untouched by an onOff-only frame",
+            );
+
+            await h.registry.setState(1, { level: 0 });
+            assert.equal(
+                (dim.stateOf("levelControl") as Record<string, unknown>).currentLevel,
+                51,
+                "currentLevel must still be retained once the trailing level:0 frame lands",
+            );
+            assert.equal((dim.stateOf("onOff") as Record<string, unknown>).onOff, false);
         } finally {
             await h.close();
         }
@@ -2228,6 +2317,47 @@ describe("driving-device rekey (issue #246/ADR-0011)", () => {
                 ],
                 "commands must route to the EXCHANGED device ids after a swap",
             );
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("(R5, #353/ADR-0017) rekey carry-over: the migrated identity keeps the OLD device's retained level, kept deliberately", async () => {
+        // For the NEW physical device this is a level it never itself
+        // confirmed — retained purely on the strength of the OLD device's
+        // history. Kept on purpose (not closed as a gap): ADR-0011 treats a
+        // migrate as the same logical accessory, and resetting the level on
+        // rekey would expose the migrated accessory to exactly the
+        // first-turn-on 100% override ADR-0017 exists to prevent. It heals
+        // the moment device 2 is itself turned on for real. See ADR-0017's
+        // "Consequences" (the rekey bullet) for the same ruling in prose.
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(1, Role.dimmableLight)], false);
+            await h.registry.setState(1, { onOff: true, level: 80 }); // 80% → round(80 × 254 / 100) = 203
+            await h.registry.setState(1, { onOff: false, level: 0 }); // retained at 203
+            const before = only(h);
+            assert.equal((before.stateOf("levelControl") as Record<string, unknown>).currentLevel, 203);
+
+            h.commands.length = 0;
+            // Device 2 takes over the identity device 1 was publishing — same
+            // role, off with its own fresh level:0 — a real rekey, not a
+            // remove+add.
+            await h.registry.reconcile(
+                [spec(2, Role.dimmableLight, { publishedAs: "indigo-1", states: { onOff: false, level: 0 } })],
+                false,
+            );
+
+            const after = only(h);
+            assert.equal(after, before, "a rekey reuses the SAME Endpoint object, not a new one");
+            assert.equal(h.registry.summaries()[0]?.indigoDeviceId, 2, "the identity is now driven by device 2");
+            assert.equal(
+                (after.stateOf("levelControl") as Record<string, unknown>).currentLevel,
+                203,
+                "the migrated identity keeps device 1's retained level, not device 2's own unconfirmed minimum",
+            );
+            assert.equal((after.stateOf("onOff") as Record<string, unknown>).onOff, false);
+            assert.deepEqual(h.commands, [], "a rekey must not emit any command events");
         } finally {
             await h.close();
         }

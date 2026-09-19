@@ -727,21 +727,19 @@ ecosystem acts. Both are enumerated here in full; there is no other source.
   Inbound (a `setLevel`/`goToPosition` command reaching the plugin), `0 ↔
   off` is preserved exactly — unchanged by #353. Outbound, a pushed
   `level: 0` is consumed, but for `dimmableLight`, `colorTemperatureLight`
-  and `extendedColorLight` it does not move `currentLevel` while the device
-  is off: the attribute instead keeps whatever level Indigo last confirmed
-  while the light was on (#353, ADR-0017). This applies to any `set_state`
-  and equally to the `states` an `attach`/upsert reconcile replays against an
-  already-LIVE endpoint — both reach `applyStates`, where the rule lives. It
-  does NOT apply to a brand-new endpoint's first-ever construction: a fresh
-  accessory still advertises the Lighting minimum until its first turn-on —
-  a known limit, not a gap in this rule (`endpoints.ts`'s
-  `retainLevelWhileOff` doc). "Off" means the same push carries
-  `onOff: false`, or carries no boolean `onOff` key and the endpoint's
-  `OnOff` attribute already reads `false`; `level: 0` pushed while the
-  device is on writes the Lighting minimum (1), unchanged. No frame or wire
-  change in either direction, and the plugin's own push (brightness 0
-  whenever Indigo reports the dimmer off) is unchanged too — the asymmetry
-  is entirely inside the node's write.
+  and `extendedColorLight` it NEVER moves `currentLevel` — full stop, with
+  no on/off test of any kind: it does not matter what `onOff` the same push
+  carries, or what the endpoint's `OnOff` attribute currently reads. The
+  attribute instead keeps whatever level Indigo last confirmed non-zero
+  (#353, ADR-0017). This applies to any `set_state` and equally to the
+  `states` an `attach`/upsert reconcile replays against an already-LIVE
+  endpoint — both reach `applyStates`, where the rule lives. It does NOT
+  apply to a brand-new endpoint's first-ever construction: a fresh accessory
+  still advertises the Lighting minimum until its first turn-on — a known
+  limit, not a gap in this rule (`endpoints.ts`'s `retainLevelWhileOff`
+  doc). No frame or wire change in either direction, and the plugin's own
+  push (brightness 0 whenever Indigo reports the dimmer off) is unchanged
+  too — the asymmetry is entirely inside the node's write.
 - Thermostat **fan is not part of v1** (the Fan descope, PRD §5.2); there are
   no fan state keys or commands. v2 candidate.
 - Units are Indigo-natural at the protocol boundary (°C, %, lux, 0–100);

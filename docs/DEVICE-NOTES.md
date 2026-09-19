@@ -260,11 +260,15 @@ The MOTIVE is still upstream's inference — nothing we can observe says why.
 
 **What we do about it:** rather than gate or drop the command — which also
 carries "Alexa, set X to 70%" sent to an off light, the identical shape —
-the bridge stops advertising the Lighting minimum while a light is off. It
-retains the last level Indigo confirmed while the light was on; a plain
-`moveToLevel`, should one still arrive, is forwarded unchanged, but now
-lands against a `currentLevel` that already reads the on-level rather than
-the minimum. Live, this measurably changed what Alexa sent: with a retained
+the bridge consumes a pushed `level: 0` but never lets it move `currentLevel`
+to the Lighting minimum. There is no on/off test involved: it does not
+matter whether the same push says the light is on or off, or what the
+endpoint currently reports — a pushed `level: 0` simply never reaches
+`currentLevel`. The attribute instead keeps the last non-zero level Indigo
+confirmed. A plain `moveToLevel`, should one still arrive, is forwarded
+completely unchanged — the fix does not neutralise that command. What
+changes is that Alexa was observed not sending it in the first place once
+the endpoint already advertises a non-minimum level: live, with a retained
 level advertised while off, Alexa sent `on` alone (5 of 5). The retained
 value is only what the bridge ADVERTISES while the light is off — it is
 never sent to the device. With Alexa now sending a plain `On`, the level a
@@ -283,6 +287,18 @@ and `BRIDGE_PROTOCOL.md` §4.2.
   covers a brand-new export, and equally a light that has not been turned on
   since this fix was installed (or since it was first exported); after that
   first turn-on the exposure stops for that light.
+- Recreating an accessory under a different role (for example, if a device's
+  capabilities change and it is re-exported with a new role) resets a
+  retained level back to the Lighting minimum while off, the same as a
+  brand-new export — an ordinary restart does not do this, only a role
+  change does.
+- Migrating an exported accessory onto a different underlying device (a
+  rekey — the same published accessory identity now driven by a different
+  Indigo device) keeps the PREVIOUS device's retained level until the new
+  device is itself turned on for real. This is deliberate, not a bug: it
+  avoids re-exposing the newly-migrated accessory to the same first-turn-on
+  override this fix exists to prevent, at the cost of showing a level for a
+  moment that the new device never itself confirmed.
 - A Matter scene recall to exactly the retained level, while the light is
   off, may not emit a level command at all (matter.js skips a level write
   that already matches `currentLevel`) — a pre-existing matter.js quirk,
