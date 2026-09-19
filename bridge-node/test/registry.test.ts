@@ -1132,6 +1132,47 @@ describe("currentLevel retention while off (#353)", () => {
         }
     });
 
+    it("(mutation kill, #357) a bare level:0 and a routine off never reach endpoint.set() — pins retainLevelWhileOff's own emptied-key deletion", async () => {
+        // A mutant that skips `delete patch[LEVEL_CONTROL]` once levelControl
+        // is left empty survives the behavioural tests in this block: the patch
+        // still comes back as {levelControl: {}} instead of {}, so
+        // applyStates' own empty-patch early return never fires and a
+        // pointless `endpoint.set({levelControl: {}})` goes out per off push
+        // instead of the lawful no-op (e) pins. Benign on matter.js 0.17.8,
+        // but a real transaction per off dimmer per attach replay — and if
+        // the onOff half's act() throws, the error would say it "applied the
+        // residual attributes" when the residual was empty and there was
+        // nothing to apply.
+        // The onOff half goes through endpoint.act(), a separate call path
+        // from endpoint.set() (see applyStates), so shadowing `set` alone
+        // isolates the level half this pins.
+        const h = await harness();
+        try {
+            await h.registry.reconcile(
+                [spec(1, Role.dimmableLight, { states: { onOff: true, level: 20 } })],
+                false,
+            );
+            const dim = only(h);
+            const dimWithSet = dim as unknown as { set: (...args: unknown[]) => Promise<unknown> };
+            const originalSet = dimWithSet.set;
+            let setCalls = 0;
+            dimWithSet.set = function (...args: unknown[]) {
+                setCalls++;
+                return originalSet.apply(dim, args);
+            };
+            try {
+                await h.registry.setState(1, { onOff: false, level: 0 });
+                assert.equal(setCalls, 0, "onOff:false + level:0 must not reach endpoint.set()");
+                await h.registry.setState(1, { level: 0 });
+                assert.equal(setCalls, 0, "a bare level:0, already off, must not reach endpoint.set()");
+            } finally {
+                dimWithSet.set = originalSet;
+            }
+        } finally {
+            await h.close();
+        }
+    });
+
     it("(f) a later on-push with a real level overwrites a retained value normally", async () => {
         const h = await harness();
         try {

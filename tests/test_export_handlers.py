@@ -256,6 +256,20 @@ class TestDimmable:
         assert handlers.handler_for("dimmableLight").states_for(dev) == \
             {"onOff": True, "level": 42}
 
+    def test_an_off_dimmer_reports_level_zero_exactly_not_floored(self, handlers):
+        """#357: `retainLevelWhileOff` (bridge-node) relies on this side
+        pushing a literal `level: 0` for an off dimmer — that is the only
+        shape it withholds `currentLevel` for. A future "fix" flooring an off
+        level to 1 would silently defeat #353's retention: `level: 1` is not
+        0, so the node overwrites the retained level with `currentLevel` 3 on
+        every off (`bridge-node/src/endpoints.ts`, `percentToCurrentLevel`).
+        Whether Alexa overrides at that level is untested — see DEVICE-NOTES."""
+        dev = DimmerDevice(1, "Lamp", onState=False, brightness=0)
+        states = handlers.handler_for("dimmableLight").states_for(dev)
+        assert states == {"onOff": False, "level": 0}
+        assert states["level"] is not False  # bool is an int subclass; guard the literal 0
+        assert type(states["level"]) is int
+
     def test_level_is_omitted_when_the_device_cannot_answer(self, handlers):
         """A relay exported as a dimmable light has no ``brightness`` at all."""
         dev = RelayDevice(1, "Plug", onState=True)
@@ -287,6 +301,74 @@ class TestDimmable:
     def test_dispatch_without_a_level_raises_rather_than_guessing(self, handlers):
         with pytest.raises(ValueError):
             handlers.handler_for("dimmableLight").dispatch("setLevel", {}, DimmerDevice(1, "L"))
+
+
+# ---------------------------------------------------------------------------
+# on-at-0 diagnostic warning (#357) — DimmableLightExport.states_for and its
+# subclasses; ADR-0017 accepted this as a visible-but-unfixed cost, this just
+# makes it diagnosable. Must never change what states_for returns.
+# ---------------------------------------------------------------------------
+class TestOnAtZeroWarning:
+    def test_on_at_brightness_0_warns_once_naming_the_device(self, handlers, caplog):
+        dev = DimmerDevice(7, "Landing Lamp", onState=True, brightness=0)
+        with caplog.at_level("WARNING"):
+            states = handlers.handler_for("dimmableLight").states_for(dev)
+        assert states == {"onOff": True, "level": 0}
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert len(warnings) == 1
+        assert "7" in warnings[0].message and "Landing Lamp" in warnings[0].message
+
+    def test_a_repeat_call_for_the_same_device_does_not_warn_again(self, handlers, caplog):
+        dev = DimmerDevice(7, "Landing Lamp", onState=True, brightness=0)
+        handler = handlers.handler_for("dimmableLight")
+        with caplog.at_level("WARNING"):
+            handler.states_for(dev)
+            handler.states_for(dev)
+        assert len([r for r in caplog.records if r.levelname == "WARNING"]) == 1
+
+    def test_the_latch_is_keyed_per_device(self, handlers, caplog):
+        handler = handlers.handler_for("dimmableLight")
+        with caplog.at_level("WARNING"):
+            handler.states_for(DimmerDevice(8, "A", onState=True, brightness=0))
+            handler.states_for(DimmerDevice(9, "B", onState=True, brightness=0))
+        assert len([r for r in caplog.records if r.levelname == "WARNING"]) == 2
+
+    @pytest.mark.parametrize("on_state,brightness", [
+        (False, 0),   # the routine off — must never warn on every ordinary off
+        (True, 50),
+        (True, 1),
+    ])
+    def test_negatives_never_warn(self, handlers, caplog, on_state, brightness):
+        dev = DimmerDevice(10, "Lamp", onState=on_state, brightness=brightness)
+        with caplog.at_level("WARNING"):
+            handlers.handler_for("dimmableLight").states_for(dev)
+        assert [r for r in caplog.records if r.levelname == "WARNING"] == []
+
+    def test_brightness_unreadable_never_warns(self, handlers, caplog):
+        """``level`` is omitted entirely when brightness cannot be read at
+        all — the on-at-0 check must not fire off a key that is not there."""
+        dev = RelayDevice(11, "Plug", onState=True)
+        with caplog.at_level("WARNING"):
+            states = handlers.handler_for("dimmableLight").states_for(dev)
+        assert "level" not in states
+        assert [r for r in caplog.records if r.levelname == "WARNING"] == []
+
+    @pytest.mark.parametrize(
+        "role", ["dimmableLight", "colorTemperatureLight", "extendedColorLight"])
+    def test_all_three_light_roles_warn(self, handlers, caplog, role):
+        dev = DimmerDevice(12, "Lamp", onState=True, brightness=0)
+        with caplog.at_level("WARNING"):
+            handlers.handler_for(role).states_for(dev)
+        assert len([r for r in caplog.records if r.levelname == "WARNING"]) == 1
+
+    def test_window_covering_is_not_affected(self, handlers, caplog):
+        """``WindowCoveringExport`` has its own ``states_for`` over
+        ``position`` only — it never calls ``DimmableLightExport.states_for``
+        and must never warn."""
+        dev = DimmerDevice(13, "Blind", onState=True, brightness=0)
+        with caplog.at_level("WARNING"):
+            handlers.handler_for("windowCovering").states_for(dev)
+        assert [r for r in caplog.records if r.levelname == "WARNING"] == []
 
 
 # ---------------------------------------------------------------------------

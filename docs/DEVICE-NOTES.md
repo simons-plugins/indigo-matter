@@ -312,3 +312,6 @@ and `BRIDGE_PROTOCOL.md` §4.2.
   retained level rather than from the minimum. `move` is unaffected in
   practice: its target is ±∞, which the bridge clamps, so it always lands on
   0% or 100% regardless of what `currentLevel` starts from.
+- If Indigo ever reports a dimmer ON at brightness 0, the bridge keeps the
+  retained level rather than the minimum, and the plugin logs a warning in
+  the Indigo Event Log, once per device, when that happens (#357).
