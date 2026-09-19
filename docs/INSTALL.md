@@ -41,6 +41,7 @@ running but matter-server is not.
   [before you pair the export bridge](#before-you-pair-the-export-bridge)
 - [Troubleshooting](#troubleshooting) —
   [the controller](#the-controller-matter-server) ·
+  [recovering from a stuck storage lock](#recovering-from-a-stuck-storage-lock) ·
   [the export bridge](#the-export-bridge)
 - [Upgrading matter-server](#upgrading-matter-server)
 - [Uninstall](#uninstall)
@@ -755,12 +756,53 @@ does say so on the page and in the log line.
 | nvm node not found by the managed agent | Auto-detect didn't find the nvm node. | Set **Node bin directory** explicitly to your own nvm bin dir (see Step 1), or use Homebrew node. |
 | `BLE is not enabled on this platform` warning | Expected — matter-server never uses BLE. The out-of-box BLE step belongs to a phone or ecosystem hub; everything this plugin does is over IP, for Wi-Fi and Thread alike. | Benign; ignore. |
 | New managed LaunchAgent doesn't take effect | A prior agent with the same label is still loaded. | Plugins ▸ Matter ▸ **Restart the Matter controller** (it reloads the plist and stops strays), or `launchctl bootout gui/$(id -u)/com.simons-plugins.indigo-matter` then restart the plugin. |
-| `Server failed to start [storage-lock] Storage is locked by another process (pid N)` | A second matter-server (orphaned from an earlier LaunchAgent) is still running and holds the storage lock. | The plugin now reaps such strays on start/restart — Plugins ▸ Matter ▸ **Restart the Matter controller**. If it persists, reboot the Mac (kills the orphan; the lock goes stale and is reclaimed automatically). |
+| `Server failed to start [storage-lock] Storage is locked by another process (pid N)` | Two different faults produce the identical error. **(a)** A second matter-server (orphaned from an earlier LaunchAgent) is genuinely still running and holds the lock. **(b)** The lock is a leftover, and the pid recorded in it has since been reused by an unrelated process — typically after a reboot. matter-server's own stale-lock check only compares its stored token when the recorded pid equals its own; for any other still-running pid it just accepts the lock as live, so in case (b) there may be **no orphan left to reap at all**. The tell: `ps -p <pid> -o command=` on the pid the error names — a non-matter command (an Indigo plugin host, say) confirms case (b). | Since 2026.32.4 the plugin sweeps stale locks automatically before starting the controller — try Plugins ▸ Matter ▸ **Restart the Matter controller** first. If the error persists, work through [Recovering from a stuck storage lock](#recovering-from-a-stuck-storage-lock) by hand. |
 | matter-server won't start after an upgrade (wedged install) | The installed package is damaged or incompatible. | Plugins ▸ Matter ▸ **Reinstall the Matter controller (clean)…** — deletes `~/indigo-matter/node_modules` and reinstalls fresh. Your commissioned devices are kept (the fabric/storage is untouched). |
 | Commissioning fails on device attestation (test/development certificate) | The device presents a test PAA (Homebridge and other dev bridges do); only the production DCL is trusted by default. | Configure… ▸ **Show advanced server settings** ▸ **Allow test/development device certificates**, then **reload the plugin** (or Plugins ▸ Matter ▸ **Restart the Matter controller**) — saving the config alone does not apply it. The log then shows the "RELAXED device attestation" warning, which reports what the plugin *starts* matter-server with; if commissioning still fails on attestation, confirm the running process really has the flag using the `lsof`/`ps` check in the row below. Managed (local) mode only — for a remote matter-server, add `--enable-test-net-dcl` where you start it. |
 | A saved setting doesn't change how matter-server behaves | Settings only reach the server when the plist is regenerated and launchd reloads it. Saving the config does neither. | Reload the plugin, or Plugins ▸ Matter ▸ **Restart the Matter controller** (it rebuilds from current prefs). Then verify what is actually running rather than trusting the log: `lsof -nP -iTCP:<your port> -sTCP:LISTEN` (5580 unless you changed it), then `ps -ww -o pid=,command= -p <PID>`, and compare that command line against `ProgramArguments` in `~/Library/LaunchAgents/com.simons-plugins.indigo-matter.plist`. |
 | Log says the server started, but it behaves like the old one | A matter-server started **outside** this plugin — or with a different `--storage-path` — is holding the port. The plugin's orphan reaper only matches servers using *its* package dir and storage path, so it never stops that one, and the fresh instance dies on the port bind (`EADDRINUSE` in `matter-server.err.log`) while the stray keeps answering on 5580 with its own arguments. (A stray with the *same* storage path fails earlier and differently — see the storage-lock row above.) | Find the owner with `lsof -nP -iTCP:5580 -sTCP:LISTEN`, confirm with `ps -ww -o pid=,command= -p <PID>`, then `kill <PID>`. Note matter-server may exit 0 on that failure, which `KeepAlive` treats as a clean exit, so launchd will not respawn it — use Plugins ▸ Matter ▸ **Restart the Matter controller** afterwards. |
 | Hand-edited plist keeps reverting | The plugin regenerates the plist from config on restart. | Change settings via **Configure…**, not the plist. |
+
+### Recovering from a stuck storage lock
+
+Only needed if **Restart the Matter controller** did not clear the
+storage-lock error above.
+
+**Check first, because this matters.** Confirm no matter process is actually
+running before touching anything:
+
+```
+pgrep -fl "MatterServer.js|indigo-matter-bridge"
+```
+
+Deleting the lock of a **running** server corrupts a live Matter fabric —
+never delete one while a matching process is alive.
+
+1. Stop the agent, so nothing restarts under you mid-cleanup:
+   ```
+   launchctl bootout gui/$(id -u)/com.simons-plugins.indigo-matter
+   ```
+   Add `.bridge` to the label too (`com.simons-plugins.indigo-matter.bridge`) if the
+   bridge's storage is the one wedged.
+2. Find the leftovers. Locks live in the storage root **and** its immediate
+   subdirectories (`config/`, `certificates/`, `vendors/`, `ota/`,
+   `server-1-fff1/` and similar):
+   ```
+   find ~/Library/Application\ Support/com.simons-plugins.indigo-matter -name 'matter.lock' -o -name 'matter.pid'
+   ```
+3. Inspect before deleting. `matter.pid` holds `"<pid> <token>"` — check what
+   that pid actually is now:
+   ```
+   cat <path>/matter.pid
+   ps -p <pid> -o command=
+   ```
+   If it names something unrelated to matter-server or the bridge, that is
+   this exact bug confirmed, not a live server.
+4. Delete the `matter.lock` and `matter.pid` files you found, then restart
+   the plugin.
+
+Deleting these two files is safe once you've confirmed no matter process is
+running: they are only a mutex and hold no fabric or device data of their own.
 
 ### The Indigo devices this plugin creates
 
