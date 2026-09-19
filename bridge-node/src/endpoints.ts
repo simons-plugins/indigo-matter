@@ -2702,25 +2702,36 @@ export function rejectedStateKeys(role: RoleValue, states: Record<string, unknow
  * this.** A brand-new endpoint has no confirmed prior level to retain, so a
  * `level: 0` construction push while off just keeps
  * {@link LEVEL_CONTROL_INITIAL}'s default `currentLevel: 1` — the bug
- * persists for such a device until its first turn-on. An EXISTING accessory
- * is unaffected by this limit across a bridge *restart*, though: matter.js
- * persists `currentLevel` (it is a nonvolatile Matter attribute) and restores
- * that value over whatever `createEndpoint` seeds as construction defaults —
- * pinned live by the "(restart) a bridge restart replays off+level:0..."
- * test below, the same restart-survival shape
- * {@link bridgedInfoFor}'s `configurationVersion` comment documents for that
- * attribute. So `createEndpoint`'s construction patch never needs this
- * function, and it matters HOW that holds: a restarted node has an empty
- * live set, so `registry.reconcile()` takes its `create` branch —
- * `createEndpoint` DOES run again, its patch DOES carry `currentLevel: 1`,
- * and `applyStates` does NOT run afterwards. The level survives only because
- * matter.js restores the persisted value over that construction patch. The
- * restore is not selective: a throwaway probe while fixing #353 showed it
- * beats a genuinely DIFFERENT attach state too (a dimmer attached as on at
- * 60% came up off at 20%), which is a separate problem from this one — the
- * restart test here pins #353's outcome, not that mechanism, so a future fix
- * that applies attach states after `create` reaches this function through
- * `applyStates` and the level is retained either way.
+ * persists for such a device until its first turn-on.
+ *
+ * **An EXISTING accessory survives a bridge restart, for two distinct
+ * reasons depending on which path it takes — not because of one mechanism.**
+ * (a) The normal path: `node.ts`'s `restoreEndpoints()` (issue #141) rebuilds
+ * every persisted accessory from `endpoint-map.json`, via
+ * `registry.restore()` → the ordinary `create` path, with `states: {}` —
+ * BEFORE the plugin ever attaches. `createEndpoint`'s construction patch has
+ * only {@link LEVEL_CONTROL_INITIAL}'s `currentLevel: 1` default to lose
+ * against, and matter.js restores the persisted `currentLevel` (a
+ * nonvolatile Matter attribute) over it. By the time the plugin's `attach`
+ * arrives, that endpoint is already LIVE, so `registry.reconcile()` takes the
+ * UPDATE branch — `applyStates`, where THIS function runs and keeps the
+ * restored level against the attach's own `{onOff:false, level:0}`. Pinned
+ * end-to-end, against a real `BridgeNode` restart, by restore.test.ts's
+ * "issue #353: currentLevel retention over a REAL node restart" test.
+ * (b) The narrower path `registry.test.ts`'s own "(create-path persistence,
+ * issue #355)…" test drives: a `create` reached with matter.js storage that
+ * already holds a persisted value but with no `restoreEndpoints()` pass
+ * ahead of it (a fresh `Registry` instance built directly against old
+ * storage, as that test does; in production, an endpoint
+ * `restoreEndpoints()` could not rebuild for some other reason while
+ * matter.js itself still has its state on disk). There
+ * `applyStates` never runs at all, so this function never runs either — the
+ * level survives only because matter.js's own restore overwrites the
+ * construction patch, the same mechanism {@link bridgedInfoFor}'s
+ * `configurationVersion` comment documents. That gap — `create` never
+ * calling `applyStates` — is real and narrower than #353 itself, tracked
+ * separately as issue #355 (unverified end-to-end); this function does
+ * nothing to close it and is unaffected either way.
  */
 function retainLevelWhileOff(endpoint: Endpoint, patch: Record<string, unknown>, rest: Record<string, unknown>): void {
     if (rest.level !== 0) {

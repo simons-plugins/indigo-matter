@@ -239,6 +239,12 @@ function onOffOf(server: ServerNode, indigoDeviceId: number): boolean | undefine
     return (child?.stateOf("onOff") as { onOff?: boolean } | undefined)?.onOff;
 }
 
+/** Issue #353 — what an ecosystem would actually read as brightness. */
+function currentLevelOf(server: ServerNode, indigoDeviceId: number): number | undefined {
+    const child = childOf(server, indigoDeviceId);
+    return (child?.stateOf("levelControl") as { currentLevel?: number } | undefined)?.currentLevel;
+}
+
 /**
  * Establish a storage dir that already holds two exported accessories, and
  * report the endpoint numbers matter.js gave them.
@@ -444,6 +450,90 @@ describe("issue #141: attach stays authoritative over the restored set", () => {
             assert.equal(session.bridge.getStatus().endpointCount, 3);
         } finally {
             await session.close();
+        }
+    });
+});
+
+describe("issue #353: currentLevel retention over a REAL node restart", () => {
+    it("an attach after restoreEndpoints retains the persisted level via applyStates, not registry-level create", async () => {
+        // The production path #353 actually has to survive: `restoreEndpoints`
+        // (issue #141, node.ts) rebuilds this accessory from
+        // `endpoint-map.json` BEFORE the plugin ever attaches — with `states:
+        // {}`, so whatever `currentLevel` matter.js restores from disk is the
+        // only thing live at that point. By the time `attach` arrives the
+        // endpoint is therefore already LIVE, so `reconcile` takes the UPDATE
+        // branch — `applyStates`, which is where `retainLevelWhileOff` (#353,
+        // endpoints.ts) actually runs. This is deliberately NOT the path
+        // `registry.test.ts`'s create-path restart test drives (a fresh
+        // `Registry` against old storage, which always takes the CREATE
+        // branch regardless of what is on disk — see that test's own comment,
+        // and issue #355 for the narrower gap it leaves: `create` never calls
+        // `applyStates` at all, so that path survives only because matter.js's
+        // own restore happens to win the race against the construction seed).
+        const storagePath = storage();
+        const LANDING = 223456792;
+        const landingSpec = {
+            indigoDeviceId: LANDING,
+            role: "dimmableLight",
+            label: "Landing Lamp",
+            reachable: true,
+            states: {},
+            options: {},
+        };
+
+        const first = await boot(storagePath);
+        try {
+            await attach(first.client, "r1", [landingSpec]);
+            await first.client.request({
+                message_id: "r2",
+                command: "set_state",
+                args: { indigoDeviceId: LANDING, states: { onOff: true, level: 20 } },
+            });
+            await first.client.request({
+                message_id: "r3",
+                command: "set_state",
+                args: { indigoDeviceId: LANDING, states: { onOff: false, level: 0 } },
+            });
+            assert.equal(
+                currentLevelOf(first.bridge.server, LANDING),
+                51,
+                "fixture setup: the pre-off level must be seeded before the restart",
+            );
+        } finally {
+            await first.close();
+        }
+
+        const second = await boot(storagePath);
+        try {
+            // Restored by matter.js before the plugin has said anything at
+            // all — proves the persisted value, not a lucky construction
+            // default, is what is live at this point.
+            assert.equal(
+                currentLevelOf(second.bridge.server, LANDING),
+                51,
+                "restoreEndpoints must not have reset the level to the Lighting minimum",
+            );
+
+            const { events } = await attach(second.client, "r4", [
+                { ...landingSpec, states: { onOff: false, level: 0 } },
+            ]);
+            assert.deepEqual(events, [], "a restart's replayed attach must not spray command events");
+
+            const reconciled = second.logged.filter(line => line.startsWith("Reconciled endpoints:"));
+            assert.deepEqual(
+                reconciled,
+                ["Reconciled endpoints: 0 created, 1 updated, 0 recreated, 0 rekeyed, 0 removed (1 live)"],
+                "this must be the UPDATE branch (applyStates), not a create",
+            );
+
+            assert.equal(
+                currentLevelOf(second.bridge.server, LANDING),
+                51,
+                "the attach's own level:0 must retain, not reset, the restored level",
+            );
+            assert.equal(onOffOf(second.bridge.server, LANDING), false);
+        } finally {
+            await second.close();
         }
     });
 });

@@ -1144,14 +1144,28 @@ describe("currentLevel retention while off (#353)", () => {
         }
     });
 
-    it("(restart) a bridge restart replays off+level:0 without resetting a persisted currentLevel", async () => {
-        // The degradation path that actually matters: whenever the bridge
-        // node restarts while lights are off, the plugin's attach reconcile
-        // sends each off dimmer's CURRENT states — including level:0 — as
-        // the initial `states` on a re-created Endpoint object for the SAME
-        // persisted endpoint id. If matter.js's own restore or
-        // this fix's construction path lost the retained level here, #353
-        // would resurface on every single restart rather than being fixed.
+    it("(create-path persistence, issue #355) a fresh Registry against old storage still shows the persisted currentLevel, though applyStates never runs here", async () => {
+        // NOT the normal bridge-node restart. That path is `restore.test.ts`'s
+        // "issue #353: currentLevel retention over a REAL node restart" test:
+        // a real `BridgeNode` restart runs `restoreEndpoints()` (issue #141)
+        // BEFORE the plugin's attach, so the endpoint is already LIVE by the
+        // time attach arrives and `registry.reconcile()` takes the UPDATE
+        // branch — `applyStates`, where `retainLevelWhileOff` (#353) actually
+        // runs.
+        //
+        // This test instead drives a brand-new `Registry` instance straight
+        // against old matter.js storage — `#live` is in-memory and starts
+        // empty on ANY fresh `Registry`, storage or not, so this second
+        // `reconcile()` always takes the CREATE branch, never UPDATE.
+        // Production reaches this specific shape only for an endpoint
+        // `restoreEndpoints()` did not rebuild while matter.js itself still
+        // holds persisted state for it — a narrower, unverified-end-to-end
+        // gap tracked separately as issue #355, because `createEndpoint`'s
+        // construction patch carries `currentLevel: 1` and `applyStates`
+        // never runs at all on this path. What survives here is entirely
+        // matter.js's own restore beating that construction patch — #353's
+        // fix is not exercised, and does not need to be, for this test to
+        // pass.
         const storagePath = mkdtempSync(join(SCRATCH_ROOT, "indigo-matter-353-restart-"));
         scratchRoots.push(storagePath);
 
@@ -1168,13 +1182,13 @@ describe("currentLevel retention while off (#353)", () => {
             await first.close();
         }
 
-        // A genuinely new node, same storage lock — mirrors the
+        // A genuinely new Registry, same storage lock — mirrors the
         // ConfigurationVersion-restart test above and "gives an id the same
-        // number across a node restart".
+        // number across a node restart", NOT `restoreEndpoints()`.
         const second = await harness({ storagePath });
         try {
-            // What the plugin's attach reconcile really sends for an off
-            // dimmer: its last confirmed states, level:0 included.
+            // create()'s construction states, as this would-be attach spec
+            // would carry them — level:0 included.
             await second.registry.reconcile(
                 [spec(1, Role.dimmableLight, { states: { onOff: false, level: 0 } })],
                 false,
@@ -1183,12 +1197,12 @@ describe("currentLevel retention while off (#353)", () => {
             assert.equal(
                 (dim.stateOf("levelControl") as Record<string, unknown>).currentLevel,
                 51,
-                "a restart's attach reconcile must not reset the persisted level to the Lighting minimum",
+                "matter.js's own restore must not lose the persisted level under a fresh Registry's create",
             );
             assert.equal((dim.stateOf("onOff") as Record<string, unknown>).onOff, false);
             // Same reasoning as the endpoint-number restart test: rebuilding
             // from persisted state must stay silent on the wire.
-            assert.deepEqual(second.commands, [], "a restart sprayed command events");
+            assert.deepEqual(second.commands, [], "a create from persisted storage sprayed command events");
         } finally {
             await second.close();
         }
