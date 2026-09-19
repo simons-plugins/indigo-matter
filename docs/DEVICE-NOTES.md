@@ -231,3 +231,55 @@ PartitionId/LeaderRouterId values were hours old on two nodes and looked like
 a partition split; a live read of the same nodes showed a single partition.
 Treat a cached partition/leader disagreement as a staleness signal to
 re-verify, not as evidence of an actual split.
+
+## Alexa's Matter "turn on" for dimmable lights (#353)
+
+**Observed:** saying "Alexa, turn on `<dimmable light>`" against an accessory
+commissioned to Alexa (the Amazon fabric, vendor 4631) sends `onOff.on`, then,
+40–70ms later, a SEPARATE plain `moveToLevel` command — `level: 254` (the
+maximum), `transitionTime: 0` — rather than the `WithOnOff` variant Apple
+Home was observed using for the same gesture. Reproduced against both a
+Z-Wave dimmer and a Zigbee dimmer bridged from this plugin, so it reads as
+role-wide Alexa behaviour, not specific to one radio. Left
+unhandled, that second command drove a dimmer Alexa turned on from off to
+100%, overriding the dimmer's own on-level.
+
+**Inference, not fact:** why Alexa sends that second command is not visible
+to us. Upstream `t0bst4r/home-assistant-matter-hub` (issue #880) reports the
+same shape and infers, from one A/B test there, that Alexa treats a light
+advertising the Matter Lighting-feature minimum level while off as needing
+an explicit level to look genuinely "on" — a non-minimum level advertised
+while off made Alexa send `On` alone in that test. Our own live A/B
+(2026-09-19, both arms from one Alexa controller on one build — see
+ADR-0017's Confirmation) agrees with the BEHAVIOUR: minimum advertised while
+off, `On` then `moveToLevel(254)`; a retained level advertised, `On` alone.
+The MOTIVE is still upstream's inference — nothing we can observe says why.
+
+**What we do about it:** rather than gate or drop the command — which also
+carries "Alexa, set X to 70%" sent to an off light, the identical shape —
+the bridge stops advertising the Lighting minimum while a light is off. It
+retains the last level Indigo confirmed while the light was on, so there is
+nothing for a stray restore-to-max to act on. The retained value is only
+what the bridge ADVERTISES while the light is off — it is never sent to the
+device. With Alexa now sending a plain `On`, the level a light comes on at is
+the dimmer's own decision (a configured on-level, or restore-last-level),
+exactly as it was with a non-Matter Alexa skill. See
+[ADR-0017](./adr/0017-currentlevel-while-off-is-the-last-confirmed-on-level.md)
+and `BRIDGE_PROTOCOL.md` §4.2.
+
+**Known limits a user might notice:**
+
+- A brand-new export has no prior on-level to retain, so it still advertises
+  the minimum — and can still be driven to 100% by this behaviour — until
+  its first-ever turn-on.
+- A Matter scene recall to exactly the retained level, while the light is
+  off, may not emit a level command at all (matter.js skips a level write
+  that already matches `currentLevel`) — a pre-existing matter.js quirk,
+  newly reachable now that "off" and "the retained level" coexist on the
+  same attribute.
+- Alexa's own threshold for what counts as "minimum" versus "a normal
+  level" is not known. Live, the minimum drew the `moveToLevel(254)` and
+  retained levels of 20% and 100% did not; nothing between the minimum and
+  20% has been tried.
+- While the light is off, a relative Matter command (step/move) now
+  computes from the retained level rather than from the minimum.
