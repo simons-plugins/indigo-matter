@@ -109,10 +109,12 @@ _LOG = logging.getLogger(__name__)
 #: submodule to reach the SAME Event Log handler ``self.logger`` uses,
 #: without ``export_bridge`` threading a logger argument through every
 #: handler for the sake of one line). Used by ``DoorLockExport``'s
-#: relay-fallback notice (issue #289 review finding 2) and by
+#: relay-fallback notice (issue #289 review finding 2),
 #: ``ColorTemperatureLightExport``'s non-z2m-ownership notice (issue #352
-#: review finding 6) — the two places in this module where a user must act
-#: on what a debug line through ``_LOG`` would otherwise hide.
+#: review finding 6), ``DimmableLightExport``'s on-at-0 warning, and
+#: :func:`battery_percent`'s overrange warning — the places in this module
+#: where a user must act on what a debug line through ``_LOG`` would
+#: otherwise hide.
 _PLUGIN_LOG = logging.getLogger("Plugin")
 
 # --------------------------------------------------------------------------
@@ -421,15 +423,19 @@ def battery_percent(dev: Any) -> Optional[int]:
     ``batteryLevel`` above 100 is a device/driver bug, not a value a working
     battery can report, so letting it through silently would just move the
     failure to the node's own ``percentToBatteryRemaining`` clamp (a debug
-    line there, naming no device) for no better an answer. This is the one
-    line in the module that logs above debug — see :data:`_overrange_warned`.
+    line there, naming no device) for no better an answer. Logged through
+    :data:`_PLUGIN_LOG`, not the module logger — see :data:`_overrange_warned`
+    and the module header.
     """
     value = getattr(dev, "batteryLevel", None)
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
     if value > 100 and dev.id not in _overrange_warned:
         _overrange_warned.add(dev.id)
-        _LOG.warning(
+        # _PLUGIN_LOG, not _LOG — see the module header. This warning exists
+        # precisely so a user can see a misbehaving device; through _LOG it
+        # never reached the Indigo Event Log.
+        _PLUGIN_LOG.warning(
             "Matter bridge: device %s (id %s) reported batteryLevel %r, above the 0-100 domain — "
             "clamped to 100.", getattr(dev, "name", ""), dev.id, value)
     percent = min(100, int(round(value)))

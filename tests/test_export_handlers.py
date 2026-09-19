@@ -1489,6 +1489,24 @@ class TestBattery:
         assert len(warnings) == 1
         assert "42" in warnings[0].message and "150" in warnings[0].message
 
+    def test_the_overrange_warning_reaches_the_plugin_logger_not_the_module_logger(
+            self, handlers, caplog):
+        """The module logger (``_LOG``) reaches no handler in production —
+        see the module header. This warning exists so a user can see a
+        misbehaving device, so it must go through ``_PLUGIN_LOG``
+        (``logging.getLogger("Plugin")``, the one the Indigo Event Log
+        actually uses) — asserting the record's logger ``name`` pins that
+        this test exercises the path production does, not merely a
+        caplog-only coincidence.
+        """
+        dev = RelayDevice(46, "Leaky Sensor 2", batteryLevel=150)
+        with caplog.at_level("WARNING"):
+            handlers.battery_percent(dev)
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert len(warnings) == 1
+        assert warnings[0].name == "Plugin"
+        assert "46" in warnings[0].message
+
     def test_the_overrange_latch_is_keyed_per_device(self, handlers, caplog):
         with caplog.at_level("WARNING"):
             handlers.battery_percent(RelayDevice(43, "A", batteryLevel=150))
