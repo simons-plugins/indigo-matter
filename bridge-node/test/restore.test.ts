@@ -468,8 +468,10 @@ describe("issue #353: currentLevel retention over a REAL node restart", () => {
         // `Registry` against old storage, which always takes the CREATE
         // branch regardless of what is on disk — see that test's own comment,
         // and issue #355 for the narrower gap it leaves: `create` never calls
-        // `applyStates` at all, so that path survives only because matter.js's
-        // own restore happens to win the race against the construction seed).
+        // `applyStates` at all, so that path survives only because persisted
+        // nonvolatile values take precedence over construction values —
+        // matter.js's own restore is applied AFTER the construction patch,
+        // deterministically, not by winning a race against it).
         const storagePath = storage();
         const LANDING = 223456792;
         const landingSpec = {
@@ -489,10 +491,16 @@ describe("issue #353: currentLevel retention over a REAL node restart", () => {
                 command: "set_state",
                 args: { indigoDeviceId: LANDING, states: { onOff: true, level: 20 } },
             });
+            // Deliberately `{onOff: false}` alone, NOT `{onOff: false,
+            // level: 0}` — a level:0 push here would run through
+            // retainLevelWhileOff (#353) and pass this fixture-setup
+            // assertion even under a revert, before the restart this test
+            // exists to pin ever runs. Omitting level leaves currentLevel at
+            // 51 regardless of the fix.
             await first.client.request({
                 message_id: "r3",
                 command: "set_state",
-                args: { indigoDeviceId: LANDING, states: { onOff: false, level: 0 } },
+                args: { indigoDeviceId: LANDING, states: { onOff: false } },
             });
             assert.equal(
                 currentLevelOf(first.bridge.server, LANDING),

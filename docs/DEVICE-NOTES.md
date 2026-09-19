@@ -236,11 +236,14 @@ re-verify, not as evidence of an actual split.
 
 **Observed:** saying "Alexa, turn on `<dimmable light>`" against an accessory
 commissioned to Alexa (the Amazon fabric, vendor 4631) sends `onOff.on`, then,
-40–70ms later, a SEPARATE plain `moveToLevel` command — `level: 254` (the
-maximum), `transitionTime: 0` — rather than the `WithOnOff` variant Apple
-Home was observed using for the same gesture. Reproduced against both a
-Z-Wave dimmer and a Zigbee dimmer bridged from this plugin, so it reads as
-role-wide Alexa behaviour, not specific to one radio. Left
+tens of milliseconds later (40–85 ms observed), a SEPARATE plain `moveToLevel`
+command — `level: 254` (the maximum), `transitionTime: 0` — rather than the
+`WithOnOff` variant Apple Home was observed using for its own brightness
+control (nothing shows Apple sending any level command for a plain turn-on).
+Reproduced against both a Z-Wave dimmer and a Zigbee dimmer bridged from this
+plugin, so it reads as Alexa behaviour independent of the radio; the fix
+applies to all three light roles in code, but only `dimmableLight` was
+live-tested — a colour-temperature or colour light is unconfirmed. Left
 unhandled, that second command drove a dimmer Alexa turned on from off to
 100%, overriding the dimmer's own on-level.
 
@@ -258,20 +261,28 @@ The MOTIVE is still upstream's inference — nothing we can observe says why.
 **What we do about it:** rather than gate or drop the command — which also
 carries "Alexa, set X to 70%" sent to an off light, the identical shape —
 the bridge stops advertising the Lighting minimum while a light is off. It
-retains the last level Indigo confirmed while the light was on, so there is
-nothing for a stray restore-to-max to act on. The retained value is only
-what the bridge ADVERTISES while the light is off — it is never sent to the
-device. With Alexa now sending a plain `On`, the level a light comes on at is
-the dimmer's own decision (a configured on-level, or restore-last-level),
-exactly as it was with a non-Matter Alexa skill. See
+retains the last level Indigo confirmed while the light was on; a plain
+`moveToLevel`, should one still arrive, is forwarded unchanged, but now
+lands against a `currentLevel` that already reads the on-level rather than
+the minimum. Live, this measurably changed what Alexa sent: with a retained
+level advertised while off, Alexa sent `on` alone (5 of 5). The retained
+value is only what the bridge ADVERTISES while the light is off — it is
+never sent to the device. With Alexa now sending a plain `On`, the level a
+light comes on at is the dimmer's own decision (a configured on-level, or
+restore-last-level) — which is how the reporter of #353 described Indigo's
+older, non-Matter Alexa skill behaving; we have not independently tested
+that skill ourselves. See
 [ADR-0017](./adr/0017-currentlevel-while-off-is-the-last-confirmed-on-level.md)
 and `BRIDGE_PROTOCOL.md` §4.2.
 
 **Known limits a user might notice:**
 
-- A brand-new export has no prior on-level to retain, so it still advertises
-  the minimum — and can still be driven to 100% by this behaviour — until
-  its first-ever turn-on.
+- Any accessory whose stored `currentLevel` is still the Lighting minimum has
+  no prior on-level to retain, so it still advertises the minimum — and can
+  still be driven to 100% by this behaviour — until its first turn-on. That
+  covers a brand-new export, and equally a light that has not been turned on
+  since this fix was installed (or since it was first exported); after that
+  first turn-on the exposure stops for that light.
 - A Matter scene recall to exactly the retained level, while the light is
   off, may not emit a level command at all (matter.js skips a level write
   that already matches `currentLevel`) — a pre-existing matter.js quirk,
@@ -281,5 +292,7 @@ and `BRIDGE_PROTOCOL.md` §4.2.
   level" is not known. Live, the minimum drew the `moveToLevel(254)` and
   retained levels of 20% and 100% did not; nothing between the minimum and
   20% has been tried.
-- While the light is off, a relative Matter command (step/move) now
-  computes from the retained level rather than from the minimum.
+- While the light is off, a relative `step` command computes from the
+  retained level rather than from the minimum. `move` is unaffected in
+  practice: its target is ±∞, which the bridge clamps, so it always lands on
+  0% or 100% regardless of what `currentLevel` starts from.

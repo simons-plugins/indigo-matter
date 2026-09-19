@@ -10,22 +10,27 @@ current version is `Info.plist`'s `PluginVersion`.
   light now receives a plain "on" from Alexa and nothing else, so it comes on
   at whatever level the dimmer itself chooses — its configured on-level, or
   its last level, as the hardware decides — instead of being driven to
-  maximum brightness. The bridge passes on no brightness of its own.
+  maximum brightness. The bridge passes on no brightness of its own. (Live-
+  tested on a dimmable light; the colour-temperature and extended-colour
+  roles run the same code path but were not individually live-tested.)
   **Known caveat:** a light that has not been turned on since this update
   (or since it was first exported) can still be driven to 100% on its first
   Alexa turn-on; after that first turn-on the override stops. See
-  `docs/DEVICE-NOTES.md`'s "Alexa's Matter turn-on for dimmable lights" entry
-  if a light opens at an unexpected level.
+  `docs/DEVICE-NOTES.md`'s "Alexa's Matter "turn on" for dimmable lights
+  (#353)" entry if a light opens at an unexpected level.
 - `bridge-node` **0.17.4**: `retainLevelWhileOff()` stops a pushed
   `level: 0` from writing Matter's `currentLevel` to the Lighting-feature
   minimum while a `dimmableLight`/`colorTemperatureLight`/
   `extendedColorLight` endpoint is off — the attribute instead keeps the
   last level Indigo confirmed while the light was on. Fixes issue #353:
-  Alexa was observed sending `onOff.on` followed, 40–70ms later, by a
-  separate plain `moveToLevel(254)` (not the `WithOnOff` variant Apple Home
-  was observed using), which the bridge still forwards unchanged (`executeIfOff` stays
-  seeded `true`) — it simply no longer has a Lighting minimum to restore
-  away from. No plugin (Python) change, no protocol frame change. See
+  Alexa was observed sending `onOff.on` followed, tens of milliseconds later
+  (40–85 ms observed), by a separate plain `moveToLevel(254)` (not the
+  `WithOnOff` variant Apple Home was observed using). The bridge still
+  forwards that command unchanged (`executeIfOff` stays seeded `true`), but
+  it now lands against a `currentLevel` that already reads the on-level
+  rather than the Lighting minimum — and live, that measurably changed what
+  Alexa sent: with a retained level advertised while off, Alexa sent `on`
+  alone (5 of 5). No plugin (Python) change, no protocol frame change. See
   ADR-0017 (confirmed live against a real Alexa fabric, 2026-09-19, both
   arms from one Alexa controller) and `BRIDGE_PROTOCOL.md` §4.2.
 
