@@ -698,8 +698,8 @@ class DimmableLightExport(OnOffExport):
             # `currentLevel` for a pushed `level: 0` (`retainLevelWhileOff`),
             # so the ecosystem keeps showing the last non-zero level — which
             # makes this combination the one accepted, documented cost of
-            # that decision (#357). It is
-            # warned HERE, in the plugin, rather than in the node: the node
+            # that decision (#357). It is warned HERE, in the plugin,
+            # rather than in the node: the node
             # only ever sees the CHANGED keys of one push, so a dimmer that
             # is already on and simply drops to 0 arrives there as a bare
             # `{level: 0}` with no `onOff` in the same frame, indistinguishable
