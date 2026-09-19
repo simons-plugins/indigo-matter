@@ -288,7 +288,15 @@ lowest retained level tried was 20%, nothing between the minimum and 20% has
 been tried), or why Alexa does it — that remains upstream's inference
 (`home-assistant-matter-hub#880`), now consistent with two independent A/Bs.
 
-**Re-checked live on the rule-a build: PENDING.**
+**Re-checked live on the rule-a build, 2026-09-19.** The final build was
+deployed to the same server and the node restarted (restored 63 of 63
+endpoints; the attach reconciled 0 created, 63 updated). A Z-Wave dimmer was
+set to 37% and turned off locally, then turned on by voice: the Alexa fabric
+sent `onOff.on` alone, no `moveToLevel` arrived from any fabric, and the
+plugin dispatched a single `onOff`. One turn-on, so this confirms the final
+build behaves as the rule-b build did for the ordinary single-frame off; the
+split-frame case rule a exists for is covered by the suite, not by this
+check.
 
 In the suite, `retainLevelWhileOff` is covered by
 `bridge-node/test/registry.test.ts` — retention in a single frame, a bare
