@@ -529,6 +529,22 @@ class LaunchAgent:
                 # Healthy and unobstructed — survive the reload untouched. A matching
                 # digest proves the right plist was WRITTEN, not that the live job is
                 # using it, so check the running args before declaring victory.
+                #
+                # Sweep for a stale storage lock too (stale-lock review, finding A).
+                # A reboot-reused pid can crash-loop THIS managed job while looking
+                # exactly like this branch: launchd respawns it every ~10s (KeepAlive
+                # Crashed:true), and whichever attempt is alive the instant we sample
+                # has the right digest and no orphan to reap — the reused pid belongs
+                # to someone else's legitimate process, so reap_orphan_servers()
+                # correctly leaves it alone; it just never gets reaped either. This
+                # branch is exactly the natural remedy a stuck user reaches for
+                # (reload the plugin), so it must not require the sample to land in
+                # the much narrower window where an orphan or a dead pid line instead
+                # routes through one of the branches below that already fall through
+                # to the bootstrap path's sweep. Must run before we return: this
+                # branch never bootstraps, so nothing else here will sweep before
+                # launchd's own KeepAlive respawns the crash-looping job again.
+                self.clear_stale_storage_locks()
                 self._warn_on_argument_drift(job["arguments"])
                 # …and a pid does not prove the job is REACHABLE (issue #182). A server
                 # that lost the port race stays alive without a WebSocket listener, so
@@ -884,8 +900,10 @@ class LaunchAgent:
         unrelated node process, another agent, or another user's server, is never
         touched), OR by finding one of our package's processes squatting on our port —
         see :meth:`_running_server_pids` for why the storage-path match alone has a blind
-        spot. Matches are SIGTERMed, we wait briefly, then SIGKILL any that ignore TERM. A
-        port holder we can't identify as ours is never signalled, only warned about.
+        spot. Matches are SIGTERMed, we wait briefly, then SIGKILL any that ignore TERM —
+        and wait once more (stale-lock review, finding B; see the comment at that second
+        wait for why). A port holder we can't identify as ours is never signalled, only
+        warned about.
 
         Pass ``exclude_pid`` (the managed job's pid) to leave a healthy running server
         alone while still clearing an orphan beside it. Returns how many were signalled.
@@ -905,15 +923,48 @@ class LaunchAgent:
         # handler, normally sub-second). Bounded ~1.5s worst case; this blocks the
         # (already synchronous) start/restart path only in the rare orphan-present case —
         # a brief, deliberate stall to un-wedge a server that would otherwise never start.
-        for _ in range(6):
-            self._sleep(0.25)
-            if not self._running_server_pids(exclude_pid=exclude_pid):
-                return len(pids)
-        for pid in self._running_server_pids(exclude_pid=exclude_pid):
+        if self._wait_for_pids_gone(exclude_pid=exclude_pid):
+            return len(pids)
+        stragglers = self._running_server_pids(exclude_pid=exclude_pid)
+        for pid in stragglers:
             self.logger.warning("%s pid %s ignored SIGTERM; sending SIGKILL",
                                 self.spec.package, pid)
             self._signal(pid, "KILL")
+        # SIGKILL never runs matter.js's exit handler — unlike the clean SIGTERM exit
+        # above, a killed process has DEFINITELY not released its storage lock. All
+        # three sweep call sites run clear_stale_storage_locks() microseconds after
+        # this method returns, and _ps_map() still lists a just-KILLed pid, with its
+        # full (still-matching) command line, for a beat after kill(2) returns — a
+        # dying/zombie process, not a gone one. Without waiting here exactly as the
+        # SIGTERM path does above, the sweep would match that corpse as LIVE_PID_OURS
+        # and leave its lock in place: the "Storage is locked by another process"
+        # failure the sweep exists to end, and the worst case to miss, because a
+        # KILLed owner's lock is unambiguously stale, never merely undecided.
+        if not self._wait_for_pids_gone(exclude_pid=exclude_pid):
+            survivors = self._running_server_pids(exclude_pid=exclude_pid)
+            self.logger.warning(
+                "%s pid(s) %s did not exit even after SIGKILL; its storage lock may "
+                "still be held the next time this plugin tries to clear it.",
+                self.spec.package, ", ".join(map(str, survivors)),
+            )
         return len(pids)
+
+    def _wait_for_pids_gone(self, exclude_pid: Optional[int], attempts: int = 6,
+                             interval: float = 0.25) -> bool:
+        """Poll :meth:`_running_server_pids` until none remain, or give up.
+
+        Shared by both the post-SIGTERM and post-SIGKILL waits in
+        :meth:`reap_orphan_servers` — the same idiom, the same injectable
+        ``self._sleep`` (instant in tests), and the same bound, because either
+        signal can leave a corpse visible to ``ps`` for a beat before the kernel
+        actually reaps it. Returns True once ``_running_server_pids`` reports none
+        left; False if ``attempts`` polls all still saw at least one.
+        """
+        for _ in range(attempts):
+            self._sleep(interval)
+            if not self._running_server_pids(exclude_pid=exclude_pid):
+                return True
+        return False
 
     def _ps_map(self) -> dict[int, str]:
         """pid → full command line for every running process ({} if ps is unavailable)."""

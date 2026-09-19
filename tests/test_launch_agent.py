@@ -17,6 +17,7 @@ import dataclasses
 import hashlib
 import os
 import plistlib
+import subprocess
 import time
 
 import pytest
@@ -1336,3 +1337,107 @@ def test_stale_lock_sweep_runs_before_bootstrap_on_restart(tmp_path, mock_logger
     agent._bootstrap_and_record = _fatal_if_bootstrap_runs_first(order)
     assert agent.restart() is True
     assert order == ["clear", "bootstrap"]
+
+
+# ---------------------------------------------------------------------------
+# Finding A (stale-lock review) — the "healthy and untouched" branch of
+# _apply_plist used to return BEFORE ever reaching clear_stale_storage_locks()
+# further down. That branch fires whenever the plist digest matches, the
+# managed job has a live pid, and there is no orphan to reap — exactly what a
+# reboot-reused pid's crash-loop looks like the instant a plugin reload
+# samples it: launchd keeps respawning the job every ~10s, the reused pid
+# belongs to someone else's legitimate process so reap_orphan_servers()
+# correctly does not touch it, and the sweep further below was never reached.
+# That is precisely the remedy ("reload the plugin") a stuck user reaches for
+# first.
+# ---------------------------------------------------------------------------
+
+def test_healthy_untouched_apply_plist_still_reaches_the_sweep(tmp_path, mock_logger):
+    """Fatal-dependency style: if the healthy/unobstructed branch stopped calling
+    clear_stale_storage_locks(), this would return normally instead of raising."""
+    agent = _agent_with_plist(tmp_path, mock_logger, ProcRunner(print_pid=5423))
+    agent._record_applied_digest(agent._digest_of(agent.build_plist()))
+
+    def _boom():
+        raise AssertionError("swept")
+
+    agent.clear_stale_storage_locks = _boom
+    with pytest.raises(AssertionError, match="swept"):
+        agent.ensure_installed()
+
+
+def test_healthy_untouched_apply_plist_still_returns_false(tmp_path, mock_logger):
+    """The sweep must not change the early-return contract: False still means
+    'nothing was re-bootstrapped' — a crash-looping agent stays launchd's to
+    respawn, and a cleared lock just lets the NEXT respawn succeed."""
+    agent = _agent_with_plist(tmp_path, mock_logger, ProcRunner(print_pid=5423))
+    agent._record_applied_digest(agent._digest_of(agent.build_plist()))
+    swept = []
+    agent.clear_stale_storage_locks = lambda: swept.append(1) or 0
+    assert agent.ensure_installed() is False
+    assert swept == [1]
+
+
+# ---------------------------------------------------------------------------
+# Finding B (stale-lock review) — reap_orphan_servers()'s SIGTERM path polls
+# until the signalled pids are gone; the SIGKILL branch used to signal and
+# return immediately. All three sweep call sites run
+# clear_stale_storage_locks() microseconds later, and `ps` still lists a
+# just-KILLed pid, with its full (still-matching) command line, for a beat
+# after kill(2) returns — a dying/zombie process, not a gone one. That made
+# the sweep match it as LIVE_PID_OURS and leave its lock in place: the worst
+# case to miss, because a SIGKILLed matter-server never runs matter.js's exit
+# handler and so has DEFINITELY not released its lock.
+# ---------------------------------------------------------------------------
+
+class KillLingersRunner(ProcRunner):
+    """A SIGKILLed pid stays visible in ``ps`` — with its full, matching command
+    line intact — for ``linger`` more ``ps`` polls after ``kill -KILL`` returns,
+    before the kernel actually reaps it. Models the exact gap Finding B closes:
+    SIGKILL signals and (pre-fix) returned immediately, with nothing waiting for
+    the corpse to actually leave ``ps``.
+    """
+
+    def __init__(self, *args, linger: int = 2, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._linger = linger
+        self._lingering: dict[str, int] = {}
+
+    def __call__(self, cmd, **kwargs):
+        if cmd and cmd[0] == "kill" and cmd[1].lstrip("-") == "KILL":
+            pid = cmd[2]
+            self.calls.append(cmd)
+            self.signals.append(("KILL", pid))
+            self._lingering[pid] = self._linger
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        if cmd and cmd[0] == "ps" and "etime=" not in cmd:
+            self.calls.append(cmd)
+            for pid, remaining in list(self._lingering.items()):
+                if remaining <= 0:
+                    self.ps_lines = [ln for ln in self.ps_lines if ln.split()[0] != pid]
+                    del self._lingering[pid]
+                else:
+                    self._lingering[pid] = remaining - 1
+            return subprocess.CompletedProcess(cmd, 0, stdout="\n".join(self.ps_lines) + "\n", stderr="")
+        return super().__call__(cmd, **kwargs)
+
+
+def test_reap_waits_after_sigkill_so_the_sweep_never_sees_a_corpse_as_live(tmp_path,
+                                                                            mock_logger):
+    storage = str(tmp_path / "a-store")
+    runner = KillLingersRunner(ignore_term=True, linger=2)
+    agent = _agent(tmp_path / "home", _spec("com.example.a", "pkg-a", storage), mock_logger,
+                   runner=runner)
+    # A baseline entry that outlives 545's removal, so an empty `ps` output never
+    # reads as "the probe is unusable" (see e.g. test_clear_stale_locks_clears_a_dead_pid).
+    runner.ps_lines = ["1 /sbin/launchd", _proc_line(agent, 545)]
+    _write_lock(storage, 545)  # the pid we are about to KILL also holds the storage lock
+
+    assert agent.reap_orphan_servers() == 1
+    assert ("TERM", "545") in runner.signals
+    assert ("KILL", "545") in runner.signals
+
+    # By the time reap_orphan_servers() has returned, 545 must actually be gone from
+    # `ps` — proving the wait, not just the signal, happened — so the sweep that every
+    # real call site runs right after can tell the lock is stale and clear it.
+    assert agent.clear_stale_storage_locks() == 1

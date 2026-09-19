@@ -39,6 +39,28 @@ current version is `Info.plist`'s `PluginVersion`.
 - matter-server is an upstream package (0.17.9, the current stable, ships a
   byte-identical `lock-utils.ts`), so this is carried on our side rather
   than waited on upstream.
+- Review fix: `_apply_plist()`'s "healthy and untouched" branch (matching
+  plist digest, a live managed pid, no orphan to reap) used to return
+  *before* ever reaching the sweep. That is exactly what a reboot-reused
+  pid's crash-loop looks like the instant a plugin reload samples it —
+  launchd keeps respawning the doomed process every ~10s, and whichever
+  attempt is alive at that instant has the right digest and nothing for
+  `reap_orphan_servers()` to reap (the reused pid belongs to someone else's
+  legitimate process). "Reload the plugin" is the natural remedy a stuck
+  user reaches for first, so that branch now sweeps too, before returning —
+  still without re-bootstrapping a job that stays launchd's to respawn.
+- Review fix: `reap_orphan_servers()`'s SIGTERM path already polled until
+  the signalled pids left `ps`; the SIGKILL branch signalled and returned
+  immediately. All three sweep call sites run right after it, and a
+  just-KILLed pid stays visible in `ps` — with its full, still-matching
+  command line — for a beat after `kill(2)` returns, so the sweep read it as
+  a live owner (`LIVE_PID_OURS`) and left its lock in place. That was the
+  worst case to miss: a SIGKILLed matter-server never runs matter.js's exit
+  handler, so unlike a clean SIGTERM exit it has definitely *not* released
+  its lock, and the fresh bootstrap that follows would die on the exact
+  `"Storage is locked by another process"` failure this feature exists to
+  end. The SIGKILL branch now waits the same way the SIGTERM branch does,
+  and reports a pid that is still present once that wait is exhausted.
 
 ## 2026.32.3 — colour-temperature writes are temperature-only again
 
