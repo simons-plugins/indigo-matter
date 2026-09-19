@@ -256,6 +256,19 @@ class TestDimmable:
         assert handlers.handler_for("dimmableLight").states_for(dev) == \
             {"onOff": True, "level": 42}
 
+    def test_an_off_dimmer_reports_level_zero_exactly_not_floored(self, handlers):
+        """#357: `retainLevelWhileOff` (bridge-node) relies on this side
+        pushing a literal `level: 0` for an off dimmer — that is the only
+        shape it withholds `currentLevel` for. Most Python drifts here are
+        harmless to the node, but a future "fix" flooring an off level to 1
+        would silently re-open #353, because `level: 1` writes `currentLevel`
+        (see `bridge-node/src/endpoints.ts`'s `percentToCurrentLevel`)."""
+        dev = DimmerDevice(1, "Lamp", onState=False, brightness=0)
+        states = handlers.handler_for("dimmableLight").states_for(dev)
+        assert states == {"onOff": False, "level": 0}
+        assert states["level"] is not False  # bool is an int subclass; guard the literal 0
+        assert type(states["level"]) is int
+
     def test_level_is_omitted_when_the_device_cannot_answer(self, handlers):
         """A relay exported as a dimmable light has no ``brightness`` at all."""
         dev = RelayDevice(1, "Plug", onState=True)

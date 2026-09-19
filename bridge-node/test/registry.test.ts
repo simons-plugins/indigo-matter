@@ -995,14 +995,19 @@ describe("currentLevel retention while off (#353)", () => {
         }
     });
 
-    it("(d) onOff:true and level:0 in the SAME push now RETAINS the prior level (accepted cost, ADR-0017)", async () => {
+    it("(d) onOff:true and level:0 in the SAME push now RETAINS the prior level (accepted cost, ADR-0017) — and #357 makes that cost VISIBLE", async () => {
         // Under rule b this floored to the minimum on the reasoning that "on
         // at level 0" should still be visible as off-like. Rule a drops that
         // exception: the owner confirmed Indigo never actually reports on at
         // brightness 0, so this combination is judged unreachable in
         // practice, and retaining here costs nothing real — pinned so a
         // future change to this behaviour is a decision, not an accident.
+        // #357: that accepted cost used to leave no trace at all (a
+        // production-silent debug line); it must now also emit a WARN naming
+        // the device, so a field report is diagnosable if the premise ever
+        // breaks.
         const h = await harness();
+        const capture = captureWarnLogs();
         try {
             await h.registry.reconcile(
                 [spec(1, Role.dimmableLight, { states: { onOff: true, level: 50 } })],
@@ -1019,7 +1024,49 @@ describe("currentLevel retention while off (#353)", () => {
                 "onOff:true and level:0 together now retains, it does not floor to the minimum",
             );
             assert.equal((dim.stateOf("onOff") as Record<string, unknown>).onOff, true);
+
+            const warnings = capture.lines.filter(line => line.includes("reported ON at brightness 0"));
+            assert.equal(warnings.length, 1, capture.lines.join("\n"));
+            assert.match(warnings[0]!, /\b1\b/, "the WARN must name the device id");
+            assert.match(warnings[0]!, /#357/);
         } finally {
+            capture.stop();
+            await h.close();
+        }
+    });
+
+    it("(357 negative) a routine off, a bare level:0, and a level-first split emit NO warn — a WARN on every ordinary off would be noise nobody could act on", async () => {
+        // "To assert something did not happen, make it fatal" (degradation-
+        // path convention): the routine off shape and the split-frame shapes
+        // (a)/(b)/(R3) pin correct BEHAVIOUR already — this pins that none of
+        // them ALSO train the field to ignore the #357 warning by firing it
+        // on cases that are not the accepted-cost shape at all.
+        const h = await harness();
+        const capture = captureWarnLogs();
+        try {
+            await h.registry.reconcile(
+                [spec(1, Role.dimmableLight, { states: { onOff: true, level: 20 } })],
+                false,
+            );
+            const dim = only(h);
+
+            // Routine off: onOff:false and level:0 together.
+            await h.registry.setState(1, { onOff: false, level: 0 });
+            // A bare level:0 — no onOff key in the push at all.
+            await h.registry.setState(1, { level: 0 });
+            // A level-first split off-push, same shape as (R3) above.
+            await h.registry.setState(1, { onOff: true, level: 20 });
+            await h.registry.setState(1, { level: 0 });
+            await h.registry.setState(1, { onOff: false });
+
+            assert.equal(
+                capture.lines.filter(line => line.includes("reported ON at brightness 0")).length,
+                0,
+                capture.lines.join("\n"),
+            );
+            assert.equal((dim.stateOf("onOff") as Record<string, unknown>).onOff, false);
+        } finally {
+            capture.stop();
             await h.close();
         }
     });
@@ -1127,6 +1174,46 @@ describe("currentLevel retention while off (#353)", () => {
             // A wrong-typed level is a different key entirely and must still
             // be refused exactly as before this change.
             await rejects(() => h.registry.setState(1, { level: "0" }), ErrorCode.malformedArgs);
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("(357, T3) a bare level:0 and a routine off never reach endpoint.set() — pins retainLevelWhileOff's own emptied-key deletion", async () => {
+        // A mutant that skips `delete patch[LEVEL_CONTROL]` once levelControl
+        // is left empty survives every assertion above unchanged: the patch
+        // still comes back as {levelControl: {}} instead of {}, so
+        // applyStates' own empty-patch early return never fires and a
+        // pointless `endpoint.set({levelControl: {}})` goes out per off push
+        // instead of the lawful no-op (e) pins. Benign on matter.js 0.17.8,
+        // but a real transaction per off dimmer per attach replay — and if
+        // the onOff half's act() throws, the resulting error would claim the
+        // residual attributes were "applied" for a set that never happened.
+        // The onOff half goes through endpoint.act(), a separate call path
+        // from endpoint.set() (see applyStates), so shadowing `set` alone
+        // isolates the level half this pins.
+        const h = await harness();
+        try {
+            await h.registry.reconcile(
+                [spec(1, Role.dimmableLight, { states: { onOff: true, level: 20 } })],
+                false,
+            );
+            const dim = only(h);
+            const dimWithSet = dim as unknown as { set: (...args: unknown[]) => Promise<unknown> };
+            const originalSet = dimWithSet.set;
+            let setCalls = 0;
+            dimWithSet.set = function (...args: unknown[]) {
+                setCalls++;
+                return originalSet.apply(dim, args);
+            };
+            try {
+                await h.registry.setState(1, { onOff: false, level: 0 });
+                assert.equal(setCalls, 0, "onOff:false + level:0 must not reach endpoint.set()");
+                await h.registry.setState(1, { level: 0 });
+                assert.equal(setCalls, 0, "a bare level:0, already off, must not reach endpoint.set()");
+            } finally {
+                dimWithSet.set = originalSet;
+            }
         } finally {
             await h.close();
         }

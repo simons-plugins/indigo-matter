@@ -2728,6 +2728,14 @@ export function rejectedStateKeys(role: RoleValue, states: Record<string, unknow
  * `applyStates` rather than inside `levelPatch` itself; unlike rule b, rule a
  * needs no endpoint to consult, so nothing else forces the split.
  *
+ * **Accepted cost (ADR-0017).** Rule a never inspects `onOff`, so if a
+ * device ever did report on at brightness 0, the ecosystem would show it on
+ * at its retained level rather than at the minimum — judged unreachable,
+ * since Indigo already treats brightness 0 as off. #357 makes that premise
+ * breaking VISIBLE instead of silent: when the same push carries
+ * `onOff: true` alongside `level: 0`, this function logs a WARN naming
+ * `indigoDeviceId` (see below) rather than the debug line below it.
+ *
  * **Known limits (ADR-0017's Consequences).**
  * - No level history: a brand-new endpoint's first-ever construction push,
  *   or any accessory still off since before this fix was installed, has no
@@ -2800,6 +2808,23 @@ function retainLevelWhileOff(
     delete levelControl.currentLevel;
     if (Object.keys(levelControl).length === 0) {
         delete patch[LEVEL_CONTROL];
+    }
+    if (rest.onOff === true) {
+        // #357 — the one shape that can be detected without inspecting the
+        // attribute: the SAME push says both on and level:0. That is exactly
+        // the "on at brightness 0" case ADR-0017 accepted as unreachable, so
+        // if it ever fires the premise has broken and it needs a trace that
+        // survives production (INFO), not the debug line below. A bare
+        // `{level: 0}` arriving while the attribute already reads on — the
+        // first frame of a split off-push, see the rule-b account above — is
+        // indistinguishable from a routine two-frame off and cannot be
+        // warned about here.
+        logger.warn(
+            `retainLevelWhileOff: indigoDeviceId ${indigoDeviceId} reported ON at brightness 0 — keeping the ` +
+                "retained currentLevel instead of the Lighting minimum (the ecosystem will show it on at that level) — " +
+                "#353/ADR-0017/#357",
+        );
+        return;
     }
     // Without this line a withheld write leaves no trace, and a field report
     // about one device's level cannot be diagnosed. Debug-level only: the
