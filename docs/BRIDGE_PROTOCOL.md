@@ -723,8 +723,23 @@ ecosystem acts. Both are enumerated here in full; there is no other source.
 - `systemMode` domain (both directions): `"off" | "heat" | "cool" | "auto"`.
   The node owns the mapping to/from Matter's `SystemModeEnum` integers.
 - `level`/`position` are integers 0–100 in both directions; the node owns the
-  0–254 Matter LevelControl conversion and its rounding (round-half-up, with
-  0 ↔ off preserved exactly).
+  0–254 Matter LevelControl conversion and its rounding (round-half-up).
+  Inbound (a `setLevel`/`goToPosition` command reaching the plugin), `0 ↔
+  off` is preserved exactly — unchanged by #353. Outbound, a pushed
+  `level: 0` is consumed, but for `dimmableLight`, `colorTemperatureLight`
+  and `extendedColorLight` it NEVER moves `currentLevel` — full stop, with
+  no on/off test of any kind: it does not matter what `onOff` the same push
+  carries, or what the endpoint's `OnOff` attribute currently reads. The
+  attribute instead keeps whatever level Indigo last confirmed non-zero
+  (#353, ADR-0017). This applies to any `set_state` and equally to the
+  `states` an `attach`/upsert reconcile replays against an already-LIVE
+  endpoint — both reach `applyStates`, where the rule lives. It does NOT
+  apply to a brand-new endpoint's first-ever construction: a fresh accessory
+  still advertises the Lighting minimum until its first turn-on — a known
+  limit, not a gap in this rule (`endpoints.ts`'s `retainLevelWhileOff`
+  doc). No frame or wire change in either direction, and the plugin's own
+  push (brightness 0 whenever Indigo reports the dimmer off) is unchanged
+  too — the asymmetry is entirely inside the node's write.
 - Thermostat **fan is not part of v1** (the Fan descope, PRD §5.2); there are
   no fan state keys or commands. v2 candidate.
 - Units are Indigo-natural at the protocol boundary (°C, %, lux, 0–100);
