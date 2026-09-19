@@ -661,8 +661,24 @@ class OnOffLightExport(OnOffExport):
     role = export_catalog.ROLE_ON_OFF_LIGHT
 
 
+#: Devices this handler has already warned about reporting on at brightness
+#: 0. Once per device, same reasoning as :data:`_overrange_warned` above: a
+#: plugin that reports brightness 0 and then ``onState`` False as two
+#: separate updates would pass on-at-0 through on EVERY ordinary turn-off,
+#: and a per-occurrence warning would be the loudest line in the log for a
+#: condition that is normally just a momentary artefact of turning off.
+_on_at_zero_warned: set[int] = set()
+
+
 class DimmableLightExport(OnOffExport):
-    """``dimmableLight`` — adds ``level`` (0–100 both sides, no conversion)."""
+    """``dimmableLight`` — adds ``level`` (0–100 both sides, no conversion).
+
+    Inherited unchanged by :class:`ColorTemperatureLightExport`, and called
+    explicitly by :class:`ExtendedColorLightExport.states_for` — so the
+    on-at-0 warning below covers all three light roles.
+    :class:`WindowCoveringExport` has its own ``states_for`` over
+    ``position`` only and never reaches this method.
+    """
 
     role = export_catalog.ROLE_DIMMABLE_LIGHT
 
@@ -671,6 +687,41 @@ class DimmableLightExport(OnOffExport):
         brightness = _number(dev, "brightness")
         if brightness is not None:
             states[STATE_LEVEL] = int(_clamp(round(brightness), 0, 100))
+        if states.get(STATE_ON_OFF) is True and states.get(STATE_LEVEL) == 0 \
+                and dev.id not in _on_at_zero_warned:
+            # Diagnostic only — the states returned above are unchanged by
+            # this branch. Indigo's own dimmer reference concedes the case:
+            # "plugin developers may decide if their device may be on but
+            # have a brightness of 0 (non-standard)" (Indigo scripting
+            # reference, dimmer device class, `brightness`).
+            # Per ADR-0017 (#353) the bridge node never writes Matter
+            # `currentLevel` for a pushed `level: 0` (`retainLevelWhileOff`),
+            # so the ecosystem keeps showing the last non-zero level — which
+            # makes this combination the one accepted, documented cost of
+            # that decision (#357). It is
+            # warned HERE, in the plugin, rather than in the node: the node
+            # only ever sees the CHANGED keys of one push, so a dimmer that
+            # is already on and simply drops to 0 arrives there as a bare
+            # `{level: 0}` with no `onOff` in the same frame, indistinguishable
+            # from the routine off-in-two-frames shape it must stay silent
+            # on. This function runs against the WHOLE device on every
+            # update (`states_for`, before any diff), so it is the one place
+            # that can SEE a device reported on at brightness 0 at all. It
+            # still cannot tell a persistent on-at-0 from a momentary one
+            # mid-turn-off — hence the wording of the message, and the
+            # once-per-device latch.
+            _on_at_zero_warned.add(dev.id)
+            # `_PLUGIN_LOG`, not `_LOG` — see the module header. This is
+            # exactly the case it describes: a debug line through `_LOG`
+            # reaches no handler in production, but a user needs to see
+            # this one, in the Indigo Event Log, to diagnose a field report.
+            _PLUGIN_LOG.warning(
+                "Matter bridge: device %s (id %s) is reported ON at brightness 0 — the "
+                "exported Matter light keeps showing its last brightness instead (the bridge "
+                "never sends a level of 0 as a brightness — issue #353), so Apple Home/Alexa "
+                "may show it on at that previous level. Harmless if this is momentary while "
+                "the device turns off; if it persists, the device's own plugin is reporting "
+                "on-at-0.", getattr(dev, "name", "?"), dev.id)
         return states
 
     def commands(self) -> dict[str, Callable[[dict, Any, dict], Optional[str]]]:

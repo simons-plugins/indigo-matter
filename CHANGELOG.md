@@ -3,38 +3,48 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
-## 2026.32.6 — a WARN when a push reports a dimmer on at brightness 0 (banked, not yet in effect)
+## 2026.32.6 — a warning in the Event Log when a dimmer is reported on at brightness 0
 
-- **Not yet in effect.** `bridge-node` 0.17.5 is in the repo but is NOT
-  published to npm, and `DEFAULT_INSTALL_SPEC` still pins
-  `indigo-matter-bridge@0.17.4`, so every npm-resolved install keeps getting
-  0.17.4 and none of the node change below runs for users yet. Banked
-  deliberately (no release for a log line); a later release publishes 0.17.5
-  and then moves the pin (publish first, then the pin — CLAUDE.md).
-- `bridge-node` **0.17.5**: `retainLevelWhileOff()` logs a WARN — visible at
-  INFO, the level the plugin launches the node at — naming the Indigo device
-  when the SAME push says both `onOff: true` and `level: 0`. ADR-0017
+- The plugin now logs a warning in the Indigo Event Log, once per device per
+  plugin run, if a dimmer is reported ON at brightness 0. It explains what that means for
+  how the light shows in the ecosystem: the exported Matter light keeps
+  showing its last brightness instead of dropping to a minimum, so Apple
+  Home/Alexa may show it on at that previous level — harmless if it is
+  momentary while the device turns off; if it persists, the device's own
+  plugin is reporting on-at-0.
+- Technical: the check lives plugin-side, in
+  `DimmableLightExport.states_for` (`export_handlers.py`), and so covers all
+  three light roles — `dimmableLight`, `colorTemperatureLight` and
+  `extendedColorLight` all route through it; `windowCovering` is unaffected.
+  It is diagnostic only — `states_for` still returns `{"onOff": true,
+  "level": 0}` exactly as before, nothing pushed to the bridge changes. This
+  is deliberately plugin-side rather than node-side: the bridge node only
+  ever sees the CHANGED keys of one push, so a dimmer that is already on and
+  simply drops to 0 arrives there as a bare `{level: 0}` with no `onOff` in
+  the same frame — indistinguishable from the routine off-in-two-frames
+  shape the node must stay silent on. The plugin's `states_for` runs against
+  the whole device on every update, so it is the one place that can see a
+  device reported on at brightness 0 at all. It still cannot tell a
+  persistent on-at-0 from a momentary one mid-turn-off, which is why the
+  message says so and why it is latched once per device. ADR-0017
   accepted, as unreachable, that a device reporting on at brightness 0 would
-  show in the ecosystem at its retained `currentLevel` rather than the
-  Lighting minimum; until now a breach of that premise left no trace (only a
-  debug line the node does not emit at INFO). Scope, stated plainly: the
-  plugin pushes changed keys only, so on-and-level-0 arrive together only on
-  a full-state replay (attach — a plugin or node restart) or an off→on-at-0
-  change. A bare `level: 0` while the attribute reads on does NOT warn: it is
-  either a genuine on-at-0 report or the first half of a two-frame off, and
-  the two look identical on arrival. A genuine one is caught at the next
-  full-state replay. In ordinary operation the line should never appear — the
-  owner confirms brightness 0 means off in Indigo. Fixes issue #357.
-- Test pins, each proven by applying a mutant: the WARN fires once for that
-  shape and names the device; it does not fire for a routine off, a bare
-  `level: 0`, or a level-first split off-push; and an emptied
+  show in the ecosystem at its retained level rather than the Lighting
+  minimum (`retainLevelWhileOff()`, `bridge-node/src/endpoints.ts`); a breach
+  of that premise now leaves a line in the Event Log. Fixes issue #357.
+- Test pins: on the Python side (`tests/test_export_handlers.py`), the
+  warning fires exactly once per device and names it, does not re-fire on a
+  repeat call, is keyed per device, never fires for a routine off/on-at-50%/
+  on-at-1%/a device that cannot report brightness at all, fires for all
+  three light roles, and does not fire for `windowCovering`; plus the
+  existing pin that an off dimmer reports `level` as the exact int `0`, not
+  floored to `1` — which would defeat #353's retention, since `level: 1`
+  overwrites the retained level with `currentLevel` 3 on every off (whether
+  Alexa overrides at that level is untested). On the bridge-node side
+  (`bridge-node/test/registry.test.ts`), a mutation-kill pin: an emptied
   `levelControl: {}` left after `retainLevelWhileOff` strips `currentLevel`
   is deleted from the patch, so a bare `level: 0` and a routine off make no
-  `endpoint.set()` call at all (`bridge-node/test/registry.test.ts`). On the
-  Python side, a test pins that an off dimmer reports `level` as the exact
-  int `0`, not floored to `1` — which would defeat #353's retention, since
-  `level: 1` overwrites the retained level with `currentLevel` 3 on every
-  off (whether Alexa overrides at that level is untested).
+  `endpoint.set()` call at all. Tests only — the published `bridge-node`
+  package is unchanged at 0.17.4, no npm publish needed.
 
 ## 2026.32.5 — Alexa's "turn on" no longer forces a dimmer to 100%
 

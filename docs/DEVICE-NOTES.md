@@ -313,9 +313,5 @@ and `BRIDGE_PROTOCOL.md` §4.2.
   practice: its target is ±∞, which the bridge clamps, so it always lands on
   0% or 100% regardless of what `currentLevel` starts from.
 - If Indigo ever reports a dimmer ON at brightness 0, the bridge keeps the
-  retained level rather than the minimum. From bridge node 0.17.5, a push
-  carrying both on and brightness 0 together (a full-state replay at attach,
-  or an off→on-at-0 change) also logs a warning naming the device (#357). A
-  brightness-only drop to 0 on an already-on dimmer does not, because it
-  looks identical to the first half of a two-part off; it surfaces at the
-  next attach.
+  retained level rather than the minimum, and the plugin logs a warning in
+  the Indigo Event Log, once per device, when that happens (#357).

@@ -995,19 +995,14 @@ describe("currentLevel retention while off (#353)", () => {
         }
     });
 
-    it("(d) onOff:true and level:0 in the SAME push now RETAINS the prior level (accepted cost, ADR-0017) — and #357 makes that cost VISIBLE", async () => {
+    it("(d) onOff:true and level:0 in the SAME push now RETAINS the prior level (accepted cost, ADR-0017)", async () => {
         // Under rule b this floored to the minimum on the reasoning that "on
         // at level 0" should still be visible as off-like. Rule a drops that
         // exception: the owner confirmed Indigo never actually reports on at
         // brightness 0, so this combination is judged unreachable in
         // practice, and retaining here costs nothing real — pinned so a
         // future change to this behaviour is a decision, not an accident.
-        // #357: that accepted cost used to leave no trace at all (a
-        // production-silent debug line); it must now also emit a WARN naming
-        // the device, so a field report is diagnosable if the premise ever
-        // breaks.
         const h = await harness();
-        const capture = captureWarnLogs();
         try {
             await h.registry.reconcile(
                 [spec(1, Role.dimmableLight, { states: { onOff: true, level: 50 } })],
@@ -1024,51 +1019,7 @@ describe("currentLevel retention while off (#353)", () => {
                 "onOff:true and level:0 together now retains, it does not floor to the minimum",
             );
             assert.equal((dim.stateOf("onOff") as Record<string, unknown>).onOff, true);
-
-            const warnings = capture.lines.filter(line => line.includes("reported ON at brightness 0"));
-            assert.equal(warnings.length, 1, capture.lines.join("\n"));
-            assert.match(warnings[0]!, /\b1\b/, "the WARN must name the device id");
-            assert.match(warnings[0]!, /#357/);
         } finally {
-            capture.stop();
-            await h.close();
-        }
-    });
-
-    it("(357 negative) a routine off, a bare level:0, and a level-first split emit NO warn — a WARN on every ordinary off would be noise nobody could act on", async () => {
-        // Negative pin: the routine-off and split-frame shapes already have
-        // their BEHAVIOUR pinned by (a)/(b)/(c)/(R3). This pins that none of
-        // them also emits the #357 WARN — a WARN on every ordinary off would
-        // train the field to ignore it. The bare `{level:0}`-while-on frame
-        // is included on purpose: it may be a genuine on-at-0 report or half
-        // of a split off, and it must stay quiet either way (see the inline
-        // comment in retainLevelWhileOff).
-        const h = await harness();
-        const capture = captureWarnLogs();
-        try {
-            await h.registry.reconcile(
-                [spec(1, Role.dimmableLight, { states: { onOff: true, level: 20 } })],
-                false,
-            );
-            const dim = only(h);
-
-            // Routine off: onOff:false and level:0 together.
-            await h.registry.setState(1, { onOff: false, level: 0 });
-            // A bare level:0 — no onOff key in the push at all.
-            await h.registry.setState(1, { level: 0 });
-            // A level-first split off-push, the same sequence (R3) drives.
-            await h.registry.setState(1, { onOff: true, level: 20 });
-            await h.registry.setState(1, { level: 0 });
-            await h.registry.setState(1, { onOff: false });
-
-            assert.equal(
-                capture.lines.filter(line => line.includes("reported ON at brightness 0")).length,
-                0,
-                capture.lines.join("\n"),
-            );
-            assert.equal((dim.stateOf("onOff") as Record<string, unknown>).onOff, false);
-        } finally {
-            capture.stop();
             await h.close();
         }
     });
