@@ -91,6 +91,14 @@ accessory. One bridge, one pairing, however many devices.
   accessories can show stale/unresponsive in Alexa for some minutes before converging
   (issue #143). Google Home and SmartThings remain untested and unclaimed; nothing here
   says they will or won't work.
+- **"Alexa, turn on" leaves a dimmer's own on-level alone** (2026.32.5, bridge 0.17.4,
+  issue #353). Alexa used to follow its "on" with a separate set-to-100% whenever an
+  exported dimmer was off, overriding the level the dimmer itself would have chosen. It now
+  sends a plain "on", so the dimmer comes on at its own level — a configured on-level, or
+  its last level, as the hardware decides. One caveat: a dimmer that has not been turned on
+  since the update (or since it was first exported) can still be driven to 100% on its
+  **first** Alexa turn-on; after that it stops. Details and the other known limits are in
+  [`docs/DEVICE-NOTES.md`](docs/DEVICE-NOTES.md).
 - **A second npm package** (`indigo-matter-bridge`), on the npm registry and installed
   from its own menu item.
 
@@ -215,7 +223,8 @@ has the "On another computer" mode, backups, upgrading and troubleshooting.
 - **[`docs/DEVICE-NOTES.md`](https://github.com/simons-plugins/indigo-matter/blob/main/docs/DEVICE-NOTES.md)** —
   behaviours of specific hardware that are not obvious from the spec: the Tapo
   reset holds (one keeps your fabrics, one wipes them), the BILRESA channel →
-  endpoint map, and why a sleepy Thread device takes seconds to answer.
+  endpoint map, why a sleepy Thread device takes seconds to answer, and how
+  Alexa's Matter "turn on" treats a dimmable light.
 
 ## Development
 
