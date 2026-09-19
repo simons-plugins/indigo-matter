@@ -2731,10 +2731,12 @@ export function rejectedStateKeys(role: RoleValue, states: Record<string, unknow
  * **Accepted cost (ADR-0017).** Rule a never inspects `onOff`, so if a
  * device ever did report on at brightness 0, the ecosystem would show it on
  * at its retained level rather than at the minimum — judged unreachable,
- * since Indigo already treats brightness 0 as off. #357 makes that premise
- * breaking VISIBLE instead of silent: when the same push carries
+ * per the owner's confirmation in (1) above. #357 adds a trace for the one
+ * push shape where that can be told apart: when the same push carries
  * `onOff: true` alongside `level: 0`, this function logs a WARN naming
- * `indigoDeviceId` (see below) rather than the debug line below it.
+ * `indigoDeviceId` and returns before the debug line. A bare `{level: 0}`
+ * on an already-on endpoint is NOT warned — see the inline comment for why,
+ * and for when a genuine on-at-0 device does surface.
  *
  * **Known limits (ADR-0017's Consequences).**
  * - No level history: a brand-new endpoint's first-ever construction push,
@@ -2810,15 +2812,18 @@ function retainLevelWhileOff(
         delete patch[LEVEL_CONTROL];
     }
     if (rest.onOff === true) {
-        // #357 — the one shape that can be detected without inspecting the
-        // attribute: the SAME push says both on and level:0. That is exactly
-        // the "on at brightness 0" case ADR-0017 accepted as unreachable, so
-        // if it ever fires the premise has broken and it needs a trace that
-        // survives production (INFO), not the debug line below. A bare
-        // `{level: 0}` arriving while the attribute already reads on — the
-        // first frame of a split off-push, see the rule-b account above — is
-        // indistinguishable from a routine two-frame off and cannot be
-        // warned about here.
+        // #357 — the one shape detectable here (this function has no
+        // endpoint, so it cannot read the attribute): the SAME push says both
+        // on and level:0. The plugin pushes changed keys only, so that
+        // happens on a full-state replay (attach) or an off→on-at-0 change
+        // in one callback. It gets a trace visible at INFO, the level the
+        // plugin launches the node at, not the debug line below. A bare
+        // `{level: 0}` while the attribute reads on is deliberately NOT
+        // warned: it is either a genuine on-at-0 report or the first half of
+        // a level-first split off (ground (3) of the rule-b account in this
+        // function's doc), and the two are identical on arrival — warning
+        // would fire on every such split off. A genuine one surfaces at the
+        // next full-state replay.
         logger.warn(
             `retainLevelWhileOff: indigoDeviceId ${indigoDeviceId} reported ON at brightness 0 — keeping the ` +
                 "retained currentLevel instead of the Lighting minimum (the ecosystem will show it on at that level) — " +

@@ -259,10 +259,11 @@ class TestDimmable:
     def test_an_off_dimmer_reports_level_zero_exactly_not_floored(self, handlers):
         """#357: `retainLevelWhileOff` (bridge-node) relies on this side
         pushing a literal `level: 0` for an off dimmer — that is the only
-        shape it withholds `currentLevel` for. Most Python drifts here are
-        harmless to the node, but a future "fix" flooring an off level to 1
-        would silently re-open #353, because `level: 1` writes `currentLevel`
-        (see `bridge-node/src/endpoints.ts`'s `percentToCurrentLevel`)."""
+        shape it withholds `currentLevel` for. A future "fix" flooring an off
+        level to 1 would silently defeat #353's retention: `level: 1` is not
+        0, so the node overwrites the retained level with `currentLevel` 3 on
+        every off (`bridge-node/src/endpoints.ts`, `percentToCurrentLevel`).
+        Whether Alexa overrides at that level is untested — see DEVICE-NOTES."""
         dev = DimmerDevice(1, "Lamp", onState=False, brightness=0)
         states = handlers.handler_for("dimmableLight").states_for(dev)
         assert states == {"onOff": False, "level": 0}

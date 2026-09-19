@@ -3,38 +3,38 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
-## 2026.32.6 — a WARN if a dimmer is ever reported on at brightness 0
+## 2026.32.6 — a WARN when a push reports a dimmer on at brightness 0 (banked, not yet in effect)
 
-- `bridge-node` **0.17.5**: `retainLevelWhileOff()` now logs a WARN (visible
-  at the node's default production log level) naming the Indigo device
-  whenever the SAME push says both `onOff: true` and `level: 0` — the one
-  shape ADR-0017 accepted as an unreachable cost of #353's fix: rule a never
-  inspects `onOff`, so if a device ever did report on at brightness 0, the
-  bridge keeps the retained `currentLevel` instead of writing the Lighting
-  minimum, and the ecosystem shows the device on at that retained level. In ordinary
-  operation a user should never see this line — Indigo already treats
-  brightness 0 as off — but if it does fire, it is now diagnosable instead
-  of leaving no trace (the prior handling of this case was a debug line the
-  node never emits in production). A bare `level: 0` arriving while the
-  attribute already reads on (the first frame of a split off-push) is not
-  distinguishable from a routine two-frame off and does not warn. Fixes
-  issue #357.
-- Test pins added: the WARN fires exactly once for the accepted-cost shape
-  and names the device (#357), and does not fire for a routine off, a bare
-  `level: 0`, or a level-first split off-push (`bridge-node/test/
-  registry.test.ts`). A second pin closes a gap a mutant survived: an empty
-  `levelControl: {}` left behind after `retainLevelWhileOff` strips
-  `currentLevel` must still be deleted from the patch, or a bare `level: 0`
-  and a routine off each reach `endpoint.set()` with a pointless empty
-  write. On the Python side, `DimmableLightExport.states_for` now has a
-  dedicated test pinning that an off dimmer reports `level` as the exact
-  int `0`, not floored to `1` (which would silently re-open #353).
 - **Not yet in effect.** `bridge-node` 0.17.5 is in the repo but is NOT
   published to npm, and `DEFAULT_INSTALL_SPEC` still pins
-  `indigo-matter-bridge@0.17.4`, so installs keep getting 0.17.4 and the WARN
-  does not run anywhere yet. Banked deliberately (no release for a log
-  line): the next release publishes 0.17.5 first, then moves the pin
-  (publish first, then the pin — CLAUDE.md).
+  `indigo-matter-bridge@0.17.4`, so every npm-resolved install keeps getting
+  0.17.4 and none of the node change below runs for users yet. Banked
+  deliberately (no release for a log line); a later release publishes 0.17.5
+  and then moves the pin (publish first, then the pin — CLAUDE.md).
+- `bridge-node` **0.17.5**: `retainLevelWhileOff()` logs a WARN — visible at
+  INFO, the level the plugin launches the node at — naming the Indigo device
+  when the SAME push says both `onOff: true` and `level: 0`. ADR-0017
+  accepted, as unreachable, that a device reporting on at brightness 0 would
+  show in the ecosystem at its retained `currentLevel` rather than the
+  Lighting minimum; until now a breach of that premise left no trace (only a
+  debug line the node does not emit at INFO). Scope, stated plainly: the
+  plugin pushes changed keys only, so on-and-level-0 arrive together only on
+  a full-state replay (attach — a plugin or node restart) or an off→on-at-0
+  change. A bare `level: 0` while the attribute reads on does NOT warn: it is
+  either a genuine on-at-0 report or the first half of a two-frame off, and
+  the two look identical on arrival. A genuine one is caught at the next
+  full-state replay. In ordinary operation the line should never appear — the
+  owner confirms brightness 0 means off in Indigo. Fixes issue #357.
+- Test pins, each proven by applying a mutant: the WARN fires once for that
+  shape and names the device; it does not fire for a routine off, a bare
+  `level: 0`, or a level-first split off-push; and an emptied
+  `levelControl: {}` left after `retainLevelWhileOff` strips `currentLevel`
+  is deleted from the patch, so a bare `level: 0` and a routine off make no
+  `endpoint.set()` call at all (`bridge-node/test/registry.test.ts`). On the
+  Python side, a test pins that an off dimmer reports `level` as the exact
+  int `0`, not floored to `1` — which would defeat #353's retention, since
+  `level: 1` overwrites the retained level with `currentLevel` 3 on every
+  off (whether Alexa overrides at that level is untested).
 
 ## 2026.32.5 — Alexa's "turn on" no longer forces a dimmer to 100%
 

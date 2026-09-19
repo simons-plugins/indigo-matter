@@ -1036,11 +1036,13 @@ describe("currentLevel retention while off (#353)", () => {
     });
 
     it("(357 negative) a routine off, a bare level:0, and a level-first split emit NO warn — a WARN on every ordinary off would be noise nobody could act on", async () => {
-        // "To assert something did not happen, make it fatal" (degradation-
-        // path convention): the routine off shape and the split-frame shapes
-        // (a)/(b)/(R3) pin correct BEHAVIOUR already — this pins that none of
-        // them ALSO train the field to ignore the #357 warning by firing it
-        // on cases that are not the accepted-cost shape at all.
+        // Negative pin: the routine-off and split-frame shapes already have
+        // their BEHAVIOUR pinned by (a)/(b)/(c)/(R3). This pins that none of
+        // them also emits the #357 WARN — a WARN on every ordinary off would
+        // train the field to ignore it. The bare `{level:0}`-while-on frame
+        // is included on purpose: it may be a genuine on-at-0 report or half
+        // of a split off, and it must stay quiet either way (see the inline
+        // comment in retainLevelWhileOff).
         const h = await harness();
         const capture = captureWarnLogs();
         try {
@@ -1054,7 +1056,7 @@ describe("currentLevel retention while off (#353)", () => {
             await h.registry.setState(1, { onOff: false, level: 0 });
             // A bare level:0 — no onOff key in the push at all.
             await h.registry.setState(1, { level: 0 });
-            // A level-first split off-push, same shape as (R3) above.
+            // A level-first split off-push, the same sequence (R3) drives.
             await h.registry.setState(1, { onOff: true, level: 20 });
             await h.registry.setState(1, { level: 0 });
             await h.registry.setState(1, { onOff: false });
@@ -1179,16 +1181,17 @@ describe("currentLevel retention while off (#353)", () => {
         }
     });
 
-    it("(357, T3) a bare level:0 and a routine off never reach endpoint.set() — pins retainLevelWhileOff's own emptied-key deletion", async () => {
+    it("(mutation kill, #357) a bare level:0 and a routine off never reach endpoint.set() — pins retainLevelWhileOff's own emptied-key deletion", async () => {
         // A mutant that skips `delete patch[LEVEL_CONTROL]` once levelControl
-        // is left empty survives every assertion above unchanged: the patch
+        // is left empty survives the behavioural tests in this block: the patch
         // still comes back as {levelControl: {}} instead of {}, so
         // applyStates' own empty-patch early return never fires and a
         // pointless `endpoint.set({levelControl: {}})` goes out per off push
         // instead of the lawful no-op (e) pins. Benign on matter.js 0.17.8,
         // but a real transaction per off dimmer per attach replay — and if
-        // the onOff half's act() throws, the resulting error would claim the
-        // residual attributes were "applied" for a set that never happened.
+        // the onOff half's act() throws, the error would say it "applied the
+        // residual attributes" when the residual was empty and there was
+        // nothing to apply.
         // The onOff half goes through endpoint.act(), a separate call path
         // from endpoint.set() (see applyStates), so shadowing `set` alone
         // isolates the level half this pins.
