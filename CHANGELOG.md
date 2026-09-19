@@ -38,6 +38,10 @@ current version is `Info.plist`'s `PluginVersion`.
   ADR-0017. No plugin (Python) change, no protocol frame change. See
   ADR-0017 (confirmed live against a real Alexa fabric, 2026-09-19, both
   arms from one Alexa controller) and `BRIDGE_PROTOCOL.md` §4.2.
+- `bridge-node` **0.17.4** published to npm; `DEFAULT_INSTALL_SPEC` moves to
+  `indigo-matter-bridge@0.17.4` (publish first, then the pin — CLAUDE.md). After
+  updating the plugin, run **Plugins ▸ Matter ▸ Install/update the Matter bridge** to
+  pick up the new node; the fix is in the node, not the plugin.
 
 ## 2026.32.4 — a rebooted Mac can no longer wedge a LaunchAgent behind a stale storage lock
 
