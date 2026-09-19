@@ -3,17 +3,22 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
-## 2026.32.7 — the battery-overrange warning now actually reaches the Event Log
+## 2026.32.7 — two more warnings that were silently going nowhere now reach the Event Log
 
 - The "battery level above 100" warning (clamped to 100, logged once per
   device) now actually appears in the Indigo Event Log. It was being logged
   to a module logger with no handler attached in production, so it has
   never been visible to a user, even though the whole point of the warning
   is to surface a misbehaving device.
+- When a device cannot be classified for export (and is listed as a device
+  error in the export picker), the error and its traceback now appear in
+  the Indigo Event Log too, explaining why — before, they went to the same
+  kind of unattached logger and were invisible.
 - Technical: `battery_percent` (`export_handlers.py`) now logs through
   `_PLUGIN_LOG` (`logging.getLogger("Plugin")`, the same logger the module's
-  other user-facing notices already use), not `_LOG`. No bridge-node
-  change.
+  other user-facing notices already use), not `_LOG`. `export_catalog.py`'s
+  `classify()` gets the same treatment, through a new `_PLUGIN_LOG` of its
+  own. No bridge-node change.
 
 ## 2026.32.6 — a warning in the Event Log when a dimmer is reported on at brightness 0
 

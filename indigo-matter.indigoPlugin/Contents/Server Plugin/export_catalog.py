@@ -41,10 +41,13 @@ import re
 from dataclasses import dataclass
 from typing import Optional, Union
 
-#: Module logger. The catalog is pure and Indigo-free, so it logs through the
-#: stdlib root configuration Indigo already installs rather than taking a
-#: logger argument on every call site.
-_LOG = logging.getLogger(__name__)
+#: The real plugin logger. A module logger (``logging.getLogger(__name__)``)
+#: reaches no handler in production — see ``export_handlers``' module header
+#: for the full account — whereas this one is the SDK's documented way for a
+#: submodule to reach the Event Log (Indigo SDK reference, "Logging from
+#: Another Class or Submodule"). Used by :func:`classify`'s device-error
+#: path, whose log line is the only account of why a device was excluded.
+_PLUGIN_LOG = logging.getLogger("Plugin")
 
 #: This plugin's bundle id (``Info.plist`` ``CFBundleIdentifier``). Only a
 #: fallback: callers pass ``self.pluginId`` so the guard follows the running
@@ -418,8 +421,11 @@ def classify(dev, plugin_id: str = DEFAULT_PLUGIN_ID, options: Optional[dict] = 
             return _custom(dev, options)
         return handler(dev, options)
     except Exception as exc:  # pylint: disable=broad-except
-        _LOG.error("Matter bridge: could not classify a device for export — %s", exc,
-                   exc_info=True)
+        # _PLUGIN_LOG — see its module-level comment. This error is the only
+        # account of why a device was excluded; a module logger here would
+        # never reach the Indigo Event Log.
+        _PLUGIN_LOG.error("Matter bridge: could not classify a device for export — %s", exc,
+                          exc_info=True)
         return Excluded(REASON_DEVICE_ERROR)
 
 

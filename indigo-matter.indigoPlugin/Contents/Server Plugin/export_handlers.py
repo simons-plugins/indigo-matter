@@ -90,7 +90,7 @@ from mired_units import kelvin_to_mireds, mireds_to_kelvin
 #: same posture ``export_catalog`` takes. It is debug-only by design: everything
 #: a user must act on is logged by ``export_bridge``, which knows the device.
 #:
-#: ``DoorLockExport`` is the one exception on both counts (issue #289 review
+#: ``DoorLockExport`` was the first exception on both counts (issue #289 review
 #: findings 2/3): it is not stateless — it holds a per-device relay-fallback
 #: latch — and its fallback notice IS something a user must act on (it names
 #: a device that cannot actually be locked/unlocked the way its export
