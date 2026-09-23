@@ -1845,7 +1845,8 @@ def test_menu_restart_clears_window_when_ensure_installed_raises(plug, plugin_mo
 # the WS client reports "connected" while talking to the wrong server)
 # ---------------------------------------------------------------------------
 
-def _fake_agent(port, package, report, *, due_bootstrap=None, has_pid=True, verdict=VERDICT_CONFLICT_FREE):
+def _fake_agent(port, package, report, *, due_bootstrap=None, has_pid=True, verdict=VERDICT_CONFLICT_FREE,
+                fatal_cause=None):
     """A LaunchAgent-shaped fake for one agent's contribution to a tick (#182/#187).
 
     ``due_bootstrap`` is the deadline TOKEN ``due_for_bootstrap_verification()``
@@ -1853,7 +1854,8 @@ def _fake_agent(port, package, report, *, due_bootstrap=None, has_pid=True, verd
     ``Optional[float]`` contract; it used to be a bare bool, and a caller wanting
     "due" now passes a real ``time.monotonic()`` value, not ``True``). ``report``,
     ``verdict`` and ``has_pid`` may be a plain value or a zero-arg callable,
-    mirroring the existing mutable-state-dict pattern used below.
+    mirroring the existing mutable-state-dict pattern used below. ``fatal_cause``
+    defaults to None (no FATAL line) — only the VERDICT_DEAD branch reads it.
     """
     return SimpleNamespace(
         port_conflict_report=lambda: report() if callable(report) else report,
@@ -1863,6 +1865,7 @@ def _fake_agent(port, package, report, *, due_bootstrap=None, has_pid=True, verd
         clear_bootstrap_verification=lambda observed: None,
         post_bootstrap_verdict=lambda: verdict() if callable(verdict) else verdict,
         managed_job_has_pid=lambda: has_pid() if callable(has_pid) else has_pid,
+        describe_fatal_cause=lambda: fatal_cause() if callable(fatal_cause) else fatal_cause,
     )
 
 
@@ -2050,7 +2053,9 @@ def test_due_bootstrap_with_a_real_conflict_uses_the_existing_error_path_and_cle
 def test_due_bootstrap_with_no_pid_is_reported_as_the_187_fault_and_cleared(plug):
     """None + no pid is the #187 fault itself (bootstrap OK, process then lost
     the bind race and exited) — distinct from every other None case, and the
-    one the old "clear on any non-raising call" code swallowed silently."""
+    one the old "clear on any non-raising call" code swallowed silently.
+    ``fatal_cause`` defaults to None here (no FATAL line to classify), so the
+    message must say the cause is unknown rather than guess a bind race."""
     now = time.monotonic()
     agent = _fake_agent(5580, "matter-server", None, due_bootstrap=now,
                         verdict=VERDICT_DEAD, has_pid=False)
@@ -2059,8 +2064,42 @@ def test_due_bootstrap_with_no_pid_is_reported_as_the_187_fault_and_cleared(plug
     plug._port_conflict_tick()
     assert plug.logger.error.call_count == 1
     said = str(plug.logger.error.call_args_list[0])
-    assert "matter-server" in said and "5580" in said
+    assert "matter-server" in said
+    assert "unknown" in said
+    assert "EADDRINUSE" not in said
     agent.clear_bootstrap_verification.assert_called_once_with(now)
+
+
+def test_due_bootstrap_dead_with_storage_lock_cause_omits_eaddrinuse(plug):
+    """A classified storage-lock cause must be used verbatim — never overridden
+    by the old hard-coded EADDRINUSE/bind-race guess."""
+    now = time.monotonic()
+    from launch_agent import FatalCause
+    cause = FatalCause("storage-lock", "pid 607 (AssetCache) holds the storage lock…")
+    agent = _fake_agent(5580, "matter-server", None, due_bootstrap=now,
+                        verdict=VERDICT_DEAD, has_pid=False, fatal_cause=cause)
+    agent.clear_bootstrap_verification = Mock()
+    plug.server_process = agent
+    plug._port_conflict_tick()
+    said = str(plug.logger.error.call_args_list[0])
+    assert "pid 607" in said and "AssetCache" in said
+    assert "EADDRINUSE" not in said
+    assert "bind race" not in said
+
+
+def test_due_bootstrap_dead_with_eaddrinuse_cause_keeps_bind_race_wording(plug):
+    """The bind-race wording is now EARNED by an actual EADDRINUSE hit, not assumed."""
+    now = time.monotonic()
+    from launch_agent import FatalCause
+    cause = FatalCause("port-conflict", "FATAL … listen EADDRINUSE 127.0.0.1:5580")
+    agent = _fake_agent(5580, "matter-server", None, due_bootstrap=now,
+                        verdict=VERDICT_DEAD, has_pid=False, fatal_cause=cause)
+    agent.clear_bootstrap_verification = Mock()
+    plug.server_process = agent
+    plug._port_conflict_tick()
+    said = str(plug.logger.error.call_args_list[0])
+    assert "EADDRINUSE" in said
+    assert "bind race" in said
 
 
 def test_due_bootstrap_pending_leaves_the_flag_armed_then_clears_once_settled(plug):

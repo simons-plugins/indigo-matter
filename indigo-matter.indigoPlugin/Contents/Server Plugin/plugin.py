@@ -93,6 +93,25 @@ _SENSITIVITY_SETTING = next(
     s for s in settings_for_type("matterMotionSensor") if s.key == "sensitivityLevel")
 
 
+def _dead_verdict_cause_text(agent) -> str:
+    """Describe WHY a VERDICT_DEAD agent didn't survive its own bootstrap.
+
+    Extracted out of :meth:`Plugin._check_agent_port_conflict` (pylint
+    too-many-branches) as well as because the wording rule stands on its own: don't
+    guess EADDRINUSE — that used to be hard-coded even when the err log said
+    something else (or nothing) entirely. Classify the actual FATAL line instead
+    (``LaunchAgent.describe_fatal_cause``); only an EADDRINUSE hit gets the
+    bind-race wording.
+    """
+    cause = agent.describe_fatal_cause()
+    if cause is None:
+        return "the cause is unknown"
+    if cause.kind == "port-conflict":
+        return (f"most likely it lost the port {agent.spec.port} bind race and "
+                f"exited on EADDRINUSE ({cause.message})")
+    return cause.message
+
+
 class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenuMixin,
              ExportRecoveryMenuMixin, BridgeAgentMenuMixin,
              DiagnosticsMenuMixin, indigo.PluginBase):
@@ -899,11 +918,11 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
             else:
                 verdict = agent.post_bootstrap_verdict()
                 if verdict == VERDICT_DEAD:
+                    cause_text = _dead_verdict_cause_text(agent)
                     self.logger.error(
                         "%s did not survive its own bootstrap: bootstrap succeeded, but the "
-                        "managed job now has no pid at all — most likely it lost the port %s "
-                        "bind race and exited on EADDRINUSE. See %s.",
-                        agent.spec.package, agent.spec.port,
+                        "managed job now has no pid at all — %s. See %s.",
+                        agent.spec.package, cause_text,
                         os.path.join(agent.log_dir, agent.spec.err_log),
                     )
                     agent.clear_bootstrap_verification(due_token)

@@ -34,6 +34,7 @@ import hashlib
 import json
 import os
 import plistlib
+import re
 import shutil
 import subprocess
 import time
@@ -97,6 +98,27 @@ VERDICT_PENDING = "pending"
 LIVE_PID_STALE = "stale"
 LIVE_PID_OURS = "ours"
 LIVE_PID_UNDECIDED = "undecided"
+
+# Pulls the pid out of a storage-lock FATAL line like "...Storage is locked by
+# another process (pid 607)". Absent on a FATAL line matter-server logged before it
+# had parsed a pid out of matter.pid itself.
+_STORAGE_LOCK_PID_RE = re.compile(r"\(pid (\d+)\)")
+
+
+@dataclass(frozen=True)
+class FatalCause:
+    """A FATAL err-log line, classified for a user-facing message.
+
+    :param kind: ``"storage-lock"``, ``"port-conflict"``, or ``"other"`` (the FATAL
+        line matched neither known pattern, so ``message`` is just that line quoted
+        verbatim).
+    :param message: ready-to-log description of the cause — already includes any
+        pid/process detail and the remedy; callers just prepend/append their own
+        framing.
+    """
+
+    kind: str
+    message: str
 
 
 @dataclass(frozen=True)
@@ -363,6 +385,95 @@ class LaunchAgent:
             return None
         tail = "".join(lines[-max_lines:]).strip()
         return tail or None
+
+    def last_fatal_line(self, max_lines: int = 20) -> Optional[str]:
+        """Return the last line of the tailed error log that contains ``FATAL``, else None.
+
+        Reuses :meth:`tail_error_log` rather than re-opening the log a second way — same
+        tail, same absent/unreadable-log handling. A tail with no FATAL line (the process
+        may simply be slow to start) also returns None; callers must not invent a cause
+        when there isn't a FATAL line to read one from.
+        """
+        tail = self.tail_error_log(max_lines=max_lines)
+        if not tail:
+            return None
+        for line in reversed(tail.splitlines()):
+            if "FATAL" in line:
+                return line.strip()
+        return None
+
+    def describe_fatal_cause(self) -> Optional[FatalCause]:
+        """Classify the last FATAL line into a cause a user can act on.
+
+        Returns None when there is nothing to classify (no FATAL line, or an
+        absent/unreadable error log) — callers fall back to their own generic
+        handling rather than claiming a specific cause on a guess (in particular,
+        never claim EADDRINUSE when the log does not actually say so).
+        """
+        fatal = self.last_fatal_line()
+        if fatal is None:
+            return None
+        if "storage-lock" in fatal or "Storage is locked" in fatal:
+            return FatalCause("storage-lock", self._describe_storage_lock_cause(fatal))
+        if EADDRINUSE_MARKER in fatal:
+            return FatalCause("port-conflict", fatal)
+        return FatalCause("other", fatal)
+
+    def _describe_storage_lock_cause(self, fatal_line: str) -> str:
+        """Turn a storage-lock FATAL line into a message a user can act on.
+
+        Names the pid and, when ``ps`` can still see it, what it actually is.
+        :meth:`clear_stale_storage_locks` already clears this automatically on
+        start/restart; this text is for when a human ends up looking anyway (that
+        sweep couldn't run or couldn't decide — see its own docstring for those
+        cases). Deliberately never claims *why* the pid was reused (a reboot is
+        the common cause but not the only one, and this message can only see a
+        pid/command mismatch, not history) and never suggests rebooting as the
+        fix — Restart-the-controller is.
+        """
+        remedy = "Use Plugins ▸ Matter ▸ Restart the Matter controller to clear it."
+        match = _STORAGE_LOCK_PID_RE.search(fatal_line)
+        if not match:
+            return f"{fatal_line} {remedy}"
+        pid = int(match.group(1))
+        command = self._describe_pid(pid)
+        if command is None:
+            return (f"pid {pid} holds the storage lock, but the process could not be "
+                    f"identified (ps failed) — not guessing what it is. {remedy}")
+        if self._looks_like_our_process(command):
+            return (f"pid {pid} ({command}) holds the storage lock and currently looks "
+                    f"like a Matter server process. {remedy}")
+        return (f"pid {pid} ({command}) holds the storage lock and is not a "
+                f"matter-server/node process — a stale lock left behind after the OS "
+                f"reused this pid for something else, not a live server. {remedy}")
+
+    def _looks_like_our_process(self, command: str) -> bool:
+        """Whether ``command`` (a ps command line) plausibly IS a Matter process.
+
+        A loose heuristic for phrasing only — :meth:`clear_stale_storage_locks`'s
+        own, stricter match (spec.package/node-path based) is what actually decides
+        whether a lock gets cleared; this only decides how confidently a message
+        can call a pid's holder "not ours".
+        """
+        lowered = command.lower()
+        return "node" in lowered or self.spec.package.lower() in lowered
+
+    def _describe_pid(self, pid: int) -> Optional[str]:
+        """``ps -p PID -o command=`` for a single pid, or None if it could not tell us.
+
+        Same runner seam as :meth:`_ps_map` (never a new subprocess style), scoped to
+        one pid instead of the whole process table — this is for a single diagnostic
+        message, not a sweep.
+        """
+        try:
+            result = self._run(["ps", "-p", str(pid), "-o", "command="],
+                               capture_output=True, text=True, check=False)
+        except OSError:
+            return None
+        if result is None or result.returncode != 0:
+            return None
+        command = (result.stdout or "").strip()
+        return command or None
 
     def install(self, install_spec: Optional[str] = None) -> bool:
         """npm-install the agent's package with the resolved node. Idempotent.
