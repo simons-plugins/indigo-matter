@@ -621,7 +621,7 @@ class LaunchAgent:
         message, not a sweep.
         """
         try:
-            result = self._run(["ps", "-p", str(pid), "-o", "command="],
+            result = self._run(["ps", "-ww", "-p", str(pid), "-o", "command="],
                                capture_output=True, text=True, check=False)
         except OSError:
             return PID_PROBE_UNKNOWN, None

@@ -1680,6 +1680,18 @@ def test_storage_lock_holder_is_another_node_process_not_our_matter_server(tmp_p
     assert "reboot" not in cause.message.lower()
 
 
+def test_storage_lock_holder_probe_never_truncates_the_command_line(tmp_path, mock_logger):
+    # Without -ww macOS ps truncates the command column, dropping the late
+    # --storage-path argument — our own live server would then read as "not ours".
+    now = 2_000_000_000.0
+    agent, runner = _diag_agent(tmp_path, mock_logger, now=now, ps_stdout="node x\n")
+    _write_err_log(agent, _storage_lock_line(now - 1, pid=606) + "\n")
+    _write_lock(agent.storage_path, 606)
+    agent.describe_fatal_cause()
+    probes = [c for c in runner.calls if c and c[0] == "ps" and "-p" in c]
+    assert probes and all("-ww" in c for c in probes)
+
+
 def test_storage_lock_holder_pid_not_running(tmp_path, mock_logger):
     now = 2_000_000_000.0
     agent, runner = _diag_agent(tmp_path, mock_logger, now=now, ps_returncode=1, ps_stdout="")
