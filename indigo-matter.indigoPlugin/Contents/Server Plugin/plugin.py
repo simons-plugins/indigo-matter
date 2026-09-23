@@ -109,7 +109,10 @@ def _dead_verdict_cause_text(agent) -> str:
     if cause.kind == "port-conflict":
         return (f"most likely it lost the port {agent.spec.port} bind race and "
                 f"exited on EADDRINUSE ({cause.message})")
-    return cause.message
+    # cause.message may itself already end with a sentence (the storage-lock kind
+    # always does — its remedy sentence). The caller's own template always appends
+    # ". See <path>." after this text, so a trailing period here would double up.
+    return cause.message.rstrip(".")
 
 
 class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenuMixin,
@@ -735,9 +738,14 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
         Indigo log so users don't have to hunt for ~/Library/Logs/indigo-matter.
         Fired once per failure streak by the client, so this never spams.
 
-        A storage-lock cause additionally triggers a self-heal attempt: PR #354's
-        sweep already runs on plugin start/restart, but this is the path that
-        catches it BETWEEN those — see :meth:`_self_heal_storage_lock`.
+        Deliberately does NOT attempt a mid-run self-heal here. An earlier version of
+        this method did (sweep the storage lock, then restart), but #354's stale-lock
+        sweep already runs at every plugin start — which is after every reboot, the
+        case that matters — so a SECOND sweep triggered mid-run only added a way to
+        race the fabric restore and the Restart menu, for a case (a stray dying
+        between one plugin start and the next) narrow enough that a days-old FATAL
+        line in the append-only err log could trigger it. Restart the Matter
+        controller (Plugins ▸ Matter) still runs the sweep on demand.
         """
         sp = self.server_process
         if sp is None:
@@ -756,24 +764,25 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
             return
         tail = sp.tail_error_log()
         if tail:
-            # describe_fatal_cause() is a single quick `ps -p` at most (never the
-            # multi-second reap sweep below) — cheap enough to do inline, same as the
-            # tail_error_log() file read just above. Guarded all the same: this runs
-            # inside the WS client's run loop, where an escape ends it permanently —
-            # a diagnostic must never be what kills reconnection.
+            # describe_fatal_cause() is a single quick `ps -p` at most — cheap enough
+            # to do inline, same as the tail_error_log() file read just above.
+            # ws_json_client's own _maybe_report_repeated_failure already catches
+            # whatever this callback raises, so a classifier escaping wouldn't kill
+            # reconnection either way — but it WOULD cost the user the tail
+            # diagnostic line below, which is the one thing here that always works.
+            # So it is still caught here, loudly (not at debug): a broken classifier
+            # is itself worth knowing about, not just quietly falling back from.
             try:
                 cause = sp.describe_fatal_cause()
             except Exception as exc:  # pylint: disable=broad-except
-                self.logger.debug("could not classify matter-server's fatal error: %s", exc)
+                self.logger.warning("could not classify matter-server's fatal error: %s",
+                                    exc, exc_info=True)
                 cause = None
-            storage_lock = cause is not None and cause.kind == "storage-lock"
-            hint = f"\n{cause.message}" if storage_lock else ""
+            hint = f"\n{cause.message}" if cause is not None and cause.kind == "storage-lock" else ""
             self.logger.error(
                 "matter-server is not responding after %d attempts and appears to be "
                 "crashing. Recent matter-server errors:\n%s%s", attempts, tail, hint,
             )
-            if storage_lock:
-                self._self_heal_storage_lock(sp)
         else:
             self.logger.error(
                 "matter-server is not responding after %d attempts and its error log is "
@@ -782,53 +791,6 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
                 "plugin.",
                 attempts, sp.project_dir,
             )
-
-    def _self_heal_storage_lock(self, sp) -> None:
-        """Dispatch the stale-lock sweep + conditional restart off this callback's thread.
-
-        ``_on_server_unreachable`` fires from inside ``ws_json_client``'s async run
-        loop — see that module's ``_maybe_report_repeated_failure`` docstring — so
-        nothing here may block the event loop. ``sp.clear_stale_storage_locks()``
-        shells out to ``ps`` and, when it finds a stray, SIGTERMs/SIGKILLs and polls
-        for up to ~1.5s (see its own docstring), and ``sp.restart()`` bootouts and
-        re-bootstraps launchd — both real, blocking I/O. Same detached-daemon-thread
-        idiom as ``actionShareMatterNode``/``CTCalibrationEngine`` for the same
-        reason: slow, fire-and-forget work nobody queued behind.
-        """
-        threading.Thread(
-            target=self._run_storage_lock_heal, args=(sp,),
-            name="matter-storage-lock-heal", daemon=True,
-        ).start()
-
-    def _run_storage_lock_heal(self, sp) -> None:
-        """Thread body for :meth:`_self_heal_storage_lock`.
-
-        Extracted so a test can call it directly and deterministically instead of
-        joining a real thread — mirrors ``_run_share_node``. Only restarts when the
-        sweep actually cleared something: a 0 means the sweep either found nothing
-        stale or couldn't decide (and already warned, per
-        ``clear_stale_storage_locks``'s own docstring) — restarting the controller
-        in that case would just be a second, pointless outage.
-        """
-        try:
-            cleared = sp.clear_stale_storage_locks()
-        except Exception as exc:  # pylint: disable=broad-except
-            # Absorbing: this runs on a detached daemon thread where an escape is
-            # silent. The diagnostic error _on_server_unreachable already logged
-            # (tail + cause) still stands — this is a best-effort extra, not the
-            # user's only signal, so a failure here is logged, not raised.
-            self.logger.exception(exc)
-            return
-        if not cleared:
-            return
-        self.logger.info(
-            "cleared %d stale storage lock(s); restarting the Matter controller…", cleared)
-        self._expect_restart()  # this outage is ours, not a crash to report
-        if not sp.restart():
-            self._restart_expected_until = 0.0  # restart failed — don't suppress the diagnostic
-            self.logger.error(
-                "matter-server restart after clearing its storage lock(s) failed; check "
-                "~/Library/Logs/indigo-matter/matter-server.err.log")
 
     def _expect_restart(self) -> None:
         """Open the ~30s window during which a client outage is treated as an expected
