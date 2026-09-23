@@ -1882,6 +1882,25 @@ def test_on_server_unreachable_non_storage_lock_never_calls_sweep(plug, plugin_m
     assert "EADDRINUSE" in said
 
 
+def test_on_server_unreachable_classifier_raising_still_logs_tail_and_never_sweeps(
+        plug, plugin_mod, monkeypatch):
+    # This callback runs inside the WS client's run loop: an escape ends reconnection
+    # for good, so a broken classifier must degrade to the plain tail, not raise.
+    monkeypatch.setattr(plugin_mod.threading, "Thread", _SyncThread)
+    sp, _ = _fake_server_process(
+        tail="FATAL … [storage-lock] Storage is locked by another process (pid 607)",
+        fatal_cause=None,
+        clear_stale=Mock(side_effect=AssertionError("sweep must not be called")),
+    )
+    sp.describe_fatal_cause = Mock(side_effect=RuntimeError("classifier broke"))
+    plug.server_process = sp
+    plug._restart_expected_until = 0.0
+    plug._restart_notice_shown = False
+    plug._on_server_unreachable(2)                     # must not raise
+    said = str(plug.logger.error.call_args_list[0])
+    assert "storage-lock" in said                      # the raw tail still reached the user
+
+
 def test_install_handler_logs_when_restart_fails(plug, plugin_mod, monkeypatch):
     plug.server_process = SimpleNamespace(install=lambda: True, resolved_bin_dir="/x")
     plug.pluginPrefs = {"serverLocation": "local"}

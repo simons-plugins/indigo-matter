@@ -758,8 +758,14 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
         if tail:
             # describe_fatal_cause() is a single quick `ps -p` at most (never the
             # multi-second reap sweep below) — cheap enough to do inline, same as the
-            # tail_error_log() file read just above.
-            cause = sp.describe_fatal_cause()
+            # tail_error_log() file read just above. Guarded all the same: this runs
+            # inside the WS client's run loop, where an escape ends it permanently —
+            # a diagnostic must never be what kills reconnection.
+            try:
+                cause = sp.describe_fatal_cause()
+            except Exception as exc:  # pylint: disable=broad-except
+                self.logger.debug("could not classify matter-server's fatal error: %s", exc)
+                cause = None
             storage_lock = cause is not None and cause.kind == "storage-lock"
             hint = f"\n{cause.message}" if storage_lock else ""
             self.logger.error(
