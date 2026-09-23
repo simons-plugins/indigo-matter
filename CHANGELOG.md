@@ -3,6 +3,31 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
+## 2026.32.8 — storage-lock crash-loop: better diagnosis, and a self-heal in between restarts
+
+- The "matter-server is not responding" error the plugin logs when it can't
+  reach the controller after several attempts now correctly diagnoses a
+  stale storage lock: it names the pid holding the lock and what that
+  process actually is (via `ps`), and says plainly when the pid does not
+  belong to a Matter process at all. It no longer tells you to reboot the
+  Mac — that was never the fix — and it no longer claims "lost the port
+  bind race and exited on EADDRINUSE" unless the error log actually says
+  EADDRINUSE.
+- The plugin now also self-heals a storage-lock crash-loop it detects
+  *between* restarts, not only on plugin start/restart (PR #354's sweep):
+  if the stale-lock sweep clears a lock, the plugin restarts the Matter
+  controller itself, once, instead of waiting for the user to notice and
+  click Plugins ▸ Matter ▸ Restart the Matter controller.
+- Technical: `LaunchAgent.last_fatal_line()` / `describe_fatal_cause()`
+  (`launch_agent.py`) classify the tailed err log into a `FatalCause`
+  (storage-lock / port-conflict / other); both the post-bootstrap
+  VERDICT_DEAD diagnostic and the live-crash diagnostic in `plugin.py` now
+  read from it instead of a hard-coded guess. The self-heal
+  (`Plugin._self_heal_storage_lock`) dispatches the sweep + restart to a
+  detached daemon thread, matching `actionShareMatterNode`/
+  `CTCalibrationEngine` — `_on_server_unreachable` runs on the async
+  WS-client run loop and must not block it with subprocess work.
+
 ## 2026.32.7 — two more warnings that were silently going nowhere now reach the Event Log
 
 - The "battery level above 100" warning (clamped to 100, logged once per
