@@ -1700,7 +1700,9 @@ def test_on_server_unreachable_suppresses_and_rearms_within_window(plug):
 
 
 def test_on_server_unreachable_surfaces_crash_outside_window(plug):
-    plug.server_process = SimpleNamespace(tail_error_log=Mock(return_value="stack trace"), project_dir="/x")
+    plug.server_process = SimpleNamespace(tail_error_log=Mock(return_value="stack trace"),
+                                          describe_fatal_cause=Mock(return_value=None),
+                                          project_dir="/x")
     plug.matter = SimpleNamespace(rearm_failure_diagnostic=Mock())
     plug._restart_expected_until = 0.0           # window closed
     plug._restart_notice_shown = False
@@ -1713,6 +1715,171 @@ def test_on_server_unreachable_no_server_process_is_noop(plug):
     plug.server_process = None
     plug._on_server_unreachable(2)               # must not raise
     plug.logger.error.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Storage-lock diagnosis + self-heal (the #354 sweep's watchdog counterpart):
+# _on_server_unreachable fires from ws_json_client's async run loop, so the
+# sweep/restart must be dispatched off-thread, never run inline here.
+# ---------------------------------------------------------------------------
+
+def _fake_server_process(*, tail, fatal_cause, clear_stale=None, restart=None):
+    from launch_agent import FatalCause  # local import: only these tests need it
+    return SimpleNamespace(
+        tail_error_log=Mock(return_value=tail),
+        describe_fatal_cause=Mock(return_value=fatal_cause),
+        clear_stale_storage_locks=clear_stale if clear_stale is not None else Mock(return_value=0),
+        restart=restart if restart is not None else Mock(
+            side_effect=AssertionError("restart must not be called")),
+        project_dir="/x",
+    ), FatalCause
+
+
+class _SyncThread:
+    """Runs the target inline — proves the dispatch happened without racing a real
+    thread, mirroring the FakeThread idiom already used for the install threads
+    above."""
+
+    def __init__(self, target=None, args=(), name=None, daemon=None):  # noqa: ARG002
+        self._target = target
+        self._args = args
+
+    def start(self):
+        self._target(*self._args)
+
+
+def _real_storage_lock_cause(tail: str, ps_stdout: str, ps_returncode: int = 0):
+    """Classify ``tail`` through the REAL LaunchAgent.describe_fatal_cause(), with
+    a fake ``ps`` seam — exercises the actual pid-parsing/description logic
+    rather than restating it, then hands the resulting :class:`FatalCause` to a
+    fake ``ServerProcess`` for a plugin-level test."""
+    import launch_agent
+    agent = launch_agent.LaunchAgent(
+        launch_agent.AgentSpec(label="l", package="matter-server", install_spec="matter-server@1",
+                               default_entry="e", storage_path="/s", out_log="o.log", err_log="e.log",
+                               argv=lambda a: []),
+        {}, Mock(),
+        runner=lambda cmd, **kw: SimpleNamespace(returncode=ps_returncode, stdout=ps_stdout),
+    )
+    monkeypatch_tail = lambda max_lines=20: tail  # noqa: E731
+    agent.tail_error_log = monkeypatch_tail
+    return agent.describe_fatal_cause()
+
+
+def test_on_server_unreachable_storage_lock_names_pid_and_process_no_reboot_no_eaddrinuse(
+        plug, plugin_mod, monkeypatch):
+    monkeypatch.setattr(plugin_mod.threading, "Thread", _SyncThread)
+    tail = ("FATAL MatterServer Server failed to start [storage-lock] Storage is "
+            "locked by another process (pid 607)")
+    cause = _real_storage_lock_cause(
+        tail, "/System/Library/PrivateFrameworks/AssetCache.framework/Support/"
+              "AssetCacheManagerService\n")
+    assert cause is not None and cause.kind == "storage-lock"
+    sp, _ = _fake_server_process(tail=tail, fatal_cause=cause)
+    plug.server_process = sp
+    plug._restart_expected_until = 0.0
+    plug._restart_notice_shown = False
+    plug._on_server_unreachable(2)
+    said = str(plug.logger.error.call_args_list[0])
+    assert "607" in said
+    assert "AssetCacheManagerService" in said
+    assert "Restart the Matter controller" in said
+    assert "reboot" not in said.lower()
+    assert "EADDRINUSE" not in said
+
+
+def test_on_server_unreachable_ps_failure_says_could_not_identify_not_a_guess(plug, plugin_mod, monkeypatch):
+    monkeypatch.setattr(plugin_mod.threading, "Thread", _SyncThread)
+    tail = "FATAL Server failed to start [storage-lock] Storage is locked by another process (pid 607)"
+    cause = _real_storage_lock_cause(tail, "", ps_returncode=1)          # ps failed
+    assert cause is not None and cause.kind == "storage-lock"
+    assert "could not be identified" in cause.message
+    sp, _ = _fake_server_process(tail=tail, fatal_cause=cause)
+    plug.server_process = sp
+    plug._restart_expected_until = 0.0
+    plug._restart_notice_shown = False
+    plug._on_server_unreachable(2)
+    said = str(plug.logger.error.call_args_list[0])
+    assert "could not be identified" in said
+    # must not have crashed getting here, and must not fabricate a description
+    assert "AssetCache" not in said
+
+
+def test_on_server_unreachable_self_heal_restarts_once_when_sweep_clears_a_lock(
+        plug, plugin_mod, monkeypatch):
+    monkeypatch.setattr(plugin_mod.threading, "Thread", _SyncThread)
+    from launch_agent import FatalCause
+    calls = []
+
+    def fake_expect_restart():
+        calls.append("expect_restart")
+    plug._expect_restart = fake_expect_restart
+    restart = Mock(side_effect=lambda: calls.append("restart") or True)
+    sp, _ = _fake_server_process(
+        tail="FATAL … [storage-lock] Storage is locked by another process (pid 607)",
+        fatal_cause=FatalCause("storage-lock", "pid 607 holds the storage lock…"),
+        clear_stale=Mock(return_value=1),
+        restart=restart,
+    )
+    plug.server_process = sp
+    plug._restart_expected_until = 0.0
+    plug._restart_notice_shown = False
+    plug._on_server_unreachable(2)
+    restart.assert_called_once()
+    assert calls == ["expect_restart", "restart"]      # _expect_restart ran BEFORE restart()
+
+
+def test_on_server_unreachable_self_heal_does_not_restart_when_sweep_clears_nothing(
+        plug, plugin_mod, monkeypatch):
+    """A 0 means the sweep either found nothing stale, or couldn't decide (and
+    already warned) — restarting anyway would just be a second, pointless outage."""
+    monkeypatch.setattr(plugin_mod.threading, "Thread", _SyncThread)
+    from launch_agent import FatalCause
+    sp, _ = _fake_server_process(
+        tail="FATAL … [storage-lock] Storage is locked by another process (pid 607)",
+        fatal_cause=FatalCause("storage-lock", "pid 607 holds the storage lock…"),
+        clear_stale=Mock(return_value=0),
+        # restart is the AssertionError-raising default — fatal if touched
+    )
+    plug.server_process = sp
+    plug._restart_expected_until = 0.0
+    plug._restart_notice_shown = False
+    plug._on_server_unreachable(2)                     # must not raise
+
+
+def test_on_server_unreachable_self_heal_sweep_raising_does_not_escape_and_diagnostic_still_logged(
+        plug, plugin_mod, monkeypatch):
+    monkeypatch.setattr(plugin_mod.threading, "Thread", _SyncThread)
+    from launch_agent import FatalCause
+    sp, _ = _fake_server_process(
+        tail="FATAL … [storage-lock] Storage is locked by another process (pid 607)",
+        fatal_cause=FatalCause("storage-lock", "pid 607 holds the storage lock…"),
+        clear_stale=Mock(side_effect=RuntimeError("sweep exploded")),
+    )
+    plug.server_process = sp
+    plug._restart_expected_until = 0.0
+    plug._restart_notice_shown = False
+    plug._on_server_unreachable(2)                     # must not raise — nothing escapes
+    plug.logger.error.assert_called()                  # the diagnostic (tail+cause) was still logged
+    said = str(plug.logger.error.call_args_list[0])
+    assert "pid 607" in said
+    plug.logger.exception.assert_called_once()          # the sweep failure is logged too
+
+
+def test_on_server_unreachable_non_storage_lock_never_calls_sweep(plug, plugin_mod, monkeypatch):
+    monkeypatch.setattr(plugin_mod.threading, "Thread", _SyncThread)
+    from launch_agent import FatalCause
+    sp, _ = _fake_server_process(
+        tail="FATAL Server failed to start: listen EADDRINUSE 127.0.0.1:5580",
+        fatal_cause=FatalCause("port-conflict", "FATAL … EADDRINUSE …"),
+        clear_stale=Mock(side_effect=AssertionError("sweep must not be called")),
+    )
+    plug.server_process = sp
+    plug._restart_expected_until = 0.0
+    plug._restart_notice_shown = False
+    plug._on_server_unreachable(2)                     # must not raise
+    said = str(plug.logger.error.call_args_list[0])
+    assert "EADDRINUSE" in said
 
 
 def test_install_handler_logs_when_restart_fails(plug, plugin_mod, monkeypatch):
