@@ -3,6 +3,42 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
+## 2026.32.8 — storage-lock crash-loop: a correct, corroborated diagnosis
+
+- The "matter-server is not responding" error the plugin logs when it can't
+  reach the controller after several attempts now correctly diagnoses a
+  stale storage lock: it names the pid currently recorded in `matter.pid`
+  and what that process actually is (via `ps`), and says plainly when the
+  pid does not belong to a Matter process at all, or when `matter.pid` is
+  missing/unreadable, or when the FATAL line named a different pid than
+  `matter.pid` currently does (both are named). It no longer tells you to
+  reboot the Mac — that was never the fix — and it no longer claims "lost
+  the port bind race and exited on EADDRINUSE" unless the error log
+  actually says EADDRINUSE.
+- The diagnosis now only trusts a FATAL line that is actually recent:
+  matter-server's error log is append-only across restarts, so a FATAL
+  from an earlier crash-loop (or an earlier day) could previously be
+  reported as the cause of a failure happening right now. Every FATAL line
+  carries its own local-time timestamp, which is now checked against this
+  LaunchAgent instance's last bootstrap (or, absent one, a bounded recent
+  window) before it is trusted; matter-server's ANSI colour codes are also
+  stripped before matching and before any line is quoted into a message.
+- Considered and deliberately NOT shipped: a mid-run self-heal (sweep +
+  restart the controller the instant this diagnostic fires). PR #354's
+  stale-lock sweep already runs at every plugin start, which is after
+  every reboot — the case that matters — so a second sweep triggered from
+  inside the live crash diagnostic only added a way to race the fabric
+  restore and the Restart menu, for a narrower case that a stale/old FATAL
+  line in the append-only log could trigger spuriously. Plugins ▸ Matter ▸
+  **Restart the Matter controller** still runs the sweep on demand and
+  remains the documented remedy.
+- Technical: `LaunchAgent.last_fatal_line()` / `describe_fatal_cause()`
+  (`launch_agent.py`) classify the tailed err log into a `FatalCause`
+  (storage-lock / port-conflict / other), freshness-gated via a new
+  wall-clock `now` seam and `_bootstrap_wall_time`; both the post-bootstrap
+  VERDICT_DEAD diagnostic and the live-crash diagnostic in `plugin.py` now
+  read from it instead of a hard-coded guess.
+
 ## 2026.32.7 — two more warnings that were silently going nowhere now reach the Event Log
 
 - The "battery level above 100" warning (clamped to 100, logged once per

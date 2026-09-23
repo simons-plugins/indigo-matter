@@ -19,11 +19,13 @@ import os
 import plistlib
 import subprocess
 import time
+from datetime import datetime
 
 import pytest
 
 from launch_agent import (
-    INSTALL_NODE_STAMP, VERDICT_CONFLICT_FREE, VERDICT_DEAD, VERDICT_PENDING, AgentSpec, LaunchAgent,
+    FATAL_FRESHNESS_SLACK_SECONDS, INSTALL_NODE_STAMP, NO_BOOTSTRAP_RECENT_WINDOW_SECONDS,
+    VERDICT_CONFLICT_FREE, VERDICT_DEAD, VERDICT_PENDING, AgentSpec, FatalCause, LaunchAgent,
 )
 from server_process import APPLIED_PLIST_MARKER, LABEL, ServerProcess
 
@@ -1441,3 +1443,309 @@ def test_reap_waits_after_sigkill_so_the_sweep_never_sees_a_corpse_as_live(tmp_p
     # `ps` — proving the wait, not just the signal, happened — so the sweep that every
     # real call site runs right after can tell the lock is stale and clear it.
     assert agent.clear_stale_storage_locks() == 1
+
+
+# ---------------------------------------------------------------------------
+# describe_fatal_cause() — freshness, ANSI stripping, and the storage-lock
+# message's pid description. No self-heal exists any more (see plugin.py's
+# _on_server_unreachable): this is the diagnosis surface on its own.
+# ---------------------------------------------------------------------------
+
+def _ts_str(epoch: float) -> str:
+    """Render ``epoch`` as matter-server's own log prefix: "YYYY-MM-DD HH:MM:SS.mmm"."""
+    dt = datetime.fromtimestamp(epoch)
+    return dt.strftime("%Y-%m-%d %H:%M:%S.") + f"{dt.microsecond // 1000:03d}"
+
+
+def _ansi_fatal_line(epoch: float, tail: str) -> str:
+    """A real jarvis-shaped ANSI-coloured FATAL line with ``tail`` after "FATAL  "."""
+    ts = _ts_str(epoch)
+    return f"\x1b[2m{ts} FATAL  \x1b[0;1;90mMatterServer         \x1b[31m{tail}"
+
+
+def _storage_lock_line(epoch: float, pid=1621, tagged=True) -> str:
+    lock = f"[\x1b[1mstorage-lock\x1b[0;31m] " if tagged else ""
+    pid_part = f"(pid {pid})" if pid is not None else "(lock reclaimed during retry)"
+    return _ansi_fatal_line(
+        epoch, f"Server failed to start \x1b[0;31m{lock}Storage is locked by "
+               f"another process {pid_part}")
+
+
+class DescribePidRunner(FakeRunner):
+    """Fakes ``ps -p PID -o command=`` only — the single subprocess call
+    ``describe_fatal_cause``'s storage-lock branch makes."""
+
+    def __init__(self, returncode=0, stdout="", raise_oserror=False):
+        super().__init__()
+        self.ps_returncode = returncode
+        self.ps_stdout = stdout
+        self.raise_oserror = raise_oserror
+
+    def __call__(self, cmd, **kwargs):
+        self.calls.append(cmd)
+        if cmd and cmd[0] == "ps" and "-p" in cmd:
+            if self.raise_oserror:
+                raise OSError(2, "No such file or directory: 'ps'")
+            return subprocess.CompletedProcess(cmd, self.ps_returncode,
+                                               stdout=self.ps_stdout, stderr="")
+        return super().__call__(cmd, **kwargs)
+
+
+def _diag_agent(tmp_path, mock_logger, *, now=2_000_000_000.0, bootstrap_wall_time="unset",
+                ps_returncode=0, ps_stdout="", raise_oserror=False):
+    """A LaunchAgent wired for describe_fatal_cause() tests: a controllable clock
+    and a ps fake scoped to _describe_pid's single-pid probe.
+
+    ``bootstrap_wall_time`` defaults to "just bootstrapped a moment ago" (fresh) —
+    pass ``None`` to model an instance that has not bootstrapped this run at all
+    (the NO_BOOTSTRAP_RECENT_WINDOW_SECONDS path), or an explicit float.
+    """
+    home = tmp_path / "home"
+    runner = DescribePidRunner(returncode=ps_returncode, stdout=ps_stdout,
+                               raise_oserror=raise_oserror)
+    agent = _agent(home, _spec("com.example.d", "matter-server", str(tmp_path / "store")),
+                   mock_logger, runner=runner)
+    agent._now = lambda: now
+    agent._bootstrap_wall_time = (now - 1) if bootstrap_wall_time == "unset" else bootstrap_wall_time
+    return agent, runner
+
+
+def _write_err_log(agent, content: str) -> None:
+    os.makedirs(agent.log_dir, exist_ok=True)
+    with open(os.path.join(agent.log_dir, agent.spec.err_log), "w", encoding="utf-8") as handle:
+        handle.write(content)
+
+
+def _our_command(agent) -> str:
+    pkg = os.path.join(agent.project_dir, "node_modules", agent.spec.package)
+    return f"node {pkg}/dist/Main.js --storage-path {agent.storage_path} --port {agent.spec.port}"
+
+
+def test_ansi_jarvis_storage_lock_line_fresh_is_storage_lock_no_ansi_in_message(
+        tmp_path, mock_logger):
+    now = 2_000_000_000.0
+    agent, runner = _diag_agent(tmp_path, mock_logger, now=now, ps_stdout="")
+    line = _storage_lock_line(now - 1, pid=1621)
+    _write_err_log(agent, line + "\n")
+    _write_lock(agent.storage_path, 1621)
+    runner.ps_stdout = _our_command(agent) + "\n"
+    cause = agent.describe_fatal_cause()
+    assert cause is not None and cause.kind == "storage-lock"
+    assert "\x1b" not in cause.message
+    assert "1621" in cause.message
+    assert "Restart the Matter controller" in cause.message
+    assert "reboot" not in cause.message.lower()
+
+
+def test_fatal_older_than_last_bootstrap_is_not_trusted(tmp_path, mock_logger):
+    now = 2_000_000_000.0
+    agent, _runner = _diag_agent(tmp_path, mock_logger, now=now, bootstrap_wall_time=now)
+    stale_ts = now - FATAL_FRESHNESS_SLACK_SECONDS - 1
+    _write_err_log(agent, _storage_lock_line(stale_ts, pid=1621) + "\n")
+    assert agent.describe_fatal_cause() is None
+
+
+def test_fatal_older_than_the_no_bootstrap_window_is_not_trusted(tmp_path, mock_logger):
+    now = 2_000_000_000.0
+    agent, _runner = _diag_agent(tmp_path, mock_logger, now=now, bootstrap_wall_time=None)
+    stale_ts = now - NO_BOOTSTRAP_RECENT_WINDOW_SECONDS - 1
+    _write_err_log(agent, _storage_lock_line(stale_ts, pid=1621) + "\n")
+    assert agent.describe_fatal_cause() is None
+
+
+def test_fatal_within_the_no_bootstrap_window_is_trusted(tmp_path, mock_logger):
+    now = 2_000_000_000.0
+    agent, runner = _diag_agent(tmp_path, mock_logger, now=now, bootstrap_wall_time=None,
+                                ps_returncode=1, ps_stdout="")
+    fresh_ts = now - NO_BOOTSTRAP_RECENT_WINDOW_SECONDS + 1
+    _write_err_log(agent, _storage_lock_line(fresh_ts, pid=1621) + "\n")
+    _write_lock(agent.storage_path, 1621)
+    cause = agent.describe_fatal_cause()
+    assert cause is not None and cause.kind == "storage-lock"
+
+
+def test_unparseable_fatal_timestamp_is_none(tmp_path, mock_logger):
+    agent, _runner = _diag_agent(tmp_path, mock_logger)
+    _write_err_log(agent, "FATAL Server failed to start [storage-lock] Storage is "
+                          "locked by another process (pid 1621)\n")  # no leading timestamp
+    assert agent.describe_fatal_cause() is None
+
+
+def test_stack_trace_with_eaddrinuse_but_no_fatal_line_is_none(tmp_path, mock_logger):
+    agent, _runner = _diag_agent(tmp_path, mock_logger)
+    _write_err_log(agent, "Error: listen EADDRINUSE: address already in use 127.0.0.1:5580\n"
+                          "    at Server.setupListenHandle [as _listen2] (net.js:1330:16)\n")
+    assert agent.describe_fatal_cause() is None
+
+
+@pytest.mark.parametrize("order", ["storage_then_other", "other_then_storage"])
+def test_two_fresh_fatals_the_last_one_in_the_file_wins(tmp_path, mock_logger, order):
+    now = 2_000_000_000.0
+    agent, runner = _diag_agent(tmp_path, mock_logger, now=now, ps_stdout="")
+    storage_line = _storage_lock_line(now - 3, pid=1621)
+    other_line = _ansi_fatal_line(now - 1, "Server failed to start: some other fault")
+    lines = ([storage_line, other_line] if order == "storage_then_other"
+             else [other_line, storage_line])
+    _write_err_log(agent, "\n".join(lines) + "\n")
+    _write_lock(agent.storage_path, 1621)
+    runner.ps_stdout = _our_command(agent) + "\n"
+    cause = agent.describe_fatal_cause()
+    assert cause is not None
+    if order == "storage_then_other":
+        assert cause.kind == "other"
+    else:
+        assert cause.kind == "storage-lock"
+
+
+def test_fresh_fatal_matching_neither_pattern_is_other_kind_verbatim_ansi_stripped(
+        tmp_path, mock_logger):
+    now = 2_000_000_000.0
+    agent, _runner = _diag_agent(tmp_path, mock_logger, now=now)
+    line = _ansi_fatal_line(now - 1, "Server failed to start: some unrelated fault")
+    _write_err_log(agent, line + "\n")
+    cause = agent.describe_fatal_cause()
+    assert cause is not None and cause.kind == "other"
+    assert "\x1b" not in cause.message
+    assert "some unrelated fault" in cause.message
+
+
+def test_storage_is_locked_without_the_tag_is_still_storage_lock(tmp_path, mock_logger):
+    now = 2_000_000_000.0
+    agent, runner = _diag_agent(tmp_path, mock_logger, now=now, ps_stdout="")
+    line = _storage_lock_line(now - 1, pid=1621, tagged=False)
+    assert "storage-lock" not in line  # sanity: the tag really is absent
+    _write_err_log(agent, line + "\n")
+    _write_lock(agent.storage_path, 1621)
+    runner.ps_stdout = _our_command(agent) + "\n"
+    cause = agent.describe_fatal_cause()
+    assert cause is not None and cause.kind == "storage-lock"
+
+
+def test_fatal_followed_by_a_long_stack_trace_is_still_found(tmp_path, mock_logger):
+    now = 2_000_000_000.0
+    agent, runner = _diag_agent(tmp_path, mock_logger, now=now, ps_stdout="")
+    line = _storage_lock_line(now - 1, pid=1621)
+    stack = "\n".join(f"    at frame{i} (file.js:{i}:1)" for i in range(30))
+    _write_err_log(agent, line + "\n" + stack + "\n")
+    _write_lock(agent.storage_path, 1621)
+    runner.ps_stdout = _our_command(agent) + "\n"
+    cause = agent.describe_fatal_cause()
+    assert cause is not None and cause.kind == "storage-lock"
+
+
+def test_missing_log_file_is_none(tmp_path, mock_logger):
+    agent, _runner = _diag_agent(tmp_path, mock_logger)
+    assert agent.describe_fatal_cause() is None
+
+
+# --- the storage-lock message's pid-holder wording, one branch at a time -----
+
+def test_storage_lock_holder_is_our_own_matter_server(tmp_path, mock_logger):
+    now = 2_000_000_000.0
+    agent, runner = _diag_agent(tmp_path, mock_logger, now=now, ps_stdout="")
+    _write_err_log(agent, _storage_lock_line(now - 1, pid=606) + "\n")
+    _write_lock(agent.storage_path, 606)
+    runner.ps_stdout = _our_command(agent) + "\n"
+    cause = agent.describe_fatal_cause()
+    assert cause.kind == "storage-lock"
+    assert "looks like this plugin's own matter-server process" in cause.message
+    assert "Restart the Matter controller" in cause.message
+    assert "reboot" not in cause.message.lower()
+
+
+def test_storage_lock_holder_is_indigo_plugin_host_not_our_matter_server(tmp_path, mock_logger):
+    now = 2_000_000_000.0
+    agent, runner = _diag_agent(tmp_path, mock_logger, now=now, ps_stdout="")
+    _write_err_log(agent, _storage_lock_line(now - 1, pid=606) + "\n")
+    _write_lock(agent.storage_path, 606)
+    runner.ps_stdout = "/Applications/IndigoServer.app/Contents/MacOS/IndigoPluginHost3 -u 12\n"
+    cause = agent.describe_fatal_cause()
+    assert "is not this plugin's matter-server" in cause.message
+    assert "the pid in the lock now belongs to an unrelated process" in cause.message
+    assert "matter-server process" not in cause.message  # never called "our matter-server"
+    assert "Restart the Matter controller" in cause.message
+    assert "reboot" not in cause.message.lower()
+
+
+def test_storage_lock_holder_is_another_node_process_not_our_matter_server(tmp_path, mock_logger):
+    now = 2_000_000_000.0
+    agent, runner = _diag_agent(tmp_path, mock_logger, now=now, ps_stdout="")
+    _write_err_log(agent, _storage_lock_line(now - 1, pid=606) + "\n")
+    _write_lock(agent.storage_path, 606)
+    runner.ps_stdout = "node /usr/local/lib/node_modules/homebridge/bin/homebridge\n"
+    cause = agent.describe_fatal_cause()
+    assert "is not this plugin's matter-server" in cause.message
+    assert "own matter-server process" not in cause.message
+    assert "Restart the Matter controller" in cause.message
+    assert "reboot" not in cause.message.lower()
+
+
+def test_storage_lock_holder_probe_never_truncates_the_command_line(tmp_path, mock_logger):
+    # Without -ww macOS ps truncates the command column, dropping the late
+    # --storage-path argument — our own live server would then read as "not ours".
+    now = 2_000_000_000.0
+    agent, runner = _diag_agent(tmp_path, mock_logger, now=now, ps_stdout="node x\n")
+    _write_err_log(agent, _storage_lock_line(now - 1, pid=606) + "\n")
+    _write_lock(agent.storage_path, 606)
+    agent.describe_fatal_cause()
+    probes = [c for c in runner.calls if c and c[0] == "ps" and "-p" in c]
+    assert probes and all("-ww" in c for c in probes)
+
+
+def test_storage_lock_holder_pid_not_running(tmp_path, mock_logger):
+    now = 2_000_000_000.0
+    agent, runner = _diag_agent(tmp_path, mock_logger, now=now, ps_returncode=1, ps_stdout="")
+    _write_err_log(agent, _storage_lock_line(now - 1, pid=606) + "\n")
+    _write_lock(agent.storage_path, 606)
+    cause = agent.describe_fatal_cause()
+    assert "is no longer running — the lock is stale" in cause.message
+    assert "Restart the Matter controller" in cause.message
+    assert "reboot" not in cause.message.lower()
+
+
+def test_storage_lock_holder_ps_cannot_run(tmp_path, mock_logger):
+    now = 2_000_000_000.0
+    agent, runner = _diag_agent(tmp_path, mock_logger, now=now, raise_oserror=True)
+    _write_err_log(agent, _storage_lock_line(now - 1, pid=606) + "\n")
+    _write_lock(agent.storage_path, 606)
+    cause = agent.describe_fatal_cause()
+    assert "could not be identified (ps failed)" in cause.message
+    assert "Restart the Matter controller" in cause.message
+    assert "reboot" not in cause.message.lower()
+
+
+def test_storage_lock_matter_pid_missing(tmp_path, mock_logger):
+    now = 2_000_000_000.0
+    agent, runner = _diag_agent(tmp_path, mock_logger, now=now, ps_stdout="")
+    _write_err_log(agent, _storage_lock_line(now - 1, pid=606) + "\n")
+    # deliberately no _write_lock() call — matter.pid does not exist
+    cause = agent.describe_fatal_cause()
+    assert "matter.pid is missing or unparseable" in cause.message
+    assert "Restart the Matter controller" in cause.message
+    assert "reboot" not in cause.message.lower()
+
+
+def test_storage_lock_fatal_line_names_no_pid(tmp_path, mock_logger):
+    """"(lock reclaimed during retry)" carries no pid at all — _STORAGE_LOCK_PID_RE
+    must not mis-parse it, and the message is driven entirely by matter.pid."""
+    now = 2_000_000_000.0
+    agent, runner = _diag_agent(tmp_path, mock_logger, now=now, ps_stdout="")
+    _write_err_log(agent, _storage_lock_line(now - 1, pid=None) + "\n")
+    _write_lock(agent.storage_path, 606)
+    runner.ps_stdout = _our_command(agent) + "\n"
+    cause = agent.describe_fatal_cause()
+    assert cause.kind == "storage-lock"
+    assert "606" in cause.message
+    assert "separately named" not in cause.message
+    assert "Restart the Matter controller" in cause.message
+
+
+def test_storage_lock_matter_pid_differs_from_fatal_pid_both_mentioned(tmp_path, mock_logger):
+    now = 2_000_000_000.0
+    agent, runner = _diag_agent(tmp_path, mock_logger, now=now, ps_stdout="")
+    _write_err_log(agent, _storage_lock_line(now - 1, pid=1621) + "\n")  # FATAL names 1621
+    _write_lock(agent.storage_path, 606)                                # matter.pid says 606
+    runner.ps_stdout = _our_command(agent) + "\n"
+    cause = agent.describe_fatal_cause()
+    assert "606" in cause.message
+    assert "1621" in cause.message

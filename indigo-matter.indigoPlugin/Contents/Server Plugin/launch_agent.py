@@ -34,10 +34,12 @@ import hashlib
 import json
 import os
 import plistlib
+import re
 import shutil
 import subprocess
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Callable, Optional
 
 # INSTALL_NODE_STAMP and expand_home are re-exported here: bridge_agent.py and
@@ -97,6 +99,69 @@ VERDICT_PENDING = "pending"
 LIVE_PID_STALE = "stale"
 LIVE_PID_OURS = "ours"
 LIVE_PID_UNDECIDED = "undecided"
+
+# Pulls the pid out of a storage-lock FATAL line like "...Storage is locked by
+# another process (pid 607)". matter.js's own message (node_modules/@matter/nodejs/
+# dist/esm/fs/lock-utils.js ~L81, L88) has two other forms that must NOT match this
+# pattern: "(pid undefined)" (readLockInfo found no pid file at all) and "(lock
+# reclaimed during retry)" (the stale-lock retry itself raced and lost). Neither
+# contains digits after "(pid ", so both correctly fall through to no match rather
+# than being mis-parsed as a pid.
+_STORAGE_LOCK_PID_RE = re.compile(r"\(pid (\d+)\)")
+# Matches matter-server's own ANSI colour escapes (e.g. "\x1b[31m"), which wrap
+# individual words/fields in its coloured console output — see the module docstring
+# of LaunchAgent.last_fatal_line for a real example line. Stripped before matching
+# "FATAL"/"storage-lock"/etc and before any line is quoted into a user-facing message.
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m")
+# The local-time timestamp matter-server prefixes each log line with, e.g.
+# "2026-09-15 22:33:33.635". No timezone — see _parse_fatal_timestamp.
+_FATAL_TIMESTAMP_RE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3})")
+# Tail size for locating the most recent FATAL line. matter-server emits a multi-line
+# stack trace immediately after a FATAL and keeps logging afterward, so a short tail
+# can scroll the FATAL itself out of view within seconds — same 200-line reasoning
+# _err_log_mentions_port_conflict already uses for exactly this shape of problem.
+FATAL_TAIL_LINES = 200
+# Slack between a FATAL line's own timestamp and this instance's recorded bootstrap
+# wall-clock time (see LaunchAgent._bootstrap_wall_time), in seconds. Bootstrap time
+# is captured the instant `launchctl bootstrap`/`load` succeeds, before matter-server
+# has even started, so a genuine FATAL from THIS run should always land after it —
+# this only forgives clock-read jitter between that capture and the log write, never
+# a line that is actually stale.
+FATAL_FRESHNESS_SLACK_SECONDS = 5
+# When this LaunchAgent instance has not (yet) bootstrapped anything itself this run
+# (freshly constructed, looking at a job some earlier instance/plugin-load started),
+# there is no bootstrap wall time to compare a FATAL's timestamp against. Falling back
+# to trusting ANY FATAL, however old, is exactly the append-only-log trap #183 warned
+# about — so require it to be within a bounded recent window instead. 10 minutes
+# comfortably covers "the server just crashed while this instance was starting up"
+# without reviving a weeks-old line.
+NO_BOOTSTRAP_RECENT_WINDOW_SECONDS = 600
+# LaunchAgent._describe_pid() outcomes — three, not two, for the same reason the
+# LIVE_PID_* trio above exists: collapsing "ps could not even run" into "pid is not
+# running" would let a broken ps probe silently read as a stale lock.
+PID_PROBE_UNKNOWN = "unknown"
+PID_PROBE_NOT_RUNNING = "not_running"
+PID_PROBE_FOUND = "found"
+
+
+@dataclass(frozen=True)
+class FatalCause:
+    """A FATAL err-log line, classified for a user-facing message.
+
+    :param kind: ``"storage-lock"``, ``"port-conflict"``, or ``"other"`` (the FATAL
+        line matched neither known pattern, so ``message`` is just that line quoted
+        verbatim).
+    :param message: ready-to-log description of the cause. For ``"storage-lock"``,
+        already includes the pid/process detail AND the Restart-the-controller
+        remedy — a caller can log it as-is. For ``"port-conflict"`` and ``"other"``,
+        this is just the raw (ANSI-stripped) FATAL line quoted verbatim, with no
+        remedy attached — a caller wanting more (see ``plugin.py``'s
+        ``_dead_verdict_cause_text``, which wraps a ``"port-conflict"`` message in
+        the bind-race sentence) supplies its own framing.
+    """
+
+    kind: str
+    message: str
 
 
 @dataclass(frozen=True)
@@ -173,7 +238,7 @@ class AgentSpec:
 class LaunchAgent:
     """Install / control one launchd LaunchAgent described by an :class:`AgentSpec`."""
 
-    def __init__(
+    def __init__(  # pylint: disable=too-many-arguments
         self,
         spec: AgentSpec,
         prefs: dict,
@@ -184,6 +249,7 @@ class LaunchAgent:
         runner: Callable[..., "subprocess.CompletedProcess"] = subprocess.run,
         exists: Callable[[str], bool] = os.path.exists,
         sleep: Callable[[float], None] = time.sleep,
+        now: Callable[[], float] = time.time,
     ) -> None:
         self.spec = spec
         self.logger = logger
@@ -192,6 +258,11 @@ class LaunchAgent:
         self._exists = exists
         # Injectable so reap_orphan_servers()'s TERM→KILL grace is instant in tests.
         self._sleep = sleep
+        # Injectable wall clock for the FATAL-freshness check (describe_fatal_cause) —
+        # same seam idiom as _sleep. Deliberately time.time(), NOT time.monotonic() like
+        # _bootstrap_verify_after below: it has to compare against a log line's own
+        # wall-clock timestamp, which monotonic time cannot do.
+        self._now = now
         # "Currently degraded" latches for the two external probes (issue #182). Each
         # is cleared by the next successful probe so a later failure is reported again.
         self._port_probe_warned = False
@@ -208,6 +279,11 @@ class LaunchAgent:
         # due_for_bootstrap_verification() has been acted on (issue #187). See that
         # method's docstring for why this exists alongside port_conflict_report().
         self._bootstrap_verify_after: Optional[float] = None
+        # Wall-clock time this instance last bootstrapped something itself (via
+        # _bootstrap_and_record's two callers, or the older-macOS `launchctl load`
+        # fallback in _apply_plist) — the freshness anchor for describe_fatal_cause().
+        # None until this instance has actually bootstrapped once.
+        self._bootstrap_wall_time: Optional[float] = None
         self.home = home or os.path.expanduser("~")
         self.project_dir = os.path.join(self.home, DEFAULT_PROJECT_DIRNAME)
         # Node/npm toolchain resolution (npx/node path, nvm, ABI-pin checks) is a
@@ -363,6 +439,200 @@ class LaunchAgent:
             return None
         tail = "".join(lines[-max_lines:]).strip()
         return tail or None
+
+    def last_fatal_line(self, max_lines: int = FATAL_TAIL_LINES) -> Optional[str]:
+        """Return the last line of the tailed error log that contains ``FATAL``, else None.
+
+        Reuses :meth:`tail_error_log` rather than re-opening the log a second way — same
+        tail, same absent/unreadable-log handling. A tail with no FATAL line (the process
+        may simply be slow to start) also returns None; callers must not invent a cause
+        when there isn't a FATAL line to read one from.
+
+        Every returned line has matter-server's own ANSI colour codes stripped —
+        e.g. a real jarvis line looks like (``\\x1b`` shown literally)::
+
+            \\x1b[2m2026-09-15 22:33:33.635 FATAL  \\x1b[0;1;90mMatterServer \\x1b[31m
+            Server failed to start \\x1b[0;31m[\\x1b[1mstorage-lock\\x1b[0;31m] Storage
+            is locked by another process (pid 1621)
+
+        Left un-stripped, those escapes would both break substring matching
+        (``"storage-lock"`` never appears contiguously) and land literal escape bytes
+        in a message quoted into the Indigo log.
+        """
+        tail = self.tail_error_log(max_lines=max_lines)
+        if not tail:
+            return None
+        for line in reversed(tail.splitlines()):
+            stripped = _ANSI_ESCAPE_RE.sub("", line).strip()
+            if "FATAL" in stripped:
+                return stripped
+        return None
+
+    def describe_fatal_cause(self) -> Optional[FatalCause]:
+        """Classify the last FATAL line into a cause a user can act on.
+
+        Returns None when there is nothing to classify: no FATAL line, an
+        absent/unreadable error log, an unparseable timestamp, or — new — a FATAL
+        whose OWN timestamp is not recent (see :meth:`_fatal_is_fresh`). The err log
+        is append-only across restarts (#183), so without that last check a FATAL
+        from weeks ago would be reported as the cause of a failure happening right
+        now. Callers fall back to their own generic handling rather than claiming a
+        specific cause on a guess (in particular, never claim EADDRINUSE when the
+        log does not actually say so, and never claim a cause this plugin cannot
+        currently corroborate as current).
+        """
+        fatal = self.last_fatal_line()
+        if fatal is None:
+            return None
+        timestamp = self._parse_fatal_timestamp(fatal)
+        if timestamp is None:
+            # Never guess how old an unparseable line is — "cause unknown" is the
+            # honest answer, not "trust it" or "distrust it".
+            return None
+        if not self._fatal_is_fresh(timestamp):
+            return None
+        if "storage-lock" in fatal or "Storage is locked" in fatal:
+            return FatalCause("storage-lock", self._describe_storage_lock_cause(fatal))
+        if EADDRINUSE_MARKER in fatal:
+            return FatalCause("port-conflict", fatal)
+        return FatalCause("other", fatal)
+
+    @staticmethod
+    def _parse_fatal_timestamp(line: str) -> Optional[float]:
+        """Parse the local-time ``YYYY-MM-DD HH:MM:SS.mmm`` matter-server prefixes
+        each log line with, into epoch seconds. None if the line doesn't start with
+        one (an older matter-server version, a mangled line, …) — never guessed.
+
+        ``line`` is assumed already ANSI-stripped, as :meth:`last_fatal_line` returns
+        it. The log carries no timezone; interpreting the naive timestamp in this
+        Mac's local zone via ``datetime.timestamp()`` is correct because that is the
+        same zone the log was WRITTEN in, and the same zone :func:`time.time` (and
+        the ``now`` seam this is compared against) reads from.
+        """
+        match = _FATAL_TIMESTAMP_RE.match(line)
+        if not match:
+            return None
+        try:
+            return datetime.strptime(match.group(1), "%Y-%m-%d %H:%M:%S.%f").timestamp()
+        except ValueError:
+            return None
+
+    def _fatal_is_fresh(self, fatal_timestamp: float) -> bool:
+        """Whether a FATAL's own timestamp is recent enough to trust as "happening
+        now" rather than an old line the append-only log merely still contains.
+
+        Two regimes (see :data:`FATAL_FRESHNESS_SLACK_SECONDS` and
+        :data:`NO_BOOTSTRAP_RECENT_WINDOW_SECONDS` for why each bound is sized the
+        way it is): compared against this instance's own last bootstrap when one is
+        known, else a bounded recent window from wall-clock now.
+        """
+        if self._bootstrap_wall_time is not None:
+            return fatal_timestamp >= self._bootstrap_wall_time - FATAL_FRESHNESS_SLACK_SECONDS
+        return fatal_timestamp >= self._now() - NO_BOOTSTRAP_RECENT_WINDOW_SECONDS
+
+    def _describe_storage_lock_cause(self, fatal_line: str) -> str:
+        """Turn a storage-lock FATAL line into a message a user can act on.
+
+        The pid to describe is the one CURRENTLY recorded in this agent's own
+        ``matter.pid`` (via :meth:`_read_matter_pid`, at the storage root — where
+        matter-server itself keeps its lock), not necessarily the pid the FATAL line
+        happened to mention: matter.js's message embeds whatever pid ``readLockInfo``
+        saw at the moment the FAILED bootstrap attempt tried to acquire the lock,
+        which is a snapshot, while matter.pid is read fresh right now. When the two
+        disagree, both are named rather than silently preferring one. The FATAL's own
+        ``(pid N)`` is sometimes absent entirely — matter.js also logs "(pid
+        undefined)" (no pid file at all) and "(lock reclaimed during retry)" (the
+        stale-lock retry itself raced and lost) — :data:`_STORAGE_LOCK_PID_RE`
+        deliberately does not match either, so ``fatal_pid`` is simply None then.
+
+        :meth:`clear_stale_storage_locks` already clears this automatically on
+        start/restart; this text is for when a human ends up looking anyway (that
+        sweep couldn't run or couldn't decide — see its own docstring for those
+        cases). Deliberately never claims *why* a pid mismatch happened (a reboot is
+        the common cause but not the only one, and this message can only see a
+        pid/command mismatch, not history) and never suggests rebooting as the fix —
+        Restart-the-controller is.
+        """
+        remedy = "Use Plugins ▸ Matter ▸ Restart the Matter controller to clear it."
+        fatal_match = _STORAGE_LOCK_PID_RE.search(fatal_line)
+        fatal_pid = int(fatal_match.group(1)) if fatal_match else None
+        matter_pid, unreadable = self._read_matter_pid(
+            os.path.join(self.storage_path, MATTER_PID_FILENAME))
+        if unreadable:
+            return (f"{fatal_line} — matter.pid could not be read, so this plugin cannot "
+                    f"tell who currently holds the storage lock. {remedy}")
+        if matter_pid is None:
+            return (f"{fatal_line} — matter.pid is missing or unparseable, so the lock's "
+                    f"current owner cannot be identified (matter.js itself treats a "
+                    f"missing pid file as stale). {remedy}")
+        description = self._describe_storage_lock_holder(matter_pid)
+        if fatal_pid is not None and fatal_pid != matter_pid:
+            description += f" (the FATAL line separately named pid {fatal_pid})."
+        else:
+            description += "."
+        return f"{description} {remedy}"
+
+    def _describe_storage_lock_holder(self, pid: int) -> str:
+        """Describe what ``pid`` (from ``matter.pid``) currently is, for a message.
+
+        Three distinct :meth:`_describe_pid` outcomes, never collapsed — see that
+        method's docstring for why (a two-way collapse is exactly the "unusable
+        precondition reads as evidence" shape the workspace degradation-path
+        convention warns about).
+        """
+        status, command = self._describe_pid(pid)
+        if status == PID_PROBE_UNKNOWN:
+            return (f"pid {pid} holds the storage lock, but the process could not be "
+                    f"identified (ps failed) — not guessing what it is")
+        if status == PID_PROBE_NOT_RUNNING:
+            return f"pid {pid} is no longer running — the lock is stale"
+        if self._looks_like_our_process(command):
+            return (f"pid {pid} ({command}) holds the storage lock and looks like this "
+                    f"plugin's own matter-server process")
+        return (f"pid {pid} ({command}) holds the storage lock and is not this plugin's "
+                f"matter-server — the pid in the lock now belongs to an unrelated process")
+
+    def _looks_like_our_process(self, command: str) -> bool:
+        """Whether ``command`` (a ps command line) IS a process of this agent's.
+
+        The SAME test :meth:`_running_server_pids` uses to decide what the sweep may
+        reap — not a looser heuristic. A pid can only be a live instance of our own
+        matter-server if its command line names both our installed package directory
+        AND our storage path; "node" or the package name alone (the old test) matches
+        an unrelated node process just as happily as a real one.
+        """
+        pkg_dir = self._package_dir()
+        return pkg_dir in command and self.storage_path in command
+
+    def _describe_pid(self, pid: int) -> tuple[str, Optional[str]]:
+        """``ps -p PID -o command=`` for a single pid, classified into one of three
+        outcomes a caller must not conflate (see :data:`PID_PROBE_UNKNOWN` and
+        siblings):
+
+        * :data:`PID_PROBE_UNKNOWN` — ``ps`` could not be run at all, or ran but
+          left us unable to tell anything (a non-zero exit with unexpected output).
+          Genuinely unknown; never treat this as "not running".
+        * :data:`PID_PROBE_NOT_RUNNING` — ``ps`` ran, exited non-zero, and printed
+          nothing: the normal "no such process" answer. A real, actionable fact.
+        * :data:`PID_PROBE_FOUND` — ``ps`` succeeded and returned a command line.
+
+        Same runner seam as :meth:`_ps_map` (never a new subprocess style), scoped to
+        one pid instead of the whole process table — this is for a single diagnostic
+        message, not a sweep.
+        """
+        try:
+            result = self._run(["ps", "-ww", "-p", str(pid), "-o", "command="],
+                               capture_output=True, text=True, check=False)
+        except OSError:
+            return PID_PROBE_UNKNOWN, None
+        if result is None:
+            return PID_PROBE_UNKNOWN, None
+        command = (result.stdout or "").strip()
+        if result.returncode != 0:
+            return (PID_PROBE_NOT_RUNNING, None) if not command else (PID_PROBE_UNKNOWN, None)
+        if not command:
+            return PID_PROBE_UNKNOWN, None
+        return PID_PROBE_FOUND, command
 
     def install(self, install_spec: Optional[str] = None) -> bool:
         """npm-install the agent's package with the resolved node. Idempotent.
@@ -590,6 +860,7 @@ class LaunchAgent:
                 self.spec.package, detail, self.plist_path,
             )
             return False
+        self._bootstrap_wall_time = self._now()  # another bootstrap path — see __init__
         self._record_applied_digest(digest)
         return True
 
@@ -611,6 +882,7 @@ class LaunchAgent:
         """
         if not self._bootstrap():
             return False
+        self._bootstrap_wall_time = self._now()  # freshness anchor for describe_fatal_cause()
         if plist_bytes is None:
             plist_bytes = self._plist_on_disk()
         if plist_bytes is not None:

@@ -12,6 +12,7 @@ import importlib
 import json
 import os
 import time
+from datetime import datetime
 from pathlib import Path
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from types import SimpleNamespace
@@ -1700,7 +1701,9 @@ def test_on_server_unreachable_suppresses_and_rearms_within_window(plug):
 
 
 def test_on_server_unreachable_surfaces_crash_outside_window(plug):
-    plug.server_process = SimpleNamespace(tail_error_log=Mock(return_value="stack trace"), project_dir="/x")
+    plug.server_process = SimpleNamespace(tail_error_log=Mock(return_value="stack trace"),
+                                          describe_fatal_cause=Mock(return_value=None),
+                                          project_dir="/x")
     plug.matter = SimpleNamespace(rearm_failure_diagnostic=Mock())
     plug._restart_expected_until = 0.0           # window closed
     plug._restart_notice_shown = False
@@ -1713,6 +1716,141 @@ def test_on_server_unreachable_no_server_process_is_noop(plug):
     plug.server_process = None
     plug._on_server_unreachable(2)               # must not raise
     plug.logger.error.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Storage-lock diagnosis (no self-heal — see plugin.py's _on_server_unreachable
+# docstring for why a mid-run heal was considered and deliberately not shipped;
+# #354's sweep at every plugin start already covers the case that matters).
+# ---------------------------------------------------------------------------
+
+def _fake_server_process(*, tail, fatal_cause):
+    return SimpleNamespace(
+        tail_error_log=Mock(return_value=tail),
+        describe_fatal_cause=Mock(return_value=fatal_cause),
+        project_dir="/x",
+    )
+
+
+_REAL_CAUSE_NOW = 2000000000.0
+
+
+def _ts(epoch: float) -> str:
+    """matter-server's own log-line timestamp prefix, e.g. "2026-09-15 22:33:33.635"."""
+    dt = datetime.fromtimestamp(epoch)
+    return dt.strftime("%Y-%m-%d %H:%M:%S.") + f"{dt.microsecond // 1000:03d}"
+
+
+def _write_matter_pid(storage_path: str, pid: int) -> None:
+    os.makedirs(storage_path, exist_ok=True)
+    with open(os.path.join(storage_path, "matter.pid"), "w", encoding="utf-8") as handle:
+        handle.write(f"{pid} deadbeef\n")
+
+
+def _real_storage_lock_cause(tail: str, ps_stdout: str, storage_path: str, ps_returncode: int = 0,
+                             raise_oserror: bool = False):
+    """Classify ``tail`` through the REAL LaunchAgent.describe_fatal_cause(), with
+    a fake ``ps`` seam — exercises the actual pid-parsing/description logic
+    rather than restating it, then hands the resulting :class:`FatalCause` to a
+    fake ``ServerProcess`` for a plugin-level test. The fake agent is given a
+    bootstrap wall time via ``now`` so the freshness gate does not swallow
+    ``tail``'s timestamp (see :func:`_ts` — callers must prefix their FATAL line
+    with one, dated at or after ``_REAL_CAUSE_NOW - 1``)."""
+    import launch_agent
+
+    def _runner(cmd, **kw):  # noqa: ANN001
+        if raise_oserror:
+            raise OSError(2, "No such file or directory: 'ps'")
+        return SimpleNamespace(returncode=ps_returncode, stdout=ps_stdout)
+
+    agent = launch_agent.LaunchAgent(
+        launch_agent.AgentSpec(label="l", package="matter-server", install_spec="matter-server@1",
+                               default_entry="e", storage_path=storage_path, out_log="o.log",
+                               err_log="e.log", argv=lambda a: []),
+        {}, Mock(),
+        runner=_runner,
+        now=lambda: _REAL_CAUSE_NOW,
+    )
+    agent._bootstrap_wall_time = _REAL_CAUSE_NOW - 1  # "just bootstrapped" — the tail is fresh
+    monkeypatch_tail = lambda max_lines=200: tail  # noqa: E731
+    agent.tail_error_log = monkeypatch_tail
+    return agent.describe_fatal_cause()
+
+
+def test_on_server_unreachable_storage_lock_names_pid_and_process_no_reboot_no_eaddrinuse(
+        plug, tmp_path):
+    storage = str(tmp_path / "store")
+    _write_matter_pid(storage, 607)
+    tail = (f"{_ts(_REAL_CAUSE_NOW - 1)} FATAL MatterServer Server failed to start "
+            f"[storage-lock] Storage is locked by another process (pid 607)")
+    cause = _real_storage_lock_cause(
+        tail, "/System/Library/PrivateFrameworks/AssetCache.framework/Support/"
+              "AssetCacheManagerService\n", storage)
+    assert cause is not None and cause.kind == "storage-lock"
+    sp = _fake_server_process(tail=tail, fatal_cause=cause)
+    plug.server_process = sp
+    plug._restart_expected_until = 0.0
+    plug._restart_notice_shown = False
+    plug._on_server_unreachable(2)
+    said = str(plug.logger.error.call_args_list[0])
+    assert "607" in said
+    assert "AssetCacheManagerService" in said
+    assert "Restart the Matter controller" in said
+    assert "reboot" not in said.lower()
+    assert "EADDRINUSE" not in said
+
+
+def test_on_server_unreachable_ps_failure_says_could_not_identify_not_a_guess(plug, tmp_path):
+    storage = str(tmp_path / "store")
+    _write_matter_pid(storage, 607)
+    tail = (f"{_ts(_REAL_CAUSE_NOW - 1)} FATAL Server failed to start [storage-lock] "
+            f"Storage is locked by another process (pid 607)")
+    cause = _real_storage_lock_cause(tail, "", storage, raise_oserror=True)       # ps could not run
+    assert cause is not None and cause.kind == "storage-lock"
+    assert "could not be identified" in cause.message
+    sp = _fake_server_process(tail=tail, fatal_cause=cause)
+    plug.server_process = sp
+    plug._restart_expected_until = 0.0
+    plug._restart_notice_shown = False
+    plug._on_server_unreachable(2)
+    said = str(plug.logger.error.call_args_list[0])
+    assert "could not be identified" in said
+    # must not have crashed getting here, and must not fabricate a description
+    assert "AssetCache" not in said
+
+
+def test_on_server_unreachable_port_conflict_cause_carries_no_storage_lock_hint(plug):
+    from launch_agent import FatalCause
+    sp = _fake_server_process(
+        tail="FATAL Server failed to start: listen EADDRINUSE 127.0.0.1:5580",
+        fatal_cause=FatalCause("port-conflict", "FATAL … EADDRINUSE …"),
+    )
+    plug.server_process = sp
+    plug._restart_expected_until = 0.0
+    plug._restart_notice_shown = False
+    plug._on_server_unreachable(2)                     # must not raise
+    said = str(plug.logger.error.call_args_list[0])
+    assert "EADDRINUSE" in said
+
+
+def test_on_server_unreachable_classifier_raising_still_logs_tail_and_warns(plug):
+    # This callback runs inside the WS client's run loop: an escape ends reconnection
+    # for good, so a broken classifier must degrade to the plain tail, not raise —
+    # but a classifier failure is itself worth a WARNING, not silence.
+    sp = _fake_server_process(
+        tail="FATAL … [storage-lock] Storage is locked by another process (pid 607)",
+        fatal_cause=None,
+    )
+    sp.describe_fatal_cause = Mock(side_effect=RuntimeError("classifier broke"))
+    plug.server_process = sp
+    plug._restart_expected_until = 0.0
+    plug._restart_notice_shown = False
+    plug._on_server_unreachable(2)                     # must not raise
+    said = str(plug.logger.error.call_args_list[0])
+    assert "storage-lock" in said                      # the raw tail still reached the user
+    plug.logger.warning.assert_called_once()
+    warned = str(plug.logger.warning.call_args_list[0])
+    assert "classifier broke" in warned
 
 
 def test_install_handler_logs_when_restart_fails(plug, plugin_mod, monkeypatch):
@@ -1845,7 +1983,8 @@ def test_menu_restart_clears_window_when_ensure_installed_raises(plug, plugin_mo
 # the WS client reports "connected" while talking to the wrong server)
 # ---------------------------------------------------------------------------
 
-def _fake_agent(port, package, report, *, due_bootstrap=None, has_pid=True, verdict=VERDICT_CONFLICT_FREE):
+def _fake_agent(port, package, report, *, due_bootstrap=None, has_pid=True, verdict=VERDICT_CONFLICT_FREE,
+                fatal_cause=None):
     """A LaunchAgent-shaped fake for one agent's contribution to a tick (#182/#187).
 
     ``due_bootstrap`` is the deadline TOKEN ``due_for_bootstrap_verification()``
@@ -1853,7 +1992,8 @@ def _fake_agent(port, package, report, *, due_bootstrap=None, has_pid=True, verd
     ``Optional[float]`` contract; it used to be a bare bool, and a caller wanting
     "due" now passes a real ``time.monotonic()`` value, not ``True``). ``report``,
     ``verdict`` and ``has_pid`` may be a plain value or a zero-arg callable,
-    mirroring the existing mutable-state-dict pattern used below.
+    mirroring the existing mutable-state-dict pattern used below. ``fatal_cause``
+    defaults to None (no FATAL line) — only the VERDICT_DEAD branch reads it.
     """
     return SimpleNamespace(
         port_conflict_report=lambda: report() if callable(report) else report,
@@ -1863,6 +2003,7 @@ def _fake_agent(port, package, report, *, due_bootstrap=None, has_pid=True, verd
         clear_bootstrap_verification=lambda observed: None,
         post_bootstrap_verdict=lambda: verdict() if callable(verdict) else verdict,
         managed_job_has_pid=lambda: has_pid() if callable(has_pid) else has_pid,
+        describe_fatal_cause=lambda: fatal_cause() if callable(fatal_cause) else fatal_cause,
     )
 
 
@@ -2050,7 +2191,9 @@ def test_due_bootstrap_with_a_real_conflict_uses_the_existing_error_path_and_cle
 def test_due_bootstrap_with_no_pid_is_reported_as_the_187_fault_and_cleared(plug):
     """None + no pid is the #187 fault itself (bootstrap OK, process then lost
     the bind race and exited) — distinct from every other None case, and the
-    one the old "clear on any non-raising call" code swallowed silently."""
+    one the old "clear on any non-raising call" code swallowed silently.
+    ``fatal_cause`` defaults to None here (no FATAL line to classify), so the
+    message must say the cause is unknown rather than guess a bind race."""
     now = time.monotonic()
     agent = _fake_agent(5580, "matter-server", None, due_bootstrap=now,
                         verdict=VERDICT_DEAD, has_pid=False)
@@ -2059,8 +2202,70 @@ def test_due_bootstrap_with_no_pid_is_reported_as_the_187_fault_and_cleared(plug
     plug._port_conflict_tick()
     assert plug.logger.error.call_count == 1
     said = str(plug.logger.error.call_args_list[0])
-    assert "matter-server" in said and "5580" in said
+    assert "matter-server" in said
+    assert "unknown" in said
+    assert "EADDRINUSE" not in said
     agent.clear_bootstrap_verification.assert_called_once_with(now)
+
+
+def test_due_bootstrap_dead_with_storage_lock_cause_omits_eaddrinuse(plug):
+    """A classified storage-lock cause must be used verbatim — never overridden
+    by the old hard-coded EADDRINUSE/bind-race guess."""
+    now = time.monotonic()
+    from launch_agent import FatalCause
+    cause = FatalCause("storage-lock", "pid 607 (AssetCache) holds the storage lock…")
+    agent = _fake_agent(5580, "matter-server", None, due_bootstrap=now,
+                        verdict=VERDICT_DEAD, has_pid=False, fatal_cause=cause)
+    agent.clear_bootstrap_verification = Mock()
+    plug.server_process = agent
+    plug._port_conflict_tick()
+    said = str(plug.logger.error.call_args_list[0])
+    assert "pid 607" in said and "AssetCache" in said
+    assert "EADDRINUSE" not in said
+    assert "bind race" not in said
+
+
+def test_due_bootstrap_dead_with_eaddrinuse_cause_keeps_bind_race_wording(plug):
+    """The bind-race wording is now EARNED by an actual EADDRINUSE hit, not assumed."""
+    now = time.monotonic()
+    from launch_agent import FatalCause
+    cause = FatalCause("port-conflict", "FATAL … listen EADDRINUSE 127.0.0.1:5580")
+    agent = _fake_agent(5580, "matter-server", None, due_bootstrap=now,
+                        verdict=VERDICT_DEAD, has_pid=False, fatal_cause=cause)
+    agent.clear_bootstrap_verification = Mock()
+    plug.server_process = agent
+    plug._port_conflict_tick()
+    said = str(plug.logger.error.call_args_list[0])
+    assert "EADDRINUSE" in said
+    assert "bind race" in said
+
+
+def test_due_bootstrap_dead_message_never_doubles_the_final_period(plug):
+    """The template appends ". See <path>." after the cause text — a storage-lock
+    cause's own message always ends in a sentence (its remedy), so naively
+    concatenating the two used to print "...to clear it.. See ...", a literal
+    double period. The log call's args are %-formatted here exactly as real
+    logging would lazily do it — a Mock logger never performs that interpolation
+    on its own, so a plain ``str(call_args)`` (as sibling tests here use for a
+    simple substring check) can't see an artifact that only appears AT the seam
+    between two args. Mutation check: remove the ``.rstrip(".")`` in
+    ``_dead_verdict_cause_text`` and this test fails."""
+    now = time.monotonic()
+    from launch_agent import FatalCause
+    cause = FatalCause(
+        "storage-lock",
+        "pid 607 (AssetCache) holds the storage lock and looks like this plugin's "
+        "own matter-server process. Use Plugins ▸ Matter ▸ Restart the Matter "
+        "controller to clear it.",
+    )
+    agent = _fake_agent(5580, "matter-server", None, due_bootstrap=now,
+                        verdict=VERDICT_DEAD, has_pid=False, fatal_cause=cause)
+    agent.clear_bootstrap_verification = Mock()
+    plug.server_process = agent
+    plug._port_conflict_tick()
+    fmt, *args = plug.logger.error.call_args_list[0].args
+    formatted = fmt % tuple(args)
+    assert ".." not in formatted
 
 
 def test_due_bootstrap_pending_leaves_the_flag_armed_then_clears_once_settled(plug):
