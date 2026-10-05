@@ -3,7 +3,7 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
-## 2026.32.9 — Alexa/Apple controllers no longer stall ~15 s after a minute of quiet
+## 2026.32.9 — Alexa no longer stalls ~15 s on the first command after a minute of quiet
 
 - Fixed: the first command after a minute or more of quiet could take ~15
   seconds to run from Alexa (and any other controller that polls rather than
@@ -16,7 +16,8 @@ current version is `Info.plist`'s `PluginVersion`.
   quiet (60 s) or old (4 h). The one cleanup that remains is unchanged: when
   a controller opens a NEW session, its older sessions are closed. That is
   safe because the controller already holds the replacement. matter.js's own
-  per-controller session cap still backstops anything else.
+  per-controller session cap remains as a backstop, though it also closes
+  sessions silently; with one session per controller it should not trigger.
 - The `sessionHygiene.closed.dead` and `closed.rotated` counters in the
   bridge's status report are kept so the frame shape does not change, but
   they are now always 0.
@@ -32,7 +33,8 @@ current version is `Info.plist`'s `PluginVersion`.
   reaction cannot be verified from here, and it would still end a session a
   polling controller regards as healthy); raising the quiet threshold would
   only have reduced the stall's frequency. The log warning when hygiene stops
-  watching now names only the superseded-session mitigation.
+  watching now names only the superseded-session mitigation. A failure in the
+  read-only per-peer diagnostic no longer switches the superseded sweep off.
 
 ## 2026.32.8 — storage-lock crash-loop: a correct, corroborated diagnosis
 

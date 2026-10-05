@@ -119,9 +119,16 @@ rather than re-explained at every call site.
   one Echo peer inside 30 minutes — well under the built-in cap — before the
   routing defect started dropping reports. `session-hygiene.ts`'s superseded
   sweep is deliberately the same mechanism at a cap of **1**, not a
-  duplicate of matter.js's own eviction.
+  duplicate of matter.js's own eviction. Caveat: that eviction also uses
+  `initiateForceClose`, so it too sends no CloseSession (see (l)) — the cap
+  is a backstop that is not free of the same silent drop. With the sweep
+  holding one session per peer+fabric it should not trigger.
 - **(l) `Session`/`NodeSession` expose everything the sweep needs as public
-  API, no matter.js patching required.** `Session.createdAt` (readonly,
+  API, no matter.js patching required.** The sweep itself needs only
+  `createdAt`, the peer id and the fabric index (plus `initiateForceClose`
+  to act); `activeTimestamp` and `subscriptions.size` remain public and are
+  carried on the session descriptor for diagnostics, but no decision reads
+  them. `Session.createdAt` (readonly,
   stamped at construction — `Session.ts:54`), `Session.activeTimestamp`
   (updated on every received message — `Session.ts:127-133`),
   `Session.initiateForceClose(context: {cause: Error; keepSubscriptions?:
@@ -146,8 +153,9 @@ rather than re-explained at every call site.
   CloseSession is sent, and the peer is never told its session is gone.**
   Earlier versions of `session-hygiene.ts` also force-closed subscription-free
   sessions after 60 s of quiet ("dead") and after 4 h of age ("rotated").
-  Alexa never subscribes — it polls — so every Echo session was "dead" a
-  minute after its last message and was dropped behind its back; the next
+  A controller whose session holds no subscription (Alexa's command/read
+  session) was therefore treated as dead 60 s after its last message and
+  was dropped behind its back; the next
   voice command was sent on the dead session, the bridge logged "Ignoring
   message for unknown session", and the Echo retransmitted for ~15 s before
   doing CASE resume (235 stalls measured, median 15.3 s). Those two closes
@@ -155,7 +163,7 @@ rather than re-explained at every call site.
   replacement session itself. A graceful (CloseSession) close was considered
   and not built: a controller's reaction to one cannot be verified from here,
   and it would still end a session a polling controller regards as healthy.
-- **(m) The wedge-watchdog signal (Finding 2 item 4) is NOT publicly
+- **(m) The wedge-watchdog signal (the issue's wedge-watchdog item) is NOT publicly
   observable — confirmed, not assumed.** `MessageExchange.onMessageReceived`
   calls `this.#notifyActivity(true)` (which sets `Session.activeTimestamp`)
   **unconditionally, before** it branches on `isStandaloneAck`
@@ -170,7 +178,7 @@ rather than re-explained at every call site.
   it last acknowledge anything". This independently corroborates the HAMH
   maintainer's comment quoted in issue #283 ("an Apple controller can keep
   MRP-acking pushed reports … while it has stopped consuming data") — and is
-  exactly why item 4 is not built (see `session-hygiene.ts`'s module
+  exactly why the wedge watchdog is not built (see `session-hygiene.ts`'s module
   docstring).
 - **(n) A `ServerSubscription` cannot be rebound to a replacement session —
   so closing a session the peer has not replaced strands its subscription.**
@@ -993,7 +1001,7 @@ and is still never repaired. Each entry is a `DriftEntry`:
   patching (§0(k)/(l); see `bridge-node/src/session-hygiene.ts` for the full
   design and its citations). Exactly one mechanism closes sessions:
 
-  1. **Superseded-session sweep** — the moment a peer opens a new CASE
+  - **Superseded-session sweep** — the moment a peer opens a new CASE
      session, its OLDER ones are closed immediately. This is the core
      mitigation: it removes the pile-up precondition for the still-open
      matter.js report-routing defect (§0(o)) at a cap of ONE session per
@@ -1006,26 +1014,31 @@ and is still never repaired. Each entry is a `DriftEntry`:
      is the point, not a risk to mitigate: the peer that superseded it has,
      by definition, a NEW session already open, and the HAMH-proven behaviour
      is that it re-subscribes over that one.
-  2. **Removed in bridge 0.17.5 — dead-session force-close and age-based
+  - **Removed in bridge 0.17.5 — dead-session force-close and age-based
      rotation.** Quiet (60 s) and old (4 h) subscription-free sessions are
      **no longer closed**. Force-close sends the peer no CloseSession (§0(l)),
-     so a polling-only controller (Alexa) sent its next command into a
-     session the bridge had silently dropped and stalled ~15 s before CASE
-     resume. A session the peer has not replaced is never closed; matter.js's
-     own per-peer cap/LRU eviction (§0(k)) remains the backstop. The
+     so a controller whose session holds no subscription (Alexa's
+     command/read session) sent its next command into a session the bridge
+     had silently dropped and stalled ~15 s before CASE resume. A session the peer has not replaced is never closed; matter.js's
+     own per-peer cap/LRU eviction (§0(k)) remains the backstop (with the
+     caveat that it also force-closes silently — §0(k); with the sweep
+     holding one session per peer+fabric it should not trigger). The
      `closed.dead` and `closed.rotated` fields stay on the wire so the frame
-     shape is stable, but are **always 0** — a client must not treat them as
-     live signals.
-  3. A mechanism (a "wedge watchdog" for a controller that keeps
+     shape is stable, but are **always 0 from bridge 0.17.5** (older bridges
+     may report non-zero) — a client must not treat them as live signals.
+  - **Not built:** a mechanism (a "wedge watchdog" for a controller that keeps
      MRP-acking pushed reports while it has stopped issuing new requests) was
-     assessed and **not built** — §0(m) traces exactly which matter.js
+     assessed and is **not built** — §0(m) traces exactly which matter.js
      internal would need to become public for it to be possible, and it is
      not, today.
 
   - `checked` — same discipline as `subscriptionChurn.checked`: `false`
     means the hygiene machinery could not observe/act on the session layer
-    at all (wiring never attached, or a handler failed and hygiene switched
-    itself off), not "nothing needed closing". No `warnings` entry
+    at all (the sweep's wiring never attached, a sweep handler failed and
+    the sweep switched itself off, or the read-only per-peer diagnostic
+    failed and stopped updating — the two failures are latched separately,
+    so a diagnostic failure does not switch the sweep off), not "nothing
+    needed closing". No `warnings` entry
     accompanies a `false` here, unlike churn — nothing hygiene does is a
     fault a user must act on, only a mitigation that has gone quiet.
   - `peers` — issue #283's own "diagnostic to run first when staleness
@@ -1035,7 +1048,9 @@ and is still never repaired. Each entry is a `DriftEntry`:
     `subscriptionChurn.peers`' "act now" view.
   - `closed` — cumulative sessions this node has force-closed since it
     started, by reason. Never decreases within a run. Only `superseded` can
-    be non-zero; `dead` and `rotated` are always 0 (see item 2 above).
+    be non-zero; `dead` and `rotated` are always 0 from bridge 0.17.5
+    (older bridges may report non-zero; see the "Removed in bridge 0.17.5"
+    note above).
 
   Every action is logged once (the session that closed, which peer, and its
   age/session-count at the moment of closure) — never silently.

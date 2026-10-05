@@ -419,24 +419,28 @@ export interface SessionHygienePeer {
 
 /**
  * §4.3 — sessions this node has force-closed since it started, by reason
- * (issue #283 "Finding 2"). Only `superseded` can be non-zero. Cumulative, never reset except by a restart —
- * the same "never decreases within a run" contract a counter earns just by
- * being a count of things that happened, not a snapshot of current state.
+ * (issue #283 "Finding 2"). From bridge 0.17.5 only `superseded` can be
+ * non-zero (older 0.17.0–0.17.4 bridges may report non-zero `dead`/`rotated`).
+ * Cumulative, never reset except by a restart — the same "never decreases
+ * within a run" contract a counter earns just by being a count of things that
+ * happened, not a snapshot of current state.
  */
 export interface SessionHygieneClosed {
     /** Older sessions closed because the same peer opened a newer one. */
     superseded: number;
     /**
-     * Always 0 (since bridge 0.17.5). Quiet subscription-free sessions used
-     * to be force-closed here; that sent the peer no CloseSession and made a
-     * polling controller (Alexa) stall ~15 s on its next command, so the
-     * close was removed. Kept on the wire only so the frame shape is stable.
+     * Always 0 from bridge 0.17.5 (older bridges may report non-zero). Quiet
+     * subscription-free sessions used to be force-closed here; that sent the
+     * peer no CloseSession and made a polling controller (Alexa) stall ~15 s
+     * on its next command, so the close was removed. Kept on the wire only
+     * so the frame shape is stable.
      */
     dead: number;
     /**
-     * Always 0 (since bridge 0.17.5). Age-based (4 h) rotation of
-     * subscription-free sessions was removed for the same reason as `dead`.
-     * Kept on the wire only so the frame shape is stable.
+     * Always 0 from bridge 0.17.5 (older bridges may report non-zero).
+     * Age-based (4 h) rotation of subscription-free sessions was removed for
+     * the same reason as `dead`. Kept on the wire only so the frame shape is
+     * stable.
      */
     rotated: number;
 }

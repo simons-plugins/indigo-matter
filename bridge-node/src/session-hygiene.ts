@@ -28,14 +28,14 @@
  * a NEW session already open, and the HAMH-proven behaviour is that it
  * re-subscribes over that one.
  *
- * **Why this is the ONLY close — the dead/rotated closes were REMOVED.**
+ * **Why the superseded sweep is the only close — the dead/rotated closes were REMOVED.**
  * Earlier versions also force-closed (a) "dead" sessions — zero
  * subscriptions, quiet for 60 s — and (b) "rotated" ones — zero
  * subscriptions, older than 4 h. Both were a bug. In matter.js 0.17.8
  * `NodeSession.initiateForceClose` sets `#isPeerLost`, so `close()` skips the
  * graceful-close emit and **no CloseSession is sent: the peer is never told
- * its session is gone**. A polling-only controller — Alexa never subscribes,
- * it reads on demand — therefore saw every session go "dead" 60 s after its
+ * its session is gone**. A controller whose session holds no subscription
+ * (Alexa's command/read session) was therefore treated as dead 60 s after its
  * last message and had it silently dropped, then sent its next voice command
  * into the void. The bridge logged "Ignoring message for unknown session";
  * the Echo retransmitted for ~15 s before falling back to CASE resume (235
@@ -45,8 +45,11 @@
  * away behind the controller's back.
  *
  * The #283 pile-up protection this leaves in place: the superseded sweep (cap
- * of one session per peer+fabric) plus matter.js's own per-peer cap and LRU
- * eviction for anything the sweep cannot see.
+ * of one session per peer+fabric), plus matter.js's own per-peer cap and LRU
+ * eviction for anything the sweep cannot see. Caveat: that LRU eviction
+ * (`SessionManager.js`, cap 5) also uses `initiateForceClose`, so the backstop
+ * is not free of the same silent drop; with the sweep holding one session per
+ * peer+fabric it should not trigger.
  *
  * **Considered and not built: a graceful close.** Sending a real
  * CloseSession before dropping a quiet session was weighed and rejected —
@@ -95,7 +98,10 @@ import type { SessionHygienePeer } from "./protocol.js";
 export type HygieneReason = "superseded";
 
 /**
- * A `NodeSession`, reduced to what this module's pure decisions need.
+ * A `NodeSession`, reduced to the plain fields this module works with.
+ * The superseded sweep decides from `createdAt`, the peer id and the fabric
+ * index only; `activeTimestamp` and `subscriptionCount` are informational
+ * (kept for tests and diagnostics) and no decision reads them.
  * `node.ts` builds these from the real matter.js objects; nothing here
  * imports matter.js so these fields are plain, clock-comparable numbers
  * rather than the branded `Timestamp` type matter.js declares them as
@@ -108,9 +114,9 @@ export interface SessionDescriptor {
     fabricIndex: number;
     /** `Session.createdAt` — ms since epoch, stamped once at construction. */
     createdAt: number;
-    /** `Session.activeTimestamp` — ms since epoch, last message RECEIVED. */
+    /** `Session.activeTimestamp` — ms since epoch, last message RECEIVED. Informational only; no decision reads it. */
     activeTimestamp: number;
-    /** `session.subscriptions.size` at the moment of the check. */
+    /** `session.subscriptions.size` at the moment of the check. Informational only; no decision reads it. */
     subscriptionCount: number;
 }
 
@@ -123,7 +129,7 @@ export interface HygieneClosure {
     /** The session's age at the moment of closure. */
     ageMs: number;
     /** How many sessions the peer held, including the new one. */
-    peerSessionCount?: number;
+    peerSessionCount: number;
 }
 
 /**

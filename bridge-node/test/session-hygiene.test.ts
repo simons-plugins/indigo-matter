@@ -20,6 +20,7 @@ const ECHO = "41869fbd537ef01";
 const OTHER_ECHO = "9f2c00114b3d201";
 const FABRIC = 2;
 const NOW = 1_700_000_000_000;
+const SIXTY_DAYS = 60 * 24 * 60 * 60 * 1000;
 
 function session(overrides: Partial<SessionDescriptor> & { sessionId: number }): SessionDescriptor {
     return {
@@ -32,7 +33,7 @@ function session(overrides: Partial<SessionDescriptor> & { sessionId: number }):
     };
 }
 
-describe("supersededSessions (issue #283 item 1)", () => {
+describe("supersededSessions (issue #283, the superseded sweep)", () => {
     it("closes every OTHER session for the peer, none of the just-opened one", () => {
         const peerSessions = [
             session({ sessionId: 1, createdAt: NOW - 10_000 }),
@@ -100,16 +101,42 @@ describe("no quiet/aged-session close decision exists (Alexa 15 s stall regressi
     });
 
     it("supersededSessions never selects a lone session, however quiet or old", () => {
+        // Far beyond any plausible quiet/age threshold (60 days each), so a
+        // mutation that merely raised the old 60 s / 4 h cut-offs still fails.
         const lone = session({
             sessionId: 1,
-            createdAt: NOW - 24 * 60 * 60 * 1000,
-            activeTimestamp: NOW - 60 * 60 * 1000,
+            createdAt: NOW - SIXTY_DAYS,
+            activeTimestamp: NOW - SIXTY_DAYS,
         });
         assert.deepEqual(supersededSessions([lone], 1), []);
     });
+
+    it("selects a quiet-and-old session only because a NEW session from the same peer superseded it", () => {
+        // Documents the intentional interaction: age and quiet time never
+        // choose a session, but a replacement from the same peer+fabric does.
+        const stale = session({
+            sessionId: 1,
+            createdAt: NOW - SIXTY_DAYS,
+            activeTimestamp: NOW - SIXTY_DAYS,
+        });
+        const fresh = session({ sessionId: 2, createdAt: NOW });
+        assert.deepEqual(supersededSessions([stale, fresh], 2).map(c => c.sessionId), [1]);
+    });
+
+    it("selects nothing from a subscribed session and a quiet subscription-free sibling absent a new session", () => {
+        // `justOpenedSessionId` is the sweep's only trigger: with no new
+        // session in the set there is nothing to supersede either sibling.
+        const subscribed = session({ sessionId: 1, subscriptionCount: 1, createdAt: NOW - SIXTY_DAYS });
+        const quietSibling = session({
+            sessionId: 2,
+            createdAt: NOW - SIXTY_DAYS,
+            activeTimestamp: NOW - SIXTY_DAYS,
+        });
+        assert.deepEqual(supersededSessions([subscribed, quietSibling], 999), []);
+    });
 });
 
-describe("peerSessionCounts (issue #283 item 5)", () => {
+describe("peerSessionCounts (issue #283, the per-peer diagnostic)", () => {
     it("groups by peer+fabric and sorts by peer id", () => {
         const sessions = [
             session({ sessionId: 1, peerNodeId: ECHO }),

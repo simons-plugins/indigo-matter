@@ -296,13 +296,23 @@ export class BridgeNode implements BridgeFacade {
     #sessionManager?: SessionManager;
     /**
      * One-way, mirroring {@link ChurnDetector.markBroken}: set the moment
-     * either the initial wiring or a later poll/event handler throws, and
-     * never cleared. Unlike churn, a broken hygiene detector raises no
+     * either the initial sweep wiring or a later `sessions.added` handler
+     * throws, and never cleared. Gates the superseded sweep itself (see
+     * {@link noteHygiene}). Unlike churn, a broken hygiene detector raises no
      * `warnings` entry — nothing here is a fault a user must act on, only a
      * mitigation that has gone quiet — but `sessionHygiene.checked: false`
      * still has to mean it, not "nothing to report".
      */
     #hygieneBroken = false;
+    /**
+     * One-way failure latch for the read-only per-peer diagnostic
+     * ({@link pollHygiene}) ALONE. Deliberately separate from
+     * {@link #hygieneBroken}: the diagnostic never closes anything, so a throw
+     * while counting sessions must not switch off the superseded sweep — the
+     * only remaining #283 mitigation. `sessionHygiene.checked` is false when
+     * EITHER latch is set.
+     */
+    #hygieneDiagnosticBroken = false;
     /**
      * Cumulative sessions this node has force-closed, by reason (§4.3). Never
      * reset except by a restart — a count of things that already happened,
@@ -1163,7 +1173,9 @@ export class BridgeNode implements BridgeFacade {
      * events behind it, so hygiene goes one-way broken rather than carrying
      * on from a state it knows is short.
      *
-     * Self-gates on `#hygieneBroken` FIRST, before `update` ever runs — the
+     * Self-gates on `#hygieneBroken` (the sweep's own latch; NOT the
+     * diagnostic's, see {@link #hygieneDiagnosticBroken}) FIRST, before
+     * `update` ever runs — the
      * same discipline every {@link ChurnDetector} method opens with for
      * `#broken` (`churn.ts`). Without this, `checked: false` documented
      * (BRIDGE_PROTOCOL §4.3) "no automatic sweep is running" while the
@@ -1189,7 +1201,7 @@ export class BridgeNode implements BridgeFacade {
         }
     }
 
-    /** A live `NodeSession`, reduced to what `session-hygiene.ts`'s pure decisions need. */
+    /** A live `NodeSession`, reduced to what `session-hygiene.ts`'s descriptor carries. */
     private describeSession(session: NodeSession): SessionDescriptor {
         return {
             sessionId: session.id,
@@ -1202,10 +1214,10 @@ export class BridgeNode implements BridgeFacade {
     }
 
     /**
-     * Issue #283 "Finding 2" item 1, the core deliverable: `justOpened` is a
-     * peer's newly-added CASE session, so every OTHER live, non-PASE session
-     * for that same peer+fabric is a candidate to close — the same
-     * `peerNodeIdHex`/`fabricIndexOf` identity `churn.ts`'s wiring already
+     * Issue #283 "Finding 2", the core deliverable (the superseded sweep):
+     * `justOpened` is a peer's newly-added CASE session, so every OTHER live,
+     * non-PASE session for that same peer+fabric is a candidate to close — the
+     * same `peerNodeIdHex`/`fabricIndexOf` identity `churn.ts`'s wiring already
      * groups sessions by.
      *
      * **Deliberately closes a superseded session even while it still holds a
@@ -1213,10 +1225,15 @@ export class BridgeNode implements BridgeFacade {
      * whole point here, because the controller that just opened `justOpened`
      * has, by definition, a NEW session to fall back to — the HAMH-proven
      * behaviour is that it re-subscribes over it. This is also why it is the
-     * ONLY session this node ever closes: a session the peer has NOT
+     * only KIND of session this node closes: a session the peer has NOT
      * replaced (quiet or old) is never closed, because force-close sends no
      * CloseSession and a polling controller (Alexa) would stall ~15 s on
      * its next command — see `session-hygiene.ts`'s module docstring.
+     *
+     * Caveat: matter.js's own per-peer LRU eviction (`SessionManager.js`,
+     * cap 5) also uses `initiateForceClose`, so that backstop is not free of
+     * the same silent drop. With this sweep holding one session per
+     * peer+fabric it should not trigger.
      */
     private sweepSuperseded(sessions: SessionManager, justOpened: NodeSession): void {
         const peerId = peerNodeIdHex(justOpened);
@@ -1309,8 +1326,8 @@ export class BridgeNode implements BridgeFacade {
     }
 
     /**
-     * §4.3 — the per-peer live-session diagnostic (issue #283 "Finding 2"
-     * item 5). **Diagnostics only: this never closes anything.** The
+     * §4.3 — the per-peer live-session diagnostic (issue #283 "Finding 2").
+     * **Diagnostics only: this never closes anything.** The
      * dead-session and age-rotation closes it used to run were removed — a
      * force-close sends the peer no CloseSession, so a polling controller
      * (Alexa) would send its next command into a dropped session and stall
@@ -1321,7 +1338,7 @@ export class BridgeNode implements BridgeFacade {
      * already established — not a new timer.
      */
     private pollHygiene(): SessionHygiene {
-        if (this.#hygieneBroken || this.#sessionManager === undefined) {
+        if (this.#hygieneBroken || this.#hygieneDiagnosticBroken || this.#sessionManager === undefined) {
             return { checked: false, peers: [], closed: { ...this.#hygieneClosed } };
         }
         try {
@@ -1338,9 +1355,14 @@ export class BridgeNode implements BridgeFacade {
             const peers = peerSessionCounts(descriptors);
             return { checked: true, peers, closed: { ...this.#hygieneClosed } };
         } catch (error) {
-            this.#hygieneBroken = true;
+            // The diagnostic's own latch only: the superseded sweep keeps
+            // running (it is not read-only, and does not depend on this).
+            this.#hygieneDiagnosticBroken = true;
             try {
-                this.log(`Session hygiene FAILED and is no longer watching the session layer: ${describeError(error)}`);
+                this.log(
+                    "Session hygiene per-peer diagnostic FAILED (the superseded sweep is unaffected): "
+                    + describeError(error),
+                );
             } catch {
                 // The logger itself failed; there is nowhere left to report.
             }

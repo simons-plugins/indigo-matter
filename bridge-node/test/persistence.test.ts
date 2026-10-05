@@ -1534,7 +1534,7 @@ async function flushHygiene(): Promise<void> {
     await new Promise(resolve => setTimeout(resolve, 0));
 }
 
-describe("the wired session-hygiene superseded sweep (issue #283 item 1)", () => {
+describe("the wired session-hygiene superseded sweep (issue #283 Finding 2)", () => {
     it("closes the peer's older session when it opens a new one, and never touches another peer's", async () => {
         const session = await boot(storage());
         try {
@@ -1601,8 +1601,9 @@ describe("the wired session-hygiene superseded sweep (issue #283 item 1)", () =>
  * Regression for the Alexa ~15 s first-command stall (CHANGELOG 2026.32.9).
  *
  * `initiateForceClose` raises NO CloseSession toward the peer (matter.js
- * 0.17.8 sets `#isPeerLost`, so `close()` skips `gracefulClose`). A polling
- * controller (Alexa never subscribes) therefore kept using a session the
+ * 0.17.8 sets `#isPeerLost`, so `close()` skips `gracefulClose`). A controller
+ * whose session holds no subscription (Alexa's command/read session) was
+ * treated as dead 60 s after its last message, but kept using the session the
  * bridge had silently dropped; its next command was ignored as "unknown
  * session" until the Echo's ~15 s retransmit gave up and did CASE resume.
  * The old dead (quiet >= 60 s) and rotated (age >= 4 h) closes did exactly
@@ -1628,23 +1629,39 @@ function fatalCloseSession(
 }
 
 describe("quiet and aged sessions are never closed (Alexa 15 s stall regression)", () => {
-    const TEN_MINUTES = 10 * 60 * 1000;
-    const FIVE_HOURS = 5 * 60 * 60 * 1000;
+    // (Two sessions of one peer cannot coexist at node level: matter.js adds
+    // them one at a time and the second add supersedes the first, so the
+    // "subscribed session beside a quiet sibling" case is a pure-function
+    // test in session-hygiene.test.ts.)
+    // Deliberately enormous (60 days, quiet and age): a closer that merely
+    // raised the old 60 s / 4 h thresholds (to 15 min / 6 h, a day, ...)
+    // must still fail these tests.
+    const SIXTY_DAYS = 60 * 24 * 60 * 60 * 1000;
+    // Several polls, not two, so a "close after N polls" closer is caught too.
+    const POLLS = 5;
 
-    it("leaves a subscription-free session quiet for 10 minutes alone, still listed and uncounted as closed", async () => {
+    async function pollRepeatedly(bridge: BridgeNode): Promise<ReturnType<BridgeNode["getStatus"]>> {
+        let status = bridge.getStatus();
+        for (let i = 1; i < POLLS; i++) {
+            await flushHygiene();
+            status = bridge.getStatus();
+        }
+        await flushHygiene();
+        return status;
+    }
+
+    it("leaves a subscription-free session quiet for 60 days alone, still listed and uncounted as closed", async () => {
         const session = await boot(storage());
         try {
             const manager = session.bridge.server.env.get(SessionManager);
             const quiet = fatalCloseSession(manager.sessions, {
                 id: 9530,
                 peerNodeId: 0x1111n,
-                activeTimestamp: Date.now() - TEN_MINUTES,
+                activeTimestamp: Date.now() - SIXTY_DAYS,
             });
             manager.sessions.add(quiet as unknown as NodeSession);
 
-            session.bridge.getStatus();
-            await flushHygiene();
-            const status = session.bridge.getStatus();
+            const status = await pollRepeatedly(session.bridge);
             assert.deepEqual(quiet.closeAttempts, [], "a quiet polling-controller session must not be closed");
             assert.equal(status.sessionHygiene.checked, true);
             assert.deepEqual(status.sessionHygiene.closed, { superseded: 0, dead: 0, rotated: 0 });
@@ -1655,20 +1672,18 @@ describe("quiet and aged sessions are never closed (Alexa 15 s stall regression)
         }
     });
 
-    it("leaves a subscription-free session older than 4 hours alone, still listed and uncounted as closed", async () => {
+    it("leaves a subscription-free session aged 60 days alone, still listed and uncounted as closed", async () => {
         const session = await boot(storage());
         try {
             const manager = session.bridge.server.env.get(SessionManager);
             const old = fatalCloseSession(manager.sessions, {
                 id: 9550,
                 peerNodeId: 0x3333n,
-                createdAt: Date.now() - FIVE_HOURS,
+                createdAt: Date.now() - SIXTY_DAYS,
             });
             manager.sessions.add(old as unknown as NodeSession);
 
-            session.bridge.getStatus();
-            await flushHygiene();
-            const status = session.bridge.getStatus();
+            const status = await pollRepeatedly(session.bridge);
             assert.deepEqual(old.closeAttempts, [], "an aged subscription-free session must not be rotated");
             assert.equal(status.sessionHygiene.checked, true);
             assert.deepEqual(status.sessionHygiene.closed, { superseded: 0, dead: 0, rotated: 0 });
@@ -1687,29 +1702,56 @@ describe("quiet and aged sessions are never closed (Alexa 15 s stall regression)
                 fatalCloseSession(manager.sessions, {
                     id: 9540,
                     peerNodeId: 0x2222n,
-                    createdAt: Date.now() - FIVE_HOURS,
-                    activeTimestamp: Date.now() - TEN_MINUTES,
+                    createdAt: Date.now() - SIXTY_DAYS,
+                    activeTimestamp: Date.now() - SIXTY_DAYS,
                     subscriptionCount: 1,
                 }),
                 fatalCloseSession(manager.sessions, {
                     id: 9541,
                     peerNodeId: 0x2223n,
-                    createdAt: Date.now() - FIVE_HOURS,
-                    activeTimestamp: Date.now() - TEN_MINUTES,
+                    createdAt: Date.now() - SIXTY_DAYS,
+                    activeTimestamp: Date.now() - SIXTY_DAYS,
                 }),
             ];
             for (const fake of sessions) {
                 manager.sessions.add(fake as unknown as NodeSession);
             }
 
-            session.bridge.getStatus();
-            await flushHygiene();
-            const status = session.bridge.getStatus();
+            const status = await pollRepeatedly(session.bridge);
             for (const fake of sessions) {
                 assert.deepEqual(fake.closeAttempts, []);
             }
             assert.deepEqual(status.sessionHygiene.closed, { superseded: 0, dead: 0, rotated: 0 });
             assert.equal(status.sessionHygiene.peers.length, 2);
+        } finally {
+            await session.close();
+        }
+    });
+
+    it("DOES close a quiet, old session once the same peer opens a NEW session (superseded sweep, intentional)", async () => {
+        const session = await boot(storage());
+        try {
+            const manager = session.bridge.server.env.get(SessionManager);
+            const stale = hygieneSession(manager.sessions, {
+                id: 9544,
+                peerNodeId: 0x2225n,
+                createdAt: Date.now() - SIXTY_DAYS,
+                activeTimestamp: Date.now() - SIXTY_DAYS,
+            });
+            manager.sessions.add(stale as unknown as NodeSession);
+            // Quiet and old alone does nothing, however often we poll...
+            await pollRepeatedly(session.bridge);
+            assert.equal(stale.forceCloseCount, 0, "quiet+old alone must not close it");
+
+            // ...but a replacement from the same peer+fabric supersedes it.
+            const fresh = hygieneSession(manager.sessions, { id: 9545, peerNodeId: 0x2225n });
+            manager.sessions.add(fresh as unknown as NodeSession);
+            const status = await pollRepeatedly(session.bridge);
+            assert.equal(stale.forceCloseCount, 1, "the superseded sweep closes it");
+            assert.equal(fresh.forceCloseCount, 0);
+            assert.equal(status.sessionHygiene.closed.superseded, 1);
+            assert.equal(status.sessionHygiene.closed.dead, 0);
+            assert.equal(status.sessionHygiene.closed.rotated, 0);
         } finally {
             await session.close();
         }
@@ -1768,10 +1810,13 @@ describe("closeSession's async-outcome discipline (issue #283 review, Finding 2)
             };
             manager.sessions.add(flaky as unknown as NodeSession);
 
-            // The superseded sweep is the only remaining closer: the same
-            // peer opening a newer session selects `flaky`.
-            const newer = hygieneSession(manager.sessions, { id: 9561, peerNodeId: 0x4444n });
-            manager.sessions.add(newer as unknown as NodeSession);
+            // Sequence: (1) `replacement` (9561) opens and its superseded
+            // sweep selects `flaky` (9560), whose close is rejected; the
+            // assertions up to "second" below are about that rejected close.
+            // (2) A later session (9562) opens, and THAT sweep closes
+            // `replacement` (the healthy one, the only close ever counted).
+            const replacement = hygieneSession(manager.sessions, { id: 9561, peerNodeId: 0x4444n });
+            manager.sessions.add(replacement as unknown as NodeSession);
 
             const first = bridge.getStatus();
             assert.equal(first.sessionHygiene.closed.superseded, 0,
@@ -1799,7 +1844,8 @@ describe("closeSession's async-outcome discipline (issue #283 review, Finding 2)
 
             // A later session-open for the same peer re-runs the sweep.
             // `flaky` is `isClosing` (set before the rejection), so it must
-            // not be re-selected; `newer`, a healthy older session, is.
+            // not be re-selected; `replacement`, now a healthy older session
+            // superseded by 9562, is.
             manager.sessions.add(hygieneSession(manager.sessions, { id: 9562, peerNodeId: 0x4444n }) as unknown as NodeSession);
             await flushHygiene();
             assert.equal(flaky.closeAttempts, 1,
@@ -1889,6 +1935,57 @@ describe("the #hygieneBroken latch actually stops the sweep (issue #283 review, 
             assert.equal(healthySecond.forceCloseCount, 0);
             assert.deepEqual(session.bridge.getStatus().sessionHygiene.closed,
                 { superseded: 0, dead: 0, rotated: 0 });
+        } finally {
+            await session.close();
+        }
+    });
+});
+
+describe("the per-peer diagnostic's failure latch is separate from the sweep's", () => {
+    it("a throw in the read-only diagnostic reports checked:false but a later session-open still sweeps a superseded session", async () => {
+        const session = await boot(storage());
+        try {
+            const manager = session.bridge.server.env.get(SessionManager);
+            // A session whose `subscriptions.size` throws only once armed:
+            // healthy when the sweep looks at it on its own add, then it
+            // breaks `pollHygiene`'s per-peer count (`describeSession`).
+            let armed = false;
+            const bomb = hygieneSession(manager.sessions, { id: 9600, peerNodeId: 0x8888n });
+            const inert = { on: () => {}, off: () => {} };
+            bomb.subscriptions = {
+                has: () => false,
+                add: () => {},
+                delete: () => {},
+                get size(): number {
+                    if (armed) {
+                        throw new Error("subscriptions.size unreadable");
+                    }
+                    return 0;
+                },
+                added: inert,
+                deleted: inert,
+            };
+            manager.sessions.add(bomb as unknown as NodeSession);
+            assert.equal(session.bridge.getStatus().sessionHygiene.checked, true,
+                "nothing has failed yet");
+
+            armed = true;
+            const broken = session.bridge.getStatus();
+            assert.equal(broken.sessionHygiene.checked, false, "a diagnostic failure must report unchecked");
+            assert.deepEqual(broken.sessionHygiene.peers, []);
+
+            // The sweep, a DIFFERENT peer's pair, must still run.
+            const older = hygieneSession(manager.sessions, { id: 9601, peerNodeId: 0x9999n });
+            manager.sessions.add(older as unknown as NodeSession);
+            const newer = hygieneSession(manager.sessions, { id: 9602, peerNodeId: 0x9999n });
+            manager.sessions.add(newer as unknown as NodeSession);
+            await flushHygiene();
+            assert.equal(older.forceCloseCount, 1,
+                "the diagnostic's failure must not switch the superseded sweep off");
+            assert.equal(newer.forceCloseCount, 0);
+            const after = session.bridge.getStatus();
+            assert.equal(after.sessionHygiene.closed.superseded, 1);
+            assert.equal(after.sessionHygiene.checked, false, "the diagnostic stays latched broken");
         } finally {
             await session.close();
         }
