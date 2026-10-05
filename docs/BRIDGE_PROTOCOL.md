@@ -139,6 +139,22 @@ rather than re-explained at every call site.
   not yet acknowledged. There is no Matter close/goodbye exchange initiated
   with the peer — that is the accurate claim — but "no network send"
   overstated it.
+
+  **Why that matters, and why only the superseded sweep closes sessions
+  (bridge 0.17.5).** `initiateForceClose` sets `#isPeerLost` on the
+  `NodeSession`, so `close()` skips `gracefulClose.emit()`: **no
+  CloseSession is sent, and the peer is never told its session is gone.**
+  Earlier versions of `session-hygiene.ts` also force-closed subscription-free
+  sessions after 60 s of quiet ("dead") and after 4 h of age ("rotated").
+  Alexa never subscribes — it polls — so every Echo session was "dead" a
+  minute after its last message and was dropped behind its back; the next
+  voice command was sent on the dead session, the bridge logged "Ignoring
+  message for unknown session", and the Echo retransmitted for ~15 s before
+  doing CASE resume (235 stalls measured, median 15.3 s). Those two closes
+  were removed. The superseded sweep is safe because the peer opened the
+  replacement session itself. A graceful (CloseSession) close was considered
+  and not built: a controller's reaction to one cannot be verified from here,
+  and it would still end a session a polling controller regards as healthy.
 - **(m) The wedge-watchdog signal (Finding 2 item 4) is NOT publicly
   observable — confirmed, not assumed.** `MessageExchange.onMessageReceived`
   calls `this.#notifyActivity(true)` (which sets `Session.activeTimestamp`)
@@ -157,7 +173,10 @@ rather than re-explained at every call site.
   exactly why item 4 is not built (see `session-hygiene.ts`'s module
   docstring).
 - **(n) A `ServerSubscription` cannot be rebound to a replacement session —
-  age-based rotation is therefore restricted to subscription-free sessions.**
+  so closing a session the peer has not replaced strands its subscription.**
+  (This was the original reason age-based rotation was restricted to
+  subscription-free sessions; rotation itself has since been removed
+  entirely, see (l).)
   `ServerSubscription.session` (`ServerSubscription.ts:207-209`) returns
   `this.#context.session`, a `readonly` field (`ServerSubscription.ts:131`)
   fixed once at construction and never reassigned anywhere in the class.
@@ -171,8 +190,7 @@ rather than re-explained at every call site.
   instance of the exact staleness pattern #283 exists to fix. No live
   hardware was available to this probe to confirm what a real controller
   does when that happens, and the source reading above is sufficient reason
-  not to risk finding out in production: `rotatableSessions` (below) only
-  ever selects sessions with zero live subscriptions.
+  not to risk finding out in production.
 - **(o) Finding 1, confirmed directly in this repo's installed 0.17.8 (not
   taken on the HAMH maintainer's word alone).**
   `ServerSubscription.ts:830`'s `#sendUpdateMessage` calls
@@ -967,13 +985,13 @@ and is still never repaired. Each entry is a `DriftEntry`:
   ```json
   {"checked": true,
    "peers": [{"peerNodeId": "41869fbd537ef01", "fabricIndex": 2, "liveSessions": 2}],
-   "closed": {"superseded": 4, "dead": 1, "rotated": 0}}
+   "closed": {"superseded": 4, "dead": 0, "rotated": 0}}
   ```
 
   Unlike `subscriptionChurn`, this feature **acts** — it does not merely
   report — through matter.js's public session-layer API, no dependency
   patching (§0(k)/(l); see `bridge-node/src/session-hygiene.ts` for the full
-  design and its citations):
+  design and its citations). Exactly one mechanism closes sessions:
 
   1. **Superseded-session sweep** — the moment a peer opens a new CASE
      session, its OLDER ones are closed immediately. This is the core
@@ -984,23 +1002,21 @@ and is still never repaired. Each entry is a `DriftEntry`:
      too high to prevent the defect from biting.
 
      **Closes a superseded session even while it still holds a live
-     subscription — deliberately**, the opposite rule from items 2/3 below.
-     Orphaning the old session's subscription is the point, not a risk to
-     mitigate: the peer that superseded it has, by definition, a NEW session
-     already open, and the HAMH-proven behaviour is that it re-subscribes
-     over that one. Items 2/3 have no such replacement in hand for the
-     session they close — stranding a subscription there, with nothing for
-     the controller to fall back to, would be the exact staleness pattern
-     this mechanism exists to prevent. Same bet, opposite session, hence the
-     opposite rule.
-  2. **Dead-session force-close** — a CASE session holding zero
-     subscriptions, quiet for 60s, is closed.
-  3. **Age-based rotation** — a subscription-FREE CASE session older than 4h
-     is closed. Deliberately narrower than closing any old session: §0(n)
-     establishes that a `ServerSubscription` is bound for life to the
-     session it was created on, so rotating a session under a live
-     subscription would strand it, not migrate it.
-  4. A fourth mechanism (a "wedge watchdog" for a controller that keeps
+     subscription — deliberately.** Orphaning the old session's subscription
+     is the point, not a risk to mitigate: the peer that superseded it has,
+     by definition, a NEW session already open, and the HAMH-proven behaviour
+     is that it re-subscribes over that one.
+  2. **Removed in bridge 0.17.5 — dead-session force-close and age-based
+     rotation.** Quiet (60 s) and old (4 h) subscription-free sessions are
+     **no longer closed**. Force-close sends the peer no CloseSession (§0(l)),
+     so a polling-only controller (Alexa) sent its next command into a
+     session the bridge had silently dropped and stalled ~15 s before CASE
+     resume. A session the peer has not replaced is never closed; matter.js's
+     own per-peer cap/LRU eviction (§0(k)) remains the backstop. The
+     `closed.dead` and `closed.rotated` fields stay on the wire so the frame
+     shape is stable, but are **always 0** — a client must not treat them as
+     live signals.
+  3. A mechanism (a "wedge watchdog" for a controller that keeps
      MRP-acking pushed reports while it has stopped issuing new requests) was
      assessed and **not built** — §0(m) traces exactly which matter.js
      internal would need to become public for it to be possible, and it is
@@ -1018,11 +1034,11 @@ and is still never repaired. Each entry is a `DriftEntry`:
     standing view of a pile *forming*, complementing
     `subscriptionChurn.peers`' "act now" view.
   - `closed` — cumulative sessions this node has force-closed since it
-    started, by reason. Never decreases within a run.
+    started, by reason. Never decreases within a run. Only `superseded` can
+    be non-zero; `dead` and `rotated` are always 0 (see item 2 above).
 
-  Every action is logged once (the session that closed, which peer, why, and
-  its age/quiet-time/session-count at the moment of closure) — never
-  silently.
+  Every action is logged once (the session that closed, which peer, and its
+  age/session-count at the moment of closure) — never silently.
 
 `endpoints[].role` is one of the §4.2 enum; `endpoints[].publishedAs` is
 issues #219/#240's accessory identity (§4.1) — informational here, tolerantly

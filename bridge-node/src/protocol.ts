@@ -419,16 +419,25 @@ export interface SessionHygienePeer {
 
 /**
  * §4.3 — sessions this node has force-closed since it started, by reason
- * (issue #283 "Finding 2"). Cumulative, never reset except by a restart —
+ * (issue #283 "Finding 2"). Only `superseded` can be non-zero. Cumulative, never reset except by a restart —
  * the same "never decreases within a run" contract a counter earns just by
  * being a count of things that happened, not a snapshot of current state.
  */
 export interface SessionHygieneClosed {
     /** Older sessions closed because the same peer opened a newer one. */
     superseded: number;
-    /** Subscription-free sessions closed after going quiet. */
+    /**
+     * Always 0 (since bridge 0.17.5). Quiet subscription-free sessions used
+     * to be force-closed here; that sent the peer no CloseSession and made a
+     * polling controller (Alexa) stall ~15 s on its next command, so the
+     * close was removed. Kept on the wire only so the frame shape is stable.
+     */
     dead: number;
-    /** Subscription-free sessions closed for being past the age ceiling. */
+    /**
+     * Always 0 (since bridge 0.17.5). Age-based (4 h) rotation of
+     * subscription-free sessions was removed for the same reason as `dead`.
+     * Kept on the wire only so the frame shape is stable.
+     */
     rotated: number;
 }
 
@@ -443,7 +452,7 @@ export interface SessionHygiene {
     /**
      * Whether the hygiene machinery could observe/act on the session layer
      * at all. `false` is NOT "nothing to report" — it means the wiring never
-     * attached, so no automatic sweep is running and the counts below are
+     * attached, so no automatic superseded sweep is running and the counts below are
      * frozen at whatever they last were (0, on a node that never wired at
      * all). Same discipline `SubscriptionChurn.checked` uses, deliberately:
      * the two features share the same `SessionManager` dependency and fail

@@ -9,13 +9,9 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
+import * as hygiene from "../src/session-hygiene.js";
 import {
-    DEAD_SESSION_QUIET_MS,
-    deadSessions,
     peerSessionCounts,
-    periodicSweep,
-    rotatableSessions,
-    SESSION_MAX_AGE_MS,
     type SessionDescriptor,
     supersededSessions,
 } from "../src/session-hygiene.js";
@@ -73,11 +69,11 @@ describe("supersededSessions (issue #283 item 1)", () => {
         assert.deepEqual(supersededSessions([session({ sessionId: 1 })], 1), []);
     });
 
-    it("closes a superseded session even while it holds a live subscription — deliberately, unlike deadSessions/rotatableSessions", () => {
+    it("closes a superseded session even while it holds a live subscription — deliberately: the peer holds the replacement", () => {
         // The bet: `justOpened` (session 2) IS the replacement the controller
         // will re-subscribe over, so orphaning session 1's subscription here
         // is the intended outcome — not an oversight `subscriptionCount`
-        // should have guarded against, the way it does for items 2/3.
+        // should have guarded against.
         const peerSessions = [
             session({ sessionId: 1, createdAt: NOW - 10_000, subscriptionCount: 1 }),
             session({ sessionId: 2, createdAt: NOW }),
@@ -87,94 +83,29 @@ describe("supersededSessions (issue #283 item 1)", () => {
     });
 });
 
-describe("deadSessions (issue #283 item 2)", () => {
-    it("closes a subscription-free session quiet for the full window", () => {
-        const sessions = [session({ sessionId: 1, activeTimestamp: NOW - DEAD_SESSION_QUIET_MS })];
-        const closures = deadSessions(sessions, NOW);
-        assert.equal(closures.length, 1);
-        assert.equal(closures[0]!.reason, "dead");
-        assert.equal(closures[0]!.quietMs, DEAD_SESSION_QUIET_MS);
+describe("no quiet/aged-session close decision exists (Alexa 15 s stall regression)", () => {
+    it("exports no dead/rotated/periodic closer — superseded is the only reason a session is ever closed", () => {
+        // `initiateForceClose` sends the peer no CloseSession, so a close
+        // decided from quiet-time or age alone silently drops a session a
+        // polling controller still believes in. See the module docstring.
+        for (const removed of [
+            "deadSessions",
+            "rotatableSessions",
+            "periodicSweep",
+            "DEAD_SESSION_QUIET_MS",
+            "SESSION_MAX_AGE_MS",
+        ]) {
+            assert.equal(removed in hygiene, false, `${removed} must stay removed`);
+        }
     });
 
-    it("never closes a session that holds a subscription, however quiet", () => {
-        const sessions = [
-            session({ sessionId: 1, activeTimestamp: NOW - DEAD_SESSION_QUIET_MS * 10, subscriptionCount: 1 }),
-        ];
-        assert.deepEqual(deadSessions(sessions, NOW), []);
-    });
-
-    it("does not close a subscription-free session inside the quiet window", () => {
-        const sessions = [session({ sessionId: 1, activeTimestamp: NOW - (DEAD_SESSION_QUIET_MS - 1) })];
-        assert.deepEqual(deadSessions(sessions, NOW), []);
-    });
-
-    it("respects a custom quiet threshold", () => {
-        const sessions = [session({ sessionId: 1, activeTimestamp: NOW - 5_000 })];
-        assert.equal(deadSessions(sessions, NOW, 5_000).length, 1);
-        assert.equal(deadSessions(sessions, NOW, 5_001).length, 0);
-    });
-});
-
-describe("rotatableSessions (issue #283 item 3)", () => {
-    it("closes a subscription-free session past the age ceiling", () => {
-        const sessions = [session({ sessionId: 1, createdAt: NOW - SESSION_MAX_AGE_MS })];
-        const closures = rotatableSessions(sessions, NOW);
-        assert.equal(closures.length, 1);
-        assert.equal(closures[0]!.reason, "rotated");
-        assert.equal(closures[0]!.ageMs, SESSION_MAX_AGE_MS);
-    });
-
-    it("never closes a session that holds a subscription, however old — §0(n)", () => {
-        // A ServerSubscription's `#context.session` is fixed at construction
-        // and never reassigned: force-closing the session it lives on would
-        // strand the subscription, not migrate it. See session-hygiene.ts's
-        // module docstring / docs/BRIDGE_PROTOCOL.md §0(n).
-        const sessions = [
-            session({ sessionId: 1, createdAt: NOW - SESSION_MAX_AGE_MS * 10, subscriptionCount: 1 }),
-        ];
-        assert.deepEqual(rotatableSessions(sessions, NOW), []);
-    });
-
-    it("does not close a subscription-free session inside the age ceiling", () => {
-        const sessions = [session({ sessionId: 1, createdAt: NOW - (SESSION_MAX_AGE_MS - 1) })];
-        assert.deepEqual(rotatableSessions(sessions, NOW), []);
-    });
-
-    it("respects a custom age ceiling", () => {
-        const sessions = [session({ sessionId: 1, createdAt: NOW - 3_600_000 })];
-        assert.equal(rotatableSessions(sessions, NOW, 3_600_000).length, 1);
-        assert.equal(rotatableSessions(sessions, NOW, 3_600_001).length, 0);
-    });
-});
-
-describe("periodicSweep (issue #283 items 2+3 combined)", () => {
-    it("reports a session that is both dead and past the age ceiling ONCE, as dead", () => {
-        const sessions = [
-            session({
-                sessionId: 1,
-                createdAt: NOW - SESSION_MAX_AGE_MS * 2,
-                activeTimestamp: NOW - DEAD_SESSION_QUIET_MS,
-            }),
-        ];
-        const closures = periodicSweep(sessions, NOW);
-        assert.equal(closures.length, 1);
-        assert.equal(closures[0]!.reason, "dead");
-    });
-
-    it("closes an independent dead session and an independent rotated session, both", () => {
-        const sessions = [
-            session({ sessionId: 1, activeTimestamp: NOW - DEAD_SESSION_QUIET_MS }), // dead, young
-            session({ sessionId: 2, createdAt: NOW - SESSION_MAX_AGE_MS, activeTimestamp: NOW }), // old, active
-        ];
-        const closures = periodicSweep(sessions, NOW);
-        const byId = new Map(closures.map(c => [c.sessionId, c.reason]));
-        assert.equal(byId.get(1), "dead");
-        assert.equal(byId.get(2), "rotated");
-    });
-
-    it("closes nothing for a healthy, young, subscribed session", () => {
-        const sessions = [session({ sessionId: 1, subscriptionCount: 1 })];
-        assert.deepEqual(periodicSweep(sessions, NOW), []);
+    it("supersededSessions never selects a lone session, however quiet or old", () => {
+        const lone = session({
+            sessionId: 1,
+            createdAt: NOW - 24 * 60 * 60 * 1000,
+            activeTimestamp: NOW - 60 * 60 * 1000,
+        });
+        assert.deepEqual(supersededSessions([lone], 1), []);
     });
 });
 

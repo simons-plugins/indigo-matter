@@ -663,8 +663,8 @@ class BridgeHealthReporter:
                 self._hygiene_warned = True
                 self._bridge._logger.warning(
                     "Matter bridge: session hygiene has stopped watching the bridge node's "
-                    "session layer — the superseded/dead/rotated-session mitigations for "
-                    "issue #283 are no longer running. Restart the Matter bridge node to "
+                    "session layer — the superseded-session mitigation for "
+                    "issue #283 is no longer running. Restart the Matter bridge node to "
                     "restore it.")
             return
         if self._hygiene_warned:
