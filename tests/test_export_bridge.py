@@ -3352,6 +3352,7 @@ class TestSessionHygiene:
         a "delta" from an assumed all-zero start would misreport a node that
         had already been closing sessions before this plugin session began."""
         h = self._harness(bridge_mod, mock_logger, devices)
+        # pre-0.17.5 bridge shape: `dead` is non-zero only on older bridges.
         hygiene = {"checked": True, "peers": [], "closed": {"superseded": 4, "dead": 1, "rotated": 0}}
         h.bridge._on_attached(self._status(hygiene), False)
         assert "session hygiene closed" not in debugs_of(mock_logger)
@@ -3363,6 +3364,7 @@ class TestSessionHygiene:
         second = {
             "checked": True,
             "peers": [{"peerNodeId": "41869fbd537ef01", "fabricIndex": 2, "liveSessions": 2}],
+            # pre-0.17.5 bridge shape: `dead` is non-zero only on older bridges.
             "closed": {"superseded": 4, "dead": 1, "rotated": 0},
         }
         h.bridge._on_attached(self._status(first), False)

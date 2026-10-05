@@ -481,6 +481,12 @@ class SessionHygienePeer:
 class SessionHygieneClosed:
     """Sessions this node has force-closed since it started, by reason
     (§4.3, issue #283 "Finding 2"). Cumulative — never decreases within a run.
+
+    From bridge 0.17.5 only ``superseded`` can be non-zero: ``dead`` and
+    ``rotated`` are kept for frame-shape stability and are always 0 (the
+    quiet/age closes were removed because a force-close sends the peer no
+    CloseSession). Older 0.17.0-0.17.4 bridges may still report non-zero
+    ``dead``/``rotated``.
     """
     superseded: int = 0
     dead: int = 0

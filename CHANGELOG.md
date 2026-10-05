@@ -3,6 +3,39 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
+## 2026.32.9 — Alexa no longer stalls ~15 s on the first command after a minute of quiet
+
+- Fixed: the first command after a minute or more of quiet could take ~15
+  seconds to run from Alexa (and any other controller that polls rather than
+  subscribes). The bridge was silently dropping a controller's session once
+  it had been quiet for 60 seconds, without telling the controller. The next
+  command went out on a session the bridge no longer had; the bridge ignored
+  it, and the Echo kept retransmitting for ~15 s before it gave up and
+  reconnected. Measured on a real home: 235 such stalls, median 15.3 s.
+- What changed: the bridge no longer closes sessions just because they are
+  quiet (60 s) or old (4 h). The one cleanup that remains is unchanged: when
+  a controller opens a NEW session, its older sessions are closed. That is
+  safe because the controller already holds the replacement. matter.js's own
+  per-controller session cap remains as a backstop, though it also closes
+  sessions silently; with one session per controller it should not trigger.
+- The `sessionHygiene.closed.dead` and `closed.rotated` counters in the
+  bridge's status report are kept so the frame shape does not change, but
+  they are now always 0.
+- **Bridge package 0.17.5 must be published to npm and the plugin's
+  `DEFAULT_INSTALL_SPEC` pin moved to it before this reaches users**; this
+  release only carries the source change, the docs and the version bumps.
+- Technical note: `NodeSession.initiateForceClose` sets `#isPeerLost` in
+  matter.js 0.17.8, so `close()` skips `gracefulClose` and no CloseSession is
+  sent. `session-hygiene.ts` therefore lost `deadSessions`, `rotatableSessions`,
+  `periodicSweep`, `DEAD_SESSION_QUIET_MS` and `SESSION_MAX_AGE_MS`;
+  `pollHygiene` is now diagnostics-only (per-peer live-session counts). A
+  graceful CloseSession was considered and not built (a controller's
+  reaction cannot be verified from here, and it would still end a session a
+  polling controller regards as healthy); raising the quiet threshold would
+  only have reduced the stall's frequency. The log warning when hygiene stops
+  watching now names only the superseded-session mitigation. A failure in the
+  read-only per-peer diagnostic no longer switches the superseded sweep off.
+
 ## 2026.32.8 — storage-lock crash-loop: a correct, corroborated diagnosis
 
 - The "matter-server is not responding" error the plugin logs when it can't

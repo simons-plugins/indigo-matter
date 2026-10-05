@@ -641,10 +641,12 @@ class BridgeHealthReporter:
     def _apply_session_hygiene(self, hygiene: Optional[Any]) -> None:
         """Surface §4.3's ``sessionHygiene`` verdict (issue #283 "Finding 2"
         review) — until this, ``checked: False`` and the per-peer/per-reason
-        counts reached nobody: the node ACTS on its own (it force-closes
-        sessions through matter.js's session-layer API), so nothing here
-        gates behaviour, and this stays deliberately minimal beside
-        :meth:`_apply_subscription_churn` — log lines only, no device, no UI.
+        counts reached nobody: the node ACTS on its own (from bridge 0.17.5
+        its only close is the superseded-session sweep, through matter.js's
+        session-layer API; older bridges also closed quiet/old sessions), so
+        nothing here gates behaviour, and this stays deliberately minimal
+        beside :meth:`_apply_subscription_churn` — log lines only, no device,
+        no UI.
 
         ``hygiene.sent`` is what makes the WARNING meaningful: a pre-0.17.0
         node never sends the ``sessionHygiene`` field at all, and
@@ -663,9 +665,10 @@ class BridgeHealthReporter:
                 self._hygiene_warned = True
                 self._bridge._logger.warning(
                     "Matter bridge: session hygiene has stopped watching the bridge node's "
-                    "session layer — the superseded/dead/rotated-session mitigations for "
-                    "issue #283 are no longer running. Restart the Matter bridge node to "
-                    "restore it.")
+                    "session layer — the superseded-session mitigation for "
+                    "issue #283 may no longer be running, and the per-peer live-session "
+                    "diagnostic and closed-session totals have stopped updating. Restart "
+                    "the Matter bridge node to restore them.")
             return
         if self._hygiene_warned:
             self._hygiene_warned = False

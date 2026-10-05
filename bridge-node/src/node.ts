@@ -79,7 +79,6 @@ import {
 import { EndpointRegistry } from "./registry.js";
 import {
     type HygieneClosure,
-    periodicSweep,
     peerSessionCounts,
     type SessionDescriptor,
     supersededSessions,
@@ -297,17 +296,29 @@ export class BridgeNode implements BridgeFacade {
     #sessionManager?: SessionManager;
     /**
      * One-way, mirroring {@link ChurnDetector.markBroken}: set the moment
-     * either the initial wiring or a later poll/event handler throws, and
-     * never cleared. Unlike churn, a broken hygiene detector raises no
+     * either the initial sweep wiring or a later `sessions.added` handler
+     * throws, and never cleared. Gates the superseded sweep itself (see
+     * {@link noteHygiene}). Unlike churn, a broken hygiene detector raises no
      * `warnings` entry — nothing here is a fault a user must act on, only a
      * mitigation that has gone quiet — but `sessionHygiene.checked: false`
      * still has to mean it, not "nothing to report".
      */
     #hygieneBroken = false;
     /**
+     * One-way failure latch for the read-only per-peer diagnostic
+     * ({@link pollHygiene}) ALONE. Deliberately separate from
+     * {@link #hygieneBroken}: the diagnostic never closes anything, so a throw
+     * while counting sessions must not switch off the superseded sweep — the
+     * only remaining #283 mitigation. `sessionHygiene.checked` is false when
+     * EITHER latch is set.
+     */
+    #hygieneDiagnosticBroken = false;
+    /**
      * Cumulative sessions this node has force-closed, by reason (§4.3). Never
      * reset except by a restart — a count of things that already happened,
-     * not a snapshot `pollHygiene` could recompute from live state.
+     * not a snapshot `pollHygiene` could recompute from live state. `dead`
+     * and `rotated` stay on the wire for shape stability but are permanently
+     * 0 — those closes were removed (see `session-hygiene.ts`).
      */
     readonly #hygieneClosed = { superseded: 0, dead: 0, rotated: 0 };
     /**
@@ -1127,8 +1138,8 @@ export class BridgeNode implements BridgeFacade {
      * sweep has to fire the moment a peer's new CASE session is added, not
      * on the next `get_status` poll — the whole point is to close the
      * pile-up precondition before a report can misroute onto it (§0(o)).
-     * `pollChurn`'s dead-session/age-rotation checks are poll-driven instead
-     * (see {@link pollHygiene}), because they need no such immediacy.
+     * The per-peer live-session diagnostic is poll-driven instead (see
+     * {@link pollHygiene}), because it needs no such immediacy.
      */
     private wireSessionHygiene(): void {
         try {
@@ -1162,7 +1173,9 @@ export class BridgeNode implements BridgeFacade {
      * events behind it, so hygiene goes one-way broken rather than carrying
      * on from a state it knows is short.
      *
-     * Self-gates on `#hygieneBroken` FIRST, before `update` ever runs — the
+     * Self-gates on `#hygieneBroken` (the sweep's own latch; NOT the
+     * diagnostic's, see {@link #hygieneDiagnosticBroken}) FIRST, before
+     * `update` ever runs — the
      * same discipline every {@link ChurnDetector} method opens with for
      * `#broken` (`churn.ts`). Without this, `checked: false` documented
      * (BRIDGE_PROTOCOL §4.3) "no automatic sweep is running" while the
@@ -1188,7 +1201,7 @@ export class BridgeNode implements BridgeFacade {
         }
     }
 
-    /** A live `NodeSession`, reduced to what `session-hygiene.ts`'s pure decisions need. */
+    /** A live `NodeSession`, reduced to what `session-hygiene.ts`'s descriptor carries. */
     private describeSession(session: NodeSession): SessionDescriptor {
         return {
             sessionId: session.id,
@@ -1201,24 +1214,26 @@ export class BridgeNode implements BridgeFacade {
     }
 
     /**
-     * Issue #283 "Finding 2" item 1, the core deliverable: `justOpened` is a
-     * peer's newly-added CASE session, so every OTHER live, non-PASE session
-     * for that same peer+fabric is a candidate to close — the same
-     * `peerNodeIdHex`/`fabricIndexOf` identity `churn.ts`'s wiring already
+     * Issue #283 "Finding 2", the core deliverable (the superseded sweep):
+     * `justOpened` is a peer's newly-added CASE session, so every OTHER live,
+     * non-PASE session for that same peer+fabric is a candidate to close — the
+     * same `peerNodeIdHex`/`fabricIndexOf` identity `churn.ts`'s wiring already
      * groups sessions by.
      *
      * **Deliberately closes a superseded session even while it still holds a
-     * live subscription** — unlike {@link deadSessions}/{@link
-     * rotatableSessions}, which both refuse to touch one (`session-hygiene.ts`
-     * §0(n)). This is not an inconsistency: orphaning the OLD session's
-     * subscription is the whole point here, because the controller that just
-     * opened `justOpened` has, by definition, a NEW session to fall back to —
-     * the HAMH-proven behaviour is that it re-subscribes over it. Dead/rotated
-     * sessions have no such replacement in hand; closing one under a live
-     * subscription there would strand it with nothing to recover onto, which
-     * is exactly the staleness pattern this module exists to prevent, not
-     * fix. See {@link supersededSessions}'s own docstring for the same
-     * reasoning at the pure-decision layer.
+     * live subscription**: orphaning the OLD session's subscription is the
+     * whole point here, because the controller that just opened `justOpened`
+     * has, by definition, a NEW session to fall back to — the HAMH-proven
+     * behaviour is that it re-subscribes over it. This is also why it is the
+     * only KIND of session this node closes: a session the peer has NOT
+     * replaced (quiet or old) is never closed, because force-close sends no
+     * CloseSession and a polling controller (Alexa) would stall ~15 s on
+     * its next command — see `session-hygiene.ts`'s module docstring.
+     *
+     * Caveat: matter.js's own per-peer LRU eviction (`SessionManager.js`,
+     * cap 5) also uses `initiateForceClose`, so that backstop is not free of
+     * the same silent drop. With this sweep holding one session per
+     * peer+fabric it should not trigger.
      */
     private sweepSuperseded(sessions: SessionManager, justOpened: NodeSession): void {
         const peerId = peerNodeIdHex(justOpened);
@@ -1255,7 +1270,7 @@ export class BridgeNode implements BridgeFacade {
     }
 
     /**
-     * Force-close one session for a hygiene reason, log it once (this
+     * Force-close one superseded session, log it once (this
      * repo's loud-but-once convention — a session can only ever be closed
      * once, so no separate latch is needed), and count it into §4.3's
      * cumulative totals — but only once the close has actually SUCCEEDED.
@@ -1263,20 +1278,18 @@ export class BridgeNode implements BridgeFacade {
      * A no-op, before any of that, when `session.isClosing` is already
      * true: this is not a fresh decision, it is the same session a close is
      * already in flight for — from an earlier hygiene decision this same
-     * sweep/poll made, or from matter.js's own teardown — and both
-     * {@link sweepSuperseded} and {@link pollHygiene} already exclude
-     * `isClosing` sessions from the snapshots they build. This is the
-     * second, later-checked line of defence against the same session being
-     * selected twice, not a duplicate of it.
+     * sweep made, or from matter.js's own teardown — and {@link
+     * sweepSuperseded} already excludes `isClosing` sessions from the
+     * snapshot it builds. This is the second, later-checked line of defence
+     * against the same session being selected twice, not a duplicate of it.
      *
-     * Fire-and-forget: `initiateForceClose` is async, but both callers
-     * ({@link sweepSuperseded}, an event handler, and {@link pollHygiene},
-     * which `getStatus()` — a *synchronous* method — calls) must not block
-     * on it. §0(l): force-close raises no session-teardown handshake with
-     * the peer, but it is NOT silent on the wire — closing active exchanges
-     * can still send a benign `StandaloneAck` for a message already
-     * received but not yet acknowledged. Nothing here is racing a
-     * meaningful round trip either way.
+     * Fire-and-forget: `initiateForceClose` is async, but its one caller
+     * ({@link sweepSuperseded}, an event handler) must not block on it.
+     * §0(l): force-close raises no session-teardown handshake with the peer
+     * (matter.js sets `#isPeerLost`, so no CloseSession is sent) — safe ONLY
+     * because the peer already holds the replacement session that
+     * superseded this one. Never call this for a session the peer has not
+     * replaced: it would silently strand a polling controller for ~15 s.
      *
      * `#hygieneClosed[reason]++` moves to the SUCCESS branch of
      * `initiateForceClose` (issue #283 review) rather than running
@@ -1284,7 +1297,7 @@ export class BridgeNode implements BridgeFacade {
      * outcome is known both miscounts a failed close as a success and,
      * because a session a failed close left live would otherwise still
      * satisfy the same hygiene decision, gets that same session re-selected
-     * and re-counted on every subsequent sweep/poll. The `.catch` keeps
+     * and re-counted on every subsequent sweep. The `.catch` keeps
      * logging the failure — separately, so it is never mistaken for the
      * decision succeeding — but no longer touches the counters.
      */
@@ -1293,11 +1306,8 @@ export class BridgeNode implements BridgeFacade {
             return;
         }
         const detail =
-            closure.reason === "superseded"
-                ? `superseded — peer now holds ${closure.peerSessionCount} session(s), this one ${closure.ageMs}ms old`
-                : closure.reason === "dead"
-                  ? `dead — 0 subscriptions, quiet ${closure.quietMs}ms`
-                  : `rotated — ${closure.ageMs}ms old, 0 subscriptions`;
+            `${closure.reason} — peer now holds ${closure.peerSessionCount} session(s), `
+            + `this one ${closure.ageMs}ms old`;
         this.log(
             `Session hygiene: closing session ${session.id} for peer ${closure.peerNodeId} `
             + `(fabric ${closure.fabricIndex}) — ${detail}`,
@@ -1316,60 +1326,43 @@ export class BridgeNode implements BridgeFacade {
     }
 
     /**
-     * §4.3 — the dead-session and age-rotation checks (issue #283 "Finding 2"
-     * items 2/3), plus the per-peer live-session diagnostic (item 5).
+     * §4.3 — the per-peer live-session diagnostic (issue #283 "Finding 2").
+     * **Diagnostics only: this never closes anything.** The
+     * dead-session and age-rotation closes it used to run were removed — a
+     * force-close sends the peer no CloseSession, so a polling controller
+     * (Alexa) would send its next command into a dropped session and stall
+     * ~15 s (see `session-hygiene.ts`). The superseded sweep (event-driven,
+     * {@link wireSessionHygiene}) is the only closer.
      *
      * Poll-driven from `getStatus()`, the same idiom `pollChurn`/`verdict`
-     * already established for recurring session-layer checks — not a new
-     * timer. `get_status` is the plugin's ~15s watchdog tick, comfortably
-     * fine-grained against both {@link DEAD_SESSION_QUIET_MS} (60s) and
-     * {@link SESSION_MAX_AGE_MS} (4h); a few seconds of poll jitter is slop,
-     * not a functional gap. The superseded sweep (item 1) is NOT run from
-     * here — see {@link wireSessionHygiene}.
+     * already established — not a new timer.
      */
     private pollHygiene(): SessionHygiene {
-        if (this.#hygieneBroken || this.#sessionManager === undefined) {
+        if (this.#hygieneBroken || this.#hygieneDiagnosticBroken || this.#sessionManager === undefined) {
             return { checked: false, peers: [], closed: { ...this.#hygieneClosed } };
         }
         try {
             const descriptors: SessionDescriptor[] = [];
-            const byId = new Map<number, NodeSession>();
             for (const session of this.#sessionManager.sessions) {
-                // Same `isClosing` guard {@link sweepSuperseded} already
-                // applies to its own snapshot — the two snapshot-builders
-                // must not differ without a stated reason, and there isn't
-                // one here: a session already closing is never a candidate
-                // to close again (see {@link closeSession}).
+                // Same filter {@link sweepSuperseded} applies to its own
+                // snapshot: PASE is commissioning, and a session already
+                // closing is not a live session to report.
                 if (session.isPase || session.isClosing) {
                     continue;
                 }
-                const descriptor = this.describeSession(session);
-                descriptors.push(descriptor);
-                byId.set(descriptor.sessionId, session);
+                descriptors.push(this.describeSession(session));
             }
             const peers = peerSessionCounts(descriptors);
-            for (const closure of periodicSweep(descriptors, Date.now())) {
-                const session = byId.get(closure.sessionId);
-                if (session !== undefined) {
-                    this.closeSession(session, closure);
-                } else {
-                    // Unreachable today, for the same reason as
-                    // `sweepSuperseded`'s own else-branch: `byId` is keyed
-                    // directly from `descriptors`, and `periodicSweep` never
-                    // invents a `sessionId` that was not in it. Logged, not
-                    // silently dropped, so a future refactor that breaks that
-                    // guarantee is caught rather than quietly losing a close.
-                    this.log(
-                        `Session hygiene: periodic-sweep closure for session ${closure.sessionId} matched no ` +
-                            "live session in this poll's snapshot — decision dropped (should be unreachable)",
-                    );
-                }
-            }
             return { checked: true, peers, closed: { ...this.#hygieneClosed } };
         } catch (error) {
-            this.#hygieneBroken = true;
+            // The diagnostic's own latch only: the superseded sweep keeps
+            // running (it is not read-only, and does not depend on this).
+            this.#hygieneDiagnosticBroken = true;
             try {
-                this.log(`Session hygiene FAILED and is no longer watching the session layer: ${describeError(error)}`);
+                this.log(
+                    "Session hygiene per-peer diagnostic FAILED (the superseded sweep is unaffected): "
+                    + describeError(error),
+                );
             } catch {
                 // The logger itself failed; there is nowhere left to report.
             }
@@ -1382,8 +1375,8 @@ export class BridgeNode implements BridgeFacade {
         // Before the literal below: this is what raises or clears the §4.3
         // churn notice that `warnings` is about to be read from.
         const subscriptionChurn = this.pollChurn();
-        // Issue #283 "Finding 2": may itself close sessions (dead/rotated) as
-        // a side effect of computing the answer — see `pollHygiene`.
+        // Issue #283 "Finding 2": read-only per-peer session diagnostic —
+        // see `pollHygiene`.
         const sessionHygiene = this.pollHygiene();
         return {
             commissioned: this.server.lifecycle.isCommissioned,
