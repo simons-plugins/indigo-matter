@@ -3,6 +3,15 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
+## 2026.32.10 — Ships the Alexa 15 s stall fix (bridge 0.17.5)
+
+- The 2026.32.9 fix lives in the bridge node, which is a separate npm
+  package. This release moves the plugin's pinned bridge to
+  `indigo-matter-bridge@0.17.5`, so the fix now reaches installs: Alexa no
+  longer stalls ~15 s on the first command after a minute of quiet. See
+  2026.32.9 for the details.
+- Nothing else changes.
+
 ## 2026.32.9 — Alexa no longer stalls ~15 s on the first command after a minute of quiet
 
 - Fixed: the first command after a minute or more of quiet could take ~15
