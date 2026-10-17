@@ -143,7 +143,7 @@ class NodeReplaceMenuMixin:
         values = valuesDict or {}
         old_node, new_node = _as_node_id(values.get("replaceOld")), _as_node_id(values.get("replaceNew"))
         if old_node is None or new_node is None:
-            return [("hint", "Choose the Indigo devices to keep and the node to sync using to see the preview.")]
+            return [("hint", "Pick both nodes above")]
         plan, refusals = self._replacement_plan(old_node, new_node, bool(values.get("replaceAnyway", False)))
         return preview_rows(plan, refusals)
 

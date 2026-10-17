@@ -124,14 +124,8 @@ A Matter pairing code is not durable: once used, or once the window expires (up 
                 <CallbackMethod>replaceNodeChanged</CallbackMethod>
                 <Description>Available nodes: the re-paired device's new node. Nodes with the same devices as the one you are keeping are listed first.</Description>
             </Field>
-            <!-- Heading label + empty list Label, the exportList layout: the
-                 empty Label is what lets the list use the dialog's width
-                 instead of the narrow control column. -->
-            <Field id="replacePreviewHeading" type="label" fontColor="darkgray">
-                <Label>Preview</Label>
-            </Field>
             <Field id="replacePreview" type="list" rows="4" readonly="true">
-                <Label></Label>
+                <Label>Preview:</Label>
                 <List class="self" method="getReplacePreview" dynamicReload="true"/>
             </Field>
             <Field id="replacePreviewNote" type="label" fontSize="small" fontColor="darkgray">
