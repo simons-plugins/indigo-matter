@@ -504,6 +504,13 @@ class DeviceSync:
         # path that hasn't wired it, which means "nothing is tombstoned" —
         # NOT "recreate nothing" — see _ensure_node_device.
         self.node_tombstones: Optional[Any] = None
+        # Nodes retired by replace_node (issue #364): still commissioned in
+        # matter-server (a reset device can't answer RemoveFabric) but their
+        # devices now live on the replacement node, so create_devices must not
+        # build a duplicate set for them. A second NodeDeviceTombstones (same
+        # set-of-node-ids semantics), injected by plugin.startup; None means
+        # "nothing retired". Cleared with the tombstone in _forget_node_capabilities.
+        self.retired_nodes: Optional[Any] = None
         # Nodes whose AttributeLists changed but whose Indigo devices have not
         # yet had their state lists rebuilt (issue #190). Needed because
         # _cache_setting_limits both records the new answer and reports the
@@ -1107,6 +1114,10 @@ class DeviceSync:
 
             if carry_tombstone and new_node_dev_id in deleted:
                 self.node_tombstones.add(new_node)
+            # The old node is usually still commissioned in matter-server; stop
+            # reconcile building a duplicate device set for it.
+            if self.retired_nodes is not None:
+                self.retired_nodes.add(old_node)
             with self._lock:
                 self._known_nodes.add(new_node)
             self.rebuild_index()
@@ -1155,9 +1166,32 @@ class DeviceSync:
         node = parse_node(raw_node, suggested_name or "")
         return self.create_devices(node, suggested_room)
 
+    def _nothing_created(self, node: NodeInfo) -> dict:
+        """The normal ``create_devices`` return shape for a pass that created nothing."""
+        return {
+            "indigoDeviceIds": [],
+            "nodeDeviceId": None,
+            "primaryDeviceId": None,
+            "endpointCount": len(node.endpoints),
+            "vendorId": node.vendor_id,
+            "productId": node.product_id,
+            "vendorName": node.vendor_name,
+            "productName": node.product_name,
+        }
+
     def create_devices(self, node: NodeInfo, suggested_room: Optional[str] = None) -> dict:
+        nid = int(node.node_id)
+        if self.retired_nodes is not None and self.retired_nodes.is_tombstoned(nid):
+            # replace_node (issue #364) moved this node's devices onto a replacement
+            # node, but matter-server still lists it (a reset device can't answer
+            # RemoveFabric). Building devices for it would duplicate the set. It stays
+            # offered for decommission via _known_nodes.
+            with self._lock:
+                self._known_nodes.add(nid)
+            self.logger.debug("node %s: retired by a node replacement; creating no devices", node.node_id)
+            return self._nothing_created(node)
         with self._lock:
-            suspended = self._creation_suspended.get(int(node.node_id), 0) > 0
+            suspended = self._creation_suspended.get(nid, 0) > 0
         if suspended:
             # replace_node (issue #364) is mid-flight for this node: node_updated
             # fires on every availability change and would recreate the very
@@ -1165,16 +1199,7 @@ class DeviceSync:
             # created nothing; _known_nodes is left alone, replace_node owns it.
             self.logger.debug("node %s: device creation suspended (node replacement in progress); skipping",
                               node.node_id)
-            return {
-                "indigoDeviceIds": [],
-                "nodeDeviceId": None,
-                "primaryDeviceId": None,
-                "endpointCount": len(node.endpoints),
-                "vendorId": node.vendor_id,
-                "productId": node.product_id,
-                "vendorName": node.vendor_name,
-                "productName": node.product_name,
-            }
+            return self._nothing_created(node)
         created: list[int] = []
         new_ids: list[int] = []
         primary: Optional[int] = None
@@ -3204,6 +3229,10 @@ class DeviceSync:
         # one event allowed to clear it, not a routine WS reconnect.
         if self.node_tombstones is not None:
             self.node_tombstones.forget(target)
+        # And the replace-node retirement (issue #364): the node has genuinely
+        # left, so a reused id must not be born retired.
+        if self.retired_nodes is not None:
+            self.retired_nodes.forget(target)
 
     def _refresh_state_lists(self, node_id: Any) -> None:
         """Ask Indigo to rebuild the state list of every device on a node.

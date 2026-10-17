@@ -64,7 +64,7 @@ from protocol import MatterWrite, Protocol
 from server_process import ServerProcess
 
 from plugin_constants import (
-    COMMAND_TIMEOUT, MAX_RESUBSCRIBE_ATTEMPTS, NODE_TOMBSTONES_PREF, ON_TIME_RETIRED_PREF,
+    COMMAND_TIMEOUT, MAX_RESUBSCRIBE_ATTEMPTS, NODE_TOMBSTONES_PREF, ON_TIME_RETIRED_PREF, RETIRED_NODES_PREF,
     PLUGIN_NAME, PORT_CONFLICT_CHECK_INTERVAL, REMOVED_STATE_LOG_PREF, RESUBSCRIBE_TICKS,
     SURVEY_LOG_PREF, sanitize_host, server_location,
 )
@@ -263,6 +263,12 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
         self.node_tombstones = NodeDeviceTombstones(save=self._save_node_tombstones, logger=self.logger)
         self.node_tombstones.load(self.pluginPrefs.get(NODE_TOMBSTONES_PREF, ""))
         self.device_sync.node_tombstones = self.node_tombstones
+
+        # Nodes retired by "Replace a Matter node…" (issue #364). Same class and
+        # prefs discipline as the tombstones above, under its own key.
+        self.retired_nodes = NodeDeviceTombstones(save=self._save_retired_nodes, logger=self.logger)
+        self.retired_nodes.load(self.pluginPrefs.get(RETIRED_NODES_PREF, ""))
+        self.device_sync.retired_nodes = self.retired_nodes
 
         # getDeviceStateList's "last reported removed-set" per device (issue
         # #312) — same prefs discipline as survey_log above.

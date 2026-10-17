@@ -267,11 +267,11 @@ class NodeReplaceMenuMixin:
         except (Exception, FuturesCancelledError) as exc:  # pylint: disable=broad-except
             # Absorbing: any failure removing the old node. Safe because it is a warning
             # and the replacement is already complete; a reset device not answering is the
-            # expected case, and the leftover entry is harmless.
+            # expected case; the plugin ignores the leftover entry (retired node).
             self.logger.warning(
                 "Matter: the replacement is done, but the old node %s could not be removed from the fabric "
                 "(%s). That is normal for a device that was factory-reset — it can't answer any more. "
-                "It is harmless; no Indigo device uses it.", name, exc)
+                "The plugin now ignores it; no Indigo device uses it.", name, exc)
             return
         if outcome and outcome.get("fabricRemoved"):
             self.logger.info("Matter: old node %s removed from the fabric.", name)
@@ -279,4 +279,4 @@ class NodeReplaceMenuMixin:
         self.logger.warning(
             "Matter: the replacement is done, but the old node %s was not removed from the fabric "
             "(the device did not confirm). That is normal for a device that was factory-reset. "
-            "It is harmless; no Indigo device uses it.", name)
+            "The plugin now ignores it; no Indigo device uses it.", name)

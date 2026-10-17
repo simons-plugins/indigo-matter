@@ -105,6 +105,7 @@ def _build_coffee(ds, indigo_env, *, with_new_node_evidence=True):
     import device_sync as device_sync_mod
     indigo, devices = indigo_env
     ds.node_tombstones = device_sync_mod.NodeDeviceTombstones()
+    ds.retired_nodes = device_sync_mod.NodeDeviceTombstones()
 
     raw_old = _coffee_raw(OLD_NODE, "1.2.3")
     ds.create_from_raw(raw_old, "Coffee Machine")
@@ -390,17 +391,46 @@ def test_attribute_event_from_the_new_node_updates_the_old_relay(ds, coffee):
 
 
 def test_reconcile_after_replacement_creates_nothing_and_renames_nothing(ds, coffee):
-    """S3: reconcile_all([node 67]) afterwards (the restart path) creates nothing and doesn't rename the old devices."""
+    """S3 + review fix 1: reconcile_all over BOTH nodes (old 52 still commissioned but unavailable, as after a
+    reset device that couldn't answer RemoveFabric) creates nothing and doesn't rename the old devices."""
     ds.replace_node(coffee.plan)
     created_before = len(coffee.indigo.device.created)
     ids_before = set(coffee.devices._by_id)
 
-    ds.reconcile_all([coffee.raw_new])
+    ds.reconcile_all([{**coffee.raw_old, "available": False}, coffee.raw_new])
 
     assert len(coffee.indigo.device.created) == created_before
     assert set(coffee.devices._by_id) == ids_before
     assert coffee.old_node.name == OLD_NODE_NAME
     assert coffee.old_relay.name == OLD_RELAY_NAME
+
+
+def test_retired_node_stays_offered_for_decommission(ds, coffee):
+    """Review fix 1: a retired node is still in list_nodes/knows_node after reconcile, so it can be decommissioned."""
+    ds.replace_node(coffee.plan)
+    ds.reconcile_all([{**coffee.raw_old, "available": False}, coffee.raw_new])
+    assert ds.knows_node(OLD_NODE)
+    assert OLD_NODE in [nid for nid, _names in ds.list_nodes()]
+
+
+def test_node_removed_clears_the_retirement(ds, coffee):
+    """Review fix 1: a node_removed for 52 (decommission) un-retires it."""
+    ds.retired_nodes.add(OLD_NODE)
+    ds.handle_event(MatterEvent(kind=protocol.EVT_NODE_REMOVED, node_id=OLD_NODE))
+    assert not ds.retired_nodes.is_tombstoned(OLD_NODE)
+
+
+def test_retirement_survives_a_persist_load_round_trip(ds, coffee):
+    """Review fix 1: the retired set is persisted like the tombstones."""
+    import device_sync as device_sync_mod
+    saved: list[str] = []
+    ds.retired_nodes = device_sync_mod.NodeDeviceTombstones(save=saved.append)
+    ds.replace_node(coffee.plan)
+    assert saved, "retiring must persist"
+    reloaded = device_sync_mod.NodeDeviceTombstones()
+    reloaded.load(saved[-1])
+    assert reloaded.is_tombstoned(OLD_NODE)
+    assert not reloaded.is_tombstoned(NEW_NODE)
 
 
 def test_refused_duplicate_delete_leaves_that_old_device_unbound_and_reports_it(ds, coffee):

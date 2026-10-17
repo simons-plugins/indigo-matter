@@ -415,7 +415,10 @@ preview shows the reason before you click:
 matter-server to drop the old node from Indigo's fabric. For a factory-reset
 device this usually **fails**, because the device has forgotten Indigo and
 cannot answer. That is fine: you get a warning in the event log, and the
-replacement is already finished. The leftover entry is harmless. The option is
+replacement is already finished. The old node entry stays in matter-server, but
+the plugin now **ignores it**: it makes no Indigo devices for it, and the choice
+is remembered across restarts. It stays in "Decommission Matter device…" so you
+can remove it later, and that decommission also clears the ignore. The option is
 skipped, with a warning, if any Indigo device still uses the old node.
 
 **One blind spot.** The check for "something refers to a new device" uses
