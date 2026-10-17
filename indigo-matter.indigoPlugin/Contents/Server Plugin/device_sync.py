@@ -1100,7 +1100,8 @@ class DeviceSync:
                     if new.dev_id not in deleted:
                         # D3: rebinding next to a surviving duplicate would leave two devices
                         # claiming one (node, endpoint, type).
-                        skipped.append((old.dev_id, f'its duplicate "{new.name}" (id {new.dev_id}) could not be deleted'))
+                        skipped.append((old.dev_id,
+                                        f'its duplicate "{new.name}" (id {new.dev_id}) could not be deleted'))
                         continue
                     try:
                         dev = indigo.devices[old.dev_id]    # fresh: earlier writes may have changed it
