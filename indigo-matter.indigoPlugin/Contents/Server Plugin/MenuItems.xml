@@ -111,7 +111,7 @@ A Matter pairing code is not durable: once used, or once the window expires (up 
         <ButtonTitle>Replace</ButtonTitle>
         <ConfigUI>
             <Field id="replaceIntro" type="label">
-                <Label>An Indigo device, and everything that refers to it (triggers, schedules, action groups, control pages), is independent of the physical device behind it. Use this after a Matter device was factory-reset and paired again: it got a new node and the plugin created a second set of Indigo devices for it. This points your original Indigo devices at the new node and deletes the new duplicates, so nothing that refers to the originals needs to change.</Label>
+                <Label>Points your existing Indigo devices at a re-paired device's new Matter node, then deletes the duplicate devices that node created.</Label>
             </Field>
             <Field id="replaceOld" type="menu">
                 <Label>Indigo devices to keep:</Label>
