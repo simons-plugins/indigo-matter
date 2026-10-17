@@ -1199,16 +1199,6 @@ class DeviceSync:
                 self._known_nodes.add(nid)
             self.logger.debug("node %s: retired by a node replacement; creating no devices", node.node_id)
             return self._nothing_created(node)
-        with self._lock:
-            suspended = self._creation_suspended.get(nid, 0) > 0
-        if suspended:
-            # replace_node (issue #364) is mid-flight for this node: node_updated
-            # fires on every availability change and would recreate the very
-            # duplicates it is deleting. Same return shape as a normal pass that
-            # created nothing; _known_nodes is left alone, replace_node owns it.
-            self.logger.debug("node %s: device creation suspended (node replacement in progress); skipping",
-                              node.node_id)
-            return self._nothing_created(node)
         created: list[int] = []
         new_ids: list[int] = []
         primary: Optional[int] = None
@@ -1219,6 +1209,17 @@ class DeviceSync:
         # that node_added raced ahead and created with the bare product name.
         authoritative = bool((node.suggested_name or "").strip()) or bool((suggested_room or "").strip())
         with self._lock:
+            if self._creation_suspended.get(nid, 0) > 0:
+                # replace_node (issue #364) is mid-flight for this node: node_updated
+                # fires on every availability change and would recreate the very
+                # duplicates it is deleting. The check lives in THIS region, which also
+                # does every creation, and creation_suspended() takes the same lock: no
+                # creation can start after the counter is raised. (A check in its own
+                # earlier region left a window.) Same return shape as a pass that created
+                # nothing; _known_nodes is left alone, replace_node owns it.
+                self.logger.debug("node %s: device creation suspended (node replacement in progress); skipping",
+                                  node.node_id)
+                return self._nothing_created(node)
             # Covers the commission and node_added paths; reconcile_all maintains
             # _known_nodes independently (see list_nodes).
             self._known_nodes.add(int(node.node_id))

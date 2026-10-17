@@ -277,6 +277,34 @@ def test_creation_suspended_stops_create_for_that_node_only(ds, indigo_env):  # 
     assert ds.lookup(NEW_NODE, 1) is None
 
 
+def test_no_creation_happens_after_the_suspension_is_raised(ds, indigo_env):  # noqa: F811
+    """Review fix 4: the suspension check and the creation share one locked region. Simulate another thread
+    raising the suspension the instant create_devices FIRST releases the lock: with a separate check-then-lock,
+    creation still runs afterwards; with one region, everything was created before the suspension began."""
+    _indigo, devices = indigo_env
+
+    class SlipLock:
+        def __init__(self, inner):
+            self.inner, self.depth, self.fired, self.at_fire = inner, 0, False, None
+
+        def __enter__(self):
+            self.inner.acquire()
+            self.depth += 1
+
+        def __exit__(self, *exc):
+            self.depth -= 1
+            self.inner.release()
+            if self.depth == 0 and not self.fired:
+                self.fired = True
+                self.at_fire = len(list(devices))
+                ds._creation_suspended[NEW_NODE] = 1   # what creation_suspended() does, once it gets the lock
+
+    ds._lock = SlipLock(ds._lock)
+    ds.create_from_raw(_coffee_raw(NEW_NODE, "2.0.0"), "Coffee Machine")
+    assert ds._lock.fired
+    assert len(list(devices)) == ds._lock.at_fire, "devices were created after the suspension was raised"
+
+
 def test_creation_suspension_lifts_after_the_block(ds, indigo_env):  # noqa: F811
     """S2: once the context exits, create_devices for the node works again."""
     with ds.creation_suspended(NEW_NODE):
