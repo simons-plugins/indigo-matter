@@ -181,7 +181,7 @@ def preview_rows(plan: ReplacementPlan, refusals: list[str]) -> list[tuple[str, 
         rows.append(("refuse", "✗ Can't replace: click Replace for the reason"))
         return rows
     for old, _new in plan.pairs:
-        rows.append((f"pair:{old.dev_id}", f"{_role(old)} → moves to {node_id_to_str(plan.new_node)}"))
+        rows.append((f"pair:{old.dev_id}", f"{_role(old)} → {node_id_to_str(plan.new_node)}"))
     for old in plan.unmatched_old:
         rows.append((f"old:{old.dev_id}", f"{_role(old)}: no match, stays"))
     for new in plan.unmatched_new:

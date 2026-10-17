@@ -447,7 +447,7 @@ def test_preview_names_the_role_and_where_it_moves(menu, coffee):
     """Spec S4 getReplacePreview (D4): short role rows, no note row."""
     rows = menu.getReplacePreview(valuesDict=_values())
     labels = [label for _value, label in rows]
-    assert "Switch → moves to 0x43" in labels
+    assert "Switch → 0x43" in labels
     assert not any(v == "note:blind-spot" for v, _l in rows)
 
 
@@ -490,7 +490,7 @@ def test_replace_menu_item_has_the_specified_fields_and_follows_decommission():
     item = items[index]
     assert item.findtext("CallbackMethod") == "menuReplaceNode"
     fields = {f.get("id"): f for f in item.find("ConfigUI").findall("Field")}
-    assert set(fields) == {"replaceIntro", "replaceOld", "replaceNew", "replacePreview", "replacePreviewNote",
+    assert set(fields) == {"replaceIntro", "replaceOld", "replaceNew", "replacePreviewHeading", "replacePreview", "replacePreviewNote",
                            "replaceShapeDiffers", "replaceAnyway", "replaceDecommissionOld", "confirm"}
     assert fields["replaceIntro"].get("type") == "label"
     for menu_id in ("replaceOld", "replaceNew"):

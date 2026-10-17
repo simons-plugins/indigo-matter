@@ -124,8 +124,14 @@ A Matter pairing code is not durable: once used, or once the window expires (up 
                 <CallbackMethod>replaceNodeChanged</CallbackMethod>
                 <Description>Available nodes: the re-paired device's new node. Nodes with the same devices as the one you are keeping are listed first.</Description>
             </Field>
-            <Field id="replacePreview" type="list" rows="8" readonly="true">
-                <Label>Preview:</Label>
+            <!-- Heading label + empty list Label, the exportList layout: the
+                 empty Label is what lets the list use the dialog's width
+                 instead of the narrow control column. -->
+            <Field id="replacePreviewHeading" type="label" fontColor="darkgray">
+                <Label>Preview</Label>
+            </Field>
+            <Field id="replacePreview" type="list" rows="4" readonly="true">
+                <Label></Label>
                 <List class="self" method="getReplacePreview" dynamicReload="true"/>
             </Field>
             <Field id="replacePreviewNote" type="label" fontSize="small" fontColor="darkgray">
@@ -140,7 +146,7 @@ A Matter pairing code is not durable: once used, or once the window expires (up 
                 <Label>The new node has different devices. Move only the ones that match?</Label>
             </Field>
             <Field id="replaceDecommissionOld" type="checkbox" defaultValue="false">
-                <Label>Also try to remove the old node from Indigo's Matter fabric. This usually fails for a reset device, which is fine.</Label>
+                <Label>Also remove the old node from Indigo's Matter fabric (harmless if it no longer answers).</Label>
             </Field>
             <Field id="confirm" type="checkbox" defaultValue="false">
                 <Label>I understand the duplicate devices on the new node will be deleted.</Label>

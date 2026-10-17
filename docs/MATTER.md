@@ -391,7 +391,7 @@ the new node and deletes the new duplicates. Names, settings and ids all stay.
 4. **Sync using node:** pick the new node. Nodes with the same devices as the
    old one come first; the rest end with "(differs)". Each entry starts with the node address.
 5. Read the preview. It lists each part and what happens to it, for example
-   "Switch → moves to 0x43". If the nodes have different devices, a
+   "Switch → 0x43". If the nodes have different devices, a
    "Move only the ones that match?" box appears; tick it to go ahead.
 6. Tick the confirmation and click **Replace**. The plugin then asks for a
    refresh, and the devices pick up live state. If the refresh fails, the

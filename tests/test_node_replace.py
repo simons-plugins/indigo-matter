@@ -247,10 +247,10 @@ def _flat(rows):
 
 
 def test_preview_rows_one_per_pair_names_the_role_and_where_it_moves():
-    """Spec S1 preview_rows: 'Switch → moves to 0x43'; names live in the pickers, not the rows."""
+    """Spec S1 preview_rows: 'Switch → 0x43'; names live in the pickers, not the rows."""
     rows = node_replace.preview_rows(_plan(), [])
     assert all(isinstance(row, tuple) and len(row) == 2 for row in rows)
-    assert [label for _v, label in rows] == ["Node device → moves to 0x43", "Switch → moves to 0x43"]
+    assert [label for _v, label in rows] == ["Node device → 0x43", "Switch → 0x43"]
 
 
 def test_preview_rows_unmatched_and_extra_rows_are_short():
