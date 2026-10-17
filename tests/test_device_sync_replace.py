@@ -178,6 +178,30 @@ def test_node_device_refs_skips_a_device_deleted_out_of_band(ds, coffee):
     assert [r.dev_id for r in refs] == [coffee.old_node.id]
 
 
+def test_node_device_refs_skips_a_device_whose_live_props_moved_to_another_node(ds, coffee):
+    """Review fix 3: a stale index entry (note_device with old props, then a props change that never
+    re-registered) must not show up under the node it no longer belongs to."""
+    ds.note_device(coffee.old_relay)
+    coffee.old_relay.pluginProps = {**coffee.old_relay.pluginProps, "nodeId": str(NEW_NODE)}
+    assert ds.lookup(OLD_NODE, 1, "matterRelay") == coffee.old_relay.id  # the index is stale on purpose
+    assert coffee.old_relay.id not in [r.dev_id for r in ds.node_device_refs(OLD_NODE)]
+
+
+def test_replace_node_rebuilds_the_index_even_when_it_raises(ds, coffee, monkeypatch):
+    """Review fix 3: rebuild_index() runs in a finally, so an unexpected failure can't leave a stale index."""
+    rebuilt: list[bool] = []
+    real = ds.rebuild_index
+    monkeypatch.setattr(ds, "rebuild_index", lambda: (rebuilt.append(True), real())[1])
+
+    def explode(_ids, _node_dev_id):
+        raise RuntimeError("unexpected")
+
+    monkeypatch.setattr(ds, "_delete_devices", explode)
+    with pytest.raises(RuntimeError):
+        ds.replace_node(coffee.plan)
+    assert rebuilt == [True]
+
+
 def test_delete_devices_dissolves_the_group_before_any_delete(ds, coffee):
     """S2: _delete_devices ungroups ALL before the first delete (fatal if a grouped root goes first)."""
     ids = [coffee.new_relay.id, coffee.new_node.id]

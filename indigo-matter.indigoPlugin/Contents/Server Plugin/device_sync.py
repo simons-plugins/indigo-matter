@@ -1004,10 +1004,18 @@ class DeviceSync:
         refs = []
         for eid, type_id, dev_id in sorted(entries, key=lambda e: (e[0], e[1], e[2])):
             try:
-                name = indigo.devices[dev_id].name
+                dev = indigo.devices[dev_id]
             except KeyError:
                 self.logger.debug("node_device_refs: device %s is gone; skipping", dev_id)
                 continue
+            live_node = str(dev.pluginProps.get("nodeId", ""))
+            if live_node != str(target):
+                # The index is stale: the device was rebound (props rewritten) without
+                # re-registering. Listing it here could pair a device with itself.
+                self.logger.debug("node_device_refs: device %s now belongs to node %s, not %s; skipping",
+                                  dev_id, live_node, target)
+                continue
+            name = dev.name
             refs.append(DeviceRef(dev_id, eid, type_id, name))
         return refs
 
@@ -1083,41 +1091,45 @@ class DeviceSync:
             # to delete because the user removed the old node's by hand.
             dups.extend(ref.dev_id for ref in plan.extra_deletes if ref.dev_id not in dups)
 
-            deleted = self._delete_devices(dups, new_node_dev_id)
+            try:
+                deleted = self._delete_devices(dups, new_node_dev_id)
 
-            rebound: list[int] = []
-            skipped: list[tuple[int, str]] = []
-            for old, new in plan.pairs:
-                if new.dev_id not in deleted:
-                    # D3: rebinding next to a surviving duplicate would leave two devices
-                    # claiming one (node, endpoint, type).
-                    skipped.append((old.dev_id, f'its duplicate "{new.name}" (id {new.dev_id}) could not be deleted'))
-                    continue
-                try:
-                    dev = indigo.devices[old.dev_id]    # fresh: earlier writes may have changed it
-                    dev.replacePluginPropsOnServer(rebound_props(
-                        dict(dev.pluginProps), new_node,
-                        software_version=software_version if old.type_id == "matterNode" else None))
-                    rebound.append(old.dev_id)
-                    self.logger.info('"%s" (id %s) rebound node %s -> %s', dev.name, old.dev_id,
-                                     node_id_to_str(old_node), node_id_to_str(new_node))
-                except Exception as exc:  # pylint: disable=broad-except
-                    # Absorbing: one refused write (or a device deleted meanwhile) must not stop
-                    # the other pairs. Safe because it is reported in `skipped`, and the device
-                    # keeps its old props, which is the pre-replacement state.
-                    skipped.append((old.dev_id, f"Indigo refused the props write: {exc}"))
-                    self.logger.warning("could not rebind Indigo device %s: %s", old.dev_id, exc)
+                rebound: list[int] = []
+                skipped: list[tuple[int, str]] = []
+                for old, new in plan.pairs:
+                    if new.dev_id not in deleted:
+                        # D3: rebinding next to a surviving duplicate would leave two devices
+                        # claiming one (node, endpoint, type).
+                        skipped.append((old.dev_id, f'its duplicate "{new.name}" (id {new.dev_id}) could not be deleted'))
+                        continue
+                    try:
+                        dev = indigo.devices[old.dev_id]    # fresh: earlier writes may have changed it
+                        dev.replacePluginPropsOnServer(rebound_props(
+                            dict(dev.pluginProps), new_node,
+                            software_version=software_version if old.type_id == "matterNode" else None))
+                        rebound.append(old.dev_id)
+                        self.logger.info('"%s" (id %s) rebound node %s -> %s', dev.name, old.dev_id,
+                                         node_id_to_str(old_node), node_id_to_str(new_node))
+                    except Exception as exc:  # pylint: disable=broad-except
+                        # Absorbing: one refused write (or a device deleted meanwhile) must not stop
+                        # the other pairs. Safe because it is reported in `skipped`, and the device
+                        # keeps its old props, which is the pre-replacement state.
+                        skipped.append((old.dev_id, f"Indigo refused the props write: {exc}"))
+                        self.logger.warning("could not rebind Indigo device %s: %s", old.dev_id, exc)
 
-            if (self.node_tombstones is not None
-                    and any(ref.type_id == "matterNode" and ref.dev_id in deleted for ref in plan.extra_deletes)):
-                self.node_tombstones.add(new_node)
-            # The old node is usually still commissioned in matter-server; stop
-            # reconcile building a duplicate device set for it.
-            if self.retired_nodes is not None:
-                self.retired_nodes.add(old_node)
-            with self._lock:
-                self._known_nodes.add(new_node)
-            self.rebuild_index()
+                if (self.node_tombstones is not None
+                        and any(ref.type_id == "matterNode" and ref.dev_id in deleted for ref in plan.extra_deletes)):
+                    self.node_tombstones.add(new_node)
+                # The old node is usually still commissioned in matter-server; stop
+                # reconcile building a duplicate device set for it.
+                if self.retired_nodes is not None:
+                    self.retired_nodes.add(old_node)
+                with self._lock:
+                    self._known_nodes.add(new_node)
+            finally:
+                # Always, even on an unexpected failure: the index must reflect what
+                # was actually deleted and rebound (an index-driven delete_node trusts it).
+                self.rebuild_index()
         for dev_id in deleted:
             self.logger.info("deleted duplicate Indigo device %s of node %s (node %s's devices now use node %s)",
                              dev_id, node_id_to_str(new_node), node_id_to_str(old_node),

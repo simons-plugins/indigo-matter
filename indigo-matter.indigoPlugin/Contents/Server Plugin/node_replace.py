@@ -92,7 +92,7 @@ def refusal_reasons(plan: ReplacementPlan, *, allow_mismatch: bool, exported_ids
                     references: dict[int, list[str]], reference_errors: dict[int, str]) -> list[str]:
     """Why the replacement must not run; empty means go.
 
-    Ordered most-fundamental first: same node, no pairs, shape mismatch, then per NEW
+    Ordered most-fundamental first: same node, no pairs, a device on both sides, shape mismatch, then per NEW
     device about to be deleted (paired, or ``extra_deletes``) exported, referenced,
     and reference lookup failed. Unmatched new devices are kept, so their
     exports and references are irrelevant. A failed lookup refuses: an
@@ -103,6 +103,14 @@ def refusal_reasons(plan: ReplacementPlan, *, allow_mismatch: bool, exported_ids
         reasons.append("The old and new node are the same; pick a different node to sync from.")
     if not plan.pairs:
         reasons.append("No device on the new node matches a device on the old node (by endpoint and type).")
+    old_ids = {old.dev_id for old, _new in plan.pairs} | {ref.dev_id for ref in plan.unmatched_old}
+    new_ids = ({new.dev_id for _old, new in plan.pairs} | {ref.dev_id for ref in plan.unmatched_new}
+               | {ref.dev_id for ref in plan.extra_deletes})
+    if old_ids & new_ids:
+        # A stale index can list one device under both nodes; deleting "the duplicate" would
+        # delete the device being kept.
+        reasons.append("An Indigo device appears on both nodes (a stale lookup); "
+                       "restart the plugin or run a resync, then try again.")
     if not plan.shape_matches and not allow_mismatch:
         reasons.append("The two nodes have different device shapes; tick 'replace anyway' to rebind only "
                        "the devices that match.")

@@ -333,3 +333,12 @@ def test_preview_labels_the_carried_node_device_as_deleted_by_hand():
     labels = [label for _value, label in rows if "Coffee Machine  " in label or label.endswith("by hand)")]
     assert any("(deleted, the old node's device was removed by hand)" in label for label in labels)
     assert len({value for value, _label in rows}) == len(rows)
+
+
+def test_a_device_on_both_sides_of_the_plan_refuses():
+    """Review fix 3: the same dev_id on the old and new side (stale index) refuses, and is not a clean plan."""
+    shared = DeviceRef(1002, 1, "matterRelay", "Coffee Machine Matter Switch")
+    plan = _plan(old=[DeviceRef(1001, 0, "matterNode", "n"), shared],
+                 new=[DeviceRef(2001, 0, "matterNode", "m"), shared])
+    reasons = _refusals(plan)
+    assert len(reasons) == 1 and "both nodes" in reasons[0]
