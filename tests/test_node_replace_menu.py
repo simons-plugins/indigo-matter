@@ -389,22 +389,66 @@ def test_new_node_picker_excludes_the_old_node_and_leads_with_matching_shapes(me
     assert str(OLD_NODE) not in _ids(options)
     assert _ids(options) == [str(NEW_NODE), "60"]
     labels = dict(options)
-    assert "(shape differs)" in labels["60"]
-    assert "(shape differs)" not in labels[str(NEW_NODE)]
+    assert labels["60"].endswith(" (differs)")
+    assert "(differs)" not in labels[str(NEW_NODE)]
+    assert labels[str(NEW_NODE)].startswith("0x43 · ")
 
 
-def test_replace_node_changed_is_a_noop_that_returns_the_values(menu):
-    """Spec S4 replaceNodeChanged: a no-op that forces the reload."""
+def test_pickers_lead_each_label_with_the_address(menu, coffee):
+    """Address first: '0x34 · <names>'."""
+    labels = dict(menu.getReplaceOldNodes())
+    assert labels[str(OLD_NODE)].startswith("0x34 · ") and OLD_NODE_NAME in labels[str(OLD_NODE)]
+
+
+def test_replace_node_changed_flags_matching_shapes_false(menu):
     values = _values()
     assert menu.replaceNodeChanged(values) is values
+    assert values["replaceShapeDiffers"] == "false"
 
 
-def test_preview_names_both_devices_and_marks_the_duplicate_deleted(menu, coffee):
-    """Spec S4 getReplacePreview (D4): read-only rows built from the plan."""
+def test_replace_node_changed_flags_a_different_shape_true(menu, ds, indigo_env):  # noqa: F811
+    _add_differently_shaped_node(ds, indigo_env, 80)
+    values = _values(replaceNew="80")
+    assert menu.replaceNodeChanged(values)["replaceShapeDiffers"] == "true"
+
+
+def test_replace_node_changed_d8_carried_node_device_is_not_a_mismatch(menu, coffee, ds):  # noqa: F811
+    """D8: old node tombstoned -> the new node device is carried, so the flag stays false."""
+    _tombstone_old_node_device(coffee, ds)
+    values = _values(replaceShapeDiffers="true")
+    assert menu.replaceNodeChanged(values)["replaceShapeDiffers"] == "false"
+
+
+def test_replace_node_changed_without_both_picks_is_false(menu):
+    assert menu.replaceNodeChanged(_values(replaceNew=""))["replaceShapeDiffers"] == "false"
+
+
+def test_replace_node_changed_failure_logs_and_leaves_values(menu):
+    class Broken:
+        def __getattr__(self, name):
+            raise RuntimeError("broken: %s" % name)
+
+    menu.device_sync = Broken()
+    menu.logger.exception.reset_mock()
+    values = _values(replaceShapeDiffers="true")
+    assert menu.replaceNodeChanged(values)["replaceShapeDiffers"] == "true"
+    assert menu.logger.exception.called
+
+
+def test_stale_shape_differs_false_still_refuses_mismatched_nodes(menu, coffee, ds, indigo_env):  # noqa: F811
+    """Replace never trusts the hidden field: a stale 'false' with mismatched nodes refuses, untouched."""
+    _add_differently_shaped_node(ds, indigo_env, 80)
+    snapshot, touched = _snapshot(coffee), _arm_untouchable(coffee)
+    result = menu.menuReplaceNode(_values(replaceNew="80", replaceShapeDiffers="false", replaceAnyway=False))
+    _assert_refused_and_untouched(menu, coffee, result, snapshot, touched)
+
+
+def test_preview_names_the_role_and_where_it_moves(menu, coffee):
+    """Spec S4 getReplacePreview (D4): short role rows, no note row."""
     rows = menu.getReplacePreview(valuesDict=_values())
-    text = " ".join(" ".join(row) for row in rows)
-    assert OLD_NODE_NAME in text and OLD_RELAY_NAME in text
-    assert "(deleted)" in text
+    labels = [label for _value, label in rows]
+    assert "Switch → moves to 0x43" in labels
+    assert not any(v == "note:blind-spot" for v, _l in rows)
 
 
 @pytest.mark.parametrize("call", ["getReplaceOldNodes", "getReplaceNewNodes", "getReplacePreview"])
@@ -446,8 +490,8 @@ def test_replace_menu_item_has_the_specified_fields_and_follows_decommission():
     item = items[index]
     assert item.findtext("CallbackMethod") == "menuReplaceNode"
     fields = {f.get("id"): f for f in item.find("ConfigUI").findall("Field")}
-    assert set(fields) == {"replaceIntro", "replaceOld", "replaceNew", "replacePreview",
-                           "replaceAnyway", "replaceDecommissionOld", "confirm"}
+    assert set(fields) == {"replaceIntro", "replaceOld", "replaceNew", "replacePreview", "replacePreviewNote",
+                           "replaceShapeDiffers", "replaceAnyway", "replaceDecommissionOld", "confirm"}
     assert fields["replaceIntro"].get("type") == "label"
     for menu_id in ("replaceOld", "replaceNew"):
         assert fields[menu_id].get("type") == "menu"
@@ -460,6 +504,15 @@ def test_replace_menu_item_has_the_specified_fields_and_follows_decommission():
     for box in ("replaceAnyway", "replaceDecommissionOld", "confirm"):
         assert fields[box].get("type") == "checkbox"
     assert fields["replaceDecommissionOld"].get("defaultValue") == "false"
+    anyway = fields["replaceAnyway"]
+    assert anyway.get("visibleBindingId") == "replaceShapeDiffers"
+    assert anyway.get("visibleBindingValue") == "true"
+    assert anyway.get("alwaysUseInDialogHeightCalc") == "true"
+    assert fields["replaceShapeDiffers"].get("hidden") == "true"
+    assert fields["replaceShapeDiffers"].get("defaultValue") == "false"
+    note = fields["replacePreviewNote"]
+    assert note.get("type") == "label" and "Lamplighter" in note.findtext("Label")
+    assert (note.get("fontSize"), note.get("fontColor")) == ("small", "darkgray")
 
 
 def test_every_callback_and_list_method_in_the_replace_menu_resolves_on_plugin(plugin_cls):

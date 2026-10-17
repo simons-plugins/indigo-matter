@@ -133,27 +133,61 @@ def refusal_reasons(plan: ReplacementPlan, *, allow_mismatch: bool, exported_ids
     return reasons
 
 
+#: Short role names for the preview rows. Mirrors ``device_sync._ROLE_LABELS`` (not importable
+#: here: device_sync imports ``indigo``) plus the node device, which that map leaves out.
+_ROLE_LABELS = {
+    "matterNode": "Node device",
+    "matterRelay": "Switch",
+    "matterDimmer": "Dimmer",
+    "matterColorDimmer": "Light",
+    "matterTemperatureSensor": "Temperature",
+    "matterHumiditySensor": "Humidity",
+    "matterMotionSensor": "Motion",
+    "matterContactSensor": "Contact",
+    "matterIlluminanceSensor": "Illuminance",
+    "matterPressureSensor": "Pressure",
+    "matterFlowSensor": "Flow",
+    "matterThermostat": "Thermostat",
+    "matterFan": "Fan",
+    "matterWindowCovering": "Window Covering",
+    "matterLock": "Lock",
+    "matterValve": "Valve",
+    "matterButton": "Button",
+    "matterSmokeCOAlarm": "Smoke/CO",
+    "matterAirQualitySensor": "Air Quality",
+    "matterCO2Sensor": "CO₂",
+    "matterPM25Sensor": "PM2.5",
+    "matterTVOCSensor": "TVOC",
+    "matterEnergyMeter": "Energy",
+    "matterUnknown": "Unsupported",
+}
+
+
+def _role(ref: DeviceRef) -> str:
+    """Short role label for a device's Indigo type; the bare type id when unknown."""
+    return _ROLE_LABELS.get(ref.type_id, ref.type_id)
+
+
 def preview_rows(plan: ReplacementPlan, refusals: list[str]) -> list[tuple[str, str]]:
     """(value, label) rows for the read-only preview list.
 
-    Indigo list values must be unique, so each row's value is a distinct tag.
-    The last row states what the reference check cannot see.
+    The pickers above already show the device names, so a row names the part
+    (its role) and the outcome. Indigo list values must be unique, so each row's
+    value is a distinct tag. Refusals collapse to ONE short row: the full reasons
+    come from the Replace click's error.
     """
     rows: list[tuple[str, str]] = []
-    for old, new in plan.pairs:
-        rows.append((f"pair:{old.dev_id}", f"{old.name}  ←  {new.name} (deleted)"))
+    if refusals:
+        rows.append(("refuse", "✗ Can't replace: click Replace for the reason"))
+        return rows
+    for old, _new in plan.pairs:
+        rows.append((f"pair:{old.dev_id}", f"{_role(old)} → moves to {node_id_to_str(plan.new_node)}"))
     for old in plan.unmatched_old:
-        rows.append((f"old:{old.dev_id}", f"{old.name}  ←  (no match on the new node; left unchanged)"))
+        rows.append((f"old:{old.dev_id}", f"{_role(old)}: no match, stays"))
     for new in plan.unmatched_new:
-        rows.append((f"new:{new.dev_id}", f"(no match on the old node)  {new.name}  (kept)"))
+        rows.append((f"new:{new.dev_id}", f"{_role(new)} (new): kept"))
     for new in plan.extra_deletes:
-        rows.append((f"extra:{new.dev_id}",
-                     f"{new.name}  (deleted, the old node's device was removed by hand)"))
-    for index, reason in enumerate(refusals):
-        rows.append((f"refuse:{index}", f"REFUSED: {reason}"))
-    rows.append(("note:blind-spot",
-                 "Note: the reference check cannot see references inside plugin-action settings "
-                 "(for example Lamplighter zones)."))
+        rows.append((f"extra:{new.dev_id}", f"{_role(new)} (new): deleted"))
     return rows
 
 

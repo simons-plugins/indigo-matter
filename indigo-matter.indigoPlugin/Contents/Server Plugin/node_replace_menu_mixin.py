@@ -33,7 +33,7 @@ from plugin_constants import RECONCILE_TIMEOUT
 #: ``{"ID": int, "Name": str}``. The dict itself is never empty (issue #364, D6).
 _DEPENDENCY_KINDS = ("actionGroups", "controlPages", "devices", "schedules", "triggers", "variables")
 
-_SHAPE_DIFFERS = " (shape differs)"
+_SHAPE_DIFFERS = " (differs)"
 
 
 def _degrades_to_empty_list(func):
@@ -83,7 +83,7 @@ class NodeReplaceMenuMixin:
             if not names:
                 continue
             unreachable = self.device_sync.node_unreachable(node_id) is True  # pylint: disable=no-member
-            label = f"{', '.join(names)} — node {node_id_to_str(node_id)}"
+            label = f"{node_id_to_str(node_id)} · {', '.join(names)}"
             if unreachable:
                 label += " — unreachable"
             rows.append((0 if unreachable else 1, node_id, str(node_id), label))
@@ -95,7 +95,7 @@ class NodeReplaceMenuMixin:
         """"Sync using node:" (Available nodes) — every other commissioned node (D5).
 
         Nodes whose shape matches the old node's lead; the rest are labelled
-        "(shape differs)" but stay selectable, or "replace anyway" would be
+        "(differs)" but stay selectable, or "replace anyway" would be
         unreachable. The refusal, if any, happens on Execute.
         """
         old_node = _as_node_id((valuesDict or {}).get("replaceOld"))
@@ -104,7 +104,7 @@ class NodeReplaceMenuMixin:
         for node_id, names in self.device_sync.list_nodes():  # pylint: disable=no-member
             if node_id == old_node:
                 continue
-            label = f"{', '.join(names) if names else '(no Indigo devices)'} — node {node_id_to_str(node_id)}"
+            label = f"{node_id_to_str(node_id)} · {', '.join(names) if names else '(no Indigo devices)'}"
             if old_node is None:
                 other.append((str(node_id), label))
                 continue
@@ -117,9 +117,24 @@ class NodeReplaceMenuMixin:
         return matching + other
 
     def replaceNodeChanged(self, valuesDict, typeId="", devId=0):  # noqa: N802, ARG002
-        """No-op callback on both pickers. Its only job is making Indigo round-trip
-        to the plugin, which re-runs the dynamicReload preview: ConfigUI has no
-        per-field change event, so a menu's own CallbackMethod is the whole mechanism."""
+        """Both pickers' callback. Indigo round-trips to the plugin, which re-runs the
+        dynamicReload preview (ConfigUI has no per-field change event), and this also
+        sets the hidden ``replaceShapeDiffers`` so "Replace anyway" shows only when the
+        two nodes' devices differ.
+
+        The field only drives visibility; ``menuReplaceNode`` re-plans from scratch and
+        never reads it. On any failure: log and leave the values as they are.
+        """
+        try:
+            old_node, new_node = _as_node_id(valuesDict.get("replaceOld")), _as_node_id(valuesDict.get("replaceNew"))
+            differs = False
+            if old_node is not None and new_node is not None:
+                differs = not self._plan_only(old_node, new_node).shape_matches
+            valuesDict["replaceShapeDiffers"] = "true" if differs else "false"
+        except Exception as exc:  # pylint: disable=broad-except
+            # Absorbing: a UI-thread callback; an escape is a raw traceback dialog. Safe
+            # because the field is cosmetic and Replace validates from a fresh plan.
+            self.logger.exception(exc)
         return valuesDict
 
     @_degrades_to_empty_list
@@ -140,11 +155,18 @@ class NodeReplaceMenuMixin:
         tombstones = getattr(self.device_sync, "node_tombstones", None)  # pylint: disable=no-member
         return old_node is not None and tombstones is not None and tombstones.is_tombstoned(old_node)
 
-    def _replacement_plan(self, old_node: int, new_node: int, allow_mismatch: bool):
-        """Build the plan and its refusal reasons without changing anything."""
+    def _plan_only(self, old_node: int, new_node: int):
+        """The pairing plan alone (no reference lookups). D8: a carried node device is not a mismatch."""
         sync = self.device_sync  # pylint: disable=no-member
-        plan = plan_replacement(old_node, sync.node_device_refs(old_node), new_node, sync.node_device_refs(new_node),
+        return plan_replacement(old_node, sync.node_device_refs(old_node), new_node, sync.node_device_refs(new_node),
                                 drop_new_node_device=self._old_node_device_tombstoned(old_node))
+
+    def _replacement_plan(self, old_node: int, new_node: int, allow_mismatch: bool):
+        """Build the plan and its refusal reasons without changing anything.
+
+        ``allow_mismatch`` only matters when the shapes differ; a stale ticked box is inert.
+        """
+        plan = self._plan_only(old_node, new_node)
         references: dict[int, list[str]] = {}
         reference_errors: dict[int, str] = {}
         # A grouped device lists its own group siblings under "devices"

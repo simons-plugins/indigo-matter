@@ -246,34 +246,35 @@ def _flat(rows):
     return " | ".join(" ".join(str(part) for part in row) for row in rows)
 
 
-def test_preview_rows_one_per_pair_names_both_sides_and_marks_the_new_one_deleted():
-    """Spec S1 preview_rows: one row per pair, '<old>  ←  <new> (deleted)'."""
+def test_preview_rows_one_per_pair_names_the_role_and_where_it_moves():
+    """Spec S1 preview_rows: 'Switch → moves to 0x43'; names live in the pickers, not the rows."""
     rows = node_replace.preview_rows(_plan(), [])
     assert all(isinstance(row, tuple) and len(row) == 2 for row in rows)
-    pair_rows = [row for row in rows if "Coffee Machine Matter Switch" in " ".join(row)]
-    assert len(pair_rows) == 1
-    text = " ".join(pair_rows[0])
-    assert "Coffee Machine - Switch" in text
-    assert "(deleted)" in text
+    assert [label for _v, label in rows] == ["Node device → moves to 0x43", "Switch → moves to 0x43"]
 
 
-def test_preview_rows_list_unmatched_devices_and_refusals_with_unique_values():
-    """Spec S1 preview_rows: unmatched devices and refusals each get a row; values are unique strings."""
-    extra = DeviceRef(2003, 2, "matterRelay", "Coffee Machine - Switch 2")
-    plan = _plan(new=_new(extra=[extra]))
-    rows = node_replace.preview_rows(plan, ["Refusal reason one", "Refusal reason two"])
-    flat = _flat(rows)
-    assert "Coffee Machine - Switch 2" in flat
-    assert "Refusal reason one" in flat and "Refusal reason two" in flat
+def test_preview_rows_unmatched_and_extra_rows_are_short():
+    """Unmatched old stays, unmatched new is kept; values are unique strings."""
+    extra = DeviceRef(2003, 2, "matterTemperatureSensor", "Coffee Machine - Temperature")
+    old_only = DeviceRef(1003, 3, "matterMotionSensor", "Coffee Machine Matter Motion")
+    plan = _plan(old=_old(extra=[old_only]), new=_new(extra=[extra]))
+    rows = node_replace.preview_rows(plan, [])
+    labels = [label for _v, label in rows]
+    assert "Motion: no match, stays" in labels
+    assert "Temperature (new): kept" in labels
     values = [row[0] for row in rows]
-    assert all(isinstance(v, str) for v in values)
     assert len(values) == len(set(values)), "a list needs unique values"
 
 
-def test_preview_rows_end_with_the_get_dependencies_blind_spot_note():
-    """Spec S1 preview_rows / D6: the last row warns the reference check cannot see plugin-action props (e.g. Lamplighter)."""
-    rows = node_replace.preview_rows(_plan(), [])
-    assert "Lamplighter" in " ".join(rows[-1])
+def test_preview_rows_refusals_collapse_to_one_short_row():
+    """Several refusals still give one row; the full reasons come from the Replace click."""
+    rows = node_replace.preview_rows(_plan(), ["Refusal reason one", "Refusal reason two"])
+    assert rows == [("refuse", "✗ Can't replace: click Replace for the reason")]
+
+
+def test_preview_rows_no_longer_carry_the_blind_spot_note():
+    """The getDependencies blind-spot note moved to a static label under the list."""
+    assert "Lamplighter" not in _flat(node_replace.preview_rows(_plan(), []))
 
 
 @pytest.mark.parametrize("refusals", [[], ["one"]])
@@ -327,11 +328,10 @@ def test_a_failed_reference_lookup_on_a_carried_node_device_refuses():
     assert len(reasons) == 1 and "boom" in reasons[0]
 
 
-def test_preview_labels_the_carried_node_device_as_deleted_by_hand():
-    """Review fix 2: preview row says it is deleted because the old node's device was removed by hand."""
+def test_preview_labels_the_carried_node_device_as_deleted():
+    """Review fix 2: the D8 extra delete reads 'Node device (new): deleted'."""
     rows = node_replace.preview_rows(_carry_plan(), [])
-    labels = [label for _value, label in rows if "Coffee Machine  " in label or label.endswith("by hand)")]
-    assert any("(deleted, the old node's device was removed by hand)" in label for label in labels)
+    assert "Node device (new): deleted" in [label for _value, label in rows]
     assert len({value for value, _label in rows}) == len(rows)
 
 

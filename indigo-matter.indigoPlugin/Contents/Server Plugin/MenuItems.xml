@@ -128,8 +128,16 @@ A Matter pairing code is not durable: once used, or once the window expires (up 
                 <Label>Preview:</Label>
                 <List class="self" method="getReplacePreview" dynamicReload="true"/>
             </Field>
-            <Field id="replaceAnyway" type="checkbox" defaultValue="false">
-                <Label>Replace anyway if the two nodes have different devices (only the devices that match are rebound).</Label>
+            <Field id="replacePreviewNote" type="label" fontSize="small" fontColor="darkgray">
+                <Label>The reference check cannot see references inside plugin-action settings (for example Lamplighter zones).</Label>
+            </Field>
+            <!-- Set by replaceNodeChanged; visibility can only bind to a field value. Cosmetic:
+                 menuReplaceNode re-plans and never reads it. -->
+            <Field id="replaceShapeDiffers" type="textfield" hidden="true" defaultValue="false"/>
+            <Field id="replaceAnyway" type="checkbox" defaultValue="false"
+                   visibleBindingId="replaceShapeDiffers" visibleBindingValue="true"
+                   alwaysUseInDialogHeightCalc="true">
+                <Label>The new node has different devices. Move only the ones that match?</Label>
             </Field>
             <Field id="replaceDecommissionOld" type="checkbox" defaultValue="false">
                 <Label>Also try to remove the old node from Indigo's Matter fabric. This usually fails for a reset device, which is fine.</Label>
