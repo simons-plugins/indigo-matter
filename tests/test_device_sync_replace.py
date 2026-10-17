@@ -481,6 +481,24 @@ def test_a_decommission_that_left_the_fabric_clears_the_retirement(ds, coffee):
     assert not ds.retired_nodes.is_tombstoned(OLD_NODE)
 
 
+def test_a_commission_onto_a_stale_retired_id_still_creates_devices(ds, coffee):
+    """Round-2 review: retirement left behind (node vanished unheard) must not make a new commission born dead."""
+    ds.retired_nodes.add(99)
+    ds.reconcile_all([coffee.raw_old, coffee.raw_new])     # 99 absent: leaves _known_nodes, retirement stays
+    raw = _coffee_raw(99, "1.0.0")
+    result = ds.create_from_raw(raw, "Kettle")
+    assert result["indigoDeviceIds"], "a commissioned node is new by definition"
+    assert not ds.retired_nodes.is_tombstoned(99)
+
+
+def test_nothing_rebound_means_the_old_node_is_not_retired(ds, coffee):
+    """Round-2 review: if every duplicate delete is refused, nothing moved, so the old node stays live."""
+    _wrap_delete(coffee.indigo, refuse={d.id for d in coffee.new_devs})
+    result = ds.replace_node(coffee.plan)
+    assert result.rebound == []
+    assert not ds.retired_nodes.is_tombstoned(OLD_NODE)
+
+
 def test_retirement_survives_a_persist_load_round_trip(ds, coffee):
     """Review fix 1: the retired set is persisted like the tombstones."""
     import device_sync as device_sync_mod

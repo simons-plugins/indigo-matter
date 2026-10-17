@@ -792,12 +792,6 @@ class DeviceSync:
             # next reconcile_all and could be picked a second time.
             if forget:
                 self._known_nodes.discard(target)
-                # Also un-retire it (issue #364). The node_removed path does
-                # this too, but an "already absent" decommission fires no
-                # node_removed, and a retirement left on an id matter-server
-                # no longer has would make a later node on that id born dead.
-                if self.retired_nodes is not None:
-                    self.retired_nodes.forget(target)
             # Collect all dev_ids across all endpoints for this node. The
             # matterNode device (if present) is still held back to the end —
             # not because deletion order matters any more (the group is
@@ -816,7 +810,15 @@ class DeviceSync:
                         candidates.append(dev_id)
             if node_dev_id is not None:
                 candidates.append(node_dev_id)
-            return self._delete_devices(candidates, node_dev_id)
+            deleted = self._delete_devices(candidates, node_dev_id)
+        # Also un-retire it (issue #364), outside the lock because forgetting
+        # persists to pluginPrefs. The node_removed path does this too, but an
+        # "already absent" decommission fires no node_removed, and a retirement
+        # left on an id matter-server no longer has would make a later node on
+        # that id born dead.
+        if forget and self.retired_nodes is not None:
+            self.retired_nodes.forget(target)
+        return deleted
 
     def _forget_device(self, dev_id: int) -> None:
         """Drop one device id from ``_index`` (every key it appears under)."""
@@ -1128,8 +1130,10 @@ class DeviceSync:
                         and any(ref.type_id == "matterNode" and ref.dev_id in deleted for ref in plan.extra_deletes)):
                     self.node_tombstones.add(new_node)
                 # The old node is usually still commissioned in matter-server; stop
-                # reconcile building a duplicate device set for it.
-                if self.retired_nodes is not None:
+                # reconcile building a duplicate device set for it. Only when
+                # something actually moved: if nothing was rebound, the old node's
+                # devices are still its own and it must keep healing as normal.
+                if self.retired_nodes is not None and rebound:
                     self.retired_nodes.add(old_node)
                 with self._lock:
                     self._known_nodes.add(new_node)
@@ -1180,6 +1184,14 @@ class DeviceSync:
     def create_from_raw(self, raw_node: dict, suggested_name: str,
                         suggested_room: Optional[str] = None) -> dict:
         node = parse_node(raw_node, suggested_name or "")
+        # Only the commission path reaches here, and a commission proves the node
+        # is new. A retirement still sitting on this id (issue #364) outlived its
+        # node unheard — removed while the plugin was stopped, say — and would
+        # otherwise give the new device no Indigo devices at all.
+        if self.retired_nodes is not None and self.retired_nodes.is_tombstoned(node.node_id):
+            self.retired_nodes.forget(node.node_id)
+            self.logger.info("node %s: cleared a leftover node-replacement retirement for this "
+                             "newly commissioned node", node_id_to_str(int(node.node_id)))
         return self.create_devices(node, suggested_room)
 
     def _nothing_created(self, node: NodeInfo) -> dict:
