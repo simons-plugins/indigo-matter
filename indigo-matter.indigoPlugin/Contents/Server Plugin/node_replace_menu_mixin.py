@@ -156,6 +156,10 @@ class NodeReplaceMenuMixin:
         for new in [new for _old, new in plan.pairs] + list(plan.extra_deletes):
             try:
                 deps = indigo.device.getDependencies(new.dev_id)
+                if not any(kind in deps for kind in _DEPENDENCY_KINDS):
+                    # Shape drift: none of the six lists we read is present, so the answer
+                    # says nothing about references. Treated as a failed lookup (refuses).
+                    raise ValueError("unexpected getDependencies reply (none of the expected lists present)")
                 referrers = [str(entry.get("Name", entry.get("ID", "?")))
                              for kind in _DEPENDENCY_KINDS for entry in (deps.get(kind) or [])
                              if not (kind == "devices" and entry.get("ID") in new_node_ids)]

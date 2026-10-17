@@ -263,6 +263,15 @@ def test_d8_carried_node_device_that_is_referenced_refuses_and_changes_nothing(m
     assert "Coffee on" in _error_text(result)
 
 
+@pytest.mark.parametrize("shape", [{}, {"unrelated": 1}])
+def test_get_dependencies_without_any_known_kind_refuses_and_changes_nothing(menu, coffee, shape):
+    """Review fix 5: a getDependencies reply with none of the six kinds is shape drift, not 'no references'."""
+    coffee.indigo.device.getDependencies = lambda _dev_id: shape
+    snapshot, touched = _snapshot(coffee), _arm_untouchable(coffee)
+    result = menu.menuReplaceNode(_values())
+    _assert_refused_and_untouched(menu, coffee, result, snapshot, touched)
+
+
 # ---------------------------------------------------------------------------
 # happy path and its degradations
 # ---------------------------------------------------------------------------
