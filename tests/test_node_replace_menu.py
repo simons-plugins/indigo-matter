@@ -191,6 +191,36 @@ def test_referenced_paired_new_device_refuses_and_changes_nothing(menu, coffee):
     _assert_refused_and_untouched(menu, coffee, result, snapshot, touched)
 
 
+def _sibling_deps(coffee, extra_devices=()):
+    """Real Indigo shape for a grouped device: its group siblings appear under
+    ``devices`` (observed live 2026-10-17 on node 67's relay and node device)."""
+    new_ids = {d.id for d in coffee.new_devs}
+
+    def deps(dev_id):
+        siblings = [{"ID": d.id, "Name": d.name} for d in coffee.new_devs if d.id != dev_id]
+        out = {kind: [] for kind in NO_DEPENDENCIES}
+        out["devices"] = siblings + list(extra_devices) if dev_id in new_ids else []
+        return out
+    return deps
+
+
+def test_group_siblings_on_the_new_node_are_not_references(menu, coffee):
+    """S4 (D6): a new device's own group siblings in getDependencies()['devices'] do not refuse."""
+    coffee.indigo.device.getDependencies = _sibling_deps(coffee)
+    result = menu.menuReplaceNode(_values())
+    assert result[0] is True, _error_text(result)
+    assert coffee.old_relay.pluginProps["nodeId"] == "67"
+
+
+def test_a_device_outside_the_new_node_still_counts_as_a_reference(menu, coffee):
+    """S4 (D6): only same-node siblings are ignored; any other device dependent still refuses."""
+    coffee.indigo.device.getDependencies = _sibling_deps(
+        coffee, extra_devices=[{"ID": 999999, "Name": "Some other device"}])
+    snapshot, touched = _snapshot(coffee), _arm_untouchable(coffee)
+    result = menu.menuReplaceNode(_values())
+    _assert_refused_and_untouched(menu, coffee, result, snapshot, touched)
+
+
 def test_get_dependencies_raising_refuses_and_changes_nothing(menu, coffee):
     """S4 (D6): getDependencies raises -> refused, never treated as 'no references'."""
     def broken(_dev_id):

@@ -54,6 +54,7 @@ from http_handlers import HttpApi
 from launch_agent import STARTUP_GRACE_SECONDS, VERDICT_CONFLICT_FREE, VERDICT_DEAD
 from matter_client import MatterClient
 from matter_handlers.registry import HandlerRegistry
+from node_replace_menu_mixin import NodeReplaceMenuMixin
 from matter_handlers.settings import settings_for_type
 import matter_server_menu_mixin  # noqa: F401 (tests patch ServerProcess)  # pylint: disable=unused-import
 from matter_server_menu_mixin import MatterServerMenuMixin
@@ -117,7 +118,7 @@ def _dead_verdict_cause_text(agent) -> str:
 
 class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenuMixin,
              ExportRecoveryMenuMixin, BridgeAgentMenuMixin,
-             DiagnosticsMenuMixin, indigo.PluginBase):
+             DiagnosticsMenuMixin, NodeReplaceMenuMixin, indigo.PluginBase):
     """Matter plugin entry point."""
 
     def __init__(self, plugin_id, plugin_display_name, plugin_version, plugin_prefs, **kwargs):

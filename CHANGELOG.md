@@ -3,6 +3,27 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
+## 2026.33.0 — Replace a Matter node…, for a device you factory-reset and paired again
+
+- New: **Plugins ▸ Matter ▸ Replace a Matter node…** (issue #364). When a
+  device is reset and paired again it gets a new node number and the plugin
+  created a second set of Indigo devices for it, leaving everything that
+  refers to the originals pointing at a dead node. This points the original
+  Indigo devices at the new node and deletes the new duplicates, so ids, names,
+  settings and every trigger, schedule and control page that uses them carry
+  on unchanged.
+- It shows a preview first, and refuses (changing nothing) if the nodes have
+  different devices (unless you tick "replace anyway"), if a duplicate is
+  exported as a Matter accessory, if anything refers to a duplicate, or if
+  Indigo could not check. A partial result is reported as an error that names
+  what was skipped.
+- Optionally tries to remove the old node from the fabric afterwards. This
+  usually fails for a reset device, which is fine: it warns and the replacement
+  stands.
+- Known limit: Indigo's dependency check cannot see references inside plugin
+  settings (such as Lamplighter zones), so those are not checked. See
+  `docs/MATTER.md`.
+
 ## 2026.32.10 — Ships the Alexa 15 s stall fix (bridge 0.17.5)
 
 - The 2026.32.9 fix lives in the bridge node, which is a separate npm

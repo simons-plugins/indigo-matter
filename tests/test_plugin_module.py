@@ -120,6 +120,7 @@ MENU_SECTIONS = [
     ["Commission device by setup code (advanced)…",
      "Share a Matter device with another ecosystem…",
      "Decommission Matter device…",
+     "Replace a Matter node…",
      "Report settable Matter settings…",
      "Explore Matter attributes (advanced)…",
      "Report Thread mesh…"],
