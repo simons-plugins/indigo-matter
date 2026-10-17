@@ -473,6 +473,28 @@ def test_old_node_tombstoned_deletes_the_new_node_device_and_tombstones_the_new_
     assert ds.lookup(NEW_NODE, 1, "matterRelay") == coffee.old_relay.id
 
 
+def test_a_kept_unmatched_new_node_device_is_not_left_marked_self_deleted(ds, indigo_env):  # noqa: F811
+    """S3 (D3/D8): 'replace anyway' keeps an unmatched new matterNode; it must not linger in _self_deleted_ids."""
+    coffee = _build_coffee(ds, indigo_env)
+    # Old node has no node device (an install that predates them), and is NOT tombstoned.
+    del coffee.devices._by_id[coffee.old_node.id]
+    ds.rebuild_index()
+    assert not ds.node_tombstones.is_tombstoned(OLD_NODE)
+
+    from node_replace import plan_replacement
+    plan = plan_replacement(OLD_NODE, [_ref(coffee.old_relay)],
+                            NEW_NODE, [_ref(coffee.new_node), _ref(coffee.new_relay)])
+    assert [ref.dev_id for ref in plan.unmatched_new] == [coffee.new_node.id]
+    result = ds.replace_node(plan)
+
+    assert result.rebound == [coffee.old_relay.id]
+    assert coffee.new_node.id in coffee.devices._by_id, "an unmatched new device is kept"
+    assert not ds._self_deleted_ids, "a device that was never deleted must not stay marked"
+    # So a LATER genuine user deletion of it still tombstones the node.
+    ds.note_node_device_deleted(NEW_NODE, coffee.new_node.id)
+    assert ds.node_tombstones.is_tombstoned(NEW_NODE)
+
+
 def test_device_deleted_for_the_deleted_new_matternode_does_not_tombstone_it(ds, coffee):
     """S3 (D8): deviceDeleted for the deleted duplicate matterNode (note_node_device_deleted) must not tombstone 67."""
     def indigo_calls_device_deleted(dev_id):

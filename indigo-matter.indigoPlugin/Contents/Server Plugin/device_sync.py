@@ -26,6 +26,7 @@ import json
 import re
 import threading
 import time
+from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
 import indigo
@@ -389,6 +390,14 @@ class NodeDeviceTombstones:
                     "Matter: could not save node-device tombstones (%s) — if the plugin "
                     "restarts before a later successful save, a node device you deleted "
                     "may be recreated.", exc)
+
+
+@dataclass
+class ReplaceResult:
+    """Outcome of :meth:`DeviceSync.replace_node` (issue #364)."""
+    rebound: list           # old device ids now pointing at the new node
+    deleted: list           # duplicate device ids actually deleted
+    skipped: list           # (old device id, reason): duplicate not deleted / props write refused
 
 
 class DeviceSync:
@@ -813,9 +822,13 @@ class DeviceSync:
         #364's replace-node operation, which deletes a chosen subset). See
         ``delete_node`` for why the group is dissolved before anything is
         deleted. ``node_dev_id`` is the matterNode device among ``dev_ids``
-        (or None): it alone is marked in ``_self_deleted_ids`` first.
+        (or None): it alone is marked in ``_self_deleted_ids`` first. One that
+        is NOT in ``dev_ids`` is ignored: marking a device this call never
+        deletes would swallow the user's later deletion of it (no tombstone).
         """
         candidates = list(dev_ids)
+        if node_dev_id not in candidates:
+            node_dev_id = None
         with self._lock:
             # Mark the node device (and only it) as self-deleted BEFORE
             # calling indigo.device.delete (issue #204 review, fix A — see
@@ -1032,6 +1045,76 @@ class DeviceSync:
             self.logger.debug("node_unreachable: read of device %s failed: %s", dev_id, exc)
             return None
         return None if value is None else not bool(value)
+
+    def replace_node(self, plan: Any) -> "ReplaceResult":
+        """Repoint the OLD node's devices at the NEW node and delete the duplicates (issue #364).
+
+        The order is the whole point (docs/plans/issue-364-replace-node.md):
+        duplicates are deleted FIRST, from ids captured before anything changes,
+        and the old devices are rebound LAST. A props write restarts the device,
+        and ``deviceStartComm`` -> ``note_device`` re-registers it in ``_index``
+        under the new node; an index-driven ``delete_node(new)`` after that would
+        delete the very devices being rescued. ``creation_suspended`` stops a
+        ``node_updated`` landing between the delete and the rebind from rebuilding
+        the duplicates.
+        """
+        # Lazy, as in node_device_refs: a plain DeviceSync import must not require it.
+        from node_replace import rebound_props  # pylint: disable=import-outside-toplevel
+        old_node, new_node = plan.old_node, plan.new_node
+        with self.creation_suspended(new_node):
+            dups = [new.dev_id for _old, new in plan.pairs]
+            with self._lock:
+                new_node_dev_id = self._index.get((new_node, 0), {}).get("matterNode")
+            # Captured before the deletes remove the device it lives on (D7).
+            software_version: Optional[str] = None
+            if new_node_dev_id is not None:
+                try:
+                    software_version = indigo.devices[new_node_dev_id].pluginProps.get("softwareVersion")
+                except KeyError:
+                    self.logger.debug("replace_node: new node device %s is gone", new_node_dev_id)
+            # D8: the user removed the old node's node device on purpose, so the one on the
+            # replacement hardware goes too, whether or not it was paired.
+            carry_tombstone = (self.node_tombstones is not None
+                               and self.node_tombstones.is_tombstoned(old_node)
+                               and new_node_dev_id is not None)
+            if carry_tombstone and new_node_dev_id not in dups:
+                dups.append(new_node_dev_id)
+
+            deleted = self._delete_devices(dups, new_node_dev_id)
+
+            rebound: list[int] = []
+            skipped: list[tuple[int, str]] = []
+            for old, new in plan.pairs:
+                if new.dev_id not in deleted:
+                    # D3: rebinding next to a surviving duplicate would leave two devices
+                    # claiming one (node, endpoint, type).
+                    skipped.append((old.dev_id, f'its duplicate "{new.name}" (id {new.dev_id}) could not be deleted'))
+                    continue
+                try:
+                    dev = indigo.devices[old.dev_id]    # fresh: earlier writes may have changed it
+                    dev.replacePluginPropsOnServer(rebound_props(
+                        dict(dev.pluginProps), new_node,
+                        software_version=software_version if old.type_id == "matterNode" else None))
+                    rebound.append(old.dev_id)
+                    self.logger.info('"%s" (id %s) rebound node %s -> %s', dev.name, old.dev_id,
+                                     node_id_to_str(old_node), node_id_to_str(new_node))
+                except Exception as exc:  # pylint: disable=broad-except
+                    # Absorbing: one refused write (or a device deleted meanwhile) must not stop
+                    # the other pairs. Safe because it is reported in `skipped`, and the device
+                    # keeps its old props, which is the pre-replacement state.
+                    skipped.append((old.dev_id, f"Indigo refused the props write: {exc}"))
+                    self.logger.warning("could not rebind Indigo device %s: %s", old.dev_id, exc)
+
+            if carry_tombstone and new_node_dev_id in deleted:
+                self.node_tombstones.add(new_node)
+            with self._lock:
+                self._known_nodes.add(new_node)
+            self.rebuild_index()
+        for dev_id in deleted:
+            self.logger.info("deleted duplicate Indigo device %s of node %s (node %s's devices now use node %s)",
+                             dev_id, node_id_to_str(new_node), node_id_to_str(old_node),
+                             node_id_to_str(new_node))
+        return ReplaceResult(rebound=rebound, deleted=deleted, skipped=skipped)
 
     def list_nodes(self) -> list:
         """Per-node summary for UI pickers: ``[(node_id, [device names])]``.
