@@ -372,6 +372,64 @@ The node device is the exception, because it is the one device here the plugin
 invented rather than derived: delete it and it **stays** deleted, with
 **Plugins → Matter → Recreate Matter node devices…** as the way back.
 
+### Replacing a re-paired device
+
+If you factory-reset a Matter device and pair it again, Matter gives it a
+**new node number**, and the plugin builds a second, brand-new set of Indigo
+devices for it. Your original devices — the ones your triggers, schedules,
+action groups and control pages point at — now belong to a node that no longer
+exists, and show as unreachable.
+
+**`Plugins ▸ Matter ▸ Replace a Matter node…`** fixes that without touching
+anything that refers to the originals. It points the original Indigo devices at
+the new node and deletes the new duplicates. Names, settings and ids all stay.
+
+1. Pair the device again as normal, and let its new devices appear.
+2. Open **Replace a Matter node…**.
+3. **Keep devices of:** pick the old device. Unreachable ones are listed
+   first.
+4. **Sync using node:** pick the new node. Nodes with the same devices as the
+   old one come first; the rest end with "(differs)". Each entry starts with the node address.
+5. Read the preview. It lists each part and what happens to it, for example
+   "Switch → 0x43". If the nodes have different devices, a
+   "Matching only" box appears; tick it to go ahead.
+6. Tick the confirmation and click **Replace**. The plugin then asks for a
+   refresh, and the devices pick up live state. If the refresh fails, the
+   devices are still rebound and refresh the next time matter-server
+   reconnects.
+
+**What it refuses, and why.** Nothing is changed when it refuses. The preview
+says "Can't replace", and clicking Replace shows the reason:
+
+- *The two nodes have different devices.* Tick "Matching only" to rebind only
+  the devices that match; the others are left as they are.
+- *A new device is exported as a Matter accessory.* It is about to be deleted,
+  which would remove its accessory from every ecosystem. Move the accessory
+  first with **Migrate an exported accessory…**.
+- *Something refers to a new device* (a trigger, schedule, action group,
+  control page or variable). Resolve those references first, or delete the
+  device by hand, the same as Indigo's own Z-Wave replace.
+- *Indigo could not check* whether a new device is referenced. It refuses
+  rather than guess.
+
+**Removing the old node.** The "also try to remove the old node" option asks
+matter-server to drop the old node from Indigo's fabric. For a factory-reset
+device this usually **fails**, because the device has forgotten Indigo and
+cannot answer. That is fine: you get a warning in the event log, and the
+replacement is already finished. The old node entry stays in matter-server, but
+the plugin now **ignores it**: it makes no Indigo devices for it, and the choice
+is remembered across restarts. It stays in "Decommission Matter device…" so you
+can remove it later, and that decommission also clears the ignore. The option is
+skipped, with a warning, if any Indigo device still uses the old node.
+
+**One blind spot.** The check for "something refers to a new device" uses
+Indigo's own dependency check, which does **not** see devices named inside a
+plugin's own settings, such as Lamplighter zones or Auto Lights. That doesn't
+matter for the devices you keep, which keep their ids. It does mean the plugin
+can't warn you if one of those settings points at a *new* duplicate that is
+about to be deleted. If you pointed anything at the new devices, repoint it at
+the originals afterwards.
+
 ## Indigo as a Matter bridge — the other direction
 
 Everything up to here is Indigo as a Matter **controller**: other people's Matter

@@ -52,6 +52,7 @@ from plugin_constants import (
     NO_SELECTION_ID,
     NO_SELECTION_LABEL,
     RECONCILE_TIMEOUT,
+    RETIRED_NODES_PREF,
     SHARE_WINDOW_TIMEOUT,
     degrades_to_list_error,
     server_location,
@@ -859,4 +860,10 @@ class MatterServerMenuMixin:
         and committed via savePluginPrefs, without which it survives only
         until the plugin stops."""
         self.pluginPrefs[NODE_TOMBSTONES_PREF] = blob
+        indigo.server.savePluginPrefs()
+
+    def _save_retired_nodes(self, blob: str) -> None:
+        """Persist the replace-node retired set (issue #364); same discipline as
+        :meth:`_save_node_tombstones`."""
+        self.pluginPrefs[RETIRED_NODES_PREF] = blob
         indigo.server.savePluginPrefs()

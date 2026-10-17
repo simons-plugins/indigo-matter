@@ -21,10 +21,12 @@ runs on the commissioning/Indigo thread, not the loop.)
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import re
 import threading
 import time
+from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
 import indigo
@@ -390,6 +392,14 @@ class NodeDeviceTombstones:
                     "may be recreated.", exc)
 
 
+@dataclass
+class ReplaceResult:
+    """Outcome of :meth:`DeviceSync.replace_node` (issue #364)."""
+    rebound: list           # old device ids now pointing at the new node
+    deleted: list           # duplicate device ids actually deleted
+    skipped: list           # (old device id, reason): duplicate not deleted / props write refused
+
+
 class DeviceSync:
     def __init__(self, registry: Any, logger: Any) -> None:
         self.registry = registry
@@ -494,6 +504,13 @@ class DeviceSync:
         # path that hasn't wired it, which means "nothing is tombstoned" —
         # NOT "recreate nothing" — see _ensure_node_device.
         self.node_tombstones: Optional[Any] = None
+        # Nodes retired by replace_node (issue #364): still commissioned in
+        # matter-server (a reset device can't answer RemoveFabric) but their
+        # devices now live on the replacement node, so create_devices must not
+        # build a duplicate set for them. A second NodeDeviceTombstones (same
+        # set-of-node-ids semantics), injected by plugin.startup; None means
+        # "nothing retired". Cleared with the tombstone in _forget_node_capabilities.
+        self.retired_nodes: Optional[Any] = None
         # Nodes whose AttributeLists changed but whose Indigo devices have not
         # yet had their state lists rebuilt (issue #190). Needed because
         # _cache_setting_limits both records the new answer and reports the
@@ -534,6 +551,10 @@ class DeviceSync:
         # immediately when its own delete raises, so a marked-but-never-
         # deleted id can never swallow a LATER genuine user deletion.
         self._self_deleted_ids: set[int] = set()
+        # node_id -> nesting depth of creation_suspended() blocks (issue #364).
+        # A counter, not a set, so an inner block exiting cannot release an outer
+        # one. Guarded by _lock.
+        self._creation_suspended: dict[int, int] = {}
         # (dev_id, kind) pairs already warned about by _ensure_grouped (issue
         # #204 stage 2). Grouping is attempted on EVERY create/reconcile pass —
         # that repetition IS the migration, and it is what makes the operation
@@ -789,6 +810,41 @@ class DeviceSync:
                         candidates.append(dev_id)
             if node_dev_id is not None:
                 candidates.append(node_dev_id)
+            deleted = self._delete_devices(candidates, node_dev_id)
+        # Also un-retire it (issue #364), outside the lock because forgetting
+        # persists to pluginPrefs. The node_removed path does this too, but an
+        # "already absent" decommission fires no node_removed, and a retirement
+        # left on an id matter-server no longer has would make a later node on
+        # that id born dead.
+        if forget and self.retired_nodes is not None:
+            self.retired_nodes.forget(target)
+        return deleted
+
+    def _forget_device(self, dev_id: int) -> None:
+        """Drop one device id from ``_index`` (every key it appears under)."""
+        with self._lock:
+            for key in list(self._index):
+                type_map = self._index[key]
+                for type_id in [t for t, d in type_map.items() if d == dev_id]:
+                    del type_map[type_id]
+                if not type_map:
+                    del self._index[key]
+
+    def _delete_devices(self, dev_ids: list, node_dev_id: Optional[int]) -> list:
+        """Ungroup every id, then delete each; return the ids actually deleted.
+
+        The body :meth:`delete_node` used to carry inline (extracted for issue
+        #364's replace-node operation, which deletes a chosen subset). See
+        ``delete_node`` for why the group is dissolved before anything is
+        deleted. ``node_dev_id`` is the matterNode device among ``dev_ids``
+        (or None): it alone is marked in ``_self_deleted_ids`` first. One that
+        is NOT in ``dev_ids`` is ignored: marking a device this call never
+        deletes would swallow the user's later deletion of it (no tombstone).
+        """
+        candidates = list(dev_ids)
+        if node_dev_id not in candidates:
+            node_dev_id = None
+        with self._lock:
             # Mark the node device (and only it) as self-deleted BEFORE
             # calling indigo.device.delete (issue #204 review, fix A — see
             # _self_deleted_ids above). Whether Indigo's deviceDeleted
@@ -822,11 +878,17 @@ class DeviceSync:
                     # test_a_refused_ungroup_still_lets_delete_node_delete_what_it_can,
                     # which asserts this exact level.
                     self.logger.debug("could not ungroup Indigo device %s: %s", dev_id, exc)
-            deleted = []
+            deleted: list[int] = []
             for dev_id in candidates:
                 try:
                     indigo.device.delete(indigo.devices[dev_id])
                     deleted.append(dev_id)
+                    # Pruned NOW, not in one pass after the loop (issue #364,
+                    # D12): the delete above can deliver an event (deviceDeleted,
+                    # a node_updated) that reaches lookup() before the next
+                    # iteration, and it must never be handed an id Indigo has
+                    # already removed.
+                    self._forget_device(dev_id)
                 except Exception as exc:  # pylint: disable=broad-except
                     # Absorbing: whatever Indigo refuses a delete for — most often that this
                     # device is the ROOT of a non-empty group. Safe because the refusal is
@@ -836,17 +898,6 @@ class DeviceSync:
                     if dev_id == node_dev_id:
                         self._self_deleted_ids.discard(dev_id)
                     self.logger.warning("could not delete Indigo device %s: %s", dev_id, exc)
-            deleted_set = set(deleted)
-            # Drop successfully-deleted devices from the nested index
-            new_index: dict[tuple[int, int], dict[str, int]] = {}
-            for key, type_map in self._index.items():
-                if key[0] == target:
-                    remaining = {tid: did for tid, did in type_map.items() if did not in deleted_set}
-                    if remaining:
-                        new_index[key] = remaining
-                else:
-                    new_index[key] = type_map
-            self._index = new_index
             return deleted
 
     def note_node_device_deleted(self, node_id: Any, dev_id: Any) -> None:
@@ -943,6 +994,159 @@ class DeviceSync:
         with self._lock:
             return dict(self._thread_event_seen)
 
+    def node_device_refs(self, node_id: Any) -> list:
+        """Snapshot of a node's Indigo devices as ``node_replace.DeviceRef`` (issue #364).
+
+        Built from ``_index``, with names resolved outside the lock (the
+        :meth:`list_nodes` discipline). A device Indigo no longer has is skipped:
+        the index can be stale until the next reconcile, and a ref for a missing
+        device could only mislead the replacement planner.
+        """
+        # Lazy: node_replace is a sibling module a plain DeviceSync import must not require.
+        from node_replace import DeviceRef  # pylint: disable=import-outside-toplevel
+        target = int(node_id)
+        with self._lock:
+            entries = [(eid, type_id, dev_id)
+                       for (nid, eid), type_map in self._index.items() if nid == target
+                       for type_id, dev_id in type_map.items()]
+        refs = []
+        for eid, type_id, dev_id in sorted(entries, key=lambda e: (e[0], e[1], e[2])):
+            try:
+                dev = indigo.devices[dev_id]
+            except KeyError:
+                self.logger.debug("node_device_refs: device %s is gone; skipping", dev_id)
+                continue
+            live_node = str(dev.pluginProps.get("nodeId", ""))
+            if live_node != str(target):
+                # The index is stale: the device was rebound (props rewritten) without
+                # re-registering. Listing it here could pair a device with itself.
+                self.logger.debug("node_device_refs: device %s now belongs to node %s, not %s; skipping",
+                                  dev_id, live_node, target)
+                continue
+            name = dev.name
+            refs.append(DeviceRef(dev_id, eid, type_id, name))
+        return refs
+
+    @contextlib.contextmanager
+    def creation_suspended(self, node_id: Any):
+        """Make :meth:`create_devices` a no-op for ``node_id`` inside the block (issue #364).
+
+        Re-entrant (a per-node counter) and released in ``finally``, so neither
+        a nested block nor an exception can leave the node frozen.
+        """
+        nid = int(node_id)
+        with self._lock:
+            self._creation_suspended[nid] = self._creation_suspended.get(nid, 0) + 1
+        try:
+            yield
+        finally:
+            with self._lock:
+                depth = self._creation_suspended.get(nid, 0) - 1
+                if depth > 0:
+                    self._creation_suspended[nid] = depth
+                else:
+                    self._creation_suspended.pop(nid, None)
+
+    def node_unreachable(self, node_id: Any) -> Optional[bool]:
+        """The node device's ``reachable`` state, inverted; None when it can't say.
+
+        None covers no node device, a device Indigo no longer has, and a state
+        that is absent: "unknown" must not be reported as reachable, since this
+        only sorts the replace-node picker and a wrong False would bury the
+        node the user is looking for.
+        """
+        with self._lock:
+            dev_id = self._index.get((int(node_id), 0), {}).get("matterNode")
+        if dev_id is None:
+            return None
+        try:
+            value = indigo.devices[dev_id].states.get("reachable")
+        except KeyError:
+            return None
+        except Exception as exc:  # pylint: disable=broad-except
+            # Absorbing: picker ordering only; the caller treats None as "unknown".
+            self.logger.debug("node_unreachable: read of device %s failed: %s", dev_id, exc)
+            return None
+        return None if value is None else not bool(value)
+
+    def replace_node(self, plan: Any) -> "ReplaceResult":
+        """Repoint the OLD node's devices at the NEW node and delete the duplicates (issue #364).
+
+        The order is the whole point (docs/adr/0018-a-re-paired-node-is-rebound-onto-its-existing-devices.md):
+        duplicates are deleted FIRST, from ids captured before anything changes,
+        and the old devices are rebound LAST. A props write restarts the device,
+        and ``deviceStartComm`` -> ``note_device`` re-registers it in ``_index``
+        under the new node; an index-driven ``delete_node(new)`` after that would
+        delete the very devices being rescued. ``creation_suspended`` stops a
+        ``node_updated`` landing between the delete and the rebind from rebuilding
+        the duplicates.
+        """
+        # Lazy, as in node_device_refs: a plain DeviceSync import must not require it.
+        from node_replace import rebound_props  # pylint: disable=import-outside-toplevel
+        old_node, new_node = plan.old_node, plan.new_node
+        with self.creation_suspended(new_node):
+            dups = [new.dev_id for _old, new in plan.pairs]
+            with self._lock:
+                new_node_dev_id = self._index.get((new_node, 0), {}).get("matterNode")
+            # Captured before the deletes remove the device it lives on (D7).
+            software_version: Optional[str] = None
+            if new_node_dev_id is not None:
+                try:
+                    software_version = indigo.devices[new_node_dev_id].pluginProps.get("softwareVersion")
+                except KeyError:
+                    self.logger.debug("replace_node: new node device %s is gone", new_node_dev_id)
+            # D8: the planner owns the carry; extra_deletes are the unpaired new node devices
+            # to delete because the user removed the old node's by hand.
+            dups.extend(ref.dev_id for ref in plan.extra_deletes if ref.dev_id not in dups)
+
+            try:
+                deleted = self._delete_devices(dups, new_node_dev_id)
+
+                rebound: list[int] = []
+                skipped: list[tuple[int, str]] = []
+                for old, new in plan.pairs:
+                    if new.dev_id not in deleted:
+                        # D3: rebinding next to a surviving duplicate would leave two devices
+                        # claiming one (node, endpoint, type).
+                        skipped.append((old.dev_id,
+                                        f'its duplicate "{new.name}" (id {new.dev_id}) could not be deleted'))
+                        continue
+                    try:
+                        dev = indigo.devices[old.dev_id]    # fresh: earlier writes may have changed it
+                        dev.replacePluginPropsOnServer(rebound_props(
+                            dict(dev.pluginProps), new_node,
+                            software_version=software_version if old.type_id == "matterNode" else None))
+                        rebound.append(old.dev_id)
+                        self.logger.info('"%s" (id %s) rebound node %s -> %s', dev.name, old.dev_id,
+                                         node_id_to_str(old_node), node_id_to_str(new_node))
+                    except Exception as exc:  # pylint: disable=broad-except
+                        # Absorbing: one refused write (or a device deleted meanwhile) must not stop
+                        # the other pairs. Safe because it is reported in `skipped`, and the device
+                        # keeps its old props, which is the pre-replacement state.
+                        skipped.append((old.dev_id, f"Indigo refused the props write: {exc}"))
+                        self.logger.warning("could not rebind Indigo device %s: %s", old.dev_id, exc)
+
+                if (self.node_tombstones is not None
+                        and any(ref.type_id == "matterNode" and ref.dev_id in deleted for ref in plan.extra_deletes)):
+                    self.node_tombstones.add(new_node)
+                # The old node is usually still commissioned in matter-server; stop
+                # reconcile building a duplicate device set for it. Only when
+                # something actually moved: if nothing was rebound, the old node's
+                # devices are still its own and it must keep healing as normal.
+                if self.retired_nodes is not None and rebound:
+                    self.retired_nodes.add(old_node)
+                with self._lock:
+                    self._known_nodes.add(new_node)
+            finally:
+                # Always, even on an unexpected failure: the index must reflect what
+                # was actually deleted and rebound (an index-driven delete_node trusts it).
+                self.rebuild_index()
+        for dev_id in deleted:
+            self.logger.info("deleted duplicate Indigo device %s of node %s (node %s's devices now use node %s)",
+                             dev_id, node_id_to_str(new_node), node_id_to_str(old_node),
+                             node_id_to_str(new_node))
+        return ReplaceResult(rebound=rebound, deleted=deleted, skipped=skipped)
+
     def list_nodes(self) -> list:
         """Per-node summary for UI pickers: ``[(node_id, [device names])]``.
 
@@ -980,9 +1184,40 @@ class DeviceSync:
     def create_from_raw(self, raw_node: dict, suggested_name: str,
                         suggested_room: Optional[str] = None) -> dict:
         node = parse_node(raw_node, suggested_name or "")
+        # Only the commission path reaches here, and a commission proves the node
+        # is new. A retirement still sitting on this id (issue #364) outlived its
+        # node unheard — removed while the plugin was stopped, say — and would
+        # otherwise give the new device no Indigo devices at all.
+        if self.retired_nodes is not None and self.retired_nodes.is_tombstoned(node.node_id):
+            self.retired_nodes.forget(node.node_id)
+            self.logger.info("node %s: cleared a leftover node-replacement retirement for this "
+                             "newly commissioned node", node_id_to_str(int(node.node_id)))
         return self.create_devices(node, suggested_room)
 
+    def _nothing_created(self, node: NodeInfo) -> dict:
+        """The normal ``create_devices`` return shape for a pass that created nothing."""
+        return {
+            "indigoDeviceIds": [],
+            "nodeDeviceId": None,
+            "primaryDeviceId": None,
+            "endpointCount": len(node.endpoints),
+            "vendorId": node.vendor_id,
+            "productId": node.product_id,
+            "vendorName": node.vendor_name,
+            "productName": node.product_name,
+        }
+
     def create_devices(self, node: NodeInfo, suggested_room: Optional[str] = None) -> dict:
+        nid = int(node.node_id)
+        if self.retired_nodes is not None and self.retired_nodes.is_tombstoned(nid):
+            # replace_node (issue #364) moved this node's devices onto a replacement
+            # node, but matter-server still lists it (a reset device can't answer
+            # RemoveFabric). Building devices for it would duplicate the set. It stays
+            # offered for decommission via _known_nodes.
+            with self._lock:
+                self._known_nodes.add(nid)
+            self.logger.debug("node %s: retired by a node replacement; creating no devices", node.node_id)
+            return self._nothing_created(node)
         created: list[int] = []
         new_ids: list[int] = []
         primary: Optional[int] = None
@@ -993,6 +1228,17 @@ class DeviceSync:
         # that node_added raced ahead and created with the bare product name.
         authoritative = bool((node.suggested_name or "").strip()) or bool((suggested_room or "").strip())
         with self._lock:
+            if self._creation_suspended.get(nid, 0) > 0:
+                # replace_node (issue #364) is mid-flight for this node: node_updated
+                # fires on every availability change and would recreate the very
+                # duplicates it is deleting. The check lives in THIS region, which also
+                # does every creation, and creation_suspended() takes the same lock: no
+                # creation can start after the counter is raised. (A check in its own
+                # earlier region left a window.) Same return shape as a pass that created
+                # nothing; _known_nodes is left alone, replace_node owns it.
+                self.logger.debug("node %s: device creation suspended (node replacement in progress); skipping",
+                                  node.node_id)
+                return self._nothing_created(node)
             # Covers the commission and node_added paths; reconcile_all maintains
             # _known_nodes independently (see list_nodes).
             self._known_nodes.add(int(node.node_id))
@@ -3012,6 +3258,10 @@ class DeviceSync:
         # one event allowed to clear it, not a routine WS reconnect.
         if self.node_tombstones is not None:
             self.node_tombstones.forget(target)
+        # And the replace-node retirement (issue #364): the node has genuinely
+        # left, so a reused id must not be born retired.
+        if self.retired_nodes is not None:
+            self.retired_nodes.forget(target)
 
     def _refresh_state_lists(self, node_id: Any) -> None:
         """Ask Indigo to rebuild the state list of every device on a node.

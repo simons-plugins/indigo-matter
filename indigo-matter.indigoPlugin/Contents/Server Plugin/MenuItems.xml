@@ -95,6 +95,73 @@ A Matter pairing code is not durable: once used, or once the window expires (up 
             </Field>
         </ConfigUI>
     </MenuItem>
+    <!--
+        Replace a Matter node… (issue #364). Wording follows Indigo's own
+        "Replacing a Z-Wave Device" flow.
+
+        The preview is a read-only LIST, not a label, on purpose (D4): ConfigUI
+        has no per-field change callback, so a label cannot update as the pickers
+        change. A dynamicReload list can, and both pickers' CallbackMethod
+        (replaceNodeChanged, a no-op) exists only to make Indigo re-run it.
+        Same mechanism as exploreAttributes and exportList.
+    -->
+    <MenuItem id="replaceMatterNode">
+        <Name>Replace a Matter node…</Name>
+        <CallbackMethod>menuReplaceNode</CallbackMethod>
+        <ButtonTitle>Replace</ButtonTitle>
+        <ConfigUI>
+            <!-- Layout copies Manage Matter Exports: SHORT labels, the
+                 explanation in <Description>. Indigo sizes the label column
+                 to the longest Label, so one sentence-long checkbox label
+                 squeezes every control (the preview list included) into a
+                 narrow strip on the right. -->
+            <Field id="replaceIntro" type="label">
+                <Label>Points your existing Indigo devices at a re-paired device's new Matter node, then deletes the duplicate devices that node created.</Label>
+            </Field>
+            <Field id="replacePickHeading" type="label" fontColor="darkgray">
+                <Label>1 · Pick the nodes</Label>
+            </Field>
+            <Field id="replaceOld" type="menu">
+                <Label>Keep devices of:</Label>
+                <List class="self" method="getReplaceOldNodes" dynamicReload="true"/>
+                <CallbackMethod>replaceNodeChanged</CallbackMethod>
+                <Description>The old node, whose Indigo devices your automations use.</Description>
+            </Field>
+            <Field id="replaceNew" type="menu">
+                <Label>Sync using node:</Label>
+                <List class="self" method="getReplaceNewNodes" dynamicReload="true"/>
+                <CallbackMethod>replaceNodeChanged</CallbackMethod>
+                <Description>The re-paired device's new node. Matching nodes are listed first.</Description>
+            </Field>
+            <Field id="replaceCheckHeading" type="label" fontColor="darkgray">
+                <Label>2 · Check and confirm</Label>
+            </Field>
+            <Field id="replacePreview" type="list" rows="4" readonly="true">
+                <Label>Preview:</Label>
+                <List class="self" method="getReplacePreview" dynamicReload="true"/>
+            </Field>
+            <Field id="replacePreviewNote" type="label" fontSize="small" fontColor="darkgray">
+                <Label>The reference check cannot see references inside plugin-action settings (for example Lamplighter zones).</Label>
+            </Field>
+            <!-- Set by replaceNodeChanged; visibility can only bind to a field value. Cosmetic:
+                 menuReplaceNode re-plans and never reads it. -->
+            <Field id="replaceShapeDiffers" type="textfield" hidden="true" defaultValue="false"/>
+            <Field id="replaceAnyway" type="checkbox" defaultValue="false"
+                   visibleBindingId="replaceShapeDiffers" visibleBindingValue="true"
+                   alwaysUseInDialogHeightCalc="true">
+                <Label>Matching only:</Label>
+                <Description>The new node has different devices. Tick to move only the ones that match.</Description>
+            </Field>
+            <Field id="replaceDecommissionOld" type="checkbox" defaultValue="false">
+                <Label>Remove old node:</Label>
+                <Description>Also remove the old node from Indigo's Matter fabric (harmless if it no longer answers).</Description>
+            </Field>
+            <Field id="confirm" type="checkbox" defaultValue="false">
+                <Label>Confirm:</Label>
+                <Description>The duplicate devices on the new node will be deleted.</Description>
+            </Field>
+        </ConfigUI>
+    </MenuItem>
 
     <!--
         Read-only diagnostics (issue #191; Report Thread mesh… added by #334).

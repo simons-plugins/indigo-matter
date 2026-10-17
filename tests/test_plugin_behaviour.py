@@ -706,7 +706,7 @@ def test_startup_wires_node_tombstones(plugin_mod, monkeypatch):
     p.logger = Mock()
     p._version = "2026.0.1"
     p._subscribed_to_devices = False
-    p.pluginPrefs = {plugin_mod.NODE_TOMBSTONES_PREF: '["42"]'}
+    p.pluginPrefs = {plugin_mod.NODE_TOMBSTONES_PREF: '["42"]', plugin_mod.RETIRED_NODES_PREF: '["52"]'}
     p.proto = object()
     p.registry = object()
     p.device_sync = Mock()
@@ -718,6 +718,8 @@ def test_startup_wires_node_tombstones(plugin_mod, monkeypatch):
         "startup() never loaded pluginPrefs into node_tombstones"
     assert p.device_sync.node_tombstones is p.node_tombstones, \
         "startup() never wired node_tombstones into device_sync"
+    assert p.retired_nodes.is_tombstoned(52), "startup() never loaded the retired-node set (#364)"
+    assert p.device_sync.retired_nodes is p.retired_nodes
 
 # ---------------------------------------------------------------------------
 # node_added → commission-job reconcile wiring (#16)
@@ -1385,6 +1387,13 @@ def test_save_node_tombstones_commits_through_indigo(plug, plugin_mod):
     import sys
     plug._save_node_tombstones('["42"]')
     assert plug.pluginPrefs[plugin_mod.NODE_TOMBSTONES_PREF] == '["42"]'
+    assert sys.modules["indigo"].server.savePluginPrefs.called
+
+
+def test_save_retired_nodes_commits_through_indigo(plug, plugin_mod):
+    import sys
+    plug._save_retired_nodes('["52"]')
+    assert plug.pluginPrefs[plugin_mod.RETIRED_NODES_PREF] == '["52"]'
     assert sys.modules["indigo"].server.savePluginPrefs.called
 
 

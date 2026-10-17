@@ -98,6 +98,8 @@ ON_TIME_RETIRED_PREF = "matterOnTimeStateRetired"
 #: startup loads it, MatterServerMenuMixin saves it (the "Recreate Matter node
 #: devices…" menu item is where a tombstone is cleared).
 NODE_TOMBSTONES_PREF = "matterNodeDeviceTombstones"
+#: Nodes retired by "Replace a Matter node…" (issue #364); same JSON-list shape.
+RETIRED_NODES_PREF = "matterRetiredNodes"
 #: pluginPrefs key holding ``getDeviceStateList``'s "last reported removed-set"
 #: log (issue #312) — one JSON object keyed by Indigo device id, valued by a
 #: fingerprint of the removed state keys, so the state-removal INFO logs once

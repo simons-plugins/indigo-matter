@@ -54,6 +54,7 @@ from http_handlers import HttpApi
 from launch_agent import STARTUP_GRACE_SECONDS, VERDICT_CONFLICT_FREE, VERDICT_DEAD
 from matter_client import MatterClient
 from matter_handlers.registry import HandlerRegistry
+from node_replace_menu_mixin import NodeReplaceMenuMixin
 from matter_handlers.settings import settings_for_type
 import matter_server_menu_mixin  # noqa: F401 (tests patch ServerProcess)  # pylint: disable=unused-import
 from matter_server_menu_mixin import MatterServerMenuMixin
@@ -64,7 +65,7 @@ from server_process import ServerProcess
 
 from plugin_constants import (
     COMMAND_TIMEOUT, MAX_RESUBSCRIBE_ATTEMPTS, NODE_TOMBSTONES_PREF, ON_TIME_RETIRED_PREF,
-    PLUGIN_NAME, PORT_CONFLICT_CHECK_INTERVAL, REMOVED_STATE_LOG_PREF, RESUBSCRIBE_TICKS,
+    PLUGIN_NAME, PORT_CONFLICT_CHECK_INTERVAL, REMOVED_STATE_LOG_PREF, RESUBSCRIBE_TICKS, RETIRED_NODES_PREF,
     SURVEY_LOG_PREF, sanitize_host, server_location,
 )
 import settings_report
@@ -117,7 +118,7 @@ def _dead_verdict_cause_text(agent) -> str:
 
 class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenuMixin,
              ExportRecoveryMenuMixin, BridgeAgentMenuMixin,
-             DiagnosticsMenuMixin, indigo.PluginBase):
+             DiagnosticsMenuMixin, NodeReplaceMenuMixin, indigo.PluginBase):
     """Matter plugin entry point."""
 
     def __init__(self, plugin_id, plugin_display_name, plugin_version, plugin_prefs, **kwargs):
@@ -262,6 +263,12 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
         self.node_tombstones = NodeDeviceTombstones(save=self._save_node_tombstones, logger=self.logger)
         self.node_tombstones.load(self.pluginPrefs.get(NODE_TOMBSTONES_PREF, ""))
         self.device_sync.node_tombstones = self.node_tombstones
+
+        # Nodes retired by "Replace a Matter node…" (issue #364). Same class and
+        # prefs discipline as the tombstones above, under its own key.
+        self.retired_nodes = NodeDeviceTombstones(save=self._save_retired_nodes, logger=self.logger)
+        self.retired_nodes.load(self.pluginPrefs.get(RETIRED_NODES_PREF, ""))
+        self.device_sync.retired_nodes = self.retired_nodes
 
         # getDeviceStateList's "last reported removed-set" per device (issue
         # #312) — same prefs discipline as survey_log above.
