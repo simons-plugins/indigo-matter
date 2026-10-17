@@ -108,7 +108,8 @@ class NodeReplaceMenuMixin:
             if old_node is None:
                 other.append((str(node_id), label))
                 continue
-            plan = plan_replacement(old_node, old_refs, node_id, self.device_sync.node_device_refs(node_id))  # pylint: disable=no-member
+            plan = plan_replacement(old_node, old_refs, node_id, self.device_sync.node_device_refs(node_id),  # pylint: disable=no-member
+                                    drop_new_node_device=self._old_node_device_tombstoned(old_node))
             if plan.shape_matches:
                 matching.append((str(node_id), label))
             else:
@@ -134,18 +135,25 @@ class NodeReplaceMenuMixin:
     # ------------------------------------------------------------------
     # Planning (shared by the preview and Execute)
     # ------------------------------------------------------------------
+    def _old_node_device_tombstoned(self, old_node: Optional[int]) -> bool:
+        """D8: did the user delete the old node's node device by hand (#204 tombstone)?"""
+        tombstones = getattr(self.device_sync, "node_tombstones", None)  # pylint: disable=no-member
+        return old_node is not None and tombstones is not None and tombstones.is_tombstoned(old_node)
+
     def _replacement_plan(self, old_node: int, new_node: int, allow_mismatch: bool):
         """Build the plan and its refusal reasons without changing anything."""
         sync = self.device_sync  # pylint: disable=no-member
-        plan = plan_replacement(old_node, sync.node_device_refs(old_node), new_node, sync.node_device_refs(new_node))
+        plan = plan_replacement(old_node, sync.node_device_refs(old_node), new_node, sync.node_device_refs(new_node),
+                                drop_new_node_device=self._old_node_device_tombstoned(old_node))
         references: dict[int, list[str]] = {}
         reference_errors: dict[int, str] = {}
         # A grouped device lists its own group siblings under "devices"
         # (observed live on 2026.2, 2026-10-17). Those are the new node's own
         # devices, about to be deleted together, so they are not references;
         # every other dependent still is.
-        new_node_ids = {new.dev_id for _o, new in plan.pairs} | {ref.dev_id for ref in plan.unmatched_new}
-        for _old, new in plan.pairs:
+        new_node_ids = ({new.dev_id for _o, new in plan.pairs} | {ref.dev_id for ref in plan.unmatched_new}
+                        | {ref.dev_id for ref in plan.extra_deletes})
+        for new in [new for _old, new in plan.pairs] + list(plan.extra_deletes):
             try:
                 deps = indigo.device.getDependencies(new.dev_id)
                 referrers = [str(entry.get("Name", entry.get("ID", "?")))

@@ -281,3 +281,55 @@ def test_preview_rows_values_stay_unique_with_and_without_refusals(refusals):
     """Spec S1 preview_rows: unique values regardless of refusal count."""
     values = [row[0] for row in node_replace.preview_rows(_plan(), refusals)]
     assert len(values) == len(set(values))
+
+
+# ---------------------------------------------------------------------------
+# D8 carry: drop_new_node_device (review fix 2)
+# ---------------------------------------------------------------------------
+
+def _carry_plan():
+    """Old node had its node device removed by hand: only the relay remains. New node has both."""
+    return node_replace.plan_replacement(
+        52, [DeviceRef(1002, 1, "matterRelay", "Coffee Machine Matter Switch")],
+        67, _new(), drop_new_node_device=True)
+
+
+def test_drop_new_node_device_moves_it_to_extra_deletes_and_is_not_a_mismatch():
+    """Review fix 2: the new matterNode goes to extra_deletes; the absent old one is not a shape mismatch."""
+    plan = _carry_plan()
+    assert [r.dev_id for r in plan.extra_deletes] == [2001]
+    assert plan.unmatched_new == ()
+    assert plan.shape_matches is True
+    assert _refusals(plan) == []
+
+
+def test_without_the_flag_the_new_node_device_stays_unmatched():
+    plan = node_replace.plan_replacement(
+        52, [DeviceRef(1002, 1, "matterRelay", "x")], 67, _new())
+    assert plan.extra_deletes == ()
+    assert [r.dev_id for r in plan.unmatched_new] == [2001]
+
+
+def test_an_exported_carried_node_device_refuses():
+    """Review fix 2: the export check covers extra_deletes."""
+    reasons = _refusals(_carry_plan(), exported=[2001])
+    assert len(reasons) == 1 and "Migrate an exported accessory" in reasons[0]
+
+
+def test_a_referenced_carried_node_device_refuses_naming_the_referrer():
+    """Review fix 2: the reference check covers extra_deletes."""
+    reasons = _refusals(_carry_plan(), references={2001: ["Coffee on"]})
+    assert len(reasons) == 1 and "Coffee on" in reasons[0]
+
+
+def test_a_failed_reference_lookup_on_a_carried_node_device_refuses():
+    reasons = _refusals(_carry_plan(), errors={2001: "boom"})
+    assert len(reasons) == 1 and "boom" in reasons[0]
+
+
+def test_preview_labels_the_carried_node_device_as_deleted_by_hand():
+    """Review fix 2: preview row says it is deleted because the old node's device was removed by hand."""
+    rows = node_replace.preview_rows(_carry_plan(), [])
+    labels = [label for _value, label in rows if "Coffee Machine  " in label or label.endswith("by hand)")]
+    assert any("(deleted, the old node's device was removed by hand)" in label for label in labels)
+    assert len({value for value, _label in rows}) == len(rows)

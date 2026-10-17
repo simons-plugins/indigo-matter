@@ -232,6 +232,37 @@ def test_get_dependencies_raising_refuses_and_changes_nothing(menu, coffee):
     _assert_refused_and_untouched(menu, coffee, result, snapshot, touched)
 
 
+def _tombstone_old_node_device(coffee, ds):  # noqa: F811
+    """The user deleted node 52's node device by hand, as plugin.deviceDeleted records it."""
+    old_node_dev = coffee.old_node
+    del coffee.devices._by_id[old_node_dev.id]
+    ds.note_node_device_deleted(OLD_NODE, old_node_dev.id)
+    assert ds.node_tombstones.is_tombstoned(OLD_NODE)
+
+
+def test_d8_happy_path_needs_no_replace_anyway(menu, coffee, ds):  # noqa: F811
+    """Review fix 2: old node tombstoned -> the new node device is carried, so the dialog does not
+    refuse a 'shape mismatch' and no 'replace anyway' is needed."""
+    _tombstone_old_node_device(coffee, ds)
+    result = menu.menuReplaceNode(_values(replaceAnyway=False))
+    assert result[0] is True, _error_text(result)
+    assert coffee.new_node.id not in coffee.devices._by_id
+    assert ds.node_tombstones.is_tombstoned(NEW_NODE)
+    assert coffee.old_relay.pluginProps["nodeId"] == "67"
+
+
+def test_d8_carried_node_device_that_is_referenced_refuses_and_changes_nothing(menu, coffee, ds):  # noqa: F811
+    """Review fix 2: the menu runs getDependencies for extra_deletes too."""
+    _tombstone_old_node_device(coffee, ds)
+    new_node_id = coffee.new_node.id
+    coffee.indigo.device.getDependencies = (
+        lambda dev_id: COFFEE_REFERENCED if dev_id == new_node_id else NO_DEPENDENCIES)
+    snapshot, touched = _snapshot(coffee), _arm_untouchable(coffee)
+    result = menu.menuReplaceNode(_values())
+    _assert_refused_and_untouched(menu, coffee, result, snapshot, touched)
+    assert "Coffee on" in _error_text(result)
+
+
 # ---------------------------------------------------------------------------
 # happy path and its degradations
 # ---------------------------------------------------------------------------

@@ -485,8 +485,10 @@ def test_old_node_tombstoned_deletes_the_new_node_device_and_tombstones_the_new_
 
     from node_replace import plan_replacement
     plan = plan_replacement(OLD_NODE, [_ref(coffee.old_relay)],
-                            NEW_NODE, [_ref(coffee.new_node), _ref(coffee.new_relay)])
-    assert [ref.dev_id for ref in plan.unmatched_new] == [coffee.new_node.id], "the node device is NOT paired here"
+                            NEW_NODE, [_ref(coffee.new_node), _ref(coffee.new_relay)],
+                            drop_new_node_device=True)
+    assert [ref.dev_id for ref in plan.extra_deletes] == [coffee.new_node.id], "the node device is carried, not paired"
+    assert plan.unmatched_new == ()
     def indigo_calls_device_deleted(dev_id):
         if dev_id == coffee.new_node.id:      # plugin.deviceDeleted only routes matterNode ids
             ds.note_node_device_deleted(NEW_NODE, dev_id)

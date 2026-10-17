@@ -1079,13 +1079,9 @@ class DeviceSync:
                     software_version = indigo.devices[new_node_dev_id].pluginProps.get("softwareVersion")
                 except KeyError:
                     self.logger.debug("replace_node: new node device %s is gone", new_node_dev_id)
-            # D8: the user removed the old node's node device on purpose, so the one on the
-            # replacement hardware goes too, whether or not it was paired.
-            carry_tombstone = (self.node_tombstones is not None
-                               and self.node_tombstones.is_tombstoned(old_node)
-                               and new_node_dev_id is not None)
-            if carry_tombstone and new_node_dev_id not in dups:
-                dups.append(new_node_dev_id)
+            # D8: the planner owns the carry; extra_deletes are the unpaired new node devices
+            # to delete because the user removed the old node's by hand.
+            dups.extend(ref.dev_id for ref in plan.extra_deletes if ref.dev_id not in dups)
 
             deleted = self._delete_devices(dups, new_node_dev_id)
 
@@ -1112,7 +1108,8 @@ class DeviceSync:
                     skipped.append((old.dev_id, f"Indigo refused the props write: {exc}"))
                     self.logger.warning("could not rebind Indigo device %s: %s", old.dev_id, exc)
 
-            if carry_tombstone and new_node_dev_id in deleted:
+            if (self.node_tombstones is not None
+                    and any(ref.type_id == "matterNode" and ref.dev_id in deleted for ref in plan.extra_deletes)):
                 self.node_tombstones.add(new_node)
             # The old node is usually still commissioned in matter-server; stop
             # reconcile building a duplicate device set for it.

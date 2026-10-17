@@ -38,6 +38,9 @@ class ReplacementPlan:
     pairs: tuple[tuple[DeviceRef, DeviceRef], ...]   # (old, new), sorted by (endpoint_id, type_id)
     unmatched_old: tuple[DeviceRef, ...]
     unmatched_new: tuple[DeviceRef, ...]
+    #: New-node devices deleted although unpaired (D8): the new node's matterNode when
+    #: the old node's was removed by hand. Checked and previewed like paired new devices.
+    extra_deletes: tuple[DeviceRef, ...] = ()
 
     @property
     def shape_matches(self) -> bool:
@@ -50,8 +53,14 @@ def _key(ref: DeviceRef) -> tuple[int, str]:
 
 
 def plan_replacement(old_node: int, old_refs: list[DeviceRef],
-                     new_node: int, new_refs: list[DeviceRef]) -> ReplacementPlan:
+                     new_node: int, new_refs: list[DeviceRef],
+                     drop_new_node_device: bool = False) -> ReplacementPlan:
     """Pair devices on (endpoint_id, type_id); whatever is left over is unmatched.
+
+    ``drop_new_node_device`` (D8: the old node's node device was removed by hand):
+    an UNPAIRED new matterNode moves from ``unmatched_new`` to ``extra_deletes``,
+    so it is deleted, is subject to the export/reference checks, and its absence on
+    the old side is not a shape mismatch.
 
     If two devices on one side share a key (not expected), they pair in dev_id
     order and the surplus is unmatched, so the result is deterministic.
@@ -71,15 +80,20 @@ def plan_replacement(old_node: int, old_refs: list[DeviceRef],
 
     unmatched_new = sorted((r for rest in new_by_key.values() for r in rest),
                            key=lambda r: (_key(r), r.dev_id))
-    return ReplacementPlan(old_node, new_node, tuple(pairs), tuple(unmatched_old), tuple(unmatched_new))
+    extra_deletes: list[DeviceRef] = []
+    if drop_new_node_device:
+        extra_deletes = [r for r in unmatched_new if r.endpoint_id == 0 and r.type_id == "matterNode"]
+        unmatched_new = [r for r in unmatched_new if r not in extra_deletes]
+    return ReplacementPlan(old_node, new_node, tuple(pairs), tuple(unmatched_old), tuple(unmatched_new),
+                           tuple(extra_deletes))
 
 
 def refusal_reasons(plan: ReplacementPlan, *, allow_mismatch: bool, exported_ids: set[int],
                     references: dict[int, list[str]], reference_errors: dict[int, str]) -> list[str]:
     """Why the replacement must not run; empty means go.
 
-    Ordered most-fundamental first: same node, no pairs, shape mismatch, then
-    per paired NEW device (they are about to be deleted) exported, referenced,
+    Ordered most-fundamental first: same node, no pairs, shape mismatch, then per NEW
+    device about to be deleted (paired, or ``extra_deletes``) exported, referenced,
     and reference lookup failed. Unmatched new devices are kept, so their
     exports and references are irrelevant. A failed lookup refuses: an
     unanswered "is it referenced?" is not a "no".
@@ -93,7 +107,7 @@ def refusal_reasons(plan: ReplacementPlan, *, allow_mismatch: bool, exported_ids
         reasons.append("The two nodes have different device shapes; tick 'replace anyway' to rebind only "
                        "the devices that match.")
 
-    new_devices = [new for _old, new in plan.pairs]
+    new_devices = [new for _old, new in plan.pairs] + list(plan.extra_deletes)
     for new in new_devices:
         if new.dev_id in exported_ids:
             reasons.append(f'"{new.name}" is exported as a Matter accessory and would be deleted. '
@@ -124,6 +138,9 @@ def preview_rows(plan: ReplacementPlan, refusals: list[str]) -> list[tuple[str, 
         rows.append((f"old:{old.dev_id}", f"{old.name}  ←  (no match on the new node; left unchanged)"))
     for new in plan.unmatched_new:
         rows.append((f"new:{new.dev_id}", f"(no match on the old node)  {new.name}  (kept)"))
+    for new in plan.extra_deletes:
+        rows.append((f"extra:{new.dev_id}",
+                     f"{new.name}  (deleted, the old node's device was removed by hand)"))
     for index, reason in enumerate(refusals):
         rows.append((f"refuse:{index}", f"REFUSED: {reason}"))
     rows.append(("note:blind-spot",
