@@ -73,7 +73,7 @@ class NodeReplaceMenuMixin:
     # ------------------------------------------------------------------
     @_degrades_to_empty_list
     def getReplaceOldNodes(self, filter="", valuesDict=None, typeId="", targetId=0):  # noqa: N802, A002, ARG002
-        """"Indigo devices to keep:" — nodes that have Indigo devices, unreachable first.
+        """"Keep devices of:" — nodes that have Indigo devices, unreachable first.
 
         The node being replaced is almost always the one that stopped answering,
         so it leads; the rest follow by node id.

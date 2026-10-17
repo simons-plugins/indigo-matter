@@ -110,19 +110,31 @@ A Matter pairing code is not durable: once used, or once the window expires (up 
         <CallbackMethod>menuReplaceNode</CallbackMethod>
         <ButtonTitle>Replace</ButtonTitle>
         <ConfigUI>
+            <!-- Layout copies Manage Matter Exports: SHORT labels, the
+                 explanation in <Description>. Indigo sizes the label column
+                 to the longest Label, so one sentence-long checkbox label
+                 squeezes every control (the preview list included) into a
+                 narrow strip on the right. -->
             <Field id="replaceIntro" type="label">
                 <Label>Points your existing Indigo devices at a re-paired device's new Matter node, then deletes the duplicate devices that node created.</Label>
             </Field>
+            <Field id="replacePickHeading" type="label" fontColor="darkgray">
+                <Label>1 · Pick the nodes</Label>
+            </Field>
             <Field id="replaceOld" type="menu">
-                <Label>Indigo devices to keep:</Label>
+                <Label>Keep devices of:</Label>
                 <List class="self" method="getReplaceOldNodes" dynamicReload="true"/>
                 <CallbackMethod>replaceNodeChanged</CallbackMethod>
+                <Description>The old node, whose Indigo devices your automations use.</Description>
             </Field>
             <Field id="replaceNew" type="menu">
                 <Label>Sync using node:</Label>
                 <List class="self" method="getReplaceNewNodes" dynamicReload="true"/>
                 <CallbackMethod>replaceNodeChanged</CallbackMethod>
-                <Description>Available nodes: the re-paired device's new node. Nodes with the same devices as the one you are keeping are listed first.</Description>
+                <Description>The re-paired device's new node. Matching nodes are listed first.</Description>
+            </Field>
+            <Field id="replaceCheckHeading" type="label" fontColor="darkgray">
+                <Label>2 · Check and confirm</Label>
             </Field>
             <Field id="replacePreview" type="list" rows="4" readonly="true">
                 <Label>Preview:</Label>
@@ -137,13 +149,16 @@ A Matter pairing code is not durable: once used, or once the window expires (up 
             <Field id="replaceAnyway" type="checkbox" defaultValue="false"
                    visibleBindingId="replaceShapeDiffers" visibleBindingValue="true"
                    alwaysUseInDialogHeightCalc="true">
-                <Label>The new node has different devices. Move only the ones that match?</Label>
+                <Label>Matching only:</Label>
+                <Description>The new node has different devices. Tick to move only the ones that match.</Description>
             </Field>
             <Field id="replaceDecommissionOld" type="checkbox" defaultValue="false">
-                <Label>Also remove the old node from Indigo's Matter fabric (harmless if it no longer answers).</Label>
+                <Label>Remove old node:</Label>
+                <Description>Also remove the old node from Indigo's Matter fabric (harmless if it no longer answers).</Description>
             </Field>
             <Field id="confirm" type="checkbox" defaultValue="false">
-                <Label>I understand the duplicate devices on the new node will be deleted.</Label>
+                <Label>Confirm:</Label>
+                <Description>The duplicate devices on the new node will be deleted.</Description>
             </Field>
         </ConfigUI>
     </MenuItem>

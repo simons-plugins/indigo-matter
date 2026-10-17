@@ -490,7 +490,7 @@ def test_replace_menu_item_has_the_specified_fields_and_follows_decommission():
     item = items[index]
     assert item.findtext("CallbackMethod") == "menuReplaceNode"
     fields = {f.get("id"): f for f in item.find("ConfigUI").findall("Field")}
-    assert set(fields) == {"replaceIntro", "replaceOld", "replaceNew", "replacePreview", "replacePreviewNote",
+    assert set(fields) == {"replaceIntro", "replacePickHeading", "replaceCheckHeading", "replaceOld", "replaceNew", "replacePreview", "replacePreviewNote",
                            "replaceShapeDiffers", "replaceAnyway", "replaceDecommissionOld", "confirm"}
     assert fields["replaceIntro"].get("type") == "label"
     for menu_id in ("replaceOld", "replaceNew"):

@@ -386,13 +386,13 @@ the new node and deletes the new duplicates. Names, settings and ids all stay.
 
 1. Pair the device again as normal, and let its new devices appear.
 2. Open **Replace a Matter node…**.
-3. **Indigo devices to keep:** pick the old device. Unreachable ones are listed
+3. **Keep devices of:** pick the old device. Unreachable ones are listed
    first.
 4. **Sync using node:** pick the new node. Nodes with the same devices as the
    old one come first; the rest end with "(differs)". Each entry starts with the node address.
 5. Read the preview. It lists each part and what happens to it, for example
    "Switch → 0x43". If the nodes have different devices, a
-   "Move only the ones that match?" box appears; tick it to go ahead.
+   "Matching only" box appears; tick it to go ahead.
 6. Tick the confirmation and click **Replace**. The plugin then asks for a
    refresh, and the devices pick up live state. If the refresh fails, the
    devices are still rebound and refresh the next time matter-server
@@ -401,7 +401,7 @@ the new node and deletes the new duplicates. Names, settings and ids all stay.
 **What it refuses, and why.** Nothing is changed when it refuses. The preview
 says "Can't replace", and clicking Replace shows the reason:
 
-- *The two nodes have different devices.* Tick "Move only the ones that match?" to rebind only
+- *The two nodes have different devices.* Tick "Matching only" to rebind only
   the devices that match; the others are left as they are.
 - *A new device is exported as a Matter accessory.* It is about to be deleted,
   which would remove its accessory from every ecosystem. Move the accessory
