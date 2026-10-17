@@ -9,7 +9,7 @@ what*, *whether to refuse*, and *what to show*; it never touches Indigo.
 Kept free of ``indigo``, I/O and matter-server so every rule is unit-testable
 with plain ``DeviceRef`` values. ``DeviceSync`` owns the ordering-sensitive
 mutation (delete duplicates first, rebind last); see
-docs/plans/issue-364-replace-node.md for the two traps that ordering avoids.
+docs/adr/0018-a-re-paired-node-is-rebound-onto-its-existing-devices.md for the two traps that ordering avoids.
 """
 from __future__ import annotations
 
@@ -112,7 +112,7 @@ def refusal_reasons(plan: ReplacementPlan, *, allow_mismatch: bool, exported_ids
         reasons.append("An Indigo device appears on both nodes (a stale lookup); "
                        "restart the plugin or run a resync, then try again.")
     if not plan.shape_matches and not allow_mismatch:
-        reasons.append("The two nodes have different device shapes; tick 'replace anyway' to rebind only "
+        reasons.append("The two nodes have different device shapes; tick 'Matching only' to rebind only "
                        "the devices that match.")
 
     new_devices = [new for _old, new in plan.pairs] + list(plan.extra_deletes)

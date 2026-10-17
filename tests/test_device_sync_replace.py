@@ -1,6 +1,6 @@
 """Issue #364 / S2 + S3 — DeviceSync primitives and ``replace_node``.
 
-Spec: docs/plans/issue-364-replace-node.md ("Tests > S2", "Tests > S3"). Each
+Spec: docs/adr/0018-a-re-paired-node-is-rebound-onto-its-existing-devices.md. Each
 test's docstring names the bullet it pins.
 
 The "coffee" pair: a fielded-looking OLD node 52 (matterNode at ep0 + matterRelay

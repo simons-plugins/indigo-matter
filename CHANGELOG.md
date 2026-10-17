@@ -13,7 +13,7 @@ current version is `Info.plist`'s `PluginVersion`.
   settings and every trigger, schedule and control page that uses them carry
   on unchanged.
 - It shows a preview first, and refuses (changing nothing) if the nodes have
-  different devices (unless you tick "replace anyway"), if a duplicate is
+  different devices (unless you tick "Matching only"), if a duplicate is
   exported as a Matter accessory, if anything refers to a duplicate, or if
   Indigo could not check. A partial result is reported as an error that names
   what was skipped.

@@ -1,6 +1,6 @@
 """Issue #364 / S4 — ``NodeReplaceMenuMixin`` and its MenuItems.xml wiring.
 
-Spec: docs/plans/issue-364-replace-node.md ("Tests > S4"). Each test's docstring
+Spec: docs/adr/0018-a-re-paired-node-is-rebound-onto-its-existing-devices.md. Each test's docstring
 names the bullet it pins.
 
 The mixin is composed on its own (the test_share_node_menu.py shape), over a REAL

@@ -1072,7 +1072,7 @@ class DeviceSync:
     def replace_node(self, plan: Any) -> "ReplaceResult":
         """Repoint the OLD node's devices at the NEW node and delete the duplicates (issue #364).
 
-        The order is the whole point (docs/plans/issue-364-replace-node.md):
+        The order is the whole point (docs/adr/0018-a-re-paired-node-is-rebound-onto-its-existing-devices.md):
         duplicates are deleted FIRST, from ids captured before anything changes,
         and the old devices are rebound LAST. A props write restarts the device,
         and ``deviceStartComm`` -> ``note_device`` re-registers it in ``_index``

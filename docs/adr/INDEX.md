@@ -35,4 +35,6 @@ chosen), see [`../ARCHITECTURE.md`](../ARCHITECTURE.md).
 * [ADR-0016](0016-destruction-is-unconditional-there-is-no-soft-removal.md) - ADR-0016: Endpoint removal is unconditionally destructive — there is no soft removal to opt out of (accepted; supersedes ADR-0015's mechanism)
 * [ADR-0017](0017-currentlevel-while-off-is-the-last-confirmed-on-level.md) - ADR-0017: currentLevel while off is the last confirmed on-level, not the Lighting minimum (accepted)
 
+* [ADR-0018](0018-a-re-paired-node-is-rebound-onto-its-existing-devices.md) - ADR-0018: A re-paired node is rebound onto its existing Indigo devices (accepted)
+
 <!-- adrlogstop -->

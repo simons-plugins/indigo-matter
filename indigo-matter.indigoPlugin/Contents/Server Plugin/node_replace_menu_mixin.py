@@ -10,7 +10,7 @@ in :mod:`node_replace` and the ordering-sensitive mutation in
 ``DeviceSync.replace_node``; this mixin only gathers inputs, enforces the
 "refuse before touching anything" rule, then runs the resync and the optional
 old-node decommission, which need the runtime and the matter client. See
-docs/plans/issue-364-replace-node.md.
+docs/adr/0018-a-re-paired-node-is-rebound-onto-its-existing-devices.md.
 
 Lives in its own mixin because every XML-named callback must resolve as a flat
 attribute on the ``Plugin`` class (issue #146).
@@ -95,7 +95,7 @@ class NodeReplaceMenuMixin:
         """"Sync using node:" (Available nodes) — every other commissioned node (D5).
 
         Nodes whose shape matches the old node's lead; the rest are labelled
-        "(differs)" but stay selectable, or "replace anyway" would be
+        "(differs)" but stay selectable, or "Matching only" would be
         unreachable. The refusal, if any, happens on Execute.
         """
         old_node = _as_node_id((valuesDict or {}).get("replaceOld"))
@@ -119,7 +119,7 @@ class NodeReplaceMenuMixin:
     def replaceNodeChanged(self, valuesDict, typeId="", devId=0):  # noqa: N802, ARG002
         """Both pickers' callback. Indigo round-trips to the plugin, which re-runs the
         dynamicReload preview (ConfigUI has no per-field change event), and this also
-        sets the hidden ``replaceShapeDiffers`` so "Replace anyway" shows only when the
+        sets the hidden ``replaceShapeDiffers`` so "Matching only" shows only when the
         two nodes' devices differ.
 
         The field only drives visibility; ``menuReplaceNode`` re-plans from scratch and

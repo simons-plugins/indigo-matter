@@ -1,8 +1,8 @@
 """Issue #364 / S1 — the pure replacement planner (``node_replace``).
 
 No Indigo in this module, so no fixtures: refs in, plan / refusals / rows out.
-Each test's docstring names the spec bullet (docs/plans/issue-364-replace-node.md,
-"Tests > S1") it pins.
+Each test's docstring names the decision it pins (D1-D13 in
+docs/adr/0018-a-re-paired-node-is-rebound-onto-its-existing-devices.md).
 
 Refusal TEXT is only pinned where the spec pins it ("Migrate an exported
 accessory…", the referrers' names). Everything else is pinned structurally
