@@ -792,6 +792,12 @@ class DeviceSync:
             # next reconcile_all and could be picked a second time.
             if forget:
                 self._known_nodes.discard(target)
+                # Also un-retire it (issue #364). The node_removed path does
+                # this too, but an "already absent" decommission fires no
+                # node_removed, and a retirement left on an id matter-server
+                # no longer has would make a later node on that id born dead.
+                if self.retired_nodes is not None:
+                    self.retired_nodes.forget(target)
             # Collect all dev_ids across all endpoints for this node. The
             # matterNode device (if present) is still held back to the end —
             # not because deletion order matters any more (the group is

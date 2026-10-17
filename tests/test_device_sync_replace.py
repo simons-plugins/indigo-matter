@@ -472,6 +472,15 @@ def test_node_removed_clears_the_retirement(ds, coffee):
     assert not ds.retired_nodes.is_tombstoned(OLD_NODE)
 
 
+def test_a_decommission_that_left_the_fabric_clears_the_retirement(ds, coffee):
+    """A decommission of an 'already absent' node fires no node_removed; delete_node(forget=True) must un-retire it."""
+    ds.retired_nodes.add(OLD_NODE)
+    ds.delete_node(OLD_NODE, forget=False)          # RemoveFabric failed: still commissioned
+    assert ds.retired_nodes.is_tombstoned(OLD_NODE)
+    ds.delete_node(OLD_NODE, forget=True)           # removed, or matter-server no longer has it
+    assert not ds.retired_nodes.is_tombstoned(OLD_NODE)
+
+
 def test_retirement_survives_a_persist_load_round_trip(ds, coffee):
     """Review fix 1: the retired set is persisted like the tombstones."""
     import device_sync as device_sync_mod
