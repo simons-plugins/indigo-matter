@@ -883,7 +883,7 @@ instead, because the server has to be upgraded where it runs. The normal way to
 upgrade is **Plugins ▸ Matter ▸ Back up the Matter fabric…** and then **Plugins ▸
 Matter ▸ Install/update the Matter controller (matter-server)**: it installs exactly
 the version this plugin release pins and restarts matter-server onto it; you don't
-need to stop anything first. To try a different version, install it by hand:
+need to stop anything first. To try a different version, install it by hand.
 
 matter-server is Beta; test before adopting a new version. With the plugin (or
 matter-server) stopped, and after **backing up the fabric** (above):

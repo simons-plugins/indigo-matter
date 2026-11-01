@@ -91,7 +91,7 @@ Health check. Domio calls this at the start of every commissioning flow as a pre
 | `bleAvailable` | bool | Whether the host Mac has BLE available to matter-server. Affects fallback commissioning paths but not the standard Domio flow. |
 | `uptime` | int | Plugin uptime in seconds. |
 | `matterServerPinnedVersion` | string | The matter-server version this plugin release is built for. Always present. |
-| `matterServerVersionStatus` | string | How the running matter-server compares with `matterServerPinnedVersion`: `"current"`, `"older"`, `"newer"` or `"unknown"`. `"unknown"` means the version could not be read; a client must not render that as current. This is the last-known comparison, so it is still populated while `ready` is false. It is reported regardless of server location; in remote mode the server must be upgraded where it runs. Upgrading the plugin does not upgrade matter-server. |
+| `matterServerVersionStatus` | string | How the running matter-server compares with `matterServerPinnedVersion`: `"current"`, `"older"`, `"newer"` or `"unknown"`. `"unknown"` means the version could not be read; a client must not render that as current. This is the last-known comparison, so it is still populated while `ready` is false. It is reported regardless of server location; in remote mode the server must be upgraded where it runs. |
 
 **Response 503:** if the plugin is loaded but matter-server is unreachable.
 
