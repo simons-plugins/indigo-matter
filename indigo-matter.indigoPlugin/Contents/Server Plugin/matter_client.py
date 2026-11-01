@@ -103,6 +103,9 @@ class MatterClient(WsJsonClient):
     async def _handshake(self, first: Any) -> None:
         # matter-server pushes server_info as a BARE object on connect (no
         # event/message_id wrapper) — verified against ws-controller v0.6.2.
+        # Forget the previous connection's info first: a reconnect onto a restarted
+        # server must never report the old server's version.
+        self.server_info = None
         if isinstance(first, dict):
             self.server_info = first
         self._mark_connected()

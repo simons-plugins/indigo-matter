@@ -291,6 +291,38 @@ def test_on_connect_fires_again_after_reconnect(mock_logger):
     run(scenario())
 
 
+def test_reconnect_to_a_mute_server_forgets_the_previous_server_info(mock_logger):
+    # a reconnect whose first frame is not a server_info object must not keep
+    # reporting the PREVIOUS server's version (#75).
+    async def scenario():
+        fakes = [FakeWebSocket(server_info={"sdk_version": "matter-server/0.6.2"}),
+                 FakeWebSocket(handshake=["not", "a", "dict"])]
+        n = {"i": 0}
+
+        def connect(uri):
+            i = n["i"]
+            n["i"] += 1
+            return returns(fakes[min(i, len(fakes) - 1)])
+
+        async def fake_sleep(_d):
+            await asyncio.sleep(0)
+
+        client = MatterClient(Protocol(), mock_logger, {}, connect=connect, sleep=fake_sleep)
+        task = asyncio.create_task(client.run())
+        await client.wait_connected(timeout=2)
+        assert client.server_info["sdk_version"] == "matter-server/0.6.2"
+        await fakes[0].close()
+        for _ in range(100):
+            await asyncio.sleep(0.01)
+            if n["i"] >= 2 and client.connected:
+                break
+        assert n["i"] >= 2 and client.connected
+        assert client.server_info is None
+        await client.close()
+        task.cancel()
+    run(scenario())
+
+
 def test_on_connect_failure_is_logged_not_swallowed(mock_logger):
     async def scenario():
         async def boom():
