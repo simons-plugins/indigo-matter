@@ -31,6 +31,7 @@ without touching the real launchd or filesystem.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import time
 from typing import Any, Callable, Optional
@@ -54,6 +55,37 @@ SERVER_ERR_LOG = "matter-server.err.log"
 #: The EXACT wording of ``MenuItems.xml``'s ``installMatterServer`` item, for the
 #: messages that tell a user to run it. See ``AgentSpec.install_menu``.
 INSTALL_MENU = "Install/update the Matter controller (matter-server)"
+
+
+def _numeric_prefix(version: Any) -> Optional[tuple]:
+    """Leading dotted-integer part of ``version`` (``"1.5.6-alpha.0-x"`` -> ``(1, 5, 6)``), else None."""
+    match = re.match(r"\d+(?:\.\d+)*", version) if isinstance(version, str) else None
+    return tuple(int(p) for p in match.group(0).split(".")) if match else None
+
+
+def version_drift(sdk_version: Any, install_spec: Any = DEFAULT_INSTALL_SPEC) -> Optional[tuple]:
+    """Compare the running matter-server with the version this plugin release pins (issue #75).
+
+    ``sdk_version`` is matter-server's reported string (``"matter-server/1.2.2 (matter.js/…)"``);
+    ``install_spec`` is ``name@version``. Returns ``(running, pinned, "older"|"newer")``, or
+    None when nothing can be said: either side missing or unparseable, or the versions equal.
+    Pre-release suffixes are ignored (only the leading numeric parts are compared). Never raises.
+    """
+    try:
+        found = re.search(r"matter-server/(\S+)", sdk_version) if isinstance(sdk_version, str) else None
+        if not found or not isinstance(install_spec, str) or "@" not in install_spec:
+            return None
+        running, pinned = found.group(1), install_spec.split("@", 1)[1].strip()
+        run_n, pin_n = _numeric_prefix(running), _numeric_prefix(pinned)
+        if run_n is None or pin_n is None:
+            return None
+        width = max(len(run_n), len(pin_n))
+        run_n, pin_n = run_n + (0,) * (width - len(run_n)), pin_n + (0,) * (width - len(pin_n))
+        if run_n == pin_n:
+            return None
+        return (running, pinned, "older" if run_n < pin_n else "newer")
+    except Exception:  # pylint: disable=broad-except
+        return None
 # Records the sha256 of the plist launchd was last told to load (bootstrap). launchd
 # caches a job's ProgramArguments at bootstrap time — rewriting the plist FILE does not
 # touch an already-loaded job — so we compare against this to tell "current definition

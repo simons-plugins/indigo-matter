@@ -1635,3 +1635,48 @@ def test_install_not_blocked_when_node_version_unreadable(tmp_path, prefs, mock_
     # unknown current node must not false-block (never blocks on an unreadable version)
     sp = _sp_with_tools(tmp_path, prefs, mock_logger, runner=FakeRunner())  # node --version → ""
     assert sp.install() is True
+
+
+# ---------------------------------------------------------------------------
+# version_drift (issue #75): running matter-server vs this release's pin
+# ---------------------------------------------------------------------------
+from server_process import version_drift  # noqa: E402
+
+_MJS = " (matter.js/0.17.0-alpha.0-20260101-abc)"
+
+
+def test_version_drift_older():
+    assert version_drift("matter-server/0.6.8" + _MJS, "matter-server@1.2.2") == ("0.6.8", "1.2.2", "older")
+
+
+def test_version_drift_equal_is_none():
+    assert version_drift("matter-server/1.2.2" + _MJS, "matter-server@1.2.2") is None
+
+
+def test_version_drift_newer():
+    assert version_drift("matter-server/1.5.5" + _MJS, "matter-server@1.2.2") == ("1.5.5", "1.2.2", "newer")
+
+
+def test_version_drift_numeric_not_lexical():
+    assert version_drift("matter-server/1.10.0", "matter-server@1.9.0")[2] == "newer"
+
+
+def test_version_drift_prerelease_running_is_newer():
+    running = "matter-server/1.5.6-alpha.0-20261031-362f4cc (matter.js/0.17.0)"
+    assert version_drift(running, "matter-server@1.2.2") == ("1.5.6-alpha.0-20261031-362f4cc", "1.2.2", "newer")
+
+
+@pytest.mark.parametrize("bad", [None, "", "unknown", "garbage", "matter-server/", "matter-server/abc", 5, {}])
+def test_version_drift_unparseable_running_is_none(bad):
+    assert version_drift(bad, "matter-server@1.2.2") is None
+
+
+@pytest.mark.parametrize("spec", ["matter-server", "matter-server@", "matter-server@latest", None, 7])
+def test_version_drift_unparseable_pin_is_none(spec):
+    assert version_drift("matter-server/0.6.8", spec) is None
+
+
+def test_version_drift_defaults_to_pin():
+    from server_process import DEFAULT_INSTALL_SPEC
+    pinned = DEFAULT_INSTALL_SPEC.split("@", 1)[1]
+    assert version_drift("matter-server/0.0.1")[1] == pinned
