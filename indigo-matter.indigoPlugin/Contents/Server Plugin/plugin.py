@@ -61,7 +61,7 @@ from matter_server_menu_mixin import MatterServerMenuMixin
 from pairing_menu_mixin import PairingMenuMixin
 import protocol
 from protocol import MatterWrite, Protocol
-from server_process import ServerProcess
+from server_process import INSTALL_MENU, ServerProcess, version_drift
 
 from plugin_constants import (
     COMMAND_TIMEOUT, MAX_RESUBSCRIBE_ATTEMPTS, NODE_TOMBSTONES_PREF, ON_TIME_RETIRED_PREF,
@@ -708,6 +708,37 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
             # reconcile") and pinned by test_fabric_label_failure_does_not_block_reconcile.
             self.logger.debug("could not set fabric label (older matter-server?): %s", exc)
 
+    def _warn_if_server_outdated(self) -> None:
+        """Managed mode only: say once if the running matter-server is behind this release's pin (#75).
+
+        Upgrading the plugin never upgrades matter-server (only the install menu item does),
+        so a stale server otherwise looks healthy. Advisory: any failure is debug-logged and
+        must never block the reconcile that follows.
+        """
+        try:
+            if self.server_process is None:
+                return
+            drift = version_drift((self.matter.server_info or {}).get("sdk_version"))
+            if drift is None:
+                return
+            running, pinned, direction = drift
+            seen = self.__dict__.setdefault("_drift_reported", set())
+            if (running, pinned) in seen:
+                return
+            seen.add((running, pinned))
+            if direction == "older":
+                self.logger.warning(
+                    "the running matter-server is %s but this plugin release is built for %s; upgrading the "
+                    "plugin does not upgrade matter-server. Run Plugins ▸ Matter ▸ %s to update it "
+                    "(back up the fabric first, see the install guide's Backups section)",
+                    running, pinned, INSTALL_MENU)
+            else:
+                self.logger.info(
+                    "the running matter-server is %s, ahead of %s, the version this plugin release was tested against",
+                    running, pinned)
+        except Exception as exc:  # pylint: disable=broad-except
+            self.logger.debug("could not check matter-server version: %s", exc)
+
     async def _resync(self) -> None:
         """Reconcile matter nodes ↔ Indigo devices. Driven by the WS client's
         on_connect, so it runs on the first connect and again on every reconnect
@@ -716,6 +747,7 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
         # purpose — close it so a LATER crash isn't wrongly suppressed as "restarting".
         self._restart_expected_until = 0.0
         await self._assert_fabric_label()
+        self._warn_if_server_outdated()
         try:
             nodes = await self.matter.get_nodes() or []
             detailed = []

@@ -21,6 +21,7 @@ from matter_client import ATTRIBUTE_TIMEOUT
 from pairing_page import _pairing_html
 from plugin_constants import DECOMMISSION_TIMEOUT, PAIRING_READ_TIMEOUT, SURVEY_READ_TIMEOUT
 from protocol import is_node_not_exists
+from server_process import DEFAULT_INSTALL_SPEC, version_drift
 from thread_page import render_thread_page
 
 #: #334 finding B5.5 set this to 12 s (below the menu's ATTRIBUTE_TIMEOUT,
@@ -109,6 +110,7 @@ class HttpApiMixin:
         # bluetooth_enabled (there is no plain "version" key).
         connected = bool(self.matter is not None and self.matter.connected)
         info = (self.matter.server_info if self.matter else None) or {}
+        drift = version_drift(info.get("sdk_version"))
         body = {
             "ready": connected,
             "controllerVersion": self._version,
@@ -118,6 +120,8 @@ class HttpApiMixin:
             "nodeCount": self.device_sync.node_count(),
             "bleAvailable": bool(info.get("bluetooth_enabled", False)),
             "uptime": int(time.monotonic() - self._start_ts),
+            "matterServerPinnedVersion": DEFAULT_INSTALL_SPEC.split("@", 1)[-1],
+            "matterServerOutdated": drift is not None and drift[2] == "older",
         }
         if not connected:
             # API.md §3.1: the 503 body carries the standard error envelope so
