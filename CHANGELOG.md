@@ -3,6 +3,20 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
+## 2026.33.1 — Warn when matter-server is older than this plugin release expects
+
+- Fix (issue #75): upgrading the plugin never upgraded matter-server. The pinned
+  version moved on, but the npm install only runs from **Plugins ▸ Matter ▸
+  Install/update the Matter controller (matter-server)**, so a server could sit on
+  0.6.x for months while looking perfectly healthy. The plugin now compares the
+  running version with the one it is built for when it connects, and if the server
+  is older it logs one Event Log warning naming that menu item and reminding you to
+  back up the fabric first. If the server is newer it logs one info line instead.
+  It says each case once per plugin start, only when the plugin manages
+  matter-server itself, and never delays the reconcile.
+- The HTTP status response gains `matterServerPinnedVersion` and
+  `matterServerOutdated`.
+
 ## 2026.33.0 — Replace a Matter node…, for a device you factory-reset and paired again
 
 - New: **Plugins ▸ Matter ▸ Replace a Matter node…** (issue #364). When a

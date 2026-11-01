@@ -874,6 +874,13 @@ dialog, most-likely-first — the top two are what a first export usually hits.
 
 ## Upgrading matter-server
 
+**Upgrading the plugin does not upgrade matter-server.** The plugin writes the new
+version into its launch agent, but only installs it when you ask. When the running
+matter-server is behind the version a plugin release is built for, the plugin says so
+in the Event Log on connect. The normal way to upgrade is **Plugins ▸ Matter ▸
+Install/update the Matter controller (matter-server)**, after backing up the fabric
+(above). The npm command below is the manual equivalent.
+
 matter-server is Beta; test before adopting a new version. With the plugin (or
 matter-server) stopped, and after **backing up the fabric** (above):
 

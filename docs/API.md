@@ -74,7 +74,9 @@ Health check. Domio calls this at the start of every commissioning flow as a pre
   "fabricId": "0x0123456789ABCDEF",
   "nodeCount": 7,
   "bleAvailable": false,
-  "uptime": 14523
+  "uptime": 14523,
+  "matterServerPinnedVersion": "1.2.2",
+  "matterServerOutdated": false
 }
 ```
 
@@ -88,6 +90,8 @@ Health check. Domio calls this at the start of every commissioning flow as a pre
 | `nodeCount` | int | Number of Matter nodes currently on the Indigo fabric. |
 | `bleAvailable` | bool | Whether the host Mac has BLE available to matter-server. Affects fallback commissioning paths but not the standard Domio flow. |
 | `uptime` | int | Plugin uptime in seconds. |
+| `matterServerPinnedVersion` | string | The matter-server version this plugin release is built for. Always present. |
+| `matterServerOutdated` | bool | True only when the running matter-server is older than `matterServerPinnedVersion`. False when current, newer, or unknown. Upgrading the plugin does not upgrade matter-server. |
 
 **Response 503:** if the plugin is loaded but matter-server is unreachable.
 
