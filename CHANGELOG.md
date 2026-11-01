@@ -3,19 +3,26 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
-## 2026.33.1 — Warn when matter-server is older than this plugin release expects
+## 2026.34.0 — Warn when matter-server is older than this plugin release expects
 
 - Fix (issue #75): upgrading the plugin never upgraded matter-server. The pinned
   version moved on, but the npm install only runs from **Plugins ▸ Matter ▸
   Install/update the Matter controller (matter-server)**, so a server could sit on
   0.6.x for months while looking perfectly healthy. The plugin now compares the
-  running version with the one it is built for when it connects, and if the server
-  is older it logs one Event Log warning naming that menu item and reminding you to
-  back up the fabric first. If the server is newer it logs one info line instead.
-  It says each case once per plugin start, only when the plugin manages
-  matter-server itself, and never delays the reconcile.
+  running version with the one it is built for when it connects. If the plugin
+  manages matter-server and it is older, one Event Log warning names both menu
+  items to run: **Back up the Matter fabric…**, then **Install/update the Matter
+  controller (matter-server)**. If you run matter-server elsewhere (remote mode),
+  you get an info line instead, since the server has to be upgraded where it runs.
+  A server ahead of the pin gets an info line in both modes.
+- A pre-release of the pinned version (for example `1.2.2-alpha.0-…` against 1.2.2)
+  counts as older.
+- If the server's version cannot be read, the plugin says so once rather than
+  silently skipping the check.
+- Each case is reported once per plugin start (again if the running version
+  changes), and never delays the reconcile.
 - The HTTP status response gains `matterServerPinnedVersion` and
-  `matterServerOutdated`.
+  `matterServerVersionStatus` (`current`, `older`, `newer` or `unknown`).
 
 ## 2026.33.0 — Replace a Matter node…, for a device you factory-reset and paired again
 
