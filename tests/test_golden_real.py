@@ -93,3 +93,8 @@ def test_real_attribute_updated_maps_to_onoff_state():
 
     handler = HandlerRegistry().handler_for_cluster(evt.cluster)
     assert handler.on_attribute_update(None, evt.attribute, evt.value) == {"onOffState": True}
+
+
+def test_real_server_info_version_drift_against_the_pin():
+    from server_process import version_drift
+    assert version_drift(REAL_SERVER_INFO["sdk_version"]) == ("0.6.2", "1.2.2", "older")
