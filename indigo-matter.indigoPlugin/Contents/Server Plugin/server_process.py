@@ -110,7 +110,10 @@ def _pref_unrecognised(value: Any) -> bool:
 def _numeric_prefix(version: Any) -> Optional[tuple]:
     """Leading dotted-integer part of ``version`` (``"1.5.6-alpha.0-x"`` -> ``(1, 5, 6)``), else None."""
     match = re.match(r"\d+(?:\.\d+)*", version) if isinstance(version, str) else None
-    return tuple(int(p) for p in match.group(0).split(".")) if match else None
+    try:
+        return tuple(int(p) for p in match.group(0).split(".")) if match else None
+    except ValueError:  # a component longer than Python's int-string limit (~4300 digits)
+        return None
 
 
 def version_drift(sdk_version: Any, install_spec: Any = DEFAULT_INSTALL_SPEC) -> Optional[tuple]:
@@ -135,7 +138,8 @@ def version_drift(sdk_version: Any, install_spec: Any = DEFAULT_INSTALL_SPEC) ->
     width = max(len(run_n), len(pin_n))
     run_n, pin_n = run_n + (0,) * (width - len(run_n)), pin_n + (0,) * (width - len(pin_n))
     if run_n == pin_n:
-        prerelease = "-" in running and "-" not in pinned
+        # Semver: a "-" before any "+build" metadata marks a pre-release; a "-" inside the metadata does not.
+        prerelease = "-" in running.split("+", 1)[0] and "-" not in pinned.split("+", 1)[0]
         return (running, pinned, "older" if prerelease else "current")
     return (running, pinned, "older" if run_n < pin_n else "newer")
 

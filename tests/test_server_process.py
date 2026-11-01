@@ -1700,6 +1700,17 @@ def test_version_drift_defaults_to_pin():
     assert version_drift("matter-server/0.0.1")[1] == pinned
 
 
+def test_version_drift_oversized_numeric_component_is_unknown_not_an_exception():
+    # Python refuses int() on strings past its digit limit; the helper's "never raises" must hold.
+    assert version_drift("matter-server/" + "9" * 5000, "matter-server@1.2.2") is None
+
+
+def test_version_drift_hyphen_inside_build_metadata_is_not_a_prerelease():
+    # The running token is reported as-is (build suffix kept); only the status matters here.
+    assert version_drift("matter-server/1.2.2+exp.sha-5114f85", "matter-server@1.2.2")[2] == "current"
+
+
+
 def test_menu_constants_match_menuitems_xml():
     import xml.etree.ElementTree as ET
     from pathlib import Path
