@@ -21,6 +21,7 @@ from matter_client import ATTRIBUTE_TIMEOUT
 from pairing_page import _pairing_html
 from plugin_constants import DECOMMISSION_TIMEOUT, PAIRING_READ_TIMEOUT, SURVEY_READ_TIMEOUT
 from protocol import is_node_not_exists
+from server_process import PINNED_VERSION, version_drift
 from thread_page import render_thread_page
 
 #: #334 finding B5.5 set this to 12 s (below the menu's ATTRIBUTE_TIMEOUT,
@@ -105,10 +106,11 @@ class HttpApiMixin:
 
     # ----- providers used by HttpApi (bridge into the loop where needed) -----
     def _status_body(self) -> dict:
-        # server_info fields per ws-controller v0.6.2: sdk_version, fabric_id,
-        # bluetooth_enabled (there is no plain "version" key).
+        # server_info fields (ws-controller 0.6.x and 1.2.x): sdk_version (e.g. "matter-server/1.2.2 (matter.js/…)",
+        # parsed by server_process.version_drift), fabric_id, bluetooth_enabled; there is no plain "version" key.
         connected = bool(self.matter is not None and self.matter.connected)
         info = (self.matter.server_info if self.matter else None) or {}
+        drift = version_drift(info.get("sdk_version"))
         body = {
             "ready": connected,
             "controllerVersion": self._version,
@@ -118,6 +120,8 @@ class HttpApiMixin:
             "nodeCount": self.device_sync.node_count(),
             "bleAvailable": bool(info.get("bluetooth_enabled", False)),
             "uptime": int(time.monotonic() - self._start_ts),
+            "matterServerPinnedVersion": PINNED_VERSION,
+            "matterServerVersionStatus": drift[2] if drift else "unknown",
         }
         if not connected:
             # API.md §3.1: the 503 body carries the standard error envelope so

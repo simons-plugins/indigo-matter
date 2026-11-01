@@ -11,12 +11,13 @@ import asyncio
 import importlib
 import json
 import os
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -53,6 +54,8 @@ def plug(plugin_mod):
     p._last_port_conflict = None
     p._next_bridge_port_check = 0.0
     p._last_bridge_port_conflict = None
+    # Mirrors Plugin.__init__: the (running, pinned) pairs the version-drift check has already reported (#75).
+    p._drift_reported = set()
     return p
 
 
@@ -2593,3 +2596,195 @@ def test_startup_really_emits_the_notice(plugin_mod, mock_indigo_base, monkeypat
     p.startup()
     assert any("'onTime' state" in str(call) for call in p.logger.info.call_args_list), \
         "startup() never announced the retired state"
+
+
+# ---------------------------------------------------------------------------
+# matter-server version drift (issue #75)
+# ---------------------------------------------------------------------------
+OLD = "matter-server/0.6.8 (matter.js/0.17.0)"
+
+
+def _drift_plug(plug, sdk_version, managed=True):
+    from server_process import PINNED_VERSION
+    plug._pinned = PINNED_VERSION
+    plug.matter = LabelMatter("Indigo")
+    plug.matter.uri = "ws://nas.local:5580/ws"
+    plug.matter.server_info = {"fabric_label": "Indigo"}
+    if sdk_version is not None:
+        plug.matter.server_info["sdk_version"] = sdk_version
+    plug.server_process = Mock() if managed else None
+    return plug
+
+
+def _warning_texts(plug):
+    return [c[0][0] % c[0][1:] for c in plug.logger.warning.call_args_list]
+
+
+def _info_texts(plug):
+    return [c[0][0] % c[0][1:] for c in plug.logger.info.call_args_list]
+
+
+def test_drift_warns_once_in_managed_mode(plug):
+    from server_process import BACKUP_MENU, INSTALL_MENU
+    _drift_plug(plug, OLD)
+    asyncio.run(plug._resync())
+    asyncio.run(plug._resync())  # reconnect churn
+    assert plug.logger.warning.call_count == 1
+    msg = _warning_texts(plug)[0]
+    assert "0.6.8" in msg and plug._pinned in msg
+    assert f"Plugins ▸ Matter ▸ {BACKUP_MENU}, then Plugins ▸ Matter ▸ {INSTALL_MENU}" in msg
+    plug.device_sync.reconcile_all.assert_called()
+
+
+def test_drift_rewarns_for_a_different_running_version(plug):
+    _drift_plug(plug, OLD)
+    asyncio.run(plug._resync())
+    plug.matter.server_info["sdk_version"] = "matter-server/1.0.0 (matter.js/0.17.0)"
+    asyncio.run(plug._resync())
+    texts = _warning_texts(plug)
+    assert len(texts) == 2 and "1.0.0" in texts[1]
+
+
+def test_drift_silent_after_upgrade_to_the_pin(plug):
+    _drift_plug(plug, OLD)
+    asyncio.run(plug._resync())
+    plug.matter.server_info["sdk_version"] = f"matter-server/{plug._pinned} (matter.js/0.17.0)"
+    asyncio.run(plug._resync())
+    assert plug.logger.warning.call_count == 1
+    assert not any("ahead" in t for t in _info_texts(plug))
+
+
+def test_drift_silent_when_equal(plug):
+    _drift_plug(plug, None)
+    plug.matter.server_info["sdk_version"] = f"matter-server/{plug._pinned} (matter.js/0.17.0)"
+    asyncio.run(plug._resync())
+    plug.logger.warning.assert_not_called()
+    assert not any("ahead" in t for t in _info_texts(plug))
+
+
+def test_drift_newer_logs_info_once(plug):
+    _drift_plug(plug, "matter-server/9.9.9 (matter.js/1)")
+    asyncio.run(plug._resync())
+    asyncio.run(plug._resync())
+    plug.logger.warning.assert_not_called()
+    ahead = [t for t in _info_texts(plug) if "ahead" in t]
+    assert len(ahead) == 1 and "9.9.9" in ahead[0] and "installs" in ahead[0]
+    assert "tested against" not in ahead[0]
+
+
+def test_drift_unmanaged_older_is_one_info_naming_the_server(plug):
+    from server_process import INSTALL_MENU
+    _drift_plug(plug, OLD, managed=False)
+    asyncio.run(plug._resync())
+    asyncio.run(plug._resync())
+    plug.logger.warning.assert_not_called()
+    notes = [t for t in _info_texts(plug) if "0.6.8" in t]
+    assert len(notes) == 1
+    assert "ws://nas.local:5580/ws" in notes[0] and plug._pinned in notes[0]
+    assert INSTALL_MENU not in notes[0]
+
+
+def test_drift_unreadable_version_is_warned_once(plug):
+    _drift_plug(plug, "matter-server 1.2.2")
+    asyncio.run(plug._resync())
+    asyncio.run(plug._resync())
+    texts = _warning_texts(plug)
+    assert len(texts) == 1
+    assert "could not read" in texts[0] and "matter-server 1.2.2" in texts[0]
+
+
+def test_drift_warns_even_when_reconcile_cannot_list_nodes(plug):
+    _drift_plug(plug, OLD)
+    plug.matter.get_nodes = AsyncMock(side_effect=RuntimeError("server wedged"))
+    asyncio.run(plug._resync())
+    assert any("0.6.8" in t for t in _warning_texts(plug))
+
+
+def test_drift_runs_after_fabric_label_and_before_reconcile(plug):
+    order = []
+    _drift_plug(plug, OLD)
+    plug.matter.set_default_fabric_label = AsyncMock(side_effect=lambda *_: order.append("label"))
+    plug.matter.server_info["fabric_label"] = "HomeAssistant"
+    plug.logger.warning.side_effect = lambda *_a, **_k: order.append("drift")
+    plug.device_sync.reconcile_all.side_effect = lambda *_a, **_k: order.append("reconcile")
+    asyncio.run(plug._resync())
+    assert order == ["label", "drift", "reconcile"]
+
+
+def test_drift_helper_failure_never_blocks_reconcile(plug, monkeypatch):
+    _drift_plug(plug, OLD)
+
+    def boom(*_a, **_k):
+        raise RuntimeError("parser bug")
+
+    monkeypatch.setattr(sys.modules["plugin"], "version_drift", boom)
+    asyncio.run(plug._resync())
+    plug.device_sync.reconcile_all.assert_called_once()
+    plug.logger.warning.assert_not_called()
+    plug.logger.exception.assert_called_once()
+    assert "could not check" in plug.logger.exception.call_args[0][0]
+
+
+def test_drift_through_the_real_handshake(plug):
+    from fakes import FakeWebSocket, returns, scripted_responder
+    from matter_client import MatterClient
+    from protocol import Protocol
+    from test_golden_real import REAL_SERVER_INFO
+
+    async def scenario():
+        fake = FakeWebSocket(server_info=REAL_SERVER_INFO,
+                             responder=scripted_responder({}))
+        plug.server_process = Mock()
+        client = MatterClient(Protocol(), Mock(), {}, connect=lambda uri: returns(fake), on_connect=plug._resync)
+        plug.matter = client
+        task = asyncio.create_task(client.run())
+        for _ in range(200):
+            if plug.device_sync.reconcile_all.called:
+                break
+            await asyncio.sleep(0.01)
+        await client.close()
+        task.cancel()
+
+    asyncio.run(scenario())
+    plug.device_sync.reconcile_all.assert_called()
+    texts = _warning_texts(plug)
+    assert len(texts) == 1 and "0.6.2" in texts[0]
+
+
+def test_status_body_reports_pin_and_outdated(plug):
+    _drift_plug(plug, OLD)
+    plug.matter = SimpleNamespace(connected=True, server_info={"sdk_version": "matter-server/0.6.8"})
+    plug.device_sync.node_count = lambda: 0
+    body = plug._status_body()
+    assert body["matterServerPinnedVersion"] == plug._pinned
+    assert body["matterServerVersionStatus"] == "older"
+    assert "matterServerOutdated" not in body
+
+
+@pytest.mark.parametrize("info,expected", [
+    ({"sdk_version": "matter-server/0.6.8"}, "older"),
+    ({"sdk_version": "matter-server/1.2.2"}, "current"),
+    ({"sdk_version": "matter-server/9.0.0"}, "newer"),
+    ({}, "unknown"),
+    ({"sdk_version": "garbage"}, "unknown"),
+])
+def test_status_body_version_status(plug, info, expected):
+    _drift_plug(plug, None)
+    plug.device_sync.node_count = lambda: 0
+    plug.matter = SimpleNamespace(connected=True, server_info=info)
+    assert plug._status_body()["matterServerVersionStatus"] == expected
+
+
+def test_status_body_keeps_last_known_status_while_disconnected(plug):
+    _drift_plug(plug, None)
+    plug.device_sync.node_count = lambda: 0
+    plug.matter = SimpleNamespace(connected=False, server_info={"sdk_version": "matter-server/0.6.8"}, uri="ws://x")
+    body = plug._status_body()
+    assert body["ready"] is False and body["matterServerVersionStatus"] == "older"
+
+
+def test_status_body_reports_status_regardless_of_server_location(plug):
+    _drift_plug(plug, None, managed=False)
+    plug.device_sync.node_count = lambda: 0
+    plug.matter = SimpleNamespace(connected=True, server_info={"sdk_version": "matter-server/0.6.8"})
+    assert plug._status_body()["matterServerVersionStatus"] == "older"

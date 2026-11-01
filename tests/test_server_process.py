@@ -1635,3 +1635,94 @@ def test_install_not_blocked_when_node_version_unreadable(tmp_path, prefs, mock_
     # unknown current node must not false-block (never blocks on an unreadable version)
     sp = _sp_with_tools(tmp_path, prefs, mock_logger, runner=FakeRunner())  # node --version → ""
     assert sp.install() is True
+
+
+# ---------------------------------------------------------------------------
+# version_drift (issue #75): running matter-server vs this release's pin
+# ---------------------------------------------------------------------------
+from server_process import version_drift  # noqa: E402
+
+_MJS = " (matter.js/0.17.0-alpha.0-20260101-abc)"
+
+
+def test_version_drift_older():
+    assert version_drift("matter-server/0.6.8" + _MJS, "matter-server@1.2.2") == ("0.6.8", "1.2.2", "older")
+
+
+def test_version_drift_equal_is_current():
+    assert version_drift("matter-server/1.2.2" + _MJS, "matter-server@1.2.2") == ("1.2.2", "1.2.2", "current")
+
+
+def test_version_drift_prerelease_of_the_pin_is_older():
+    # semver: 1.2.2-alpha.0-... sorts BELOW 1.2.2 even though the numeric parts are equal
+    running = "matter-server/1.2.2-alpha.0-20261031-362f4cc (matter.js/0.18.0)"
+    assert version_drift(running, "matter-server@1.2.2") == ("1.2.2-alpha.0-20261031-362f4cc", "1.2.2", "older")
+
+
+def test_version_drift_build_metadata_is_not_a_prerelease():
+    assert version_drift("matter-server/1.2.2+build", "matter-server@1.2.2")[2] == "current"
+
+
+def test_version_drift_pads_short_versions():
+    assert version_drift("matter-server/1.2", "matter-server@1.2.0")[2] == "current"
+
+
+def test_version_drift_older_than_a_prerelease_pin():
+    assert version_drift("matter-server/1.2.1", "matter-server@1.3.0-alpha.1")[2] == "older"
+
+
+def test_version_drift_newer():
+    assert version_drift("matter-server/1.5.5" + _MJS, "matter-server@1.2.2") == ("1.5.5", "1.2.2", "newer")
+
+
+def test_version_drift_numeric_not_lexical():
+    assert version_drift("matter-server/1.10.0", "matter-server@1.9.0")[2] == "newer"
+
+
+def test_version_drift_prerelease_running_is_newer():
+    running = "matter-server/1.5.6-alpha.0-20261031-362f4cc (matter.js/0.17.0)"
+    assert version_drift(running, "matter-server@1.2.2") == ("1.5.6-alpha.0-20261031-362f4cc", "1.2.2", "newer")
+
+
+@pytest.mark.parametrize("bad", [None, "", "unknown", "garbage", "matter-server/", "matter-server/abc", 5, {}])
+def test_version_drift_unparseable_running_is_none(bad):
+    assert version_drift(bad, "matter-server@1.2.2") is None
+
+
+@pytest.mark.parametrize("spec", ["matter-server", "matter-server@", "matter-server@latest", None, 7])
+def test_version_drift_unparseable_pin_is_none(spec):
+    assert version_drift("matter-server/0.6.8", spec) is None
+
+
+def test_version_drift_defaults_to_pin():
+    from server_process import DEFAULT_INSTALL_SPEC
+    pinned = DEFAULT_INSTALL_SPEC.split("@", 1)[1]
+    assert version_drift("matter-server/0.0.1")[1] == pinned
+
+
+def test_version_drift_oversized_numeric_component_is_unknown_not_an_exception():
+    # Python refuses int() on strings past its digit limit; the helper's "never raises" must hold.
+    assert version_drift("matter-server/" + "9" * 5000, "matter-server@1.2.2") is None
+
+
+def test_version_drift_hyphen_inside_build_metadata_is_not_a_prerelease():
+    # The running token is reported as-is (build suffix kept); only the status matters here.
+    assert version_drift("matter-server/1.2.2+exp.sha-5114f85", "matter-server@1.2.2")[2] == "current"
+
+
+
+def test_menu_constants_match_menuitems_xml():
+    import xml.etree.ElementTree as ET
+    from pathlib import Path
+    from server_process import BACKUP_MENU, INSTALL_MENU
+
+    root = ET.parse(Path(__file__).parent.parent / "indigo-matter.indigoPlugin" / "Contents"
+                    / "Server Plugin" / "MenuItems.xml").getroot()
+    names = {item.get("id"): item.findtext("Name") for item in root.findall("MenuItem")}
+    assert names["exportFabricBackup"] == BACKUP_MENU
+    assert names["installMatterServer"] == INSTALL_MENU
+
+
+def test_pinned_version_is_the_install_spec_version():
+    from server_process import DEFAULT_INSTALL_SPEC, PINNED_VERSION
+    assert DEFAULT_INSTALL_SPEC == f"matter-server@{PINNED_VERSION}"
