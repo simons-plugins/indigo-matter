@@ -61,7 +61,7 @@ from matter_server_menu_mixin import MatterServerMenuMixin
 from pairing_menu_mixin import PairingMenuMixin
 import protocol
 from protocol import MatterWrite, Protocol
-from server_process import INSTALL_MENU, ServerProcess, version_drift
+from server_process import BACKUP_MENU, INSTALL_MENU, ServerProcess, version_drift
 
 from plugin_constants import (
     COMMAND_TIMEOUT, MAX_RESUBSCRIBE_ATTEMPTS, NODE_TOMBSTONES_PREF, ON_TIME_RETIRED_PREF,
@@ -139,6 +139,9 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
         # verdict logged so a standing conflict is reported once, not every pass.
         self._next_port_check: float = 0.0
         self._last_port_conflict: str | None = None
+        # (running, pinned) pairs the matter-server version check has already reported (#75),
+        # so reconnect churn doesn't repeat a line; a different running version is heard again.
+        self._drift_reported: set[tuple[str, str]] = set()
         # Same, for the bridge agent (#187) — a SEPARATE pair of state variables
         # because the two agents start/stop on unrelated triggers (serverLocation
         # vs the export allow-list) and must not silence each other's verdicts.
@@ -709,35 +712,46 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
             self.logger.debug("could not set fabric label (older matter-server?): %s", exc)
 
     def _warn_if_server_outdated(self) -> None:
-        """Managed mode only: say once if the running matter-server is behind this release's pin (#75).
+        """Say once if the running matter-server is behind (or ahead of) this release's pin (#75).
 
         Upgrading the plugin never upgrades matter-server (only the install menu item does),
-        so a stale server otherwise looks healthy. Advisory: any failure is debug-logged and
-        must never block the reconcile that follows.
+        so a stale server otherwise looks healthy. Managed (local) mode: an older server gets a
+        WARNING naming the backup and install menu items. Unmanaged (remote) mode: an INFO line
+        instead, because the plugin cannot upgrade a server it does not run. A newer server
+        gets an INFO in both modes; an unreadable version gets one WARNING. Advisory: a failure
+        here is logged with its traceback but must never block the reconcile that follows.
         """
         try:
-            if self.server_process is None:
-                return
-            drift = version_drift((self.matter.server_info or {}).get("sdk_version"))
+            info = self.matter.server_info or {}
+            raw = info.get("sdk_version")
+            drift = version_drift(raw)
             if drift is None:
+                if ("?", str(raw)) not in self._drift_reported:
+                    self._drift_reported.add(("?", str(raw)))
+                    self.logger.warning(
+                        "could not read the matter-server version from %r; the version check is skipped "
+                        "until it can be read", raw)
                 return
-            running, pinned, direction = drift
-            seen = self.__dict__.setdefault("_drift_reported", set())
-            if (running, pinned) in seen:
+            running, pinned, status = drift
+            if status == "current" or (running, pinned) in self._drift_reported:
                 return
-            seen.add((running, pinned))
-            if direction == "older":
+            self._drift_reported.add((running, pinned))
+            if status == "older" and self.server_process is not None:
                 self.logger.warning(
                     "the running matter-server is %s but this plugin release is built for %s; upgrading the "
-                    "plugin does not upgrade matter-server. Run Plugins ▸ Matter ▸ %s to update it "
-                    "(back up the fabric first, see the install guide's Backups section)",
-                    running, pinned, INSTALL_MENU)
+                    "plugin does not upgrade matter-server. Run Plugins ▸ Matter ▸ %s, then Plugins ▸ Matter ▸ %s "
+                    "to update it", running, pinned, BACKUP_MENU, INSTALL_MENU)
+            elif status == "older":
+                self.logger.info(
+                    "matter-server at %s is %s; this plugin release is built for %s. The plugin does not "
+                    "manage that server, so upgrade it where it runs",
+                    getattr(self.matter, "uri", "?"), running, pinned)
             else:
                 self.logger.info(
-                    "the running matter-server is %s, ahead of %s, the version this plugin release was tested against",
+                    "the running matter-server is %s, ahead of %s, the version this plugin release installs",
                     running, pinned)
-        except Exception as exc:  # pylint: disable=broad-except
-            self.logger.debug("could not check matter-server version: %s", exc)
+        except Exception:  # pylint: disable=broad-except
+            self.logger.exception("could not check the matter-server version; the check is skipped this start")
 
     async def _resync(self) -> None:
         """Reconcile matter nodes ↔ Indigo devices. Driven by the WS client's
