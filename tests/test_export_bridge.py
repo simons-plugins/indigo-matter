@@ -1531,6 +1531,72 @@ class TestFailureSurfacing:
         assert "Indigo devices and inbound Matter control are unaffected" in said
 
 
+class TestStoppedByUser:
+    """#342: a deliberate stop from the menu is not an outage to shout about."""
+
+    def _stopped(self, bridge_mod, mock_logger, devices):
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(101, "onOffLight")])
+        h.start()
+        h.touched = []
+
+        def _tail():
+            h.touched.append("diagnose")
+            raise AssertionError("the error-log tail must not be read after a deliberate stop")
+
+        h.bridge._agent_diagnose = _tail
+        h.bridge.note_agent_stopped()
+        return h
+
+    @staticmethod
+    def _infos(mock_logger):
+        return [str(c.args[0]) for c in mock_logger.info.call_args_list]
+
+    def test_menu_stop_is_quiet_across_many_reconnect_attempts(
+            self, bridge_mod, mock_logger, devices):
+        h = self._stopped(bridge_mod, mock_logger, devices)
+        h.client.attached = False
+        seam = h.client.kwargs["outage_expected"]
+        for attempt in range(1, 41):
+            assert seam() is True, "the client demotes its per-attempt line to debug"
+            h.bridge._on_unreachable(attempt)
+            h.bridge.health_tick()
+        assert mock_logger.warning.call_count == 0
+        assert h.touched == [], "no error-log tail for an outage the user ordered"
+        stopped = [m for m in self._infos(mock_logger) if "stopped from" in m]
+        assert len(stopped) == 1
+        assert "Plugins" in stopped[0] and "Reload the plugin" in stopped[0]
+
+    def test_a_start_that_fails_after_a_stop_reports_the_full_diagnostic(
+            self, bridge_mod, mock_logger, devices):
+        h = self._stopped(bridge_mod, mock_logger, devices)
+        h.bridge._agent_diagnose = lambda: "Recent error log: boom"
+
+        def _boom():
+            raise RuntimeError("launchd said no")
+
+        h.bridge._agent_start = _boom
+        h.bridge._ensure_agent()
+        assert h.client.kwargs["outage_expected"]() is False
+        h.bridge._on_unreachable(3)
+        said = warnings_of(mock_logger)
+        assert "not responding" in said and "boom" in said
+
+    def test_the_install_path_clears_it_before_restarting_the_node(
+            self, bridge_mod, mock_logger, devices):
+        h = self._stopped(bridge_mod, mock_logger, devices)
+        h.bridge.expect_restart()
+        h.bridge.cancel_expected_restart()   # the restart failed
+        assert h.client.kwargs["outage_expected"]() is False
+
+    def test_a_reattach_clears_it(self, bridge_mod, mock_logger, devices):
+        h = self._stopped(bridge_mod, mock_logger, devices)
+        h.bridge._on_attached(_attached_status())
+        assert h.client.kwargs["outage_expected"]() is False
+        h.bridge._agent_diagnose = lambda: "diag"
+        h.bridge._on_unreachable(1)
+        assert "not responding" in warnings_of(mock_logger)
+
+
 class TestHealthTick:
     def _bridge(self, bridge_mod, mock_logger, devices):
         h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(101, "onOffLight")])

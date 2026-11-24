@@ -3,6 +3,27 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
+## 2026.34.1 — Stopping the bridge node on purpose is no longer reported as a failure
+
+- Fix (issue #366): an un-export that had completed was repeated on every plugin
+  start while the export list was empty, with "'Dict' object has no attribute
+  'pop'" in the log. The "outstanding un-export" flag is now actually cleared. The
+  same mistake in the node device's config dialog is fixed too.
+- Fix (issue #366): **Stop the Matter bridge node** no longer sometimes warns that
+  the agent "could not be stopped" when launchd was merely slow to drop it; the
+  plugin now waits up to two seconds before deciding it failed. A node that really
+  is still running afterwards still gets the warning.
+- Fix (issue #366): about two minutes after a deliberate stop, the plugin no longer
+  logs a false "did not survive its own bootstrap" error. A job that dies on its
+  own still does.
+- Fix (issue #342): after **Stop the Matter bridge node** the Event Log no longer
+  fills with a "bridge node connection lost" warning on every reconnect attempt
+  (about 120 an hour), followed by "still not attached" and "not responding"
+  warnings carrying an old error-log tail. You now get one info line saying the node
+  was stopped from the menu and how to bring it back. Starting the node again, or
+  it attaching, switches normal reporting back on, so a start that then fails is
+  still reported in full.
+
 ## 2026.34.0 — Warn when matter-server is older than this plugin release expects
 
 - Fix (issue #75): upgrading the plugin never upgraded matter-server. The pinned

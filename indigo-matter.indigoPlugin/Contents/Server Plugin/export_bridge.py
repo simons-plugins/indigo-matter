@@ -253,6 +253,13 @@ class ExportBridge:
         #: the stop (see :meth:`_stop_agent`) so a session that never started it
         #: never boots one out.
         self._agent_started = False
+        #: The user stopped the bridge node from the menu (#342). The client keeps
+        #: dialling a node nobody wants up, so while this is set that outage is
+        #: expected: per-attempt lines drop to debug and :meth:`_on_unreachable`
+        #: says ONE info line. Cleared before any agent start and on attach, so a
+        #: start that fails after a stop still reports its real error in full.
+        self._stopped_by_user = False
+        self._stopped_notice_shown = False
 
         #: The live client, or ``None`` while nothing is exported (XG5).
         self.client: Optional[BridgeClient] = None
@@ -667,6 +674,7 @@ class ExportBridge:
         The consequence of failing is an export outage, which the client's
         unreachable path already reports with the node's own error log attached.
         """
+        self._stopped_by_user = False   # about to start it: failures are real again (#342)
         if self._agent_start is None:
             return
         # Latched BEFORE the attempt: a start that raised may still have written
@@ -718,8 +726,14 @@ class ExportBridge:
         menu has made that false, and leaving it set would have the next
         empty-transition bootout a job the *user* may have started again by hand
         — the exact thing the latch exists to prevent.
+
+        Also latches "stopped by the user" (#342): the outage that follows is one
+        the user ordered, so it is not reported as a failure. See
+        :meth:`_restart_expected` and :meth:`_on_unreachable`.
         """
         self._agent_started = False
+        self._stopped_by_user = True
+        self._stopped_notice_shown = False
 
     def _pending_replace_all(self) -> int:
         """**How many** endpoints an un-export still owes the node (XAC7).
@@ -1873,6 +1887,7 @@ class ExportBridge:
         # restarting" — the window must mean "we are waiting for THIS bounce",
         # not "the last 30 seconds were forgiven". Through the named closer, so
         # there is exactly one body that knows what closing involves.
+        self._stopped_by_user = False      # the node is back: nothing is stopped (#342)
         self.cancel_expected_restart()
         self._halted_reported = False
         self._recovery_reported = False
@@ -2117,6 +2132,7 @@ class ExportBridge:
         (:meth:`stop`), and the install path's own failure branches. Expiry is
         the backstop for none of those happening at all.
         """
+        self._stopped_by_user = False   # a start is being ordered (#342)
         self._restart_expected_until = self._now() + EXPECTED_RESTART_WINDOW
         self._restart_notice_shown = False
 
@@ -2138,7 +2154,7 @@ class ExportBridge:
         per-attempt reconnect warnings and this class's diagnostic answer to one
         window rather than two copies of it.
         """
-        return self._now() < self._restart_expected_until
+        return self._stopped_by_user or self._now() < self._restart_expected_until
 
     def _on_unreachable(self, attempts: int) -> None:
         """The node is not answering — and since E7 the agent is asked why.
@@ -2166,6 +2182,15 @@ class ExportBridge:
         as evidence of "the node is down right now" can be — and in the issue's
         log was — a crash-loop from eight days earlier.
         """
+        if self._stopped_by_user:
+            if not self._stopped_notice_shown:
+                self._stopped_notice_shown = True
+                self._logger.info(
+                    "Matter bridge: the bridge node was stopped from the Plugins ▸ Matter menu "
+                    "and has not been restarted, so exported accessories show as unavailable. "
+                    "Reload the plugin, or run Plugins ▸ Matter ▸ Install/update the Matter "
+                    "bridge, to bring it back.")
+            return
         if self._restart_expected():
             if not self._restart_notice_shown:
                 self._restart_notice_shown = True
