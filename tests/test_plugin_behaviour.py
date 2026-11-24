@@ -2372,6 +2372,41 @@ def test_a_concurrent_rearm_during_the_probe_survives_a_stale_clear(plug):
     assert agent.due_for_bootstrap_verification() == new_deadline, "the new arming must survive"
 
 
+def test_a_stop_during_the_probe_is_not_reported_as_a_dead_bootstrap(plug):
+    """#366 item 3, narrow race: the tick reads the due token, then spends seconds
+    in the port-conflict report. A deliberate stop (`uninstall()`) landing in that
+    gap disarms the check; the job having no pid is then the user's doing, not a
+    crash, and the ERROR must not fire."""
+    deadline = time.monotonic() - 1
+
+    class _Agent:
+        def __init__(self):
+            self.spec = SimpleNamespace(port=5580, package="matter-server")
+            self.log_dir = "/tmp/fake-log-dir"
+            self._deadline = deadline
+
+        def port_conflict_report(self):
+            self._deadline = None                     # uninstall() ran mid-report
+            return None
+
+        def due_for_bootstrap_verification(self):
+            return self._deadline
+
+        def clear_bootstrap_verification(self, observed):
+            if self._deadline == observed:
+                self._deadline = None
+
+        def post_bootstrap_verdict(self):
+            return VERDICT_DEAD
+
+        def managed_job_has_pid(self):
+            return False
+
+    plug.server_process = _Agent()
+    plug._port_conflict_tick()
+    assert not plug.logger.error.called
+
+
 def test_both_agents_due_simultaneously_are_each_handled_independently(plug):
     now = time.monotonic()
     server = _fake_agent(5580, "matter-server", None, due_bootstrap=now)
