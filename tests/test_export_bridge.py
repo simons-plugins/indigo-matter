@@ -27,6 +27,7 @@ References to ``§N`` are ``docs/BRIDGE_PROTOCOL.md``.
 from __future__ import annotations
 
 import importlib
+import sys
 
 import pytest
 
@@ -68,7 +69,8 @@ class Harness:
 
     def __init__(self, module, mock_logger, devices, entries=()):
         self.logger = mock_logger
-        self.prefs: dict = {}
+        # indigo.Dict stand-in, NOT dict: it has no `pop` (issue #366), like the real one.
+        self.prefs = sys.modules["indigo"].Dict()
         self.devices = devices
         self.store = ExportStore(lambda: self.prefs, mock_logger)
         for entry in entries:
@@ -2060,6 +2062,34 @@ class TestPendingUnExport:
         h.store.upsert(ExportEntry(101, "onOffLight"))
         h.bridge.exports_changed()
         assert h.bridge._pending_replace_all() == 1
+
+    def test_clearing_a_set_flag_removes_it_and_saves_prefs(self, bridge_mod, mock_logger, devices):
+        """Issue #366: indigo.Dict has no `pop`, so the flag was never cleared."""
+        h = Harness(bridge_mod, mock_logger, devices, [])
+        h.prefs[bridge_mod.PREF_PENDING_REPLACE_ALL] = 4
+        saves = h.saves
+        h.bridge._clear_pending_replace_all()
+        assert bridge_mod.PREF_PENDING_REPLACE_ALL not in h.prefs
+        assert h.saves == saves + 1
+        assert not mock_logger.warning.called
+
+    def test_clearing_an_absent_flag_does_not_raise(self, bridge_mod, mock_logger, devices):
+        h = Harness(bridge_mod, mock_logger, devices, [])
+        h.bridge._clear_pending_replace_all()
+        assert not mock_logger.warning.called
+
+    def test_startup_with_an_empty_list_after_a_cleared_debt_does_not_relaunch_the_node(
+            self, bridge_mod, mock_logger, devices):
+        h = self._emptied_with_a_dead_node(bridge_mod, mock_logger, devices)
+        h.bridge.exports_changed()
+        h.bridge._on_attached(bridge_protocol.parse_status(
+            FRAMES["attach_replace_all"]["response"]["result"]), True)
+        assert bridge_mod.PREF_PENDING_REPLACE_ALL not in h.prefs
+        clients_before = len(h.clients)
+        # Next plugin start: empty list, nothing owed -> must not reconnect.
+        h.bridge.exports_changed()
+        assert len(h.clients) == clients_before
+        assert h.bridge.active is False
 
     def test_a_successful_attach_discharges_the_debt_and_drops_the_client(
             self, bridge_mod, mock_logger, devices):

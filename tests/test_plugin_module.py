@@ -438,6 +438,21 @@ def test_validate_matter_node_strips_last_survey_summary_before_save(
     assert result[1]["nodeId"] == "9"  # only the survey field is stripped
 
 
+def test_validate_strips_last_survey_summary_from_a_real_indigo_dict(
+        plugin_cls, mock_indigo_base):
+    """Issue #366: valuesDict is an indigo.Dict at runtime, which has no `pop`."""
+    mock_indigo_base.devices = {9: _dev({}, type_id="matterNode")}
+    values = mock_indigo_base.Dict()
+    values["lastSurveySummary"] = "3 settings confirmed."
+    values["nodeId"] = "9"
+    result = plugin_cls.validateDeviceConfigUi(None, values, "matterNode", 9)
+    assert result[0] is True
+    assert "lastSurveySummary" not in result[1]
+    # absent key must not raise either
+    result = plugin_cls.validateDeviceConfigUi(None, mock_indigo_base.Dict(), "matterNode", 9)
+    assert result[0] is True
+
+
 def test_validate_other_types_keep_their_fields_untouched(plugin_cls, mock_indigo_base):
     """The strip is matterNode-specific — it must not touch any other device
     type's valuesDict, even one that happens to have a field of that name."""

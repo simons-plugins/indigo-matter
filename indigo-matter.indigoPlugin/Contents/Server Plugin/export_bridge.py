@@ -823,7 +823,10 @@ class ExportBridge:
         side effect of passing 0 to a recorder (see there for what that cost).
         """
         try:
-            self._prefs_getter().pop(PREF_PENDING_REPLACE_ALL, None)
+            # `indigo.Dict` has no `pop` (issue #366): test-and-delete instead.
+            prefs = self._prefs_getter()
+            if PREF_PENDING_REPLACE_ALL in prefs:
+                del prefs[PREF_PENDING_REPLACE_ALL]
             if self._save_prefs is not None:
                 self._save_prefs()
         except Exception as exc:  # pylint: disable=broad-except

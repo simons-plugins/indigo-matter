@@ -1190,7 +1190,9 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
         field's per-device echo of that store.
         """
         if typeId == "matterNode":
-            valuesDict.pop("lastSurveySummary", None)
+            # indigo.Dict has no `pop` (issue #366)
+            if "lastSurveySummary" in valuesDict:
+                del valuesDict["lastSurveySummary"]
         created = ""
         try:
             created = indigo.devices[devId].pluginProps.get("createdTypeId", "")

@@ -60,7 +60,15 @@ class _IndigoDict(dict):
 
     Subclassing dict keeps every existing test working (the mapping behaves
     identically) while making the isinstance check mean something.
+
+    ``pop`` is DELIBERATELY unavailable: real ``indigo.Dict`` has none (issue
+    #366 — ``"'Dict' object has no attribute 'pop'"``), and the suite stayed
+    green over two ``prefs.pop(key, None)`` calls because ``dict`` has one. Only
+    ``pop`` is confirmed missing; no other dict method is disabled here on a guess.
     """
+
+    def pop(self, *args, **kwargs):
+        raise AttributeError("'Dict' object has no attribute 'pop'")
 
 
 class _IndigoList(list):
