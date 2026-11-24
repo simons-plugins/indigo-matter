@@ -28,6 +28,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+from conftest import _IndigoDict
 import pytest
 
 SERVER_PLUGIN = (Path(__file__).parent.parent / "indigo-matter.indigoPlugin"
@@ -95,7 +96,7 @@ def mixin(mock_indigo_base, mock_logger):
     module = importlib.import_module("diagnostics_menu_mixin")
     obj = module.DiagnosticsMenuMixin()
     obj.logger = mock_logger
-    obj.pluginPrefs = {}
+    obj.pluginPrefs = _IndigoDict({})
     obj.runtime = Mock()
     obj.matter = Mock()
     obj.device_sync = Mock()

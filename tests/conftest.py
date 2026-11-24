@@ -61,14 +61,30 @@ class _IndigoDict(dict):
     Subclassing dict keeps every existing test working (the mapping behaves
     identically) while making the isinstance check mean something.
 
-    ``pop`` is DELIBERATELY unavailable: real ``indigo.Dict`` has none (issue
-    #366 — ``"'Dict' object has no attribute 'pop'"``), and the suite stayed
-    green over two ``prefs.pop(key, None)`` calls because ``dict`` has one. Only
-    ``pop`` is confirmed missing; no other dict method is disabled here on a guess.
+    **Probed on a live Indigo 2026.1 server, 2026-11-24.** MISSING: ``pop``,
+    ``popitem``, ``setdefault``, ``copy`` (the reporter's log for #366 was
+    ``"'Dict' object has no attribute 'pop'"``; the suite had stayed green over two
+    ``prefs.pop(key, None)`` calls because ``dict`` has one). PRESENT: ``update``,
+    ``clear``, ``get``, ``keys``, ``values``, ``items``, ``to_dict``, ``in``,
+    ``del``. Storing ``None`` works. Reading a nested list returns a COPY, so
+    appending to ``d["lst"]`` is not visible afterwards; that is NOT emulated here.
     """
 
     def pop(self, *args, **kwargs):
         raise AttributeError("'Dict' object has no attribute 'pop'")
+
+    def popitem(self, *args, **kwargs):
+        raise AttributeError("'Dict' object has no attribute 'popitem'")
+
+    def setdefault(self, *args, **kwargs):
+        raise AttributeError("'Dict' object has no attribute 'setdefault'")
+
+    def copy(self, *args, **kwargs):
+        raise AttributeError("'Dict' object has no attribute 'copy'")
+
+    def to_dict(self):
+        """Present on the real one: a plain ``dict`` of the same items."""
+        return dict(self)
 
 
 class _IndigoList(list):

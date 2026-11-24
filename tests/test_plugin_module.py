@@ -429,18 +429,10 @@ def test_validate_matter_node_strips_last_survey_summary_before_save(
     """Indigo persists every ConfigUI field into pluginProps on Save, readonly
     included — left alone the display-only survey summary would become a
     stored (and stale, comm-restart-triggering) prop. validateDeviceConfigUi
-    must strip it out of valuesDict before Save can persist it."""
-    mock_indigo_base.devices = {9: _dev({}, type_id="matterNode")}
-    values = {"lastSurveySummary": "3 settings confirmed.", "nodeId": "9"}
-    result = plugin_cls.validateDeviceConfigUi(None, values, "matterNode", 9)
-    assert result[0] is True
-    assert "lastSurveySummary" not in result[1]
-    assert result[1]["nodeId"] == "9"  # only the survey field is stripped
+    must strip it out of valuesDict before Save can persist it.
 
-
-def test_validate_strips_last_survey_summary_from_a_real_indigo_dict(
-        plugin_cls, mock_indigo_base):
-    """Issue #366: valuesDict is an indigo.Dict at runtime, which has no `pop`."""
+    valuesDict is an indigo.Dict at runtime, which has no `pop` (issue #366), so
+    the stand-in is used rather than a plain dict."""
     mock_indigo_base.devices = {9: _dev({}, type_id="matterNode")}
     values = mock_indigo_base.Dict()
     values["lastSurveySummary"] = "3 settings confirmed."
@@ -448,7 +440,8 @@ def test_validate_strips_last_survey_summary_from_a_real_indigo_dict(
     result = plugin_cls.validateDeviceConfigUi(None, values, "matterNode", 9)
     assert result[0] is True
     assert "lastSurveySummary" not in result[1]
-    # absent key must not raise either
+    assert result[1]["nodeId"] == "9"  # only the survey field is stripped
+    # an absent key must not raise either
     result = plugin_cls.validateDeviceConfigUi(None, mock_indigo_base.Dict(), "matterNode", 9)
     assert result[0] is True
 

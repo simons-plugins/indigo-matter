@@ -27,6 +27,7 @@ from concurrent.futures import TimeoutError as FuturesTimeoutError
 from pathlib import Path
 from unittest.mock import Mock
 
+from conftest import _IndigoDict
 import pytest
 
 from indigo_fakes import FakeDev
@@ -67,7 +68,7 @@ def menu(coffee, ds, mock_logger):  # noqa: F811
 
     obj = _Composed()
     obj.logger = mock_logger
-    obj.pluginPrefs = {}
+    obj.pluginPrefs = _IndigoDict({})
     obj.device_sync = ds
     obj.matter = Mock()
     obj.runtime = Mock()

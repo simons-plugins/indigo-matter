@@ -36,6 +36,7 @@ import bridge_protocol
 import export_catalog
 from export_store import ExportEntry, ExportStore
 
+from conftest import _IndigoDict
 from fakes import FakeIndigoDevices, RelayDevice
 
 SERVER_PLUGIN = (Path(__file__).parent.parent
@@ -85,7 +86,7 @@ def plug(plugin_mod, devices):  # noqa: ARG001 - devices installs indigo.devices
     p = plugin_mod.Plugin.__new__(plugin_mod.Plugin)
     p.logger = Mock()
     p.pluginId = OURS
-    p.pluginPrefs = {}
+    p.pluginPrefs = _IndigoDict({})
     p.exports = ExportStore(lambda: p.pluginPrefs, p.logger)
     p.exports.upsert(ExportEntry(101, "onOffPlugInUnit"))
     p.export_bridge = None

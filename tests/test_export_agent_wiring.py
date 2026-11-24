@@ -25,6 +25,7 @@ import bridge_protocol
 import export_catalog
 from export_store import ExportEntry, ExportStore
 
+from conftest import _IndigoDict
 from fakes import (
     DimmerDevice,
     FakeBridgeClient,
@@ -62,7 +63,7 @@ class AgentHarness:
 
     def __init__(self, module, mock_logger, devices, entries=(), prefs=None, now=None):
         self.logger = mock_logger
-        self.prefs: dict = dict(prefs or {})
+        self.prefs = _IndigoDict(prefs or {})
         #: #340: injected so a window can be left to EXPIRE. Hand-zeroing the
         #: deadline instead is what let a never-expiring window (a mistyped
         #: constant, a write/read clock mismatch) pass the whole suite.
