@@ -27,10 +27,12 @@ References to ``§N`` are ``docs/BRIDGE_PROTOCOL.md``.
 from __future__ import annotations
 
 import importlib
+import sys
 
 import pytest
 
 import bridge_client
+import bridge_health
 import bridge_protocol
 import export_catalog
 from export_store import ExportEntry, ExportStore
@@ -68,7 +70,8 @@ class Harness:
 
     def __init__(self, module, mock_logger, devices, entries=()):
         self.logger = mock_logger
-        self.prefs: dict = {}
+        # indigo.Dict stand-in, NOT dict: it has no `pop` (issue #366), like the real one.
+        self.prefs = sys.modules["indigo"].Dict()
         self.devices = devices
         self.store = ExportStore(lambda: self.prefs, mock_logger)
         for entry in entries:
@@ -1529,6 +1532,134 @@ class TestFailureSurfacing:
         assert "Indigo devices and inbound Matter control are unaffected" in said
 
 
+class TestStoppedByUser:
+    """#342: a deliberate stop from the menu is not an outage to shout about."""
+
+    def _stopped(self, bridge_mod, mock_logger, devices):
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(101, "onOffLight")])
+        h.start()
+        h.touched = []
+
+        def _tail():
+            h.touched.append("diagnose")
+            raise AssertionError("the error-log tail must not be read after a deliberate stop")
+
+        h.bridge._agent_diagnose = _tail
+        h.bridge.note_agent_stopped()
+        return h
+
+    @staticmethod
+    def _infos(mock_logger):
+        return [str(c.args[0]) for c in mock_logger.info.call_args_list]
+
+    def test_menu_stop_is_quiet_across_many_reconnect_attempts(
+            self, bridge_mod, mock_logger, devices):
+        h = self._stopped(bridge_mod, mock_logger, devices)
+        h.client.attached = False
+        seam = h.client.kwargs["outage_expected"]
+        for attempt in range(1, 41):
+            assert seam() is True, "the client demotes its per-attempt line to debug"
+            h.bridge._on_unreachable(attempt)
+            h.bridge.health_tick()
+        assert mock_logger.warning.call_count == 0
+        assert h.touched == [], "no error-log tail for an outage the user ordered"
+        stopped = [m for m in self._infos(mock_logger) if "stopped from" in m]
+        assert len(stopped) == 1
+        assert "Plugins" in stopped[0] and "Changing an export" in stopped[0]
+
+    def test_a_start_that_fails_after_a_stop_reports_the_full_diagnostic(
+            self, bridge_mod, mock_logger, devices):
+        h = self._stopped(bridge_mod, mock_logger, devices)
+        h.bridge._agent_diagnose = lambda: "Recent error log: boom"
+
+        def _boom():
+            raise RuntimeError("launchd said no")
+
+        h.bridge._agent_start = _boom
+        h.bridge._ensure_agent()
+        assert h.client.kwargs["outage_expected"]() is False
+        h.bridge._on_unreachable(3)
+        said = warnings_of(mock_logger)
+        assert "not responding" in said and "boom" in said
+
+    def test_the_install_path_clears_it_before_restarting_the_node(
+            self, bridge_mod, mock_logger, devices):
+        h = self._stopped(bridge_mod, mock_logger, devices)
+        h.bridge.expect_restart()
+        h.bridge.cancel_expected_restart()   # the restart failed
+        assert h.client.kwargs["outage_expected"]() is False
+
+    def test_a_reattach_clears_it(self, bridge_mod, mock_logger, devices):
+        h = self._stopped(bridge_mod, mock_logger, devices)
+        h.bridge._on_attached(_attached_status())
+        assert h.client.kwargs["outage_expected"]() is False
+        h.bridge._agent_diagnose = lambda: "diag"
+        h.bridge._on_unreachable(1)
+        assert "not responding" in warnings_of(mock_logger)
+
+    def test_the_latched_branch_defers_the_diagnostic_it_does_not_drop_it(
+            self, bridge_mod, mock_logger, devices):
+        """The client latches `on_repeated_failure` once per streak. A supervisor
+        that suppresses one firing must re-arm it or the streak goes silent."""
+        h = self._stopped(bridge_mod, mock_logger, devices)
+        h.bridge._on_unreachable(2)
+        assert "rearm_failure_diagnostic" in h.client.names()
+
+    def test_the_notice_stays_once_only_while_the_diagnostic_is_rearmed(
+            self, bridge_mod, mock_logger, devices):
+        h = self._stopped(bridge_mod, mock_logger, devices)
+        for attempt in (2, 3, 4):
+            h.bridge._on_unreachable(attempt)
+        assert h.client.names().count("rearm_failure_diagnostic") == 3
+        assert len([m for m in self._infos(mock_logger) if "stopped from" in m]) == 1
+
+    def test_still_not_attached_fires_again_after_the_latch_clears(
+            self, bridge_mod, mock_logger, devices):
+        """`_disconnect_ticks` kept counting past the threshold while latched, and
+        the warning tests `==`, so it was lost for good once the latch cleared."""
+        h = self._stopped(bridge_mod, mock_logger, devices)
+        h.client.attached = False
+        for _ in range(bridge_health.DISCONNECT_WARN_TICKS + 3):
+            h.bridge.health_tick()
+        assert "still not attached" not in warnings_of(mock_logger)
+        h.bridge.expect_restart()            # the user runs Install/update
+        h.bridge.cancel_expected_restart()   # ... and it fails
+        for _ in range(bridge_health.DISCONNECT_WARN_TICKS):
+            h.bridge.health_tick()
+        assert "still not attached" in warnings_of(mock_logger)
+
+    def test_an_attached_tick_clears_the_latch(self, bridge_mod, mock_logger, devices):
+        """A node that is demonstrably up (failed stop, an orphan outside launchd)
+        must not stay 'stopped by the user'."""
+        h = self._stopped(bridge_mod, mock_logger, devices)
+        h.client.attached = True
+        h.bridge.health_tick()
+        assert h.bridge._stopped_by_user is False
+        assert h.client.kwargs["outage_expected"]() is False
+
+    def test_a_refusal_clears_the_latch(self, bridge_mod, mock_logger, devices):
+        """A refusal means the node answered: it is up."""
+        h = self._stopped(bridge_mod, mock_logger, devices)
+        h.bridge._on_attach_refused(bridge_protocol.ERR_INTERNAL, "node is confused")
+        assert h.bridge._stopped_by_user is False
+        assert h.client.kwargs["outage_expected"]() is False
+
+    def test_a_failed_stop_can_be_undone(self, bridge_mod, mock_logger, devices):
+        h = self._stopped(bridge_mod, mock_logger, devices)
+        h.bridge.note_agent_stop_failed()
+        assert h.bridge._stopped_by_user is False
+        assert h.client.kwargs["outage_expected"]() is False
+
+    def test_a_second_stop_after_a_reattach_announces_itself_again(
+            self, bridge_mod, mock_logger, devices):
+        h = self._stopped(bridge_mod, mock_logger, devices)
+        for _ in range(2):
+            h.bridge.note_agent_stopped()
+            h.bridge._on_unreachable(2)
+            h.bridge._on_attached(_attached_status())
+        assert len([m for m in self._infos(mock_logger) if "stopped from" in m]) == 2
+
+
 class TestHealthTick:
     def _bridge(self, bridge_mod, mock_logger, devices):
         h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(101, "onOffLight")])
@@ -2060,6 +2191,34 @@ class TestPendingUnExport:
         h.store.upsert(ExportEntry(101, "onOffLight"))
         h.bridge.exports_changed()
         assert h.bridge._pending_replace_all() == 1
+
+    def test_clearing_a_set_flag_removes_it_and_saves_prefs(self, bridge_mod, mock_logger, devices):
+        """Issue #366: indigo.Dict has no `pop`, so the flag was never cleared."""
+        h = Harness(bridge_mod, mock_logger, devices, [])
+        h.prefs[bridge_mod.PREF_PENDING_REPLACE_ALL] = 4
+        saves = h.saves
+        h.bridge._clear_pending_replace_all()
+        assert bridge_mod.PREF_PENDING_REPLACE_ALL not in h.prefs
+        assert h.saves == saves + 1
+        assert not mock_logger.warning.called
+
+    def test_clearing_an_absent_flag_does_not_raise(self, bridge_mod, mock_logger, devices):
+        h = Harness(bridge_mod, mock_logger, devices, [])
+        h.bridge._clear_pending_replace_all()
+        assert not mock_logger.warning.called
+
+    def test_startup_with_an_empty_list_after_a_cleared_debt_does_not_relaunch_the_node(
+            self, bridge_mod, mock_logger, devices):
+        h = self._emptied_with_a_dead_node(bridge_mod, mock_logger, devices)
+        h.bridge.exports_changed()
+        h.bridge._on_attached(bridge_protocol.parse_status(
+            FRAMES["attach_replace_all"]["response"]["result"]), True)
+        assert bridge_mod.PREF_PENDING_REPLACE_ALL not in h.prefs
+        clients_before = len(h.clients)
+        # Next plugin start: empty list, nothing owed -> must not reconnect.
+        h.bridge.exports_changed()
+        assert len(h.clients) == clients_before
+        assert h.bridge.active is False
 
     def test_a_successful_attach_discharges_the_debt_and_drops_the_client(
             self, bridge_mod, mock_logger, devices):

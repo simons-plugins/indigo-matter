@@ -25,6 +25,7 @@ import bridge_protocol
 import export_catalog
 from export_store import ExportEntry, ExportStore
 
+from conftest import _IndigoDict
 from fakes import (
     DimmerDevice,
     FakeBridgeClient,
@@ -62,7 +63,7 @@ class AgentHarness:
 
     def __init__(self, module, mock_logger, devices, entries=(), prefs=None, now=None):
         self.logger = mock_logger
-        self.prefs: dict = dict(prefs or {})
+        self.prefs = _IndigoDict(prefs or {})
         #: #340: injected so a window can be left to EXPIRE. Hand-zeroing the
         #: deadline instead is what let a never-expiring window (a mistyped
         #: constant, a write/read clock mismatch) pass the whole suite.
@@ -858,3 +859,83 @@ class TestDeferralAgainstARealClient:
             "mutation check: latching _diag_fired AFTER the hook instead of before "
             "overwrites the rearm, and the node is never reported at all")
         assert "EADDRINUSE" in said, "the deferred diagnosis must arrive in full"
+
+
+class TestStopThenInstallAgainstARealClient:
+    """#342 deferral, through a real client: menu stop, then Install/update, then a
+    node that never comes back must still produce the "not responding" diagnosis."""
+
+    def _boom(self, _uri):
+        async def go():
+            raise ConnectionError("node not there")
+        return go()
+
+    def test_a_node_that_fails_to_return_after_a_stop_and_an_install_is_reported(
+            self, bridge_mod, mock_logger, devices):
+        clock = Clock()
+        h = AgentHarness(bridge_mod, mock_logger, devices, [ExportEntry(101, "onOffLight")],
+                         now=clock)
+        h.diagnosis = "Recent bridge node errors:\nlisten EADDRINUSE 5540"
+
+        async def scenario():
+            delays = []
+
+            async def fake_sleep(delay):
+                delays.append(delay)
+                if len(delays) == 3:
+                    # The streak fired once under the latch (one INFO), then the
+                    # user ran Install/update, which clears it and opens a window.
+                    h.bridge.expect_restart()
+                if len(delays) == 5:
+                    clock.advance(bridge_mod.EXPECTED_RESTART_WINDOW + 1)
+                if len(delays) >= 8:
+                    await client.close()
+                await asyncio.sleep(0)
+
+            client = bridge_client.BridgeClient(
+                mock_logger, {}, connect=self._boom, sleep=fake_sleep,
+                on_repeated_failure=h.bridge._on_unreachable,
+                outage_expected=h.bridge._restart_expected)
+            h.bridge.client = client
+            h.bridge.note_agent_stopped()
+            await asyncio.wait_for(client.run(), timeout=5)
+
+        asyncio.run(scenario())
+
+        assert "stopped from" in infos_of(mock_logger), "premise: the latched streak ran"
+        said = warnings_of(mock_logger)
+        assert "not responding" in said and "EADDRINUSE" in said
+
+
+class TestExportAfterAMenuStop:
+    """The stop menu promises "the next export starts the node again"; a client that
+    is still retrying used to make `start()` return before reaching the agent."""
+
+    def test_a_stopped_node_is_started_by_the_next_export(self, bridge_mod, mock_logger, devices):
+        h = AgentHarness(bridge_mod, mock_logger, devices, [ExportEntry(101, "onOffLight")])
+        h.bridge.exports_changed()
+        h.bridge.note_agent_stopped()
+        h.agent.clear()
+        h.bridge.start()
+        assert h.agent == ["start"]
+        assert len(h.clients) == 1, "the retrying client is kept, not rebuilt"
+        assert h.client.kwargs["outage_expected"]() is False
+        assert h.bridge._stopped_by_user is False
+
+    def test_without_a_stop_start_does_not_touch_the_agent(self, bridge_mod, mock_logger, devices):
+        h = AgentHarness(bridge_mod, mock_logger, devices, [ExportEntry(101, "onOffLight")])
+        h.bridge.exports_changed()
+
+        def _fatal():
+            raise AssertionError("start() must not touch the agent while a client exists")
+
+        h.bridge._agent_start = _fatal
+        h.bridge.start()
+        assert len(h.clients) == 1
+
+    def test_the_notice_says_changing_an_export_restarts_it(self, bridge_mod, mock_logger, devices):
+        h = AgentHarness(bridge_mod, mock_logger, devices, [ExportEntry(101, "onOffLight")])
+        h.bridge.exports_changed()
+        h.bridge.note_agent_stopped()
+        h.bridge._on_unreachable(2)
+        assert "Changing an export" in infos_of(mock_logger)

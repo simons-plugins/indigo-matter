@@ -19,6 +19,7 @@ from concurrent.futures import TimeoutError as FuturesTimeoutError
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
+from conftest import _IndigoDict
 import pytest
 
 from launch_agent import STARTUP_GRACE_SECONDS, VERDICT_CONFLICT_FREE, VERDICT_DEAD, VERDICT_PENDING
@@ -42,7 +43,7 @@ def plug(plugin_mod):
     p.device_sync = Mock()
     p.http = Mock()
     p.jobs = None
-    p.pluginPrefs = {}
+    p.pluginPrefs = _IndigoDict({})
     p.export_bridge = None
     p.bridge_process = None
     p._exported_ids = frozenset()
@@ -503,7 +504,7 @@ def test_startup_passes_test_net_dcl_through_unpinned(plugin_mod, monkeypatch):
         p.logger = Mock()
         p._version = "2026.0.1"
         p._subscribed_to_devices = False
-        p.pluginPrefs = {"serverLocation": "local", "enableTestNetDcl": value}
+        p.pluginPrefs = _IndigoDict({"serverLocation": "local", "enableTestNetDcl": value})
         p.proto = object()
         p.registry = object()
         p.device_sync = Mock()
@@ -556,7 +557,7 @@ def test_startup_wires_connect_and_disconnect_callbacks(plugin_mod, monkeypatch)
     p.logger = Mock()
     p._version = "2026.0.1"
     p._subscribed_to_devices = False
-    p.pluginPrefs = {}
+    p.pluginPrefs = _IndigoDict({})
     p.proto = object()
     p.registry = object()
     p.device_sync = Mock()
@@ -609,7 +610,7 @@ def test_startup_hands_the_matter_client_the_plugins_own_restart_window(plugin_m
     p.logger = Mock()
     p._version = "2026.0.1"
     p._subscribed_to_devices = False
-    p.pluginPrefs = {}
+    p.pluginPrefs = _IndigoDict({})
     p.proto = object()
     p.registry = object()
     p.device_sync = Mock()
@@ -664,7 +665,7 @@ def test_startup_wires_knows_node_into_commission_jobs(plugin_mod, monkeypatch):
     p.logger = Mock()
     p._version = "2026.0.1"
     p._subscribed_to_devices = False
-    p.pluginPrefs = {}
+    p.pluginPrefs = _IndigoDict({})
     p.proto = object()
     p.registry = object()
     p.device_sync = Mock()
@@ -709,7 +710,7 @@ def test_startup_wires_node_tombstones(plugin_mod, monkeypatch):
     p.logger = Mock()
     p._version = "2026.0.1"
     p._subscribed_to_devices = False
-    p.pluginPrefs = {plugin_mod.NODE_TOMBSTONES_PREF: '["42"]', plugin_mod.RETIRED_NODES_PREF: '["52"]'}
+    p.pluginPrefs = _IndigoDict({plugin_mod.NODE_TOMBSTONES_PREF: '["42"]', plugin_mod.RETIRED_NODES_PREF: '["52"]'})
     p.proto = object()
     p.registry = object()
     p.device_sync = Mock()
@@ -798,7 +799,7 @@ def test_menu_export_fabric_backup_writes_real_zip(plug, plugin_mod, tmp_path, m
     import fabric_backup
     storage = _storage_with_fabric(tmp_path)
     plug.server_process = SimpleNamespace(storage_path=storage)
-    plug.pluginPrefs = {}
+    plug.pluginPrefs = _IndigoDict({})
     plug.menuExportFabricBackup()
     # a real archive landed in the sibling backups dir
     backups = fabric_backup.list_backups(storage)
@@ -829,7 +830,7 @@ def test_menu_export_fabric_backup_archives_the_BRIDGE_storage_too(
 
     monkeypatch.setattr(fabric_backup, "create_backup", fake_create_backup)
     plug.server_process = SimpleNamespace(storage_path=_storage_with_fabric(tmp_path))
-    plug.pluginPrefs = {}
+    plug.pluginPrefs = _IndigoDict({})
 
     plug.menuExportFabricBackup()
 
@@ -841,7 +842,7 @@ def test_menu_export_fabric_backup_logs_error_on_no_fabric(plug, tmp_path):
     # storage dir missing → create_backup raises FileNotFoundError → handler logs
     # an explicit "no fabric to back up" ERROR and never raises (H5).
     plug.server_process = SimpleNamespace(storage_path=str(tmp_path / "missing"))
-    plug.pluginPrefs = {}
+    plug.pluginPrefs = _IndigoDict({})
     plug.menuExportFabricBackup()  # must not raise
     plug.logger.error.assert_called()
     # the message must make clear nothing was written
@@ -853,7 +854,7 @@ def test_get_fabric_backups_lists_for_picker(plug, plugin_mod, tmp_path):
     import fabric_backup
     storage = _storage_with_fabric(tmp_path)
     plug.server_process = SimpleNamespace(storage_path=storage)
-    plug.pluginPrefs = {}
+    plug.pluginPrefs = _IndigoDict({})
     from datetime import datetime, timezone
     archive = fabric_backup.create_backup(storage, now=datetime(2026, 6, 10, 12, 41, 45, tzinfo=timezone.utc))
     options = plug.getFabricBackups()
@@ -874,7 +875,7 @@ def test_menu_restore_refuses_in_manual_mode(plug):
 
 def test_menu_restore_requires_confirmation(plug, tmp_path):
     plug.server_process = SimpleNamespace(storage_path=_storage_with_fabric(tmp_path))
-    plug.pluginPrefs = {}
+    plug.pluginPrefs = _IndigoDict({})
     ok, _vd, errors = plug.menuRestoreFabricBackup({"backup": "/x.zip", "confirm": False}, "restoreFabricBackup")
     assert ok is False
     assert "confirm" in errors
@@ -882,7 +883,7 @@ def test_menu_restore_requires_confirmation(plug, tmp_path):
 
 def test_menu_restore_requires_selection(plug, tmp_path):
     plug.server_process = SimpleNamespace(storage_path=_storage_with_fabric(tmp_path))
-    plug.pluginPrefs = {}
+    plug.pluginPrefs = _IndigoDict({})
     ok, _vd, errors = plug.menuRestoreFabricBackup({"backup": "", "confirm": True}, "restoreFabricBackup")
     assert ok is False
     assert "backup" in errors
@@ -900,7 +901,7 @@ def test_menu_restore_success_path(plug, plugin_mod, tmp_path):
         stop=lambda: calls.append("stop") or True,
         start=lambda: calls.append("start") or True,
     )
-    plug.pluginPrefs = {}
+    plug.pluginPrefs = _IndigoDict({})
 
     result = plug.menuRestoreFabricBackup({"backup": archive, "confirm": True}, "restoreFabricBackup")
     ok, _vd = result
@@ -933,7 +934,7 @@ def test_menu_restore_surfaces_error_dict_when_restore_fails(plug, tmp_path):
         stop=lambda: True,
         start=fake_start,
     )
-    plug.pluginPrefs = {}
+    plug.pluginPrefs = _IndigoDict({})
 
     ok, _vd, errors = plug.menuRestoreFabricBackup({"backup": archive, "confirm": True}, "restoreFabricBackup")
     assert ok is False
@@ -971,7 +972,7 @@ def test_menu_restore_passes_the_bridge_control_and_path(plug, tmp_path, monkeyp
 
     monkeypatch.setattr(fabric_backup, "restore_backup", fake_restore_backup)
     plug.server_process = SimpleNamespace(storage_path=storage)
-    plug.pluginPrefs = {}
+    plug.pluginPrefs = _IndigoDict({})
 
     ok, _vd = plug.menuRestoreFabricBackup({"backup": "/x.zip", "confirm": True}, "restoreFabricBackup")
 
@@ -996,7 +997,7 @@ def test_menu_restore_builds_a_bridge_control_when_the_session_never_exported(pl
 
     monkeypatch.setattr(fabric_backup, "restore_backup", fake_restore_backup)
     plug.server_process = SimpleNamespace(storage_path=storage)
-    plug.pluginPrefs = {}
+    plug.pluginPrefs = _IndigoDict({})
     assert plug.bridge_process is None
 
     plug.menuRestoreFabricBackup({"backup": "/x.zip", "confirm": True}, "restoreFabricBackup")
@@ -1019,7 +1020,7 @@ def test_menu_restore_reuses_an_existing_bridge_process(plug, tmp_path, monkeypa
 
     monkeypatch.setattr(fabric_backup, "restore_backup", fake_restore_backup)
     plug.server_process = SimpleNamespace(storage_path=storage)
-    plug.pluginPrefs = {}
+    plug.pluginPrefs = _IndigoDict({})
 
     plug.menuRestoreFabricBackup({"backup": "/x.zip", "confirm": True}, "restoreFabricBackup")
 
@@ -1044,7 +1045,7 @@ def test_menu_restore_falls_back_to_no_bridge_control_when_one_cannot_be_built(p
 
     monkeypatch.setattr(fabric_backup, "restore_backup", fake_restore_backup)
     plug.server_process = SimpleNamespace(storage_path=storage)
-    plug.pluginPrefs = {}
+    plug.pluginPrefs = _IndigoDict({})
 
     ok, _vd = plug.menuRestoreFabricBackup({"backup": "/x.zip", "confirm": True}, "restoreFabricBackup")
 
@@ -1062,7 +1063,7 @@ def test_menu_restore_never_clears_the_XAC1_latch(plug, tmp_path, monkeypatch):
     storage = _storage_with_fabric(tmp_path)
     plug.export_bridge = Mock()
     plug.server_process = SimpleNamespace(storage_path=storage)
-    plug.pluginPrefs = {}
+    plug.pluginPrefs = _IndigoDict({})
 
     monkeypatch.setattr(fabric_backup, "restore_backup",
                         lambda archive_path, *_a, **_k: _fake_restore_result(archive_path))
@@ -1081,7 +1082,7 @@ def test_menu_restore_reports_the_bridge_outcome_honestly(plug, tmp_path, monkey
     import fabric_backup
     storage = _storage_with_fabric(tmp_path)
     plug.server_process = SimpleNamespace(storage_path=storage)
-    plug.pluginPrefs = {}
+    plug.pluginPrefs = _IndigoDict({})
 
     monkeypatch.setattr(fabric_backup, "restore_backup",
                         lambda archive_path, *_a, **_k: _fake_restore_result(
@@ -1501,11 +1502,11 @@ def test_fabric_label_not_resent_when_already_correct(plug):
 
 def test_fabric_label_pref_respected_truncated_and_blank_falls_back(plug):
     plug.matter = LabelMatter("HomeAssistant")
-    plug.pluginPrefs = {"fabricLabel": "  My Smart Castle Automation Server XL  "}
+    plug.pluginPrefs = _IndigoDict({"fabricLabel": "  My Smart Castle Automation Server XL  "})
     asyncio.run(plug._resync())
     assert plug.matter.label_calls == ["My Smart Castle Automation Serve"]  # 32 chars
     plug.matter = LabelMatter("HomeAssistant")
-    plug.pluginPrefs = {"fabricLabel": "   "}
+    plug.pluginPrefs = _IndigoDict({"fabricLabel": "   "})
     asyncio.run(plug._resync())
     assert plug.matter.label_calls == ["Indigo"]
 
@@ -1530,7 +1531,7 @@ def test_fabric_label_failure_does_not_block_reconcile(plug):
 def test_install_handler_pins_node_and_reinstalls(plug, plugin_mod, monkeypatch):
     plug.server_process = SimpleNamespace(install=lambda: True,
                                           resolved_bin_dir="/opt/homebrew/bin")
-    plug.pluginPrefs = {"serverLocation": "local"}
+    plug.pluginPrefs = _IndigoDict({"serverLocation": "local"})
     plug._stopping = False
     plug._restart_expected_until = 0.0
     reinstalled = SimpleNamespace(ensure_installed=Mock(), restart=Mock())
@@ -1548,7 +1549,7 @@ def test_install_handler_pins_node_and_reinstalls(plug, plugin_mod, monkeypatch)
 
 def test_install_handler_aborts_and_logs_when_install_fails(plug, plugin_mod, monkeypatch):
     plug.server_process = SimpleNamespace(install=lambda: False, resolved_bin_dir="/x")
-    plug.pluginPrefs = {"serverLocation": "local"}
+    plug.pluginPrefs = _IndigoDict({"serverLocation": "local"})
     plug._stopping = False
     reinstalled = SimpleNamespace(ensure_installed=Mock())
     monkeypatch.setattr(plugin_mod.matter_server_menu_mixin, "ServerProcess", lambda *a, **k: reinstalled)
@@ -1560,7 +1561,7 @@ def test_install_handler_aborts_and_logs_when_install_fails(plug, plugin_mod, mo
 
 def test_install_handler_skips_state_mutation_when_stopping(plug, plugin_mod, monkeypatch):
     plug.server_process = SimpleNamespace(install=lambda: True, resolved_bin_dir="/x")
-    plug.pluginPrefs = {"serverLocation": "local"}
+    plug.pluginPrefs = _IndigoDict({"serverLocation": "local"})
     plug._stopping = True                              # plugin tearing down
     monkeypatch.setattr(plugin_mod.matter_server_menu_mixin, "ServerProcess",
                         lambda *a, **k: SimpleNamespace(ensure_installed=Mock()))
@@ -1569,7 +1570,7 @@ def test_install_handler_skips_state_mutation_when_stopping(plug, plugin_mod, mo
 
 
 def test_menu_install_spawns_daemon_thread_in_local_mode(plug, plugin_mod, monkeypatch):
-    plug.pluginPrefs = {"serverLocation": "local"}
+    plug.pluginPrefs = _IndigoDict({"serverLocation": "local"})
     plug._install_thread = None
     captured = {}
 
@@ -1591,7 +1592,7 @@ def test_menu_install_spawns_daemon_thread_in_local_mode(plug, plugin_mod, monke
 
 
 def test_menu_install_refuses_when_already_running(plug):
-    plug.pluginPrefs = {"serverLocation": "local"}
+    plug.pluginPrefs = _IndigoDict({"serverLocation": "local"})
     plug._install_thread = SimpleNamespace(is_alive=lambda: True)
     plug.menuInstallMatterServer()
     plug.logger.warning.assert_called()               # "already in progress", no 2nd install
@@ -1607,7 +1608,7 @@ def test_install_handler_clean_removes_package_before_reinstall(plug, plugin_mod
         remove_package=lambda: (order.append("remove"), True)[1],
         install=lambda: (order.append("install"), True)[1],
         resolved_bin_dir="/opt/homebrew/bin")
-    plug.pluginPrefs = {"serverLocation": "local"}
+    plug.pluginPrefs = _IndigoDict({"serverLocation": "local"})
     plug._stopping = False
     plug._restart_expected_until = 0.0
     reinstalled = SimpleNamespace(ensure_installed=Mock(), restart=Mock(return_value=True))
@@ -1631,7 +1632,7 @@ def test_a_clean_reinstall_that_could_not_remove_does_not_install_over_it(plug, 
         remove_package=lambda: False,
         install=lambda: installed.append(True) or True,
         resolved_bin_dir="/x")
-    plug.pluginPrefs = {"serverLocation": "local"}
+    plug.pluginPrefs = _IndigoDict({"serverLocation": "local"})
     plug._stopping = False
     plug._restart_expected_until = 0.0
     plug._install_matter_server(clean=True)
@@ -1645,7 +1646,7 @@ def test_install_handler_default_does_not_remove_package(plug, plugin_mod, monke
     plug.server_process = SimpleNamespace(
         remove_package=lambda: removed.append(True),
         install=lambda: True, resolved_bin_dir="/x")
-    plug.pluginPrefs = {"serverLocation": "local"}
+    plug.pluginPrefs = _IndigoDict({"serverLocation": "local"})
     plug._stopping = False
     plug._restart_expected_until = 0.0
     monkeypatch.setattr(plugin_mod.matter_server_menu_mixin, "ServerProcess",
@@ -1656,21 +1657,21 @@ def test_install_handler_default_does_not_remove_package(plug, plugin_mod, monke
 
 
 def test_menu_reinstall_clean_requires_confirmation(plug):
-    plug.pluginPrefs = {"serverLocation": "local"}
+    plug.pluginPrefs = _IndigoDict({"serverLocation": "local"})
     ok, _vd, errors = plug.menuReinstallMatterServerClean({"confirm": False}, "reinstallMatterServerClean")
     assert ok is False
     assert "confirm" in errors                        # dialog stays open, no destructive action
 
 
 def test_menu_reinstall_clean_refuses_remote_mode(plug):
-    plug.pluginPrefs = {"serverLocation": "remote"}
+    plug.pluginPrefs = _IndigoDict({"serverLocation": "remote"})
     ok, _vd, errors = plug.menuReinstallMatterServerClean({"confirm": True}, "reinstallMatterServerClean")
     assert ok is False
     assert "confirm" in errors
 
 
 def test_menu_reinstall_clean_spawns_thread_with_clean_kwarg(plug, plugin_mod, monkeypatch):
-    plug.pluginPrefs = {"serverLocation": "local"}
+    plug.pluginPrefs = _IndigoDict({"serverLocation": "local"})
     plug._install_thread = None
     captured = {}
 
@@ -1693,7 +1694,7 @@ def test_menu_reinstall_clean_spawns_thread_with_clean_kwarg(plug, plugin_mod, m
 
 
 def test_menu_install_refuses_in_remote_mode(plug):
-    plug.pluginPrefs = {"serverLocation": "remote"}
+    plug.pluginPrefs = _IndigoDict({"serverLocation": "remote"})
     plug._install_thread = None
     plug.menuInstallMatterServer()
     plug.logger.error.assert_called()
@@ -1867,7 +1868,7 @@ def test_on_server_unreachable_classifier_raising_still_logs_tail_and_warns(plug
 
 def test_install_handler_logs_when_restart_fails(plug, plugin_mod, monkeypatch):
     plug.server_process = SimpleNamespace(install=lambda: True, resolved_bin_dir="/x")
-    plug.pluginPrefs = {"serverLocation": "local"}
+    plug.pluginPrefs = _IndigoDict({"serverLocation": "local"})
     plug._stopping = False
     plug._restart_expected_until = 0.0
     plug._restart_notice_shown = False
@@ -1886,7 +1887,7 @@ def test_menu_restart_sets_window_on_success(plug, plugin_mod, monkeypatch):
                               restart=Mock(return_value=True))
     monkeypatch.setattr(plugin_mod.matter_server_menu_mixin, "ServerProcess", lambda *a, **k: rebuilt)
     plug.server_process = SimpleNamespace(restart=Mock(return_value=True))
-    plug.pluginPrefs = {"serverLocation": "local"}
+    plug.pluginPrefs = _IndigoDict({"serverLocation": "local"})
     plug._restart_expected_until = 0.0
     plug._restart_notice_shown = True
     plug.menuRestartMatterServer()
@@ -1899,7 +1900,7 @@ def test_menu_restart_clears_window_on_failure(plug, plugin_mod, monkeypatch):
                               restart=Mock(return_value=False))
     monkeypatch.setattr(plugin_mod.matter_server_menu_mixin, "ServerProcess", lambda *a, **k: rebuilt)
     plug.server_process = SimpleNamespace(restart=Mock(return_value=False))
-    plug.pluginPrefs = {"serverLocation": "local"}
+    plug.pluginPrefs = _IndigoDict({"serverLocation": "local"})
     plug._restart_expected_until = 0.0
     plug._restart_notice_shown = False
     plug.menuRestartMatterServer()
@@ -1928,7 +1929,7 @@ def test_menu_restart_applies_prefs_changed_since_startup(plug, plugin_mod, monk
     monkeypatch.setattr(plugin_mod.matter_server_menu_mixin, "ServerProcess", _factory)
     stale = SimpleNamespace(restart=Mock(return_value=True))
     plug.server_process = stale
-    plug.pluginPrefs = {"serverLocation": "local", "enableTestNetDcl": True}
+    plug.pluginPrefs = _IndigoDict({"serverLocation": "local", "enableTestNetDcl": True})
     plug._restart_expected_until = 0.0
     plug._restart_notice_shown = False
     plug.menuRestartMatterServer()
@@ -1947,7 +1948,7 @@ def test_menu_restart_does_not_double_restart_when_prefs_changed(plug, plugin_mo
     rebuilt = SimpleNamespace(ensure_installed=parent.ensure_installed, restart=parent.restart)
     monkeypatch.setattr(plugin_mod.matter_server_menu_mixin, "ServerProcess", lambda *a, **k: rebuilt)
     plug.server_process = SimpleNamespace(restart=Mock())  # non-None: management is on
-    plug.pluginPrefs = {"serverLocation": "local"}
+    plug.pluginPrefs = _IndigoDict({"serverLocation": "local"})
     plug._restart_expected_until = 0.0
     plug._restart_notice_shown = False
     plug.menuRestartMatterServer()
@@ -1964,7 +1965,7 @@ def test_menu_restart_stops_when_preflight_tore_the_plist_down(plug, plugin_mod,
     rebuilt = SimpleNamespace(ensure_installed=parent.ensure_installed, restart=parent.restart)
     monkeypatch.setattr(plugin_mod.matter_server_menu_mixin, "ServerProcess", lambda *a, **k: rebuilt)
     plug.server_process = SimpleNamespace(restart=Mock())  # non-None: management is on
-    plug.pluginPrefs = {"serverLocation": "local"}
+    plug.pluginPrefs = _IndigoDict({"serverLocation": "local"})
     plug._restart_expected_until = 0.0
     plug._restart_notice_shown = False
     plug.menuRestartMatterServer()
@@ -1981,7 +1982,7 @@ def test_menu_restart_clears_window_when_ensure_installed_raises(plug, plugin_mo
                               restart=Mock(return_value=True))
     monkeypatch.setattr(plugin_mod.matter_server_menu_mixin, "ServerProcess", lambda *a, **k: rebuilt)
     plug.server_process = SimpleNamespace(restart=Mock())  # non-None: management is on
-    plug.pluginPrefs = {"serverLocation": "local"}
+    plug.pluginPrefs = _IndigoDict({"serverLocation": "local"})
     plug._restart_expected_until = 0.0
     plug._restart_notice_shown = False
     plug.menuRestartMatterServer()                 # must not raise into Indigo's dispatcher
@@ -2372,6 +2373,41 @@ def test_a_concurrent_rearm_during_the_probe_survives_a_stale_clear(plug):
     assert agent.due_for_bootstrap_verification() == new_deadline, "the new arming must survive"
 
 
+def test_a_stop_during_the_probe_is_not_reported_as_a_dead_bootstrap(plug):
+    """#366 item 3, narrow race: the tick reads the due token, then spends seconds
+    in the port-conflict report. A deliberate stop (`uninstall()`) landing in that
+    gap disarms the check; the job having no pid is then the user's doing, not a
+    crash, and the ERROR must not fire."""
+    deadline = time.monotonic() - 1
+
+    class _Agent:
+        def __init__(self):
+            self.spec = SimpleNamespace(port=5580, package="matter-server")
+            self.log_dir = "/tmp/fake-log-dir"
+            self._deadline = deadline
+
+        def port_conflict_report(self):
+            self._deadline = None                     # uninstall() ran mid-report
+            return None
+
+        def due_for_bootstrap_verification(self):
+            return self._deadline
+
+        def clear_bootstrap_verification(self, observed):
+            if self._deadline == observed:
+                self._deadline = None
+
+        def post_bootstrap_verdict(self):
+            return VERDICT_DEAD
+
+        def managed_job_has_pid(self):
+            return False
+
+    plug.server_process = _Agent()
+    plug._port_conflict_tick()
+    assert not plug.logger.error.called
+
+
 def test_both_agents_due_simultaneously_are_each_handled_independently(plug):
     now = time.monotonic()
     server = _fake_agent(5580, "matter-server", None, due_bootstrap=now)
@@ -2586,7 +2622,7 @@ def test_startup_really_emits_the_notice(plugin_mod, mock_indigo_base, monkeypat
     p.logger = Mock()
     p._version = "2026.0.1"
     p._subscribed_to_devices = False
-    p.pluginPrefs = {}
+    p.pluginPrefs = _IndigoDict({})
     p.proto = object()
     p.registry = object()
     p.device_sync = Mock()

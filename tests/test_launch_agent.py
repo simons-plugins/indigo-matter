@@ -713,6 +713,60 @@ def test_start_also_arms_verification(tmp_path, mock_logger):
     assert agent.due_for_bootstrap_verification() == 0.0
 
 
+def _past_grace(monkeypatch):
+    """Advance time.monotonic() beyond STARTUP_GRACE_SECONDS from now."""
+    import launch_agent
+    real = time.monotonic
+    monkeypatch.setattr(launch_agent.time, "monotonic",
+                        lambda: real() + launch_agent.STARTUP_GRACE_SECONDS + 1)
+
+
+def test_a_deliberate_uninstall_disarms_the_verification(tmp_path, mock_logger, monkeypatch):
+    """#366: ~120 s after a deliberate stop the plugin logged a false 'did not
+    survive its own bootstrap' ERROR, because the armed deadline outlived the job."""
+    agent = _agent(tmp_path / "home", _spec("com.example.a", "pkg-a", str(tmp_path / "s"), port=5580),
+                   mock_logger, runner=FakeRunner())
+    agent.ensure_installed()
+    agent.uninstall()
+    _past_grace(monkeypatch)
+    assert agent.due_for_bootstrap_verification() is None
+
+
+def test_a_deliberate_stop_disarms_the_verification(tmp_path, mock_logger, monkeypatch):
+    agent = _agent(tmp_path / "home", _spec("com.example.a", "pkg-a", str(tmp_path / "s"), port=5580),
+                   mock_logger, runner=FakeRunner())
+    agent.ensure_installed()
+    agent.stop()
+    _past_grace(monkeypatch)
+    assert agent.due_for_bootstrap_verification() is None
+
+
+def test_a_job_that_dies_without_an_uninstall_is_still_due_for_verification(
+        tmp_path, mock_logger, monkeypatch):
+    """The inverse, which matters more: only a DELIBERATE stop may disarm it."""
+    agent = _agent(tmp_path / "home", _spec("com.example.a", "pkg-a", str(tmp_path / "s"), port=5580),
+                   mock_logger, runner=FakeRunner())
+    agent.ensure_installed()
+    armed = agent._bootstrap_verify_after
+    assert agent.due_for_bootstrap_verification() is None   # inside the grace window
+    _past_grace(monkeypatch)
+    assert agent.due_for_bootstrap_verification() == armed
+
+
+def test_start_after_stop_rearms_the_verification(tmp_path, mock_logger):
+    """stop() disarms (#366); the start that follows must arm again, or a node that
+    dies right after being brought back is never reported."""
+    agent = _agent(tmp_path / "home", _spec("com.example.a", "pkg-a", str(tmp_path / "s"), port=5580),
+                   mock_logger, runner=FakeRunner())
+    agent.ensure_installed()
+    agent.stop()
+    assert agent._bootstrap_verify_after is None
+    assert agent.start() is True
+    assert agent._bootstrap_verify_after is not None
+    agent._bootstrap_verify_after = 0.0
+    assert agent.due_for_bootstrap_verification() == 0.0
+
+
 def test_leaving_a_healthy_job_untouched_does_not_arm_verification(tmp_path, mock_logger):
     """The digest-matches 'leave alone' branch already checks the port itself
     (#182, unchanged) — it must not ALSO arm a #187 verification, since no

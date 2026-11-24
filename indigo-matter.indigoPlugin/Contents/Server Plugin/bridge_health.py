@@ -800,12 +800,18 @@ class BridgeHealthReporter:
                                              "endpoint-map rebuild; nothing is being exported.")
             return
         if client.attached:
+            # Attached means up, however it got that way (a failed stop, an orphan
+            # node outside launchd): nothing is "stopped by the user" any more.
+            self._bridge._clear_stopped_by_user()  # pylint: disable=protected-access
             self._bridge._disconnect_ticks = 0
             self._bridge._poll_node_status(client)
             return
         self._mark_health_unknown()
         self._bridge._disconnect_ticks += 1
-        if self._bridge._disconnect_ticks == DISCONNECT_WARN_TICKS:
+        if self._bridge._stopped_by_user:
+            # #342: the user stopped the node; `_on_unreachable` said so once.
+            self._bridge._logger.debug("Matter bridge: bridge node stopped by the user")
+        elif self._bridge._disconnect_ticks == DISCONNECT_WARN_TICKS:
             self._bridge._logger.warning("Matter bridge: still not attached to the bridge node "
                                          "after ~1 min")
         else:

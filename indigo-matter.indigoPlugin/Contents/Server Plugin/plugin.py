@@ -989,7 +989,11 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
                 agent.clear_bootstrap_verification(due_token)  # a verdict; the error path below logs it
             else:
                 verdict = agent.post_bootstrap_verdict()
-                if verdict == VERDICT_DEAD:
+                # A DEAD verdict counts only while the check is STILL armed for this very
+                # token: a deliberate stop that landed while the report above was running
+                # disarms it, and the missing pid is then the user's doing, not a failed
+                # bootstrap (#366). Disarmed, it falls through and logs nothing.
+                if verdict == VERDICT_DEAD and agent.due_for_bootstrap_verification() == due_token:
                     cause_text = _dead_verdict_cause_text(agent)
                     self.logger.error(
                         "%s did not survive its own bootstrap: bootstrap succeeded, but the "
@@ -1190,7 +1194,9 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
         field's per-device echo of that store.
         """
         if typeId == "matterNode":
-            valuesDict.pop("lastSurveySummary", None)
+            # indigo.Dict has no `pop` (issue #366)
+            if "lastSurveySummary" in valuesDict:
+                del valuesDict["lastSurveySummary"]
         created = ""
         try:
             created = indigo.devices[devId].pluginProps.get("createdTypeId", "")

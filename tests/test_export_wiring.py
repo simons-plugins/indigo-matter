@@ -25,6 +25,7 @@ import pytest
 import bridge_protocol
 import export_catalog
 from export_store import ExportEntry, ExportStore
+from conftest import _IndigoDict
 from fakes import FakeIndigoDevices, RelayDevice
 
 OURS = export_catalog.DEFAULT_PLUGIN_ID
@@ -54,7 +55,7 @@ def plug(plugin_mod, devices):  # noqa: ARG001 - devices installs indigo.devices
     p.logger = Mock()
     p.pluginId = OURS
     p._version = "2026.7.28"
-    p.pluginPrefs = {}
+    p.pluginPrefs = _IndigoDict({})
     p.exports = ExportStore(lambda: p.pluginPrefs, p.logger)
     p.export_bridge = Mock()
     # The fixture's allow-list is empty, so XG5 says there is no client — and a
@@ -144,7 +145,7 @@ def _started_plugin(plugin_mod, monkeypatch, prefs):
 
 def _prefs_with_exports(*entries):
     """pluginPrefs carrying a persisted allow-list, written by the real store."""
-    prefs: dict = {}
+    prefs = _IndigoDict()
     store = ExportStore(lambda: prefs, Mock())
     for entry in entries:
         store.upsert(entry)
@@ -185,7 +186,7 @@ class TestStartupWithExistingExports:
         mock_indigo_base.devices.subscribeToChanges = subscribe
         monkeypatch.setattr(plugin_mod, "ExportBridge", lambda *a, **k: Mock())
 
-        p = _started_plugin(plugin_mod, monkeypatch, {})
+        p = _started_plugin(plugin_mod, monkeypatch, _IndigoDict())
 
         assert p._exported_ids == frozenset()
         subscribe.assert_not_called()
@@ -735,7 +736,7 @@ class TestSurveyLogWiring:
                                                     mock_indigo_base):
         import settings_report
 
-        p = _started_plugin(plugin_mod, monkeypatch, {})
+        p = _started_plugin(plugin_mod, monkeypatch, _IndigoDict())
         assert isinstance(p.device_sync.survey_log, settings_report.SurveyLog), (
             "device_sync has no survey log, so the automatic report never fires"
         )
@@ -747,7 +748,7 @@ class TestSurveyLogWiring:
         """
         from plugin_constants import SURVEY_LOG_PREF
 
-        p = _started_plugin(plugin_mod, monkeypatch, {SURVEY_LOG_PREF: '{"52": "fp-1"}'})
+        p = _started_plugin(plugin_mod, monkeypatch, _IndigoDict({SURVEY_LOG_PREF: '{"52": "fp-1"}'}))
         assert not p.survey_log.should_report(0x34, "fp-1")
 
     def test_a_recorded_answer_reaches_prefs(self, plugin_mod, monkeypatch,
@@ -757,7 +758,7 @@ class TestSurveyLogWiring:
         saved."""
         from plugin_constants import SURVEY_LOG_PREF
 
-        prefs: dict = {}
+        prefs = _IndigoDict()
         p = _started_plugin(plugin_mod, monkeypatch, prefs)
         p.survey_log.record(0x34, "fp-9")
         assert json.loads(prefs[SURVEY_LOG_PREF]) == {"52": "fp-9"}

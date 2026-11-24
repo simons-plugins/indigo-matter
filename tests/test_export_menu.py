@@ -34,6 +34,7 @@ import fakes
 from export_store import (OPTION_CT_LEARNED_MAX_MIREDS, OPTION_CT_LEARNED_MIN_MIREDS,
                           OPTION_CT_MAX_MIREDS, OPTION_CT_MIN_MIREDS, OPTION_INVERT, PREF_KEY,
                           ExportEntry, ExportStore)
+from conftest import _IndigoDict
 from fakes import (
     OTHER_PLUGIN_ID,
     DimmerDevice,
@@ -77,7 +78,7 @@ def plug(plugin_mod, devices):  # noqa: ARG001 - devices installs indigo.devices
     p = plugin_mod.Plugin.__new__(plugin_mod.Plugin)
     p.logger = Mock()
     p.pluginId = OURS
-    p.pluginPrefs = {}
+    p.pluginPrefs = _IndigoDict({})
     p.exports = ExportStore(lambda: p.pluginPrefs, p.logger)
     # Post-startup shape: the dialog callbacks nudge the export bridge and
     # refresh the deviceUpdated fast-path id set (E3b).
@@ -1411,7 +1412,7 @@ def test_remove_reports_a_failed_save_instead_of_claiming_success(plug, monkeypa
 # S3 — a load failure must never render as "Nothing is exported yet."
 # ---------------------------------------------------------------------------
 def test_the_dialog_reports_an_unreadable_export_list(plug):
-    plug.pluginPrefs = {PREF_KEY: "{broken"}
+    plug.pluginPrefs = _IndigoDict({PREF_KEY: "{broken"})
     plug.exports = ExportStore(lambda: plug.pluginPrefs, plug.logger)
     status = plug.get_menu_action_config_ui_values("manageMatterExports")["exportStatus"]
     assert "could not be read" in status
@@ -1424,7 +1425,7 @@ def test_the_dialog_reports_dropped_rows_alongside_the_count(plug):
         {"indigoDeviceId": 101, "role": "onOffLight"},
         {"indigoDeviceId": 102, "role": "teleporter"},
     ]})
-    plug.pluginPrefs = {PREF_KEY: blob}
+    plug.pluginPrefs = _IndigoDict({PREF_KEY: blob})
     plug.exports = ExportStore(lambda: plug.pluginPrefs, plug.logger)
     status = plug._export_summary()
     assert "could not be read" in status
@@ -1505,7 +1506,7 @@ def started(plugin_mod, devices, monkeypatch):  # noqa: ARG001 - devices install
         p._subscribed_to_devices = False
         p._exported_ids = frozenset()
         p.export_bridge = None
-        p.pluginPrefs = {} if prefs is None else prefs
+        p.pluginPrefs = _IndigoDict() if prefs is None else prefs
         p.proto = object()
         p.registry = object()
         p.device_sync = Mock()
@@ -1545,7 +1546,7 @@ def test_startup_wires_the_store_to_a_live_prefs_binding(started):
     """S2 — a PluginConfig save can hand the plugin a NEW pluginPrefs object."""
     p = started()
     p.startup()
-    p.pluginPrefs = {}                      # Indigo rebinds it
+    p.pluginPrefs = _IndigoDict({})                      # Indigo rebinds it
     p.exports.upsert(ExportEntry(101, "onOffLight"))
     assert PREF_KEY in p.pluginPrefs        # the write followed the rebinding
 
@@ -1798,7 +1799,7 @@ class TestRebuildMenuCallback:
         rebuild that already succeeded and cannot be undone.
         """
         import bridge_client
-        plug.pluginPrefs = {}
+        plug.pluginPrefs = _IndigoDict({})
         plug.exports = ExportStore(lambda: plug.pluginPrefs, plug.logger)
         for device_id in range(1, 91):
             plug.exports.upsert(ExportEntry(device_id, "onOffLight"))

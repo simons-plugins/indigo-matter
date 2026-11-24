@@ -253,6 +253,13 @@ class ExportBridge:
         #: the stop (see :meth:`_stop_agent`) so a session that never started it
         #: never boots one out.
         self._agent_started = False
+        #: The user stopped the bridge node from the menu (#342). The client keeps
+        #: dialling a node nobody wants up, so while this is set that outage is
+        #: expected: per-attempt lines drop to debug and :meth:`_on_unreachable`
+        #: says ONE info line. Cleared before any agent start and on attach, so a
+        #: start that fails after a stop still reports its real error in full.
+        self._stopped_by_user = False
+        self._stopped_notice_shown = False
 
         #: The live client, or ``None`` while nothing is exported (XG5).
         self.client: Optional[BridgeClient] = None
@@ -410,6 +417,10 @@ class ExportBridge:
                 "Matter bridge: start deferred until the in-flight un-export finishes")
             return
         if self.client is not None:
+            if self._stopped_by_user:
+                # The user stopped the node from the menu while the client kept
+                # retrying; the next export is what the menu promises restarts it.
+                self._ensure_agent()
             return
         if not self._export_enabled():
             # Not an error and not a latch: the user has turned export off in
@@ -667,6 +678,7 @@ class ExportBridge:
         The consequence of failing is an export outage, which the client's
         unreachable path already reports with the node's own error log attached.
         """
+        self._clear_stopped_by_user()   # about to start it: failures are real again (#342)
         if self._agent_start is None:
             return
         # Latched BEFORE the attempt: a start that raised may still have written
@@ -718,8 +730,37 @@ class ExportBridge:
         menu has made that false, and leaving it set would have the next
         empty-transition bootout a job the *user* may have started again by hand
         — the exact thing the latch exists to prevent.
+
+        Also latches "stopped by the user" (#342): the outage that follows is one
+        the user ordered, so it is not reported as a failure. See
+        :meth:`_restart_expected` and :meth:`_on_unreachable`.
         """
         self._agent_started = False
+        self._stopped_by_user = True
+        self._stopped_notice_shown = False
+
+    def note_agent_stop_failed(self) -> None:
+        """The menu's stop did not take: the node is not stopped, so drop the latch.
+
+        :meth:`note_agent_stopped` is called BEFORE the stop (the socket drops
+        during it, and that drop must already be "expected"), so a stop that then
+        fails has to undo it or a later genuine crash is reported as "stopped from
+        the menu". ``_agent_started`` is deliberately NOT restored: the stop menu
+        already reports that nothing retries a failed stop, and that is the state
+        this latch has always described.
+        """
+        self._clear_stopped_by_user()
+
+    def _clear_stopped_by_user(self) -> None:
+        """Drop the "stopped by the user" latch (#342); the ONE place it is cleared.
+
+        Also zeroes ``_disconnect_ticks``: it keeps counting while latched, and the
+        "still not attached after ~1 min" warning tests ``==``, so a count left past
+        the threshold would lose that warning for good once reporting resumes.
+        """
+        if self._stopped_by_user:
+            self._stopped_by_user = False
+            self._disconnect_ticks = 0
 
     def _pending_replace_all(self) -> int:
         """**How many** endpoints an un-export still owes the node (XAC7).
@@ -823,7 +864,10 @@ class ExportBridge:
         side effect of passing 0 to a recorder (see there for what that cost).
         """
         try:
-            self._prefs_getter().pop(PREF_PENDING_REPLACE_ALL, None)
+            # `indigo.Dict` has no `pop` (issue #366): test-and-delete instead.
+            prefs = self._prefs_getter()
+            if PREF_PENDING_REPLACE_ALL in prefs:
+                del prefs[PREF_PENDING_REPLACE_ALL]
             if self._save_prefs is not None:
                 self._save_prefs()
         except Exception as exc:  # pylint: disable=broad-except
@@ -1870,6 +1914,7 @@ class ExportBridge:
         # restarting" — the window must mean "we are waiting for THIS bounce",
         # not "the last 30 seconds were forgiven". Through the named closer, so
         # there is exactly one body that knows what closing involves.
+        self._clear_stopped_by_user()      # the node is back: nothing is stopped (#342)
         self.cancel_expected_restart()
         self._halted_reported = False
         self._recovery_reported = False
@@ -1955,6 +2000,7 @@ class ExportBridge:
         likely to be the thing the user needs to read.
         """
         self.cancel_expected_restart()
+        self._clear_stopped_by_user()     # a refusal is an answer: the node is up (#342)
         if code == bridge_protocol.ERR_ENDPOINT_MAP_INVALID:
             # One code, two opposite remedies — see REFUSE_IDENTITY_UNREADABLE.
             # This branch used to hard-code the map wording for both, so a user
@@ -2114,6 +2160,7 @@ class ExportBridge:
         (:meth:`stop`), and the install path's own failure branches. Expiry is
         the backstop for none of those happening at all.
         """
+        self._clear_stopped_by_user()   # a start is being ordered (#342)
         self._restart_expected_until = self._now() + EXPECTED_RESTART_WINDOW
         self._restart_notice_shown = False
 
@@ -2135,7 +2182,7 @@ class ExportBridge:
         per-attempt reconnect warnings and this class's diagnostic answer to one
         window rather than two copies of it.
         """
-        return self._now() < self._restart_expected_until
+        return self._stopped_by_user or self._now() < self._restart_expected_until
 
     def _on_unreachable(self, attempts: int) -> None:
         """The node is not answering — and since E7 the agent is asked why.
@@ -2163,6 +2210,20 @@ class ExportBridge:
         as evidence of "the node is down right now" can be — and in the issue's
         log was — a crash-loop from eight days earlier.
         """
+        if self._stopped_by_user:
+            if not self._stopped_notice_shown:
+                self._stopped_notice_shown = True
+                self._logger.info(
+                    "Matter bridge: the bridge node was stopped from the Plugins ▸ Matter menu "
+                    "and has not been restarted, so exported accessories show as unavailable. "
+                    "Changing an export, reloading the plugin, or running Plugins ▸ Matter ▸ "
+                    "Install/update the Matter bridge will bring it back.")
+            # Defer, never drop (see the expected-restart branch below): the client
+            # latches this hook once per streak, and the latch can clear before the
+            # streak ends (Install/update), when the real diagnosis must still arrive.
+            if self.client is not None:
+                self.client.rearm_failure_diagnostic()
+            return
         if self._restart_expected():
             if not self._restart_notice_shown:
                 self._restart_notice_shown = True
