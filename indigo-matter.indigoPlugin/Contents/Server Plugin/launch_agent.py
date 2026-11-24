@@ -927,7 +927,13 @@ class LaunchAgent:
             self.logger.debug("could not record applied LaunchAgent digest: %s", exc)
 
     def uninstall(self) -> None:
-        """Unload and remove the LaunchAgent. NEVER touches the storage dir."""
+        """Unload and remove the LaunchAgent. NEVER touches the storage dir.
+
+        Also disarms the post-bootstrap verification (#366): a deliberately removed
+        job has no pid, which that check would report ~STARTUP_GRACE_SECONDS later as
+        "did not survive its own bootstrap". A job that dies WITHOUT this call stays armed.
+        """
+        self._bootstrap_verify_after = None
         if not self._bootout():
             self._launchctl("unload", self.plist_path)
         try:
@@ -1040,8 +1046,10 @@ class LaunchAgent:
         """Stop the agent (bootout) but keep the plist so ``start`` can reload it.
 
         Part of the ``server_control`` seam used by fabric restore. Returns True
-        if the bootout succeeded.
+        if the bootout succeeded. Disarms the post-bootstrap verification (#366) for
+        the same reason :meth:`uninstall` does; the next ``start`` re-arms it.
         """
+        self._bootstrap_verify_after = None
         return self._bootout()
 
     def start(self) -> bool:
