@@ -989,20 +989,19 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
                 agent.clear_bootstrap_verification(due_token)  # a verdict; the error path below logs it
             else:
                 verdict = agent.post_bootstrap_verdict()
-                if verdict == VERDICT_DEAD:
-                    # Only if STILL armed for this very token: a deliberate stop that
-                    # landed while the report above was running disarms the check, and
-                    # the missing pid is then the user's doing, not a failed bootstrap
-                    # (#366).
-                    if agent.due_for_bootstrap_verification() == due_token:
-                        cause_text = _dead_verdict_cause_text(agent)
-                        self.logger.error(
-                            "%s did not survive its own bootstrap: bootstrap succeeded, but the "
-                            "managed job now has no pid at all — %s. See %s.",
-                            agent.spec.package, cause_text,
-                            os.path.join(agent.log_dir, agent.spec.err_log),
-                        )
-                        agent.clear_bootstrap_verification(due_token)
+                # A DEAD verdict counts only while the check is STILL armed for this very
+                # token: a deliberate stop that landed while the report above was running
+                # disarms it, and the missing pid is then the user's doing, not a failed
+                # bootstrap (#366). Disarmed, it falls through and logs nothing.
+                if verdict == VERDICT_DEAD and agent.due_for_bootstrap_verification() == due_token:
+                    cause_text = _dead_verdict_cause_text(agent)
+                    self.logger.error(
+                        "%s did not survive its own bootstrap: bootstrap succeeded, but the "
+                        "managed job now has no pid at all — %s. See %s.",
+                        agent.spec.package, cause_text,
+                        os.path.join(agent.log_dir, agent.spec.err_log),
+                    )
+                    agent.clear_bootstrap_verification(due_token)
                 elif verdict == VERDICT_CONFLICT_FREE:
                     agent.clear_bootstrap_verification(due_token)
                 # else VERDICT_PENDING: too young (or unknowable) to render a verdict yet —

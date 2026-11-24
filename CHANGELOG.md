@@ -20,9 +20,10 @@ current version is `Info.plist`'s `PluginVersion`.
   fills with a "bridge node connection lost" warning on every reconnect attempt
   (about 120 an hour), followed by "still not attached" and "not responding"
   warnings carrying an old error-log tail. You now get one info line saying the node
-  was stopped from the menu and how to bring it back. Starting the node again, or
-  it attaching, switches normal reporting back on, so a start that then fails is
-  still reported in full.
+  was stopped from the menu and how to bring it back (changing an export, reloading
+  the plugin, or Install/update). Starting the node again, or it attaching, switches
+  normal reporting back on, so a start that then fails is still reported in full. A
+  stop that did not take is not treated as a deliberate one.
 
 ## 2026.34.0 — Warn when matter-server is older than this plugin release expects
 
