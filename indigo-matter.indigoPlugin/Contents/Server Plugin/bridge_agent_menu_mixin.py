@@ -23,6 +23,12 @@ import indigo  # provided by the Indigo runtime
 
 import bridge_agent
 
+#: After an uninstall, how long to wait for launchd to finish dropping the job
+#: before calling the stop a failure (#366): 8 x 0.25 s = 2 s.
+_STOP_RECHECKS = 8
+_STOP_RECHECK_INTERVAL = 0.25
+
+
 class BridgeAgentMenuMixin:
     """Install/reinstall/start/stop the Matter bridge node's LaunchAgent, and
     diagnose why it is not answering.
@@ -146,7 +152,18 @@ class BridgeAgentMenuMixin:
         self._last_bridge_port_conflict = None
         was_loaded = agent.is_running()      # "is there a job on the books"
         agent.uninstall()                    # bootout + remove the plist
-        if agent.is_running() or os.path.exists(agent.plist_path):
+        # launchd's bootout can return before the job is gone (#366), so a single
+        # immediate check warned "could not be stopped" over a job that was
+        # already on its way out. Re-check for a bounded ~2 s; a job still there
+        # after that really did not stop. ``agent._sleep`` is the agent's own
+        # injectable sleep (instant in tests).
+        still_running = agent.is_running()
+        for _ in range(_STOP_RECHECKS):
+            if not still_running:
+                break
+            agent._sleep(_STOP_RECHECK_INTERVAL)  # pylint: disable=protected-access
+            still_running = agent.is_running()
+        if still_running or os.path.exists(agent.plist_path):
             # ⊗ The silent branch. stop() returning False used to say nothing at
             # all, and `_agent_started` had already been cleared, so nothing
             # retried: the node kept serving every paired ecosystem with the log
@@ -156,7 +173,7 @@ class BridgeAgentMenuMixin:
                 "be %s (%s). It keeps running and serving every paired ecosystem, and NOTHING "
                 "retries this on its own — reload the plugin, or run 'launchctl bootout "
                 "gui/$(id -u)/%s' and delete that file by hand.",
-                "stopped" if agent.is_running() else "removed", agent.plist_path,
+                "stopped" if still_running else "removed", agent.plist_path,
                 bridge_agent.LABEL)
             return
         if was_loaded:

@@ -900,6 +900,26 @@ class TestBridgeAgentWiring:
         assert "NOTHING retries" in said
         assert "launchctl bootout" in said
 
+    def test_a_job_launchd_is_still_dropping_is_not_reported_as_a_failed_stop(
+            self, plug, tmp_path):
+        """#366: bootout can return before the job is gone. Re-check, don't warn."""
+        agent = Mock(plist_path=str(tmp_path / "gone.plist"))
+        agent.is_running.side_effect = [True, True, True, False]  # loaded, then lingers, then gone
+        plug.bridge_process = agent
+        plug._stop_bridge_agent()
+        assert "could not be" not in _logged(plug.logger)
+        assert agent._sleep.call_count == 2, "waited through the two lingering checks"
+
+    def test_a_job_still_running_after_the_wait_still_warns(self, plug, tmp_path):
+        """The wait is bounded (~2 s) and must not swallow a real failure."""
+        agent = Mock(plist_path=str(tmp_path / "gone.plist"))
+        agent.is_running.return_value = True
+        plug.bridge_process = agent
+        plug._stop_bridge_agent()
+        assert "could not be stopped" in _logged(plug.logger)
+        waited = sum(c.args[0] for c in agent._sleep.call_args_list)
+        assert 1.5 <= waited <= 2.5
+
     def test_stopping_when_nothing_was_loaded_is_not_reported_as_a_failure(self, plug,
                                                                           tmp_path):
         """The other False `stop()` conflated: "there was no such job"."""
