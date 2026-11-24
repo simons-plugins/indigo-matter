@@ -32,6 +32,7 @@ import sys
 import pytest
 
 import bridge_client
+import bridge_health
 import bridge_protocol
 import export_catalog
 from export_store import ExportEntry, ExportStore
@@ -1564,7 +1565,7 @@ class TestStoppedByUser:
         assert h.touched == [], "no error-log tail for an outage the user ordered"
         stopped = [m for m in self._infos(mock_logger) if "stopped from" in m]
         assert len(stopped) == 1
-        assert "Plugins" in stopped[0] and "Reload the plugin" in stopped[0]
+        assert "Plugins" in stopped[0] and "Changing an export" in stopped[0]
 
     def test_a_start_that_fails_after_a_stop_reports_the_full_diagnostic(
             self, bridge_mod, mock_logger, devices):
@@ -1595,6 +1596,68 @@ class TestStoppedByUser:
         h.bridge._agent_diagnose = lambda: "diag"
         h.bridge._on_unreachable(1)
         assert "not responding" in warnings_of(mock_logger)
+
+    def test_the_latched_branch_defers_the_diagnostic_it_does_not_drop_it(
+            self, bridge_mod, mock_logger, devices):
+        """The client latches `on_repeated_failure` once per streak. A supervisor
+        that suppresses one firing must re-arm it or the streak goes silent."""
+        h = self._stopped(bridge_mod, mock_logger, devices)
+        h.bridge._on_unreachable(2)
+        assert "rearm_failure_diagnostic" in h.client.names()
+
+    def test_the_notice_stays_once_only_while_the_diagnostic_is_rearmed(
+            self, bridge_mod, mock_logger, devices):
+        h = self._stopped(bridge_mod, mock_logger, devices)
+        for attempt in (2, 3, 4):
+            h.bridge._on_unreachable(attempt)
+        assert h.client.names().count("rearm_failure_diagnostic") == 3
+        assert len([m for m in self._infos(mock_logger) if "stopped from" in m]) == 1
+
+    def test_still_not_attached_fires_again_after_the_latch_clears(
+            self, bridge_mod, mock_logger, devices):
+        """`_disconnect_ticks` kept counting past the threshold while latched, and
+        the warning tests `==`, so it was lost for good once the latch cleared."""
+        h = self._stopped(bridge_mod, mock_logger, devices)
+        h.client.attached = False
+        for _ in range(bridge_health.DISCONNECT_WARN_TICKS + 3):
+            h.bridge.health_tick()
+        assert "still not attached" not in warnings_of(mock_logger)
+        h.bridge.expect_restart()            # the user runs Install/update
+        h.bridge.cancel_expected_restart()   # ... and it fails
+        for _ in range(bridge_health.DISCONNECT_WARN_TICKS):
+            h.bridge.health_tick()
+        assert "still not attached" in warnings_of(mock_logger)
+
+    def test_an_attached_tick_clears_the_latch(self, bridge_mod, mock_logger, devices):
+        """A node that is demonstrably up (failed stop, an orphan outside launchd)
+        must not stay 'stopped by the user'."""
+        h = self._stopped(bridge_mod, mock_logger, devices)
+        h.client.attached = True
+        h.bridge.health_tick()
+        assert h.bridge._stopped_by_user is False
+        assert h.client.kwargs["outage_expected"]() is False
+
+    def test_a_refusal_clears_the_latch(self, bridge_mod, mock_logger, devices):
+        """A refusal means the node answered: it is up."""
+        h = self._stopped(bridge_mod, mock_logger, devices)
+        h.bridge._on_attach_refused(bridge_protocol.ERR_INTERNAL, "node is confused")
+        assert h.bridge._stopped_by_user is False
+        assert h.client.kwargs["outage_expected"]() is False
+
+    def test_a_failed_stop_can_be_undone(self, bridge_mod, mock_logger, devices):
+        h = self._stopped(bridge_mod, mock_logger, devices)
+        h.bridge.note_agent_stop_failed()
+        assert h.bridge._stopped_by_user is False
+        assert h.client.kwargs["outage_expected"]() is False
+
+    def test_a_second_stop_after_a_reattach_announces_itself_again(
+            self, bridge_mod, mock_logger, devices):
+        h = self._stopped(bridge_mod, mock_logger, devices)
+        for _ in range(2):
+            h.bridge.note_agent_stopped()
+            h.bridge._on_unreachable(2)
+            h.bridge._on_attached(_attached_status())
+        assert len([m for m in self._infos(mock_logger) if "stopped from" in m]) == 2
 
 
 class TestHealthTick:

@@ -800,6 +800,9 @@ class BridgeHealthReporter:
                                              "endpoint-map rebuild; nothing is being exported.")
             return
         if client.attached:
+            # Attached means up, however it got that way (a failed stop, an orphan
+            # node outside launchd): nothing is "stopped by the user" any more.
+            self._bridge._clear_stopped_by_user()  # pylint: disable=protected-access
             self._bridge._disconnect_ticks = 0
             self._bridge._poll_node_status(client)
             return
