@@ -762,6 +762,72 @@ class TestPairingPage:
 # ---------------------------------------------------------------------------
 # E7: the agent seams and the bridge install action
 # ---------------------------------------------------------------------------
+class _LaunchdRunner:
+    """A launchctl stand-in with state: bootstrap loads the job, bootout drops it.
+
+    ``lingers`` is how many ``print`` calls still show the job after a bootout —
+    launchd can return from bootout before the job is gone (#366). ``pid=None``
+    models a job that is loaded but has no process.
+    """
+
+    def __init__(self, pid=4242, lingers=0):
+        self.pid = pid
+        self.lingers = lingers
+        self.loaded = False
+        self._dropping = None
+
+    def __call__(self, cmd, **_kwargs):
+        import subprocess
+        sub = cmd[1] if len(cmd) > 1 else ""
+        rc, out = 0, ""
+        if cmd[0] == "launchctl":
+            if sub in ("bootstrap", "load"):
+                self.loaded, self._dropping = True, None
+            elif sub in ("bootout", "unload"):
+                self._dropping = self.lingers
+            elif sub == "print":
+                if self._dropping is not None and self._dropping <= 0:
+                    self.loaded, self._dropping = False, None
+                elif self._dropping is not None:
+                    self._dropping -= 1
+                if not self.loaded:
+                    rc = 1
+                elif self.pid is not None:
+                    out = f"\tstate = running\n\tpid = {self.pid}\n"
+        return subprocess.CompletedProcess(cmd, rc, stdout=out, stderr="")
+
+
+def _real_bridge_agent(plugin_mod, monkeypatch, tmp_path, runner, sleeps=None):
+    """Make ``plugin.bridge_agent.BridgeProcess`` build a REAL one on ``runner``."""
+    import bridge_agent as bridge_agent_mod
+    from bridge_agent import BridgeProcess as RealBridgeProcess
+
+    home = tmp_path / "home"
+    bindir = home / "bin"
+    bindir.mkdir(parents=True, exist_ok=True)
+    (bindir / "npx").write_text("#!/bin/sh\n")
+    (bindir / "node").write_text("#!/bin/sh\n")
+    entry = (home / "indigo-matter" / "node_modules" / bridge_agent_mod.BRIDGE_PACKAGE
+             / "dist" / "main.js")
+    entry.parent.mkdir(parents=True, exist_ok=True)
+    entry.write_text("// fake entry\n")
+    record = sleeps if sleeps is not None else []
+
+    def _factory(prefs, logger):
+        return RealBridgeProcess(prefs, logger, home=str(home), npx_path=str(bindir / "npx"),
+                                 runner=runner, sleep=record.append)
+
+    monkeypatch.setattr(plugin_mod.bridge_agent, "BridgeProcess", _factory)
+    return record
+
+
+def _past_grace(monkeypatch):
+    import time
+    from launch_agent import STARTUP_GRACE_SECONDS
+    real = time.monotonic
+    monkeypatch.setattr(time, "monotonic", lambda: real() + STARTUP_GRACE_SECONDS + 1)
+
+
 class TestBridgeAgentWiring:
     def test_startup_hands_the_export_engine_all_three_seams(self, plugin_mod, plug,
                                                              monkeypatch):
@@ -908,7 +974,48 @@ class TestBridgeAgentWiring:
         plug.bridge_process = agent
         plug._stop_bridge_agent()
         assert "could not be" not in _logged(plug.logger)
+        assert "has been stopped" in _logged(plug.logger)
         assert agent._sleep.call_count == 2, "waited through the two lingering checks"
+
+    def test_a_lingering_job_is_waited_for_through_the_real_agents_sleep(
+            self, plug, plugin_mod, monkeypatch, tmp_path):
+        """A Mock agent accepts any attribute, so a rename of `LaunchAgent._sleep`
+        would leave the test above green. This one runs the real thing."""
+        sleeps = []
+        runner = _LaunchdRunner(lingers=2)
+        _real_bridge_agent(plugin_mod, monkeypatch, tmp_path, runner, sleeps)
+        plug._start_bridge_agent()
+        sleeps.clear()
+        plug.export_bridge = None
+        ok, _values = plug.menuStopBridgeNode({"confirm": True})
+        assert ok is True
+        assert "could not be" not in _logged(plug.logger)
+        assert "has been stopped" in _logged(plug.logger)
+        assert sleeps == [0.25, 0.25]
+
+    def test_a_deliberate_stop_is_not_reported_as_a_dead_bootstrap_later(
+            self, plug, plugin_mod, monkeypatch, tmp_path):
+        """#366 item 3 end to end: start, stop, wait out the grace period, tick."""
+        runner = _LaunchdRunner()
+        _real_bridge_agent(plugin_mod, monkeypatch, tmp_path, runner)
+        plug._start_bridge_agent()
+        assert plug._stop_bridge_agent() is True
+        _past_grace(monkeypatch)
+        plug._port_conflict_tick()
+        errors = [str(c.args[0]) for c in plug.logger.error.call_args_list]
+        assert not [e for e in errors if "did not survive" in e]
+
+    def test_a_job_that_dies_by_itself_is_still_reported_as_a_dead_bootstrap(
+            self, plug, plugin_mod, monkeypatch, tmp_path):
+        """The inverse, without which the test above proves nothing: no stop, the
+        job is loaded but has no pid."""
+        runner = _LaunchdRunner(pid=None)
+        _real_bridge_agent(plugin_mod, monkeypatch, tmp_path, runner)
+        plug._start_bridge_agent()
+        _past_grace(monkeypatch)
+        plug._port_conflict_tick()
+        errors = [str(c.args[0]) for c in plug.logger.error.call_args_list]
+        assert len([e for e in errors if "did not survive" in e]) == 1
 
     def test_a_job_still_running_after_the_wait_still_warns(self, plug, tmp_path):
         """The wait is bounded (~2 s) and must not swallow a real failure."""
@@ -943,6 +1050,7 @@ class TestBridgeAgentWiring:
         assert ok is True
         agent.uninstall.assert_called_once()
         bridge.note_agent_stopped.assert_called_once()
+        assert plug.logger.error.call_count == 0
 
     def _real_bridge(self, plug):
         import export_bridge

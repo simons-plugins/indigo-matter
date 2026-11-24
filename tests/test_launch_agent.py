@@ -753,6 +753,20 @@ def test_a_job_that_dies_without_an_uninstall_is_still_due_for_verification(
     assert agent.due_for_bootstrap_verification() == armed
 
 
+def test_start_after_stop_rearms_the_verification(tmp_path, mock_logger):
+    """stop() disarms (#366); the start that follows must arm again, or a node that
+    dies right after being brought back is never reported."""
+    agent = _agent(tmp_path / "home", _spec("com.example.a", "pkg-a", str(tmp_path / "s"), port=5580),
+                   mock_logger, runner=FakeRunner())
+    agent.ensure_installed()
+    agent.stop()
+    assert agent._bootstrap_verify_after is None
+    assert agent.start() is True
+    assert agent._bootstrap_verify_after is not None
+    agent._bootstrap_verify_after = 0.0
+    assert agent.due_for_bootstrap_verification() == 0.0
+
+
 def test_leaving_a_healthy_job_untouched_does_not_arm_verification(tmp_path, mock_logger):
     """The digest-matches 'leave alone' branch already checks the port itself
     (#182, unchanged) — it must not ALSO arm a #187 verification, since no
