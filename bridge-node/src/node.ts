@@ -2125,8 +2125,10 @@ export class BridgeNode implements BridgeFacade {
                 iterations: PBKDF_ITERATIONS,
                 salt,
             });
-            await server.env.get(DeviceCommissioner).allowEnhancedCommissioning(discriminator, paseServer, () => {
-                this.#window.noteEnded();
+            await server.env.get(DeviceCommissioner).allowEnhancedCommissioning(discriminator, paseServer, {
+                onClose: () => {
+                    this.#window.noteEnded();
+                },
             });
         } catch (error) {
             this.log(`Failed to open commissioning window: ${describeErrorWithStack(error)}`);
