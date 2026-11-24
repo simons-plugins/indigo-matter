@@ -944,6 +944,54 @@ class TestBridgeAgentWiring:
         agent.uninstall.assert_called_once()
         bridge.note_agent_stopped.assert_called_once()
 
+    def _real_bridge(self, plug):
+        import export_bridge
+        return export_bridge.ExportBridge(
+            plug.exports, Mock(), plug.logger, lambda: plug.pluginPrefs,
+            plugin_version="2026.34.1", plugin_id=OURS)
+
+    def test_a_stop_that_did_not_take_leaves_the_latch_clear(
+            self, plug, plugin_mod, monkeypatch, tmp_path):
+        """If the node is still serving, a later genuine crash must not be reported
+        as 'stopped from the menu'."""
+        agent = Mock(plist_path=str(tmp_path / "gone.plist"))
+        agent.is_running.return_value = True          # never goes away
+        monkeypatch.setattr(plugin_mod.bridge_agent, "BridgeProcess", lambda *_a, **_k: agent)
+        plug.export_bridge = self._real_bridge(plug)
+        ok, _values = plug.menuStopBridgeNode({"confirm": True})
+        assert ok is True
+        assert "could not be stopped" in _logged(plug.logger)
+        assert plug.export_bridge._stopped_by_user is False
+
+    def test_a_stop_that_took_latches_before_the_job_is_booted_out(
+            self, plug, plugin_mod, monkeypatch, tmp_path):
+        """The socket drops DURING the stop; that drop must already be expected."""
+        agent = Mock(plist_path=str(tmp_path / "gone.plist"))
+        agent.is_running.return_value = False
+        plug.export_bridge = self._real_bridge(plug)
+        seen = []
+
+        def _uninstall():
+            seen.append(plug.export_bridge._stopped_by_user)
+
+        agent.uninstall.side_effect = _uninstall
+        monkeypatch.setattr(plugin_mod.bridge_agent, "BridgeProcess", lambda *_a, **_k: agent)
+        plug.menuStopBridgeNode({"confirm": True})
+        assert seen == [True]
+        assert plug.export_bridge._stopped_by_user is True
+
+    def test_stop_bridge_agent_reports_whether_it_took(self, plug, tmp_path):
+        gone = Mock(plist_path=str(tmp_path / "gone.plist"))
+        gone.is_running.return_value = False
+        plug.bridge_process = gone
+        assert plug._stop_bridge_agent() is True
+        stuck = Mock(plist_path=str(tmp_path / "gone.plist"))
+        stuck.is_running.return_value = True
+        plug.bridge_process = stuck
+        assert plug._stop_bridge_agent() is False
+        plug.bridge_process = None
+        assert plug._stop_bridge_agent() is False
+
     def test_the_stop_menu_needs_the_tick(self, plug, plugin_mod, monkeypatch):
         built = []
         monkeypatch.setattr(plugin_mod.bridge_agent, "BridgeProcess",

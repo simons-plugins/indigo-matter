@@ -117,8 +117,13 @@ class BridgeAgentMenuMixin:
                 else "could not be loaded by launchd",
                 self._bridge_agent_diagnosis())
 
-    def _stop_bridge_agent(self) -> None:
+    def _stop_bridge_agent(self) -> bool:
         """Stop the bridge agent and REMOVE its plist. The storage is untouched.
+
+        Returns True only when the node is confirmed stopped and the plist is gone;
+        False when it is still running, the plist is still there, or there is no
+        agent. The ``agent_stop`` seam ignores it; the stop menu uses it to undo its
+        "stopped by the user" latch (#342).
 
         The ``agent_stop`` seam, called only once there is genuinely nothing to
         serve.
@@ -148,7 +153,7 @@ class BridgeAgentMenuMixin:
         """
         agent = self.bridge_process
         if agent is None:
-            return
+            return False
         self._last_bridge_port_conflict = None
         was_loaded = agent.is_running()      # "is there a job on the books"
         agent.uninstall()                    # bootout + remove the plist
@@ -175,7 +180,7 @@ class BridgeAgentMenuMixin:
                 "gui/$(id -u)/%s' and delete that file by hand.",
                 "stopped" if still_running else "removed", agent.plist_path,
                 bridge_agent.LABEL)
-            return
+            return False
         if was_loaded:
             self.logger.info(
                 "Matter bridge: nothing is exported — the bridge node has been stopped and its "
@@ -187,6 +192,7 @@ class BridgeAgentMenuMixin:
             self.logger.debug(
                 "Matter bridge: nothing is exported and no bridge node LaunchAgent was loaded; "
                 "any plist has been removed. Pairings are kept.")
+        return True
 
     def _bridge_agent_diagnosis(self) -> Optional[str]:
         """Why is the bridge node not answering? The ``agent_diagnose`` seam.
@@ -297,11 +303,16 @@ class BridgeAgentMenuMixin:
         # Built from CURRENT prefs rather than reused: this must work in a
         # session that never started the agent, which is the whole point of it.
         self.bridge_process = bridge_agent.BridgeProcess(dict(self.pluginPrefs), self.logger)
-        self._stop_bridge_agent()
         if self.export_bridge is not None:
             # The plugin no longer has an agent it started, so the XAC1 latch
-            # must not go on claiming it does.
+            # must not go on claiming it does. Latched BEFORE the stop: the node's
+            # socket drops during it, and that drop is the outage the user ordered
+            # (#342), not one to warn about.
             self.export_bridge.note_agent_stopped()
+        if not self._stop_bridge_agent() and self.export_bridge is not None:
+            # It did not stop (the warning above says so), so the node is still
+            # serving: an outage that follows is a real one.
+            self.export_bridge.note_agent_stop_failed()
         return (True, valuesDict)
 
     def _expect_bridge_restart(self) -> None:
