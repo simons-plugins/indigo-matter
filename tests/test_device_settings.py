@@ -720,6 +720,166 @@ def test_a_read_back_failure_names_the_underlying_error():
 
 
 # ===========================================================================
+# issue #360 — the same OnOff setting on dimmers and colour dimmers
+#
+# A dimmer's OnOff cluster is the same cluster with the same Lighting-feature
+# attribute as a relay's, so the setting is declared once and owned by three
+# Indigo types. Every gate below must behave on a dimmer exactly as it does on
+# a relay: AttributeList decides, unknown withholds, a missing node hides it.
+# ===========================================================================
+
+DIMMER = "matterDimmer"
+COLOR_DIMMER = "matterColorDimmer"
+_LIGHTING_TYPES = [RELAY, DIMMER, COLOR_DIMMER]
+
+
+@pytest.mark.parametrize("type_id", [DIMMER, COLOR_DIMMER])
+def test_dimmers_declare_the_same_startup_setting_as_the_relay(type_id):
+    relay = next(s for s in settings_for_type(RELAY) if s.key == "startUpOnOff")
+    on_dimmer = [s for s in settings_for_type(type_id)]
+    assert on_dimmer == [relay], "one declaration, shared — not a second copy"
+
+
+@pytest.mark.parametrize("type_id", [DIMMER, COLOR_DIMMER])
+def test_a_dimmer_with_the_lighting_feature_is_offered_the_setting(type_id):
+    offered = offered_settings(type_id, lambda c, a: None,
+                               _attr_lists({0x0006: ONOFF_WITH_LIGHTING}))
+    assert [o.setting.key for o in offered] == ["startUpOnOff"]
+
+
+@pytest.mark.parametrize("type_id", [DIMMER, COLOR_DIMMER])
+def test_a_dimmer_without_the_lighting_feature_is_offered_nothing(type_id):
+    skipped = []
+    offered = offered_settings(type_id, lambda c, a: None,
+                               _attr_lists({0x0006: ONOFF_WITHOUT_LIGHTING}),
+                               on_skip=lambda s, reason: skipped.append(reason))
+    assert offered == []
+    assert skipped and "AttributeList" in skipped[0]
+
+
+@pytest.mark.parametrize("type_id", [DIMMER, COLOR_DIMMER])
+@pytest.mark.parametrize("lists", [{}, {0x0006: None}, {0x0006: []}, {0x0006: "junk"}])
+def test_an_unknown_attribute_list_withholds_the_setting_on_a_dimmer(type_id, lists):
+    """Unknown is not 'supported' (spec-bounded settings resolve for everything)
+    and is not 'unsupported forever' either — see the next test."""
+    assert offered_settings(type_id, lambda c, a: None, _attr_lists(lists)) == []
+
+
+@pytest.mark.parametrize("type_id", [DIMMER, COLOR_DIMMER])
+def test_unknown_is_not_unsupported_the_offer_returns_once_the_list_arrives(type_id):
+    """The gate is re-evaluated on every dialog open, so a cold cache costs
+    nothing permanent: the same device is offered the setting once reconciled."""
+    cache = {}
+    lookup = lambda cluster: cache.get(cluster)  # noqa: E731
+    assert offered_settings(type_id, lambda c, a: None, lookup) == []
+    cache[0x0006] = ONOFF_WITH_LIGHTING
+    assert [o.setting.key for o in offered_settings(type_id, lambda c, a: None, lookup)] \
+        == ["startUpOnOff"]
+
+
+@pytest.mark.parametrize("type_id", [DIMMER, COLOR_DIMMER])
+def test_a_dimmer_state_is_withdrawn_only_on_a_positive_no(type_id):
+    assert [s.key for s in device_settings.unimplemented_states(
+        type_id, _attr_lists({0x0006: ONOFF_WITHOUT_LIGHTING}))] == ["startUpOnOff"]
+    assert device_settings.unimplemented_states(
+        type_id, _attr_lists({0x0006: ONOFF_WITH_LIGHTING})) == []
+    assert device_settings.unimplemented_states(type_id, _attr_lists({})) == []
+    assert device_settings.unimplemented_states(type_id, None) == []
+
+
+@pytest.mark.parametrize("type_id", [DIMMER, COLOR_DIMMER])
+def test_a_dimmer_with_no_matter_node_is_offered_nothing(type_id):
+    assert offered_settings(type_id, lambda c, a: None,
+                            _attr_lists({0x0006: ONOFF_WITH_LIGHTING}),
+                            device_known=False) == []
+
+
+@pytest.mark.parametrize("type_id", [DIMMER, COLOR_DIMMER])
+def test_a_dimmers_dialog_shows_the_current_value(type_id):
+    values = config_ui_values(type_id, {"startUpOnOff": 1}, lambda c, a: None,
+                              attribute_list=_attr_lists({0x0006: ONOFF_WITH_LIGHTING}))
+    assert values["hasStartUpOnOff"] == MARKER_YES
+    assert values["hasAnySetting"] == MARKER_YES
+    assert values["startUpOnOff"] == "1"
+
+
+@pytest.mark.parametrize("type_id", [DIMMER, COLOR_DIMMER])
+def test_a_dimmers_dialog_hides_the_control_when_the_device_lacks_it(type_id):
+    """Hidden, not shown-but-failing: both markers say no."""
+    values = config_ui_values(type_id, {"startUpOnOff": 0}, lambda c, a: None,
+                              attribute_list=_attr_lists({0x0006: ONOFF_WITHOUT_LIGHTING}))
+    assert values["hasStartUpOnOff"] == MARKER_NO
+    assert values["hasAnySetting"] == MARKER_NO
+
+
+@pytest.mark.parametrize("type_id", [DIMMER, COLOR_DIMMER])
+def test_a_dimmers_dialog_hides_the_control_while_the_list_is_unknown(type_id):
+    values = config_ui_values(type_id, {}, lambda c, a: None,
+                              attribute_list=_attr_lists({}))
+    assert values["hasStartUpOnOff"] == MARKER_NO
+
+
+@pytest.mark.parametrize("type_id", [DIMMER, COLOR_DIMMER])
+def test_a_changed_dimmer_setting_plans_one_write_of_that_value(type_id):
+    lists = _attr_lists({0x0006: ONOFF_WITH_LIGHTING})
+    plans = planned_writes(type_id, {"startUpOnOff": "2"}, {"startUpOnOff": 1},
+                           lambda c, a: None, lists)
+    assert [(p.setting.key, p.value, p.previous) for p in plans] == [("startUpOnOff", 2, 1)]
+
+
+@pytest.mark.parametrize("type_id", [DIMMER, COLOR_DIMMER])
+def test_an_unchanged_dimmer_setting_writes_nothing(type_id):
+    lists = _attr_lists({0x0006: ONOFF_WITH_LIGHTING})
+    assert planned_writes(type_id, {"startUpOnOff": "1"}, {"startUpOnOff": 1},
+                          lambda c, a: None, lists) == []
+
+
+@pytest.mark.parametrize("type_id", [DIMMER, COLOR_DIMMER])
+def test_a_dimmer_with_a_null_or_unreported_value_round_trips_without_a_write(type_id):
+    """The relay path cannot write null (EnumValues has no null member), so a
+    dimmer cannot either. What it must do is never turn an untouched dialog on a
+    device holding null into a write: blank means 'leave this alone'."""
+    lists = _attr_lists({0x0006: ONOFF_WITH_LIGHTING})
+    values = config_ui_values(type_id, {"startUpOnOff": None}, lambda c, a: None,
+                              attribute_list=lists)
+    assert values["startUpOnOff"] == ""
+    assert validate_settings(type_id, values, lambda c, a: None, lists) == {}
+    assert planned_writes(type_id, values, {"startUpOnOff": None},
+                          lambda c, a: None, lists) == []
+
+
+@pytest.mark.parametrize("type_id", [DIMMER, COLOR_DIMMER])
+def test_a_dimmer_setting_rejects_a_value_outside_the_enum(type_id):
+    lists = _attr_lists({0x0006: ONOFF_WITH_LIGHTING})
+    assert validate_settings(type_id, {"startUpOnOff": "2"}, lambda c, a: None, lists) == {}
+    assert "startUpOnOff" in validate_settings(
+        type_id, {"startUpOnOff": "3"}, lambda c, a: None, lists)
+
+
+@pytest.mark.parametrize("type_id", [DIMMER, COLOR_DIMMER])
+def test_a_dimmer_write_goes_to_onoff_startuponoff_on_the_right_endpoint(type_id):
+    """On the wire: node 56, endpoint 3, cluster 0x0006, attribute 0x4003."""
+    setting = next(s for s in settings_for_type(type_id) if s.key == "startUpOnOff")
+    client = _Client(reads=2)
+    ok, _message = _run(apply_setting(client, 56, 3, PlannedWrite(setting, 2, 1),
+                                      sleep=_no_sleep))
+    assert ok is True
+    assert [(w.node_id, w.endpoint, w.cluster, w.attribute, w.value)
+            for w in client.writes] == [(56, 3, 0x0006, 0x4003, 2)]
+
+
+@pytest.mark.parametrize("type_id", [DIMMER, COLOR_DIMMER])
+def test_a_dimmer_that_acks_and_ignores_the_write_is_reported_as_a_failure(type_id):
+    setting = next(s for s in settings_for_type(type_id) if s.key == "startUpOnOff")
+    observed = []
+    ok, message = _run(apply_setting(_LyingClient(keeps=1), 56, 3,
+                                     PlannedWrite(setting, 2, 1), sleep=_no_sleep,
+                                     on_observed=observed.append))
+    assert ok is False and "NOT applied" in message
+    assert observed == [1], "the device's real value is handed back, not the asked-for one"
+
+
+# ===========================================================================
 # issue #190 — which STATES a unit should own
 # ===========================================================================
 
