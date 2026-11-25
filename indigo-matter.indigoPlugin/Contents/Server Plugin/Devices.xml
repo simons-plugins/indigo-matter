@@ -42,7 +42,7 @@
                    visibleBindingId="hasAnySetting" visibleBindingValue="yes"/>
             <Field id="settingsHeading" type="label" fontColor="darkgray"
                    visibleBindingId="hasAnySetting" visibleBindingValue="yes">
-                <Label>Device Settings — stored on the device itself, not in Indigo. Changing one changes how the device behaves for EVERY app it is paired with, including Apple Home. A blank field means the device has not reported its value yet; leave it blank to change nothing.</Label>
+                <Label>Device Settings — stored on the device itself, not in Indigo. Changing one changes how the device behaves for EVERY app it is paired with, including Apple Home. A blank field, or a picker showing "Not read from the device yet", means the value has not been read; leave it alone to change nothing. Values shown are the last the device reported.</Label>
             </Field>
             <Field id="startUpOnOff" type="menu"
                    visibleBindingId="hasStartUpOnOff" visibleBindingValue="yes">
@@ -261,7 +261,7 @@
                    visibleBindingId="hasAnySetting" visibleBindingValue="yes"/>
             <Field id="settingsHeading" type="label" fontColor="darkgray"
                    visibleBindingId="hasAnySetting" visibleBindingValue="yes">
-                <Label>Device Settings — stored on the device itself, not in Indigo. Changing one changes how the device behaves for EVERY app it is paired with, including Apple Home. A blank field means the device has not reported its value yet; leave it blank to change nothing.</Label>
+                <Label>Device Settings — stored on the device itself, not in Indigo. Changing one changes how the device behaves for EVERY app it is paired with, including Apple Home. A blank field, or a picker showing "Not read from the device yet", means the value has not been read; leave it alone to change nothing. Values shown are the last the device reported.</Label>
             </Field>
             <Field id="holdTime" type="textfield"
                    visibleBindingId="hasHoldTime" visibleBindingValue="yes">
@@ -331,7 +331,7 @@
                    visibleBindingId="hasAnySetting" visibleBindingValue="yes"/>
             <Field id="settingsHeading" type="label" fontColor="darkgray"
                    visibleBindingId="hasAnySetting" visibleBindingValue="yes">
-                <Label>Device Settings — stored on the device itself, not in Indigo. Changing one changes how the device behaves for EVERY app it is paired with, including Apple Home. A blank field means the device has not reported its value yet; leave it blank to change nothing.</Label>
+                <Label>Device Settings — stored on the device itself, not in Indigo. Changing one changes how the device behaves for EVERY app it is paired with, including Apple Home. A blank field, or a picker showing "Not read from the device yet", means the value has not been read; leave it alone to change nothing. Values shown are the last the device reported.</Label>
             </Field>
             <Field id="sensitivityLevel" type="menu"
                    visibleBindingId="hasSensitivity" visibleBindingValue="yes">
@@ -480,7 +480,7 @@
                    visibleBindingId="hasAnySetting" visibleBindingValue="yes"/>
             <Field id="settingsHeading" type="label" fontColor="darkgray"
                    visibleBindingId="hasAnySetting" visibleBindingValue="yes">
-                <Label>Device Settings — stored on the device itself, not in Indigo. Changing one changes how the device behaves for EVERY app it is paired with, including Apple Home. A blank field means the device has not reported its value yet; leave it blank to change nothing.</Label>
+                <Label>Device Settings — stored on the device itself, not in Indigo. Changing one changes how the device behaves for EVERY app it is paired with, including Apple Home. A blank field, or a picker showing "Not read from the device yet", means the value has not been read; leave it alone to change nothing. Values shown are the last the device reported.</Label>
             </Field>
             <Field id="autoRelockTime" type="textfield"
                    visibleBindingId="hasAutoRelockTime" visibleBindingValue="yes">

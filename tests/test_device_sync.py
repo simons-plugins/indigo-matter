@@ -5941,7 +5941,8 @@ def test_operating_mode_and_require_pin_never_become_states(ds, indigo_env):
     _indigo, devices = indigo_env
     ds.create_from_raw(LOCK_SETTINGS_NODE, "Side Gate")
     dev = devices[ds.lookup(0x39, 1)]
-    assert set(dev.states) - {"onOffState", "lockState", *_LOCK_SETTING_STATES} == set()
+    states = {k for k in dev.states if not k.endswith(".ui")}
+    assert states - {"onOffState", "lockState", *_LOCK_SETTING_STATES} == set()
 
 
 def test_an_existing_lock_gains_the_settings_on_upgrade_without_recreation(ds, indigo_env):
@@ -6073,9 +6074,13 @@ def test_unread_setting_states_are_flagged_unknown_and_a_reading_clears_it(ds, i
     dev = devices[ds.lookup(0x39, 1)]
     ds.flag_unread_settings(dev)
     assert dev.states["userCodeTemporaryDisableTime.ui"] == "unknown"
-    assert "autoRelockTime.ui" not in dev.states            # a read one is left alone
+    assert dev.states["autoRelockTime.ui"] == "30 seconds"  # a read one is left alone
+    # The display value must actually CHANGE when the reading arrives - the fake only
+    # updates ``.ui`` when a uiValue is sent (the pessimistic Indigo case), so this
+    # passes only because every setting write sends an explicit one.
     ds.apply_states(dev.id, [{"key": "userCodeTemporaryDisableTime", "value": 60}])
     assert ds.setting_primed(dev.id, "userCodeTemporaryDisableTime")
+    assert dev.states["userCodeTemporaryDisableTime.ui"] == "60 seconds"
 
 
 def test_marking_a_setting_unread_drops_it_back_to_unprimed_and_unknown(ds, indigo_env):

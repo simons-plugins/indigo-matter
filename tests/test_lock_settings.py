@@ -381,16 +381,16 @@ def test_the_auto_relock_range_hint_states_the_cap_and_unit():
     assert values["autoRelockTimeRange"] == "0-86400 seconds"
 
 
-def test_a_picker_setting_is_hidden_until_primed_and_never_written_unprimed():
-    """A menu cannot be blank: Indigo would pick its first row and a Save would
-    write it. So an unread picker is not shown, and not planned, until read."""
+def test_an_unread_picker_is_still_offered_and_seeded_to_its_leave_alone_row():
+    """A menu cannot be blank, and hiding it took the section away with no
+    explanation. It leads with a "not read yet" row instead (see test_unread_settings)."""
     relay_list = lambda cluster: [0, 0x4003, 65531] if cluster == 0x0006 else None   # noqa: E731
     values = config_ui_values("matterRelay", {"startUpOnOff": 0}, _no_limits,
                               attribute_list=relay_list, primed=UNPRIMED)
-    assert values["hasStartUpOnOff"] == "no"
-    assert values["hasAnySetting"] == "no"
-    assert planned_writes("matterRelay", {"startUpOnOff": "2"}, {"startUpOnOff": 0}, _no_limits,
-                          relay_list, primed=UNPRIMED) == []
+    assert values["hasStartUpOnOff"] == "yes" and values["hasAnySetting"] == "yes"
+    assert values["startUpOnOff"] == "unread"
+    assert planned_writes("matterRelay", {"startUpOnOff": "unread"}, {"startUpOnOff": 0},
+                          _no_limits, relay_list, primed=UNPRIMED) == []
     shown = config_ui_values("matterRelay", {"startUpOnOff": 1}, _no_limits,
                              attribute_list=relay_list, primed=_primed("startUpOnOff"))
     assert shown["hasStartUpOnOff"] == "yes" and shown["startUpOnOff"] == "1"

@@ -194,7 +194,7 @@ def test_config_ui_values_hides_a_setting_the_device_lacks():
     values = config_ui_values(MOTION, {"sensitivityLevel": 1}, _limits(table))
     assert values["hasHoldTime"] == MARKER_NO
     assert values["hasSensitivity"] == MARKER_YES
-    assert "holdTime" not in values
+    assert values["holdTime"] == ""          # explicitly blank, never an old saved prop
 
 
 def test_the_whole_section_hides_when_nothing_is_offered():

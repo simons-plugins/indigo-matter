@@ -47,7 +47,8 @@ __all__ = [
     "OfferedSetting", "PlannedWrite", "MARKER_YES", "MARKER_NO",
     "offered_settings", "unimplemented_states", "config_ui_values",
     "validate_settings", "planned_writes", "apply_setting",
-    "RemovedStateLog", "PrimedLookup",
+    "RemovedStateLog", "PrimedLookup", "picker_rows",
+    "UNREAD_OPTION_ID", "UNREAD_OPTION_LABEL",
 ]
 
 #: Marker values for the ``hasX`` hidden ConfigUI fields that drive
@@ -72,12 +73,28 @@ def _is_primed(primed: Optional[PrimedLookup], setting: DeviceSetting) -> bool:
     return True if primed is None else bool(primed(setting.key))
 
 
-def _editable_unprimed(setting: DeviceSetting, primed: Optional[PrimedLookup]) -> bool:
-    """May this setting be edited? A NUMERIC one always may (blank = leave alone, any
-    typed value is written and verified); a PICKER cannot be blank, so an unread one
-    is neither shown nor written - Indigo would select its first row and a Save would
-    write that."""
-    return not setting.is_choice or _is_primed(primed, setting)
+#: The picker row an UNREAD choice setting leads with, and the id that means "leave
+#: this alone". Not "" because Indigo rejects an empty list id ("UI dynamic list
+#: function returned illegal ID string"; see ``getDeviceFolders``) - so a blank value
+#: and this id are treated the same everywhere (:func:`_is_leave_alone`).
+UNREAD_OPTION_ID = "unread"
+UNREAD_OPTION_LABEL = "Not read from the device yet (leave unchanged)"
+
+
+def picker_rows(offer: "OfferedSetting", primed: Optional[PrimedLookup]) -> Optional[list]:
+    """A choice setting's picker rows, led by the "not read yet" row while unread.
+
+    A menu cannot be blank, so an unread picker offers an explicit "leave unchanged"
+    row rather than being hidden: hiding it took the section away, with no
+    explanation, for a null value, an unavailable node or an unanswered read-back.
+    None for a setting that is not a picker.
+    """
+    rows = offer.setting.option_rows(offer.bounds)
+    if rows is None:
+        return None
+    if _is_primed(primed, offer.setting):
+        return rows
+    return [(UNREAD_OPTION_ID, UNREAD_OPTION_LABEL), *rows]
 
 
 @dataclass(frozen=True)
@@ -214,23 +231,28 @@ def config_ui_values(device_type_id: str, states: dict, limits: LimitsLookup,
     out = dict(values or {})
     offered = offered_settings(device_type_id, limits, attribute_list,
                                device_known, on_skip)
-    # An unread picker is withheld entirely (see _editable_unprimed).
-    shown = [o for o in offered if _editable_unprimed(o.setting, primed)]
-    by_key = {o.setting.key: o for o in shown}
+    by_key = {o.setting.key: o for o in offered}
 
     for setting in settings_for_type(device_type_id):
         out[_marker_field(setting)] = MARKER_YES if setting.key in by_key else MARKER_NO
-    out["hasAnySetting"] = MARKER_YES if shown else MARKER_NO
+        # EVERY setting field is set explicitly. ``values`` starts from the device's
+        # saved props, so a field left unset here would carry a value saved by an
+        # earlier dialog session straight into this Save - and into a write.
+        out[setting.key] = ""
+    out["hasAnySetting"] = MARKER_YES if offered else MARKER_NO
 
-    for offer in shown:
+    for offer in offered:
         setting = offer.setting
         current = states.get(setting.key)
-        # A menu's value must be a string to match its option ids; a text field
-        # is a string either way. An unknown current value leaves the field
-        # blank rather than inventing a plausible one - and so does a setting
-        # whose device reading has not landed yet: the state then holds Indigo's
-        # default (0), which looks exactly like a real value.
-        out[setting.key] = _seed_value(current) if _is_primed(primed, setting) else ""
+        if _is_primed(primed, setting):
+            # A menu's value must be a string to match its option ids; a text field
+            # is a string either way. An unknown current value leaves the field
+            # blank rather than inventing a plausible one.
+            out[setting.key] = _seed_value(current)
+        else:
+            # The state holds Indigo's default (0), which looks exactly like a real
+            # value. A number field is blank; a picker leads with its "not read" row.
+            out[setting.key] = UNREAD_OPTION_ID if setting.is_choice else ""
         if not setting.is_choice:
             out[f"{setting.key}Range"] = setting.describe_range(offer.bounds)
     return out
@@ -279,9 +301,13 @@ def _is_editing(setting, values: dict) -> bool:
     two must agree — a setting one of them skips and the other does not is
     either a value validated and never sent, or one sent and never validated.
     """
-    if setting.key not in values:
-        return False
-    return bool(str(values.get(setting.key, "")).strip())
+    return not _is_leave_alone(values.get(setting.key)) if setting.key in values else False
+
+
+def _is_leave_alone(raw: Any) -> bool:
+    """Blank, or the "not read yet" picker row: neither is an edit."""
+    text = str(raw if raw is not None else "").strip()
+    return text in ("", UNREAD_OPTION_ID)
 
 
 def validate_settings(device_type_id: str, values: dict, limits: LimitsLookup,
@@ -303,10 +329,10 @@ def validate_settings(device_type_id: str, values: dict, limits: LimitsLookup,
     errors: dict = {}
     for offer in offered_settings(device_type_id, limits, attribute_list, device_known):
         setting = offer.setting
-        if not _is_editing(setting, values) or not _editable_unprimed(setting, primed):
+        if not _is_editing(setting, values):
             continue
-        if (states is not None and _is_primed(primed, setting)
-                and str(values.get(setting.key, "")).strip() == _seed_value(states.get(setting.key))):
+        if states is not None and _is_primed(primed, setting) and _unchanged(
+                setting, values.get(setting.key), states.get(setting.key)):
             continue
         value, reason = coerce_value(setting, values.get(setting.key), offer.bounds)
         if value is None:
@@ -329,7 +355,7 @@ def planned_writes(device_type_id: str, values: dict, states: dict,
     planned: list[PlannedWrite] = []
     for offer in offered_settings(device_type_id, limits, attribute_list, device_known):
         setting = offer.setting
-        if not _is_editing(setting, values) or not _editable_unprimed(setting, primed):
+        if not _is_editing(setting, values):
             continue
         value, _reason = coerce_value(setting, values.get(setting.key), offer.bounds)
         if value is None:
@@ -341,6 +367,21 @@ def planned_writes(device_type_id: str, values: dict, states: dict,
             continue
         planned.append(PlannedWrite(setting, value, previous))
     return planned
+
+
+def _unchanged(setting: DeviceSetting, typed: Any, current: Any) -> bool:
+    """Is *typed* just the device's own current value, so not an edit at all?
+
+    Numerically for a number field ("00" and " 0 " are the 0 the device holds), by
+    text for a picker.
+    """
+    text = str(typed).strip()
+    if text == _seed_value(current):
+        return True
+    if setting.is_choice:
+        return False
+    typed_int, current_int = _as_int(text), _as_int(current)
+    return typed_int is not None and typed_int == current_int
 
 
 def _as_int(value: Any) -> Optional[int]:

@@ -2896,7 +2896,8 @@ class DeviceSync:
 
     def _prime_states(self, node: NodeInfo, dev_id: int, endpoint_id: int,
                       own_type_id: str,
-                      ep_sibling_types: Optional[set] = None) -> None:
+                      ep_sibling_types: Optional[set] = None,
+                      clear_error: bool = True) -> None:
         """Apply the node's current attribute values to a freshly-created device.
 
         get_node carries a snapshot of every attribute; matter-server only emits
@@ -3014,7 +3015,7 @@ class DeviceSync:
                 # one bad attr must not abort priming
                 self.logger.warning("prime %s attr %s/%s failed: %s", dev_id, cluster, attribute, exc)
         if kv:
-            self.apply_states(dev_id, kv)
+            self.apply_states(dev_id, kv, clear_error=clear_error)
         self._log_unwritable_setting_readings(node, dev, endpoint_id)
 
     # ------------------------------------------------------------------
@@ -3794,6 +3795,7 @@ class DeviceSync:
             self._refresh_live_node(node)
         else:
             self.mark_unreachable(node.node_id)
+            self._prime_settings_only(node)
         # The node device's own `reachable` STATE (issue #204) — on top of the
         # errorState marking above, which `mark_unreachable`/`_refresh_live_node`
         # already apply to it like any other device on the node via `_index`.
@@ -4207,8 +4209,15 @@ class DeviceSync:
         if states:
             self.apply_states(dev_id, handler.format_kv(states))
 
-    def apply_states(self, dev_id: int, kvlist: list) -> None:
-        """The single asyncio→Indigo write seam (see module docstring)."""
+    def apply_states(self, dev_id: int, kvlist: list, *, clear_error: bool = True,
+                     count_as_read: bool = True) -> None:
+        """The single asyncio→Indigo write seam (see module docstring).
+
+        ``clear_error=False`` is for a write that is NOT evidence the device is
+        reachable (a cached reading replayed from a snapshot); ``count_as_read=False``
+        is for a display-only write (``uiValue="unknown"``) that must not mark a
+        setting as read.
+        """
         try:
             dev = indigo.devices[dev_id]
         except KeyError:
@@ -4221,13 +4230,16 @@ class DeviceSync:
                 dev_id, len(kvlist),
             )
             return
-        kvlist = self._drop_unstorable_settings(dev, kvlist)
+        if count_as_read:
+            kvlist = self._drop_unstorable_settings(dev, kvlist)
+            kvlist = self._with_setting_display(dev, kvlist)
         if not kvlist:
             return
         dev.updateStatesOnServer(kvlist)
-        self._note_settings_primed(dev, kvlist)
+        if count_as_read:
+            self._note_settings_primed(dev, kvlist)
         # a fresh value means the device is reachable — clear any stale error
-        if getattr(dev, "errorState", ""):
+        if clear_error and getattr(dev, "errorState", ""):
             dev.setErrorStateOnServer("")
 
     # ------------------------------------------------------------------
@@ -4267,11 +4279,56 @@ class DeviceSync:
         return kept
 
     def _note_settings_primed(self, dev: Any, kvlist: list) -> None:
-        keys = self._setting_keys(dev)
-        written = {(int(dev.id), kv["key"]) for kv in kvlist if kv.get("key") in keys}
-        if written:
-            with self._lock:
-                self._settings_primed |= written
+        """Record that these setting states hold a real reading, and keep the cached
+        reading current so a later re-prime can never replay an older one."""
+        settings = {s.key: s for s in settings_for_type(getattr(dev, "deviceTypeId", "") or "")}
+        written = {(int(dev.id), kv["key"]) for kv in kvlist if kv.get("key") in settings}
+        if not written:
+            return
+        props = dev.pluginProps
+        with self._lock:
+            self._settings_primed |= written
+            if self._prop_present(props.get("nodeId")) and self._prop_present(props.get("endpointId")):
+                node_id, endpoint_id = int(props["nodeId"]), int(props["endpointId"])
+                readings = dict(self._setting_readings.get(node_id, {}))
+                for kv in kvlist:
+                    setting = settings.get(kv.get("key"))
+                    if setting is not None:
+                        readings[(endpoint_id, setting.cluster, setting.attribute)] = kv["value"]
+                self._setting_readings = {**self._setting_readings, node_id: readings}
+
+    def _with_setting_display(self, dev: Any, kvlist: list) -> list:
+        """Give every setting state write an explicit ``uiValue``.
+
+        Whether Indigo regenerates the display string when only ``value`` is sent is
+        not something this plugin has verified, and a stale "unknown" would read as a
+        lie. So the number with its unit, or the option's label, is always sent.
+        """
+        settings = {s.key: s for s in settings_for_type(getattr(dev, "deviceTypeId", "") or "")}
+        out = []
+        for kv in kvlist:
+            setting = settings.get(kv.get("key"))
+            if setting is None or "uiValue" in kv:
+                out.append(kv)
+            else:
+                out.append({**kv, "uiValue": self._setting_display(dev, setting, kv["value"])})
+        return out
+
+    def _setting_display(self, dev: Any, setting: Any, value: Any) -> str:
+        if not setting.is_choice:
+            return f"{value}{setting.unit}"
+        try:
+            props = dev.pluginProps
+            bounds = setting.resolve_bounds(
+                lambda cluster, attribute: self.setting_limits(
+                    props.get("nodeId"), props.get("endpointId"), cluster, attribute))
+            for row_id, label in setting.option_rows(bounds) or []:
+                if row_id == str(value):
+                    return label
+        except Exception:  # pylint: disable=broad-except
+            # a display label must never stop a state write; fall back to the number
+            self.logger.debug("no display label for %s=%r", setting.key, value, exc_info=True)
+        return str(value)
 
     def setting_primed(self, dev_id: Any, key: str) -> bool:
         """Has a real device reading of this setting been written this run?"""
@@ -4307,7 +4364,9 @@ class DeviceSync:
         kv = [{"key": key, "value": current.get(key, 0), "uiValue": "unknown"}
               for key in keys if key in current]
         if kv:
-            dev.updateStatesOnServer(kv)
+            # Through the one write seam, and as neither a reading nor evidence the
+            # device is reachable.
+            self.apply_states(dev.id, kv, clear_error=False, count_as_read=False)
 
     def reprime_settings(self, dev: Any) -> None:
         """Write this device's cached setting readings into its states again.
@@ -4321,13 +4380,46 @@ class DeviceSync:
         if not (self._prop_present(props.get("nodeId")) and self._prop_present(props.get("endpointId"))):
             return
         node_id, endpoint_id = int(props["nodeId"]), int(props["endpointId"])
+        type_id = getattr(dev, "deviceTypeId", "") or ""
         with self._lock:
             readings = dict(self._setting_readings.get(node_id, {}))
-        own = {k: v for k, v in readings.items() if k[0] == endpoint_id}
+            primed = set(self._settings_primed)
+        # ONLY settings not yet read. deviceStartComm re-fires on every prop change
+        # (every dialog Save), and a cached reading can be older than the state: a
+        # setting already read this run is current by construction.
+        own = {}
+        for setting in settings_for_type(type_id):
+            if (int(dev.id), setting.key) in primed:
+                continue
+            key = (endpoint_id, setting.cluster, setting.attribute)
+            if key in readings:
+                own[key] = readings[key]
         if not own:
             return
         self._prime_states(NodeInfo(node_id=node_id, attributes=own), dev.id, endpoint_id,
-                           getattr(dev, "deviceTypeId", "") or "")
+                           type_id, clear_error=False)
+
+    def _prime_settings_only(self, node: NodeInfo) -> None:
+        """Write a node's SETTING states from its snapshot - and nothing else.
+
+        For a node matter-server reports unavailable: its snapshot still carries the
+        last values the device reported, and before the read-this-run mechanism the
+        dialog showed them. Live states are not touched (the node is not live), and
+        the error flag is left alone (a snapshot is not evidence of reachability).
+        """
+        pairs = {(s.cluster, s.attribute) for s in SETTINGS}
+        for endpoint in node.endpoints:
+            ep = int(endpoint.endpoint_id)
+            with self._lock:
+                type_map = dict(self._index.get((int(node.node_id), ep), {}))
+            if not type_map:
+                continue
+            own = {k: v for k, v in node.attributes.items() if k[0] == ep and (k[1], k[2]) in pairs}
+            if not own:
+                continue
+            for type_id, dev_id in type_map.items():
+                self._prime_states(NodeInfo(node_id=node.node_id, attributes=own), dev_id, ep,
+                                   type_id, clear_error=False)
 
     def _log_unwritable_setting_readings(self, node: NodeInfo, dev: Any, endpoint_id: int) -> None:
         """Debug-log a setting reading that could not land because its state is not

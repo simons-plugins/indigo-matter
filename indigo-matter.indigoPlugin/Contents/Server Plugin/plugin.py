@@ -1565,9 +1565,9 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
         picker) because the two degrade differently, and deliberately so. The
         action's list must always offer something — it is building an automation
         that may run long before the device is ever reachable. This one is
-        backed by the same bounds that gate the field's visibility, so when the
-        device's values are unknown the field is not shown at all and there is
-        nothing to guess about.
+        backed by the same bounds that gate the field's visibility, and while the
+        device's value has not been read it leads with a "not read yet (leave
+        unchanged)" row, so the field is never hidden and never guesses.
         """
         props = dict(valuesDict or {})
         try:
@@ -1584,7 +1584,7 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
                 self._has_matter_node(props)):
             if wanted and offer.setting.key != wanted:
                 continue
-            rows = offer.setting.option_rows(offer.bounds)
+            rows = device_settings.picker_rows(offer, self._setting_primed_lookup(targetId))
             if rows is not None:
                 return rows
         return []
@@ -1706,9 +1706,9 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
             if actual is not None:
                 self.device_sync.apply_states(
                     dev_id, [{"key": plan.setting.key, "value": actual}])
-            elif not observed:
-                # The read-back got NO answer, so the state still holds the old
-                # value and nothing confirms it: not-read again (blank next open).
+            else:
+                # No answer at all, or a null: the state still holds the old value
+                # and nothing confirms it, so it is not-read again (unread next open).
                 self.device_sync.mark_setting_unread(dev_id, plan.setting.key)
         except KeyError:
             # The device was deleted between the dialog closing and this
@@ -1764,10 +1764,16 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
         # self-healing step: it must never stop a device starting.
         try:
             self.device_sync.reprime_settings(dev)
+        except Exception as exc:  # pylint: disable=broad-except
+            self.logger.warning(
+                "could not re-prime the setting states of device %s (%s)", dev.id, exc,
+                exc_info=True)
+        try:
             self.device_sync.flag_unread_settings(dev)
         except Exception as exc:  # pylint: disable=broad-except
             self.logger.warning(
-                "could not settle the setting states of device %s (%s)", dev.id, exc)
+                "could not flag the unread setting states of device %s (%s)", dev.id, exc,
+                exc_info=True)
         if dev.deviceTypeId == "matterRelay":
             self._prime_retired_on_time_state(dev)
         if dev.deviceTypeId == "matterNode":
