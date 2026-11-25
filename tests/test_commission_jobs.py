@@ -1928,4 +1928,39 @@ def test_a_late_discovery_failure_is_hinted_too(mock_logger):
     assert final["error"]["code"] == "commissioning_failed"
     assert _RESTART_MENU_ITEM in final["error"]["message"]
     assert set(final["error"]) == {"code", "message", "matterErrorCode"}
+    # The log line carries the hinted text too, not the bare matter-server details.
+    assert _RESTART_MENU_ITEM in str(mock_logger.warning.call_args)
 
+
+
+def _fail_discovery(mock_logger, managed):
+    from protocol import ProtocolError
+
+    async def scenario():
+        class FailingMatter(FakeMatter):
+            async def commission_with_code(self, code, **_kwargs):
+                raise ProtocolError(1, _DISCOVERY_DETAILS)
+
+        jobs = CommissionJobs(
+            FailingMatter(), _good_create, mock_logger, schedule=asyncio.ensure_future,
+            managed=lambda: managed)
+        _, body = jobs.create_job({"setupCode": "12345678901", "suggestedName": "Side Gate"})
+        return await _await_terminal(jobs, body["jobId"])()
+    return asyncio.run(scenario())
+
+
+def test_when_the_plugin_manages_matter_server_the_hint_names_the_menu_item(mock_logger):
+    message = _fail_discovery(mock_logger, managed=True)["error"]["message"]
+    assert _RESTART_MENU_ITEM in message
+
+
+def test_when_matter_server_is_remote_the_hint_does_not_point_at_a_menu_item_that_does_nothing(
+        mock_logger):
+    """With LaunchAgent management off the menu item only logs a warning."""
+    final = _fail_discovery(mock_logger, managed=False)
+    message = final["error"]["message"]
+    assert _RESTART_MENU_ITEM not in message
+    assert "restart matter-server on the machine that runs it" in message
+    assert "fresh pairing code" in message
+    assert _DISCOVERY_DETAILS in message
+    assert set(final["error"]) == {"code", "message", "matterErrorCode"}
