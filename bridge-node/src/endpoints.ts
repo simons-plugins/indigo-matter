@@ -787,7 +787,22 @@ class IndigoOnOffServer extends OnOffServer.with("Lighting") {
      * open half of countdown correctness; this guard only concerns the
      * replayed push that follows such a restart.)
      */
-    applyIndigoOnOff(value: boolean): MaybePromise {
+    async applyIndigoOnOff(value: boolean): Promise<void> {
+        // #338: take the `onOff.state` lock ASYNCHRONOUSLY before anything
+        // below reads or writes. `timedOnTimer` and `delayedOffTimer` are
+        // `{lock: true}` callbacks that hold this lock across an async commit
+        // every 100 ms, and the `super.on()`/`super.off()` writes below are
+        // synchronous ones, which throw `SynchronousTransactionConflictError`
+        // instead of waiting — leaving Indigo off and the ecosystem on. Both
+        // directions contend (ON meets a `delayedOffTimer` tick, or a
+        // `timedOnTimer` one while the attribute lags the countdown), so the
+        // lock sits ahead of the equality guard: one rule, and the guard reads
+        // a value no tick can change under it. `Transaction.lock()` (matter.js
+        // 0.18) is `addResources` + `begin` with a promise-free fast path when
+        // nothing holds the lock — what matter.js's own commissioning code now
+        // uses for the same job. The level/colour writes need nothing:
+        // `endpoint.set()` already begins its transaction asynchronously.
+        await this.context.transaction.lock(this);
         if (value === this.state.onOff) {
             // The `.with("Lighting")` composed type loses the base's `protected
             // internal` declaration (matter.js 0.17.8 .d.ts quirk); the runtime

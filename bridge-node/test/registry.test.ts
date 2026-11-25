@@ -3085,6 +3085,92 @@ describe("onOff commands (§4.2, §7, #143, #201)", () => {
         }
     });
 
+    it("an off push landing at any point in a running countdown always lands (#338)", async () => {
+        // `timedOnTick` is a `{lock: true}` callback: every 100 ms it holds the
+        // `onOff.state` lock across an ASYNC commit of `onTime`. The plugin's
+        // push used to write synchronously, and a synchronous write that meets
+        // a held lock throws `SynchronousTransactionConflictError` instead of
+        // waiting — Indigo then showed off while the ecosystem still showed on.
+        // The race is timing-dependent (measured ~16% of random offsets), so
+        // sweep many offsets across several tick periods: the odds of a
+        // pre-fix run passing every one are vanishing.
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(1, Role.onOffLight)], false);
+            const endpoint = only(h);
+            await h.registry.setState(1, { onOff: true });
+            const failures: string[] = [];
+            for (let i = 0; i < 150; i++) {
+                // The test's own setup takes the lock asynchronously, so a
+                // leftover tick from a failed iteration cannot fail the SETUP
+                // and mask which push actually lost the race.
+                await endpoint.act(async agent => {
+                    const behavior = agent.get(OnOffLighting);
+                    await agent.context.transaction.addResources(behavior);
+                    await agent.context.transaction.begin();
+                    await behavior.onWithTimedOff({
+                        onOffControl: { acceptOnlyWhenOn: false },
+                        onTime: 6000,
+                        offWaitTime: 0,
+                    });
+                });
+                // 0..~99 ms into a tick, stepping by a prime so offsets spread.
+                await new Promise(resolve => setTimeout(resolve, (i * 37) % 100));
+                try {
+                    await h.registry.setState(1, { onOff: false });
+                } catch (error) {
+                    failures.push(`#${i}: ${String(error)}`);
+                }
+                const state = endpoint.stateOf("onOff") as Record<string, unknown>;
+                if (state.onOff !== false) {
+                    failures.push(`#${i}: attribute still ${String(state.onOff)} after the off push`);
+                }
+                await h.registry.setState(1, { onOff: true });
+            }
+            assert.deepEqual(failures, [], "an off push lost the race against the countdown's tick lock");
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("an ON push landing during a countdown the attribute has not yet confirmed also lands (#338)", async () => {
+        // The ON direction contends too: under no-auto-confirm an ecosystem
+        // `OnWithTimedOff` starts the timer while the attribute still reads
+        // false (the ON is only emitted), so Indigo's confirming ON push is a
+        // write racing the same `{lock: true}` tick.
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(1, Role.onOffLight)], false);
+            const endpoint = only(h);
+            const failures: string[] = [];
+            for (let i = 0; i < 100; i++) {
+                await endpoint.act(async agent => {
+                    const behavior = agent.get(OnOffLighting);
+                    await agent.context.transaction.addResources(behavior);
+                    await agent.context.transaction.begin();
+                    await behavior.onWithTimedOff({
+                        onOffControl: { acceptOnlyWhenOn: false },
+                        onTime: 6000,
+                        offWaitTime: 0,
+                    });
+                });
+                await new Promise(resolve => setTimeout(resolve, (i * 37) % 100));
+                try {
+                    await h.registry.setState(1, { onOff: true });
+                } catch (error) {
+                    failures.push(`#${i}: ${String(error)}`);
+                }
+                if ((endpoint.stateOf("onOff") as Record<string, unknown>).onOff !== true) {
+                    failures.push(`#${i}: attribute still false after the on push`);
+                }
+                await h.registry.setState(1, { onOff: false });
+            }
+            assert.deepEqual(failures, [], "an on push lost the race against the countdown's tick lock");
+        } finally {
+            await h.close();
+        }
+    });
+
     it("a redundant push does not kill a live countdown (§7.3)", async () => {
         const h = await harness();
         try {
