@@ -11,6 +11,7 @@ where they translate Indigo actions.
 """
 from __future__ import annotations
 
+import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Optional, Union
@@ -77,6 +78,36 @@ def node_endpoint(indigo_dev: Any) -> tuple[int, int]:
     node_id = int(indigo_dev.pluginProps["nodeId"])
     endpoint_id = int(indigo_dev.pluginProps["endpointId"])
     return node_id, endpoint_id
+
+
+def toggle_command_name(indigo_dev: Any) -> str:
+    """OnOff command that an Indigo *Toggle* should send (issue #367).
+
+    Matter's own ``Toggle`` flips what the DEVICE believes, which is the
+    opposite of what Indigo's screen promised when the two disagree (an IKEA
+    KAJPLATS bulb keeps reporting on while dark after a power cut). So Toggle is
+    resolved from the on/off state Indigo SHOWS: ``Off`` if shown on, ``On`` if
+    shown off. ``Toggle`` is only the fallback when Indigo has no usable on/off
+    state — the attribute is missing, ``None``, not a real ``bool`` (``"false"``
+    or ``1`` must not be guessed at), or reading it raises. A failed read is
+    logged at debug and never becomes a confident wrong command.
+
+    Deliberately reads ``onState`` (on/off), never brightness, and ignores
+    ``errorState``: an unreachable device is toggled from its last shown state,
+    exactly as before.
+    """
+    try:
+        shown_on = getattr(indigo_dev, "onState", None)
+    except Exception as exc:  # pylint: disable=broad-except
+        # Absorbing: any failure reading the shown state. Safe because the
+        # fallback is the old behaviour (Matter Toggle), never an explicit
+        # command from state we could not read; the cause is kept at debug.
+        logging.getLogger("Plugin").debug(
+            "could not read the shown on/off state for toggle, using Matter Toggle: %s", exc)
+        return "Toggle"
+    if isinstance(shown_on, bool):
+        return "Off" if shown_on else "On"
+    return "Toggle"
 
 
 class ClusterHandler(ABC):

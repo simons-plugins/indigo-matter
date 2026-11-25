@@ -18,6 +18,7 @@ from .base import (
     MatterCommand,
     base_props,
     node_endpoint,
+    toggle_command_name,
 )
 from .electrical import meter_props
 
@@ -85,7 +86,7 @@ class LevelControlHandler(ClusterHandler):
         if device_action == indigo.kDeviceAction.TurnOff:
             return self._onoff(node_id, endpoint_id, "Off")
         if device_action == indigo.kDeviceAction.Toggle:
-            return self._onoff(node_id, endpoint_id, "Toggle")
+            return self._onoff(node_id, endpoint_id, toggle_command_name(indigo_dev))
 
         # Brightness routes through LevelControl (MoveToLevelWithOnOff so 0 turns off
         # and >0 turns on).

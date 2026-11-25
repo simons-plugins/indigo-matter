@@ -16,6 +16,7 @@ from .base import (
     MatterCommand,
     base_props,
     node_endpoint,
+    toggle_command_name,
 )
 from .electrical import meter_props
 from .settings import ATTR_START_UP_ON_OFF
@@ -110,7 +111,7 @@ class OnOffHandler(ClusterHandler):
         elif device_action == indigo.kDeviceAction.TurnOff:
             command = self.CMD_OFF
         elif device_action == indigo.kDeviceAction.Toggle:
-            command = self.CMD_TOGGLE
+            command = toggle_command_name(indigo_dev)
         else:
             return None
         return MatterCommand(
