@@ -1681,6 +1681,17 @@ export class BridgeNode implements BridgeFacade {
         return this.getStatus();
     }
 
+    /** Whether matter.js's commissioning window is open right now (any kind, whoever opened it). */
+    private windowOpen(): boolean {
+        // `#server`, not the `server` getter: this is a plain read of the live node, and a subclass that
+        // narrows `server` (the churn-wiring test double) is about the session layer, not this.
+        const server = this.#server;
+        if (server === undefined) {
+            throw new UninitializedDependencyError("indigo-matter-bridge", "is not initialized");
+        }
+        return server.env.get(DeviceCommissioner).windowStatus !== WINDOW_NOT_OPEN;
+    }
+
     /**
      * Keep an UNCOMMISSIONED bridge pairable. matter.js 0.18 actually starts the timer on the basic
      * window a node opens itself (0.17.8 built it and never started it), and for a node with no
@@ -1703,7 +1714,7 @@ export class BridgeNode implements BridgeFacade {
             if (!server.lifecycle.isOnline || server.lifecycle.isCommissioned || this.#window.isOpen) {
                 return false;
             }
-            if (server.env.get(DeviceCommissioner).windowStatus !== WINDOW_NOT_OPEN) {
+            if (this.windowOpen()) {
                 return false;
             }
             await server.act(agent => agent.get(CommissioningServer).enterCommissionableMode());
@@ -2137,7 +2148,7 @@ export class BridgeNode implements BridgeFacade {
             // The never-commissioned state: the node's own basic window, with the persisted
             // original codes (§3.7). Whether it is OPEN is read, not assumed: matter.js 0.18 closes it
             // after 48 hours, and {@link ensureCommissionable} reopens it within a minute.
-            const open = this.server.env.get(DeviceCommissioner).windowStatus !== WINDOW_NOT_OPEN;
+            const open = this.windowOpen();
             const codes = this.server.state.commissioning.pairingCodes;
             return {
                 commissioned: false,
