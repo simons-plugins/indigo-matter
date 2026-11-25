@@ -27,6 +27,7 @@ import {
 import {
     COUNTDOWN_LOST_REASON,
     type CommandEventData,
+    STATE_NOT_APPLIED_PHRASE,
     describeError,
     describeErrorWithStack,
     type EndpointSpec,
@@ -901,8 +902,8 @@ export class EndpointRegistry {
                 // accessory exists (#355).
                 throw new ProtocolError(
                     ErrorCode.internal,
-                    `device ${spec.indigoDeviceId} (${spec.role}): the endpoint is live, but its exported state could not be ` +
-                        `applied and it may show stale state until the plugin pushes it again: ${describeError(error)}`,
+                    `device ${spec.indigoDeviceId} (${spec.role}): ${STATE_NOT_APPLIED_PHRASE} ` +
+                        `and it may show stale state until the plugin pushes it again: ${describeError(error)}`,
                 );
             }
         }

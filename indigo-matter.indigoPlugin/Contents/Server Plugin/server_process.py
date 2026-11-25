@@ -116,6 +116,26 @@ def _numeric_prefix(version: Any) -> Optional[tuple]:
         return None
 
 
+def compare_versions(running: str, pinned: str) -> Optional[str]:
+    """``"older"``, ``"current"`` or ``"newer"`` for ``running`` against ``pinned``; None if either is unparseable.
+
+    Numeric parts compare first; on equal numeric parts a ``-`` pre-release running version against a
+    release pin counts as ``"older"`` (semver: ``1.2.2-alpha.0-…`` < ``1.2.2``). A ``+build`` suffix is
+    not a pre-release. Shared by :func:`version_drift` (matter-server) and
+    ``bridge_agent.bridge_version_drift`` (the bridge node).
+    """
+    run_n, pin_n = _numeric_prefix(running), _numeric_prefix(pinned)
+    if run_n is None or pin_n is None:
+        return None
+    width = max(len(run_n), len(pin_n))
+    run_n, pin_n = run_n + (0,) * (width - len(run_n)), pin_n + (0,) * (width - len(pin_n))
+    if run_n == pin_n:
+        # Semver: a "-" before any "+build" metadata marks a pre-release; a "-" inside the metadata does not.
+        prerelease = "-" in running.split("+", 1)[0] and "-" not in pinned.split("+", 1)[0]
+        return "older" if prerelease else "current"
+    return "older" if run_n < pin_n else "newer"
+
+
 def version_drift(sdk_version: Any, install_spec: Any = DEFAULT_INSTALL_SPEC) -> Optional[tuple]:
     """Compare the running matter-server with the version this plugin release pins (issue #75).
 
@@ -132,16 +152,8 @@ def version_drift(sdk_version: Any, install_spec: Any = DEFAULT_INSTALL_SPEC) ->
     if not found or not isinstance(install_spec, str) or "@" not in install_spec:
         return None
     running, pinned = found.group(1), install_spec.split("@", 1)[1].strip()
-    run_n, pin_n = _numeric_prefix(running), _numeric_prefix(pinned)
-    if run_n is None or pin_n is None:
-        return None
-    width = max(len(run_n), len(pin_n))
-    run_n, pin_n = run_n + (0,) * (width - len(run_n)), pin_n + (0,) * (width - len(pin_n))
-    if run_n == pin_n:
-        # Semver: a "-" before any "+build" metadata marks a pre-release; a "-" inside the metadata does not.
-        prerelease = "-" in running.split("+", 1)[0] and "-" not in pinned.split("+", 1)[0]
-        return (running, pinned, "older" if prerelease else "current")
-    return (running, pinned, "older" if run_n < pin_n else "newer")
+    status = compare_versions(running, pinned)
+    return None if status is None else (running, pinned, status)
 
 
 def _port_number(port: str) -> Optional[int]:

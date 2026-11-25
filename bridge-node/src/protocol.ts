@@ -332,6 +332,14 @@ export interface RemoveResult {
 }
 
 /**
+ * #355 — the phrase in an `internal` error's details that means "the endpoint
+ * WAS created and is live, but the state it was exported with did not land".
+ * The plugin matches on it to stop claiming nothing is exported
+ * (`bridge_protocol.STATE_NOT_APPLIED_PHRASE`); a test pins the two together.
+ */
+export const STATE_NOT_APPLIED_PHRASE = "the endpoint is live, but its exported state could not be applied";
+
+/**
  * #203 — the `reason` the node puts in the `args` of an `onOff` command it
  * raises ITSELF (not an ecosystem), to end a timed-on countdown a node restart
  * lost. Additive and ignorable: a plugin that does not read it just turns the

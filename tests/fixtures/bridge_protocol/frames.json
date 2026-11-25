@@ -715,6 +715,17 @@
       "reason": "commissioned"
     }
   },
+  "command_on_off_countdown_lost": {
+    "event": "command",
+    "data": {
+      "indigoDeviceId": 123456789,
+      "command": "onOff",
+      "args": {
+        "value": false,
+        "reason": "countdown_lost_on_restart"
+      }
+    }
+  },
   "command_on_off": {
     "event": "command",
     "data": {
