@@ -20,7 +20,9 @@ from protocol import Protocol
 from matter_client import MatterClient
 
 from fakes import FakeWebSocket, returns
-from indigo_fakes import FakeDev, FakeDevices
+from test_dimmer_color import COLOR_NODE, DIMMER_NODE
+from test_handlers import RELAY_NODE
+from indigo_fakes import FakeDev, FakeDeviceFactory, FakeDevices
 
 ON_OFF_CLUSTER = 0x0006
 
@@ -28,10 +30,20 @@ ON_OFF_CLUSTER = 0x0006
 TOGGLE_TYPES = ["matterRelay", "matterDimmer", "matterColorDimmer"]
 
 
+@pytest.fixture(autouse=True)
+def _fresh_warning_memory():
+    from matter_handlers import base
+    base.TOGGLE_FALLBACK_WARNED.clear()
+    yield
+    base.TOGGLE_FALLBACK_WARNED.clear()
+
+
 @pytest.fixture
 def env(mock_indigo_base, mock_logger):
     indigo = mock_indigo_base
     indigo.devices = FakeDevices()
+    indigo.device = FakeDeviceFactory(indigo.devices)
+    indigo.kProtocol = SimpleNamespace(Plugin="plugin")
     import device_sync
     importlib.reload(device_sync)
     from matter_handlers.registry import HandlerRegistry
@@ -84,8 +96,12 @@ def test_toggle_when_shown_off_sends_on(env, type_id):
 
 
 @pytest.mark.parametrize("type_id", TOGGLE_TYPES)
-def test_toggle_with_no_state_falls_back_to_matter_toggle(env, type_id):
-    assert _toggle(env, _dev(type_id)) == [(ON_OFF_CLUSTER, "Toggle")]  # no onState attr at all
+def test_toggle_with_missing_state_falls_back_to_matter_toggle(env, type_id):
+    assert _toggle(env, _dev(type_id)) == [(ON_OFF_CLUSTER, "Toggle")]  # no onOffState key at all
+
+
+@pytest.mark.parametrize("type_id", TOGGLE_TYPES)
+def test_toggle_with_none_state_falls_back_to_matter_toggle(env, type_id):
     assert _toggle(env, _dev(type_id, None)) == [(ON_OFF_CLUSTER, "Toggle")]
 
 
@@ -132,17 +148,125 @@ def test_unexpected_state_type_falls_back_to_toggle(env, bad):
     assert _toggle(env, _dev("matterRelay", bad)) == [(ON_OFF_CLUSTER, "Toggle")]
 
 
-def test_second_toggle_before_report_resends_same_command(env):
+@pytest.mark.parametrize("type_id", TOGGLE_TYPES)
+def test_second_toggle_before_report_resends_same_command(env, type_id):
     # Nothing here updates the shown state after a send (no optimistic echo for
     # on/off), so a second press before the device's report arrives reads the
     # same old state and sends the same command again.
-    assert _toggle(env, _dev("matterRelay", False), times=2) == [
+    assert _toggle(env, _dev(type_id, False), times=2) == [
         (ON_OFF_CLUSTER, "On"), (ON_OFF_CLUSTER, "On")]
 
 
-def test_explicit_on_off_actions_unchanged(env):
-    import device_sync  # noqa: F401
-    handler_dev = _dev("matterRelay", True)
+@pytest.mark.parametrize("type_id", TOGGLE_TYPES)
+def test_explicit_on_off_actions_unchanged(env, type_id):
     for action, name in ((env.indigo.kDeviceAction.TurnOn, "On"), (env.indigo.kDeviceAction.TurnOff, "Off")):
-        cmd = env.ds.build_command(handler_dev, SimpleNamespace(deviceAction=action))
+        cmd = env.ds.build_command(_dev(type_id, True), SimpleNamespace(deviceAction=action))
         assert cmd.command == name
+
+
+# --- the actual #367 sequence: a device report arrives, THEN Toggle -----------
+NODES = {"matterRelay": RELAY_NODE, "matterDimmer": DIMMER_NODE, "matterColorDimmer": COLOR_NODE}
+
+
+def _created(env, type_id):
+    node = NODES[type_id]
+    env.ds.create_from_raw(node, "Lamp")
+    return env.indigo.devices[env.ds.lookup(node["node_id"], 1)]
+
+
+def _report(env, type_id, value):
+    env.ds.handle_event(protocol.MatterEvent(
+        kind=protocol.EVT_ATTRIBUTE_UPDATED, node_id=NODES[type_id]["node_id"], endpoint=1,
+        cluster=ON_OFF_CLUSTER, attribute=0x0000, value=value))
+
+
+@pytest.mark.parametrize("type_id", TOGGLE_TYPES)
+def test_report_says_on_then_toggle_sends_off(env, type_id):
+    dev = _created(env, type_id)
+    assert dev.deviceTypeId == type_id
+    _report(env, type_id, True)
+    assert _toggle(env, dev) == [(ON_OFF_CLUSTER, "Off")]
+
+
+@pytest.mark.parametrize("type_id", TOGGLE_TYPES)
+def test_report_says_off_then_toggle_sends_on(env, type_id):
+    dev = _created(env, type_id)
+    _report(env, type_id, True)
+    _report(env, type_id, False)
+    assert _toggle(env, dev) == [(ON_OFF_CLUSTER, "On")]
+
+
+@pytest.mark.parametrize("type_id", TOGGLE_TYPES)
+def test_freshly_created_never_reported_toggle_sends_on(env, type_id):
+    dev = _created(env, type_id)
+    assert dev.states["onOffState"] is False
+    assert _toggle(env, dev) == [(ON_OFF_CLUSTER, "On")]
+
+
+# --- visibility: the fallback warns once per device; the normal path never ----
+def _toggle_warnings(caplog):
+    return [r for r in caplog.records if r.levelno == logging.WARNING and "Toggle" in r.getMessage()]
+
+
+class _PropertyAttributeError:
+    deviceTypeId = "matterRelay"
+    pluginProps = {"nodeId": "7", "endpointId": "1"}
+    id = 5
+    name = "Broken"
+
+    @property
+    def onState(self):  # noqa: N802
+        raise AttributeError("inside the property")
+
+
+@pytest.mark.parametrize("make", [
+    lambda: _dev("matterRelay"),                  # missing
+    lambda: _dev("matterRelay", None),            # None
+    lambda: _dev("matterRelay", "on"),            # non-bool
+    lambda: _RaisingState(),                      # raises
+    lambda: _PropertyAttributeError(),            # AttributeError inside the property
+], ids=["missing", "none", "non-bool", "raises", "property-attribute-error"])
+def test_every_fallback_warns(env, caplog, make):
+    dev = make()
+    with caplog.at_level(logging.WARNING, logger="Plugin"):
+        assert _toggle(env, dev) == [(ON_OFF_CLUSTER, "Toggle")]
+    (record,) = _toggle_warnings(caplog)
+    message = record.getMessage()
+    assert "Matter Toggle" in message and "device's own state" in message
+
+
+def test_fallback_warning_names_device_and_value(env, caplog):
+    dev = _dev("matterRelay", "on")
+    with caplog.at_level(logging.WARNING, logger="Plugin"):
+        _toggle(env, dev)
+    message = _toggle_warnings(caplog)[0].getMessage()
+    assert "Lamp" in message and "'on'" in message
+
+
+def test_fallback_warning_once_per_device(env, caplog):
+    first, other = _dev("matterRelay", None), _dev("matterRelay", None)
+    other.id = 2
+    with caplog.at_level(logging.WARNING, logger="Plugin"):
+        _toggle(env, first, times=2)
+        assert len(_toggle_warnings(caplog)) == 1      # second press, same device: quiet
+        _toggle(env, other)
+        assert len(_toggle_warnings(caplog)) == 2      # a different device warns
+
+
+def test_fallback_warning_cannot_raise_when_device_id_unreadable(env, caplog):
+    class NoId(_RaisingState):
+        @property
+        def id(self):
+            raise RuntimeError("no id")
+    with caplog.at_level(logging.WARNING, logger="Plugin"):
+        assert _toggle(env, NoId()) == [(ON_OFF_CLUSTER, "Toggle")]
+    assert len(_toggle_warnings(caplog)) == 1
+
+
+@pytest.mark.parametrize("shown", [True, False])
+def test_explicit_path_never_warns_and_logs_resolution_at_debug(env, caplog, shown):
+    with caplog.at_level(logging.DEBUG, logger="Plugin"):
+        _toggle(env, _dev("matterRelay", shown))
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+    expected = f'Toggle "Lamp": shown {"on" if shown else "off"}, sending {"Off" if shown else "On"}'
+    assert expected in [r.getMessage() for r in caplog.records if r.levelno == logging.DEBUG]
