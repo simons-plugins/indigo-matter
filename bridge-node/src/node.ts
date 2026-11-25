@@ -26,6 +26,7 @@ import {
     CommissioningServer,
     Endpoint,
     Environment,
+    Lifecycle,
     Seconds,
     ServerNode,
     UninitializedDependencyError,
@@ -39,6 +40,7 @@ import { Crypto } from "@matter/main";
 import {
     DeviceCommissioner,
     FabricManager,
+    FailsafeContext,
     type NodeSession,
     PaseClient,
     PaseServer,
@@ -1734,6 +1736,22 @@ export class BridgeNode implements BridgeFacade {
             }
             const commissioner = this.commissioner();
             if (commissioner === undefined || commissioner.windowStatus !== WINDOW_NOT_OPEN) {
+                return false;
+            }
+            // `isCommissioned` lags the fabric: on a pairing, matter.js adds the fabric and closes the window
+            // when the commissioning completes, but flips `isCommissioned` only after the fail-safe is torn
+            // down (CommissioningServer `#failsafeChanged` -> `handleFabricChange` -> `#syncCommissioned`),
+            // and on the last fabric leaving there is a gap before the erase. Reopening a basic window in
+            // either gap would make the user's Enhanced window fail with MatterFlowError. So also require
+            // that the FabricManager — the table matter.js's own `#enterOnlineMode`/`#resetWhenIdle` gate on,
+            // populated before `commissioned` fires — is empty, and that no fail-safe is armed. Both are
+            // read with `has`/`maybeGet`, never constructed.
+            const fabrics = server.env.maybeGet(FabricManager);
+            if (fabrics === undefined || fabrics.length > 0) {
+                return false;
+            }
+            const failsafe = server.env.maybeGet(FailsafeContext);
+            if (failsafe !== undefined && failsafe.construction.status !== Lifecycle.Status.Destroyed) {
                 return false;
             }
             await server.act(agent => agent.get(CommissioningServer).enterCommissionableMode());

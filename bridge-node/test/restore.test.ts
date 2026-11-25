@@ -31,7 +31,7 @@ import { after, describe, it, mock } from "node:test";
 
 import { type Endpoint, Environment, Environmental, Logger, Seconds, ServerNode, Time, UninitializedDependencyError } from "@matter/main";
 import { AdministratorCommissioning } from "@matter/main/clusters/administrator-commissioning";
-import { DeviceCommissioner } from "@matter/main/protocol";
+import { DeviceCommissioner, FabricManager, FailsafeContext } from "@matter/main/protocol";
 import { OnOffServer } from "@matter/main/behaviors/on-off";
 
 import {
@@ -2184,6 +2184,51 @@ describe("an uncommissioned bridge stays pairable (matter.js 0.18's 48-hour wind
             assert.equal(created.whileReading, 0, "a read must never construct a DeviceCommissioner");
         } finally {
             (DeviceCommissioner as unknown as Record<symbol, unknown>)[Environmental.create] = original;
+            await session.close();
+        }
+    });
+
+    it("a node whose fabric table already has a fabric is NOT reopened, even while isCommissioned has not flipped yet", async () => {
+        // matter.js adds the fabric and closes the window when commissioning completes, but `isCommissioned` only
+        // flips later (failsafe teardown -> handleFabricChange -> syncCommissioned). Reopening a BASIC window in that
+        // gap makes the user's Enhanced window fail with MatterFlowError. Same shape between the last fabric
+        // leaving and the erase. Stand-in: a real node (so `isCommissioned` is genuinely false) whose FabricManager
+        // reports one fabric — no matter.js test controller is in this suite.
+        const capture = captureWindowTimers();
+        const session = await boot(storage());
+        try {
+            await capture.timers.at(-1)!.cb();
+            await settle();
+            assert.equal(session.bridge.server.lifecycle.isCommissioned, false);
+            const fabrics = session.bridge.server.env.get(FabricManager);
+            Object.defineProperty(fabrics, "length", { get: () => 1, configurable: true });
+            const before = session.logged.length;
+            assert.equal(await session.bridge.ensureCommissionable(), false);
+            assert.equal(statusOf(session), NOT_OPEN, "no window opened");
+            assert.equal((await session.bridge.getPairingSettled()).windowOpen, false);
+            assert.equal(statusOf(session), NOT_OPEN, "and asking for the pairing codes did not open one");
+            assert.deepEqual(session.logged.slice(before).filter(line => /48 hours/.test(line)), []);
+            delete (fabrics as unknown as Record<string, unknown>).length;
+            assert.equal(await session.bridge.ensureCommissionable(), true, "with no fabric it reopens as before");
+        } finally {
+            capture.restore();
+            await session.close();
+        }
+    });
+
+    it("a node with a fail-safe armed (a commissioning in progress) is NOT reopened", async () => {
+        const capture = captureWindowTimers();
+        const session = await boot(storage());
+        const env = session.bridge.server.env;
+        try {
+            await capture.timers.at(-1)!.cb();
+            await settle();
+            env.set(FailsafeContext, { construction: { status: "active" }, close: async () => {}, [Symbol.asyncDispose]: async () => {} } as never);
+            assert.equal(await session.bridge.ensureCommissionable(), false);
+            assert.equal(statusOf(session), NOT_OPEN);
+        } finally {
+            env.delete(FailsafeContext, env.maybeGet(FailsafeContext) as never);
+            capture.restore();
             await session.close();
         }
     });
