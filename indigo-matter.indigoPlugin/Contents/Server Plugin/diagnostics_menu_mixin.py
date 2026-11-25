@@ -442,10 +442,7 @@ class DiagnosticsMenuMixin:
         # #334 post-review, B3.1: Indigo delivers a checkbox as the STRING
         # "true"/"false", and bool("false") is True — this used to always
         # live-read regardless of the checkbox, silently ignoring "off".
-        # The checkbox was "liveReadSleepy" until it started live-reading routers
-        # too (#348); an old saved dialog/script that still sends the old id must
-        # keep meaning "live-read", not silently fall back to the default.
-        live_read = _truthy(valuesDict.get("liveReadNodes", valuesDict.get("liveReadSleepy", True)))
+        live_read = _truthy(valuesDict.get("liveReadNodes", True))
         total_timeout = ATTRIBUTE_TIMEOUT + SURVEY_READ_TIMEOUT
 
         # R8 — eager, Indigo-thread resolution (see docstring above).
@@ -501,7 +498,7 @@ class DiagnosticsMenuMixin:
             functools.partial(self._on_thread_mesh_survey_done, live_read, page_url))
 
         self.logger.info(
-            "Matter: Thread mesh survey started (live-read sleepy: %s) — the report will "
+            "Matter: Thread mesh survey started (live-read every node: %s) — the report will "
             "follow in the Event Log within about a minute.", "yes" if live_read else "no")
         return (True, valuesDict)
 
@@ -643,14 +640,19 @@ class DiagnosticsMenuMixin:
         for line in thread_mesh.render_report(mesh, survey.diags, page_url=page_url, now=now):
             self.logger.info("%s", line)
 
-        if mesh.unreadable:
+        # Only a node whose live read was ASKED FOR and failed (so it is still
+        # cache-sourced) is "could not be live-read"; a cache-only run, or a node
+        # that was read live fine, must not make that claim. Unreadable nodes are
+        # still listed by the report itself above, in either case.
+        failed_live = [d for d in survey.diags if live_read and d.source == "cache" and d.read_error]
+        if failed_live:
             # Partial failure, same convention as menuReportSettings: still
             # print everything (the cached values above), then say so — a
             # diagnostic that looks complete when it is not is the failure
             # mode a diagnostic can least afford.
             self.logger.warning(
                 "Matter: %d node(s) could not be live-read — cached values shown above.",
-                len(mesh.unreadable))
+                len(failed_live))
 
     def _thread_node_names(self) -> dict:
         """``node_id -> the single name a human would use for it``, shared by

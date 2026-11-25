@@ -337,8 +337,9 @@ class _ThreadFakeMatter:
     "must never be touched" for a caller-chosen set), and records every node id
     it was asked to read."""
 
-    def __init__(self, nodes, *, timeout_nodes=(), forbidden_nodes=(), get_nodes_error=None):
+    def __init__(self, nodes, *, timeout_nodes=(), forbidden_nodes=(), get_nodes_error=None, overrides=None):
         self.nodes = nodes
+        self._overrides = dict(overrides or {})  # {(node_id, attribute): live answer}
         self.connected = True  # B5.6 — menuReportThreadMesh now checks this
         self.read_calls: list[int] = []
         self._timeout_nodes = set(timeout_nodes)
@@ -359,6 +360,8 @@ class _ThreadFakeMatter:
             raise AssertionError(f"read() must never touch node 0x{node_id:X}")
         if node_id in self._timeout_nodes:
             raise asyncio.TimeoutError()
+        if (node_id, attribute) in self._overrides:
+            return self._overrides[(node_id, attribute)]
         raw = next(n for n in self.nodes if n["node_id"] == node_id)
         return raw["attributes"].get(f"{endpoint}/{cluster}/{attribute}")
 
@@ -614,19 +617,65 @@ def test_routers_are_live_read_too(mixin):
     assert set(matter.read_calls) == THREAD_NON_ROUTER_IDS | THREAD_ROUTER_IDS
 
 
-def test_the_old_live_read_sleepy_dialog_id_is_still_honoured(mixin):
-    # Backward compatibility (#348): a saved dialog / script still sending the old
-    # checkbox id keeps its meaning, in both directions.
-    nodes = json.loads(THREAD_FIXTURE_PATH.read_text(encoding="utf-8"))
-    off = _ThreadFakeMatter(nodes, forbidden_nodes=THREAD_ROUTER_IDS | THREAD_NON_ROUTER_IDS)
-    _module, obj = _thread_mesh_mixin(mixin, off)
-    ok, _values = obj.menuReportThreadMesh({"liveReadSleepy": "false"})[:2]
-    assert ok and off.read_calls == []
+def test_the_report_thread_mesh_dialog_really_has_a_liveReadNodes_field():
+    # The id menuReportThreadMesh reads must exist in the dialog: Indigo menu dialogs
+    # never remember values, so a renamed id would silently fall back to its default.
+    item = next(c for c in ET.parse(MENU_ITEMS_XML).getroot().findall("MenuItem")
+                if c.get("id") == "reportThreadMesh")
+    fields = {f.get("id"): f for f in item.find("ConfigUI").findall("Field")}
+    assert "liveReadNodes" in fields and fields["liveReadNodes"].get("type") == "checkbox"
+    assert "liveReadSleepy" not in fields
+    assert "every node" in fields["liveReadNodes"].find("Label").text
 
-    on = _ThreadFakeMatter(nodes)
-    _module, obj = _thread_mesh_mixin(mixin, on)
-    ok, _values = obj.menuReportThreadMesh({"liveReadSleepy": "true"})[:2]
-    assert ok and set(on.read_calls) == THREAD_NON_ROUTER_IDS | THREAD_ROUTER_IDS
+
+def test_the_start_line_says_every_node_not_sleepy(mixin):
+    nodes = json.loads(THREAD_FIXTURE_PATH.read_text(encoding="utf-8"))
+    _module, obj = _thread_mesh_mixin(mixin, _ThreadFakeMatter(nodes))
+    obj.menuReportThreadMesh({"liveReadNodes": True})
+    started = [_fmt(c) for c in obj.logger.info.call_args_list if "survey started" in _fmt(c)]
+    assert started and "sleepy" not in started[0] and "live-read every node: yes" in started[0]
+
+
+def _role_unreadable_nodes():
+    """The fixture with node 0x2E's RoutingRole removed from the cache (other 0x35
+    keys stay): parse_node_diag records a read_error ("RoutingRole unreadable")."""
+    nodes = json.loads(THREAD_FIXTURE_PATH.read_text(encoding="utf-8"))
+    next(n for n in nodes if n["node_id"] == 0x2E)["attributes"].pop("0/53/1")
+    return nodes
+
+
+def test_a_cache_only_run_does_not_claim_a_live_read_failed(mixin):
+    matter = _ThreadFakeMatter(_role_unreadable_nodes(), forbidden_nodes=THREAD_ROUTER_IDS | THREAD_NON_ROUTER_IDS)
+    _module, obj = _thread_mesh_mixin(mixin, matter)
+    obj.menuReportThreadMesh({"liveReadNodes": False})
+    assert "0x2E: RoutingRole unreadable" in _log_body(obj), "the node is still reported unreadable"
+    assert "could not be live-read" not in _warn_body(obj)
+
+
+def test_a_live_run_counts_only_nodes_whose_live_read_failed(mixin):
+    # 0x2E has an unreadable cached role but its live read FAILS too -> counted once;
+    # a node that was live-read fine is not.
+    matter = _ThreadFakeMatter(_role_unreadable_nodes(), timeout_nodes={0x2E})
+    _module, obj = _thread_mesh_mixin(mixin, matter)
+    obj.menuReportThreadMesh({"liveReadNodes": True})
+    assert "1 node(s) could not be live-read" in _warn_body(obj)
+
+
+def test_a_departed_child_reaches_the_event_log_and_is_not_drawn_as_a_child(mixin):
+    # Mutation guard: a report that drops per-node parse_warnings loses the line.
+    from thread_mesh import ATTR_NEIGHBOR_TABLE  # pylint: disable=import-outside-toplevel
+    nodes = json.loads(THREAD_FIXTURE_PATH.read_text(encoding="utf-8"))
+    cached = next(n for n in nodes if n["node_id"] == 0x3F)["attributes"][f"0/53/{ATTR_NEIGHBOR_TABLE}"]
+    live = [e for e in cached if e["2"] != 0x5C04]
+    _module, obj = _thread_mesh_mixin(mixin, _ThreadFakeMatter(nodes, overrides={(0x3F, ATTR_NEIGHBOR_TABLE): live}))
+    obj.menuReportThreadMesh({"liveReadNodes": True})
+    body = "\n".join(_fmt(c) for c in obj.logger.info.call_args_list)
+    assert "child 0x5C04 was in matter-server's cache but is absent from this router's live" in body
+    assert "Child 0x5C04" not in body
+    # control: cache-only still draws the child as a neighbour row (0x5C04 in the node block)
+    _module, cache_obj = _thread_mesh_mixin(mixin, _ThreadFakeMatter(nodes))
+    cache_obj.menuReportThreadMesh({"liveReadNodes": False})
+    assert "0x5C04" in "\n".join(_fmt(c) for c in cache_obj.logger.info.call_args_list)
 
 
 def test_wifi_only_fabric_is_a_friendly_success_not_an_error(mixin):
