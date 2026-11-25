@@ -22,6 +22,9 @@ will actually occur.
 
 ## §0 — Measured probes (matter.js 0.17.8)
 
+> The probe tables below were measured on matter.js 0.17.8 and have **not** been re-measured for the 0.18.0
+> upgrade (issue #375).
+
 A handful of `bridge-node/src/` comments cite `§0` for a claim that is not
 derivable from the matter.js typings or docs alone — it was established by
 running the stack and reading back what it actually did. Recorded once here

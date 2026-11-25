@@ -3,6 +3,39 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
+## 2026.35.0 — Bridge 0.18.0: three Matter export fixes on matter.js 0.18
+
+Needs **bridge 0.18.0** (Install/update the Matter bridge; the plugin now pins it).
+The plugin/bridge protocol is unchanged (still v2), so no handshake or minimum-version
+check moves.
+
+- Upgrade (issue #375): the bridge node now runs on matter.js 0.18.0 (was 0.17.8). A
+  bridge commissioned on 0.17.8 starts on 0.18.0 with the same fabric and endpoints in
+  a matter.js test controller; **not yet soaked against real Apple Home and Alexa**, so
+  expect to watch the first days. matter.js 0.18 now also publishes a Groupcast cluster
+  and the Auxiliary ACL on the bridge's root endpoint, and logs a device-type warning
+  for a smoke or CO alarm exported without a battery (it always lacked the Power Source
+  cluster its device type calls for; 0.18 is just the first version to say so).
+- Fix (issue #338): turning a device off from Indigo while an ecosystem's timed-on
+  countdown (`OnWithTimedOff`) was running could fail with a transaction conflict,
+  leaving Indigo showing off and the ecosystem showing on. The bridge now waits for the
+  countdown's lock instead of failing. The same wait protects pushing a device on.
+- Fix (issue #203): restarting the bridge node mid-countdown left the device on for
+  good, because the countdown timer lived only in memory. After the next attach, a
+  device that reads on with a countdown still pending and no timer running is turned off
+  in Indigo and the countdown cleared (so it cannot fire again at the next restart).
+  **Known limitation:** the bridge stores the time remaining, not a deadline, so if you
+  turn the device off and on again in Indigo while the node is down, that deliberate
+  "on" is indistinguishable and is turned off. A countdown that is still running (a
+  plugin-only reconnect) and a device Indigo reports off are left alone.
+- Fix (issue #355): un-exporting a device, restarting the bridge node and exporting it
+  again brought the accessory back showing its old state instead of the state sent with
+  the export. The bridge now applies those states when it creates the endpoint, and a
+  failure to do so is reported rather than left silent.
+- Internal: the session-hygiene age in the bridge log is now a whole number of
+  milliseconds (matter.js 0.18 reports session times on a monotonic clock; only
+  differences between them are used).
+
 ## 2026.34.1 — Stopping the bridge node on purpose is no longer reported as a failure
 
 - Fix (issue #366): an un-export that had completed was repeated on every plugin
