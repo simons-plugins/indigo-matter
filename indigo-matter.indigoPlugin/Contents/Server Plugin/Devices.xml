@@ -59,6 +59,8 @@
                  Declared for the TYPE; getDeviceStateList removes it per unit
                  when the device's own AttributeList says it does not implement
                  the attribute (#190). -->
+            <!-- Values: 0 Off, 1 On, 2 Toggle, 255 = null / "previous state"
+                 (plugin encoding; never sent to the device — see the dimmers). -->
             <State id="startUpOnOff">
                 <ValueType>Integer</ValueType>
                 <TriggerLabel>Power-On Behaviour</TriggerLabel>
@@ -137,7 +139,11 @@
             <!-- Power-on behaviour (issue #360); see matterRelay's declaration.
                  getDeviceStateList withdraws it per unit on a positive NO from
                  the unit's AttributeList (#190). Existing dimmers gain it when
-                 deviceStartComm rebuilds their state list. -->
+                 deviceStartComm rebuilds their state list.
+                 Values: 0 Off, 1 On, 2 Toggle, and 255 = the device reports null
+                 ("restore the previous state", the usual factory default;
+                 uiValue "previous state"). 255 is a plugin encoding, never sent
+                 to the device, and cannot be set from Indigo yet. -->
             <State id="startUpOnOff">
                 <ValueType>Integer</ValueType>
                 <TriggerLabel>Power-On Behaviour</TriggerLabel>
@@ -191,7 +197,11 @@
             <!-- Power-on behaviour (issue #360); see matterRelay's declaration.
                  getDeviceStateList withdraws it per unit on a positive NO from
                  the unit's AttributeList (#190). Existing dimmers gain it when
-                 deviceStartComm rebuilds their state list. -->
+                 deviceStartComm rebuilds their state list.
+                 Values: 0 Off, 1 On, 2 Toggle, and 255 = the device reports null
+                 ("restore the previous state", the usual factory default;
+                 uiValue "previous state"). 255 is a plugin encoding, never sent
+                 to the device, and cannot be set from Indigo yet. -->
             <State id="startUpOnOff">
                 <ValueType>Integer</ValueType>
                 <TriggerLabel>Power-On Behaviour</TriggerLabel>

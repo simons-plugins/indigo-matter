@@ -18,7 +18,7 @@ from .base import (
     node_endpoint,
 )
 from .electrical import meter_props
-from .settings import ATTR_START_UP_ON_OFF
+from .settings import ATTR_START_UP_ON_OFF, CLUSTER_ON_OFF, SETTINGS
 
 CLUSTER_LEVEL_CONTROL = 0x0008
 CLUSTER_COLOR_CONTROL = 0x0300
@@ -78,6 +78,9 @@ class OnOffHandler(ClusterHandler):
         ATTR_START_UP_ON_OFF: "startUpOnOff",
     }
 
+    #: Settings on this cluster, by attribute id — for their null handling.
+    _SETTINGS_BY_ATTRIBUTE = {s.attribute: s for s in SETTINGS if s.cluster == CLUSTER_ON_OFF}
+
     def attributes_to_subscribe(self) -> list[int]:
         return [self.ATTR_ON_OFF, *self.SETTING_STATES]
 
@@ -85,8 +88,20 @@ class OnOffHandler(ClusterHandler):
         if attribute_id == self.ATTR_ON_OFF:
             return {"onOffState": bool(value)}
         state_key = self.SETTING_STATES.get(attribute_id)
-        if state_key is None or value is None:
+        if state_key is None:
             return {}
+        if value is None:
+            # A null reading ("restore the previous state") is a real answer,
+            # recorded as the setting's declared null state — dropping it left
+            # Indigo's default 0 ("Off") showing for it. A setting that does not
+            # declare one keeps the old behaviour: nothing is written.
+            setting = self._SETTINGS_BY_ATTRIBUTE.get(attribute_id)
+            if setting is None or setting.null_state is None:
+                return {}
+            # Same fielded-device guard as below.
+            if state_key not in getattr(indigo_dev, "states", {}):
+                return {}
+            return {state_key: setting.null_state}
         try:
             number = int(value)
         except (TypeError, ValueError):
@@ -101,6 +116,12 @@ class OnOffHandler(ClusterHandler):
         if state_key not in getattr(indigo_dev, "states", {}):
             return {}
         return {state_key: number}
+
+    def format_kv(self, states: dict) -> list:
+        """Attach the null state's display string ("previous state")."""
+        by_key = {s.key: s for s in self._SETTINGS_BY_ATTRIBUTE.values()}
+        return [by_key[key].state_entry(value) if key in by_key
+                else {"key": key, "value": value} for key, value in states.items()]
 
     def handle_indigo_action(self, indigo_dev: Any, action: Any) -> Optional[MatterCommand]:
         import indigo  # provided by the Indigo runtime (and the test mock)
