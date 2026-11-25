@@ -8,21 +8,29 @@ current version is `Info.plist`'s `PluginVersion`.
 - New (issue #368): a Matter lock's **Edit Device** dialog now offers up to three
   settings, each shown only if that lock says it implements it: **Auto-relock**
   (seconds; 0 turns it off), **Wrong-code limit** (attempts, 1-255) and **Lockout
-  time** (seconds, 1-255; how long the lock ignores commands after too many wrong
+  time** (seconds, 1-255; how long code entry is disabled after too many wrong
   codes). Like other device settings they are stored on the lock itself, are read
   back after a change, and each has a state you can use in triggers. Locks you
   already have gain them on upgrade with no need to recreate the device. The
-  Auto-relock field accepts any whole number up to 4294967295 because the Matter
-  model sets no tighter limit.
+  Matter sets no upper limit on auto-relock; the plugin caps it at 86400 seconds
+  (one day), because a larger number does not fit an Indigo state and would stop SQL
+  Logger recording that device. A lock already holding more is left alone and is not
+  written to the state.
+- A setting whose value the device has not reported yet now shows blank in the dialog,
+  and "unknown" on the device, instead of Indigo's default 0 (which looked like a real
+  value; for auto-relock it read as "off"). Leaving a field blank changes nothing;
+  typing a value, including 0, writes it. This applies to the existing sensor and relay
+  settings too. A save no longer refuses a value you did not change. After a change the
+  lock does not confirm, the field is blank next time you open it.
 - Not offered, on purpose: **Require PIN for remote operation**, because the plugin
   locks and unlocks without a PIN, so switching it on would make the lock refuse
   Indigo's commands. The "settable attributes not offered yet" report no longer
   lists it or invites a request for it. **Operating mode** is still listed there;
   it needs more work.
 - Fix (issue #368): when matter-server reports "No commissionable device was
-  discovered", the error (Event Log, and the message the iOS app shows) now
+  discovered", the error (Event Log, and the message dom.io shows) now
   suggests Plugins ▸ Matter ▸ **Restart the Matter controller** and retrying with a
-  fresh pairing code. That was the fix for the reporter's Aqara lock after a
+  fresh pairing code (or, if you run matter-server yourself, restarting it there). That was the fix for the reporter's Aqara lock after a
   long-running matter-server stopped hearing it. The cause is not confirmed, and
   nothing is restarted automatically. Other commissioning errors are unchanged.
 
