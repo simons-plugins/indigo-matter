@@ -394,15 +394,79 @@ def test_the_unparseable_role_path_never_leaves_read_error_on_a_live_diag():
     assert not [d for d in survey.diags if d.source == "live" and d.read_error]
 
 
-@pytest.mark.parametrize("empty_table", [[], [{"0": 1}], [{"bad": "row"}, "garbage", None]])
-def test_an_empty_or_all_malformed_live_neighbour_table_is_a_failed_read(empty_table):
-    # The cache had neighbours; "no neighbours" must not become a live fact, and
-    # every cached child must not become "departed".
-    matter = FakeMatter(overrides={(0x3F, ATTR_NEIGHBOR_TABLE): empty_table})
+def test_an_empty_live_neighbour_table_from_an_unchanged_attached_router_is_a_failed_read():
+    # Same role live as cached (Router), cache had neighbours, live says "none": far
+    # likelier a failed read than "everyone left" — so the cached table is shown.
+    matter = FakeMatter(overrides={(0x3F, ATTR_NEIGHBOR_TABLE): []})
     survey = _run(survey_thread_nodes(matter, live_read=True))
     diag = _assert_failed_read_kept_cache(survey, expect_in_error="live neighbour table came back empty")
-    assert "cached" in diag.read_error
+    assert "cached" in diag.read_error and "none could be parsed" not in diag.read_error
     assert ("single_neighbour", "bad") not in {(f.code, f.severity) for f in health_flags(diag)}
+
+
+@pytest.mark.parametrize("role", [1, 2, 3, 4, 5, 6])
+@pytest.mark.parametrize("rows", [[{"0": 1}], [{"bad": "row"}, "garbage", None]])
+def test_an_all_malformed_live_neighbour_table_is_a_failed_read_under_every_role(role, rows):
+    # Rows existed but none parsed: unparseable, not empty — whatever role is claimed.
+    matter = FakeMatter(overrides={(0x3F, ATTR_NEIGHBOR_TABLE): rows, (0x3F, ATTR_ROUTING_ROLE): role})
+    survey = _run(survey_thread_nodes(matter, live_read=True))
+    diag = next(d for d in survey.diags if d.node_id == 0x3F)
+    assert diag.source == "cache" and diag.role_name == "Router"
+    assert "none could be parsed" in diag.read_error and "came back empty" not in diag.read_error
+    assert [c.rloc16 for c in diag.children] == [DEPARTED_RLOC] and _no_departure_warning(diag)
+
+
+@pytest.mark.parametrize("node_id", [0x2E, 0x27])
+def test_a_node_that_really_detached_is_taken_live_and_flagged_detached(node_id):
+    # Live Unassigned, empty tables, null partition/leader: a CORRECT live answer that
+    # shows exactly what this diagnostic exists to find. Never replaced by the cached
+    # "attached" view.
+    matter = FakeMatter(overrides={
+        (node_id, ATTR_ROUTING_ROLE): 1, (node_id, ATTR_NEIGHBOR_TABLE): [], (node_id, ATTR_ROUTE_TABLE): [],
+        (node_id, ATTR_PARTITION_ID): None, (node_id, ATTR_LEADER_ROUTER_ID): None})
+    survey = _run(survey_thread_nodes(matter, live_read=True))
+    diag = next(d for d in survey.diags if d.node_id == node_id)
+    assert diag.source == "live" and diag.read_error is None
+    assert diag.role_name == "Unassigned" and diag.neighbours == [] and diag.partition_id is None
+    flags = {f.code for f in health_flags(diag)}
+    assert "detached" in flags
+    assert node_id not in {n for n, _ in build_mesh(survey.diags).unreadable}
+
+
+def test_a_router_that_split_off_as_a_one_node_leader_is_taken_live():
+    matter = FakeMatter(overrides={(0x27, ATTR_ROUTING_ROLE): 6, (0x27, ATTR_NEIGHBOR_TABLE): []})
+    survey = _run(survey_thread_nodes(matter, live_read=True))
+    diag = next(d for d in survey.diags if d.node_id == 0x27)
+    assert diag.source == "live" and diag.read_error is None and diag.role_name == "Leader"
+    assert ("single_neighbour", "bad") in {(f.code, f.severity) for f in health_flags(diag)}  # "no neighbours"
+
+
+def test_a_changed_role_with_an_empty_table_is_taken_live():
+    # Router -> End Device with no neighbours: the role CHANGED, which shows the node
+    # really answered; the guard only distrusts "unchanged attached role + nothing".
+    matter = FakeMatter(overrides={(0x3F, ATTR_ROUTING_ROLE): 3, (0x3F, ATTR_NEIGHBOR_TABLE): []})
+    survey = _run(survey_thread_nodes(matter, live_read=True))
+    diag = next(d for d in survey.diags if d.node_id == 0x3F)
+    assert diag.source == "live" and diag.read_error is None and diag.role_name == "EndDevice"
+    assert "no_parent" in {f.code for f in health_flags(diag)}
+
+
+@pytest.mark.parametrize("cached_role_node", [0x2E, 0x27])
+def test_an_unchanged_attached_role_with_an_empty_table_fails_for_sleepy_and_router_alike(cached_role_node):
+    matter = FakeMatter(overrides={(cached_role_node, ATTR_NEIGHBOR_TABLE): []})
+    survey = _run(survey_thread_nodes(matter, live_read=True))
+    diag = next(d for d in survey.diags if d.node_id == cached_role_node)
+    assert diag.source == "cache" and "came back empty" in diag.read_error
+
+
+def test_a_live_role_of_unspecified_with_null_partition_is_taken_live_and_flagged_role_unknown():
+    matter = FakeMatter(overrides={
+        (0x27, ATTR_ROUTING_ROLE): 0, (0x27, ATTR_NEIGHBOR_TABLE): [], (0x27, ATTR_ROUTE_TABLE): [],
+        (0x27, ATTR_PARTITION_ID): None, (0x27, ATTR_LEADER_ROUTER_ID): None})
+    survey = _run(survey_thread_nodes(matter, live_read=True))
+    diag = next(d for d in survey.diags if d.node_id == 0x27)
+    assert diag.source == "live" and diag.read_error is None
+    assert "role_unknown" in {f.code for f in health_flags(diag)}
 
 
 def test_an_empty_live_neighbour_table_is_accepted_when_the_cache_was_empty_too():

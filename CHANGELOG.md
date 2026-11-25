@@ -14,10 +14,13 @@ current version is `Info.plist`'s `PluginVersion`.
   live report takes at most about 50 s however many routers you have.
 - Fix (issue #348): a live answer only replaces the cache when it is usable. If a node's
   live read fails, times out, or comes back unusable (no RoutingRole, RouteTable,
-  PartitionId or LeaderRouterId, or a neighbour table that is empty or unparseable
-  while the cache had neighbours), the node keeps its cached data, is listed under
+  PartitionId or LeaderRouterId, a neighbour table whose rows none could be parsed, or an
+  empty neighbour table from a node whose role is unchanged and still attached while the
+  cache had neighbours), the node keeps its cached data, is listed under
   **Unreadable** with the reason (naming each attribute that failed), and carries the
-  `stale` note. It is never half cached and half live.
+  `stale` note. It is never half cached and half live. A node that really has detached (live role Unassigned or Unspecified, empty
+  tables, no partition), or split off as the Leader of its own partition, is a correct
+  live answer and is shown as such, flagged `detached` / `role_unknown` / no neighbours.
 - Fix (issue #348): a child a router's cache listed but its usable live table no longer
   does is not drawn as an anonymous child of that router; the node's block says so
   ("child 0x5C04 was in matter-server's cache but is absent from this router's live

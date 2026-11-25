@@ -49,6 +49,12 @@ from thread_mesh import (
     ATTR_ROUTE_TABLE,
     ATTR_ROUTING_ROLE,
     CLUSTER_THREAD_DIAG,
+    ROLE_ED,
+    ROLE_REED,
+    ROLE_ROUTER,
+    ROLE_SED,
+    ROLE_UNASSIGNED,
+    ROLE_UNSPECIFIED,
     NodeDiag,
     parse_node_diag,
 )
@@ -259,9 +265,17 @@ _ATTR_NAMES = {
     ATTR_LEADER_ROUTER_ID: "LeaderRouterId",
 }
 
-#: RoutingRole value for "Unassigned" — a node that says it is off the mesh has no
-#: partition or leader to report, so a null there is its true answer (#348 review).
-_ROLE_UNASSIGNED = 1
+#: Live roles that say "not attached": such a node has no partition or leader to
+#: report, so a null there is its true answer, not an unusable one (#348 review).
+#: Unspecified counts — a live "role unknown" statement must not be replaced by a
+#: cached "attached" one (it surfaces as ``role_unknown``).
+_NOT_ATTACHED_ROLES = (ROLE_UNSPECIFIED, ROLE_UNASSIGNED)
+
+#: The attached, NON-leader roles. Only for these is "I have no neighbours at all"
+#: implausible enough, when the role is unchanged from the cache, to be distrusted.
+#: A Leader can legitimately be alone in its own partition, and Unassigned has no
+#: neighbours by definition.
+_ATTACHED_NON_LEADER_ROLES = (ROLE_SED, ROLE_ED, ROLE_REED, ROLE_ROUTER)
 
 
 def _is_int(value: Any) -> bool:
@@ -282,7 +296,7 @@ def _unusable_live_answers(live_values: Mapping[int, Any]) -> list[str]:
         problems.append("live read returned no NeighborTable")
     if not isinstance(live_values[ATTR_ROUTE_TABLE], list):
         problems.append("live read returned no usable RouteTable")
-    detached = role == _ROLE_UNASSIGNED
+    detached = role in _NOT_ATTACHED_ROLES
     for attr in (ATTR_PARTITION_ID, ATTR_LEADER_ROUTER_ID):
         value = live_values[attr]
         if not _is_int(value) and not (detached and value is None):
@@ -305,12 +319,19 @@ async def _live_refresh(  # pylint: disable=too-many-return-statements
     ``"live"`` diag. Failed means: any attribute read raised or the node timed out
     (the message names each attribute); any answer is unusable (see
     :func:`_unusable_live_answers`); or the live NeighborTable came back empty when
-    the cache had neighbours (an empty answer from a node that was just seen with
-    neighbours is far likelier a failed read than "everyone left").
+    the cache had neighbours AND the node still claims, live, the same attached
+    non-leader role as in the cache (Router, REED, End Device, Sleepy End Device).
+    An unchanged "attached, but I see nobody" is far likelier a failed read than
+    "everyone left"; but a node that live-reports Unassigned/Unspecified (really
+    detached), Leader (alone in its own partition) or ANY different role has
+    demonstrably answered, and that answer is exactly what this diagnostic exists
+    to show — it is taken as it is. A table whose rows existed but none parsed is
+    unparseable (not empty) and is a failed read under every role.
     """
     node_id = diag.node_id
     cached_child_rlocs = [child.rloc16 for child in diag.children]
     cached_neighbour_count = len(diag.neighbours)
+    cached_role = diag.role
     try:
         values = await asyncio.wait_for(
             asyncio.gather(*(matter.read(node_id, 0, CLUSTER_THREAD_DIAG, attr) for attr in _LIVE_ATTR_IDS),
@@ -367,11 +388,19 @@ async def _live_refresh(  # pylint: disable=too-many-return-statements
     if live_diag is None:
         diag.read_error = "live read returned no usable RoutingRole"
         return
-    skipped_rows = len(live_values[ATTR_NEIGHBOR_TABLE]) - len(live_diag.neighbours)
-    if not live_diag.neighbours and cached_neighbour_count:
+    live_row_count = len(live_values[ATTR_NEIGHBOR_TABLE])
+    skipped_rows = live_row_count - len(live_diag.neighbours)
+    if live_row_count and not live_diag.neighbours:
         diag.read_error = (
-            "live neighbour table came back empty or unparseable while the cache had "
-            f"{cached_neighbour_count} neighbour(s) — the cached table is shown"
+            f"live neighbour table had {live_row_count} row(s) and none could be parsed — "
+            "the cached table is shown"
+        )
+        return
+    if (not live_row_count and cached_neighbour_count
+            and live_diag.role == cached_role and cached_role in _ATTACHED_NON_LEADER_ROLES):
+        diag.read_error = (
+            "live neighbour table came back empty while the cache had "
+            f"{cached_neighbour_count} neighbour(s) and the role is unchanged — the cached table is shown"
         )
         return
     live_diag.source = "live"
